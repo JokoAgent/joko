@@ -350,6 +350,7 @@ function toProtoActivity(activity: PartnerActivitySummary): contract.PartnerActi
   return create(contract.PartnerActivitySchema, {
     partnerId: activity.partnerId,
     unreadReplyCount: BigInt(activity.unreadReplyCount),
+    latestReplyPreview: activity.latestReplyPreview,
     ...(activity.latestReplyCursor === undefined
       ? {}
       : { latestReplyCursor: toProtoRevision(activity.latestReplyCursor) }),

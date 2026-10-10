@@ -89,6 +89,7 @@ import {
   type MobilePartnerDirectoryTransport
 } from "./mobile-partner-directory";
 import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport } from "./mobile-partner-conversation";
+import type { MobilePartnerDirectoryObservation } from "./mobile-partner-activity";
 import { validateMobilePartnerProfileDraft, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
 import { MobilePartnerCreationRejected, mobilePartnerCreationBackends, validateMobilePartnerCreationDraft,
@@ -980,6 +981,12 @@ export class MobileClient {
         if (result.kind === "absent") throw new Error("The original Partner intent could not be retired.");
         return resolve(requestId, result, signal);
       }) };
+  }
+
+  partnerDirectoryObservation(): MobilePartnerDirectoryObservation | undefined {
+    if (this.#state.status !== "connected" && this.#state.status !== "offline") return undefined;
+    const ownerKey = this.#partnerPrivateAuthorityKey({ ...this.#state, status: "connected" });
+    return ownerKey && this.#state.owner ? { ownerKey, online: this.#state.status === "connected", snapshot: this.#state.owner } : undefined;
   }
 
   partnerDirectoryTransport(): MobilePartnerDirectoryTransport | undefined {

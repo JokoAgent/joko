@@ -157,6 +157,7 @@ export interface PartnerActivitySummary {
   readonly unreadReplyCount: number;
   readonly latestReplyCursor?: bigint;
   readonly latestReplyAt?: number;
+  readonly latestReplyPreview: string;
   readonly artifactCount: number;
   readonly activeDelegationCount: number;
   readonly readState: PartnerReadStateRecord;
@@ -295,6 +296,9 @@ export class PartnerManager {
     return {
       partnerId: partner.id,
       unreadReplyCount,
+      latestReplyPreview: latestReply?.payload.type === "message_complete"
+        ? latestReply.payload.blocks.filter((block) => block.kind === "text")
+          .map((block) => block.text).join(" ").replace(/\s+/gu, " ").trim().slice(0, 500) : "",
       ...(latestReply === undefined ? {} : {
         latestReplyCursor: latestReply.globalCursor,
         latestReplyAt: latestReply.emittedAt

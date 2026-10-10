@@ -151,6 +151,9 @@ message PartnerActivity {
   uint64 active_delegation_count = 6;
   Revision read_through_cursor = 7;
   google.protobuf.Timestamp read_updated_at = 8;
+  // At most 500 characters from the latest completed public assistant reply.
+  // Empty when that reply has no text. Private messages and reasoning are excluded.
+  string latest_reply_preview = 9;
 }
 
 message PartnerSession {

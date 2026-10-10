@@ -13,10 +13,18 @@ import type {
 } from "./mobile-partner-directory";
 import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
 import type { MobilePartnerCreationTransport } from "./mobile-partner-creation";
+import { create } from "@bufbuild/protobuf";
+import { SessionState, SnapshotSchema } from "@joko/contracts";
+import type { MobilePartnerDirectoryObservation } from "./mobile-partner-activity";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const native = vi.hoisted(() => ({ back: undefined as undefined | (() => boolean) }));
+vi.mock("./MobilePartnerPresenceRing", async () => {
+  const React = await import("react");
+  return { MobilePartnerPresenceRing: ({ active }: { active: boolean }) => active
+    ? React.createElement("span", { "data-testid": "partnerDirectory.presenceRing" }) : null };
+});
 vi.mock("./MobilePartnerCreateSheet", async () => {
   const React = await import("react");
   return { MobilePartnerCreateSheet: ({ visible }: { visible: boolean }) => visible ? React.createElement("div", { "data-testid": "partnerCreation.sheet" }) : null };
@@ -137,7 +145,7 @@ const onBack = vi.fn();
 const onOpenTask = vi.fn();
 
 async function render(active?: MobilePartnerDirectoryTransport, initializationTransport?: MobilePartnerInitializationTransport,
-  creationTransport?: MobilePartnerCreationTransport) {
+  creationTransport?: MobilePartnerCreationTransport, observation?: MobilePartnerDirectoryObservation) {
   if (!root) {
     container = document.createElement("div");
     document.body.append(container);
@@ -145,7 +153,7 @@ async function render(active?: MobilePartnerDirectoryTransport, initializationTr
   }
   await act(async () => {
     root.render(createElement(MobilePartnerDirectoryScreen, {
-      colors, locale: "en", transport: active, initializationTransport, creationTransport, onBack, onOpenTask
+      colors, locale: "en", transport: active, initializationTransport, creationTransport, observation, onBack, onOpenTask
     }));
   });
 }
@@ -195,7 +203,7 @@ describe("MobilePartnerDirectoryScreen", () => {
     const active = transport();
     await render(active);
     expect(container.textContent).toContain("Ada");
-    expect(container.textContent).toContain("3 Artifacts · 1 active handoffs");
+    expect(container.textContent).toContain("Ada works across product surfaces.");
     expect((container.querySelector('[aria-label="Open Pending\'s task"]') as HTMLButtonElement).disabled).toBe(true);
     expect(container.querySelector('[aria-label="Search Partners"]')).toBeTruthy();
     const input = container.querySelector('[aria-label="Search Partners"]') as HTMLInputElement;
@@ -234,5 +242,50 @@ describe("MobilePartnerDirectoryScreen", () => {
     expect(container.textContent).toContain("Reconnect to view Partners");
     expect(native.back?.()).toBe(true);
     expect(onBack).toHaveBeenCalledOnce();
+  });
+
+  it("shows canonical working and waiting state, preserves the same owner's reply offline and retires it on owner loss", async () => {
+    const active = transport();
+    vi.mocked(active.list).mockResolvedValue({ ...catalog, partners: [{ ...ada,
+      activity: { ...ada.activity, latestReplyPreview: "**Ready** [report](https://example.test)" } }] });
+    const observation: MobilePartnerDirectoryObservation = { ownerKey: active.ownerKey, online: true,
+      snapshot: create(SnapshotSchema, { sessions: [{ sessionId: ada.canonicalSessionId, targetId: ada.homeTargetId,
+        backendId: "backend", state: SessionState.RUNNING, version: { generation: 1n } }] }) };
+    await render(active, undefined, undefined, observation);
+    expect(container.textContent).toContain("Thinking…");
+    expect(container.querySelector('[data-testid="partnerDirectory.presenceRing"]')).not.toBeNull();
+    observation.snapshot.sessions[0]!.state = SessionState.WAITING;
+    await render(active, undefined, undefined, observation);
+    expect(container.textContent).toContain("Waiting for your confirmation · Ready report");
+    expect(container.querySelector('[data-testid="partnerDirectory.presenceRing"]')).toBeNull();
+    await render(undefined, undefined, undefined, { ...observation, online: false });
+    expect(container.textContent).toContain("Offline · Ready report");
+    expect(container.querySelector<HTMLButtonElement>('[data-testid="partnerDirectory.item.ada"]')!.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>('[data-testid="partnerDirectory.refresh"]')!.disabled).toBe(true);
+    expect(active.open).not.toHaveBeenCalled();
+    await render(undefined);
+    expect(container.textContent).not.toContain("Ready report");
+  });
+
+  it("polls without overlapping reads and stops after a read failure or offline transition", async () => {
+    vi.useFakeTimers();
+    try {
+      const active = transport(); await render(active);
+      let finish!: (value: MobilePartnerCatalog) => void;
+      vi.mocked(active.list).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+      expect(active.list).toHaveBeenCalledTimes(2);
+      await act(async () => { await vi.advanceTimersByTimeAsync(7500); });
+      expect(active.list).toHaveBeenCalledTimes(2);
+      await act(async () => finish(catalog));
+      vi.mocked(active.list).mockRejectedValueOnce(new Error("connection lost"));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+      expect(container.textContent).toContain("The saved list may be out of date");
+      await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+      expect(active.list).toHaveBeenCalledTimes(3);
+      await render(undefined);
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+      expect(active.list).toHaveBeenCalledTimes(3);
+    } finally { vi.useRealTimers(); }
   });
 });

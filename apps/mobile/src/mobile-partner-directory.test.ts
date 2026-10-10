@@ -80,6 +80,10 @@ describe("mobile Partner directory projection", () => {
       partnerId: "ada", profileVersion: 3n,
       activity: { unreadReplyCount: 2, latestReplyCursor: 5n, readThroughCursor: 3n }
     });
+    const preview = catalog(); preview.partners[0]!.activity!.latestReplyPreview = "A public reply";
+    expect(projectMobilePartnerCatalog(preview).partners[0]!.activity.latestReplyPreview).toBe("A public reply");
+    preview.partners[0]!.activity!.latestReplyPreview = "x".repeat(501);
+    expect(() => projectMobilePartnerCatalog(preview)).toThrow(/reply activity/u);
     const sessions = create(ListPartnerSessionsResponseSchema, { sessions: [{
       sessionId: "session-ada", partnerId: "ada", role: PartnerSessionRole.CANONICAL,
       profileVersion: 3n, displayName: "Ada", available: true, createdAt: at(10n)

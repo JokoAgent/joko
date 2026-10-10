@@ -39,6 +39,7 @@ export interface MobilePartnerActivity {
   readonly unreadReplyCount: number;
   readonly latestReplyCursor?: bigint;
   readonly latestReplyAt?: number;
+  readonly latestReplyPreview?: string;
   readonly artifactCount: number;
   readonly activeDelegationCount: number;
   readonly readThroughCursor: bigint;
@@ -271,6 +272,7 @@ function projectActivity(value: PartnerActivity | undefined): MobilePartnerActiv
   const readThroughCursor = cursor(value.readThroughCursor, "Partner read cursor");
   const unreadReplyCount = count(value.unreadReplyCount, "Partner unread reply count");
   if ((latestReplyCursor === undefined) !== (latestReplyAt === undefined)
+    || value.latestReplyPreview.length > 500 || value.latestReplyPreview !== "" && latestReplyCursor === undefined
     || unreadReplyCount > 0 && (latestReplyCursor === undefined || latestReplyCursor <= readThroughCursor)) {
     throw new Error("The Joko node returned inconsistent Partner reply activity.");
   }
@@ -279,6 +281,7 @@ function projectActivity(value: PartnerActivity | undefined): MobilePartnerActiv
     unreadReplyCount,
     ...(latestReplyCursor === undefined ? {} : { latestReplyCursor }),
     ...(latestReplyAt === undefined ? {} : { latestReplyAt }),
+    ...(value.latestReplyPreview === "" ? {} : { latestReplyPreview: value.latestReplyPreview }),
     artifactCount: count(value.artifactCount, "Partner Artifact count"),
     activeDelegationCount: count(value.activeDelegationCount, "Partner active delegation count"),
     readThroughCursor,

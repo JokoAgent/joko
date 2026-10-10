@@ -392,16 +392,21 @@ describe("PartnerManager", () => {
     } });
     expect(fixture.manager.activity(recipient.id).unreadReplyCount).toBe(0);
     expect(fixture.manager.activity(recipient.id).latestReplyCursor).toBeUndefined();
+    expect(fixture.manager.activity(recipient.id).latestReplyPreview).toBe("");
     fixture.sessionHost.enqueueServiceInput({ operationId: "public-canonical-input", sessionId: recipient.canonicalSessionId!, source: "system",
-      prompt: { text: "A public canonical question", images: [], files: [], mentions: [], disposition: "prompt" } });
+      prompt: { text: `A public canonical question ${"x".repeat(800)}`, images: [], files: [], mentions: [], disposition: "prompt" } });
     await vi.waitFor(() => expect(fixture.manager.activity(recipient.id).unreadReplyCount).toBe(1));
     const activity = fixture.manager.activity(recipient.id);
     expect(activity.latestReplyCursor).toBeDefined();
+    expect(activity.latestReplyPreview).not.toBe("");
+    expect(activity.latestReplyPreview).toHaveLength(500);
+    expect(activity.latestReplyPreview).not.toContain("Please check whether");
     expect(activity.artifactCount).toBe(0);
     expect(fixture.manager.markRead(recipient.id, activity.latestReplyCursor!)).toMatchObject({
       throughCursor: activity.latestReplyCursor
     });
     expect(fixture.manager.activity(recipient.id).unreadReplyCount).toBe(0);
+    expect(fixture.manager.activity(recipient.id).latestReplyPreview).toBe(activity.latestReplyPreview);
 
     const thread = fixture.manager.getPrivateThread(delivered.reservation.thread.id, recipient.id);
     expect(thread.messages).toEqual([

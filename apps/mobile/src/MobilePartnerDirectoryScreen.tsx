@@ -25,11 +25,14 @@ import { MobilePartnerInitializationScreen } from "./MobilePartnerInitialization
 import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
 import type { MobilePartnerCreationTransport } from "./mobile-partner-creation";
 import { MobilePartnerCreateSheet } from "./MobilePartnerCreateSheet";
+import { MobilePartnerPresenceRing } from "./MobilePartnerPresenceRing";
+import { mobilePartnerActivityState, mobilePartnerDirectoryPreview, type MobilePartnerDirectoryObservation } from "./mobile-partner-activity";
 
 export interface MobilePartnerDirectoryScreenProps {
   readonly colors: MobilePartnersColors;
   readonly locale: MobileSupportedLocale;
   readonly transport?: MobilePartnerDirectoryTransport;
+  readonly observation?: MobilePartnerDirectoryObservation;
   readonly initializationTransport?: MobilePartnerInitializationTransport;
   readonly creationTransport?: MobilePartnerCreationTransport;
   readonly onBack: () => void;
@@ -73,44 +76,60 @@ function Action({ label, colors, onPress, disabled = false, testID }: {
   </Pressable>;
 }
 
-function PartnerRow({ partner, colors, locale, opening, recoverable, last, onOpen }: {
+function PartnerRow({ partner, colors, locale, opening, recoverable, online, observation, last, onOpen }: {
   readonly partner: MobilePartnerDirectoryProfile;
   readonly colors: MobilePartnersColors;
   readonly locale: MobileSupportedLocale;
   readonly opening: boolean;
   readonly recoverable: boolean;
+  readonly online: boolean;
+  readonly observation?: MobilePartnerDirectoryObservation;
   readonly last: boolean;
   readonly onOpen: () => void;
 }) {
-  const available = partner.lifecycle === "active" && partner.initializationState === "ready"
+  const available = online && partner.lifecycle === "active" && partner.initializationState === "ready"
     && partner.canonicalSessionId !== undefined;
   const identity = firstIdentityLine(partner.identitySource);
   const activity = mobileMessage(locale, "partnerDirectory.activity", {
     artifacts: partner.activity.artifactCount, delegations: partner.activity.activeDelegationCount
   });
+  const execution = observation ? mobilePartnerActivityState(partner, observation) : online ? "unknown" : "offline";
+  const working = online && partner.lifecycle === "active" && partner.initializationState === "ready"
+    && ["working", "recovering", "compacting"].includes(execution);
+  const prefix = !online ? mobileMessage(locale, "partnerDirectory.execution.offline")
+    : partner.lifecycle !== "active" || partner.initializationState !== "ready" ? statusLabel(partner, locale)
+      : execution === "ready" || execution === "working" ? "" : mobileMessage(locale, `partnerDirectory.execution.${execution}`);
+  const preview = working ? mobileMessage(locale, `partnerDirectory.execution.${execution}`)
+    : mobilePartnerDirectoryPreview(partner) || mobileMessage(locale, "partnerDirectory.startChat");
   return <Pressable accessibilityRole="button"
     accessibilityLabel={mobileMessage(locale, recoverable ? "partnerInitialization.openAccessibility"
       : "partnerDirectory.openAccessibility", { name: partner.displayName })}
-    accessibilityHint={[statusLabel(partner, locale), identity, activity,
+    accessibilityHint={[prefix, preview, identity, activity,
       recoverable ? mobileMessage(locale, "partnerInitialization.openAccessibility", { name: partner.displayName })
         : mobileMessage(locale, available ? "partnerDirectory.openTask" : "partnerDirectory.unavailable")].join(" · ")}
     accessibilityState={{ disabled: !available && !recoverable || opening }} disabled={!available && !recoverable || opening}
     onPress={onOpen} testID={`partnerDirectory.item.${partner.partnerId}`}
     style={[styles.row, { backgroundColor: colors.surface }, !available && !recoverable && styles.unavailable]}>
-    <MobilePartnerAvatar preset={partner.avatar} partner={partner} colors={colors} />
+    <View style={styles.avatar}>
+      <View style={!online ? styles.unavailable : undefined}><MobilePartnerAvatar preset={partner.avatar} partner={partner} colors={colors} /></View>
+      <MobilePartnerPresenceRing active={working} color={colors.accent} />
+      <View accessible={false} style={[styles.presence, { backgroundColor: colors.surface }]}>
+        <View style={[styles.presenceDot, { backgroundColor: online ? colors.ink : colors.muted }]} />
+      </View>
+    </View>
     <View style={[styles.rowBody, !last && { borderBottomColor: colors.border, borderBottomWidth: StyleSheet.hairlineWidth }]}>
       <View style={styles.titleRow}>
         <Text style={[styles.name, { color: colors.ink }]} numberOfLines={1}>{partner.displayName}</Text>
         <View style={styles.grow} />
-        {opening ? <ActivityIndicator color={colors.muted} />
+        {opening || working ? <View testID={`partnerDirectory.working.${partner.partnerId}`}><ActivityIndicator color={colors.muted} /></View>
           : <Text style={[styles.time, { color: colors.muted }]} numberOfLines={1}>
             {formatTime(partner.activity.latestReplyAt ?? partner.updatedAt, locale)}
           </Text>}
       </View>
       <View style={styles.previewRow}>
         <Text style={[styles.preview, { color: colors.muted }]} numberOfLines={1}>
-          {!available && <Text style={{ color: colors.ink, fontWeight: "500" }}>{statusLabel(partner, locale)} · </Text>}
-          {activity}
+          {!working && prefix !== "" && <Text style={{ color: colors.ink, fontWeight: "500" }}>{prefix} · </Text>}
+          {preview}
         </Text>
         {partner.activity.unreadReplyCount > 0 && <View accessibilityLabel={mobileMessage(locale,
           "partnerDirectory.unreadReplies", { count: partner.activity.unreadReplyCount })}
@@ -120,7 +139,7 @@ function PartnerRow({ partner, colors, locale, opening, recoverable, last, onOpe
   </Pressable>;
 }
 
-export function MobilePartnerDirectoryScreen({ colors, locale, transport, initializationTransport, creationTransport, onBack, onOpenTask }:
+export function MobilePartnerDirectoryScreen({ colors, locale, transport, observation, initializationTransport, creationTransport, onBack, onOpenTask }:
   MobilePartnerDirectoryScreenProps) {
   const [state, setState] = useState<DirectoryState>(() => transport
     ? { ownerKey: transport.ownerKey, status: "loading", refreshing: false }
@@ -135,14 +154,17 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
   const requestRef = useRef<AbortController | undefined>(undefined);
   const openRef = useRef<AbortController | undefined>(undefined);
   const generationRef = useRef(0);
+  const ownerKey = observation?.ownerKey ?? transport?.ownerKey;
+  const ownerRef = useRef(ownerKey); ownerRef.current = ownerKey;
   transportRef.current = transport;
 
   const load = (): void => {
-    requestRef.current?.abort();
+    if (requestRef.current) return;
     const current = transportRef.current;
     const generation = ++generationRef.current;
     if (!current) {
-      setState({ status: "offline", refreshing: false });
+      setState((previous) => previous.ownerKey === ownerRef.current && previous.catalog
+        ? { ...previous, status: "offline", refreshing: false } : { status: "offline", refreshing: false });
       return;
     }
     const ownerKey = current.ownerKey;
@@ -162,19 +184,28 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
       setState((previous) => previous.ownerKey === ownerKey && previous.catalog
         ? { ...previous, status: "ready", refreshing: false, error: message }
         : { ownerKey, status: "error", refreshing: false, error: message });
-    });
+    }).finally(() => { if (requestRef.current === controller) requestRef.current = undefined; });
   };
 
   useEffect(() => {
     setOpeningId(undefined);
     setActionError(undefined);
+    requestRef.current?.abort(); requestRef.current = undefined;
+    openRef.current?.abort();
     load();
     return () => {
       generationRef.current += 1;
       requestRef.current?.abort();
       openRef.current?.abort();
     };
-  }, [transport?.ownerKey]);
+  }, [ownerKey, transport?.ownerKey]);
+
+  useEffect(() => {
+    if (!transport || state.ownerKey !== transport.ownerKey || !state.catalog || state.refreshing || state.error
+      || initialization || creation || openingId) return;
+    const timer = setTimeout(load, 2500);
+    return () => clearTimeout(timer);
+  }, [transport?.ownerKey, state.catalog, state.refreshing, state.error, initialization, creation, openingId]);
 
   const leaveInitialization = (): void => { setInitialization(undefined); load(); };
   useEffect(() => {
@@ -185,7 +216,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
     return () => subscription.remove();
   }, [onBack, initialization]);
 
-  const currentOwner = transport !== undefined && state.ownerKey === transport.ownerKey;
+  const currentOwner = ownerKey !== undefined && state.ownerKey === ownerKey;
   const catalog = currentOwner ? state.catalog : undefined;
   const status = currentOwner ? state.status : transport ? "loading" : "offline";
   const visible = useMemo(() => filterMobilePartnerDirectory(catalog?.partners ?? [], lifecycle, query, locale),
@@ -223,7 +254,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
         <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "partnerDirectory.subtitle")}</Text>
       </View>
       <Action label={mobileMessage(locale, "common.refresh")} colors={colors}
-        disabled={status === "loading" || state.refreshing} onPress={load}
+        disabled={!transport || status === "loading" || state.refreshing} onPress={load}
         testID="partnerDirectory.refresh" />
       <Action label={mobileMessage(locale, "partnerCreation.create")} colors={colors} onPress={() => setCreation(true)}
         disabled={!creationTransport || creationTransport.ownerKey !== transport?.ownerKey} testID="partnerDirectory.create" />
@@ -266,7 +297,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
       <Text style={[styles.body, { color: colors.negative }]}>{actionError ?? mobileMessage(locale,
         catalog ? "partnerDirectory.stale" : "partnerDirectory.error")}</Text>
     </View>}
-    {status === "offline" ? <View style={styles.center}>
+    {status === "offline" && !catalog ? <View style={styles.center}>
       <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "partnerDirectory.offline")}</Text>
     </View> : status === "loading" ? <View style={styles.center}>
       <ActivityIndicator color={colors.accent} />
@@ -287,6 +318,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, initia
         const recoverable = item.lifecycle === "active" && item.initializationState !== "ready"
           && initializationTransport !== undefined && initializationTransport.ownerKey === transport?.ownerKey;
         return <PartnerRow partner={item} colors={colors} locale={locale} recoverable={recoverable}
+          online={transport !== undefined} observation={observation?.ownerKey === ownerKey ? observation : undefined}
           last={index === visible.length - 1} opening={openingId === item.partnerId} onOpen={() => {
             if (recoverable && transport) setInitialization({ ownerKey: transport.ownerKey, partnerId: item.partnerId });
             else open(item);
@@ -327,6 +359,9 @@ const styles = StyleSheet.create({
   emptyList: { flexGrow: 1, justifyContent: "center" },
   emptyText: { textAlign: "center" },
   row: { height: 78, paddingLeft: 16, gap: 12, flexDirection: "row", alignItems: "center" },
+  avatar: { width: 44, height: 44 },
+  presence: { position: "absolute", right: 0, bottom: 0, padding: 2, borderRadius: 7 },
+  presenceDot: { width: 10, height: 10, borderRadius: 5 },
   rowBody: { flex: 1, minWidth: 0, alignSelf: "stretch", justifyContent: "center", paddingRight: 16 },
   titleRow: { flexDirection: "row", alignItems: "center", gap: 4, height: 28 },
   time: { fontSize: 13, lineHeight: 22, fontVariant: ["tabular-nums"] },

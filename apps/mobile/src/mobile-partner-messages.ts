@@ -10,6 +10,15 @@ type MobilePartnerMessageRow = readonly [
 ];
 
 const rows = [
+  ["partnerDirectory.startChat", "Start a conversation", "开始对话", "開始對話", "会話を始める", "대화 시작"],
+  ["partnerDirectory.execution.working", "Thinking…", "正在思考…", "正在思考…", "考え中…", "생각 중…"],
+  ["partnerDirectory.execution.ready", "Available", "可用", "可用", "利用可能", "사용 가능"],
+  ["partnerDirectory.execution.waiting", "Waiting for your confirmation", "等你确认", "等你確認", "確認を待っています", "확인 대기 중"],
+  ["partnerDirectory.execution.recovering", "Reconnecting…", "正在恢复连接…", "正在恢復連線…", "再接続中…", "다시 연결 중…"],
+  ["partnerDirectory.execution.compacting", "Organizing conversation…", "正在整理对话…", "正在整理對話…", "会話を整理中…", "대화 정리 중…"],
+  ["partnerDirectory.execution.attention", "Needs attention", "需要关注", "需要注意", "確認が必要", "확인 필요"],
+  ["partnerDirectory.execution.unknown", "Status unavailable", "状态不可用", "狀態無法使用", "状態を取得できません", "상태 확인 불가"],
+  ["partnerDirectory.execution.offline", "Offline", "离线", "離線", "オフライン", "오프라인"],
   ["partnerCreation.title", "Invite a Partner", "邀请伙伴", "邀請夥伴", "パートナーを招待", "파트너 초대"],
   ["partnerCreation.create", "Invite Partner", "邀请伙伴", "邀請夥伴", "パートナーを招待", "파트너 초대"],
   ["partnerCreation.backend", "Execution environment", "执行环境", "執行環境", "実行環境", "실행 환경"],

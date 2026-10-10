@@ -257,6 +257,8 @@ describe("PartnerService", () => {
       partnerId: second.id
     }), context());
     expect(beforeRead.partner?.activity?.unreadReplyCount).toBe(1n);
+    expect(beforeRead.partner?.activity?.latestReplyPreview).toBe(fixture.manager.activity(second.id).latestReplyPreview);
+    expect(beforeRead.partner?.activity?.latestReplyPreview).not.toContain("Please inspect the recovery boundary.");
     const marked = await service.markPartnerRead(create(contract.MarkPartnerReadRequestSchema, {
       partnerId: second.id,
       throughCursor: beforeRead.partner!.activity!.latestReplyCursor

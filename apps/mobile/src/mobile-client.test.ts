@@ -2902,6 +2902,21 @@ describe("mobile Partner private authority", () => {
     expect(network.updatePartnerProfile).toHaveBeenCalledTimes(2);
   });
 
+  it("retains only a proven same-node directory observation during a temporary disconnect", async () => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const connected = app.partnerDirectoryObservation();
+    expect(connected).toMatchObject({ online: true, snapshot: app.state.owner });
+    vi.mocked(network.inspect).mockRejectedValueOnce(new Error("radio slept")); await app.refresh();
+    expect(app.state.status).toBe("offline");
+    expect(app.partnerDirectoryObservation()).toMatchObject({ ownerKey: connected!.ownerKey, online: false });
+    expect(app.partnerDirectoryTransport()).toBeUndefined();
+    app.setForeground(false); expect(app.partnerDirectoryObservation()).toBeUndefined();
+    vi.mocked(network.inspect).mockResolvedValueOnce({ ...node, serverId: "another-node" });
+    app.setForeground(true); await vi.waitFor(() => expect(app.state.status).not.toBe("connected"));
+    await app.refresh(); expect(app.partnerDirectoryObservation()).toBeUndefined();
+  });
+
   it("opens a roster Partner only after exact profile and canonical Session revalidation", async () => {
     const network = fakeNetwork();
     const partner = {
