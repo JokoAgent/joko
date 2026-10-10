@@ -1,6 +1,7 @@
 import { useEffect, useRef, type ReactNode } from "react";
 import { AccessibilityInfo, Animated, Easing, StyleSheet, Text, View } from "react-native";
 import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
+import type { MobilePartnerAvatarValue, MobilePartnerAvatarIdentity } from "./mobile-partner-avatar";
 import { MobilePartnerEntranceLedger } from "./mobile-partner-entrance";
 import { formatMobilePartnerTime } from "./mobile-partner-presentation";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
@@ -9,10 +10,11 @@ import type { TimelineRow } from "./timeline";
 
 const entrances = new MobilePartnerEntranceLedger();
 
-export function MobilePartnerConversationRow({ row, ownerKey, preset, timestamp, colors, locale, animate, children }: {
+export function MobilePartnerConversationRow({ row, ownerKey, preset, partner, timestamp, colors, locale, animate, children }: {
   readonly row: TimelineRow;
   readonly ownerKey: string;
-  readonly preset: string;
+  readonly preset: MobilePartnerAvatarValue;
+  readonly partner?: MobilePartnerAvatarIdentity;
   readonly timestamp?: number;
   readonly colors: MobilePartnersColors;
   readonly locale: MobileSupportedLocale;
@@ -45,7 +47,7 @@ export function MobilePartnerConversationRow({ row, ownerKey, preset, timestamp,
       ...(user ? [{ scale: progress.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1] }) }] : [])
     ] }}>
       <View style={user ? styles.user : reply ? styles.reply : styles.inset}>
-        {reply && <View style={styles.portrait}><MobilePartnerAvatar preset={preset} colors={colors} size={28} /></View>}
+        {reply && <View style={styles.portrait}><MobilePartnerAvatar preset={preset} partner={partner} colors={colors} size={28} /></View>}
         <View style={styles.content}>{children}</View>
       </View>
     </Animated.View>

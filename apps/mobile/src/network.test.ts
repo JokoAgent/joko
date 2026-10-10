@@ -12,6 +12,7 @@ import {
   ListPartnersRequestSchema, ListPartnersResponseSchema, MarkPartnerReadRequestSchema, MarkPartnerReadResponseSchema,
   GetPartnerDirectoryResponseSchema, UpdatePartnerRequestSchema, UpdatePartnerResponseSchema,
   RetryPartnerInitializationRequestSchema, RetryPartnerInitializationResponseSchema,
+  ReadPartnerAvatarRequestSchema, ReadPartnerAvatarResponseSchema,
   PermissionMode, type UpdatePartnerRequest,
   ConnectionSchema, ConnectionState, CredentialKind, DeviceKind, DeviceSchema,
   ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionMainViewIcon,
@@ -115,6 +116,44 @@ import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
 import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
 
 describe("mobile Partner catalog network", () => {
+  it("sends typed photo patches, omits unchanged image bodies and verifies exact image responses", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    const content = new Uint8Array(Buffer.from("/9j/2w==", "base64"));
+    const avatar = { sha256: createHash("sha256").update(content).digest("hex"), mimeType: "image/jpeg" as const, byteLength: content.length };
+    const current = { ...profilePartner, avatar, revision: 3n };
+    const patches: UpdatePartnerRequest[] = []; let tampered = false;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname; const body = new Uint8Array(init?.body as Uint8Array);
+      const headers = { "content-type": "application/proto" };
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer partner-fixture-key");
+      if (path.endsWith("/UpdatePartner")) {
+        patches.push(fromBinary(UpdatePartnerRequestSchema, body));
+        return new Response(toBinary(UpdatePartnerResponseSchema, create(UpdatePartnerResponseSchema, {
+          partner: profilePartnerWire(current), directory: { revision: { value: 4n }, avatarPresets: ["orbit"] }
+        })), { headers });
+      }
+      expect(path).toBe("/joko.v1.PartnerService/ReadPartnerAvatar");
+      expect(fromBinary(ReadPartnerAvatarRequestSchema, body)).toMatchObject({ partnerId: current.partnerId,
+        expectedRevision: { value: current.revision }, sha256: avatar.sha256 });
+      return new Response(toBinary(ReadPartnerAvatarResponseSchema, create(ReadPartnerAvatarResponseSchema, {
+        image: { ...avatar, byteLength: BigInt(avatar.byteLength) }, content: tampered ? new Uint8Array(content.length) : content
+      })), { headers });
+    });
+    try {
+      const draft = { ...mobilePartnerProfileDraft(profilePartner), avatar: { base64: "/9j/2w==" } };
+      await expect(mobileNetwork.updatePartnerProfile!(credential, current.partnerId, 2n, draft)).resolves.toMatchObject({ avatar });
+      expect(patches[0]?.patch?.avatar?.value).toEqual({ case: "imageBase64", value: "/9j/2w==" });
+      await mobileNetwork.updatePartnerProfile!(credential, current.partnerId, 2n, mobilePartnerProfileDraft(current));
+      expect(patches[1]?.patch?.avatar).toBeUndefined();
+      await expect(mobileNetwork.readPartnerAvatar!(credential, current)).resolves.toBe("data:image/jpeg;base64,/9j/2w==");
+      tampered = true; await expect(mobileNetwork.readPartnerAvatar!(credential, current)).rejects.toThrow(/verified/u);
+      const abort = new AbortController(); abort.abort(); const calls = fetcher.mock.calls.length;
+      await expect(mobileNetwork.readPartnerAvatar!(credential, current, abort.signal)).rejects.toThrow();
+      expect(fetcher).toHaveBeenCalledTimes(calls);
+    } finally { fetcher.mockRestore(); }
+  });
+
   it("uses the generated initialization CAS and rejects missing, mismatched or non-advancing results", async () => {
     const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
       connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };

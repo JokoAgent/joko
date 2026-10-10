@@ -16,6 +16,42 @@ afterEach(async () => {
 });
 
 describe("PartnerStore", () => {
+  it("atomically owns image bytes outside public profiles and reads only the exact live revision across reopen", async () => {
+    const fixture = await fileStore();
+    const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRZkAAAAASUVORK5CYII=";
+    const created = fixture.store.createPartner({ expectedDirectoryRevision: 1n, ...draft("A".repeat(200)), avatar: { base64 } });
+    expect(typeof created.avatar).toBe("object");
+    const image = created.avatar as Exclude<typeof created.avatar, string>;
+    expect(image).toMatchObject({ mimeType: "image/png", byteLength: Buffer.from(base64, "base64").length });
+    expect(JSON.stringify({ ...created, revision: String(created.revision) })).not.toContain(base64);
+    expect(fixture.store.readPartnerAvatar(created.id, created.revision, image.sha256).content).toEqual(new Uint8Array(Buffer.from(base64, "base64")));
+    expectStoreError(() => fixture.store.readPartnerAvatar(created.id, created.revision, "a".repeat(64)), "PARTNER_NOT_FOUND");
+    fixture.store.close(); const reopened = new PartnerStore(fixture.path); cleanups.push(async () => reopened.close());
+    expect(reopened.readPartnerAvatar(created.id, created.revision, image.sha256).image).toEqual(image);
+    const updated = reopened.updatePartner(created.id, created.revision, { displayName: "Updated" });
+    expectStoreError(() => reopened.readPartnerAvatar(created.id, created.revision, image.sha256), "PARTNER_CHANGED");
+    expect(reopened.readPartnerAvatar(created.id, updated.revision, image.sha256).image).toEqual(image);
+    const deleted = reopened.setLifecycle(created.id, updated.revision, "deleted");
+    expectStoreError(() => reopened.readPartnerAvatar(created.id, deleted.revision, image.sha256), "PARTNER_NOT_FOUND");
+  });
+
+  it("rejects invalid image/name inputs without advancing revisions and reclaims replaced private bytes", async () => {
+    const fixture = await fileStore();
+    const input = { expectedDirectoryRevision: 1n, ...draft("Aster") };
+    for (const avatar of [{ base64: "not-an-image" }, { base64: "PHN2Zz48L3N2Zz4=" }, { base64: "A".repeat(7_000_000) }]) {
+      expectStoreError(() => fixture.store.createPartner({ ...input, avatar }), "PARTNER_INVALID");
+    }
+    expectStoreError(() => fixture.store.createPartner({ ...input, displayName: "A".repeat(201) }), "PARTNER_INVALID");
+    expect(fixture.store.directoryState().revision).toBe(1n);
+    const created = fixture.store.createPartner({ ...input, avatar: { base64: "/9j/2w==" } });
+    const image = created.avatar as Exclude<typeof created.avatar, string>;
+    const replacement = fixture.store.updatePartner(created.id, created.revision, { avatar: "spark" });
+    expect(replacement.avatar).toBe("spark");
+    const database = new DatabaseSync(fixture.path);
+    try { expect(database.prepare("SELECT sha256 FROM partner_avatar_images WHERE sha256 = ?").get(image.sha256)).toBeUndefined(); }
+    finally { database.close(); }
+  });
+
   it("replays a durable creation intent across edits and reopen without replacing the current profile", async () => {
     const fixture = await fileStore();
     const input = { expectedDirectoryRevision: 1n, ...draft("Aster") };

@@ -26,7 +26,9 @@ export const profileSnapshot: MobilePartnerProfileSnapshot = {
 export function profilePartnerWire(partner = profilePartner) {
   return create(PartnerProfileSchema, {
     partnerId: partner.partnerId, revision: { value: partner.revision }, profileVersion: partner.profileVersion,
-    displayName: partner.displayName, avatar: partner.avatar, identitySource: partner.identitySource, templateId: partner.templateId,
+    displayName: partner.displayName, avatar: { value: typeof partner.avatar === "string" ? { case: "presetId", value: partner.avatar }
+      : { case: "image", value: { ...partner.avatar, byteLength: BigInt(partner.avatar.byteLength) } } },
+    identitySource: partner.identitySource, templateId: partner.templateId,
     lifecycle: PartnerLifecycle.ACTIVE, initializationState: PartnerInitializationState.READY, invitationStage: PartnerInvitationStage.READY,
     homeTargetId: partner.homeTargetId, canonicalSessionId: partner.canonicalSessionId, usesDirectoryDefaults: partner.usesDirectoryDefaults,
     capabilities: { modelChain: [...partner.capabilities.modelChain], permissionMode: PermissionMode.ASK, planMode: false },

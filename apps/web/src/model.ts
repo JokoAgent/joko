@@ -1,4 +1,5 @@
 import type { JSONContent } from "@tiptap/core";
+import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar.js";
 import type { VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView } from "@joko/contracts";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
@@ -519,7 +520,7 @@ export interface PartnerProfileView {
   readonly revision: bigint;
   readonly profileVersion: bigint;
   readonly displayName: string;
-  readonly avatar: string;
+  readonly avatar: PartnerAvatarView;
   readonly identitySource: string;
   readonly templateId: string;
   readonly lifecycle: PartnerLifecycleView;
@@ -625,7 +626,7 @@ export interface PartnerDelegationView {
 
 export interface PartnerDraftView {
   readonly displayName: string;
-  readonly avatar: string;
+  readonly avatar: PartnerAvatarInputView;
   readonly identitySource: string;
   readonly templateId: string;
   readonly capabilities?: PartnerCapabilitiesView;
@@ -634,7 +635,7 @@ export interface PartnerDraftView {
 
 export interface PartnerPatchView {
   readonly displayName?: string;
-  readonly avatar?: string;
+  readonly avatar?: PartnerAvatarInputView;
   readonly identitySource?: string;
   readonly modelChain?: readonly PartnerModelRouteView[];
   readonly permissionMode?: PartnerPermissionModeView;
@@ -6365,6 +6366,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   getPartner(partnerId: string, signal?: AbortSignal): Promise<PartnerProfileView>;
   createPartner(expectedDirectoryRevision: bigint, draft: PartnerDraftView, requestId: string, signal?: AbortSignal): Promise<PartnerMutationView>;
   getPartnerCreation(requestId: string, signal?: AbortSignal): Promise<PartnerMutationView>;
+  readPartnerAvatar(partnerId: string, expectedRevision: bigint, image: Exclude<PartnerAvatarView, string>, signal?: AbortSignal): Promise<string>;
   retirePartnerCreation(requestId: string, signal?: AbortSignal): Promise<{ readonly directory: PartnerDirectoryView; readonly partner?: PartnerProfileView }>;
   updatePartner(partnerId: string, expectedRevision: bigint, patch: PartnerPatchView, signal?: AbortSignal): Promise<PartnerMutationView>;
   setPartnerLifecycle(partnerId: string, expectedRevision: bigint, lifecycle: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerMutationView>;

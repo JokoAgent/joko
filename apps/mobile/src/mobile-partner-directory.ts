@@ -1,3 +1,4 @@
+import { projectMobilePartnerAvatar, type MobilePartnerAvatarValue } from "./mobile-partner-avatar";
 import {
   PartnerInitializationErrorCode,
   PartnerInitializationState,
@@ -49,7 +50,7 @@ export interface MobilePartnerDirectoryProfile {
   readonly revision: bigint;
   readonly profileVersion: bigint;
   readonly displayName: string;
-  readonly avatar: string;
+  readonly avatar: MobilePartnerAvatarValue;
   readonly identitySource: string;
   readonly templateId: string;
   readonly lifecycle: "active" | "archived";
@@ -207,8 +208,8 @@ export function projectMobilePartnerProfile(value: PartnerProfile): MobilePartne
     partnerId,
     revision: revision(value.revision, "Partner"),
     profileVersion: positive(value.profileVersion, "Partner profile version"),
-    displayName: label(value.displayName, 100, "Partner name"),
-    avatar: label(value.avatar, 256, "Partner avatar"),
+    displayName: label(value.displayName, 200, "Partner name"),
+    avatar: projectMobilePartnerAvatar(value.avatar),
     identitySource: text(value.identitySource, 8_000, "Partner identity"),
     templateId: id(value.templateId, "Partner template ID"),
     lifecycle,

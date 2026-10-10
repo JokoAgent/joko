@@ -8,12 +8,14 @@ import { profilePartner, profileSnapshot } from "./test/mobile-partner-profile";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const alerts = vi.hoisted(() => ({ alert: vi.fn() }));
+const photo = vi.hoisted(() => ({ pick: vi.fn() }));
+vi.mock("./mobile-partner-avatar", async (original) => ({ ...await original<typeof import("./mobile-partner-avatar")>(), pickMobilePartnerPhoto: photo.pick }));
 vi.mock("react-native", async () => {
   const React = await import("react");
   const element = (tag: string) => ({ children, accessibilityLabel, accessibilityRole, disabled, onPress }: {
     children?: ReactNode; accessibilityLabel?: string; accessibilityRole?: string; disabled?: boolean; onPress?: () => void;
   }) => React.createElement(tag, { "aria-label": accessibilityLabel, role: accessibilityRole, disabled, onClick: onPress }, children);
-  return { Alert: { alert: alerts.alert }, ActivityIndicator: () => null,
+  return { Alert: { alert: alerts.alert }, ActivityIndicator: () => null, Image: () => React.createElement("img"),
     Modal: ({ visible, children }: { visible: boolean; children: ReactNode }) => visible ? children : null,
     Pressable: element("button"), ScrollView: element("div"), Text: element("span"), View: element("div"),
     StyleSheet: { create: <T,>(value: T) => value, hairlineWidth: 1 },
@@ -59,9 +61,30 @@ async function editName(name: string) {
   await act(async () => { input.value = name; input.dispatchEvent(new Event("input", { bubbles: true })); });
 }
 afterEach(() => { if (root) act(() => root.unmount()); container?.remove(); root = undefined as unknown as Root;
-  close.mockReset(); saved.mockReset(); alerts.alert.mockReset(); });
+  close.mockReset(); saved.mockReset(); alerts.alert.mockReset(); photo.pick.mockReset(); });
 
 describe("MobilePartnerProfileSheet", () => {
+  it("blocks saving while preparing, preserves cancelled selection and saves the accepted user photo", async () => {
+    const active = transport(); await render(active); photo.pick.mockResolvedValueOnce(undefined);
+    await press("Choose a photo"); await press("Save Partner"); expect(active.save).not.toHaveBeenCalled();
+    let finish!: (value: { readonly base64: string }) => void;
+    photo.pick.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await press("Choose a photo"); await press("Save Partner"); expect(active.save).not.toHaveBeenCalled();
+    await act(async () => finish({ base64: "/9j/2w==" })); await press("Save Partner");
+    expect(vi.mocked(active.save).mock.calls[0]?.[1].avatar).toEqual({ base64: "/9j/2w==" });
+  });
+
+  it("does not adopt a photo prepared for a retired profile owner and makes picker failure retryable", async () => {
+    const old = transport("old"); await render(old); let finish!: (value: { readonly base64: string }) => void;
+    photo.pick.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    await press("Choose a photo"); const active = transport(); await render(active); await act(async () => finish({ base64: "/9j/2w==" }));
+    await press("Save Partner"); expect(active.save).not.toHaveBeenCalled();
+    photo.pick.mockRejectedValueOnce(new Error("Picker failed")); await press("Choose a photo");
+    expect(container.textContent).toContain("Could not prepare this photo");
+    photo.pick.mockResolvedValueOnce(undefined); await press("Choose a photo");
+    expect(container.textContent).not.toContain("Could not prepare this photo");
+  });
+
   it("edits a complete profile draft and assigns an advertised effort to a fallback model", async () => {
     const active = transport(); await render(active);
     await editName("Ada Two"); await press("Add fallback model"); await press("Save Partner");

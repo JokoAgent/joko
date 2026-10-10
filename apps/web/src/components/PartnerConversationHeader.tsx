@@ -3,7 +3,7 @@ import type { JSX, ReactNode } from "react";
 
 import type { SessionView } from "../model.js";
 import { usePartnerConversation } from "./PartnerConversation.js";
-import { PartnerAvatar } from "./PartnersPage.js";
+import { PartnerAvatar } from "./PartnerAvatar.js";
 import { IconButton, Spinner } from "./ui.js";
 import type { Translator } from "./types.js";
 
@@ -23,7 +23,7 @@ export function PartnerConversationHeader({ session, navigationOpen, onOpenNavig
       {!navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
       {partner !== undefined ? <button type="button" className="partner-conversation-identity" onClick={() => openSettings()} disabled={!editable}
         aria-label={t("partners.settingsTitle", { name: partner.displayName })} title={t("partners.settingsTitle", { name: partner.displayName })}
-      ><PartnerAvatar preset={partner.avatar} /><span>{partner.displayName}</span></button>
+      ><PartnerAvatar preset={partner.avatar} partner={partner} /><span>{partner.displayName}</span></button>
         : <span className="partner-conversation-placeholder">{!failed && <Spinner />}{failed ? session.name : t("partners.loading")}</span>}
     </div>
     <div className="session-header__actions">

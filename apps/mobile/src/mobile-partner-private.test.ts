@@ -13,7 +13,7 @@ import {
 
 const at = (seconds: bigint) => ({ seconds, nanos: 0 });
 const partner = (partnerId: string, sessionId: string) => ({
-  partnerId, profileVersion: 1n, displayName: partnerId, avatar: "standard",
+  partnerId, revision: { value: 1n }, profileVersion: 1n, displayName: partnerId, avatar: { value: { case: "presetId" as const, value: "standard" } },
   lifecycle: PartnerLifecycle.ACTIVE, initializationState: PartnerInitializationState.READY,
   canonicalSessionId: sessionId
 });

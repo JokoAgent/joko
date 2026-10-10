@@ -6,6 +6,8 @@ import type { PromptInput, SessionDescriptor, TargetDescriptor } from "@joko/cor
 import {
   NotFoundError,
   PartnerStoreError,
+  decodePartnerAvatar,
+  type PartnerAvatarInput,
   partnerHomeDirectoryName,
   type CreatePartnerInput,
   type OperationalStore,
@@ -194,7 +196,17 @@ export class PartnerManager {
     this.#workspaceService = options.workspaceService;
     this.#homesRoot = resolve(options.homesRoot);
     this.#prepareAvatar = options.prepareAvatar ?? (async ({ partner, homePath }) => {
-      await atomicWrite(join(homePath, "AVATAR.svg"), avatarSvg(partner.avatar as PartnerAvatarPreset));
+      const file = typeof partner.avatar === "string" ? "AVATAR.svg"
+        : partner.avatar.mimeType === "image/jpeg" ? "AVATAR.jpg"
+          : partner.avatar.mimeType === "image/png" ? "AVATAR.png" : "AVATAR.webp";
+      const content = typeof partner.avatar === "string" ? avatarSvg(partner.avatar as PartnerAvatarPreset)
+        : this.#store.readPartnerAvatar(partner.id, partner.revision, partner.avatar.sha256).content;
+      await atomicWrite(join(homePath, file), content);
+      for (const other of ["AVATAR.svg", "AVATAR.jpg", "AVATAR.png", "AVATAR.webp"]) {
+        if (other !== file) await unlink(join(homePath, other)).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+      }
     });
   }
 
@@ -212,6 +224,10 @@ export class PartnerManager {
 
   getPartner(partnerId: string): PartnerProfileRecord {
     return this.#store.getPartner(partnerId);
+  }
+
+  readPartnerAvatar(partnerId: string, expectedRevision: bigint, sha256: string) {
+    return this.#store.readPartnerAvatar(partnerId, expectedRevision, sha256);
   }
 
   getPartnerCreation(requestId: string): PartnerProfileRecord {
@@ -477,7 +493,10 @@ export class PartnerManager {
   }
 
   async createPartner(input: CreatePartnerInput): Promise<PartnerProfileRecord> {
-    assertPresentation(input.templateId, input.avatar);
+    if (!PARTNER_TEMPLATES.some((template) => template.templateId === input.templateId)) {
+      throw new PartnerManagerError("PARTNER_TEMPLATE_INVALID", "The selected partner template is unavailable.");
+    }
+    await assertAvatar(input.avatar);
     const existing = this.#store.getPartnerCreation(input.requestId);
     const created = this.#store.createPartner(input);
     if (existing !== undefined) return created;
@@ -494,7 +513,7 @@ export class PartnerManager {
       if (current.revision !== expectedRevision) {
         throw new PartnerStoreError("PARTNER_CHANGED", `Partner ${partnerId} changed; read it again and retry.`);
       }
-      if (patch.avatar !== undefined) assertAvatar(patch.avatar);
+      if (patch.avatar !== undefined) await assertAvatar(patch.avatar);
       const usesDefaults = patch.usesDirectoryDefaults ?? current.usesDirectoryDefaults;
       if (usesDefaults && patch.capabilities !== undefined) {
         throw new PartnerStoreError("PARTNER_INVALID", "A partner using directory defaults cannot also provide capability overrides.");
@@ -1046,16 +1065,23 @@ export class PartnerManager {
   }
 }
 
-function assertPresentation(templateId: string, avatar: string): void {
-  if (!PARTNER_TEMPLATES.some((template) => template.templateId === templateId)) {
-    throw new PartnerManagerError("PARTNER_TEMPLATE_INVALID", "The selected partner template is unavailable.");
+async function assertAvatar(avatar: PartnerAvatarInput): Promise<void> {
+  if (typeof avatar === "string") {
+    if (!(PARTNER_AVATAR_PRESETS as readonly string[]).includes(avatar)) {
+      throw new PartnerManagerError("PARTNER_AVATAR_INVALID", "The selected partner avatar is unavailable.");
+    }
+    return;
   }
-  assertAvatar(avatar);
-}
-
-function assertAvatar(avatar: string): asserts avatar is PartnerAvatarPreset {
-  if (!(PARTNER_AVATAR_PRESETS as readonly string[]).includes(avatar)) {
-    throw new PartnerManagerError("PARTNER_AVATAR_INVALID", "The selected partner avatar is unavailable.");
+  const { bytes } = decodePartnerAvatar(avatar?.base64);
+  try {
+    const { default: sharp } = await import("sharp");
+    const decoder = sharp(bytes, { limitInputPixels: 40_000_000, failOn: "warning" });
+    const metadata = await decoder.metadata();
+    if (!["jpeg", "png", "webp"].includes(metadata.format ?? "") || !metadata.width || !metadata.height
+      || metadata.width > 16_384 || metadata.height > 16_384 || (metadata.pages ?? 1) !== 1) throw new Error();
+    await decoder.resize(1, 1).raw().toBuffer();
+  } catch {
+    throw new PartnerManagerError("PARTNER_AVATAR_INVALID", "Select a valid, single-frame PNG, JPEG or WebP Partner image.");
   }
 }
 
@@ -1086,7 +1112,7 @@ function servicePrompt(text: string): PromptInput {
   };
 }
 
-async function atomicWrite(path: string, content: string): Promise<void> {
+async function atomicWrite(path: string, content: string | Uint8Array): Promise<void> {
   const temporary = join(dirname(path), `.${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, content, { encoding: "utf8", flag: "wx", mode: 0o600 });

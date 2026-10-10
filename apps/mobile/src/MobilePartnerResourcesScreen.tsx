@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
 import {
   ActivityIndicator,
   BackHandler,
@@ -262,9 +263,7 @@ export function MobilePartnerResourcesScreen({ colors, locale, transport, onBack
                   style={[styles.row, { borderColor: partner.partnerId === visibleDetail.partnerId ? colors.accent : colors.border,
                     backgroundColor: partner.partnerId === visibleDetail.partnerId ? colors.brandBackground : colors.surface },
                   !enabled && styles.disabled]}>
-                  <View style={[styles.avatar, { backgroundColor: colors.brandBackground }]}>
-                    <Text style={[styles.avatarText, { color: colors.ink }]}>{partner.avatar.slice(0, 2)}</Text>
-                  </View>
+                  <MobilePartnerAvatar preset={partner.avatar} partner={partner} colors={colors} />
                   <View style={styles.grow}>
                     <Text style={[styles.label, { color: colors.ink }]} numberOfLines={2}>{partner.displayName}</Text>
                     <Text style={[styles.caption, { color: colors.muted }]}>{partnerStatus(partner, locale)}</Text>

@@ -43,7 +43,7 @@ import type { Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import { TIMELINE_REMARK_PLUGINS } from "./timeline-markdown.js";
 import { usePartnerConversation } from "./PartnerConversation.js";
-import { PartnerAvatar } from "./PartnersPage.js";
+import { PartnerAvatar } from "./PartnerAvatar.js";
 import { firstUnreadPartnerReply, formatPartnerTimeGroup, partnerTimeGroupStarts, simplifyPartnerRenderItems } from "./partner-conversation-presentation.js";
 import "katex/dist/katex.min.css";
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
@@ -1482,7 +1482,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
   return (
     <RenderedShareSelectionContext.Provider value={shareSelected}>
     <article className={cx("message-assistant", partner !== undefined && "message-assistant--partner", selectionActive && "is-share-selecting")} data-message-client-id={item.id} {...(shareable ? { [RENDERED_SHARE_MESSAGE_ATTRIBUTE]: item.id } : {})} data-selection-quote-message-id={item.id} data-selection-quote-source-event-id={item.sourceEventId} data-selection-quote-role="assistant" aria-label={roleLabel}>
-      {partner !== undefined && <div className="partner-message-avatar" aria-hidden="true"><PartnerAvatar preset={partner.avatar} /></div>}
+      {partner !== undefined && <div className="partner-message-avatar" aria-hidden="true"><PartnerAvatar preset={partner.avatar} partner={partner} /></div>}
       {selectionControl}
       {partner !== undefined ? <div className="partner-message-content">{item.partnerPrivateOrigin !== undefined && <span className="partner-private-reply">{t("partners.privateReply")}</span>}{assistantContent}</div>
         : selectionActive ? <div className="message-assistant__selection-stack">{assistantContent}</div> : assistantContent}

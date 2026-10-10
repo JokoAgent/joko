@@ -286,6 +286,7 @@ service PartnerService {
   rpc GetPartnerDirectory(GetPartnerDirectoryRequest) returns (GetPartnerDirectoryResponse);
   rpc ListPartners(ListPartnersRequest) returns (ListPartnersResponse);
   rpc GetPartner(GetPartnerRequest) returns (GetPartnerResponse);
+  rpc ReadPartnerAvatar(ReadPartnerAvatarRequest) returns (ReadPartnerAvatarResponse);
   rpc CreatePartner(CreatePartnerRequest) returns (CreatePartnerResponse);
   rpc GetPartnerCreation(GetPartnerCreationRequest) returns (GetPartnerCreationResponse);
   rpc RetirePartnerCreation(RetirePartnerCreationRequest) returns (RetirePartnerCreationResponse);

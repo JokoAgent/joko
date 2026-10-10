@@ -49,7 +49,7 @@ describe("mounted Partner collaboration product chain", () => {
     fixture = undefined;
   });
 
-  mountedIt("recovers a lost creation receipt after edits, service restart and narrow Web reload without duplicate initialization", async () => {
+  mountedIt("recovers a user-photo Partner after lost creation receipt, edits, service restart and narrow Web reload without duplicate initialization", async () => {
     const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
     const webDirectory = requiredEnvironment("JOKO_MOUNTED_WEB_DIR");
     fixture = await RealPiSystemFixture.start({ webDirectory, keepRoot: true, enableInternalServer: true });
@@ -91,6 +91,11 @@ describe("mounted Partner collaboration product chain", () => {
     await page.locator(".partners-page .route-header").getByRole("button", { name: "Invite partner", exact: true }).click();
     const invite = page.getByRole("dialog", { name: "Invite a partner", exact: true });
     await invite.getByLabel("Name", { exact: true }).fill("Nova");
+    await invite.locator('.partner-avatar-picker input[type=file]').setInputFiles({ name: "partner-photo.png", mimeType: "image/png",
+      buffer: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64") });
+    await waitFor(() => invite.getByRole("button", { name: "Choose a photo", exact: true }).getAttribute("aria-pressed"),
+      (value) => value === "true", "the prepared user photo");
+    await invite.locator(".partner-avatar--photo img").waitFor({ state: "visible" });
     await invite.getByRole("combobox", { name: "Primary model", exact: true }).click();
     await page.getByRole("option", { name: /Joko real Pi E2E model/u }).click();
     await invite.getByRole("button", { name: "Invite partner", exact: true }).click();
@@ -102,6 +107,12 @@ describe("mounted Partner collaboration product chain", () => {
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     const request = required(captured, "the original creation request");
     const original = required((await manager.clients.partner.getPartnerCreation({ requestId: request.requestId })).partner, "the original Partner");
+    const originalImage = required(original.avatar, "the image avatar").value;
+    if (originalImage.case !== "image") throw new Error("The Partner must retain its user photo.");
+    const photo = await manager.clients.partner.readPartnerAvatar({ partnerId: original.partnerId,
+      expectedRevision: original.revision, sha256: originalImage.value.sha256 });
+    expect(photo.image).toMatchObject({ mimeType: "image/jpeg", byteLength: BigInt(photo.content.length) });
+    expect(photo.content.length).toBeLessThanOrEqual(41_250);
     const updated = required((await manager.clients.partner.updatePartner({
       partnerId: original.partnerId, expectedRevision: original.revision, patch: { displayName: "Nova updated" }
     })).partner, "the updated Partner");
@@ -114,6 +125,8 @@ describe("mounted Partner collaboration product chain", () => {
     const replayed = required((await restarted.partner.createPartner(request)).partner, "the replayed Partner");
     expect(replayed).toMatchObject({ partnerId: original.partnerId, canonicalSessionId: original.canonicalSessionId, displayName: "Nova updated", revision: updated.revision });
     expect((await restarted.partner.listPartners({})).partners).toHaveLength(1);
+    expect((await restarted.partner.readPartnerAvatar({ partnerId: replayed.partnerId,
+      expectedRevision: replayed.revision, sha256: originalImage.value.sha256 })).content).toEqual(photo.content);
     await page.unroute("**/joko.v1.PartnerService/CreatePartner");
     await page.setViewportSize({ width: 390, height: 844 });
     await page.reload({ waitUntil: "domcontentloaded" });
@@ -127,6 +140,8 @@ describe("mounted Partner collaboration product chain", () => {
     expect(await recovery.getByLabel("Name", { exact: true }).isDisabled()).toBe(true);
     await recovery.getByRole("button", { name: "Check creation result", exact: true }).click();
     await waitFor(async () => page.url(), (value) => value.includes(`#/partners/${original.partnerId}`), "the recovered original Partner route");
+    await page.getByRole("dialog").getByRole("tab", { name: "Profile settings", exact: true }).click();
+    await page.getByRole("dialog").locator(".partner-avatar--photo img").waitFor({ state: "visible" });
     expect(sent).toBe(1);
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith("joko.partner.creation.v1:")).length)).toBe(0);
@@ -387,7 +402,7 @@ async function createPartner(
     expectedDirectoryRevision: required(directory.directory?.revision, "Partner directory revision"),
     draft: create(PartnerDraftSchema, {
       displayName,
-      avatar,
+      avatar: { value: { case: "presetId", value: avatar } },
       identitySource: `You are ${displayName}, a durable mounted-browser Partner.`,
       templateId: "general",
       usesDirectoryDefaults: false,

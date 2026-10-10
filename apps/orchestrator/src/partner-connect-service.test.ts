@@ -31,6 +31,39 @@ afterEach(async () => {
 });
 
 describe("PartnerService", () => {
+  it("owns decoded user images privately and authorizes only an exact live avatar read", async () => {
+    const fixture = await createFixture();
+    const { default: sharp } = await import("sharp");
+    const photo = await sharp({ create: { width: 256, height: 256, channels: 3, background: "#ff9800" } }).jpeg().toBuffer();
+    const service = createPartnerConnectService(fixture.manager, () => ({ connectionId: "connection-1" }));
+    const request = create(contract.CreatePartnerRequestSchema, {
+      requestId: "creation-request-image-rpc", expectedDirectoryRevision: revision(1n),
+      draft: { displayName: "A".repeat(200), avatar: { value: { case: "imageBase64", value: photo.toString("base64") } },
+        identitySource: "Product work", templateId: "general", capabilities: protoCapabilities() }
+    });
+    const created = await service.createPartner(request, context());
+    expect(created.partner?.avatar?.value?.case).toBe("image");
+    const image = created.partner?.avatar?.value;
+    if (image?.case !== "image" || !image.value?.sha256) throw new Error("The image descriptor is required.");
+    expect(image.value).toMatchObject({ mimeType: "image/jpeg", byteLength: BigInt(photo.length) });
+    const read = create(contract.ReadPartnerAvatarRequestSchema, { partnerId: created.partner!.partnerId,
+      expectedRevision: create(contract.RevisionSchema, created.partner!.revision), sha256: image.value.sha256 });
+    expect((await service.readPartnerAvatar(read, context())).content).toEqual(new Uint8Array(photo));
+    expect(() => service.readPartnerAvatar(create(contract.ReadPartnerAvatarRequestSchema, { ...read, sha256: "a".repeat(64) }), context()))
+      .toThrow(expect.objectContaining({ code: Code.NotFound }));
+    const denied = createPartnerConnectService(fixture.manager, () => { throw new ConnectError("Denied", Code.Unauthenticated); });
+    expect(() => denied.readPartnerAvatar(read, context())).toThrow(expect.objectContaining({ code: Code.Unauthenticated }));
+    await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, requestId: "creation-request-image-invalid",
+      draft: { ...request.draft!, avatar: create(contract.PartnerAvatarInputSchema, { value: { case: "imageBase64", value: "/9j/2w==" } }) } }), context()))
+      .rejects.toMatchObject({ code: Code.InvalidArgument });
+    const updated = await service.updatePartner(create(contract.UpdatePartnerRequestSchema, {
+      partnerId: read.partnerId, expectedRevision: read.expectedRevision, patch: { avatar: { value: { case: "presetId", value: "spark" } } }
+    }), context());
+    expect(updated.partner?.avatar?.value).toEqual({ case: "presetId", value: "spark" });
+    expect(() => service.readPartnerAvatar(read, context())).toThrow(expect.objectContaining({ code: Code.Aborted }));
+    expect(fixture.partnerStore.listPartners()).toHaveLength(1);
+  });
+
   it("authenticates stable creation lookup and atomically retires absent intents against late creates", async () => {
     const fixture = await createFixture();
     const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));
@@ -39,7 +72,7 @@ describe("PartnerService", () => {
     const request = create(contract.CreatePartnerRequestSchema, {
       requestId: "creation-request-rpc",
       expectedDirectoryRevision: revision(1n),
-      draft: { displayName: "Aster", avatar: "orbit", identitySource: "You help with ongoing work.", templateId: "general", capabilities: protoCapabilities() }
+      draft: { displayName: "Aster", avatar: { value: { case: "presetId" as const, value: "orbit" } }, identitySource: "You help with ongoing work.", templateId: "general", capabilities: protoCapabilities() }
     });
     const created = await service.createPartner(request, callContext);
     const found = await service.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: request.requestId }), callContext);
@@ -99,7 +132,7 @@ describe("PartnerService", () => {
       expectedDirectoryRevision: defaults.directory!.revision,
       draft: create(contract.PartnerDraftSchema, {
         displayName: "Aster",
-        avatar: "orbit",
+        avatar: { value: { case: "presetId" as const, value: "orbit" } },
         identitySource: "You are Aster, a long-lived work partner.",
         templateId: "general",
         usesDirectoryDefaults: true
@@ -212,6 +245,10 @@ describe("PartnerService", () => {
     ), context());
     expect(read.readState?.throughSequence).toBe(1n);
 
+    expect(fixture.manager.activity(second.id).latestReplyCursor).toBeUndefined();
+    expect(fixture.manager.activity(second.id).unreadReplyCount).toBe(0);
+    fixture.sessionHost.enqueueServiceInput({ operationId: "public-canonical-rpc-input", sessionId: second.canonicalSessionId!, source: "system",
+      prompt: { text: "A public canonical question", images: [], files: [], mentions: [], disposition: "prompt" } });
     await vi.waitFor(
       () => expect(fixture.manager.activity(second.id).latestReplyCursor).toBeDefined(),
       { timeout: 5_000 }
@@ -285,7 +322,7 @@ async function createFixture(streamDelayMs = 0) {
     operationalStore.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { manager, partnerStore };
+  return { manager, partnerStore, sessionHost };
 }
 
 function partnerInput(store: PartnerStore, displayName: string) {

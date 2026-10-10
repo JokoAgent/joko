@@ -1,3 +1,4 @@
+import { projectMobilePartnerAvatar, type MobilePartnerAvatarValue } from "./mobile-partner-avatar";
 import {
   PartnerInitializationState, PartnerLifecycle, PartnerPrivateMessageDeliveryStatus,
   PartnerPrivateThreadCloseReason, PartnerPrivateThreadStatus, PartnerSessionRole,
@@ -8,8 +9,9 @@ import {
 
 export interface MobilePartner {
   readonly partnerId: string;
+  readonly revision: bigint;
   readonly displayName: string;
-  readonly avatar: string;
+  readonly avatar: MobilePartnerAvatarValue;
   readonly lifecycle: "active" | "archived";
   readonly initializationState: "pending" | "ready" | "error";
   readonly canonicalSessionId?: string;
@@ -151,8 +153,9 @@ export function projectMobilePartners(response: ListPartnersResponse): readonly 
     }
     return {
       partnerId,
-      displayName: label(partner.displayName, 100, "Partner name"),
-      avatar: label(partner.avatar, 256, "Partner avatar"),
+      revision: BigInt(positiveSafe(partner.revision?.value ?? 0n, "Partner revision")),
+      displayName: label(partner.displayName, 200, "Partner name"),
+      avatar: projectMobilePartnerAvatar(partner.avatar),
       lifecycle,
       initializationState,
       ...(canonicalSessionId === undefined ? {} : { canonicalSessionId }),

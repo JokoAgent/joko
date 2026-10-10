@@ -12,6 +12,7 @@ import { AppErrorBoundary, routeErrorBoundaryKey } from "./components/ErrorBound
 import { resolveComposerAttachmentPolicy } from "./components/composer-behavior.js";
 import { reviewRunForReviewerSession } from "./components/reviewer-session.js";
 import { mergeTimelineWindows } from "./components/timeline-behavior.js";
+import { PartnerAvatarProvider } from "./components/PartnerAvatar.js";
 import {
   clampNavigationDragWidth,
   finalizeNavigationDrag,
@@ -2156,6 +2157,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
 
   return (
     <PartnerConversationScope controller={controller} session={activeSession} active={state.route.kind === "session"} t={t}>
+    <PartnerAvatarProvider controller={controller} ownerKey={state.connectionState === "connected" && state.activeProfile
+      ? JSON.stringify([state.activeProfile.id, state.activeProfile.deviceId, state.activeProfile.serverId, state.activeProfile.origin, state.snapshot.generation.toString()]) : undefined}>
     <div
       className={cx("app", shellNavigationOpen && "has-navigation", settingsRoute ? "navigation-hidden" : `navigation-${navigationMode}`, formalFilesMode && "workspace-files-mode", navigationDrag !== undefined && !settingsRoute && "is-navigation-resizing", inspectorAttached && "has-inspector")}
       style={{
@@ -2560,6 +2563,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onFile={openPortableSessionImportFile}
       />}
     </div>
+    </PartnerAvatarProvider>
     </PartnerConversationScope>
   );
 }

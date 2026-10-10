@@ -2904,7 +2904,7 @@ describe("mobile Partner private authority", () => {
 
   it("previews authorized Partner Artifacts and opens only the revalidated canonical task", async () => {
     const network = fakeNetwork();
-    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+    const partner = { partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
       canonicalSessionId: "session" };
     network.listPartners = vi.fn(async () => [partner]);
@@ -2935,7 +2935,7 @@ describe("mobile Partner private authority", () => {
 
   it("retires late Partner Resource reads and refuses a changed preview before selection", async () => {
     const network = fakeNetwork();
-    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+    const partner = { partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
       canonicalSessionId: "session" };
     let finish!: (value: Awaited<ReturnType<MobileNetwork["listPartners"]>>) => void;
@@ -2969,7 +2969,7 @@ describe("mobile Partner private authority", () => {
 
   it("does not report a Partner Resource open after selection retires its owner", async () => {
     const network = fakeNetwork();
-    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+    const partner = { partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
       canonicalSessionId: "session" };
     network.listPartners = vi.fn(async () => [partner]);
@@ -2990,7 +2990,7 @@ describe("mobile Partner private authority", () => {
 
   it("revalidates a task preview against its exact canonical Partner Session and target participant", async () => {
     const network = fakeNetwork();
-    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", displayName: "A", avatar: "standard",
+    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 1,
       canonicalSessionId: "session" }]);
     network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
@@ -3023,7 +3023,7 @@ describe("mobile Partner private authority", () => {
         senderPartnerId: "partner-a", recipientPartnerId: "partner-b", content: "Private text",
         deliveryStatus: "pending" as const, createdAt: 2_000 }]
     };
-    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", displayName: "A", avatar: "standard",
+    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 1,
       canonicalSessionId: "session" }]);
     network.listPartnerPrivateThreads = vi.fn(async () => [thread]);

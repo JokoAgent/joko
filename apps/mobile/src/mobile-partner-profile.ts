@@ -1,4 +1,5 @@
 import type { PartnerDirectory, UpdatePartnerResponse } from "@joko/contracts";
+import { mobilePartnerPhotoValid, type MobilePartnerAvatarDraft } from "./mobile-partner-avatar";
 import { projectMobilePartnerCapabilities, projectMobilePartnerProfile,
   type MobilePartnerCapabilities, type MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import type { MobileModelRoute } from "./mobile-runtime-controls";
@@ -10,7 +11,7 @@ export interface MobilePartnerProfileOptions {
 }
 export interface MobilePartnerProfileDraft {
   readonly displayName: string;
-  readonly avatar: string;
+  readonly avatar: MobilePartnerAvatarDraft;
   readonly identitySource: string;
   readonly usesDirectoryDefaults: boolean;
   readonly capabilities: MobilePartnerCapabilities;
@@ -63,8 +64,8 @@ export function validateMobilePartnerProfileDraft(snapshot: MobilePartnerProfile
   draft: MobilePartnerProfileDraft): MobilePartnerProfileDraft {
   const displayName = draft.displayName.normalize("NFKC").trim().replace(/\s+/gu, " ");
   const identitySource = draft.identitySource.trim();
-  if (displayName.length < 1 || displayName.length > 100 || !LABEL.test(displayName)) {
-    throw new MobilePartnerProfileValidationError("name", "Enter a Partner name of 1–100 characters without control characters.");
+  if (displayName.length < 1 || displayName.length > 200 || !LABEL.test(displayName)) {
+    throw new MobilePartnerProfileValidationError("name", "Enter a Partner name of 1–200 characters without control characters.");
   }
   if (snapshot.names.some((candidate) => candidate.partnerId !== snapshot.partner.partnerId
     && normalizedName(candidate.displayName) === normalizedName(displayName))) {
@@ -73,7 +74,11 @@ export function validateMobilePartnerProfileDraft(snapshot: MobilePartnerProfile
   if (identitySource.length < 1 || identitySource.length > 8_000 || !TEXT.test(identitySource)) {
     throw new MobilePartnerProfileValidationError("identity", "Enter a Partner identity of 1–8,000 characters without control characters.");
   }
-  if (!snapshot.options.avatarPresets.includes(draft.avatar)) throw new MobilePartnerProfileValidationError("avatar", "Select a current Partner avatar.");
+  if (typeof draft.avatar === "string" ? !snapshot.options.avatarPresets.includes(draft.avatar)
+    : "base64" in draft.avatar ? !mobilePartnerPhotoValid(draft.avatar.base64)
+      : JSON.stringify(draft.avatar) !== JSON.stringify(snapshot.partner.avatar)) {
+    throw new MobilePartnerProfileValidationError("avatar", "Select a current Partner avatar.");
+  }
   const capabilities = draft.usesDirectoryDefaults ? snapshot.options.defaultCapabilities : draft.capabilities;
   if (!capabilities) throw new MobilePartnerProfileValidationError("defaults", "Partner directory defaults are not configured.");
   const chain = capabilities.modelChain;

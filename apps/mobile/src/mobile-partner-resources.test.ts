@@ -18,6 +18,7 @@ import {
 const at = (seconds: bigint) => ({ seconds, nanos: 0 });
 const partner: MobilePartner = {
   partnerId: "partner-a",
+  revision: 2n,
   displayName: "Ada",
   avatar: "standard",
   lifecycle: "active",

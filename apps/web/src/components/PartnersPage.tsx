@@ -17,6 +17,9 @@ import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 
 import { PartnerCreationReceipts } from "../partner-creation-receipts.js";
+import { partnerAvatarInput, type PartnerAvatarDraft } from "../partner-avatar.js";
+import { PartnerAvatar } from "./PartnerAvatar.js";
+import { AvatarPicker } from "./PartnerAvatarPicker.js";
 
 import type { AppController } from "../controller.js";
 import type {
@@ -51,7 +54,7 @@ interface PartnerCatalogState {
 
 interface PartnerEditorDraft {
   readonly displayName: string;
-  readonly avatar: string;
+  readonly avatar: PartnerAvatarDraft;
   readonly identitySource: string;
   readonly usesDirectoryDefaults: boolean;
   readonly capabilities: PartnerCapabilitiesView;
@@ -285,7 +288,7 @@ function PartnerCard({ partner, pending, t, onEdit, onOpen, onRetry, onArchive, 
   const primary = partner.capabilities.modelChain[0]!;
   const statusTone = partner.initializationState === "ready" ? "success" : partner.initializationState === "error" ? "danger" : "warning";
   return <article className={cx("partner-card", partner.lifecycle === "archived" && "is-archived")} data-partner-id={partner.id}>
-    <header><PartnerAvatar preset={partner.avatar} /><div><h2>{partner.displayName}</h2><p>{primary.providerId} · {primary.modelId}</p></div><Pill tone={statusTone}>{t(`partners.state.${partner.initializationState}`)}</Pill></header>
+    <header><PartnerAvatar preset={partner.avatar} partner={partner} /><div><h2>{partner.displayName}</h2><p>{primary.providerId} · {primary.modelId}</p></div><Pill tone={statusTone}>{t(`partners.state.${partner.initializationState}`)}</Pill></header>
     <p className="partner-card__identity">{firstIdentityLine(partner.identitySource)}</p>
     <div className="partner-card__activity" aria-label={t("partners.activitySummary")}>
       {partner.activity.unreadReplyCount > 0 && <Pill tone="accent">{t("partners.unreadReplies", { count: partner.activity.unreadReplyCount })}</Pill>}
@@ -318,6 +321,9 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
   const [draft, setDraft] = useState<PartnerDraftView>(initial);
   const [formDirectory, setFormDirectory] = useState(directory);
   const [submitting, setSubmitting] = useState(false);
+  const [avatarPreparing, setAvatarPreparing] = useState(false);
+  const avatarPreparingRef = useRef(false);
+  const preparingAvatar = (value: boolean): void => { avatarPreparingRef.current = value; setAvatarPreparing(value); };
   const [error, setError] = useState<string>();
   const [receipts, setReceipts] = useState<readonly string[]>([]);
   const [receiptUnavailable, setReceiptUnavailable] = useState(true);
@@ -397,7 +403,7 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
   };
   const submit = async (): Promise<void> => {
     const store = receiptStoreRef.current;
-    if (!valid || locked || store === undefined) return;
+    if (!valid || locked || avatarPreparingRef.current || store === undefined) return;
     const action = begin();
     if (action === undefined) return;
     let requestId: string | undefined;
@@ -473,7 +479,7 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
       setResolution(undefined);
       setFormDirectory(fresh);
       if (pending.length === 0 && (!fresh.templates.some((template) => template.id === draft.templateId)
-        || !fresh.avatarPresets.includes(draft.avatar))) setDraft(inviteDraft(fresh, snapshot));
+        || typeof draft.avatar === "string" && !fresh.avatarPresets.includes(draft.avatar))) setDraft(inviteDraft(fresh, snapshot));
     } catch {
       if (action.current()) setError(t("partners.creationLookupFailed"));
     } finally { finish(action); }
@@ -483,17 +489,17 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
     templateId: template.id,
     identitySource: template.identitySource
   }));
-  return <Modal open={open} title={t("partners.inviteTitle")} description={t("partners.inviteBody")} size="large" onClose={submitting ? () => undefined : onClose}>
+  return <Modal open={open} title={t("partners.inviteTitle")} description={t("partners.inviteBody")} size="large" onClose={submitting || avatarPreparing ? () => undefined : onClose}>
     <form ref={formRef} className="partner-editor" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
       <fieldset disabled={locked}><legend>{t("partners.template")}</legend><div className="partner-template-grid">{formDirectory.templates.map((template) => <button type="button" key={template.id} className={cx(draft.templateId === template.id && "is-selected")} aria-pressed={draft.templateId === template.id} onClick={() => selectTemplate(template)}><strong>{template.displayName}</strong><span>{template.description}</span></button>)}</div></fieldset>
-      <div className="partner-editor__identity-row"><label className="field"><span>{t("partners.name")}</span><input required disabled={locked} maxLength={100} value={draft.displayName} onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))} /></label><AvatarPicker value={draft.avatar} options={formDirectory.avatarPresets} disabled={locked} t={t} onChange={(avatar) => setDraft((current) => ({ ...current, avatar }))} /></div>
+      <div className="partner-editor__identity-row"><label className="field"><span>{t("partners.name")}</span><input required disabled={locked} maxLength={200} value={draft.displayName} onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))} /></label><AvatarPicker ownerKey={ownerKey} value={draft.avatar} options={formDirectory.avatarPresets} disabled={locked} t={t} onPreparing={preparingAvatar} onChange={(avatar) => setDraft((current) => ({ ...current, avatar }))} /></div>
       <label className="field"><span>{t("partners.identity")}</span><textarea required disabled={locked} rows={8} maxLength={8_000} value={draft.identitySource} onChange={(event) => setDraft((current) => ({ ...current, identitySource: event.target.value }))} /><small>{t("partners.identityHelp")}</small></label>
       {formDirectory.defaultCapabilities !== undefined && <label className="check-row"><CheckboxControl disabled={locked} checked={draft.usesDirectoryDefaults} onChange={(event) => setDraft((current) => ({ ...current, usesDirectoryDefaults: event.target.checked, capabilities: event.target.checked ? undefined : current.capabilities ?? formDirectory.defaultCapabilities }))} /><span><strong>{t("partners.useDefaults")}</strong><small>{t("partners.useDefaultsHelp")}</small></span></label>}
       {!draft.usesDirectoryDefaults && draft.capabilities !== undefined && <CapabilitiesEditor value={draft.capabilities} snapshot={snapshot} disabled={locked} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
       {receipts.length > 0 && <p role="status">{t(resolution === "absent" ? "partners.creationAbsent" : resolution === "retired" ? "partners.creationRetired" : "partners.creationUnknown")}</p>}
       {!modelsAvailable && receipts.length === 0 && <p role="status">{t("partners.error.modelUnavailable")}</p>}
       {error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}
-      <div className="modal__actions"><Button onClick={onClose} disabled={submitting}>{t(receipts.length > 0 ? "common.close" : "common.cancel")}</Button>{receipts.length > 0 ? <Button tone="primary" disabled={submitting} onClick={() => void (resolution === undefined ? recover() : newIntent())}>{submitting ? t("common.working") : t(resolution === undefined ? "partners.creationCheck" : "partners.creationNewIntent")}</Button> : <Button type="submit" tone="primary" disabled={!valid || locked}>{submitting ? t("partners.preparing") : t("partners.invite")}</Button>}</div>
+      <div className="modal__actions"><Button onClick={onClose} disabled={submitting || avatarPreparing}>{t(receipts.length > 0 ? "common.close" : "common.cancel")}</Button>{receipts.length > 0 ? <Button tone="primary" disabled={submitting} onClick={() => void (resolution === undefined ? recover() : newIntent())}>{submitting ? t("common.working") : t(resolution === undefined ? "partners.creationCheck" : "partners.creationNewIntent")}</Button> : <Button type="submit" tone="primary" disabled={!valid || locked || avatarPreparing}>{submitting ? t("partners.preparing") : t("partners.invite")}</Button>}</div>
     </form>
   </Modal>;
 }
@@ -557,6 +563,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   draftRef.current = draft;
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(true);
+  const [avatarPreparing, setAvatarPreparing] = useState(false);
   const [saveError, setSaveError] = useState<string>();
   const [conflict, setConflict] = useState(false);
   const [section, setSection] = useState<"profile" | "activity">(initialSection);
@@ -569,7 +576,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   const draftKey = editorDraftKey(draft);
   const baselineKey = editorDraftKey(editorDraft(baseline));
   const dirty = draftKey !== baselineKey;
-  const valid = validEditorDraft(draft, directory);
+  const valid = !avatarPreparing && validEditorDraft(draft, directory);
 
   useEffect(() => {
     if (!dirty || !valid || saving || conflict || saveError !== undefined) return;
@@ -629,7 +636,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
       <div className="partner-editor__status"><Pill tone={conflict || saveError !== undefined ? "danger" : saving || dirty ? "warning" : "success"}>{status}</Pill><span>{t("partners.profileVersionValue", { version: baseline.profileVersion.toString() })}</span></div>
       {(conflict || saveError !== undefined) && <div className="partner-conflict" role="alert"><CircleAlert aria-hidden="true" /><div><strong>{conflict ? t("partners.conflictTitle") : t("partners.saveFailed")}</strong><p>{conflict ? t("partners.conflictBody") : saveError}</p></div><div><Button onClick={() => void reconcile(false)}>{t("partners.reload")}</Button><Button tone="primary" onClick={() => void reconcile(true)}>{t("common.retry")}</Button></div></div>}
       {!valid && <p className="partner-editor__validation" role="alert">{t("partners.invalidDraft")}</p>}
-      <div className="partner-editor__identity-row"><label className="field"><span>{t("partners.name")}</span><input required maxLength={100} value={draft.displayName} onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))} /></label><AvatarPicker value={draft.avatar} options={directory.avatarPresets} t={t} onChange={(avatar) => setDraft((current) => ({ ...current, avatar }))} /></div>
+      <div className="partner-editor__identity-row"><label className="field"><span>{t("partners.name")}</span><input required maxLength={200} value={draft.displayName} onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))} /></label><AvatarPicker ownerKey={ownerKey} value={draft.avatar} options={directory.avatarPresets} t={t} onPreparing={setAvatarPreparing} partner={baseline} disabled={saving || conflict} onChange={(avatar) => setDraft((current) => ({ ...current, avatar }))} /></div>
       <label className="field"><span>{t("partners.identity")}</span><textarea required rows={9} maxLength={8_000} value={draft.identitySource} onChange={(event) => setDraft((current) => ({ ...current, identitySource: event.target.value }))} /><small>{t("partners.autosaveHelp")}</small></label>
       <label className="check-row"><CheckboxControl checked={draft.usesDirectoryDefaults} disabled={directory.defaultCapabilities === undefined} onChange={(event) => setDraft((current) => ({ ...current, usesDirectoryDefaults: event.target.checked, capabilities: event.target.checked ? directory.defaultCapabilities ?? current.capabilities : current.capabilities }))} /><span><strong>{t("partners.useDefaults")}</strong><small>{directory.defaultCapabilities === undefined ? t("partners.defaultsMissing") : t("partners.useDefaultsHelp")}</small></span></label>
       {!draft.usesDirectoryDefaults && <CapabilitiesEditor value={draft.capabilities} snapshot={snapshot} disabled={saving} t={t} onChange={(capabilities) => setDraft((current) => ({ ...current, capabilities }))} />}
@@ -1008,14 +1015,6 @@ function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: 
   </fieldset>;
 }
 
-function AvatarPicker({ value, options, disabled = false, t, onChange }: { readonly value: string; readonly options: readonly string[]; readonly disabled?: boolean; readonly t: Translator; readonly onChange: (value: string) => void }): JSX.Element {
-  return <fieldset className="partner-avatar-picker" disabled={disabled}><legend>{t("partners.avatar")}</legend><div>{options.map((option) => <button type="button" key={option} className={cx(value === option && "is-selected")} aria-label={t("partners.avatarOption", { name: option })} aria-pressed={value === option} onClick={() => onChange(option)}><PartnerAvatar preset={option} /></button>)}</div></fieldset>;
-}
-
-export function PartnerAvatar({ preset }: { readonly preset: string }): JSX.Element {
-  return <span className={`partner-avatar partner-avatar--${safeCssToken(preset)}`} aria-hidden="true"><span /></span>;
-}
-
 function DeletePartnerDialog({ partner, pending, t, onClose, onDelete }: { readonly partner?: PartnerProfileView; readonly pending: boolean; readonly t: Translator; readonly onClose: () => void; readonly onDelete: () => void }): JSX.Element {
   const [confirmation, setConfirmation] = useState("");
   useEffect(() => setConfirmation(""), [partner?.id]);
@@ -1086,8 +1085,8 @@ function validPartnerCapabilities(value: PartnerCapabilitiesView): boolean {
 }
 
 function validPartnerDraft(draft: PartnerDraftView): boolean {
-  return draft.displayName.trim().length > 0 && draft.displayName.trim().length <= 100
-    && draft.avatar.trim() !== "" && draft.templateId.trim() !== ""
+  return draft.displayName.trim().length > 0 && draft.displayName.trim().length <= 200
+    && partnerAvatarInput(draft.avatar) && draft.templateId.trim() !== ""
     && draft.identitySource.trim().length > 0 && draft.identitySource.length <= 8_000
     && (draft.usesDirectoryDefaults || draft.capabilities !== undefined && validPartnerCapabilities(draft.capabilities));
 }
@@ -1103,8 +1102,9 @@ function editorDraft(partner: PartnerProfileView): PartnerEditorDraft {
 }
 
 function validEditorDraft(draft: PartnerEditorDraft, directory: PartnerDirectoryView): boolean {
-  return draft.displayName.trim().length > 0 && draft.displayName.trim().length <= 100
-    && draft.avatar.trim() !== "" && draft.identitySource.trim().length > 0 && draft.identitySource.length <= 8_000
+  return draft.displayName.trim().length > 0 && draft.displayName.trim().length <= 200
+    && (partnerAvatarInput(draft.avatar) || typeof draft.avatar !== "string" && "sha256" in draft.avatar)
+    && draft.identitySource.trim().length > 0 && draft.identitySource.length <= 8_000
     && (!draft.usesDirectoryDefaults || directory.defaultCapabilities !== undefined)
     && (draft.usesDirectoryDefaults || validPartnerCapabilities(draft.capabilities));
 }
@@ -1112,7 +1112,7 @@ function validEditorDraft(draft: PartnerEditorDraft, directory: PartnerDirectory
 function editorPatch(draft: PartnerEditorDraft): PartnerPatchView {
   return {
     displayName: draft.displayName,
-    avatar: draft.avatar,
+    ...(partnerAvatarInput(draft.avatar) ? { avatar: draft.avatar } : {}),
     identitySource: draft.identitySource,
     usesDirectoryDefaults: draft.usesDirectoryDefaults,
     ...(draft.usesDirectoryDefaults ? {} : {
@@ -1139,10 +1139,6 @@ function comparePartners(left: PartnerProfileView, right: PartnerProfileView): n
 
 function firstIdentityLine(source: string): string {
   return source.split(/\r?\n/u).map((line) => line.replace(/^#+\s*/u, "").trim()).find(Boolean) ?? source;
-}
-
-function safeCssToken(value: string): string {
-  return /^[a-z][a-z0-9-]{0,31}$/u.test(value) ? value : "custom";
 }
 
 function errorMessage(error: unknown, fallback: string): string {

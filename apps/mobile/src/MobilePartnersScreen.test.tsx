@@ -67,9 +67,9 @@ const colors: MobilePartnersScreenProps["colors"] = {
 };
 
 const partners = [
-  { partnerId: "alpha", displayName: "Ada", avatar: "A", lifecycle: "active" as const,
+  { partnerId: "alpha", revision: 2n, displayName: "Ada", avatar: "A", lifecycle: "active" as const,
     initializationState: "ready" as const, profileVersion: 1 },
-  { partnerId: "beta", displayName: "Bo", avatar: "B", lifecycle: "active" as const,
+  { partnerId: "beta", revision: 2n, displayName: "Bo", avatar: "B", lifecycle: "active" as const,
     initializationState: "ready" as const, profileVersion: 1 }
 ];
 const thread = {

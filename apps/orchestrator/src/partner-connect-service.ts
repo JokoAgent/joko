@@ -4,6 +4,8 @@ import * as contract from "@joko/contracts";
 import {
   PartnerStoreError,
   type PartnerCapabilitiesRecord,
+  type PartnerAvatarInput,
+  type PartnerAvatarRecord,
   type PartnerDelegationStatus,
   type PartnerInitializationErrorCode,
   type PartnerInitializationState,
@@ -68,6 +70,16 @@ export function createPartnerConnectService(
         partner: toProtoProfile(owner().getPartner(request.partnerId), owner().activity(request.partnerId))
       }));
     },
+    readPartnerAvatar: (request, context) => {
+      authenticate(context);
+      return partnerRpc(() => {
+        const result = owner().readPartnerAvatar(request.partnerId,
+          fromProtoRevision(request.expectedRevision, "expected_revision"), request.sha256);
+        return create(contract.ReadPartnerAvatarResponseSchema, {
+          image: { ...result.image, byteLength: BigInt(result.image.byteLength) }, content: result.content
+        });
+      });
+    },
     createPartner: async (request, context) => {
       authenticate(context);
       return partnerRpc(async () => {
@@ -89,7 +101,7 @@ export function createPartnerConnectService(
           requestId: request.requestId,
           expectedDirectoryRevision: fromProtoRevision(request.expectedDirectoryRevision, "expected_directory_revision"),
           displayName: draft.displayName,
-          avatar: draft.avatar,
+          avatar: fromProtoAvatarInput(draft.avatar),
           identitySource: draft.identitySource,
           templateId: draft.templateId,
           capabilities,
@@ -151,7 +163,7 @@ export function createPartnerConnectService(
           fromProtoRevision(request.expectedRevision, "expected_revision"),
           {
             ...(patch.displayName === undefined ? {} : { displayName: patch.displayName }),
-            ...(patch.avatar === undefined ? {} : { avatar: patch.avatar }),
+            ...(patch.avatar === undefined ? {} : { avatar: fromProtoAvatarInput(patch.avatar) }),
             ...(patch.identitySource === undefined ? {} : { identitySource: patch.identitySource }),
             ...(capabilities === undefined ? {} : { capabilities }),
             ...(patch.usesDirectoryDefaults === undefined
@@ -294,6 +306,18 @@ function toProtoDirectory(view: PartnerDirectoryView): contract.PartnerDirectory
   });
 }
 
+function fromProtoAvatarInput(value: contract.PartnerAvatarInput | undefined): PartnerAvatarInput {
+  if (value?.value.case === "presetId") return value.value.value;
+  if (value?.value.case === "imageBase64") return { base64: value.value.value };
+  throw new ConnectError("A Partner avatar preset or image is required.", Code.InvalidArgument);
+}
+
+function toProtoAvatar(avatar: PartnerAvatarRecord): contract.PartnerAvatar {
+  return create(contract.PartnerAvatarSchema, { value: typeof avatar === "string"
+    ? { case: "presetId", value: avatar }
+    : { case: "image", value: { ...avatar, byteLength: BigInt(avatar.byteLength) } } });
+}
+
 function toProtoProfile(
   profile: PartnerProfileRecord,
   activity: PartnerActivitySummary
@@ -303,7 +327,7 @@ function toProtoProfile(
     revision: toProtoRevision(profile.revision),
     profileVersion: BigInt(profile.profileVersion),
     displayName: profile.displayName,
-    avatar: profile.avatar,
+    avatar: toProtoAvatar(profile.avatar),
     identitySource: profile.identitySource,
     templateId: profile.templateId,
     lifecycle: toProtoLifecycle(profile.lifecycle),

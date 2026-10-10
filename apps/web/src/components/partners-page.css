@@ -52,7 +52,9 @@
 .partner-template-grid > button:hover { background: var(--surface-hover); }.partner-template-grid > button.is-selected { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 13%, transparent); }
 .partner-template-grid strong { font-size: var(--text-11); }.partner-template-grid span { color: var(--text-soft); font-size: var(--text-9); line-height: 1.45; }
 .partner-avatar-picker { width: max-content; }
-.partner-avatar-picker > div { display: flex; gap: 7px; }
+.partner-avatar-picker > div { display: flex; flex-wrap: wrap; gap: 7px; }
+.partner-avatar > img { width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+.partner-avatar-upload { width: 36px; height: 36px; display: grid; place-items: center; font-size: 24px; color: var(--text-soft); }
 .partner-avatar-picker button { border: 2px solid transparent; border-radius: 15px; padding: 2px; background: transparent; }
 .partner-avatar-picker button:hover { background: var(--surface-hover); }.partner-avatar-picker button.is-selected { border-color: var(--accent); background: var(--accent-soft); }
 .partner-avatar-picker .partner-avatar { width: 36px; height: 36px; border-radius: 11px; }.partner-avatar-picker .partner-avatar > span { transform: scale(.82) rotate(-12deg); }

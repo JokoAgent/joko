@@ -2931,6 +2931,7 @@ export function useAppController(): AppController {
     createPartner: (expectedDirectoryRevision, draft, requestId, signal) =>
       gateway().createPartner(expectedDirectoryRevision, draft, requestId, signal),
     getPartnerCreation: (requestId, signal) => gateway().getPartnerCreation(requestId, signal),
+      readPartnerAvatar: (partnerId, revision, image, signal) => gateway().readPartnerAvatar(partnerId, revision, image, signal),
     retirePartnerCreation: (requestId, signal) => gateway().retirePartnerCreation(requestId, signal),
     updatePartner: (partnerId, expectedRevision, patch, signal) =>
       gateway().updatePartner(partnerId, expectedRevision, patch, signal),

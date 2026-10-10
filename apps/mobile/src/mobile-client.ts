@@ -1,4 +1,5 @@
 import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
+import type { MobilePartnerAvatarTransport } from "./mobile-partner-avatar";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { Code } from "@connectrpc/connect";
@@ -1062,6 +1063,23 @@ export class MobileClient {
     } };
   }
 
+  partnerAvatarTransport(): MobilePartnerAvatarTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.readPartnerAvatar) return undefined;
+    const ownerKey = context.authorityKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey || this.#credential !== context.credential) {
+        throw new Error("The Partner image owner changed.");
+      }
+    };
+    return { ownerKey, read: async (partner, signal) => {
+      requireCurrent(signal);
+      const uri = await this.network.readPartnerAvatar!(context.credential, partner, signal);
+      requireCurrent(signal); return uri;
+    } };
+  }
+
   partnerProfileTransport(): MobilePartnerProfileTransport | undefined {
     const conversation = this.partnerConversationTransport();
     const directory = this.partnerDirectoryTransport();
@@ -1116,7 +1134,7 @@ export class MobileClient {
         }
         const confirmed = (await load(updated, signal)).partner;
         if (confirmed.revision < updated.revision || confirmed.displayName !== validated.displayName
-          || confirmed.avatar !== validated.avatar || confirmed.identitySource !== validated.identitySource
+          || JSON.stringify(confirmed.avatar) !== JSON.stringify(updated.avatar) || confirmed.identitySource !== validated.identitySource
           || confirmed.usesDirectoryDefaults !== validated.usesDirectoryDefaults
           || !validated.usesDirectoryDefaults && JSON.stringify(confirmed.capabilities) !== JSON.stringify(validated.capabilities)) {
           throw new Error("The saved Partner profile could not be confirmed by the current node.");

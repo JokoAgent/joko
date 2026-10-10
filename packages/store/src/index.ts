@@ -38,6 +38,7 @@ export {
 export type * from "./partner-store.js";
 export { PartnerStoreError } from "./partner-types.js";
 export type * from "./partner-types.js";
+export { decodePartnerAvatar, partnerAvatarImage, PARTNER_AVATAR_MAX_BYTES } from "./partner-avatar.js";
 export {
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   messagingConversationContextAad,

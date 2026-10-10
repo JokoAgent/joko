@@ -1,4 +1,6 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
+import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
+import { protoMobilePartnerAvatar, type MobilePartnerAvatarIdentity } from "./mobile-partner-avatar";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
@@ -205,6 +207,7 @@ export interface MobileNetwork {
   getPartnerProfileOptions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerProfileOptions>;
   updatePartnerProfile?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
     draft: MobilePartnerProfileDraft, signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
+  readPartnerAvatar?(credential: PairedCredential, partner: MobilePartnerAvatarIdentity, signal?: AbortSignal): Promise<string>;
   retryPartnerInitialization?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
     signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
   markPartnerRead?(credential: PairedCredential, partnerId: string, throughCursor: bigint,
@@ -1581,13 +1584,34 @@ export const mobileNetwork: MobileNetwork = {
     if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current Partner profile.");
     const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
       .updatePartner({ partnerId, expectedRevision: { value: expectedRevision }, patch: {
-        displayName: draft.displayName, avatar: draft.avatar, identitySource: draft.identitySource,
+        displayName: draft.displayName, identitySource: draft.identitySource,
+        ...(typeof draft.avatar === "string" || "base64" in draft.avatar ? { avatar: protoMobilePartnerAvatar(draft.avatar) } : {}),
         usesDirectoryDefaults: draft.usesDirectoryDefaults,
         ...(draft.usesDirectoryDefaults ? {} : { modelChain: { routes: [...draft.capabilities.modelChain] },
           permissionMode: draft.capabilities.permissionMode === "ask" ? PermissionMode.ASK : PermissionMode.AUTO,
           planMode: draft.capabilities.planMode })
       } }, options(signal));
-    return projectMobilePartnerProfileUpdate(partnerId, expectedRevision, response);
+    const partner = projectMobilePartnerProfileUpdate(partnerId, expectedRevision, response);
+    if (typeof draft.avatar === "string" ? partner.avatar !== draft.avatar
+      : "base64" in draft.avatar && (typeof partner.avatar === "string"
+        || partner.avatar.sha256 !== await sha256Hex(base64Decode(draft.avatar.base64)))) {
+      throw new Error("The Partner avatar update could not be confirmed.");
+    }
+    signal?.throwIfAborted();
+    return partner;
+  },
+  async readPartnerAvatar(credential, partner, signal) {
+    signal?.throwIfAborted();
+    const image = partner.avatar;
+    if (typeof image === "string" || !validMobilePartnerId(partner.partnerId) || partner.revision < 1n) throw new Error("Select a current Partner image.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .readPartnerAvatar({ partnerId: partner.partnerId, expectedRevision: { value: partner.revision }, sha256: image.sha256 }, options(signal));
+    signal?.throwIfAborted();
+    if (!response.image || response.image.sha256 !== image.sha256 || response.image.mimeType !== image.mimeType
+      || response.image.byteLength !== BigInt(image.byteLength) || response.content.length !== image.byteLength
+      || await sha256Hex(response.content) !== image.sha256) throw new Error("The Partner image response could not be verified.");
+    signal?.throwIfAborted();
+    return `data:${image.mimeType};base64,${base64Encode(response.content)}`;
   },
   async listPartnerSessions(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");

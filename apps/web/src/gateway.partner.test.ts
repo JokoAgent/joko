@@ -1,4 +1,5 @@
 import { create } from "@bufbuild/protobuf";
+import { createHash } from "node:crypto";
 import type { Transport } from "@connectrpc/connect";
 import {
   PartnerDelegationStatus,
@@ -18,6 +19,22 @@ import * as contract from "@joko/contracts";
 
 describe("Partner gateway", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("reads only a current typed image and verifies its metadata and SHA before rendering", async () => {
+    const bytes = new Uint8Array([255, 216, 255, 219]);
+    const image = { sha256: createHash("sha256").update(bytes).digest("hex"), mimeType: "image/jpeg" as const, byteLength: bytes.length };
+    let invalid = false;
+    const requests: Array<{ method: string; input: any; signal?: AbortSignal }> = [];
+    const gateway = connectedGateway(partnerTransport((method) => method === "readPartnerAvatar"
+      ? { image: { ...image, byteLength: BigInt(image.byteLength) }, content: invalid ? new Uint8Array([255, 216, 255, 220]) : bytes }
+      : partnerResponse(method), requests));
+    await gateway.connect();
+    expect(await gateway.readPartnerAvatar("partner-one", 8n, image)).toBe("data:image/jpeg;base64,/9j/2w==");
+    expect(requests.find((request) => request.method === "readPartnerAvatar")?.input).toMatchObject({ partnerId: "partner-one",
+      expectedRevision: { value: 8n }, sha256: image.sha256 });
+    invalid = true; await expect(gateway.readPartnerAvatar("partner-one", 8n, image)).rejects.toThrow(/verification/u);
+    gateway.disconnect();
+  });
 
   it("uses generated workbench RPCs and rejects stale owners, revisions, details and unknown states", async () => {
     const owner = { partnerId: "partner-one", profileVersion: 2n, sessionId: "session-one", sessionGeneration: 1n, targetId: "home-one" };
@@ -297,7 +314,7 @@ function profile() {
     revision: revision(8n),
     profileVersion: 2n,
     displayName: "Aster",
-    avatar: "orbit",
+    avatar: { value: { case: "presetId" as const, value: "orbit" } },
     identitySource: "You are Aster.",
     templateId: "general",
     lifecycle: PartnerLifecycle.ACTIVE,

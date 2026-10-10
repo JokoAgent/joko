@@ -30,7 +30,7 @@ const profile = (input: {
   revision: { value: 2n },
   profileVersion: 3n,
   displayName: input.name,
-  avatar: "orbit",
+  avatar: { value: { case: "presetId" as const, value: "orbit" } },
   identitySource: `${input.name} helps with product work.`,
   templateId: "general",
   lifecycle: PartnerLifecycle.ACTIVE,

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, Modal, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
-import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
+import { MobilePartnerPhotoPicker } from "./MobilePartnerPhotoPicker";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnerDirectoryProfile, MobilePartnerModelRoute } from "./mobile-partner-directory";
@@ -26,6 +26,9 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
     readonly draft?: MobilePartnerProfileDraft; readonly phase: "loading" | "ready" | "error"; readonly error?: string;
     readonly requiresRefresh?: boolean }>({ phase: "loading" });
   const [busy, setBusy] = useState(false);
+  const [avatarPreparing, setAvatarPreparing] = useState(false);
+  const avatarPreparingRef = useRef(false);
+  const preparingAvatar = (value: boolean): void => { avatarPreparingRef.current = value; setAvatarPreparing(value); };
   const [modelIndex, setModelIndex] = useState<number>();
   const busyRef = useRef(false);
   const requestRef = useRef<AbortController | undefined>(undefined);
@@ -64,7 +67,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
   }, [binding]);
 
   const close = (): void => {
-    if (busyRef.current) return;
+    if (busyRef.current || avatarPreparingRef.current) return;
     if (!dirty) { onClose(); return; }
     Alert.alert(mobileMessage(locale, "partnerProfile.discardTitle"), undefined, [
       { text: mobileMessage(locale, "common.cancel"), style: "cancel" },
@@ -81,7 +84,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
   };
   const save = (): void => {
     const current = propsRef.current.transport; const expected = bindingRef.current;
-    if (!editable || !snapshot || !draft || !current || !expected || busyRef.current) return;
+    if (!editable || !snapshot || !draft || !current || !expected || busyRef.current || avatarPreparingRef.current) return;
     let validated: MobilePartnerProfileDraft;
     try { validated = validateMobilePartnerProfileDraft(snapshot, draft); }
     catch (error) {
@@ -123,7 +126,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
     <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]} edges={["top", "bottom"]}>
       <MobileKeyboardAvoidingView style={styles.screen} keyboard={keyboard} consumedBottomInset={insets.bottom}>
         <View style={styles.header}>
-          {action(mobileMessage(locale, "common.close"), close, busy)}
+          {action(mobileMessage(locale, "common.close"), close, busy || avatarPreparing)}
           <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "partnerProfile.title")}</Text>
         </View>
         {!binding ? <Text style={[styles.notice, { color: colors.muted }]}>{mobileMessage(locale, "partnerProfile.offline")}</Text>
@@ -139,17 +142,12 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
             </View>}
             {caption("name")}
             <TextInput accessibilityLabel={mobileMessage(locale, "partnerProfile.name")} value={draft.displayName} editable={editable}
-              onChangeText={(displayName) => change({ ...draft, displayName })} maxLength={100} autoCorrect={false}
+              onChangeText={(displayName) => change({ ...draft, displayName })} maxLength={200} autoCorrect={false}
               style={[styles.input, { borderColor: colors.border, color: colors.ink, backgroundColor: colors.surface }]} />
             {caption("avatar")}
-            <View style={styles.choices}>
-              {snapshot.options.avatarPresets.map((preset) => <Pressable key={preset} accessibilityRole="radio"
-                accessibilityLabel={preset} accessibilityState={{ checked: draft.avatar === preset, disabled: !editable }}
-                disabled={!editable} onPress={() => change({ ...draft, avatar: preset })}
-                style={[styles.avatar, { borderColor: draft.avatar === preset ? colors.accent : colors.border }]}>
-                <MobilePartnerAvatar preset={preset} colors={colors} />
-              </Pressable>)}
-            </View>
+            <MobilePartnerPhotoPicker key={binding} value={draft.avatar} presets={snapshot.options.avatarPresets} partner={snapshot.partner}
+              colors={colors} locale={locale} disabled={!editable} onPreparing={preparingAvatar}
+              onChange={(avatar) => change({ ...draft, avatar })} />
             {caption("identity")}
             <TextInput accessibilityLabel={mobileMessage(locale, "partnerProfile.identity")} value={draft.identitySource}
               editable={editable} multiline maxLength={8_000} onChangeText={(identitySource) => change({ ...draft, identitySource })}
@@ -223,7 +221,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, colors,
                   capabilities: { ...draft.capabilities, planMode } })} />
             </View>
             {busy && <ActivityIndicator color={colors.accent} />}
-            {action(mobileMessage(locale, "partnerProfile.save"), save, !editable || !dirty)}
+            {action(mobileMessage(locale, "partnerProfile.save"), save, !editable || !dirty || avatarPreparing)}
           </ScrollView>}
       </MobileKeyboardAvoidingView>
     </SafeAreaView>

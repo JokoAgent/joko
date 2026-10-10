@@ -158,7 +158,7 @@ async function createPartner(
     requestId: `creation-request-${displayName}`,
     expectedDirectoryRevision: revision,
     draft: create(PartnerDraftSchema, {
-      displayName, avatar,
+      displayName, avatar: { value: { case: "presetId", value: avatar } },
       identitySource: `You are ${displayName}, a Partner in the mobile private-thread test.`,
       templateId: "general", usesDirectoryDefaults: false,
       capabilities: create(PartnerCapabilitiesSchema, {

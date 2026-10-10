@@ -1,4 +1,6 @@
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { base64Encode } from "@bufbuild/protobuf/wire";
+import { mapPartnerAvatar, protoPartnerAvatar, type PartnerAvatarImageView } from "./partner-avatar.js";
 import { createClient, ConnectError, Code, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
@@ -7216,7 +7218,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       expectedDirectoryRevision: { value: expectedDirectoryRevision },
       draft: {
         displayName: draft.displayName,
-        avatar: draft.avatar,
+        avatar: protoPartnerAvatar(draft.avatar),
         identitySource: draft.identitySource,
         templateId: draft.templateId,
         ...(draft.capabilities === undefined ? {} : { capabilities: protoPartnerCapabilities(draft.capabilities) }),
@@ -7232,6 +7234,24 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const response = await createClient(PartnerService, scope.transport).getPartnerCreation({ requestId }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async readPartnerAvatar(partnerId: string, expectedRevision: bigint, image: PartnerAvatarImageView, signal?: AbortSignal): Promise<string> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).readPartnerAvatar({
+      partnerId, expectedRevision: { value: expectedRevision }, sha256: image.sha256
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const actual = response.image;
+    if (!actual || actual.sha256 !== image.sha256 || actual.mimeType !== image.mimeType
+      || actual.byteLength !== BigInt(image.byteLength) || response.content.length !== image.byteLength) {
+      throw new GatewayError("The Partner image response belongs to another descriptor.");
+    }
+    const digest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(response.content).buffer)))
+      .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    scope.signal.throwIfAborted();
+    if (digest !== image.sha256) throw new GatewayError("The Partner image failed content verification.");
+    return `data:${image.mimeType};base64,${base64Encode(response.content)}`;
   }
 
   async retirePartnerCreation(requestId: string, signal?: AbortSignal): Promise<{ readonly directory: PartnerDirectoryView; readonly partner?: PartnerProfileView }> {
@@ -19987,7 +20007,7 @@ function protoPartnerCapabilities(value: PartnerCapabilitiesView) {
 function protoPartnerPatch(value: PartnerPatchView) {
   return {
     ...(value.displayName === undefined ? {} : { displayName: value.displayName }),
-    ...(value.avatar === undefined ? {} : { avatar: value.avatar }),
+    ...(value.avatar === undefined ? {} : { avatar: protoPartnerAvatar(value.avatar) }),
     ...(value.identitySource === undefined ? {} : { identitySource: value.identitySource }),
     ...(value.modelChain === undefined ? {} : { modelChain: { routes: value.modelChain.map(protoPartnerRoute) } }),
     ...(value.permissionMode === undefined ? {} : { permissionMode: protoPermission(value.permissionMode) }),
@@ -20026,7 +20046,7 @@ function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined): Pa
 
 function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfileView {
   if (value === undefined || value.partnerId.trim() === "" || value.displayName.trim() === ""
-    || value.avatar.trim() === "" || value.identitySource.trim() === "" || value.templateId.trim() === ""
+    || value.displayName.length > 200 || value.identitySource.trim() === "" || value.templateId.trim() === ""
     || value.homeTargetId.trim() === "" || value.profileVersion < 1n
     || (value.canonicalSessionId !== undefined && value.canonicalSessionId.trim() === "")) {
     throw new GatewayError("Orchestrator returned an incomplete Partner profile.");
@@ -20051,7 +20071,7 @@ function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfi
     revision: requiredPartnerRevision(value.revision, "Partner"),
     profileVersion: value.profileVersion,
     displayName: value.displayName,
-    avatar: value.avatar,
+    avatar: mapPartnerAvatar(value.avatar),
     identitySource: value.identitySource,
     templateId: value.templateId,
     lifecycle,

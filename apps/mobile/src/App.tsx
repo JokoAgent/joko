@@ -288,7 +288,7 @@ import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
 import { MobilePartnerDirectoryScreen } from "./MobilePartnerDirectoryScreen";
 import { useMobilePartnerIdentity, useMobilePartnerRead } from "./use-mobile-partner-read";
-import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
+import { MobilePartnerAvatar, MobilePartnerAvatarProvider } from "./MobilePartnerAvatar";
 import { MobilePartnerConversationRow } from "./MobilePartnerConversationRow";
 import { mobilePartnerConversationRows, mobilePartnerTimeGroups, mobilePublicConversationInputs } from "./mobile-partner-presentation";
 import { useMobileHiddenHistory } from "./use-mobile-hidden-history";
@@ -826,6 +826,7 @@ export function App() {
   const handleComposerFocused = useCallback(() => setFocusTaskComposer(false), []);
   return (
     <SafeAreaProvider>
+      <MobilePartnerAvatarProvider transport={client.partnerAvatarTransport()}>
       <View style={[styles.root, { backgroundColor: colors.background }]}>
         <StatusBar style={dark ? "light" : "dark"} />
         {updates.forced ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
@@ -991,6 +992,7 @@ export function App() {
           actions={mobileUpdateActions} />
         </>}
       </View>
+      </MobilePartnerAvatarProvider>
     </SafeAreaProvider>
   );
 }
@@ -5486,7 +5488,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     <MobileTaskHeader key={`${state.activeProfileId}/${state.selectedId}/${session?.backendId}/${session?.targetId}/${session?.nativeBinding?.runtimeGeneration}`}
       title={partnerRead.partner?.displayName ?? (partnerRead.ready ? session?.displayName || mobileMessage(locale, "task.titleFallback")
         : mobileMessage(locale, "task.loading"))}
-      identity={partnerRead.partner ? { mark: <MobilePartnerAvatar preset={partnerRead.partner.avatar} colors={colors} size={32} />,
+      identity={partnerRead.partner ? { mark: <MobilePartnerAvatar preset={partnerRead.partner.avatar} partner={partnerRead.partner} colors={colors} size={32} />,
         label: partnerRead.partner.displayName, settingsLabel: mobileMessage(locale, "partnerProfile.open", { name: partnerRead.partner.displayName }),
         disabled: !partnerProfileTransport || state.busy || attachmentBusy || voice.busy,
         onOpen: openRuntimeControls } : undefined}
@@ -5596,7 +5598,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         </View>}
       </View> : undefined}
       renderItem={({ item }) => partnerIdentity.partner && !isWorkGroup(item) ? <MobilePartnerConversationRow row={item}
-        ownerKey={partnerConversationTransport!.ownerKey} preset={partnerIdentity.partner.avatar} timestamp={partnerTimeGroups.get(item.id)}
+        ownerKey={partnerConversationTransport!.ownerKey} preset={partnerIdentity.partner.avatar} partner={partnerIdentity.partner} timestamp={partnerTimeGroups.get(item.id)}
         colors={colors} locale={locale} animate={state.status === "connected" && state.window === undefined && !state.historyBusy}>
         {renderTimelineItem(item)}
       </MobilePartnerConversationRow> : renderTimelineItem(item)} />

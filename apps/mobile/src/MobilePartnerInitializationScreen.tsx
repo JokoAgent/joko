@@ -100,7 +100,7 @@ export function MobilePartnerInitializationScreen({ partnerId, transport, colors
             : <><ActivityIndicator color={colors.muted} /><Text style={[styles.body, { color: colors.muted }]}>
               {mobileMessage(locale, "partnerInitialization.loading")}</Text></>}
         </> : <>
-          <MobilePartnerAvatar preset={partner.avatar} colors={colors} />
+          <MobilePartnerAvatar preset={partner.avatar} partner={partner} colors={colors} />
           <Text style={[styles.title, styles.centered, { color: colors.ink }]}>{mobileMessage(locale,
             "partnerInitialization.waiting", { name: partner.displayName })}</Text>
           <Text style={[styles.body, styles.centered, { color: colors.muted }]}>{mobileMessage(locale,

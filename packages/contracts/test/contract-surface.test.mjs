@@ -661,6 +661,7 @@ test("Partners exposes revision-fenced durable profiles without private home or 
     "getPartnerDirectory",
     "listPartners",
     "getPartner",
+    "readPartnerAvatar",
     "createPartner",
     "getPartnerCreation",
     "retirePartnerCreation",
@@ -705,6 +706,10 @@ test("Partners exposes revision-fenced durable profiles without private home or 
   assert.equal(field(contract.CreatePartnerRequestSchema, "request_id").number, 3);
   assert.equal(roundTrip(contract.CreatePartnerRequestSchema, { requestId: "creation-request-contract" }).requestId, "creation-request-contract");
   assert.equal(roundTrip(contract.RetirePartnerCreationResponseSchema, { retired: true }).retired, true);
+  assert.equal(roundTrip(contract.PartnerAvatarInputSchema, { value: { case: "imageBase64", value: "/9j/2w==" } }).value.case, "imageBase64");
+  assert.deepEqual(roundTrip(contract.ReadPartnerAvatarResponseSchema, { image: {
+    sha256: "a".repeat(64), mimeType: "image/jpeg", byteLength: 4n }, content: new Uint8Array([255, 216, 255, 219]) }).content,
+  new Uint8Array([255, 216, 255, 219]));
   assert.equal(field(contract.PartnerPatchSchema, "display_name").proto.proto3Optional, true);
   assert.equal(field(contract.PartnerPatchSchema, "permission_mode").proto.proto3Optional, true);
   assert.equal(field(contract.PartnerPatchSchema, "uses_directory_defaults").proto.proto3Optional, true);

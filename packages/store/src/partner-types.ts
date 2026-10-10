@@ -8,6 +8,13 @@ export type PartnerInitializationErrorCode =
   | "session_unavailable"
   | "state_changed";
 export type PartnerPermissionMode = "ask" | "auto";
+export interface PartnerAvatarImageRecord {
+  readonly sha256: string;
+  readonly mimeType: "image/jpeg" | "image/png" | "image/webp";
+  readonly byteLength: number;
+}
+export type PartnerAvatarRecord = string | PartnerAvatarImageRecord;
+export type PartnerAvatarInput = string | { readonly base64: string };
 export type PartnerSessionRole = "canonical" | "history" | "delegation";
 export type PartnerPrivateThreadStatus = "active" | "closed";
 export type PartnerPrivateThreadCloseReason = "message_limit" | "idle_timeout";
@@ -50,7 +57,7 @@ export interface PartnerProfileRecord {
   readonly revision: bigint;
   readonly profileVersion: number;
   readonly displayName: string;
-  readonly avatar: string;
+  readonly avatar: PartnerAvatarRecord;
   readonly identitySource: string;
   readonly templateId: string;
   readonly lifecycle: PartnerLifecycle;
@@ -159,7 +166,7 @@ export interface PartnerDelegationRecord {
 
 export interface PartnerDraft {
   readonly displayName: string;
-  readonly avatar: string;
+  readonly avatar: PartnerAvatarInput;
   readonly identitySource: string;
   readonly templateId: string;
   readonly capabilities: PartnerCapabilitiesRecord;
@@ -168,7 +175,7 @@ export interface PartnerDraft {
 
 export interface PartnerPatch {
   readonly displayName?: string;
-  readonly avatar?: string;
+  readonly avatar?: PartnerAvatarInput;
   readonly identitySource?: string;
   readonly capabilities?: PartnerCapabilitiesRecord;
   readonly usesDirectoryDefaults?: boolean;

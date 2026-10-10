@@ -94,7 +94,7 @@ function PartnerRow({ partner, colors, locale, opening, recoverable, last, onOpe
     accessibilityState={{ disabled: !available && !recoverable || opening }} disabled={!available && !recoverable || opening}
     onPress={onOpen} testID={`partnerDirectory.item.${partner.partnerId}`}
     style={[styles.row, { backgroundColor: colors.surface }, !available && !recoverable && styles.unavailable]}>
-    <MobilePartnerAvatar preset={partner.avatar} colors={colors} />
+    <MobilePartnerAvatar preset={partner.avatar} partner={partner} colors={colors} />
     <View style={[styles.rowBody, !last && { borderBottomColor: colors.border, borderBottomWidth: StyleSheet.hairlineWidth }]}>
       <View style={styles.titleRow}>
         <Text style={[styles.name, { color: colors.ink }]} numberOfLines={1}>{partner.displayName}</Text>

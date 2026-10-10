@@ -28,6 +28,8 @@ import type {
   PartnerSessionRole
 } from "./partner-types.js";
 import { PartnerStoreError } from "./partner-types.js";
+import type { PartnerAvatarRecord, PartnerAvatarInput } from "./partner-types.js";
+import { decodePartnerAvatar, partnerAvatarImage } from "./partner-avatar.js";
 
 type Row = Record<string, unknown>;
 
@@ -76,7 +78,7 @@ export interface TransitionPartnerDelegationInput {
 const PARTNER_SCHEMA_VERSION = 1;
 const MAX_SAFE_REVISION = 9_007_199_254_740_991;
 const MAX_PARTNERS = 1_000;
-const MAX_DISPLAY_NAME = 100;
+const MAX_DISPLAY_NAME = 200;
 const MAX_IDENTITY_SOURCE = 8_000;
 const MAX_MODEL_ROUTES = 3;
 export const PARTNER_PRIVATE_MAX_MESSAGES = 12;
@@ -122,7 +124,7 @@ CREATE TABLE partners (
   profile_version INTEGER NOT NULL CHECK (profile_version BETWEEN 1 AND 9007199254740991),
   display_name TEXT NOT NULL,
   normalized_name TEXT NOT NULL,
-  avatar TEXT NOT NULL,
+  avatar_json TEXT NOT NULL,
   identity_source TEXT NOT NULL,
   template_id TEXT NOT NULL,
   lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active', 'archived', 'deleted')),
@@ -143,6 +145,13 @@ CREATE UNIQUE INDEX partners_live_name_unique
   ON partners(normalized_name)
   WHERE lifecycle <> 'deleted';
 CREATE INDEX partners_lifecycle_updated_idx ON partners(lifecycle, updated_at DESC, id);
+
+CREATE TABLE partner_avatar_images (
+  sha256 TEXT PRIMARY KEY CHECK (length(sha256) = 64),
+  mime_type TEXT NOT NULL CHECK (mime_type IN ('image/jpeg', 'image/png', 'image/webp')),
+  byte_length INTEGER NOT NULL CHECK (byte_length BETWEEN 1 AND 5242880),
+  content BLOB NOT NULL CHECK (length(content) = byte_length)
+) STRICT;
 
 CREATE TABLE retired_partner_creations (
   request_id TEXT PRIMARY KEY,
@@ -312,6 +321,31 @@ export class PartnerStore {
     if (this.#closed) return;
     this.#closed = true;
     this.#database.close();
+  }
+
+  readPartnerAvatar(partnerId: string, expectedRevision: bigint, sha256: string): {
+    readonly image: Exclude<PartnerAvatarRecord, string>; readonly content: Uint8Array;
+  } {
+    const partner = this.getPartner(partnerId);
+    assertRevision(partner, expectedRevision);
+    if (partner.lifecycle === "deleted" || typeof partner.avatar === "string" || partner.avatar.sha256 !== sha256) {
+      throw new PartnerStoreError("PARTNER_NOT_FOUND", "The current Partner image is unavailable.");
+    }
+    const row = this.#database.prepare("SELECT mime_type, byte_length, content FROM partner_avatar_images WHERE sha256 = ?")
+      .get(sha256) as Row | undefined;
+    if (!row || !(row["content"] instanceof Uint8Array)) throw unavailable("The Partner image is unavailable.");
+    const content = new Uint8Array(row["content"]);
+    const image = partnerAvatarImage({ sha256, mimeType: row["mime_type"], byteLength: row["byte_length"] });
+    if (JSON.stringify(image) !== JSON.stringify(partner.avatar) || content.length !== image.byteLength
+      || createHash("sha256").update(content).digest("hex") !== sha256) throw unavailable("The Partner image is invalid.");
+    return { image, content };
+  }
+
+  #persistAvatar(avatar: PartnerAvatarInput): void {
+    if (typeof avatar === "string") return;
+    const { image, bytes } = decodePartnerAvatar(avatar.base64);
+    this.#database.prepare(`INSERT INTO partner_avatar_images(sha256, mime_type, byte_length, content)
+      VALUES (?, ?, ?, ?) ON CONFLICT(sha256) DO NOTHING`).run(image.sha256, image.mimeType, image.byteLength, bytes);
   }
 
   directoryState(): PartnerDirectoryState {
@@ -487,7 +521,7 @@ export class PartnerStore {
       if (this.#database.prepare("SELECT request_id FROM retired_partner_creations WHERE request_id = ?").get(requestId) !== undefined) {
         throw new PartnerStoreError("PARTNER_CREATION_RETIRED", "This partner creation request was retired.");
       }
-      const requestedDraft = partnerDraft(input);
+      const requestedDraft = partnerDraft({ ...input, avatar: avatarInput(input.avatar) });
       const fingerprint = creationFingerprint(input, requestedDraft);
       const existing = this.#database.prepare("SELECT * FROM partners WHERE creation_request_id = ?")
         .get(requestId) as Row | undefined;
@@ -517,14 +551,15 @@ export class PartnerStore {
       }
       const draft = { ...requestedDraft, capabilities };
       const at = this.#now();
+      this.#persistAvatar(input.avatar);
       this.#database.prepare(`
         INSERT INTO partners(
-          id, creation_request_id, creation_fingerprint, revision, profile_version, display_name, normalized_name, avatar, identity_source, template_id,
+          id, creation_request_id, creation_fingerprint, revision, profile_version, display_name, normalized_name, avatar_json, identity_source, template_id,
           lifecycle, initialization_state, invitation_stage, initialization_error_code,
           home_target_id, canonical_session_id, model_chain_json, permission_mode, plan_mode,
           uses_directory_defaults, created_at, updated_at
         ) VALUES (?, ?, ?, 1, 1, ?, ?, ?, ?, ?, 'active', 'pending', 'home', NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
-      `).run(id, requestId, fingerprint, draft.displayName, normalizedPartnerName(draft.displayName), draft.avatar,
+      `).run(id, requestId, fingerprint, draft.displayName, normalizedPartnerName(draft.displayName), JSON.stringify(draft.avatar),
         draft.identitySource, draft.templateId, homeTargetId, modelChainJson(draft.capabilities.modelChain),
         draft.capabilities.permissionMode, draft.capabilities.planMode ? 1 : 0,
         draft.usesDirectoryDefaults ? 1 : 0, at, at);
@@ -551,7 +586,7 @@ export class PartnerStore {
       }
       const next = partnerDraft({
         displayName: patch.displayName ?? current.displayName,
-        avatar: patch.avatar ?? current.avatar,
+        avatar: patch.avatar === undefined ? current.avatar : avatarInput(patch.avatar),
         identitySource: patch.identitySource ?? current.identitySource,
         templateId: current.templateId,
         capabilities,
@@ -561,18 +596,24 @@ export class PartnerStore {
       const at = this.#now();
       const nextRevision = nextNumber(current.revision, "Partner revision");
       const nextVersion = nextSafeInteger(current.profileVersion, "Partner profile version");
+      if (patch.avatar !== undefined) this.#persistAvatar(patch.avatar);
       const result = this.#database.prepare(`
         UPDATE partners SET
-          revision = ?, profile_version = ?, display_name = ?, normalized_name = ?, avatar = ?, identity_source = ?,
+          revision = ?, profile_version = ?, display_name = ?, normalized_name = ?, avatar_json = ?, identity_source = ?,
           model_chain_json = ?, permission_mode = ?, plan_mode = ?, uses_directory_defaults = ?,
           initialization_state = 'pending', invitation_stage = 'home',
           initialization_error_code = NULL, updated_at = ?
         WHERE id = ? AND revision = ?
-      `).run(nextRevision, nextVersion, next.displayName, normalizedPartnerName(next.displayName), next.avatar,
+      `).run(nextRevision, nextVersion, next.displayName, normalizedPartnerName(next.displayName), JSON.stringify(next.avatar),
         next.identitySource, modelChainJson(next.capabilities.modelChain), next.capabilities.permissionMode,
         next.capabilities.planMode ? 1 : 0, next.usesDirectoryDefaults ? 1 : 0,
         at, current.id, Number(current.revision));
       if (Number(result.changes) !== 1) throw changed(current.id);
+      if (typeof current.avatar !== "string" && JSON.stringify(current.avatar) !== JSON.stringify(next.avatar)) {
+        this.#database.prepare(`DELETE FROM partner_avatar_images WHERE sha256 = ?
+          AND NOT EXISTS (SELECT 1 FROM partners WHERE json_extract(avatar_json, '$.sha256') = ?)`)
+          .run(current.avatar.sha256, current.avatar.sha256);
+      }
       this.#insertVersion(current.id, nextVersion, next.identitySource, next.capabilities,
         next.usesDirectoryDefaults, at);
       this.#bumpDirectory(at);
@@ -1291,7 +1332,7 @@ export class PartnerStore {
         revision: BigInt(safeInteger(row["revision"], "Partner revision")),
         profileVersion: positiveInteger(row["profile_version"], "Partner profile version"),
         displayName: displayName(row["display_name"]),
-        avatar: avatarId(row["avatar"]),
+        avatar: avatarRecord(JSON.parse(stringValue(row["avatar_json"], "Partner avatar"))),
         identitySource: identityValue(row["identity_source"]),
         templateId: templateId(row["template_id"]),
         lifecycle,
@@ -1628,7 +1669,9 @@ function creationRequestId(value: unknown): string {
   return value;
 }
 
-function creationFingerprint(input: CreatePartnerInput, draft: PartnerDraft): string {
+type NormalizedPartnerDraft = Omit<PartnerDraft, "avatar"> & { readonly avatar: PartnerAvatarRecord };
+
+function creationFingerprint(input: CreatePartnerInput, draft: NormalizedPartnerDraft): string {
   const revision = revisionNumber(input.expectedDirectoryRevision, "Partner directory revision");
   return createHash("sha256").update(JSON.stringify({
     expectedDirectoryRevision: revision,
@@ -1647,13 +1690,13 @@ function creationFingerprint(input: CreatePartnerInput, draft: PartnerDraft): st
   })).digest("hex");
 }
 
-function partnerDraft(input: PartnerDraft): PartnerDraft {
+function partnerDraft(input: NormalizedPartnerDraft): NormalizedPartnerDraft {
   if (typeof input.usesDirectoryDefaults !== "boolean") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner default inheritance must be boolean.");
   }
   return {
     displayName: displayName(input.displayName),
-    avatar: avatarId(input.avatar),
+    avatar: avatarRecord(input.avatar),
     identitySource: identityValue(input.identitySource),
     templateId: templateId(input.templateId),
     capabilities: capabilitiesValue(input.capabilities),
@@ -1759,9 +1802,9 @@ function modelChainJson(routes: readonly PartnerModelRouteRecord[]): string {
   })));
 }
 
-function sameProfileContent(current: PartnerProfileRecord, next: PartnerDraft): boolean {
+function sameProfileContent(current: PartnerProfileRecord, next: NormalizedPartnerDraft): boolean {
   return current.displayName === next.displayName
-    && current.avatar === next.avatar
+    && JSON.stringify(current.avatar) === JSON.stringify(next.avatar)
     && current.identitySource === next.identitySource
     && current.templateId === next.templateId
     && current.usesDirectoryDefaults === next.usesDirectoryDefaults
@@ -1812,6 +1855,18 @@ function avatarId(value: unknown): string {
   const result = stringValue(value, "Partner avatar");
   if (!AVATAR_ID.test(result)) throw new PartnerStoreError("PARTNER_INVALID", "Partner avatar preset is invalid.");
   return result;
+}
+
+function avatarRecord(value: unknown): PartnerAvatarRecord {
+  return typeof value === "string" ? avatarId(value) : partnerAvatarImage(value);
+}
+
+function avatarInput(value: PartnerAvatarInput): PartnerAvatarRecord {
+  if (typeof value === "string") return avatarId(value);
+  if (!value || typeof value !== "object" || Object.keys(value).join(",") !== "base64") {
+    throw new PartnerStoreError("PARTNER_INVALID", "A Partner avatar preset or image is required.");
+  }
+  return decodePartnerAvatar(value.base64).image;
 }
 
 function templateId(value: unknown): string {
