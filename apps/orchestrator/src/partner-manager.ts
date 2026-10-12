@@ -1,20 +1,29 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { lstat, mkdir, realpath, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
 import type { PromptInput, SessionDescriptor, TargetDescriptor } from "@joko/core";
 import {
   NotFoundError,
   PartnerStoreError,
+  decodePartnerAvatar,
+  type PartnerAvatarInput,
+  partnerHomeDirectoryName,
   type CreatePartnerInput,
   type OperationalStore,
   type PersistedEvent,
   type PartnerCapabilitiesRecord,
+  type PartnerModelRouteRecord,
   type PartnerDirectoryState,
   type PartnerInitializationErrorCode,
   type PartnerInvitationStage,
   type PartnerPatch,
   type PartnerDelegationRecord,
+  type PartnerDeletionRecord,
+  type PartnerRestartRecord,
+  type PartnerPauseRecord,
+  type PartnerLifecycle,
   type PartnerPrivateMessageRecord,
   type PartnerPrivateMessageReservation,
   type PartnerPrivateThreadReadStateRecord,
@@ -101,8 +110,8 @@ export function partnerSessionRuntimeFallback(
   if (partner.lifecycle !== "active" || partner.initializationState !== "ready") return { owned: true };
   const chain = partner.capabilities.modelChain;
   if (input.currentHop >= chain.length - 1) return { owned: true };
-  const key = (route: Pick<SessionRuntimeProfile, "providerId" | "modelId">) =>
-    `${route.providerId}\0${route.modelId}`;
+  const key = (route: Pick<SessionRuntimeProfile, "backendId" | "providerId" | "modelId">) =>
+    `${route.backendId}\0${route.providerId}\0${route.modelId}`;
   const visited = new Set([...input.visitedRoutes, key(input.current)]);
   const currentIndex = chain.findIndex((route) => key(route) === key(input.current));
   const candidate = (currentIndex < 0 ? chain : chain.slice(currentIndex + 1))
@@ -132,10 +141,21 @@ export interface PartnerManagerOptions {
   readonly sessionHost: Pick<
     SessionHost,
     "registerTarget" | "createServiceSession" | "applySessionSettings" | "updateServiceSessionPrompt"
-    | "enqueueServiceInput" | "abort"
+    | "enqueueServiceInput" | "abort" | "getSessionRuntimeControl" | "setSessionRuntimeControl"
+    | "retirePartnerSession" | "quiescePartnerTargetCreations"
+    | "restartPartnerSession" | "canRestartPartnerSession"
+    | "preparePartnerPauseQueue" | "pausePartnerSession" | "restorePartnerQueue" | "wakePartnerSession"
   >;
-  readonly workspaceService: Pick<WorkspaceService, "register">;
+  readonly workspaceService: Pick<WorkspaceService, "register" | "unregister">;
   readonly homesRoot: string;
+  readonly appDefaultModel?: () => PartnerCapabilitiesRecord["modelChain"][number] | undefined;
+  readonly retireWorkbench?: (partnerId: string, targetId: string) => void;
+  readonly ownedIndependentSessions?: (partnerId: string) => readonly string[];
+  readonly forgetIndependentTasks?: (partnerId: string) => void;
+  readonly resumeIndependentReturns?: (partnerId: string) => Promise<void>;
+  readonly pauseGoal?: (sessionId: string, operationId: string) => Promise<void>;
+  readonly onRoutineLifecycle?: (partnerId: string, state: PartnerLifecycle) => Promise<void>;
+  readonly prepareImportDeletion?: (partnerId: string) => Promise<void>;
   /** Test seam for a recoverable, optional-artwork preparation failure. */
   readonly prepareAvatar?: (input: {
     readonly partner: PartnerProfileRecord;
@@ -154,6 +174,7 @@ export interface PartnerActivitySummary {
   readonly unreadReplyCount: number;
   readonly latestReplyCursor?: bigint;
   readonly latestReplyAt?: number;
+  readonly latestReplyPreview: string;
   readonly artifactCount: number;
   readonly activeDelegationCount: number;
   readonly readState: PartnerReadStateRecord;
@@ -178,39 +199,85 @@ export interface PartnerDelegationView {
 
 /** Owns durable profile → managed home Target → canonical Session reconciliation. */
 export class PartnerManager {
+  readonly #importScope = new AsyncLocalStorage<{ key: string; active: boolean }>();
+  readonly #prepareImportDeletion: PartnerManagerOptions["prepareImportDeletion"];
   readonly #store: PartnerStore;
   readonly #operationalStore: OperationalStore;
   readonly #sessionHost: PartnerManagerOptions["sessionHost"];
   readonly #workspaceService: PartnerManagerOptions["workspaceService"];
   readonly #homesRoot: string;
+  readonly #appDefaultModel: PartnerManagerOptions["appDefaultModel"];
   readonly #prepareAvatar: NonNullable<PartnerManagerOptions["prepareAvatar"]>;
+  readonly #retireWorkbench: PartnerManagerOptions["retireWorkbench"];
+  readonly #ownedIndependentSessions: PartnerManagerOptions["ownedIndependentSessions"];
+  readonly #forgetIndependentTasks: PartnerManagerOptions["forgetIndependentTasks"];
+  readonly #resumeIndependentReturns: PartnerManagerOptions["resumeIndependentReturns"];
+  readonly #pauseGoal: PartnerManagerOptions["pauseGoal"];
+  readonly #routineLifecycle: PartnerManagerOptions["onRoutineLifecycle"];
   readonly #locks = new Map<string, Promise<void>>();
+  readonly #pauseFlights = new Map<string, Promise<void>>();
 
   constructor(options: PartnerManagerOptions) {
+    this.#appDefaultModel = options.appDefaultModel;
     this.#store = options.store;
     this.#operationalStore = options.operationalStore;
     this.#sessionHost = options.sessionHost;
     this.#workspaceService = options.workspaceService;
     this.#homesRoot = resolve(options.homesRoot);
+    this.#retireWorkbench = options.retireWorkbench;
+    this.#ownedIndependentSessions = options.ownedIndependentSessions;
+    this.#forgetIndependentTasks = options.forgetIndependentTasks;
+    this.#resumeIndependentReturns = options.resumeIndependentReturns;
+    this.#pauseGoal = options.pauseGoal;
+    this.#routineLifecycle = options.onRoutineLifecycle;
+    this.#prepareImportDeletion = options.prepareImportDeletion;
     this.#prepareAvatar = options.prepareAvatar ?? (async ({ partner, homePath }) => {
-      await atomicWrite(join(homePath, "AVATAR.svg"), avatarSvg(partner.avatar as PartnerAvatarPreset));
+      const file = typeof partner.avatar === "string" ? "AVATAR.svg"
+        : partner.avatar.mimeType === "image/jpeg" ? "AVATAR.jpg"
+          : partner.avatar.mimeType === "image/png" ? "AVATAR.png" : "AVATAR.webp";
+      const content = typeof partner.avatar === "string" ? avatarSvg(partner.avatar as PartnerAvatarPreset)
+        : this.#store.readPartnerAvatar(partner.id, partner.revision, partner.avatar.sha256).content;
+      await atomicWrite(join(homePath, file), content);
+      for (const other of ["AVATAR.svg", "AVATAR.jpg", "AVATAR.png", "AVATAR.webp"]) {
+        if (other !== file) await unlink(join(homePath, other)).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "ENOENT") throw error;
+        });
+      }
     });
   }
 
   directory(): PartnerDirectoryView {
+    const state = this.#store.directoryState();
+    const defaultCapabilities = state.defaultCapabilities ?? this.#followingDefaults();
     return {
-      state: this.#store.directoryState(),
+      state: { ...state, ...(defaultCapabilities === undefined ? {} : { defaultCapabilities }) },
       templates: PARTNER_TEMPLATES,
       avatarPresets: PARTNER_AVATAR_PRESETS
     };
   }
 
-  listPartners(lifecycle?: "active" | "archived" | "deleted"): readonly PartnerProfileRecord[] {
+  listPartners(lifecycle?: PartnerLifecycle): readonly PartnerProfileRecord[] {
     return this.#store.listPartners(lifecycle === undefined ? {} : { lifecycle });
   }
 
   getPartner(partnerId: string): PartnerProfileRecord {
     return this.#store.getPartner(partnerId);
+  }
+
+  readPartnerAvatar(partnerId: string, expectedRevision: bigint, sha256: string) {
+    return this.#store.readPartnerAvatar(partnerId, expectedRevision, sha256);
+  }
+
+  getPartnerCreation(requestId: string): PartnerProfileRecord {
+    const partner = this.#store.getPartnerCreation(requestId);
+    if (partner === undefined) {
+      throw new PartnerStoreError("PARTNER_NOT_FOUND", "This partner creation request was not found.");
+    }
+    return partner;
+  }
+
+  retirePartnerCreation(requestId: string): PartnerProfileRecord | undefined {
+    return this.#store.retirePartnerCreation(requestId);
   }
 
   partnerForHomeTarget(targetId: string): PartnerProfileRecord | undefined {
@@ -236,6 +303,38 @@ export class PartnerManager {
     return partner;
   }
 
+  resolveTaskModel(sessionId: string, explicit?: PartnerModelRouteRecord): { readonly route: PartnerModelRouteRecord; readonly assertCurrent: () => void } {
+    const profile = this.canonicalCaller(sessionId), session = this.#operationalStore.getSession(sessionId).descriptor;
+    const target = this.#operationalStore.getTarget(session.targetId);
+    const callerGeneration = this.#operationalStore.getBackend(session.backendId).descriptor.instanceGeneration;
+    const runtime = this.#sessionHost.getSessionRuntimeControl(sessionId);
+    const selected = explicit ?? profile.taskModelOverride ?? runtime.effective;
+    if (selected === undefined || !target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined) throw modelUnavailable();
+    const route = Object.freeze({ ...selected });
+    const capabilities = { ...profile.capabilities, modelChain: [route] };
+    this.#validateCapabilities(capabilities);
+    const backend = this.#operationalStore.getBackend(route.backendId).descriptor;
+    const catalog = () => {
+      const current = this.#operationalStore.getBackend(route.backendId).descriptor;
+      return JSON.stringify([current.instanceGeneration, current.installationState, current.health, current.authenticationState,
+        current.models, [...current.capabilities].map(([key, value]) => [key, value.supported, value.options])]);
+    };
+    const sourceCatalog = catalog();
+    const assertCurrent = () => {
+      const current = this.canonicalCaller(sessionId), live = this.#operationalStore.getSession(sessionId).descriptor;
+      const home = this.#operationalStore.getTarget(session.targetId);
+      if (current.revision !== profile.revision || current.profileVersion !== profile.profileVersion
+        || live.binding.generation !== session.binding.generation || live.backendId !== session.backendId
+        || home.revision !== target.revision || !home.descriptor.trusted || home.descriptor.remoteWorkspace !== undefined
+        || this.#operationalStore.getBackend(session.backendId).descriptor.instanceGeneration !== callerGeneration
+        || this.#operationalStore.getBackend(route.backendId).descriptor.instanceGeneration !== backend.instanceGeneration
+        || catalog() !== sourceCatalog || explicit === undefined && profile.taskModelOverride === undefined
+          && this.#sessionHost.getSessionRuntimeControl(sessionId).generation !== runtime.generation) throw modelUnavailable();
+      this.#validateCapabilities(capabilities);
+    };
+    assertCurrent(); return { route, assertCurrent };
+  }
+
   activity(partnerId: string): PartnerActivitySummary {
     const partner = this.#store.getPartner(partnerId);
     const readState = this.#store.readState(partner.id);
@@ -247,7 +346,8 @@ export class PartnerManager {
       for (;;) {
         const page = this.#operationalStore.listEvents({ sessionId, afterCursor, limit: 1_000 });
         for (const event of page) {
-          if (event.payload.type === "message_complete" && event.payload.role === "assistant") {
+          if (event.payload.type === "message_complete" && event.payload.role === "assistant"
+            && event.payload.partnerPrivateOrigin === undefined) {
             unreadReplyCount += 1;
             latestReply = event;
           }
@@ -255,9 +355,9 @@ export class PartnerManager {
         if (page.length < 1_000) break;
         afterCursor = page.at(-1)!.globalCursor;
       }
-      if (latestReply === undefined) latestReply = this.#latestAssistantReply(sessionId);
+      if (latestReply === undefined) latestReply = this.#latestAssistantReply(sessionId, true);
     }
-    const artifactCount = this.#store.listSessionLinks(partner.id)
+    const artifactCount = this.#store.listSessionLinks(partner.id).filter(link => link.role !== "group")
       .reduce((count, link) => count + this.#operationalStore.countArtifacts({ sessionId: link.sessionId }), 0);
     const activeDelegationCount = this.#store.listDelegations(partner.id, {
       statuses: ["preparing", "queued", "running", "waiting", "unknown"]
@@ -265,6 +365,9 @@ export class PartnerManager {
     return {
       partnerId: partner.id,
       unreadReplyCount,
+      latestReplyPreview: latestReply?.payload.type === "message_complete"
+        ? latestReply.payload.blocks.filter((block) => block.kind === "text")
+          .map((block) => block.text).join(" ").replace(/\s+/gu, " ").trim().slice(0, 500) : "",
       ...(latestReply === undefined ? {} : {
         latestReplyCursor: latestReply.globalCursor,
         latestReplyAt: latestReply.emittedAt
@@ -292,16 +395,16 @@ export class PartnerManager {
     return this.#store.markRead(partner.id, throughCursor);
   }
 
-  listSessions(partnerId: string): readonly PartnerSessionView[] {
+  listSessions(partnerId: string, includeGroup = false): readonly PartnerSessionView[] {
     const partner = this.#store.getPartner(partnerId);
-    return this.#store.listSessionLinks(partner.id).map((link) => {
+    return this.#store.listSessionLinks(partner.id).filter(link => includeGroup || link.role !== "group").map((link) => {
       let session: SessionDescriptor | undefined;
       try {
         session = this.#operationalStore.getSession(link.sessionId).descriptor;
       } catch (error) {
         if (!(error instanceof NotFoundError)) throw error;
       }
-      if (session !== undefined && session.targetId !== partner.homeTargetId) {
+      if (session !== undefined && link.role !== "group" && session.targetId !== partner.homeTargetId) {
         throw new PartnerStoreError(
           "PARTNER_SESSION_CONFLICT",
           "A linked partner task no longer belongs to the partner home."
@@ -463,42 +566,57 @@ export class PartnerManager {
   }
 
   async createPartner(input: CreatePartnerInput): Promise<PartnerProfileRecord> {
-    assertPresentation(input.templateId, input.avatar);
-    const created = this.#store.createPartner(input);
+    return this.#createPartner(input, false);
+  }
+
+  async createImportedPartner(input: CreatePartnerInput): Promise<PartnerProfileRecord> {
+    const scope = this.#importScope.getStore();
+    if (!input.id || !scope?.active || scope.key !== input.id) throw new PartnerStoreError("PARTNER_INVALID", "Import creation requires its active management owner.");
+    return this.#createPartner(input, true);
+  }
+
+  async #createPartner(input: CreatePartnerInput, acceptedImport: boolean): Promise<PartnerProfileRecord> {
+    if (!PARTNER_TEMPLATES.some((template) => template.templateId === input.templateId)) {
+      throw new PartnerManagerError("PARTNER_TEMPLATE_INVALID", "The selected partner template is unavailable.");
+    }
+    await assertAvatar(input.avatar);
+    const existing = this.#store.getPartnerCreation(input.requestId);
+    const created = acceptedImport ? this.#store.createImportedPartner(input) : this.#store.createPartner(input, this.#followingDefaults());
+    if (existing !== undefined) return created;
     return this.#serialized(created.id, () => this.#initializeCurrent(created.id));
   }
 
   async updatePartner(
     partnerId: string,
     expectedRevision: bigint,
-    patch: PartnerPatch
+    patch: PartnerPatch,
+    assertCurrent?: () => void,
+    modelOnlyDefaults = false
   ): Promise<PartnerProfileRecord> {
     return this.#serialized(partnerId, async () => {
       const current = this.#store.getPartner(partnerId);
       if (current.revision !== expectedRevision) {
         throw new PartnerStoreError("PARTNER_CHANGED", `Partner ${partnerId} changed; read it again and retry.`);
       }
-      if (patch.avatar !== undefined) assertAvatar(patch.avatar);
+      if (patch.avatar !== undefined) await assertAvatar(patch.avatar);
       const usesDefaults = patch.usesDirectoryDefaults ?? current.usesDirectoryDefaults;
       if (usesDefaults && patch.capabilities !== undefined) {
         throw new PartnerStoreError("PARTNER_INVALID", "A partner using directory defaults cannot also provide capability overrides.");
       }
       const capabilities = usesDefaults
-        ? this.#store.directoryState().defaultCapabilities
+        ? this.#effectiveDefaults(current, modelOnlyDefaults)
         : patch.capabilities ?? current.capabilities;
       if (capabilities === undefined) {
         throw new PartnerManagerError("PARTNER_MODEL_UNAVAILABLE", "Partner directory defaults are not configured.");
       }
       this.#validateCapabilities(capabilities);
-      const currentBackend = current.capabilities.modelChain[0]?.backendId;
-      const nextBackend = capabilities.modelChain[0]?.backendId;
-      if (current.canonicalSessionId !== undefined && currentBackend !== nextBackend) {
-        throw new PartnerManagerError(
-          "PARTNER_BACKEND_CHANGE_UNSUPPORTED",
-          "An initialized partner cannot move its canonical Session to another Backend."
-        );
+      const taskModel = patch.taskModelOverride === null ? undefined : patch.taskModelOverride ?? current.taskModelOverride;
+      if (taskModel !== undefined && (JSON.stringify(taskModel) !== JSON.stringify(current.taskModelOverride)
+        || capabilities.permissionMode !== current.capabilities.permissionMode || capabilities.planMode !== current.capabilities.planMode)) {
+        this.#validateCapabilities({ ...capabilities, modelChain: [taskModel] });
       }
-      const updated = this.#store.updatePartner(partnerId, expectedRevision, patch);
+      assertCurrent?.();
+      const updated = this.#store.updatePartner(partnerId, expectedRevision, patch, usesDefaults ? capabilities : undefined);
       return this.#initializeCurrent(updated.id);
     });
   }
@@ -506,10 +624,20 @@ export class PartnerManager {
   async setLifecycle(
     partnerId: string,
     expectedRevision: bigint,
-    lifecycle: "active" | "archived" | "deleted"
+    lifecycle: PartnerLifecycle
   ): Promise<PartnerProfileRecord> {
     return this.#serialized(partnerId, async () => {
+      if (lifecycle === "paused") {
+        const pause = this.#store.claimPartnerPause(partnerId, expectedRevision);
+        await this.#advancePause(pause); return this.#store.getPartner(partnerId);
+      }
+      const current = this.#store.getPartner(partnerId);
+      if (current.lifecycle === "paused" && lifecycle === "active") {
+        if (current.revision !== expectedRevision) throw new PartnerStoreError("PARTNER_CHANGED", "Partner changed. Refresh before resuming.");
+        return this.#resumePaused(this.#store.getPartnerPause(partnerId)!);
+      }
       const updated = this.#store.setLifecycle(partnerId, expectedRevision, lifecycle);
+      await this.#routineLifecycle?.(partnerId, updated.lifecycle);
       if (updated.lifecycle !== "active" || updated.initializationState === "ready") return updated;
       const pending = updated.initializationState === "error"
         ? this.#store.prepareInitialization(updated.id, updated.revision)
@@ -525,6 +653,246 @@ export class PartnerManager {
     });
   }
 
+  async runOwnedManagement<T>(partnerId: string, expectedRevision: bigint, action: () => Promise<T>): Promise<T> {
+    return this.#serialized(partnerId, async () => {
+      const partner = this.#store.getPartner(partnerId);
+      if (partner.revision !== expectedRevision) throw new PartnerStoreError("PARTNER_CHANGED", "Partner changed. Refresh before continuing.");
+      if (partner.lifecycle !== "active" || partner.initializationState !== "ready"
+        || this.#store.listPendingPartnerRestarts().some(restart => restart.partnerId === partnerId)) {
+        throw new PartnerStoreError("PARTNER_INVALID", "Partner is unavailable for management.");
+      }
+      return action();
+    });
+  }
+
+  /** One import pass shares the profile mutation lane with edits, pause and deletion. */
+  async runImportManagement<T>(partnerId: string, action: () => Promise<T>): Promise<T> {
+    return this.#serialized(partnerId, async () => {
+      const scope = { key: partnerId, active: true };
+      try { return await this.#importScope.run(scope, action); }
+      finally { scope.active = false; }
+    });
+  }
+
+  async #advancePause(pause: PartnerPauseRecord): Promise<void> {
+    if (pause.phase !== "closing") return;
+    if (this.#pauseFlights.has(pause.partnerId)) throw new PartnerStoreError("PARTNER_CHANGED", "Partner shutdown is still settling. Refresh before retrying.");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const task = this.#finishPause(pause).finally(() => { if (this.#pauseFlights.get(pause.partnerId) === task) this.#pauseFlights.delete(pause.partnerId); });
+    this.#pauseFlights.set(pause.partnerId, task);
+    const timeout = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new PartnerStoreError("PARTNER_CHANGED", "Partner shutdown is still awaiting confirmation.")), 30_000); });
+    try { await Promise.race([task, timeout]); }
+    catch {
+      if (this.#store.getPartnerPause(pause.partnerId)?.id === pause.id) this.#store.recordPartnerPauseFailure(pause.partnerId, pause.id);
+      throw new PartnerStoreError("PARTNER_CHANGED", "Partner shutdown is pending. Refresh or resume explicitly to continue cleanup.");
+    } finally { clearTimeout(timer); }
+  }
+
+  async #finishPause(initial: PartnerPauseRecord): Promise<void> {
+    let pause = this.#store.getPartnerPause(initial.partnerId)!;
+    const assertCurrent = () => {
+      if (this.#store.getPartner(pause.partnerId).lifecycle !== "paused" || this.#store.getPartnerPause(pause.partnerId)?.id !== pause.id) {
+        throw new PartnerStoreError("PARTNER_CHANGED", "Partner shutdown owner changed.");
+      }
+    };
+    assertCurrent();
+    if (!pause.captured) {
+      await Promise.allSettled(pause.delegationIds.map(id => this.#locks.get(`delegation:${id}`)).filter((value): value is Promise<void> => value !== undefined));
+      assertCurrent();
+      const sessions = new Set(this.listSessions(pause.partnerId, true).map(value => value.link.sessionId));
+      for (const id of this.#ownedIndependentSessions?.(pause.partnerId) ?? []) sessions.add(id);
+      for (const id of pause.delegationIds) { const delegated = this.#store.getDelegation(id); if (delegated.childSessionId) sessions.add(delegated.childSessionId); }
+      pause = this.#store.capturePartnerPause(pause.partnerId, pause.id, [...sessions].sort()
+        .filter(sessionId => {
+          try { this.#operationalStore.getSession(sessionId); return true; }
+          catch (error) { if (error instanceof NotFoundError) return false; throw error; }
+        })
+        .map(sessionId => ({ sessionId, wasQueuePaused: this.#operationalStore.getQueueControl(sessionId).paused, closeCompleted: false })));
+    }
+    for (const session of pause.sessions) {
+      if (session.wasQueuePaused || session.queuePauseRevision !== undefined) continue;
+      const queuePauseRevision = this.#sessionHost.preparePartnerPauseQueue({ sessionId: session.sessionId,
+        operationId: `partner-pause:${pause.id}:${session.sessionId}`, wasQueuePaused: session.wasQueuePaused });
+      pause = this.#store.advancePartnerPauseSession(pause.partnerId, pause.id, { sessionId: session.sessionId,
+        ...(queuePauseRevision === undefined ? {} : { queuePauseRevision }) });
+    }
+    // Closing the native handles can unblock routine cancellation; both owners settle before the paused checkpoint.
+    const results = await Promise.allSettled([
+      this.#routineLifecycle?.(pause.partnerId, "paused") ?? Promise.resolve(),
+      (async () => {
+        for (const session of pause.sessions) {
+          if (session.closeCompleted) continue;
+          assertCurrent();
+          await this.#sessionHost.pausePartnerSession({ sessionId: session.sessionId, operationId: `partner-pause:${pause.id}:${session.sessionId}`,
+            cancelQueued: pause.delegationIds.some(id => this.#store.getDelegation(id).childSessionId === session.sessionId)
+              || this.#ownedIndependentSessions?.(pause.partnerId).includes(session.sessionId) === true,
+            assertCurrent, pauseGoal: () => this.#pauseGoal?.(session.sessionId, `partner-pause:${pause.id}:${session.sessionId}:goal`) ?? Promise.resolve() });
+          assertCurrent(); this.#store.advancePartnerPauseSession(pause.partnerId, pause.id, { sessionId: session.sessionId, closeCompleted: true });
+        }
+      })()
+    ]);
+    if (results.some(result => result.status === "rejected")) throw new PartnerStoreError("PARTNER_CHANGED", "Partner shutdown is still pending.");
+    assertCurrent(); this.#store.settlePartnerPause(pause.partnerId, pause.id);
+  }
+
+  async #resumePaused(initial: PartnerPauseRecord): Promise<PartnerProfileRecord> {
+    if (initial.phase === "closing") await this.#advancePause(initial);
+    const pause = this.#store.preparePartnerResume(initial.partnerId, initial.id);
+    try {
+      await this.#preparePausedProfile(this.#store.getPartner(pause.partnerId));
+      await this.#routineLifecycle?.(pause.partnerId, "active");
+      for (const session of pause.sessions) this.#sessionHost.restorePartnerQueue({ sessionId: session.sessionId,
+        operationId: `partner-pause:${pause.id}:${session.sessionId}`, ...(session.queuePauseRevision === undefined ? {} : { queuePauseRevision: session.queuePauseRevision }) });
+      const resumed = this.#store.finishPartnerResume(pause.partnerId, pause.id);
+      await this.#resumeIndependentReturns?.(pause.partnerId);
+      for (const session of pause.sessions) { try { this.#sessionHost.wakePartnerSession(session.sessionId); } catch { /* A retained historical task need not reactivate. */ } }
+      return resumed;
+    } catch {
+      this.#store.recordPartnerPauseFailure(pause.partnerId, pause.id);
+      throw new PartnerStoreError("PARTNER_CHANGED", "Partner resume is pending. Refresh and resume explicitly to continue.");
+    }
+  }
+
+  restartControls(partnerId: string): { readonly revision: bigint; readonly available: boolean } {
+    const partner = this.#store.getPartner(partnerId);
+    return { revision: partner.revision, available: partner.lifecycle === "active" && partner.canonicalSessionId !== undefined
+      && this.#sessionHost.canRestartPartnerSession(partner.canonicalSessionId) };
+  }
+
+  listPendingRestarts(): readonly PartnerRestartRecord[] { return this.#store.listPendingPartnerRestarts(); }
+  getRestart(requestId: string): PartnerRestartRecord | undefined { return this.#store.getPartnerRestart(requestId); }
+  isRestartRetired(requestId: string): boolean { return this.#store.isPartnerRestartRetired(requestId); }
+  retireRestart(requestId: string): PartnerRestartRecord | undefined { return this.#store.retirePartnerRestart(requestId); }
+
+  async restartPartner(input: { readonly requestId: string; readonly partnerId: string;
+    readonly expectedRevision: bigint }): Promise<PartnerRestartRecord> {
+    return this.#serialized(input.partnerId, async () => {
+      const existing = this.#store.getPartnerRestart(input.requestId);
+      if (existing !== undefined) {
+        if (existing.partnerId !== input.partnerId) throw new PartnerStoreError("PARTNER_INVALID", "The restart belongs to another partner.");
+        return existing;
+      }
+      const partner = this.#store.getPartner(input.partnerId);
+      if (!this.restartControls(partner.id).available || partner.canonicalSessionId === undefined) {
+        throw new PartnerStoreError("PARTNER_INVALID", "The partner runtime cannot be restarted right now.");
+      }
+      const binding = this.#operationalStore.getSession(partner.canonicalSessionId).descriptor.binding;
+      const restart = this.#store.claimPartnerRestart({ ...input, sourceGeneration: binding.generation,
+        sourceBindingFingerprint: createHash("sha256").update(binding.opaqueRef).digest("hex") });
+      return this.#advanceRestart(restart);
+    });
+  }
+
+  async retryRestart(requestId: string): Promise<PartnerRestartRecord> {
+    const current = this.#store.getPartnerRestart(requestId);
+    if (current === undefined) throw new PartnerStoreError("PARTNER_NOT_FOUND", "The partner restart was not found.");
+    return this.#serialized(current.partnerId, () => this.#advanceRestart(current));
+  }
+
+  async #advanceRestart(initial: PartnerRestartRecord): Promise<PartnerRestartRecord> {
+    const restart = this.#store.getPartnerRestart(initial.requestId)!;
+    if (restart.phase === "ready") return restart;
+    const operationId = `partner-restart:${createHash("sha256").update(restart.requestId).digest("hex")}`;
+    const assertCurrent = () => {
+      const current = this.#store.getPartnerRestart(restart.requestId);
+      const partner = this.#store.getPartner(restart.partnerId);
+      const session = this.#operationalStore.getSession(restart.sessionId).descriptor;
+      if (current?.phase !== "closing" || partner.lifecycle !== "active"
+        || partner.canonicalSessionId !== restart.sessionId || partner.revision !== restart.profileRevision
+        || session.archived || session.deletedAt !== undefined || session.binding.generation !== restart.sourceGeneration
+        || createHash("sha256").update(session.binding.opaqueRef).digest("hex") !== restart.sourceBindingFingerprint) {
+        throw new PartnerStoreError("PARTNER_CHANGED", "The runtime restart no longer owns this canonical Session.");
+      }
+    };
+    try {
+      assertCurrent();
+      await this.#sessionHost.restartPartnerSession({ sessionId: restart.sessionId, operationId, assertCurrent,
+        pauseGoal: () => this.#pauseGoal?.(restart.sessionId, `${operationId}:goal`) ?? Promise.resolve() });
+      assertCurrent();
+      return this.#store.settlePartnerRestart(restart.requestId, true);
+    } catch { return this.#store.settlePartnerRestart(restart.requestId, false); }
+  }
+
+  listPendingDeletions(): readonly PartnerDeletionRecord[] { return this.#store.listPendingPartnerDeletions(); }
+  getDeletion(requestId: string): PartnerDeletionRecord | undefined { return this.#store.getPartnerDeletion(requestId); }
+  isDeletionRetired(requestId: string): boolean { return this.#store.isPartnerDeletionRetired(requestId); }
+  retireDeletion(requestId: string): PartnerDeletionRecord | undefined { return this.#store.retirePartnerDeletion(requestId); }
+
+  async deletePartner(input: { readonly requestId: string; readonly partnerId: string;
+    readonly expectedRevision: bigint; readonly confirmName: string }): Promise<PartnerDeletionRecord> {
+    return this.#serialized(input.partnerId, async () => {
+      const existing = this.#store.getPartnerDeletion(input.requestId);
+      if (existing) {
+        if (existing.partnerId !== input.partnerId) throw new PartnerStoreError("PARTNER_INVALID", "The deletion request belongs to another partner.");
+        return existing;
+      }
+      const pause = this.#store.getPartnerPause(input.partnerId);
+      if (pause?.phase === "closing") await this.#advancePause(pause);
+      if (this.#pauseFlights.has(input.partnerId)) throw new PartnerStoreError("PARTNER_CHANGED", "The previous shutdown is still settling.");
+      const deletion = this.#store.claimPartnerDeletion(input);
+      return this.#advanceDeletion(deletion);
+    });
+  }
+
+  async retryDeletion(requestId: string): Promise<PartnerDeletionRecord> {
+    const deletion = this.#store.getPartnerDeletion(requestId);
+    if (!deletion) throw new PartnerStoreError("PARTNER_NOT_FOUND", "The partner deletion was not found.");
+    return this.#serialized(deletion.partnerId, () => this.#advanceDeletion(deletion));
+  }
+
+  async #advanceDeletion(initial: PartnerDeletionRecord): Promise<PartnerDeletionRecord> {
+    let deletion = this.#store.getPartnerDeletion(initial.requestId)!;
+    if (deletion.phase === "completed") return deletion;
+    try {
+      await this.#routineLifecycle?.(deletion.partnerId, "deleted");
+      await this.#prepareImportDeletion?.(deletion.partnerId);
+      this.#retireWorkbench?.(deletion.partnerId, deletion.homeTargetId);
+      this.#workspaceService.unregister(deletion.homeTargetId);
+      try {
+        const target = this.#operationalStore.getTarget(deletion.homeTargetId);
+        if (target.descriptor.trusted) this.#operationalStore.upsertTarget({ ...target.descriptor, trusted: false }, target.metadata);
+      } catch (error) { if (!(error instanceof NotFoundError)) throw error; }
+      if (deletion.phase === "closing") {
+        await Promise.allSettled(this.#store.listDelegations(deletion.partnerId).map((entry) => this.#locks.get(`delegation:${entry.id}`))
+          .filter((entry): entry is Promise<void> => entry !== undefined));
+        await this.#sessionHost.quiescePartnerTargetCreations(deletion.homeTargetId);
+        deletion = this.#store.extendPartnerDeletionSessions(deletion.requestId,
+          this.#operationalStore.listSessions({ targetId: deletion.homeTargetId, includeArchived: true, includeDeleted: true })
+            .map((session) => session.descriptor.id).concat(this.#ownedIndependentSessions?.(deletion.partnerId) ?? []));
+        for (const sessionId of deletion.sessionIds) {
+          try { this.#operationalStore.getSession(sessionId); }
+          catch (error) { if (error instanceof NotFoundError) continue; throw error; }
+          const operationId = `partner-retirement:${createHash("sha256").update(`${deletion.requestId}\n${sessionId}`).digest("hex")}`;
+          await this.#sessionHost.retirePartnerSession(sessionId, operationId);
+        }
+        deletion = this.#store.advancePartnerDeletion(deletion.requestId);
+      }
+      await this.#removeHome(deletion.partnerId);
+      this.#forgetIndependentTasks?.(deletion.partnerId);
+      return this.#store.completePartnerDeletion(deletion.requestId);
+    } catch {
+      return this.#store.recordPartnerDeletionFailure(deletion.requestId,
+        deletion.phase === "closing" ? "runtime_close_pending" : "home_cleanup_pending");
+    }
+  }
+
+  async #removeHome(partnerId: string): Promise<void> {
+    let rootInfo;
+    try { rootInfo = await lstat(this.#homesRoot); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error("The managed home root changed.");
+    const root = await realpath(this.#homesRoot);
+    if (!samePath(root, this.#homesRoot)) throw new Error("The managed home root changed.");
+    const home = join(root, partnerHomeDirectoryName(partnerId));
+    let info;
+    try { info = await lstat(home); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("The managed home is not a directory.");
+    const canonical = await realpath(home);
+    if (!samePath(canonical, home) || !samePath(dirname(canonical), root)) throw new Error("The managed home escaped its root.");
+    await rm(canonical, { recursive: true, force: true });
+  }
+
   async updateDirectoryDefaults(
     expectedDirectoryRevision: bigint,
     capabilities: PartnerCapabilitiesRecord
@@ -538,8 +906,40 @@ export class PartnerManager {
     return reconciled;
   }
 
+  #followingDefaults(current?: PartnerProfileRecord): PartnerCapabilitiesRecord | undefined {
+    const route = this.#appDefaultModel?.();
+    return route === undefined ? undefined : { modelChain: [route], permissionMode: current?.capabilities.permissionMode ?? "ask", planMode: current?.capabilities.planMode ?? false };
+  }
+  #effectiveDefaults(current: PartnerProfileRecord, modelOnly: boolean): PartnerCapabilitiesRecord | undefined {
+    const defaults = this.#store.directoryState().defaultCapabilities ?? this.#followingDefaults(current);
+    return defaults === undefined ? undefined : modelOnly ? { ...current.capabilities, modelChain: defaults.modelChain } : defaults;
+  }
+  async followAppDefaultModel(): Promise<void> {
+    if (this.#store.directoryState().defaultCapabilities !== undefined) return;
+    for (const profile of this.#store.listPartners().filter(item => item.usesDirectoryDefaults)) {
+      await this.#serialized(profile.id, async () => {
+        const current = this.#store.getPartner(profile.id);
+        if (!current.usesDirectoryDefaults || this.#store.directoryState().defaultCapabilities !== undefined) return;
+        const defaults = this.#followingDefaults(current); if (!defaults) return;
+        const updated = this.#store.updatePartner(current.id, current.revision, { usesDirectoryDefaults: true }, defaults);
+        // Unsupported inherited modes remain visible as initialization errors;
+        // a global model change must not silently lower permission or Plan.
+        await this.#initializeCurrent(updated.id);
+      });
+    }
+  }
+
   /** Resume only interrupted work. Explicit failures remain visible until retry. */
   async recoverPending(): Promise<void> {
+    for (const pause of this.#store.listPartnerPauses()) {
+      await this.#serialized(pause.partnerId, async () => {
+        try { if (pause.phase === "resuming") await this.#resumePaused(pause); else await this.#advancePause(pause); }
+        catch { /* The durable paused owner remains available for explicit recovery. */ }
+      });
+    }
+    for (const deletion of this.#store.listPendingPartnerDeletions()) {
+      await this.#serialized(deletion.partnerId, () => this.#advanceDeletion(deletion));
+    }
     for (const partner of this.#store.listPartners({ lifecycle: "active" })) {
       if (partner.initializationState !== "pending") continue;
       await this.#serialized(partner.id, () => this.#initializeCurrent(partner.id));
@@ -590,7 +990,12 @@ export class PartnerManager {
       sessionId: message.recipientSessionId,
       prompt: servicePrompt(prompt),
       source: "system",
-      originSessionId: message.senderSessionId
+      originSessionId: message.senderSessionId,
+      partnerPrivateOrigin: {
+        messageId: message.id, threadId: message.threadId,
+        senderPartnerId: message.senderPartnerId, recipientPartnerId: message.recipientPartnerId,
+        senderDisplayName: sender.displayName
+      }
     });
     return this.#store.markPrivateMessageDelivered(message.id, execution.value.runId);
   }
@@ -624,6 +1029,7 @@ export class PartnerManager {
           operationId: current.createOperationId,
           serviceKind: "partner",
           targetId: target.homeTargetId,
+          runtimeBackendId: primary.backendId,
           title: `${target.displayName}: ${current.title}`,
           providerId: primary.providerId,
           modelId: primary.modelId,
@@ -741,7 +1147,7 @@ export class PartnerManager {
     return text || "The delegated task completed without a text summary.";
   }
 
-  #latestAssistantReply(sessionId: string): PersistedEvent | undefined {
+  #latestAssistantReply(sessionId: string, publicOnly = false): PersistedEvent | undefined {
     let beforeCursor: bigint | undefined;
     for (;;) {
       const page = this.#operationalStore.listEvents({
@@ -751,7 +1157,8 @@ export class PartnerManager {
         limit: 1_000
       });
       const reply = page.find((event) =>
-        event.payload.type === "message_complete" && event.payload.role === "assistant");
+        event.payload.type === "message_complete" && event.payload.role === "assistant"
+        && (!publicOnly || event.payload.partnerPrivateOrigin === undefined));
       if (reply !== undefined || page.length < 1_000) return reply;
       beforeCursor = page.at(-1)!.globalCursor;
     }
@@ -759,6 +1166,7 @@ export class PartnerManager {
 
   async #initializeCurrent(partnerId: string): Promise<PartnerProfileRecord> {
     let current = this.#store.getPartner(partnerId);
+    if (current.lifecycle === "paused") { await this.#preparePausedProfile(current); return this.#store.getPartner(partnerId); }
     if (current.lifecycle !== "active" || current.initializationState === "ready") return current;
 
     try {
@@ -804,6 +1212,7 @@ export class PartnerManager {
           operationId: `partner-session:${current.id}:${current.profileVersion}:${current.revision}`,
           serviceKind: "partner",
           targetId: current.homeTargetId,
+          runtimeBackendId: primary.backendId,
           title: current.displayName,
           providerId: primary.providerId,
           modelId: primary.modelId,
@@ -849,8 +1258,7 @@ export class PartnerManager {
       if (error instanceof NotFoundError) return { sessionId: profile.canonicalSessionId, replace: true };
       throw error;
     }
-    const primary = profile.capabilities.modelChain[0]!;
-    if (session.targetId !== profile.homeTargetId || session.backendId !== primary.backendId) {
+    if (session.targetId !== profile.homeTargetId) {
       throw new PartnerStoreError("PARTNER_SESSION_CONFLICT", "The canonical Session no longer belongs to this partner home.");
     }
     return {
@@ -859,10 +1267,60 @@ export class PartnerManager {
     };
   }
 
+  async #preparePausedProfile(profile: PartnerProfileRecord): Promise<void> {
+    const pause = this.#store.getPartnerPause(profile.id);
+    if (!pause || pause.phase === "closing" || !profile.canonicalSessionId) throw new PartnerStoreError("PARTNER_CHANGED", "Partner shutdown is still pending.");
+    const assertCurrent = (): void => {
+      const current = this.#store.getPartner(profile.id);
+      if (current.lifecycle !== "paused" || current.revision !== profile.revision
+        || current.canonicalSessionId !== profile.canonicalSessionId || this.#store.getPartnerPause(profile.id)?.id !== pause.id) {
+        throw new PartnerStoreError("PARTNER_CHANGED", "The paused Partner settings owner changed.");
+      }
+    };
+    assertCurrent(); this.#validateCapabilities(profile.capabilities);
+    const primary = profile.capabilities.modelChain[0]!;
+    const homePath = await this.#writeHome(profile); assertCurrent();
+    await this.#workspaceService.register({ id: profile.homeTargetId, root: homePath, displayName: `${profile.displayName} home`, trusted: true }); assertCurrent();
+    await this.#sessionHost.registerTarget(this.#target(profile, primary.backendId, homePath), {
+      kind: "partner_home", partnerId: profile.id, profileVersion: profile.profileVersion, workspaceId: profile.homeTargetId
+    }); assertCurrent();
+    const stored = this.#operationalStore.getSession(profile.canonicalSessionId);
+    if (stored.descriptor.targetId !== profile.homeTargetId
+      || stored.descriptor.deletedAt !== undefined || stored.descriptor.archived) throw new PartnerStoreError("PARTNER_CHANGED", "The paused Partner canonical task changed.");
+    await this.#sessionHost.updateServiceSessionPrompt(profile.canonicalSessionId, profile.identitySource); assertCurrent();
+    const latest = this.#operationalStore.getSession(profile.canonicalSessionId);
+    if (latest.descriptor.backendId !== primary.backendId) {
+      this.#operationalStore.updateSession(profile.canonicalSessionId, { title: profile.displayName,
+        permissionMode: profile.capabilities.permissionMode, planMode: profile.capabilities.planMode }, latest.revision);
+      const runtime = this.#sessionHost.getSessionRuntimeControl(profile.canonicalSessionId);
+      await this.#sessionHost.setSessionRuntimeControl({ sessionId: profile.canonicalSessionId, expectedGeneration: runtime.generation,
+        patch: { ...primary } }); assertCurrent(); return;
+    }
+    const runtime = this.#sessionHost.getSessionRuntimeControl(profile.canonicalSessionId);
+    if (runtime.handoffState === "pending") {
+      await this.#sessionHost.setSessionRuntimeControl({ sessionId: profile.canonicalSessionId,
+        expectedGeneration: runtime.generation, patch: { ...primary } }); assertCurrent();
+    }
+    this.#operationalStore.updateSession(profile.canonicalSessionId, { title: profile.displayName,
+      providerId: primary.providerId, modelId: primary.modelId, effort: primary.effort ?? null, fastMode: primary.fastMode,
+      permissionMode: profile.capabilities.permissionMode, planMode: profile.capabilities.planMode }, latest.revision);
+  }
+
   async #applyCanonicalSettings(profile: PartnerProfileRecord, sessionId: string): Promise<void> {
     const primary = profile.capabilities.modelChain[0]!;
     await this.#sessionHost.updateServiceSessionPrompt(sessionId, profile.identitySource);
     const before = this.#operationalStore.getSession(sessionId);
+    if (before.descriptor.backendId !== primary.backendId) {
+      this.#operationalStore.updateSession(sessionId, { title: profile.displayName, permissionMode: profile.capabilities.permissionMode,
+        planMode: profile.capabilities.planMode }, before.revision);
+      const runtime = this.#sessionHost.getSessionRuntimeControl(sessionId);
+      await this.#sessionHost.setSessionRuntimeControl({ sessionId, expectedGeneration: runtime.generation, patch: { ...primary } });
+      return;
+    }
+    const runtime = this.#sessionHost.getSessionRuntimeControl(sessionId);
+    if (runtime.handoffState === "pending") {
+      await this.#sessionHost.setSessionRuntimeControl({ sessionId, expectedGeneration: runtime.generation, patch: { ...primary } });
+    }
     const state = await this.#sessionHost.applySessionSettings(sessionId, {
       providerId: primary.providerId,
       modelId: primary.modelId,
@@ -870,7 +1328,7 @@ export class PartnerManager {
       fastMode: primary.fastMode,
       permissionMode: profile.capabilities.permissionMode,
       planMode: profile.capabilities.planMode
-    }, { requireNativeObservation: true });
+    }, { requireNativeObservation: true, reconcileNativePolicy: runtime.handoffState === "pending" });
     if (state === undefined
       || state.providerId !== primary.providerId
       || state.modelId !== primary.modelId
@@ -900,6 +1358,7 @@ export class PartnerManager {
   }
 
   #target(profile: PartnerProfileRecord, backendId: string, homePath: string): TargetDescriptor {
+    if (profile.canonicalSessionId !== undefined) backendId = this.#operationalStore.getTarget(profile.homeTargetId).descriptor.backendId;
     return {
       id: profile.homeTargetId,
       backendId,
@@ -911,22 +1370,15 @@ export class PartnerManager {
   }
 
   #validateCapabilities(capabilities: PartnerCapabilitiesRecord): void {
-    if (capabilities.modelChain.length < 1 || capabilities.modelChain.length > 3) throw modelUnavailable();
-    const backendId = capabilities.modelChain[0]!.backendId;
-    if (capabilities.modelChain.some((route) => route.backendId !== backendId)) throw modelUnavailable();
-    let backend;
-    try {
-      backend = this.#operationalStore.getBackend(backendId).descriptor;
-    } catch {
-      throw modelUnavailable();
-    }
-    if (backend.health === "unavailable" || backend.installationState !== "installed"
-      || (backend.authenticationState !== "authenticated" && backend.authenticationState !== "not_required")) {
-      throw modelUnavailable();
-    }
+    if (capabilities.modelChain.length < 1 || capabilities.modelChain.length > 5) throw modelUnavailable();
     const identities = new Set<string>();
     for (const route of capabilities.modelChain) {
-      const identity = `${route.providerId}\0${route.modelId}`;
+      const backendId = route.backendId;
+      let backend;
+      try { backend = this.#operationalStore.getBackend(backendId).descriptor; } catch { throw modelUnavailable(); }
+      if (backend.health === "unavailable" || backend.installationState !== "installed"
+        || backend.authenticationState !== "authenticated" && backend.authenticationState !== "not_required") throw modelUnavailable();
+      const identity = `${backendId}\0${route.providerId}\0${route.modelId}`;
       if (identities.has(identity)) throw modelUnavailable();
       identities.add(identity);
       const model = backend.models.find((candidate) =>
@@ -943,9 +1395,10 @@ export class PartnerManager {
         backend.capabilities.get("model.fast_mode")?.supported !== true
         || model.supportsFastMode !== true
       )) throw modelUnavailable();
-    }
-    if (capabilities.modelChain.length > 1
-      && backend.capabilities.get("model.switch")?.supported !== true) throw modelUnavailable();
+      if (capabilities.modelChain.filter(candidate => candidate.backendId === backendId).length > 1
+        && backend.capabilities.get("model.switch")?.supported !== true) throw modelUnavailable();
+      if (capabilities.modelChain.some(candidate => candidate.backendId !== backendId)
+        && backend.capabilities.get("session.resume")?.supported !== true) throw modelUnavailable();
     const modes = backend.capabilities.get("permission.modes");
     if (modes?.supported !== true || !modes.options?.includes(capabilities.permissionMode)) {
       throw modelUnavailable();
@@ -953,12 +1406,13 @@ export class PartnerManager {
     if (capabilities.planMode && backend.capabilities.get("plan_mode")?.supported !== true) {
       throw modelUnavailable();
     }
+    }
   }
 
   async #writeHome(profile: PartnerProfileRecord): Promise<string> {
     await mkdir(this.#homesRoot, { recursive: true });
     const root = await realpath(this.#homesRoot);
-    const directoryName = `partner-${createHash("sha256").update(profile.id, "utf8").digest("hex").slice(0, 32)}`;
+    const directoryName = partnerHomeDirectoryName(profile.id);
     const homePath = join(root, directoryName);
     await mkdir(homePath).catch((error: unknown) => {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -1013,6 +1467,8 @@ export class PartnerManager {
   }
 
   async #serialized<T>(partnerId: string, action: () => Promise<T>): Promise<T> {
+    const current = this.#importScope.getStore();
+    if (current?.active && current.key === partnerId) return action();
     const previous = this.#locks.get(partnerId) ?? Promise.resolve();
     const task = previous.catch(() => undefined).then(action);
     const tail = task.then(() => undefined, () => undefined);
@@ -1024,16 +1480,23 @@ export class PartnerManager {
   }
 }
 
-function assertPresentation(templateId: string, avatar: string): void {
-  if (!PARTNER_TEMPLATES.some((template) => template.templateId === templateId)) {
-    throw new PartnerManagerError("PARTNER_TEMPLATE_INVALID", "The selected partner template is unavailable.");
+async function assertAvatar(avatar: PartnerAvatarInput): Promise<void> {
+  if (typeof avatar === "string") {
+    if (!(PARTNER_AVATAR_PRESETS as readonly string[]).includes(avatar)) {
+      throw new PartnerManagerError("PARTNER_AVATAR_INVALID", "The selected partner avatar is unavailable.");
+    }
+    return;
   }
-  assertAvatar(avatar);
-}
-
-function assertAvatar(avatar: string): asserts avatar is PartnerAvatarPreset {
-  if (!(PARTNER_AVATAR_PRESETS as readonly string[]).includes(avatar)) {
-    throw new PartnerManagerError("PARTNER_AVATAR_INVALID", "The selected partner avatar is unavailable.");
+  const { bytes } = decodePartnerAvatar(avatar?.base64);
+  try {
+    const { default: sharp } = await import("sharp");
+    const decoder = sharp(bytes, { limitInputPixels: 40_000_000, failOn: "warning" });
+    const metadata = await decoder.metadata();
+    if (!["jpeg", "png", "webp"].includes(metadata.format ?? "") || !metadata.width || !metadata.height
+      || metadata.width > 16_384 || metadata.height > 16_384 || (metadata.pages ?? 1) !== 1) throw new Error();
+    await decoder.resize(1, 1).raw().toBuffer();
+  } catch {
+    throw new PartnerManagerError("PARTNER_AVATAR_INVALID", "Select a valid, single-frame PNG, JPEG or WebP Partner image.");
   }
 }
 
@@ -1064,7 +1527,7 @@ function servicePrompt(text: string): PromptInput {
   };
 }
 
-async function atomicWrite(path: string, content: string): Promise<void> {
+async function atomicWrite(path: string, content: string | Uint8Array): Promise<void> {
   const temporary = join(dirname(path), `.${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, content, { encoding: "utf8", flag: "wx", mode: 0o600 });

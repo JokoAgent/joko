@@ -259,6 +259,7 @@ export interface ClaudeSdkQueryOptions {
   readonly settingSources: readonly ("user" | "project" | "local")[];
   readonly skills?: readonly string[];
   readonly strictMcpConfig?: true;
+  readonly plugins?: readonly { readonly type: "local"; readonly path: string }[];
   readonly systemPrompt: {
     readonly type: "preset";
     readonly preset: "claude_code";
@@ -731,6 +732,7 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       ...(params.options.settings === undefined ? {} : { settings: { ...params.options.settings } }),
       settingSources: [...params.options.settingSources],
       ...(params.options.skills === undefined ? {} : { skills: [...params.options.skills] }),
+      ...(params.options.plugins === undefined ? {} : { plugins: params.options.plugins.map((plugin) => ({ ...plugin })) }),
       ...(params.options.strictMcpConfig === undefined ? {} : { strictMcpConfig: params.options.strictMcpConfig }),
       systemPrompt: params.options.systemPrompt,
       ...(params.options.title === undefined ? {} : { title: params.options.title }),

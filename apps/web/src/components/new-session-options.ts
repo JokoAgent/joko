@@ -78,8 +78,15 @@ export function parseNewSessionSelection(
 
 export function defaultNewSessionSelection(
   targets: readonly TargetView[],
-  backends: readonly BackendView[]
+  backends: readonly BackendView[],
+  preferredBackendId?: string
 ): NewSessionDraftSelection | undefined {
+  if (preferredBackendId !== undefined) {
+    const preferredTarget = targets.find(candidate => !candidate.archived && candidate.backendId === preferredBackendId);
+    if (preferredTarget) return { kind: "target", targetId: preferredTarget.id };
+    const preferredBackend = dialogueBackends(backends).find(candidate => candidate.id === preferredBackendId);
+    return preferredBackend === undefined ? undefined : { kind: "dialogue", backendId: preferredBackend.id };
+  }
   const target = targets.find((candidate) => !candidate.archived);
   if (target !== undefined) return { kind: "target", targetId: target.id };
   const backend = dialogueBackends(backends)[0];

@@ -12,6 +12,10 @@ import {
   CapabilityDrivenBackendAdapter,
   HOST_COMPOSED_CAPABILITIES,
   JokoError,
+  snapshotNativeSkills,
+  type ApprovedSkillResolver,
+  type NativeSkillPolicyResolver,
+  type NativeSkillSnapshot,
   MEMORY_NATIVE_RESET_LOCAL_OPTION,
   SESSION_REWIND_SERVICE_NODE_ONLY_OPTION,
   type AdapterContext,
@@ -44,6 +48,7 @@ import {
   type NativeNavigationTarget,
   type NativeSessionCatalogEntry,
   type NativeSessionCatalogResult,
+  type NativeSessionPreview,
   type NativeSessionCandidate,
   type NativeSessionState,
   type PermissionMode,
@@ -106,6 +111,7 @@ import {
   scanClaudeSessionCatalog,
   type ClaudeCatalogSource
 } from "./session-catalog.js";
+import { readClaudeNativeSessionPreview } from "./native-session-preview.js";
 import {
   ClaudeCodeOAuthAccount,
   type ClaudeCodeAccountSnapshot,
@@ -374,6 +380,8 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
   readonly resolveNativeMemoryEnabled?: () => boolean;
   /** Resolves approved text resources for one exact product Session runtime. */
   readonly resolveTextResources?: ClaudeTextResourceResolver;
+  readonly resolveNativeSkills?: ApprovedSkillResolver;
+  readonly resolveNativeSkillPolicy?: NativeSkillPolicyResolver;
   /** Service-owned Router authority for a committed local standard Session. */
   readonly mcpBridge?: ClaudeMcpBridgePort;
 }
@@ -547,6 +555,7 @@ interface NativeRuntime {
   readonly nativeMemoryEnabled: boolean | undefined;
   readonly appendSystemPrompt: string | undefined;
   readonly textResources: readonly ClaudeRuntimeTextResource[] | undefined;
+  readonly nativeSkills: NativeSkillSnapshot | undefined;
   readonly capabilities: Set<string>;
   readonly pendingPermissions: Map<string, PendingPermission>;
   readonly resolvedPermissions: Map<string, PermissionCacheEntry>;
@@ -619,6 +628,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   readonly #hostCapabilities: ReadonlySet<HostComposedCapability>;
   readonly #inputResolvers: ClaudeInputResolvers;
   readonly #resolveTextResources: ClaudeTextResourceResolver | undefined;
+  readonly #resolveNativeSkills: ApprovedSkillResolver | undefined;
+  readonly #resolveNativeSkillPolicy: NativeSkillPolicyResolver | undefined;
   readonly #mcpBridge: ClaudeMcpBridgePort | undefined;
   readonly #resolveSubagentModel: ClaudeCodeAdapterOptions["resolveSubagentModel"];
   readonly #resolveNativeMemoryEnabled: ClaudeCodeAdapterOptions["resolveNativeMemoryEnabled"];
@@ -707,6 +718,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     this.#resolveSubagentModel = options.resolveSubagentModel;
     this.#resolveNativeMemoryEnabled = options.resolveNativeMemoryEnabled;
     this.#resolveTextResources = options.resolveTextResources;
+    this.#resolveNativeSkills = options.resolveNativeSkills;
+    this.#resolveNativeSkillPolicy = options.resolveNativeSkillPolicy;
     this.#mcpBridge = options.mcpBridge;
     this.#inputResolvers = {
       ...(options.readBlob === undefined ? {} : { readBlob: options.readBlob }),
@@ -1216,6 +1229,17 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     };
   }
 
+  async scanNativeSessionPreviewCatalog(): Promise<NativeSessionCatalogResult> {
+    return this.scanNativeSessionCatalog();
+  }
+
+  async readNativeSessionPreview(entry: NativeSessionCatalogEntry): Promise<NativeSessionPreview> {
+    this.#assertUsable();
+    const source = this.#catalogSources.get(entry);
+    if (source === undefined || !catalogEntryMatches(entry, source.entry)) throw catalogSourceChanged();
+    return readClaudeNativeSessionPreview(source.source, (text) => this.#projection.text(text, 1_200));
+  }
+
   async bindCatalogSession(
     entry: NativeSessionCatalogEntry,
     generation: number
@@ -1662,7 +1686,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (this.#resolveTextResources === undefined) return this.unsupported("runtime.resources");
     const runtime = this.#requireRuntime(context);
     if (runtime.runtimePolicy === "review_read_only") return Promise.resolve([]);
-    return Promise.resolve(loadedClaudeTextResources(runtime.textResources ?? []));
+    return Promise.resolve(loadedClaudeTextResources((runtime.textResources ?? [])
+      .filter(resource => !runtime.nativeSkills?.indexedResourceIds.includes(resource.id))));
   }
 
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
@@ -1699,6 +1724,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     let providerLease: ManagedProviderOperationLease | undefined;
     try {
       preparationSignal.throwIfAborted();
+      await runtime.nativeSkills?.assertFilesCurrent(preparationSignal);
       prepared = await waitFor(
         prepareClaudePrompt(input, context, this.#inputResolvers, preparationSignal, runtime.textResources),
         this.#admissionTimeoutMs,
@@ -1803,6 +1829,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           runtime.freshSessionCanRestart = false;
         }, preparationSignal, () => {
           prepared.assertCurrent();
+          runtime.nativeSkills?.assertCurrent();
           this.#assertCurrent(runtime, context, context.binding);
           if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed) {
             throw dispatchError("The native input authority ended before consumption.", false);
@@ -1881,6 +1908,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     runtime.inputPreparation = cancellation;
     try {
       signal.throwIfAborted();
+      await runtime.nativeSkills?.assertFilesCurrent(signal);
       const prepared = await waitFor(
         prepareClaudePrompt(input, context, this.#inputResolvers, signal, runtime.textResources), this.#admissionTimeoutMs, signal,
         () => claudeCodeError("INPUT_PREPARATION_TIMEOUT", "Same-turn input could not be prepared in time.", "input")
@@ -1894,6 +1922,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         type: "user", message: { role: "user", content: prepared.content }, parent_tool_use_id: null, origin: { kind: "human" }, uuid
       }, () => { steer.consumed = true; }, signal, () => {
         prepared.assertCurrent();
+        runtime.nativeSkills?.assertCurrent();
         this.#assertCurrent(runtime, context, context.binding);
         if (!this.#isTurnCurrent(runtime, turn) || turn.stopping || turn.terminalClaimed || turn.awaitingNativeContinuation) throw steerNotActive();
       }), this.#admissionTimeoutMs, signal,
@@ -2210,6 +2239,31 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const result = await this.#deriveSession(context, navigation, target.entryId, true);
     if (result.nativeHistory === undefined) throw new Error("Native navigation lacks its confirmed history.");
     return { kind: "replacement", binding: result.binding, nativeHistory: result.nativeHistory };
+  }
+
+  async prepareRestartContext(context: AdapterContext): Promise<NativeSessionBinding> {
+    this.#assertUsable(); this.#assertBackendInstance(context);
+    assertStandardReviewContext(context, "prepare a restarted native context");
+    if (context.binding === undefined || context.operationId === undefined || !this.#supportsFreshContext(context.target)) throw continuityGap();
+    this.#assertBindingContext(context.binding, context);
+    const source = this.#sessions.get(context.sessionId);
+    if (source !== undefined && !source.retirementConfirmed) throw freshContextUnknown("The source Query has not confirmed retirement.");
+    await this.validateTarget(context.target);
+    const scoped = await this.#targetRuntime(context.target, context.signal);
+    await scoped.runtime.prepareFreshContextRecovery!();
+    context.signal.throwIfAborted(); scoped.assertCurrent();
+    const owner = scoped.runtime.freshContexts!;
+    const prior = await owner.getForOperation(context.operationId);
+    const binding = prior?.binding ?? bindingFor(randomUUID(), context.generation + 1);
+    const identity: ClaudeFreshContextIdentity = { operationId: context.operationId,
+      sourceSessionId: context.sessionId, sourceBinding: context.binding,
+      ...this.#freshContextLookup(binding, context, scoped) };
+    await owner.reserve(identity);
+    context.signal.throwIfAborted(); scoped.assertCurrent();
+    await owner.recover(identity, { retirementConfirmed: true });
+    await owner.adopt(identity, { retirementConfirmed: true });
+    context.signal.throwIfAborted(); scoped.assertCurrent();
+    return binding;
   }
 
   async #navigateToStart(context: AdapterContext, navigation: NativeSessionNavigation): Promise<NativeSessionNavigationResult> {
@@ -3238,7 +3292,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const gate = new AsyncInputGate<ClaudeSdkUserMessage>();
     const abortController = new AbortController();
     let textResources: readonly ClaudeRuntimeTextResource[] | undefined;
+    let nativeSkills: NativeSkillSnapshot | undefined;
     try {
+      if (launch.runtimePolicy === "standard" && !scoped.remote && this.#resolveNativeSkills !== undefined) {
+        const resourceSignal = AbortSignal.any([context.signal, abortController.signal]);
+        const policy = await this.#resolveNativeSkillPolicy?.(context);
+        nativeSkills = await snapshotNativeSkills(await this.#resolveNativeSkills(context, resourceSignal), resourceSignal, undefined, policy);
+      }
       if (this.#resolveTextResources !== undefined) {
         if (launch.runtimePolicy === "review_read_only") {
           textResources = Object.freeze([]);
@@ -3264,6 +3324,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       }
     } catch (error) {
       abortController.abort();
+      await nativeSkills?.dispose();
       managedRoute?.dispose();
       if (error instanceof JokoError) throw error;
       throw claudeCodeError(
@@ -3300,7 +3361,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }, async (tool, arguments_, options) => {
       if (runtime === undefined) throw new Error("The product MCP Query is not ready.");
       return this.#callProductMcp(runtime, tool, arguments_, options);
-    }).catch((error: unknown) => { abortController.abort(); managedRoute?.dispose(); launch.mcpLease?.release(); throw error; });
+    }, nativeSkills).catch(async (error: unknown) => { abortController.abort(); await nativeSkills?.dispose(); managedRoute?.dispose(); launch.mcpLease?.release(); throw error; });
     const query = startedQuery.query;
     try {
       runtime = {
@@ -3340,6 +3401,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         nativeMemoryEnabled: startedQuery.nativeMemoryEnabled,
         appendSystemPrompt: launch.appendSystemPrompt,
         textResources,
+        nativeSkills,
+        ...(nativeSkills !== undefined && nativeSkills.skills.length > 0 ? { requiresConfirmedRetirement: true } : {}),
         capabilities: new Set(),
         pendingPermissions: new Map(),
         resolvedPermissions: new Map(),
@@ -3471,7 +3534,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       tool: ClaudeMcpTool,
       arguments_: Readonly<Record<string, unknown>>,
       options: { readonly toolUseId: string; readonly signal: AbortSignal }
-    ) => Promise<ClaudeMcpCallResult>
+    ) => Promise<ClaudeMcpCallResult>,
+    nativeSkills: NativeSkillSnapshot | undefined
   ): Promise<{
     readonly query: ClaudeSdkQuery;
     readonly subagentModel: string | undefined;
@@ -3548,6 +3612,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         throw new Error("The subscription authorization changed before native startup.");
       }
       scoped.assertCurrent();
+      nativeSkills?.assertCurrent();
       const managedLimitEnvironment = managedRoute === undefined
         ? undefined
         : managedEffortSnapshot!.limitEnvironment;
@@ -3560,6 +3625,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           ...(launch.runtimePolicy === "review_read_only" ? { agents: {} } : {}),
           canUseTool,
           cwd: scoped.workspaceRoot,
+          ...(nativeSkills === undefined || nativeSkills.skills.length === 0 ? {} : {
+            plugins: [{ type: "local" as const, path: nativeSkills.pluginRoot }]
+          }),
           env: {
             ...this.#environment,
             ...runtimeAuthorization?.environment,
@@ -3603,6 +3671,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             : {
                 settings: {
                   disableClaudeAiConnectors: true,
+                  ...(nativeSkills?.restrictImplicit ? { skillOverrides: { ...nativeSkills.skillOverrides } } : {}),
                   // Filesystem settings remain available below, but a native
                   // helper must never replace the Host-owned credential path.
                   // The fixed CLI additionally filters provider-related `env`
@@ -3656,7 +3725,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           ...(storedSessionAccess === undefined ? {} : { sessionStoreAccess: storedSessionAccess }),
           ...(freshContext === undefined ? {} : { freshContextClaim: freshContext }),
           ...(launch.resume ? { resume: nativeSessionId } : { sessionId: nativeSessionId }),
-          settingSources: launch.runtimePolicy === "review_read_only" ? [] : [...this.#settingSources],
+          settingSources: launch.runtimePolicy === "review_read_only" || nativeSkills?.restrictImplicit ? [] : [...this.#settingSources],
           systemPrompt: {
             type: "preset",
             preset: "claude_code",
@@ -5597,6 +5666,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       catch { throw freshContextUnknown("The source Query retired, but its durable context fence could not be confirmed."); }
     }
     runtime.retirementConfirmed = true;
+    await runtime.nativeSkills?.dispose();
     if (this.#sessions.get(runtime.productSessionId) === runtime) {
       this.#sessions.delete(runtime.productSessionId);
     }
@@ -6723,6 +6793,7 @@ function capabilityManifest(
     "session.detach",
     "session.discovery",
     "session.catalog",
+    "session.preview",
     "turn.stream",
     "turn.abort",
     "input.text",
@@ -6768,7 +6839,7 @@ function capabilityManifest(
   for (const capability of hostCapabilities) supported.add(capability);
   return new Map(CAPABILITIES.map((key): [string, Capability] => {
     const implemented = supported.has(key);
-    const available = key === "session.catalog" || (installed && implemented);
+    const available = key === "session.catalog" || key === "session.preview" || (installed && implemented);
     const options = key === "session.rewind_to_start" && freshContextSupported && !remoteFreshContextSupported
       ? [SESSION_REWIND_SERVICE_NODE_ONLY_OPTION]
       : key === "provider.login" && supportsLogin

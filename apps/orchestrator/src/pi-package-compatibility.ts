@@ -10,6 +10,7 @@ import { minimatch } from "minimatch";
 import {
   parseExtensionSurfaceManifest,
   type ExtensionLibraryDescriptor,
+  type ExtensionRoutineEventsDescriptor,
   type ExtensionMainViewDescriptor,
   type ExtensionRecommendationDescriptor
 } from "./extension-surface-manifest.js";
@@ -81,6 +82,7 @@ export interface PiPackageResourceDetail {
   readonly entryPath?: string;
   readonly mainView?: ExtensionMainViewDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
+  readonly routineEvents?: ExtensionRoutineEventsDescriptor;
   readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   readonly compatibility: PiPackageCompatibility;
   readonly compatibilityIssues: readonly PiPackageCompatibilityIssue[];
@@ -128,6 +130,7 @@ export interface PiPackageCatalogInspection {
     readonly resourceName: string;
     readonly mainView?: ExtensionMainViewDescriptor;
     readonly library?: ExtensionLibraryDescriptor;
+    readonly routineEvents?: ExtensionRoutineEventsDescriptor;
     readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   }[];
 }
@@ -446,6 +449,7 @@ export async function inspectPiPackageCatalog(packagePath: string): Promise<PiPa
       resourceName: boundedDisplay(basename(entry)),
       ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
       ...(surface?.library === undefined ? {} : { library: surface.library }),
+      ...(surface?.routineEvents === undefined ? {} : { routineEvents: surface.routineEvents }),
       ...(surface?.recommendations === undefined ? {} : { recommendations: copyRecommendations(surface.recommendations) })
     };
   });
@@ -568,6 +572,7 @@ async function extensionDetail(
   surface?: {
     readonly mainView?: ExtensionMainViewDescriptor;
     readonly library?: ExtensionLibraryDescriptor;
+    readonly routineEvents?: ExtensionRoutineEventsDescriptor;
     readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   }
 ): Promise<PiPackageResourceDetail> {
@@ -579,6 +584,7 @@ async function extensionDetail(
       entryPath,
       ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
       ...(surface?.library === undefined ? {} : { library: surface.library }),
+      ...(surface?.routineEvents === undefined ? {} : { routineEvents: surface.routineEvents }),
       ...(surface?.recommendations === undefined ? {} : { recommendations: copyRecommendations(surface.recommendations) }),
       compatibility: analysis.compatibility,
       compatibilityIssues: analysis.compatibilityIssues,
@@ -592,6 +598,7 @@ async function extensionDetail(
       entryPath,
       ...(surface?.mainView === undefined ? {} : { mainView: surface.mainView }),
       ...(surface?.library === undefined ? {} : { library: surface.library }),
+      ...(surface?.routineEvents === undefined ? {} : { routineEvents: surface.routineEvents }),
       ...(surface?.recommendations === undefined ? {} : { recommendations: copyRecommendations(surface.recommendations) })
     };
   }

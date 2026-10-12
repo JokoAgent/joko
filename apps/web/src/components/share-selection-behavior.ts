@@ -10,6 +10,7 @@ export function shareableTimelineMessages(items: readonly TimelineItemView[]): r
   return items.filter((item) => (
     (item.kind === "user" || item.kind === "assistant")
     && !isInternalContinuationTimelineItem(item)
+    && !(item.kind === "user" && item.partnerPrivateOrigin !== undefined)
     && item.streaming !== true
     && ((item.text?.trim().length ?? 0) > 0 || (item.attachments?.length ?? 0) > 0)
   ));

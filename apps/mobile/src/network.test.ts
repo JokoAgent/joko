@@ -9,6 +9,17 @@ import {
   BlobTransferTicketSchema,
   BeginPairingRequestSchema, BeginPairingResponseSchema,
   CompletePairingRequestSchema, CompletePairingResponseSchema,
+  ListPartnersRequestSchema, ListPartnersResponseSchema, MarkPartnerReadRequestSchema, MarkPartnerReadResponseSchema,
+  GetPartnerDirectoryResponseSchema, UpdatePartnerRequestSchema, UpdatePartnerResponseSchema,
+  RetryPartnerInitializationRequestSchema, RetryPartnerInitializationResponseSchema,
+  ReadPartnerAvatarRequestSchema, ReadPartnerAvatarResponseSchema,
+  ReadPartnerWorkingStatusRequestSchema, ReadPartnerWorkingStatusResponseSchema, PartnerWorkingPhase,
+  CreatePartnerRequestSchema, CreatePartnerResponseSchema, GetPartnerCreationRequestSchema, GetPartnerCreationResponseSchema,
+  RetirePartnerCreationRequestSchema, RetirePartnerCreationResponseSchema,
+  DeletePartnerRequestSchema, DeletePartnerResponseSchema, GetPartnerDeletionRequestSchema, GetPartnerDeletionResponseSchema,
+  RetryPartnerDeletionRequestSchema, RetryPartnerDeletionResponseSchema, RetirePartnerDeletionRequestSchema, RetirePartnerDeletionResponseSchema,
+  PartnerDeletionPhase, PartnerDeletionFailure,
+  PermissionMode, type UpdatePartnerRequest,
   ConnectionSchema, ConnectionState, CredentialKind, DeviceKind, DeviceSchema,
   ExtensionCatalogEntrySchema, ExtensionCatalogSource, ExtensionInstallState, ExtensionMainViewIcon,
   ExtensionMainViewSurfaceSchema, ExtensionOwnerSchema, ExtensionResourceOwnerSchema,
@@ -107,6 +118,274 @@ import {
   type PairedCredential
 } from "./network";
 import { mobileDeviceNameSource } from "./mobile-device-name";
+import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
+import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
+import { creationSnapshot } from "./test/mobile-partner-creation";
+import { mobilePartnerCreationDraft, MobilePartnerCreationRejected } from "./mobile-partner-creation";
+
+describe("mobile Partner creation network", () => {
+  const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+    connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+  const requestId = "creation-request-native-network";
+  it("maps all typed creation fields and never dual-writes inherited capabilities", async () => {
+    const drafts: ReturnType<typeof fromBinary<typeof CreatePartnerRequestSchema>>[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/joko.v1.PartnerService/CreatePartner");
+      const request = fromBinary(CreatePartnerRequestSchema, new Uint8Array(init?.body as Uint8Array)); drafts.push(request);
+      expect(request).toMatchObject({ requestId, expectedDirectoryRevision: { value: 4n }, draft: { displayName: "Nova",
+        avatar: { value: { case: "imageBase64", value: "/9j/2w==" } }, templateId: "general", identitySource: "Product work" } });
+      return new Response(toBinary(CreatePartnerResponseSchema, create(CreatePartnerResponseSchema, {
+        partner: profilePartnerWire(), directory: { revision: { value: 5n }, templates: [...creationSnapshot.options.templates],
+          avatarPresets: [...creationSnapshot.options.avatarPresets] }
+      })), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      const draft = { ...mobilePartnerCreationDraft(creationSnapshot)!, displayName: "Nova", avatar: { base64: "/9j/2w==" } };
+      await expect(mobileNetwork.createPartner!(credential, requestId, 4n, draft)).resolves.toMatchObject({ kind: "found", partner: { partnerId: "partner-a" } });
+      expect(drafts[0]?.draft?.capabilities).toBeUndefined();
+      await mobileNetwork.createPartner!(credential, requestId, 4n, { ...draft, usesDirectoryDefaults: false });
+      expect(drafts[1]?.draft?.capabilities).toMatchObject({ permissionMode: PermissionMode.ASK, modelChain: [{ providerId: "alpha", modelId: "a", effort: "low" }] });
+    } finally { fetcher.mockRestore(); }
+  });
+  it("distinguishes typed rejection from unknown and typed lookup absence without matching error text", async () => {
+    let code = "invalid_argument";
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer partner-fixture-key");
+      return new Response(JSON.stringify({ code, message: "Request not confirmed" }), { status: 400, headers: { "content-type": "application/json" } });
+    });
+    try {
+      const draft = { ...mobilePartnerCreationDraft(creationSnapshot)!, displayName: "Nova" };
+      await expect(mobileNetwork.createPartner!(credential, requestId, 4n, draft)).rejects.toBeInstanceOf(MobilePartnerCreationRejected);
+      code = "aborted"; await expect(mobileNetwork.createPartner!(credential, requestId, 4n, draft)).rejects.not.toBeInstanceOf(MobilePartnerCreationRejected);
+      code = "not_found"; await expect(mobileNetwork.getPartnerCreation!(credential, requestId)).resolves.toEqual({ kind: "absent" });
+      const abort = new AbortController(); abort.abort(); const calls = fetcher.mock.calls.length;
+      await expect(mobileNetwork.createPartner!(credential, requestId, 4n, draft, abort.signal)).rejects.toThrow();
+      expect(fetcher).toHaveBeenCalledTimes(calls);
+    } finally { fetcher.mockRestore(); }
+  });
+  it("uses only generated lookup/atomic retirement and rejects an ambiguous retirement result", async () => {
+    let retired = true; let ambiguous = false;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname; const body = new Uint8Array(init?.body as Uint8Array);
+      if (path.endsWith("/GetPartnerCreation")) {
+        expect(fromBinary(GetPartnerCreationRequestSchema, body).requestId).toBe(requestId);
+        return new Response(toBinary(GetPartnerCreationResponseSchema, create(GetPartnerCreationResponseSchema, { partner: profilePartnerWire() })),
+          { headers: { "content-type": "application/proto" } });
+      }
+      expect(path).toBe("/joko.v1.PartnerService/RetirePartnerCreation");
+      expect(fromBinary(RetirePartnerCreationRequestSchema, body).requestId).toBe(requestId);
+      return new Response(toBinary(RetirePartnerCreationResponseSchema, create(RetirePartnerCreationResponseSchema, { retired,
+        ...(!retired || ambiguous ? { partner: profilePartnerWire() } : {}) })), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.getPartnerCreation!(credential, requestId)).resolves.toMatchObject({ kind: "found" });
+      await expect(mobileNetwork.retirePartnerCreation!(credential, requestId)).resolves.toEqual({ kind: "retired" });
+      retired = false; await expect(mobileNetwork.retirePartnerCreation!(credential, requestId)).resolves.toMatchObject({ kind: "found" });
+      retired = true; ambiguous = true; await expect(mobileNetwork.retirePartnerCreation!(credential, requestId)).rejects.toThrow(/ambiguous/u);
+    } finally { fetcher.mockRestore(); }
+  });
+});
+
+describe("mobile Partner catalog network", () => {
+  it("uses authenticated deletion and recovery RPCs with exact typed receipt identity", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    const requestId = "deletion-native-network-intent";
+    const deletion = { requestId, partnerId: "partner-a", phase: PartnerDeletionPhase.CLOSING, failure: PartnerDeletionFailure.RUNTIME_CLOSE_PENDING,
+      createdAt: { seconds: 1n }, updatedAt: { seconds: 2n } };
+    let mode: "valid" | "identity" | "phase" | "absent" | "retired" | "contradiction" = "valid";
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer partner-fixture-key");
+      const path = new URL(String(input)).pathname; const body = new Uint8Array(init?.body as Uint8Array);
+      const value = mode === "absent" ? {} : mode === "retired" ? { retired: true } : { retired: mode === "contradiction",
+        deletion: { ...deletion, ...(mode === "identity" ? { partnerId: "another-partner" } : {}),
+          ...(mode === "phase" ? { phase: PartnerDeletionPhase.UNSPECIFIED } : {}) } };
+      const headers = { "content-type": "application/proto" };
+      if (path.endsWith("/DeletePartner")) {
+        expect(fromBinary(DeletePartnerRequestSchema, body)).toMatchObject({ requestId, partnerId: "partner-a", expectedRevision: { value: 2n }, confirmName: "Ada" });
+        return new Response(toBinary(DeletePartnerResponseSchema, create(DeletePartnerResponseSchema, value)), { headers });
+      }
+      if (path.endsWith("/GetPartnerDeletion")) {
+        expect(fromBinary(GetPartnerDeletionRequestSchema, body).requestId).toBe(requestId);
+        return new Response(toBinary(GetPartnerDeletionResponseSchema, create(GetPartnerDeletionResponseSchema, value)), { headers });
+      }
+      if (path.endsWith("/RetryPartnerDeletion")) {
+        expect(fromBinary(RetryPartnerDeletionRequestSchema, body).requestId).toBe(requestId);
+        return new Response(toBinary(RetryPartnerDeletionResponseSchema, create(RetryPartnerDeletionResponseSchema, value)), { headers });
+      }
+      expect(path).toBe("/joko.v1.PartnerService/RetirePartnerDeletion");
+      expect(fromBinary(RetirePartnerDeletionRequestSchema, body).requestId).toBe(requestId);
+      return new Response(toBinary(RetirePartnerDeletionResponseSchema, create(RetirePartnerDeletionResponseSchema, value)), { headers });
+    });
+    try {
+      expect(await mobileNetwork.deletePartner!(credential, requestId, "partner-a", 2n, "Ada")).toMatchObject({ requestId, phase: "closing", failure: "runtime_close_pending" });
+      expect(await mobileNetwork.retryPartnerDeletion!(credential, requestId)).toMatchObject({ requestId });
+      mode = "identity"; await expect(mobileNetwork.deletePartner!(credential, requestId, "partner-a", 2n, "Ada")).rejects.toThrow(/owner/u);
+      mode = "phase"; await expect(mobileNetwork.getPartnerDeletion!(credential, requestId)).rejects.toThrow(/state/u);
+      mode = "contradiction"; await expect(mobileNetwork.retirePartnerDeletion!(credential, requestId)).rejects.toThrow(/invalid/u);
+      mode = "absent"; expect(await mobileNetwork.getPartnerDeletion!(credential, requestId)).toEqual({ retired: false });
+      await expect(mobileNetwork.retirePartnerDeletion!(credential, requestId)).rejects.toThrow(/invalid/u);
+      mode = "retired"; expect(await mobileNetwork.retirePartnerDeletion!(credential, requestId)).toEqual({ retired: true });
+    } finally { fetcher.mockRestore(); }
+  });
+  it("binds working caption responses to the exact generated turn, phase and language", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    const status = { sessionId: "session", targetId: "target", backendId: "backend", generation: 2n,
+      runId: "run", attemptId: "attempt", phase: "testing" as const };
+    let response = create(ReadPartnerWorkingStatusResponseSchema, { workingStatus: { ...status, phase: PartnerWorkingPhase.TESTING, caption: "Running tests" } });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/joko.v1.PartnerService/ReadPartnerWorkingStatus");
+      expect(fromBinary(ReadPartnerWorkingStatusRequestSchema, new Uint8Array(init?.body as Uint8Array))).toMatchObject({
+        partnerId: "partner-a", sessionId: "session", generation: 2n, runId: "run", attemptId: "attempt", phase: PartnerWorkingPhase.TESTING, locale: "en"
+      });
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer partner-fixture-key");
+      return new Response(toBinary(ReadPartnerWorkingStatusResponseSchema, response), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.readPartnerWorkingStatus!(credential, "partner-a", status, "en")).resolves.toBe("Running tests");
+      response.workingStatus!.attemptId = "old";
+      await expect(mobileNetwork.readPartnerWorkingStatus!(credential, "partner-a", status, "en")).rejects.toThrow(/another turn/u);
+      response.workingStatus!.attemptId = "attempt"; response.workingStatus!.caption = "/private/tests";
+      await expect(mobileNetwork.readPartnerWorkingStatus!(credential, "partner-a", status, "en")).rejects.toThrow(/invalid/u);
+      response = create(ReadPartnerWorkingStatusResponseSchema);
+      await expect(mobileNetwork.readPartnerWorkingStatus!(credential, "partner-a", status, "en")).resolves.toBeUndefined();
+      const abort = new AbortController(); abort.abort(); const calls = fetcher.mock.calls.length;
+      await expect(mobileNetwork.readPartnerWorkingStatus!(credential, "partner-a", status, "en", abort.signal)).rejects.toThrow();
+      expect(fetcher).toHaveBeenCalledTimes(calls);
+    } finally { fetcher.mockRestore(); }
+  });
+  it("sends typed photo patches, omits unchanged image bodies and verifies exact image responses", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    const content = new Uint8Array(Buffer.from("/9j/2w==", "base64"));
+    const avatar = { sha256: createHash("sha256").update(content).digest("hex"), mimeType: "image/jpeg" as const, byteLength: content.length };
+    const current = { ...profilePartner, avatar, revision: 3n };
+    const patches: UpdatePartnerRequest[] = []; let tampered = false;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname; const body = new Uint8Array(init?.body as Uint8Array);
+      const headers = { "content-type": "application/proto" };
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer partner-fixture-key");
+      if (path.endsWith("/UpdatePartner")) {
+        patches.push(fromBinary(UpdatePartnerRequestSchema, body));
+        return new Response(toBinary(UpdatePartnerResponseSchema, create(UpdatePartnerResponseSchema, {
+          partner: profilePartnerWire(current), directory: { revision: { value: 4n }, avatarPresets: ["orbit"] }
+        })), { headers });
+      }
+      expect(path).toBe("/joko.v1.PartnerService/ReadPartnerAvatar");
+      expect(fromBinary(ReadPartnerAvatarRequestSchema, body)).toMatchObject({ partnerId: current.partnerId,
+        expectedRevision: { value: current.revision }, sha256: avatar.sha256 });
+      return new Response(toBinary(ReadPartnerAvatarResponseSchema, create(ReadPartnerAvatarResponseSchema, {
+        image: { ...avatar, byteLength: BigInt(avatar.byteLength) }, content: tampered ? new Uint8Array(content.length) : content
+      })), { headers });
+    });
+    try {
+      const draft = { ...mobilePartnerProfileDraft(profilePartner), avatar: { base64: "/9j/2w==" } };
+      await expect(mobileNetwork.updatePartnerProfile!(credential, current.partnerId, 2n, draft)).resolves.toMatchObject({ avatar });
+      expect(patches[0]?.patch?.avatar?.value).toEqual({ case: "imageBase64", value: "/9j/2w==" });
+      await mobileNetwork.updatePartnerProfile!(credential, current.partnerId, 2n, mobilePartnerProfileDraft(current));
+      expect(patches[1]?.patch?.avatar).toBeUndefined();
+      await expect(mobileNetwork.readPartnerAvatar!(credential, current)).resolves.toBe("data:image/jpeg;base64,/9j/2w==");
+      tampered = true; await expect(mobileNetwork.readPartnerAvatar!(credential, current)).rejects.toThrow(/verified/u);
+      const abort = new AbortController(); abort.abort(); const calls = fetcher.mock.calls.length;
+      await expect(mobileNetwork.readPartnerAvatar!(credential, current, abort.signal)).rejects.toThrow();
+      expect(fetcher).toHaveBeenCalledTimes(calls);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it("uses the generated initialization CAS and rejects missing, mismatched or non-advancing results", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    let returned = profilePartnerWire({ ...profilePartner, revision: 3n });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/joko.v1.PartnerService/RetryPartnerInitialization");
+      const request = fromBinary(RetryPartnerInitializationRequestSchema, new Uint8Array(init?.body as Uint8Array));
+      expect(request).toMatchObject({ partnerId: "partner-a", expectedRevision: { value: 2n } });
+      return new Response(toBinary(RetryPartnerInitializationResponseSchema, create(RetryPartnerInitializationResponseSchema, {
+        partner: returned, directory: { revision: { value: 5n }, avatarPresets: ["orbit"] }
+      })), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.retryPartnerInitialization!(credential, "partner-a", 2n))
+        .resolves.toMatchObject({ partnerId: "partner-a", revision: 3n, canonicalSessionId: "session" });
+      returned = profilePartnerWire({ ...profilePartner, revision: 2n });
+      await expect(mobileNetwork.retryPartnerInitialization!(credential, "partner-a", 2n)).rejects.toThrow(/mismatched/u);
+      returned = profilePartnerWire({ ...profilePartner, partnerId: "another", revision: 3n });
+      await expect(mobileNetwork.retryPartnerInitialization!(credential, "partner-a", 2n)).rejects.toThrow(/mismatched/u);
+      const calls = fetcher.mock.calls.length;
+      await expect(mobileNetwork.retryPartnerInitialization!(credential, "partner-a", 0n)).rejects.toThrow(/current Partner/u);
+      expect(fetcher).toHaveBeenCalledTimes(calls);
+    } finally { fetcher.mockRestore(); }
+  });
+  it("uses generated profile options and CAS patches without dual-writing inherited capabilities", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    const directory = { revision: { value: 4n }, avatarPresets: ["orbit", "spark"] };
+    const patches: UpdatePartnerRequest[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const headers = { "content-type": "application/proto" };
+      if (path.endsWith("/GetPartnerDirectory")) return new Response(toBinary(GetPartnerDirectoryResponseSchema,
+        create(GetPartnerDirectoryResponseSchema, { directory })), { headers });
+      expect(path).toBe("/joko.v1.PartnerService/UpdatePartner");
+      const request = fromBinary(UpdatePartnerRequestSchema, new Uint8Array(init?.body as Uint8Array)); patches.push(request);
+      expect(request).toMatchObject({ partnerId: "partner-a", expectedRevision: { value: 2n } });
+      const taskModelOverride = request.patch?.taskModelPreference.case === "taskModelOverride" ? request.patch.taskModelPreference.value : undefined;
+      return new Response(toBinary(UpdatePartnerResponseSchema, create(UpdatePartnerResponseSchema, {
+        partner: profilePartnerWire({ ...profilePartner, displayName: "Ada Two", revision: 3n, profileVersion: 4n, taskModelOverride }), directory
+      })), { headers });
+    });
+    try {
+      await expect(mobileNetwork.getPartnerProfileOptions!(credential)).resolves.toMatchObject({ revision: 4n });
+      const draft = { ...mobilePartnerProfileDraft(profilePartner), displayName: "Ada Two" };
+      await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, draft))
+        .resolves.toMatchObject({ revision: 3n, profileVersion: 4n });
+      await mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, { ...draft, usesDirectoryDefaults: true });
+      expect(patches[0]?.patch).toMatchObject({ modelChain: { routes: [{ providerId: "alpha", modelId: "a", effort: "low" }] },
+        permissionMode: PermissionMode.ASK, planMode: false, usesDirectoryDefaults: false });
+      expect(patches[1]?.patch).toMatchObject({ usesDirectoryDefaults: true });
+      expect(patches[1]?.patch?.modelChain).toBeUndefined(); expect(patches[1]?.patch?.permissionMode).toBeUndefined();
+      expect(patches[1]?.patch?.taskModelPreference).toEqual({ case: "inheritTaskModel", value: true });
+      const task = { ...profilePartner.capabilities.modelChain[0]!, backendId: "task-backend", modelId: "task-model" };
+      await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, { ...draft, usesDirectoryDefaults: true, taskModelOverride: task }))
+        .resolves.toMatchObject({ taskModelOverride: task });
+      expect(patches[2]?.patch).toMatchObject({ usesDirectoryDefaults: true, taskModelPreference: { case: "taskModelOverride", value: task } });
+      expect(patches[2]?.patch?.modelChain).toBeUndefined();
+      await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 0n, draft)).rejects.toThrow(/current Partner/u);
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it("uses generated node-local directory and monotonic read RPCs and rejects a mismatched acknowledgement", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    let wrongOwner = false;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const body = new Uint8Array(init?.body as Uint8Array);
+      const headers = { "content-type": "application/proto" };
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer partner-fixture-key");
+      if (path.endsWith("/ListPartners")) {
+        expect(fromBinary(ListPartnersRequestSchema, body).lifecycle).toBeUndefined();
+        return new Response(toBinary(ListPartnersResponseSchema, create(ListPartnersResponseSchema, {
+          directory: { revision: { value: 1n }, updatedAt: { seconds: 1n } }
+        })), { headers });
+      }
+      expect(path).toBe("/joko.v1.PartnerService/MarkPartnerRead");
+      expect(fromBinary(MarkPartnerReadRequestSchema, body)).toMatchObject({ partnerId: "ada", throughCursor: { value: 5n } });
+      return new Response(toBinary(MarkPartnerReadResponseSchema, create(MarkPartnerReadResponseSchema, {
+        activity: { partnerId: wrongOwner ? "bea" : "ada", readThroughCursor: { value: 5n }, readUpdatedAt: { seconds: 2n } }
+      })), { headers });
+    });
+    try {
+      await expect(mobileNetwork.listPartnerCatalog!(credential)).resolves.toMatchObject({ partners: [], directory: { revision: 1n } });
+      await expect(mobileNetwork.markPartnerRead!(credential, "ada", 5n)).resolves.toMatchObject({ readThroughCursor: 5n });
+      wrongOwner = true;
+      await expect(mobileNetwork.markPartnerRead!(credential, "ada", 5n)).rejects.toThrow(/mismatched/u);
+      await expect(mobileNetwork.markPartnerRead!(credential, "ada", -1n)).rejects.toThrow(/valid Partner/u);
+      expect(fetcher).toHaveBeenCalledTimes(3);
+    } finally { fetcher.mockRestore(); }
+  });
+});
 
 describe("mobile device name handshake", () => {
   const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",

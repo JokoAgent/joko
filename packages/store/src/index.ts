@@ -1,4 +1,6 @@
 export * from "./errors.js";
+export * from "./session-runtime-handoff-store.js";
+export * from "./partner-workbench-store.js";
 export * from "./voice-dictionary-peer-store.js";
 export {
   CONTACT_SCHEMA_BASELINE_ID,
@@ -37,6 +39,7 @@ export {
 export type * from "./partner-store.js";
 export { PartnerStoreError } from "./partner-types.js";
 export type * from "./partner-types.js";
+export { decodePartnerAvatar, partnerAvatarImage, PARTNER_AVATAR_MAX_BYTES } from "./partner-avatar.js";
 export {
   MESSAGE_SEARCH_EMBEDDING_MODEL_ID,
   messagingConversationContextAad,
@@ -63,6 +66,9 @@ export {
   REMOTE_HOST_FAILURE_CODES
 } from "./types.js";
 export type * from "./types.js";
+export { PartnerRoutineStore } from "./partner-routine-store.js";
+export { PartnerGroupStore, PartnerGroupStoreError } from "./partner-group-store.js";
+export type { AppendPartnerGroupMessage } from "./partner-group-store.js";
 export type * from "./usage-report.js";
 export { UsageReportQueryError, UsageReportCapacityError } from "./usage-report.js";
 export type * from "./resource-usage-report.js";

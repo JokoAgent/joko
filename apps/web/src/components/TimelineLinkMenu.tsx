@@ -1,9 +1,9 @@
 import { useLayoutEffect, useRef, useState, type JSX, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 
-/** A menu belongs to the document of its source link, including keyboard and focus. */
+/** A menu belongs to the document of its source control, including keyboard and focus. */
 export function TimelineLinkMenu({ trigger, position, label, onClose, children }: {
-  readonly trigger: HTMLAnchorElement;
+  readonly trigger: HTMLElement;
   readonly position: { readonly x: number; readonly y: number };
   readonly label: string;
   readonly onClose: (restoreFocus: boolean) => void;

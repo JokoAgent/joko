@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
+import { create } from "@bufbuild/protobuf";
+import { ListPartnerGroupsResponseSchema, type PartnerGroupApi } from "@joko/contracts";
 import { visualSamples } from "../i18n/visual-samples.js";
 import { AppWithController } from "../App.js";
 import { automaticConnectionTargetForProfile, resolveLinkOpenPreference } from "../controller.js";
@@ -106,6 +108,22 @@ export function VisualHarness(): JSX.Element {
   const subagents = useMemo(() => new VisualSubagentFixture(), []);
   const terminals = useMemo(() => new VisualTerminalFixture(), []);
   const usageHistory = useMemo(() => new VisualUsageHistoryFixture(scenario.usageState), []);
+  const partnerGroups = useMemo<PartnerGroupApi>(() => {
+    const unavailable = async (): Promise<never> => { throw new Error("The visual group action is unavailable."); };
+    return {
+      ownerKey: "visual-profile",
+      newRequestId: () => `visual-group-${sequence.current++}`,
+      list: async (signal) => {
+        signal.throwIfAborted();
+        return create(ListPartnerGroupsResponseSchema, { revision: { value: 1n }, changeSequence: 0n });
+      },
+      create: unavailable, get: unavailable, update: unavailable, members: unavailable, remove: unavailable,
+      send: unavailable, continue: unavailable, stop: unavailable, markRead: unavailable,
+      planAction: unavailable, planEdit: unavailable, lookup: unavailable, retire: unavailable,
+      changes: async function* () { throw new Error("The visual group stream is unavailable."); },
+      respond: unavailable, file: unavailable
+    };
+  }, []);
   const protectedStorageDraft = useMemo<ComposerDraft | undefined>(() => scenario.scenario === "artifact-storage" ? {
     text: "", mentions: [], deliveryMode: "prompt",
     attachments: [{ id: "visual-protected-storage-draft", kind: "file",
@@ -421,6 +439,12 @@ export function VisualHarness(): JSX.Element {
   const controller = useMemo(() => {
     const implemented = {
       state,
+      partnerGroupApi: () => partnerGroups,
+      listPartners: async (_lifecycle: Parameters<AppController["listPartners"]>[0], signal?: AbortSignal): ReturnType<AppController["listPartners"]> => {
+        signal?.throwIfAborted();
+        return { partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0,
+          updatedAt: FIXED_NOW, templates: [], avatarPresets: [] } };
+      },
       ...mcpActions,
       ...draftActions,
       ...(scenario.scenario === "maintenance" ? {
@@ -2300,7 +2324,7 @@ export function VisualHarness(): JSX.Element {
         return async (): Promise<undefined> => undefined;
       }
     }) as unknown as AppController;
-  }, [artifactActions, artifactStorage, draftActions, historyMaintenance, interactionFixture, mcpActions, remoteHosts, send, state, toolPolicy, usageHistory]);
+  }, [artifactActions, artifactStorage, draftActions, historyMaintenance, interactionFixture, mcpActions, partnerGroups, remoteHosts, send, state, toolPolicy, usageHistory]);
 
   if (scenario.scenario === "usage") return <main style={{ maxWidth: 1040, margin: "0 auto" }}>
     <UsageHistorySection controller={controller} t={(key, values) => translate(state.effectiveLocale, key, values)} />

@@ -35,7 +35,33 @@ interface PersistedExtraDirectory {
  * projected or passed to an adapter.
  */
 export class ExtraDirectoryManager {
+  readonly #workbenchGrants = new Map<string, {
+    readonly revision: bigint;
+    readonly records: readonly ExtraDirectoryRecord[];
+    readonly current: () => boolean;
+  }>();
   constructor(private readonly store: OperationalStore) {}
+
+  /** Derived runtime projection of the Partner workbench's single durable
+   * grant. It never creates a second approval record or consumes the ordinary
+   * 32-directory allowance. Only its owning manager can refresh this scope. */
+  replaceWorkbenchGrant(input: {
+    readonly targetId: string;
+    readonly revision: bigint;
+    readonly directories: readonly { readonly path: string; readonly addedAt: number }[];
+    readonly current: () => boolean;
+  }): void {
+    if (input.directories.length > 50) throw directoryError("WORKBENCH_DIRECTORY_LIMIT", "The workbench project limit was exceeded.", "Refresh its durable state.");
+    const previous = this.#workbenchGrants.get(input.targetId);
+    if (previous !== undefined && previous.revision > input.revision) return;
+    const target = this.store.getTarget(input.targetId);
+    const records = input.directories.map((directory): ExtraDirectoryRecord => {
+      if (!isAbsolute(directory.path) || resolve(directory.path) !== directory.path) throw directoryError("WORKBENCH_DIRECTORY_INVALID", "The workbench project path is invalid.", "Choose a canonical project directory.");
+      return { id: stableDirectoryId(input.targetId, directory.path), workspaceId: workspaceIdForTarget(target), targetId: input.targetId,
+        path: directory.path, access: "read_write", approved: true, approvedAt: directory.addedAt, updatedAt: directory.addedAt, revision: input.revision };
+    });
+    this.#workbenchGrants.set(input.targetId, { revision: input.revision, records, current: input.current });
+  }
 
   async add(input: {
     readonly workspaceId: string;
@@ -44,7 +70,7 @@ export class ExtraDirectoryManager {
   }): Promise<ExtraDirectoryRecord> {
     const target = this.requireWorkspace(input.workspaceId);
     const canonicalPath = await canonicalDirectory(input.serverPath);
-    const existing = this.listForTarget(target.descriptor.id);
+    const existing = this.#ordinary().filter((entry) => entry.targetId === target.descriptor.id);
     const duplicate = existing.find((entry) => samePath(entry.path, canonicalPath));
     if (duplicate !== undefined) {
       if (duplicate.access === input.access) return duplicate;
@@ -107,6 +133,15 @@ export class ExtraDirectoryManager {
   }
 
   list(): readonly ExtraDirectoryRecord[] {
+    const byId = new Map(this.#ordinary().map((entry) => [entry.id, entry]));
+    for (const grant of this.#workbenchGrants.values()) {
+      if (!grant.current()) continue;
+      for (const entry of grant.records) byId.set(entry.id, entry);
+    }
+    return [...byId.values()].sort((left, right) => left.workspaceId.localeCompare(right.workspaceId) || left.path.localeCompare(right.path));
+  }
+
+  #ordinary(): readonly ExtraDirectoryRecord[] {
     return this.store.listSettings("target")
       .filter((setting) => setting.key.startsWith(SETTING_PREFIX))
       .map(parseSetting)

@@ -6,6 +6,7 @@ const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(scriptDirectory, "..", "..", "..");
 const runtimePackageRoots = [
   "apps/orchestrator",
+  "packages/agent-import",
   "packages/adapter-claude-code",
   "packages/adapter-codex",
   "packages/adapter-dictation-refinement",

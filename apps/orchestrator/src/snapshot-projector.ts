@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
 
 import type {
   BackendSnapshotScope,
@@ -100,6 +101,9 @@ export interface SnapshotProjectorOptions {
   readonly idFactory?: () => string;
   /** Internal SQLite event scan page size; it does not change the requested timeline length. */
   readonly timelinePageSize?: number;
+  /** Private service lanes are opened explicitly by their owning product surface. */
+  readonly hideSessionFromCatalog?: (sessionId: string) => boolean;
+  readonly hideTargetFromCatalog?: (targetId: string) => boolean;
   /** Optional live Provider/auth projection. Built-in models remain durable Backend inventory. */
   readonly providerCatalog?: () => readonly SnapshotProviderCatalogEntry[];
   /** Adapter-composition defaults used only when a current native observation omits them. */
@@ -274,26 +278,36 @@ export class SnapshotProjector {
     }
   }
 
+  private catalogBase(base: OperationalSnapshot): OperationalSnapshot {
+    return { ...base, sessions: base.sessions.filter(session => this.options.hideSessionFromCatalog?.(session.descriptor.id) !== true),
+      targets: base.targets.filter(target => this.options.hideTargetFromCatalog?.(target.descriptor.id) !== true) };
+  }
+
   projectOwnerSnapshot(): Snapshot {
     const createdAt = this.now();
     return this.store.transaction((store) => {
       // The public store transaction is the consistency boundary for the base
       // snapshot plus entity lists not exposed by OperationalSnapshot.
-      const base = store.getSnapshot(createdAt);
+      const base = this.catalogBase(store.getSnapshot(createdAt));
+      const hiddenReferences = new Set([
+        ...store.listSessions({ includeArchived: true }).filter(session => this.options.hideSessionFromCatalog?.(session.descriptor.id) === true).map(session => session.descriptor.id),
+        ...store.listTargets().filter(target => this.options.hideTargetFromCatalog?.(target.descriptor.id) === true).map(target => target.descriptor.id)
+      ]);
       const visibleSessionIds = new Set(base.sessions.map((session) => session.descriptor.id));
       const runs = scanStorePages((offset, limit) => store.listRuns({ limit, offset }))
         .filter((run) => visibleSessionIds.has(run.descriptor.sessionId));
       const visibleRunIds = new Set(runs.map((run) => run.descriptor.id));
       const queueItems = scanStorePages((offset, limit) => store.listQueueItems({ limit, offset }))
         .filter((item) => visibleSessionIds.has(item.sessionId) && visibleRunIds.has(item.runId));
-      const schedules = store.listSchedules()
+      const schedules = store.listSchedules().filter(schedule => !isPartnerRoutineSchedule(schedule))
         .filter((schedule) => schedule.sessionId === undefined || visibleSessionIds.has(schedule.sessionId));
       const interactions = scanStorePages((offset, limit) => store.listInteractions({ limit, offset }))
         .filter((interaction) => visibleSessionIds.has(interaction.sessionId));
-      const artifacts = scanStorePages((offset, limit) => store.listArtifacts({ limit, offset }));
+      const artifacts = scanStorePages((offset, limit) => store.listArtifacts({ limit, offset }))
+        .filter(artifact => artifact.sessionId === undefined || this.options.hideSessionFromCatalog?.(artifact.sessionId) !== true);
       const toolLeases = store.listToolLeases()
         .filter((lease) => visibleSessionIds.has(lease.sessionId));
-      const operations = scanStorePages((offset, limit) => store.listOperations({ limit, offset }));
+      const operations = scanStorePages((offset, limit) => store.listOperations({ limit, offset })).filter(operation => !operationMatches(operation, hiddenReferences));
       const scope = proto<SnapshotScope>("joko.v1.SnapshotScope", {
         kind: {
           case: "owner",
@@ -397,6 +411,7 @@ export class SnapshotProjector {
     });
     return this.projectFilteredSnapshot(scope, (store, base) => {
       const schedule = store.getSchedule(scheduleId);
+      if (isPartnerRoutineSchedule(schedule)) throw new NotFoundError("Schedule", scheduleId);
       const sessionIds = new Set(schedule.sessionId === undefined
         ? base.sessions
           .filter((session) => session.descriptor.targetId === schedule.targetId)
@@ -509,7 +524,7 @@ export class SnapshotProjector {
   ): Snapshot {
     const createdAt = this.now();
     return this.store.transaction((store) => {
-      const base = store.getSnapshot(createdAt);
+      const base = this.catalogBase(store.getSnapshot(createdAt));
       const filter = select(store, base);
       const backends = base.backends.filter((backend) => filter.backendIds.has(backend.descriptor.id));
       const targets = base.targets.filter((target) => filter.targetIds.has(target.descriptor.id));
@@ -522,7 +537,7 @@ export class SnapshotProjector {
         .filter((item) => visibleSessionIds.has(item.sessionId) && visibleRunIds.has(item.runId));
       const schedules = filter.includeSchedules === false
         ? []
-        : store.listSchedules().filter((schedule) => filter.scheduleIds === undefined
+        : store.listSchedules().filter(schedule => !isPartnerRoutineSchedule(schedule)).filter((schedule) => filter.scheduleIds === undefined
           ? filter.targetIds.has(schedule.targetId) &&
             (schedule.sessionId === undefined || visibleSessionIds.has(schedule.sessionId))
           : filter.scheduleIds.has(schedule.id));

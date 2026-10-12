@@ -2,6 +2,9 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { randomUUID } from "expo-crypto";
 import * as SecureStore from "expo-secure-store";
 import { createMobileStorage } from "./connection-storage";
+import { MobilePartnerCreationReceipts } from "./mobile-partner-creation-receipts";
+import { MobilePartnerDeletionReceipts } from "./mobile-partner-deletion";
+import { MobilePartnerRestartReceipts } from "./mobile-partner-restart";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { MobileInteractionDraftStore } from "./interaction-draft-store";
 import { MobileNewTaskDraftStore } from "./new-task-draft-store";
@@ -38,6 +41,9 @@ export const mobileSecureStorage = {
 };
 
 export const mobileComposerDrafts = new MobileComposerDraftStore(mobilePlainStorage);
+export const mobilePartnerCreationReceipts = new MobilePartnerCreationReceipts(mobilePlainStorage);
+export const mobilePartnerDeletionReceipts = new MobilePartnerDeletionReceipts(mobilePlainStorage);
+export const mobilePartnerRestartReceipts = new MobilePartnerRestartReceipts(mobilePlainStorage);
 export const mobileInteractionDrafts = new MobileInteractionDraftStore(mobilePlainStorage);
 export const mobileNewTaskDrafts = new MobileNewTaskDraftStore(mobilePlainStorage);
 export const mobileAttachmentFiles = new MobileAttachmentFiles();

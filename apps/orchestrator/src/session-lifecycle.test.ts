@@ -276,6 +276,7 @@ function durableMutationHost(
 ): SessionHost {
   return {
     ...effects,
+    isPartnerSessionRetiring: () => false,
     assertSessionLifecycleIdle: () => undefined,
     async mutate<T>(input: {
       readonly operationId: string;

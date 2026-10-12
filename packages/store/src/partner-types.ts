@@ -1,4 +1,48 @@
-export type PartnerLifecycle = "active" | "archived" | "deleted";
+export type PartnerLifecycle = "active" | "paused" | "archived" | "deleted";
+/** Durable, body-free ownership of a reversible Partner shutdown. */
+export interface PartnerPauseSession {
+  readonly sessionId: string;
+  readonly wasQueuePaused: boolean;
+  readonly queuePauseRevision?: bigint;
+  readonly closeCompleted: boolean;
+}
+export interface PartnerPauseRecord {
+  readonly id: string;
+  readonly partnerId: string;
+  readonly phase: "closing" | "paused" | "resuming";
+  readonly captured: boolean;
+  readonly sessions: readonly PartnerPauseSession[];
+  readonly delegationIds: readonly string[];
+  readonly failure?: "runtime_close_pending" | "state_commit_pending";
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+/** Content-free ownership of an explicit canonical runtime restart. */
+export interface PartnerRestartRecord {
+  readonly requestId: string;
+  readonly partnerId: string;
+  readonly sessionId: string;
+  readonly profileRevision: bigint;
+  readonly sourceBindingFingerprint: string;
+  readonly sourceGeneration: number;
+  readonly phase: "closing" | "ready";
+  readonly failure?: "runtime_close_pending";
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+export type PartnerDeletionPhase = "closing" | "cleanup" | "completed";
+export type PartnerDeletionFailure = "runtime_close_pending" | "home_cleanup_pending";
+/** A body-free cleanup manifest. Session history belongs to OperationalStore. */
+export interface PartnerDeletionRecord {
+  readonly requestId: string;
+  readonly partnerId: string;
+  readonly homeTargetId: string;
+  readonly sessionIds: readonly string[];
+  readonly phase: PartnerDeletionPhase;
+  readonly failure?: PartnerDeletionFailure;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
 export type PartnerInitializationState = "pending" | "ready" | "error";
 export type PartnerInvitationStage = "home" | "avatar" | "session" | "ready" | "failed";
 export type PartnerInitializationErrorCode =
@@ -8,7 +52,14 @@ export type PartnerInitializationErrorCode =
   | "session_unavailable"
   | "state_changed";
 export type PartnerPermissionMode = "ask" | "auto";
-export type PartnerSessionRole = "canonical" | "history" | "delegation";
+export interface PartnerAvatarImageRecord {
+  readonly sha256: string;
+  readonly mimeType: "image/jpeg" | "image/png" | "image/webp";
+  readonly byteLength: number;
+}
+export type PartnerAvatarRecord = string | PartnerAvatarImageRecord;
+export type PartnerAvatarInput = string | { readonly base64: string };
+export type PartnerSessionRole = "canonical" | "history" | "delegation" | "group";
 export type PartnerPrivateThreadStatus = "active" | "closed";
 export type PartnerPrivateThreadCloseReason = "message_limit" | "idle_timeout";
 export type PartnerPrivateMessageDeliveryStatus = "pending" | "delivered" | "failed";
@@ -50,10 +101,12 @@ export interface PartnerProfileRecord {
   readonly revision: bigint;
   readonly profileVersion: number;
   readonly displayName: string;
-  readonly avatar: string;
+  readonly description: string;
+  readonly avatar: PartnerAvatarRecord;
   readonly identitySource: string;
   readonly templateId: string;
   readonly lifecycle: PartnerLifecycle;
+  readonly pauseCleanupPending?: boolean;
   readonly initializationState: PartnerInitializationState;
   readonly invitationStage: PartnerInvitationStage;
   readonly initializationErrorCode?: PartnerInitializationErrorCode;
@@ -63,6 +116,7 @@ export interface PartnerProfileRecord {
   readonly usesDirectoryDefaults: boolean;
   readonly createdAt: number;
   readonly updatedAt: number;
+  readonly taskModelOverride?: PartnerModelRouteRecord;
 }
 
 export interface PartnerProfileVersionRecord {
@@ -72,6 +126,7 @@ export interface PartnerProfileVersionRecord {
   readonly capabilities: PartnerCapabilitiesRecord;
   readonly usesDirectoryDefaults: boolean;
   readonly createdAt: number;
+  readonly taskModelOverride?: PartnerModelRouteRecord;
 }
 
 export interface PartnerSessionLinkRecord {
@@ -159,7 +214,8 @@ export interface PartnerDelegationRecord {
 
 export interface PartnerDraft {
   readonly displayName: string;
-  readonly avatar: string;
+  readonly description?: string;
+  readonly avatar: PartnerAvatarInput;
   readonly identitySource: string;
   readonly templateId: string;
   readonly capabilities: PartnerCapabilitiesRecord;
@@ -168,10 +224,12 @@ export interface PartnerDraft {
 
 export interface PartnerPatch {
   readonly displayName?: string;
-  readonly avatar?: string;
+  readonly description?: string;
+  readonly avatar?: PartnerAvatarInput;
   readonly identitySource?: string;
   readonly capabilities?: PartnerCapabilitiesRecord;
   readonly usesDirectoryDefaults?: boolean;
+  readonly taskModelOverride?: PartnerModelRouteRecord | null;
 }
 
 export type PartnerStoreErrorCode =
@@ -180,6 +238,8 @@ export type PartnerStoreErrorCode =
   | "PARTNER_DIRECTORY_CHANGED"
   | "PARTNER_CHANGED"
   | "PARTNER_NAME_CONFLICT"
+  | "PARTNER_CREATION_CONFLICT"
+  | "PARTNER_CREATION_RETIRED"
   | "PARTNER_SESSION_CONFLICT"
   | "PARTNER_PRIVATE_LIMIT"
   | "PARTNER_PRIVATE_WAIT"

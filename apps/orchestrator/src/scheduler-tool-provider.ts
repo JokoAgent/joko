@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
+import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
 
 import { redactSecrets, type PermissionMode, type PromptInput, type SessionDescriptor } from "@joko/core";
 import {
@@ -298,7 +299,7 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
       switch (name) {
         case "schedule_list": {
           assertKeys(arguments_, []);
-          return toolResult(this.#store.listSchedules({ targetId: context.targetId }).map(publicSchedule));
+          return toolResult(this.#store.listSchedules({ targetId: context.targetId }).filter(schedule => !isPartnerRoutineSchedule(schedule)).map(publicSchedule));
         }
         case "schedule_get": {
           assertKeys(arguments_, ["id"]);
@@ -412,7 +413,7 @@ export class SchedulerToolBridgeProvider implements BridgeToolProvider {
 
   #findOwnedSchedule(id: string, targetId: string): ScheduleRecord | undefined {
     const schedule = this.#store.findSchedule(id);
-    return schedule?.targetId === targetId ? schedule : undefined;
+    return schedule?.targetId === targetId && !isPartnerRoutineSchedule(schedule) ? schedule : undefined;
   }
 
   #requireOwnedSchedule(id: string, targetId: string): ScheduleRecord {

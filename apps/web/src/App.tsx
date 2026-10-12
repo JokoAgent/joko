@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { AlertTriangle, Bell, CircleAlert, CirclePlus, Info, Menu, RefreshCcw, ServerCrash, Sparkles, X } from "lucide-react";
 import { appRouteHash, useAppController } from "./controller.js";
+import { useAppDefaultModelBridge } from "./app-default-model-bridge.js";
 import type { AppController } from "./controller.js";
 import { translate } from "./i18n.js";
 import type { ComposerDraft, ComposerFileSelectionQuoteDraft, InteractionView, SessionMessageSearchMatchView, SessionView, TargetView, TimelineHistoryCursorView, TimelineItemView } from "./model.js";
@@ -12,6 +13,7 @@ import { AppErrorBoundary, routeErrorBoundaryKey } from "./components/ErrorBound
 import { resolveComposerAttachmentPolicy } from "./components/composer-behavior.js";
 import { reviewRunForReviewerSession } from "./components/reviewer-session.js";
 import { mergeTimelineWindows } from "./components/timeline-behavior.js";
+import { PartnerAvatarProvider } from "./components/PartnerAvatar.js";
 import {
   clampNavigationDragWidth,
   finalizeNavigationDrag,
@@ -130,6 +132,8 @@ import {
   summarizeWorktreeRemovalPreflights,
   type WorktreeRemovalPreflightSummary
 } from "./worktree-removal-preflight.js";
+import { PartnerConversationScope } from "./components/PartnerConversation.js";
+import { PartnerGroupPage, PartnerGroupsNavigation } from "./components/PartnerGroups.js";
 
 const SessionPane = lazy(async () => ({ default: (await import("./components/SessionPane.js")).SessionPane }));
 
@@ -248,6 +252,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
   const extensionApplicationWindow = typeof window !== "undefined" && isExtensionApplicationWindow(window.location);
   const auxiliaryApplicationWindow = sessionApplicationWindow || extensionApplicationWindow;
+  useAppDefaultModelBridge(controller, !auxiliaryApplicationWindow);
   const dedicatedHardwareBridge = typeof window !== "undefined"
     && window.jokoDesktop?.capabilities.includes("hardware.dedicatedInput") === true
     ? window.jokoDesktop.dedicatedHardware
@@ -2154,6 +2159,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   };
 
   return (
+    <PartnerConversationScope controller={controller} session={activeSession} active={state.route.kind === "session"} t={t}>
+    <PartnerAvatarProvider controller={controller} ownerKey={state.connectionState === "connected" && state.activeProfile
+      ? JSON.stringify([state.activeProfile.id, state.activeProfile.deviceId, state.activeProfile.serverId, state.activeProfile.origin, state.snapshot.generation.toString()]) : undefined}>
     <div
       className={cx("app", shellNavigationOpen && "has-navigation", settingsRoute ? "navigation-hidden" : `navigation-${navigationMode}`, formalFilesMode && "workspace-files-mode", navigationDrag !== undefined && !settingsRoute && "is-navigation-resizing", inspectorAttached && "has-inspector")}
       style={{
@@ -2171,6 +2179,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       <DesktopPageSearchBar overrides={shortcutOverrides} t={t} />
       {applicationMenuFeedback}
       {!formalFilesMode && !settingsRoute && <Sidebar
+        groupNavigation={<PartnerGroupsNavigation controller={controller} t={t} onClose={closeNavigation} />}
         snapshot={sidebarSnapshot}
         activeSessionId={creatingNewSession ? undefined : activeSession?.id}
         route={state.route}
@@ -2406,7 +2415,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           {state.route.kind === "files" && <main className="empty-session-page"><EmptyState icon={<AlertTriangle />} title={t("workspace.filesLoadFailed")} body={t("workspace.noWorkspace")} action={<Button onClick={() => { const sessionId = activeSession?.id; controller.navigate(sessionId === undefined ? { kind: "session" } : { kind: "session", sessionId }); }}>{t("workspace.filesBack")}</Button>} /></main>}
           {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.effectiveLocale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
-          {state.route.kind === "partners" && <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
+          {state.route.kind === "partners" && (state.route.groupId ? <PartnerGroupPage controller={controller} groupId={state.route.groupId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />
+            : <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />)}
           {state.route.kind === "tools" && <ToolsPage
             controller={controller}
             snapshot={state.snapshot}
@@ -2558,6 +2568,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onFile={openPortableSessionImportFile}
       />}
     </div>
+    </PartnerAvatarProvider>
+    </PartnerConversationScope>
   );
 }
 

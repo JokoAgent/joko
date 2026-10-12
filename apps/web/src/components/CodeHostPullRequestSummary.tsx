@@ -134,7 +134,7 @@ export function codeHostPullRequestCompactLabel(
   });
 }
 
-function codeHostPullRequestStateLabel(
+export function codeHostPullRequestStateLabel(
   pullRequest: CodeHostPullRequestView,
   t: Translator
 ): string {

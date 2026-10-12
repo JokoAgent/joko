@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import darkAppIconUrl from "@joko/brand-assets/icon-dark.svg?url";
 import lightAppIconUrl from "@joko/brand-assets/icon-light.svg?url";
 import { assertBrowserActionCurrent, WorkspaceHtmlExternalUnavailableError, type HttpLinkOpenOptions } from "./browser-action.js";
@@ -119,7 +120,7 @@ export type AppRoute =
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string }
   | { readonly kind: "projects"; readonly projectId?: string }
-  | { readonly kind: "partners"; readonly partnerId?: string }
+  | { readonly kind: "partners"; readonly partnerId?: string; readonly groupId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
   | { readonly kind: "tools"; readonly tab?: ToolsTab; readonly extensionId?: string; readonly recommendationNonce?: string }
   | { readonly kind: "extensionMainView"; readonly extensionId: string }
@@ -197,6 +198,7 @@ export interface ControllerState {
 }
 
 export interface AppController extends OperationApi {
+  readonly appDefaultModelUi?: AppDefaultModelUiPort;
   readonly state: ControllerState;
   /** True only when the Desktop-managed local Orchestrator reports shutdown-blocking work. */
   probeRuntimeActivity(): Promise<boolean>;
@@ -2481,6 +2483,11 @@ export function useAppController(): AppController {
   }, [artifactGateway]);
   return useMemo<AppController>(() => ({
     state,
+    appDefaultModelUi: {
+      watchAppDefaultModel: (id, signal) => gateway().watchAppDefaultModel(id, signal),
+      syncAppDefaultModel: (id, mirror, signal) => gateway().syncAppDefaultModel(id, mirror, signal),
+      claimAppDefaultModel: (id, requestId, signal) => gateway().claimAppDefaultModel(id, requestId, signal)
+    },
     probeRuntimeActivity,
     connect,
     pair,
@@ -2927,18 +2934,40 @@ export function useAppController(): AppController {
     deleteCredential: (credentialId) => gateway().deleteCredential(credentialId),
     getPartnerDirectory: (signal) => gateway().getPartnerDirectory(signal),
     listPartners: (lifecycle, signal) => gateway().listPartners(lifecycle, signal),
+    partnerRoutineApi: (partnerId, ownerKey) => gateway().partnerRoutineApi(partnerId, ownerKey),
+    partnerGroupApi: ownerKey => gateway().partnerGroupApi(ownerKey),
+    uploadPartnerGroupFile: (file, signal) => gateway().uploadPartnerGroupFile(file, signal),
+    partnerMemoryApi: (partnerId, ownerKey) => gateway().partnerMemoryApi(partnerId, ownerKey),
+    partnerConnectionsApi: (partnerId, ownerKey) => gateway().partnerConnectionsApi(partnerId, ownerKey),
+    partnerImportApi: ownerKey => gateway().partnerImportApi(ownerKey),
+    readPartnerWorkingStatus: (partnerId, status, locale, signal) => gateway().readPartnerWorkingStatus(partnerId, status, locale, signal),
     getPartner: (partnerId, signal) => gateway().getPartner(partnerId, signal),
-    createPartner: (expectedDirectoryRevision, draft, signal) =>
-      gateway().createPartner(expectedDirectoryRevision, draft, signal),
+    createPartner: (expectedDirectoryRevision, draft, requestId, signal) =>
+      gateway().createPartner(expectedDirectoryRevision, draft, requestId, signal),
+    getPartnerCreation: (requestId, signal) => gateway().getPartnerCreation(requestId, signal),
+      readPartnerAvatar: (partnerId, revision, image, signal) => gateway().readPartnerAvatar(partnerId, revision, image, signal),
+    retirePartnerCreation: (requestId, signal) => gateway().retirePartnerCreation(requestId, signal),
     updatePartner: (partnerId, expectedRevision, patch, signal) =>
       gateway().updatePartner(partnerId, expectedRevision, patch, signal),
     setPartnerLifecycle: (partnerId, expectedRevision, lifecycle, signal) =>
       gateway().setPartnerLifecycle(partnerId, expectedRevision, lifecycle, signal),
+    deletePartner: (requestId, partnerId, expectedRevision, confirmName, signal) =>
+      gateway().deletePartner(requestId, partnerId, expectedRevision, confirmName, signal),
+    getPartnerDeletion: (requestId, signal) => gateway().getPartnerDeletion(requestId, signal),
+    getPartnerRestartControls: (partnerId, signal) => gateway().getPartnerRestartControls(partnerId, signal),
+    restartPartner: (requestId, partnerId, revision, signal) => gateway().restartPartner(requestId, partnerId, revision, signal),
+    getPartnerRestart: (requestId, signal) => gateway().getPartnerRestart(requestId, signal),
+    retryPartnerRestart: (requestId, signal) => gateway().retryPartnerRestart(requestId, signal),
+    retirePartnerRestart: (requestId, signal) => gateway().retirePartnerRestart(requestId, signal),
+    retirePartnerDeletion: (requestId, signal) => gateway().retirePartnerDeletion(requestId, signal),
+    retryPartnerDeletion: (requestId, signal) => gateway().retryPartnerDeletion(requestId, signal),
     retryPartnerInitialization: (partnerId, expectedRevision, signal) =>
       gateway().retryPartnerInitialization(partnerId, expectedRevision, signal),
     updatePartnerDefaults: (expectedDirectoryRevision, capabilities, signal) =>
       gateway().updatePartnerDefaults(expectedDirectoryRevision, capabilities, signal),
     listPartnerSessions: (partnerId, signal) => gateway().listPartnerSessions(partnerId, signal),
+    listPartnerSessionTasks: (partnerId, signal) => gateway().listPartnerSessionTasks(partnerId, signal),
+    controlPartnerSessionTask: (partnerId, revision, task, action, signal) => gateway().controlPartnerSessionTask(partnerId, revision, task, action, signal),
     markPartnerRead: (partnerId, throughCursor, signal) => gateway().markPartnerRead(partnerId, throughCursor, signal),
     listPartnerPrivateThreads: (partnerId, signal) => gateway().listPartnerPrivateThreads(partnerId, signal),
     getPartnerPrivateThread: (partnerId, threadId, signal) =>
@@ -2950,6 +2979,13 @@ export function useAppController(): AppController {
       gateway().getPartnerDelegation(partnerId, delegationId, signal),
     cancelPartnerDelegation: (partnerId, delegationId, expectedRevision, signal) =>
       gateway().cancelPartnerDelegation(partnerId, delegationId, expectedRevision, signal),
+    getPartnerWorkbench: (partnerId, signal) => gateway().getPartnerWorkbench(partnerId, signal),
+    addPartnerWorkbenchProject: (owner, expectedRevision, path, signal) => gateway().addPartnerWorkbenchProject(owner, expectedRevision, path, signal),
+    removePartnerWorkbenchProject: (owner, expectedRevision, path, signal) => gateway().removePartnerWorkbenchProject(owner, expectedRevision, path, signal),
+    setPartnerWorkbenchJudgment: (owner, expectedRevision, judgment, signal) => gateway().setPartnerWorkbenchJudgment(owner, expectedRevision, judgment, signal),
+    getPartnerWorkbenchDetail: (owner, taskId, signal) => gateway().getPartnerWorkbenchDetail(owner, taskId, signal),
+    resolvePartnerWorkbenchReference: (owner, ref, signal) => gateway().resolvePartnerWorkbenchReference(owner, ref, signal),
+    readPartnerWorkbenchDocument: (owner, path, signal) => gateway().readPartnerWorkbenchDocument(owner, path, signal),
     listCollaborationGoals: (sessionId, includeArchived, signal) =>
       gateway().listCollaborationGoals(sessionId, includeArchived, signal),
     getCollaborationGoal: (goalId, viewerSessionId, signal) =>
@@ -3838,6 +3874,7 @@ export function routeFromHash(hash: string): AppRoute {
     };
   }
   if (parts[0] === "projects") return { kind: "projects", ...(parts[1] === undefined ? {} : { projectId: parts[1] }) };
+  if (parts[0] === "partners" && parts[1] === "groups" && parts[2]) return { kind: "partners", groupId: parts[2] };
   if (parts[0] === "partners") return { kind: "partners", ...(parts[1] === undefined ? {} : { partnerId: parts[1] }) };
   if (parts[0] === "tools") {
     const extensionId = query.get("extension")?.trim();
@@ -3913,7 +3950,7 @@ export function appRouteHash(route: AppRoute): string {
     return `#/tasks/new${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   if (route.kind === "projects") return route.projectId === undefined ? "#/projects" : `#/projects/${encodeURIComponent(route.projectId)}`;
-  if (route.kind === "partners") return route.partnerId === undefined ? "#/partners" : `#/partners/${encodeURIComponent(route.partnerId)}`;
+  if (route.kind === "partners") return route.groupId ? `#/partners/groups/${encodeURIComponent(route.groupId)}` : route.partnerId === undefined ? "#/partners" : `#/partners/${encodeURIComponent(route.partnerId)}`;
   if (route.kind === "schedules") {
     const query = new URLSearchParams();
     if (route.scheduleId !== undefined) query.set("focus", route.scheduleId);

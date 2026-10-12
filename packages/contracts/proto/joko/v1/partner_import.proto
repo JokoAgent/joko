@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package joko.v1;
+
+enum PartnerImportSourceKind {
+  PARTNER_IMPORT_SOURCE_KIND_UNSPECIFIED = 0;
+  PARTNER_IMPORT_SOURCE_KIND_HERMES = 1;
+  PARTNER_IMPORT_SOURCE_KIND_OPENCLAW = 2;
+}
+enum PartnerImportCategory {
+  PARTNER_IMPORT_CATEGORY_UNSPECIFIED = 0;
+  PARTNER_IMPORT_CATEGORY_PERSONALITY = 1;
+  PARTNER_IMPORT_CATEGORY_MEMORY = 2;
+  PARTNER_IMPORT_CATEGORY_SKILLS = 3;
+  PARTNER_IMPORT_CATEGORY_CONNECTIONS = 4;
+  PARTNER_IMPORT_CATEGORY_AUTOMATIONS = 5;
+}
+enum PartnerImportStatus {
+  PARTNER_IMPORT_STATUS_UNSPECIFIED = 0;
+  PARTNER_IMPORT_STATUS_RUNNING = 1;
+  PARTNER_IMPORT_STATUS_COMPLETE = 2;
+  PARTNER_IMPORT_STATUS_NEEDS_ATTENTION = 3;
+}
+enum PartnerImportCheckStatus {
+  PARTNER_IMPORT_CHECK_STATUS_UNSPECIFIED = 0;
+  PARTNER_IMPORT_CHECK_STATUS_COPIED = 1;
+  PARTNER_IMPORT_CHECK_STATUS_VERIFIED = 2;
+  PARTNER_IMPORT_CHECK_STATUS_NEEDS_ATTENTION = 3;
+  PARTNER_IMPORT_CHECK_STATUS_TAKEN_OVER = 4;
+  PARTNER_IMPORT_CHECK_STATUS_PAUSED = 5;
+}
+message PartnerImportSource {
+  string id = 1;
+  PartnerImportSourceKind kind = 2;
+  string name = 3;
+}
+message PartnerImportEntry {
+  string id = 1;
+  uint32 index = 2;
+  PartnerImportCategory category = 3;
+  string name = 4;
+  optional string description = 5;
+  bool selected = 6;
+  optional bool enabled = 7;
+  repeated string depends_on = 8;
+  repeated string exclusive_with = 9;
+  repeated string issues = 10;
+}
+message PartnerImportPreviewPage {
+  string id = 1;
+  PartnerImportSource source = 2;
+  string name = 3;
+  optional string avatar_image_base64 = 4;
+  repeated PartnerImportEntry entries = 5;
+  uint32 total = 6;
+  optional uint32 next_offset = 7;
+}
+message PartnerImportEntryRange { uint32 first = 1; uint32 last = 2; }
+message PartnerImportSelection {
+  string preview_id = 1;
+  string request_id = 2;
+  string name = 3;
+  optional string avatar_image_base64 = 4;
+  repeated string entry_ids = 5;
+  repeated PartnerImportEntryRange entry_ranges = 6;
+  bool takeover = 7;
+  bool defer_setup = 8;
+}
+message PartnerImportProgress { uint32 saved = 1; uint32 total = 2; }
+message PartnerImportCheck {
+  string entry_id = 1;
+  PartnerImportCheckStatus status = 2;
+  optional string message = 3;
+  PartnerImportProgress progress = 4;
+  optional string name = 5;
+}
+message PartnerImportResult {
+  string request_id = 1;
+  string partner_id = 2;
+  optional string canonical_session_id = 3;
+  PartnerImportStatus status = 4;
+  repeated PartnerImportCheck checks = 5;
+  bool saved = 6;
+  repeated string saved_entry_ids = 7;
+}
+message ListPartnerImportSourcesRequest { string controller_id = 1; }
+message ListPartnerImportSourcesResponse { repeated PartnerImportSource sources = 1; }
+message PreviewPartnerImportRequest { string source_id = 1; string controller_id = 2; }
+message PreviewPartnerImportResponse { PartnerImportPreviewPage preview = 1; }
+message ReadPartnerImportPreviewRequest { string preview_id = 1; uint32 offset = 2; string controller_id = 3; }
+message ReadPartnerImportPreviewResponse { PartnerImportPreviewPage preview = 1; }
+message StartPartnerImportRequest { PartnerImportSelection selection = 1; string controller_id = 2; }
+message StartPartnerImportResponse { PartnerImportResult result = 1; }
+message GetPartnerImportStatusRequest { string request_id = 1; }
+message GetPartnerImportStatusResponse { PartnerImportResult result = 1; }
+message RetryPartnerImportRequest { string request_id = 1; bool resume_setup = 2; }
+message RetryPartnerImportResponse { PartnerImportResult result = 1; }
+
+service PartnerImportService {
+  rpc ListPartnerImportSources(ListPartnerImportSourcesRequest) returns (ListPartnerImportSourcesResponse);
+  rpc PreviewPartnerImport(PreviewPartnerImportRequest) returns (PreviewPartnerImportResponse);
+  rpc ReadPartnerImportPreview(ReadPartnerImportPreviewRequest) returns (ReadPartnerImportPreviewResponse);
+  rpc StartPartnerImport(StartPartnerImportRequest) returns (StartPartnerImportResponse);
+  rpc GetPartnerImportStatus(GetPartnerImportStatusRequest) returns (GetPartnerImportStatusResponse);
+  rpc RetryPartnerImport(RetryPartnerImportRequest) returns (RetryPartnerImportResponse);
+}

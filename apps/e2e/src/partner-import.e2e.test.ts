@@ -1,0 +1,71 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Code } from "@connectrpc/connect";
+import { afterEach, expect, it } from "vitest";
+import { createPartnerImportApi, importSelectionInput, PartnerImportCategory, PartnerImportStatus, PermissionMode, RoutineRunStatus } from "@joko/contracts";
+import { RealPiSystemFixture, REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID } from "./real-pi-fixture.js";
+import { waitFor } from "./fixture.js";
+import { queueRunIdFrom, sendInputMutation, submit } from "./operations.js";
+
+let fixture: RealPiSystemFixture | undefined;
+afterEach(async () => { await fixture?.close({ removeRoot: true }); fixture = undefined; });
+it("imports into the production HTTP/SQLite/published runtime, uses its full redacted resources and routines without a UI and restores the same task after restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-real-pi-system-e2e-")); const native = join(root, ".hermes");
+  await mkdir(join(native, "skills", "reports"), { recursive: true }); await mkdir(join(native, "memories")); await mkdir(join(native, "cron"));
+  const secret = "fixture-native-import-secret-abcdef012345";
+  const identity = `You are a local analyst. ${secret}\n` + "Retain complete identity context.\n".repeat(400) + "IDENTITY_END_MARKER";
+  await writeFile(join(native, "config.yaml"), "name: Analyst\n"); await writeFile(join(native, ".env"), `ACCESS_TOKEN=${secret}\n`);
+  await writeFile(join(native, "SOUL.md"), identity); await writeFile(join(native, "memories", "notes.md"), `Retain source notes. ${secret}`);
+  await writeFile(join(native, "skills", "reports", "SKILL.md"), "---\nname: Reports\ndescription: Read complete reports\n---\n" + "Full skill instructions.\n".repeat(14000));
+  await writeFile(join(native, "cron", "jobs.json"), JSON.stringify([{ id: "weekly", name: "Review", enabled: false, prompt: "Review the retained import context.", schedule: { kind: "cron", expr: "0 9 * * 1" } }]));
+  const sources = { home: root, environment: {} };
+  fixture = await RealPiSystemFixture.start({ rootDirectory: root, keepRoot: true, enableInternalServer: true, agentImportSources: sources });
+  const paired = await fixture.pair("Import manager"); let clients = paired.clients;
+  const directory = (await clients.partner.getPartnerDirectory({})).directory!;
+  await clients.partner.updatePartnerDefaults({ expectedDirectoryRevision: directory.revision, capabilities: {
+    modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }], permissionMode: PermissionMode.AUTO, planMode: false } });
+  const api = createPartnerImportApi({ rpc: clients.partnerImport, ownerKey: paired.connectionId, controllerId: "import-sheet", assertCurrent() {}, newRequestId: randomUUID });
+  const signal = new AbortController().signal; const preview = await api.preview((await api.sources(signal))[0]!.id, signal);
+  expect(new Set(preview.entries.map(entry => entry.category)).size).toBe(5);
+  const selection = importSelectionInput(preview, new Set(preview.entries.map(entry => entry.id)), { requestId: "product_import_request_0001", name: "Imported analyst", takeover: true, deferSetup: true });
+  await api.start(selection, signal);
+  const saved = await waitFor(() => api.status(selection.requestId, signal), value => value?.status !== PartnerImportStatus.RUNNING, "the complete saved import", 45000);
+  expect(saved, JSON.stringify({ checks: saved?.checks, profiles: fixture.application.partners?.listPartners().map(profile => ({ state: profile.initializationState, error: profile.initializationErrorCode })) })).toMatchObject({ saved: true, status: PartnerImportStatus.COMPLETE }); const taskId = saved!.canonicalSessionId!;
+  const partner = (await clients.partner.getPartner({ partnerId: saved!.partnerId })).partner!;
+  const home = fixture.application.store.getTarget(partner.homeTargetId).descriptor.workspaceRoot;
+  const resources = fixture.application.piResources!.list({ targetId: partner.homeTargetId, kind: "skill" }); expect(resources[0]?.enabled).toBe(true);
+  const generation = fixture.application.store.getSession(taskId).descriptor.binding.generation;
+  const bridge = fixture.application.mcpRouter!.createPiBridgeSnapshot({ endpoint: `${fixture.application.config.internalOrigin}/internal/mcp`, sessionId: taskId,
+    targetId: partner.homeTargetId, expectedPiGeneration: generation });
+  expect(bridge.mcpBridge.tools.some(tool => tool.serverId === "joko_imported_connections" && tool.name === "setup_status")).toBe(true);
+  const call = async (toolName: string, args: Record<string, unknown>) => {
+    const response = await fetch(bridge.mcpBridge.endpoint, { method: "POST", headers: { authorization: `Bearer ${bridge.mcpBridge.token}`, "content-type": "application/json", "x-joko-pi-generation": String(generation) },
+      body: JSON.stringify({ requestId: randomUUID(), sessionId: taskId, targetId: partner.homeTargetId, generation, serverId: "joko_imported_connections", toolName, arguments: args }) });
+    expect(response.ok).toBe(true); const result = await response.json() as { isError: boolean; content: Array<{ text: string }> };
+    expect(result.isError).toBe(false); return JSON.parse(result.content[0]!.text) as Record<string, unknown>;
+  };
+  expect(await call("setup_status", {})).toMatchObject({ saved: true, status: "complete" });
+  const identityId = preview.entries.find(entry => entry.category === PartnerImportCategory.PERSONALITY)!.id;
+  const document = await call("read_document", { document_id: identityId }); expect(document.text).toContain("IDENTITY_END_MARKER"); expect(document.text).not.toContain(secret);
+  const execution = await submit(clients.operation, paired.connectionId, sendInputMutation(taskId, BigInt(generation), "Review the full imported context. Do not run any command."));
+  const runId = queueRunIdFrom(execution);
+  await waitFor(async () => fixture!.application.store.getRun(runId).descriptor.state, value => ["completed", "failed", "aborted"].includes(value), "the published runtime", 45000);
+  expect(fixture.application.store.getRun(runId).descriptor.state).toBe("completed");
+  expect(JSON.stringify(fixture.providerRequests.map(request => request.body))).toContain("IDENTITY_END_MARKER"); expect(JSON.stringify(fixture.providerRequests)).not.toContain(secret);
+  const catalog = await clients.partnerRoutine.listPartnerRoutines({ partnerId: partner.partnerId }); const routine = catalog.routines[0]!;
+  await clients.partnerRoutine.runPartnerRoutine({ partnerId: partner.partnerId, expectedPartnerRevision: partner.revision, routineId: routine.id, expectedRevision: routine.revision, requestId: "product_import_routine_run" });
+  const history = await waitFor(() => clients.partnerRoutine.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id }), value => value.runs[0]?.status === RoutineRunStatus.SUCCESS || value.runs[0]?.status === RoutineRunStatus.FAILED, "the imported routine", 45000);
+  expect(history.runs[0]?.status).toBe(RoutineRunStatus.SUCCESS);
+  expect((await readFile(join(root, "data", "orchestrator.db"))).includes(Buffer.from(secret))).toBe(false);
+  await expect(fixture.anonymous.partnerImport.getPartnerImportStatus({ requestId: selection.requestId })).rejects.toMatchObject({ code: Code.Unauthenticated });
+  const port = Number(new URL(fixture.baseUrl).port); const internalPort = Number(new URL(fixture.application.config.internalOrigin).port);
+  await fixture.close(); fixture = await RealPiSystemFixture.start({ rootDirectory: root, keepRoot: true, port, internalPort, enableInternalServer: true, agentImportSources: sources }); clients = fixture.clients(paired.authKey);
+  expect((await clients.partnerImport.getPartnerImportStatus({ requestId: selection.requestId })).result).toEqual(saved);
+  expect((await clients.partner.getPartner({ partnerId: partner.partnerId })).partner?.canonicalSessionId).toBe(taskId);
+  expect((await clients.partnerRoutine.listPartnerRoutineRuns({ partnerId: partner.partnerId, routineId: routine.id })).runs[0]?.id).toBe(history.runs[0]?.id);
+  expect(fixture.application.store.getTarget(partner.homeTargetId).descriptor.workspaceRoot).toBe(home);
+  await clients.partner.deletePartner({ requestId: "product_import_delete_request", partnerId: partner.partnerId, expectedRevision: (await clients.partner.getPartner({ partnerId: partner.partnerId })).partner!.revision, confirmName: partner.displayName });
+  expect(fixture.application.partnerImports?.status(selection.requestId, { ownerKey: "service-check", assertCurrent() {} })?.status).toBe("needs-attention");
+}, 150000);

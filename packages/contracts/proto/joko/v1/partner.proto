@@ -11,6 +11,77 @@ enum PartnerLifecycle {
   PARTNER_LIFECYCLE_ACTIVE = 1;
   PARTNER_LIFECYCLE_ARCHIVED = 2;
   PARTNER_LIFECYCLE_DELETED = 3;
+  PARTNER_LIFECYCLE_PAUSED = 4;
+}
+
+enum PartnerDeletionPhase {
+  PARTNER_DELETION_PHASE_UNSPECIFIED = 0;
+  PARTNER_DELETION_PHASE_CLOSING = 1;
+  PARTNER_DELETION_PHASE_CLEANUP = 2;
+  PARTNER_DELETION_PHASE_COMPLETED = 3;
+}
+
+enum PartnerRestartPhase {
+  PARTNER_RESTART_PHASE_UNSPECIFIED = 0;
+  PARTNER_RESTART_PHASE_CLOSING = 1;
+  PARTNER_RESTART_PHASE_READY = 2;
+}
+message PartnerRestart {
+  string request_id = 1;
+  string partner_id = 2;
+  PartnerRestartPhase phase = 3;
+  bool runtime_close_pending = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+message GetPartnerRestartControlsRequest { string partner_id = 1; }
+message GetPartnerRestartControlsResponse { Revision revision = 1; bool available = 2; }
+message RestartPartnerRequest { string request_id = 1; string partner_id = 2; Revision expected_revision = 3; }
+message RestartPartnerResponse { PartnerRestart restart = 1; }
+message GetPartnerRestartRequest { string request_id = 1; }
+message GetPartnerRestartResponse { PartnerRestart restart = 1; bool retired = 2; }
+message RetryPartnerRestartRequest { string request_id = 1; }
+message RetryPartnerRestartResponse { PartnerRestart restart = 1; }
+message RetirePartnerRestartRequest { string request_id = 1; }
+message RetirePartnerRestartResponse { PartnerRestart restart = 1; bool retired = 2; }
+
+enum PartnerDeletionFailure {
+  PARTNER_DELETION_FAILURE_UNSPECIFIED = 0;
+  PARTNER_DELETION_FAILURE_RUNTIME_CLOSE_PENDING = 1;
+  PARTNER_DELETION_FAILURE_HOME_CLEANUP_PENDING = 2;
+}
+
+message PartnerDeletion {
+  string request_id = 1;
+  string partner_id = 2;
+  PartnerDeletionPhase phase = 3;
+  PartnerDeletionFailure failure = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message DeletePartnerRequest {
+  string request_id = 1;
+  string partner_id = 2;
+  Revision expected_revision = 3;
+  string confirm_name = 4;
+}
+
+message DeletePartnerResponse {
+  PartnerDeletion deletion = 1;
+}
+
+message GetPartnerDeletionRequest { string request_id = 1; }
+message GetPartnerDeletionResponse {
+  PartnerDeletion deletion = 1;
+  bool retired = 2;
+}
+message RetryPartnerDeletionRequest { string request_id = 1; }
+message RetryPartnerDeletionResponse { PartnerDeletion deletion = 1; }
+message RetirePartnerDeletionRequest { string request_id = 1; }
+message RetirePartnerDeletionResponse {
+  PartnerDeletion deletion = 1;
+  bool retired = 2;
 }
 
 enum PartnerInitializationState {
@@ -43,6 +114,32 @@ enum PartnerSessionRole {
   PARTNER_SESSION_ROLE_CANONICAL = 1;
   PARTNER_SESSION_ROLE_HISTORY = 2;
   PARTNER_SESSION_ROLE_DELEGATION = 3;
+}
+
+enum PartnerWorkingPhase {
+  PARTNER_WORKING_PHASE_UNSPECIFIED = 0;
+  PARTNER_WORKING_PHASE_THINKING = 1;
+  PARTNER_WORKING_PHASE_REPLYING = 2;
+  PARTNER_WORKING_PHASE_PROCESSING = 3;
+  PARTNER_WORKING_PHASE_COMPACTING = 4;
+  PARTNER_WORKING_PHASE_READING_MEMORY = 5;
+  PARTNER_WORKING_PHASE_SAVING_MEMORY = 6;
+  PARTNER_WORKING_PHASE_DELETING_MEMORY = 7;
+  PARTNER_WORKING_PHASE_ORGANIZING_MEMORY = 8;
+  PARTNER_WORKING_PHASE_READING_FILE = 9;
+  PARTNER_WORKING_PHASE_SAVING_FILE = 10;
+  PARTNER_WORKING_PHASE_SEARCHING = 11;
+  PARTNER_WORKING_PHASE_READING_WEB = 12;
+  PARTNER_WORKING_PHASE_SEARCHING_FILES = 13;
+  PARTNER_WORKING_PHASE_TESTING = 14;
+  PARTNER_WORKING_PHASE_CHECKING = 15;
+  PARTNER_WORKING_PHASE_REVIEWING_MEMORY = 16;
+  PARTNER_WORKING_PHASE_REVIEWING_FILES = 17;
+  PARTNER_WORKING_PHASE_REVIEWING_SOURCES = 18;
+  PARTNER_WORKING_PHASE_REVIEWING_CHECKS = 19;
+  PARTNER_WORKING_PHASE_RECONNECTING = 20;
+  PARTNER_WORKING_PHASE_MODEL_BUSY = 21;
+  PARTNER_WORKING_PHASE_RATE_LIMIT = 22;
 }
 
 enum PartnerPrivateThreadStatus {
@@ -101,12 +198,32 @@ message PartnerTemplate {
   string identity_source = 4;
 }
 
+message PartnerAvatarImage {
+  string sha256 = 1;
+  string mime_type = 2;
+  uint64 byte_length = 3;
+}
+
+message PartnerAvatar {
+  oneof value {
+    string preset_id = 1;
+    PartnerAvatarImage image = 2;
+  }
+}
+
+message PartnerAvatarInput {
+  oneof value {
+    string preset_id = 1;
+    string image_base64 = 2;
+  }
+}
+
 message PartnerProfile {
   string partner_id = 1;
   Revision revision = 2;
   uint64 profile_version = 3;
   string display_name = 4;
-  string avatar = 5;
+  PartnerAvatar avatar = 5;
   string identity_source = 6;
   string template_id = 7;
   PartnerLifecycle lifecycle = 8;
@@ -120,6 +237,9 @@ message PartnerProfile {
   google.protobuf.Timestamp updated_at = 16;
   bool uses_directory_defaults = 17;
   PartnerActivity activity = 18;
+  optional bool pause_cleanup_pending = 19;
+  optional PartnerModelRoute task_model_override = 20;
+  string description = 21;
 }
 
 message PartnerActivity {
@@ -131,6 +251,37 @@ message PartnerActivity {
   uint64 active_delegation_count = 6;
   Revision read_through_cursor = 7;
   google.protobuf.Timestamp read_updated_at = 8;
+  // At most 500 characters from the latest completed public assistant reply.
+  // Empty when that reply has no text. Private messages and reasoning are excluded.
+  string latest_reply_preview = 9;
+  PartnerWorkingStatus working_status = 10;
+}
+
+// Public execution facts scoped to the current canonical task incarnation.
+message PartnerWorkingStatus {
+  string session_id = 1;
+  string target_id = 2;
+  string backend_id = 3;
+  uint64 generation = 4;
+  string run_id = 5;
+  string attempt_id = 6;
+  PartnerWorkingPhase phase = 7;
+  // Optional, validated activity caption. Never task content or tool output.
+  string caption = 8;
+}
+
+message ReadPartnerWorkingStatusRequest {
+  string partner_id = 1;
+  string session_id = 2;
+  uint64 generation = 3;
+  string run_id = 4;
+  string attempt_id = 5;
+  PartnerWorkingPhase phase = 6;
+  string locale = 7;
+}
+
+message ReadPartnerWorkingStatusResponse {
+  PartnerWorkingStatus working_status = 1;
 }
 
 message PartnerSession {
@@ -217,21 +368,27 @@ message PartnerDirectory {
 
 message PartnerDraft {
   string display_name = 1;
-  string avatar = 2;
+  PartnerAvatarInput avatar = 2;
   string identity_source = 3;
   string template_id = 4;
   PartnerCapabilities capabilities = 5;
   bool uses_directory_defaults = 6;
+  string description = 7;
 }
 
 message PartnerPatch {
   optional string display_name = 1;
-  optional string avatar = 2;
+  PartnerAvatarInput avatar = 2;
   optional string identity_source = 3;
   optional PartnerModelChain model_chain = 4;
   optional PermissionMode permission_mode = 5;
   optional bool plan_mode = 6;
   optional bool uses_directory_defaults = 7;
+  oneof task_model_preference {
+    PartnerModelRoute task_model_override = 8;
+    bool inherit_task_model = 9;
+  }
+  optional string description = 10;
 }
 
 message GetPartnerDirectoryRequest {}
@@ -247,6 +404,8 @@ message ListPartnersRequest {
 message ListPartnersResponse {
   repeated PartnerProfile partners = 1;
   PartnerDirectory directory = 2;
+  repeated PartnerDeletion pending_deletions = 3;
+  repeated PartnerRestart pending_restarts = 4;
 }
 
 message GetPartnerRequest {
@@ -257,14 +416,45 @@ message GetPartnerResponse {
   PartnerProfile partner = 1;
 }
 
+message ReadPartnerAvatarRequest {
+  string partner_id = 1;
+  Revision expected_revision = 2;
+  string sha256 = 3;
+}
+
+message ReadPartnerAvatarResponse {
+  PartnerAvatarImage image = 1;
+  bytes content = 2;
+}
+
 message CreatePartnerRequest {
   Revision expected_directory_revision = 1;
   PartnerDraft draft = 2;
+  string request_id = 3;
 }
 
 message CreatePartnerResponse {
   PartnerProfile partner = 1;
   PartnerDirectory directory = 2;
+}
+
+message GetPartnerCreationRequest {
+  string request_id = 1;
+}
+
+message GetPartnerCreationResponse {
+  PartnerProfile partner = 1;
+  PartnerDirectory directory = 2;
+}
+
+message RetirePartnerCreationRequest {
+  string request_id = 1;
+}
+
+message RetirePartnerCreationResponse {
+  bool retired = 1;
+  PartnerProfile partner = 2;
+  PartnerDirectory directory = 3;
 }
 
 message UpdatePartnerRequest {
@@ -315,7 +505,55 @@ message ListPartnerSessionsRequest {
 
 message ListPartnerSessionsResponse {
   repeated PartnerSession sessions = 1;
+  repeated PartnerSessionTask tasks = 2;
 }
+
+enum PartnerSessionTaskStatus {
+  PARTNER_SESSION_TASK_STATUS_UNSPECIFIED = 0;
+  PARTNER_SESSION_TASK_STATUS_PREPARING = 1;
+  PARTNER_SESSION_TASK_STATUS_QUEUED = 2;
+  PARTNER_SESSION_TASK_STATUS_RUNNING = 3;
+  PARTNER_SESSION_TASK_STATUS_WAITING = 4;
+  PARTNER_SESSION_TASK_STATUS_COMPLETED = 5;
+  PARTNER_SESSION_TASK_STATUS_FAILED = 6;
+  PARTNER_SESSION_TASK_STATUS_CANCELLED = 7;
+  PARTNER_SESSION_TASK_STATUS_TIMED_OUT = 8;
+  PARTNER_SESSION_TASK_STATUS_UNKNOWN = 9;
+}
+enum PartnerSessionTaskControl {
+  PARTNER_SESSION_TASK_CONTROL_UNSPECIFIED = 0;
+  PARTNER_SESSION_TASK_CONTROL_ACTIVE = 1;
+  PARTNER_SESSION_TASK_CONTROL_PAUSING = 2;
+  PARTNER_SESSION_TASK_CONTROL_PAUSED = 3;
+  PARTNER_SESSION_TASK_CONTROL_CANCELLING = 4;
+}
+message PartnerSessionTask {
+  string id = 1;
+  string partner_id = 2;
+  string session_id = 3;
+  string title = 4;
+  PartnerSessionTaskStatus status = 5;
+  PartnerSessionTaskControl control = 6;
+  Revision revision = 7;
+  google.protobuf.Timestamp deadline_at = 8;
+  string result = 9;
+  string error = 10;
+}
+enum PartnerSessionTaskAction {
+  PARTNER_SESSION_TASK_ACTION_UNSPECIFIED = 0;
+  PARTNER_SESSION_TASK_ACTION_PAUSE = 1;
+  PARTNER_SESSION_TASK_ACTION_RESUME = 2;
+  PARTNER_SESSION_TASK_ACTION_CANCEL = 3;
+}
+message ControlPartnerSessionTaskRequest {
+  string request_id = 1;
+  string partner_id = 2;
+  string task_id = 3;
+  Revision expected_partner_revision = 4;
+  Revision expected_task_revision = 5;
+  PartnerSessionTaskAction action = 6;
+}
+message ControlPartnerSessionTaskResponse { PartnerSessionTask task = 1; }
 
 message MarkPartnerReadRequest {
   string partner_id = 1;
@@ -381,3 +619,192 @@ message CancelPartnerDelegationRequest {
 message CancelPartnerDelegationResponse {
   PartnerDelegation delegation = 1;
 }
+
+enum PartnerMemoryKind {
+  PARTNER_MEMORY_KIND_UNSPECIFIED = 0;
+  PARTNER_MEMORY_KIND_USER = 1;
+  PARTNER_MEMORY_KIND_FEEDBACK = 2;
+  PARTNER_MEMORY_KIND_PROJECT = 3;
+  PARTNER_MEMORY_KIND_REFERENCE = 4;
+}
+
+message PartnerMemoryOwner {
+  string partner_id = 1;
+  string home_target_id = 2;
+  string canonical_session_id = 3;
+  Revision revision = 4;
+  bool read_only = 5;
+  optional bool memory_enabled = 6;
+}
+
+message PartnerMemorySummary {
+  string entry_id = 1;
+  PartnerMemoryKind kind = 2;
+  string title = 3;
+  string preview = 4;
+  google.protobuf.Timestamp updated_at = 5;
+  Revision revision = 6;
+}
+
+message PartnerMemoryEntry {
+  PartnerMemorySummary summary = 1;
+  string body = 2;
+}
+
+message PartnerMemoryGroup {
+  PartnerMemoryKind kind = 1;
+  uint32 count = 2;
+  repeated PartnerMemorySummary entries = 3;
+}
+
+message ListPartnerMemoriesRequest { string partner_id = 1; string query = 2; }
+message ListPartnerMemoriesResponse {
+  PartnerMemoryOwner owner = 1;
+  repeated PartnerMemoryGroup groups = 2;
+  bool truncated = 3;
+}
+message ReadPartnerMemoryRequest { string partner_id = 1; string entry_id = 2; }
+message ReadPartnerMemoryResponse { PartnerMemoryOwner owner = 1; PartnerMemoryEntry entry = 2; }
+message UpdatePartnerMemoryRequest {
+  string partner_id = 1;
+  string entry_id = 2;
+  Revision expected_partner_revision = 3;
+  Revision expected_revision = 4;
+  string title = 5;
+  string body = 6;
+}
+message UpdatePartnerMemoryResponse { PartnerMemoryOwner owner = 1; PartnerMemoryEntry entry = 2; }
+message DeletePartnerMemoryRequest {
+  string partner_id = 1;
+  string entry_id = 2;
+  Revision expected_partner_revision = 3;
+  Revision expected_revision = 4;
+}
+message DeletePartnerMemoryResponse { PartnerMemoryOwner owner = 1; string entry_id = 2; }
+
+message PartnerMemoryPreferences {
+  PartnerMemoryOwner owner = 1;
+  bool enabled = 2;
+  string user_context = 3;
+  Revision revision = 4;
+}
+message GetPartnerMemoryPreferencesRequest { string partner_id = 1; }
+message GetPartnerMemoryPreferencesResponse { PartnerMemoryPreferences preferences = 1; }
+message UpdatePartnerMemoryPreferencesRequest {
+  string partner_id = 1;
+  Revision expected_partner_revision = 2;
+  Revision expected_revision = 3;
+  optional bool enabled = 4;
+  optional string user_context = 5;
+}
+message UpdatePartnerMemoryPreferencesResponse { PartnerMemoryPreferences preferences = 1; }
+
+enum PartnerConnectionKind {
+  PARTNER_CONNECTION_KIND_UNSPECIFIED = 0;
+  PARTNER_CONNECTION_KIND_MCP = 1;
+  PARTNER_CONNECTION_KIND_TOOLSET = 2;
+  PARTNER_CONNECTION_KIND_SKILL = 3;
+}
+enum PartnerConnectionMode {
+  PARTNER_CONNECTION_MODE_UNSPECIFIED = 0;
+  PARTNER_CONNECTION_MODE_INHERIT = 1;
+  PARTNER_CONNECTION_MODE_ALLOWLIST = 2;
+}
+message PartnerConnectionSelection {
+  PartnerConnectionMode mode = 1;
+  repeated string ids = 2;
+}
+message PartnerConnectionEntry {
+  PartnerConnectionKind kind = 1;
+  string id = 2;
+  string name = 3;
+  bool available = 4;
+  bool inherited = 5;
+  bool personal = 6;
+  string description = 7;
+}
+message PartnerConnectionsOwner {
+  string partner_id = 1;
+  string home_target_id = 2;
+  string canonical_session_id = 3;
+  Revision revision = 4;
+  bool read_only = 5;
+}
+message PartnerConnections {
+  PartnerConnectionsOwner owner = 1;
+  optional Revision revision = 2;
+  string catalog_revision = 3;
+  repeated PartnerConnectionEntry entries = 4;
+  PartnerConnectionSelection mcp = 5;
+  PartnerConnectionSelection toolsets = 6;
+  PartnerConnectionSelection skills = 7;
+}
+message GetPartnerConnectionsRequest { string partner_id = 1; }
+message GetPartnerConnectionsResponse { PartnerConnections connections = 1; }
+message UpdatePartnerConnectionsRequest {
+  string partner_id = 1;
+  Revision expected_partner_revision = 2;
+  optional Revision expected_revision = 3;
+  string expected_catalog_revision = 4;
+  PartnerConnectionSelection mcp = 5;
+  PartnerConnectionSelection toolsets = 6;
+  PartnerConnectionSelection skills = 7;
+}
+message UpdatePartnerConnectionsResponse { PartnerConnections connections = 1; }
+
+message PartnerSkillsOwner {
+  string partner_id = 1;
+  string home_target_id = 2;
+  string canonical_session_id = 3;
+  Revision revision = 4;
+  bool read_only = 5;
+}
+message PartnerSkillSummary {
+  string id = 1;
+  string slug = 2;
+  string name = 3;
+  string description = 4;
+  string updated_at = 5;
+  bool enabled = 6;
+  Revision revision = 7;
+  string content_revision = 8;
+}
+message PartnerSkill {
+  PartnerSkillSummary summary = 1;
+  string body = 2;
+  bool read_only = 3;
+  uint64 body_bytes = 4;
+}
+message ListPartnerSkillsRequest {
+  string partner_id = 1;
+  string query = 2;
+  uint32 offset = 3;
+  uint32 limit = 4;
+}
+message ListPartnerSkillsResponse {
+  PartnerSkillsOwner owner = 1;
+  repeated PartnerSkillSummary skills = 2;
+  optional uint32 next_offset = 3;
+  uint32 total = 4;
+}
+message ReadPartnerSkillRequest { string partner_id = 1; string skill_id = 2; }
+message ReadPartnerSkillResponse { PartnerSkillsOwner owner = 1; PartnerSkill skill = 2; }
+message UpdatePartnerSkillRequest {
+  string partner_id = 1;
+  string skill_id = 2;
+  Revision expected_partner_revision = 3;
+  Revision expected_revision = 4;
+  string expected_content_revision = 5;
+  string name = 6;
+  string description = 7;
+  string body = 8;
+}
+message UpdatePartnerSkillResponse { PartnerSkillsOwner owner = 1; PartnerSkill skill = 2; }
+message DeletePartnerSkillRequest {
+  string partner_id = 1;
+  string skill_id = 2;
+  Revision expected_partner_revision = 3;
+  Revision expected_revision = 4;
+  string expected_content_revision = 5;
+}
+message DeletePartnerSkillResponse { PartnerSkillsOwner owner = 1; string skill_id = 2; }

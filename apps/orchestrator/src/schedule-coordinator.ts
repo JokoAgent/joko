@@ -246,7 +246,8 @@ export class ScheduleCoordinator {
 
   async runNowWithResult(
     scheduleId: string,
-    operationId: string = randomUUID()
+    operationId: string = randomUUID(),
+    canDispatch?: () => boolean
   ): Promise<ScheduleDispatchResult> {
     const schedule = this.#store.getSchedule(scheduleId);
     return this.dispatchOccurrence(schedule, {
@@ -254,7 +255,8 @@ export class ScheduleCoordinator {
       operationId: `manual-schedule-${operationId}`,
       preserveNextRun: true,
       ignoreMisfire: true,
-      source: "run-now"
+      source: "run-now",
+      ...(canDispatch === undefined ? {} : { canDispatch })
     });
   }
 
@@ -266,6 +268,7 @@ export class ScheduleCoordinator {
       readonly preserveNextRun?: boolean;
       readonly ignoreMisfire?: boolean;
       readonly source?: "automatic" | "run-now";
+      readonly canDispatch?: () => boolean;
     } = {}
   ): Promise<ScheduleDispatchResult> {
     if (this.#deletionFences.has(schedule.id)) {
@@ -361,6 +364,7 @@ export class ScheduleCoordinator {
       readonly preserveNextRun?: boolean;
       readonly ignoreMisfire?: boolean;
       readonly source?: "automatic" | "run-now";
+      readonly canDispatch?: () => boolean;
     },
     signal: AbortSignal
   ): Promise<ScheduleDispatchResult> {
@@ -515,7 +519,7 @@ export class ScheduleCoordinator {
     if (this.#recovery.wasForceReleased(runId)) return { runId, status: "failed" };
     schedule = resolved.schedule;
     const sessionId = resolved.sessionId;
-    if (signal.aborted || this.#deletionFences.has(schedule.id)) {
+    if (signal.aborted || this.#deletionFences.has(schedule.id) || options.canDispatch?.() === false) {
       const current = this.#store.findSchedule(schedule.id);
       if (current !== undefined) {
         this.recordPreSessionOutcome({

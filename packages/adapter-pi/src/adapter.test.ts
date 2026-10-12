@@ -564,6 +564,44 @@ class ScriptedPiProcess extends EventEmitter {
 }
 
 describe("PiBackendAdapter", () => {
+  it("isolates explicit skills for an empty shelf while retaining the native policy bridge", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-pi-explicit-")); const specs: PiProcessSpec[] = [];
+    const adapter = createPiAdapter({ agentHome: join(root, "agent"), sessionRoot: join(root, "sessions"), versionProbe: async () => "pi 99.99.99-latest-test",
+      resolveNativeSkills: async () => [], resolveNativeSkillPolicy: () => ({ mode: "explicit", assertCurrent: () => undefined }),
+      processFactory: spec => { specs.push(spec); return new ScriptedPiProcess(spec) as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "explicit-home", backendId: "pi", displayName: "Home", workspaceRoot: root, managed: true, trusted: true };
+    try { const context = makeContext(target, []), binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, context);
+      expect(specs[0]!.args).toContain("--no-skills"); expect(specs[0]!.args).not.toContain("--skill"); expect(specs[0]!.args).toContain("--extension");
+      await adapter.closeSession(binding, { ...context, binding });
+    } finally { await adapter.dispose(); await rm(root, { recursive: true, force: true }); }
+  });
+  it("launches personal skill discovery through native argv and fences revoked originals before a prompt", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-pi-personal-")), source = join(root, "source"), workspace = join(root, "workspace");
+    await mkdir(source); await mkdir(workspace);
+    const body = "---\nname: report\ndescription: Prepare reports\n---\nComplete original instructions.\n";
+    await writeFile(join(source, "SKILL.md"), body);
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+    let current = true; const specs: PiProcessSpec[] = [], processes: ScriptedPiProcess[] = [];
+    const adapter = createPiAdapter({ agentHome: join(root, "agent-home"), sessionRoot: join(root, "session-root"), versionProbe: async () => "pi 99.99.99-latest-test",
+      resolveNativeSkills: async () => [{ sourcePath: source, resource: { id: "personal-report", name: "Report", kind: "skill", source: "managed", state: "approved", revision, resourceVersion: 3n },
+        assertCurrent: () => { if (!current) throw Error("Private approval retired"); },
+        personal: { slug: "report", name: "Report", description: "Long metadata ".repeat(2_000), updatedAt: "2026-10-12", frontmatterBytes: 30_000, bodyStartLine: 5 } }],
+      processFactory: spec => { specs.push(spec); const path = spec.args[spec.args.indexOf("--skill") + 1]!;
+        const process = new ScriptedPiProcess(spec, { commands: [{ name: "personal-skill-library", description: "Search skills", source: "skill", sourceInfo: { path: join(path, "SKILL.md") } }] });
+        processes.push(process); return process as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "personal-home", backendId: "pi", displayName: "Home", workspaceRoot: workspace, managed: true, trusted: true };
+    try {
+      const context = makeContext(target, []), binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, context);
+      const path = specs[0]!.args[specs[0]!.args.indexOf("--skill") + 1]!;
+      expect(path).toContain("personal-skill-library"); expect(await readFile(join(path, "SKILL.md"), "utf8")).toContain("list_partner_skills");
+      expect(await adapter.getResources({ ...context, binding })).toEqual([]); current = false;
+      await expect(adapter.send({ text: "Use reports.", images: [], files: [], mentions: [], disposition: "prompt" }, { ...context, binding })).rejects.toMatchObject({ publicError: { code: "SKILL_RUNTIME_AUTHORITY_INVALID" } });
+      expect(processes[0]!.commands.filter(command => command["type"] === "prompt")).toEqual([]);
+      current = true; await adapter.closeSession(binding, { ...context, binding }); await expect(readFile(join(path, "SKILL.md"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(source, "SKILL.md"), "utf8")).toBe(body);
+    } finally { current = true; await adapter.dispose(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("validates canonical Windows device-peer Targets without treating them as POSIX or SSH", async () => {
     const validateRemoteWorkspace = vi.fn(async () => undefined);
     const adapter = createPiAdapter({
@@ -1170,7 +1208,7 @@ describe("PiBackendAdapter", () => {
     }
   });
 
-  it("restores the private append prompt from AdapterContext after an adapter restart", async () => {
+  it("restores the current private append prompt from AdapterContext across cached and cold adapter resumes", async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-personalization-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-personalization-workspace-"));
     const specs: PiProcessSpec[] = [];
@@ -1212,6 +1250,11 @@ describe("PiBackendAdapter", () => {
       appendSystemPrompt: prompt
     }, initialContext);
     await first.closeSession(binding, { ...initialContext, binding });
+    const updatedPrompt = `${prompt}\n${"Complete service identity.\n".repeat(400)}IDENTITY_END_MARKER`;
+    const updatedContext = { ...initialContext, binding, generation: binding.generation + 1, appendSystemPrompt: updatedPrompt };
+    await first.resumeSession(binding, updatedContext);
+    expect(optionalArgument(specs.at(-1)!.args, "--append-system-prompt")).toContain(updatedPrompt);
+    await first.closeSession(binding, updatedContext);
     await first.dispose();
 
     const restarted = createPiAdapter(options);
@@ -1219,12 +1262,12 @@ describe("PiBackendAdapter", () => {
       ...initialContext,
       generation: binding.generation + 1,
       binding,
-      appendSystemPrompt: prompt
+      appendSystemPrompt: updatedPrompt
     };
     try {
       await restarted.resumeSession(binding, resumeContext);
       const restoredPrompt = optionalArgument(specs.at(-1)!.args, "--append-system-prompt");
-      expect(restoredPrompt).toContain(prompt);
+      expect(restoredPrompt).toContain(updatedPrompt);
       expect(restoredPrompt).toContain(memoryPrompt);
       expect(restoredPrompt).toContain("Use the dedicated grep tool for content search");
       expect(restoredPrompt).toContain("After locating a target, read only the relevant range when practical");

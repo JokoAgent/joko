@@ -77,6 +77,7 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([
 
 /** Partner-only direct tools. Every call is fenced to one active canonical Session. */
 export class PartnerToolBridgeProvider implements BridgeToolProvider {
+  readonly canonicalPartnerOnly = true;
   readonly id = PARTNER_TOOL_PROVIDER_ID;
   readonly generation = 1;
   readonly available = true;

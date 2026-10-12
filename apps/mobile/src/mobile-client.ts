@@ -1,8 +1,17 @@
 import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
+import { projectPartnerSessionTask } from "@joko/contracts";
+import { MobileAttachmentCamera } from "./mobile-attachment-camera";
+import { MobilePhotoLibrary } from "./mobile-photo-library";
+import { waitForMobileAttachmentAuthority } from "./mobile-attachment-authority";
+import { createMobileGroupImageTools } from "./mobile-partner-group-images";
+import { createMobileGroupMedia } from "./mobile-partner-group-media";
+import type { MobilePartnerAvatarTransport } from "./mobile-partner-avatar";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { Code } from "@connectrpc/connect";
 import {
+  PartnerRoutineEditor, RoutineCreationReceipts, PartnerResumeEditor, PartnerImportEditor, PartnerImportReceipts, PartnerMemoryEditor, PartnerConnectionsEditor, PartnerSkillsEditor,
+  PartnerGroupAttachmentSchema, PartnerGroupAttachmentCategory,
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, SessionDerivationKind,
   CreateTaskTagMutationSchema, UpdateTaskTagMutationSchema, ReorderTaskTagsMutationSchema, SetSessionTaskTagsMutationSchema, DeleteTaskTagMutationSchema,
@@ -81,6 +90,24 @@ import {
   type MobilePartnerResourceTransport
 } from "./mobile-partner-resources";
 import {
+  assertMobilePartnerDirectorySession,
+  mobilePartnerDirectoryIdentity,
+  type MobilePartnerCatalog,
+  type MobilePartnerDirectoryProfile,
+  type MobilePartnerDirectoryTransport
+} from "./mobile-partner-directory";
+import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport } from "./mobile-partner-conversation";
+import type { MobilePartnerDirectoryObservation } from "./mobile-partner-activity";
+import type { MobilePartnerWorkingTransport } from "./mobile-partner-working";
+import { projectSessionWorkingStatus, workingStatusTurnKey } from "@joko/contracts";
+import { validateMobilePartnerProfileDraft, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
+import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
+import { MobilePartnerCreationRejected, mobilePartnerCreationBackends, validateMobilePartnerCreationDraft,
+  type MobilePartnerCreationTransport, type MobilePartnerCreationResult } from "./mobile-partner-creation";
+import type { MobilePartnerCreationReceipts } from "./mobile-partner-creation-receipts";
+import type { MobilePartnerDeletionReceipts, MobilePartnerDeletionTransport } from "./mobile-partner-deletion";
+import type { MobilePartnerRestartReceipts, MobilePartnerRestartTransport } from "./mobile-partner-restart";
+import {
   assertMobileExtensionMainViewSurface,
   mobileExtensionKey,
   sameMobileExtensionMainViewSurface,
@@ -141,6 +168,7 @@ import {
 } from "./workspace-files";
 import { sortMobileGeneratedArtifacts, sortMobileWorkspaceEntries, type MobileFilesSortMode } from "./mobile-files-presentation";
 import type { MobileFilesClipboardLease } from "./mobile-files-clipboard";
+import { MobileComposerImagePaste } from "./mobile-composer-image-paste";
 import { mapMobileAudioMetadata, mobileAudioMetadataSourceKey } from "./mobile-audio-metadata";
 import {
   mobileMediaPreviewKind,
@@ -825,6 +853,7 @@ export class MobileClient {
   #automationHistoryAbort?: AbortController;
   #automationHistoryPageTokens = new Set<string>();
   #partnerPrivateEpoch = 0;
+  #partnerGroupAttachments?: import("./mobile-partner-groups").MobileGroupAttachmentTransport;
   #partnerPrivateAbort?: AbortController;
   #partnerPrivateReadAbort?: AbortController;
   #partnerPrivateReadFlight?: Promise<void>;
@@ -833,6 +862,8 @@ export class MobileClient {
   #partnerPrivateRefreshTimer?: ReturnType<typeof setTimeout>;
   #partnerPrivateSourceSessionId?: string;
   #partnerPrivateSourceTargetId?: string;
+  #partnerCreationFlight?: { readonly ownerKey: string; readonly token: symbol };
+  #partnerCreationKnown?: { readonly ownerKey: string; readonly requestId: string };
   #partnerPrivateResume?: {
     readonly credentialKey: string;
     readonly selectedPartnerId?: string;
@@ -859,10 +890,703 @@ export class MobileClient {
     private readonly offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
     private readonly readOnlyDictionaryCache?: Pick<MobileVoiceDictionaryReadOnlyCache, "clear">,
     filesThumbnailDisk?: Pick<MobileFilesThumbnailCache, "get" | "put" | "remove">,
-    private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform)
+    private readonly deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, platform),
+    private readonly partnerCreationReceipts?: MobilePartnerCreationReceipts,
+    private readonly partnerDeletionReceipts?: MobilePartnerDeletionReceipts,
+    private readonly partnerRestartReceipts?: MobilePartnerRestartReceipts
   ) { this.#filesThumbnails = new MobileFilesThumbnailReader(filesThumbnailDisk); }
 
   get state(): MobileState { return this.#state; }
+
+  partnerCreationTransport(): MobilePartnerCreationTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    const directory = this.partnerDirectoryTransport();
+    const receipts = this.partnerCreationReceipts;
+    if (!context || !directory || !receipts || !this.network.getPartnerCreationOptions || !this.network.createPartner
+      || !this.network.getPartnerCreation || !this.network.retirePartnerCreation) return undefined;
+    const ownerKey = context.authorityKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey || this.#credential !== context.credential) {
+        throw new Error("The Partner creation owner changed.");
+      }
+    };
+    const pending = async (signal: AbortSignal): Promise<string | undefined> => {
+      requireCurrent(signal);
+      const stored = await receipts.load(context.credential, signal);
+      requireCurrent(signal);
+      if (stored) {
+        this.#partnerCreationKnown = { ownerKey, requestId: stored };
+        return stored;
+      }
+      return this.#partnerCreationKnown?.ownerKey === ownerKey ? this.#partnerCreationKnown.requestId : undefined;
+    };
+    const load: MobilePartnerCreationTransport["load"] = async (signal) => {
+      requireCurrent(signal);
+      const options = await this.network.getPartnerCreationOptions!(context.credential, signal);
+      const catalog = await directory.list(signal);
+      const observed = await this.network.readOwner(context.credential, this.deviceNameSource(), signal);
+      requireCurrent(signal);
+      this.#assertOwner(context.credential, observed, this.#state.node!);
+      if (this.#partnerPrivateAuthorityKey({ ...this.#state, owner: observed.snapshot }) !== ownerKey
+        || options.revision !== catalog.directory.revision) throw new Error("The Partner creation options changed. Refresh this form.");
+      return { ownerKey, options, names: catalog.partners.map(({ partnerId, displayName }) => ({ partnerId, displayName })),
+        backends: mobilePartnerCreationBackends(observed.snapshot) };
+    };
+    const action = async <T,>(signal: AbortSignal, perform: () => Promise<T>): Promise<T> => {
+      requireCurrent(signal);
+      if (this.#partnerCreationFlight?.ownerKey === ownerKey) throw new Error("A Partner creation action is already in flight.");
+      const token = Symbol("partner-create"); this.#partnerCreationFlight = { ownerKey, token };
+      try { return await perform(); }
+      finally { if (this.#partnerCreationFlight?.token === token) this.#partnerCreationFlight = undefined; }
+    };
+    const resolve = async (requestId: string, result: MobilePartnerCreationResult, signal: AbortSignal): Promise<MobilePartnerCreationResult> => {
+      requireCurrent(signal);
+      if (result.kind !== "absent") {
+        await receipts.resolve(context.credential, requestId, signal);
+        requireCurrent(signal);
+        if (this.#partnerCreationKnown?.ownerKey === ownerKey && this.#partnerCreationKnown.requestId === requestId) {
+          this.#partnerCreationKnown = undefined;
+        }
+      }
+      return result;
+    };
+    const requirePending = async (requestId: string, signal: AbortSignal): Promise<void> => {
+      if (await pending(signal) !== requestId) throw new Error("Select the current retained Partner creation request.");
+      requireCurrent(signal);
+    };
+    return { ownerKey, pending, load,
+      create: (snapshot, draft, signal) => action(signal, async () => {
+        if (snapshot.ownerKey !== ownerKey) throw new Error("The Partner creation draft belongs to another owner.");
+        if (await pending(signal)) throw new Error("Check the retained Partner creation result before creating again.");
+        const fresh = await load(signal);
+        if (fresh.options.revision !== snapshot.options.revision) throw new Error("Refresh the Partner form before creating.");
+        const validated = validateMobilePartnerCreationDraft(fresh, draft);
+        const frozen = { ...validated, avatar: typeof validated.avatar === "string" ? validated.avatar : { base64: validated.avatar.base64 },
+          capabilities: { ...validated.capabilities, modelChain: validated.capabilities.modelChain.map((route) => ({ ...route })) } };
+        const requestId = this.newId();
+        await receipts.claim(context.credential, requestId, signal);
+        requireCurrent(signal);
+        this.#partnerCreationKnown = { ownerKey, requestId };
+        try {
+          const returned = await this.network.createPartner!(context.credential, requestId, fresh.options.revision, frozen, signal);
+          requireCurrent(signal);
+          const confirmed = await this.network.getPartnerCreation!(context.credential, requestId, signal);
+          requireCurrent(signal);
+          if (confirmed.kind === "absent" || confirmed.kind === "retired" || returned.kind === "found"
+            && confirmed.kind === "found" && returned.partner.partnerId !== confirmed.partner.partnerId) {
+            throw new Error("The created Partner could not be confirmed.");
+          }
+          return await resolve(requestId, confirmed, signal);
+        } catch (error) {
+          requireCurrent(signal);
+          if (error instanceof MobilePartnerCreationRejected) await resolve(requestId, { kind: "retired" }, signal);
+          throw error;
+        }
+      }),
+      lookup: (requestId, signal) => action(signal, async () => {
+        await requirePending(requestId, signal);
+        const result = await this.network.getPartnerCreation!(context.credential, requestId, signal);
+        requireCurrent(signal);
+        return resolve(requestId, result, signal);
+      }),
+      retire: (requestId, signal) => action(signal, async () => {
+        await requirePending(requestId, signal);
+        const result = await this.network.retirePartnerCreation!(context.credential, requestId, signal);
+        requireCurrent(signal);
+        if (result.kind === "absent") throw new Error("The original Partner intent could not be retired.");
+        return resolve(requestId, result, signal);
+      }) };
+  }
+
+  partnerWorkingTransport(): MobilePartnerWorkingTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.readPartnerWorkingStatus) return undefined;
+    const ownerKey = context.authorityKey;
+    const current = (): boolean => this.#partnerPrivateAuthorityKey(this.#state) === ownerKey && this.#credential === context.credential;
+    return { ownerKey, read: async (partner, expected, locale, signal) => {
+      const requireCurrent = (): void => {
+        signal.throwIfAborted();
+        if (!current() || partner.lifecycle !== "active" || partner.initializationState !== "ready"
+          || partner.canonicalSessionId !== expected.sessionId || partner.homeTargetId !== expected.targetId
+          ) throw new Error("The Partner working owner changed.");
+        const snapshot = this.#state.detail?.sessions.some((session) => session.sessionId === expected.sessionId)
+          ? this.#state.detail : this.#state.owner;
+        const matches = snapshot?.sessions.filter((session) => session.sessionId === expected.sessionId) ?? [];
+        const live = snapshot && matches.length === 1
+          ? projectSessionWorkingStatus(matches[0]!, snapshot.runs, snapshot.interactions, []) : undefined;
+        if (!live || workingStatusTurnKey(live) !== workingStatusTurnKey(expected)) throw new Error("The Partner working turn changed.");
+      };
+      requireCurrent();
+      const text = await this.network.readPartnerWorkingStatus!(context.credential, partner.partnerId, expected, locale, signal);
+      requireCurrent();
+      return text;
+    } };
+  }
+
+  partnerDirectoryObservation(): MobilePartnerDirectoryObservation | undefined {
+    if (this.#state.status !== "connected" && this.#state.status !== "offline") return undefined;
+    const ownerKey = this.#partnerPrivateAuthorityKey({ ...this.#state, status: "connected" });
+    return ownerKey && this.#state.owner ? { ownerKey, online: this.#state.status === "connected", snapshot: this.#state.owner } : undefined;
+  }
+
+  partnerDirectoryTransport(): MobilePartnerDirectoryTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    const listPartnerCatalog = this.network.listPartnerCatalog;
+    if (!context || !listPartnerCatalog) return undefined;
+    const ownerKey = context.authorityKey;
+    const current = (): boolean => this.#partnerPrivateAuthorityKey(this.#state) === ownerKey
+      && this.#credential === context.credential;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (!current()) throw new Error("The Partner directory owner changed.");
+    };
+    const list = async (signal: AbortSignal): Promise<MobilePartnerCatalog> => {
+      requireCurrent(signal);
+      const catalog = await listPartnerCatalog.call(this.network, context.credential, signal);
+      requireCurrent(signal);
+      return catalog;
+    };
+    const exact = (catalog: MobilePartnerCatalog, selected: MobilePartnerDirectoryProfile): MobilePartnerDirectoryProfile => {
+      const matches = catalog.partners.filter((partner) => partner.partnerId === selected.partnerId);
+      if (matches.length !== 1 || mobilePartnerDirectoryIdentity(matches[0]!) !== mobilePartnerDirectoryIdentity(selected)) {
+        throw new Error("The selected Partner changed; refresh the directory and try again.");
+      }
+      return matches[0]!;
+    };
+    return {
+      ownerKey,
+      list,
+      open: async (selected, signal) => {
+        const initial = exact(await list(signal), selected);
+        const initialSessions = await this.network.listPartnerSessions(context.credential, initial.partnerId, signal);
+        requireCurrent(signal);
+        const sessionId = assertMobilePartnerDirectorySession(initial, initialSessions);
+        const visible = this.#state.owner?.sessions.filter((session) => session.sessionId === sessionId) ?? [];
+        if (visible.length !== 1 || visible[0]!.targetId !== initial.homeTargetId
+          || visible[0]!.archived
+          || visible[0]!.state === SessionState.ARCHIVED || visible[0]!.state === SessionState.CLOSED) {
+          throw new Error("The Partner canonical task is not available in the current task directory.");
+        }
+        await this.select(sessionId);
+        requireCurrent(signal);
+        if (this.#state.selectedId !== sessionId) {
+          throw new Error("The Partner canonical task was not selected by the current owner.");
+        }
+        const finalPartner = exact(await list(signal), initial);
+        const finalSessions = await this.network.listPartnerSessions(context.credential, finalPartner.partnerId, signal);
+        requireCurrent(signal);
+        if (assertMobilePartnerDirectorySession(finalPartner, finalSessions) !== sessionId) {
+          throw new Error("The Partner canonical task changed while it was opening.");
+        }
+        return { sessionId };
+      }
+    };
+  }
+
+  partnerInitializationTransport(): MobilePartnerInitializationTransport | undefined {
+    const directory = this.partnerDirectoryTransport();
+    const context = this.#partnerPrivateContext();
+    const retryInitialization = this.network.retryPartnerInitialization;
+    if (!directory || !context || !retryInitialization) return undefined;
+    const ownerKey = directory.ownerKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey) {
+        throw new Error("The Partner initialization owner changed.");
+      }
+    };
+    const load: MobilePartnerInitializationTransport["load"] = async (partnerId, signal) => {
+      if (!validMobilePartnerId(partnerId)) throw new Error("Select a current Partner initialization.");
+      const catalog = await directory.list(signal);
+      requireCurrent(signal);
+      const matches = catalog.partners.filter((partner) => partner.partnerId === partnerId);
+      if (matches.length !== 1 || matches[0]!.lifecycle !== "active") {
+        throw new Error("The Partner initialization is no longer available.");
+      }
+      return matches[0]!;
+    };
+    return { ownerKey, load, retry: async (selected, signal) => {
+      requireCurrent(signal);
+      const current = await load(selected.partnerId, signal);
+      if (mobilePartnerDirectoryIdentity(current) !== mobilePartnerDirectoryIdentity(selected)
+        || current.initializationState !== "error") {
+        throw new Error("The Partner initialization changed; refresh before retrying.");
+      }
+      const action = this.#claimMutation();
+      try {
+        const updated = await retryInitialization.call(this.network, context.credential, current.partnerId,
+          current.revision, signal);
+        requireCurrent(signal);
+        const sameProfile = (value: MobilePartnerDirectoryProfile): boolean => value.partnerId === current.partnerId
+          && value.lifecycle === "active" && value.homeTargetId === current.homeTargetId
+          && value.profileVersion === current.profileVersion
+          && value.capabilities.modelChain[0]?.backendId === current.capabilities.modelChain[0]?.backendId
+          && (current.canonicalSessionId === undefined || value.canonicalSessionId === current.canonicalSessionId);
+        if (!sameProfile(updated) || updated.revision <= current.revision) {
+          throw new Error("The initialization result belongs to another Partner profile.");
+        }
+        const confirmed = await load(current.partnerId, signal);
+        if (!sameProfile(confirmed) || confirmed.revision < updated.revision) {
+          throw new Error("The Partner initialization result could not be confirmed.");
+        }
+        return confirmed;
+      } catch (error) {
+        signal.throwIfAborted();
+        throw new Error("The Partner initialization retry may have been applied. Refresh before another retry.", { cause: error });
+      } finally { this.#releaseMutation(action); }
+    }, open: async (selected, signal) => {
+      requireCurrent(signal);
+      const current = await load(selected.partnerId, signal);
+      if (mobilePartnerDirectoryIdentity(current) !== mobilePartnerDirectoryIdentity(selected)
+        || current.initializationState !== "ready") throw new Error("The initialized Partner changed before opening.");
+      // A just-initialized home may not be in the last task snapshot yet. Observe it without reconnecting
+      // or retiring the recovery page's owner, then use the existing canonical navigation checks.
+      const node = this.#state.node!;
+      const observed = await this.network.readOwner(context.credential, this.deviceNameSource(), signal);
+      requireCurrent(signal);
+      this.#assertOwner(context.credential, observed, node);
+      if (this.#partnerPrivateAuthorityKey({ ...this.#state, owner: observed.snapshot }) !== ownerKey) {
+        throw new Error("The Partner initialization task directory owner changed.");
+      }
+      this.#set({ owner: observed.snapshot });
+      requireCurrent(signal);
+      return directory.open(current, signal);
+    } };
+  }
+
+  partnerConversationTransport(): MobilePartnerConversationTransport | undefined {
+    const directory = this.partnerDirectoryTransport();
+    const presentationKey = this.taskPresentationOwnerKey();
+    const credential = this.#credential;
+    const sessionId = this.#state.selectedId;
+    if (!directory || !presentationKey || !credential || !sessionId) return undefined;
+    const ownerKey = `${directory.ownerKey}\u001f${presentationKey}`;
+    const requireCurrent = (signal: AbortSignal): Session => {
+      signal.throwIfAborted();
+      if (this.#credential !== credential || this.#partnerPrivateAuthorityKey(this.#state) !== directory.ownerKey
+        || this.taskPresentationOwnerKey() !== presentationKey || this.#state.selectedId !== sessionId) {
+        throw new Error("The Partner conversation owner changed.");
+      }
+      return this.#selectedSession()!;
+    };
+    const resolve = async (signal: AbortSignal): Promise<MobilePartnerDirectoryProfile | undefined> => {
+      const catalog = await directory.list(signal);
+      const session = requireCurrent(signal);
+      const matches = catalog.partners.filter((partner) => partner.canonicalSessionId === sessionId);
+      if (matches.length === 0) return undefined;
+      const partner = matches[0]!;
+      if (matches.length !== 1 || partner.homeTargetId !== session.targetId) {
+        throw new Error("The Partner conversation identity is inconsistent.");
+      }
+      const sessions = await this.network.listPartnerSessions(credential, partner.partnerId, signal);
+      requireCurrent(signal);
+      if (assertMobilePartnerDirectorySession(partner, sessions, true) !== sessionId) {
+        throw new Error("The Partner conversation is no longer canonical.");
+      }
+      return partner;
+    };
+    return { ownerKey, sessionId, resolve, acknowledge: async (partner, reply, signal, stillVisible) => {
+      const requireVisible = (): void => {
+        const session = requireCurrent(signal);
+        if (!stillVisible() || session.archived || ![SessionState.IDLE, SessionState.ERROR].includes(session.state)) {
+          throw new Error("The completed Partner reply is no longer visible in an idle conversation.");
+        }
+        const events = this.#state.window
+          ?? [...this.#state.older, ...(this.#state.detail?.timeline ?? []), ...this.#state.live];
+        const actual = mobilePartnerVisibleReply(events, sessionId, this.#state.owner!.generation,
+          new Set([reply.messageId]));
+        if (!actual || actual.eventId !== reply.eventId || actual.cursor !== reply.cursor) {
+          throw new Error("The Partner read cursor is not a current completed public reply.");
+        }
+      };
+      requireVisible();
+      const current = await resolve(signal);
+      requireVisible();
+      if (!current || mobilePartnerDirectoryIdentity(current) !== mobilePartnerDirectoryIdentity(partner)) {
+        throw new Error("The Partner profile changed before read acknowledgement.");
+      }
+      if (reply.cursor <= current.activity.readThroughCursor) return current.activity;
+      if (!this.network.markPartnerRead) throw new Error("Partner read acknowledgement is unavailable.");
+      const activity = await this.network.markPartnerRead(credential, partner.partnerId, reply.cursor, signal);
+      requireCurrent(signal);
+      if (activity.partnerId !== partner.partnerId || activity.readThroughCursor < reply.cursor) {
+        throw new Error("The Partner read acknowledgement is invalid.");
+      }
+      return activity;
+    } };
+  }
+
+  partnerAvatarTransport(): MobilePartnerAvatarTransport | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.readPartnerAvatar) return undefined;
+    const ownerKey = context.authorityKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey || this.#credential !== context.credential) {
+        throw new Error("The Partner image owner changed.");
+      }
+    };
+    return { ownerKey, read: async (partner, signal) => {
+      requireCurrent(signal);
+      const uri = await this.network.readPartnerAvatar!(context.credential, partner, signal);
+      requireCurrent(signal); return uri;
+    } };
+  }
+
+  partnerProfileTransport(): MobilePartnerProfileTransport | undefined {
+    const conversation = this.partnerConversationTransport();
+    const directory = this.partnerDirectoryTransport();
+    const context = this.#partnerPrivateContext();
+    if (!conversation || !directory || !context || !this.network.getPartnerProfileOptions || !this.network.updatePartnerProfile) return undefined;
+    const ownerKey = conversation.ownerKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.partnerConversationTransport()?.ownerKey !== ownerKey || this.#credential !== context.credential) {
+        throw new Error("The Partner profile owner changed.");
+      }
+    };
+    const load: MobilePartnerProfileTransport["load"] = async (selected, signal) => {
+      requireCurrent(signal);
+      const partner = await conversation.resolve(signal);
+      requireCurrent(signal);
+      if (!partner || partner.partnerId !== selected.partnerId) throw new Error("The Partner profile is no longer canonical.");
+      const options = await this.network.getPartnerProfileOptions!(context.credential, signal);
+      const catalog = await directory.list(signal);
+      requireCurrent(signal);
+      const final = catalog.partners.find((candidate) => candidate.partnerId === partner.partnerId);
+      if (!final || mobilePartnerDirectoryIdentity(final) !== mobilePartnerDirectoryIdentity(partner)
+        || options.revision !== catalog.directory.revision) throw new Error("The Partner profile changed while its settings were loading.");
+      const controls = this.taskRuntimeControls();
+      const taskModels = mobilePartnerCreationBackends(this.#state.owner).flatMap(backend => backend.models.map(model => ({ ...model,
+        canSwitchModel: backend.canSwitchModel, canSetEffort: backend.canSetEffort, canSetFastMode: backend.canSetFastMode, canSetPlanMode: backend.canSetPlanMode,
+        permissionModes: backend.permissionModes })));
+      const sessions = await this.network.listPartnerSessions(context.credential, final.partnerId, signal); requireCurrent(signal);
+      return { ownerKey, partner: final, options,
+        tasks: sessions.tasks.map(task => projectPartnerSessionTask(task, final.partnerId)),
+        names: catalog.partners.map(({ partnerId, displayName }) => ({ partnerId, displayName })),
+        models: taskModels,
+        taskModels,
+        canSwitchModel: controls?.canSwitchModel === true, canSetEffort: controls?.canSetEffort === true,
+        canSetFastMode: controls?.canSetFastMode === true, canSetPlanMode: controls?.canSetPlanMode === true,
+        permissionModes: (controls?.permissionModes ?? []).filter((mode) => mode === PermissionMode.ASK || mode === PermissionMode.AUTO)
+          .map((mode) => mode === PermissionMode.ASK ? "ask" as const : "auto" as const) };
+    };
+    return { ownerKey, load,
+      controlTask: async (snapshot, task, action, signal) => {
+        requireCurrent(signal);
+        if (snapshot.ownerKey !== ownerKey || task.partnerId !== snapshot.partner.partnerId || !this.network.controlPartnerSessionTask) throw new Error("Independent task control is unavailable.");
+        await this.network.controlPartnerSessionTask(context.credential, this.newId(), snapshot.partner.partnerId, snapshot.partner.revision, task, action, signal); requireCurrent(signal);
+      },
+      openTask: async (snapshot, task, signal) => {
+        requireCurrent(signal); if (snapshot.ownerKey !== ownerKey || task.partnerId !== snapshot.partner.partnerId || !task.sessionId) throw new Error("Select a current independent task.");
+        const listed = await this.network.listPartnerSessions(context.credential, task.partnerId, signal); requireCurrent(signal);
+        if (!listed.tasks.some(item => item.id === task.id && item.partnerId === task.partnerId && item.sessionId === task.sessionId)) throw new Error("The independent task changed.");
+        await this.select(task.sessionId);
+        if (this.#credential !== context.credential || this.#state.selectedId !== task.sessionId) throw new Error("The task owner changed while opening.");
+      },
+      save: async (snapshot, draft, signal) => {
+      requireCurrent(signal);
+      if (snapshot.ownerKey !== ownerKey) throw new Error("The Partner profile draft belongs to another owner.");
+      const fresh = await load(snapshot.partner, signal);
+      if (mobilePartnerDirectoryIdentity(fresh.partner) !== mobilePartnerDirectoryIdentity(snapshot.partner)
+        || fresh.options.revision !== snapshot.options.revision) {
+        throw new Error("The Partner profile changed; refresh settings before saving this draft.");
+      }
+      const validated = validateMobilePartnerProfileDraft(fresh, draft);
+      requireCurrent(signal);
+      const action = this.#claimMutation();
+      try {
+        const updated = await this.network.updatePartnerProfile!(context.credential, fresh.partner.partnerId,
+          fresh.partner.revision, validated, signal);
+        requireCurrent(signal);
+        if (updated.partnerId !== fresh.partner.partnerId || updated.canonicalSessionId !== conversation.sessionId
+          || updated.homeTargetId !== fresh.partner.homeTargetId || updated.revision < fresh.partner.revision) {
+          throw new Error("The Partner update returned a different canonical identity.");
+        }
+        const confirmed = (await load(updated, signal)).partner;
+        if (confirmed.revision < updated.revision || confirmed.displayName !== validated.displayName
+          || confirmed.description !== validated.description
+          || JSON.stringify(confirmed.avatar) !== JSON.stringify(updated.avatar) || confirmed.identitySource !== validated.identitySource
+          || confirmed.usesDirectoryDefaults !== validated.usesDirectoryDefaults
+          || JSON.stringify(confirmed.taskModelOverride) !== JSON.stringify(validated.taskModelOverride)
+          || !validated.usesDirectoryDefaults && JSON.stringify(confirmed.capabilities) !== JSON.stringify(validated.capabilities)) {
+          throw new Error("The saved Partner profile could not be confirmed by the current node.");
+        }
+        return confirmed;
+      } catch (error) {
+        signal.throwIfAborted();
+        throw new Error("The Partner update may have been applied. Refresh settings before another save.", { cause: error });
+      } finally { this.#releaseMutation(action); }
+    } };
+  }
+
+  partnerDeletionTransport(): MobilePartnerDeletionTransport | undefined {
+    const context = this.#partnerPrivateContext(); const directory = this.partnerDirectoryTransport();
+    const receipts = this.partnerDeletionReceipts;
+    if (!context || !directory || !receipts || !this.network.deletePartner || !this.network.getPartnerDeletion
+      || !this.network.retryPartnerDeletion || !this.network.retirePartnerDeletion) return undefined;
+    const ownerKey = context.authorityKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey || this.#credential !== context.credential) throw new Error("The Partner deletion owner changed.");
+    };
+    const settle = async (result: import("@joko/contracts").PartnerDeletionResult, requestId: string, signal: AbortSignal) => {
+      requireCurrent(signal);
+      if (result.deletion && (result.deletion.requestId !== requestId || result.retired)) throw new Error("The Partner deletion receipt changed.");
+      if (result.retired || result.deletion?.phase === "completed") await receipts.resolve(context.credential, requestId, signal);
+      requireCurrent(signal); return result;
+    };
+    return { ownerKey,
+      newRequestId: () => this.newId(),
+      listRequests: async (signal) => {
+        requireCurrent(signal); const ids = await receipts.load(context.credential, signal);
+        const catalog = await directory.list(signal); requireCurrent(signal);
+        return [...new Set([...ids, ...(catalog.pendingDeletions ?? []).map((entry) => entry.requestId)])];
+      },
+      delete: async (requestId, selected, confirmName, signal) => {
+        requireCurrent(signal); const catalog = await directory.list(signal); requireCurrent(signal);
+        const fresh = catalog.partners.find((entry) => entry.partnerId === selected.partnerId);
+        if (!fresh || fresh.revision !== selected.revision || fresh.displayName !== confirmName) throw new Error("Refresh the Partner before confirming deletion.");
+        await receipts.claim(context.credential, requestId, signal); requireCurrent(signal);
+        const action = this.#claimMutation();
+        try {
+          const deletion = await this.network.deletePartner!(context.credential, requestId, selected.partnerId, selected.revision, confirmName, signal);
+          if (deletion.partnerId !== selected.partnerId) throw new Error("The Partner deletion owner changed.");
+          await settle({ deletion, retired: false }, requestId, signal); return deletion;
+        } finally { this.#releaseMutation(action); }
+      },
+      read: async (id, signal) => { requireCurrent(signal); return settle(await this.network.getPartnerDeletion!(context.credential, id, signal), id, signal); },
+      retire: async (id, signal) => { requireCurrent(signal); return settle(await this.network.retirePartnerDeletion!(context.credential, id, signal), id, signal); },
+      retry: async (id, signal) => {
+        requireCurrent(signal); const action = this.#claimMutation();
+        try { const deletion = await this.network.retryPartnerDeletion!(context.credential, id, signal);
+          await settle({ deletion, retired: false }, id, signal); return deletion;
+        } finally { this.#releaseMutation(action); }
+      }
+    };
+  }
+
+  partnerRestartTransport(): MobilePartnerRestartTransport | undefined {
+    const context = this.#partnerPrivateContext(); const directory = this.partnerDirectoryTransport();
+    const receipts = this.partnerRestartReceipts;
+    if (!context || !directory || !receipts || !this.network.restartPartner || !this.network.getPartnerRestart
+      || !this.network.retryPartnerRestart || !this.network.retirePartnerRestart || !this.network.getPartnerRestartControls) return undefined;
+    const ownerKey = context.authorityKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey || this.#credential !== context.credential) throw new Error("The Partner restart owner changed.");
+    };
+    const settle = async (result: import("@joko/contracts").PartnerRestartResult, requestId: string, signal: AbortSignal) => {
+      requireCurrent(signal);
+      if (result.restart && (result.restart.requestId !== requestId || result.retired)) throw new Error("The Partner restart receipt changed.");
+      if (result.retired || result.restart?.phase === "ready") await receipts.resolve(context.credential, requestId, signal);
+      requireCurrent(signal); return result;
+    };
+    return { ownerKey,
+      newRequestId: () => this.newId(),
+      controls: async (selected, signal) => { requireCurrent(signal);
+        const controls = await this.network.getPartnerRestartControls!(context.credential, selected.partnerId, signal);
+        requireCurrent(signal); return controls; },
+      listRequests: async (signal) => {
+        requireCurrent(signal); const ids = await receipts.load(context.credential, signal);
+        const catalog = await directory.list(signal); requireCurrent(signal);
+        return [...new Set([...ids, ...(catalog.pendingRestarts ?? []).map((entry) => entry.requestId)])];
+      },
+      restart: async (requestId, selected, signal) => {
+        requireCurrent(signal); const catalog = await directory.list(signal); requireCurrent(signal);
+        const fresh = catalog.partners.find((entry) => entry.partnerId === selected.partnerId);
+        if (!fresh || fresh.revision !== selected.revision) throw new Error("Refresh the Partner before restarting.");
+        const controls = await this.network.getPartnerRestartControls!(context.credential, selected.partnerId, signal); requireCurrent(signal);
+        if (!controls.available || controls.revision !== selected.revision) throw new Error("The Partner restart controls changed.");
+        await receipts.claim(context.credential, requestId, signal); requireCurrent(signal);
+        const action = this.#claimMutation();
+        try {
+          const restart = await this.network.restartPartner!(context.credential, requestId, selected.partnerId, selected.revision, signal);
+          if (restart.partnerId !== selected.partnerId) throw new Error("The Partner restart owner changed.");
+          await settle({ restart, retired: false }, requestId, signal); return restart;
+        } finally { this.#releaseMutation(action); }
+      },
+      read: async (id, signal) => { requireCurrent(signal); return settle(await this.network.getPartnerRestart!(context.credential, id, signal), id, signal); },
+      retire: async (id, signal) => { requireCurrent(signal); return settle(await this.network.retirePartnerRestart!(context.credential, id, signal), id, signal); },
+      retry: async (id, signal) => {
+        requireCurrent(signal); const action = this.#claimMutation();
+        try { const restart = await this.network.retryPartnerRestart!(context.credential, id, signal);
+          await settle({ restart, retired: false }, id, signal); return restart;
+        } finally { this.#releaseMutation(action); }
+      }
+    };
+  }
+
+  partnerResumeEditor(selected: MobilePartnerDirectoryProfile, conversationOwnerKey?: string): PartnerResumeEditor | undefined {
+    const context = this.#partnerPrivateContext(); const directory = this.partnerDirectoryTransport();
+    if (!context || !directory || !this.network.resumePartner || selected.lifecycle !== "paused") return undefined;
+    const ownerKey = conversationOwnerKey ?? context.authorityKey;
+    const requireCurrent = (signal: AbortSignal): void => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential
+        || conversationOwnerKey !== undefined && this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) {
+        throw new Error("The Partner resume owner changed.");
+      }
+    };
+    const profile = (value: MobilePartnerDirectoryProfile) => ({ ...value, backendId: value.capabilities.modelChain[0]?.backendId ?? "" });
+    const read = async (signal: AbortSignal) => {
+      requireCurrent(signal); const catalog = await directory.list(signal); requireCurrent(signal);
+      const rows = catalog.partners.filter(value => value.partnerId === selected.partnerId);
+      if (rows.length !== 1) throw new Error("The paused Partner is no longer available.");
+      return profile(rows[0]!);
+    };
+    return new PartnerResumeEditor({ ownerKey, read, resume: async (current, signal) => {
+      requireCurrent(signal); const fresh = await read(signal); requireCurrent(signal);
+      if (mobilePartnerDirectoryIdentity(fresh) !== mobilePartnerDirectoryIdentity(current) || fresh.lifecycle !== "paused"
+        || fresh.pauseCleanupPending !== current.pauseCleanupPending) throw new Error("Refresh the Partner before resuming.");
+      const action = this.#claimMutation();
+      try { const resumed = await this.network.resumePartner!(context.credential, current.partnerId, current.revision, signal);
+        requireCurrent(signal); return profile(resumed);
+      } finally { this.#releaseMutation(action); }
+    } }, profile(selected));
+  }
+
+  partnerImportEditor(storage: import("@joko/contracts").ImportReceiptStorage): import("@joko/contracts").PartnerImportEditor | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.partnerImportApi) return undefined;
+    const api = this.network.partnerImportApi(context.credential, context.authorityKey, this.newId, signal => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential) throw new Error("IMPORT_OWNER_CHANGED");
+    });
+    const credential = context.credential;
+    return new PartnerImportEditor(api, new PartnerImportReceipts(storage,
+      JSON.stringify([credential.serverId, credential.profileId, credential.deviceId, new URL(credential.origin).href])));
+  }
+
+  partnerSkillsEditor(partner: MobilePartnerDirectoryProfile, conversationOwnerKey: string): import("@joko/contracts").PartnerSkillsEditor | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.partnerSkillsApi || !partner.canonicalSessionId
+      || this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) return undefined;
+    const api = this.network.partnerSkillsApi(context.credential, partner.partnerId, conversationOwnerKey, signal => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential
+        || this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) throw new Error("Partner skills owner changed.");
+    });
+    return new PartnerSkillsEditor(api, { partnerId: partner.partnerId, homeTargetId: partner.homeTargetId, canonicalSessionId: partner.canonicalSessionId });
+  }
+
+  partnerConnectionsEditor(partner: MobilePartnerDirectoryProfile, conversationOwnerKey?: string): import("@joko/contracts").PartnerConnectionsEditor | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.partnerConnectionsApi || !partner.canonicalSessionId
+      || conversationOwnerKey !== undefined && this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) return undefined;
+    const ownerKey = conversationOwnerKey ?? context.authorityKey;
+    const api = this.network.partnerConnectionsApi(context.credential, partner.partnerId, ownerKey, signal => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential
+        || conversationOwnerKey !== undefined && this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) throw new Error("Partner connections owner changed.");
+    });
+    return new PartnerConnectionsEditor(api, { partnerId: partner.partnerId, homeTargetId: partner.homeTargetId, canonicalSessionId: partner.canonicalSessionId });
+  }
+
+  partnerMemoryEditor(partner: MobilePartnerDirectoryProfile, conversationOwnerKey?: string): import("@joko/contracts").PartnerMemoryEditor | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.partnerMemoryApi || !partner.canonicalSessionId
+      || conversationOwnerKey !== undefined && this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) return undefined;
+    const ownerKey = conversationOwnerKey ?? context.authorityKey;
+    const api = this.network.partnerMemoryApi(context.credential, partner.partnerId, ownerKey, signal => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential
+        || conversationOwnerKey !== undefined && this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) {
+        throw new Error("Partner memory owner changed.");
+      }
+    });
+    return new PartnerMemoryEditor(api, { partnerId: partner.partnerId, homeTargetId: partner.homeTargetId, canonicalSessionId: partner.canonicalSessionId });
+  }
+
+  partnerGroupAttachmentTransport(): import("./mobile-partner-groups").MobileGroupAttachmentTransport | undefined {
+    const context = this.#partnerPrivateContext(), files = this.attachmentFiles, api = this.partnerGroupApi();
+    if (!context || !files || !this.network.listPartnerCatalog || !api) return undefined;
+    if (this.#partnerGroupAttachments?.ownerKey === context.authorityKey) return this.#partnerGroupAttachments;
+    const current = (signal: AbortSignal) => { signal.throwIfAborted(); if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential) throw new Error("Group attachment owner changed."); };
+    const photoLibrary = new MobilePhotoLibrary(files), camera = new MobileAttachmentCamera(files);
+    const policyFor = async (group: import("@joko/contracts").PartnerGroupSummary, signal: AbortSignal) => {
+        current(signal); const catalog = await this.network.listPartnerCatalog!(context.credential, signal); current(signal);
+        const policies = catalog.partners.filter(partner => group.members.some(member => member.partnerId === partner.partnerId)).flatMap(partner => {
+          const route = partner.capabilities.modelChain[0], backend = this.#state.owner?.backends.find(item => item.backendId === route?.backendId);
+          const model = route ? resolveMobileExplicitNewTaskModelAuthority(this.#state.owner, route.backendId, { providerId: route.providerId, modelId: route.modelId, fastMode: route.fastMode, ...(route.effort ? { effortId: route.effort } : {}) }) : undefined;
+          const policy = resolveMobileAttachmentPolicy(backend, model?.supportsImages === true); return policy ? [policy] : [];
+        });
+        if (!policies.length) throw new Error("No current group member accepts attachments.");
+        const policy = { images: policies.some(item => item.images), files: policies.some(item => item.files), maximumItems: 20,
+          maximumBytes: Math.min(...policies.map(item => item.maximumBytes)), imageMediaTypes: [...new Set(policies.flatMap(item => item.imageMediaTypes))],
+          fileMediaTypes: policies.some(item => item.files && !item.fileMediaTypes.length) ? [] : [...new Set(policies.flatMap(item => item.fileMediaTypes))] };
+        return policy;
+    };
+    const transport: import("./mobile-partner-groups").MobileGroupAttachmentTransport = { ownerKey: context.authorityKey, profileId: context.credential.profileId, photoLibrary,
+      ...createMobileGroupMedia({ ownerKey: context.authorityKey, api, newId: this.newId, current, fileShare: this.fileShare,
+        thumbnail: (blob, signal) => this.network.readImageThumbnail(context.credential, blob, 256, signal),
+        download: (blob, signal) => this.network.downloadBlob(context.credential, blob, signal), authorize: (blob, signal) => this.network.authorizeBlobDownload(context.credential, blob, signal) }),
+      ...createMobileGroupImageTools({ files, profileId: context.credential.profileId, newId: this.newId, current, policy: policyFor }),
+      paste: async (group, existing, images, signal) => {
+        const policy = await policyFor(group, signal);
+        const staged = await new MobileComposerImagePaste(files).stage(context.credential.profileId, existing, policy, images, this.newId, signal);
+        try { current(signal); return staged; }
+        catch (error) { await Promise.all(staged.map(item => files.remove(context.credential.profileId, item))); throw error; }
+      },
+      removeReplacedImage: async (original, replacement) => { if (original.attachmentId === replacement.attachmentId) return;
+        await files.removeVisibleBytes(context.credential.profileId, original);
+        if (original.annotation && original.annotation.source.storageId !== replacement.annotation?.source.storageId) await files.removeOwnedBytes(context.credential.profileId, original.annotation.source.storageId);
+      },
+      pick: async (group, existing, signal, source = "files", assets) => {
+        const policy = await policyFor(group, signal);
+        const staged = source === "camera" ? await camera.captureAndStage(context.credential.profileId, existing, policy, this.newId, signal)
+          : source === "photos" ? assets ? await photoLibrary.stageSelectedAssets(context.credential.profileId, existing, policy, assets, this.newId, signal)
+            : await photoLibrary.pickSystemAndStage(context.credential.profileId, existing, policy, this.newId, signal)
+          : await files.pickAndStage(context.credential.profileId, existing, policy, this.newId, signal);
+        try {
+          await waitForMobileAttachmentAuthority({ profileId: context.credential.profileId, surfaceOwnerKey: context.authorityKey },
+            () => this.#partnerPrivateAuthorityKey(this.#state) ? { profileId: context.credential.profileId, surfaceOwnerKey: this.#partnerPrivateAuthorityKey(this.#state)!, policy } : undefined,
+            listener => this.subscribe(() => listener()), { signal, retired: () => this.#disposed || this.#credential !== context.credential || this.#activeProfileId !== context.credential.profileId || ["unpaired", "revoked"].includes(this.#state.status) });
+          current(signal); return staged;
+        } catch (error) { await Promise.all(staged.map(item => files.remove(context.credential.profileId, item))); throw error; }
+      },
+      upload: async (attachment, signal) => {
+        current(signal); const source = await files.verifyForUpload(context.credential.profileId, attachment, signal); current(signal);
+        const blob = await this.network.uploadBlob(context.credential, source, signal); current(signal);
+        return create(PartnerGroupAttachmentSchema, { id: attachment.attachmentId, name: attachment.fileName, blob, annotated: attachment.annotation !== undefined,
+          category: attachment.kind === "image" ? PartnerGroupAttachmentCategory.IMAGE : attachment.mediaType === "application/pdf" ? PartnerGroupAttachmentCategory.PDF : attachment.mediaType.startsWith("text/") ? PartnerGroupAttachmentCategory.TEXT : PartnerGroupAttachmentCategory.FILE });
+      }, remove: attachment => files.remove(context.credential.profileId, attachment) };
+    this.#partnerGroupAttachments = transport;
+    return transport;
+  }
+
+  partnerGroupReceiptScope(): string | undefined {
+    const credential = this.#credential;
+    return credential ? JSON.stringify([credential.serverId, credential.profileId, credential.deviceId, new URL(credential.origin).href]) : undefined;
+  }
+
+  partnerGroupApi(): import("@joko/contracts").PartnerGroupApi | undefined {
+    const context = this.#partnerPrivateContext(); if (!context || !this.network.partnerGroupApi) return undefined;
+    return this.network.partnerGroupApi(context.credential, context.authorityKey, this.newId, signal => {
+      signal.throwIfAborted(); if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential) throw new Error("Partner group owner changed.");
+    });
+  }
+
+  partnerRoutineApi(partnerId: string, conversationOwnerKey?: string): import("@joko/contracts").PartnerRoutineApi | undefined {
+    const context = this.#partnerPrivateContext();
+    if (!context || !this.network.partnerRoutineApi
+      || conversationOwnerKey !== undefined && this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey) return undefined;
+    const ownerKey = conversationOwnerKey ?? context.authorityKey;
+    return this.network.partnerRoutineApi(context.credential, partnerId, ownerKey, this.newId, signal => {
+      signal.throwIfAborted();
+      if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential
+        || conversationOwnerKey !== undefined && this.partnerConversationTransport()?.ownerKey !== conversationOwnerKey)
+        throw new Error("Partner routine owner changed.");
+    });
+  }
+
+  partnerRoutineEditor(partnerId: string, storage: import("@joko/contracts").RoutineReceiptStorage, conversationOwnerKey?: string): import("@joko/contracts").PartnerRoutineEditor | undefined {
+    const api = this.partnerRoutineApi(partnerId, conversationOwnerKey); const credential = this.#credential;
+    if (!api || !credential) return undefined;
+    return new PartnerRoutineEditor(api, new RoutineCreationReceipts(storage,
+      JSON.stringify([credential.serverId, credential.profileId, credential.deviceId, new URL(credential.origin).href])), partnerId);
+  }
 
   partnerResourceTransport(): MobilePartnerResourceTransport | undefined {
     const context = this.#partnerPrivateContext();
@@ -2060,6 +2784,7 @@ export class MobileClient {
   }
 
   #retire(): number {
+    this.#partnerGroupAttachments = undefined;
     const partnerPrivate = this.#state.partnerPrivate;
     const credentialKey = this.#partnerPrivateCredentialKey(this.#credential);
     if (partnerPrivate.open && credentialKey

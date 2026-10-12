@@ -107,6 +107,16 @@ export interface DeviceContentProjection {
   readonly versionUpdatedAt: number;
 }
 
+/** Host-authored provenance of a private message delivered to a canonical
+ * Partner task. This marker is never accepted from public input or an Adapter. */
+export interface PartnerPrivateMessageOrigin {
+  readonly messageId: string;
+  readonly threadId: string;
+  readonly senderPartnerId: string;
+  readonly recipientPartnerId: string;
+  readonly senderDisplayName: string;
+}
+
 export type EventPayload =
   | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError }
   /** Store-owned observation; never emitted by a Session adapter. */
@@ -123,6 +133,7 @@ export type EventPayload =
       readonly blocks: readonly MessageBlock[];
       /** Host-owned accepted Queue input for canonical user presentation, independent of the native echo. */
       readonly acceptedInput?: PromptInput;
+      readonly partnerPrivateOrigin?: PartnerPrivateMessageOrigin;
       /** Per-message provider accounting when authoritatively reported. */
       readonly usage?: UsageSnapshot;
       /** Generation-only time for this assistant message, never turn wall-clock time. */
@@ -249,7 +260,7 @@ export type EventPayload =
   | {
       /** Internal same-Backend native boundary, projected only as a system card. */
       readonly type: "context_rebuild";
-      readonly reason: "context_overflow" | "prompt_timeout";
+      readonly reason: "context_overflow" | "prompt_timeout" | "manual_restart";
       /** Redacted text actually handed to the replacement native context. */
       readonly handoff: string;
       readonly sourceRunId?: RunId;
@@ -263,6 +274,8 @@ export type EventPayload =
   | { readonly type: "session_reset" }
   | { readonly type: "history_pruned"; readonly activeContextReset: boolean }
   | { readonly type: "native_session_changed"; readonly opaqueRef: string; readonly nativeSessionId?: string; readonly leafId?: string }
+  | { readonly type: "runtime_handoff"; readonly fromBackendId: string; readonly toBackendId: string; readonly modelId: string; readonly resumed: boolean }
+  | { readonly type: "app_default_model_requested"; readonly requestId: string; readonly uiOwnerId: string; readonly connectionId: string; readonly expiresAt: number }
   | {
       readonly type: "background_task";
       readonly taskId: string;

@@ -17,13 +17,15 @@ type InteractionOwnershipState = { readonly scope: string; readonly snapshot: In
 
 const questionDrafts = new QuestionWizardDraftStore();
 
-export function InteractionDialog({ controller, interaction, remaining, inline = false, t, runAction }: {
+export function InteractionDialog({ controller, interaction, remaining, inline = false, t, runAction, onResolve, onDismiss }: {
   readonly controller: AppController;
   readonly interaction?: InteractionView;
   readonly remaining: number;
   readonly inline?: boolean;
   readonly t: Translator;
   readonly runAction: RunAction;
+  readonly onResolve?: (resolution: InteractionResolutionDraft) => Promise<void>;
+  readonly onDismiss?: () => Promise<void>;
 }): JSX.Element | null {
   const activeProfile = controller.state.activeProfile;
   const interactionScope = (interaction?.kind === "question" || interaction?.kind === "permission") && activeProfile !== undefined
@@ -200,8 +202,8 @@ export function InteractionDialog({ controller, interaction, remaining, inline =
       }
     });
   };
-  const resolve = (resolution: InteractionResolutionDraft): void => settle(`interaction:${interactionDraftKey}`, () => controller.resolveInteraction(interaction, resolution));
-  const dismiss = (): void => settle(`dismiss:${interactionDraftKey}`, () => controller.dismissInteraction(interaction));
+  const resolve = (resolution: InteractionResolutionDraft): void => settle(`interaction:${interactionDraftKey}`, () => onResolve ? onResolve(resolution) : controller.resolveInteraction(interaction, resolution));
+  const dismiss = (): void => settle(`dismiss:${interactionDraftKey}`, () => onDismiss ? onDismiss() : controller.dismissInteraction(interaction));
   gamepadDecisionRef.current = (action) => {
     if (visibleMinimized || settlingRef.current || controller.state.connectionState !== "connected"
       || (interaction.kind !== "permission" && interaction.kind !== "plan") || (interaction.kind === "permission" && !ownsInteraction)) return;

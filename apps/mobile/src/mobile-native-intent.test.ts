@@ -24,6 +24,27 @@ import {
 } from "./mobile-native-intent";
 
 describe("mobile public native intents", () => {
+  it("parses the bounded group handoff and rejects task-only query fields", () => {
+    expect(parseMobileNativeIntent("joko://partner-group/group-one")).toEqual({ kind: "group", groupId: "group-one" });
+    expect(parseMobileNativeIntent("joko://partner-group/group-one?profile=node-one")).toEqual({ kind: "group", groupId: "group-one", profileId: "node-one" });
+    for (const suffix of ["/", "/one/two", "/one?message=two", "/one?profile=a&profile=b", "/one#two"]) expect(parseMobileNativeIntent(`joko://partner-group${suffix}`)).toBeUndefined();
+  });
+  it("checks the group on the selected authenticated node without using the ordinary task directory", async () => {
+    const f = harness("joko://partner-group/group-one", snapshot({ status: "connected", activeProfileId: "node-one", savedProfileIds: ["node-one"], sessionIds: [] }));
+    const loadGroup = vi.fn(async () => undefined), showGroup = vi.fn(); const runtime = { ...f.runtime, snapshot: () => f.fake.snapshot(), loadGroup, showGroup } as MobileNativeIntentRuntime;
+    // Keep the original runtime methods, including the connection/recovery fences.
+    Object.setPrototypeOf(runtime, f.runtime);
+    await expect(executeMobileNativeIntent(f.claim, f.delivery, runtime)).resolves.toBe("group"); expect(loadGroup).toHaveBeenCalledWith("group-one"); expect(showGroup).toHaveBeenCalledWith("group-one"); expect(f.fake.selectSession).not.toHaveBeenCalled();
+    const late = harness("joko://partner-group/group-two", snapshot({ status: "connected", activeProfileId: "node-one", savedProfileIds: ["node-one"] }));
+    let release!: () => void; late.runtime.loadGroup = () => new Promise<void>(resolve => { release = resolve; }); late.runtime.showGroup = showGroup;
+    const pending = executeMobileNativeIntent(late.claim, late.delivery, late.runtime); late.delivery.offer("joko://settings"); release();
+    await expect(pending).resolves.toBe("retired"); expect(showGroup).toHaveBeenCalledTimes(1);
+  });
+  it("recovers an unavailable group on the same node and never dispatches an ordinary task", async () => {
+    const f = harness("joko://partner-group/group-missing", snapshot({ status: "connected", activeProfileId: "node-one", savedProfileIds: ["node-one"] }));
+    f.runtime.loadGroup = async () => { throw new Error("No visible group"); }; f.runtime.showGroup = vi.fn();
+    await expect(executeMobileNativeIntent(f.claim, f.delivery, f.runtime)).resolves.toBe("group-unavailable"); expect(f.fake.recoveries).toEqual(["group-unavailable"]); expect(f.fake.selectSession).not.toHaveBeenCalled();
+  });
   it("builds portable canonical task and exact message links that round-trip through the public parser", () => {
     const task = buildMobileTaskDeepLink("task / 一");
     const message = buildMobileMessageDeepLink("task / 一", "message / 一", "event / 一");

@@ -91,7 +91,23 @@ message EventPayload {
     ResourceUsageRecordedEvent resource_usage_recorded = 73;
     ObjectiveLifecycleEvent objective_lifecycle = 74;
     TaskTagCatalogChangedEvent task_tag_catalog_changed = 75;
+    RuntimeHandoffEvent runtime_handoff = 76;
+    AppDefaultModelRequestedEvent app_default_model_requested = 77;
   }
+}
+
+message AppDefaultModelRequestedEvent {
+  string request_id = 1;
+  string ui_owner_id = 2;
+  string connection_id = 3;
+  google.protobuf.Timestamp expires_at = 4;
+}
+
+message RuntimeHandoffEvent {
+  string from_backend_id = 1;
+  string to_backend_id = 2;
+  string model_id = 3;
+  bool resumed = 4;
 }
 
 message ProjectionInvalidatedEvent {
@@ -209,6 +225,16 @@ message MessageStartedEvent {
   // Host-authored marker for one Objective-owned turn. This authority is not
   // part of public InputContent and cannot be supplied by SendInput callers.
   ObjectiveContinuation objective_continuation = 12;
+  // Host-owned provenance; absent from public InputContent.
+  PartnerPrivateMessageOrigin partner_private_origin = 13;
+}
+
+message PartnerPrivateMessageOrigin {
+  string message_id = 1;
+  string thread_id = 2;
+  string sender_partner_id = 3;
+  string recipient_partner_id = 4;
+  string sender_display_name = 5;
 }
 
 message ObjectiveContinuation {
@@ -325,6 +351,7 @@ message MessageCompletedEvent {
   // Authoritative, Backend-neutral final message content. Stream deltas are
   // transient hints only; clients reconcile them against these ordered blocks.
   repeated MessageBlock blocks = 9;
+  PartnerPrivateMessageOrigin partner_private_origin = 10;
 }
 
 message MessageBlock {
@@ -502,6 +529,7 @@ enum ContextRebuildReason {
   CONTEXT_REBUILD_REASON_UNSPECIFIED = 0;
   CONTEXT_REBUILD_REASON_CONTEXT_OVERFLOW = 1;
   CONTEXT_REBUILD_REASON_PROMPT_TIMEOUT = 2;
+  CONTEXT_REBUILD_REASON_MANUAL_RESTART = 3;
 }
 
 // Hidden same-Backend boundary. `handoff` is the exact redacted text injected

@@ -1,4 +1,4 @@
-export const INSPECTOR_TAB_KINDS = ["context", "branches", "files", "changes", "background", "subagents", "shell", "terminal", "simulator", "tools", "browser"] as const;
+export const INSPECTOR_TAB_KINDS = ["context", "branches", "files", "changes", "background", "subagents", "shell", "terminal", "simulator", "tools", "browser", "workbench"] as const;
 
 export type InspectorTabKind = (typeof INSPECTOR_TAB_KINDS)[number];
 
@@ -10,6 +10,10 @@ export interface InspectorTabState {
 export interface InspectorTabBucket {
   readonly tabs: readonly InspectorTabState[];
   readonly activeTabId?: string;
+  readonly workbenchInitialized?: true;
+  readonly workbenchOwner?: string;
+  readonly workbenchTaskId?: string;
+  readonly workbenchProject?: string;
 }
 
 export type InspectorTabBuckets = Readonly<Record<string, InspectorTabBucket>>;
@@ -28,19 +32,19 @@ export function projectInspectorTabBucket(
   const activeTabId = tabs.some((tab) => tab.id === bucket.activeTabId)
     ? bucket.activeTabId
     : tabs[0]?.id;
-  return { tabs, activeTabId };
+  return { ...bucket, tabs, activeTabId };
 }
 
 export function addInspectorTab(bucket: InspectorTabBucket, kind: Exclude<InspectorTabKind, "terminal">): InspectorTabBucket {
   const existing = bucket.tabs.find((tab) => tab.kind === kind);
   if (existing !== undefined) return { ...bucket, activeTabId: existing.id };
   const tab = { id: kind, kind } as const;
-  return { tabs: [...bucket.tabs, tab], activeTabId: tab.id };
+  return { ...bucket, tabs: [...bucket.tabs, tab], activeTabId: tab.id };
 }
 
 export function addInspectorTerminalTab(bucket: InspectorTabBucket, terminalId: string): InspectorTabBucket {
   if (bucket.tabs.some((tab) => tab.id === terminalId)) return { ...bucket, activeTabId: terminalId };
-  return { tabs: [...bucket.tabs, { id: terminalId, kind: "terminal" }], activeTabId: terminalId };
+  return { ...bucket, tabs: [...bucket.tabs, { id: terminalId, kind: "terminal" }], activeTabId: terminalId };
 }
 
 export function activateInspectorTab(bucket: InspectorTabBucket, tabId: string): InspectorTabBucket {
@@ -52,7 +56,7 @@ export function closeInspectorTab(bucket: InspectorTabBucket, tabId: string): In
   if (index < 0) return bucket;
   const tabs = bucket.tabs.filter((tab) => tab.id !== tabId);
   if (bucket.activeTabId !== tabId) return { ...bucket, tabs };
-  return { tabs, activeTabId: tabs[Math.min(index, tabs.length - 1)]?.id };
+  return { ...bucket, tabs, activeTabId: tabs[Math.min(index, tabs.length - 1)]?.id };
 }
 
 export function reorderVisibleInspectorTabs(
@@ -103,8 +107,11 @@ export function parseInspectorTabBuckets(raw: string | null): InspectorTabBucket
   const buckets: Record<string, InspectorTabBucket> = {};
   for (const [sessionId, candidate] of Object.entries(value)) {
     if (!isSafeSessionKey(sessionId) || !isRecord(candidate) || !Array.isArray(candidate.tabs)) return {};
-    const candidateKeys = Object.keys(candidate).sort().join(",");
-    if (candidateKeys !== "activeTabId,tabs" && candidateKeys !== "tabs") return {};
+    if (Object.keys(candidate).some((key) => !["tabs", "activeTabId", "workbenchInitialized", "workbenchOwner", "workbenchTaskId", "workbenchProject"].includes(key))) return {};
+    if (candidate.workbenchInitialized !== undefined && candidate.workbenchInitialized !== true) return {};
+    if (candidate.workbenchOwner !== undefined && (typeof candidate.workbenchOwner !== "string" || candidate.workbenchOwner.length > 4_096)) return {};
+    if (candidate.workbenchTaskId !== undefined && (typeof candidate.workbenchTaskId !== "string" || candidate.workbenchTaskId.length > 256)) return {};
+    if (candidate.workbenchProject !== undefined && (typeof candidate.workbenchProject !== "string" || candidate.workbenchProject.length > 32_768)) return {};
     const tabs: InspectorTabState[] = [];
     const kinds = new Set<InspectorTabKind>();
     const ids = new Set<string>();
@@ -118,7 +125,11 @@ export function parseInspectorTabBuckets(raw: string | null): InspectorTabBucket
     }
     const activeTabId = candidate.activeTabId;
     if ((tabs.length === 0 && activeTabId !== undefined) || (tabs.length > 0 && (typeof activeTabId !== "string" || !tabs.some((tab) => tab.id === activeTabId)))) return {};
-    buckets[sessionId] = activeTabId === undefined ? { tabs } : { tabs, activeTabId: activeTabId as string };
+    buckets[sessionId] = { tabs, ...(activeTabId === undefined ? {} : { activeTabId: activeTabId as string }),
+      ...(candidate.workbenchInitialized === true ? { workbenchInitialized: true } : {}),
+      ...(candidate.workbenchOwner === undefined ? {} : { workbenchOwner: candidate.workbenchOwner as string }),
+      ...(candidate.workbenchTaskId === undefined ? {} : { workbenchTaskId: candidate.workbenchTaskId as string }),
+      ...(candidate.workbenchProject === undefined ? {} : { workbenchProject: candidate.workbenchProject as string }) };
   }
   return buckets;
 }

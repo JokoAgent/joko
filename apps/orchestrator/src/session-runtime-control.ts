@@ -11,6 +11,7 @@ export interface SessionRuntimeProfile {
 }
 
 export interface SessionRuntimePatch {
+  readonly backendId?: string;
   readonly providerId?: string | null;
   readonly modelId?: string;
   readonly effort?: string;
@@ -30,6 +31,7 @@ export interface PendingSessionRuntimeMutation {
 }
 
 export interface SessionRuntimeControlSnapshot {
+  readonly handoffState?: "pending" | "closed" | "effect" | "ready" | "unknown";
   readonly generation: number;
   readonly baseline?: SessionRuntimeProfile;
   readonly effective?: SessionRuntimeProfile;
@@ -49,6 +51,14 @@ interface SessionRuntimeControlState {
 export class SessionRuntimeControlRegistry {
   readonly #states = new Map<string, SessionRuntimeControlState>();
 
+  restoreDurableMutation(sessionId: string, generation: number, pending?: PendingSessionRuntimeMutation): void {
+    if (this.#states.has(sessionId) && this.#states.get(sessionId)!.generation >= generation) return;
+    const state = this.#stateFor(sessionId);
+    if (state.generation > generation) return;
+    state.generation = generation; state.pending = pending;
+    if (state.effectiveOverride?.backendId !== pending?.profile.backendId) state.effectiveOverride = undefined;
+  }
+
   snapshot(sessionId: string, baseline: SessionRuntimeProfile | undefined): SessionRuntimeControlSnapshot {
     const state = this.#states.get(sessionId);
     return {
@@ -65,6 +75,9 @@ export class SessionRuntimeControlRegistry {
 
   generationMatches(sessionId: string, expectedGeneration: number): boolean {
     return (this.#states.get(sessionId)?.generation ?? 0) === expectedGeneration;
+  }
+  cancelPending(sessionId: string): void {
+    const state = this.#states.get(sessionId); if (state) state.pending = undefined;
   }
 
   acceptApplied(
@@ -317,8 +330,8 @@ export function applySessionRuntimeAxisPatch(
   };
 }
 
-export function sessionRuntimeRouteKey(profile: Pick<SessionRuntimeProfile, "providerId" | "modelId">): string {
-  return `${profile.providerId}\0${profile.modelId}`;
+export function sessionRuntimeRouteKey(profile: Pick<SessionRuntimeProfile, "backendId" | "providerId" | "modelId">): string {
+  return `${profile.backendId}\0${profile.providerId}\0${profile.modelId}`;
 }
 
 export function pickSessionRuntimeFallback(input: {
@@ -346,7 +359,7 @@ export function pickSessionRuntimeFallback(input: {
       && input.availableProviderIds.has(model.providerId))
   ];
   for (const candidate of candidates) {
-    const route = { providerId: candidate.providerId, modelId: candidate.modelId };
+    const route = { backendId: input.current.backendId, providerId: candidate.providerId, modelId: candidate.modelId };
     if (visited.has(sessionRuntimeRouteKey(route))) continue;
     const effort = compatibleSessionRuntimeEffort(candidate.thinkingLevels, input.current.effort);
     return {

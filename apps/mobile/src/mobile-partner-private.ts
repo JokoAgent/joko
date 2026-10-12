@@ -1,3 +1,4 @@
+import { projectMobilePartnerAvatar, type MobilePartnerAvatarValue } from "./mobile-partner-avatar";
 import {
   PartnerInitializationState, PartnerLifecycle, PartnerPrivateMessageDeliveryStatus,
   PartnerPrivateThreadCloseReason, PartnerPrivateThreadStatus, PartnerSessionRole,
@@ -8,9 +9,10 @@ import {
 
 export interface MobilePartner {
   readonly partnerId: string;
+  readonly revision: bigint;
   readonly displayName: string;
-  readonly avatar: string;
-  readonly lifecycle: "active" | "archived";
+  readonly avatar: MobilePartnerAvatarValue;
+  readonly lifecycle: "active" | "paused" | "archived";
   readonly initializationState: "pending" | "ready" | "error";
   readonly canonicalSessionId?: string;
   readonly profileVersion: number;
@@ -138,11 +140,12 @@ export function projectMobilePartners(response: ListPartnersResponse): readonly 
     if (ids.has(partnerId)) throw new Error("The Joko node returned duplicate Partners.");
     ids.add(partnerId);
     const lifecycle = partner.lifecycle === PartnerLifecycle.ACTIVE ? "active"
+      : partner.lifecycle === PartnerLifecycle.PAUSED ? "paused"
       : partner.lifecycle === PartnerLifecycle.ARCHIVED ? "archived" : undefined;
     const initializationState = partner.initializationState === PartnerInitializationState.PENDING ? "pending"
       : partner.initializationState === PartnerInitializationState.READY ? "ready"
         : partner.initializationState === PartnerInitializationState.ERROR ? "error" : undefined;
-    if (!lifecycle || !initializationState) throw new Error("The Joko node returned an unknown Partner state.");
+    if (!lifecycle || !initializationState || (lifecycle === "paused") !== (typeof partner.pauseCleanupPending === "boolean")) throw new Error("The Joko node returned an unknown Partner state.");
     const canonicalSessionId = partner.canonicalSessionId === undefined
       ? undefined : requiredId(partner.canonicalSessionId, "Partner canonical Session ID");
     if (canonicalSessionId !== undefined) {
@@ -151,8 +154,9 @@ export function projectMobilePartners(response: ListPartnersResponse): readonly 
     }
     return {
       partnerId,
-      displayName: label(partner.displayName, 100, "Partner name"),
-      avatar: label(partner.avatar, 256, "Partner avatar"),
+      revision: BigInt(positiveSafe(partner.revision?.value ?? 0n, "Partner revision")),
+      displayName: label(partner.displayName, 200, "Partner name"),
+      avatar: projectMobilePartnerAvatar(partner.avatar),
       lifecycle,
       initializationState,
       ...(canonicalSessionId === undefined ? {} : { canonicalSessionId }),
@@ -318,7 +322,7 @@ export function assertMobileCanonicalPartnerSession(
   const matches = response.sessions.filter((session) => session.sessionId === sessionId);
   if (matches.length !== 1 || matches[0]?.partnerId !== partner.partnerId
     || matches[0].role !== PartnerSessionRole.CANONICAL || !matches[0].available
-    || matches[0].profileVersion !== BigInt(partner.profileVersion)
+    || matches[0].profileVersion < 1n || matches[0].profileVersion > BigInt(partner.profileVersion)
     || matches[0].readOnly || matches[0].deleted || matches[0].archived) {
     throw new Error("The selected task is not this Partner's available canonical Session.");
   }

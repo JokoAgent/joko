@@ -53,7 +53,7 @@ import {
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
-import { ContactStore, OperationalStore, PartnerStore, VoiceDictionaryPeerStore } from "@joko/store";
+import { ContactStore, OperationalStore, PartnerStore, PartnerWorkbenchStore, VoiceDictionaryPeerStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner } from "@joko/git-safety";
 import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
@@ -167,6 +167,15 @@ import {
   resolveAuthenticatedLspTarget
 } from "./lsp-tool-bridge.js";
 import { MakerMemoryBridgeProvider, MakerMemoryController } from "./maker-memory.js";
+import { PartnerMemoryPreferences } from "./partner-memory-preferences.js";
+import { PartnerConnectionPreferences, PartnerConnectionsManager } from "./partner-connections.js";
+import { PartnerRuntimePromptResolver } from "./partner-runtime-prompt.js";
+import { PartnerGroupStore } from "@joko/store";
+import { PartnerGroupSessionRuntime } from "./partner-group-runtime.js";
+import { PartnerGroupManager } from "./partner-group-manager.js";
+import { PartnerGroupWorkspaces } from "./partner-group-workspaces.js";
+import { PartnerGroupAttachments } from "./partner-group-attachments.js";
+import { PLAN_DECISION_SYSTEM_PROMPT, buildPlanDecisionPrompt, parsePlanDecision } from "./partner-group-division.js";
 import { MessagingManager, type MessagingManagerOptions } from "./messaging-manager.js";
 import type { WeChatAuthorizationPort } from "./wechat-authorization-manager.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
@@ -196,6 +205,11 @@ import { SkillLearningManager } from "./skill-learning-manager.js";
 import { SkillMarketManager } from "./skill-market-manager.js";
 import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
+import { PartnerSkillsManager, PartnerSkillsToolProvider } from "./partner-skills.js";
+import { PartnerCapabilityTools } from "./partner-capability-tools.js";
+import { PartnerProfileTools } from "./partner-profile-tools.js";
+import { AppDefaultModelCoordinator } from "./app-default-model.js";
+import { AppDefaultModelTools } from "./app-default-model-tools.js";
 import { SkillPublicationManager } from "./skill-publication-manager.js";
 import { CollaborationManager } from "./collaboration-manager.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
@@ -205,6 +219,21 @@ import { ContactManager } from "./contact-manager.js";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
 import { PartnerManager, partnerSessionRuntimeFallback } from "./partner-manager.js";
+import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
+import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
+import { PartnerRoutineStore } from "@joko/store";
+import { PartnerRoutineManager } from "./partner-routine-manager.js";
+import { PartnerRoutineTools } from "./partner-routine-tools.js";
+import { PartnerImportManager } from "./partner-import-manager.js";
+import { PartnerImportStorage } from "./partner-import-storage.js";
+import { PartnerImportRuntime } from "./partner-import-runtime.js";
+import { adoptPartnerImportSettings, createPartnerImportEffects, preparePartnerImportCreation } from "./partner-import-effects.js";
+import { ExtensionRoutineRuntime } from "./extension-routine-runtime.js";
+import { PartnerWorkingStatusManager } from "./partner-working-status.js";
+import { PartnerWorkbenchManager } from "./partner-workbench-manager.js";
+import { PartnerWorkbenchBriefReader } from "./partner-workbench-brief.js";
+import { PartnerWorkbenchToolProvider } from "./partner-workbench-tool-provider.js";
+import { CodeHostProjectProvider } from "@joko/code-host";
 import { PartnerToolBridgeProvider } from "./partner-tool-provider.js";
 import { DevicePeerOwner } from "./device-peer-owner.js";
 import {
@@ -427,6 +456,14 @@ export interface OrchestratorApplication {
   readonly contactSync?: ContactSyncManager;
   /** Node-local authority for long-lived partner profiles and their canonical Sessions. */
   readonly partners?: PartnerManager;
+  readonly partnerGroupRuntime?: PartnerGroupSessionRuntime;
+  readonly partnerGroups?: PartnerGroupManager;
+  readonly appDefaultModels?: AppDefaultModelCoordinator;
+  readonly partnerRoutines?: PartnerRoutineManager;
+  readonly partnerImports?: PartnerImportManager;
+  readonly partnerWorkingStatus?: PartnerWorkingStatusManager;
+  readonly partnerWorkbenches?: PartnerWorkbenchManager;
+  readonly partnerSessionTasks?: PartnerSessionTaskManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -438,6 +475,9 @@ export interface OrchestratorApplication {
   readonly providerAccountUsage?: ProviderAccountUsageProvider;
   readonly messageSearch?: MessageSearchEmbeddingCoordinator;
   readonly makerMemory?: MakerMemoryController;
+  readonly partnerMemoryPreferences?: PartnerMemoryPreferences;
+  readonly partnerConnections?: PartnerConnectionsManager;
+  readonly partnerSkills?: PartnerSkillsManager;
   readonly visionBridge?: VisionBridgeCoordinator;
   readonly promptPrediction?: PromptPredictionService;
   readonly auxiliaryText?: AuxiliaryTextRouting;
@@ -477,6 +517,7 @@ export interface PiSettingsProjectionDefaults {
 }
 
 export interface OrchestratorApplicationDependencies {
+  readonly agentImportSources?: { readonly home: string; readonly environment: NodeJS.ProcessEnv };
   /** Private host capability; proxy credentials remain outside durable Orchestrator state. */
   readonly resolveOutboundProxy?: OutboundProxyResolver;
   /** Optional speech transport owner; its credentials remain behind the factory port. */
@@ -547,7 +588,8 @@ export async function createOrchestratorApplication(
     mkdir(config.artifactDirectory, { recursive: true })
   ]);
 
-  const store = new OperationalStore(config.databasePath);
+  let suppressPrivateSessionNotifications: (sessionId: string) => boolean = () => false;
+  const store = new OperationalStore(config.databasePath, { suppressSessionNotifications: sessionId => suppressPrivateSessionNotifications(sessionId) });
   let contactStore: ContactStore;
   try {
     contactStore = new ContactStore(join(config.dataDirectory, "contacts.db"));
@@ -566,6 +608,14 @@ export async function createOrchestratorApplication(
     throw error;
   }
   let backendInstances!: BackendInstanceRegistry;
+  suppressPrivateSessionNotifications = sessionId => partnerStore.getSessionLink(sessionId)?.role === "group";
+  let partnerGroupStore: PartnerGroupStore;
+  try { partnerGroupStore = new PartnerGroupStore(join(config.dataDirectory, "partner-groups.db")); }
+  catch (error) { contacts.close(); contactStore.close(); partnerStore.close(); store.close(); throw error; }
+  let partnerGroupRuntime: PartnerGroupSessionRuntime | undefined;
+  let partnerGroups: PartnerGroupManager | undefined;
+  let partnerGroupWorkspaces: PartnerGroupWorkspaces | undefined;
+  const privateResourceTarget = (context: AdapterContext) => partnerGroupRuntime?.homeTarget(context.sessionId, context.target.id);
   let voiceDictionaryPeerStore: VoiceDictionaryPeerStore;
   try {
     voiceDictionaryPeerStore = new VoiceDictionaryPeerStore(join(config.dataDirectory, "voice-dictionary-peers.db"));
@@ -573,6 +623,7 @@ export async function createOrchestratorApplication(
     contacts.close();
     contactStore.close();
     partnerStore.close();
+    partnerGroupStore.close();
     store.close();
     throw error;
   }
@@ -802,7 +853,8 @@ export async function createOrchestratorApplication(
   });
   const piResources = new PiResourceManager({
     store,
-    managedRoot: join(config.piAgentHome, "managed-resources")
+    managedRoot: join(config.piAgentHome, "managed-resources"),
+    privateResourceTarget
   });
   await piResources.initialize();
   const skillMutations = new SkillMutationCoordinator();
@@ -855,9 +907,14 @@ export async function createOrchestratorApplication(
     trustedNodeExecutable: trustedManagedRunnerNodeExecutable,
     inspectRunnerProcess: createManagedSubagentRunnerProcessInspector()
   });
+  const partnerConnectionPreferences = new PartnerConnectionPreferences(store);
+  let partnerConnections: PartnerConnectionsManager | undefined;
+  let partnerSkills: PartnerSkillsManager | undefined;
   const mcpRouter = new McpRouter({
     store,
     credentials,
+    targetReferences: (targetId, sessionId) => partnerConnections?.targetReferences(sessionId === undefined ? targetId : partnerGroupRuntime?.homeTarget(sessionId, targetId) ?? targetId),
+    isGroupSession: sessionId => partnerStore.getSessionLink(sessionId)?.role === "group",
     resultArtifacts: artifacts,
     nativeAuth: {
       describe: (providerId) => providers.describeNativeAuthLease(providerId),
@@ -1055,8 +1112,14 @@ export async function createOrchestratorApplication(
     }
   });
   const unregisterLspBridge = mcpRouter.registerBridgeToolProvider(lspBridge);
+  const partnerImportStorage = new PartnerImportStorage(store, credentialVault);
+  const partnerMemoryPreferences = new PartnerMemoryPreferences(store, credentialVault, async (partnerId, assertCurrent) => {
+    const environment = await partnerImportStorage.environment.read(partnerId, assertCurrent); assertCurrent();
+    return environment?.profileProjection.user ?? "";
+  });
   const makerMemory = new MakerMemoryController({
     store,
+    targetPreferences: partnerMemoryPreferences,
     onSettingsChanged: () => refreshPiGenerationImpl()
   });
   const unregisterMakerMemoryBridge = mcpRouter.registerBridgeToolProvider(
@@ -1200,7 +1263,9 @@ export async function createOrchestratorApplication(
     hostCapabilities: piHostCapabilities,
     hostToolCapabilities,
     managedResources: resourceSnapshot,
-    resolveTargetResources: (context) => piResources.targetRuntimeSnapshot("pi", context.target.id),
+    resolveTargetResources: (context) => piResources.targetRuntimeSnapshot("pi", privateResourceTarget(context) ?? context.target.id),
+    resolveNativeSkills: (context, signal) => piResources.runtimeSkillSnapshot(piBackendId, context.target.id, signal, partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context),
+    resolveNativeSkillPolicy: context => partnerConnections?.nativeSkillPolicy(context),
     resolveMakerMemoryPrompt: (context) => makerMemory.runtimePrompt(context.target.id),
     isCompactionMemoryEnabled: (context) => makerMemory.enabledForBackend(context.target.backendId),
     onCompactionDigest: (input) => { makerMemory.writeCompactionDigest(input); },
@@ -1340,6 +1405,8 @@ export async function createOrchestratorApplication(
               mcpBridge
             }),
             resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId, false),
+            resolveNativeSkills: (context, signal) => piResources.runtimeSkillSnapshot(instanceId, context.target.id, signal, partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context),
+            resolveNativeSkillPolicy: context => partnerConnections?.nativeSkillPolicy(context),
             managedProviders,
             smartRouting,
             profileDirectory: codexHome,
@@ -1426,8 +1493,11 @@ export async function createOrchestratorApplication(
         resolveTextResources: (context, signal) => piResources.runtimeTextSnapshot(
           instanceId,
           context.target.id,
-          signal
+          signal,
+          partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context
         ),
+        resolveNativeSkills: (context, signal) => piResources.runtimeSkillSnapshot(instanceId, context.target.id, signal, partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context),
+        resolveNativeSkillPolicy: context => partnerConnections?.nativeSkillPolicy(context),
         resolveArtifactMention: createArtifactMentionResolver({
           store, artifacts,
           resolveTarget: (session) => sessionWorktrees.effectiveTarget(session),
@@ -1484,6 +1554,7 @@ export async function createOrchestratorApplication(
   let startupSessionWorktrees: SessionWorktreeCoordinator | undefined;
   let startupHistoryMaintenance: HistoryMaintenance | undefined;
   let startupCleanupHandled = false;
+  let startupRoutineRuntime: ExtensionRoutineRuntime | undefined;
   let startupBackendCleanup: Promise<readonly unknown[]> | undefined;
   const cleanupStartupBackendOwners = (): Promise<readonly unknown[]> => {
     if (startupBackendCleanup !== undefined) return startupBackendCleanup;
@@ -1505,6 +1576,8 @@ export async function createOrchestratorApplication(
     return startupBackendCleanup;
   };
   let closed = false;
+  let startupPartnerImports: PartnerImportManager | undefined;
+  let startupPartnerImportRuntime: PartnerImportRuntime | undefined;
   try {
   const currentPi = (): ReturnType<typeof createPiAdapter> => {
     const current = backendInstances.adapter(piBackendId);
@@ -1554,6 +1627,10 @@ export async function createOrchestratorApplication(
     if (backend.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported !== true) return true;
     return providers.list(backendId).find((provider) => provider.provider.id === providerId)?.enabled !== false;
   };
+  const partnerRuntimePrompt = new PartnerRuntimePromptResolver(partnerStore, store, partnerMemoryPreferences,
+    (partnerId, assertCurrent) => partnerImportStorage.environment.read(partnerId, assertCurrent), makerMemory,
+    (session, partnerId) => partnerGroupRuntime?.validTarget(session, partnerId) === true);
+  let partnerSessionTasks: PartnerSessionTaskManager | undefined;
   const sessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
     backendDescriptors: backendInstances.descriptors(),
     backendDescriptorsAlreadyPublished: true,
@@ -1582,7 +1659,22 @@ export async function createOrchestratorApplication(
         && providers.list(backendId).some((provider) => !provider.enabled)
       ),
     sessionRuntimeFallbackEnabled: () => configuredSessionRuntimeFallback(store),
-    serviceSessionRuntimeFallback: (input) => partnerSessionRuntimeFallback(partnerStore, input),
+    serviceSessionRuntimeFallback: (input) => {
+      const task = partnerSessionTasks?.fallback(input);
+      const group = partnerGroupRuntime?.fallback(input);
+      return task?.owned ? task : group?.owned ? group : partnerSessionRuntimeFallback(partnerStore, input);
+    },
+    partnerSessionRetiring: (sessionId) => partnerStore.isPartnerSessionRetiring(sessionId)
+      || partnerStore.isPartnerTargetRetiring(store.getSession(sessionId).descriptor.targetId) || partnerSessionTasks?.isRetiring(sessionId) === true
+      || partnerGroupRuntime?.isRetiring(sessionId) === true,
+    partnerTargetRetired: (targetId) => partnerStore.isPartnerTargetRetired(targetId),
+    partnerSessionRestarting: (sessionId) => partnerStore.isPartnerSessionRestarting(sessionId),
+    partnerSessionPaused: (sessionId) => partnerStore.isPartnerSessionPaused(sessionId) || partnerSessionTasks?.isHeld(sessionId) === true || partnerGroupRuntime?.isHeld(sessionId) === true,
+    resolveServiceRuntimePrompt: (session, assertCurrent) => partnerRuntimePrompt.resolve(session, assertCurrent),
+    resolveServiceRuntimeConfiguration: session => {
+      const connections = partnerConnections?.runtimeIdentity(session), skills = partnerSkills?.runtimeIdentity(session);
+      return connections === undefined && skills === undefined ? undefined : JSON.stringify([connections ?? null, skills ?? null]);
+    },
     backendDispatchBlocked: (backendId) => deferredBackendRestarts?.blocksDispatch(backendId) === true,
     onBackendMayBeIdle: (backendId) => deferredBackendRestarts?.onBackendMayBeIdle(backendId),
     sessionRuntimeFallbackContext: (backendId) => {
@@ -1617,8 +1709,8 @@ export async function createOrchestratorApplication(
       const failures = results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
       if (failures.length > 0) throw new AggregateError(failures, "Service Run settlement projection failed.");
     },
-    onServiceInteractionOpened: (input) => messaging?.onInteractionOpened(input),
-    onServiceInteractionSettled: (input) => messaging?.onInteractionSettled(input),
+    onServiceInteractionOpened: (input) => { partnerGroupRuntime?.interactionChanged(input.sessionId); return messaging?.onInteractionOpened(input); },
+    onServiceInteractionSettled: (input) => { partnerGroupRuntime?.interactionChanged(input.sessionId); return messaging?.onInteractionSettled(input); },
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
   objectives = new ObjectiveManager({ store, sessionHost });
@@ -1673,13 +1765,45 @@ export async function createOrchestratorApplication(
       ? {}
       : { retryDelayMs: dependencies.messagingRetryDelayMs })
   });
+  let partnerRoutines: PartnerRoutineManager | undefined;
+  partnerGroupRuntime = new PartnerGroupSessionRuntime(partnerGroupStore, partnerStore, store, sessionHost, workspaces);
+  let partnerImports: PartnerImportManager | undefined;
+  const assertImportService = () => { if (closed) throw new Error("Import service is closed."); };
+  let appDefaultModels: AppDefaultModelCoordinator | undefined;
   const partners = new PartnerManager({
     store: partnerStore,
     operationalStore: store,
+    appDefaultModel: () => {
+      const current = appDefaultModels?.current();
+      if (!current || !sessionHost.appDefaultModelChoices().some(choice => choice.id === JSON.stringify([current.backendId, current.providerId, current.modelId]))) return undefined;
+      return { backendId: current.backendId, providerId: current.providerId, modelId: current.modelId,
+        ...(current.effort ? { effort: current.effort } : {}), fastMode: current.fastMode };
+    },
     sessionHost,
     workspaceService: workspaces,
-    homesRoot: join(config.dataDirectory, "partner-homes")
+    homesRoot: join(config.dataDirectory, "partner-homes"),
+    onRoutineLifecycle: async (partnerId, state) => { await partnerRoutines?.lifecycle(partnerId, state); await partnerGroups?.partnerLifecycle(partnerId, state); },
+    prepareImportDeletion: async partnerId => { await partnerImports?.prepareDeletion(partnerId); await startupPartnerImportRuntime?.close();
+      partnerMemoryPreferences.remove(partnerStore.getPartner(partnerId).homeTargetId);
+      partnerConnectionPreferences.remove(partnerStore.getPartner(partnerId).homeTargetId); },
+    pauseGoal: async (sessionId, operationId) => {
+      const goal = store.findObjective(sessionId);
+      if (goal !== undefined && (goal.status === "active" || goal.status === "dispatch_unknown")) {
+        await objectives!.pause({ sessionId, operationId, expectedRevision: goal.revision,
+          expectedOwnerGeneration: goal.ownerGeneration, reason: "Partner runtime restarted by user." });
+      }
+    },
+    retireWorkbench: (partnerId, targetId) => partnerWorkbenches.retirePartner(partnerId, targetId),
+    ownedIndependentSessions: (partnerId) => [...partnerSessionTasks?.ownedSessions(partnerId) ?? [], ...partnerGroupRuntime?.ownedSessions(partnerId) ?? []],
+    forgetIndependentTasks: (partnerId) => partnerSessionTasks?.forgetPartner(partnerId),
+    resumeIndependentReturns: async (partnerId) => partnerSessionTasks?.refreshPartner(partnerId)
   });
+  const partnerWorkbenches = new PartnerWorkbenchManager({ partners, partnerStore, store, host: sessionHost, workspaces,
+    workbenches: new PartnerWorkbenchStore(join(config.dataDirectory, "partner-homes")), managedDataDirectory: config.dataDirectory,
+    briefs: new PartnerWorkbenchBriefReader(new CodeHostProjectProvider()), sessionTasks: () => partnerSessionTasks, routines: () => partnerRoutines,
+    pullRequestProviders: (authorization) => composeCodeHostProviders(dependencies.codeHostProviders, authorization) });
+  partnerSessionTasks = new PartnerSessionTaskManager(store, partners, sessionHost, workspaces, config.dataDirectory);
+  const unregisterPartnerSessionTaskTools = mcpRouter.registerBridgeToolProvider(new PartnerSessionTaskTools(partnerSessionTasks));
   const collaborationGoals = new CollaborationGoalManager({
     store,
     sessionHost,
@@ -1691,6 +1815,7 @@ export async function createOrchestratorApplication(
   const unregisterPartnerTools = mcpRouter.registerBridgeToolProvider(
     new PartnerToolBridgeProvider({ store, partners })
   );
+  const unregisterPartnerWorkbenchTools = mcpRouter.registerBridgeToolProvider(new PartnerWorkbenchToolProvider({ store, partners, workbench: partnerWorkbenches }));
   let backendLifecycleTail: Promise<void> = Promise.resolve();
   const runBackendLifecycle = <T>(action: () => Promise<T>): Promise<T> => {
     const result = backendLifecycleTail.catch(() => undefined).then(action);
@@ -1925,6 +2050,11 @@ export async function createOrchestratorApplication(
     onActivityTransition: runtimeActivity.markBlockingActivity
   });
   schedulerForBridgeTools = scheduler;
+  partnerRoutines = new PartnerRoutineManager({ partners, store, scheduler,
+    storage: new PartnerRoutineStore(join(config.dataDirectory, "partner-routines")) });
+  const extensionRoutineRuntime = new ExtensionRoutineRuntime({ catalog: extensionCatalog, resources: piResources, store,
+    surfaces: extensionMainViews, engine: partnerRoutines.engine, ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
+  startupRoutineRuntime = extensionRoutineRuntime;
   const diagnosticsBundles = new DiagnosticsBundleService({
     store,
     artifacts,
@@ -1934,6 +2064,61 @@ export async function createOrchestratorApplication(
   const messageSearch = new MessageSearchEmbeddingCoordinator({ store, providers });
   messageSearchForHelperTools = messageSearch;
   const auxiliaryText = new AuxiliaryTextRouting({ store, routes: modelRoutes, providers });
+  const agentImportSources = dependencies.agentImportSources ?? { home: userInfo().homedir, environment: { ...process.env } };
+  partnerImports = new PartnerImportManager({ storage: partnerImportStorage, ...agentImportSources,
+    prepareCreation: selection => preparePartnerImportCreation(partners, selection), adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, partnerImportStorage, id, assertOwner),
+    runPass: (id, action) => partners.runImportManagement(id, action),
+    assertServiceOwner: assertImportService, effects: context => createPartnerImportEffects({ partners, routines: partnerRoutines!,
+      storage: partnerImportStorage, store, memory: makerMemory, resources: piResources, artifacts,
+      verification: partnerImportRuntime.verification, ...agentImportSources }, context),
+    onSaved: result => {
+      if (!result.saved || !result.canonicalSessionId) return;
+      sessionHost.appendImportMessage(result.canonicalSessionId, `import-saved-${result.requestId}`,
+        "Imported content has been saved. You can review its saved, verified and active status here, retry missing items, and explicitly continue verification and schedule takeover.", assertImportService);
+    } });
+  const partnerImportRuntime = new PartnerImportRuntime({ partners, storage: partnerImportStorage, store, host: sessionHost,
+    imports: partnerImports, auxiliary: auxiliaryText, routines: partnerRoutines, assertServiceOwner: assertImportService,
+    groupHomeTarget: (sessionId, targetId) => partnerGroupRuntime?.homeTarget(sessionId, targetId), isGroupSession: sessionId => partnerStore.getSessionLink(sessionId)?.role === "group" });
+  startupPartnerImports = partnerImports; startupPartnerImportRuntime = partnerImportRuntime;
+  const unregisterPartnerImportTools = mcpRouter.registerBridgeToolProvider(partnerImportRuntime);
+  partnerRoutines.setImportedRuntime(partnerImportRuntime);
+  partnerConnections = new PartnerConnectionsManager(partners, partnerStore, store, partnerConnectionPreferences, mcpRouter,
+    (sessionId, targetId, id) => toolPolicies.enabledForSession(sessionId, targetId, id), piResources,
+    (partnerId, signal, backendId) => partnerSkills!.referenceMetadata(partnerId, signal, backendId),
+    (sessionId, targetId) => partnerGroupRuntime?.homeTarget(sessionId, targetId));
+  partnerSkills = new PartnerSkillsManager(partners, partnerStore, store, piResources, skillMutations,
+    sessionId => sessionHost.requestServiceRuntimeRefresh(sessionId), (sessionId, targetId) => partnerGroupRuntime?.homeTarget(sessionId, targetId));
+  const unregisterPartnerSkillTools = mcpRouter.registerBridgeToolProvider(new PartnerSkillsToolProvider(partnerSkills));
+  const unregisterPartnerCapabilityTools = mcpRouter.registerBridgeToolProvider(new PartnerCapabilityTools(partnerConnections,
+    sessionId => sessionHost.requestServiceRuntimeRefresh(sessionId)));
+  const partnerProfileTools = new PartnerProfileTools(partners, partnerSessionTasks, partnerConnections, partnerMemoryPreferences);
+  const unregisterPartnerProfileTools = mcpRouter.registerBridgeToolProvider(partnerProfileTools);
+  const unregisterPartnerRoutineTools = mcpRouter.registerBridgeToolProvider(new PartnerRoutineTools(
+    partnerRoutines, partnerProfileTools, scheduleHookScripts, scheduleRunNotifications));
+  appDefaultModels = new AppDefaultModelCoordinator(store, () => sessionHost.appDefaultModelChoices(), () => partners.followAppDefaultModel());
+  const unregisterAppDefaultModelTools = mcpRouter.registerBridgeToolProvider(new AppDefaultModelTools(appDefaultModels, partnerProfileTools));
+  const partnerWorkingStatus = new PartnerWorkingStatusManager({ store, partners, auxiliary: auxiliaryText });
+  partnerGroupWorkspaces = new PartnerGroupWorkspaces(store, config.dataDirectory);
+  await partnerGroupWorkspaces.initialize();
+  partnerGroups = new PartnerGroupManager({ storage: partnerGroupStore, partners, runtime: partnerGroupRuntime,
+    work: partnerGroupWorkspaces, attachments: new PartnerGroupAttachments(artifacts), changed: (groupId, change) => { partnerGroupStore.appendChange(groupId, change); },
+    decidePlan: async (input, signal, stillCurrent) => {
+      const plan = auxiliaryText.capture(), members = new Set(input.members.map(member => member.partnerId));
+      const result = await auxiliaryText.run(plan, { system: PLAN_DECISION_SYSTEM_PROMPT, user: buildPlanDecisionPrompt(input), maxTokens: 800,
+        timeoutMs: 20_000, signal, stillCurrent, validate: raw => parsePlanDecision(raw, input.mode, members) === null ? undefined : raw });
+      return result.status === "ok" ? parsePlanDecision(result.text, input.mode, members) : null;
+    },
+    notifyStep: async (group, plan) => {
+      if (partnerGroupStore.find(group.id)?.lifecycle !== "active" || !group.memberIds.length || group.memberIds.some(id => {
+        try { const member = partners.getPartner(id); return member.lifecycle === "deleted" || member.lifecycle === "archived"; } catch { return true; }
+      })) return;
+      const step = plan.currentStep === null ? undefined : plan.steps[plan.currentStep];
+      const lane = partnerGroupStore.lanes(group.id).find(item => item.planId === plan.id && item.partnerId === step?.partnerId);
+      const sourceSessionId = lane?.sessionId ?? partners.getPartner(plan.organizerPartnerId).canonicalSessionId;
+      if (!sourceSessionId) return;
+      mobilePush.notifyGroupStep({ groupId: group.id, groupTitle: group.name, sourceSessionId,
+        subjectSequence: BigInt(partnerGroupStore.latestChangeSequence()), kind: step?.status === "failed" ? "error" : plan.status === "done" ? "done" : "awaiting" });
+    } });
   const promptPrediction = new PromptPredictionService({ store, auxiliary: auxiliaryText });
   const sessionNavigation = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryText, credentials });
   let browser: BrowserProvider | undefined;
@@ -2242,7 +2427,10 @@ export async function createOrchestratorApplication(
     }
     await reviewCoordinator.reconcileStartup();
     await sessionWorktrees.initialize();
+    await partnerWorkbenches.initialize();
     await sessionHost.initialize();
+    await partnerGroups.start();
+    await partnerSessionTasks.initialize();
     await historyMaintenance.initialize();
     await skillLearning.initialize();
     for (const registration of backendTargets) {
@@ -2448,8 +2636,12 @@ export async function createOrchestratorApplication(
     skillMarketSync.beginPending();
     messageSearch.start();
     sessionNavigation.start();
+    partnerWorkingStatus.start();
     mobilePush.start();
     scheduler.start();
+    await partnerRoutines.start();
+    await partnerImports.recover();
+    await extensionRoutineRuntime.start();
     armMaintenance();
     void runMaintenance().catch(() => {
       store.appendDiagnostic({
@@ -2467,6 +2659,8 @@ export async function createOrchestratorApplication(
       try { await cleanup(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
     };
     closed = true;
+    await attempt(() => partnerImports?.close());
+    await attempt(() => partnerImportRuntime.close());
     await attempt(() => deferredBackendRestarts?.dispose());
     await attempt(() => commandConcurrencyGate.close());
     await attempt(() => stopExtensionLibraryAuthorityNotifications());
@@ -2474,9 +2668,11 @@ export async function createOrchestratorApplication(
     await attempt(() => skillPublication.close());
     await attempt(() => skills.close());
     await attempt(() => skillMarket.close());
+    await attempt(() => extensionRoutineRuntime.stop());
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());
     await attempt(() => extensionPackagePublisher.close());
+    await attempt(() => partnerRoutines?.stop());
     await attempt(() => scheduler.stop());
     await attempt(() => mobilePush.close());
     await attempt(() => providerAuth.beginShutdown());
@@ -2510,6 +2706,12 @@ export async function createOrchestratorApplication(
     await attempt(() => unregisterContactTools());
     await attempt(() => unregisterCollaborationGoalTools());
     await attempt(() => unregisterPartnerTools());
+    await attempt(() => unregisterPartnerWorkbenchTools());
+    await attempt(() => unregisterPartnerSessionTaskTools());
+    await attempt(() => unregisterPartnerProfileTools());
+    await attempt(() => unregisterPartnerRoutineTools());
+    await attempt(() => unregisterAppDefaultModelTools());
+    await attempt(() => partnerSessionTasks?.close());
     await attempt(() => unregisterLspBridge());
     await attempt(() => unregisterRemoteHostTools());
     await attempt(() => unregisterDocumentTools());
@@ -2519,10 +2721,14 @@ export async function createOrchestratorApplication(
     await attempt(() => unregisterSchedulerBridgeTools());
     await attempt(() => unregisterVisionBridgeTools());
     await attempt(() => unregisterMakerMemoryBridge());
+    makerMemory.dispose();
     await attempt(() => { if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer); });
     await attempt(() => maintenanceTail);
     await attempt(() => messageSearch.stop());
     await attempt(() => sessionNavigation.dispose());
+    await attempt(() => partnerWorkingStatus.dispose());
+    await attempt(() => partnerGroups?.close());
+    await attempt(() => partnerGroupWorkspaces?.dispose());
     await attempt(() => auxiliaryText.dispose());
     await attempt(() => mcpRouter.dispose());
     await attempt(() => voiceInput.close());
@@ -2539,6 +2745,7 @@ export async function createOrchestratorApplication(
     await attempt(() => contacts.close());
     await attempt(() => contactStore.close());
     await attempt(() => partnerStore.close());
+    await attempt(() => partnerGroupStore.close());
     await attempt(() => store.close());
     if (cleanupErrors.length > 0) {
       throw new AggregateError(
@@ -2615,6 +2822,13 @@ export async function createOrchestratorApplication(
     contacts,
     contactSync,
     partners,
+    partnerGroupRuntime,
+    partnerGroups,
+    appDefaultModels,
+    partnerRoutines,
+    partnerImports,
+    partnerWorkbenches,
+    partnerSessionTasks,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
@@ -2625,9 +2839,13 @@ export async function createOrchestratorApplication(
     providerAccountUsage,
     messageSearch,
     makerMemory,
+    partnerMemoryPreferences,
+    partnerConnections,
+    partnerSkills,
     visionBridge,
     promptPrediction,
     auxiliaryText,
+    partnerWorkingStatus,
     subagentModels,
     modelFavorites,
     sessionNavigation,
@@ -2668,19 +2886,34 @@ export async function createOrchestratorApplication(
         serviceCleanups.clear();
         deferredBackendRestarts?.dispose();
         for (const cleanup of cleanups) await attempt(cleanup);
+        await attempt(() => partnerImports?.close());
+        await attempt(() => partnerSessionTasks?.close());
+        await attempt(() => unregisterPartnerSessionTaskTools());
+        await attempt(() => partnerImportRuntime.close());
+        await attempt(() => unregisterPartnerImportTools());
+        await attempt(() => unregisterPartnerSkillTools());
+        await attempt(() => unregisterPartnerCapabilityTools());
+        await attempt(() => unregisterPartnerProfileTools());
+        await attempt(() => unregisterPartnerRoutineTools());
+        await attempt(() => unregisterAppDefaultModelTools());
         await attempt(() => commandConcurrencyGate.close());
         await attempt(() => stopExtensionLibraryAuthorityNotifications());
         await attempt(() => skillMarketSync.close());
         await attempt(() => skillPublication.close());
         await attempt(() => skills.close());
         await attempt(() => skillMarket.close());
+        await attempt(() => extensionRoutineRuntime.stop());
         await attempt(() => extensionLibraries.close());
         await attempt(() => extensionMainViews.close());
         await attempt(() => extensionPackagePublisher.close());
         if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer);
+        await attempt(() => partnerRoutines?.stop());
         await attempt(() => scheduler.stop());
         await attempt(() => mobilePush.close());
         await attempt(() => sessionNavigation.dispose());
+        await attempt(() => partnerWorkingStatus.dispose());
+        await attempt(() => partnerGroups?.close());
+        await attempt(() => partnerGroupWorkspaces?.dispose());
         await attempt(() => auxiliaryText.dispose());
         await attempt(() => providerAuth.beginShutdown());
         await attempt(() => providerAccountUsage.invalidate());
@@ -2714,6 +2947,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterContactTools());
         await attempt(() => unregisterCollaborationGoalTools());
         await attempt(() => unregisterPartnerTools());
+        await attempt(() => unregisterPartnerWorkbenchTools());
         await attempt(() => unregisterLspBridge());
         await attempt(() => unregisterRemoteHostTools());
         await attempt(() => unregisterDocumentTools());
@@ -2725,6 +2959,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterSchedulerBridgeTools());
         await attempt(() => unregisterVisionBridgeTools());
         await attempt(() => unregisterMakerMemoryBridge());
+        makerMemory.dispose();
         await maintenanceTail.catch(() => undefined);
         await attempt(() => messageSearch.stop());
         await attempt(() => mcpRouter.dispose());
@@ -2743,6 +2978,7 @@ export async function createOrchestratorApplication(
         await attempt(() => contacts.close());
         await attempt(() => contactStore.close());
         await attempt(() => partnerStore.close());
+        await attempt(() => partnerGroupStore.close());
         await attempt(() => store.close());
         if (failures.length === 1) throw failures[0];
         if (failures.length > 1) throw new AggregateError(failures, "Some Orchestrator owners could not finish shutdown.");
@@ -2757,6 +2993,10 @@ export async function createOrchestratorApplication(
     const attempt = async (cleanup: () => unknown): Promise<void> => {
       try { await cleanup(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
     };
+    await attempt(() => startupPartnerImports?.close());
+    await attempt(() => partnerGroups?.close());
+    await attempt(() => partnerGroupWorkspaces?.dispose());
+    await attempt(() => startupPartnerImportRuntime?.close());
     await attempt(() => deferredBackendRestarts?.dispose());
     await attempt(() => commandConcurrencyGate.close());
     await attempt(() => stopExtensionLibraryAuthorityNotifications());
@@ -2779,6 +3019,7 @@ export async function createOrchestratorApplication(
     await attempt(() => skillPublication.close());
     await attempt(() => skills.close());
     await attempt(() => skillMarket.close());
+    await attempt(() => startupRoutineRuntime?.stop());
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());
     await attempt(() => extensionPackagePublisher.close());
@@ -2790,6 +3031,7 @@ export async function createOrchestratorApplication(
     await attempt(() => contacts.close());
     await attempt(() => contactStore.close());
     await attempt(() => partnerStore.close());
+    await attempt(() => partnerGroupStore.close());
     await attempt(() => store.close());
     if (cleanupErrors.length > 0) {
       throw new AggregateError(

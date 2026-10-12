@@ -47,6 +47,7 @@ export type RealPiProviderResponder = (input: {
 }) => RealPiProviderReply | Promise<RealPiProviderReply>;
 
 export interface RealPiSystemFixtureOptions {
+  readonly agentImportSources?: OrchestratorApplicationDependencies["agentImportSources"];
   readonly rootDirectory?: string;
   readonly keepRoot?: boolean;
   readonly webDirectory?: string;
@@ -204,6 +205,7 @@ export class RealPiSystemFixture {
         corsOrigins: []
       };
       application = await createOrchestratorApplication(config, {
+        ...(options.agentImportSources === undefined ? {} : { agentImportSources: options.agentImportSources }),
         ...(options.telegramApiBaseUrl === undefined
           ? {}
           : { messagingTelegramApiBaseUrl: options.telegramApiBaseUrl }),
@@ -417,12 +419,21 @@ export async function startLocalProvider(
         }));
         return;
       }
+      const id = `joko-real-pi-${requests.length}`;
+      if (body["stream"] === false) {
+        const message = reply.kind === "text" ? { role: "assistant", content: reply.text } : { role: "assistant", content: null,
+          tool_calls: [{ id: reply.callId ?? `call-${requests.length}`, type: "function", function: { name: reply.name, arguments: JSON.stringify(reply.arguments) } }] };
+        response.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify({ id, object: "chat.completion", created: 1, model: REAL_PI_MODEL_ID,
+          choices: [{ index: 0, message, finish_reason: reply.kind === "tool" ? "tool_calls" : "stop" }],
+          usage: { prompt_tokens: usage.promptTokens, completion_tokens: usage.completionTokens, total_tokens: usage.promptTokens + usage.completionTokens } }));
+        return;
+      }
       response.writeHead(200, {
         "content-type": "text/event-stream; charset=utf-8",
         "cache-control": "no-cache",
         connection: "keep-alive"
       });
-      const id = `joko-real-pi-${requests.length}`;
       const delta = reply.kind === "text"
         ? { role: "assistant", content: reply.text }
         : {

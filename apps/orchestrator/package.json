@@ -34,6 +34,7 @@
     "@joko/adapter-transcription-realtime": "workspace:*",
     "@joko/adapter-transcription-scribe": "workspace:*",
     "@joko/adapter-transcription-sauc": "workspace:*",
+    "@joko/agent-import": "workspace:*",
     "@joko/contracts": "workspace:*",
     "@joko/core": "workspace:*",
     "@joko/device-peer": "workspace:*",

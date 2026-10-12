@@ -26,6 +26,18 @@ const BUCKET: InspectorTabBucket = {
 };
 
 describe("inspector tab buckets", () => {
+  it("retains workbench owner and selection through singleton close, reopen, projection and storage", () => {
+    const original = { ...addInspectorTab(BUCKET, "workbench"), workbenchInitialized: true as const,
+      workbenchOwner: "profile/session/partner", workbenchTaskId: "task:selected", workbenchProject: "D:/project" };
+    const closed = closeInspectorTab(original, "workbench");
+    expect(closed).toMatchObject({ workbenchInitialized: true, workbenchTaskId: "task:selected" });
+    expect(closed.tabs.some((tab) => tab.kind === "workbench")).toBe(false);
+    const reopened = addInspectorTab(addInspectorTab(closed, "workbench"), "workbench");
+    expect(reopened.tabs.filter((tab) => tab.kind === "workbench")).toHaveLength(1);
+    expect(projectInspectorTabBucket(reopened, new Set(["workbench"]))).toMatchObject({ workbenchProject: "D:/project", activeTabId: "workbench" });
+    expect(parseInspectorTabBuckets(serializeInspectorTabBuckets({ session: reopened }))).toEqual({ session: reopened });
+  });
+
   it("creates and activates singleton tabs without duplicating a kind", () => {
     expect(createInitialInspectorTabBucket()).toEqual({ tabs: [{ id: "context", kind: "context" }], activeTabId: "context" });
     expect(addInspectorTab(BUCKET, "browser").activeTabId).toBe("browser");

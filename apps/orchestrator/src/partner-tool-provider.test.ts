@@ -154,7 +154,7 @@ async function createFixture() {
     store: partnerStore,
     operationalStore,
     sessionHost,
-    workspaceService: { register: async (input) => input },
+    workspaceService: { register: async (input) => input, unregister: () => undefined },
     homesRoot: join(directory, "partner-homes")
   });
   const provider = new PartnerToolBridgeProvider({ store: operationalStore, partners: manager });
@@ -169,6 +169,7 @@ async function createFixture() {
 
 function input(store: PartnerStore, displayName: string) {
   return {
+    requestId: `creation-request-${store.directoryState().revision}`,
     expectedDirectoryRevision: store.directoryState().revision,
     displayName,
     avatar: "orbit",

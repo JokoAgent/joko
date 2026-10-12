@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { redactSecrets } from "@joko/core";
 
 import type {
   PartnerCapabilitiesRecord,
@@ -11,6 +12,11 @@ import type {
   PartnerInitializationState,
   PartnerInvitationStage,
   PartnerLifecycle,
+  PartnerPauseRecord,
+  PartnerPauseSession,
+  PartnerDeletionRecord,
+  PartnerRestartRecord,
+  PartnerDeletionFailure,
   PartnerDelegationRecord,
   PartnerDelegationStatus,
   PartnerModelRouteRecord,
@@ -28,6 +34,8 @@ import type {
   PartnerSessionRole
 } from "./partner-types.js";
 import { PartnerStoreError } from "./partner-types.js";
+import type { PartnerAvatarRecord, PartnerAvatarInput } from "./partner-types.js";
+import { decodePartnerAvatar, partnerAvatarImage } from "./partner-avatar.js";
 
 type Row = Record<string, unknown>;
 
@@ -43,6 +51,7 @@ export interface PartnerListOptions {
 
 export interface CreatePartnerInput extends PartnerDraft {
   readonly expectedDirectoryRevision: bigint;
+  readonly requestId: string;
   readonly id?: string;
   readonly homeTargetId?: string;
 }
@@ -75,9 +84,9 @@ export interface TransitionPartnerDelegationInput {
 const PARTNER_SCHEMA_VERSION = 1;
 const MAX_SAFE_REVISION = 9_007_199_254_740_991;
 const MAX_PARTNERS = 1_000;
-const MAX_DISPLAY_NAME = 100;
+const MAX_DISPLAY_NAME = 200;
 const MAX_IDENTITY_SOURCE = 8_000;
-const MAX_MODEL_ROUTES = 3;
+const MAX_MODEL_ROUTES = 5;
 export const PARTNER_PRIVATE_MAX_MESSAGES = 12;
 export const PARTNER_PRIVATE_IDLE_TIMEOUT_MS = 15 * 60_000;
 export const PARTNER_PRIVATE_LIMIT_COOLDOWN_MS = 15 * 60_000;
@@ -87,6 +96,7 @@ const MAX_DELEGATION_OBJECTIVE = 12_000;
 const MAX_DELEGATION_RESULT = 12_000;
 const MAX_ERROR_TEXT = 2_000;
 const ENTITY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const CREATION_REQUEST_ID = /^[A-Za-z0-9_-]{16,80}$/u;
 const AVATAR_ID = /^[a-z][a-z0-9-]{0,31}$/u;
 const TEMPLATE_ID = /^[a-z][a-z0-9-]{0,31}$/u;
 const FORBIDDEN_INLINE_TEXT = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
@@ -114,20 +124,24 @@ CREATE TABLE partner_directory (
 
 CREATE TABLE partners (
   id TEXT PRIMARY KEY,
+  creation_request_id TEXT NOT NULL UNIQUE,
+  creation_fingerprint TEXT NOT NULL CHECK (length(creation_fingerprint) = 64),
   revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
   profile_version INTEGER NOT NULL CHECK (profile_version BETWEEN 1 AND 9007199254740991),
   display_name TEXT NOT NULL,
+  description TEXT NOT NULL,
   normalized_name TEXT NOT NULL,
-  avatar TEXT NOT NULL,
+  avatar_json TEXT NOT NULL,
   identity_source TEXT NOT NULL,
   template_id TEXT NOT NULL,
-  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active', 'archived', 'deleted')),
+  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active', 'paused', 'archived', 'deleted')),
   initialization_state TEXT NOT NULL CHECK (initialization_state IN ('pending', 'ready', 'error')),
   invitation_stage TEXT NOT NULL CHECK (invitation_stage IN ('home', 'avatar', 'session', 'ready', 'failed')),
   initialization_error_code TEXT CHECK (initialization_error_code IS NULL OR initialization_error_code IN ('home_unavailable', 'avatar_unavailable', 'model_unavailable', 'session_unavailable', 'state_changed')),
   home_target_id TEXT NOT NULL UNIQUE,
   canonical_session_id TEXT UNIQUE,
   model_chain_json TEXT NOT NULL,
+  task_model_json TEXT,
   permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
@@ -140,11 +154,72 @@ CREATE UNIQUE INDEX partners_live_name_unique
   WHERE lifecycle <> 'deleted';
 CREATE INDEX partners_lifecycle_updated_idx ON partners(lifecycle, updated_at DESC, id);
 
+CREATE TABLE partner_avatar_images (
+  sha256 TEXT PRIMARY KEY CHECK (length(sha256) = 64),
+  mime_type TEXT NOT NULL CHECK (mime_type IN ('image/jpeg', 'image/png', 'image/webp')),
+  byte_length INTEGER NOT NULL CHECK (byte_length BETWEEN 1 AND 5242880),
+  content BLOB NOT NULL CHECK (length(content) = byte_length)
+) STRICT;
+
+CREATE TABLE retired_partner_creations (
+  request_id TEXT PRIMARY KEY,
+  retired_at INTEGER NOT NULL CHECK (retired_at >= 0)
+) STRICT;
+
+CREATE TABLE partner_deletions (
+  request_id TEXT PRIMARY KEY,
+  partner_id TEXT NOT NULL UNIQUE,
+  home_target_id TEXT NOT NULL,
+  session_ids_json TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK (phase IN ('closing', 'cleanup', 'completed')),
+  failure TEXT CHECK (failure IS NULL OR failure IN ('runtime_close_pending', 'home_cleanup_pending')),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+  CHECK (phase <> 'completed' OR failure IS NULL)
+) STRICT;
+
+CREATE TABLE partner_restarts (
+  request_id TEXT PRIMARY KEY,
+  partner_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  profile_revision INTEGER NOT NULL CHECK (profile_revision >= 1),
+  source_binding_fingerprint TEXT NOT NULL CHECK (length(source_binding_fingerprint) = 64),
+  source_generation INTEGER NOT NULL CHECK (source_generation >= 1),
+  phase TEXT NOT NULL CHECK (phase IN ('closing', 'ready')),
+  failure TEXT CHECK (failure IS NULL OR failure = 'runtime_close_pending'),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+  CHECK (phase <> 'ready' OR failure IS NULL)
+) STRICT;
+CREATE UNIQUE INDEX partner_restarts_pending_unique ON partner_restarts(partner_id) WHERE phase = 'closing';
+CREATE TABLE partner_pauses (
+  partner_id TEXT PRIMARY KEY REFERENCES partners(id) ON DELETE CASCADE,
+  id TEXT NOT NULL UNIQUE,
+  phase TEXT NOT NULL CHECK (phase IN ('closing', 'paused', 'resuming')),
+  captured INTEGER NOT NULL CHECK (captured IN (0, 1)),
+  sessions_json TEXT NOT NULL,
+  delegation_ids_json TEXT NOT NULL,
+  failure TEXT CHECK (failure IS NULL OR failure IN ('runtime_close_pending', 'state_commit_pending')),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
+) STRICT;
+
+CREATE TABLE retired_partner_restarts (
+  request_id TEXT PRIMARY KEY,
+  retired_at INTEGER NOT NULL CHECK (retired_at >= 0)
+) STRICT;
+
+CREATE TABLE retired_partner_deletions (
+  request_id TEXT PRIMARY KEY,
+  retired_at INTEGER NOT NULL CHECK (retired_at >= 0)
+) STRICT;
+
 CREATE TABLE partner_profile_versions (
   partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
   version INTEGER NOT NULL CHECK (version BETWEEN 1 AND 9007199254740991),
   identity_source TEXT NOT NULL,
   model_chain_json TEXT NOT NULL,
+  task_model_json TEXT,
   permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
@@ -252,7 +327,7 @@ CREATE INDEX partner_delegations_recovery_idx
 CREATE TABLE partner_session_links (
   session_id TEXT PRIMARY KEY,
   partner_id TEXT NOT NULL REFERENCES partners(id) ON DELETE CASCADE,
-  role TEXT NOT NULL CHECK (role IN ('canonical', 'history', 'delegation')),
+  role TEXT NOT NULL CHECK (role IN ('canonical', 'history', 'delegation', 'group')),
   profile_version INTEGER NOT NULL CHECK (profile_version BETWEEN 1 AND 9007199254740991),
   parent_session_id TEXT,
   delegation_id TEXT REFERENCES partner_delegations(id) ON DELETE CASCADE,
@@ -305,6 +380,31 @@ export class PartnerStore {
     this.#database.close();
   }
 
+  readPartnerAvatar(partnerId: string, expectedRevision: bigint, sha256: string): {
+    readonly image: Exclude<PartnerAvatarRecord, string>; readonly content: Uint8Array;
+  } {
+    const partner = this.getPartner(partnerId);
+    assertRevision(partner, expectedRevision);
+    if (partner.lifecycle === "deleted" || typeof partner.avatar === "string" || partner.avatar.sha256 !== sha256) {
+      throw new PartnerStoreError("PARTNER_NOT_FOUND", "The current Partner image is unavailable.");
+    }
+    const row = this.#database.prepare("SELECT mime_type, byte_length, content FROM partner_avatar_images WHERE sha256 = ?")
+      .get(sha256) as Row | undefined;
+    if (!row || !(row["content"] instanceof Uint8Array)) throw unavailable("The Partner image is unavailable.");
+    const content = new Uint8Array(row["content"]);
+    const image = partnerAvatarImage({ sha256, mimeType: row["mime_type"], byteLength: row["byte_length"] });
+    if (JSON.stringify(image) !== JSON.stringify(partner.avatar) || content.length !== image.byteLength
+      || createHash("sha256").update(content).digest("hex") !== sha256) throw unavailable("The Partner image is invalid.");
+    return { image, content };
+  }
+
+  #persistAvatar(avatar: PartnerAvatarInput): void {
+    if (typeof avatar === "string") return;
+    const { image, bytes } = decodePartnerAvatar(avatar.base64);
+    this.#database.prepare(`INSERT INTO partner_avatar_images(sha256, mime_type, byte_length, content)
+      VALUES (?, ?, ?, ?) ON CONFLICT(sha256) DO NOTHING`).run(image.sha256, image.mimeType, image.byteLength, bytes);
+  }
+
   directoryState(): PartnerDirectoryState {
     this.#assertOpen();
     const row = this.#database.prepare(`
@@ -342,18 +442,20 @@ export class PartnerStore {
       }
       const at = this.#now();
       const profiles = this.listPartners().filter((profile) => profile.usesDirectoryDefaults);
+      for (const current of profiles) this.#assertRestartIdle(current.id);
       for (const current of profiles) {
         const nextRevision = nextNumber(current.revision, "Partner revision");
         const nextVersion = nextSafeInteger(current.profileVersion, "Partner profile version");
         const result = this.#database.prepare(`
           UPDATE partners SET revision = ?, profile_version = ?, model_chain_json = ?, permission_mode = ?,
-            plan_mode = ?, initialization_state = 'pending', invitation_stage = 'home',
+            plan_mode = ?, initialization_state = CASE WHEN lifecycle = 'paused' THEN 'ready' ELSE 'pending' END,
+            invitation_stage = CASE WHEN lifecycle = 'paused' THEN 'ready' ELSE 'home' END,
             initialization_error_code = NULL, updated_at = ?
           WHERE id = ? AND revision = ?
         `).run(nextRevision, nextVersion, modelChainJson(next.modelChain), next.permissionMode,
           next.planMode ? 1 : 0, at, current.id, Number(current.revision));
         if (Number(result.changes) !== 1) throw changed(current.id);
-        this.#insertVersion(current.id, nextVersion, current.identitySource, next, true, at);
+        this.#insertVersion(current.id, nextVersion, current.identitySource, next, true, at, current.taskModelOverride);
       }
       this.#database.prepare(`
         UPDATE partner_directory SET default_model_chain_json = ?, default_permission_mode = ?,
@@ -384,6 +486,428 @@ export class PartnerStore {
     const row = this.#database.prepare("SELECT * FROM partners WHERE id = ?").get(id) as Row | undefined;
     if (row === undefined) throw new PartnerStoreError("PARTNER_NOT_FOUND", "The partner profile was not found.");
     return this.#profile(row);
+  }
+
+  getPartnerCreation(requestId: string): PartnerProfileRecord | undefined {
+    this.#assertOpen();
+    const row = this.#database.prepare("SELECT * FROM partners WHERE creation_request_id = ?")
+      .get(creationRequestId(requestId)) as Row | undefined;
+    return row === undefined ? undefined : this.#profile(row);
+  }
+
+  /** Fence an absent request against delayed dispatch without deleting an existing profile. */
+  retirePartnerCreation(requestId: string): PartnerProfileRecord | undefined {
+    return this.#write(() => {
+      const id = creationRequestId(requestId);
+      const existing = this.getPartnerCreation(id);
+      if (existing !== undefined) return existing;
+      this.#database.prepare("INSERT INTO retired_partner_creations(request_id, retired_at) VALUES (?, ?) ON CONFLICT(request_id) DO NOTHING")
+        .run(id, this.#now());
+      return undefined;
+    });
+  }
+
+  getPartnerRestart(requestId: string): PartnerRestartRecord | undefined {
+    this.#assertOpen();
+    const row = this.#database.prepare("SELECT * FROM partner_restarts WHERE request_id = ?")
+      .get(creationRequestId(requestId)) as Row | undefined;
+    if (row === undefined) return undefined;
+    const phase = row['phase']; const failure = row['failure'];
+    if (phase !== 'closing' && phase !== 'ready') throw unavailable("Partner restart phase is invalid.");
+    if (failure !== null && failure !== 'runtime_close_pending') throw unavailable("Partner restart failure is invalid.");
+    return { requestId: creationRequestId(row['request_id']), partnerId: entityId(row['partner_id'], "Partner ID"),
+      sessionId: entityId(row['session_id'], "Partner Session ID"),
+      profileRevision: BigInt(positiveInteger(row['profile_revision'], "Partner restart revision")),
+      sourceBindingFingerprint: stringValue(row['source_binding_fingerprint'], "Partner restart binding"),
+      sourceGeneration: positiveInteger(row['source_generation'], "Partner restart generation"), phase,
+      ...(failure === null ? {} : { failure }), createdAt: timestamp(row['created_at'], "Partner restart creation time"),
+      updatedAt: timestamp(row['updated_at'], "Partner restart update time") };
+  }
+
+  listPendingPartnerRestarts(): readonly PartnerRestartRecord[] {
+    this.#assertOpen();
+    return (this.#database.prepare("SELECT request_id FROM partner_restarts WHERE phase = 'closing' ORDER BY created_at, request_id")
+      .all() as Row[]).map((row) => this.getPartnerRestart(stringValue(row['request_id'], "Partner restart request"))!);
+  }
+
+  isPartnerSessionRestarting(sessionId: string): boolean {
+    this.#assertOpen();
+    return this.#database.prepare("SELECT request_id FROM partner_restarts WHERE session_id = ? AND phase = 'closing'")
+      .get(sessionId) !== undefined;
+  }
+
+  isPartnerRestartRetired(requestId: string): boolean {
+    this.#assertOpen();
+    return this.#database.prepare("SELECT request_id FROM retired_partner_restarts WHERE request_id = ?")
+      .get(creationRequestId(requestId)) !== undefined;
+  }
+
+  retirePartnerRestart(requestId: string): PartnerRestartRecord | undefined {
+    return this.#write(() => {
+      const id = creationRequestId(requestId); const current = this.getPartnerRestart(id);
+      if (current !== undefined) return current;
+      this.#database.prepare("INSERT INTO retired_partner_restarts(request_id, retired_at) VALUES (?, ?) ON CONFLICT(request_id) DO NOTHING")
+        .run(id, this.#now());
+      return undefined;
+    });
+  }
+
+  claimPartnerRestart(input: { readonly requestId: string; readonly partnerId: string; readonly expectedRevision: bigint;
+    readonly sourceBindingFingerprint: string; readonly sourceGeneration: number }): PartnerRestartRecord {
+    return this.#write(() => {
+      const id = creationRequestId(input.requestId); const partnerId = entityId(input.partnerId, "Partner ID");
+      const existing = this.getPartnerRestart(id);
+      if (existing !== undefined) {
+        if (existing.partnerId !== partnerId) throw new PartnerStoreError("PARTNER_INVALID", "The restart belongs to another partner.");
+        return existing;
+      }
+      if (this.isPartnerRestartRetired(id)) throw new PartnerStoreError("PARTNER_INVALID", "This restart request was retired before dispatch.");
+      const partner = this.getPartner(partnerId);
+      assertRevision(partner, input.expectedRevision); assertMutable(partner); this.#assertRestartIdle(partnerId);
+      if (partner.lifecycle !== "active" || partner.canonicalSessionId === undefined) {
+        throw new PartnerStoreError("PARTNER_INVALID", "Restart requires an active canonical partner Session.");
+      }
+      if (!/^[a-f0-9]{64}$/u.test(input.sourceBindingFingerprint)) throw new PartnerStoreError("PARTNER_INVALID", "The restart binding is invalid.");
+      const at = this.#now();
+      this.#database.prepare(`INSERT INTO partner_restarts(request_id, partner_id, session_id, profile_revision,
+        source_binding_fingerprint, source_generation, phase, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'closing', ?, ?)`)
+        .run(id, partnerId, partner.canonicalSessionId, Number(partner.revision), input.sourceBindingFingerprint,
+          positiveInteger(input.sourceGeneration, "Partner restart generation"), at, at);
+      return this.getPartnerRestart(id)!;
+    });
+  }
+
+  settlePartnerRestart(requestId: string, ready: boolean): PartnerRestartRecord {
+    return this.#write(() => {
+      const current = this.getPartnerRestart(requestId);
+      if (current === undefined) throw new PartnerStoreError("PARTNER_NOT_FOUND", "The partner restart was not found.");
+      if (current.phase === "ready") return current;
+      this.#database.prepare("UPDATE partner_restarts SET phase = ?, failure = ?, updated_at = ? WHERE request_id = ?")
+        .run(ready ? "ready" : "closing", ready ? null : "runtime_close_pending", this.#now(), current.requestId);
+      return this.getPartnerRestart(current.requestId)!;
+    });
+  }
+
+  #assertRestartIdle(partnerId: string, allowResumingForDeletion = false): void {
+    const pause = this.getPartnerPause(partnerId);
+    if (pause && pause.phase !== "paused" && !(allowResumingForDeletion && pause.phase === "resuming")) throw new PartnerStoreError("PARTNER_CHANGED", "Recover the pending Partner lifecycle transition before changing this profile.");
+    if (this.listPendingPartnerRestarts().some((entry) => entry.partnerId === partnerId)) {
+      throw new PartnerStoreError("PARTNER_CHANGED", "Recover the pending runtime restart before changing this partner.");
+    }
+  }
+
+  getPartnerPause(partnerId: string): PartnerPauseRecord | undefined {
+    this.#assertOpen();
+    const row = this.#database.prepare("SELECT * FROM partner_pauses WHERE partner_id = ?")
+      .get(entityId(partnerId, "Partner ID")) as Row | undefined;
+    return row === undefined ? undefined : this.#pause(row);
+  }
+
+  listPartnerPauses(): readonly PartnerPauseRecord[] {
+    this.#assertOpen();
+    return (this.#database.prepare("SELECT * FROM partner_pauses ORDER BY created_at, partner_id").all() as Row[])
+      .map(row => this.#pause(row));
+  }
+
+  isPartnerSessionPaused(sessionId: string): boolean {
+    this.#assertOpen();
+    const id = entityId(sessionId, "Partner Session ID");
+    return this.#database.prepare(`SELECT 1 FROM partner_session_links AS link JOIN partners AS profile ON profile.id = link.partner_id
+      WHERE link.session_id = ? AND profile.lifecycle = 'paused' LIMIT 1`).get(id) !== undefined
+      || this.#database.prepare(`SELECT 1 FROM partner_pauses AS pause, json_each(pause.sessions_json) AS item
+        WHERE json_extract(item.value, '$.sessionId') = ? LIMIT 1`).get(id) !== undefined
+      || this.#database.prepare(`SELECT 1 FROM partner_pauses AS pause, json_each(pause.delegation_ids_json) AS item
+        JOIN partner_delegations AS delegation ON delegation.id = item.value
+        WHERE delegation.child_session_id = ? LIMIT 1`).get(id) !== undefined;
+  }
+
+  claimPartnerPause(partnerId: string, expectedRevision: bigint): PartnerPauseRecord {
+    return this.#write(() => {
+      const partner = this.getPartner(partnerId); assertRevision(partner, expectedRevision);
+      const existing = this.getPartnerPause(partner.id);
+      if (existing) {
+        if (existing.phase === "resuming") throw new PartnerStoreError("PARTNER_CHANGED", "Recover the pending resume before pausing again.");
+        return existing;
+      }
+      this.#assertRestartIdle(partner.id);
+      if (partner.lifecycle !== "active" || partner.initializationState !== "ready" || !partner.canonicalSessionId) {
+        throw new PartnerStoreError("PARTNER_INVALID", "Only a ready active Partner can be paused.");
+      }
+      const at = this.#now();
+      const delegations = this.#database.prepare(`SELECT id FROM partner_delegations WHERE (requester_partner_id = ? OR target_partner_id = ?)
+        AND status NOT IN ('completed', 'failed', 'cancelled') ORDER BY id`).all(partner.id, partner.id) as Row[];
+      this.#database.prepare(`INSERT INTO partner_pauses(partner_id, id, phase, captured, sessions_json, delegation_ids_json, created_at, updated_at)
+        VALUES (?, ?, 'closing', 0, '[]', ?, ?, ?)`)
+        .run(partner.id, randomUUID(), JSON.stringify(delegations.map(row => entityId(row['id'], "Partner delegation ID"))), at, at);
+      this.#database.prepare("UPDATE partners SET lifecycle = 'paused', revision = ?, updated_at = ? WHERE id = ?")
+        .run(nextNumber(partner.revision, "Partner revision"), at, partner.id);
+      this.#database.prepare(`UPDATE partner_delegations SET status = 'cancelled', revision = revision + 1,
+        completed_at = ?, updated_at = ?, error_text = NULL, result_summary = NULL
+        WHERE (requester_partner_id = ? OR target_partner_id = ?) AND status NOT IN ('completed', 'failed', 'cancelled')`)
+        .run(at, at, partner.id, partner.id);
+      this.#bumpDirectory(at); return this.getPartnerPause(partner.id)!;
+    });
+  }
+
+  capturePartnerPause(partnerId: string, pauseId: string, sessions: readonly PartnerPauseSession[]): PartnerPauseRecord {
+    return this.#write(() => {
+      const pause = this.#requirePause(partnerId, pauseId); if (pause.captured) return pause;
+      if (pause.phase !== "closing") throw new PartnerStoreError("PARTNER_CHANGED", "The Partner pause changed.");
+      const ids = new Set<string>();
+      for (const session of sessions) {
+        if (ids.has(session.sessionId) || session.closeCompleted || session.queuePauseRevision !== undefined
+          || typeof session.wasQueuePaused !== "boolean") throw new PartnerStoreError("PARTNER_INVALID", "Pause Session capture is invalid.");
+        ids.add(entityId(session.sessionId, "Partner pause Session ID"));
+      }
+      this.#database.prepare("UPDATE partner_pauses SET captured = 1, sessions_json = ?, updated_at = ? WHERE partner_id = ?")
+        .run(JSON.stringify(sessions), this.#now(), partnerId);
+      return this.getPartnerPause(partnerId)!;
+    });
+  }
+
+  advancePartnerPauseSession(partnerId: string, pauseId: string, input: { readonly sessionId: string; readonly queuePauseRevision?: bigint; readonly closeCompleted?: boolean }): PartnerPauseRecord {
+    return this.#write(() => {
+      const pause = this.#requirePause(partnerId, pauseId);
+      if (pause.phase !== "closing" || !pause.captured) throw new PartnerStoreError("PARTNER_CHANGED", "The Partner pause changed.");
+      if (!pause.sessions.some(session => session.sessionId === input.sessionId)) throw new PartnerStoreError("PARTNER_INVALID", "The Session is not owned by this pause.");
+      const sessions = pause.sessions.map(session => session.sessionId !== input.sessionId ? session : { ...session,
+        ...(input.queuePauseRevision === undefined ? {} : { queuePauseRevision: BigInt(revisionNumber(input.queuePauseRevision, "Pause Queue revision")) }),
+        closeCompleted: session.closeCompleted || input.closeCompleted === true });
+      this.#database.prepare("UPDATE partner_pauses SET sessions_json = ?, updated_at = ? WHERE partner_id = ?")
+        .run(JSON.stringify(sessions.map(session => ({ ...session, ...(session.queuePauseRevision === undefined ? {} : { queuePauseRevision: session.queuePauseRevision.toString() }) }))), this.#now(), partnerId);
+      return this.getPartnerPause(partnerId)!;
+    });
+  }
+
+  settlePartnerPause(partnerId: string, pauseId: string): PartnerPauseRecord {
+    return this.#write(() => {
+      const pause = this.#requirePause(partnerId, pauseId);
+      if (pause.phase !== "closing") return pause;
+      if (!pause.captured || pause.sessions.some(session => !session.closeCompleted)) throw new PartnerStoreError("PARTNER_CHANGED", "Partner shutdown is still pending.");
+      this.#database.prepare("UPDATE partner_pauses SET phase = 'paused', failure = NULL, updated_at = ? WHERE partner_id = ?")
+        .run(this.#now(), partnerId); return this.getPartnerPause(partnerId)!;
+    });
+  }
+
+  preparePartnerResume(partnerId: string, pauseId: string): PartnerPauseRecord {
+    return this.#write(() => {
+      const pause = this.#requirePause(partnerId, pauseId);
+      if (pause.phase === "closing") throw new PartnerStoreError("PARTNER_CHANGED", "Complete Partner shutdown before resuming.");
+      this.#database.prepare("UPDATE partner_pauses SET phase = 'resuming', failure = NULL, updated_at = ? WHERE partner_id = ?")
+        .run(this.#now(), partnerId); return this.getPartnerPause(partnerId)!;
+    });
+  }
+
+  finishPartnerResume(partnerId: string, pauseId: string): PartnerProfileRecord {
+    return this.#write(() => {
+      const pause = this.#requirePause(partnerId, pauseId); const partner = this.getPartner(partnerId);
+      if (pause.phase !== "resuming") throw new PartnerStoreError("PARTNER_CHANGED", "The Partner is not resuming.");
+      const at = this.#now();
+      this.#database.prepare("UPDATE partners SET lifecycle = 'active', revision = ?, updated_at = ? WHERE id = ?")
+        .run(nextNumber(partner.revision, "Partner revision"), at, partnerId);
+      this.#database.prepare("DELETE FROM partner_pauses WHERE partner_id = ?").run(partnerId);
+      this.#bumpDirectory(at); return this.getPartner(partnerId);
+    });
+  }
+
+  recordPartnerPauseFailure(partnerId: string, pauseId: string): PartnerPauseRecord {
+    return this.#write(() => {
+      const pause = this.#requirePause(partnerId, pauseId);
+      this.#database.prepare("UPDATE partner_pauses SET failure = ?, updated_at = ? WHERE partner_id = ?")
+        .run(pause.phase === "closing" ? "runtime_close_pending" : "state_commit_pending", this.#now(), partnerId);
+      return this.getPartnerPause(partnerId)!;
+    });
+  }
+
+  #requirePause(partnerId: string, pauseId: string): PartnerPauseRecord {
+    const pause = this.getPartnerPause(partnerId);
+    if (!pause || pause.id !== pauseId || this.getPartner(partnerId).lifecycle !== "paused") {
+      throw new PartnerStoreError("PARTNER_CHANGED", "The Partner pause no longer owns this profile.");
+    }
+    return pause;
+  }
+
+  #pause(row: Row): PartnerPauseRecord {
+    const phase = stringValue(row['phase'], "Partner pause phase");
+    if (phase !== "closing" && phase !== "paused" && phase !== "resuming") throw new Error("Partner pause phase is invalid.");
+    const rawSessions: unknown = JSON.parse(stringValue(row['sessions_json'], "Partner pause Sessions"));
+    const rawDelegations: unknown = JSON.parse(stringValue(row['delegation_ids_json'], "Partner pause delegations"));
+    if (!Array.isArray(rawSessions) || !Array.isArray(rawDelegations)) throw new Error("Partner pause ownership is invalid.");
+    const ids = new Set<string>();
+    const sessions = rawSessions.map((value: unknown): PartnerPauseSession => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Partner pause Session is invalid.");
+      const item = value as Record<string, unknown>; const sessionId = entityId(item['sessionId'], "Partner pause Session ID");
+      if (ids.has(sessionId) || typeof item['wasQueuePaused'] !== "boolean" || typeof item['closeCompleted'] !== "boolean"
+        || Object.keys(item).some(key => !['sessionId', 'wasQueuePaused', 'queuePauseRevision', 'closeCompleted'].includes(key))) throw new Error("Partner pause Session is invalid.");
+      ids.add(sessionId); const revision = item['queuePauseRevision'];
+      if (revision !== undefined && (typeof revision !== "string" || !/^[1-9][0-9]*$/u.test(revision))) throw new Error("Partner pause Queue revision is invalid.");
+      return { sessionId, wasQueuePaused: item['wasQueuePaused'], closeCompleted: item['closeCompleted'],
+        ...(revision === undefined ? {} : { queuePauseRevision: BigInt(revisionNumber(BigInt(revision as string), "Pause Queue revision")) }) };
+    });
+    const failure = row['failure'] === null ? undefined : stringValue(row['failure'], "Partner pause failure");
+    if (failure !== undefined && failure !== "runtime_close_pending" && failure !== "state_commit_pending") throw new Error("Partner pause failure is invalid.");
+    const captured = booleanInteger(row['captured'], "Partner pause capture");
+    if ((!captured && sessions.length > 0) || phase !== "closing" && (!captured || sessions.some(session => !session.closeCompleted))) throw new Error("Partner pause progress is invalid.");
+    return { id: entityId(row['id'], "Partner pause ID"), partnerId: entityId(row['partner_id'], "Partner ID"), phase, captured, sessions,
+      delegationIds: rawDelegations.map(id => entityId(id, "Partner pause delegation ID")), ...(failure === undefined ? {} : { failure }),
+      createdAt: safeInteger(row['created_at'], "Partner pause time"), updatedAt: safeInteger(row['updated_at'], "Partner pause time") };
+  }
+
+  getPartnerDeletion(requestId: string): PartnerDeletionRecord | undefined {
+    this.#assertOpen();
+    const row = this.#database.prepare("SELECT * FROM partner_deletions WHERE request_id = ?")
+      .get(creationRequestId(requestId)) as Row | undefined;
+    return row === undefined ? undefined : this.#deletion(row);
+  }
+
+  isPartnerDeletionRetired(requestId: string): boolean {
+    this.#assertOpen();
+    return this.#database.prepare("SELECT request_id FROM retired_partner_deletions WHERE request_id = ?")
+      .get(creationRequestId(requestId)) !== undefined;
+  }
+
+  retirePartnerDeletion(requestId: string): PartnerDeletionRecord | undefined {
+    return this.#write(() => {
+      const id = creationRequestId(requestId); const existing = this.getPartnerDeletion(id);
+      if (existing !== undefined) return existing;
+      this.#database.prepare("INSERT INTO retired_partner_deletions(request_id, retired_at) VALUES (?, ?) ON CONFLICT(request_id) DO NOTHING")
+        .run(id, this.#now());
+      return undefined;
+    });
+  }
+
+  listPendingPartnerDeletions(): readonly PartnerDeletionRecord[] {
+    this.#assertOpen();
+    return (this.#database.prepare("SELECT * FROM partner_deletions WHERE phase <> 'completed' ORDER BY created_at, request_id")
+      .all() as Row[]).map((row) => this.#deletion(row));
+  }
+
+  isPartnerSessionRetiring(sessionId: string): boolean {
+    return this.listPendingPartnerDeletions().some((record) => record.sessionIds.includes(sessionId));
+  }
+
+  isPartnerTargetRetired(targetId: string): boolean {
+    this.#assertOpen();
+    return this.#database.prepare("SELECT request_id FROM partner_deletions WHERE home_target_id = ?").get(targetId) !== undefined;
+  }
+
+  isPartnerTargetRetiring(targetId: string): boolean {
+    this.#assertOpen();
+    return this.#database.prepare("SELECT request_id FROM partner_deletions WHERE home_target_id = ? AND phase <> 'completed'").get(targetId) !== undefined;
+  }
+
+  extendPartnerDeletionSessions(requestId: string, sessionIds: readonly string[]): PartnerDeletionRecord {
+    return this.#write(() => {
+      const current = this.getPartnerDeletion(requestId);
+      if (current === undefined || current.phase !== "closing") throw new PartnerStoreError("PARTNER_INVALID", "Partner shutdown is not pending.");
+      const ids = [...new Set([...current.sessionIds, ...sessionIds.map((id) => entityId(id, "Partner Session ID"))])].sort();
+      this.#database.prepare("UPDATE partner_deletions SET session_ids_json = ?, updated_at = ? WHERE request_id = ?")
+        .run(JSON.stringify(ids), this.#now(), requestId);
+      return this.getPartnerDeletion(requestId)!;
+    });
+  }
+
+  claimPartnerDeletion(input: {
+    readonly requestId: string; readonly partnerId: string; readonly expectedRevision: bigint; readonly confirmName: string;
+  }): PartnerDeletionRecord {
+    return this.#write(() => {
+      const requestId = creationRequestId(input.requestId);
+      const partnerId = entityId(input.partnerId, "Partner ID");
+      const existing = this.getPartnerDeletion(requestId);
+      if (existing !== undefined) {
+        if (existing.partnerId !== partnerId) throw new PartnerStoreError("PARTNER_INVALID", "The deletion request belongs to another partner.");
+        return existing;
+      }
+      if (this.isPartnerDeletionRetired(requestId)) throw new PartnerStoreError("PARTNER_INVALID", "This deletion request was retired before dispatch.");
+      if (this.#database.prepare("SELECT request_id FROM partner_deletions WHERE partner_id = ?").get(partnerId) !== undefined) {
+        throw new PartnerStoreError("PARTNER_CHANGED", "This partner already has a deletion to recover.");
+      }
+      const current = this.getPartner(partnerId);
+      assertRevision(current, input.expectedRevision);
+      assertMutable(current);
+      this.#assertRestartIdle(partnerId, true);
+      if (input.confirmName !== current.displayName) throw new PartnerStoreError("PARTNER_INVALID", "Type the partner's full name to delete it.");
+      const pause = this.getPartnerPause(partnerId);
+      const links = this.#database.prepare("SELECT session_id FROM partner_session_links WHERE partner_id = ?").all(partnerId) as Row[];
+      const delegated = this.#database.prepare(`SELECT child_session_id FROM partner_delegations
+        WHERE (requester_partner_id = ? OR target_partner_id = ?) AND child_session_id IS NOT NULL
+          AND status NOT IN ('completed', 'failed', 'cancelled')`).all(partnerId, partnerId) as Row[];
+      const sessionIds = [...new Set([...links.map((row) => entityId(row['session_id'], "Partner Session ID")),
+        ...delegated.map((row) => entityId(row['child_session_id'], "Partner child Session ID")),
+        ...(pause?.sessions.map(session => session.sessionId) ?? [])])].sort();
+      const at = this.#now();
+      this.#database.prepare(`INSERT INTO partner_deletions(request_id, partner_id, home_target_id, session_ids_json, phase, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'closing', ?, ?)`).run(requestId, partnerId, current.homeTargetId, JSON.stringify(sessionIds), at, at);
+      this.#database.prepare("UPDATE partners SET lifecycle = 'deleted', revision = ?, updated_at = ? WHERE id = ?")
+        .run(nextNumber(current.revision, "Partner revision"), at, partnerId);
+      this.#database.prepare("DELETE FROM partner_pauses WHERE partner_id = ?").run(partnerId);
+      this.#database.prepare(`UPDATE partner_delegations SET status = 'cancelled', revision = revision + 1,
+        completed_at = ?, updated_at = ?, error_text = NULL, result_summary = NULL
+        WHERE (requester_partner_id = ? OR target_partner_id = ?) AND status NOT IN ('completed', 'failed', 'cancelled')`)
+        .run(at, at, partnerId, partnerId);
+      this.#database.prepare(`UPDATE partner_private_messages SET delivery_status = 'failed', error_text = 'Partner deletion is pending.'
+        WHERE (sender_partner_id = ? OR recipient_partner_id = ?) AND delivery_status = 'pending'`).run(partnerId, partnerId);
+      this.#bumpDirectory(at);
+      return this.getPartnerDeletion(requestId)!;
+    });
+  }
+
+  advancePartnerDeletion(requestId: string): PartnerDeletionRecord {
+    return this.#write(() => {
+      const current = this.getPartnerDeletion(requestId);
+      if (current === undefined) throw new PartnerStoreError("PARTNER_NOT_FOUND", "The partner deletion was not found.");
+      if (current.phase !== "closing") return current;
+      this.#database.prepare("UPDATE partner_deletions SET phase = 'cleanup', failure = NULL, updated_at = ? WHERE request_id = ?")
+        .run(this.#now(), current.requestId);
+      return this.getPartnerDeletion(current.requestId)!;
+    });
+  }
+
+  recordPartnerDeletionFailure(requestId: string, failure: PartnerDeletionFailure): PartnerDeletionRecord {
+    return this.#write(() => {
+      const current = this.getPartnerDeletion(requestId);
+      if (current === undefined) throw new PartnerStoreError("PARTNER_NOT_FOUND", "The partner deletion was not found.");
+      if (current.phase === "completed") return current;
+      this.#database.prepare("UPDATE partner_deletions SET failure = ?, updated_at = ? WHERE request_id = ?")
+        .run(failure, this.#now(), current.requestId);
+      return this.getPartnerDeletion(current.requestId)!;
+    });
+  }
+
+  completePartnerDeletion(requestId: string): PartnerDeletionRecord {
+    return this.#write(() => {
+      const current = this.getPartnerDeletion(requestId);
+      if (current === undefined) throw new PartnerStoreError("PARTNER_NOT_FOUND", "The partner deletion was not found.");
+      if (current.phase === "completed") return current;
+      if (current.phase !== "cleanup") throw new PartnerStoreError("PARTNER_INVALID", "Partner runtimes must close before profile cleanup.");
+      const partner = this.getPartner(current.partnerId);
+      if (partner.lifecycle !== "deleted") throw new PartnerStoreError("PARTNER_CHANGED", "The deletion lost its frozen profile.");
+      const creation = this.#database.prepare("SELECT creation_request_id FROM partners WHERE id = ?").get(partner.id) as Row;
+      const at = this.#now();
+      this.#database.prepare("INSERT INTO retired_partner_creations(request_id, retired_at) VALUES (?, ?) ON CONFLICT(request_id) DO NOTHING")
+        .run(creationRequestId(creation['creation_request_id']), at);
+      this.#database.prepare("DELETE FROM partners WHERE id = ?").run(partner.id);
+      if (typeof partner.avatar !== "string") this.#database.prepare(`DELETE FROM partner_avatar_images WHERE sha256 = ?
+        AND NOT EXISTS (SELECT 1 FROM partners WHERE json_extract(avatar_json, '$.sha256') = ?)`)
+        .run(partner.avatar.sha256, partner.avatar.sha256);
+      this.#database.prepare("UPDATE partner_deletions SET phase = 'completed', failure = NULL, updated_at = ? WHERE request_id = ?")
+        .run(at, current.requestId);
+      this.#bumpDirectory(at);
+      return this.getPartnerDeletion(current.requestId)!;
+    });
+  }
+
+  #deletion(row: Row): PartnerDeletionRecord {
+    const sessionIds: unknown = JSON.parse(stringValue(row['session_ids_json'], "Partner deletion Sessions"));
+    if (!Array.isArray(sessionIds)) throw unavailable("Partner deletion Sessions are invalid.");
+    const phase = row['phase']; const failure = row['failure'];
+    if (phase !== "closing" && phase !== "cleanup" && phase !== "completed") throw unavailable("Partner deletion phase is invalid.");
+    if (failure !== null && failure !== "runtime_close_pending" && failure !== "home_cleanup_pending") throw unavailable("Partner deletion failure is invalid.");
+    return { requestId: creationRequestId(row['request_id']), partnerId: entityId(row['partner_id'], "Partner ID"),
+      homeTargetId: entityId(row['home_target_id'], "Partner home Target ID"),
+      sessionIds: sessionIds.map((id) => entityId(id, "Partner deletion Session ID")), phase,
+      ...(failure === null ? {} : { failure }), createdAt: timestamp(row['created_at'], "Partner deletion creation time"),
+      updatedAt: timestamp(row['updated_at'], "Partner deletion update time") };
   }
 
   findPartnerByCanonicalSession(sessionId: string): PartnerProfileRecord | undefined {
@@ -428,6 +952,43 @@ export class PartnerStore {
     return rows.map(partnerSessionLink);
   }
 
+  /** Group route ownership remains in the group Store; this link owns only the private Profile. */
+  bindGroupSession(input: { readonly partnerId: string; readonly expectedRevision: bigint; readonly profileVersion: number; readonly sessionId: string }): PartnerSessionLinkRecord {
+    return this.#write(() => {
+      const profile = this.getPartner(input.partnerId); assertMutable(profile); assertRevision(profile, input.expectedRevision);
+      if (profile.initializationState !== "ready" || profile.profileVersion !== input.profileVersion) throw changed(profile.id);
+      const sessionId = entityId(input.sessionId, "Group Session ID"), existing = this.getSessionLink(sessionId);
+      if (existing) {
+        if (existing.partnerId !== profile.id || existing.role !== "group" || existing.profileVersion !== input.profileVersion) throw changed(profile.id);
+        return existing;
+      }
+      this.#database.prepare(`INSERT INTO partner_session_links(session_id,partner_id,role,profile_version,parent_session_id,delegation_id,created_at)
+        VALUES (?,?,'group',?,NULL,NULL,?)`).run(sessionId, profile.id, input.profileVersion, this.#now());
+      return this.getSessionLink(sessionId)!;
+    });
+  }
+
+  discardUnstoredGroupSessionLink(sessionId: string, partnerId: string, profileVersion: number): void {
+    this.#write(() => {
+      const link = this.getSessionLink(entityId(sessionId, "Group Session ID")); if (!link) return;
+      if (link.role !== "group" || link.partnerId !== partnerId || link.profileVersion !== profileVersion) throw unavailable("The uncreated group Profile link changed.");
+      this.#database.prepare("DELETE FROM partner_session_links WHERE session_id = ? AND partner_id = ? AND role = 'group' AND profile_version = ?")
+        .run(sessionId, partnerId, profileVersion);
+    });
+  }
+
+  advanceGroupSessionProfile(sessionId: string, expectedProfileVersion: number, expectedPartnerRevision: bigint): PartnerSessionLinkRecord {
+    return this.#write(() => {
+      const link = this.getSessionLink(entityId(sessionId, "Group Session ID"));
+      if (!link || link.role !== "group" || link.profileVersion !== expectedProfileVersion) throw unavailable("The group Profile link changed.");
+      const profile = this.getPartner(link.partnerId); assertMutable(profile); assertRevision(profile, expectedPartnerRevision);
+      if (profile.initializationState !== "ready") throw changed(profile.id);
+      this.#database.prepare("UPDATE partner_session_links SET profile_version = ? WHERE session_id = ? AND role = 'group' AND profile_version = ?")
+        .run(profile.profileVersion, sessionId, expectedProfileVersion);
+      return this.getSessionLink(sessionId)!;
+    });
+  }
+
   readState(partnerId: string): PartnerReadStateRecord {
     const partner = this.getPartner(partnerId);
     const row = this.#database.prepare("SELECT * FROM partner_read_states WHERE partner_id = ?")
@@ -453,33 +1014,64 @@ export class PartnerStore {
     });
   }
 
-  createPartner(input: CreatePartnerInput): PartnerProfileRecord {
+  createPartner(input: CreatePartnerInput, resolvedDefaults?: PartnerCapabilitiesRecord): PartnerProfileRecord {
+    return this.#createPartner(input, false, resolvedDefaults);
+  }
+
+  /** An accepted service checkpoint already owns explicit routes and identity. */
+  createImportedPartner(input: CreatePartnerInput): PartnerProfileRecord {
+    if (!input.id || input.usesDirectoryDefaults) throw new PartnerStoreError("PARTNER_INVALID", "Imported creation requires an owned identity and explicit capabilities.");
+    return this.#createPartner(input, true);
+  }
+
+  #createPartner(input: CreatePartnerInput, acceptedImport: boolean, resolvedDefaults?: PartnerCapabilitiesRecord): PartnerProfileRecord {
     return this.#write(() => {
+      const requestId = creationRequestId(input.requestId);
+      if (this.#database.prepare("SELECT request_id FROM retired_partner_creations WHERE request_id = ?").get(requestId) !== undefined) {
+        throw new PartnerStoreError("PARTNER_CREATION_RETIRED", "This partner creation request was retired.");
+      }
+      const requestedDraft = partnerDraft({ ...input, avatar: avatarInput(input.avatar) });
+      const fingerprint = creationFingerprint(input, requestedDraft);
+      const existing = this.#database.prepare("SELECT * FROM partners WHERE creation_request_id = ?")
+        .get(requestId) as Row | undefined;
+      if (existing !== undefined) {
+        if (existing["creation_fingerprint"] !== fingerprint) {
+          throw new PartnerStoreError("PARTNER_CREATION_CONFLICT", "This creation request already belongs to another intent.");
+        }
+        const partner = this.#profile(existing);
+        if (partner.lifecycle === "deleted") {
+          throw new PartnerStoreError("PARTNER_CREATION_RETIRED", "The partner created by this request was deleted.");
+        }
+        return partner;
+      }
       const directory = this.directoryState();
-      if (directory.revision !== input.expectedDirectoryRevision) {
+      if (!acceptedImport && directory.revision !== input.expectedDirectoryRevision) {
         throw new PartnerStoreError("PARTNER_DIRECTORY_CHANGED", "The partner directory changed; read it again and retry.");
       }
       const count = safeInteger((this.#database.prepare("SELECT COUNT(*) AS count FROM partners WHERE lifecycle <> 'deleted'").get() as Row)["count"], "Partner count");
       if (count >= MAX_PARTNERS) throw new PartnerStoreError("PARTNER_INVALID", "The partner directory reached its current-v1 limit.");
       const id = entityId(input.id ?? this.#idFactory(), "Partner ID");
+      if (this.#database.prepare("SELECT partner_id FROM partner_deletions WHERE partner_id = ?").get(id) !== undefined) {
+        throw new PartnerStoreError("PARTNER_CREATION_RETIRED", "A deleted partner identity cannot be reused.");
+      }
       const homeTargetId = entityId(input.homeTargetId ?? `partner:${id}`, "Partner home Target ID");
-      const requestedDraft = partnerDraft(input);
       const capabilities = requestedDraft.usesDirectoryDefaults
-        ? this.directoryState().defaultCapabilities
+        ? this.directoryState().defaultCapabilities ?? resolvedDefaults
         : requestedDraft.capabilities;
       if (capabilities === undefined) {
         throw new PartnerStoreError("PARTNER_INVALID", "Partner directory defaults must be configured first.");
       }
       const draft = { ...requestedDraft, capabilities };
       const at = this.#now();
+      this.#persistAvatar(input.avatar);
       this.#database.prepare(`
         INSERT INTO partners(
-          id, revision, profile_version, display_name, normalized_name, avatar, identity_source, template_id,
+          id, creation_request_id, creation_fingerprint, revision, profile_version, display_name, description, normalized_name, avatar_json, identity_source, template_id,
           lifecycle, initialization_state, invitation_stage, initialization_error_code,
-          home_target_id, canonical_session_id, model_chain_json, permission_mode, plan_mode,
+          home_target_id, canonical_session_id, model_chain_json, task_model_json, permission_mode, plan_mode,
           uses_directory_defaults, created_at, updated_at
-        ) VALUES (?, 1, 1, ?, ?, ?, ?, ?, 'active', 'pending', 'home', NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
-      `).run(id, draft.displayName, normalizedPartnerName(draft.displayName), draft.avatar,
+        ) VALUES (?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, 'active', 'pending', 'home', NULL, ?, NULL, ?, NULL, ?, ?, ?, ?, ?)
+      `).run(id, requestId, fingerprint, draft.displayName, draft.description, normalizedPartnerName(draft.displayName), JSON.stringify(draft.avatar),
         draft.identitySource, draft.templateId, homeTargetId, modelChainJson(draft.capabilities.modelChain),
         draft.capabilities.permissionMode, draft.capabilities.planMode ? 1 : 0,
         draft.usesDirectoryDefaults ? 1 : 0, at, at);
@@ -489,9 +1081,10 @@ export class PartnerStore {
     });
   }
 
-  updatePartner(partnerId: string, expectedRevision: bigint, patch: PartnerPatch): PartnerProfileRecord {
+  updatePartner(partnerId: string, expectedRevision: bigint, patch: PartnerPatch, resolvedDefaults?: PartnerCapabilitiesRecord): PartnerProfileRecord {
     return this.#write(() => {
       const current = this.getPartner(partnerId);
+      this.#assertRestartIdle(partnerId);
       assertMutable(current);
       assertRevision(current, expectedRevision);
       const usesDirectoryDefaults = patch.usesDirectoryDefaults ?? current.usesDirectoryDefaults;
@@ -499,47 +1092,60 @@ export class PartnerStore {
         throw new PartnerStoreError("PARTNER_INVALID", "A partner using directory defaults cannot also provide capability overrides.");
       }
       const capabilities = usesDirectoryDefaults
-        ? this.directoryState().defaultCapabilities
+        ? resolvedDefaults ?? this.directoryState().defaultCapabilities
         : patch.capabilities ?? current.capabilities;
       if (capabilities === undefined) {
         throw new PartnerStoreError("PARTNER_INVALID", "Partner directory defaults must be configured first.");
       }
       const next = partnerDraft({
         displayName: patch.displayName ?? current.displayName,
-        avatar: patch.avatar ?? current.avatar,
+        description: patch.description ?? current.description,
+        avatar: patch.avatar === undefined ? current.avatar : avatarInput(patch.avatar),
         identitySource: patch.identitySource ?? current.identitySource,
         templateId: current.templateId,
         capabilities,
-        usesDirectoryDefaults
+        usesDirectoryDefaults,
+        ...(patch.taskModelOverride === null ? {} : { taskModelOverride: patch.taskModelOverride ?? current.taskModelOverride })
       });
       if (sameProfileContent(current, next)) return current;
       const at = this.#now();
       const nextRevision = nextNumber(current.revision, "Partner revision");
       const nextVersion = nextSafeInteger(current.profileVersion, "Partner profile version");
+      if (patch.avatar !== undefined) this.#persistAvatar(patch.avatar);
       const result = this.#database.prepare(`
         UPDATE partners SET
-          revision = ?, profile_version = ?, display_name = ?, normalized_name = ?, avatar = ?, identity_source = ?,
-          model_chain_json = ?, permission_mode = ?, plan_mode = ?, uses_directory_defaults = ?,
-          initialization_state = 'pending', invitation_stage = 'home',
+          revision = ?, profile_version = ?, display_name = ?, description = ?, normalized_name = ?, avatar_json = ?, identity_source = ?,
+          model_chain_json = ?, task_model_json = ?, permission_mode = ?, plan_mode = ?, uses_directory_defaults = ?,
+          initialization_state = CASE WHEN lifecycle = 'paused' THEN 'ready' ELSE 'pending' END,
+          invitation_stage = CASE WHEN lifecycle = 'paused' THEN 'ready' ELSE 'home' END,
           initialization_error_code = NULL, updated_at = ?
         WHERE id = ? AND revision = ?
-      `).run(nextRevision, nextVersion, next.displayName, normalizedPartnerName(next.displayName), next.avatar,
-        next.identitySource, modelChainJson(next.capabilities.modelChain), next.capabilities.permissionMode,
+      `).run(nextRevision, nextVersion, next.displayName, next.description, normalizedPartnerName(next.displayName), JSON.stringify(next.avatar),
+        next.identitySource, modelChainJson(next.capabilities.modelChain), taskModelJson(next.taskModelOverride), next.capabilities.permissionMode,
         next.capabilities.planMode ? 1 : 0, next.usesDirectoryDefaults ? 1 : 0,
         at, current.id, Number(current.revision));
       if (Number(result.changes) !== 1) throw changed(current.id);
+      if (typeof current.avatar !== "string" && JSON.stringify(current.avatar) !== JSON.stringify(next.avatar)) {
+        this.#database.prepare(`DELETE FROM partner_avatar_images WHERE sha256 = ?
+          AND NOT EXISTS (SELECT 1 FROM partners WHERE json_extract(avatar_json, '$.sha256') = ?)`)
+          .run(current.avatar.sha256, current.avatar.sha256);
+      }
       this.#insertVersion(current.id, nextVersion, next.identitySource, next.capabilities,
-        next.usesDirectoryDefaults, at);
+        next.usesDirectoryDefaults, at, next.taskModelOverride);
       this.#bumpDirectory(at);
       return this.getPartner(current.id);
     });
   }
 
   setLifecycle(partnerId: string, expectedRevision: bigint, lifecycle: PartnerLifecycle): PartnerProfileRecord {
+    if (lifecycle === "deleted") throw new PartnerStoreError("PARTNER_INVALID", "Use the confirmed partner deletion action.");
+    if (lifecycle === "paused") throw new PartnerStoreError("PARTNER_INVALID", "Use the owned Partner pause action.");
     return this.#write(() => {
       const current = this.getPartner(partnerId);
+      this.#assertRestartIdle(partnerId);
       assertRevision(current, expectedRevision);
       lifecycleValue(lifecycle);
+      if (this.getPartnerPause(partnerId)) throw new PartnerStoreError("PARTNER_CHANGED", "Complete the Partner pause or resume before changing its lifecycle.");
       if (current.lifecycle === lifecycle) return current;
       if (current.lifecycle === "deleted") {
         throw new PartnerStoreError("PARTNER_INVALID", "A deleted partner profile cannot be restored.");
@@ -557,6 +1163,7 @@ export class PartnerStore {
   prepareInitialization(partnerId: string, expectedRevision: bigint): PartnerProfileRecord {
     return this.#write(() => {
       const current = this.getPartner(partnerId);
+      this.#assertRestartIdle(partnerId);
       assertMutable(current);
       assertRevision(current, expectedRevision);
       const at = this.#now();
@@ -721,6 +1328,7 @@ export class PartnerStore {
       version: safeInteger(row["version"], "Partner profile version"),
       identitySource: identityValue(row["identity_source"]),
       capabilities: capabilitiesFromRow(row),
+      ...taskModelFromRow(row),
       usesDirectoryDefaults: booleanInteger(row["uses_directory_defaults"], "Partner version default inheritance"),
       createdAt: timestamp(row["created_at"], "Partner profile version created time")
     }));
@@ -1238,6 +1846,8 @@ export class PartnerStore {
         throw new Error("Partner initialization failure and invitation stage disagree.");
       }
       const canonicalSessionId = nullableEntityId(row["canonical_session_id"], "Canonical Session ID");
+      const pause = lifecycle === "paused" ? this.getPartnerPause(entityId(row['id'], "Partner ID")) : undefined;
+      if (lifecycle === "paused" && !pause) throw new Error("A paused Partner has no durable shutdown owner.");
       if (initializationState === "ready" && canonicalSessionId === undefined) {
         throw new Error("A ready partner has no canonical Session.");
       }
@@ -1246,16 +1856,19 @@ export class PartnerStore {
         revision: BigInt(safeInteger(row["revision"], "Partner revision")),
         profileVersion: positiveInteger(row["profile_version"], "Partner profile version"),
         displayName: displayName(row["display_name"]),
-        avatar: avatarId(row["avatar"]),
+        description: descriptionValue(row["description"]),
+        avatar: avatarRecord(JSON.parse(stringValue(row["avatar_json"], "Partner avatar"))),
         identitySource: identityValue(row["identity_source"]),
         templateId: templateId(row["template_id"]),
         lifecycle,
+        ...(pause === undefined ? {} : { pauseCleanupPending: pause.phase !== "paused" }),
         initializationState,
         invitationStage,
         ...(initializationError === undefined ? {} : { initializationErrorCode: initializationError }),
         homeTargetId: entityId(row["home_target_id"], "Partner home Target ID"),
         ...(canonicalSessionId === undefined ? {} : { canonicalSessionId }),
         capabilities: capabilitiesFromRow(row),
+        ...taskModelFromRow(row),
         usesDirectoryDefaults: booleanInteger(row["uses_directory_defaults"], "Partner default inheritance"),
         createdAt: timestamp(row["created_at"], "Partner created time"),
         updatedAt: timestamp(row["updated_at"], "Partner updated time")
@@ -1272,14 +1885,15 @@ export class PartnerStore {
     identitySource: string,
     capabilities: PartnerCapabilitiesRecord,
     usesDirectoryDefaults: boolean,
-    at: number
+    at: number,
+    taskModelOverride?: PartnerModelRouteRecord
   ): void {
     this.#database.prepare(`
       INSERT INTO partner_profile_versions(
-        partner_id, version, identity_source, model_chain_json, permission_mode, plan_mode,
+        partner_id, version, identity_source, model_chain_json, task_model_json, permission_mode, plan_mode,
         uses_directory_defaults, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(partnerId, version, identitySource, modelChainJson(capabilities.modelChain),
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(partnerId, version, identitySource, modelChainJson(capabilities.modelChain), taskModelJson(taskModelOverride),
       capabilities.permissionMode, capabilities.planMode ? 1 : 0, usesDirectoryDefaults ? 1 : 0, at);
   }
 
@@ -1378,7 +1992,7 @@ function partnerSessionLink(row: Row): PartnerSessionLinkRecord {
 }
 
 function partnerSessionRole(value: unknown): PartnerSessionRole {
-  if (value === "canonical" || value === "history" || value === "delegation") return value;
+  if (value === "canonical" || value === "history" || value === "delegation" || value === "group") return value;
   throw unavailable("The partner Session role is invalid.");
 }
 
@@ -1576,17 +2190,48 @@ function stablePartnerOperationId(prefix: string, ...parts: readonly string[]): 
   return `${prefix}:${createHash("sha256").update(parts.join("\0"), "utf8").digest("hex")}`;
 }
 
-function partnerDraft(input: PartnerDraft): PartnerDraft {
+function creationRequestId(value: unknown): string {
+  if (typeof value !== "string" || !CREATION_REQUEST_ID.test(value)) {
+    throw new PartnerStoreError("PARTNER_INVALID", "Partner creation request ID must contain 16–80 letters, digits, underscores or hyphens.");
+  }
+  return value;
+}
+
+type NormalizedPartnerDraft = Omit<PartnerDraft, "avatar" | "description"> & { readonly description: string; readonly avatar: PartnerAvatarRecord; readonly taskModelOverride?: PartnerModelRouteRecord };
+
+function creationFingerprint(input: CreatePartnerInput, draft: NormalizedPartnerDraft): string {
+  const revision = revisionNumber(input.expectedDirectoryRevision, "Partner directory revision");
+  return createHash("sha256").update(JSON.stringify({
+    expectedDirectoryRevision: revision,
+    id: input.id === undefined ? null : entityId(input.id, "Partner ID"),
+    homeTargetId: input.homeTargetId === undefined ? null : entityId(input.homeTargetId, "Partner home Target ID"),
+    displayName: draft.displayName,
+    description: draft.description,
+    avatar: draft.avatar,
+    identitySource: draft.identitySource,
+    templateId: draft.templateId,
+    usesDirectoryDefaults: draft.usesDirectoryDefaults,
+    capabilities: draft.usesDirectoryDefaults ? null : {
+      modelChain: modelChainJson(draft.capabilities.modelChain),
+      permissionMode: draft.capabilities.permissionMode,
+      planMode: draft.capabilities.planMode
+    }
+  })).digest("hex");
+}
+
+function partnerDraft(input: Omit<NormalizedPartnerDraft, "description"> & { readonly description?: string }): NormalizedPartnerDraft {
   if (typeof input.usesDirectoryDefaults !== "boolean") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner default inheritance must be boolean.");
   }
   return {
     displayName: displayName(input.displayName),
-    avatar: avatarId(input.avatar),
+    description: descriptionValue(input.description ?? ""),
+    avatar: avatarRecord(input.avatar),
     identitySource: identityValue(input.identitySource),
     templateId: templateId(input.templateId),
     capabilities: capabilitiesValue(input.capabilities),
-    usesDirectoryDefaults: input.usesDirectoryDefaults
+    usesDirectoryDefaults: input.usesDirectoryDefaults,
+    ...(input.taskModelOverride === undefined ? {} : { taskModelOverride: modelRoute(input.taskModelOverride) })
   };
 }
 
@@ -1602,13 +2247,9 @@ function capabilitiesValue(value: PartnerCapabilitiesRecord): PartnerCapabilitie
     throw new PartnerStoreError("PARTNER_INVALID", "Partner Plan mode must be boolean.");
   }
   if (!Array.isArray(value.modelChain) || value.modelChain.length < 1 || value.modelChain.length > MAX_MODEL_ROUTES) {
-    throw new PartnerStoreError("PARTNER_INVALID", "Partner model chain must contain one to three routes.");
+    throw new PartnerStoreError("PARTNER_INVALID", "Partner model chain must contain one to five routes.");
   }
   const routes = value.modelChain.map(modelRoute);
-  const backendId = routes[0]!.backendId;
-  if (routes.some((route) => route.backendId !== backendId)) {
-    throw new PartnerStoreError("PARTNER_INVALID", "Partner model routes must belong to one Backend.");
-  }
   const identities = new Set<string>();
   for (const route of routes) {
     const identity = `${route.backendId}\0${route.providerId}\0${route.modelId}`;
@@ -1688,12 +2329,26 @@ function modelChainJson(routes: readonly PartnerModelRouteRecord[]): string {
   })));
 }
 
-function sameProfileContent(current: PartnerProfileRecord, next: PartnerDraft): boolean {
+function taskModelJson(route: PartnerModelRouteRecord | undefined): string | null {
+  return route === undefined ? null : JSON.stringify(modelRoute(route));
+}
+
+function taskModelFromRow(row: Row): { readonly taskModelOverride?: PartnerModelRouteRecord } {
+  if (row["task_model_json"] === null) return {};
+  const raw = stringValue(row["task_model_json"], "Partner task model");
+  const route = modelRoute(JSON.parse(raw));
+  if (taskModelJson(route) !== raw) throw unavailable("The Partner task model is not the current shape.");
+  return { taskModelOverride: route };
+}
+
+function sameProfileContent(current: PartnerProfileRecord, next: NormalizedPartnerDraft): boolean {
   return current.displayName === next.displayName
-    && current.avatar === next.avatar
+    && current.description === next.description
+    && JSON.stringify(current.avatar) === JSON.stringify(next.avatar)
     && current.identitySource === next.identitySource
     && current.templateId === next.templateId
     && current.usesDirectoryDefaults === next.usesDirectoryDefaults
+    && taskModelJson(current.taskModelOverride) === taskModelJson(next.taskModelOverride)
     && current.capabilities.permissionMode === next.capabilities.permissionMode
     && current.capabilities.planMode === next.capabilities.planMode
     && modelChainJson(current.capabilities.modelChain) === modelChainJson(next.capabilities.modelChain);
@@ -1743,6 +2398,18 @@ function avatarId(value: unknown): string {
   return result;
 }
 
+function avatarRecord(value: unknown): PartnerAvatarRecord {
+  return typeof value === "string" ? avatarId(value) : partnerAvatarImage(value);
+}
+
+function avatarInput(value: PartnerAvatarInput): PartnerAvatarRecord {
+  if (typeof value === "string") return avatarId(value);
+  if (!value || typeof value !== "object" || Object.keys(value).join(",") !== "base64") {
+    throw new PartnerStoreError("PARTNER_INVALID", "A Partner avatar preset or image is required.");
+  }
+  return decodePartnerAvatar(value.base64).image;
+}
+
 function templateId(value: unknown): string {
   const result = stringValue(value, "Partner template");
   if (!TEMPLATE_ID.test(result)) throw new PartnerStoreError("PARTNER_INVALID", "Partner template is invalid.");
@@ -1750,7 +2417,7 @@ function templateId(value: unknown): string {
 }
 
 function lifecycleValue(value: unknown): PartnerLifecycle {
-  if (value === "active" || value === "archived" || value === "deleted") return value;
+  if (value === "active" || value === "paused" || value === "archived" || value === "deleted") return value;
   throw new PartnerStoreError("PARTNER_INVALID", "Partner lifecycle is invalid.");
 }
 
@@ -1783,6 +2450,15 @@ function nullableEntityId(value: unknown, label: string): string | undefined {
 
 function routeText(value: unknown, label: string, maximum = 128, allowEmpty = false): string {
   return textValue(value, label, maximum, !allowEmpty);
+}
+
+function descriptionValue(value: unknown): string {
+  if (typeof value !== "string") throw new PartnerStoreError("PARTNER_INVALID", "Partner introduction must be text.");
+  const result = value.replace(/\r\n?/gu, "\n").trim();
+  if (result.length > 12_000 || FORBIDDEN_MULTILINE_TEXT.test(result) || redactSecrets(result) !== result) {
+    throw new PartnerStoreError("PARTNER_INVALID", "Partner introduction is invalid or exceeds its limit.");
+  }
+  return result;
 }
 
 function identityValue(value: unknown): string {

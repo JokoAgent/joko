@@ -222,6 +222,8 @@ CREATE TABLE mobile_push_deliveries (
         registration_id TEXT NOT NULL REFERENCES mobile_push_registrations(id) ON DELETE CASCADE,
         session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
         kind TEXT NOT NULL CHECK (kind IN ('done', 'awaiting', 'error')),
+        group_id TEXT CHECK (group_id IS NULL OR (length(group_id) BETWEEN 1 AND 256 AND instr(group_id, char(0)) = 0)),
+        group_title TEXT CHECK (group_title IS NULL OR (length(group_title) BETWEEN 1 AND 160 AND instr(group_title, char(0)) = 0)),
         subject_cursor INTEGER NOT NULL CHECK (subject_cursor >= 1),
         subject_generation INTEGER NOT NULL CHECK (subject_generation >= 0),
         message_id TEXT CHECK (
@@ -244,13 +246,16 @@ CREATE TABLE mobile_push_deliveries (
         created_at INTEGER NOT NULL CHECK (created_at >= 0),
         updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
         revision INTEGER NOT NULL CHECK (revision >= 1),
-        UNIQUE(registration_id, session_id, subject_cursor, subject_generation),
+        UNIQUE(registration_id, group_id, subject_cursor, subject_generation),
+        CHECK ((group_id IS NULL) = (group_title IS NULL)),
         CHECK ((message_id IS NULL) = (message_event_id IS NULL)),
         CHECK ((status = 'dispatching') = (claim_token IS NOT NULL AND claimed_at IS NOT NULL))
       ) STRICT;
 
 CREATE INDEX mobile_push_deliveries_pending_idx
   ON mobile_push_deliveries(status, available_at, created_at, id);
+CREATE UNIQUE INDEX mobile_push_session_subject_idx
+  ON mobile_push_deliveries(registration_id, session_id, subject_cursor, subject_generation) WHERE group_id IS NULL;
 
 CREATE TABLE diagnostics (
         id TEXT PRIMARY KEY,
@@ -882,6 +887,7 @@ CREATE INDEX session_task_tags_by_tag
 CREATE TABLE queue_controls (
         session_id TEXT PRIMARY KEY REFERENCES product_sessions(id) ON DELETE CASCADE,
         paused INTEGER NOT NULL CHECK (paused IN (0, 1)),
+        resume_on_user_input INTEGER NOT NULL DEFAULT 0 CHECK (resume_on_user_input IN (0, 1) AND (resume_on_user_input = 0 OR paused = 1)),
         pause_reason TEXT,
         paused_at INTEGER,
         paused_by_connection_id TEXT REFERENCES connections(id) ON DELETE SET NULL,
@@ -1310,11 +1316,18 @@ CREATE TABLE session_context_rebuilds (
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
         revision INTEGER NOT NULL CHECK (revision >= 1),
-        reason TEXT NOT NULL CHECK (reason IN ('message_deletion', 'context_overflow', 'prompt_timeout')),
+        reason TEXT NOT NULL CHECK (reason IN ('message_deletion', 'context_overflow', 'prompt_timeout', 'manual_restart')),
         source_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
         source_queue_item_id TEXT REFERENCES queue_items(id) ON DELETE RESTRICT,
         source_input_pending INTEGER NOT NULL CHECK (source_input_pending IN (0, 1)),
         replay_safe INTEGER NOT NULL CHECK (replay_safe IN (0, 1))
+      ) STRICT;
+
+CREATE TABLE session_context_handoffs (
+        session_id TEXT PRIMARY KEY REFERENCES product_sessions(id) ON DELETE CASCADE,
+        binding_opaque_ref TEXT NOT NULL,
+        handoff TEXT NOT NULL CHECK (length(handoff) BETWEEN 1 AND 524288),
+        updated_at INTEGER NOT NULL
       ) STRICT;
 
 CREATE TABLE session_event_counters (

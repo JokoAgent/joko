@@ -50,6 +50,7 @@ export interface ScheduleHookScriptInstallInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly signal?: AbortSignal;
+  readonly assertCurrent?: () => void;
 }
 
 export interface ScheduleHookScriptInstallResult {
@@ -84,19 +85,24 @@ export class ScheduleHookScriptInstaller {
 
   async #install(input: ScheduleHookScriptInstallInput): Promise<ScheduleHookScriptInstallResult> {
     input.signal?.throwIfAborted();
+    input.assertCurrent?.();
     const workspace = await canonicalDirectory(input.workspaceRoot, "Schedule workspace");
+    input.assertCurrent?.();
     const installDirectory = await safeInstallDirectory(workspace);
     const currentFilePath = input.currentFilePath === undefined
       ? undefined
       : await reusableScriptPath(input.currentFilePath, installDirectory);
     const content = await this.#resolveContent(input, workspace, currentFilePath);
     input.signal?.throwIfAborted();
+    input.assertCurrent?.();
     const filePath = currentFilePath ?? await availableScriptPath(
       installDirectory,
       scheduleHookScriptSlug(input.scheduleName, input.description)
     );
     await assertInstallDirectoryStable(workspace, installDirectory);
+    input.assertCurrent?.();
     await atomicWriteScript(filePath, content);
+    input.assertCurrent?.();
     const command = scheduleHookScriptCommand(filePath);
     const test = await executeSchedulePreRunHook({
       command,

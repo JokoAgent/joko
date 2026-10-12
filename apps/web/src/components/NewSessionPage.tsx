@@ -25,6 +25,7 @@ import {
   plainTextToComposerDocument
 } from "../composer-quote-document.js";
 import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
+import { readAppDefaultModelPreference, setAppDefaultModelPreference, useAppDefaultModelPreference } from "../app-default-model-preferences.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
@@ -198,7 +199,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     && eligibleDialogueBackends.some((backend) => backend.id === initialDialogueBackendId)
     ? { kind: "dialogue", backendId: initialDialogueBackendId }
     : undefined);
-  const [selection, setSelection] = useState<NewSessionDraftSelection | undefined>(() => requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
+  const [selection, setSelection] = useState<NewSessionDraftSelection | undefined>(() => requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends,
+    readAppDefaultModelPreference(controller.state.activeProfile?.serverId).current?.backendId));
   const [projectEditorOpen, setProjectEditorOpen] = useState(false);
   const [projectEditorInitialDirectory, setProjectEditorInitialDirectory] = useState<string>();
   const [projectCreatePending, setProjectCreatePending] = useState(false);
@@ -684,6 +686,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const selectedModel = execution.selectedModel ?? snapshot.models.find((model) => model.backendId === backend?.id
     && modelKeyFor(model.providerId, model.modelId) === modelKey);
   const pickerOwnerId = modelPreferenceOwnerId(controller.state.activeProfile?.serverId);
+  const appDefault = useAppDefaultModelPreference(pickerOwnerId).current;
+  const appDefaultKey = JSON.stringify([pickerOwnerId, appDefault]);
+  const observedAppDefault = useRef(appDefaultKey);
   const pickerBackendDefaults = snapshot.settings.backendSettings.find((settings) => settings.backendId === backend?.id);
   const pickerDefaultModel = pickerBackendDefaults?.model === undefined
     ? execution.availableModels[0]
@@ -1013,7 +1018,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     setRecommendationRestored(false);
     worktreeAuthorityTargetRef.current = undefined;
     setDraftError(undefined);
-    setSelection(requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends));
+    setSelection(requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends,
+      readAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId).current?.backendId));
     void (async () => {
       const pendingReader = typeof controllerRef.current.readPendingExtensionUse === "function"
         ? controllerRef.current.readPendingExtensionUse()
@@ -1040,15 +1046,16 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
           if (suggestion !== undefined) await controllerRef.current.compareAndSetPendingExtensionSuggestion(suggestion);
         } else setRecommendationReturn(suggestion);
       }
+      const preferredBackend = readAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId).current?.backendId;
       const restoredSelection = draft === undefined
-        ? requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends)
+        ? requestedSelection ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends, preferredBackend)
         : requestedSelection
           ?? (draft.selection.kind === "unselected"
             ? undefined
             : draft.selection.kind === "target"
               ? draft.selection
               : parseNewSessionSelection(newSessionSelectionValue(draft.selection), projectTargets, eligibleDialogueBackends))
-          ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends);
+          ?? defaultNewSessionSelection(activeTargets, eligibleDialogueBackends, preferredBackend);
       const restored = draft === undefined || restoredSelection === undefined
         ? undefined
         : { ...draft, selection: restoredSelection };
@@ -1139,7 +1146,8 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       ? undefined
       : parseNewSessionSelection(selectionKey, projectTargets, eligibleDialogueBackends);
     if (stillValid !== undefined) return;
-    const fallback = defaultNewSessionSelection(activeTargets, eligibleDialogueBackends);
+    const fallback = defaultNewSessionSelection(activeTargets, eligibleDialogueBackends,
+      readAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId).current?.backendId);
     if (fallback === undefined && selection === undefined) return;
     setSelection(fallback);
     setStartKind("fresh");
@@ -1160,10 +1168,16 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       const restoredModel = snapshot.models.find((model) => model.backendId === backend.id
         && modelKeyFor(model.providerId, model.modelId) === restoredModelKey);
       setModelKey(restoredModelKey);
-      setEffort(restoredModel === undefined ? restored.effort ?? "" : restoredOptions.effortSupported && restored.effort !== undefined && restoredModel.efforts.includes(restored.effort)
+      const restoredEffort = restoredModel === undefined ? restored.effort ?? "" : restoredOptions.effortSupported && restored.effort !== undefined && restoredModel.efforts.includes(restored.effort)
         ? restored.effort
-        : restoredOptions.effortSupported ? restoredModel?.efforts[0] ?? "" : "");
-      setFastMode(restoredModel === undefined ? restored.fastMode : restoredOptions.fastModeSupported && restoredModel.supportsFast && restored.fastMode);
+        : restoredOptions.effortSupported ? restoredModel?.efforts[0] ?? "" : "";
+      const restoredFast = restoredModel === undefined ? restored.fastMode : restoredOptions.fastModeSupported && restoredModel.supportsFast && restored.fastMode;
+      setEffort(restoredEffort);
+      setFastMode(restoredFast);
+      if (!readAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId).current && restored.providerId && restored.modelId) {
+        setAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId, { backendId: backend.id, providerId: restored.providerId,
+          modelId: restored.modelId, effort: restoredEffort, fastMode: restoredFast });
+      }
       setPermissionMode(restoredOptions.permissionModes.includes(restored.permissionMode)
         ? restored.permissionMode
         : restoredOptions.permissionModes[0] ?? "ask");
@@ -1186,19 +1200,26 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       return;
     }
     const defaults = snapshot.settings.backendSettings.find((settings) => settings.backendId === backend.id);
+    const preference = readAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId).current;
+    const preferredModel = preference?.backendId === backend.id ? preference : undefined;
+    const defaultRoute = preferredModel ?? defaults?.model;
     const availableOptions = resolveNewSessionExecutionOptions(backend, snapshot.models, "");
-    const defaultModel = defaults?.model === undefined
+    const defaultModel = defaultRoute === undefined
       ? availableOptions.availableModels[0]
       : availableOptions.availableModels.find((model) =>
-          model.providerId === defaults.model?.providerId && model.modelId === defaults.model.modelId);
+          model.providerId === defaultRoute.providerId && model.modelId === defaultRoute.modelId);
     const options = resolveNewSessionExecutionOptions(backend, snapshot.models, defaultModel === undefined ? "" : modelKeyFor(defaultModel.providerId, defaultModel.modelId));
     const initialModel = options.modelSwitchSupported ? options.selectedModel : undefined;
-    setModelKey(!options.modelSwitchSupported ? "" : defaults?.model !== undefined
-      ? modelKeyFor(defaults.model.providerId, defaults.model.modelId)
+    setModelKey(!options.modelSwitchSupported ? "" : defaultRoute !== undefined
+      ? modelKeyFor(defaultRoute.providerId, defaultRoute.modelId)
       : initialModel === undefined ? "" : modelKeyFor(initialModel.providerId, initialModel.modelId));
-    setEffort(options.effortSupported ? defaults?.model?.effort ?? initialModel?.efforts[0] ?? "" : "");
-    setFastMode(initialModel === undefined && defaults?.model !== undefined ? defaults.model.fastMode
-      : options.fastModeSupported && initialModel?.supportsFast === true && (defaults?.model?.fastMode ?? false));
+    setEffort(options.effortSupported ? defaultRoute?.effort ?? initialModel?.efforts[0] ?? "" : "");
+    setFastMode(initialModel === undefined && defaultRoute !== undefined ? defaultRoute.fastMode
+      : options.fastModeSupported && initialModel?.supportsFast === true && (defaultRoute?.fastMode ?? false));
+    if (!preference && initialModel?.available) setAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId, {
+      backendId: backend.id, providerId: initialModel.providerId, modelId: initialModel.modelId,
+      effort: options.effortSupported ? defaultRoute?.effort ?? initialModel.efforts[0] ?? "" : "", fastMode: options.fastModeSupported && initialModel.supportsFast && (defaultRoute?.fastMode ?? false)
+    });
     const defaultPermission = defaults?.permissionMode ?? snapshot.settings.policy.defaultMode;
     setPermissionMode(options.permissionModes.includes(defaultPermission) ? defaultPermission : options.permissionModes[0] ?? "ask");
     setPlanMode(options.planModeSupported && (defaults?.planMode ?? false));
@@ -1219,6 +1240,17 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     setPalette(undefined);
     typedPaletteTriggerRef.current = undefined;
   }, [backend?.id, hydrationRevision, selectionKey]);
+
+  useLayoutEffect(() => {
+    if (observedAppDefault.current === appDefaultKey) return;
+    observedAppDefault.current = appDefaultKey;
+    if (!appDefault || appDefault.backendId !== backend?.id || startKind !== "fresh" || !hydrated || hydratedProfileScope !== profileScope) return;
+    const model = execution.availableModels.find(item => item.providerId === appDefault.providerId && item.modelId === appDefault.modelId);
+    if (!model?.available) return;
+    setModelKey(modelKeyFor(model.providerId, model.modelId));
+    setEffort(appDefault.effort);
+    setFastMode(appDefault.fastMode);
+  }, [appDefaultKey]);
 
   useEffect(() => {
     if (nativeDiscoveryScope === undefined || selected === undefined) {
@@ -2759,10 +2791,14 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                       model.providerId === selection.providerId && model.modelId === selection.modelId);
                     if (nextModel === undefined || !nextModel.available) return;
                     setModelKey(modelKeyFor(nextModel.providerId, nextModel.modelId));
-                    setEffort(selection.effort !== undefined && nextModel.efforts.includes(selection.effort)
+                    const nextEffort = selection.effort !== undefined && nextModel.efforts.includes(selection.effort)
                       ? selection.effort
-                      : nextModel.efforts[0] ?? "");
-                    setFastMode(execution.fastModeSupported && nextModel.supportsFast && selection.fastMode);
+                      : nextModel.efforts[0] ?? "";
+                    const nextFast = execution.fastModeSupported && nextModel.supportsFast && selection.fastMode;
+                    setEffort(nextEffort);
+                    setFastMode(nextFast);
+                    if (backend) setAppDefaultModelPreference(pickerOwnerId, { backendId: backend.id, providerId: nextModel.providerId,
+                      modelId: nextModel.modelId, effort: nextEffort, fastMode: nextFast });
                   }}
                 />}
                 {execution.permissionSelectable ? <PermissionSelector value={permissionMode} modes={execution.permissionModes} disabled={submitting} disabledReason={submitting ? t("common.working") : undefined} onChange={selectPermissionMode} t={t} /> : <Pill tone="neutral"><Shield aria-hidden="true" />{permissionLabel(execution.permissionModes[0] ?? "ask", t)}</Pill>}

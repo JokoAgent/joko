@@ -35,6 +35,7 @@ import {
   type NativeSessionDerivationLifecycle,
   type NativeSessionForkResult,
   type NativeSessionState,
+  type SessionDescriptor,
   type PermissionMode,
   type PolicySnapshot,
   type PortableNativeSession,
@@ -61,6 +62,7 @@ import {
   OperationalStore,
   OperationConflictError,
   OperationPreviouslyFailedError,
+  SessionRuntimeHandoffStore,
   type PersistedEvent,
   type QueueItemRecord,
   RevisionConflictError,
@@ -222,6 +224,121 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it("hands off at the next send and resumes parked bindings with delta history in the same task", async () => {
+    const profile = { ...PI_LIKE_PROFILE, capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+      ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability) };
+    const first = new FakeBackendAdapter({ ...profile, id: "runtime-first", streamDelayMs: 70 });
+    const second = new FakeBackendAdapter({ ...profile, id: "runtime-second" });
+    const f = await createMultiAdapterFixture([first, second]);
+    await f.host.registerTarget({ id: "runtime-target", backendId: first.id, displayName: "Workspace", workspaceRoot: f.directory, managed: false, trusted: true });
+    const connection = f.store.createConnection({ id: "runtime-device", name: "Runtime device", authKeyDigest: "digest" });
+    const firstCreate = vi.spyOn(first, "createSession"), firstClose = vi.spyOn(first, "closeSession");
+    const firstResume = vi.spyOn(first, "resumeSession"), firstSend = vi.spyOn(first, "send");
+    const secondCreate = vi.spyOn(second, "createSession"), secondSend = vi.spyOn(second, "send");
+    const sessionId = (await f.host.createSession({ operationId: "runtime-create", connection, targetId: "runtime-target", title: "Keep this task",
+      providerId: "test", modelId: "text", effort: "medium", permissionMode: "ask", planMode: false, fastMode: false })).value.sessionId;
+    const original = f.store.getSession(sessionId).descriptor;
+    const select = (backendId: string) => f.host.setSessionRuntimeControl({ sessionId, expectedGeneration: f.host.getSessionRuntimeControl(sessionId).generation,
+      patch: { backendId, providerId: "test", modelId: "text", effort: "medium", fastMode: false } });
+    const send = (text: string) => f.host.enqueueInput({ operationId: `runtime-${text}`, connection, sessionId,
+      prompt: { text, images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    const originalRun = send("before-switch");
+    await eventually(() => f.store.getRun(originalRun.runId).descriptor.state === "running");
+    expect(await select(second.id)).toMatchObject({ status: "deferred", effectiveBoundary: "next_send" });
+    await select(first.id);
+    expect(new SessionRuntimeHandoffStore(f.store).read(sessionId)?.pending).toBeUndefined();
+    await select(second.id);
+    await eventually(() => f.store.getRun(originalRun.runId).descriptor.state === "completed");
+    expect(firstClose).not.toHaveBeenCalled(); expect(secondCreate).not.toHaveBeenCalled();
+    const switched = send("while-away");
+    await eventually(() => f.store.getRun(switched.runId).descriptor.state === "completed");
+    expect(f.store.getSession(sessionId).descriptor).toMatchObject({ id: sessionId, backendId: second.id,
+      targetId: original.targetId, permissionMode: original.permissionMode, planMode: original.planMode });
+    expect(f.store.getTarget(original.targetId).descriptor.backendId).toBe(first.id);
+    expect(firstClose).toHaveBeenCalledTimes(1); expect(secondCreate).toHaveBeenCalledTimes(1);
+    expect(secondSend.mock.calls[0]![0].text).toContain("This conversation was previously driven");
+    expect(secondSend.mock.calls[0]![0].text).toContain("before-switch");
+    expect(secondSend.mock.calls[0]![0].text).toMatch(/while-away$/u);
+    expect(f.store.getQueueItem(switched.queueItemId).body.text).toBe("while-away");
+    expect(f.store.getAttempt(f.store.getQueueItem(switched.queueItemId).attemptId!).descriptor.generation)
+      .toBe(f.store.getSession(sessionId).descriptor.binding.generation);
+    const cloned = await f.host.deriveSession({ operationId: "clone-handed-off", connection, sourceSessionId: sessionId, kind: "clone", title: "Derived work" });
+    expect(f.store.getSession(cloned.value.sessionId).descriptor).toMatchObject({ backendId: second.id, targetId: original.targetId });
+    await select(first.id);
+    const returned = send("after-return");
+    await eventually(() => f.store.getRun(returned.runId).descriptor.state === "completed");
+    expect(firstCreate).toHaveBeenCalledTimes(1); expect(firstResume.mock.calls[0]![0].opaqueRef).toBe(original.binding.opaqueRef);
+    expect(firstSend.mock.calls.at(-1)![0].text).toContain("worked on this conversation before");
+    expect(firstSend.mock.calls.at(-1)![0].text).toContain("while-away");
+    expect(f.store.getSession(sessionId).descriptor.binding.opaqueRef).toBe(original.binding.opaqueRef);
+    expect(f.store.listEvents({ sessionId }).filter(event => event.payload.type === "runtime_handoff")
+      .map(event => event.payload)).toEqual([
+        { type: "runtime_handoff", fromBackendId: first.id, toBackendId: second.id, modelId: "text", resumed: false },
+        { type: "runtime_handoff", fromBackendId: second.id, toBackendId: first.id, modelId: "text", resumed: true }
+      ]);
+  });
+
+  it.each(["absent", "unknown"] as const)("creates a fresh full handoff only when a parked binding is confirmed %s", async absence => {
+    const profile = { ...PI_LIKE_PROFILE, capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+      ? { ...capability, options: ["ask", "auto"] } : capability) };
+    const first = Object.assign(new FakeBackendAdapter({ ...profile, id: "parked-first" }), {
+      inspectNativeSessionDeletion: vi.fn(async () => absence)
+    });
+    const second = new FakeBackendAdapter({ ...profile, id: "parked-second" });
+    const f = await createMultiAdapterFixture([first, second]);
+    await f.host.registerTarget({ id: "parked-target", backendId: first.id, displayName: "Workspace", workspaceRoot: f.directory, managed: false, trusted: true });
+    const create = vi.spyOn(first, "createSession"), send = vi.spyOn(first, "send");
+    const sessionId = (await f.host.createServiceSession({ operationId: "parked-create", serviceKind: "partner", targetId: "parked-target", title: "Parked task",
+      providerId: "test", modelId: "text", effort: "medium", permissionMode: "ask", planMode: false, fastMode: false })).value.sessionId;
+    const select = (backendId: string) => f.host.setSessionRuntimeControl({ sessionId, expectedGeneration: f.host.getSessionRuntimeControl(sessionId).generation,
+      patch: { backendId, providerId: "test", modelId: "text", effort: "medium", fastMode: false } });
+    const enqueue = (text: string) => f.host.enqueueServiceInput({ operationId: `parked-${text}`, sessionId, source: "system",
+      prompt: { text, disposition: "prompt", images: [], files: [], mentions: [] } }).value;
+    await select(second.id); const away = enqueue("away");
+    await eventually(() => f.store.getRun(away.runId).descriptor.state === "completed");
+    vi.spyOn(first, "resumeSession").mockRejectedValueOnce(new JokoError({ code: "NATIVE_SESSION_CONTINUITY_GAP", message: "No native history",
+      phase: "resume", retryable: false, stateMayHaveChanged: false, recovery: "Inspect native storage." }));
+    await select(first.id); const returning = enqueue("return");
+    if (absence === "absent") {
+      await eventually(() => f.store.getRun(returning.runId).descriptor.state === "completed");
+      expect(create).toHaveBeenCalledTimes(2);
+      expect(send.mock.calls.at(-1)![0].text).toContain("This conversation was previously driven");
+    } else {
+      await eventually(() => f.store.listEvents({ sessionId }).some(event => event.payload.type === "error" && event.payload.error.code === "RUNTIME_HANDOFF_BLOCKED"));
+      expect(create).toHaveBeenCalledTimes(1); expect(send).not.toHaveBeenCalled();
+      expect(f.store.getQueueItem(returning.queueItemId).state).toBe("accepted");
+    }
+    expect(first.inspectNativeSessionDeletion).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["close", "create"] as const)("keeps an unknown %s effect durable and never replays it when the queued task wakes", async effect => {
+    const profile = { ...PI_LIKE_PROFILE, capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+      ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability) };
+    const first = new FakeBackendAdapter({ ...profile, id: "unknown-first" });
+    const second = new FakeBackendAdapter({ ...profile, id: "unknown-second" });
+    const f = await createMultiAdapterFixture([first, second]);
+    await f.host.registerTarget({ id: "unknown-target", backendId: first.id, displayName: "Workspace", workspaceRoot: f.directory, managed: false, trusted: true });
+    const sessionId = (await f.host.createServiceSession({ operationId: "unknown-create", serviceKind: "partner", targetId: "unknown-target", title: "Unknown effect",
+      providerId: "test", modelId: "text", effort: "medium", permissionMode: "ask", planMode: false, fastMode: false })).value.sessionId;
+    const failure = new JokoError({ code: "NATIVE_EFFECT_UNKNOWN", message: "Lost native response", phase: "test", retryable: false,
+      stateMayHaveChanged: true, recovery: "Inspect before retrying." });
+    const failed = effect === "close" ? vi.spyOn(first, "closeSession").mockRejectedValue(failure)
+      : vi.spyOn(second, "createSession").mockRejectedValue(failure);
+    const send = vi.spyOn(second, "send");
+    await f.host.setSessionRuntimeControl({ sessionId, expectedGeneration: f.host.getSessionRuntimeControl(sessionId).generation,
+      patch: { backendId: second.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false } });
+    const queued = f.host.enqueueServiceInput({ operationId: "unknown-send", sessionId, source: "system",
+      prompt: { text: "Keep this input", images: [], files: [], mentions: [], disposition: "prompt" } }).value;
+    const handoffs = new SessionRuntimeHandoffStore(f.store);
+    await eventually(() => handoffs.read(sessionId)?.pending?.phase === "unknown");
+    f.host.requestQueueDrain(sessionId);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(failed).toHaveBeenCalledTimes(1); expect(send).not.toHaveBeenCalled();
+    expect(f.store.getQueueItem(queued.queueItemId).state).toBe("accepted");
+    expect(f.store.getSession(sessionId).descriptor.backendId).toBe(first.id);
+    expect(f.host.getSessionRuntimeControl(sessionId).handoffState).toBe("unknown");
+  });
+
   it("retains a Registry-owned descriptor refresh performed before Host initialization", async () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-host-published-backend-"));
     const store = new OperationalStore(join(directory, "store.db"));
@@ -1675,6 +1792,27 @@ describe("SessionHost", () => {
       effective: { providerId: "provider-b", modelId: "reasoner" },
       fallbackHop: 1
     });
+  });
+
+  it("keeps failed private delivery provenance on the service recovery boundary", async () => {
+    const adapter = new RuntimeRecoveryFakeAdapter();
+    const fixture = await createFixture(adapter, { sessionRuntimeFallbackEnabled: () => true,
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds: new Set(["provider-a", "provider-b"]) }), sessionRuntimeRecoveryDelayMs: () => 0 });
+    const create = (operationId: string) => fixture.host.createSession({ operationId, connection: fixture.connection, targetId: "target-one", title: "Private recovery",
+      providerId: "provider-a", modelId: "reasoner", effort: "medium", fastMode: false, permissionMode: "ask", planMode: false });
+    const recipient = (await create("private-recovery-recipient")).value.sessionId;
+    const sender = (await create("private-recovery-sender")).value.sessionId;
+    const partnerPrivateOrigin = { messageId: "private", threadId: "thread", senderPartnerId: "sender", recipientPartnerId: "recipient", senderDisplayName: "Sender" };
+    fixture.host.enqueueServiceInput({ operationId: "private-recovery-input", sessionId: recipient, source: "system", originSessionId: sender, partnerPrivateOrigin,
+      prompt: { text: "Recover a private delivery", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.listRuns({ sessionId: recipient, states: ["failed"], limit: 10 }).length === 1, 5_000);
+    const events = fixture.store.listEvents({ sessionId: recipient, order: "asc", limit: 1_000 });
+    const messages = events.filter((event) => event.payload.type === "message_complete");
+    expect(messages).toHaveLength(1);
+    for (const event of messages) expect(event.payload).toMatchObject({ partnerPrivateOrigin });
+    expect(events.some((event) => event.payload.type === "runtime_recovery")).toBe(false);
+    expect(adapter.prompts).toEqual(["Recover a private delivery"]);
+    expect(fixture.store.getOperation("private-recovery-input").body).toMatchObject({ originSessionId: sender, partnerPrivateOrigin });
   });
 
   it("keeps a temporary route when the owner changes only effort and Fast", async () => {
@@ -6905,6 +7043,52 @@ describe("SessionHost", () => {
     expect(abortUserShell.mock.invocationCallOrder[0]).toBeLessThan(closeSession.mock.invocationCallOrder[0]!);
   });
 
+  it.each(["task-delete", "schedule-archive", "schedule-delete"] as const)
+    ("interrupts pending SDK dispatch before waiting for %s cleanup to settle", async (owner) => {
+      class PendingDispatchAdapter extends FakeBackendAdapter {
+        release: () => void = () => undefined;
+        override async send(): Promise<void> { await new Promise<void>((resolve) => { this.release = resolve; }); }
+        override async closeSession(...args: Parameters<FakeBackendAdapter["closeSession"]>): Promise<void> {
+          this.release(); await super.closeSession(...args);
+        }
+      }
+      const adapter = new PendingDispatchAdapter(PI_LIKE_PROFILE); const fixture = await createFixture(adapter);
+      const options = { operationId: `create-${owner}`, targetId: "target-one", title: "Pending dispatch cleanup",
+        fastMode: false, permissionMode: "ask" as const, planMode: false };
+      const schedule = owner === "task-delete" ? undefined : fixture.store.upsertSchedule({ id: `schedule-${owner}`,
+        backendId: adapter.id, targetId: "target-one", sessionMode: "fresh", name: "Pending dispatch cleanup", kind: "manual",
+        timezone: "UTC", enabled: true, prompt: { text: "pending", images: [], files: [], mentions: [], disposition: "prompt" },
+        executionSnapshot: CURRENT_AGENT_SCHEDULE_EXECUTION_SNAPSHOT, overlapPolicy: "queue", misfirePolicy: "run_once" });
+      const created = schedule ? await fixture.host.createScheduledSession({ ...options, automationOrigin: { scheduleId: schedule.id,
+        scheduleName: schedule.name, runId: `origin-${owner}`, scheduleRevision: schedule.revision } })
+        : await fixture.host.createSession({ ...options, connection: fixture.connection });
+      const sessionId = created.value.sessionId; const close = vi.spyOn(adapter, "closeSession"); const send = vi.spyOn(adapter, "send");
+      fixture.host.enqueueInput({ operationId: `send-${owner}`, connection: fixture.connection, sessionId,
+        prompt: { text: "admitted SDK dispatch", images: [], files: [], mentions: [], disposition: "prompt" } });
+      await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+      if (schedule) fixture.store.prepareScheduleDeletionCleanup({ operationId: `cleanup-${owner}`, scheduleId: schedule.id,
+        disposition: owner === "schedule-archive" ? "archive" : "delete", at: Date.now() });
+      else fixture.store.prepareSessionLifecycleCleanup({ operationId: `cleanup-${owner}`, sessionId, disposition: "delete", at: Date.now() });
+      const closing = (async () => {
+        if (schedule) await fixture.host.prepareDestructiveSessionClose(sessionId);
+        else await fixture.host.prepareSessionLifecycleClose(sessionId, "delete");
+        await fixture.host.closeIfActive(sessionId);
+      })();
+      try { await vi.waitFor(() => expect(close).toHaveBeenCalledOnce(), { timeout: 200 }); }
+      finally { adapter.release(); await closing; }
+      expect(send).toHaveBeenCalledOnce(); expect(close).toHaveBeenCalledOnce();
+      await expect(fixture.host.resume(sessionId)).rejects.toThrow();
+    });
+
+  it("rejects destructive runtime close without a durable cleanup owner", async () => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE); const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-unowned-close", connection: fixture.connection,
+      targetId: "target-one", title: "Unowned close", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const close = vi.spyOn(adapter, "closeSession");
+    await expect(fixture.host.prepareDestructiveSessionClose(sessionId)).rejects.toBeInstanceOf(StoreError);
+    expect(close).not.toHaveBeenCalled();
+  });
+
   it("dismisses an open interaction before destructive lifecycle close waits for the Run to settle", async () => {
     const adapter = new InteractionFakeAdapter({
       id: "delete-lifecycle-interaction",
@@ -7078,30 +7262,29 @@ describe("SessionHost", () => {
       at: Date.now()
     });
     adapter.closeArmed = true;
-    await fixture.host.prepareSessionLifecycleClose(sessionId, "delete");
-    const closing = fixture.host.closeIfActive(sessionId);
+    const closing = fixture.host.prepareSessionLifecycleClose(sessionId, "delete")
+      .then(() => fixture.host.closeIfActive(sessionId));
     await adapter.closeGate.entered;
 
-    expect(() => fixture.host.enqueueInput({
-      operationId: "enqueue-during-gated-lifecycle-close",
-      connection: fixture.connection,
-      sessionId,
-      prompt: { text: "must remain fenced", images: [], files: [], mentions: [], disposition: "prompt" }
-    })).toThrow(/lifecycle transition is in progress/iu);
-    await expect(fixture.host.inspect(sessionId)).rejects.toThrow(/lifecycle transition is in progress/iu);
-    expect(fixture.store.listRuns({ sessionId })).toHaveLength(0);
-    await expect(fixture.host.restart(sessionId)).rejects.toThrow(/lifecycle transition is in progress/iu);
-    const currentBackend = fixture.store.getBackend(adapter.id).descriptor;
-    const replacementEffect = vi.fn(async () => undefined);
-    await expect(fixture.host.replaceBackendInstance({
-      backendId: adapter.id,
-      expectedCurrentGeneration: currentBackend.instanceGeneration,
-      perform: replacementEffect
-    })).rejects.toThrow(/native side effect|lifecycle owner/iu);
-    expect(replacementEffect).not.toHaveBeenCalled();
-
-    adapter.closeGate.release();
-    await closing;
+    try {
+      expect(() => fixture.host.enqueueInput({
+        operationId: "enqueue-during-gated-lifecycle-close",
+        connection: fixture.connection,
+        sessionId,
+        prompt: { text: "must remain fenced", images: [], files: [], mentions: [], disposition: "prompt" }
+      })).toThrow(/lifecycle transition is in progress/iu);
+      await expect(fixture.host.inspect(sessionId)).rejects.toThrow(/lifecycle transition is in progress/iu);
+      expect(fixture.store.listRuns({ sessionId })).toHaveLength(0);
+      await expect(fixture.host.restart(sessionId)).rejects.toThrow(/lifecycle transition is in progress/iu);
+      const currentBackend = fixture.store.getBackend(adapter.id).descriptor;
+      const replacementEffect = vi.fn(async () => undefined);
+      await expect(fixture.host.replaceBackendInstance({
+        backendId: adapter.id,
+        expectedCurrentGeneration: currentBackend.instanceGeneration,
+        perform: replacementEffect
+      })).rejects.toThrow(/native side effect|lifecycle owner/iu);
+      expect(replacementEffect).not.toHaveBeenCalled();
+    } finally { adapter.closeGate.release(); await closing; }
     expect(adapter.closeCalls).toBe(1);
   });
 
@@ -10994,6 +11177,61 @@ describe("SessionHost", () => {
     expect(adapter.createInputs).toHaveLength(1);
   });
 
+  it("resolves complete service identity at native boundaries without persisting it and rejects a late owner change", async () => {
+    const adapter = new PersonalizationPromptFakeAdapter();
+    let fullPrompt = "Complete private identity.\n".repeat(400);
+    let gate: { wait: Promise<void>; release: () => void } | undefined;
+    let reached: (() => void) | undefined;
+    const fixture = await createFixture(adapter, { resolveServiceRuntimePrompt: async (_session, assertCurrent) => {
+      if (gate) { reached?.(); await gate.wait; }
+      assertCurrent(); return fullPrompt;
+    } });
+    const created = await fixture.host.createSession({ operationId: "create-service-identity", connection: fixture.connection,
+      targetId: "target-one", title: "Service identity", fastMode: false, permissionMode: "ask", planMode: false,
+      appendSystemPrompt: "Public bounded identity" });
+    const id = created.value.sessionId;
+    await fixture.host.close(id); await fixture.host.resume(id);
+    expect(adapter.resumeContexts.at(-1)?.appendSystemPrompt).toBe(fullPrompt);
+    expect(fixture.store.getSession(id).descriptor.appendSystemPrompt).toBe("Public bounded identity");
+    expect(JSON.stringify(fixture.store.getOperation("create-service-identity").body)).not.toContain(fullPrompt);
+    fullPrompt += "Updated complete identity.";
+    await fixture.host.resume(id);
+    expect(adapter.resumeContexts.at(-1)?.appendSystemPrompt).toBe(fullPrompt);
+    await fixture.host.close(id);
+    let release!: () => void;
+    gate = { wait: new Promise<void>(resolve => { release = resolve; }), release: () => release() };
+    const started = new Promise<void>(resolve => { reached = resolve; });
+    const count = adapter.resumeContexts.length;
+    const pending = fixture.host.resume(id);
+    const rejected = expect(pending).rejects.toThrow("owner changed");
+    await started;
+    const current = fixture.store.getSession(id);
+    fixture.store.updateSession(id, { archived: true }, current.revision);
+    gate.release(); await rejected;
+    expect(adapter.resumeContexts).toHaveLength(count);
+  });
+
+  it("refreshes private connection configuration at an idle boundary and keeps an in-flight runtime frozen", async () => {
+    const adapter = new PersonalizationPromptFakeAdapter(); let configuration = "private-selection-one";
+    const fixture = await createFixture(adapter, { resolveServiceRuntimeConfiguration: () => configuration });
+    const created = await fixture.host.createSession({ operationId: "create-connection-runtime", connection: fixture.connection,
+      targetId: "target-one", title: "Connection runtime", fastMode: false, permissionMode: "ask", planMode: false });
+    const id = created.value.sessionId;
+    await fixture.host.close(id); await fixture.host.resume(id);
+    const count = adapter.resumeContexts.length;
+    fixture.store.createRun({ id: "connection-inflight", sessionId: id, source: "user", state: "running", createdAt: Date.now(), startedAt: Date.now() });
+    configuration = "private-selection-two";
+    await fixture.host.resume(id); expect(adapter.resumeContexts).toHaveLength(count);
+    fixture.store.updateRunState({ runId: "connection-inflight", state: "completed", traceId: "complete-connection-inflight" });
+    await fixture.host.resume(id); expect(adapter.resumeContexts).toHaveLength(count + 1);
+    expect(adapter.resumeContexts.at(-1)?.appendSystemPrompt).toBeUndefined();
+    expect(JSON.stringify(fixture.store.getOperation("create-connection-runtime").body)).not.toContain("private-selection");
+    expect(fixture.store.getSession(id).descriptor.appendSystemPrompt).toBeUndefined();
+    const resume = vi.spyOn(adapter, "resumeSession").mockImplementationOnce(async (binding, context) => { configuration = "changed-during-native-start"; return FakeBackendAdapter.prototype.resumeSession.call(adapter, binding, context); });
+    await fixture.host.close(id);
+    await expect(fixture.host.resume(id)).rejects.toThrow("configuration changed during activation"); expect(resume).toHaveBeenCalledOnce();
+  });
+
   it("does not create a product Session when the native fork is cancelled", async () => {
     const adapter = new GatedFakeAdapter();
     adapter.forkFailure = new JokoError({
@@ -14641,6 +14879,8 @@ async function createFixture(
     readonly modelRoutingEnabled?: (backendId: string, providerId: string, modelId: string) => boolean;
     readonly modelAccessRestricted?: (backendId: string) => boolean;
     readonly sessionRuntimeFallbackEnabled?: () => boolean;
+    readonly resolveServiceRuntimePrompt?: (session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>;
+    readonly resolveServiceRuntimeConfiguration?: (session: SessionDescriptor) => string | undefined;
     readonly serviceSessionRuntimeFallback?: (input: {
       readonly sessionId: string;
       readonly current: SessionRuntimeProfile;

@@ -4,6 +4,7 @@ import { mobilePushMessages } from "./mobile-push-messages";
 import { mobileNativeIntentMessages } from "./mobile-native-intent-messages";
 import { mobilePartnerMessages } from "./mobile-partner-messages";
 import { mobileTaskMessages } from "./mobile-task-messages";
+import { mobileConversationSearchMessages } from "./mobile-conversation-search-messages";
 import { mobileUpdateMessages } from "./mobile-update-messages";
 import { mobileVoiceMessages } from "./mobile-voice-messages";
 import { mobileVoiceReadOnlyMessages } from "./mobile-voice-readonly-messages";
@@ -12,6 +13,7 @@ import { mobileTaskTagMessages } from "./mobile-task-tag-messages";
 import { mobileExtensionMessages } from "./mobile-extension-messages";
 
 const en = {
+  ...mobileConversationSearchMessages.en,
   "common.about": "About",
   "common.address": "Address",
   "common.api": "API",
@@ -335,6 +337,7 @@ export type MobileMessageKey = keyof typeof en;
 type MobileMessageCatalog = { readonly [K in MobileMessageKey]: string };
 
 const zhCN: MobileMessageCatalog = {
+  ...mobileConversationSearchMessages["zh-CN"],
   "common.about": "关于",
   "common.address": "地址",
   "common.api": "API",
@@ -655,6 +658,7 @@ const zhCN: MobileMessageCatalog = {
 };
 
 const zhTW: MobileMessageCatalog = {
+  ...mobileConversationSearchMessages.en,
   "common.about": "關於",
   "common.address": "位址",
   "common.api": "API",
@@ -975,6 +979,7 @@ const zhTW: MobileMessageCatalog = {
 };
 
 const ja: MobileMessageCatalog = {
+  ...mobileConversationSearchMessages.en,
   "common.about": "情報",
   "common.address": "アドレス",
   "common.api": "API",
@@ -1295,6 +1300,7 @@ const ja: MobileMessageCatalog = {
 };
 
 const ko: MobileMessageCatalog = {
+  ...mobileConversationSearchMessages.en,
   "common.about": "정보",
   "common.address": "주소",
   "common.api": "API",

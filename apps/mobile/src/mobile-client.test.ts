@@ -1,6 +1,13 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
+import { createPartnerRoutineApi, newRoutineDefinition, ListPartnerRoutinesResponseSchema, PartnerRoutineSchema,
+  SavePartnerRoutineResponseSchema, RunPartnerRoutineResponseSchema, DeletePartnerRoutineResponseSchema,
+  ListPartnerRoutineRunsResponseSchema, GetPartnerRoutineCreationResponseSchema, RetirePartnerRoutineCreationResponseSchema } from "@joko/contracts";
+import { createPartnerMemoryApi, ListPartnerMemoriesResponseSchema, PartnerMemoryKind, ReadPartnerMemoryResponseSchema, UpdatePartnerMemoryResponseSchema, DeletePartnerMemoryResponseSchema,
+  GetPartnerMemoryPreferencesResponseSchema, UpdatePartnerMemoryPreferencesResponseSchema } from "@joko/contracts";
 import { Code } from "@connectrpc/connect";
+import { createPartnerConnectionsApi, GetPartnerConnectionsResponseSchema, UpdatePartnerConnectionsResponseSchema, PartnerConnectionMode } from "@joko/contracts";
+import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSkillResponseSchema, UpdatePartnerSkillResponseSchema, DeletePartnerSkillResponseSchema } from "@joko/contracts";
 import { createHash } from "node:crypto";
 import sharp from "sharp";
 import {
@@ -29,6 +36,11 @@ import {
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileClient, type MobileStorage, type PendingOperation } from "./mobile-client";
+import { MobilePartnerCreationReceipts } from "./mobile-partner-creation-receipts";
+import { MobilePartnerDeletionReceipts } from "./mobile-partner-deletion";
+import { MobilePartnerRestartReceipts } from "./mobile-partner-restart";
+import { mobilePartnerCreationDraft, MobilePartnerCreationRejected, type MobilePartnerCreationResult } from "./mobile-partner-creation";
+import { creationSnapshot } from "./test/mobile-partner-creation";
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import { animatedPngBytes, gifBytes, svgBytes, bmpBytes, tiffBytes, isoImageBytes, iconBytes, iconDibBytes } from "./test/image-formats";
@@ -86,6 +98,8 @@ import {
 import { createMobileAutomationDraft } from "./mobile-automation-authoring";
 import { parseMobileNativeIntent } from "./mobile-native-intent";
 import type { MobileExtension, MobileExtensionMainViewSurface } from "./mobile-extensions";
+import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
+import { profilePartner, profileSnapshot } from "./test/mobile-partner-profile";
 import type {
   MobileExtensionLibraryLocationValidation,
   MobileExtensionLibraryOverview,
@@ -1770,11 +1784,14 @@ function client(
   fileShare?: Pick<MobileFileShare, "perform">,
   offlineCache?: Pick<MobileOfflineCache, "load" | "save" | "clear">,
   readOnlyDictionaryCache?: { clear(profileId: string): Promise<void> },
-  deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, "android")
+  deviceNameSource: MobileDeviceNameSourceProvider = () => mobileDeviceNameSource(undefined, "android"),
+  creationReceipts?: MobilePartnerCreationReceipts,
+  deletionReceipts?: MobilePartnerDeletionReceipts,
+  restartReceipts?: MobilePartnerRestartReceipts
 ) {
   const instance = new MobileClient(network, storage, discovery ?? { scan: vi.fn(async () => []) }, newId, "android", now,
     clearInteractionDraft, drafts.newTask, drafts.composer, attachmentFiles, mediaPreviewFiles, pdfPreviewFiles,
-    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache, undefined, deviceNameSource);
+    modelPreviewFiles, fileShare, offlineCache, readOnlyDictionaryCache, undefined, deviceNameSource, creationReceipts, deletionReceipts, restartReceipts);
   clients.push(instance);
   return instance;
 }
@@ -2707,10 +2724,601 @@ describe("mobile Extension catalog authority", () => {
   });
 });
 
+describe("mobile Partner creation authority", () => {
+  function fixture() {
+    const network = fakeNetwork(); const data = new Map<string, string>();
+    const driver = { getItem: vi.fn(async (key: string) => data.get(key) ?? null),
+      setItem: vi.fn(async (key: string, value: string) => { data.set(key, value); }),
+      removeItem: vi.fn(async (key: string) => { data.delete(key); }) };
+    const receipts = new MobilePartnerCreationReceipts(driver);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.getPartnerCreationOptions = vi.fn(async () => creationSnapshot.options);
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [] }));
+    const created = { ...profilePartner, displayName: "Nova" };
+    network.createPartner = vi.fn(async (_credential, requestId) => {
+      expect(await receipts.load(credential, new AbortController().signal)).toBe(requestId);
+      return { kind: "found" as const, partner: created };
+    });
+    network.getPartnerCreation = vi.fn(async () => ({ kind: "found" as const, partner: created }));
+    network.retirePartnerCreation = vi.fn(async () => ({ kind: "retired" as const }));
+    const storage = memoryStorage(credential).storage;
+    const makeClient = () => client(network, storage, undefined, undefined, () => "creation-request-native-client",
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      new MobilePartnerCreationReceipts(driver));
+    return { network, driver, receipts, data, created, makeClient };
+  }
+  it("persists before dispatch, confirms the original result and clears only its owned receipt", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start();
+    const active = app.partnerCreationTransport()!; const signal = new AbortController().signal;
+    const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova", avatar: { base64: "/9j/2w==" } };
+    expect(await active.create(snapshot, draft, signal)).toEqual({ kind: "found", partner: f.created });
+    expect(f.network.createPartner).toHaveBeenCalledOnce(); expect(f.network.getPartnerCreation).toHaveBeenCalledOnce();
+    expect(f.data.size).toBe(0); expect(await active.pending(signal)).toBeUndefined();
+  });
+  it("recovers unknown across a new Client, never resends and preserves the current edited Partner", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start();
+    f.network.createPartner = vi.fn(async () => { throw new Error("lost acknowledgement"); });
+    const active = app.partnerCreationTransport()!; const signal = new AbortController().signal; const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova" };
+    await expect(active.create(snapshot, draft, signal)).rejects.toThrow(/lost/u);
+    expect([...f.data.values()]).toEqual(["creation-request-native-client"]);
+    app.dispose(); const reloaded = f.makeClient(); await reloaded.start(); const recovered = reloaded.partnerCreationTransport()!;
+    const requestId = await recovered.pending(signal); expect(requestId).toBe("creation-request-native-client");
+    await expect(recovered.create(await recovered.load(signal), draft, signal)).rejects.toThrow(/retained/u);
+    f.network.getPartnerCreation = vi.fn(async () => ({ kind: "found" as const, partner: { ...f.created, displayName: "Nova edited", revision: 9n } }));
+    expect(await recovered.lookup(requestId!, signal)).toMatchObject({ kind: "found", partner: { displayName: "Nova edited", revision: 9n } });
+    expect(f.network.createPartner).toHaveBeenCalledOnce(); expect(f.data.size).toBe(0);
+  });
+  it("keeps absence ambiguous, atomically retires it and treats only a typed rejection as uncreated", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerCreationTransport()!;
+    const signal = new AbortController().signal; const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova" };
+    f.network.createPartner = vi.fn(async () => { throw new Error("lost"); });
+    await expect(active.create(snapshot, draft, signal)).rejects.toThrow();
+    f.network.getPartnerCreation = vi.fn(async () => ({ kind: "absent" as const })); const requestId = (await active.pending(signal))!;
+    expect(await active.lookup(requestId, signal)).toEqual({ kind: "absent" }); expect(f.data.size).toBe(1);
+    expect(await active.retire(requestId, signal)).toEqual({ kind: "retired" }); expect(f.data.size).toBe(0);
+    f.network.createPartner = vi.fn(async () => { throw new MobilePartnerCreationRejected("Rejected"); });
+    await expect(active.create(snapshot, draft, signal)).rejects.toBeInstanceOf(MobilePartnerCreationRejected); expect(f.data.size).toBe(0);
+  });
+  it("prevents duplicate dispatch and ignores a late owner result without clearing its receipt", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerCreationTransport()!;
+    const signal = new AbortController().signal; const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova" };
+    let finish!: (result: MobilePartnerCreationResult) => void;
+    f.network.createPartner = vi.fn(() => new Promise<MobilePartnerCreationResult>((resolve) => { finish = resolve; }));
+    const first = active.create(snapshot, draft, signal); await vi.waitFor(() => expect(f.network.createPartner).toHaveBeenCalledOnce());
+    await expect(active.create(snapshot, draft, signal)).rejects.toThrow(/in flight/u);
+    app.setForeground(false); finish({ kind: "found", partner: f.created });
+    await expect(first).rejects.toThrow(/owner changed/u); expect(f.data.size).toBe(1); expect(f.network.getPartnerCreation).not.toHaveBeenCalled();
+  });
+  it("does not dispatch when receipt persistence or the fresh directory CAS fails", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerCreationTransport()!;
+    const signal = new AbortController().signal; const snapshot = await active.load(signal);
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova" };
+    f.driver.setItem.mockRejectedValueOnce(new Error("disk unavailable"));
+    await expect(active.create(snapshot, draft, signal)).rejects.toThrow(/unavailable/u); expect(f.network.createPartner).not.toHaveBeenCalled();
+    await expect(active.create({ ...snapshot, options: { ...snapshot.options, revision: 3n } }, draft, signal)).rejects.toThrow(/Refresh/u);
+    expect(f.network.createPartner).not.toHaveBeenCalled(); expect(f.data.size).toBe(0);
+  });
+});
+
+describe("mobile Partner restart authority", () => {
+  function fixture() {
+    const network = fakeNetwork(); const data = new Map<string, string>();
+    const driver = { getItem: vi.fn(async (key: string) => data.get(key) ?? null),
+      setItem: vi.fn(async (key: string, value: string) => { data.set(key, value); }),
+      removeItem: vi.fn(async (key: string) => { data.delete(key); }) };
+    const receipts = new MobilePartnerRestartReceipts(driver);
+    const requestId = "restart-native-client-intent";
+    const completed = { requestId, partnerId: profilePartner.partnerId, phase: "ready" as const, runtimeClosePending: false, createdAt: 1, updatedAt: 2 };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [profilePartner] }));
+    network.getPartnerRestartControls = vi.fn(async () => ({ revision: profilePartner.revision, available: true }));
+    network.restartPartner = vi.fn(async () => {
+      expect(await receipts.load(credential, new AbortController().signal)).toEqual([requestId]);
+      expect([...data.values()]).toEqual([JSON.stringify([requestId])]);
+      return completed;
+    });
+    network.getPartnerRestart = vi.fn(async () => ({ retired: false }));
+    network.retryPartnerRestart = vi.fn(async () => completed);
+    network.retirePartnerRestart = vi.fn(async () => ({ retired: true }));
+    const storage = memoryStorage(credential).storage;
+    const makeClient = () => client(network, storage, undefined, undefined, () => requestId,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, new MobilePartnerRestartReceipts(driver));
+    return { network, data, driver, receipts, requestId, completed, makeClient };
+  }
+  it("persists only the owned request before dispatch and clears it only on confirmed completion", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerRestartTransport()!;
+    const signal = new AbortController().signal;
+    expect(active.newRequestId()).toBe(f.requestId);
+    expect(await active.restart(f.requestId, profilePartner, signal)).toEqual(f.completed);
+    expect(f.network.restartPartner).toHaveBeenCalledWith(credential, f.requestId, profilePartner.partnerId, profilePartner.revision, signal);
+    expect(f.data.size).toBe(0); expect(await active.listRequests(signal)).toEqual([]);
+  });
+  it("recovers an unknown restart across a new Client using reads and the existing intent only", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const signal = new AbortController().signal;
+    f.network.restartPartner = vi.fn(async () => { throw new Error("lost response"); });
+    await expect(app.partnerRestartTransport()!.restart(f.requestId, profilePartner, signal)).rejects.toThrow(/lost/u);
+    app.dispose(); const reloaded = f.makeClient(); await reloaded.start(); const active = reloaded.partnerRestartTransport()!;
+    expect(await active.listRequests(signal)).toEqual([f.requestId]);
+    expect(await active.read(f.requestId, signal)).toEqual({ retired: false }); expect(f.data.size).toBe(1);
+    await expect(active.restart(f.requestId, profilePartner, signal)).rejects.toThrow(/pending/u);
+    f.network.getPartnerRestart = vi.fn(async () => ({ restart: { ...f.completed, phase: "closing" as const, runtimeClosePending: true }, retired: false }));
+    expect((await active.read(f.requestId, signal)).restart?.runtimeClosePending).toBe(true);
+    expect(await active.retry(f.requestId, signal)).toEqual(f.completed);
+    expect(f.data.size).toBe(0); expect(f.network.restartPartner).toHaveBeenCalledOnce();
+  });
+  it("does not dispatch when Host controls or profile CAS or receipt persistence fails", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerRestartTransport()!;
+    const signal = new AbortController().signal;
+    await expect(active.restart(f.requestId, { ...profilePartner, revision: 1n }, signal)).rejects.toThrow(/Refresh/u);
+    f.network.getPartnerRestartControls = vi.fn(async () => ({ revision: profilePartner.revision, available: false }));
+    await expect(active.restart(f.requestId, profilePartner, signal)).rejects.toThrow(/controls changed/u);
+    f.network.getPartnerRestartControls = vi.fn(async () => ({ revision: profilePartner.revision, available: true }));
+    f.driver.setItem.mockRejectedValueOnce(new Error("disk unavailable"));
+    await expect(active.restart(f.requestId, profilePartner, signal)).rejects.toThrow(/unavailable/u);
+    expect(f.network.restartPartner).not.toHaveBeenCalled(); expect(f.data.size).toBe(0);
+  });
+  it("ignores a late background result and retains the body-free receipt for foreground recovery", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerRestartTransport()!;
+    let finish!: (value: typeof f.completed) => void;
+    f.network.restartPartner = vi.fn(() => new Promise<typeof f.completed>((resolve) => { finish = resolve; }));
+    const first = active.restart(f.requestId, profilePartner, new AbortController().signal);
+    await vi.waitFor(() => expect(f.network.restartPartner).toHaveBeenCalledOnce());
+    app.setForeground(false); finish(f.completed); await expect(first).rejects.toThrow(/owner changed/u);
+    expect(f.data.size).toBe(1); expect(app.partnerRestartTransport()).toBeUndefined();
+  });
+});
+
+describe("mobile Partner deletion authority", () => {
+  function fixture() {
+    const network = fakeNetwork(); const data = new Map<string, string>();
+    const driver = { getItem: vi.fn(async (key: string) => data.get(key) ?? null),
+      setItem: vi.fn(async (key: string, value: string) => { data.set(key, value); }),
+      removeItem: vi.fn(async (key: string) => { data.delete(key); }) };
+    const receipts = new MobilePartnerDeletionReceipts(driver);
+    const requestId = "deletion-native-client-intent";
+    const completed = { requestId, partnerId: profilePartner.partnerId, phase: "completed" as const, createdAt: 1, updatedAt: 2 };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [profilePartner] }));
+    network.deletePartner = vi.fn(async () => {
+      expect(await receipts.load(credential, new AbortController().signal)).toEqual([requestId]);
+      expect([...data.values()]).toEqual([JSON.stringify([requestId])]);
+      return completed;
+    });
+    network.getPartnerDeletion = vi.fn(async () => ({ retired: false }));
+    network.retryPartnerDeletion = vi.fn(async () => completed);
+    network.retirePartnerDeletion = vi.fn(async () => ({ retired: true }));
+    const storage = memoryStorage(credential).storage;
+    const makeClient = () => client(network, storage, undefined, undefined, () => requestId,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      new MobilePartnerDeletionReceipts(driver));
+    return { network, data, driver, receipts, requestId, completed, makeClient };
+  }
+  it("persists only the owned request before dispatch and clears it only on confirmed completion", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerDeletionTransport()!;
+    const signal = new AbortController().signal;
+    expect(active.newRequestId()).toBe(f.requestId);
+    expect(await active.delete(f.requestId, profilePartner, profilePartner.displayName, signal)).toEqual(f.completed);
+    expect(f.network.deletePartner).toHaveBeenCalledWith(credential, f.requestId, profilePartner.partnerId, profilePartner.revision, profilePartner.displayName, signal);
+    expect(f.data.size).toBe(0); expect(await active.listRequests(signal)).toEqual([]);
+  });
+  it("recovers an unknown deletion across a new Client using reads and the existing intent only", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const signal = new AbortController().signal;
+    f.network.deletePartner = vi.fn(async () => { throw new Error("lost response"); });
+    await expect(app.partnerDeletionTransport()!.delete(f.requestId, profilePartner, profilePartner.displayName, signal)).rejects.toThrow(/lost/u);
+    app.dispose(); const reloaded = f.makeClient(); await reloaded.start(); const active = reloaded.partnerDeletionTransport()!;
+    expect(await active.listRequests(signal)).toEqual([f.requestId]);
+    expect(await active.read(f.requestId, signal)).toEqual({ retired: false }); expect(f.data.size).toBe(1);
+    await expect(active.delete(f.requestId, profilePartner, profilePartner.displayName, signal)).rejects.toThrow(/pending/u);
+    f.network.getPartnerDeletion = vi.fn(async () => ({ deletion: { ...f.completed, phase: "closing" as const, failure: "runtime_close_pending" as const }, retired: false }));
+    expect((await active.read(f.requestId, signal)).deletion?.failure).toBe("runtime_close_pending");
+    expect(await active.retry(f.requestId, signal)).toEqual(f.completed);
+    expect(f.data.size).toBe(0); expect(f.network.deletePartner).toHaveBeenCalledOnce();
+  });
+  it("does not dispatch when full-name CAS or receipt persistence fails", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerDeletionTransport()!;
+    const signal = new AbortController().signal;
+    await expect(active.delete(f.requestId, { ...profilePartner, revision: 1n }, profilePartner.displayName, signal)).rejects.toThrow(/Refresh/u);
+    await expect(active.delete(f.requestId, profilePartner, "another name", signal)).rejects.toThrow(/Refresh/u);
+    f.driver.setItem.mockRejectedValueOnce(new Error("disk unavailable"));
+    await expect(active.delete(f.requestId, profilePartner, profilePartner.displayName, signal)).rejects.toThrow(/unavailable/u);
+    expect(f.network.deletePartner).not.toHaveBeenCalled(); expect(f.data.size).toBe(0);
+  });
+  it("ignores a late background result and retains the body-free receipt for foreground recovery", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start(); const active = app.partnerDeletionTransport()!;
+    let finish!: (value: typeof f.completed) => void;
+    f.network.deletePartner = vi.fn(() => new Promise<typeof f.completed>((resolve) => { finish = resolve; }));
+    const first = active.delete(f.requestId, profilePartner, profilePartner.displayName, new AbortController().signal);
+    await vi.waitFor(() => expect(f.network.deletePartner).toHaveBeenCalledOnce());
+    app.setForeground(false); finish(f.completed); await expect(first).rejects.toThrow(/owner changed/u);
+    expect(f.data.size).toBe(1); expect(app.partnerDeletionTransport()).toBeUndefined();
+  });
+});
+
 describe("mobile Partner private authority", () => {
+  const initializationFailed: typeof profilePartner = { ...profilePartner, initializationState: "error",
+    invitationStage: "failed", initializationErrorCode: "sessionUnavailable", canonicalSessionId: undefined };
+  const initializationCatalog = (partner: typeof profilePartner) => ({ directory: { revision: 4n,
+    activeCount: partner.lifecycle === "active" ? 1 : 0, archivedCount: partner.lifecycle === "archived" ? 1 : 0,
+    errorCount: partner.initializationState === "error" ? 1 : 0, updatedAt: 2_000 }, partners: [partner] });
+
+  it("recovers the same failed Partner and observes its new task before canonical navigation without marking it read", async () => {
+    const network = fakeNetwork(); let current = initializationFailed;
+    const emptyOwner = create(SnapshotSchema, { ...runtimeControlProjection(), sessions: [] });
+    network.readOwner = vi.fn(async () => ({ connection, device,
+      snapshot: current.initializationState === "ready" ? runtimeControlProjection() : emptyOwner }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.listPartnerCatalog = vi.fn(async () => initializationCatalog(current));
+    network.retryPartnerInitialization = vi.fn(async (_credential, partnerId, expectedRevision) => {
+      expect(partnerId).toBe(current.partnerId); expect(expectedRevision).toBe(current.revision);
+      current = { ...profilePartner, revision: 5n }; return current;
+    });
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{
+      partnerId: current.partnerId, sessionId: "session", role: PartnerSessionRole.CANONICAL,
+      profileVersion: 1n, available: true, displayName: "Ada task", createdAt: { seconds: 1n }
+    }] }));
+    network.markPartnerRead = vi.fn();
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const active = app.partnerInitializationTransport()!;
+    expect(await active.load(current.partnerId, new AbortController().signal)).toEqual(initializationFailed);
+    expect(app.state.owner?.sessions).toHaveLength(0);
+    const confirmed = await active.retry(current, new AbortController().signal);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledWith(credential, "partner-a", 2n, expect.any(AbortSignal));
+    expect(confirmed.profileVersion).toBe(initializationFailed.profileVersion);
+    await expect(active.open(confirmed, new AbortController().signal)).resolves.toMatchObject({ sessionId: "session" });
+    expect(app.state.selectedId).toBe("session"); expect(app.state.owner?.sessions).toHaveLength(1);
+    expect(network.markPartnerRead).not.toHaveBeenCalled(); expect(app.state.pending).toHaveLength(0);
+  });
+
+  it("rejects changed initialization snapshots before dispatch and treats mismatched or lost retry results as unconfirmed", async () => {
+    const network = fakeNetwork(); let current = { ...initializationFailed, revision: 3n };
+    network.listPartnerCatalog = vi.fn(async () => initializationCatalog(current));
+    network.retryPartnerInitialization = vi.fn(async () => ({ ...profilePartner, revision: 4n, homeTargetId: "wrong" }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const active = app.partnerInitializationTransport()!;
+    await expect(active.retry(initializationFailed, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(network.retryPartnerInitialization).not.toHaveBeenCalled();
+    await expect(active.retry(current, new AbortController().signal)).rejects.toThrow(/may have been applied/u);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledOnce();
+    vi.mocked(network.retryPartnerInitialization).mockRejectedValueOnce(new Error("response lost"));
+    await expect(active.retry(current, new AbortController().signal)).rejects.toThrow(/may have been applied/u);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledTimes(2); expect(app.state.busy).toBe(false);
+    current = { ...current, lifecycle: "archived" };
+    await expect(active.load(current.partnerId, new AbortController().signal)).rejects.toThrow(/no longer available/u);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledTimes(2);
+  });
+
+  it("serializes initialization retries and refuses a late acknowledgement after foreground retirement", async () => {
+    const network = fakeNetwork();
+    network.listPartnerCatalog = vi.fn(async () => initializationCatalog(initializationFailed));
+    let finish!: (partner: typeof profilePartner) => void;
+    network.retryPartnerInitialization = vi.fn(() => new Promise<typeof profilePartner>((resolve) => { finish = resolve; }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const active = app.partnerInitializationTransport()!;
+    const first = active.retry(initializationFailed, new AbortController().signal);
+    await vi.waitFor(() => expect(network.retryPartnerInitialization).toHaveBeenCalledOnce());
+    await expect(active.retry(initializationFailed, new AbortController().signal)).rejects.toThrow(/in progress/u);
+    app.setForeground(false); finish({ ...profilePartner, revision: 4n });
+    await expect(first).rejects.toThrow(/may have been applied/u);
+    await expect(active.load("partner-a", new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(network.retryPartnerInitialization).toHaveBeenCalledOnce(); expect(network.listPartnerSessions).not.toHaveBeenCalled();
+  });
+
+  it("resolves paused Partner settings, requires fresh resume ownership and blocks a preflight retired in background", async () => {
+    const network = fakeNetwork(); let currentPartner = { ...profilePartner, lifecycle: "paused" as const, pauseCleanupPending: false };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [currentPartner] }));
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{
+      partnerId: currentPartner.partnerId, sessionId: "session", role: PartnerSessionRole.CANONICAL, profileVersion: 1n,
+      available: true, displayName: "Ada task", createdAt: { seconds: 1n }
+    }] }));
+    network.resumePartner = vi.fn();
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const conversation = app.partnerConversationTransport()!;
+    expect((await conversation.resolve(new AbortController().signal))?.lifecycle).toBe("paused");
+    await expect(app.partnerDirectoryTransport()!.open(currentPartner, new AbortController().signal)).rejects.toThrow(/available canonical/u);
+    const editor = app.partnerResumeEditor(currentPartner, conversation.ownerKey)!; expect(editor.api.ownerKey).toBe(conversation.ownerKey);
+    await editor.refresh(); expect(editor.available).toBe(true);
+    let finish!: () => void; const gate = new Promise<void>(resolve => { finish = resolve; });
+    vi.mocked(network.listPartnerCatalog!).mockImplementationOnce(async () => { await gate; return { directory: { revision: 4n, activeCount: 0,
+      archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [currentPartner] }; });
+    const pending = editor.resume(); app.setForeground(false); finish(); await pending;
+    expect(network.resumePartner).not.toHaveBeenCalled(); expect(editor.state.phase).toBe("error"); expect(app.partnerResumeEditor(currentPartner)).toBeUndefined(); editor.dispose();
+  });
+
+  it.each(["task", "background"] as const)("fences Partner memory reads under the original node and Task across %s retirement", async (retirement) => {
+    const network = fakeNetwork(); network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.getPartnerProfileOptions = vi.fn(async () => profileSnapshot.options); network.updatePartnerProfile = vi.fn();
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [profilePartner] }));
+    const result = create(ListPartnerMemoriesResponseSchema, { owner: { partnerId: profilePartner.partnerId, homeTargetId: profilePartner.homeTargetId,
+      canonicalSessionId: profilePartner.canonicalSessionId, revision: { value: profilePartner.revision }, memoryEnabled: true },
+      groups: [PartnerMemoryKind.USER, PartnerMemoryKind.FEEDBACK, PartnerMemoryKind.PROJECT, PartnerMemoryKind.REFERENCE].map(kind => ({ kind })) });
+    let finish!: () => void; const gate = new Promise<void>(resolve => { finish = resolve; });
+    const rpc: Parameters<typeof createPartnerMemoryApi>[0]["rpc"] = { listPartnerMemories: vi.fn(async () => { await gate; return result; }),
+      readPartnerMemory: vi.fn(async () => create(ReadPartnerMemoryResponseSchema)), updatePartnerMemory: vi.fn(async () => create(UpdatePartnerMemoryResponseSchema)),
+      deletePartnerMemory: vi.fn(async () => create(DeletePartnerMemoryResponseSchema)), getPartnerMemoryPreferences: vi.fn(async () => create(GetPartnerMemoryPreferencesResponseSchema)),
+      updatePartnerMemoryPreferences: vi.fn(async () => create(UpdatePartnerMemoryPreferencesResponseSchema)) };
+    network.partnerMemoryApi = vi.fn((_credential, partnerId, ownerKey, assertCurrent) => createPartnerMemoryApi({ rpc, partnerId, ownerKey, assertCurrent }));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const ownerKey = app.partnerProfileTransport()!.ownerKey; const editor = app.partnerMemoryEditor(profilePartner, ownerKey)!;
+    expect(app.partnerMemoryEditor(profilePartner, "retired-task")).toBeUndefined();
+    const pending = editor.refresh(); await vi.waitFor(() => expect(rpc.listPartnerMemories).toHaveBeenCalledOnce());
+    if (retirement === "task") await app.select(undefined); else app.setForeground(false);
+    finish(); await pending; expect(editor.state.catalog).toBeUndefined();
+    await expect(editor.api.list("", new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(rpc.listPartnerMemories).toHaveBeenCalledOnce(); editor.dispose();
+  });
+
+  it.each(["task", "background"] as const)("binds personal skills to the Task owner and rejects late reads after %s retirement", async retirement => {
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.getPartnerProfileOptions = vi.fn(async () => profileSnapshot.options); network.updatePartnerProfile = vi.fn();
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [profilePartner] }));
+    const response = create(ListPartnerSkillsResponseSchema, { owner: { partnerId: profilePartner.partnerId, homeTargetId: profilePartner.homeTargetId,
+      canonicalSessionId: profilePartner.canonicalSessionId, revision: { value: profilePartner.revision } } });
+    let finish!: () => void; const gate = new Promise<void>(resolve => { finish = resolve; });
+    const rpc: Parameters<typeof createPartnerSkillsApi>[0]["rpc"] = { listPartnerSkills: vi.fn(async () => { await gate; return response; }),
+      readPartnerSkill: vi.fn(async () => create(ReadPartnerSkillResponseSchema)), updatePartnerSkill: vi.fn(async () => create(UpdatePartnerSkillResponseSchema)),
+      deletePartnerSkill: vi.fn(async () => create(DeletePartnerSkillResponseSchema)) };
+    network.partnerSkillsApi = vi.fn((_credential, partnerId, ownerKey, assertCurrent) => createPartnerSkillsApi({ rpc, partnerId, ownerKey, assertCurrent }));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const ownerKey = app.partnerProfileTransport()!.ownerKey, editor = app.partnerSkillsEditor(profilePartner, ownerKey)!;
+    expect(app.partnerSkillsEditor(profilePartner, "retired-task")).toBeUndefined();
+    const pending = editor.refresh(); await vi.waitFor(() => expect(rpc.listPartnerSkills).toHaveBeenCalledOnce());
+    if (retirement === "task") await app.select(undefined); else app.setForeground(false);
+    finish(); await pending; expect(editor.state.page).toBeUndefined();
+    await expect(editor.api.list("", 0, new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(rpc.listPartnerSkills).toHaveBeenCalledOnce(); editor.dispose();
+  });
+
+  it.each(["task", "background"] as const)("binds Partner connections to the Task owner and rejects late reads after %s retirement", async retirement => {
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.getPartnerProfileOptions = vi.fn(async () => profileSnapshot.options); network.updatePartnerProfile = vi.fn();
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [profilePartner] }));
+    const response = create(GetPartnerConnectionsResponseSchema, { connections: { owner: { partnerId: profilePartner.partnerId,
+      homeTargetId: profilePartner.homeTargetId, canonicalSessionId: profilePartner.canonicalSessionId, revision: { value: profilePartner.revision } },
+      catalogRevision: "a".repeat(64), mcp: { mode: PartnerConnectionMode.INHERIT }, toolsets: { mode: PartnerConnectionMode.INHERIT }, skills: { mode: PartnerConnectionMode.ALLOWLIST } } });
+    let finish!: () => void; const gate = new Promise<void>(resolve => { finish = resolve; });
+    const rpc: Parameters<typeof createPartnerConnectionsApi>[0]["rpc"] = { getPartnerConnections: vi.fn(async () => { await gate; return response; }),
+      updatePartnerConnections: vi.fn(async () => create(UpdatePartnerConnectionsResponseSchema)) };
+    network.partnerConnectionsApi = vi.fn((_credential, partnerId, ownerKey, assertCurrent) => createPartnerConnectionsApi({ rpc, partnerId, ownerKey, assertCurrent }));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const ownerKey = app.partnerProfileTransport()!.ownerKey, editor = app.partnerConnectionsEditor(profilePartner, ownerKey)!;
+    expect(app.partnerConnectionsEditor(profilePartner, "retired-task")).toBeUndefined();
+    const pending = editor.refresh(); await vi.waitFor(() => expect(rpc.getPartnerConnections).toHaveBeenCalledOnce());
+    if (retirement === "task") await app.select(undefined); else app.setForeground(false);
+    finish(); await pending; expect(editor.state.detail).toBeUndefined();
+    await expect(editor.api.read(new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(rpc.getPartnerConnections).toHaveBeenCalledOnce(); editor.dispose();
+  });
+
+  it.each(["task", "background"] as const)("binds profile routines to the canonical Task and keeps an unknown creation receipt after %s retirement", async (retirement) => {
+    const network = fakeNetwork();
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.getPartnerProfileOptions = vi.fn(async () => profileSnapshot.options); network.updatePartnerProfile = vi.fn();
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 2000 }, partners: [profilePartner] }));
+    const routine = create(PartnerRoutineSchema, { id: "scoped-routine", partnerId: profilePartner.partnerId, revision: { value: 1n },
+      definition: { ...newRoutineDefinition(), name: "Scoped routine", prompt: "Check the project." } });
+    let finish!: () => void; const gate = new Promise<void>(resolve => { finish = resolve; });
+    const rpc: Parameters<typeof createPartnerRoutineApi>[0]["rpc"] = {
+      listPartnerRoutines: vi.fn(async () => create(ListPartnerRoutinesResponseSchema, { partnerId: profilePartner.partnerId,
+        partnerRevision: { value: profilePartner.revision }, writable: true })),
+      savePartnerRoutine: vi.fn(async () => { await gate; return create(SavePartnerRoutineResponseSchema, { routine }); }),
+      runPartnerRoutine: vi.fn(async () => create(RunPartnerRoutineResponseSchema)),
+      deletePartnerRoutine: vi.fn(async () => create(DeletePartnerRoutineResponseSchema)),
+      listPartnerRoutineRuns: vi.fn(async () => create(ListPartnerRoutineRunsResponseSchema)),
+      getPartnerRoutineCreation: vi.fn(async () => create(GetPartnerRoutineCreationResponseSchema, { routine })),
+      retirePartnerRoutineCreation: vi.fn(async () => create(RetirePartnerRoutineCreationResponseSchema))
+    };
+    network.partnerRoutineApi = vi.fn((_credential, partnerId, ownerKey, newRequestId, assertCurrent) =>
+      createPartnerRoutineApi({ rpc, partnerId, ownerKey, newRequestId, assertCurrent }));
+    const requestId = "routine-creation-owned-001"; const app = client(network, memoryStorage(credential).storage, undefined, () => 2000, () => requestId);
+    await app.start(); await app.select("session");
+    const ownerKey = app.partnerProfileTransport()!.ownerKey;
+    const values = new Map<string, string>(); const receipts = { getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); }, removeItem: (key: string) => { values.delete(key); } };
+    const home = app.partnerRoutineEditor(profilePartner.partnerId, receipts)!;
+    const editor = app.partnerRoutineEditor(profilePartner.partnerId, receipts, ownerKey)!;
+    expect(editor.api.ownerKey).toBe(ownerKey); expect(home.api.ownerKey).toBe(app.partnerDirectoryTransport()!.ownerKey);
+    expect(home.api.ownerKey).not.toBe(ownerKey); expect(app.partnerRoutineEditor(profilePartner.partnerId, receipts, "retired-task")).toBeUndefined();
+    await editor.refresh(); editor.edit({ name: "Scoped routine", prompt: "Check the project." });
+    const pending = editor.save(); await vi.waitFor(() => expect(rpc.savePartnerRoutine).toHaveBeenCalledOnce());
+    expect([...values.values()]).toEqual([requestId]);
+    if (retirement === "task") { await app.select(undefined); await home.api.list(new AbortController().signal); }
+    else app.setForeground(false);
+    const reads = vi.mocked(rpc.listPartnerRoutines).mock.calls.length;
+    await expect(editor.api.list(new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(rpc.listPartnerRoutines).toHaveBeenCalledTimes(reads); finish(); await pending;
+    expect(editor.state).toMatchObject({ requiresRefresh: true, pendingId: requestId }); expect(editor.state.selected).toBeUndefined();
+    expect([...values.values()]).toEqual([requestId]); await editor.save(); expect(rpc.savePartnerRoutine).toHaveBeenCalledOnce();
+    if (retirement === "background") app.setForeground(true); await app.select("session");
+    const recovered = app.partnerRoutineEditor(profilePartner.partnerId, receipts, app.partnerProfileTransport()!.ownerKey)!;
+    await recovered.refresh(); expect(recovered.state.selected?.id).toBe(routine.id); expect(recovered.state.pendingId).toBeUndefined();
+    expect(rpc.getPartnerRoutineCreation).toHaveBeenCalledWith({ partnerId: profilePartner.partnerId, requestId }, expect.anything());
+    expect(values.size).toBe(0); expect(rpc.savePartnerRoutine).toHaveBeenCalledOnce();
+    editor.dispose(); recovered.dispose(); home.dispose();
+  });
+
+  it("saves canonical profile settings with fresh CAS, confirms them and does not replay unknown updates", async () => {
+    const network = fakeNetwork();
+    let currentPartner = profilePartner; let directoryRevision = 4n;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: directoryRevision, activeCount: 1,
+      archivedCount: 0, errorCount: 0, updatedAt: 2_000 }, partners: [currentPartner] }));
+    network.getPartnerProfileOptions = vi.fn(async () => ({ ...profileSnapshot.options, revision: directoryRevision }));
+    network.listPartners = vi.fn(async () => [{ ...currentPartner, profileVersion: Number(currentPartner.profileVersion) }]);
+    network.listSessionArtifacts = vi.fn(async () => ({ artifacts: [], revision: "edited-profile-artifacts" }));
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{
+      partnerId: currentPartner.partnerId, sessionId: "session", role: PartnerSessionRole.CANONICAL,
+      profileVersion: 1n, available: true, displayName: "Ada task", createdAt: { seconds: 1n }
+    }] }));
+    network.updatePartnerProfile = vi.fn(async (_credential, _partnerId, expectedRevision, draft) => {
+      expect(expectedRevision).toBe(currentPartner.revision);
+      currentPartner = { ...currentPartner, ...draft, revision: currentPartner.revision + 1n, profileVersion: currentPartner.profileVersion + 1n };
+      directoryRevision += 1n; return currentPartner;
+    });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const transport = app.partnerProfileTransport()!;
+    const initial = await transport.load(currentPartner, new AbortController().signal);
+    expect(initial.taskModels?.some(model => model.backendId === "backend" && model.providerId === "alpha" && model.modelId === "a")).toBe(true);
+    const draft = { ...mobilePartnerProfileDraft(currentPartner), displayName: "Ada Two", taskModelOverride: { ...currentPartner.capabilities.modelChain[0]! } };
+    await expect(transport.save(initial, draft, new AbortController().signal)).resolves.toMatchObject({ displayName: "Ada Two", profileVersion: 4n, taskModelOverride: draft.taskModelOverride });
+    expect(network.updatePartnerProfile).toHaveBeenCalledOnce();
+    await expect(app.partnerResourceTransport()!.preview("partner-a", new AbortController().signal)).resolves.toMatchObject({
+      partner: { displayName: "Ada Two", profileVersion: 4 }, session: { sessionId: "session", profileVersion: 4 }
+    });
+    await expect(transport.save(initial, draft, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(network.updatePartnerProfile).toHaveBeenCalledOnce();
+    const fresh = await transport.load(currentPartner, new AbortController().signal);
+    vi.mocked(network.updatePartnerProfile).mockRejectedValueOnce(new Error("response lost"));
+    await expect(transport.save(fresh, { ...draft, displayName: "Ada Three" }, new AbortController().signal)).rejects.toThrow(/may have been applied/u);
+    expect(network.updatePartnerProfile).toHaveBeenCalledTimes(2);
+    expect(app.state.busy).toBe(false);
+    app.setForeground(false);
+    await expect(transport.save(fresh, draft, new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(network.updatePartnerProfile).toHaveBeenCalledTimes(2);
+  });
+
+  it("reads public working captions only for the current exact turn and retires late foreground results", async () => {
+    const network = fakeNetwork();
+    const live = clone(SnapshotSchema, snapshot);
+    live.sessions[0]!.state = SessionState.RUNNING; live.sessions[0]!.version!.generation = 8n;
+    live.runs = create(SnapshotSchema, { runs: [{ runId: "run", activeAttemptId: "attempt", sessionId: "session",
+      targetId: "target", backendId: "backend", state: RunState.RUNNING, version: { generation: 8n } }] }).runs;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: live }));
+    network.readSession = vi.fn(async () => live);
+    const read = vi.fn(async () => "Running tests"); network.readPartnerWorkingStatus = read;
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const partner = { ...profileSnapshot.partner, canonicalSessionId: "session", homeTargetId: "target" };
+    const status = { sessionId: "session", targetId: "target", backendId: "backend", generation: 8n,
+      runId: "run", attemptId: "attempt", phase: "testing" as const };
+    const transport = app.partnerWorkingTransport()!;
+    await expect(transport.read(partner, status, "en", new AbortController().signal)).resolves.toBe("Running tests");
+    expect(read).toHaveBeenCalledWith(credential, partner.partnerId, status, "en", expect.any(AbortSignal));
+    await expect(transport.read(partner, { ...status, attemptId: "old" }, "en", new AbortController().signal)).rejects.toThrow(/turn changed/u);
+    expect(read).toHaveBeenCalledOnce();
+    let finish!: (value: string) => void;
+    read.mockImplementationOnce(async () => new Promise((resolve) => { finish = resolve; }));
+    const late = transport.read(partner, status, "en", new AbortController().signal);
+    app.setForeground(false); expect(app.partnerWorkingTransport()).toBeUndefined();
+    finish("Old tests"); await expect(late).rejects.toThrow(/owner changed/u);
+    await expect(transport.read(partner, status, "en", new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains only a proven same-node directory observation during a temporary disconnect", async () => {
+    const network = fakeNetwork();
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const connected = app.partnerDirectoryObservation();
+    expect(connected).toMatchObject({ online: true, snapshot: app.state.owner });
+    vi.mocked(network.inspect).mockRejectedValueOnce(new Error("radio slept")); await app.refresh();
+    expect(app.state.status).toBe("offline");
+    expect(app.partnerDirectoryObservation()).toMatchObject({ ownerKey: connected!.ownerKey, online: false });
+    expect(app.partnerDirectoryTransport()).toBeUndefined();
+    app.setForeground(false); expect(app.partnerDirectoryObservation()).toBeUndefined();
+    vi.mocked(network.inspect).mockResolvedValueOnce({ ...node, serverId: "another-node" });
+    app.setForeground(true); await vi.waitFor(() => expect(app.state.status).not.toBe("connected"));
+    await app.refresh(); expect(app.partnerDirectoryObservation()).toBeUndefined();
+  });
+
+  it("opens a roster Partner only after exact profile and canonical Session revalidation", async () => {
+    const network = fakeNetwork();
+    const partner = {
+      partnerId: "partner-a", revision: 2n, profileVersion: 3n, displayName: "A", description: "", avatar: "standard",
+      identitySource: "A handles product work.", templateId: "general", lifecycle: "active" as const,
+      initializationState: "ready" as const, invitationStage: "ready" as const, homeTargetId: "target",
+      canonicalSessionId: "session", capabilities: { modelChain: [{ backendId: "backend", providerId: "provider",
+        modelId: "model", fastMode: false }], permissionMode: "ask" as const, planMode: false },
+      usesDirectoryDefaults: true, createdAt: 1_000, updatedAt: 2_000,
+      activity: { partnerId: "partner-a", unreadReplyCount: 1, latestReplyCursor: 4n, latestReplyAt: 2_000,
+        artifactCount: 0, activeDelegationCount: 0, readThroughCursor: 3n, readUpdatedAt: 1_500 }
+    };
+    const catalog = { directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0,
+      updatedAt: 2_000 }, partners: [partner] };
+    network.listPartnerCatalog = vi.fn(async () => catalog);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
+      sessions: [{ partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+        profileVersion: 3n, displayName: "A task", available: true, readOnly: false, deleted: false,
+        archived: false, createdAt: { seconds: 1n } }]
+    }));
+    network.markPartnerRead = vi.fn(async () => ({ ...partner.activity, unreadReplyCount: 0,
+      readThroughCursor: 4n }));
+    const completedReply = clone(EventSchema, messageEvent);
+    completedReply.cursor!.sequence = 4n;
+    network.readSession = vi.fn(async () => create(SnapshotSchema, { ...snapshot, timeline: [completedReply] }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+
+    const transport = app.partnerDirectoryTransport()!;
+    expect(await transport.list(new AbortController().signal)).toEqual(catalog);
+    await expect(transport.open(partner, new AbortController().signal)).resolves.toMatchObject({
+      sessionId: "session"
+    });
+    expect(app.state.selectedId).toBe("session");
+    expect(network.listPartnerSessions).toHaveBeenCalledTimes(2);
+    expect(network.markPartnerRead).not.toHaveBeenCalled();
+    const conversation = app.partnerConversationTransport()!;
+    expect(await conversation.resolve(new AbortController().signal)).toEqual(partner);
+    const reply = { eventId: completedReply.eventId, messageId: "message-1", cursor: 4n };
+    await expect(conversation.acknowledge(partner, reply, new AbortController().signal, () => false))
+      .rejects.toThrow(/no longer visible/u);
+    expect(network.markPartnerRead).not.toHaveBeenCalled();
+    await expect(conversation.acknowledge(partner, { ...reply, cursor: 5n }, new AbortController().signal, () => true))
+      .rejects.toThrow(/current completed public/u);
+    expect(network.markPartnerRead).not.toHaveBeenCalled();
+    await expect(conversation.acknowledge(partner, reply, new AbortController().signal, () => true))
+      .resolves.toMatchObject({ readThroughCursor: 4n });
+    expect(network.markPartnerRead).toHaveBeenCalledWith(credential, "partner-a", 4n, expect.any(AbortSignal));
+    vi.mocked(network.markPartnerRead).mockClear();
+    let finish!: (value: typeof catalog) => void;
+    vi.mocked(network.listPartnerCatalog).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const late = conversation.acknowledge(partner, reply, new AbortController().signal, () => true);
+    app.setForeground(false);
+    finish(catalog);
+    await expect(late).rejects.toThrow(/owner changed/u);
+    expect(network.markPartnerRead).not.toHaveBeenCalled();
+  });
+
+  it("refuses a roster profile that changed before selection", async () => {
+    const network = fakeNetwork();
+    const partner = {
+      partnerId: "partner-a", revision: 2n, profileVersion: 3n, displayName: "A", description: "", avatar: "standard",
+      identitySource: "A handles product work.", templateId: "general", lifecycle: "active" as const,
+      initializationState: "ready" as const, invitationStage: "ready" as const, homeTargetId: "target",
+      canonicalSessionId: "session", capabilities: { modelChain: [{ backendId: "backend", providerId: "provider",
+        modelId: "model", fastMode: false }], permissionMode: "ask" as const, planMode: false },
+      usesDirectoryDefaults: true, createdAt: 1_000, updatedAt: 2_000,
+      activity: { partnerId: "partner-a", unreadReplyCount: 0, artifactCount: 0, activeDelegationCount: 0,
+        readThroughCursor: 0n, readUpdatedAt: 1_500 }
+    };
+    network.listPartnerCatalog = vi.fn(async () => ({
+      directory: { revision: 5n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 3_000 },
+      partners: [{ ...partner, revision: 3n }]
+    }));
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const select = vi.spyOn(app, "select");
+
+    await expect(app.partnerDirectoryTransport()!.open(partner, new AbortController().signal))
+      .rejects.toThrow(/changed/u);
+    expect(select).not.toHaveBeenCalled();
+    expect(network.listPartnerSessions).not.toHaveBeenCalled();
+  });
+
   it("previews authorized Partner Artifacts and opens only the revalidated canonical task", async () => {
     const network = fakeNetwork();
-    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+    const partner = { partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
       canonicalSessionId: "session" };
     network.listPartners = vi.fn(async () => [partner]);
@@ -2741,7 +3349,7 @@ describe("mobile Partner private authority", () => {
 
   it("retires late Partner Resource reads and refuses a changed preview before selection", async () => {
     const network = fakeNetwork();
-    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+    const partner = { partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
       canonicalSessionId: "session" };
     let finish!: (value: Awaited<ReturnType<MobileNetwork["listPartners"]>>) => void;
@@ -2775,7 +3383,7 @@ describe("mobile Partner private authority", () => {
 
   it("does not report a Partner Resource open after selection retires its owner", async () => {
     const network = fakeNetwork();
-    const partner = { partnerId: "partner-a", displayName: "A", avatar: "standard",
+    const partner = { partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 3,
       canonicalSessionId: "session" };
     network.listPartners = vi.fn(async () => [partner]);
@@ -2796,7 +3404,7 @@ describe("mobile Partner private authority", () => {
 
   it("revalidates a task preview against its exact canonical Partner Session and target participant", async () => {
     const network = fakeNetwork();
-    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", displayName: "A", avatar: "standard",
+    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 1,
       canonicalSessionId: "session" }]);
     network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, {
@@ -2829,7 +3437,7 @@ describe("mobile Partner private authority", () => {
         senderPartnerId: "partner-a", recipientPartnerId: "partner-b", content: "Private text",
         deliveryStatus: "pending" as const, createdAt: 2_000 }]
     };
-    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", displayName: "A", avatar: "standard",
+    network.listPartners = vi.fn(async () => [{ partnerId: "partner-a", revision: 2n, displayName: "A", avatar: "standard",
       lifecycle: "active" as const, initializationState: "ready" as const, profileVersion: 1,
       canonicalSessionId: "session" }]);
     network.listPartnerPrivateThreads = vi.fn(async () => [thread]);

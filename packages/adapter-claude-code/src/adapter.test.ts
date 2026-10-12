@@ -59,6 +59,34 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("isolates explicit skills with native setting sources and frozen command overrides even for an empty shelf", async () => {
+    const runtime = new FakeSdkRuntime(), adapter = adapterFor(runtime, { resolveNativeSkills: async () => [],
+      resolveNativeSkillPolicy: () => ({ mode: "explicit", overrides: { report: "off" }, assertCurrent: () => undefined }) });
+    try { const binding = await adapter.createSession(createInput(), contextFor().context), options = runtime.queries[0]!.params.options;
+      expect(options.settingSources).toEqual([]); expect(options.settings).toMatchObject({ skillOverrides: { report: "off" } });
+      expect(options.plugins).toBeUndefined(); await adapter.closeSession(binding, contextFor(binding).context);
+    } finally { await adapter.dispose(); }
+  });
+  test("loads personal skill discovery through the native plugin and retains the full original file", async () => {
+    const source = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-personal-")));
+    const body = "---\nname: report\ndescription: Prepare reports\n---\nComplete original instructions.\n";
+    await writeFile(join(source, "SKILL.md"), body);
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+    const runtime = new FakeSdkRuntime(), adapter = adapterFor(runtime, {
+      resolveNativeSkills: async () => [{ sourcePath: source, resource: { id: "personal-report", kind: "skill", name: "Report", source: "managed", state: "approved", revision, resourceVersion: 3n }, assertCurrent: () => undefined,
+        personal: { slug: "report", name: "Report", description: "Long metadata ".repeat(2_000), updatedAt: "2026-10-12", frontmatterBytes: 30_000, bodyStartLine: 5 } }],
+      resolveTextResources: async () => [textResourceSeed({ id: "personal-report", kind: "skill", content: body, revision, resourceVersion: 3n })]
+    });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context), plugin = runtime.queries[0]!.params.options.plugins![0]!;
+      const path = join(plugin.path, "skills", "personal-skill-library", "SKILL.md"); expect(await readFile(path, "utf8")).toContain("list_partner_skills");
+      const row = JSON.parse((await readFile(join(plugin.path, "catalog.jsonl"), "utf8")).trim()) as { filePath: string };
+      expect(await readFile(row.filePath, "utf8")).toBe(body);
+      expect(await adapter.getResources(contextFor(binding).context)).toEqual([]);
+      await adapter.closeSession(binding, contextFor(binding).context); await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { await adapter.dispose(); await rm(source, { recursive: true, force: true }); }
+  });
+
   test("binds exact local Query process usage to the real product Session and fences termination", async () => {
     const sdk = new FakeSdkRuntime({ processInspectionSupported: true });
     const adapter = adapterFor(sdk);
@@ -2389,6 +2417,41 @@ describe("ClaudeCodeAdapter", () => {
     } finally {
       await adapter.dispose();
     }
+  });
+
+  test("loads complete native skill plugins and retains their files until Query retirement is confirmed", async () => {
+    const source = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-skill-")));
+    const body = "---\nname: report\ndescription: Prepare reports\n---\n" + "Full original instructions.\n".repeat(20_000);
+    await writeFile(join(source, "SKILL.md"), body);
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+    let current = true;
+    const assertCurrent = () => { if (!current) throw new Error("private source retired"); };
+    const runtime = new FakeSdkRuntime();
+    const adapter = adapterFor(runtime, {
+      resolveNativeSkills: async () => [{ sourcePath: source, resource: { id: "native-report", kind: "skill", name: "Report", source: "managed", state: "approved", revision, resourceVersion: 3n }, assertCurrent }],
+      resolveTextResources: async () => [textResourceSeed({ kind: "skill", content: body, revision, resourceVersion: 3n, assertCurrent })]
+    });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const plugin = runtime.queries[0]!.params.options.plugins![0]!;
+      expect(plugin.type).toBe("local");
+      const path = join(plugin.path, "skills", "skill-0", "SKILL.md");
+      expect(await readFile(path, "utf8")).toBe(body);
+      expect(plugin.path).not.toBe(source);
+      const active = contextFor(binding, { operationId: "native-report-input" });
+      current = false;
+      await expect(adapter.send(textPrompt("Use the report skill."), active.context)).rejects.toMatchObject({ publicError: { code: "SKILL_RUNTIME_AUTHORITY_INVALID" } });
+      expect(runtime.queries[0]!.receivedInputs).toEqual([]);
+      current = true;
+      runtime.retirementFailure = true;
+      await expect(adapter.closeSession(binding, active.context)).rejects.toThrow("retirement");
+      expect(await readFile(path, "utf8")).toBe(body);
+      runtime.retirementFailure = false;
+      await adapter.closeSession(binding, active.context);
+      await expect(readFile(path)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(join(source, "SKILL.md"), "utf8")).toBe(body);
+      expect(runtime.retiredQueries).toContain(runtime.queries[0]);
+    } finally { runtime.retirementFailure = false; await adapter.dispose(); await rm(source, { recursive: true, force: true }); }
   });
 
   test.each([
@@ -5389,6 +5452,33 @@ describe("ClaudeCodeAdapter", () => {
     } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
   });
 
+  test("reserves a restarted context without a native turn and cold-reclaims its exact identity and private prompt", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-claude-restart-context-"));
+    const runtime = new FakeSdkRuntime();
+    runtime.freshContexts = new ClaudeFreshContextOwner({ rootDirectory: directory, namespace: "backend-restart", generation: INSTANCE_GENERATION });
+    const adapter = adapterFor(runtime); const source = await adapter.createSession(createInput(), contextFor().context);
+    const context = contextFor(source, { operationId: "restart-native-context" }).context;
+    await expect(adapter.prepareRestartContext(context)).rejects.toMatchObject({ publicError: { stateMayHaveChanged: true } });
+    await adapter.closeSession(source, context);
+    const binding = await adapter.prepareRestartContext(context);
+    expect(binding.opaqueRef).not.toBe(source.opaqueRef); expect(binding.generation).toBe(source.generation + 1);
+    expect(await adapter.prepareRestartContext(context)).toEqual(binding); expect(runtime.queries).toHaveLength(1);
+    expect(runtime.queries[0]!.receivedInputs).toEqual([]); await adapter.dispose();
+    const next = new FakeSdkRuntime(); next.persistFreshMetadata = false;
+    next.freshContexts = new ClaudeFreshContextOwner({ rootDirectory: directory, namespace: "backend-restart", generation: INSTANCE_GENERATION + 1 });
+    const restored = adapterFor(next, { instanceGeneration: INSTANCE_GENERATION + 1 });
+    const currentBinding = { ...binding, generation: binding.generation + 1 };
+    const restoredContext = { ...contextFor(currentBinding, { generation: currentBinding.generation,
+      backendInstanceGeneration: INSTANCE_GENERATION + 1 }).context, appendSystemPrompt: "Private redacted restart handoff" };
+    try {
+      expect((await restored.inspectSession(currentBinding, restoredContext)).binding).toEqual(currentBinding);
+      await restored.resumeSession(currentBinding, restoredContext);
+      expect(next.queries[0]!.params.options.sessionId).toBe(binding.nativeSessionId);
+      expect(next.queries[0]!.params.options.resume).toBeUndefined();
+      expect(next.queries[0]!.params.options.systemPrompt).toMatchObject({ append: "Private redacted restart handoff" });
+      expect(next.queries[0]!.receivedInputs).toEqual([]);
+    } finally { await restored.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
   test("adopts an empty local context and reclaims the same UUID across Backend and Product generations", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-claude-empty-context-"));
     const runtime = new FakeSdkRuntime();

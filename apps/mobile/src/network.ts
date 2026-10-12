@@ -1,9 +1,23 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
+import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
+import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
+import { partnerSessionTaskAction, projectPartnerSessionTask, type PartnerSessionTaskView } from "@joko/contracts";
+import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
+import { create } from "@bufbuild/protobuf";
+import { OperationMutationSchema } from "@joko/contracts";
+import { protoMobilePartnerAvatar, type MobilePartnerAvatarIdentity } from "./mobile-partner-avatar";
+import { MobilePartnerCreationRejected, projectMobilePartnerCreationOptions, projectMobilePartnerCreationResult,
+  type MobilePartnerCreationOptions, type MobilePartnerCreationDraft, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import { createConnectTransport } from "@connectrpc/connect-web";
+import { createPartnerRoutineApi, PartnerRoutineService, type PartnerRoutineApi, createPartnerImportApi, PartnerImportService, type PartnerImportApi } from "@joko/contracts";
+import { createPartnerGroupApi, PartnerGroupService, type PartnerGroupApi } from "@joko/contracts";
+import { createPartnerMemoryApi, type PartnerMemoryApi } from "@joko/contracts";
+import { createPartnerConnectionsApi, type PartnerConnectionsApi } from "@joko/contracts";
+import { createPartnerSkillsApi, type PartnerSkillsApi } from "@joko/contracts";
 import {
   ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
-  MobilePushProvider, OperationService, OperationState, PartnerService, RemoteDesktopService, ExtensionService,
+  MobilePushProvider, OperationService, OperationState, PartnerService, PartnerLifecycle, PermissionMode, RemoteDesktopService, ExtensionService,
   ExtensionLibraryLocationKind,
   ResourceKind, SchedulerService, SessionService, TargetService, VoiceInputService, SettingsService, CredentialService, CredentialKind,
   type VoiceInputServiceSettings, type TestVoiceInputConnectionResponse,
@@ -62,6 +76,20 @@ import {
   type MobilePartner, type MobilePrivateDetail, type MobilePrivateReadState,
   type MobilePrivateThread
 } from "./mobile-partner-private";
+import {
+  projectMobilePartnerCatalog,
+  projectMobilePartnerProfile,
+  projectMobilePartnerReadResponse,
+  type MobilePartnerActivity,
+  type MobilePartnerCatalog
+} from "./mobile-partner-directory";
+import { projectMobilePartnerProfileOptions, projectMobilePartnerProfileUpdate,
+  type MobilePartnerProfileDraft, type MobilePartnerProfileOptions } from "./mobile-partner-profile";
+import { projectMobilePartnerInitializationRetry } from "./mobile-partner-initialization";
+import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
+import { projectMobilePartnerWorkingStatus } from "./mobile-partner-working";
+import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
+import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import {
   collectMobileExtensionCatalog,
   projectMobileExtension,
@@ -191,7 +219,48 @@ export interface MobileNetwork {
   transferRemoteDesktopClipboardContent?(credential: PairedCredential, peer: DevicePeerRouteIdentity,
     transfer: RemoteDesktopClipboardContentRequest, signal?: AbortSignal): Promise<RemoteDesktopClipboardContentResult>;
   listPartners(credential: PairedCredential, signal?: AbortSignal): Promise<readonly MobilePartner[]>;
+  partnerMemoryApi?(credential: PairedCredential, partnerId: string, ownerKey: string,
+    assertCurrent: (signal: AbortSignal) => void): PartnerMemoryApi;
+  partnerConnectionsApi?(credential: PairedCredential, partnerId: string, ownerKey: string,
+    assertCurrent: (signal: AbortSignal) => void): PartnerConnectionsApi;
+  partnerSkillsApi?(credential: PairedCredential, partnerId: string, ownerKey: string,
+    assertCurrent: (signal: AbortSignal) => void): PartnerSkillsApi;
+  partnerRoutineApi?(credential: PairedCredential, partnerId: string, ownerKey: string,
+    newRequestId: () => string, assertCurrent: (signal: AbortSignal) => void): PartnerRoutineApi;
+  partnerGroupApi?(credential: PairedCredential, ownerKey: string, newRequestId: () => string,
+    assertCurrent: (signal: AbortSignal) => void): PartnerGroupApi;
+  listPartnerCatalog?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerCatalog>;
+  getPartnerProfileOptions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerProfileOptions>;
+  resumePartner?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
+    signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
+  updatePartnerProfile?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
+    draft: MobilePartnerProfileDraft, signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
+  readPartnerAvatar?(credential: PairedCredential, partner: MobilePartnerAvatarIdentity, signal?: AbortSignal): Promise<string>;
+  readPartnerWorkingStatus?(credential: PairedCredential, partnerId: string, status: SessionWorkingStatus,
+    locale: MobileSupportedLocale, signal?: AbortSignal): Promise<string | undefined>;
+  partnerImportApi?(credential: PairedCredential, ownerKey: string, newRequestId: () => string, assertCurrent: (signal: AbortSignal) => void): PartnerImportApi;
+  getPartnerCreationOptions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerCreationOptions>;
+  createPartner?(credential: PairedCredential, requestId: string, expectedDirectoryRevision: bigint,
+    draft: MobilePartnerCreationDraft, signal?: AbortSignal): Promise<MobilePartnerCreationResult>;
+  deletePartner?(credential: PairedCredential, requestId: string, partnerId: string, revision: bigint,
+    confirmName: string, signal?: AbortSignal): Promise<PartnerDeletionView>;
+  getPartnerDeletion?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<PartnerDeletionResult>;
+  getPartnerRestartControls?(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<{ readonly revision: bigint; readonly available: boolean }>;
+  restartPartner?(credential: PairedCredential, requestId: string, partnerId: string, revision: bigint, signal?: AbortSignal): Promise<PartnerRestartView>;
+  getPartnerRestart?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<PartnerRestartResult>;
+  retirePartnerRestart?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<PartnerRestartResult>;
+  retryPartnerRestart?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<PartnerRestartView>;
+  retirePartnerDeletion?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<PartnerDeletionResult>;
+  retryPartnerDeletion?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<PartnerDeletionView>;
+  getPartnerCreation?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<MobilePartnerCreationResult>;
+  retirePartnerCreation?(credential: PairedCredential, requestId: string, signal?: AbortSignal): Promise<MobilePartnerCreationResult>;
+  retryPartnerInitialization?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
+    signal?: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
+  markPartnerRead?(credential: PairedCredential, partnerId: string, throughCursor: bigint,
+    signal?: AbortSignal): Promise<MobilePartnerActivity>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
+  controlPartnerSessionTask?(credential: PairedCredential, requestId: string, partnerId: string, partnerRevision: bigint, task: PartnerSessionTaskView,
+    action: "pause" | "resume" | "cancel", signal?: AbortSignal): Promise<PartnerSessionTaskView>;
   listExtensions(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
   getExtension(credential: PairedCredential, extensionId: string, signal?: AbortSignal): Promise<MobileExtension>;
   getExtensionForRuntime(
@@ -1536,15 +1605,241 @@ export const mobileNetwork: MobileNetwork = {
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop clipboard content result.");
     return response.result;
   },
+  partnerRoutineApi(credential, partnerId, ownerKey, newRequestId, assertCurrent) {
+    return createPartnerRoutineApi({ rpc: createClient(PartnerRoutineService, transport(credential.origin, credential.authKey)),
+      partnerId, ownerKey, newRequestId, assertCurrent });
+  },
+  partnerGroupApi(credential, ownerKey, newRequestId, assertCurrent) {
+    return createPartnerGroupApi({ rpc: createClient(PartnerGroupService, transport(credential.origin, credential.authKey)), ownerKey, newRequestId, assertCurrent,
+      respond: async (interaction, decision, signal) => {
+        const result = await this.submit(credential, newRequestId(), create(OperationMutationSchema, { payload: { case: "resolveInteraction", value: {
+          interactionId: interaction.interactionId, interactionGeneration: interaction.generation, resolution: { connectionId: credential.connectionId, decision }
+        } } }), signal);
+        if (result.state === OperationState.FAILED) throw new Error(result.error?.message ?? "The group response failed.");
+      } });
+  },
+  partnerMemoryApi(credential, partnerId, ownerKey, assertCurrent) {
+    return createPartnerMemoryApi({ rpc: createClient(PartnerService, transport(credential.origin, credential.authKey)),
+      partnerId, ownerKey, assertCurrent });
+  },
+  partnerConnectionsApi(credential, partnerId, ownerKey, assertCurrent) {
+    return createPartnerConnectionsApi({ rpc: createClient(PartnerService, transport(credential.origin, credential.authKey)),
+      partnerId, ownerKey, assertCurrent });
+  },
+  partnerSkillsApi(credential, partnerId, ownerKey, assertCurrent) {
+    return createPartnerSkillsApi({ rpc: createClient(PartnerService, transport(credential.origin, credential.authKey)),
+      partnerId, ownerKey, assertCurrent });
+  },
+  partnerImportApi(credential, ownerKey, newRequestId, assertCurrent) {
+    return createPartnerImportApi({ rpc: createClient(PartnerImportService, transport(credential.origin, credential.authKey)), ownerKey,
+      controllerId: newRequestId(), newRequestId, assertCurrent: () => assertCurrent(new AbortController().signal) });
+  },
   async listPartners(credential, signal) {
     const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
       .listPartners({}, options(signal));
     return projectMobilePartners(response);
   },
+  async getPartnerCreationOptions(credential, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerDirectory({}, options(signal));
+    signal?.throwIfAborted();
+    return projectMobilePartnerCreationOptions(response.directory);
+  },
+  async createPartner(credential, requestId, expectedDirectoryRevision, draft, signal) {
+    signal?.throwIfAborted();
+    if (!/^[A-Za-z0-9_-]{16,80}$/u.test(requestId) || expectedDirectoryRevision < 1n) throw new Error("A current Partner creation identity is required.");
+    try {
+      const capabilities = draft.capabilities;
+      const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).createPartner({ requestId,
+        expectedDirectoryRevision: { value: expectedDirectoryRevision }, draft: { displayName: draft.displayName,
+          description: draft.description,
+          avatar: protoMobilePartnerAvatar(draft.avatar), identitySource: draft.identitySource, templateId: draft.templateId,
+          usesDirectoryDefaults: draft.usesDirectoryDefaults, ...(draft.usesDirectoryDefaults ? {} : { capabilities: {
+            modelChain: [...capabilities.modelChain], permissionMode: capabilities.permissionMode === "ask" ? PermissionMode.ASK : PermissionMode.AUTO,
+            planMode: capabilities.planMode } }) } }, options(signal));
+      signal?.throwIfAborted();
+      projectMobilePartnerCreationOptions(response.directory);
+      return projectMobilePartnerCreationResult(response.partner);
+    } catch (error) {
+      if (error instanceof ConnectError && [Code.InvalidArgument, Code.AlreadyExists].includes(error.code)) {
+        throw new MobilePartnerCreationRejected("The Partner creation was rejected. Check the name and fields.");
+      }
+      throw error;
+    }
+  },
+  async deletePartner(credential, requestId, partnerId, revision, confirmName, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).deletePartner({ requestId,
+      partnerId, expectedRevision: { value: revision }, confirmName }, { signal }); signal?.throwIfAborted();
+    const deletion = projectPartnerDeletion(response.deletion);
+    if (deletion.requestId !== requestId || deletion.partnerId !== partnerId) throw new Error("The Partner deletion owner changed.");
+    return deletion;
+  },
+  async getPartnerDeletion(credential, requestId, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerDeletion({ requestId }, { signal });
+    signal?.throwIfAborted(); const deletion = response.deletion ? projectPartnerDeletion(response.deletion) : undefined;
+    if (deletion && (deletion.requestId !== requestId || response.retired)) throw new Error("The Partner deletion result changed.");
+    return { ...(deletion ? { deletion } : {}), retired: response.retired };
+  },
+  async retirePartnerDeletion(credential, requestId, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retirePartnerDeletion({ requestId }, { signal });
+    signal?.throwIfAborted(); const deletion = response.deletion ? projectPartnerDeletion(response.deletion) : undefined;
+    if (deletion ? deletion.requestId !== requestId || response.retired : !response.retired) throw new Error("The Partner deletion result is invalid.");
+    return { ...(deletion ? { deletion } : {}), retired: response.retired };
+  },
+  async retryPartnerDeletion(credential, requestId, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retryPartnerDeletion({ requestId }, { signal });
+    signal?.throwIfAborted(); const deletion = projectPartnerDeletion(response.deletion);
+    if (deletion.requestId !== requestId) throw new Error("The Partner deletion owner changed.");
+    return deletion;
+  },
+  async getPartnerRestartControls(credential, partnerId, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerRestartControls({ partnerId }, { signal });
+    signal?.throwIfAborted();
+    if (!response.revision || response.revision.value < 1n) throw new Error("The Partner restart controls are invalid.");
+    return { revision: response.revision.value, available: response.available };
+  },
+  async restartPartner(credential, requestId, partnerId, revision, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).restartPartner({ requestId,
+      partnerId, expectedRevision: { value: revision } }, { signal }); signal?.throwIfAborted();
+    const restart = projectPartnerRestart(response.restart);
+    if (restart.requestId !== requestId || restart.partnerId !== partnerId) throw new Error("The Partner restart owner changed.");
+    return restart;
+  },
+  async getPartnerRestart(credential, requestId, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerRestart({ requestId }, { signal });
+    signal?.throwIfAborted(); const restart = response.restart ? projectPartnerRestart(response.restart) : undefined;
+    if (restart && (restart.requestId !== requestId || response.retired)) throw new Error("The Partner restart result changed.");
+    return { ...(restart ? { restart } : {}), retired: response.retired };
+  },
+  async retirePartnerRestart(credential, requestId, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retirePartnerRestart({ requestId }, { signal });
+    signal?.throwIfAborted(); const restart = response.restart ? projectPartnerRestart(response.restart) : undefined;
+    if (restart ? restart.requestId !== requestId || response.retired : !response.retired) throw new Error("The Partner restart result is invalid.");
+    return { ...(restart ? { restart } : {}), retired: response.retired };
+  },
+  async retryPartnerRestart(credential, requestId, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retryPartnerRestart({ requestId }, { signal });
+    signal?.throwIfAborted(); const restart = projectPartnerRestart(response.restart);
+    if (restart.requestId !== requestId) throw new Error("The Partner restart owner changed.");
+    return restart;
+  },
+  async getPartnerCreation(credential, requestId, signal) {
+    signal?.throwIfAborted();
+    if (!/^[A-Za-z0-9_-]{16,80}$/u.test(requestId)) throw new Error("A retained Partner creation identity is required.");
+    try {
+      const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).getPartnerCreation({ requestId }, options(signal));
+      signal?.throwIfAborted();
+      return projectMobilePartnerCreationResult(response.partner);
+    } catch (error) {
+      if (error instanceof ConnectError && error.code === Code.NotFound) return { kind: "absent" };
+      throw error;
+    }
+  },
+  async retirePartnerCreation(credential, requestId, signal) {
+    signal?.throwIfAborted();
+    if (!/^[A-Za-z0-9_-]{16,80}$/u.test(requestId)) throw new Error("A retained Partner creation identity is required.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).retirePartnerCreation({ requestId }, options(signal));
+    signal?.throwIfAborted();
+    if (response.retired && !response.partner) return { kind: "retired" };
+    if (!response.retired && response.partner) return projectMobilePartnerCreationResult(response.partner);
+    throw new Error("The Joko node returned an ambiguous Partner creation retirement.");
+  },
+  async listPartnerCatalog(credential, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .listPartners({}, options(signal));
+    return projectMobilePartnerCatalog(response);
+  },
+  async markPartnerRead(credential, partnerId, throughCursor, signal) {
+    if (!validMobilePartnerId(partnerId) || throughCursor < 0n) {
+      throw new Error("A valid Partner and read cursor are required.");
+    }
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .markPartnerRead({ partnerId, throughCursor: { value: throughCursor } }, options(signal));
+    return projectMobilePartnerReadResponse(partnerId, throughCursor, response);
+  },
+  async getPartnerProfileOptions(credential, signal) {
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .getPartnerDirectory({}, options(signal));
+    return projectMobilePartnerProfileOptions(response.directory);
+  },
+  async updatePartnerProfile(credential, partnerId, expectedRevision, draft, signal) {
+    if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current Partner profile.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .updatePartner({ partnerId, expectedRevision: { value: expectedRevision }, patch: {
+        displayName: draft.displayName, description: draft.description, identitySource: draft.identitySource,
+        taskModelPreference: draft.taskModelOverride === undefined ? { case: "inheritTaskModel", value: true }
+          : { case: "taskModelOverride", value: draft.taskModelOverride },
+        ...(typeof draft.avatar === "string" || "base64" in draft.avatar ? { avatar: protoMobilePartnerAvatar(draft.avatar) } : {}),
+        usesDirectoryDefaults: draft.usesDirectoryDefaults,
+        ...(draft.usesDirectoryDefaults ? {} : { modelChain: { routes: [...draft.capabilities.modelChain] },
+          permissionMode: draft.capabilities.permissionMode === "ask" ? PermissionMode.ASK : PermissionMode.AUTO,
+          planMode: draft.capabilities.planMode })
+      } }, options(signal));
+    const partner = projectMobilePartnerProfileUpdate(partnerId, expectedRevision, response);
+    if (typeof draft.avatar === "string" ? partner.avatar !== draft.avatar
+      : "base64" in draft.avatar && (typeof partner.avatar === "string"
+        || partner.avatar.sha256 !== await sha256Hex(base64Decode(draft.avatar.base64)))) {
+      throw new Error("The Partner avatar update could not be confirmed.");
+    }
+    signal?.throwIfAborted();
+    return partner;
+  },
+  async resumePartner(credential, partnerId, expectedRevision, signal) {
+    if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current paused Partner.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .setPartnerLifecycle({ partnerId, expectedRevision: { value: expectedRevision }, lifecycle: PartnerLifecycle.ACTIVE }, options(signal));
+    signal?.throwIfAborted();
+    if (!response.partner) throw new Error("The Partner resume returned no profile.");
+    const partner = projectMobilePartnerProfile(response.partner);
+    if (partner.partnerId !== partnerId || partner.lifecycle !== "active" || partner.revision <= expectedRevision) {
+      throw new Error("The Partner resume could not be confirmed.");
+    }
+    return partner;
+  },
+  async readPartnerAvatar(credential, partner, signal) {
+    signal?.throwIfAborted();
+    const image = partner.avatar;
+    if (typeof image === "string" || !validMobilePartnerId(partner.partnerId) || partner.revision < 1n) throw new Error("Select a current Partner image.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .readPartnerAvatar({ partnerId: partner.partnerId, expectedRevision: { value: partner.revision }, sha256: image.sha256 }, options(signal));
+    signal?.throwIfAborted();
+    if (!response.image || response.image.sha256 !== image.sha256 || response.image.mimeType !== image.mimeType
+      || response.image.byteLength !== BigInt(image.byteLength) || response.content.length !== image.byteLength
+      || await sha256Hex(response.content) !== image.sha256) throw new Error("The Partner image response could not be verified.");
+    signal?.throwIfAborted();
+    return `data:${image.mimeType};base64,${base64Encode(response.content)}`;
+  },
+  async readPartnerWorkingStatus(credential, partnerId, status, locale, signal) {
+    signal?.throwIfAborted();
+    if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).readPartnerWorkingStatus({
+      partnerId, sessionId: status.sessionId, generation: status.generation, runId: status.runId,
+      attemptId: status.attemptId, phase: toPartnerWorkingPhase(status.phase), locale
+    }, options(signal));
+    signal?.throwIfAborted();
+    if (!response.workingStatus) return undefined;
+    const value = projectMobilePartnerWorkingStatus(response.workingStatus);
+    if (value.phase !== status.phase || workingStatusTurnKey(value) !== workingStatusTurnKey(status)) {
+      throw new Error("The Partner working response belongs to another turn.");
+    }
+    return response.workingStatus.caption.trim() || undefined;
+  },
   async listPartnerSessions(credential, partnerId, signal) {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
     return createClient(PartnerService, transport(credential.origin, credential.authKey))
       .listPartnerSessions({ partnerId }, options(signal));
+  },
+  async controlPartnerSessionTask(credential, requestId, partnerId, partnerRevision, task, action, signal) {
+    if (task.partnerId !== partnerId) throw new Error("The independent task belongs to another Partner.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey)).controlPartnerSessionTask({ requestId,
+      partnerId, taskId: task.id, expectedPartnerRevision: { value: partnerRevision }, expectedTaskRevision: { value: task.revision }, action: partnerSessionTaskAction(action) }, options(signal));
+    if (!response.task || response.task.id !== task.id) throw new Error("The task control response is inconsistent.");
+    return projectPartnerSessionTask(response.task, partnerId);
+  },
+  async retryPartnerInitialization(credential, partnerId, expectedRevision, signal) {
+    if (!validMobilePartnerId(partnerId) || expectedRevision < 1n) throw new Error("Select a current Partner initialization.");
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .retryPartnerInitialization({ partnerId, expectedRevision: { value: expectedRevision } }, options(signal));
+    return projectMobilePartnerInitializationRetry(partnerId, expectedRevision, response);
   },
   async listExtensions(credential, signal) {
     const client = createClient(ExtensionService, transport(credential.origin, credential.authKey));

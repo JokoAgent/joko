@@ -130,7 +130,7 @@ describe("session runtime control", () => {
       models: allModels,
       availableProviderIds: new Set(["provider-b", "provider-c"]),
       explicitDefault: { providerId: "provider-c", modelId: "default" },
-      visitedRoutes: ["provider-b\0reasoner"],
+      visitedRoutes: ["pi\0provider-b\0reasoner"],
       currentHop: 1,
       maxHops: 2,
       fastModeSupported: true

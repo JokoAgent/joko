@@ -21,6 +21,7 @@ export interface MobilePushDeliveryInput {
   readonly locale: MobilePushLocale;
   readonly kind: "done" | "awaiting" | "error";
   readonly intent: string;
+  readonly title?: string;
 }
 
 export type MobilePushDeliveryResult =
@@ -167,6 +168,10 @@ export class MobilePushCoordinator {
     });
   }
 
+  notifyGroupStep(input: Parameters<OperationalStore["enqueuePartnerGroupStepPush"]>[0]): void {
+    this.#store.enqueuePartnerGroupStepPush(input); this.wake();
+  }
+
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
@@ -193,11 +198,12 @@ export class MobilePushCoordinator {
           token,
           locale: claimed.registration.locale,
           kind: claimed.delivery.kind,
-          intent: mobilePushIntent(
+          ...(claimed.delivery.groupTitle === undefined ? {} : { title: claimed.delivery.groupTitle }),
+          intent: claimed.delivery.groupId === undefined ? mobilePushIntent(
             claimed.delivery.sessionId,
             claimed.delivery.messageId,
             claimed.delivery.messageEventId
-          )
+          ) : `joko://partner-group/${encodeURIComponent(boundedIdentity(claimed.delivery.groupId, "Push group ID"))}`
         }, signal);
       } catch (error) {
         result = signal.aborted || abortError(error)

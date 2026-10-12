@@ -54,6 +54,13 @@ export async function validateCodexCatalogSource(
   }
 }
 
+/** Resolve only the exact read-only rollout admitted by the scanned source. */
+export async function resolveCodexCatalogPreviewPath(source: CodexCatalogSource, nativeSessionId: string): Promise<string> {
+  await validateCodexCatalogSource(source, nativeSessionId);
+  if (source.rollout === undefined) throw materializationUnavailable("The source task has no readable rollout file.");
+  return resolveFencedRollout(await canonicalDirectory(source.profileDirectory), source.rollout);
+}
+
 /**
  * Publish one external native task into the active profile without overwriting
  * an existing native identity. Every partial step has an idempotent recovery

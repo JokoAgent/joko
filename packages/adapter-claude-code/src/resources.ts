@@ -6,7 +6,6 @@ const MAXIMUM_RESOURCE_NAME_BYTES = 4_096;
 const MAXIMUM_RESOURCE_VERSION_BYTES = 4_096;
 const MAXIMUM_RESOURCE_CONTENT_BYTES = 256 * 1024;
 const MAXIMUM_RUNTIME_RESOURCE_BYTES = 256 * 1024 * 1024;
-const MAXIMUM_RUNTIME_RESOURCES = 4_096;
 const MAXIMUM_UINT64 = 18_446_744_073_709_551_615n;
 
 export interface ClaudeTextResourceSeed {
@@ -48,7 +47,7 @@ export function snapshotClaudeTextResources(
   runtimeGeneration: number,
   lifetimeSignal: AbortSignal
 ): readonly ClaudeRuntimeTextResource[] {
-  if (!Array.isArray(value) || value.length > MAXIMUM_RUNTIME_RESOURCES) {
+  if (!Array.isArray(value)) {
     throw catalogError("The approved text resource catalog exceeds its runtime limit.");
   }
   if (!Number.isSafeInteger(runtimeGeneration) || runtimeGeneration < 1) {
@@ -73,7 +72,7 @@ export function snapshotClaudeTextResources(
     const content = `${seed.content}`;
     const contentBytes = Buffer.byteLength(content, "utf8");
     totalBytes += contentBytes;
-    if (contentBytes > MAXIMUM_RESOURCE_CONTENT_BYTES || totalBytes > MAXIMUM_RUNTIME_RESOURCE_BYTES) {
+    if ((seed.kind === "prompt" && contentBytes > MAXIMUM_RESOURCE_CONTENT_BYTES) || totalBytes > MAXIMUM_RUNTIME_RESOURCE_BYTES) {
       throw catalogError("Approved text resource content exceeds its runtime limit.");
     }
     const resource = Object.freeze({

@@ -220,6 +220,10 @@ export function readSessionCodeHostReferences(
   return readSessionCodeHostProjection(store, sessionId)?.references ?? [];
 }
 
+export function refreshSessionCodeHostReferencesInBackground(store: OperationalStore, sessionIds: readonly string[]): void {
+  installedRuntimes.get(store)?.refreshSessionsInBackground(sessionIds);
+}
+
 function sessionCodeHostContext(
   store: Pick<OperationalStore, "listEvents">,
   session: StoredSession

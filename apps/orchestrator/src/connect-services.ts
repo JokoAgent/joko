@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createAppDefaultModelConnectService } from "./app-default-model-connect-service.js";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -430,6 +431,11 @@ import { createManagedModelRuntimeConnectService } from "./managed-model-runtime
 import { createMessagingConnectService } from "./messaging-connect-service.js";
 import { createContactConnectService } from "./contact-connect-service.js";
 import { createPartnerConnectService } from "./partner-connect-service.js";
+import { PartnerMemoryManager } from "./partner-memory.js";
+import { createPartnerRoutineConnectService } from "./partner-routine-connect-service.js";
+import { createPartnerGroupConnectService } from "./partner-group-connect-service.js";
+import { createPartnerImportConnectService } from "./partner-import-connect-service.js";
+import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
 import { createCollaborationConnectService } from "./collaboration-connect-service.js";
 import { createObjectiveConnectService } from "./objective-connect-service.js";
 import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
@@ -532,6 +538,7 @@ interface ConnectServiceDependencies {
   readonly providerAccountUsage?: ProviderAccountUsageProvider;
   readonly messageSearch?: MessageSearchEmbeddingCoordinator;
   readonly makerMemory?: MakerMemoryController;
+  readonly partnerGroupRuntime?: OrchestratorApplication["partnerGroupRuntime"];
   readonly visionBridge?: VisionBridgeCoordinator;
   readonly promptPrediction?: PromptPredictionService;
   readonly auxiliaryText?: AuxiliaryTextRouting;
@@ -731,6 +738,7 @@ function toProtoArtifactCleanupProgress(progress: ArtifactCleanupJob) {
 }
 
 export interface ConnectServiceSet {
+  readonly appDefaultModel: ServiceImpl<typeof contract.AppDefaultModelService>;
   readonly connection: ServiceImpl<typeof contract.ConnectionService>;
   readonly event: ServiceImpl<typeof contract.EventService>;
   readonly operation: ServiceImpl<typeof contract.OperationService>;
@@ -754,6 +762,9 @@ export interface ConnectServiceSet {
   readonly messaging: ServiceImpl<typeof contract.MessagingService>;
   readonly contact: ServiceImpl<typeof contract.ContactService>;
   readonly partner: ServiceImpl<typeof contract.PartnerService>;
+  readonly partnerRoutine: ServiceImpl<typeof contract.PartnerRoutineService>;
+  readonly partnerGroup: ServiceImpl<typeof contract.PartnerGroupService>;
+  readonly partnerImport: ServiceImpl<typeof contract.PartnerImportService>;
   readonly collaborationGoal: ServiceImpl<typeof contract.CollaborationService>;
   readonly managedModelRuntime: ServiceImpl<typeof contract.ManagedModelRuntimeService>;
   readonly tool: ServiceImpl<typeof contract.ToolService>;
@@ -1147,6 +1158,7 @@ const RUNTIME_GENERATION = BigInt(Date.now());
 export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): void {
   const services = createConnectServices(application, projectionShutdownSignal);
   router.service(contract.ConnectionService, withConnectErrors(services.connection));
+  router.service(contract.AppDefaultModelService, withConnectErrors(services.appDefaultModel));
   router.service(contract.EventService, withConnectErrors(services.event));
   router.service(contract.OperationService, withConnectErrors(services.operation));
   router.service(contract.BackendService, withConnectErrors(services.backend));
@@ -1169,6 +1181,9 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.MessagingService, withConnectErrors(services.messaging));
   router.service(contract.ContactService, withConnectErrors(services.contact));
   router.service(contract.PartnerService, withConnectErrors(services.partner));
+  router.service(contract.PartnerRoutineService, withConnectErrors(services.partnerRoutine));
+  router.service(contract.PartnerGroupService, withConnectErrors(services.partnerGroup));
+  router.service(contract.PartnerImportService, withConnectErrors(services.partnerImport));
   router.service(contract.CollaborationService, withConnectErrors(services.collaborationGoal));
   router.service(contract.ManagedModelRuntimeService, withConnectErrors(services.managedModelRuntime));
   router.service(contract.ToolService, withConnectErrors(services.tool));
@@ -1269,6 +1284,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.providerAccountUsage === undefined ? {} : { providerAccountUsage: application.providerAccountUsage }),
     ...(application.messageSearch === undefined ? {} : { messageSearch: application.messageSearch }),
     ...(application.makerMemory === undefined ? {} : { makerMemory: application.makerMemory }),
+    ...(application.partnerGroupRuntime === undefined ? {} : { partnerGroupRuntime: application.partnerGroupRuntime }),
     ...(application.visionBridge === undefined ? {} : { visionBridge: application.visionBridge }),
     ...(application.promptPrediction === undefined ? {} : { promptPrediction: application.promptPrediction }),
     ...(application.auxiliaryText === undefined ? {} : { auxiliaryText: application.auxiliaryText }),
@@ -1430,8 +1446,19 @@ export function createConnectServices(application: OrchestratorApplication, proj
   );
   const partner = createPartnerConnectService(
     application.partners,
-    (context) => authenticate(context)
+    (context) => authenticate(context),
+    application.partnerWorkbenches,
+    application.partnerWorkingStatus,
+    application.partners && application.makerMemory
+      ? new PartnerMemoryManager(application.partners, application.store, application.makerMemory, application.partnerMemoryPreferences) : undefined,
+    application.partnerConnections,
+    application.partnerSkills,
+    application.partnerSessionTasks
   );
+  const partnerRoutine = createPartnerRoutineConnectService(application.partnerRoutines, context => authenticate(context));
+  const partnerGroup = createPartnerGroupConnectService(application.partnerGroups, application.store, context => authenticate(context),
+    (connectionId, callback) => application.connections.onRevoked(connectionId, callback), { workspaces: application.workspaces, artifacts: application.artifacts });
+  const partnerImport = createPartnerImportConnectService(application.partnerImports, context => authenticate(context));
   const collaborationGoal = createCollaborationConnectService(
     application.collaborationGoals,
     (context) => authenticate(context)
@@ -1669,6 +1696,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
         now,
         idFactory: randomUUID,
         timelinePageSize: 200,
+        hideSessionFromCatalog: sessionId => dependencies.partnerGroupRuntime?.isGroupSession(sessionId) === true,
+        hideTargetFromCatalog: targetId => dependencies.partnerGroupRuntime?.isGroupTarget(targetId) === true,
         resolveSessionContextDefaults: dependencies.resolveSessionContextDefaults,
         resolveSessionRuntimeModel: ({ sessionId }) =>
           dependencies.sessionHost.getSessionRuntimeControl(sessionId).effective
@@ -3008,6 +3037,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         ...(request.targetId === "" ? {} : { targetId: request.targetId }),
         ...(request.sessionId === "" ? {} : { sessionId: request.sessionId })
       });
+      records = records.filter(item => !isPartnerRoutineSchedule(item));
       if (request.backendId !== "") records = records.filter((item) => item.backendId === request.backendId);
       const values = records.map((item) => mapSchedule(dependencies.store, item))
         .filter((item) => request.state === undefined || item.state === request.state);
@@ -3016,11 +3046,13 @@ export function createConnectServices(application: OrchestratorApplication, proj
     },
     getSchedule: (request, context) => {
       authenticate(context);
+      requirePublicSchedule(dependencies.store, request.scheduleId);
       return { schedule: mapSchedule(dependencies.store, dependencies.store.getSchedule(request.scheduleId)) };
     },
     listScheduleRunHistory: (request, context) => {
       authenticate(context);
       const schedule = dependencies.store.getSchedule(request.scheduleId);
+      requirePublicSchedule(dependencies.store, request.scheduleId);
       const window = storePageWindow(request.page);
       const history = dependencies.store.listScheduleRuns(schedule.id, window.limit, window.offset);
       const values = toProtoSchedule(schedule, history, runMap(dependencies.store, history)).recentRuns;
@@ -5327,7 +5359,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
+  return { appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -5906,6 +5938,8 @@ async function resumePendingSessionLifecycleCleanup(
 ): Promise<SessionLifecycleCleanupRecord | undefined> {
   let cleanup = dependencies.store.findSessionLifecycleCleanup(operationId);
   if (cleanup?.state !== "pending") return cleanup;
+  // Service-owned Partner retirement has its own durable recovery coordinator.
+  if (dependencies.sessionHost.isPartnerSessionRetiring(cleanup.sessionId)) return cleanup;
   cleanup = await advanceSessionLifecycleCleanup(dependencies, cleanup);
   return dependencies.store.finalizeSessionLifecycleCleanup({
     operationId,
@@ -7110,6 +7144,7 @@ function eventContext(
 function eventMatchesScope(item: PersistedEvent, scope: contract.SnapshotScope | undefined, dependencies: ConnectServiceDependencies): boolean {
   if (item.payload.type === "device_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
   if (item.payload.type === "task_tag_catalog_changed") return scope?.kind.case === undefined || scope.kind.case === "owner";
+  if (scope?.kind.case !== "session" && dependencies.partnerGroupRuntime?.isGroupSession(item.sessionId) === true) return false;
   switch (scope?.kind.case) {
     case undefined:
     case "owner": return true;
@@ -15430,6 +15465,9 @@ async function dispatchMutation(
   const host = withOperationPreconditions(dependencies.sessionHost as ExtendedSessionHost, mutation);
   dependencies = { ...dependencies, sessionHost: host };
   const payload = mutation.payload;
+  if (payload.value && typeof payload.value === "object" && "scheduleId" in payload.value && typeof payload.value.scheduleId === "string") {
+    requirePublicSchedule(dependencies.store, payload.value.scheduleId);
+  }
   switch (payload.case) {
     case "startReview": {
       if (dependencies.reviewCoordinator === undefined) {
@@ -22829,6 +22867,10 @@ async function deleteSettingOperation(
     }
   });
   return presented(execution);
+}
+
+function requirePublicSchedule(store: OperationalStore, scheduleId: string): void {
+  if (isPartnerRoutineSchedule(store.getSchedule(scheduleId))) throw new ConnectError("Schedule is managed by its Partner.", Code.NotFound);
 }
 
 function scheduleInput(

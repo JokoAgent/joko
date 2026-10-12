@@ -32,6 +32,7 @@ export const ORCHESTRATOR_BUNDLED_NPM_RUNTIME = {
 
 export const ORCHESTRATOR_RUNTIME_PACKAGES = [
   { name: "@joko/orchestrator", workspacePath: "apps/orchestrator", candidatePath: "." },
+  { name: "@joko/agent-import", workspacePath: "packages/agent-import", candidatePath: "node_modules/@joko/agent-import" },
   { name: "@joko/adapter-claude-code", workspacePath: "packages/adapter-claude-code", candidatePath: "node_modules/@joko/adapter-claude-code" },
   { name: "@joko/adapter-codex", workspacePath: "packages/adapter-codex", candidatePath: "node_modules/@joko/adapter-codex" },
   { name: "@joko/adapter-dictation-refinement", workspacePath: "packages/adapter-dictation-refinement", candidatePath: "node_modules/@joko/adapter-dictation-refinement" },
@@ -65,6 +66,7 @@ export const ORCHESTRATOR_RUNTIME_PACKAGES = [
 
 export const ORCHESTRATOR_RUNTIME_CRITICAL_IMPORTS = [
   "@joko/orchestrator",
+  "@joko/agent-import",
   "@joko/adapter-claude-code",
   "@joko/adapter-codex",
   "@joko/adapter-dictation-refinement",
