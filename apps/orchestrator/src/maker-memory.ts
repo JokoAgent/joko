@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { MEMORY_SAVE_REQUEST_PREFIXES } from "./i18n/orchestration-language.js";
+import type { PartnerMemoryPreferences } from "./partner-memory-preferences.js";
 
 import type {
   MakerMemoryEntry,
@@ -65,16 +66,20 @@ export class MakerMemoryController {
   readonly #store: OperationalStore;
   readonly #scopeId: string;
   readonly #onSettingsChanged: () => Promise<void>;
+  readonly #targetPreferences: PartnerMemoryPreferences | undefined;
   #generation = 1;
+  #entriesRefresh?: ReturnType<typeof setTimeout>;
 
   constructor(input: {
     readonly store: OperationalStore;
     readonly scopeId?: string;
     readonly onSettingsChanged?: () => Promise<void>;
+    readonly targetPreferences?: PartnerMemoryPreferences;
   }) {
     this.#store = input.store;
     this.#scopeId = input.scopeId ?? "orchestrator";
     this.#onSettingsChanged = input.onSettingsChanged ?? (() => Promise.resolve());
+    this.#targetPreferences = input.targetPreferences;
     const stored = this.#store.findSetting<unknown>("service", this.#scopeId, MAKER_MEMORY_SETTING_KEY);
     if (stored !== undefined) validateStoredSettings(stored.value);
   }
@@ -83,9 +88,22 @@ export class MakerMemoryController {
     return this.#generation;
   }
 
+  requestEntriesRefresh(): void {
+    if (this.#entriesRefresh) clearTimeout(this.#entriesRefresh);
+    this.#entriesRefresh = setTimeout(() => {
+      this.#entriesRefresh = undefined;
+      void this.reconcileSettingsChange();
+    }, 3_000);
+    this.#entriesRefresh.unref();
+  }
+
+  dispose(): void { if (this.#entriesRefresh) clearTimeout(this.#entriesRefresh); this.#entriesRefresh = undefined; }
+
   get available(): boolean {
     return this.settings().makerEnabled;
   }
+  enabledForTarget(targetId: string): boolean { return this.settings().makerEnabled && (this.#targetPreferences?.enabled(targetId) ?? true); }
+  targetMemoryEnabled(targetId: string): boolean { return this.#targetPreferences?.enabled(targetId) ?? true; }
 
   settings(): StoredMemorySettings {
     const stored = this.#store.findSetting<unknown>("service", this.#scopeId, MAKER_MEMORY_SETTING_KEY);
@@ -176,7 +194,7 @@ export class MakerMemoryController {
 
   /** Curated startup snapshot. Digest is deliberately omitted. */
   runtimePrompt(targetId: string): string | undefined {
-    if (!this.settings().makerEnabled) return undefined;
+    if (!this.enabledForTarget(targetId)) return undefined;
     const entries = this.list(targetId)
       .filter((entry) => entry.kind !== "digest");
     const index = entries.length === 0
@@ -193,7 +211,7 @@ export class MakerMemoryController {
     readonly summary: string;
     readonly reason: string;
   }): boolean {
-    if (!this.enabledForBackend(input.backendId)) return false;
+    if (!this.enabledForBackend(input.backendId) || !this.enabledForTarget(input.targetId)) return false;
     const body = truncateUtf8(input.summary.trim(), 7_000);
     if (body === "") return false;
     try {
@@ -297,6 +315,7 @@ export class MakerMemoryBridgeProvider implements BridgeToolProvider {
 
   get generation(): number { return this.#memory.generation; }
   get available(): boolean { return this.#memory.available; }
+  includeForTarget(targetId: string): boolean { return this.#memory.enabledForTarget(targetId); }
 
   async callTool(
     name: string,
@@ -306,6 +325,7 @@ export class MakerMemoryBridgeProvider implements BridgeToolProvider {
   ): Promise<McpCallResult> {
     signal?.throwIfAborted();
     const targetId = context.targetId;
+    if (!this.#memory.enabledForTarget(targetId)) throw new Error("Memory is disabled for this workspace.");
     switch (name) {
       case "memory_list":
         return privateResult({ entries: this.#memory.list(targetId).map((entry) => publicEntry(entry)) });

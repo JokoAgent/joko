@@ -279,6 +279,7 @@ const SIDEBAR_SESSION_INFO_OPTIONS = [
   { value: "cost", label: "nav.sessionInfoCost", Icon: Wallet }
 ] as const;
 export interface SidebarProps {
+  readonly groupNavigation?: ReactNode;
   readonly snapshot: AppSnapshot;
   readonly activeSessionId?: string;
   readonly route: AppRoute;
@@ -1885,6 +1886,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
             onClick={() => navigateAndClose({ kind: "extensionMainView", extensionId: extension.id })}
           ><ExtensionShortcutIcon extension={extension} /><span><strong>{extension.mainView?.title ?? extension.name}</strong><small>{extension.description}</small></span></button>)}
         </section>}
+        {!searchPopupOpen && props.groupNavigation}
         {!searchPopupOpen && pinnedEntries.length === 0 && recent.length === 0 && remoteMachineSessionCount === 0 && sidebarExtensions.length === 0 && <p className="sidebar__empty">{t("session.emptyBody")}</p>}
         </nav>
 

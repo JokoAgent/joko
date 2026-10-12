@@ -40,6 +40,7 @@ export type CapabilityManifest = ReadonlyMap<string, Capability>;
 export const CAPABILITIES = [
   "session.discovery",
   "session.catalog",
+  "session.preview",
   "session.auto_title",
   "session.ai_rename",
   "session.summary",
@@ -739,6 +740,12 @@ export interface NativeSessionCatalogResult {
   readonly entries: readonly NativeSessionCatalogEntry[];
   /** Semantically rejected internal or non-user tasks. Scan errors and limits are excluded. */
   readonly rejectedCount: number;
+}
+
+/** Read-only bounded text from an exact Adapter-owned native file source. */
+export interface NativeSessionPreview {
+  readonly messages: readonly { readonly role: "user" | "assistant"; readonly text: string; readonly at: UnixMillis }[];
+  readonly truncated: boolean;
 }
 
 export const TASK_TAG_COLORS = [

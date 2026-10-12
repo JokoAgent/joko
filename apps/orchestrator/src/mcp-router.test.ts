@@ -104,7 +104,7 @@ class FakeMcpFactory implements McpClientFactory {
   }
 }
 
-interface FixtureOptions extends Partial<Pick<McpRouterOptions, "now" | "bridgeGrantTtlMs" | "nativeAuthLeaseTtlMs" | "nativeAuth" | "nativeAuthRecovery" | "trustedManagedRunnerScriptSha256" | "toolDiscoveryPolicy">> {
+interface FixtureOptions extends Partial<Pick<McpRouterOptions, "now" | "bridgeGrantTtlMs" | "nativeAuthLeaseTtlMs" | "nativeAuth" | "nativeAuthRecovery" | "trustedManagedRunnerScriptSha256" | "toolDiscoveryPolicy" | "targetReferences">> {
   readonly maximumBlobBytes?: number;
   readonly audioResultDownloader?: McpAudioResultDownloader;
 }
@@ -230,13 +230,48 @@ async function fixture(options: FixtureOptions = {}) {
     ...(options.nativeAuthRecovery === undefined ? {} : { nativeAuthRecovery: options.nativeAuthRecovery }),
     ...(options.trustedManagedRunnerScriptSha256 === undefined
       ? {} : { trustedManagedRunnerScriptSha256: options.trustedManagedRunnerScriptSha256 }),
-    ...(options.toolDiscoveryPolicy === undefined ? {} : { toolDiscoveryPolicy: options.toolDiscoveryPolicy })
+    ...(options.toolDiscoveryPolicy === undefined ? {} : { toolDiscoveryPolicy: options.toolDiscoveryPolicy }),
+    ...(options.targetReferences === undefined ? {} : { targetReferences: options.targetReferences })
   });
   await router.initialize();
   return { root, store, credentials, factory, artifacts, router };
 }
 
 describe("McpRouter", () => {
+  it("freezes Partner connection selections, preserves essential tools and leaves ordinary scopes unchanged", async () => {
+    let selected = { mcpIds: new Set(["selected"]), toolsetIds: new Set(["optional-policy"]) };
+    const { root, store, router } = await fixture({ targetReferences: targetId => targetId === "target-1" ? selected : undefined });
+    const optionalCall = vi.fn(async () => ({ content: [{ type: "text", text: "Optional result" }], isError: false }));
+    let unregisterOptional: () => void = () => undefined;
+    try {
+      for (const id of ["selected", "unselected"]) await router.upsert({ id, displayName: id, enabled: true, transport: "streamable_http", endpoint: "http://127.0.0.1:4321/mcp", credentialBindings: [] });
+      for (const id of ["optional", "essential"]) {
+        const unregisterProvider = router.registerBridgeToolProvider({ id, generation: 1, available: true,
+        ...(id === "optional" ? { configurablePolicy: { id: "optional-policy", displayName: "Optional", description: "Optional tools", productDefaultEnabled: false } } : {}),
+        tools: [{ serverId: id, name: "probe", description: "Probe", inputSchema: { type: "object" }, requiresPermission: false }], callTool: optionalCall });
+        if (id === "optional") unregisterOptional = unregisterProvider;
+      }
+      expect(router.toolsetCatalog().map(item => item.id)).toEqual(["optional-policy"]);
+      const input = { endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1, includeToolPolicy: () => false };
+      const original = router.createPiBridgeSnapshot(input);
+      expect(original.mcpBridge.tools.map(tool => tool.serverId).sort()).toEqual(["essential", "optional", "selected"]);
+      selected = { mcpIds: new Set(), toolsetIds: new Set() };
+      const next = router.createPiBridgeSnapshot(input);
+      expect(next.mcpBridge.tools.map(tool => tool.serverId)).toEqual(["essential"]);
+      const call = { authorization: `Bearer ${original.mcpBridge.token}`, requestId: "original-selected-call", generation: 1, sessionId: "session-1", targetId: "target-1", serverId: "optional", toolName: "probe" };
+      expect(await router.executeBridgeCall(call)).toMatchObject({ isError: false }); expect(optionalCall).toHaveBeenCalledOnce();
+      await expect(router.executeBridgeCall({ ...call, authorization: `Bearer ${next.mcpBridge.token}`, requestId: "next-rejected-call" })).rejects.toThrow("not present");
+      const ordinary = router.createPiBridgeSnapshot({ endpoint: input.endpoint, targetId: "ordinary-target", includeToolPolicy: () => true });
+      expect(ordinary.mcpBridge.tools.map(tool => tool.serverId).sort()).toEqual(["essential", "optional", "selected", "unselected"]);
+      const sibling: BridgeToolProvider = { id: "optional-sibling", generation: 8, available: true,
+        configurablePolicy: { id: "optional-policy", displayName: "Optional", description: "Optional tools", productDefaultEnabled: false }, tools: [], callTool: optionalCall };
+      const unregister = router.registerBridgeToolProvider(sibling), before = router.toolsetCatalog()[0]!.revision;
+      unregisterOptional();
+      router.registerBridgeToolProvider({ ...sibling, id: "optional", generation: 2 });
+      const after = router.toolsetCatalog()[0]!.revision; expect(after).not.toBe(before);
+      unregister(); expect(router.toolsetCatalog()[0]!.revision).not.toBe(after);
+    } finally { await router.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
   it("adopts standard MCP embedded and linked audio with explicit artwork through the producing resource connection", async () => {
     const { root, store, router, factory, artifacts } = await fixture();
     const audioUri = "https://media.example.test/track?access=ephemeral-value";

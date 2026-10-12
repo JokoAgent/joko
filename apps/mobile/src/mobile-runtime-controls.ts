@@ -33,6 +33,7 @@ export interface MobileEffortOption {
 export interface MobileModelRoute {
   readonly key: string;
   readonly backendId: string;
+  readonly backendName?: string;
   readonly providerId: string;
   readonly providerName: string;
   readonly modelId: string;

@@ -44,6 +44,8 @@ import type {
 export interface OperationalStoreOptions {
   readonly now?: () => number;
   readonly idFactory?: () => string;
+  /** A private product owner supplies its own notification journey. */
+  readonly suppressSessionNotifications?: (sessionId: string) => boolean;
 }
 
 export interface OperationalHistoryMaintenanceCandidate {
@@ -213,6 +215,8 @@ export interface MobilePushDeliveryRecord {
   readonly id: string;
   readonly registrationId: string;
   readonly sessionId: string;
+  readonly groupId?: string;
+  readonly groupTitle?: string;
   readonly kind: "done" | "awaiting" | "error";
   readonly subjectCursor: bigint;
   readonly subjectGeneration: number;
@@ -1289,6 +1293,8 @@ export interface DesktopHostAuthorizationRecord {
 export interface QueueControlRecord {
   readonly sessionId: SessionId;
   readonly paused: boolean;
+  /** Only an explicit user admission may release a restart-owned pause. */
+  readonly resumeOnUserInput: boolean;
   readonly pauseReason?: string;
   readonly pausedAt?: UnixMillis;
   readonly pausedByConnectionId?: ConnectionId;
@@ -1487,8 +1493,8 @@ export interface SubagentTranscriptPage {
 
 export interface PendingContextRebuild {
   readonly sessionId: SessionId;
-  readonly reason: "message_deletion" | "context_overflow" | "prompt_timeout";
-  /** Operation whose deletion or failed dispatch established this boundary. */
+  readonly reason: "message_deletion" | "context_overflow" | "prompt_timeout" | "manual_restart";
+  /** Operation whose explicit mutation or failed dispatch established this boundary. */
   readonly latestDeletionOperationId: OperationId;
   readonly sourceNativeOpaqueRef: string;
   readonly sourceRunId?: RunId;

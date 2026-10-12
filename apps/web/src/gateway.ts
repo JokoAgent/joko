@@ -1,4 +1,16 @@
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { AppDefaultModelService } from "@joko/contracts";
+import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
+import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
+import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
+import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService } from "@joko/contracts";
+import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
+import { createPartnerMemoryApi } from "@joko/contracts";
+import { createPartnerConnectionsApi } from "@joko/contracts";
+import { base64Encode } from "@bufbuild/protobuf/wire";
+import { mapPartnerAvatar, protoPartnerAvatar, type PartnerAvatarImageView } from "./partner-avatar.js";
+import { mapPartnerWorkingStatus } from "./partner-working-status.js";
+import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
 import { createClient, ConnectError, Code, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
@@ -10,6 +22,8 @@ import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, rea
 import { SshKeyService, SshAgentState, SshAgentHostPlatform, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
 import type { SshKeyView, SshKeyCatalogView, SshKeyGenerateDraft, SshKeyInstallCommandDraft } from "./model.js";
 import type { UsageReportQueryView, UsageReportView } from "./model.js";
+import type { PartnerWorkbenchView, PartnerWorkbenchOwnerView, PartnerWorkbenchJudgmentView, PartnerWorkbenchDetailView } from "./model.js";
+import { mapPartnerWorkbench, mapPartnerWorkbenchDetail, protoWorkbenchOwner, protoWorkbenchJudgment, sameWorkbenchOwner } from "./partner-workbench-wire.js";
 import {
   ArtifactKind,
   AudioArtifactKind,
@@ -966,7 +980,7 @@ export interface PairingOutcome {
   readonly authKey: string;
 }
 
-export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage"> {
+export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage">, AppDefaultModelUiPort {
   connect(): Promise<void>;
   disconnect(): void;
   pair(origin: string, humanCode: string, deviceName: string): Promise<PairingOutcome>;
@@ -1143,6 +1157,24 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       else this.#callbacks.onError?.(gatewayError);
       throw gatewayError;
     }
+  }
+
+  async *watchAppDefaultModel(uiOwnerId: string, signal: AbortSignal) {
+    const transport = this.requireTransport();
+    for await (const message of createClient(AppDefaultModelService, transport).watchAppDefaultModel({ uiOwnerId }, { signal })) {
+      if (transport !== this.requireTransport()) return;
+      yield { ready: message.ready, requestId: message.requestId };
+    }
+  }
+  async syncAppDefaultModel(uiOwnerId: string, mirror: Parameters<AppDefaultModelUiPort["syncAppDefaultModel"]>[1], signal: AbortSignal) {
+    const response = await createClient(AppDefaultModelService, this.requireTransport()).syncAppDefaultModel({ uiOwnerId, ...mirror,
+      tuning: [...mirror.tuning], hiddenRouteIds: [...mirror.hiddenRouteIds], visibleRouteIds: [...mirror.visibleRouteIds ?? []] }, { signal });
+    return response.accepted;
+  }
+  async claimAppDefaultModel(uiOwnerId: string, requestId: string, signal: AbortSignal) {
+    const response = await createClient(AppDefaultModelService, this.requireTransport()).claimAppDefaultModel({ uiOwnerId, requestId }, { signal });
+    if (response.requested === undefined || response.remainingMs < 1 || response.remainingMs > 5_000) throw new GatewayError("The application default-model request expired.");
+    return { remainingMs: response.remainingMs, ...(response.expected === undefined ? {} : { expected: response.expected }), requested: response.requested };
   }
 
   disconnect(): void {
@@ -4794,6 +4826,50 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return { capturedAt, processes };
   }
 
+  partnerConnectionsApi(partnerId: string, ownerKey: string) {
+    const transport = this.requireTransport();
+    return createPartnerConnectionsApi({ rpc: createClient(PartnerService, transport), partnerId, ownerKey, assertCurrent: signal => {
+      signal.throwIfAborted();
+      if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Connection settings owner changed.");
+    } });
+  }
+
+  partnerMemoryApi(partnerId: string, ownerKey: string) {
+    const transport = this.requireTransport();
+    return createPartnerMemoryApi({ rpc: createClient(PartnerService, transport), partnerId, ownerKey, assertCurrent: signal => {
+      signal.throwIfAborted();
+      if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Memory connection owner changed.");
+    } });
+  }
+
+  partnerRoutineApi(partnerId: string, ownerKey: string) {
+    const transport = this.requireTransport();
+    return createPartnerRoutineApi({ rpc: createClient(PartnerRoutineService, transport), partnerId, ownerKey,
+      newRequestId: () => crypto.randomUUID(), assertCurrent: () => {
+        if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Routine connection owner changed.");
+      } });
+  }
+  partnerGroupApi(ownerKey: string) {
+    const transport = this.requireTransport();
+    return createPartnerGroupApi({ rpc: createClient(PartnerGroupService, transport), ownerKey, newRequestId: () => crypto.randomUUID(), respond: async (interaction, decision, signal) => {
+      await this.submit({ case: "resolveInteraction", value: { interactionId: interaction.interactionId, interactionGeneration: interaction.generation,
+        resolution: { connectionId: this.#profile?.id ?? "", decision } } }, false, [], signal);
+    }, assertCurrent: () => {
+      if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Group connection owner changed.");
+    } });
+  }
+  async uploadPartnerGroupFile(file: File, signal: AbortSignal): Promise<import("@joko/contracts").BlobRef> {
+    return await this.uploadAttachment(file, this.captureActionScope(signal)) as unknown as import("@joko/contracts").BlobRef;
+  }
+
+  partnerImportApi(ownerKey: string) {
+    const transport = this.requireTransport();
+    return createPartnerImportApi({ rpc: createClient(PartnerImportService, transport), ownerKey, controllerId: crypto.randomUUID(),
+      newRequestId: () => crypto.randomUUID(), assertCurrent: () => {
+        if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Import connection owner changed.");
+      } });
+  }
+
   async getUsageReport(query: UsageReportQueryView, signal: AbortSignal): Promise<UsageReportView> {
     const client = createClient(BackendService, this.requireTransport());
     const requestSignal = this.#abort === undefined ? signal : AbortSignal.any([signal, this.#abort.signal]);
@@ -7191,7 +7267,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     scope.signal.throwIfAborted();
     return {
       partners: response.partners.map(mapPartnerProfile),
-      directory: mapPartnerDirectory(response.directory)
+      directory: mapPartnerDirectory(response.directory),
+      pendingDeletions: response.pendingDeletions.map(projectPartnerDeletion),
+      pendingRestarts: response.pendingRestarts.map(projectPartnerRestart)
     };
   }
 
@@ -7202,17 +7280,35 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapPartnerProfile(response.partner);
   }
 
+  async readPartnerWorkingStatus(partnerId: string, status: SessionWorkingStatus, locale: "en" | "zh-CN",
+    signal?: AbortSignal): Promise<string | undefined> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).readPartnerWorkingStatus({ partnerId,
+      sessionId: status.sessionId, generation: status.generation, runId: status.runId, attemptId: status.attemptId,
+      phase: toPartnerWorkingPhase(status.phase), locale }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.workingStatus === undefined) return undefined;
+    const facts = mapPartnerWorkingStatus(response.workingStatus);
+    if (workingStatusTurnKey(facts) !== workingStatusTurnKey(status) || facts.phase !== status.phase) {
+      throw new GatewayError("The Partner working response belongs to a different turn.");
+    }
+    return response.workingStatus.caption.trim() || undefined;
+  }
+
   async createPartner(
     expectedDirectoryRevision: bigint,
     draft: PartnerDraftView,
+    requestId: string,
     signal?: AbortSignal
   ): Promise<PartnerMutationView> {
     const scope = this.captureActionScope(signal);
     const response = await createClient(PartnerService, scope.transport).createPartner({
+      requestId,
       expectedDirectoryRevision: { value: expectedDirectoryRevision },
       draft: {
         displayName: draft.displayName,
-        avatar: draft.avatar,
+        description: draft.description ?? "",
+        avatar: protoPartnerAvatar(draft.avatar),
         identitySource: draft.identitySource,
         templateId: draft.templateId,
         ...(draft.capabilities === undefined ? {} : { capabilities: protoPartnerCapabilities(draft.capabilities) }),
@@ -7221,6 +7317,42 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, { signal: scope.signal });
     scope.signal.throwIfAborted();
     return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async getPartnerCreation(requestId: string, signal?: AbortSignal): Promise<PartnerMutationView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerCreation({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapPartnerMutation(response.partner, response.directory);
+  }
+
+  async readPartnerAvatar(partnerId: string, expectedRevision: bigint, image: PartnerAvatarImageView, signal?: AbortSignal): Promise<string> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).readPartnerAvatar({
+      partnerId, expectedRevision: { value: expectedRevision }, sha256: image.sha256
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const actual = response.image;
+    if (!actual || actual.sha256 !== image.sha256 || actual.mimeType !== image.mimeType
+      || actual.byteLength !== BigInt(image.byteLength) || response.content.length !== image.byteLength) {
+      throw new GatewayError("The Partner image response belongs to another descriptor.");
+    }
+    const digest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", Uint8Array.from(response.content).buffer)))
+      .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+    scope.signal.throwIfAborted();
+    if (digest !== image.sha256) throw new GatewayError("The Partner image failed content verification.");
+    return `data:${image.mimeType};base64,${base64Encode(response.content)}`;
+  }
+
+  async retirePartnerCreation(requestId: string, signal?: AbortSignal): Promise<{ readonly directory: PartnerDirectoryView; readonly partner?: PartnerProfileView }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).retirePartnerCreation({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.retired !== (response.partner === undefined)) throw new GatewayError("The partner creation retirement result is inconsistent.");
+    return {
+      directory: mapPartnerDirectory(response.directory),
+      ...(response.partner === undefined ? {} : { partner: mapPartnerProfile(response.partner) })
+    };
   }
 
   async updatePartner(
@@ -7255,6 +7387,88 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return mapPartnerMutation(response.partner, response.directory);
   }
 
+  async deletePartner(requestId: string, partnerId: string, expectedRevision: bigint, confirmName: string, signal?: AbortSignal): Promise<PartnerDeletionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).deletePartner({ requestId, partnerId,
+      expectedRevision: { value: expectedRevision }, confirmName }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const deletion = projectPartnerDeletion(response.deletion);
+    if (deletion.requestId !== requestId || deletion.partnerId !== partnerId) throw new Error("The Partner deletion owner changed.");
+    return deletion;
+  }
+
+  async getPartnerDeletion(requestId: string, signal?: AbortSignal): Promise<PartnerDeletionResult> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerDeletion({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const deletion = response.deletion ? projectPartnerDeletion(response.deletion) : undefined;
+    if (deletion && (deletion.requestId !== requestId || response.retired)) throw new Error("The Partner deletion result changed.");
+    return { ...(deletion ? { deletion } : {}), retired: response.retired };
+  }
+
+  async retirePartnerDeletion(requestId: string, signal?: AbortSignal): Promise<PartnerDeletionResult> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).retirePartnerDeletion({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const deletion = response.deletion ? projectPartnerDeletion(response.deletion) : undefined;
+    if (deletion ? deletion.requestId !== requestId || response.retired : !response.retired) throw new Error("The Partner deletion result is invalid.");
+    return { ...(deletion ? { deletion } : {}), retired: response.retired };
+  }
+
+  async retryPartnerDeletion(requestId: string, signal?: AbortSignal): Promise<PartnerDeletionView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).retryPartnerDeletion({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const deletion = projectPartnerDeletion(response.deletion);
+    if (deletion.requestId !== requestId) throw new Error("The Partner deletion owner changed.");
+    return deletion;
+  }
+
+  async getPartnerRestartControls(partnerId: string, signal?: AbortSignal): Promise<{ readonly revision: bigint; readonly available: boolean }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerRestartControls({ partnerId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.revision || response.revision.value < 1n) throw new Error("The Partner restart controls are invalid.");
+    return { revision: response.revision.value, available: response.available };
+  }
+
+  async restartPartner(requestId: string, partnerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerRestartView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).restartPartner({ requestId, partnerId,
+      expectedRevision: { value: expectedRevision } }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const restart = projectPartnerRestart(response.restart);
+    if (restart.requestId !== requestId || restart.partnerId !== partnerId) throw new Error("The Partner restart owner changed.");
+    return restart;
+  }
+
+  async getPartnerRestart(requestId: string, signal?: AbortSignal): Promise<PartnerRestartResult> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerRestart({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const restart = response.restart ? projectPartnerRestart(response.restart) : undefined;
+    if (restart && (restart.requestId !== requestId || response.retired)) throw new Error("The Partner restart result changed.");
+    return { ...(restart ? { restart } : {}), retired: response.retired };
+  }
+
+  async retirePartnerRestart(requestId: string, signal?: AbortSignal): Promise<PartnerRestartResult> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).retirePartnerRestart({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const restart = response.restart ? projectPartnerRestart(response.restart) : undefined;
+    if (restart ? restart.requestId !== requestId || response.retired : !response.retired) throw new Error("The Partner restart result is invalid.");
+    return { ...(restart ? { restart } : {}), retired: response.retired };
+  }
+
+  async retryPartnerRestart(requestId: string, signal?: AbortSignal): Promise<PartnerRestartView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).retryPartnerRestart({ requestId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const restart = projectPartnerRestart(response.restart);
+    if (restart.requestId !== requestId) throw new Error("The Partner restart owner changed.");
+    return restart;
+  }
+
   async retryPartnerInitialization(
     partnerId: string,
     expectedRevision: bigint,
@@ -7284,6 +7498,25 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       directory: mapPartnerDirectory(response.directory),
       affectedPartners: response.affectedPartners.map(mapPartnerProfile)
     };
+  }
+
+  async listPartnerSessionTasks(partnerId: string, signal?: AbortSignal): Promise<readonly import("@joko/contracts").PartnerSessionTaskView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).listPartnerSessions({ partnerId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const { projectPartnerSessionTask } = await import("@joko/contracts");
+    return response.tasks.map(task => projectPartnerSessionTask(task, partnerId));
+  }
+
+  async controlPartnerSessionTask(partnerId: string, partnerRevision: bigint, task: import("@joko/contracts").PartnerSessionTaskView,
+    action: "pause" | "resume" | "cancel", signal?: AbortSignal): Promise<import("@joko/contracts").PartnerSessionTaskView> {
+    const scope = this.captureActionScope(signal), { partnerSessionTaskAction, projectPartnerSessionTask } = await import("@joko/contracts");
+    if (task.partnerId !== partnerId) throw new GatewayError("The independent task belongs to another Partner.");
+    const response = await createClient(PartnerService, scope.transport).controlPartnerSessionTask({ requestId: crypto.randomUUID(), partnerId, taskId: task.id,
+      expectedPartnerRevision: { value: partnerRevision }, expectedTaskRevision: { value: task.revision }, action: partnerSessionTaskAction(action) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.task || response.task.id !== task.id) throw new GatewayError("The task control response is inconsistent.");
+    return projectPartnerSessionTask(response.task, partnerId);
   }
 
   async listPartnerSessions(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerSessionView[]> {
@@ -7441,6 +7674,68 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       throw new GatewayError("Orchestrator returned a mismatched Partner delegation cancellation.");
     }
     return delegation;
+  }
+
+  async getPartnerWorkbench(partnerId: string, signal?: AbortSignal): Promise<PartnerWorkbenchView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerWorkbench({ partnerId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const view = mapPartnerWorkbench(response.workbench, mapCodeHostPullRequest);
+    if (view.owner.partnerId !== partnerId) throw new GatewayError("Orchestrator returned a mismatched workbench owner.");
+    return view;
+  }
+
+  async addPartnerWorkbenchProject(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, path: string, signal?: AbortSignal): Promise<PartnerWorkbenchView & { readonly acceptedProject: string }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).addPartnerWorkbenchProject({ owner: protoWorkbenchOwner(owner), expectedRevision: { value: expectedRevision }, path }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const view = mapPartnerWorkbench(response.workbench, mapCodeHostPullRequest);
+    if (!sameWorkbenchOwner(view.owner, owner) || view.revision < expectedRevision) throw new GatewayError("The workbench owner changed.");
+    if (!view.projects.some((project) => project.path === response.acceptedProject)) throw new GatewayError("The handed-over project is unavailable.");
+    return { ...view, acceptedProject: response.acceptedProject };
+  }
+
+  async removePartnerWorkbenchProject(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, path: string, signal?: AbortSignal): Promise<PartnerWorkbenchView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).removePartnerWorkbenchProject({ owner: protoWorkbenchOwner(owner), expectedRevision: { value: expectedRevision }, path }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const view = mapPartnerWorkbench(response.workbench, mapCodeHostPullRequest);
+    if (!sameWorkbenchOwner(view.owner, owner) || view.revision < expectedRevision) throw new GatewayError("The workbench owner changed.");
+    return view;
+  }
+
+  async setPartnerWorkbenchJudgment(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, judgment: Omit<PartnerWorkbenchJudgmentView, "updatedAt">, signal?: AbortSignal): Promise<PartnerWorkbenchView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).setPartnerWorkbenchJudgment({ owner: protoWorkbenchOwner(owner), expectedRevision: { value: expectedRevision }, judgment: protoWorkbenchJudgment(judgment) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const view = mapPartnerWorkbench(response.workbench, mapCodeHostPullRequest);
+    if (!sameWorkbenchOwner(view.owner, owner) || view.revision < expectedRevision) throw new GatewayError("The workbench owner changed.");
+    return view;
+  }
+
+  async getPartnerWorkbenchDetail(owner: PartnerWorkbenchOwnerView, taskId: string, signal?: AbortSignal): Promise<PartnerWorkbenchDetailView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).getPartnerWorkbenchDetail({ owner: protoWorkbenchOwner(owner), taskId }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const detail = mapPartnerWorkbenchDetail(response.detail, mapCodeHostPullRequest);
+    if (detail.task.id !== taskId) throw new GatewayError("Orchestrator returned a mismatched workbench task.");
+    return detail;
+  }
+
+  async resolvePartnerWorkbenchReference(owner: PartnerWorkbenchOwnerView, ref: string, signal?: AbortSignal): Promise<{ readonly kind: "https" | "file"; readonly value: string; readonly workspaceId?: string; readonly relativePath?: string; readonly directory: boolean }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).resolvePartnerWorkbenchReference({ owner: protoWorkbenchOwner(owner), ref }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.kind !== "https" && response.kind !== "file" || response.value === "") throw new GatewayError("The workbench reference is unavailable.");
+    if (response.kind === "file" && (response.workspaceId === undefined || response.workspaceId === "" || response.relativePath === undefined)) throw new GatewayError("The project file authority is unavailable.");
+    return { kind: response.kind, value: response.value, workspaceId: response.workspaceId, relativePath: response.relativePath, directory: response.directory };
+  }
+
+  async readPartnerWorkbenchDocument(owner: PartnerWorkbenchOwnerView, path: string, signal?: AbortSignal): Promise<{ readonly path: string; readonly text: string; readonly truncated: boolean }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(PartnerService, scope.transport).readPartnerWorkbenchDocument({ owner: protoWorkbenchOwner(owner), path }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return { path: response.path, text: response.text, truncated: response.truncated };
   }
 
   async listCollaborationGoals(
@@ -10364,6 +10659,7 @@ export function projectSnapshotEvent(
     case "imageProduced":
     case "recoverableError":
     case "contextRebuilt":
+    case "runtimeHandoff":
     case "browserActivity":
     case "objectiveLifecycle":
       break;
@@ -10507,6 +10803,7 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
     || kind === "retryChanged"
     || kind === "compactionChanged"
     || kind === "contextRebuilt"
+    || kind === "runtimeHandoff"
     || kind === "runDone"
     || kind === "runAborted"
     || kind === "recoverableError"
@@ -10590,6 +10887,7 @@ function projectTimelineEvent(
         ...(kind.value.role === 1 && pastedTextRanges.length > 0 ? { pastedTextRanges } : {}),
         ...(kind.value.role === 1 && automationOrigin !== undefined ? { automationOrigin } : {}),
         ...(kind.value.role === 1 && inputDelivery !== undefined ? { inputDelivery } : {}),
+        ...timelinePrivateMessageOrigin(kind.value.partnerPrivateOrigin),
         ...(kind.value.role === 1 && kind.value.automaticContinuation && kind.value.runtimeRecoveryId.trim().length > 0
           ? { automaticContinuation: { recoveryId: kind.value.runtimeRecoveryId } }
           : {}),
@@ -10959,6 +11257,13 @@ function projectTimelineEvent(
       }, (candidate) => candidate.compaction?.id === compactionId);
       break;
     }
+    case "runtimeHandoff": {
+      const handoff = kind.value;
+      if (!handoff.fromBackendId.trim() || !handoff.toBackendId.trim() || !handoff.modelId.trim()) { changed = false; break; }
+      replaceOrAppend({ id: event.eventId, sequence, kind: "runtimeHandoff", createdAt, runtimeHandoff: {
+        fromBackendId: handoff.fromBackendId, toBackendId: handoff.toBackendId, modelId: handoff.modelId, resumed: handoff.resumed } });
+      break;
+    }
     case "contextRebuilt": {
       const rebuilt = kind.value;
       const reason = contextRebuildTimelineReason(rebuilt.reason);
@@ -11088,6 +11393,8 @@ function reconcileCompletedAssistantMessage(
           kind: "assistant",
           createdAt: existing?.createdAt ?? createdAt,
           text: finalText,
+          ...(event.cursor !== undefined && event.cursor.sequence > 0n ? { completionCursor: event.cursor.sequence } : {}),
+          ...timelinePrivateMessageOrigin(completed.partnerPrivateOrigin),
           streaming: false,
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(usage === undefined ? {} : { usage })
@@ -11196,6 +11503,8 @@ function reconcileCompletedAssistantMessage(
         text: "",
         streaming: false,
         attachments,
+        ...(event.cursor !== undefined && event.cursor.sequence > 0n ? { completionCursor: event.cursor.sequence } : {}),
+        ...timelinePrivateMessageOrigin(completed.partnerPrivateOrigin),
         ...(usage === undefined ? {} : { usage })
       }
     });
@@ -12481,7 +12790,7 @@ function mapSession(
   session: Session,
   providers: ReadonlyMap<string, ProviderDescriptor>,
   models: ReadonlyMap<string, ModelDescriptor>,
-  activeRun: Pick<Snapshot["runs"][number], "runId" | "state" | "startedAt"> | undefined,
+  activeRun: Pick<Snapshot["runs"][number], "runId" | "state" | "startedAt" | "activeAttemptId" | "version" | "targetId" | "backendId"> | undefined,
   retryRun: { readonly runId: string } | undefined,
   compactingOverride?: boolean
 ): SessionView {
@@ -12587,6 +12896,9 @@ function mapSession(
     }),
     ...(compacting === undefined ? {} : { compacting }),
     ...(activeRun === undefined ? {} : { activeRunId: activeRun.runId }),
+    ...(activeRun?.activeAttemptId && activeRun.version?.generation === session.nativeBinding?.runtimeGeneration
+      && activeRun.targetId === session.targetId && activeRun.backendId === session.backendId
+      ? { activeAttemptId: activeRun.activeAttemptId } : {}),
     ...(activeRun?.startedAt === undefined ? {} : { activeRunStartedAt: timestampMs(activeRun.startedAt) }),
     ...(retryRun === undefined ? {} : { retryRunId: retryRun.runId }),
     ...(session.activeNativeEntryId.length === 0 ? {} : { nativeLeafId: session.activeNativeEntryId })
@@ -12627,6 +12939,14 @@ function withTimelineHistoryInvalidation(
   const timelineHistoryRevisionBySession = new Map(snapshot.timelineHistoryRevisionBySession);
   timelineHistoryRevisionBySession.set(sessionId, nextRevision);
   return { ...snapshot, timelineHistoryRevisionBySession };
+}
+
+function timelinePrivateMessageOrigin(value: ProtoMessageCompletedEvent["partnerPrivateOrigin"]): Pick<TimelineItemView, "partnerPrivateOrigin"> {
+  if (value === undefined) return {};
+  const { messageId, threadId, senderPartnerId, recipientPartnerId, senderDisplayName } = value;
+  if ([messageId, threadId, senderPartnerId, recipientPartnerId, senderDisplayName].some((text) => text.trim() === "" || text.length > 256)
+    || senderPartnerId === recipientPartnerId) throw new GatewayError("Orchestrator returned invalid private message provenance.");
+  return { partnerPrivateOrigin: { messageId, threadId, senderPartnerId, recipientPartnerId, senderDisplayName } };
 }
 
 function timelineNativeMessageIdentity(
@@ -18578,7 +18898,7 @@ function recoveryActionKind(kind: RecoveryActionKind): ErrorView["recovery"][num
   return "unknown";
 }
 
-async function interactionDecision(
+export async function interactionDecision(
   raw: Interaction,
   resolution: InteractionResolutionDraft
 ): Promise<NonNullable<MessageInitShape<typeof InteractionResolutionSchema>["decision"]>> {
@@ -19833,12 +20153,14 @@ function requiredPartnerRevision(value: { readonly value: bigint } | undefined, 
 
 function protoPartnerLifecycle(value: PartnerLifecycleView): PartnerLifecycle {
   if (value === "active") return PartnerLifecycle.ACTIVE;
+  if (value === "paused") return PartnerLifecycle.PAUSED;
   if (value === "archived") return PartnerLifecycle.ARCHIVED;
   return PartnerLifecycle.DELETED;
 }
 
 function partnerLifecycle(value: PartnerLifecycle): PartnerLifecycleView {
   if (value === PartnerLifecycle.ACTIVE) return "active";
+  if (value === PartnerLifecycle.PAUSED) return "paused";
   if (value === PartnerLifecycle.ARCHIVED) return "archived";
   if (value === PartnerLifecycle.DELETED) return "deleted";
   throw new GatewayError("Orchestrator returned an unknown Partner lifecycle.");
@@ -19889,8 +20211,11 @@ function protoPartnerCapabilities(value: PartnerCapabilitiesView) {
 
 function protoPartnerPatch(value: PartnerPatchView) {
   return {
+    ...(value.taskModelOverride === undefined ? {} : { taskModelPreference: value.taskModelOverride === null
+      ? { case: "inheritTaskModel" as const, value: true } : { case: "taskModelOverride" as const, value: protoPartnerRoute(value.taskModelOverride) } }),
     ...(value.displayName === undefined ? {} : { displayName: value.displayName }),
-    ...(value.avatar === undefined ? {} : { avatar: value.avatar }),
+    ...(value.description === undefined ? {} : { description: value.description }),
+    ...(value.avatar === undefined ? {} : { avatar: protoPartnerAvatar(value.avatar) }),
     ...(value.identitySource === undefined ? {} : { identitySource: value.identitySource }),
     ...(value.modelChain === undefined ? {} : { modelChain: { routes: value.modelChain.map(protoPartnerRoute) } }),
     ...(value.permissionMode === undefined ? {} : { permissionMode: protoPermission(value.permissionMode) }),
@@ -19899,11 +20224,7 @@ function protoPartnerPatch(value: PartnerPatchView) {
   };
 }
 
-function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined): PartnerCapabilitiesView {
-  if (value === undefined || value.modelChain.length < 1 || value.modelChain.length > 3) {
-    throw new GatewayError("Orchestrator returned an invalid Partner model chain.");
-  }
-  const routes = value.modelChain.map((route): PartnerModelRouteView => {
+function mapPartnerRoute(route: ProtoPartnerCapabilities["modelChain"][number]): PartnerModelRouteView {
     if (route.backendId.trim() === "" || route.providerId.trim() === "" || route.modelId.trim() === ""
       || (route.effort !== undefined && route.effort.trim() === "")) {
       throw new GatewayError("Orchestrator returned an incomplete Partner model route.");
@@ -19915,10 +20236,15 @@ function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined): Pa
       ...(route.effort === undefined ? {} : { effort: route.effort }),
       fastMode: route.fastMode
     };
-  });
-  const backendId = routes[0]!.backendId;
-  const identities = new Set(routes.map((route) => `${route.providerId}\u0000${route.modelId}`));
-  if (routes.some((route) => route.backendId !== backendId) || identities.size !== routes.length) {
+}
+
+function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined): PartnerCapabilitiesView {
+  if (value === undefined || value.modelChain.length < 1 || value.modelChain.length > 5) {
+    throw new GatewayError("Orchestrator returned an invalid Partner model chain.");
+  }
+  const routes = value.modelChain.map(mapPartnerRoute);
+  const identities = new Set(routes.map((route) => `${route.backendId}\u0000${route.providerId}\u0000${route.modelId}`));
+  if (identities.size !== routes.length) {
     throw new GatewayError("Orchestrator returned an inconsistent Partner model chain.");
   }
   const permissionMode = value.permissionMode === ProtoPermissionMode.ASK ? "ask" as const
@@ -19929,12 +20255,15 @@ function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined): Pa
 
 function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfileView {
   if (value === undefined || value.partnerId.trim() === "" || value.displayName.trim() === ""
-    || value.avatar.trim() === "" || value.identitySource.trim() === "" || value.templateId.trim() === ""
+    || value.displayName.length > 200 || value.description.length > 12_000 || value.description.includes("\0") || value.identitySource.trim() === "" || value.templateId.trim() === ""
     || value.homeTargetId.trim() === "" || value.profileVersion < 1n
     || (value.canonicalSessionId !== undefined && value.canonicalSessionId.trim() === "")) {
     throw new GatewayError("Orchestrator returned an incomplete Partner profile.");
   }
   const lifecycle = partnerLifecycle(value.lifecycle);
+  if ((lifecycle === "paused") !== (value.pauseCleanupPending !== undefined)) {
+    throw new GatewayError("Orchestrator returned an inconsistent Partner pause state.");
+  }
   const initializationState = partnerInitializationState(value.initializationState);
   const invitationStage = partnerInvitationStage(value.invitationStage);
   const initializationErrorCode = value.initializationErrorCode === undefined
@@ -19954,16 +20283,19 @@ function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfi
     revision: requiredPartnerRevision(value.revision, "Partner"),
     profileVersion: value.profileVersion,
     displayName: value.displayName,
-    avatar: value.avatar,
+    description: value.description,
+    avatar: mapPartnerAvatar(value.avatar),
     identitySource: value.identitySource,
     templateId: value.templateId,
     lifecycle,
+    ...(value.pauseCleanupPending === undefined ? {} : { pauseCleanupPending: value.pauseCleanupPending }),
     initializationState,
     invitationStage,
     ...(initializationErrorCode === undefined ? {} : { initializationErrorCode }),
     homeTargetId: value.homeTargetId,
     ...(value.canonicalSessionId === undefined ? {} : { canonicalSessionId: value.canonicalSessionId }),
     capabilities: mapPartnerCapabilities(value.capabilities),
+    ...(value.taskModelOverride === undefined ? {} : { taskModelOverride: mapPartnerRoute(value.taskModelOverride) }),
     usesDirectoryDefaults: value.usesDirectoryDefaults,
     createdAt: requiredContactTimestamp(value.createdAt, "Partner creation"),
     updatedAt: requiredContactTimestamp(value.updatedAt, "Partner update"),
@@ -19990,7 +20322,9 @@ function mapPartnerActivity(value: ProtoPartnerActivity | undefined): PartnerAct
     artifactCount: safePartnerCount(value.artifactCount, "Partner Artifact count"),
     activeDelegationCount: safePartnerCount(value.activeDelegationCount, "Partner active delegation count"),
     readThroughCursor: partnerCursor(value.readThroughCursor, "Partner read cursor"),
-    readUpdatedAt: requiredContactTimestamp(value.readUpdatedAt, "Partner read update")
+    readUpdatedAt: requiredContactTimestamp(value.readUpdatedAt, "Partner read update"),
+    ...(value.latestReplyPreview === "" ? {} : { latestReplyPreview: value.latestReplyPreview.slice(0, 500) }),
+    ...(value.workingStatus === undefined ? {} : { workingStatus: mapPartnerWorkingStatus(value.workingStatus) })
   };
 }
 
@@ -22358,6 +22692,7 @@ function contextRebuildTimelineReason(
 ): NonNullable<TimelineItemView["contextRebuild"]>["reason"] | undefined {
   if (value === ContextRebuildReason.CONTEXT_OVERFLOW) return "contextOverflow";
   if (value === ContextRebuildReason.PROMPT_TIMEOUT) return "promptTimeout";
+  if (value === ContextRebuildReason.MANUAL_RESTART) return "manualRestart";
   return undefined;
 }
 

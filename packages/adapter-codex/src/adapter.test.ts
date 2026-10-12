@@ -39,6 +39,81 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it("isolates explicit skill mounts from a refreshed ambient native catalog and fails closed on invalid paths", async () => {
+    const source = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-explicit-"))); cleanups.push(() => rm(source, { recursive: true, force: true }));
+    const body = "---\nname: report\ndescription: Reports\n---\nFull instructions.\n"; await writeFile(join(source, "SKILL.md"), body);
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+    const options = { resolveNativeSkills: async () => [{ sourcePath: source, resource: { id: "shared-report", name: "Report", kind: "skill" as const, source: "managed", state: "approved" as const, revision, resourceVersion: 2n }, assertCurrent: () => undefined }],
+      resolveNativeSkillPolicy: () => ({ mode: "explicit" as const, assertCurrent: () => undefined }) };
+    const setup = await createSetup(7, options), ambient = join(source, "ambient", "SKILL.md");
+    setup.fake.reviewSkills.push({ path: ambient, name: "Ambient", enabled: true }); setup.fake.reviewConfig["skills"] = { config: [{ path: ambient, enabled: true }] };
+    const ctx = context(setup.target, [], { backendInstanceGeneration: 7 }), binding = await setup.adapter.createSession(sessionInput(setup.target), ctx);
+    const configuration = (setup.fake.transport!.requests.find(request => request.method === "thread/start")!.params as JsonObject)["config"] as JsonObject;
+    const entries = configuration["skills.config"] as JsonObject[]; expect(entries.find(item => item["path"] === ambient)).toEqual({ path: ambient, enabled: false });
+    const mounted = entries.find(item => item["enabled"] === true)!["path"] as string; expect(await readFile(mounted, "utf8")).toBe(body);
+    expect(setup.fake.transport!.requests.some(request => request.method === "skills/list" && (request.params as JsonObject)["forceReload"] === true)).toBe(true);
+    await setup.adapter.closeSession(binding, { ...ctx, binding });
+    const invalid = await createSetup(7, options); invalid.fake.reviewSkills.push({ path: "relative/SKILL.md", name: "Invalid", enabled: true });
+    await expect(invalid.adapter.createSession(sessionInput(invalid.target), context(invalid.target, [], { backendInstanceGeneration: 7 }))).rejects.toBeDefined();
+    expect(invalid.fake.transport!.requests.some(request => request.method === "thread/start")).toBe(false);
+  });
+  it("mounts personal skill discovery per thread without reporting indexed originals as loaded", async () => {
+    const source = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-personal-"))); cleanups.push(() => rm(source, { recursive: true, force: true }));
+    const body = "---\nname: report\ndescription: Prepare reports\n---\nComplete instructions.\n";
+    await writeFile(join(source, "SKILL.md"), body);
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+    const setup = await createSetup(7, { resolveNativeSkills: async () => [{ sourcePath: source,
+      resource: { id: "personal-report", name: "Report", kind: "skill", source: "managed", state: "approved", revision, resourceVersion: 3n }, assertCurrent: () => undefined,
+      personal: { slug: "report", name: "Report", description: "Long metadata ".repeat(2_000), updatedAt: "2026-10-12", frontmatterBytes: 30_000, bodyStartLine: 5 } }] });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+    const configuration = (setup.fake.transport!.requests.find(request => request.method === "thread/start")!.params as JsonObject)["config"] as JsonObject;
+    const entries = configuration["skills.config"] as JsonObject[]; expect(entries).toHaveLength(1);
+    const path = entries[0]!["path"] as string; expect(path).toContain("personal-skill-library");
+    setup.fake.reviewSkills.push({ path, name: "personal-skill-library", enabled: true });
+    const active = context(setup.target, [], { binding, backendInstanceGeneration: 7 }); expect(await setup.adapter.getResources(active)).toEqual([]);
+    const sourceText = await readFile(path, "utf8"); expect(sourceText).toContain("list_partner_skills");
+    await setup.adapter.closeSession(binding, active); await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(source, "SKILL.md"), "utf8")).toBe(body);
+  });
+
+  it("mounts approved native skills per thread, confirms exact paths and rebuilds them on resume", async () => {
+    let current = true;
+    const source = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-skill-")));
+    cleanups.push(() => rm(source, { recursive: true, force: true }));
+    const body = "---\nname: report\ndescription: Prepare reports\n---\nComplete instructions.\n";
+    await writeFile(join(source, "SKILL.md"), body);
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+    const setup = await createSetup(7, { resolveNativeSkills: async () => [{ sourcePath: source,
+      resource: { id: "approved-report", name: "Report", kind: "skill", source: "managed", state: "approved", revision, resourceVersion: 3n },
+      assertCurrent: () => { if (!current) throw new Error("retired private approval"); }
+    }] });
+    setup.fake.reviewConfig["skills"] = { config: [{ path: "/old/disabled/SKILL.md", enabled: false }] };
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+    const configuration = (setup.fake.transport!.requests.find((request) => request.method === "thread/start")!.params as JsonObject)["config"] as JsonObject;
+    const entries = configuration["skills.config"] as JsonObject[];
+    expect(entries[0]).toEqual({ path: "/old/disabled/SKILL.md", enabled: false });
+    const path = entries[1]!["path"] as string;
+    expect(await readFile(path, "utf8")).toBe(body);
+    expect(path).not.toBe(join(source, "SKILL.md"));
+    const active = context(setup.target, [], { binding, operationId: "approved-skill-turn", backendInstanceGeneration: 7 });
+    await expect(setup.adapter.getResources(active)).resolves.toEqual([]);
+    setup.fake.reviewSkills.push({ path, name: "report", description: "Prepare reports", scope: "user", enabled: true });
+    expect(await setup.adapter.getResources(active)).toEqual([expect.objectContaining({ id: "approved-report", state: "loaded", revision, resourceVersion: 3n, runtimeGeneration: 1 })]);
+    current = false;
+    await expect(setup.adapter.send(prompt("Use the report skill."), active)).rejects.toMatchObject({ publicError: { code: "SKILL_RUNTIME_AUTHORITY_INVALID" } });
+    current = true;
+    await setup.adapter.closeSession(binding, active);
+    await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
+    await setup.adapter.resumeSession(binding, active);
+    const resume = setup.fake.transport!.requests.findLast((request) => request.method === "thread/resume")!.params as JsonObject;
+    const nextPath = ((resume["config"] as JsonObject)["skills.config"] as JsonObject[])[1]!["path"] as string;
+    expect(nextPath).not.toBe(path);
+    expect(await readFile(nextPath, "utf8")).toBe(body);
+    await setup.adapter.closeSession(binding, active);
+    await expect(stat(nextPath)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(source, "SKILL.md"), "utf8")).toBe(body);
+  });
+
   it("keeps Objective continuation under product ownership for start, fork, and resume", async () => {
     const setup = await createSetup();
     const sourceContext = context(setup.target, [], { backendInstanceGeneration: 7 });

@@ -12,6 +12,7 @@ import {
 import path, { type PlatformPath } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
+import { SessionRuntimeHandoffStore, type RuntimeHandoffSource } from "./session-runtime-handoff-store.js";
 
 import type {
   AttemptDescriptor,
@@ -680,6 +681,7 @@ export class OperationalStore {
   private database: DatabaseSync;
   private readonly now: () => number;
   private readonly idFactory: () => string;
+  private readonly suppressSessionNotifications: OperationalStoreOptions["suppressSessionNotifications"];
   private readonly subscribers = new Set<EventSubscriber>();
   private readonly operationSubscribers = new Set<(operationId: string) => void>();
   private readonly pendingPublications: PersistedEvent[] = [];
@@ -699,6 +701,7 @@ export class OperationalStore {
     this.database = new DatabaseSync(filePath, { allowExtension: true });
     this.now = options.now ?? Date.now;
     this.idFactory = options.idFactory ?? randomUUID;
+    this.suppressSessionNotifications = options.suppressSessionNotifications;
     let messageVectorAvailable = false;
     try {
       try {
@@ -2120,6 +2123,27 @@ export class OperationalStore {
     ).all() as Row[]).map(mobilePushDeliveryFromRow);
   }
 
+  /** The private group owner supplies the settled step identity; ordinary lane attention stays silent. */
+  enqueuePartnerGroupStepPush(input: { readonly groupId: string; readonly groupTitle: string; readonly sourceSessionId: string;
+    readonly subjectSequence: bigint; readonly kind: "done" | "awaiting" | "error" }): number {
+    return this.write(() => {
+      const groupId = boundedPrivateIdentity(input.groupId, "Push group ID"), title = nonBlank(input.groupTitle, "Push group title");
+      if (title.length > 160 || serializeJson(title) !== JSON.stringify(title) || input.subjectSequence < 1n) throw new StoreError("Group push subject is invalid.");
+      const source = this.getSession(input.sourceSessionId).descriptor, at = this.now();
+      const registrations = this.listMobilePushRegistrations().filter(registration => registration.expiresAt > at).filter(registration => {
+        const connection = this.getConnection(registration.connectionId), device = this.getDevice(registration.deviceId);
+        return connection.state === "active" && connection.deviceId === device.id && device.state === "active" && device.kind === "mobile" && device.platform.toLowerCase() === "ios";
+      });
+      const insert = this.database.prepare(`INSERT OR IGNORE INTO mobile_push_deliveries(
+        id,registration_id,session_id,group_id,group_title,kind,subject_cursor,subject_generation,status,available_at,attempts,created_at,updated_at,revision
+      ) VALUES (?,?,?,?,?,?,?,0,'pending',?,0,?,?,?)`);
+      let added = 0;
+      for (const registration of registrations) added += Number(insert.run(this.idFactory(), registration.id, source.id, groupId, title,
+        enumValue(input.kind, ["done", "awaiting", "error"] as const), asSqlInteger(input.subjectSequence), at, at, at, asSqlInteger(this.requireActiveRevision())).changes);
+      return added;
+    });
+  }
+
   recoverInterruptedMobilePushDeliveries(now = this.now()): number {
     return this.write(() => Number(this.database.prepare(`
       UPDATE mobile_push_deliveries
@@ -3350,6 +3374,7 @@ export class OperationalStore {
     descriptor: SessionDescriptor,
     options: {
       readonly nativeSessionBlank?: boolean;
+      readonly localRuntimeBackendSelection?: boolean;
       readonly derivationOperationId?: string;
       readonly nativeCatalogAdoptionOperationId?: string;
     } = {}
@@ -3362,7 +3387,8 @@ export class OperationalStore {
       }
       const derivation = this.assertNativeBindingAdoptionAllowed(descriptor, options.derivationOperationId);
       const target = this.getTarget(descriptor.targetId);
-      if (target.descriptor.backendId !== descriptor.backendId) {
+      if (target.descriptor.backendId !== descriptor.backendId && (options.localRuntimeBackendSelection !== true && derivation === undefined
+        || !target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined || descriptor.remoteWorkspace !== undefined)) {
         throw new StoreError("Session backend does not match its target backend.");
       }
       const projectId = descriptor.projectId ?? descriptor.targetId;
@@ -7273,6 +7299,18 @@ export class OperationalStore {
     ).changes));
   }
 
+  /** Exact creation provenance excludes service workers from ordinary project
+   * aggregation without inferring ownership from titles or prompt text. */
+  sessionCreationServiceKind(sessionId: string): "partner" | "collaboration" | "messaging" | "learning" | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`SELECT kind FROM operations
+      WHERE status = 'completed' AND json_extract(response_json, '$.sessionId') = ?
+        AND kind IN ('create_partner_session', 'create_collaboration_worker_session', 'create_messaging_session', 'create_learning_session')
+      ORDER BY created_at LIMIT 1`).get(nonBlank(sessionId, "Session ID")) as Row | undefined;
+    return row === undefined ? undefined : row["kind"] === "create_partner_session" ? "partner"
+      : row["kind"] === "create_collaboration_worker_session" ? "collaboration" : row["kind"] === "create_messaging_session" ? "messaging" : "learning";
+  }
+
   listSessions(options: { readonly targetId?: string; readonly includeArchived?: boolean; readonly includeDeleted?: boolean } = {}): StoredSession[] {
     this.assertOpen();
     const clauses: string[] = [];
@@ -7350,7 +7388,7 @@ export class OperationalStore {
       }
       if (source.descriptor.backendId !== normalized.backendId
         || source.descriptor.targetId !== normalized.targetId
-        || target.descriptor.backendId !== normalized.backendId
+        || target.descriptor.backendId !== normalized.backendId && (!target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined)
         || !sameRemoteWorkspace(source.descriptor.remoteWorkspace, normalized.remoteWorkspace)
         || !sameRemoteWorkspace(target.descriptor.remoteWorkspace, normalized.remoteWorkspace)
         || !sameNativeBinding(source.descriptor.binding, normalized.sourceBinding)) {
@@ -7566,7 +7604,7 @@ export class OperationalStore {
       const source = this.getSession(normalized.sourceSessionId).descriptor;
       const target = this.getTarget(normalized.targetId).descriptor;
       if (source.backendId !== normalized.backendId || source.targetId !== normalized.targetId
-        || target.backendId !== normalized.backendId
+        || target.backendId !== normalized.backendId && (!target.trusted || target.remoteWorkspace !== undefined)
         || !sameRemoteWorkspace(source.remoteWorkspace, normalized.remoteWorkspace)
         || !sameRemoteWorkspace(target.remoteWorkspace, normalized.remoteWorkspace)) {
         throw new StoreError("The native derivation source owner does not match its admission.");
@@ -7888,6 +7926,17 @@ export class OperationalStore {
   private assertNativeBindingAdoptionAllowed(
     descriptor: SessionDescriptor, derivationOperationId?: string
   ): NativeSessionDerivationRecord | undefined {
+    for (const setting of this.listSettings("service", "session.runtime-handoffs")) {
+      if (setting.key === descriptor.id) continue;
+      const owner = new SessionRuntimeHandoffStore(this).read(setting.key);
+      const bindings = [...(owner?.parked ?? []), ...(owner?.pending?.binding === undefined ? [] : [{
+        backendId: owner.pending.profile.backendId, binding: owner.pending.binding
+      }])];
+      if (bindings.some(row => row.backendId === descriptor.backendId
+        && row.binding.opaqueRef.toLocaleLowerCase("en-US") === descriptor.binding.opaqueRef.toLocaleLowerCase("en-US"))) {
+        throw new StoreError("The native binding is reserved by another task's runtime handoff.");
+      }
+    }
     const row = this.database.prepare(`
       SELECT * FROM native_session_derivations WHERE backend_id = ? AND native_opaque_ref = ? COLLATE NOCASE
     `).get(descriptor.backendId, descriptor.binding.opaqueRef) as Row | undefined;
@@ -8121,6 +8170,63 @@ export class OperationalStore {
       }
       return updated;
     });
+  }
+
+  /** Adopt one prepared native handoff without changing the product work target. */
+  adoptSessionRuntimeHandoff(sessionId: string, generation: number): StoredSession {
+    return this.write(() => {
+      const handoffs = new SessionRuntimeHandoffStore(this), record = handoffs.read(sessionId), pending = record?.pending;
+      const current = this.getSession(sessionId), source = pending?.origin;
+      if (pending?.generation !== generation || pending.phase !== "ready" || !source || !pending.binding
+        || !pending.handoff || pending.backendInstanceGeneration === undefined) throw new StoreError("Native handoff has no exact prepared adoption receipt.");
+      this.assertSessionRuntimeHandoffSource(sessionId, source);
+      if (this.getBackend(pending.profile.backendId).descriptor.instanceGeneration !== pending.backendInstanceGeneration
+        || pending.binding.generation !== source.binding.generation + 1) throw new StoreError("Native handoff Backend generation changed before adoption.");
+      const duplicate = this.findLiveSessionByNativeBinding(pending.profile.backendId, pending.binding.opaqueRef);
+      const historic = this.database.prepare("SELECT session_id FROM native_binding_adoptions WHERE backend_id = ? AND native_opaque_ref = ? COLLATE NOCASE")
+        .get(pending.profile.backendId, pending.binding.opaqueRef) as Row | undefined;
+      if (duplicate && duplicate.descriptor.id !== sessionId || historic && stringValue(historic["session_id"]) !== sessionId) {
+        throw new StoreError("The native handoff binding belongs to another product Session.");
+      }
+      const at = this.now();
+      this.database.prepare("UPDATE product_sessions SET backend_id = ? WHERE id = ?").run(pending.profile.backendId, sessionId);
+      const updated = this.updateSession(sessionId, { binding: pending.binding, providerId: pending.profile.providerId,
+        modelId: pending.profile.modelId, effort: pending.profile.effort ?? null, fastMode: pending.profile.fastMode }, current.revision, at);
+      this.recordNativeBindingAdoption(sessionId, pending.profile.backendId, pending.binding, at);
+      this.database.prepare("DELETE FROM session_context_handoffs WHERE session_id = ?").run(sessionId);
+      // The same Objective and accepted Queue survive; their next Attempt owns the new native generation.
+      this.database.prepare("UPDATE session_objectives SET session_generation = ?, revision = ? WHERE session_id = ?")
+        .run(pending.binding.generation, asSqlInteger(this.requireActiveRevision()), sessionId);
+      for (const item of this.listQueueItems({ sessionId, states: ["accepted"], limit: 10_000 })) {
+        this.renewQueueAttemptGeneration({ queueItemId: item.id, generation: pending.binding.generation,
+          attemptId: `attempt:runtime-handoff:${sessionId}:${generation}:${item.id}`, at });
+      }
+      handoffs.settle(sessionId, generation, pending.binding);
+      this.appendEvent({ backendId: updated.descriptor.backendId, targetId: updated.descriptor.targetId, sessionId,
+        generation: pending.binding.generation, emittedAt: at, traceId: `runtime-handoff:${sessionId}:${generation}`,
+        payload: { type: "runtime_handoff", fromBackendId: source.backendId, toBackendId: pending.profile.backendId,
+          modelId: pending.profile.modelId, resumed: pending.resumed === true } });
+      return updated;
+    });
+  }
+
+  assertSessionRuntimeHandoffSource(sessionId: string, source: RuntimeHandoffSource): void {
+    const current = this.getSession(sessionId), descriptor = current.descriptor;
+    if (descriptor.backendId !== source.backendId || descriptor.targetId !== source.targetId
+      || !sameNativeBinding(descriptor.binding, source.binding) || descriptor.archived || descriptor.deletedAt !== undefined
+      || descriptor.remoteWorkspace !== undefined || this.getTarget(source.targetId).revision.toString() !== source.targetRevision
+      || !this.getTarget(source.targetId).descriptor.trusted || this.getTarget(source.targetId).descriptor.remoteWorkspace !== undefined
+      || JSON.stringify(descriptor.worktree ?? null) !== source.worktreeJson
+      || (descriptor.worktree?.path ?? this.getTarget(source.targetId).descriptor.workspaceRoot) !== source.workspaceRoot
+      || descriptor.permissionMode !== source.permissionMode || descriptor.planMode !== source.planMode
+      || this.getBackend(source.backendId).descriptor.instanceGeneration !== source.backendInstanceGeneration
+      || this.findPendingSessionLifecycleCleanup(sessionId) !== undefined || this.findPendingContextRebuild(sessionId) !== undefined
+      || this.findSessionRuntimePolicy(sessionId) !== undefined || this.findCollaborationWorkerBySession(sessionId) !== undefined
+      || this.listCollaborationGoals({ leadSessionId: sessionId }).length > 0
+      || this.listRuns({ sessionId, states: ["running", "waiting", "retrying", "dispatch_unknown"], limit: 1 }).length > 0
+      || this.listQueueItems({ sessionId, states: ["dispatching", "dispatch_unknown", "backend_accepted"], limit: 1 }).length > 0) {
+      throw new StoreError("Native handoff lost its idle Session, workspace, or runtime authority.");
+    }
   }
 
   updateSession(
@@ -9741,6 +9847,7 @@ export class OperationalStore {
   setQueuePaused(input: {
     readonly sessionId: string;
     readonly paused: boolean;
+    readonly resumeOnUserInput?: boolean;
     readonly reason?: string;
     readonly connectionId?: string;
     readonly expectedRevision?: bigint;
@@ -9753,16 +9860,19 @@ export class OperationalStore {
       if (input.expectedRevision !== undefined && input.expectedRevision !== current.revision) {
         throw new RevisionConflictError("Queue control", input.sessionId, input.expectedRevision, current.revision);
       }
-      if (current.paused === input.paused && (!input.paused || current.pauseReason === (input.reason ?? ""))) return current;
+      const resumeOnUserInput = input.paused && input.resumeOnUserInput === true;
+      if (current.paused === input.paused && current.resumeOnUserInput === resumeOnUserInput
+        && (!input.paused || current.pauseReason === (input.reason ?? ""))) return current;
       if (input.connectionId !== undefined) this.getConnection(input.connectionId);
       const at = input.at ?? this.now();
       const result = this.database.prepare(`
         UPDATE queue_controls
-        SET paused = ?, pause_reason = ?, paused_at = ?, paused_by_connection_id = ?,
+        SET paused = ?, resume_on_user_input = ?, pause_reason = ?, paused_at = ?, paused_by_connection_id = ?,
             updated_at = ?, revision = ?
         WHERE session_id = ? AND revision = ?
       `).run(
         boolInt(input.paused),
+        boolInt(resumeOnUserInput),
         input.paused ? input.reason?.trim() || null : null,
         input.paused ? at : null,
         input.paused ? input.connectionId ?? null : null,
@@ -10253,7 +10363,8 @@ export class OperationalStore {
       "tombstone.event_id IS NULL",
       "json_extract(event.payload_json, '$.payload.type') = 'message_complete'",
       "json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL",
-      "json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL"
+      "json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL",
+      "(json_extract(event.payload_json, '$.payload.role') <> 'user' OR json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL)"
     ];
     const params: Array<string | number | bigint | null> = [...(nativeVisibility?.params ?? []), sessionId];
     if (input.eventId !== undefined) {
@@ -10518,6 +10629,14 @@ export class OperationalStore {
     return row === undefined ? undefined : contextRebuildFromRow(row);
   }
 
+  getSessionContextHandoff(sessionId: string): string | undefined {
+    this.assertOpen();
+    const binding = this.getSession(sessionId).descriptor.binding;
+    const row = this.database.prepare("SELECT handoff FROM session_context_handoffs WHERE session_id = ? AND binding_opaque_ref = ?")
+      .get(sessionId, binding.opaqueRef) as Row | undefined;
+    return row === undefined ? undefined : stringValue(row["handoff"]);
+  }
+
   /**
    * Arm a content-free native recovery fence after the typed terminal error is
    * durable. Repeated terminal frames are idempotent and never displace an
@@ -10572,6 +10691,30 @@ export class OperationalStore {
         boolInt(input.replaySafe)
       );
       return this.findPendingContextRebuild(session.descriptor.id)!;
+    });
+  }
+
+  /** Explicit restart has no failed input to replay and no message deletion. */
+  armManualContextRebuild(input: { readonly sessionId: string; readonly operationId: string }): PendingContextRebuild {
+    return this.write(() => {
+      const session = this.getSession(input.sessionId); const operation = this.getOperation(input.operationId);
+      if (operation.kind !== "restart_partner_runtime" || typeof operation.body !== "object" || operation.body === null
+        || !("sessionId" in operation.body) || operation.body.sessionId !== input.sessionId) {
+        throw new StoreError("Manual context rebuild requires its exact durable restart operation.");
+      }
+      const current = this.findPendingContextRebuild(input.sessionId);
+      if (current?.state === "running") throw new StoreError("A native context replacement is still settling.");
+      if (current?.reason === "manual_restart" && current.latestDeletionOperationId === operation.id) return current;
+      const at = this.now();
+      this.database.prepare(`INSERT INTO session_context_rebuilds(
+        session_id, latest_deletion_operation_id, source_native_opaque_ref, state, created_at, updated_at, revision,
+        reason, source_input_pending, replay_safe) VALUES (?, ?, ?, 'pending', ?, ?, ?, 'manual_restart', 0, 0)
+        ON CONFLICT(session_id) DO UPDATE SET latest_deletion_operation_id = excluded.latest_deletion_operation_id,
+        source_native_opaque_ref = excluded.source_native_opaque_ref, state = 'pending', claim_token = NULL, claimed_at = NULL,
+        updated_at = excluded.updated_at, revision = excluded.revision, reason = 'manual_restart',
+        source_run_id = NULL, source_queue_item_id = NULL, source_input_pending = 0, replay_safe = 0`)
+        .run(input.sessionId, operation.id, session.descriptor.binding.opaqueRef, at, at, asSqlInteger(this.requireActiveRevision()));
+      return this.findPendingContextRebuild(input.sessionId)!;
     });
   }
 
@@ -10631,6 +10774,7 @@ export class OperationalStore {
     readonly binding: SessionDescriptor["binding"];
     readonly operationId?: string;
     readonly handoff?: string;
+    readonly restoreRuntimeHandoff?: boolean;
     readonly replayScheduled?: boolean;
     readonly traceId: string;
     readonly at?: number;
@@ -10702,6 +10846,11 @@ export class OperationalStore {
         throw new StoreError("Session native binding changed while its source dispatch was reconciled.");
       }
       const updated = this.updateSession(input.sessionId, { binding: input.binding }, refreshed.revision, at);
+      this.database.prepare("DELETE FROM session_context_handoffs WHERE session_id = ?").run(input.sessionId);
+      if (input.restoreRuntimeHandoff === true && pending.reason === "manual_restart" && handoff !== undefined) {
+        this.database.prepare("INSERT INTO session_context_handoffs(session_id, binding_opaque_ref, handoff, updated_at) VALUES (?, ?, ?, ?)")
+          .run(input.sessionId, input.binding.opaqueRef, handoff, at);
+      }
       const deleted = this.database.prepare(`
         DELETE FROM session_context_rebuilds
         WHERE session_id = ? AND state = 'running' AND claim_token = ?
@@ -11019,6 +11168,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.role') = 'user'
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL
       ORDER BY event.global_cursor DESC
       LIMIT 1
     `).get(normalizedSessionId) as Row | undefined;
@@ -13365,6 +13515,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.role') IN ('user', 'assistant')
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
+        AND (json_extract(event.payload_json, '$.payload.role') <> 'user' OR json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL)
         AND (
           (
             identity.entry_id IS NOT NULL
@@ -13472,6 +13623,7 @@ export class OperationalStore {
     attention: SessionAttentionRecord,
     at: number
   ): void {
+    if (this.suppressSessionNotifications?.(session.descriptor.id) === true) return;
     const message = this.latestMobilePushMessageOrigin(
       session.descriptor.id,
       attention.subjectCursor
@@ -14441,8 +14593,10 @@ export class OperationalStore {
     readonly operationId: string;
     readonly requestOperationId?: string;
     readonly operationBodyHash: string;
-    readonly connectionId: string;
-    readonly authKeyDigest: string;
+    readonly connectionId?: string;
+    readonly authKeyDigest?: string;
+    readonly serviceOriginSessionId?: string;
+    readonly serviceOriginGeneration?: number;
     readonly sessionId: string;
     readonly backendId: string;
     readonly targetId: string;
@@ -14458,10 +14612,20 @@ export class OperationalStore {
     const at = input.at ?? this.now();
     if (!Number.isSafeInteger(at) || at < 0) throw new StoreError("Native catalog adoption time is invalid.");
     return this.write(() => {
-      this.authorizeConnection(input.connectionId, input.authKeyDigest);
       const operation = this.getOperation(input.operationId);
-      if (operation.connectionId !== input.connectionId || operation.kind !== "create_session"
-        || operation.bodyHash !== input.operationBodyHash || operation.status !== "started") {
+      if (input.connectionId !== undefined && input.authKeyDigest !== undefined && input.serviceOriginSessionId === undefined) {
+        this.authorizeConnection(input.connectionId, input.authKeyDigest);
+        if (operation.connectionId !== input.connectionId || operation.kind !== "create_session") throw new StoreError("Native catalog adoption lost its original connection.");
+      } else if (input.connectionId === undefined && input.authKeyDigest === undefined && input.serviceOriginSessionId !== undefined) {
+        const origin = this.getSession(input.serviceOriginSessionId).descriptor;
+        if (operation.connectionId !== undefined || operation.kind !== "create_partner_session" || input.requestOperationId !== undefined
+          || !isRecord(operation.body) || operation.body["serviceKind"] !== "partner"
+          || operation.body["originSessionId"] !== origin.id || operation.body["originSessionGeneration"] !== input.serviceOriginGeneration
+          || origin.binding.generation !== input.serviceOriginGeneration || origin.archived || origin.deletedAt !== undefined || origin.remoteWorkspace !== undefined) {
+          throw new StoreError("Native catalog adoption lost its original service owner.");
+        }
+      } else throw new StoreError("Native catalog adoption requires one exact effect owner.");
+      if (operation.bodyHash !== input.operationBodyHash || operation.status !== "started") {
         throw new StoreError("Native catalog adoption lost its original Operation.");
       }
       if (input.requestOperationId !== undefined) {
@@ -14588,7 +14752,16 @@ export class OperationalStore {
       const target = this.getTarget(current.targetId);
       const request = current.requestOperationId === undefined
         ? undefined : this.getOperation(current.requestOperationId);
-      if (operation.kind !== "create_session" || operation.status !== "started"
+      const body = isRecord(operation.body) ? operation.body : undefined;
+      const serviceOrigin = operation.kind === "create_partner_session" && operation.connectionId === undefined
+        && body?.["serviceKind"] === "partner" && typeof body["originSessionId"] === "string"
+        && typeof body["originSessionGeneration"] === "number"
+        ? this.getSession(body["originSessionId"]).descriptor : undefined;
+      const ownsOperation = operation.kind === "create_session" && operation.connectionId !== undefined
+        || serviceOrigin !== undefined && request === undefined
+          && serviceOrigin.binding.generation === body?.["originSessionGeneration"]
+          && !serviceOrigin.archived && serviceOrigin.deletedAt === undefined && serviceOrigin.remoteWorkspace === undefined;
+      if (!ownsOperation || operation.status !== "started"
         || (request !== undefined && (request.kind !== "createSession" || request.status !== "started"
           || request.connectionId !== operation.connectionId))
         || target.revision !== current.targetRevision || target.descriptor.backendId !== current.backendId
@@ -16537,8 +16710,11 @@ export class OperationalStore {
       throw new StoreError("Memory Backend ID is required only for compression digests.");
     }
     const slug = normalizeMakerMemorySlug(input.slug);
-    const title = boundedPrivateMemoryText(input.title, "Memory title", 100, false);
-    const description = boundedPrivateMemoryText(input.description, "Memory description", 200, false);
+    const title = boundedPrivateMemoryText(input.title, "Memory title", 400, false);
+    const description = boundedPrivateMemoryText(input.description, "Memory description", 800, false);
+    if (Array.from(title).length > 100 || Array.from(description).length > 200) {
+      throw new StoreError("Memory title or description exceeds its character boundary.");
+    }
     if (/\r|\n/u.test(description)) throw new StoreError("Memory description must be one line.");
     const body = boundedPrivateMemoryText(input.body, "Memory body", 8_192, true);
     const mode = input.mode ?? "create";
@@ -16808,6 +16984,15 @@ export class OperationalStore {
     return (this.database.prepare(`
       SELECT * FROM settings WHERE scope_type = ? AND scope_id = ? ORDER BY key
     `).all(scopeType, scopeId) as Row[]).map(settingFromRow);
+  }
+
+  /** Read an Owner's metadata namespace without materializing unrelated private archives. */
+  listSettingsByKeyPrefix(scopeType: SettingScope, scopeId: string, prefix: string): SettingRecord[] {
+    this.assertOpen();
+    return (this.database.prepare(`
+      SELECT * FROM settings WHERE scope_type = ? AND scope_id = ?
+        AND substr(key, 1, length(?)) = ? ORDER BY key
+    `).all(scopeType, scopeId, prefix, prefix) as Row[]).map(settingFromRow);
   }
 
   deleteSetting(scopeType: SettingScope, scopeId: string, key: string): boolean {
@@ -18443,7 +18628,8 @@ function escapeLikePattern(query: string): string {
 
 function visibleMessageText(payload: EventPayload): string | undefined {
   if (payload.type === "message_complete"
-    && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined)) return undefined;
+    && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined
+      || payload.role === "user" && payload.partnerPrivateOrigin !== undefined)) return undefined;
   let parts: readonly string[];
   if (payload.type === "message_complete" && (payload.role === "user" || payload.role === "assistant")) {
     parts = payload.blocks.flatMap((block) =>
@@ -18562,6 +18748,8 @@ function mobilePushDeliveryFromRow(row: Row): MobilePushDeliveryRecord {
   if ((messageId === undefined) !== (messageEventId === undefined)) {
     throw new StoreError("Stored mobile push message identity is incomplete.");
   }
+  const groupId = optionalString("groupId", row["group_id"]).groupId, groupTitle = optionalString("groupTitle", row["group_title"]).groupTitle;
+  if ((groupId === undefined) !== (groupTitle === undefined)) throw new StoreError("Stored group push identity is incomplete.");
   return {
     id: boundedPrivateIdentity(stringValue(row["id"]), "Stored mobile push delivery ID"),
     registrationId: boundedPrivateIdentity(
@@ -18569,6 +18757,7 @@ function mobilePushDeliveryFromRow(row: Row): MobilePushDeliveryRecord {
       "Stored mobile push registration ID"
     ),
     sessionId: stringValue(row["session_id"]),
+    ...(groupId === undefined ? {} : { groupId, groupTitle: groupTitle! }),
     kind: enumValue(row["kind"], ["done", "awaiting", "error"] as const),
     subjectCursor: toBigInt(row["subject_cursor"]),
     subjectGeneration: numberValue(row["subject_generation"]),
@@ -20042,6 +20231,7 @@ function queueControlFromRow(row: Row, at: number): QueueControlRecord {
   return {
     sessionId: stringValue(row["session_id"]),
     paused: booleanValue(row["paused"]),
+    resumeOnUserInput: booleanValue(row["resume_on_user_input"]),
     ...optionalString("pauseReason", row["pause_reason"]),
     ...optionalNumber("pausedAt", row["paused_at"]),
     ...optionalString("pausedByConnectionId", row["paused_by_connection_id"]),
@@ -20084,7 +20274,7 @@ function contextRebuildFromRow(row: Row): PendingContextRebuild {
   }
   return {
     sessionId: stringValue(row["session_id"]),
-    reason: enumValue(row["reason"], ["message_deletion", "context_overflow", "prompt_timeout"] as const),
+    reason: enumValue(row["reason"], ["message_deletion", "context_overflow", "prompt_timeout", "manual_restart"] as const),
     latestDeletionOperationId: stringValue(row["latest_deletion_operation_id"]),
     sourceNativeOpaqueRef: stringValue(row["source_native_opaque_ref"]),
     ...optionalString("sourceRunId", row["source_run_id"]),

@@ -11,6 +11,10 @@ import {
   evaluateOrderedPolicyRules,
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   redactSecrets,
+  snapshotNativeSkills,
+  type ApprovedSkillResolver,
+  type NativeSkillPolicyResolver,
+  type NativeSkillSnapshot,
   validInputMentionRanges,
   type ApprovedDirectory,
   type AdapterContext,
@@ -25,6 +29,9 @@ import {
   type DurableNativeDispatchPreparation,
   type NativeSessionBinding,
   type NativeSessionCandidate,
+  type NativeSessionCatalogEntry,
+  type NativeSessionCatalogResult,
+  type NativeSessionPreview,
   type NativeSessionDerivation,
   type NativeSessionDerivationLifecycle,
   type NativeSessionForkResult,
@@ -138,6 +145,7 @@ import {
   type ProjectSkillCandidate
 } from "./resources.js";
 import { PiSessionStore, type PiExternalSessionSource } from "./session-store.js";
+import { PiNativePreviewCatalog } from "./native-session-preview.js";
 import { projectPiNativeState } from "./state-projection.js";
 import {
   provisionManagedSilentEncryptedRetry,
@@ -406,6 +414,8 @@ export interface PiAdapterOptions {
    * filesystem discovery is never used as a substitute.
    */
   readonly resolveTargetResources?: (context: AdapterContext) => PiManagedRuntimeResourceSnapshot | Promise<PiManagedRuntimeResourceSnapshot>;
+  readonly resolveNativeSkills?: ApprovedSkillResolver;
+  readonly resolveNativeSkillPolicy?: NativeSkillPolicyResolver;
   readonly mcpBridge?: PiMcpBridgeOptions;
   /** Target-scoped immutable bridge snapshot sampled exactly once at runtime spawn. */
   readonly resolveMcpBridge?: (context: AdapterContext) => PiMcpBridgeOptions | undefined | Promise<PiMcpBridgeOptions | undefined>;
@@ -551,6 +561,7 @@ interface PiRuntime {
   readonly artifactDirectory: string;
   readonly redactValues: readonly string[];
   readonly resources: readonly RuntimeResource[];
+  readonly nativeSkills?: NativeSkillSnapshot;
   readonly generationLease: PiManagedGenerationLease;
   translator: PiEventTranslator;
   context: AdapterContext;
@@ -714,6 +725,7 @@ export class PiBackendAdapter implements
   readonly #sessionStore: PiSessionStore;
   readonly #externalSessionRoots: readonly string[];
   readonly #externalSessionReferences = new Map<string, PiExternalSessionSource>();
+  readonly #nativePreviewCatalog: PiNativePreviewCatalog;
   readonly #runtimes = new Map<string, PiRuntime>();
   readonly #runtimeStarts = new Map<string, Promise<PiRuntime>>();
   readonly #spawnProfiles = new Map<string, SessionSpawnProfile>();
@@ -750,6 +762,7 @@ export class PiBackendAdapter implements
       assertContained(sessionRoot, generationsRoot, "Pi generations root");
     }
     this.#externalSessionRoots = externalSessionRoots;
+    this.#nativePreviewCatalog = new PiNativePreviewCatalog([join(sessionRoot, "sessions"), ...externalSessionRoots]);
     this.#options = copyAdapterOptions({ ...options, externalSessionRoots }, this.#agentHome, sessionRoot);
     this.#silentEncryptedRetryEnabled = this.#options.silentEncryptedRetryEnabled
       ?? SILENT_ENCRYPTED_RETRY_DEFAULT_ENABLED;
@@ -1266,6 +1279,7 @@ export class PiBackendAdapter implements
       });
     }
     const runtime = this.#runtime(context);
+    await runtime.nativeSkills?.assertFilesCurrent(context.signal);
     const options = runtime.generationLease.generation.options;
     const imageState = input.images.length > 0 ? await this.#requestState(runtime, context) : undefined;
     const bridged: Awaited<ReturnType<PiVisionBridgeTransform>> =
@@ -1481,6 +1495,7 @@ export class PiBackendAdapter implements
           : { type: "prompt", message, images };
     try {
       await this.#runExclusiveSessionMutation(runtime, context, async () => {
+        runtime.nativeSkills?.assertCurrent();
         if (
           command.type === "prompt" &&
           persistFence !== undefined &&
@@ -3242,6 +3257,7 @@ export class PiBackendAdapter implements
   async getResources(context: AdapterContext): Promise<readonly RuntimeResource[]> {
     const runtime = this.#runtime(context);
     if (runtime.control.runtimePolicy === "review_read_only") return [];
+    await runtime.nativeSkills?.assertFilesCurrent(context.signal);
     // Pi startup is intentionally tolerant of invalid resources. Only the
     // current process' typed get_commands catalog proves that a command,
     // skill, or prompt from the exact immutable snapshot actually loaded.
@@ -4188,6 +4204,16 @@ export class PiBackendAdapter implements
     });
   }
 
+  async scanNativeSessionPreviewCatalog(projectDirectories: readonly string[]): Promise<NativeSessionCatalogResult> {
+    this.#assertNotDisposed();
+    return this.#nativePreviewCatalog.scan(projectDirectories);
+  }
+
+  async readNativeSessionPreview(entry: NativeSessionCatalogEntry): Promise<NativeSessionPreview> {
+    this.#assertNotDisposed();
+    return this.#nativePreviewCatalog.read(entry);
+  }
+
   async listNativeSessions(targetOrWorkspace?: TargetDescriptor | string): Promise<readonly NativeSessionCandidate[]> {
     await this.#initialize();
     const workspaceRoot = typeof targetOrWorkspace === "string"
@@ -4538,17 +4564,20 @@ export class PiBackendAdapter implements
     const targetResources = profile.runtimePolicy === "review_read_only" ? undefined : context.target.trusted
       ? await options.resolveTargetResources?.(context)
       : undefined;
+    const nativeSkillsEnabled = profile.runtimePolicy !== "review_read_only" && context.target.trusted
+      && context.target.remoteWorkspace === undefined && options.resolveNativeSkills !== undefined;
+    const mergedResources = mergeManagedResourceSnapshots(managedResources, targetResources);
     const [managedResourceSnapshot, projectResourceSnapshot] = profile.runtimePolicy === "review_read_only" ? [
       { extensionPaths: [], skillPaths: [], promptTemplatePaths: [], resources: [] },
       { skillPaths: [], resources: [] }
     ] : await Promise.all([
       snapshotManagedRuntimeResources({
-        snapshot: mergeManagedResourceSnapshots(managedResources, targetResources),
+        snapshot: nativeSkillsEnabled ? { ...mergedResources, skills: [], resources: mergedResources.resources.filter(resource => resource.kind !== "skill") } : mergedResources,
         destinationRoot: join(runtimeDirectory, "resources", "managed"),
         maxFiles: options.managedResourceMaxFiles,
         maxBytes: options.managedResourceMaxBytes
       }),
-      context.target.remoteWorkspace === undefined
+      context.target.remoteWorkspace === undefined && !nativeSkillsEnabled
         ? snapshotApprovedProjectResources({
             workspaceRoot: context.target.workspaceRoot,
             destinationRoot: join(runtimeDirectory, "resources", "project"),
@@ -4566,6 +4595,9 @@ export class PiBackendAdapter implements
         recovery: "Retry after the trusted project resources stop changing or reject the unsafe resource."
       });
     });
+    const nativeSkillPolicy = nativeSkillsEnabled ? await options.resolveNativeSkillPolicy?.(context) : undefined;
+    const nativeSkills = nativeSkillsEnabled ? await snapshotNativeSkills(await options.resolveNativeSkills!(context, context.signal),
+      context.signal, join(runtimeDirectory, "resources", "native"), nativeSkillPolicy) : undefined;
 
     const mcpBridge = profile.runtimePolicy === "review_read_only"
       ? undefined
@@ -4613,7 +4645,8 @@ export class PiBackendAdapter implements
     // handler can mutate arguments after the final permission decision.
     if (managedSubagentToolsEnabled) args.push("--extension", subagentPath);
     args.push("--extension", bridgePath);
-    for (const skillPath of [...managedResourceSnapshot.skillPaths, ...projectResourceSnapshot.skillPaths]) args.push("--skill", skillPath);
+    if (!nativeSkills?.restrictImplicit) for (const skillPath of [...managedResourceSnapshot.skillPaths, ...projectResourceSnapshot.skillPaths]) args.push("--skill", skillPath);
+    for (const mount of nativeSkills?.skills ?? []) args.push("--skill", mount.path);
     for (const promptPath of managedResourceSnapshot.promptTemplatePaths) args.push("--prompt-template", promptPath);
     if (binding) args.push("--session", binding.opaqueRef);
     else args.push("--session-id", stableNativeSessionId(context.sessionId, context.generation));
@@ -4623,7 +4656,7 @@ export class PiBackendAdapter implements
     const makerMemoryPrompt = profile.runtimePolicy === "review_read_only"
       ? undefined
       : options.resolveMakerMemoryPrompt?.(context);
-    const appendPrompt = [DEFAULT_APPEND_SYSTEM_PROMPT, options.appendSystemPrompt, makerMemoryPrompt, profile.appendSystemPrompt].filter(Boolean).join("\n\n");
+    const appendPrompt = [DEFAULT_APPEND_SYSTEM_PROMPT, options.appendSystemPrompt, makerMemoryPrompt, context.appendSystemPrompt ?? profile.appendSystemPrompt].filter(Boolean).join("\n\n");
     if (appendPrompt) args.push("--append-system-prompt", appendPrompt);
 
     const baseEnvironment = this.#baseEnvironment();
@@ -4733,6 +4766,7 @@ export class PiBackendAdapter implements
       // the process factory. A revocation that raced earlier provisioning must
       // fence an unresolved native default before it can receive the snapshot.
       this.#assertProviderAuthenticationNotRevoked(options, profile.providerId);
+      await nativeSkills?.assertFilesCurrent(context.signal);
       const process = await this.#processFactory({
         command: this.#command,
         args,
@@ -4850,7 +4884,9 @@ export class PiBackendAdapter implements
         silentEncryptedRetryControlPath,
         artifactDirectory,
         redactValues,
-        resources: [...managedResourceSnapshot.resources, ...projectResourceSnapshot.resources],
+        resources: [...managedResourceSnapshot.resources, ...projectResourceSnapshot.resources,
+          ...(nativeSkills?.skills.filter(mount => !mount.discovery).map(mount => ({ ...mount.seed.resource, runtimePath: mount.path })) ?? [])],
+        ...(nativeSkills ? { nativeSkills } : {}),
         generationLease,
         translator: undefined as unknown as PiEventTranslator,
         context,
@@ -5568,6 +5604,7 @@ export class PiBackendAdapter implements
     // The process is confirmed stopped before this method is called. Remove
     // auth.json before invoking host callbacks that may rotate this Adapter.
     await this.#removeRuntimeDirectory(runtime.runtimeRoot, runtime.runtimeDirectory);
+    await runtime.nativeSkills?.dispose();
     if (runtime.nativeAuthPersistenceRevoked) return;
     if (readError !== undefined) {
       throw piError("PI_NATIVE_AUTH_REFRESH_INVALID", "Pi produced an invalid runtime-scoped native credential snapshot", "shutdown", {
@@ -6099,6 +6136,7 @@ export class PiBackendAdapter implements
 
   #capabilities(compatibility: PiCompatibilityOutcome): ReadonlyMap<string, Capability> {
     const supported = new Set<string>(compatibility.status === "compatible" ? [
+      "session.preview",
       "session.discovery",
       "session.resume",
       "session.detach",
@@ -6167,7 +6205,7 @@ export class PiBackendAdapter implements
     for (const capability of this.#options.hostCapabilities ?? []) supported.add(capability);
     for (const capability of this.#options.hostToolCapabilities ?? []) supported.add(capability);
     const entries: Array<readonly [string, Capability]> = CAPABILITIES.map((key): readonly [string, Capability] => {
-        if (supported.has(key)) {
+        if (key === "session.preview" || supported.has(key)) {
           return [key, {
             key,
             supported: true,

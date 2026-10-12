@@ -6,6 +6,16 @@ const entries = ["extensions/review.ts", "extensions/search/index.js"];
 const files = [...entries, "ui/review/index.html", "ui/review/app.js", "ui/search.html"];
 
 describe("Extension surface manifest", () => {
+  it("admits a resident event publisher only with inspected HTML and unique bounded declarations", () => {
+    const binding = { entry: entries[0], routineEvents: { html: "ui/review/index.html", events: [{ type: "changed", name: "Changed", fields: ["scope"] }] } };
+    const manifest = (value: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [value] } } });
+    expect(parseExtensionSurfaceManifest(manifest(binding), entries, files)).toEqual([binding]);
+    for (const routineEvents of [{ ...binding.routineEvents, html: "ui/missing/index.html" },
+      { ...binding.routineEvents, events: [binding.routineEvents.events[0], binding.routineEvents.events[0]] },
+      { ...binding.routineEvents, events: [{ type: "changed", name: "Changed", fields: ["scope", "scope"] }] }]) {
+      expect(() => parseExtensionSurfaceManifest(manifest({ ...binding, routineEvents }), entries, files)).toThrow();
+    }
+  });
   it("accepts the single strict v1 shape and exact discovered entry", () => {
     expect(parseExtensionSurfaceManifest({
       joko: {

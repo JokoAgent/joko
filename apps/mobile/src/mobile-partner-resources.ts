@@ -1,6 +1,5 @@
 import {
   ArtifactKind,
-  PartnerSessionRole,
   type ListPartnerSessionsResponse
 } from "@joko/contracts";
 import type { ArtifactCatalogSnapshot } from "./network";
@@ -64,10 +63,6 @@ export function projectMobilePartnerResourcePreview(
   assertMobileCanonicalPartnerSession(partner, sessionId, response);
   const sessions = response.sessions.filter((candidate) => candidate.sessionId === sessionId);
   const session = sessions[0]!;
-  if (session.role !== PartnerSessionRole.CANONICAL
-    || session.profileVersion !== BigInt(partner.profileVersion)) {
-    throw new Error("The Partner task no longer matches this Resource.");
-  }
   const createdAt = timestamp(session.createdAt, "Partner task creation time");
   const lastActivityAt = session.lastActivityAt === undefined
     ? undefined : timestamp(session.lastActivityAt, "Partner task activity time");

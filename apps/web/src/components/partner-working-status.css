@@ -1,0 +1,10 @@
+.partner-working-status, .partner-working-label { --partner-working-fade: 150ms; min-width: 0; }
+.partner-working-status { display: flex; align-items: center; gap: 8px; width: min(100%, 934px); min-height: 32px; margin: 0 auto; padding: 6px 8px; color: var(--text-faint); font-size: var(--text-12); user-select: none; }
+.partner-working-status > .partner-avatar { width: 20px; height: 20px; border-radius: 6px; }
+.partner-working-status > .partner-avatar > span { width: 10px; height: 10px; border-width: 2px; }
+.partner-working-status > .partner-avatar > img { width: 100%; height: 100%; object-fit: cover; }
+.partner-working-spinner { width: 12px; height: 12px; flex: 0 0 auto; animation: spin .9s linear infinite; }
+.partner-working-label, .partner-working-text { min-width: 0; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.partner-working-text { transition: opacity var(--partner-working-fade) ease-out; }
+.partner-card__working { color: var(--text-soft); font-size: var(--text-12); }
+@media (prefers-reduced-motion: reduce) { .partner-working-spinner { animation: none; }.partner-working-text { transition: none; } }

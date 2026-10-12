@@ -72,9 +72,9 @@ const colors: MobilePartnerResourcesScreenProps["colors"] = {
   background: "#fafafa", surface: "#fff", ink: "#111", muted: "#666",
   border: "#ddd", accent: "#f90", negative: "#b00", brandBackground: "#fff0d0"
 };
-const ada = { partnerId: "ada", displayName: "Ada", avatar: "A", lifecycle: "active" as const,
+const ada = { partnerId: "ada", revision: 2n, displayName: "Ada", avatar: "A", lifecycle: "active" as const,
   initializationState: "ready" as const, canonicalSessionId: "session-ada", profileVersion: 2 };
-const pending = { partnerId: "pending", displayName: "Pending", avatar: "P", lifecycle: "active" as const,
+const pending = { partnerId: "pending", revision: 2n, displayName: "Pending", avatar: "P", lifecycle: "active" as const,
   initializationState: "pending" as const, profileVersion: 1 };
 const preview: MobilePartnerResourcePreview = {
   resourceKey: "ada\u001f2\u001fsession-ada\u001factive\u001fready",

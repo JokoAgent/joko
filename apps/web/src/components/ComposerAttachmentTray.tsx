@@ -13,12 +13,13 @@ import { WorkspaceImageLightbox } from "./WorkspaceImageLightbox.js";
 
 type AttachmentPreviewKind = "image" | "text";
 
-export function ComposerAttachmentTray({ ownerKey, attachments, removeDisabled = false, t, onRemove }: {
+export function ComposerAttachmentTray({ ownerKey, attachments, removeDisabled = false, t, onRemove, onReplaceImage }: {
   readonly ownerKey: string;
   readonly attachments: readonly AttachmentDraft[];
   readonly removeDisabled?: boolean;
   readonly t: Translator;
   readonly onRemove: (attachment: AttachmentDraft) => void;
+  readonly onReplaceImage?: (attachment: AttachmentDraft, file: File) => void | Promise<void>;
 }): JSX.Element {
   return <div className="attachment-list" aria-label={t("composer.attachments")}>
     {attachments.map((attachment) => <ComposerAttachmentItem
@@ -28,16 +29,18 @@ export function ComposerAttachmentTray({ ownerKey, attachments, removeDisabled =
       removeDisabled={removeDisabled}
       t={t}
       onRemove={onRemove}
+      onReplaceImage={onReplaceImage}
     />)}
   </div>;
 }
 
-function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRemove }: {
+function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRemove, onReplaceImage }: {
   readonly ownerKey: string;
   readonly attachment: AttachmentDraft;
   readonly removeDisabled: boolean;
   readonly t: Translator;
   readonly onRemove: (attachment: AttachmentDraft) => void;
+  readonly onReplaceImage?: (attachment: AttachmentDraft, file: File) => void | Promise<void>;
 }): JSX.Element {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const textObjectUrlRef = useRef<string | undefined>(undefined);
@@ -152,6 +155,7 @@ function ComposerAttachmentItem({ ownerKey, attachment, removeDisabled, t, onRem
       returnFocus={triggerRef.current}
       onClose={() => setImageOpen(false)}
       onDownload={download}
+      onSendToChat={!removeDisabled && onReplaceImage ? file => onReplaceImage(attachment, file) : undefined}
     />}
     {textPreviewTrigger !== undefined && <TimelineTextAttachmentLightbox
       ownerKey={JSON.stringify([ownerKey, attachment.id])}

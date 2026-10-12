@@ -277,9 +277,10 @@ export const SESSION_HELPER_NESTED_TOOLS: readonly NestedToolDescriptor[] = Obje
   nestedTool(
     "set_session_runtime",
     "control",
-    "Atomically change a task's temporary same-Backend provider, model, effort, or Fast selection. Busy tasks defer to the next turn boundary.",
+    "Change a task's provider, model, effort, or Fast selection. A complete local Backend selection takes effect at the next send, preserving the task and work target.",
     objectSchema({
       session_id: ID_SCHEMA,
+      backend_id: ID_SCHEMA,
       provider_id: { anyOf: [{ type: "string", minLength: 1, maxLength: 256 }, { type: "null" }] },
       model: { type: "string", minLength: 1, maxLength: 256 },
       effort: { type: "string", enum: ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] },
@@ -1219,6 +1220,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
         source: runtime.pending.source,
         profile: sessionRuntimeProfilePayload(runtime.pending.profile)
       },
+      handoff_state: runtime.handoffState ?? null,
       fallback_enabled: this.#requireHost().sessionRuntimeFallbackEnabled()
     };
   }
@@ -1227,7 +1229,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     input: Readonly<Record<string, unknown>>,
     caller: SessionDescriptor
   ): Promise<unknown> {
-    assertKeys(input, ["session_id", "provider_id", "model", "effort", "fast", "expected_generation"]);
+    assertKeys(input, ["session_id", "backend_id", "provider_id", "model", "effort", "fast", "expected_generation"]);
     const sessionId = optionalId(input["session_id"], "session_id") ?? caller.id;
     this.#requireMutableTarget(sessionId);
     const expectedGeneration = optionalInteger(
@@ -1239,6 +1241,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     if (expectedGeneration === undefined) {
       throw new SessionHelperError("INVALID_ARGS", "expected_generation is required; read get_session_runtime first.");
     }
+    const backendId = optionalId(input["backend_id"], "backend_id");
     const providerValue = input["provider_id"];
     const providerId = providerValue === null
       ? null
@@ -1246,13 +1249,14 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     const modelId = optionalText(input["model"], "model", 256)?.trim();
     const effort = optionalEffort(input["effort"]);
     const fastMode = optionalBoolean(input["fast"], "fast");
-    if (providerId === undefined && modelId === undefined && effort === undefined && fastMode === undefined) {
+    if (backendId === undefined && providerId === undefined && modelId === undefined && effort === undefined && fastMode === undefined) {
       throw new SessionHelperError("INVALID_ARGS", "At least one runtime selection axis is required.");
     }
     const result = await this.#requireHost().setSessionRuntimeControl({
       sessionId,
       expectedGeneration,
       patch: {
+        ...(backendId === undefined ? {} : { backendId }),
         ...(providerId === undefined ? {} : { providerId }),
         ...(modelId === undefined ? {} : { modelId }),
         ...(effort === undefined ? {} : { effort }),
@@ -1269,7 +1273,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
         source: result.pending.source,
         profile: sessionRuntimeProfilePayload(result.pending.profile)
       },
-      effective_boundary: result.status === "deferred" ? "next_turn" : "immediate"
+      effective_boundary: result.effectiveBoundary ?? (result.status === "deferred" ? "next_turn" : "immediate")
     };
   }
 

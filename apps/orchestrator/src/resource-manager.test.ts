@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 
 import { OperationalStore } from "@joko/store";
+import { snapshotNativeSkills } from "@joko/core";
 import { describe, expect, it } from "vitest";
 
 import type { PiPackageAcquisition, PiPackageAcquisitionRequest } from "./resource-acquisition.js";
@@ -126,6 +127,41 @@ function registerTarget(store: OperationalStore, input: {
 }
 
 describe("PiResourceManager", () => {
+  it("leases complete native skill directories only to the approved Backend Target and revokes disabled owners", async () => {
+    const { root, store, manager } = await fixture();
+    registerBackend(store, "native", "Native");
+    const workspace = join(root, "native-workspace");
+    const other = join(root, "native-other-workspace");
+    await mkdir(workspace); await mkdir(other);
+    registerTarget(store, { id: "native-target", backendId: "native", root: workspace, trusted: true });
+    registerTarget(store, { id: "other-native-target", backendId: "native", root: other, trusted: true });
+    const skillRoot = join(workspace, ".agents", "skills", "report");
+    await mkdir(join(skillRoot, "assets"), { recursive: true });
+    const body = "---\nname: report\ndescription: Prepare reports\n---\n" + "Complete body.\n".repeat(40_000);
+    await writeFile(join(skillRoot, "SKILL.md"), body);
+    const asset = Buffer.from([0, 255, 8, 12]);
+    await writeFile(join(skillRoot, "assets", "template.bin"), asset);
+    let snapshot: Awaited<ReturnType<typeof snapshotNativeSkills>> | undefined;
+    try {
+      const resource = await manager.discover({ id: "native-report", backendId: "native", targetId: "native-target", kind: "skill", scope: "project",
+        source: { kind: "local", path: skillRoot }, workspaceRoot: workspace, name: "Report" });
+      await manager.approve(resource.id, resource.discoveredRevision, "skill-connection");
+      await manager.setEnabled(resource.id, true);
+      const seeds = await manager.runtimeSkillSnapshot("native", "native-target", new AbortController().signal);
+      expect(seeds.map((seed) => seed.resource.id)).toEqual([resource.id]);
+      expect(seeds[0]!.resource.source).toBe("managed");
+      expect((await manager.runtimeTextSnapshot("native", "native-target", new AbortController().signal))[0]!.content).toBe(body);
+      expect(await manager.runtimeSkillSnapshot("native", "other-native-target", new AbortController().signal)).toEqual([]);
+      await expect(manager.runtimeSkillSnapshot("pi", "native-target", new AbortController().signal)).rejects.toThrow();
+      snapshot = await snapshotNativeSkills(seeds, new AbortController().signal);
+      expect(await readFile(snapshot.skills[0]!.filePath, "utf8")).toBe(body);
+      expect(await readFile(join(snapshot.skills[0]!.path, "assets", "template.bin"))).toEqual(asset);
+      await manager.setEnabled(resource.id, false);
+      expect(() => snapshot!.assertCurrent()).toThrow("approved skill snapshot");
+      expect(await manager.runtimeSkillSnapshot("native", "native-target", new AbortController().signal)).toEqual([]);
+    } finally { await snapshot?.dispose(); store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("requires a matching approval revision before install and fences modified installed content", async () => {
     const { root, store, manager } = await fixture();
     const source = join(root, "skill-source");

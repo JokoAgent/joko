@@ -197,6 +197,8 @@ describe("session gamepad actions", () => {
 
 async function mount(overrides: AppShortcutOverrides = {}) {
   const api = { setModel: vi.fn<AppController["setModel"]>(async () => undefined), setPlanMode: vi.fn(async () => undefined),
+    getPortableReplacementCleanup: vi.fn(async () => undefined),
+    listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } })),
     pinSession: vi.fn(async () => undefined), abort: vi.fn(async () => undefined), forkSession: vi.fn<AppController["forkSession"]>(async () => "forked"),
     loadSessionTimelinePage: vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({ items: [] })),
     cloneSession: vi.fn<AppController["cloneSession"]>(async () => "cloned"), navigate: vi.fn(), exportSession: vi.fn(), getArtifactUrl: vi.fn(), releaseArtifactUrl: vi.fn() };

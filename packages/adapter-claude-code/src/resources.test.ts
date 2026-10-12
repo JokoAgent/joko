@@ -59,12 +59,23 @@ test("copies approved text into an immutable generation and never projects priva
   });
 });
 
+test("retains full approved skills and the complete catalog while bounding actual text input", () => {
+  const seed: ClaudeTextResourceSeed = { id: "full-skill", name: "Full skill", kind: "skill", revision: "sha256:approved",
+    resourceVersion: 1n, content: "x".repeat(512 * 1024), assertCurrent: () => undefined };
+  const snapshot = snapshotClaudeTextResources([seed, ...Array.from({ length: 4096 }, (_, i) => ({ ...seed, id: `skill-${i}`, content: "short" }))], 1, new AbortController().signal);
+  expect(snapshot).toHaveLength(4097);
+  expect(snapshot[0]!.content).toBe(seed.content);
+  expect(thrown(() => resolveClaudeResourceMention({ kind: "resource", label: seed.name, reference: seed.id,
+    discoveredRevision: seed.revision, resourceVersion: "1", runtimeGeneration: 1 }, snapshot)))
+    .toMatchObject({ publicError: { code: "RESOURCE_CONTENT_TOO_LARGE" } });
+});
+
 test.each([
   ["duplicate identity", (seed: ClaudeTextResourceSeed) => [seed, { ...seed }]],
   ["unsupported kind", (seed: ClaudeTextResourceSeed) => [{ ...seed, kind: "extension" }]],
   ["zero entity revision", (seed: ClaudeTextResourceSeed) => [{ ...seed, resourceVersion: 0n }]],
   ["control character identity", (seed: ClaudeTextResourceSeed) => [{ ...seed, revision: "bad\nrevision" }]],
-  ["oversized content", (seed: ClaudeTextResourceSeed) => [{ ...seed, content: "x".repeat(256 * 1024 + 1) }]]
+  ["oversized prompt", (seed: ClaudeTextResourceSeed) => [{ ...seed, kind: "prompt", content: "x".repeat(256 * 1024 + 1) }]]
 ] as const)("rejects a %s before a native runtime can advertise the catalog", (_label, change) => {
   const seed: ClaudeTextResourceSeed = {
     id: "approved-skill",

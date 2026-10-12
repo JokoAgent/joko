@@ -1,0 +1,273 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/interaction.proto";
+
+enum PartnerGroupReplyMode {
+  PARTNER_GROUP_REPLY_MODE_UNSPECIFIED = 0;
+  PARTNER_GROUP_REPLY_MODE_ALL = 1;
+  PARTNER_GROUP_REPLY_MODE_MENTIONED = 2;
+}
+enum PartnerGroupSpeakingMode {
+  PARTNER_GROUP_SPEAKING_MODE_UNSPECIFIED = 0;
+  PARTNER_GROUP_SPEAKING_MODE_AUTO = 1;
+  PARTNER_GROUP_SPEAKING_MODE_SEQUENTIAL = 2;
+}
+enum PartnerGroupMemberStatus {
+  PARTNER_GROUP_MEMBER_STATUS_UNSPECIFIED = 0;
+  PARTNER_GROUP_MEMBER_STATUS_ACTIVE = 1;
+  PARTNER_GROUP_MEMBER_STATUS_PAUSED = 2;
+  PARTNER_GROUP_MEMBER_STATUS_ERROR = 3;
+  PARTNER_GROUP_MEMBER_STATUS_ARCHIVED = 4;
+  PARTNER_GROUP_MEMBER_STATUS_DELETING = 5;
+  PARTNER_GROUP_MEMBER_STATUS_MISSING = 6;
+}
+enum PartnerGroupMessageKind {
+  PARTNER_GROUP_MESSAGE_KIND_UNSPECIFIED = 0;
+  PARTNER_GROUP_MESSAGE_KIND_MESSAGE = 1;
+  PARTNER_GROUP_MESSAGE_KIND_ROUND_END = 2;
+  PARTNER_GROUP_MESSAGE_KIND_NOTICE = 3;
+  PARTNER_GROUP_MESSAGE_KIND_PLAN = 4;
+  PARTNER_GROUP_MESSAGE_KIND_PLAN_END = 5;
+}
+enum PartnerGroupAuthorKind {
+  PARTNER_GROUP_AUTHOR_KIND_UNSPECIFIED = 0;
+  PARTNER_GROUP_AUTHOR_KIND_USER = 1;
+  PARTNER_GROUP_AUTHOR_KIND_PARTNER = 2;
+  PARTNER_GROUP_AUTHOR_KIND_SYSTEM = 3;
+}
+enum PartnerGroupNoticeCode {
+  PARTNER_GROUP_NOTICE_CODE_UNSPECIFIED = 0;
+  PARTNER_GROUP_NOTICE_CODE_MEMBER_FAILED = 1;
+  PARTNER_GROUP_NOTICE_CODE_MEMBER_TIMEOUT = 2;
+  PARTNER_GROUP_NOTICE_CODE_MEMBER_UNAVAILABLE = 3;
+  PARTNER_GROUP_NOTICE_CODE_PLAN_FAILED = 4;
+  PARTNER_GROUP_NOTICE_CODE_PLAN_STOPPED = 5;
+  PARTNER_GROUP_NOTICE_CODE_WORKDIR_UNAVAILABLE = 6;
+}
+enum PartnerGroupAttachmentCategory {
+  PARTNER_GROUP_ATTACHMENT_CATEGORY_UNSPECIFIED = 0;
+  PARTNER_GROUP_ATTACHMENT_CATEGORY_IMAGE = 1;
+  PARTNER_GROUP_ATTACHMENT_CATEGORY_PDF = 2;
+  PARTNER_GROUP_ATTACHMENT_CATEGORY_TEXT = 3;
+  PARTNER_GROUP_ATTACHMENT_CATEGORY_OFFICE = 4;
+  PARTNER_GROUP_ATTACHMENT_CATEGORY_FILE = 5;
+}
+enum PartnerGroupPlanStatus {
+  PARTNER_GROUP_PLAN_STATUS_UNSPECIFIED = 0;
+  PARTNER_GROUP_PLAN_STATUS_PROPOSED = 1;
+  PARTNER_GROUP_PLAN_STATUS_RUNNING = 2;
+  PARTNER_GROUP_PLAN_STATUS_WAITING = 3;
+  PARTNER_GROUP_PLAN_STATUS_DONE = 4;
+  PARTNER_GROUP_PLAN_STATUS_STOPPED = 5;
+  PARTNER_GROUP_PLAN_STATUS_DISMISSED = 6;
+  PARTNER_GROUP_PLAN_STATUS_SUPERSEDED = 7;
+}
+enum PartnerGroupStepStatus {
+  PARTNER_GROUP_STEP_STATUS_UNSPECIFIED = 0;
+  PARTNER_GROUP_STEP_STATUS_PENDING = 1;
+  PARTNER_GROUP_STEP_STATUS_RUNNING = 2;
+  PARTNER_GROUP_STEP_STATUS_DONE = 3;
+  PARTNER_GROUP_STEP_STATUS_FAILED = 4;
+}
+enum PartnerGroupSpeakerActivity {
+  PARTNER_GROUP_SPEAKER_ACTIVITY_UNSPECIFIED = 0;
+  PARTNER_GROUP_SPEAKER_ACTIVITY_REPLY = 1;
+  PARTNER_GROUP_SPEAKER_ACTIVITY_PLANNING = 2;
+  PARTNER_GROUP_SPEAKER_ACTIVITY_STEP = 3;
+}
+enum PartnerGroupChangeKind {
+  PARTNER_GROUP_CHANGE_KIND_UNSPECIFIED = 0;
+  PARTNER_GROUP_CHANGE_KIND_CREATED = 1;
+  PARTNER_GROUP_CHANGE_KIND_UPDATED = 2;
+  PARTNER_GROUP_CHANGE_KIND_DELETED = 3;
+  PARTNER_GROUP_CHANGE_KIND_MESSAGES = 4;
+  PARTNER_GROUP_CHANGE_KIND_ROUND = 5;
+  PARTNER_GROUP_CHANGE_KIND_PLAN = 6;
+  PARTNER_GROUP_CHANGE_KIND_READ = 7;
+}
+enum PartnerGroupPlanAction {
+  PARTNER_GROUP_PLAN_ACTION_UNSPECIFIED = 0;
+  PARTNER_GROUP_PLAN_ACTION_START = 1;
+  PARTNER_GROUP_PLAN_ACTION_DISMISS = 2;
+  PARTNER_GROUP_PLAN_ACTION_CONTINUE = 3;
+  PARTNER_GROUP_PLAN_ACTION_RETRY = 4;
+}
+enum PartnerGroupPlanEditAction {
+  PARTNER_GROUP_PLAN_EDIT_ACTION_UNSPECIFIED = 0;
+  PARTNER_GROUP_PLAN_EDIT_ACTION_REASSIGN = 1;
+  PARTNER_GROUP_PLAN_EDIT_ACTION_REMOVE = 2;
+}
+
+message PartnerGroupMention { bool all = 1; repeated string partner_ids = 2; }
+message PartnerGroupAttachment {
+  string id = 1;
+  string name = 2;
+  PartnerGroupAttachmentCategory category = 3;
+  BlobRef blob = 4;
+  bool annotated = 5;
+}
+message PartnerGroupMember { string partner_id = 1; string name = 2; PartnerGroupMemberStatus status = 3; }
+message PartnerGroupSpeaker { string partner_id = 1; optional string session_id = 2; PartnerGroupSpeakerActivity activity = 3; }
+message PartnerGroupMessage {
+  string id = 1;
+  uint64 sequence = 2;
+  PartnerGroupMessageKind kind = 3;
+  PartnerGroupAuthorKind author_kind = 4;
+  optional string author_partner_id = 5;
+  string author_name = 6;
+  string content = 7;
+  PartnerGroupMention mentions = 8;
+  PartnerGroupNoticeCode notice_code = 9;
+  optional string plan_id = 10;
+  repeated string files = 11;
+  repeated PartnerGroupAttachment attachments = 12;
+  google.protobuf.Timestamp created_at = 13;
+}
+message PartnerGroupPlanStep {
+  uint32 position = 1;
+  string partner_id = 2;
+  string partner_name = 3;
+  string task = 4;
+  PartnerGroupStepStatus status = 5;
+  optional string result_message_id = 6;
+  google.protobuf.Timestamp started_at = 7;
+  google.protobuf.Timestamp finished_at = 8;
+}
+message PartnerGroupPlan {
+  string id = 1;
+  string group_id = 2;
+  Revision revision = 3;
+  PartnerGroupPlanStatus status = 4;
+  string request_text = 5;
+  repeated PartnerGroupAttachment attachments = 6;
+  string organizer_partner_id = 7;
+  string organizer_name = 8;
+  repeated PartnerGroupPlanStep steps = 9;
+  optional uint32 current_step = 10;
+  optional string work_dir = 11;
+  optional string branch = 12;
+  google.protobuf.Timestamp created_at = 13;
+  google.protobuf.Timestamp updated_at = 14;
+}
+message PartnerGroupPreview {
+  PartnerGroupAuthorKind author_kind = 1;
+  string author_name = 2;
+  string content = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+message PartnerGroupSummary {
+  string id = 1;
+  Revision revision = 2;
+  string name = 3;
+  PartnerGroupReplyMode reply_mode = 4;
+  PartnerGroupSpeakingMode speaking_mode = 5;
+  optional string organizer_partner_id = 6;
+  optional string project_dir = 7;
+  optional string project_dir_name = 8;
+  repeated PartnerGroupMember members = 9;
+  PartnerGroupPreview last_message = 10;
+  google.protobuf.Timestamp last_reply_at = 11;
+  bool unread = 12;
+  optional string planning_partner_id = 13;
+  repeated PartnerGroupSpeaker speakers = 14;
+  PartnerGroupPlan open_plan = 15;
+  google.protobuf.Timestamp created_at = 16;
+  google.protobuf.Timestamp updated_at = 17;
+  bool deleting = 18;
+}
+message PartnerGroupDetail {
+  PartnerGroupSummary group = 1;
+  repeated PartnerGroupMessage messages = 2;
+  bool has_more_before = 3;
+  bool round_running = 4;
+  bool can_continue = 5;
+  repeated PartnerGroupPlan plans = 6;
+}
+message PartnerGroupInteraction {
+  string partner_id = 1;
+  string session_id = 2;
+  string backend_id = 3;
+  string target_id = 4;
+  uint64 generation = 5;
+  repeated Interaction interactions = 6;
+}
+message PartnerGroupChangeNotice {
+  uint64 sequence = 1;
+  optional string group_id = 2;
+  Revision group_revision = 3;
+  Revision directory_revision = 4;
+  PartnerGroupChangeKind change = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+message ListPartnerGroupsRequest {}
+message ListPartnerGroupsResponse { Revision revision = 1; repeated PartnerGroupSummary groups = 2; uint64 change_sequence = 3; }
+message CreatePartnerGroupRequest { string request_id = 1; Revision expected_directory_revision = 2; string name = 3; repeated string member_ids = 4; }
+message CreatePartnerGroupResponse { PartnerGroupSummary group = 1; }
+message GetPartnerGroupRequest { string group_id = 1; optional uint64 before_sequence = 2; }
+message GetPartnerGroupResponse { PartnerGroupDetail detail = 1; repeated PartnerGroupInteraction interactions = 2; }
+message UpdatePartnerGroupRequest {
+  string group_id = 1;
+  Revision expected_revision = 2;
+  optional string name = 3;
+  optional PartnerGroupReplyMode reply_mode = 4;
+  optional PartnerGroupSpeakingMode speaking_mode = 5;
+  oneof organizer_selection { string organizer_partner_id = 6; bool clear_organizer = 7; }
+  oneof project_selection { string project_dir = 8; bool clear_project_dir = 9; }
+}
+message UpdatePartnerGroupResponse { PartnerGroupSummary group = 1; }
+message SetPartnerGroupMembersRequest { string group_id = 1; Revision expected_revision = 2; repeated string member_ids = 3; }
+message SetPartnerGroupMembersResponse { PartnerGroupSummary group = 1; }
+message DeletePartnerGroupRequest { string group_id = 1; Revision expected_revision = 2; }
+message DeletePartnerGroupResponse {}
+message SendPartnerGroupMessageRequest {
+  string group_id = 1;
+  Revision expected_revision = 2;
+  string client_id = 3;
+  string text = 4;
+  PartnerGroupMention mentions = 5;
+  bool division = 6;
+  repeated PartnerGroupAttachment attachments = 7;
+}
+message SendPartnerGroupMessageResponse { PartnerGroupMessage message = 1; }
+message ContinuePartnerGroupRequest { string group_id = 1; }
+message ContinuePartnerGroupResponse {}
+message StopPartnerGroupRequest { string group_id = 1; }
+message StopPartnerGroupResponse {}
+message MarkPartnerGroupReadRequest { string group_id = 1; uint64 through_sequence = 2; }
+message MarkPartnerGroupReadResponse {}
+message ActPartnerGroupPlanRequest { string group_id = 1; string plan_id = 2; Revision expected_revision = 3; PartnerGroupPlanAction action = 4; }
+message ActPartnerGroupPlanResponse {}
+message EditPartnerGroupPlanRequest { string group_id = 1; string plan_id = 2; Revision expected_revision = 3; uint32 position = 4; PartnerGroupPlanEditAction action = 5; optional string partner_id = 6; }
+message EditPartnerGroupPlanResponse {}
+message GetPartnerGroupCreationRequest { string request_id = 1; }
+message GetPartnerGroupCreationResponse { bool retired = 1; PartnerGroupSummary group = 2; }
+message RetirePartnerGroupCreationRequest { string request_id = 1; }
+message RetirePartnerGroupCreationResponse { bool retired = 1; PartnerGroupSummary group = 2; }
+message StreamPartnerGroupChangesRequest { uint64 after_sequence = 1; }
+message StreamPartnerGroupChangesResponse { PartnerGroupChangeNotice notice = 1; }
+message ReadPartnerGroupFileRequest { string group_id = 1; string message_id = 2; string relative_path = 3; }
+message ReadPartnerGroupFileResponse { BlobRef blob = 1; }
+
+service PartnerGroupService {
+  rpc ListPartnerGroups(ListPartnerGroupsRequest) returns (ListPartnerGroupsResponse);
+  rpc CreatePartnerGroup(CreatePartnerGroupRequest) returns (CreatePartnerGroupResponse);
+  rpc GetPartnerGroup(GetPartnerGroupRequest) returns (GetPartnerGroupResponse);
+  rpc UpdatePartnerGroup(UpdatePartnerGroupRequest) returns (UpdatePartnerGroupResponse);
+  rpc SetPartnerGroupMembers(SetPartnerGroupMembersRequest) returns (SetPartnerGroupMembersResponse);
+  rpc DeletePartnerGroup(DeletePartnerGroupRequest) returns (DeletePartnerGroupResponse);
+  rpc SendPartnerGroupMessage(SendPartnerGroupMessageRequest) returns (SendPartnerGroupMessageResponse);
+  rpc ContinuePartnerGroup(ContinuePartnerGroupRequest) returns (ContinuePartnerGroupResponse);
+  rpc StopPartnerGroup(StopPartnerGroupRequest) returns (StopPartnerGroupResponse);
+  rpc MarkPartnerGroupRead(MarkPartnerGroupReadRequest) returns (MarkPartnerGroupReadResponse);
+  rpc ActPartnerGroupPlan(ActPartnerGroupPlanRequest) returns (ActPartnerGroupPlanResponse);
+  rpc EditPartnerGroupPlan(EditPartnerGroupPlanRequest) returns (EditPartnerGroupPlanResponse);
+  rpc GetPartnerGroupCreation(GetPartnerGroupCreationRequest) returns (GetPartnerGroupCreationResponse);
+  rpc RetirePartnerGroupCreation(RetirePartnerGroupCreationRequest) returns (RetirePartnerGroupCreationResponse);
+  rpc StreamPartnerGroupChanges(StreamPartnerGroupChangesRequest) returns (stream StreamPartnerGroupChangesResponse);
+  rpc ReadPartnerGroupFile(ReadPartnerGroupFileRequest) returns (ReadPartnerGroupFileResponse);
+}

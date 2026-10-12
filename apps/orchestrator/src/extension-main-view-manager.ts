@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import type { ExtensionLibraryDescriptor, ExtensionMainViewDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionLibraryDescriptor, ExtensionMainViewDescriptor, ExtensionRoutineEventsDescriptor } from "./extension-surface-manifest.js";
 import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
 import type { PiInstalledPackageLease, PiResourceManager } from "./resource-manager.js";
 
@@ -37,6 +37,8 @@ export interface ExtensionMainViewAuthority {
   readonly extensionEntry: string;
   readonly mainView: ExtensionMainViewDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
+  /** A node-owned resident publisher uses an inspected HTML entry independent of the visible view. */
+  readonly routineEvents?: ExtensionRoutineEventsDescriptor;
 }
 
 export interface ExtensionMainViewSurface {
@@ -247,8 +249,11 @@ export class ExtensionMainViewManager {
         }
         const catalog = await inspectPiPackageCatalog(packageRoot);
         const extension = catalog.extensions.find((entry) => entry.relativePath === input.authority.extensionEntry);
-        if (extension === undefined || !sameMainView(extension.mainView, input.authority.mainView)
-          || !sameLibrary(extension.library, input.authority.library)
+        const publisher = input.authority.routineEvents;
+        const declarationMatches = publisher === undefined
+          ? sameMainView(extension?.mainView, input.authority.mainView) && sameLibrary(extension?.library, input.authority.library)
+          : extension?.routineEvents?.html === input.authority.mainView.html && JSON.stringify(extension.routineEvents) === JSON.stringify(publisher);
+        if (extension === undefined || !declarationMatches
           || catalog.name !== input.authority.packageName
           || catalog.version !== input.authority.packageVersion) {
           throw new Error("Extension main-view declaration changed while its surface was opening.");
@@ -288,7 +293,7 @@ export class ExtensionMainViewManager {
     });
   }
 
-  async getSurface(surfaceId: string, connectionId: string): Promise<ExtensionMainViewSurface> {
+  async getSurface(surfaceId: string, connectionId: string, renewPublisher = false): Promise<ExtensionMainViewSurface> {
     this.#assertReady();
     if (!SURFACE_ID.test(surfaceId) || !SAFE_CONNECTION_ID.test(connectionId)) {
       throw new ExtensionMainViewError(404, "Extension main view not found.");
@@ -306,6 +311,9 @@ export class ExtensionMainViewManager {
         await this.#destroy(surface);
         throw new ExtensionMainViewError(410, "Extension main view was revoked.");
       }
+      if (renewPublisher && surface.authority.routineEvents) {
+        const renewed = { ...surface, expiresAt: this.#now() + this.#ttlMs }; this.#surfaces.set(surface.id, renewed);
+      }
       return {
         id: surface.id,
         extensionId: surface.authority.extensionId,
@@ -313,7 +321,7 @@ export class ExtensionMainViewManager {
         endpoint: surface.endpoint,
         ...(surface.authority.mainView.title === undefined ? {} : { title: surface.authority.mainView.title }),
         ...(surface.authority.mainView.icon === undefined ? {} : { icon: surface.authority.mainView.icon }),
-        expiresAt: surface.expiresAt
+        expiresAt: this.#surfaces.get(surface.id)!.expiresAt
       };
     });
   }
@@ -461,7 +469,8 @@ function validateAuthority(authority: ExtensionMainViewAuthority): void {
 }
 
 function copyAuthority(authority: ExtensionMainViewAuthority): ExtensionMainViewAuthority {
-  return { ...authority, mainView: { ...authority.mainView }, ...(authority.library === undefined ? {} : { library: { ...authority.library } }) };
+  return { ...authority, mainView: { ...authority.mainView }, ...(authority.library === undefined ? {} : { library: { ...authority.library } }),
+    ...(authority.routineEvents === undefined ? {} : { routineEvents: structuredClone(authority.routineEvents) }) };
 }
 
 function sameMainView(left: ExtensionMainViewDescriptor | undefined, right: ExtensionMainViewDescriptor): boolean {

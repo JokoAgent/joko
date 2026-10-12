@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+
+enum RoutineFilterOperator {
+  ROUTINE_FILTER_OPERATOR_UNSPECIFIED = 0;
+  ROUTINE_FILTER_OPERATOR_EQUALS = 1;
+  ROUTINE_FILTER_OPERATOR_CONTAINS = 2;
+  ROUTINE_FILTER_OPERATOR_NOT_EQUALS = 3;
+}
+enum RoutineRunStatus {
+  ROUTINE_RUN_STATUS_UNSPECIFIED = 0;
+  ROUTINE_RUN_STATUS_QUEUED = 1;
+  ROUTINE_RUN_STATUS_RUNNING = 2;
+  ROUTINE_RUN_STATUS_SUCCESS = 3;
+  ROUTINE_RUN_STATUS_FAILED = 4;
+  ROUTINE_RUN_STATUS_INTERRUPTED = 5;
+  ROUTINE_RUN_STATUS_CANCELLED = 6;
+  ROUTINE_RUN_STATUS_SKIPPED = 7;
+}
+enum RoutineSourceStatus {
+  ROUTINE_SOURCE_STATUS_UNSPECIFIED = 0;
+  ROUTINE_SOURCE_STATUS_LISTENING = 1;
+  ROUTINE_SOURCE_STATUS_DISCONNECTED = 2;
+  ROUTINE_SOURCE_STATUS_ERROR = 3;
+}
+message RoutineCronTrigger { string expression = 1; string timezone = 2; }
+message RoutineIntervalTrigger { uint64 interval_ms = 1; optional uint64 anchor_ms = 2; }
+message RoutineOnceTrigger { google.protobuf.Timestamp at = 1; }
+message RoutineEventFilter { string field = 1; RoutineFilterOperator operator = 2; string value = 3; }
+message RoutineEventTrigger { string source_id = 1; string event_type = 2; repeated RoutineEventFilter filters = 3; }
+message RoutineTrigger {
+  string id = 1;
+  oneof kind { RoutineCronTrigger cron = 2; RoutineIntervalTrigger interval = 3; RoutineOnceTrigger once = 4; RoutineEventTrigger event = 5; }
+}
+message RoutinePreRunHook { string command = 1; optional uint64 timeout_ms = 2; }
+message RoutineDefinition {
+  string name = 1;
+  string prompt = 2;
+  optional bool enabled = 3;
+  repeated RoutineTrigger triggers = 4;
+  optional bool silent_when_idle = 5;
+  RoutinePreRunHook pre_run_hook = 6;
+}
+message PartnerRoutine {
+  string id = 1;
+  string partner_id = 2;
+  Revision revision = 3;
+  RoutineDefinition definition = 4;
+  optional RoutineRunStatus activity = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+message RoutineSourceEvent { string type = 1; string name = 2; repeated string fields = 3; }
+message RoutineSource {
+  string id = 1;
+  string name = 2;
+  RoutineSourceStatus status = 3;
+  repeated RoutineSourceEvent events = 4;
+  google.protobuf.Timestamp last_event_at = 5;
+}
+message PartnerRoutineRun {
+  string id = 1;
+  string routine_id = 2;
+  Revision definition_revision = 3;
+  repeated string trigger_ids = 4;
+  RoutineRunStatus status = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp finished_at = 7;
+  optional string error = 8;
+  optional string schedule_run_id = 9;
+  optional string result_text = 10;
+}
+message ListPartnerRoutinesRequest { string partner_id = 1; }
+message ListPartnerRoutinesResponse {
+  string partner_id = 1;
+  Revision partner_revision = 2;
+  bool writable = 3;
+  repeated PartnerRoutine routines = 4;
+  repeated RoutineSource sources = 5;
+}
+message SavePartnerRoutineRequest {
+  string partner_id = 1;
+  Revision expected_partner_revision = 2;
+  RoutineDefinition definition = 3;
+  oneof intent { string creation_request_id = 4; string routine_id = 5; }
+  Revision expected_revision = 6;
+}
+message SavePartnerRoutineResponse { PartnerRoutine routine = 1; }
+message RunPartnerRoutineRequest {
+  string partner_id = 1;
+  Revision expected_partner_revision = 2;
+  string routine_id = 3;
+  Revision expected_revision = 4;
+  string request_id = 5;
+}
+message RunPartnerRoutineResponse {}
+message DeletePartnerRoutineRequest {
+  string partner_id = 1;
+  Revision expected_partner_revision = 2;
+  string routine_id = 3;
+  Revision expected_revision = 4;
+}
+message DeletePartnerRoutineResponse {}
+message ListPartnerRoutineRunsRequest { string partner_id = 1; string routine_id = 2; optional uint32 offset = 3; }
+message ListPartnerRoutineRunsResponse { repeated PartnerRoutineRun runs = 1; optional uint32 next_offset = 2; }
+message GetPartnerRoutineCreationRequest { string partner_id = 1; string request_id = 2; }
+message GetPartnerRoutineCreationResponse { PartnerRoutine routine = 1; bool retired = 2; }
+message RetirePartnerRoutineCreationRequest { string partner_id = 1; string request_id = 2; }
+message RetirePartnerRoutineCreationResponse { PartnerRoutine routine = 1; bool retired = 2; }
+
+service PartnerRoutineService {
+  rpc ListPartnerRoutines(ListPartnerRoutinesRequest) returns (ListPartnerRoutinesResponse);
+  rpc SavePartnerRoutine(SavePartnerRoutineRequest) returns (SavePartnerRoutineResponse);
+  rpc RunPartnerRoutine(RunPartnerRoutineRequest) returns (RunPartnerRoutineResponse);
+  rpc DeletePartnerRoutine(DeletePartnerRoutineRequest) returns (DeletePartnerRoutineResponse);
+  rpc ListPartnerRoutineRuns(ListPartnerRoutineRunsRequest) returns (ListPartnerRoutineRunsResponse);
+  rpc GetPartnerRoutineCreation(GetPartnerRoutineCreationRequest) returns (GetPartnerRoutineCreationResponse);
+  rpc RetirePartnerRoutineCreation(RetirePartnerRoutineCreationRequest) returns (RetirePartnerRoutineCreationResponse);
+}

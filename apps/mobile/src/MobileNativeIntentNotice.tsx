@@ -4,6 +4,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { mobileMessage } from "./mobile-messages";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import type { MobileNativeIntentRecovery } from "./mobile-native-intent";
+import { partnerGroupMessages } from "@joko/contracts";
 
 export interface MobileNativeIntentNoticeProps {
   readonly colors: {
@@ -38,6 +39,7 @@ export function mobileNativeIntentRecoveryText(
     case "profile-unavailable": return mobileMessage(locale, "intent.profileUnavailable");
     case "profile-connect-failed": return mobileMessage(locale, "intent.profileConnectFailed");
     case "session-unavailable": return mobileMessage(locale, "intent.sessionUnavailable");
+    case "group-unavailable": return partnerGroupMessages(locale).unavailable;
     case "message-unavailable": return mobileMessage(locale, "intent.messageUnavailable");
   }
 }

@@ -37,6 +37,7 @@ import { PermissionSelector } from "./PermissionSelector.js";
 import { PinnedPlanPanel } from "./PinnedPlanPanel.js";
 import { RetryStatusIndicator } from "./RetryStatusIndicator.js";
 import { SessionRunningStatusBar } from "./SessionRunningStatusBar.js";
+import { PartnerWorkingStatus } from "./PartnerWorkingStatus.js";
 import { SessionScheduleNotice } from "./SessionScheduleNotice.js";
 import { activeBackgroundTaskIds } from "./running-status.js";
 import { collectTimelineSubagentRuns, timelineSubagentDetailResponseIsCurrent } from "./subagent-inline-card.js";
@@ -71,6 +72,8 @@ import {
   type UsageLimitRecoveryHint
 } from "../usage-limit-recovery.js";
 import { SessionHeaderActionsMenu } from "./SessionHeaderActionsMenu.js";
+import { PartnerConversationHeader } from "./PartnerConversationHeader.js";
+import { PartnerConversationProvider, usePartnerConversation } from "./PartnerConversation.js";
 import { TaskTagDots } from "./TaskTags.js";
 import { codeHostDisplayBranch } from "./CodeHostPullRequestSummary.js";
 import { openCodeHostPullRequestExternal } from "../code-host-pull-request.js";
@@ -141,7 +144,17 @@ interface ActiveMessageFork {
 
 export type SessionPanePresentation = "standard" | "filesRail";
 
-export function SessionPane({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
+export function SessionPane(props: Parameters<typeof SessionPaneContent>[0]): JSX.Element {
+  const conversation = usePartnerConversation();
+  if (conversation?.sessionId === props.session.id) return <SessionPaneContent {...props} />;
+  const route = props.controller.state.route;
+  return <PartnerConversationProvider controller={props.controller} session={props.session}
+    active={route?.kind === "session" && route.sessionId === props.session.id} t={props.t}>
+    <SessionPaneContent {...props} />
+  </PartnerConversationProvider>;
+}
+
+function SessionPaneContent({ controller, session, target, backend, reviewReadOnly = false, presentation = "standard", composerAutoFocus = true, models, timeline, timelineHasEarlier, timelineHistoryLoading, timelineHistoryError, onLoadEarlierTimeline, timelineFocusRequest, extensionWidgets, extensionStatuses, queue, queueControl, workspace, extraDirectories, resources, commandRefreshSignal, interaction, remainingInteractions, navigationOpen, inspectorOpen, inspectorAvailable = true, selectionQuoteInsertion, attachmentInsertion, objectiveDialogHandoff, onObjectiveDialogHandoffHandled, t, runAction, onOpenNavigation, onOpenInspector, onOpenSubagent, onOpenTurnReview, onRename, onManageTaskTags = () => undefined, onPin, onArchive, onPrefetchRemoval, onDelete, onMoveSessionProject, movingSessionProject = false, onCopyTaskLink, onExportPortableSession, onSplitSession, onOpenSessionWindow }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly target?: TargetView;
@@ -193,6 +206,8 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   readonly onOpenSessionWindow?: () => void;
 }): JSX.Element {
   const exportDownload = useArtifactDownload(session.id, controller.exportSession);
+  const partnerConversation = usePartnerConversation();
+  const partnerRuntimeLocked = partnerConversation?.kind !== "task";
   const timelineResourceOwnerKey = useMemo(() => randomUuid(), [controller.getArtifactUrl, controller.releaseArtifactUrl, controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, session.id, workspace?.id]);
   const timelineResourceOwnerRef = useRef<string | undefined>(undefined);
   useLayoutEffect(() => {
@@ -459,11 +474,11 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   const canAbort = backend?.capabilities.get("turn.abort")?.supported === true;
   const canAbortRetry = backend?.capabilities.get("context.auto_retry")?.supported === true;
   const canStop = session.state === "retrying" ? canAbortRetry && activeRetry?.source === "auto" : canAbort;
-  const canSwitchModel = !reviewReadOnly && backend?.capabilities.get("model.switch")?.supported === true;
-  const canSetEffort = !reviewReadOnly && backend?.capabilities.get("model.effort")?.supported === true;
-  const canSetFast = !reviewReadOnly && backend?.capabilities.get("model.fast_mode")?.supported === true;
+  const canSwitchModel = !reviewReadOnly && !partnerRuntimeLocked && backend?.capabilities.get("model.switch")?.supported === true;
+  const canSetEffort = !reviewReadOnly && !partnerRuntimeLocked && backend?.capabilities.get("model.effort")?.supported === true;
+  const canSetFast = !reviewReadOnly && !partnerRuntimeLocked && backend?.capabilities.get("model.fast_mode")?.supported === true;
   const allowedPermissions = advertisedPermissionModes(backend);
-  const canSetPermission = !reviewReadOnly && permissionChangeSupported(backend);
+  const canSetPermission = !reviewReadOnly && !partnerRuntimeLocked && permissionChangeSupported(backend);
   const canListRuntimeCommands = !reviewReadOnly && backend?.capabilities.get("runtime.commands")?.supported === true;
   const objectiveAccess = objectiveSessionAccess(session, backend, {
     connected: controller.state.connectionState === "connected",
@@ -499,7 +514,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     && controller.state.connectionState === "connected"
     && backend?.capabilities.get("input.mention")?.supported === true
     && backend.capabilities.get("input.mention")?.options.includes("artifact") === true;
-  const canSetPlanMode = !reviewReadOnly && planModeSupported(backend);
+  const canSetPlanMode = !reviewReadOnly && !partnerRuntimeLocked && planModeSupported(backend);
   const canContactOwner = controller.state.activeProfile !== undefined && controller.state.snapshot.revision > 0n;
   const canListSubagents = backend?.capabilities.get("subagents.list")?.supported === true
     && backend.capabilities.get("subagents.detail")?.supported === true;
@@ -698,7 +713,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
   };
   const permissionCycleOptions = permissionModesForShortcut(backend, target, controller.state.snapshot.settings.policy.projectTrustRequired);
   const messageHistory = useMemo(() => recoveryPresentationTimeline.flatMap((item): readonly ComposerHistoryEntry[] => {
-    if (item.kind !== "user" || !item.text?.trim()) return [];
+    if (item.kind !== "user" || item.partnerPrivateOrigin !== undefined || !item.text?.trim()) return [];
     const editorDocument = composerDocumentFromMessage(item.text, item.quotesEncoded === true, {
         sessionId: session.id,
         messageId: item.id,
@@ -1708,7 +1723,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
     } : {})
   });
 
-  const composerControls = (
+  const composerControls = partnerRuntimeLocked ? undefined : (
     <div className="composer__controls" aria-label={t("session.controls")}>
       {canSetPermission && <PermissionSelector
         value={session.permissionMode}
@@ -1804,7 +1819,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
         return;
       }
     }}>
-      {presentation !== "filesRail" && <header className="session-header">
+      {presentation !== "filesRail" && <PartnerConversationHeader session={session} navigationOpen={navigationOpen} onOpenNavigation={onOpenNavigation} t={t}><header className="session-header">
         <div className="session-header__leading">
           {!navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
           <div className="session-heading">
@@ -1876,7 +1891,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           />
           {!reviewReadOnly && inspectorAvailable && !inspectorOpen && <IconButton label={t("a11y.openInspector")} onClick={onOpenInspector}><PanelRight aria-hidden="true" /></IconButton>}
         </div>
-      </header>}
+      </header></PartnerConversationHeader>}
 
       {session.worktree?.state === "preserved" && <div className="session-worktree-warning" role="alert"><GitBranch aria-hidden="true" /><span><strong>{t("worktree.preservedTitle")}</strong><small>{t("worktree.preservedDescription", { branch: session.worktree.branch })}</small></span></div>}
       {!reviewReadOnly && <PortableReplacementCleanupNotice controller={controller} sessionId={session.id} t={t} />}
@@ -2062,6 +2077,9 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
       </div>}
       {activeCompaction !== undefined && <CompactionStatusIndicator compaction={activeCompaction} t={t} />}
       {activeRetry !== undefined && <RetryStatusIndicator retry={activeRetry} t={t} />}
+      {interaction !== undefined && interaction.kind !== "plan" && partnerConversation?.kind === "partner" && <PartnerWorkingStatus
+        controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} waiting
+        suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} />}
       <InteractionPromptHost
         enabled={presentation === "filesRail"}
         hasInteraction={interaction !== undefined}
@@ -2084,7 +2102,7 @@ export function SessionPane({ controller, session, target, backend, reviewReadOn
           }}
           t={t}
         />}
-        <Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={<SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
+<Composer artifacts={canListSessionArtifacts ? liveArtifacts : []} sessions={historicalSessionMentionCandidates} controller={controller} session={session} backend={backend} sessionUsage={effectiveSessionUsage} readOnly={reviewReadOnly} autoFocus={composerAutoFocus && presentation === "standard" && currentShareSelection === undefined} focusRequest={composerFocusRequest} queue={queue} queueControl={queueControl} workspace={workspace} extraDirectories={extraDirectories} resources={canListSessionResources ? liveResources : []} commands={canListRuntimeCommands ? liveCommands : []} messageHistory={messageHistory} controls={composerControls} runningStatus={partnerConversation !== undefined && partnerConversation.kind !== "task" ? <PartnerWorkingStatus controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} /> : <SessionRunningStatusBar session={session} items={recoveryPresentationTimeline} backgroundTaskIds={backgroundTaskIds} canStopBackgroundTasks={canStopBackgroundTasks} backgroundStopping={backgroundStopping} backgroundStopError={backgroundStopError} suppressed={reviewReadOnly} t={t} onStopBackgroundTasks={stopAllBackgroundTasks} />} messageMentionInsertion={composerMessageMentionInsertion} selectionQuoteInsertion={composerSelectionQuoteInsertion} attachmentInsertion={composerAttachmentInsertion} draftReplacement={composerDraftReplacement} objectiveDialogHandoff={objectiveDialogHandoff} onObjectiveDialogHandoffRejected={onObjectiveDialogHandoffHandled} onDraftMutation={noteComposerDraftMutation} t={t} runAction={runAction} onLocalSend={(sourceSessionId) => { if (activeSessionIdRef.current === sourceSessionId) setFollowLatestSignal((current) => current + 1); }} onOpenObjective={objectiveSupported ? (onSaved, handoff) => {
           if (handoff !== undefined) {
             if (!objectiveDialogRequestMatchesOwner(handoff, controller, session)) {
               onObjectiveDialogHandoffHandled?.(handoff.id);

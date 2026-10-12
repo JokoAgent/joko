@@ -34,6 +34,20 @@ afterEach(async () => {
 });
 
 describe("Claude SDK owned custom spawn", () => {
+  it("forwards only the Query-owned local plugin mounts to the native SDK", async () => {
+    sdk.query.mockRejectedValueOnce(new Error("bounded plugin fixture stop"));
+    const runtime = new DefaultClaudeSdkRuntime();
+    const params = queryParams();
+    const plugins = [{ type: "local" as const, path: join(tmpdir(), "query-owned-skills") }];
+    try {
+      await expect(runtime.query({ ...params, options: { ...params.options, plugins } })).rejects.toThrow("bounded plugin fixture stop");
+      const native = sdk.query.mock.calls.at(-1)![0] as { options: { plugins: typeof plugins } };
+      expect(native.options.plugins).toEqual(plugins);
+      expect(native.options.plugins).not.toBe(plugins);
+      expect(native.options.plugins[0]).not.toBe(plugins[0]);
+    } finally { await runtime.closeSessionOperations(); }
+  });
+
   it("keeps filesystem settings enabled during discovery while forwarding the Host credential override", async () => {
     sdk.startup.mockRejectedValueOnce(new Error("bounded fixture stop"));
     const runtime = new DefaultClaudeSdkRuntime();

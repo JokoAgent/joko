@@ -8,6 +8,7 @@ import type {
   NativeNavigationTarget,
   NativeSessionCatalogEntry,
   NativeSessionCatalogResult,
+  NativeSessionPreview,
   NativeSessionCandidate,
   NativeSessionStart,
   PermissionMode,
@@ -272,7 +273,7 @@ export interface ContextRebuildMessage {
   readonly blocks: readonly MessageBlock[];
 }
 
-export type ContextRebuildReason = "message_deletion" | "context_overflow" | "prompt_timeout";
+export type ContextRebuildReason = "message_deletion" | "context_overflow" | "prompt_timeout" | "manual_restart";
 
 export interface ContextRebuildInput {
   readonly reason: ContextRebuildReason;
@@ -445,6 +446,10 @@ export interface BackendAdapter {
   listNativeSessions?(target: TargetDescriptor): Promise<readonly NativeSessionCandidate[]>;
   /** Scan the Adapter-owned local profile without requiring a pre-existing Target. */
   scanNativeSessionCatalog?(): Promise<NativeSessionCatalogResult>;
+  /** Read-only project-scoped discovery. This does not confer import capability. */
+  scanNativeSessionPreviewCatalog?(projectDirectories: readonly string[]): Promise<NativeSessionCatalogResult>;
+  /** Only accepts the exact entry obtained from this Adapter's own scan. Never starts a runtime. */
+  readNativeSessionPreview?(entry: NativeSessionCatalogEntry): Promise<NativeSessionPreview>;
   /** Convert an entry returned by the Adapter's catalog into a dormant binding without starting a runtime. */
   bindCatalogSession?(
     entry: NativeSessionCatalogEntry,
@@ -569,6 +574,10 @@ export interface BackendAdapter {
    * persistence while rebuilding it.
    */
   rebuildContext?(input: ContextRebuildInput, context: AdapterContext): Promise<NativeSessionBinding>;
+  /** Reserve a durable empty replacement after the Host confirms source shutdown.
+   * No native user turn is dispatched. The Host restores its private handoff
+   * when activating this exact binding, including after process restart. */
+  prepareRestartContext?(context: AdapterContext): Promise<NativeSessionBinding>;
   /**
    * Replace the attached native context with a truly empty same-Backend
    * session. Unlike rebuildContext, reset must not carry transcript handoff

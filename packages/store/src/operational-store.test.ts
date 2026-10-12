@@ -22,6 +22,7 @@ import {
   RevisionConflictError,
   SCHEMA_BASELINE_ID,
   SCHEMA_VERSION,
+  SessionRuntimeHandoffStore,
   StaleGenerationError,
   StoreError
 } from "./index.js";
@@ -34,6 +35,41 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("adopts a runtime binding and all accepted attempts atomically while retaining parked ownership across reopen", () => {
+    const f = createFixture(), store = f.store, handoffs = new SessionRuntimeHandoffStore(store);
+    store.upsertBackend({ ...store.getBackend("pi").descriptor, id: "second-runtime" });
+    store.createAttempt({ id: "handoff-attempt", runId: "run-1", ordinal: 1, generation: 0, startedAt: 3 });
+    store.runOperation({ id: "handoff-prompt", kind: "prompt", body: f.prompt }, owner => {
+      owner.enqueueQueueItem({ id: "handoff-queue", sessionId: "session-1", runId: "run-1", attemptId: "handoff-attempt",
+        operationId: "handoff-prompt", disposition: "prompt", body: f.prompt }); return {};
+    });
+    const source = { backendId: "pi", binding: store.getSession("session-1").descriptor.binding, backendInstanceGeneration: 0, cursor: "0",
+      targetId: "target-1", targetRevision: store.getTarget("target-1").revision.toString(), workspaceRoot: "D:/workspace", realWorkspaceRoot: "D:/workspace",
+      worktreeJson: "null", permissionMode: "ask" as const, planMode: false, promptDigest: "a".repeat(64) };
+    const profile = { backendId: "second-runtime", providerId: "test", modelId: "text", fastMode: false };
+    const binding = { opaqueRef: "native/second", nativeSessionId: "second", generation: 1 };
+    handoffs.stage("session-1", 1, profile, "agent");
+    handoffs.transition("session-1", 1, { generation: 1, source: "agent", profile, origin: source, phase: "unknown", effect: "create" });
+    expect(() => store.adoptSessionRuntimeHandoff("session-1", 1)).toThrow(/receipt/u);
+    expect(store.getQueueItem("handoff-queue").attemptId).toBe("handoff-attempt");
+    handoffs.transition("session-1", 1, { generation: 1, source: "agent", profile, origin: source, phase: "ready",
+      binding, backendInstanceGeneration: 0, resumed: false, handoff: "Private visible history" });
+    const observed: string[] = [];
+    store.subscribe(event => { if (event.payload.type === "runtime_handoff") observed.push(store.getSession("session-1").descriptor.backendId); });
+    store.adoptSessionRuntimeHandoff("session-1", 1);
+    expect(observed).toEqual(["second-runtime"]);
+    expect(store.getTarget("target-1").descriptor.backendId).toBe("pi");
+    const queued = store.getQueueItem("handoff-queue");
+    expect(queued.body).toEqual(f.prompt); expect(queued.state).toBe("accepted");
+    expect(store.getAttempt(queued.attemptId!).descriptor.generation).toBe(1);
+    const path = store.filePath; store.close(); f.replaceStore(new OperationalStore(path));
+    expect(new SessionRuntimeHandoffStore(f.store).read("session-1")?.parked).toEqual([{
+      backendId: "pi", binding: source.binding, backendInstanceGeneration: 0, cursor: "0"
+    }]);
+    expect(() => f.store.createSession({ ...f.store.getSession("session-1").descriptor, id: "steal-parked", backendId: "pi", binding: source.binding }))
+      .toThrow(/reserved/u);
+  });
+
   it("publishes immutable owner Device content only after commit and keeps Session routing strict", () => {
     const { store } = createFixture();
     store.createConnection({ id: "name-connection", deviceId: "name-device", name: "Unchanged label",

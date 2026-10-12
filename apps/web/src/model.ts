@@ -1,5 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
-import type { VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView } from "@joko/contracts";
+import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar.js";
+import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine } from "@joko/contracts";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
 export type SystemLocale = Exclude<Locale, "en-XA">;
@@ -458,7 +459,7 @@ export interface RemoteHostCapabilitiesView {
   readonly backendRuntimeSetup: boolean;
 }
 
-export type PartnerLifecycleView = "active" | "archived" | "deleted";
+export type PartnerLifecycleView = "active" | "paused" | "archived" | "deleted";
 export type PartnerInitializationStateView = "pending" | "ready" | "error";
 export type PartnerInitializationErrorCodeView =
   | "homeUnavailable"
@@ -519,16 +520,19 @@ export interface PartnerProfileView {
   readonly revision: bigint;
   readonly profileVersion: bigint;
   readonly displayName: string;
-  readonly avatar: string;
+  readonly description: string;
+  readonly avatar: PartnerAvatarView;
   readonly identitySource: string;
   readonly templateId: string;
   readonly lifecycle: PartnerLifecycleView;
+  readonly pauseCleanupPending?: boolean;
   readonly initializationState: PartnerInitializationStateView;
   readonly invitationStage: PartnerInvitationStageView;
   readonly initializationErrorCode?: PartnerInitializationErrorCodeView;
   readonly homeTargetId: string;
   readonly canonicalSessionId?: string;
   readonly capabilities: PartnerCapabilitiesView;
+  readonly taskModelOverride?: PartnerModelRouteView;
   readonly usesDirectoryDefaults: boolean;
   readonly createdAt: number;
   readonly updatedAt: number;
@@ -544,6 +548,8 @@ export interface PartnerActivityView {
   readonly activeDelegationCount: number;
   readonly readThroughCursor: bigint;
   readonly readUpdatedAt: number;
+  readonly latestReplyPreview?: string;
+  readonly workingStatus?: SessionWorkingStatus;
 }
 
 export interface PartnerSessionView {
@@ -625,7 +631,8 @@ export interface PartnerDelegationView {
 
 export interface PartnerDraftView {
   readonly displayName: string;
-  readonly avatar: string;
+  readonly description?: string;
+  readonly avatar: PartnerAvatarInputView;
   readonly identitySource: string;
   readonly templateId: string;
   readonly capabilities?: PartnerCapabilitiesView;
@@ -634,17 +641,99 @@ export interface PartnerDraftView {
 
 export interface PartnerPatchView {
   readonly displayName?: string;
-  readonly avatar?: string;
+  readonly description?: string;
+  readonly avatar?: PartnerAvatarInputView;
   readonly identitySource?: string;
   readonly modelChain?: readonly PartnerModelRouteView[];
   readonly permissionMode?: PartnerPermissionModeView;
   readonly planMode?: boolean;
   readonly usesDirectoryDefaults?: boolean;
+  readonly taskModelOverride?: PartnerModelRouteView | null;
 }
 
 export interface PartnerListView {
   readonly partners: readonly PartnerProfileView[];
   readonly directory: PartnerDirectoryView;
+  readonly pendingDeletions?: readonly import("@joko/contracts").PartnerDeletionView[];
+  readonly pendingRestarts?: readonly import("@joko/contracts").PartnerRestartView[];
+}
+
+export interface PartnerWorkbenchOwnerView {
+  readonly partnerId: string;
+  readonly profileVersion: bigint;
+  readonly sessionId: string;
+  readonly sessionGeneration: bigint;
+  readonly targetId: string;
+}
+export interface PartnerWorkbenchJudgmentView {
+  readonly taskId: string;
+  readonly project: string;
+  readonly title: string;
+  readonly verdict: "unfinished" | "idea" | "done";
+  readonly next: string | null;
+  readonly ref?: string;
+  readonly updatedAt: number;
+}
+export interface PartnerWorkbenchTextView {
+  readonly role: "user" | "assistant";
+  readonly text: string;
+  readonly at: number;
+  readonly privateMessageOrigin?: { readonly messageId: string; readonly threadId: string; readonly senderPartnerId: string; readonly recipientPartnerId: string; readonly senderDisplayName: string };
+}
+export interface PartnerWorkbenchTaskView {
+  readonly id: string;
+  readonly kind: "session" | "external" | "item" | "automation";
+  readonly project: string;
+  readonly title: string;
+  readonly state: "running" | "waiting" | "queued" | "stopped" | "automation" | "done";
+  readonly group: "waiting" | "running" | "todo" | "done";
+  readonly updatedAt: number;
+  readonly sessionId?: string;
+  readonly scheduleId?: string;
+  readonly routine?: PartnerWorkbenchRoutine;
+  readonly startedAt?: number;
+  readonly scheduleSummary?: string;
+  readonly nextRunAt?: number;
+  readonly pullRequest?: CodeHostPullRequestView;
+  readonly stopReason?: "interrupted" | "failed" | "unavailable";
+  readonly sourceLabel: string;
+  readonly ownedBackground: boolean;
+  readonly unread: boolean;
+  readonly judgment?: PartnerWorkbenchJudgmentView;
+  readonly digest: { readonly purpose: string | null; readonly recent: readonly { readonly role: "user" | "assistant"; readonly text: string }[] };
+}
+export interface PartnerWorkbenchProjectBriefView {
+  readonly project: string;
+  readonly docs: readonly string[];
+  readonly recent: readonly { readonly path: string; readonly modifiedAt: number }[];
+  readonly git?: { readonly branch?: string; readonly changes?: number;
+    readonly commits: readonly { readonly sha: string; readonly date: string; readonly author: string; readonly subject: string }[];
+    readonly branches: readonly { readonly name: string; readonly date: string }[]; readonly remotes: readonly string[] };
+  readonly codeHost: { readonly repository?: string;
+    readonly pullRequests: readonly { readonly number: number; readonly title: string; readonly url: string; readonly updatedAt: number }[];
+    readonly issues: readonly { readonly number: number; readonly title: string; readonly url: string; readonly updatedAt: number }[];
+    readonly unavailable?: "not_supported" | "no_credential" | "unavailable" };
+}
+export interface PartnerWorkbenchView {
+  readonly owner: PartnerWorkbenchOwnerView;
+  readonly revision: bigint;
+  readonly projects: readonly { readonly path: string; readonly name: string; readonly addedAt: number; readonly exists: boolean }[];
+  readonly judgments: readonly PartnerWorkbenchJudgmentView[];
+  readonly projectOptions: readonly { readonly path: string; readonly name: string; readonly taskCount: number; readonly nativeCount: number; readonly automationCount: number; readonly repository: boolean; readonly granted: boolean }[];
+  readonly tasks: readonly PartnerWorkbenchTaskView[];
+  readonly candidates: readonly PartnerWorkbenchTaskView[];
+  readonly briefs: readonly PartnerWorkbenchProjectBriefView[];
+  readonly olderCount: number;
+  readonly truncated: boolean;
+  readonly unavailableSources: readonly string[];
+  readonly outputs: readonly PartnerWorkbenchArtifactView[];
+}
+export interface PartnerWorkbenchArtifactView { readonly id: string; readonly title: string; readonly mimeType: string; readonly byteSize: number; readonly sessionId: string }
+export interface PartnerWorkbenchDetailView {
+  readonly task: PartnerWorkbenchTaskView;
+  readonly transcript: readonly PartnerWorkbenchTextView[];
+  readonly truncated: boolean;
+  readonly artifacts: readonly PartnerWorkbenchArtifactView[];
 }
 
 export interface PartnerMutationView {
@@ -1281,6 +1370,8 @@ export interface SessionView {
   /** Present when supplied by a fresh Pi observation or a typed lifecycle event. */
   readonly compacting?: boolean;
   readonly activeRunId?: string;
+  /** Current Attempt identity from the same authenticated Run projection. */
+  readonly activeAttemptId?: string;
   /** Authoritative start time of the active Run; absent when no active Run exists. */
   readonly activeRunStartedAt?: number;
   readonly retryRunId?: string;
@@ -1397,6 +1488,8 @@ export interface TimelineItemView {
   /** Terminal outcome carried only by durable run-terminal timeline events. */
   readonly runTerminal?: "completed" | "aborted" | "failed";
   readonly sequence: bigint;
+  /** Global cursor of authoritative message completion, independent of sort position. */
+  readonly completionCursor?: bigint;
   readonly kind:
     | "user"
     | "assistant"
@@ -1409,6 +1502,7 @@ export interface TimelineItemView {
     | "error"
     | "compaction"
     | "contextRebuild"
+    | "runtimeHandoff"
     | "runtimeRecovery"
     | "objective"
     | "interaction"
@@ -1443,6 +1537,13 @@ export interface TimelineItemView {
   readonly usage?: TimelineMessageUsageView;
   /** Durable host-authored identity for a scheduler-injected user prompt. */
   readonly automationOrigin?: TimelineAutomationOriginView;
+  readonly partnerPrivateOrigin?: {
+    readonly messageId: string;
+    readonly threadId: string;
+    readonly senderPartnerId: string;
+    readonly recipientPartnerId: string;
+    readonly senderDisplayName: string;
+  };
   /** Typed accepted-input semantics; absent only for untyped imported history. */
   readonly inputDelivery?: DeliveryMode | "scheduler";
   /** Service-owned continuation prompt; hidden in favor of its recovery activity row. */
@@ -1467,6 +1568,7 @@ export interface TimelineItemView {
   readonly compaction?: TimelineCompactionView;
   /** Hidden same-Backend native-context replacement, rendered only as a system boundary. */
   readonly contextRebuild?: TimelineContextRebuildView;
+  readonly runtimeHandoff?: { readonly fromBackendId: string; readonly toBackendId: string; readonly modelId: string; readonly resumed: boolean };
   /** Durable interrupted-turn recovery lifecycle. */
   readonly runtimeRecovery?: TimelineRuntimeRecoveryView;
   /** Durable Objective lifecycle presentation; internal directives remain separate and hidden. */
@@ -1553,7 +1655,7 @@ export interface TimelineCompactionView {
 }
 
 export interface TimelineContextRebuildView {
-  readonly reason: "contextOverflow" | "promptTimeout";
+  readonly reason: "contextOverflow" | "promptTimeout" | "manualRestart";
   readonly handoff: string;
   readonly sourceRunId?: string;
   readonly replayScheduled: boolean;
@@ -6279,13 +6381,35 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   putMessagingRoute(draft: MessagingRouteDraftView, signal?: AbortSignal): Promise<MessagingRouteView>;
   getPartnerDirectory(signal?: AbortSignal): Promise<PartnerDirectoryView>;
   listPartners(lifecycle?: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerListView>;
+  partnerRoutineApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerRoutineApi;
+  partnerGroupApi(ownerKey: string): import("@joko/contracts").PartnerGroupApi;
+  uploadPartnerGroupFile(file: File, signal: AbortSignal): Promise<import("@joko/contracts").BlobRef>;
+  partnerMemoryApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerMemoryApi;
+  partnerConnectionsApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerConnectionsApi;
+  partnerImportApi(ownerKey: string): import("@joko/contracts").PartnerImportApi;
   getPartner(partnerId: string, signal?: AbortSignal): Promise<PartnerProfileView>;
-  createPartner(expectedDirectoryRevision: bigint, draft: PartnerDraftView, signal?: AbortSignal): Promise<PartnerMutationView>;
+  readPartnerWorkingStatus(partnerId: string, status: SessionWorkingStatus, locale: "en" | "zh-CN", signal?: AbortSignal): Promise<string | undefined>;
+  createPartner(expectedDirectoryRevision: bigint, draft: PartnerDraftView, requestId: string, signal?: AbortSignal): Promise<PartnerMutationView>;
+  getPartnerCreation(requestId: string, signal?: AbortSignal): Promise<PartnerMutationView>;
+  readPartnerAvatar(partnerId: string, expectedRevision: bigint, image: Exclude<PartnerAvatarView, string>, signal?: AbortSignal): Promise<string>;
+  retirePartnerCreation(requestId: string, signal?: AbortSignal): Promise<{ readonly directory: PartnerDirectoryView; readonly partner?: PartnerProfileView }>;
   updatePartner(partnerId: string, expectedRevision: bigint, patch: PartnerPatchView, signal?: AbortSignal): Promise<PartnerMutationView>;
   setPartnerLifecycle(partnerId: string, expectedRevision: bigint, lifecycle: PartnerLifecycleView, signal?: AbortSignal): Promise<PartnerMutationView>;
+  deletePartner(requestId: string, partnerId: string, expectedRevision: bigint, confirmName: string, signal?: AbortSignal): Promise<import("@joko/contracts").PartnerDeletionView>;
+  getPartnerDeletion(requestId: string, signal?: AbortSignal): Promise<import("@joko/contracts").PartnerDeletionResult>;
+  getPartnerRestartControls(partnerId: string, signal?: AbortSignal): Promise<{ readonly revision: bigint; readonly available: boolean }>;
+  restartPartner(requestId: string, partnerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").PartnerRestartView>;
+  getPartnerRestart(requestId: string, signal?: AbortSignal): Promise<import("@joko/contracts").PartnerRestartResult>;
+  retryPartnerRestart(requestId: string, signal?: AbortSignal): Promise<import("@joko/contracts").PartnerRestartView>;
+  retirePartnerRestart(requestId: string, signal?: AbortSignal): Promise<import("@joko/contracts").PartnerRestartResult>;
+  retirePartnerDeletion(requestId: string, signal?: AbortSignal): Promise<import("@joko/contracts").PartnerDeletionResult>;
+  retryPartnerDeletion(requestId: string, signal?: AbortSignal): Promise<import("@joko/contracts").PartnerDeletionView>;
   retryPartnerInitialization(partnerId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerMutationView>;
   updatePartnerDefaults(expectedDirectoryRevision: bigint, capabilities: PartnerCapabilitiesView, signal?: AbortSignal): Promise<PartnerDefaultsMutationView>;
   listPartnerSessions(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerSessionView[]>;
+  listPartnerSessionTasks(partnerId: string, signal?: AbortSignal): Promise<readonly import("@joko/contracts").PartnerSessionTaskView[]>;
+  controlPartnerSessionTask(partnerId: string, partnerRevision: bigint, task: import("@joko/contracts").PartnerSessionTaskView,
+    action: "pause" | "resume" | "cancel", signal?: AbortSignal): Promise<import("@joko/contracts").PartnerSessionTaskView>;
   markPartnerRead(partnerId: string, throughCursor: bigint, signal?: AbortSignal): Promise<PartnerActivityView>;
   listPartnerPrivateThreads(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerPrivateThreadView[]>;
   getPartnerPrivateThread(partnerId: string, threadId: string, signal?: AbortSignal): Promise<PartnerPrivateThreadDetailView>;
@@ -6293,6 +6417,13 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   listPartnerDelegations(partnerId: string, signal?: AbortSignal): Promise<readonly PartnerDelegationView[]>;
   getPartnerDelegation(partnerId: string, delegationId: string, signal?: AbortSignal): Promise<PartnerDelegationView>;
   cancelPartnerDelegation(partnerId: string, delegationId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<PartnerDelegationView>;
+  getPartnerWorkbench(partnerId: string, signal?: AbortSignal): Promise<PartnerWorkbenchView>;
+  addPartnerWorkbenchProject(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, path: string, signal?: AbortSignal): Promise<PartnerWorkbenchView & { readonly acceptedProject: string }>;
+  removePartnerWorkbenchProject(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, path: string, signal?: AbortSignal): Promise<PartnerWorkbenchView>;
+  setPartnerWorkbenchJudgment(owner: PartnerWorkbenchOwnerView, expectedRevision: bigint, judgment: Omit<PartnerWorkbenchJudgmentView, "updatedAt">, signal?: AbortSignal): Promise<PartnerWorkbenchView>;
+  getPartnerWorkbenchDetail(owner: PartnerWorkbenchOwnerView, taskId: string, signal?: AbortSignal): Promise<PartnerWorkbenchDetailView>;
+  resolvePartnerWorkbenchReference(owner: PartnerWorkbenchOwnerView, ref: string, signal?: AbortSignal): Promise<{ readonly kind: "https" | "file"; readonly value: string; readonly workspaceId?: string; readonly relativePath?: string; readonly directory: boolean }>;
+  readPartnerWorkbenchDocument(owner: PartnerWorkbenchOwnerView, path: string, signal?: AbortSignal): Promise<{ readonly path: string; readonly text: string; readonly truncated: boolean }>;
   listCollaborationGoals(sessionId: string, includeArchived?: boolean, signal?: AbortSignal): Promise<readonly CollaborationGoalView[]>;
   getCollaborationGoal(goalId: string, viewerSessionId: string, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;
   createCollaborationGoal(leadSessionId: string, expectedSessionGeneration: bigint, title: string, objective: string, maximumWorkers?: number, signal?: AbortSignal): Promise<CollaborationGoalTreeView>;

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vitest";
 import { scanCodexSessionCatalog } from "./session-catalog.js";
+import { readCodexNativeSessionPreview } from "./native-session-preview.js";
 
 const roots: string[] = [];
 
@@ -13,6 +14,21 @@ afterEach(async () => {
 });
 
 describe("Codex local task catalog", () => {
+  test("reads only bounded native messages from the exact scanned source without materialization", async () => {
+    const profile = await profileFixture();
+    const id = randomUUID();
+    const records = [metadata({ id, cwd: "C:\\repo", thread_source: "user", timestamp: 1 }),
+      JSON.stringify({ type: "response_item", timestamp: "2026-10-09T00:00:00Z", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Project purpose" }] } }),
+      JSON.stringify({ type: "response_item", payload: { type: "function_call", role: "assistant", content: "Internal tool" } }),
+      JSON.stringify({ type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Current result" }, { type: "reasoning", text: "Private reasoning" }] } })];
+    await writeRollout(profile, "sessions", id, records.join("\n"), 10);
+    const scanned = await scanCodexSessionCatalog({ profileDirectories: [profile] });
+    const source = scanned.summaries.find((item) => item.nativeSessionId === id)!.source;
+    expect((await readCodexNativeSessionPreview(source, id)).messages.map((item) => item.text)).toEqual(["Project purpose", "Current result"]);
+    await writeRollout(profile, "sessions", id, records.join("\n") + "\n{}", 11);
+    await expect(readCodexNativeSessionPreview(source, id)).rejects.toThrow();
+  });
+
   test("merges bounded state and rollout metadata without reopening database-known history", async () => {
     const profile = await profileFixture();
     const ids = {

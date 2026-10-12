@@ -210,6 +210,8 @@ export interface BridgeToolProvider {
   readonly id: string;
   readonly generation: number;
   readonly available: boolean;
+  /** The existing management facade is meaningful only in the canonical Partner task. */
+  readonly canonicalPartnerOnly?: boolean;
   /** Capability-neutral subject applied to this Provider's full Tool snapshot. */
   readonly policySubject?: PolicySubjectKind;
   /** Provider-owned declaration for ordinary user/project availability policy. */
@@ -218,6 +220,9 @@ export interface BridgeToolProvider {
   readonly includeInSnapshot?: boolean;
   /** Optional product-scope gate sampled only when one new Target runtime is frozen. */
   includeForTarget?(targetId: string): boolean;
+  /** Private Session-scoped resources may resolve to a Partner Home while work runs elsewhere. */
+  includeForSession?(sessionId: string, targetId: string): boolean;
+  toolsForSession?(sessionId: string): readonly McpToolDescriptor[];
   readonly tools: readonly McpToolDescriptor[];
   callTool(
     name: string,
@@ -386,6 +391,12 @@ export interface McpRouterOptions {
   readonly nativeAuthRecovery?: NativeAuthRecoveryPort;
   readonly trustedManagedRunnerScriptSha256?: string;
   readonly toolDiscoveryPolicy?: Partial<McpToolDiscoveryPolicy>;
+  /** Private product selections affect only a newly frozen Target runtime. */
+  readonly targetReferences?: (targetId: string, sessionId?: string) => {
+    readonly mcpIds?: ReadonlySet<string>;
+    readonly toolsetIds?: ReadonlySet<string>;
+  } | undefined;
+  readonly isGroupSession?: (sessionId: string) => boolean;
 }
 
 /**
@@ -519,11 +530,15 @@ export class McpRouter {
   readonly #nativeAuthProviderRoutes = new Map<string, NativeAuthProviderRouteState>();
   readonly #remoteAttestationNonces = new Map<string, number>();
   readonly #bridgeToolProviders = new Map<string, BridgeToolProvider>();
+  readonly #targetReferences: McpRouterOptions["targetReferences"];
+  readonly #isGroupSession: McpRouterOptions["isGroupSession"];
   #lastGeneration = 0;
   #initialized = false;
   #tail: Promise<void> = Promise.resolve();
 
   constructor(options: McpRouterOptions) {
+    this.#targetReferences = options.targetReferences;
+    this.#isGroupSession = options.isGroupSession;
     this.#store = options.store;
     this.#credentials = options.credentials;
     this.#resultArtifacts = options.resultArtifacts;
@@ -654,6 +669,22 @@ export class McpRouter {
     }
     return [...declarations.values()].sort((left, right) =>
       left.displayName.localeCompare(right.displayName, "en") || left.id.localeCompare(right.id, "en"));
+  }
+
+  /** Only optional Provider declarations are selectable; essential infrastructure has no entry. */
+  toolsetCatalog(): readonly { readonly id: string; readonly name: string; readonly available: boolean; readonly revision: string }[] {
+    this.#assertInitialized();
+    const entries = new Map<string, { id: string; name: string; available: boolean; providers: Array<{ id: string; generation: number; available: boolean; included: boolean }> }>();
+    for (const provider of this.#bridgeToolProviders.values()) {
+      const policy = provider.configurablePolicy; if (!policy) continue;
+      const previous = entries.get(policy.id);
+      entries.set(policy.id, { id: policy.id, name: previous?.name ?? policy.displayName,
+        available: (previous?.available ?? false) || provider.available && provider.includeInSnapshot !== false,
+        providers: [...previous?.providers ?? [], { id: provider.id, generation: provider.generation, available: provider.available, included: provider.includeInSnapshot !== false }] });
+    }
+    return [...entries.values()].map(({ providers, ...entry }) => ({ ...entry,
+      revision: createHash("sha256").update(JSON.stringify(providers.sort((a, b) => a.id.localeCompare(b.id, "en")))).digest("hex")
+    })).sort((a, b) => a.id.localeCompare(b.id, "en"));
   }
 
   async upsert(input: McpServerInput, expectedVersion?: bigint): Promise<McpServerDescriptor> {
@@ -820,10 +851,12 @@ export class McpRouter {
       };
     }
     const serverGenerations = new Map<string, number>();
+    const references = input.targetId === undefined ? undefined : this.#targetReferences?.(input.targetId, input.sessionId);
     const tools: PiMcpToolDescriptor[] = [];
     const audioResultMappings = new Map<string, McpAudioResultMapping>();
     for (const server of this.#servers.values()) {
       if (!server.input.enabled) continue;
+      if (references?.mcpIds !== undefined && !references.mcpIds.has(server.input.id)) continue;
       const runtime = this.#runtime(server.input.id, server.generation);
       if (runtime === undefined || runtime.state !== "connected") continue;
       serverGenerations.set(server.input.id, server.generation);
@@ -850,18 +883,22 @@ export class McpRouter {
     }
     for (const provider of this.#bridgeToolProviders.values()) {
       if (!provider.available || provider.includeInSnapshot === false) continue;
+      if (provider.canonicalPartnerOnly === true && input.sessionId !== undefined && this.#isGroupSession?.(input.sessionId) === true) continue;
       if (provider.configurablePolicy !== undefined) {
-        const enabled = input.includeToolPolicy?.(provider.configurablePolicy.id)
-          ?? provider.configurablePolicy.productDefaultEnabled;
+        const enabled = references?.toolsetIds === undefined
+          ? input.includeToolPolicy?.(provider.configurablePolicy.id) ?? provider.configurablePolicy.productDefaultEnabled
+          : references.toolsetIds.has(provider.configurablePolicy.id);
         if (!enabled) continue;
       }
-      if (provider.includeForTarget !== undefined
+      if (provider.includeForSession !== undefined && input.sessionId !== undefined && input.targetId !== undefined) {
+        if (!provider.includeForSession(input.sessionId, input.targetId)) continue;
+      } else if (provider.includeForTarget !== undefined
         && (input.targetId === undefined || !provider.includeForTarget(input.targetId))) continue;
       if (!Number.isSafeInteger(provider.generation) || provider.generation < 1) {
         throw new Error("Bridge Tool Provider generation is invalid.");
       }
       serverGenerations.set(provider.id, provider.generation);
-      for (const tool of provider.tools) {
+      for (const tool of input.sessionId === undefined ? provider.tools : provider.toolsForSession?.(input.sessionId) ?? provider.tools) {
         tools.push({
           serverId: tool.serverId,
           name: tool.name,

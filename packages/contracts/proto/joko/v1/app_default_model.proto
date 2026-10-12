@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+package joko.v1;
+
+message AppDefaultModelRoute {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+  string effort = 4;
+  bool fast_mode = 5;
+}
+
+// A live renderer owns the preference; Orchestrator keeps only its mirror.
+message WatchAppDefaultModelRequest { string ui_owner_id = 1; }
+message WatchAppDefaultModelResponse { bool ready = 1; string request_id = 2; }
+message SyncAppDefaultModelRequest {
+  string ui_owner_id = 1;
+  AppDefaultModelRoute current = 2;
+  repeated string hidden_route_ids = 3;
+  repeated AppDefaultModelRoute tuning = 4;
+  string confirmed_request_id = 5;
+  repeated string visible_route_ids = 6;
+}
+message SyncAppDefaultModelResponse { bool accepted = 1; }
+message ClaimAppDefaultModelRequest { string ui_owner_id = 1; string request_id = 2; }
+message ClaimAppDefaultModelResponse {
+  uint32 remaining_ms = 1;
+  AppDefaultModelRoute expected = 2;
+  AppDefaultModelRoute requested = 3;
+}

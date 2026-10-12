@@ -35,6 +35,11 @@ describe("mobile notification public intent", () => {
     expect(parseMobileNotificationResponseIntent(response({ data: { intent: "joko://task/session-1" } }))).toBeUndefined();
     expect(parseMobileNotificationResponseIntent(response({ intent: 1 }))).toBeUndefined();
   });
+  it("accepts only a portable group notification and keeps profile selection outside its payload", () => {
+    const intent = "joko://partner-group/group-one"; expect(parseMobileNotificationResponseIntent(response({ intent }))).toBe(intent);
+    expect(parseMobileNotificationResponseIntent(response({ intent: `${intent}?profile=another-node` }))).toBeUndefined();
+    expect(parseMobileNotificationResponseIntent(response({ intent: `${intent}?message=another-task` }))).toBeUndefined();
+  });
 
   it("uses a bounded native identifier and otherwise deduplicates by the validated intent", () => {
     const intent = "joko://task/session-1";

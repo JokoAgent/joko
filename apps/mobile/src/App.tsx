@@ -11,7 +11,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, SessionState, TargetState, capabilityNames,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, SessionState, TargetState, capabilityNames, partnerResumeMessages,
   type QueueItem, type Session
 } from "@joko/contracts";
 import { MobileSharedConnectionScreen } from "./MobileSharedConnectionScreen";
@@ -67,6 +67,10 @@ import {
   mobileLocalePreferences,
   mobilePushDeviceStore,
   mobileStorage,
+  mobilePlainStorage,
+  mobilePartnerCreationReceipts,
+  mobilePartnerDeletionReceipts,
+  mobilePartnerRestartReceipts,
   mobileThemePreferences,
   mobileFilesPreferences,
   mobileVoicePreferences,
@@ -286,6 +290,17 @@ import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
 import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
+import { MobilePartnerDirectoryScreen } from "./MobilePartnerDirectoryScreen";
+import { useMobilePartnerIdentity, useMobilePartnerRead } from "./use-mobile-partner-read";
+import { MobilePartnerAvatar, MobilePartnerAvatarProvider } from "./MobilePartnerAvatar";
+import { MobilePartnerConversationRow } from "./MobilePartnerConversationRow";
+import { MobilePartnerWorkingStatus } from "./MobilePartnerWorkingStatus";
+import { mobilePartnerWorkingStatus } from "./mobile-partner-working";
+import { mobilePartnerConversationRows, mobilePartnerTimeGroups, mobilePublicConversationInputs } from "./mobile-partner-presentation";
+import { useMobileHiddenHistory } from "./use-mobile-hidden-history";
+import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
+import { MobileConversationSearchSheet } from "./MobileConversationSearchSheet";
+import type { MobileConversationSearchHit } from "./mobile-conversation-search";
 import { MobilePartnerResourcesScreen } from "./MobilePartnerResourcesScreen";
 import { MobileExtensionsScreen } from "./MobileExtensionsScreen";
 import { MobileFilesToolbar } from "./MobileFilesToolbar";
@@ -335,7 +350,10 @@ const client = new MobileClient(
   mobileOfflineCache,
   mobileReadOnlyDictionaryCache,
   mobileFilesThumbnailCache,
-  () => mobileDeviceNameSource(Constants.deviceName, Platform.OS)
+  () => mobileDeviceNameSource(Constants.deviceName, Platform.OS),
+  mobilePartnerCreationReceipts,
+  mobilePartnerDeletionReceipts,
+  mobilePartnerRestartReceipts
 );
 const readOnlyDictionary = new MobileVoiceDictionaryReadOnlyController(mobileReadOnlyDictionaryCache,
   (profileId, signal) => client.voiceDictionaryReadOnlyTransport(profileId, signal));
@@ -365,7 +383,7 @@ const mobileUpdateActions: MobileUpdateActions = {
   onOpenUpdate: (target) => mobileUpdates.openUpdate(target),
   onRecheckForced: () => mobileUpdates.recheckForced()
 };
-type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "extensions" | "partner-resources" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
+type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "extensions" | "partner-directory" | "partner-resources" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
 
 interface MobileRemoteDesktopEntry {
   readonly ownerKey: string;
@@ -539,6 +557,7 @@ export function App() {
   const [nativeIntentRevision, setNativeIntentRevision] = useState(0);
   const [nativeIntentRecovery, setNativeIntentRecovery] = useState<MobileNativeIntentRecovery>();
   const [nativeIntentMessageFocus, setNativeIntentMessageFocus] = useState<MobileNativeIntentMessageFocus>();
+  const [nativeIntentGroupId, setNativeIntentGroupId] = useState<string>();
   const [deviceId, setDeviceId] = useState<string>();
   const [remoteDesktopEntry, setRemoteDesktopEntry] = useState<MobileRemoteDesktopEntry>();
   const [foreground, setForeground] = useState(AppState.currentState === "active");
@@ -711,6 +730,8 @@ export function App() {
         finally { nativeIntentConnectingRef.current = false; }
       },
       selectSession: (sessionId) => client.select(sessionId),
+      loadGroup: async groupId => { const api = client.partnerGroupApi(); if (!api) throw new Error("The group owner is unavailable."); await api.get(groupId, undefined, new AbortController().signal); },
+      showGroup: groupId => { setNativeIntentGroupId(groupId); setPage("partner-directory"); },
       loadAround: (eventId) => client.around(eventId),
       loadOlder: () => client.older(),
       returnLatest: () => client.latest(),
@@ -819,6 +840,7 @@ export function App() {
   const handleComposerFocused = useCallback(() => setFocusTaskComposer(false), []);
   return (
     <SafeAreaProvider>
+      <MobilePartnerAvatarProvider transport={client.partnerAvatarTransport()}>
       <View style={[styles.root, { backgroundColor: colors.background }]}>
         <StatusBar style={dark ? "light" : "dark"} />
         {updates.forced ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
@@ -893,6 +915,22 @@ export function App() {
                     setFocusTaskComposer(true);
                     setPage("task");
                   }} /> :
+                page === "partner-directory" ? <MobilePartnerDirectoryScreen colors={colors}
+                  locale={locale.effectiveLocale} transport={client.partnerDirectoryTransport()}
+                  observation={client.partnerDirectoryObservation()}
+                  workingTransport={client.partnerWorkingTransport()}
+                  initializationTransport={client.partnerInitializationTransport()}
+                  deletionTransport={client.partnerDeletionTransport()}
+                  restartTransport={client.partnerRestartTransport()}
+                  resumeFactory={partner => client.partnerResumeEditor(partner)}
+                  routineFactory={partnerId => client.partnerRoutineEditor(partnerId, mobilePlainStorage)}
+                  memoryFactory={partner => client.partnerMemoryEditor(partner)}
+                  creationTransport={client.partnerCreationTransport()}
+                  importFactory={() => client.partnerImportEditor(mobilePlainStorage)}
+                  groupApi={client.partnerGroupApi()} groupAttachments={client.partnerGroupAttachmentTransport()}
+                  groupCreationStorage={mobilePlainStorage} groupReceiptScope={client.partnerGroupReceiptScope()}
+                  initialGroupId={nativeIntentGroupId} onGroupOpened={() => setNativeIntentGroupId(undefined)}
+                  onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "partner-resources" ? <MobilePartnerResourcesScreen colors={colors}
                   locale={locale.effectiveLocale} transport={client.partnerResourceTransport()}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
@@ -967,7 +1005,8 @@ export function App() {
           onAutomations={() => queueHomeMenuAction(() => setPage("automations"))}
           onExtensions={() => queueHomeMenuAction(() => setPage("extensions"))}
           onPartnerResources={() => queueHomeMenuAction(() => setPage("partner-resources"))}
-          onPartners={() => queueHomeMenuAction(() => {
+          onPartners={() => queueHomeMenuAction(() => setPage("partner-directory"))}
+          onPartnerChats={() => queueHomeMenuAction(() => {
             setPartnerReturnPage("home");
             void client.openPartnerDirectory();
             setPage("partners");
@@ -979,6 +1018,7 @@ export function App() {
           actions={mobileUpdateActions} />
         </>}
       </View>
+      </MobilePartnerAvatarProvider>
     </SafeAreaProvider>
   );
 }
@@ -1351,9 +1391,9 @@ function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu, incomi
 
 type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
 
-function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onExtensions, onPartnerResources, onPartners, onSwitch, onSettings, onDevices }: ScreenProps & {
+function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onExtensions, onPartnerResources, onPartners, onPartnerChats, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
-  onSearch: () => void; onAutomations: () => void; onExtensions: () => void; onPartnerResources: () => void; onPartners: () => void;
+  onSearch: () => void; onAutomations: () => void; onExtensions: () => void; onPartnerResources: () => void; onPartners: () => void; onPartnerChats: () => void;
   onSwitch: () => void; onSettings: () => void; onDevices: () => void;
 }) {
   const { width } = useWindowDimensions();
@@ -1381,8 +1421,10 @@ function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMounted
           description={mobileMessage(locale, "extension.menuDescription")} onPress={onExtensions} colors={colors} />
         <MenuRow label={mobileMessage(locale, "partnerResource.title")}
           description={mobileMessage(locale, "partnerResource.menuDescription")} onPress={onPartnerResources} colors={colors} />
+        <MenuRow label={mobileMessage(locale, "partnerDirectory.title")}
+          description={mobileMessage(locale, "partnerDirectory.menuDescription")} onPress={onPartners} colors={colors} />
         <MenuRow label={mobileMessage(locale, "partner.title")}
-          description={mobileMessage(locale, "partner.menuDescription")} onPress={onPartners} colors={colors} />
+          description={mobileMessage(locale, "partner.menuDescription")} onPress={onPartnerChats} colors={colors} />
         <MenuRow label={mobileMessage(locale, "home.menu.switch")} description={mobileMessage(locale, "home.menu.switchDescription")}
           onPress={onSwitch} colors={colors} />
         <MenuRow label={mobileMessage(locale, "common.devices")} description={mobileMessage(locale, "home.menu.devicesDescription")}
@@ -3122,6 +3164,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const [selectedInteractionId, setSelectedInteractionId] = useState<string | undefined>(initialInteractions[0]?.interactionId);
   const [interactionVisible, setInteractionVisible] = useState(initialInteractions.length > 0);
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
+  const [partnerSettingsOwner, setPartnerSettingsOwner] = useState<string>();
   const [taskTagsVisible, setTaskTagsVisible] = useState(false);
   const [contextVisible, setContextVisible] = useState(false);
   const [nativeTreeVisible, setNativeTreeVisible] = useState(false);
@@ -3147,6 +3190,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const [fileShareProgress, setFileShareProgress] = useState<MobileFileShareProgress>();
   const [timelinePreviewSource, setTimelinePreviewSource] = useState<MobileTimelineArtifact>();
   const [messageFocusHighlight, setMessageFocusHighlight] = useState<string>();
+  const [searchOwner, setSearchOwner] = useState<string>();
+  const [searchFocus, setSearchFocus] = useState<MobileConversationSearchHit & { readonly scope: string }>();
+  const searchFocusRef = useRef(searchFocus); searchFocusRef.current = searchFocus;
+  const searchFooterRef = useRef({ scope: "", y: undefined as number | undefined, items: new Map<string, number>() });
+  const searchOwnerRef = useRef({ scope: "", open: false });
+  const searchScrollRef = useRef<{ readonly scope: string; readonly index: number; retried: boolean; timer?: ReturnType<typeof setTimeout> } | undefined>(undefined);
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
@@ -3166,14 +3215,22 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<MobileWorkItem<TimelineRow>>>(null);
   const timelineViewportRef = useRef<View>(null);
+  const partnerConversationTransport = client.partnerConversationTransport();
+  const partnerIdentity = useMobilePartnerIdentity(partnerConversationTransport);
+  const [visiblePartnerRows, setVisiblePartnerRows] = useState<{
+    readonly ownerKey?: string; readonly ids: ReadonlySet<string>;
+  }>({ ids: new Set() });
   const [imageViewportPulse, setImageViewportPulse] = useState(0);
   const [visibleImageRows, setVisibleImageRows] = useState<ReadonlySet<string>>(new Set());
   const imageViewability = useRef({ itemVisiblePercentThreshold: 1, minimumViewTime: 80 }).current;
-  const onImageRowsVisible = useRef(({ viewableItems }: { readonly viewableItems: readonly { readonly item: MobileWorkItem<TimelineRow>; readonly isViewable: boolean }[] }) => {
+  const onImageRowsVisible = useMemo(() => ({ viewableItems }: { readonly viewableItems: readonly { readonly item: MobileWorkItem<TimelineRow>; readonly isViewable: boolean }[] }) => {
     const rowIds = (item: MobileWorkItem<TimelineRow>): string[] => isWorkGroup(item) ? item.children.flatMap(rowIds) : [item.id];
     const next = new Set(viewableItems.filter((item) => item.isViewable).flatMap((item) => rowIds(item.item)));
     setVisibleImageRows((previous) => previous.size === next.size && [...next].every((id) => previous.has(id)) ? previous : next);
-  }).current;
+    setVisiblePartnerRows((previous) => previous.ownerKey === partnerConversationTransport?.ownerKey
+      && previous.ids.size === next.size && [...next].every((id) => previous.ids.has(id)) ? previous
+      : { ownerKey: partnerConversationTransport?.ownerKey, ids: next });
+  }, [partnerConversationTransport?.ownerKey]);
   const screenshotMessageViewsRef = useRef(new Map<string, View>());
   const messageFocusRetryRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const messageFocusRetryKeyRef = useRef<string | undefined>(undefined);
@@ -3319,11 +3376,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         state.selectedId ?? ""
       ), [observedRows, optimisticOwnerKey, ownerOptimisticRows, state.selectedId, state.status, state.window]);
   const rows = useMemo(() => {
-    const rawRows = messageRows.flatMap((row) => {
+    const rawRows = mobilePublicConversationInputs(messageRows, partnerIdentity.partner?.partnerId).flatMap((row) => {
       const attached = delegatedAffinity.byEventId.get(row.eventId);
       if (delegatedAffinity.suppressedMetadataEventIds.has(row.eventId) && !attached?.length) return [];
       const persistentTask = attached?.some((entry) => ["queued", "running", "waiting"].includes(projectMobileDelegated(entry).state));
-      return [persistentTask ? { ...row, persistentTask: true } : row];
+      return [persistentTask || attached?.length ? { ...row, ...(persistentTask ? { persistentTask: true } : {}),
+        partnerDelivery: true } : row];
     });
     const sourceRows = new Map(rawRows.map((row) => [row.id, row]));
     const planRows = inlinePlans.cards.map((plan): TimelineRow => {
@@ -3335,9 +3393,65 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         ...(source?.runScope === undefined ? {} : { runScope: source.runScope }) };
     });
     return [...rawRows, ...planRows];
-  }, [delegatedAffinity, inlinePlans, locale, messageRows]);
-  const displayRows = useMemo(() => mobileWorkItems(rows, actualSessionStreaming && state.window === undefined),
+  }, [delegatedAffinity, inlinePlans, locale, messageRows, partnerIdentity.partner?.partnerId]);
+  const workRows = useMemo(() => mobileWorkItems(rows, actualSessionStreaming && state.window === undefined),
     [actualSessionStreaming, rows, state.window]);
+  const partnerWorking = state.status === "connected" && session !== undefined
+    && [SessionState.RUNNING, SessionState.WAITING, SessionState.RECOVERING].includes(session.state);
+  const partnerRows = useMemo(() => partnerIdentity.partner
+    ? mobilePartnerConversationRows(workRows, partnerWorking && state.window === undefined, partnerIdentity.partner.partnerId)
+    : undefined, [partnerWorking, partnerIdentity.partner?.partnerId, state.window, workRows]);
+  const displayRows = !partnerIdentity.ready ? [] : partnerRows ?? workRows;
+  const searchScope = JSON.stringify([blockOwnerKey, partnerConversationTransport?.ownerKey ?? "", state.status]);
+  const searchVisible = searchOwner === searchScope;
+  searchOwnerRef.current = { scope: searchScope, open: searchVisible };
+  if (searchFooterRef.current.scope !== searchScope) searchFooterRef.current = { scope: searchScope, y: undefined, items: new Map() };
+  const scrollSearchFooter = (): boolean => {
+    const focus = searchFocusRef.current, footer = searchFooterRef.current;
+    if (!searchOwnerRef.current.open || searchOwnerRef.current.scope !== searchScope || focus?.scope !== searchScope || footer.scope !== searchScope) return false;
+    const y = footer.items.get(focus.itemKey);
+    if (footer.y === undefined || y === undefined) return false;
+    timelineListRef.current?.scrollToOffset({ offset: Math.max(0, footer.y + y - 20), animated: false }); return true;
+  };
+  const openConversationSearch = (): void => {
+    if (!partnerIdentity.ready || !state.detail || AppState.currentState !== "active") return;
+    Keyboard.dismiss(); setMessageFocusHighlight(undefined); setSearchOwner(searchScope);
+  };
+  const focusSearchHit = (hit: MobileConversationSearchHit): void => {
+    if (!searchOwnerRef.current.open || searchOwnerRef.current.scope !== searchScope) return;
+    for (const key of mobileWorkExpansionKeys(displayRows, (row) => row.id === hit.sourceKey)) mobileExpandedBlockStore.setExpanded(blockOwnerKey, key, true);
+    const controls = client.taskDelegatedControls();
+    if (controls) {
+      const source = rows.find((row) => row.id === hit.sourceKey);
+      const attached = source === undefined ? [] : delegatedAffinity.byEventId.get(source.eventId) ?? [];
+      for (const entry of [...attached, ...delegatedAffinity.orphanEntries.filter((item) => item.key === hit.sourceKey)])
+        mobileExpandedBlockStore.setExpanded(controls.surfaceOwnerKey, entry.key, true);
+    }
+    setSearchFocus({ ...hit, scope: searchScope });
+  };
+  const searchFocusIndex = searchFocus?.scope === searchScope ? displayRows.findIndex((item) => item.id === searchFocus.itemKey) : -1;
+  const searchFooterFocus = searchFocus?.scope === searchScope && delegatedAffinity.orphanEntries.some((entry) => searchFocus.itemKey === `delegated/${entry.key}`);
+  useEffect(() => {
+    if (!searchVisible || searchFocusIndex < 0 && !searchFooterFocus) return;
+    const flight = { scope: searchScope, index: searchFocusIndex, retried: false, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+    searchScrollRef.current = flight;
+    const frame = requestAnimationFrame(() => {
+      if (searchFooterFocus) { if (!scrollSearchFooter()) timelineListRef.current?.scrollToEnd({ animated: false }); }
+      else timelineListRef.current?.scrollToIndex({ index: flight.index, animated: false, viewPosition: 0.2 });
+    });
+    return () => { cancelAnimationFrame(frame); if (flight.timer !== undefined) clearTimeout(flight.timer); if (searchScrollRef.current === flight) searchScrollRef.current = undefined; };
+  }, [searchVisible, searchScope, searchFocusIndex, searchFocus?.sourceKey, searchFooterFocus]);
+  useEffect(() => { setSearchOwner(undefined); setSearchFocus(undefined); }, [searchScope]);
+  const partnerTimeGroups = useMemo(() => mobilePartnerTimeGroups(partnerRows ?? []), [partnerRows]);
+  const chasingHiddenHistory = useMobileHiddenHistory({ scope: `${partnerConversationTransport?.ownerKey ?? ""}\u001f${state.window === undefined ? "latest" : `window/${state.window.at(-1)?.eventId ?? ""}`}`,
+    enabled: partnerIdentity.ready && partnerRows !== undefined && state.status === "connected" && !state.busy
+      && !drawerMounted && !partnerSettingsOwner && !imageGallery.view,
+    visibleCount: displayRows.length, hasEarlier: !state.historyEnd, loading: state.historyBusy,
+    cursor: state.before ? `${state.before.generation}/${state.before.sequence}/${state.before.opaqueToken}` : undefined
+  }, async () => {
+    try { await client.older(); }
+    catch (error) { if (taskMountedRef.current) setLocalError(errorText(error)); throw error; }
+  });
   const activeOptimisticOperationIds = useMemo(() => new Set([
     ...state.pending.filter((item) => item.kind === "send" && item.sessionId === state.selectedId
       && item.state === "accepted").map((item) => item.operationId),
@@ -3485,7 +3599,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     || runtimeControls.canSetPermission || runtimeControls.canSetPlanMode);
   const queueMutationPending = state.pending.some((item) => item.sessionId === state.selectedId
     && ["queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder"].includes(item.kind));
-  const conversationShare = useMobileConversationShare({ client, rows, locale,
+  const conversationShare = useMobileConversationShare({ client, rows: partnerRows ?? rows, locale,
     onNativeActivityChange: (active) => { attachmentNativeActivityRef.current = active; } });
   const conversationShareColors = useMemo(() => ({ background: colors.background, surfaceElevated: colors.surface,
     textPrimary: colors.ink, textSecondary: colors.muted, textTertiary: colors.muted }), [colors]);
@@ -3768,7 +3882,34 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     setComposerSelection({ start: next.text.length, end: next.text.length });
     setDraftReady(true);
   }, [state.restoredComposerDraft]);
-  const composerOwnerReady = loadedDraftKey === draftIdentityKey && draftReady;
+  const partnerSettingsVisible = partnerSettingsOwner !== undefined && partnerSettingsOwner === partnerConversationTransport?.ownerKey;
+  const partnerRead = useMobilePartnerRead(partnerConversationTransport, partnerIdentity, state.window ?? taskTimelineEvents,
+    state.owner?.generation ?? 0n,
+    visiblePartnerRows.ownerKey === partnerConversationTransport?.ownerKey ? visiblePartnerRows.ids : new Set<string>(),
+    state.status === "connected" && !state.busy && !attachmentBusy && !fileShareBusy && !galleryOpening
+      && imageGallery.view === undefined && state.timelinePreview === undefined && queueEdit === undefined
+      && !conversationShare.busy && !conversationShare.active && !partnerSettingsVisible && !drawerOpen && !drawerMounted
+      && !messageActionsVisible && !taskActionsVisible && !interactionVisible && !contextVisible
+      && !cloneVisible && forkEventId === undefined && rewindEventId === undefined && !nativeTreeVisible
+      && !runtimeControlsVisible && !searchVisible && !sessionMentionsVisible && !workspaceMentionsVisible && !catalogMentionsVisible
+      && photoLibraryLease === undefined && imageEditorLease === undefined && quoteSelection === undefined
+      && commandHelpItems === undefined && !runtimeCommandCommitting
+      && (session?.state === SessionState.IDLE || session?.state === SessionState.ERROR));
+  const partnerProfileTransport = client.partnerProfileTransport();
+  const partnerWorkingStatus = useMemo(() => {
+    const snapshot = state.detail ?? state.owner;
+    return !partnerConversationTransport || !partnerRead.ready || !snapshot ? undefined
+      : mobilePartnerWorkingStatus(partnerRead.partner, { ownerKey: partnerConversationTransport.ownerKey,
+        online: state.status === "connected", snapshot }, taskTimelineEvents);
+  }, [partnerConversationTransport?.ownerKey, partnerRead.partner, partnerRead.ready, state.detail, state.owner,
+    state.status, taskTimelineEvents]);
+  const openRuntimeControls = (): void => {
+    if (!partnerRead.ready) return;
+    if (partnerRead.partner && partnerProfileTransport) setPartnerSettingsOwner(partnerConversationTransport!.ownerKey);
+    else if (!partnerRead.partner) setRuntimeControlsVisible(true);
+  };
+  const composerOwnerReady = loadedDraftKey === draftIdentityKey && draftReady && partnerRead.ready
+    && partnerRead.partner?.lifecycle !== "paused" && !partnerSettingsVisible && !searchVisible;
   useEffect(() => {
     if (!composerOwnerReady || !focusComposer) return;
     const timer = setTimeout(() => {
@@ -3907,7 +4048,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     : [];
   useMobileScreenshotSelection({ owner: client.conversationShareOwnerKey(), selectionActive: conversationShare.active,
     blocked: conversationShareDisabled || drawerOpen || messageActionsVisible || taskActionsVisible || interactionVisible || contextVisible
-      || cloneVisible || forkEventId !== undefined || rewindEventId !== undefined || nativeTreeVisible || runtimeControlsVisible || sessionMentionsVisible || workspaceMentionsVisible || catalogMentionsVisible
+      || cloneVisible || forkEventId !== undefined || rewindEventId !== undefined || nativeTreeVisible || runtimeControlsVisible || searchVisible || sessionMentionsVisible || workspaceMentionsVisible || catalogMentionsVisible
       || photoLibraryLease !== undefined || imageEditorLease !== undefined || quoteSelection !== undefined
       || commandHelpItems !== undefined || runtimeCommandCommitting,
     visible: (signal) => {
@@ -5330,14 +5471,16 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
             if (view && mobileMessageShareable(item)) screenshotMessageViewsRef.current.set(item.id, view);
             else screenshotMessageViewsRef.current.delete(item.id);
           }}
-          style={[styles.message, linked && styles.messageFocused,
+          style={[styles.message, partnerIdentity.partner && item.kind === "assistant" && styles.partnerReply,
+            linked && styles.messageFocused,
             { backgroundColor: linked ? colors.brandBackground : colors.surface,
-              borderColor: linked ? colors.accent : colors.border }]}>
+              borderColor: linked ? colors.accent : colors.border },
+            partnerIdentity.partner && item.kind === "assistant" && !linked && { backgroundColor: "transparent" }]}>
         {linked && <Text style={[styles.caption, { color: colors.accent }]}>
           {mobileMessage(locale, "intent.linkedMessage", { label: item.label })}
         </Text>}
-        {!delegatedOnly && <View style={styles.statusTitle}>
-          <Text style={[styles.caption, { color: colors.muted }]}>{item.label}{item.optimistic
+        {!delegatedOnly && (!partnerIdentity.partner || item.kind !== "user" && item.kind !== "assistant" || item.optimistic) && <View style={styles.statusTitle}>
+          <Text style={[styles.caption, { color: colors.muted }]}>{item.runtimeHandoff ? handoffMessages(locale).changed : item.label}{item.runtimeHandoff?.resumed ? ` · ${handoffMessages(locale).resumed}` : ""}{item.optimistic
             ? ` · ${mobileMessage(locale, "common.sending")}` : ""}</Text>
           {item.optimistic && <ActivityIndicator size="small" color={colors.accent} />}
           {conversationShare.active && mobileMessageShareable(item) && <Pressable accessibilityRole="checkbox"
@@ -5349,6 +5492,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           </Pressable>}
         </View>}
         <View pointerEvents={conversationShare.active ? "none" : "auto"}>
+        {partnerIdentity.partner && item.partnerPrivateOrigin && item.kind === "assistant" && <Text style={[styles.caption, { color: colors.muted }]}>
+          {mobileMessage(locale, "partnerConversation.privateReply")}
+        </Text>}
         {delegatedOnly ? undefined : item.messageParts ? item.messageParts.map((part) => {
           if (part.kind === "thinking") return <MobileThinkingCard key={part.thinking.key} thinking={part.thinking}
             ownerKey={blockOwnerKey} colors={colors} locale={locale} enabled={state.status === "connected" || state.status === "offline"}
@@ -5367,7 +5513,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
-          : <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{item.text}</Text>}
+          : <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{partnerIdentity.partner && item.runStopped
+            ? mobileMessage(locale, "partnerConversation.stopped") : item.text}</Text>}
         {delegatedCards.map(renderDelegatedCard)}
         {item.partnerPrivatePreview && <Pressable accessibilityRole="button"
           accessibilityLabel={`${mobileMessage(locale, "partner.openThread")} · ${item.partnerPrivatePreview.targetName}`}
@@ -5419,7 +5566,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       behavior={Platform.OS === "android" ? "height" : undefined}
       accessibilityElementsHidden={drawerMounted} importantForAccessibility={drawerMounted ? "no-hide-descendants" : "auto"}>
     <MobileTaskHeader key={`${state.activeProfileId}/${state.selectedId}/${session?.backendId}/${session?.targetId}/${session?.nativeBinding?.runtimeGeneration}`}
-      title={session?.displayName || mobileMessage(locale, "task.titleFallback")}
+      title={partnerRead.partner?.displayName ?? (partnerRead.ready ? session?.displayName || mobileMessage(locale, "task.titleFallback")
+        : mobileMessage(locale, "task.loading"))}
+      identity={partnerRead.partner ? { mark: <MobilePartnerAvatar preset={partnerRead.partner.avatar} partner={partnerRead.partner} colors={colors} size={32} />,
+        label: partnerRead.partner.displayName, settingsLabel: mobileMessage(locale, "partnerProfile.open", { name: partnerRead.partner.displayName }),
+        disabled: !partnerProfileTransport || state.busy || attachmentBusy || voice.busy,
+        onOpen: openRuntimeControls } : undefined}
       titleAccessory={<MobileTaskTagDots tags={session?.taskTags} locale={locale} dark={colors.dark} />}
       subtitle={session ? sessionState(session.state, locale) : mobileMessage(locale, "task.loading")}
       navigationRef={drawerMenuRef} drawerNavigation={wideNavigation.enabled}
@@ -5429,6 +5581,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         ? () => { pendingDrawerActionRef.current = undefined; setDrawerOpen(true); } : onBack}
       disabled={session === undefined} colors={colors} locale={locale} onMenuVisibilityChange={setTaskActionsVisible}
       actions={[
+        { id: "search", label: mobileMessage(locale, "conversationSearch.title"), onPress: openConversationSearch,
+          disabled: !partnerIdentity.ready || state.detail === undefined || state.busy || attachmentBusy || voice.busy },
         ...(state.owner?.taskTagCatalog?.taskTags ?? []).slice(0, 7).map((tag) => ({
           id: `tag:${tag.taskTagId}` as const,
           label: `${session?.taskTags.some((candidate) => candidate.taskTagId === tag.taskTagId) === true ? "✓ " : ""}${mobileTaskTagName(tag, locale)}`,
@@ -5451,9 +5605,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         { id: "context", label: contextControls?.usage ? mobileMessage(locale, "task.contextPercent", { percent: contextControls.usage.percent }) : mobileMessage(locale, "task.context"),
           onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setRuntimeControlsVisible(false); setContextVisible(true); },
           disabled: state.status !== "connected" || contextControls === undefined || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
-        { id: "controls", label: mobileMessage(locale, "task.controls"),
-          onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); setRuntimeControlsVisible(true); },
-          disabled: state.status !== "connected" || !runtimeControlsAvailable || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
+        { id: "controls", label: mobileMessage(locale, partnerRead.partner ? "partnerProfile.title" : "task.controls"),
+          onPress: () => { setSessionMentionsVisible(false); setWorkspaceMentionsVisible(false); setCatalogMentionsVisible(false); setNativeTreeVisible(false); setContextVisible(false); openRuntimeControls(); },
+          disabled: state.status !== "connected" || !partnerRead.ready || (partnerRead.partner ? !partnerProfileTransport : !runtimeControlsAvailable)
+            || state.busy || attachmentBusy || voice.busy || interactions.length > 0 },
         ...(remoteDesktopDeviceId ? [{ id: "remote-desktop" as const, label: mobileRemoteDesktopCopy(locale).title,
           onPress: () => onRemoteDesktop(remoteDesktopDeviceId),
           disabled: state.status !== "connected" || state.busy || attachmentBusy || voice.busy }] : []),
@@ -5472,17 +5627,32 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     {state.status === "offline" && state.offlineSnapshotAt !== undefined
       && <MobileOfflineNotice cachedAt={state.offlineSnapshotAt} locale={locale} colors={colors} />}
     {state.error && <Banner text={state.error} colors={colors} />}
+    {partnerRead.failed && <View accessibilityLiveRegion="polite" style={styles.connectionNotice}>
+      <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileMessage(locale, "partnerDirectory.readFailed")}</Text>
+      <Action label={mobileMessage(locale, "common.retry")} colors={colors} onPress={partnerRead.retry} />
+    </View>}
     {fileShareBusy && <View accessibilityLiveRegion="polite" style={[styles.connectionNotice, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       <ActivityIndicator color={colors.accent} />
       <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{formatMobileFileShareProgress(fileShareProgress, locale)}</Text>
     </View>}
     {conversationShare.notice && <Banner text={conversationShare.notice} colors={colors} />}
     <View ref={timelineViewportRef} collapsable={false} style={styles.fill} onLayout={() => setImageViewportPulse((value) => value + 1)}>
-    <FlatList key={draftIdentityKey} ref={timelineListRef} data={displayRows}
-      extraData={{ selection: conversationShare.selectedIds, visibleImageRows, imageViewportPulse }} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
+    <FlatList key={`${draftIdentityKey ?? ""}\u001f${partnerConversationTransport?.ownerKey ?? ""}`} ref={timelineListRef} data={displayRows}
+      extraData={{ selection: conversationShare.selectedIds, visibleImageRows, imageViewportPulse, searchFocus }} keyExtractor={(row) => row.id} style={styles.fill} contentContainerStyle={styles.list}
       viewabilityConfig={imageViewability} onViewableItemsChanged={onImageRowsVisible}
       scrollEventThrottle={100} onScroll={() => setImageViewportPulse((value) => value + 1)}
       onScrollToIndexFailed={({ averageItemLength, index }) => {
+        const search = searchScrollRef.current;
+        if (search && searchOwnerRef.current.open && searchOwnerRef.current.scope === search.scope && search.index === index) {
+          if (search.retried) return;
+          search.retried = true;
+          timelineListRef.current?.scrollToOffset({ offset: Math.max(0, averageItemLength * index), animated: false });
+          search.timer = setTimeout(() => {
+            if (taskMountedRef.current && searchScrollRef.current === search && searchOwnerRef.current.open && searchOwnerRef.current.scope === search.scope)
+              timelineListRef.current?.scrollToIndex({ index, animated: false, viewPosition: 0.2 });
+          }, 80);
+          return;
+        }
         if (messageFocusHighlight === undefined || messageFocusKey !== messageFocusHighlight) return;
         if (messageFocusRetryKeyRef.current === messageFocusKey) return;
         messageFocusRetryKeyRef.current = messageFocusKey;
@@ -5505,10 +5675,13 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           onPress={() => void client.older().catch((error) => setLocalError(errorText(error)))} />}
         </View>
       </View>}
-      ListEmptyComponent={<Centered label={mobileMessage(locale, state.status === "offline"
-        ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
-      ListFooterComponent={delegatedControls ? <View style={styles.list} pointerEvents={conversationShare.active ? "none" : "auto"}>
-        {delegatedAffinity.orphanEntries.map(renderDelegatedCard)}
+      ListEmptyComponent={<Centered label={mobileMessage(locale, !partnerIdentity.ready ? "task.loading" : chasingHiddenHistory
+        ? "task.loadingHistory" : state.status === "offline" ? state.detail ? "task.offlineEmpty" : "task.offlineMissing" : "task.empty")} colors={colors} />}
+      ListFooterComponent={delegatedControls ? <View style={styles.list} pointerEvents={conversationShare.active ? "none" : "auto"}
+        onLayout={(event) => { if (searchOwnerRef.current.scope === searchScope) { searchFooterRef.current.y = event.nativeEvent.layout.y; scrollSearchFooter(); } }}>
+        {delegatedAffinity.orphanEntries.map((entry) => <View key={entry.key}
+          style={searchVisible && searchFocus?.scope === searchScope && searchFocus.sourceKey === entry.key ? { borderLeftWidth: 2, borderLeftColor: colors.accent } : undefined}
+          onLayout={(event) => { if (searchOwnerRef.current.scope === searchScope) { searchFooterRef.current.items.set(`delegated/${entry.key}`, event.nativeEvent.layout.y); scrollSearchFooter(); } }}>{renderDelegatedCard(entry)}</View>)}
         {delegated.phase === "loading" && <View accessibilityLiveRegion="polite" style={styles.connectionNotice}>
           <ActivityIndicator color={colors.muted} />
           <Text style={[styles.caption, styles.fill, { color: colors.muted }]}>{mobileDelegatedTaskMessage(locale, "loading")}</Text>
@@ -5520,7 +5693,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
           <Action label={mobileDelegatedTaskMessage(locale, "retry")} colors={colors} compact onPress={delegated.retry} />
         </View>}
       </View> : undefined}
-      renderItem={({ item }) => renderTimelineItem(item)} />
+      renderItem={({ item }) => <View style={searchVisible && searchFocus?.scope === searchScope && searchFocus.itemKey === item.id ? { borderLeftWidth: 2, borderLeftColor: colors.accent } : undefined}>{partnerIdentity.partner && !isWorkGroup(item) ? <MobilePartnerConversationRow row={item}
+        ownerKey={partnerConversationTransport!.ownerKey} preset={partnerIdentity.partner.avatar} partner={partnerIdentity.partner} timestamp={partnerTimeGroups.get(item.id)}
+        colors={colors} locale={locale} animate={state.status === "connected" && state.window === undefined && !state.historyBusy}>
+        {renderTimelineItem(item)}
+      </MobilePartnerConversationRow> : renderTimelineItem(item)}</View>} />
     </View>
     {queueItems.length > 0 && <View style={styles.queueRegion}>
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
@@ -5579,6 +5756,12 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       <Action label={mobileMessage(locale, "composer.cancelEdit")} colors={colors} compact disabled={state.status !== "connected" || state.busy}
         onPress={cancelQueueEdit} />
     </View>}
+    {partnerRead.partner?.lifecycle === "paused" && <Text accessibilityLiveRegion="polite" style={{ color: colors.muted }}>{partnerResumeMessages(locale).paused}</Text>}
+    {partnerRead.partner && partnerWorkingStatus && !conversationShare.active && interactions.length === 0
+      && <View style={[styles.partnerWorkingFrame, { backgroundColor: colors.surface }]}>
+        <MobilePartnerWorkingStatus key={partnerWorkingStatus.turnKey} status={partnerWorkingStatus} transport={client.partnerWorkingTransport()}
+          partner={partnerRead.partner} locale={locale} colors={colors} />
+      </View>}
     {conversationShare.active ? <MobileConversationShareBar count={conversationShare.selectedIds.length}
       allSelected={conversationShare.allSelected} busy={conversationShare.busy} locale={locale} colors={colors}
       screenshotTriggered={conversationShare.screenshotTriggered}
@@ -5594,6 +5777,11 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       <Action label={mobileMessage(locale, "task.openRequest")} colors={colors} compact disabled={interactionMutationPending}
         onPress={() => setInteractionVisible(true)} />
     </View> : <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+      {partnerRead.partner && <Action label={[partnerRead.partner.capabilities.modelChain[0]?.modelId,
+        mobileMessage(locale, partnerRead.partner.capabilities.permissionMode === "ask" ? "partnerProfile.ask" : "partnerProfile.auto"),
+        ...(partnerRead.partner.capabilities.planMode ? [mobileMessage(locale, "partnerProfile.plan")] : [])].filter(Boolean).join(" · ")}
+        colors={colors} compact disabled={!partnerProfileTransport || state.busy || attachmentBusy || voice.busy}
+        onPress={openRuntimeControls} />}
       <View accessible accessibilityRole="adjustable" accessibilityLabel={mobileMessage(locale, "composer.heightLabel")}
         accessibilityHint={mobileMessage(locale, "composer.heightHint")}
         accessibilityActions={[{ name: "increment", label: mobileMessage(locale, "composer.heightIncrease") },
@@ -5737,7 +5925,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
             draft={composerOwnerReady ? draft : emptyMobileComposerDraft()}
             editable={composerPasteEditable} height={composerHeight.visibleHeight} locale={locale}
             maxHeight={composerBounds.maximumHeight} ownerKey={`task\u001f${draftIdentityKey ?? "none"}`}
-            placeholder={mobileMessage(locale, composerOwnerReady ? "composer.placeholder" : "composer.restoring")}
+            placeholder={partnerRead.partner?.lifecycle === "paused" ? partnerResumeMessages(locale).paused : mobileMessage(locale, composerOwnerReady ? "composer.placeholder" : "composer.restoring")}
             selection={composerOwnerReady ? composerSelection : { start: 0, end: 0 }} theme={composerTheme}
             onEdit={(result, sourceDraft) => {
               const identity = draftIdentityRef.current;
@@ -5918,7 +6106,23 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         return completed;
       }}
       onError={setLocalError} />
-    <MobileRuntimeControlsSheet visible={runtimeControlsVisible && runtimeControls !== undefined} locale={locale}
+    <MobilePartnerProfileSheet visible={partnerSettingsVisible} partner={partnerRead.partner} transport={partnerProfileTransport}
+      routineFactory={(partnerId, ownerKey) => client.partnerRoutineEditor(partnerId, mobilePlainStorage, ownerKey)}
+      memoryFactory={(partner, ownerKey) => client.partnerMemoryEditor(partner, ownerKey)}
+      connectionsFactory={(partner, ownerKey) => client.partnerConnectionsEditor(partner, ownerKey)}
+      skillsFactory={(partner, ownerKey) => client.partnerSkillsEditor(partner, ownerKey)}
+      deletionTransport={client.partnerDeletionTransport()}
+      restartTransport={client.partnerRestartTransport()}
+      resumeFactory={partner => client.partnerResumeEditor(partner, partnerProfileTransport?.ownerKey)}
+      colors={colors} locale={locale} onClose={() => setPartnerSettingsOwner(undefined)} onSaved={() => partnerRead.retry()} onSearch={openConversationSearch} />
+    <MobileConversationSearchSheet key={searchScope} visible={searchVisible} rows={displayRows} colors={colors} locale={locale}
+      additional={delegatedControls && partnerIdentity.ready ? delegatedAffinity.orphanEntries.map((entry) => {
+        const card = projectMobileDelegated(entry); return { itemKey: `delegated/${entry.key}`, sourceKey: entry.key, text: [card.title, card.assignment, card.summary, card.statusText, card.error].filter(Boolean).join("\n") };
+      }) : undefined}
+      hasEarlier={!state.historyEnd} loadingEarlier={state.historyBusy} canLoadEarlier={state.status === "connected"}
+      onClose={() => { if (searchOwnerRef.current.scope === searchScope) setSearchOwner(undefined); }} onFocus={focusSearchHit}
+      onLoadEarlier={async () => { if (searchOwnerRef.current.scope === searchScope && searchOwnerRef.current.open) await client.older(); }} />
+    <MobileRuntimeControlsSheet visible={runtimeControlsVisible && runtimeControls !== undefined && partnerRead.ready && !partnerRead.partner} locale={locale}
       controls={runtimeControls} busy={state.busy || runtimeControlPending || modelFavoritePending || attachmentBusy} colors={colors}
       onClose={() => setRuntimeControlsVisible(false)}
       onSetModel={(authorityKey, selection) => client.setTaskModel(authorityKey, selection)}
@@ -7218,6 +7422,7 @@ const styles = StyleSheet.create({
   devices: { flexGrow: 0, maxHeight: 50 }, deviceList: { paddingHorizontal: 16, gap: 8 },
   deviceChip: { borderWidth: 1, borderRadius: 18, overflow: "hidden", paddingHorizontal: 12, paddingVertical: 8 },
   message: { borderWidth: 1, borderRadius: 14, padding: 14, gap: 6, marginBottom: 8 },
+  partnerReply: { borderWidth: 0, padding: 0, borderRadius: 0 },
   messageFocused: { borderWidth: 2 },
   messageImages: { gap: 8, paddingTop: 4 },
   messageImageTile: { minHeight: 58, borderWidth: 1, borderRadius: 12, paddingHorizontal: 12, paddingVertical: 8,
@@ -7236,6 +7441,7 @@ const styles = StyleSheet.create({
   interactionAwaiting: { minHeight: 68, borderTopWidth: 1, paddingHorizontal: 14, paddingVertical: 9, flexDirection: "row", alignItems: "center", gap: 12 },
   pendingReceipt: { gap: 4, paddingVertical: 4 },
   composer: { borderTopWidth: 1, paddingHorizontal: 12, paddingBottom: 8 },
+  partnerWorkingFrame: { paddingHorizontal: 12 },
   composerResizeHandle: { minHeight: 44, alignItems: "center", justifyContent: "center" },
   composerGrabber: { width: 88, height: 4, borderRadius: 2 },
   composerTools: { minHeight: 44, flexDirection: "row", alignItems: "center", gap: 8, paddingBottom: 6 },
@@ -7287,3 +7493,4 @@ const styles = StyleSheet.create({
   textPreviewContainer: { paddingHorizontal: 16, paddingBottom: 36 },
   textPreview: { fontSize: 13, lineHeight: 20, fontFamily: Platform.select({ ios: "Menlo", android: "monospace" }) }
 });
+import { sessionHandoffMessages as handoffMessages } from "@joko/contracts";

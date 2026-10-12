@@ -22,6 +22,21 @@ afterEach(async () => {
 });
 
 describe("mobile push Orchestrator boundary", () => {
+  it("persists and deduplicates settled group steps through the original worker with a group intent", async () => {
+    const fixture = await createFixture(), sends: MobilePushDeliveryInput[] = [];
+    const coordinator = new MobilePushCoordinator({ store: fixture.store, vault: fixture.vault, serverId: "server-1", now: () => 1_000,
+      provider: { send: async input => { sends.push(input); return { outcome: "delivered", code: "APNS_200" }; } } });
+    cleanups.push(() => coordinator.close());
+    coordinator.register({ connectionId: fixture.connection.id, deviceId: fixture.connection.deviceId, expectedDeviceRevision: fixture.deviceRevision,
+      environment: "apns_sandbox", locale: "zh-CN", deviceToken: "group-device-token", registrationId: "group-registration", revocationSecret: "g".repeat(43) });
+    const subject = { groupId: "group-one", groupTitle: "Project group", sourceSessionId: "session-1", subjectSequence: 1n, kind: "awaiting" as const };
+    coordinator.notifyGroupStep(subject); coordinator.notifyGroupStep(subject);
+    expect(fixture.store.listMobilePushDeliveries()).toHaveLength(1); expect(fixture.store.listMobilePushDeliveries()[0]?.status).toBe("pending");
+    coordinator.start(); await vi.waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]).toMatchObject({ intent: "joko://partner-group/group-one", title: "Project group", kind: "awaiting" });
+    expect(fixture.store.listMobilePushDeliveries()[0]).toMatchObject({ groupId: "group-one", groupTitle: "Project group", status: "delivered" });
+    const frozen = JSON.stringify(fixture.store.listEvents().map(event => event.payload)); expect(frozen).not.toContain("group-device-token");
+  });
   it("recovers idempotent registration and dispatches only a generic public task intent", async () => {
     const fixture = await createFixture();
     let now = 1_000;

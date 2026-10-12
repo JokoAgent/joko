@@ -29,7 +29,7 @@ export async function collectConversationMarkdown(
     if (!isCurrent()) throw new ConversationMarkdownError("stale");
     pages.push(page.items);
     for (const item of page.items) {
-      if (isInternalContinuationTimelineItem(item)) continue;
+      if (isInternalContinuationTimelineItem(item) || item.kind === "user" && item.partnerPrivateOrigin !== undefined) continue;
       if (item.kind === "user" || item.kind === "assistant") projectedLength += item.text?.length ?? 0;
     }
     if (projectedLength > MAX_MARKDOWN_LENGTH * 2) throw new ConversationMarkdownError("too-large");
@@ -46,7 +46,7 @@ export async function collectConversationMarkdown(
 
   const messages = new Map<string, TimelineItemView>();
   for (const page of pages.reverse()) for (const item of page) {
-    if (isInternalContinuationTimelineItem(item)) continue;
+    if (isInternalContinuationTimelineItem(item) || item.kind === "user" && item.partnerPrivateOrigin !== undefined) continue;
     if (item.kind !== "user" && item.kind !== "assistant") continue;
     const previous = messages.get(item.id);
     if (previous === undefined) { messages.set(item.id, item); continue; }

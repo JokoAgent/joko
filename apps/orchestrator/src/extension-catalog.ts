@@ -4,7 +4,7 @@ import type { RuntimeCommand, RuntimeToolDescriptor } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import type { CredentialKind, CredentialManager } from "./credential-manager.js";
-import type { ExtensionMainViewDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor, McpServerInput } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
@@ -83,6 +83,7 @@ export interface ExtensionCatalogDescriptor {
   readonly enabled: boolean;
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
+  readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
   readonly sidebarSupported: boolean;
   readonly sidebarVisible: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
@@ -157,6 +158,7 @@ interface ExtensionDefinition {
   readonly enabled: boolean;
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
+  readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
   readonly sidebarSupported: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
   readonly permissions: readonly Omit<ExtensionPermissionDescriptor, "granted">[];
@@ -655,6 +657,7 @@ export class ExtensionCatalogManager {
       enabled: definition.enabled,
       ...(definition.mainView === undefined ? {} : { mainView: { ...definition.mainView } }),
       ...(definition.library === undefined ? {} : { library: { ...definition.library } }),
+      ...(definition.routineEvents === undefined ? {} : { routineEvents: structuredClone(definition.routineEvents) }),
       sidebarSupported: definition.sidebarSupported,
       sidebarVisible: definition.sidebarSupported && record.sidebarVisible,
       tools,
@@ -875,6 +878,7 @@ function projectDefinitions(
         ...(detail.library === undefined || detail.entryPath === undefined ? {} : {
           library: { ...detail.library, extensionEntry: detail.entryPath }
         }),
+        ...(detail.routineEvents === undefined || detail.entryPath === undefined ? {} : { routineEvents: { ...detail.routineEvents, extensionEntry: detail.entryPath } }),
         sidebarSupported: detail.mainView !== undefined,
         tools: [],
         permissions,
@@ -887,6 +891,7 @@ function projectDefinitions(
           state: resource.state,
           enabled: resource.enabled,
           library: detail.library ?? null,
+          routineEvents: detail.routineEvents ?? null,
           recommendations: detail.recommendations ?? [],
           update: updateIdentity,
           error: resource.error

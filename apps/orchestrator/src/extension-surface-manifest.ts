@@ -26,6 +26,11 @@ export interface ExtensionLibraryDescriptor {
   readonly schemaVersion: 1;
 }
 
+export interface ExtensionRoutineEventsDescriptor {
+  readonly html: string;
+  readonly events: readonly { readonly type: string; readonly name: string; readonly fields: readonly string[] }[];
+}
+
 export type ExtensionRecommendationLocale = "en" | "zh-CN";
 
 export interface ExtensionRecommendationTranslation {
@@ -48,6 +53,7 @@ export interface ExtensionSurfaceBinding {
   readonly entry: string;
   readonly mainView?: ExtensionMainViewDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
+  readonly routineEvents?: ExtensionRoutineEventsDescriptor;
   readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
 }
 
@@ -99,14 +105,14 @@ export function parseExtensionSurfaceManifest(
   const result: ExtensionSurfaceBinding[] = [];
   for (const rawBinding of surfaces.extensions) {
     const binding = requirePlainObject(rawBinding, "Extension surface declaration");
-    requireExactKeys(binding, ["entry", "mainView", "library", "recommendations"], ["entry"], "Extension surface declaration");
+    requireExactKeys(binding, ["entry", "mainView", "library", "routineEvents", "recommendations"], ["entry"], "Extension surface declaration");
     const entry = requirePortablePath(binding.entry, "Extension surface entry");
     if (!EXTENSION_SUFFIXES.has(extname(entry).toLowerCase())) throw new Error("Extension surface entry has an unsupported file type.");
     if (!discoveredEntries.has(entry)) throw new Error("Extension surface entry does not exactly match a discovered Extension.");
     if (seenEntries.has(entry)) throw new Error("Extension surface entry is declared more than once.");
     seenEntries.add(entry);
 
-    if (binding.mainView === undefined && binding.library === undefined && binding.recommendations === undefined) {
+    if (binding.mainView === undefined && binding.library === undefined && binding.routineEvents === undefined && binding.recommendations === undefined) {
       throw new Error("Extension surface declaration must advertise at least one current capability.");
     }
     let mainView: ExtensionMainViewDescriptor | undefined;
@@ -136,14 +142,40 @@ export function parseExtensionSurfaceManifest(
     const recommendations = binding.recommendations === undefined
       ? undefined
       : validateExtensionRecommendations(binding.recommendations).items;
+    const routineEvents = binding.routineEvents === undefined ? undefined : parseExtensionRoutineEvents(binding.routineEvents);
+    if (routineEvents && !discoveredFiles.has(routineEvents.html)) throw new Error("Routine publisher HTML is not an inspected regular package file.");
     result.push({
       entry,
       ...(mainView === undefined ? {} : { mainView }),
       ...(library === undefined ? {} : { library }),
+      ...(routineEvents === undefined ? {} : { routineEvents }),
       ...(recommendations === undefined ? {} : { recommendations })
     });
   }
   return result;
+}
+
+/** Flat event declarations are adapted from the fixed publisher protocol. */
+export function parseExtensionRoutineEvents(value: unknown): ExtensionRoutineEventsDescriptor {
+  const raw = requirePlainObject(value, "Routine events");
+  requireExactKeys(raw, ["html", "events"], ["html", "events"], "Routine events");
+  const html = requirePortablePath(raw.html, "Routine publisher HTML");
+  if (extname(html) !== ".html" || posix.dirname(html) === ".") throw new Error("Routine publisher HTML must be in a self-contained directory.");
+  if (!Array.isArray(raw.events) || raw.events.length < 1 || raw.events.length > 32) throw new Error("Routine events must declare 1–32 event types.");
+  const token = (candidate: unknown): string => {
+    if (typeof candidate !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/u.test(candidate)) throw new Error("Routine event identifier is invalid.");
+    return candidate;
+  };
+  const events = raw.events.map(item => {
+    const event = requirePlainObject(item, "Routine event declaration");
+    requireExactKeys(event, ["type", "name", "fields"], ["type", "name", "fields"], "Routine event declaration");
+    if (typeof event.name !== "string" || !event.name.trim() || event.name.length > 200 || FORBIDDEN_TEXT.test(event.name)) throw new Error("Routine event name is invalid.");
+    if (!Array.isArray(event.fields) || event.fields.length > 32) throw new Error("Routine event fields are invalid.");
+    const fields = event.fields.map(token); if (new Set(fields).size !== fields.length) throw new Error("Routine event fields must be unique.");
+    return { type: token(event.type), name: event.name, fields };
+  });
+  if (new Set(events.map(event => event.type)).size !== events.length) throw new Error("Routine event types must be unique.");
+  return { html, events };
 }
 
 export function validateExtensionRecommendations(value: unknown):

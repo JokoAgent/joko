@@ -34,7 +34,7 @@ export interface MessageNavVisibleRange {
 export function deriveMessageNavEntries(items: readonly TimelineItemView[]): readonly MessageNavEntry[] {
   const entries: Array<{ id: string; preview: string; isAutomation?: boolean; attachmentsOnly?: number; answerExcerpt?: string }> = [];
   for (const item of items) {
-    if (isInternalContinuationTimelineItem(item)) continue;
+    if (isInternalContinuationTimelineItem(item) || item.partnerPrivateOrigin !== undefined) continue;
     if (item.kind === "user") {
       // Only service-authored prompt boundaries are navigable. Missing or
       // unknown delivery semantics cannot prove a standalone user turn.

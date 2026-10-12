@@ -23,6 +23,16 @@ afterEach(async () => {
 });
 
 describe("ScheduleHookScriptInstaller", () => {
+  it("rejects a retired caller after generation before installing or testing its script", async () => {
+    const workspace = await fixtureDirectory(); let current = true, complete!: (script: string) => void;
+    const installer = new ScheduleHookScriptInstaller({ generate: () => new Promise<string>(resolve => { complete = resolve; }) });
+    const installing = installer.install({ backendId: "backend-a", workspaceRoot: workspace, scheduleName: "Retired",
+      description: "Check current work", assertCurrent: () => { if (!current) throw new Error("Caller retired"); } });
+    await vi.waitFor(() => expect(complete).toBeTypeOf("function"));
+    current = false; complete("process.exit(0)");
+    await expect(installing).rejects.toThrow("Caller retired");
+    await expect(readFile(join(workspace, "scripts", "schedule-checks", "retired.mjs"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
   it("installs authored ESM in the workspace and self-tests the exit protocol", async () => {
     const workspace = await fixtureDirectory();
     const installer = new ScheduleHookScriptInstaller();
