@@ -15,6 +15,12 @@ export interface PiManagedModel {
   /** Joko-owned identity used to merge route-specific copies in settings. */
   readonly logicalId?: string;
   readonly name?: string;
+  /** Product metadata; never passed to the native model configuration. */
+  readonly description?: string;
+  readonly defaultEffort?: string;
+  readonly displayThinkingLevels?: readonly string[];
+  readonly referenceApi?: PiSupportedApi;
+  readonly declaredOutputModalities?: readonly string[];
   readonly api?: PiSupportedApi;
   readonly reasoning?: boolean;
   /** Explicit BYOM declaration; never inferred from an arbitrary endpoint. */
@@ -505,6 +511,15 @@ function validateProvider(provider: PiManagedProvider): void {
     if (model.api !== undefined && !["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"].includes(model.api)) {
       throw piError("PI_MODEL_INVALID_API", `Model '${provider.id}/${model.id}' has an invalid API type`, "provision");
     }
+    if (model.description !== undefined && (typeof model.description !== "string" || model.description.length > 16_384)
+      || model.referenceApi !== undefined && !["anthropic-messages", "openai-responses", "openai-completions", "google-generative-ai"].includes(model.referenceApi)
+      || model.defaultEffort !== undefined && !supportedPiThinkingLevels(model.reasoning, model.thinkingLevelMap).includes(model.defaultEffort)
+      || model.displayThinkingLevels !== undefined && (!Array.isArray(model.displayThinkingLevels) || model.displayThinkingLevels.length > 16
+        || model.displayThinkingLevels.some(level => typeof level !== "string" || level.length === 0 || level.length > 128))
+      || model.declaredOutputModalities !== undefined && (!Array.isArray(model.declaredOutputModalities) || model.declaredOutputModalities.length > 16
+        || model.declaredOutputModalities.some(value => typeof value !== "string" || value.length === 0 || value.length > 128))) {
+      throw piError("PI_MODEL_INVALID_METADATA", `Model '${provider.id}/${model.id}' has invalid declared metadata`, "provision");
+    }
     if (ids.has(model.id)) throw piError("PI_MODEL_DUPLICATE", `Duplicate model '${provider.id}/${model.id}'`, "provision");
     ids.add(model.id);
     if (!isPositiveSafeInteger(model.contextWindow ?? 1) || !isPositiveSafeInteger(model.maxTokens ?? 1)) {
@@ -568,8 +583,20 @@ export function piProviderModel(provider: PiManagedProvider, model: PiManagedMod
     logicalId: model.logicalId ?? model.id,
     displayName: model.name ?? model.id,
     api,
+    ...(model.description === undefined ? {} : { description: model.description }),
+    ...(model.defaultEffort === undefined || !thinkingLevels.includes(model.defaultEffort) ? {} : { defaultEffort: model.defaultEffort }),
+    ...(model.displayThinkingLevels === undefined ? {} : { displayThinkingLevels: [...model.displayThinkingLevels] }),
+    ...(model.referenceApi === undefined ? {} : {
+      referenceApi: model.referenceApi,
+      protocolMode: model.referenceApi === api ? "matching" as const : "compatibility" as const
+    }),
+    ...(model.input === undefined ? {} : { declaredInputModalities: [...model.input], declaredSupportsImages: model.input.includes("image") }),
+    ...(model.declaredOutputModalities === undefined ? {} : { declaredOutputModalities: [...model.declaredOutputModalities] }),
+    ...(model.supportsFastMode === undefined ? {} : { declaredSupportsFastMode: model.supportsFastMode }),
     contextWindow,
     maxOutputTokens: piModelOutputTokenLimit(model.maxTokens, contextWindow),
+    ...(model.contextWindow === undefined ? {} : { contextWindowSource: "declared" as const }),
+    ...(model.maxTokens === undefined ? {} : { maxOutputTokensSource: "declared" as const }),
     supportsImages: model.input?.includes("image") ?? false,
     ...(model.supportsTools === undefined ? {} : { supportsTools: model.supportsTools }),
     defaultVisible: model.defaultVisible ?? true,
@@ -594,6 +621,11 @@ function managedPiModelConfiguration(model: PiManagedModel): Record<string, unkn
     supportsTools: _supportsTools,
     defaultVisible: _defaultVisible,
     logicalId: _logicalId,
+    description: _description,
+    defaultEffort: _defaultEffort,
+    displayThinkingLevels: _displayThinkingLevels,
+    referenceApi: _referenceApi,
+    declaredOutputModalities: _declaredOutputModalities,
     ...piModel
   } = model;
   const contextWindow = model.contextWindow ?? 128_000;

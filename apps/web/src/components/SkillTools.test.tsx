@@ -8,6 +8,7 @@ import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
 import type {
   BackendView,
+  ResourceView,
   ResourceUsageReportView,
   SkillDescriptorView,
   SkillDraftView,
@@ -35,6 +36,67 @@ afterEach(async () => {
 });
 
 describe("SkillTools", () => {
+  it("reviews a frozen remote project Skill before approval and keeps failure retry and enable separate from loaded state", async () => {
+    let skill: SkillDescriptorView = { ...projectSkill(), state: "awaitingApproval", enabled: false,
+      canEdit: false, canDelete: false, canToggle: false, contentAvailable: true };
+    const resource: ResourceView = remoteResource(skill);
+    let resolveApproval!: () => void;
+    const approval = new Promise<void>((resolve) => { resolveApproval = resolve; });
+    const approveResource = vi.fn()
+      .mockRejectedValueOnce(new Error("Captured content changed. Refresh and review again."))
+      .mockImplementationOnce(async () => { await approval; skill = { ...skill, revision: 2n, state: "approved", canToggle: true }; });
+    const controller = skillController({
+      listSkills: vi.fn(async () => ({ revision: skill.revision, skills: [skill] })),
+      openSkill: vi.fn(async () => ({ ...sessionFor(skill), dirty: false })),
+      approveResource,
+      readSkillFile: vi.fn(async () => ({ key: "SKILL.md", content: "# Frozen remote capture", revision: "sha256:file", size: 24, editable: false }))
+    });
+    const container = await renderSkills(controller, [resource], projectResourceBackends);
+    await settle();
+    expect(container.textContent).toContain("Remote project (SSH)");
+    expect(container.textContent).toContain("Awaiting approval");
+    expect(container.textContent).toContain(resource.discoveredRevision);
+    expect(container.textContent).toContain("# Frozen remote capture");
+    expect(container.querySelector(".skill-detail__header .eyebrow")?.textContent).toBe("Remote project (SSH)");
+    expect([...container.querySelectorAll("button")].some((button) => ["Edit", "Publish", "Enable", "Rename"].includes(button.textContent?.trim() ?? ""))).toBe(false);
+    await act(async () => buttonWithText(container, "Approve resource").click());
+    await settle();
+    expect(container.textContent).toContain("Captured content changed.");
+    await act(async () => buttonWithText(container, "Approve resource").click());
+    expect(buttonWithText(container, "Working").disabled).toBe(true);
+    await act(async () => { resolveApproval(); await approval; });
+    await settle();
+    expect(approveResource.mock.calls).toEqual([[resource.id, resource.discoveredRevision], [resource.id, resource.discoveredRevision]]);
+    expect(container.textContent).toContain("Not loaded");
+    await act(async () => buttonWithText(container, "Enable").click());
+    await settle();
+    expect(controller.setSkillEnabled).toHaveBeenCalledWith(expect.objectContaining({ id: skill.id, revision: 2n }), true);
+  });
+
+  it("retires late remote project approval on owner change and withdraws approval when the live capability disappears", async () => {
+    const skill = { ...projectSkill(), state: "awaitingApproval" as const, enabled: false, contentAvailable: false, canToggle: false, canEdit: false, canDelete: false };
+    const resource = remoteResource(skill);
+    let resolve!: () => void;
+    const pending = new Promise<void>((done) => { resolve = done; });
+    const approveResource = vi.fn(() => pending);
+    const first = skillController({ listSkills: vi.fn(async () => ({ revision: 1n, skills: [skill] })), approveResource });
+    const second = skillController({ listSkills: vi.fn(async () => ({ revision: 1n, skills: [skill] })), approveResource });
+    const container = document.createElement("div"); document.body.append(container);
+    const root = createRoot(container); roots.push(root);
+    const render = (controller: AppController, capable = true) => act(async () => root.render(<SkillTools controller={controller}
+      resources={[resource]} backends={capable ? projectResourceBackends : []} targets={targets} locale="en" t={skillTranslator} />));
+    await render(first); await settle();
+    await act(async () => buttonWithText(container, "Approve resource").click());
+    await render(second); await settle();
+    const reads = vi.mocked(second.listSkills).mock.calls.length;
+    await act(async () => { resolve(); await pending; }); await settle();
+    expect(second.listSkills).toHaveBeenCalledTimes(reads);
+    expect(buttonWithText(container, "Approve resource").disabled).toBe(false);
+    await render(second, false);
+    expect([...container.querySelectorAll("button")].some((button) => button.textContent?.trim() === "Approve resource")).toBe(false);
+    expect(first.openSkill).not.toHaveBeenCalled();
+  });
+
   it("shows loading, catalog failure, empty, and independently retryable recovery states", async () => {
     const listSkills = vi.fn()
       .mockRejectedValueOnce(new Error("Catalog unavailable."))
@@ -647,12 +709,24 @@ function marketEntryFixture(): SkillMarketEntryView {
   };
 }
 
-async function renderSkills(controller: AppController): Promise<HTMLDivElement> {
+const skillTranslator = (key: Parameters<typeof translate>[1], values?: Readonly<Record<string, string | number>>) => translate("en", key, values);
+const projectResourceBackends = backends.map((backend) => ({ ...backend,
+  capabilities: new Map([["runtime.resources", { name: "runtime.resources", supported: true, options: ["skill"] }]]) }));
+
+function remoteResource(skill: SkillDescriptorView): ResourceView {
+  return { id: skill.id, backendId: skill.backendId, targetId: skill.targetId, name: skill.name,
+    kind: "skill", scope: "project", state: skill.state, enabled: skill.enabled,
+    source: "project-helper", sourceKind: "remoteProject", sourceIdentity: "remote-source:exact",
+    discoveredRevision: "sha256:frozen-complete-tree", compatibilityDetails: [], runtimeRequirements: [],
+    warnings: [], disabledLifecycleScripts: [], canToggle: skill.canToggle, requiresExtensionApproval: false, postMutationNotice: false };
+}
+
+async function renderSkills(controller: AppController, resources: readonly ResourceView[] = [], catalogBackends: readonly BackendView[] = backends): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
-  await act(async () => root.render(<SkillTools controller={controller} backends={backends} targets={targets} locale="en" t={(key, values) => translate("en", key, values)} />));
+  await act(async () => root.render(<SkillTools controller={controller} backends={catalogBackends} targets={targets} resources={resources} locale="en" t={skillTranslator} />));
   return container;
 }
 

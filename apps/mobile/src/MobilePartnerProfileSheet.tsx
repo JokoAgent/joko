@@ -10,7 +10,7 @@ import type { MobilePartnerDeletionTransport } from "./mobile-partner-deletion";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import { partnerSessionTaskMessages, partnerSessionTaskActive } from "@joko/contracts";
-import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
+import { mobilePartnerDirectoryIdentity, type MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import { MobilePartnerProfileValidationError, mobilePartnerProfileDraft, validateMobilePartnerProfileDraft,
   type MobilePartnerProfileDraft, type MobilePartnerProfileSnapshot, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
@@ -23,8 +23,17 @@ import { partnerConnectionsMessages, type PartnerConnectionsEditor } from "@joko
 import { MobilePartnerConnectionsSheet } from "./MobilePartnerConnectionsSheet";
 import { partnerSkillsMessages, type PartnerSkillsEditor } from "@joko/contracts";
 import { MobilePartnerSkillsSheet } from "./MobilePartnerSkillsSheet";
+import { MobilePartnerOutputsView } from "./MobilePartnerOutputsView";
+import type { MobilePartnerTaskOutput } from "./mobile-partner-task-outputs";
 
-export function MobilePartnerProfileSheet({ visible, partner, transport, deletionTransport, restartTransport, routineFactory, resumeFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale, onClose, onSaved, onSearch }: {
+interface OutputHandoff {
+  readonly owner: string;
+  readonly transport: MobilePartnerProfileTransport;
+  readonly snapshot: MobilePartnerProfileSnapshot;
+  readonly row: MobilePartnerTaskOutput;
+}
+
+export function MobilePartnerProfileSheet({ visible, partner, transport, deletionTransport, restartTransport, routineFactory, resumeFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale, onClose, onSaved, onSearch, online = true, onOutputsPageChange, onOpenOutputError }: {
   readonly visible: boolean;
   readonly partner?: MobilePartnerDirectoryProfile;
   readonly transport?: MobilePartnerProfileTransport;
@@ -40,6 +49,9 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   readonly onClose: () => void;
   readonly onSaved: (partner: MobilePartnerDirectoryProfile) => void;
   readonly onSearch?: () => void;
+  readonly online?: boolean;
+  readonly onOutputsPageChange?: (open: boolean) => void;
+  readonly onOpenOutputError?: (message: string) => void;
 }) {
   const binding = visible && partner && transport ? `${transport.ownerKey}\u001f${partner.partnerId}` : undefined;
   const [routine, setRoutine] = useState<PartnerRoutineEditor>();
@@ -72,16 +84,45 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   const sourceOwner = partner && transport ? `${transport.ownerKey}\u001f${partner.partnerId}` : undefined;
   const sourceOwnerRef = useRef(sourceOwner); sourceOwnerRef.current = sourceOwner;
   const pendingSearch = useRef<string | undefined>(undefined); const onSearchRef = useRef(onSearch); onSearchRef.current = onSearch;
+  const [outputsOpen, setOutputsOpen] = useState(false);
+  const [foreground, setForeground] = useState(AppState.currentState === "active");
+  const pendingOutput = useRef<OutputHandoff | undefined>(undefined);
+  const outputRequest = useRef<AbortController | undefined>(undefined);
+  const outputContext = useRef({ visible, online, locale, onOpenOutputError }); outputContext.current = { visible, online, locale, onOpenOutputError };
+  const retireOutput = (): void => { pendingOutput.current = undefined; outputRequest.current?.abort(); outputRequest.current = undefined; };
   const mountedRef = useRef(true);
   const deliverSearch = (): void => {
     const expected = pendingSearch.current; pendingSearch.current = undefined;
     if (expected !== undefined && expected === sourceOwnerRef.current && AppState.currentState === "active") onSearchRef.current?.();
   };
+  const deliverOutput = (): void => {
+    const selected = pendingOutput.current; pendingOutput.current = undefined;
+    if (!selected || !mountedRef.current || outputContext.current.visible || !outputContext.current.online
+      || selected.owner !== sourceOwnerRef.current || AppState.currentState !== "active") return;
+    const request = new AbortController(); outputRequest.current?.abort(); outputRequest.current = request;
+    void selected.transport.openOutputTask!(selected.snapshot, selected.row, request.signal).catch(() => {
+      if (request.signal.aborted || !mountedRef.current || selected.owner !== sourceOwnerRef.current
+        || !outputContext.current.online || AppState.currentState !== "active") return;
+      outputContext.current.onOpenOutputError?.(mobileMessage(outputContext.current.locale, "partnerOutputs.openFailed"));
+    }).finally(() => { if (outputRequest.current === request) outputRequest.current = undefined; });
+  };
+  const deliverClosed = (): void => { deliverSearch(); deliverOutput(); };
   useEffect(() => { mountedRef.current = true; sourceOwnerRef.current = sourceOwner;
-    return () => { mountedRef.current = false; pendingSearch.current = undefined; sourceOwnerRef.current = undefined; }; }, []);
+    return () => { mountedRef.current = false; pendingSearch.current = undefined; sourceOwnerRef.current = undefined; retireOutput(); }; }, []);
+  useEffect(() => { retireOutput(); }, [sourceOwner]);
+  useEffect(() => { if (!online) retireOutput(); }, [online]);
   useEffect(() => {
-    if (visible || pendingSearch.current === undefined || Platform.OS !== "android") return;
-    const frame = requestAnimationFrame(deliverSearch);
+    const subscription = AppState.addEventListener("change", state => {
+      setForeground(state === "active"); if (state !== "active") retireOutput();
+    });
+    return () => subscription.remove();
+  }, []);
+  useEffect(() => { setOutputsOpen(false); }, [binding]);
+  useEffect(() => { onOutputsPageChange?.(outputsOpen); }, [outputsOpen]);
+  useEffect(() => {
+    if (visible) { retireOutput(); return; }
+    if (pendingSearch.current === undefined && pendingOutput.current === undefined || Platform.OS !== "android") return;
+    const frame = requestAnimationFrame(deliverClosed);
     return () => cancelAnimationFrame(frame);
   }, [visible]);
   const [state, setState] = useState<{ readonly binding?: string; readonly snapshot?: MobilePartnerProfileSnapshot;
@@ -94,6 +135,13 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   const busyRef = useRef(false);
   const requestRef = useRef<AbortController | undefined>(undefined);
   const generationRef = useRef(0);
+  const permissionConfirmation = useRef<symbol | undefined>(undefined);
+  const stateRef = useRef(state); stateRef.current = state;
+  useEffect(() => { if (!online || !visible) permissionConfirmation.current = undefined; }, [online, visible]);
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", value => { if (value !== "active") permissionConfirmation.current = undefined; });
+    return () => { permissionConfirmation.current = undefined; subscription.remove(); };
+  }, []);
   const keyboard = useMobileKeyboardState();
   const insets = useSafeAreaInsets();
   const snapshot = state.binding === binding && binding !== undefined ? state.snapshot : undefined;
@@ -102,6 +150,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   const editable = !!snapshot && !!draft && !busy && !taskBusy && !restartBusy && !routine && !resume && !memory && !connections && !skills && snapshot.partner.pauseCleanupPending !== true && !state.requiresRefresh;
 
   const load = (): void => {
+    permissionConfirmation.current = undefined;
     const selected = propsRef.current.partner; const current = propsRef.current.transport;
     const expected = bindingRef.current;
     if (!expected || !selected || !current || busyRef.current) return;
@@ -125,11 +174,14 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
     return () => { generationRef.current += 1; requestRef.current?.abort(); };
   }, [binding]);
 
-  const close = (next?: "search"): void => {
+  const close = (next?: "search" | OutputHandoff): void => {
     if (busyRef.current || avatarPreparingRef.current || deletionBusyRef.current || restartBusyRef.current || routine || resume || memory || connections || skills) return;
     const expected = sourceOwner;
     const finish = (): void => {
       if (!mountedRef.current || expected !== sourceOwnerRef.current || next === "search" && expected === undefined) return;
+      if (next && next !== "search" && (!outputContext.current.online || AppState.currentState !== "active"
+        || next.owner !== sourceOwnerRef.current)) return;
+      pendingOutput.current = next && next !== "search" ? next : undefined;
       pendingSearch.current = next === "search" ? expected : undefined; onClose();
     };
     if (!dirty) { finish(); return; }
@@ -139,6 +191,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
     ]);
   };
   const change = (next: MobilePartnerProfileDraft): void => {
+    permissionConfirmation.current = undefined;
     if (editable) setState((previous) => ({ ...previous, draft: next, error: undefined }));
   };
   const save = (): void => {
@@ -152,7 +205,13 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
       setState((previous) => ({ ...previous, error: message })); return;
     }
     const commit = (): void => {
-      if (bindingRef.current !== expected || busyRef.current) return;
+      if (!mountedRef.current || bindingRef.current !== expected || propsRef.current.transport !== current
+        || !propsRef.current.partner || mobilePartnerDirectoryIdentity(propsRef.current.partner) !== capturedPartner
+        || generationRef.current !== generation || stateRef.current.snapshot !== snapshot
+        || JSON.stringify(stateRef.current.draft) !== capturedDraft || permissionConfirmation.current !== confirmation
+        || !outputContext.current.visible || !outputContext.current.online || AppState.currentState !== "active"
+        || busyRef.current || avatarPreparingRef.current || restartBusyRef.current || deletionBusyRef.current) return;
+      permissionConfirmation.current = undefined;
       busyRef.current = true; setBusy(true);
       requestRef.current?.abort();
       const controller = new AbortController(); requestRef.current = controller;
@@ -165,11 +224,16 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
         if (bindingRef.current === expected) { busyRef.current = false; setBusy(false); }
       });
     };
-    if (validated.capabilities.permissionMode === "auto" && snapshot.partner.capabilities.permissionMode !== "auto") {
-      Alert.alert(mobileMessage(locale, "partnerProfile.permission"), mobileMessage(locale, "partnerProfile.autoWarning"), [
-        { text: mobileMessage(locale, "common.cancel"), style: "cancel" },
+    const generation = generationRef.current, capturedDraft = JSON.stringify(draft),
+      capturedPartner = mobilePartnerDirectoryIdentity(propsRef.current.partner!), confirmation = Symbol("partner-permission-confirmation");
+    permissionConfirmation.current = confirmation;
+    if (validated.capabilities.permissionMode === "bypassPermissions"
+      || validated.capabilities.permissionMode === "auto" && snapshot.partner.capabilities.permissionMode !== "auto") {
+      Alert.alert(mobileMessage(locale, validated.capabilities.permissionMode === "bypassPermissions" ? "controls.fullAccessTitle" : "partnerProfile.permission"),
+        mobileMessage(locale, validated.capabilities.permissionMode === "bypassPermissions" ? "controls.fullAccessBody" : "partnerProfile.autoWarning"), [
+        { text: mobileMessage(locale, "common.cancel"), style: "cancel", onPress: () => { if (permissionConfirmation.current === confirmation) permissionConfirmation.current = undefined; } },
         { text: mobileMessage(locale, "partnerProfile.save"), onPress: commit }
-      ]);
+      ], { cancelable: true, onDismiss: () => { if (permissionConfirmation.current === confirmation) permissionConfirmation.current = undefined; } });
     } else commit();
   };
   const action = (label: string, onPress: () => void, disabled = false, selected = false) => <Pressable
@@ -178,8 +242,8 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
       backgroundColor: selected ? colors.brandBackground : colors.surface }, disabled && styles.disabled]}>
     <Text style={[styles.body, { color: colors.ink }]}>{label}</Text>
   </Pressable>;
-  return <Modal visible={visible} animationType={pendingSearch.current !== undefined && Platform.OS === "android" ? "none" : "slide"}
-    presentationStyle="pageSheet" allowSwipeDismissal={false} onRequestClose={() => close()} onDismiss={deliverSearch}>
+  return <Modal visible={visible} animationType={(pendingSearch.current !== undefined || pendingOutput.current !== undefined) && Platform.OS === "android" ? "none" : "slide"}
+    presentationStyle="pageSheet" allowSwipeDismissal={false} onRequestClose={() => outputsOpen ? setOutputsOpen(false) : close()} onDismiss={deliverClosed}>
     {connections && visible && `${connections.api.ownerKey}\u001f${connections.initial.partnerId}` === binding && <MobilePartnerConnectionsSheet editor={connections} colors={colors} locale={locale} onClose={() => setConnections(undefined)} />}
     {skills && visible && `${skills.api.ownerKey}\u001f${skills.initial.partnerId}` === binding && <MobilePartnerSkillsSheet editor={skills} colors={colors} locale={locale} onClose={() => setSkills(undefined)} />}
     {memory && visible && `${memory.api.ownerKey}\u001f${memory.initial.partnerId}` === binding && <MobilePartnerMemorySheet editor={memory} colors={colors} locale={locale} onClose={() => setMemory(undefined)} />}
@@ -189,10 +253,16 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
     <SafeAreaView style={[styles.screen, { backgroundColor: colors.background }]} edges={["top", "bottom"]}>
       <MobileKeyboardAvoidingView style={styles.screen} keyboard={keyboard} consumedBottomInset={insets.bottom}>
         <View style={styles.header}>
-          {action(mobileMessage(locale, "common.close"), close, busy || avatarPreparing || deletionBusy || restartBusy || !!routine || !!resume || !!memory || !!connections || !!skills)}
-          <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "partnerProfile.title")}</Text>
+          {outputsOpen && action(mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "partnerProfile.title") }), () => setOutputsOpen(false))}
+          {action(mobileMessage(locale, "common.close"), () => close(), busy || avatarPreparing || deletionBusy || restartBusy || !!routine || !!resume || !!memory || !!connections || !!skills)}
+          <Text accessibilityRole="header" style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, outputsOpen ? "partnerOutputs.title" : "partnerProfile.title")}</Text>
         </View>
         <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.content}>
+        {outputsOpen && snapshot && transport ? <MobilePartnerOutputsView snapshot={snapshot} transport={transport}
+          online={online} foreground={foreground} colors={colors} locale={locale}
+          onOpen={row => { if (sourceOwner && online && foreground && transport.openOutputTask) close({ owner: sourceOwner, snapshot, transport, row }); }} /> : <>
+        {snapshot && transport?.listOutputs && transport.openOutputTask && action(mobileMessage(locale, "partnerOutputs.title"), () => setOutputsOpen(true),
+          !editable || avatarPreparing || deletionBusy || !online || !foreground)}
         {onSearch && action(mobileMessage(locale, "conversationSearch.title"), () => close("search"), sourceOwner === undefined || busy || avatarPreparing || deletionBusy || restartBusy || !!routine || !!resume || !!memory || !!connections || !!skills)}
         {snapshot && <View>
           <Text accessibilityRole="header" style={{ color: colors.ink }}>{partnerSessionTaskMessages(locale).title}</Text>
@@ -258,6 +328,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
             {busy && <ActivityIndicator color={colors.accent} />}
             {action(mobileMessage(locale, "partnerProfile.save"), save, !editable || !dirty || avatarPreparing || deletionBusy)}
           </View>}
+        </>}
         </ScrollView>
       </MobileKeyboardAvoidingView>
     </SafeAreaView>

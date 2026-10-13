@@ -71,6 +71,24 @@ class FakeProviders implements LocalModelProviderCatalog {
 }
 
 describe("LocalModelProviderCoordinator", () => {
+  it("advertises only the exact owned Provider route and retires its association", async () => {
+    const owner = { ownerId: "owner-a", generation: 1 };
+    let currentOwner = owner;
+    const providers = new FakeProviders();
+    const coordinator = new LocalModelProviderCoordinator({ providers, backendId: "backend-a", currentOwner: () => currentOwner });
+    expect(coordinator.routes(owner)).toEqual([]);
+    await coordinator.sync(owner, [model("model-a")]);
+    const owned = providers.values[0]!;
+    expect(coordinator.routes(owner)).toEqual([{ backendId: "backend-a", providerId: MANAGED_LOCAL_PROVIDER_ID }]);
+    providers.values = [{ ...owned, credentialReferenceIds: ["credential-ref"] }, { ...owned, backendId: "backend-b" }];
+    expect(coordinator.routes(owner)).toEqual([]);
+    providers.values = [owned];
+    await coordinator.sync(owner, []);
+    expect(coordinator.routes(owner)).toEqual([]);
+    currentOwner = { ...owner, generation: 2 };
+    expect(() => coordinator.routes(owner)).toThrow(expect.objectContaining({ code: "OWNER_CHANGED" }));
+  });
+
   it("creates one owner-managed keyless Provider without inventing prices", async () => {
     const owner = { ownerId: "owner-a", generation: 1 };
     const providers = new FakeProviders();

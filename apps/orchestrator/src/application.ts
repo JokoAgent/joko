@@ -178,8 +178,11 @@ import { PartnerGroupAttachments } from "./partner-group-attachments.js";
 import { PLAN_DECISION_SYSTEM_PROMPT, buildPlanDecisionPrompt, parsePlanDecision } from "./partner-group-division.js";
 import { MessagingManager, type MessagingManagerOptions } from "./messaging-manager.js";
 import type { WeChatAuthorizationPort } from "./wechat-authorization-manager.js";
-import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
-import { createManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
+import type { ManagedModelRuntimeRegistry } from "./managed-model-runtime-registry.js";
+import { createManagedModelRuntimeSystem, type ManagedModelRuntimeSystem } from "./managed-model-runtime-system.js";
+import type { ModelWorkingContextCoordinator } from "./model-working-context.js";
+import { composeModelWorkingContext } from "./model-working-context-system.js";
+import { createOutboundStreamingFetch } from "./outbound-streaming-fetch.js";
 import { McpRouter, type PiMcpBridgeSnapshot } from "./mcp-router.js";
 import { NativeAuthRecoveryStore } from "./native-auth-recovery.js";
 import { ProviderCredentialSurfaceResolver } from "./provider-credential-surface.js";
@@ -200,6 +203,7 @@ import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-
 import { PiProviderAuthSupervisor } from "./pi-provider-auth-supervisor.js";
 import { ProviderAccountUsageProvider } from "./provider-account-usage.js";
 import { PiResourceManager } from "./resource-manager.js";
+import { RemoteSkillSourceOwner } from "./remote-skill-source.js";
 import { SkillManager } from "./skill-manager.js";
 import { SkillLearningManager } from "./skill-learning-manager.js";
 import { SkillMarketManager } from "./skill-market-manager.js";
@@ -279,6 +283,7 @@ import { VoiceInputSettingsController } from "./voice-input-settings.js";
 import { WorkspaceChangeSetService } from "./workspace-change-set.js";
 import { OperationalWorkspaceChangeJournal } from "./workspace-change-stream.js";
 import { DurableWorkspaceRunCapture } from "./workspace-run-capture.js";
+import { PartnerTaskOutputProjection } from "./partner-task-outputs.js";
 import { WorkspaceService } from "./workspace-service.js";
 import { OperationalCodeHostSessionAuthorization } from "./session-code-host-context.js";
 
@@ -433,7 +438,9 @@ export interface OrchestratorApplication {
   readonly credentials?: CredentialManager;
   readonly providers?: ProviderCatalogManager;
   /** Node-owned local inference runtime; renderer and Desktop IPC never own its processes. */
-  readonly managedModelRuntime?: ManagedModelRuntimeController;
+  readonly managedModelRuntime?: ManagedModelRuntimeRegistry;
+  readonly modelWorkingContext?: ModelWorkingContextCoordinator;
+  readonly removeManagedModelProvider?: (providerId: string) => Promise<boolean | undefined>;
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly skills?: SkillManager;
@@ -464,6 +471,7 @@ export interface OrchestratorApplication {
   readonly partnerWorkingStatus?: PartnerWorkingStatusManager;
   readonly partnerWorkbenches?: PartnerWorkbenchManager;
   readonly partnerSessionTasks?: PartnerSessionTaskManager;
+  readonly partnerTaskOutputs?: PartnerTaskOutputProjection;
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
@@ -854,6 +862,9 @@ export async function createOrchestratorApplication(
   const piResources = new PiResourceManager({
     store,
     managedRoot: join(config.piAgentHome, "managed-resources"),
+    remoteProjectSkills: new RemoteSkillSourceOwner({ store,
+      managedRoot: join(config.piAgentHome, "remote-project-skills"),
+      captureSkillSourceAuthority: (workspaceId, signal) => remoteWorkspaceFiles.captureSkillSourceAuthority(workspaceId, signal) }),
     privateResourceTarget
   });
   await piResources.initialize();
@@ -1402,7 +1413,9 @@ export async function createOrchestratorApplication(
             remoteRuntimes: new RemoteCodexRuntimeResolver({
               store,
               remoteExecution,
-              mcpBridge
+              mcpBridge,
+              captureSkillSourceAuthority: (workspaceId, signal) => remoteWorkspaceFiles.captureSkillSourceAuthority(workspaceId, signal),
+              nativeSkillJournalRoot: join(config.dataDirectory, "remote-codex-skill-mounts", instanceId, String(generation))
             }),
             resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId, false),
             resolveNativeSkills: (context, signal) => piResources.runtimeSkillSnapshot(instanceId, context.target.id, signal, partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context),
@@ -1631,7 +1644,11 @@ export async function createOrchestratorApplication(
     (partnerId, assertCurrent) => partnerImportStorage.environment.read(partnerId, assertCurrent), makerMemory,
     (session, partnerId) => partnerGroupRuntime?.validTarget(session, partnerId) === true);
   let partnerSessionTasks: PartnerSessionTaskManager | undefined;
+  let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
+  let modelWorkingContext: ModelWorkingContextCoordinator | undefined;
   const sessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
+    resolveModelWorkingContext: target => modelWorkingContext?.resolve(target),
+    prepareManagedProviderRuntime: async context => { await managedModelRuntimeForSession?.prepareProviderRuntime(context); },
     backendDescriptors: backendInstances.descriptors(),
     backendDescriptorsAlreadyPublished: true,
     workspaceCapture,
@@ -1670,6 +1687,13 @@ export async function createOrchestratorApplication(
     partnerTargetRetired: (targetId) => partnerStore.isPartnerTargetRetired(targetId),
     partnerSessionRestarting: (sessionId) => partnerStore.isPartnerSessionRestarting(sessionId),
     partnerSessionPaused: (sessionId) => partnerStore.isPartnerSessionPaused(sessionId) || partnerSessionTasks?.isHeld(sessionId) === true || partnerGroupRuntime?.isHeld(sessionId) === true,
+    partnerSessionPolicy: (sessionId) => {
+      const profile = partnerStore.findPartnerByCanonicalSession(sessionId);
+      return profile === undefined ? undefined : {
+        identity: JSON.stringify([profile.id, profile.homeTargetId, profile.canonicalSessionId, profile.profileVersion, profile.capabilities.permissionMode]),
+        status: profile.initializationState
+      };
+    },
     resolveServiceRuntimePrompt: (session, assertCurrent) => partnerRuntimePrompt.resolve(session, assertCurrent),
     resolveServiceRuntimeConfiguration: session => {
       const connections = partnerConnections?.runtimeIdentity(session), skills = partnerSkills?.runtimeIdentity(session);
@@ -1712,6 +1736,13 @@ export async function createOrchestratorApplication(
     onServiceInteractionOpened: (input) => { partnerGroupRuntime?.interactionChanged(input.sessionId); return messaging?.onInteractionOpened(input); },
     onServiceInteractionSettled: (input) => { partnerGroupRuntime?.interactionChanged(input.sessionId); return messaging?.onInteractionSettled(input); },
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
+  });
+  const workingContextOwner = { ownerId: serverId, generation: durableRuntimeGeneration() };
+  modelWorkingContext = composeModelWorkingContext({
+    store,
+    providers,
+    sessionHost,
+    currentOwner: () => closed ? undefined : workingContextOwner
   });
   objectives = new ObjectiveManager({ store, sessionHost });
   await simulatorCreate?.recoverPending();
@@ -1803,6 +1834,7 @@ export async function createOrchestratorApplication(
     briefs: new PartnerWorkbenchBriefReader(new CodeHostProjectProvider()), sessionTasks: () => partnerSessionTasks, routines: () => partnerRoutines,
     pullRequestProviders: (authorization) => composeCodeHostProviders(dependencies.codeHostProviders, authorization) });
   partnerSessionTasks = new PartnerSessionTaskManager(store, partners, sessionHost, workspaces, config.dataDirectory);
+  const partnerTaskOutputs = new PartnerTaskOutputProjection(store, partnerSessionTasks, partnerStore, workspaceCapture);
   const unregisterPartnerSessionTaskTools = mcpRouter.registerBridgeToolProvider(new PartnerSessionTaskTools(partnerSessionTasks));
   const collaborationGoals = new CollaborationGoalManager({
     store,
@@ -2332,8 +2364,17 @@ export async function createOrchestratorApplication(
     dataDirectory: config.dataDirectory,
     ownerId: serverId,
     ownerGeneration: durableRuntimeGeneration(),
-    onModelsChanged: refreshPiGeneration
+    onModelsChanged: refreshPiGeneration,
+    onProviderChanged: async backendIds => {
+      for (const backendId of backendIds) {
+        if (backendId === providers.nativeAuthenticationBackendId) await refreshPiGeneration();
+        else await refreshBackendDescriptor(backendId);
+      }
+    },
+    fetchStreaming: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
+      environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) })
   });
+  managedModelRuntimeForSession = managedModelRuntimeSystem;
 
   const runMaintenance = (): Promise<void> => {
     const maintenance = maintenanceTail.catch(() => undefined).then(async () => {
@@ -2804,7 +2845,9 @@ export async function createOrchestratorApplication(
     refreshSubagentSmartRouting,
     credentials,
     providers,
-    managedModelRuntime: managedModelRuntimeSystem.controller,
+    managedModelRuntime: managedModelRuntimeSystem.registry,
+    modelWorkingContext,
+    removeManagedModelProvider: providerId => managedModelRuntimeSystem.removeProvider(providerId),
     mcpRouter,
     piResources,
     skills,
@@ -2829,6 +2872,7 @@ export async function createOrchestratorApplication(
     partnerImports,
     partnerWorkbenches,
     partnerSessionTasks,
+    partnerTaskOutputs,
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,

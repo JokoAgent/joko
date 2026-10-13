@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import type { BackendDescriptor, SessionDescriptor, TargetDescriptor } from "@joko/core";
 import { OperationalStore } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-snapshots.js";
 import { WorkspaceChangeSetService } from "./workspace-change-set.js";
@@ -21,6 +21,71 @@ afterEach(async () => {
 });
 
 describe("DurableWorkspaceRunCapture", () => {
+  it("keeps terminal output pending until the exact accepted capture and event commit together", async () => {
+    const f = await outputFixture();
+    await f.capture.captureBeforeRun(f.input); f.accept();
+    await writeFile(join(f.workspace, "report.txt"), "result"); f.finish();
+    let release!: () => void; const capture = f.service.captureChangeSet.bind(f.service);
+    vi.spyOn(f.service, "captureChangeSet").mockImplementationOnce(async (...args) => {
+      await new Promise<void>(resolve => { release = resolve; }); return capture(...args);
+    });
+    const observed: unknown[] = [];
+    const unsubscribe = f.store.subscribe(event => {
+      if (event.payload.type === "workspace_diff") observed.push(f.store.getSetting("session", f.input.sessionId, "workspace_output_seal.run-one").value);
+    });
+    const first = f.capture.captureAfterRun(f.input), joined = f.capture.captureAfterRun(f.input);
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+    expect(f.store.getRun("run-one").descriptor.state).toBe("completed");
+    expect(await f.capture.readRunOutput(f.input.sessionId, "run-one")).toEqual({ readiness: "pending", changes: [] });
+    release(); await first; await joined;
+    expect(f.service.captureChangeSet).toHaveBeenCalledOnce();
+    expect(observed).toMatchObject([{ state: "ready", queueItemId: "queue-one" }]);
+    expect(await f.capture.readRunOutput(f.input.sessionId, "run-one")).toEqual({ readiness: "ready", changes: [{ path: "report.txt", status: "added" }] });
+    unsubscribe();
+  });
+
+  it("distinguishes a sealed valid empty result from missing, failed and incomplete captures", async () => {
+    const empty = await outputFixture(); await empty.capture.captureBeforeRun(empty.input); empty.accept(); empty.finish();
+    await empty.capture.captureAfterRun(empty.input);
+    expect(await empty.capture.readRunOutput(empty.input.sessionId, "run-one")).toEqual({ readiness: "ready", changes: [] });
+    const missing = await outputFixture(); missing.accept(); missing.finish(); await missing.capture.captureAfterRun(missing.input);
+    expect(await missing.capture.readRunOutput(missing.input.sessionId, "run-one")).toEqual({ readiness: "unavailable", changes: [] });
+    const failed = await outputFixture(); await failed.capture.captureBeforeRun(failed.input); failed.accept(); failed.finish();
+    vi.spyOn(failed.service, "captureChangeSet").mockRejectedValueOnce(new Error("Capture failed"));
+    await expect(failed.capture.captureAfterRun(failed.input)).rejects.toThrow("Capture failed");
+    expect((await failed.capture.readRunOutput(failed.input.sessionId, "run-one")).readiness).toBe("unavailable");
+    const incomplete = await outputFixture(1); await incomplete.capture.captureBeforeRun(incomplete.input); incomplete.accept();
+    await writeFile(join(incomplete.workspace, "large.txt"), "larger than snapshot budget");
+    await writeFile(join(incomplete.workspace, "partial.txt"), "x"); incomplete.finish(); await incomplete.capture.captureAfterRun(incomplete.input);
+    expect(await incomplete.capture.readRunOutput(incomplete.input.sessionId, "run-one")).toEqual({ readiness: "unavailable", changes: [{ path: "partial.txt", status: "added" }] });
+  });
+
+  it("requires exact accepted Queue and Run anchors rather than only a terminal state", async () => {
+    const f = await outputFixture(); await f.capture.captureBeforeRun(f.input);
+    await writeFile(join(f.workspace, "unaccepted.txt"), "not accepted"); f.finish(); await f.capture.captureAfterRun(f.input);
+    expect((await f.capture.readRunOutput(f.input.sessionId, "run-one")).readiness).toBe("unavailable");
+    f.store.setSetting("session", f.input.sessionId, "workspace_output_seal.run-one", { version: 1,
+      sessionId: "different-session", runId: "run-one", state: "ready", queueItemId: "queue-one", changeSetId: "wrong" });
+    await expect(f.capture.readRunOutput(f.input.sessionId, "run-one")).rejects.toThrow("seal is unavailable");
+  });
+
+  it("reads sealed output after restart without scanning or overwriting ready on a late failure", async () => {
+    const f = await outputFixture(); await f.capture.captureBeforeRun(f.input); f.accept();
+    await writeFile(join(f.workspace, "saved.txt"), "saved"); f.finish(); await f.capture.captureAfterRun(f.input);
+    f.store.close(); cleanupStores.delete(f.store);
+    const restarted = new OperationalStore(join(f.data, "orchestrator.db")); cleanupStores.add(restarted);
+    const reloaded = new WorkspaceChangeSetService({ snapshotDirectory: join(f.data, "snapshots"), repository: new OperationalWorkspaceSnapshotRepository(restarted) }); await reloaded.initialize();
+    const capture = new DurableWorkspaceRunCapture(restarted, reloaded);
+    vi.spyOn(reloaded, "captureBaseline").mockRejectedValue(new Error("No new scan"));
+    vi.spyOn(reloaded, "captureChangeSet").mockRejectedValue(new Error("No new capture"));
+    expect(await capture.readRunOutput(f.input.sessionId, "run-one")).toEqual({ readiness: "ready", changes: [{ path: "saved.txt", status: "added" }] });
+    await capture.captureAfterRun(f.input);
+    restarted.deleteSetting("session", f.input.sessionId, "workspace_capture.run-one");
+    await expect(capture.captureBeforeRun(f.input)).rejects.toThrow("No new scan");
+    expect(restarted.getSetting<{ state: string }>("session", f.input.sessionId, "workspace_output_seal.run-one").value.state).toBe("ready");
+    expect(reloaded.captureChangeSet).not.toHaveBeenCalled();
+  });
+
   it("captures a run change set, projects it, and restores only after a safe preview", async () => {
     const workspace = await mkdtemp(join(tmpdir(), "joko-run-workspace-"));
     const data = await mkdtemp(join(tmpdir(), "joko-run-capture-"));
@@ -115,3 +180,31 @@ describe("DurableWorkspaceRunCapture", () => {
     cleanupStores.delete(store);
   });
 });
+
+async function outputFixture(maximumFileBytes?: number) {
+  const workspace = await mkdtemp(join(tmpdir(), "joko-output-workspace-")), data = await mkdtemp(join(tmpdir(), "joko-output-capture-"));
+  cleanupPaths.push(workspace, data);
+  const store = new OperationalStore(join(data, "orchestrator.db")); cleanupStores.add(store);
+  const target: TargetDescriptor = { id: "target-one", backendId: "fake", displayName: "Workspace", workspaceRoot: workspace, managed: true, trusted: true };
+  const backend: BackendDescriptor = { id: "fake", displayName: "Fake", version: "1.0.0", health: "healthy", adapterKind: "fixture", instanceGeneration: 0,
+    installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] };
+  const now = Date.now();
+  const session: SessionDescriptor = { id: "session-one", backendId: "fake", targetId: target.id, title: "Output", binding: { opaqueRef: "fake://session-one", generation: 1 },
+    pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: now, updatedAt: now };
+  store.upsertBackend(backend); store.upsertTarget(target, { workspaceId: "workspace-one" }); store.createSession(session);
+  store.createRun({ id: "run-one", sessionId: session.id, source: "system", state: "queued", createdAt: now });
+  store.createAttempt({ id: "attempt-one", runId: "run-one", ordinal: 1, generation: 1, startedAt: now });
+  const prompt = { text: "Produce output", images: [], files: [], mentions: [], disposition: "prompt" as const };
+  store.runOperation({ id: "output-input", kind: "service_send_input", body: { sessionId: session.id, prompt } }, transaction => {
+    transaction.enqueueQueueItem({ id: "queue-one", sessionId: session.id, runId: "run-one", attemptId: "attempt-one", operationId: "output-input", disposition: "prompt", body: prompt }); return {};
+  });
+  store.claimNextQueueItem({ sessionId: session.id, backendInstanceGeneration: 0, traceId: "dispatch" });
+  store.updateRunState({ runId: "run-one", state: "running", activeAttemptId: "attempt-one", traceId: "running" });
+  const repository = new OperationalWorkspaceSnapshotRepository(store);
+  const service = new WorkspaceChangeSetService({ snapshotDirectory: join(data, "snapshots"), repository,
+    ...(maximumFileBytes === undefined ? {} : { maximumFileBytes }) }); await service.initialize();
+  const capture = new DurableWorkspaceRunCapture(store, service);
+  return { workspace, data, store, repository, service, capture, input: { sessionId: session.id, runId: "run-one", target },
+    accept() { store.updateQueueState({ queueItemId: "queue-one", state: "backend_accepted", attemptId: "attempt-one", traceId: "accepted" }); },
+    finish() { store.updateRunState({ runId: "run-one", state: "completed", traceId: "completed" }); } };
+}

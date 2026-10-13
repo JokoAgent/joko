@@ -152,6 +152,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const [palette, setPalette] = useState<"add" | "mention" | "commands">();
   const [commandActivation, setCommandActivation] = useState<ComposerCommandActivation>();
   const [commandActiveIndex, setCommandActiveIndex] = useState(0);
+  const [resourceCommandPending, setResourceCommandPending] = useState(false);
+  const paletteRef = useRef(palette);
+  paletteRef.current = palette;
   const [workspaceMentionIndex, setWorkspaceMentionIndex] = useState<ComposerWorkspaceMentionIndex>();
   const [workspaceMentionReload, setWorkspaceMentionReload] = useState(0);
   const [queueExpandedSessionId, setQueueExpandedSessionId] = useState<string>();
@@ -314,6 +317,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     && backend.capabilities.get("input.text")?.supported === true
     && onOpenObjective !== undefined;
   const commandOptions = {
+    resourceMentionSupported: mentionPolicy.resources && !readOnly && !session.archived
+      && session.state !== "closed" && controller.state.connectionState === "connected",
     helpSupported: true,
     learnSupported,
     goalSupported,
@@ -383,6 +388,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
 
   const activateTypedCommand = (nextText: string, caret: number, isComposing: boolean, isBash: boolean): boolean => {
     const activation = detectComposerCommandActivation(nextText, caret, { isComposing, bashMode: isBash });
+    if (activation !== undefined && inlineMentionRangesRef.current.some(range =>
+      range.from === activation.from && range.to === activation.to
+      && mentionsRef.current.some(mention => mention.id === range.mentionId && mention.kind === "resource"))) {
+      retireTypedCommand();
+      return false;
+    }
     if (activation === undefined) {
       suppressedCommandFromRef.current = undefined;
       retireTypedCommand();
@@ -518,6 +529,14 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   useLayoutEffect(() => () => attachmentPicker.retire(), [attachmentPicker, sendOwner]);
   const sendStateRef = useRef({ owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, goalSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey });
   sendStateRef.current = { owner: sendOwner, readOnly, connected: controller.state.connectionState === "connected", learnSupported, goalSupported, supportedModes, attachmentPolicy, mentionPolicy, resources, route: sendRouteKey };
+  const resourceCommandStateRef = useRef({ owner: sendOwner, commands, locked: composerLocked, bashMode: effectiveBashMode });
+  resourceCommandStateRef.current = { owner: sendOwner, commands, locked: composerLocked, bashMode: effectiveBashMode };
+  const resourceCommandFlightRef = useRef<AbortController | undefined>(undefined);
+  useLayoutEffect(() => () => {
+    resourceCommandFlightRef.current?.abort();
+    resourceCommandFlightRef.current = undefined;
+    setResourceCommandPending(false);
+  }, [sendOwner]);
   const voiceSendFlight = useRef<object | undefined>(undefined);
   const sendDraftRef = useRef<(mode?: DeliveryMode, completedDocument?: JSONContent) => void>(() => undefined);
   const canFinishVoiceSend = !readOnly && controller.state.connectionState === "connected" && submissionKind === undefined && !effectiveBashMode && !modelRouteUnavailable && supportedModes.includes(deliveryMode)
@@ -1919,7 +1938,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
 
   sendDraftRef.current = sendDraft;
 
-  const insert = (item: ComposerPaletteItem): void => {
+  const insertResolved = (item: ComposerPaletteItem): void => {
     if (composerLocked || item.mention !== undefined && !composerMentionsAllowed([item.mention], mentionPolicy, resources)) return;
     const typedActivation = commandActivationRef.current;
     if (typedActivation !== undefined) {
@@ -1935,7 +1954,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       if (nextDocument === undefined || composerDocumentPlainText(nextDocument) !== normalizedReplacementText) return;
       markDraftEdited(session.id);
       resetHistoryNavigation();
-      const nextRanges = remapComposerInlineMentionReplacement(
+      const mappedRanges = remapComposerInlineMentionReplacement(
         inlineMentionRangesRef.current,
         typedActivation.from,
         typedActivation.to,
@@ -1945,8 +1964,12 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       setEditorDocument(nextDocument);
       textRef.current = normalizedReplacementText;
       setText(normalizedReplacementText);
+      const nextRanges = item.mention === undefined ? mappedRanges : [...mappedRanges, {
+        mentionId: item.mention.id, from: typedActivation.from, to: typedActivation.from + item.value.length
+      }];
       replaceInlineMentionRanges(nextRanges);
-      const nextMentions = composerMentionsFromRanges(mentionsRef.current, nextRanges);
+      const nextMentions = [...composerMentionsFromRanges(mentionsRef.current, mappedRanges),
+        ...(item.mention === undefined ? [] : [item.mention])];
       mentionsRef.current = nextMentions;
       setMentions(nextMentions);
       const caret = Math.min(replacement.caret, normalizedReplacementText.length);
@@ -1978,6 +2001,113 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     }
     closePalette();
     requestComposerFrame(() => richEditorRef.current?.focus());
+  };
+
+  const insert = (item: ComposerPaletteItem): void => {
+    const command = item.resourceCommand;
+    if (command === undefined) { insertResolved(item); return; }
+    if (composerLocked || effectiveBashMode || !commandOptions.resourceMentionSupported
+      || resourceCommandFlightRef.current !== undefined) return;
+    const ownerDocument = composerStackRef.current?.ownerDocument;
+    const ownerWindow = ownerDocument?.defaultView;
+    if (!ownerDocument || !ownerWindow) return;
+    const sourceOwner = sendOwner;
+    const sourceGuard = operationGuardRef.current;
+    const token = sourceGuard.capture(session.id);
+    const sourceDocument = editorDocumentRef.current;
+    const sourceText = textRef.current;
+    const sourceDraft: ComposerDraft = {
+      text: sourceText, editorDocument: sourceDocument, mentions: mentionsRef.current,
+      inlineMentionRanges: inlineMentionRangesRef.current, deliveryMode,
+      attachments: attachmentsRef.current, browserComments: browserCommentsRef.current,
+      ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
+    };
+    const sourceActivation = commandActivationRef.current;
+    const sourceCaret = lastComposerCaretRef.current;
+    const sourcePalette = paletteRef.current;
+    const sourceEpoch = sendEpochRef.current;
+    const sourceController = controllerRef.current;
+    const request = new AbortController();
+    resourceCommandFlightRef.current = request;
+    setResourceCommandPending(true);
+    const retire = (): void => request.abort();
+    ownerWindow.addEventListener("pagehide", retire);
+    const isCurrent = (): boolean => {
+      const current = resourceCommandStateRef.current;
+      const capability = sendStateRef.current;
+      return !request.signal.aborted && composerMountedRef.current
+        && resourceCommandFlightRef.current === request && current.owner === sourceOwner
+        && !current.locked && !current.bashMode && capability.connected && capability.mentionPolicy.resources
+        && sendEpochRef.current === sourceEpoch && sourceEpoch !== undefined
+        && operationGuardRef.current === sourceGuard && sourceGuard.ownsActivation(token) && sourceGuard.draftUnchanged(token)
+        && !composerIsComposingRef.current && editorDocumentRef.current === sourceDocument && textRef.current === sourceText
+        && paletteRef.current === sourcePalette && commandActivationRef.current === sourceActivation && lastComposerCaretRef.current === sourceCaret
+        && composerStackRef.current?.isConnected === true && composerStackRef.current.ownerDocument === ownerDocument
+        && current.commands.some(candidate => candidate.id === command.id && candidate.name === command.name
+          && candidate.loaded && candidate.inputMode === "resource_mention" && candidate.resourceId === command.resourceId
+          && (candidate.sessionId === undefined || candidate.sessionId === session.id));
+    };
+    setAttachmentError(undefined);
+    flushPendingDraftSave(voiceDictionaryOwnerKey);
+    void (async () => {
+      await draftSaveChainRef.current;
+      if (!isCurrent()) return;
+      const stored = await sourceController.readDraftSnapshot(session.id);
+      if (!isCurrent()) return;
+      if (stored.draft === undefined || !sameObjectiveInvocationDraft(stored.draft, sourceDraft)) {
+        throw new Error(t("composer.inputUnavailable"));
+      }
+      const catalog = await sourceController.listSessionResources(session.id, request.signal);
+      if (!isCurrent()) return;
+      const matches = catalog.filter(resource => resource.id === command.resourceId
+        && resource.sessionId === session.id && BigInt(resource.runtimeGeneration) === session.generation
+        && resource.kind === "skill");
+      if (matches.length !== 1) throw new Error(t("composer.inputUnavailable"));
+      const resource = matches[0]!;
+      const mention: ComposerMentionDraft = {
+        id: randomUuid(), kind: "resource", reference: resource.id, label: item.value, token: item.value,
+        discoveredRevision: resource.discoveredRevision, resourceVersion: resource.resourceVersion,
+        runtimeGeneration: resource.runtimeGeneration
+      };
+      if (!composerMentionsAllowed([mention], sendStateRef.current.mentionPolicy, sendStateRef.current.resources)) {
+        throw new Error(t("composer.inputUnavailable"));
+      }
+      const from = sourceActivation?.from ?? sourceText.length;
+      const to = sourceActivation?.to ?? sourceText.length;
+      const replacement = sourceActivation === undefined
+        ? `${sourceText.length > 0 && !/\s$/u.test(sourceText) ? " " : ""}${item.value} `
+        : replaceComposerCommandRun(sourceText, sourceActivation, item.value)?.replacement;
+      if (replacement === undefined) return;
+      const nextDocument = replaceComposerDocumentTextRange(sourceDocument, from, to, replacement);
+      if (nextDocument === undefined) return;
+      const nextText = composerDocumentPlainText(nextDocument);
+      const mapped = remapComposerInlineMentionReplacement(inlineMentionRangesRef.current, from, to, replacement.length);
+      const start = from + (sourceActivation === undefined ? replacement.indexOf(item.value) : 0);
+      const ranges = [...mapped, { mentionId: mention.id, from: start, to: start + item.value.length }].sort((a, b) => a.from - b.from);
+      const nextMentions = [...composerMentionsFromRanges(mentionsRef.current, mapped), mention];
+      const draft: ComposerDraft = { ...stored.draft, text: nextText, editorDocument: nextDocument, mentions: nextMentions, inlineMentionRanges: ranges };
+      if (!isCurrent()) return;
+      const revision = await sourceController.saveDraftIfRevision(session.id, draft, stored.revision);
+      if (!isCurrent()) return;
+      if (revision === undefined) throw new Error(t("composer.inputUnavailable"));
+      hydratedDraftRevisionRef.current = revision;
+      markDraftEdited(session.id);
+      editorRevisionRef.current += 1;
+      resetHistoryNavigation();
+      editorDocumentRef.current = nextDocument; textRef.current = nextText; mentionsRef.current = nextMentions;
+      setEditorDocument(nextDocument); setText(nextText); setMentions(nextMentions); replaceInlineMentionRanges(ranges);
+      const caret = Math.min(from + replacement.length, nextText.length);
+      lastComposerCaretRef.current = caret;
+      closePalette(); focusComposerAt(caret);
+    })().catch(error => {
+      if (isCurrent()) setAttachmentError(messageOf(error));
+    }).finally(() => {
+      ownerWindow.removeEventListener("pagehide", retire);
+      if (resourceCommandFlightRef.current === request) {
+        resourceCommandFlightRef.current = undefined;
+        if (composerMountedRef.current) setResourceCommandPending(false);
+      }
+    });
   };
 
   const selectInlineMention = (item: ComposerMentionCatalogItem, reference = false): void => {
@@ -2099,7 +2229,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       if (!isCurrent()) return;
       const matches = currentCommands.filter((command) => command.source === "skill" && command.loaded
         && command.resourceId === binding.resourceId && (command.sessionId === undefined || command.sessionId === session.id));
-      const item = matches.length === 1 ? composerCommandItems(matches)[0] : undefined;
+      const item = matches.length === 1 ? composerCommandItems(matches, {
+        resourceMentionSupported: commandOptions.resourceMentionSupported
+      })[0] : undefined;
       if (item === undefined) { setGamepadSkillError(t("settings.gamepad.skillInputUnavailable")); return; }
       insertSkillRef.current(item);
       setGamepadSkillError(undefined);
@@ -2665,7 +2797,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
                   onClose={() => closeInlineMention(true, true)}
                   onRetry={() => setWorkspaceMentionReload((current) => current + 1)}
                 />}
-                {palette === "commands" && paletteInAddMenu && <ComposerPalette embedded title={t("composer.commands")} items={availableCommandItems} empty={t("composer.noCommands")} t={t} onSelect={insert} onClose={() => closePalette(true)} />}
+                {palette === "commands" && paletteInAddMenu && <ComposerPalette embedded pending={resourceCommandPending} title={t("composer.commands")} items={availableCommandItems} empty={t("composer.noCommands")} t={t} onSelect={insert} onClose={() => closePalette(true)} />}
               </ComposerAddMenu>
               {palette === "mention" && inlineMentionActivation !== undefined && !paletteInAddMenu && <ComposerInlineMentionPanel
                 title={t("composer.mention")}
@@ -2686,6 +2818,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
                 items={typedCommandItems}
                 empty={t("composer.noCommands")}
                 activeIndex={selectedCommandIndex}
+                pending={resourceCommandPending}
                 t={t}
                 onActiveIndexChange={setCommandActiveIndex}
                 onSelect={insert}
@@ -2800,11 +2933,12 @@ function isCodedReviewDispatchFailure(error: unknown): boolean {
     && error.code.length > 0;
 }
 
-function ComposerTypedCommandPalette({ title, items, empty, activeIndex, t, onActiveIndexChange, onSelect, onClose }: {
+function ComposerTypedCommandPalette({ title, items, empty, activeIndex, pending, t, onActiveIndexChange, onSelect, onClose }: {
   readonly title: string;
   readonly items: readonly ComposerPaletteItem[];
   readonly empty: string;
   readonly activeIndex: number;
+  readonly pending: boolean;
   readonly t: Translator;
   readonly onActiveIndexChange: (index: number) => void;
   readonly onSelect: (item: ComposerPaletteItem) => void;
@@ -2822,12 +2956,13 @@ function ComposerTypedCommandPalette({ title, items, empty, activeIndex, t, onAc
   return (
     <div ref={rootRef} className="composer-palette" role="dialog" aria-label={title} data-composer-typed-command-palette="true">
       <header><strong>{title}</strong><IconButton label={t("common.close")} onClick={onClose}><X aria-hidden="true" /></IconButton></header>
-      <div id={listId} className="composer-palette__list" role="listbox" aria-label={title} aria-activedescendant={activeOptionId}>
+      <div id={listId} className="composer-palette__list" role="listbox" aria-busy={pending} aria-label={title} aria-activedescendant={activeOptionId}>
         {items.map((item, index) => <button
           id={`${listId}-option-${index}`}
           type="button"
           role="option"
           aria-selected={index === activeIndex}
+          disabled={pending && item.resourceCommand !== undefined}
           tabIndex={-1}
           key={item.id}
           onMouseMove={() => onActiveIndexChange(index)}
@@ -2840,7 +2975,7 @@ function ComposerTypedCommandPalette({ title, items, empty, activeIndex, t, onAc
 }
 
 
-function ComposerPalette({ title, items, empty, t, onSelect, onClose, embedded = false }: { readonly title: string; readonly items: readonly ComposerPaletteItem[]; readonly empty: string; readonly t: Translator; readonly onSelect: (item: ComposerPaletteItem) => void; readonly onClose: () => void; readonly embedded?: boolean }): JSX.Element {
+function ComposerPalette({ title, items, empty, t, onSelect, onClose, embedded = false, pending = false }: { readonly title: string; readonly items: readonly ComposerPaletteItem[]; readonly empty: string; readonly t: Translator; readonly onSelect: (item: ComposerPaletteItem) => void; readonly onClose: () => void; readonly embedded?: boolean; readonly pending?: boolean }): JSX.Element {
   const [query, setQuery] = useState("");
   const [activeIndex, setActiveIndex] = useState(0);
   const listId = useId();
@@ -2892,8 +3027,8 @@ function ComposerPalette({ title, items, empty, t, onSelect, onClose, embedded =
         placeholder={t("common.filter")}
         aria-label={`${t("common.filter")} ${title}`}
       />
-      <div id={listId} className="composer-palette__list" role="listbox">
-        {visible.map((item, index) => <button id={`${listId}-option-${index}`} type="button" role="option" aria-selected={index === selectedIndex} tabIndex={-1} key={item.id} onMouseMove={() => setActiveIndex(index)} onClick={() => onSelect(item)}><span>{item.label}</span><small>{item.meta}</small></button>)}
+      <div id={listId} className="composer-palette__list" role="listbox" aria-busy={pending}>
+        {visible.map((item, index) => <button id={`${listId}-option-${index}`} type="button" role="option" aria-selected={index === selectedIndex} disabled={pending && item.resourceCommand !== undefined} tabIndex={-1} key={item.id} onMouseMove={() => setActiveIndex(index)} onClick={() => onSelect(item)}><span>{item.label}</span><small>{item.meta}</small></button>)}
         {visible.length === 0 && <p>{empty}</p>}
       </div>
     </div>

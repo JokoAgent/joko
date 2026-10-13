@@ -379,6 +379,65 @@ describe("ProviderSettings model visibility", () => {
     expect(document.body.querySelector(".provider-add-wizard")?.textContent).toContain("Local runtime");
   });
 
+  it("adds an empty repository Provider explicitly and reuses its runtime in configured details without starting", async () => {
+    const base = emptySnapshot();
+    const runtime = managedRepositoryRuntime();
+    const initial = { ...base, managedModelRuntimes: [runtime] };
+    const configuration = provider("repository-provider", "Local repository provider", { kind: "localKeyless", runtimes: [runtimeConfiguration()] });
+    const configuredRuntime = { ...runtime, providerRoutes: [{ backendId: "backend-provider-catalog", providerId: configuration.id }] };
+    const configured = { ...base, providers: [providerRuntime(configuration, { authenticationState: "notRequired" })], settings: { ...base.settings, providers: [configuration] }, managedModelRuntimes: [configuredRuntime] };
+    const ensure = vi.fn(async () => configuredRuntime);
+    const start = vi.fn();
+    const install = vi.fn();
+    const controller = { ...controllerFor(initial), ensureManagedModelRuntimeProvider: ensure, refresh: vi.fn(async () => { root.render(view(configured)); }), refreshManagedModelRuntimes: vi.fn(async () => [configuredRuntime]), startManagedModelRuntime: start, installManagedModelRuntime: install } as unknown as AppController;
+    const container = document.createElement("div"); document.body.append(container);
+    const root = createRoot(container); roots.push(root);
+    const view = (snapshot: typeof initial) => <ProviderSettings controller={controller} snapshot={snapshot} runAction={(_key, action) => { void action(); }} t={(key, values) => translate("en", key, values)} />;
+    await act(async () => root.render(view(initial)));
+    expect(container.querySelector(".provider-master")?.textContent).not.toContain(runtime.name);
+    await act(async () => required(container.querySelector<HTMLButtonElement>(".provider-master__footer button")).click());
+    await act(async () => required([...document.body.querySelectorAll<HTMLButtonElement>(".provider-add-wizard__catalog button")].find((button) => button.textContent?.includes(runtime.name))).click());
+    expect(ensure).toHaveBeenCalledOnce();
+    expect(ensure).toHaveBeenCalledWith(runtime.id);
+    expect(container.querySelector(".provider-detail")?.textContent).toContain("Local repository provider");
+    expect(container.querySelector(".provider-detail .managed-model-runtime-card")?.textContent).toContain(runtime.name);
+    expect(container.querySelector('[aria-label="Delete Local repository provider"]')).not.toBeNull();
+    expect(start).not.toHaveBeenCalled(); expect(install).not.toHaveBeenCalled();
+    await act(async () => required(container.querySelector<HTMLButtonElement>(".provider-master__footer button")).click());
+    await act(async () => required([...document.body.querySelectorAll<HTMLButtonElement>(".provider-add-wizard__catalog button")].find((button) => button.textContent?.includes(runtime.name))).click());
+    expect(ensure).toHaveBeenCalledOnce();
+    expect(document.body.querySelector(".provider-runtime-modal")).toBeNull();
+  });
+
+  it.each(["failure", "closed", "owner changed"] as const)("keeps explicit repository Add visible on failure and retires late navigation when %s", async (kind) => {
+    const runtime = managedRepositoryRuntime();
+    const snapshot = { ...emptySnapshot(), managedModelRuntimes: [runtime] };
+    let finish!: () => void;
+    let failed = false;
+    const ensure = vi.fn(async () => { await new Promise<void>((resolve) => { finish = resolve; }); if (kind === "failure" && !failed) { failed = true; throw new Error("Add failed"); } return { ...runtime, providerRoutes: [{ backendId: "route-a", providerId: "new-provider" }] }; });
+    const refresh = vi.fn(async () => undefined);
+    const controller = { ...controllerFor(snapshot), ensureManagedModelRuntimeProvider: ensure, refresh } as unknown as AppController;
+    const container = document.createElement("div"); document.body.append(container); const root = createRoot(container); roots.push(root);
+    const view = (current: AppController) => <ProviderSettings controller={current} snapshot={snapshot} runAction={(_key, action) => { void action(); }} t={(key, values) => translate("en", key, values)} />;
+    await act(async () => root.render(view(controller)));
+    await act(async () => required(container.querySelector<HTMLButtonElement>(".provider-master__footer button")).click());
+    const choose = required([...document.body.querySelectorAll<HTMLButtonElement>(".provider-add-wizard__catalog button")].find((button) => button.textContent?.includes(runtime.name)));
+    await act(async () => choose.click());
+    expect(choose.disabled).toBe(true);
+    expect(document.body.querySelector('.provider-add-wizard [role="status"]')).not.toBeNull();
+    if (kind === "closed") await act(async () => required(document.body.querySelector<HTMLButtonElement>(".provider-add-wizard-modal .provider-flow-header-back")).click());
+    if (kind === "owner changed") await act(async () => root.render(view({ ...controller, state: { ...controller.state, activeProfile: { ...controller.state.activeProfile!, serverId: "different-owner" } } } as AppController)));
+    await act(async () => finish());
+    expect(refresh).not.toHaveBeenCalled();
+    if (kind === "failure") {
+      expect(document.body.querySelector('.provider-add-wizard [role="alert"]')?.textContent).toContain("action failed");
+      expect(choose.disabled).toBe(false);
+      await act(async () => choose.click());
+      await act(async () => finish());
+      expect(refresh).toHaveBeenCalledOnce();
+    } else expect(container.querySelector(".provider-detail")?.textContent).not.toContain("new-provider");
+  });
+
   it("returns from custom provider setup through the title-bar Back action", async () => {
     const snapshot = { ...emptySnapshot(), backends: [
       managedBackend(),
@@ -986,8 +1045,11 @@ describe("ProviderSettings model visibility", () => {
     const updateBackendSettings = vi.fn(async () => undefined);
     const controller = {
       refreshProviderModels: vi.fn(async () => undefined),
+      getModelWorkingContext: vi.fn(async () => ({ target: { backendId: "backend-a", providerId: "shared-provider", modelId: "shared-model" }, revision: 0n, sourceRevision: "source", canConfigure: false, customized: false, mixed: false })),
       updateBackendSettings,
       state: {
+        connectionState: "connected",
+        effectiveLocale: "en",
         activeProfile: { id: "profile-one", serverId: "orchestrator-one", name: "Orchestrator", origin: "https://orchestrator.invalid" },
         preferences: { locale: "en" },
         snapshot
@@ -1034,8 +1096,8 @@ describe("ProviderSettings model visibility", () => {
     expect(required(container.querySelector<HTMLButtonElement>(".provider-model-row [role=switch]")).getAttribute("aria-checked")).toBe("true");
     await act(async () => required(divergence ?? null).click());
 
-    await act(async () => required(container.querySelector<HTMLButtonElement>(".provider-model-row__menu > summary")).click());
-    const disableModel = [...container.querySelectorAll<HTMLButtonElement>(".provider-model-row__menu button")]
+    await act(async () => required(container.querySelector<HTMLButtonElement>(".provider-model-advanced-button")).click());
+    const disableModel = [...document.querySelectorAll<HTMLButtonElement>(".model-advanced-drawer button")]
       .find((button) => button.textContent === "Disable model");
     await act(async () => { required(disableModel ?? null).click(); await Promise.resolve(); });
     expect(updateBackendSettings).toHaveBeenCalledWith("backend-a", { modelAccessUpdate: { providerId: "shared-provider", modelId: "shared-model", enabled: false } });
@@ -1534,6 +1596,10 @@ function controllerFor(snapshot: ReturnType<typeof emptySnapshot>): AppControlle
       snapshot
     }
   } as unknown as AppController;
+}
+
+function managedRepositoryRuntime(): ManagedModelRuntimeView {
+  return { id: "repository-runtime", name: "Repository runtime", state: "absent", source: "none", capabilities: { canInstall: true, canCancelInstall: false, canStart: true, canListModels: true, canPullModels: true, canDeleteModels: false, canPausePulls: true, canResumePulls: true, canCancelPulls: true, supportsCustomModels: true, supportsCuratedCatalog: true, supportsModelPreflight: true, canConfigure: true, canStop: false, canRestart: false, supportsRepositoryModels: true, startupPolicy: "onUse" }, installPreflight: { allowed: true, memory: "sufficient", disk: "sufficient", requiredDiskBytes: 1_024 }, installedModels: [], catalog: [], transfers: [], providerRoutes: [], revision: 1n };
 }
 
 function providerNames(container: HTMLElement): (string | null)[] {

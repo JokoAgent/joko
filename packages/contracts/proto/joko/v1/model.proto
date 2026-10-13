@@ -158,6 +158,48 @@ message ModelDescriptor {
   google.protobuf.Timestamp price_updated_at = 20;
   // Stable cross-runtime identity. The route-specific ModelKey remains authoritative for mutations.
   string logical_id = 21;
+  optional string description = 22;
+  optional string default_effort = 23;
+  repeated string display_thinking_levels = 24;
+  ModelDeclaredModalities declared_modalities = 25;
+  optional bool declared_supports_images = 26;
+  optional bool declared_supports_fast_mode = 27;
+  optional string reference_api = 28;
+  string api = 29;
+  optional string protocol_mode = 30;
+  optional string context_window_source = 31;
+  optional string max_output_tokens_source = 32;
+}
+
+message ModelModalityValues { repeated string values = 1; }
+message ModelDeclaredModalities {
+  ModelModalityValues input = 1;
+  ModelModalityValues output = 2;
+}
+
+message ModelWorkingContextTarget {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+}
+message ModelNativeContextInfo {
+  optional uint64 context_window_tokens = 1;
+  optional uint64 auto_compact_limit_tokens = 2;
+  string source = 3;
+  bool pending_apply = 4;
+}
+message ModelWorkingContextView {
+  ModelWorkingContextTarget target = 1;
+  optional uint64 limit_tokens = 2;
+  optional uint64 default_context_window_tokens = 3;
+  optional uint64 effective_context_window_tokens = 4;
+  bool customized = 5;
+  bool mixed = 6;
+  Revision revision = 7;
+  string source_revision = 8;
+  bool can_configure = 9;
+  optional string blocked_reason = 10;
+  ModelNativeContextInfo native_context = 11;
 }
 
 enum ModelInputModality {

@@ -150,8 +150,8 @@ describe("ExtensionCatalogManager", () => {
       const observed = catalog.snapshot({
         sessionId: "session-a",
         commands: [
-          { name: "open-nav", description: "Open navigation", source: "extension", loaded: true, resourceId: "other-resource" },
-          { name: "open-nav", description: "Open navigation", source: "extension", loaded: true, resourceId: "resource-extension-a" }
+          { name: "open-nav", description: "Open navigation", source: "extension", inputMode: "text", loaded: true, resourceId: "other-resource" },
+          { name: "open-nav", description: "Open navigation", source: "extension", inputMode: "text", loaded: true, resourceId: "resource-extension-a" }
         ]
       }).entries.find((entry) => entry.id === extension?.id);
       expect(observed?.commands).toEqual([{ name: "open-nav", description: "Open navigation", sessionId: "session-a" }]);

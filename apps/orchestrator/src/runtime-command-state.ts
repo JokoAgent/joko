@@ -75,6 +75,7 @@ export function sameRuntimeCommands(
       command.name === candidate.name &&
       command.description === candidate.description &&
       command.source === candidate.source &&
+      command.inputMode === candidate.inputMode &&
       command.path === candidate.path &&
       command.resourceId === candidate.resourceId &&
       command.loaded === candidate.loaded;
@@ -97,10 +98,18 @@ function normalizeRuntimeCommand(value: RuntimeCommand, index: number): RuntimeC
   const resourceId = value["resourceId"] === undefined
     ? undefined
     : safeText(value["resourceId"], MAX_RESOURCE_ID_LENGTH).trim();
+  const inputMode = value["inputMode"];
+  if (inputMode !== "text" && inputMode !== "resource_mention") {
+    throw new Error(`Runtime command ${index} has an invalid input mode.`);
+  }
+  if (inputMode === "resource_mention" && (source !== "skill" || !value["loaded"] || !resourceId)) {
+    throw new Error(`Runtime command ${index} has no loaded Skill Resource identity.`);
+  }
   return {
     name,
     description,
     source,
+    inputMode,
     ...(path === undefined || path === "" ? {} : { path }),
     ...(resourceId === undefined || resourceId === "" ? {} : { resourceId }),
     loaded: value["loaded"]
@@ -113,7 +122,7 @@ function safeText(value: unknown, maximum: number): string {
 }
 
 function runtimeCommandIdentity(command: RuntimeCommand): string {
-  return `${command.source}\0${command.name}\0${command.path ?? ""}\0${command.resourceId ?? ""}`;
+  return `${command.source}\0${command.name}\0${command.path ?? ""}\0${command.resourceId ?? ""}\0${command.inputMode}`;
 }
 
 function compareRuntimeCommands(left: RuntimeCommand, right: RuntimeCommand): number {

@@ -13,10 +13,14 @@ import {
   type RuntimePreflight,
   type RuntimePublicErrorCode
 } from "@joko/local-model-runtime";
+import type { ManagedRepositoryModel, ManagedRuntimeConfigureBlockedReason, ManagedRuntimeHostProfile,
+  ManagedRuntimeProviderRoute, ManagedRuntimeRepositoryVariant } from "./managed-model-runtime-port.js";
 
 export interface ManagedModelRuntimeCatalogEntry extends CuratedLocalModel {
   readonly recommended: boolean;
   readonly preflight: RuntimePreflight;
+  readonly descriptions?: Readonly<Record<string, string>>;
+  readonly variants?: readonly ManagedRuntimeRepositoryVariant[];
 }
 
 export interface ManagedModelRuntimeCapabilityProfile extends LocalRuntimeCapabilities {
@@ -26,7 +30,20 @@ export interface ManagedModelRuntimeCapabilityProfile extends LocalRuntimeCapabi
   readonly supportsCustomModels: boolean;
   readonly supportsCuratedCatalog: boolean;
   readonly supportsModelPreflight: boolean;
+  readonly canConfigure?: boolean;
+  readonly canStop?: boolean;
+  readonly canRestart?: boolean;
+  readonly supportsRepositoryModels?: boolean;
+  readonly startupPolicy?: "explicit" | "on_use";
 }
+
+export interface ManagedRuntimeInstalledModel extends InstalledLocalModel {
+  readonly displayName?: string;
+  readonly repositoryModel?: ManagedRepositoryModel;
+}
+export type ManagedRuntimeTransfer = (ModelPullProgress | RuntimeInstallProgress) & {
+  readonly transferId?: string; readonly repositoryModel?: ManagedRepositoryModel;
+};
 
 export interface ManagedModelRuntimeSnapshot {
   readonly runtimeId: string;
@@ -36,9 +53,12 @@ export interface ManagedModelRuntimeSnapshot {
   readonly version?: string;
   readonly capabilities: ManagedModelRuntimeCapabilityProfile;
   readonly installPreflight: RuntimePreflight;
-  readonly installedModels: readonly InstalledLocalModel[];
+  readonly installedModels: readonly ManagedRuntimeInstalledModel[];
   readonly catalog: readonly ManagedModelRuntimeCatalogEntry[];
-  readonly transfers: readonly (ModelPullProgress | RuntimeInstallProgress)[];
+  readonly transfers: readonly ManagedRuntimeTransfer[];
+  readonly providerRoutes?: readonly ManagedRuntimeProviderRoute[];
+  readonly hostProfile?: ManagedRuntimeHostProfile;
+  readonly configureBlockedReason?: ManagedRuntimeConfigureBlockedReason;
   readonly publicErrorCode?: RuntimePublicErrorCode;
   readonly revision: bigint;
   readonly updatedAt: number;
@@ -73,6 +93,7 @@ export interface ManagedModelRuntimeControllerOptions {
   readonly runtimeId?: string;
   readonly displayName?: string;
   readonly freeDiskBytes?: () => Promise<number | undefined>;
+  readonly providerRoutes?: () => readonly ManagedRuntimeProviderRoute[];
   readonly now?: () => number;
 }
 
@@ -141,13 +162,16 @@ export class ManagedModelRuntimeController {
       canCancelPulls: pulls.length > 0,
       supportsCustomModels: status.capabilities.canPullModels,
       supportsCuratedCatalog: true,
-      supportsModelPreflight: true
+      supportsModelPreflight: true,
+      canConfigure: true, canStop: false, canRestart: false, supportsRepositoryModels: false, startupPolicy: "explicit"
     };
+    const providerRoutes = this.options.providerRoutes?.().map(route => ({ ...route })) ?? [];
     const projection = JSON.stringify({
       status,
       capabilities,
       installPreflight: this.manager.runtimePreflight(this.owner, freeDiskBytes),
       installedModels,
+      providerRoutes,
       catalog,
       transfers: [...(installProgress === undefined ? [] : [installProgress]), ...pulls],
       lastError: this.lastError
@@ -168,6 +192,7 @@ export class ManagedModelRuntimeController {
       capabilities,
       installPreflight: this.manager.runtimePreflight(this.owner, freeDiskBytes),
       installedModels,
+      providerRoutes,
       catalog,
       transfers: [...(installProgress === undefined ? [] : [installProgress]), ...pulls],
       ...(this.lastError ?? status.publicErrorCode) === undefined

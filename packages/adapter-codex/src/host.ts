@@ -212,7 +212,15 @@ export class AppServerHost {
       options.beforeDispatch?.();
     };
     beforeDispatch();
-    const value = await transport!.request(method, params, { ...options, beforeDispatch });
+    const value = await transport!.request(method, params, { ...options, beforeDispatch,
+      ...(options.beforeDispatchAsync === undefined ? {} : { beforeDispatchAsync: async (signal: AbortSignal) => {
+        beforeDispatch();
+        signal.throwIfAborted();
+        await options.beforeDispatchAsync!(signal);
+        signal.throwIfAborted();
+        beforeDispatch();
+      } })
+    });
     if (generation !== this.#generation) {
       throw new TransportFault("process_exited", "The Codex app-server generation changed before the response was accepted.", {
         stateMayHaveChanged: options.mutation

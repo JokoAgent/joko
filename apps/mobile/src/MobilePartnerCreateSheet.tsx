@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { AccessibilityInfo, ActivityIndicator, Alert, Animated, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { AccessibilityInfo, ActivityIndicator, Alert, Animated, AppState, Modal, Platform, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { MobilePartnerProfileForm } from "./MobilePartnerProfileForm";
@@ -29,6 +29,8 @@ export function MobilePartnerCreateSheet({ visible, transport, colors, locale, o
   const [busy, setBusy] = useState(false); const busyRef = useRef(false);
   const [preparing, setPreparing] = useState(false); const preparingRef = useRef(false);
   const request = useRef<AbortController | undefined>(undefined); const sequence = useRef(0);
+  const permissionConfirmation = useRef<symbol | undefined>(undefined);
+  const stateRef = useRef(state); stateRef.current = state;
   const completed = useRef<{ readonly ownerKey: string; readonly partner: MobilePartnerDirectoryProfile } | undefined>(undefined);
   const keyboard = useMobileKeyboardState(); const insets = useSafeAreaInsets();
   const ownerKey = transport?.ownerKey;
@@ -62,6 +64,7 @@ export function MobilePartnerCreateSheet({ visible, transport, colors, locale, o
   useEffect(() => { if (Platform.OS !== "ios" && !presented && !visible) deliver(); }, [presented, visible]);
 
   const load = (keepDraft = false): void => {
+    permissionConfirmation.current = undefined;
     const active = props.current.transport;
     if (!props.current.visible || !active || busyRef.current) return;
     request.current?.abort(); const abort = new AbortController(); request.current = abort;
@@ -89,6 +92,10 @@ export function MobilePartnerCreateSheet({ visible, transport, colors, locale, o
     if (visible) { completed.current = undefined; load(); }
     return () => { sequence.current += 1; request.current?.abort(); };
   }, [visible, ownerKey]);
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", value => { if (value !== "active") permissionConfirmation.current = undefined; });
+    return () => subscription.remove();
+  }, []);
 
   const close = (): void => {
     if (busyRef.current || preparingRef.current) return;
@@ -142,15 +149,26 @@ export function MobilePartnerCreateSheet({ visible, transport, colors, locale, o
         ? mobileMessage(locale, `partnerProfile.error.${error.code}`) : mobileMessage(locale, "partnerCreation.failed") })); return;
     }
     const expected = ownerKey;
+    const generation = sequence.current, capturedDraft = JSON.stringify(draft), confirmation = Symbol("partner-creation-permission-confirmation");
+    permissionConfirmation.current = confirmation;
     const commit = (): void => {
-      if (props.current.transport?.ownerKey === expected && props.current.visible) perform((active, signal) => active.create(snapshot, validated, signal));
+      if (permissionConfirmation.current !== confirmation || sequence.current !== generation
+        || stateRef.current.snapshot !== snapshot || JSON.stringify(stateRef.current.draft) !== capturedDraft
+        || props.current.transport !== transport || props.current.transport?.ownerKey !== expected || !props.current.visible
+        || AppState.currentState !== "active" || busyRef.current || preparingRef.current || stateRef.current.pending || stateRef.current.loading) return;
+      permissionConfirmation.current = undefined;
+      perform((active, signal) => active.create(snapshot, validated, signal));
     };
-    if (validated.capabilities.permissionMode === "auto") Alert.alert(mobileMessage(locale, "partnerProfile.permission"),
-      mobileMessage(locale, "partnerProfile.autoWarning"), [{ text: mobileMessage(locale, "common.cancel"), style: "cancel" },
-        { text: mobileMessage(locale, "partnerCreation.create"), onPress: commit }]);
+    if (validated.capabilities.permissionMode === "auto" || validated.capabilities.permissionMode === "bypassPermissions") Alert.alert(
+      mobileMessage(locale, validated.capabilities.permissionMode === "bypassPermissions" ? "controls.fullAccessTitle" : "partnerProfile.permission"),
+      mobileMessage(locale, validated.capabilities.permissionMode === "bypassPermissions" ? "controls.fullAccessBody" : "partnerProfile.autoWarning"),
+      [{ text: mobileMessage(locale, "common.cancel"), style: "cancel", onPress: () => { if (permissionConfirmation.current === confirmation) permissionConfirmation.current = undefined; } },
+        { text: mobileMessage(locale, "partnerCreation.create"), onPress: commit }],
+      { cancelable: true, onDismiss: () => { if (permissionConfirmation.current === confirmation) permissionConfirmation.current = undefined; } });
     else commit();
   };
   const change = (next: MobilePartnerProfileDraft): void => {
+    permissionConfirmation.current = undefined;
     const avatar = next.avatar;
     if (editable && (typeof avatar === "string" || "base64" in avatar)) {
       setState((previous) => ({ ...previous, draft: { ...draft!, ...next, avatar }, error: undefined }));

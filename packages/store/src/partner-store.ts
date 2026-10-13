@@ -114,7 +114,7 @@ CREATE TABLE partner_directory (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
   default_model_chain_json TEXT,
-  default_permission_mode TEXT CHECK (default_permission_mode IS NULL OR default_permission_mode IN ('ask', 'auto')),
+  default_permission_mode TEXT CHECK (default_permission_mode IS NULL OR default_permission_mode IN ('ask', 'auto', 'bypassPermissions')),
   default_plan_mode INTEGER CHECK (default_plan_mode IS NULL OR default_plan_mode IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
@@ -142,7 +142,7 @@ CREATE TABLE partners (
   canonical_session_id TEXT UNIQUE,
   model_chain_json TEXT NOT NULL,
   task_model_json TEXT,
-  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto')),
+  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -220,7 +220,7 @@ CREATE TABLE partner_profile_versions (
   identity_source TEXT NOT NULL,
   model_chain_json TEXT NOT NULL,
   task_model_json TEXT,
-  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto')),
+  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -2240,7 +2240,7 @@ function capabilitiesValue(value: PartnerCapabilitiesRecord): PartnerCapabilitie
     throw new PartnerStoreError("PARTNER_INVALID", "Partner capabilities are required.");
   }
   const permissionMode = value.permissionMode;
-  if (permissionMode !== "ask" && permissionMode !== "auto") {
+  if (permissionMode !== "ask" && permissionMode !== "auto" && permissionMode !== "bypassPermissions") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner permission mode is invalid.");
   }
   if (typeof value.planMode !== "boolean") {
@@ -2314,7 +2314,7 @@ function capabilitiesFromColumns(row: Row, prefix: string): PartnerCapabilitiesR
   const permissionMode = stringValue(row[`${prefix}permission_mode`], "Partner permission mode");
   return capabilitiesValue({
     modelChain: routes,
-    permissionMode: permissionMode === "ask" || permissionMode === "auto" ? permissionMode : permissionMode as never,
+    permissionMode: permissionMode as PartnerCapabilitiesRecord["permissionMode"],
     planMode: booleanInteger(row[`${prefix}plan_mode`], "Partner Plan mode")
   });
 }

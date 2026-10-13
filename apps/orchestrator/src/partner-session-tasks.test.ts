@@ -21,7 +21,7 @@ import type { OrchestratorApplication } from "./application.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-const profile = { ...PI_LIKE_PROFILE, streamDelayMs: 30_000, capabilities: [...PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+const profile = { ...PI_LIKE_PROFILE, permissionModes: ["ask", "auto", "bypassPermissions"] as const, streamDelayMs: 30_000, capabilities: [...PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
   ? { key: "permission.modes", supported: true, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true }],
   models: [...PI_LIKE_PROFILE.models, { ...PI_LIKE_PROFILE.models[0]!, modelId: "backup" }] };
 class RecordedAdapter extends FakeBackendAdapter {
@@ -34,6 +34,47 @@ class RecordedAdapter extends FakeBackendAdapter {
   }
 }
 describe("Partner independent Session tasks", () => {
+  it("freezes exact Full access on an admitted independent Task while later Tasks use the new profile", async () => {
+    const f = await fixture();
+    const full = await f.partners.updatePartner(f.partner.id, f.partner.revision, { capabilities: { ...f.partner.capabilities, permissionMode: "bypassPermissions" } });
+    const first = await f.tasks.start(f.parent, "task:full-permission", { instruction: "First owned task" }, () => undefined);
+    expect(first.permissionMode).toBe("bypassPermissions");
+    expect(f.store.getSession(first.sessionId!).descriptor.permissionMode).toBe("bypassPermissions");
+    await f.partners.updatePartner(full.id, full.revision, { capabilities: { ...full.capabilities, permissionMode: "ask" } });
+    expect(f.tasks.list(full.id).find(row => row.id === first.id)?.permissionMode).toBe("bypassPermissions");
+    expect(f.store.getSession(first.sessionId!).descriptor.permissionMode).toBe("bypassPermissions");
+    const next = await f.tasks.start(f.parent, "task:ask-permission", { instruction: "Next owned task" }, () => undefined);
+    expect(next.permissionMode).toBe("ask"); expect(f.store.getSession(next.sessionId!).descriptor.permissionMode).toBe("ask");
+  });
+  it("retains ordered admitted Runs for one execution through restart and resets them on explicit reopening", async () => {
+    const f = await fixture(), task = await f.tasks.start(f.parent, "task:output-runs", { instruction: "Produce outputs" }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs).toHaveLength(1));
+    await f.tasks.message(f.parent, task.id, "task:output-followup", { mode: "queue", message: "Add another output" }, () => undefined);
+    await f.tasks.message(f.parent, task.id, "task:output-followup", { mode: "queue", message: "Add another output" }, () => undefined);
+    const runIds = f.store.listQueueItems({ sessionId: task.sessionId! }).map(row => row.runId);
+    expect(runIds).toHaveLength(2); expect(f.tasks.list(f.partner.id)[0]!.executionRunIds).toEqual(runIds);
+    await f.tasks.close(); f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now); await f.tasks.initialize();
+    expect(f.tasks.list(f.partner.id)[0]!.executionRunIds).toEqual(runIds);
+    await f.primary.complete(task.sessionId!, "First output");
+    await vi.waitFor(() => expect(f.primary.inputs.filter(row => row.context.sessionId === task.sessionId)).toHaveLength(2));
+    await f.primary.complete(task.sessionId!, "Second output");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]!.status).toBe("completed"));
+    await f.tasks.message(f.parent, task.id, "task:output-new-execution", { mode: "queue", message: "New execution" }, () => undefined);
+    const reopened = f.tasks.list(f.partner.id)[0]!;
+    expect(reopened.execution).toBe(2); expect(reopened.executionRunIds).toEqual([reopened.runId]);
+    expect(runIds).not.toContain(reopened.runId);
+    await f.tasks.close(); f.tasks = new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now); await f.tasks.initialize();
+    expect(f.tasks.list(f.partner.id)[0]!.executionRunIds).toEqual(reopened.executionRunIds);
+  });
+  it("rejects a persisted Task without the current execution Run identity shape", async () => {
+    const f = await fixture(), task = await f.tasks.start(f.parent, "task:output-shape", { instruction: "Keep exact Runs" }, () => undefined);
+    await f.tasks.close();
+    const current = f.store.getSetting<import("./partner-session-tasks.js").PartnerSessionTaskRecord>("service", "partner.session-tasks", task.id).value;
+    const { executionRunIds: _runIds, ...old } = current;
+    f.store.setSetting("service", "partner.session-tasks", task.id, old);
+    expect(() => new PartnerSessionTaskManager(f.store, f.partners, f.host, f.workspaces, f.managed, f.now)).toThrow();
+    f.store.setSetting("service", "partner.session-tasks", task.id, current);
+  });
   it("creates one visible task, freezes a cross-Backend preference and returns adopted artifacts once", async () => {
     const f = await fixture(), selected = await f.partners.updatePartner(f.partner.id, f.partner.revision, { taskModelOverride: f.route });
     const created = await f.tasks.start(f.parent, "task:first", { instruction: "Produce the report", title: "Report", workingDir: f.project }, () => undefined);

@@ -54,10 +54,14 @@ export interface NativeModel {
   readonly id: string;
   readonly model: string;
   readonly displayName: string;
+  readonly description?: string;
+  readonly defaultReasoningEffort?: string;
   readonly hidden: boolean;
   readonly supportedReasoningEfforts: readonly { readonly reasoningEffort: string }[];
   readonly inputModalities: readonly string[];
+  readonly inputModalitiesDeclared?: boolean;
   readonly serviceTiers: readonly { readonly id: string }[];
+  readonly serviceTiersDeclared?: boolean;
   readonly defaultServiceTier?: string | null;
   readonly isDefault: boolean;
 }
@@ -102,7 +106,7 @@ export interface CommandApprovalAvailability {
 const MAX_COMMAND_APPROVAL_DECISIONS = 16;
 
 export interface NativeUserInput extends JsonObject {
-  readonly type: "text" | "image" | "localImage" | "mention";
+  readonly type: "text" | "image" | "localImage" | "mention" | "skill";
 }
 
 export function objectValue(value: JsonValue | unknown, label = "value"): JsonObject {
@@ -254,10 +258,15 @@ export function parseModels(
       id: stringValue(model["id"], "model id"),
       model: stringValue(model["model"], "model slug"),
       displayName: stringValue(model["displayName"], "model display name"),
+      ...(typeof model["description"] === "string" ? { description: model["description"].slice(0, 16_384) } : {}),
+      ...(typeof model["defaultReasoningEffort"] === "string" && efforts.some((effort) => effort.reasoningEffort === model["defaultReasoningEffort"])
+        ? { defaultReasoningEffort: model["defaultReasoningEffort"] } : {}),
       hidden: model["hidden"] === true,
       supportedReasoningEfforts: efforts,
       inputModalities: modalities,
+      inputModalitiesDeclared: Array.isArray(model["inputModalities"]),
       serviceTiers: tiers,
+      serviceTiersDeclared: Array.isArray(model["serviceTiers"]),
       ...(typeof model["defaultServiceTier"] === "string" ? { defaultServiceTier: model["defaultServiceTier"] } : {}),
       isDefault: model["isDefault"] === true
     };

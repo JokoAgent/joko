@@ -4,6 +4,7 @@ import { basename, isAbsolute, relative, resolve } from "node:path";
 import {
   JokoError,
   redactSecrets,
+  validInputMentionRanges,
   type AdapterContext,
   type ArtifactMentionResolver,
   type BlobRef,
@@ -38,10 +39,19 @@ export interface ResolvedBlob {
   readonly mimeType?: string;
 }
 
+export interface ResolvedCodexSkill {
+  readonly name: string;
+  readonly path: string;
+  readonly defaultPrompt?: string;
+  readonly assertCurrent: () => void;
+  readonly assertFilesCurrent: (signal: AbortSignal) => Promise<void>;
+}
+
 export interface CodexInputResolvers {
   readonly readBlob?: (blob: BlobRef) => Promise<ResolvedBlob>;
   readonly resolveFile?: (blob: BlobRef, context: AdapterContext) => Promise<string>;
   readonly resolveArtifactMention?: ArtifactMentionResolver;
+  readonly resolveSkillMention?: (mention: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>, context: AdapterContext) => Promise<ResolvedCodexSkill>;
   readonly maximumBlobBytes?: number;
   readonly maximumAggregateBlobBytes?: number;
   readonly maximumFileBytes?: number;
@@ -83,6 +93,7 @@ export function createTranslatorState(threadId?: string): TranslatorState {
 export interface PreparedCodexPrompt {
   readonly input: readonly NativeUserInput[];
   readonly assertCurrent: () => void;
+  readonly assertFilesCurrent: (signal: AbortSignal) => Promise<void>;
 }
 
 export async function translatePromptInput(
@@ -92,6 +103,8 @@ export async function translatePromptInput(
 ): Promise<PreparedCodexPrompt> {
   for (const mention of input.mentions) {
     if (mention.kind === "workspace_file" && mention.lineRange === undefined) continue;
+    if (mention.kind === "resource" && resolvers.resolveSkillMention !== undefined
+      && context.assertResourceMentionCurrent !== undefined) continue;
     if (mention.kind === "artifact") {
       if (resolvers.resolveArtifactMention === undefined) throw unsupportedMention();
       if (mention.reference.length === 0 || mention.reference.length > 1_024
@@ -130,7 +143,16 @@ export async function translatePromptInput(
       recovery: "Reduce the number of attachments and mentions before retrying."
     });
   }
-  const textParts = input.text.length > 0 ? [input.text] : [];
+  if (input.mentionRanges !== undefined && !validInputMentionRanges(input.text, input.mentions, input.mentionRanges, input.pastedTextRanges)) {
+    throw adapterError({ code: "CODEX_MENTION_RANGE_INVALID", message: "The selected input occurrence is no longer valid.",
+      phase: "dispatch", recovery: "Select the input again in the current draft." });
+  }
+  const leadingCommand = /^(\s*)(\/[^\s/]+)(?=\s|$)/u.exec(input.text);
+  const leadingRange = leadingCommand === null ? undefined : input.mentionRanges?.find(range =>
+    range.start === leadingCommand[1]!.length && range.end === leadingCommand[1]!.length + leadingCommand[2]!.length
+    && input.mentions[range.mentionIndex]?.kind === "resource");
+  let promptText = input.text;
+  const textParts: string[] = [];
   if (Buffer.byteLength(input.text, "utf8") > maximumPromptTextBytes) {
     throw adapterError({
       code: "CODEX_PROMPT_TOO_LARGE",
@@ -155,6 +177,7 @@ export async function translatePromptInput(
     positiveBound(context.artifactCapacityBytes, DEFAULT_MAXIMUM_FILE_BYTES, "Artifact capacity")
   );
   const mentionAuthorities: Array<() => void> = [];
+  const mentionFileProofs: Array<(signal: AbortSignal) => Promise<void>> = [];
   for (const image of input.images) {
     if (!Number.isSafeInteger(image.blob.byteLength) || image.blob.byteLength < 0) {
       throw adapterError({
@@ -233,10 +256,30 @@ export async function translatePromptInput(
       path
     })}`);
   }
-  for (const mention of input.mentions) {
+  for (const [mentionIndex, mention] of input.mentions.entries()) {
     if (mention.kind === "workspace_file") {
       const path = await resolveWorkspacePath(context.target.workspaceRoot, mention.reference);
       textParts.push(`Workspace file reference: ${JSON.stringify({ name: mention.label, path })}`);
+      continue;
+    }
+    if (mention.kind === "resource") {
+      context.assertResourceMentionCurrent!(mention);
+      const resolved = await resolvers.resolveSkillMention!(mention, context);
+      if (resolved.name.trim().length === 0 || resolved.name.length > 256 || /[\u0000-\u001f\u007f]/u.test(resolved.name)
+        || !isAbsolute(resolved.path) || resolved.path.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(resolved.path)) {
+        throw unsupportedMention();
+      }
+      const assertSkillCurrent = (): void => {
+        context.assertResourceMentionCurrent!(mention);
+        resolved.assertCurrent();
+      };
+      assertSkillCurrent();
+      mentionAuthorities.push(assertSkillCurrent);
+      mentionFileProofs.push(resolved.assertFilesCurrent);
+      result.push({ type: "skill", name: resolved.name, path: resolved.path });
+      if (leadingRange?.mentionIndex === mentionIndex) {
+        promptText = input.text.slice(leadingRange.end).trim() || resolved.defaultPrompt?.trim() || "";
+      }
       continue;
     }
     if (mention.kind !== "artifact") throw unsupportedMention();
@@ -282,7 +325,7 @@ export async function translatePromptInput(
     mentionAuthorities.push(assertArtifactCurrent);
     textParts.push(`Artifact reference: ${JSON.stringify({ name: mention.label, path })}`);
   }
-  const combinedText = textParts.join("\n\n");
+  const combinedText = [...(promptText.length > 0 ? [promptText] : []), ...textParts].join("\n\n");
   if (Buffer.byteLength(combinedText, "utf8") > maximumPromptTextBytes) {
     throw adapterError({
       code: "CODEX_PROMPT_TOO_LARGE",
@@ -291,8 +334,7 @@ export async function translatePromptInput(
       recovery: "Shorten the prompt or attach bounded workspace files instead."
     });
   }
-  // Native mentions select tools such as apps, plugins, and skills. Ordinary
-  // file identities must remain model-visible text instead of using that form.
+  // Approved Skills use their exact native Skill input; file references remain text.
   if (combinedText.length > 0) result.unshift({ type: "text", text: combinedText, text_elements: [] });
   if (result.length === 0) {
     throw adapterError({
@@ -307,15 +349,19 @@ export async function translatePromptInput(
     for (const assertMentionCurrent of mentionAuthorities) assertMentionCurrent();
   };
   assertCurrent();
-  return { input: result, assertCurrent };
+  return { input: result, assertCurrent, assertFilesCurrent: async (signal) => {
+    signal.throwIfAborted();
+    assertCurrent();
+    for (const proof of mentionFileProofs) { await proof(signal); signal.throwIfAborted(); assertCurrent(); }
+  } };
 }
 
 function unsupportedMention(): Error {
   return adapterError({
     code: "CODEX_MENTION_KIND_UNSUPPORTED",
-    message: "This native input supports regular workspace files and service-authorized Artifacts.",
+    message: "The selected mention is not available for this native input.",
     phase: "dispatch",
-    recovery: "Choose a regular workspace file or an Artifact advertised by this Backend."
+    recovery: "Choose an input advertised by this Backend's current catalog."
   });
 }
 

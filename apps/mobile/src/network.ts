@@ -79,6 +79,7 @@ import {
 } from "./mobile-partner-private";
 import {
   projectMobilePartnerCatalog,
+  mobilePartnerPermissionToProto,
   projectMobilePartnerProfile,
   projectMobilePartnerReadResponse,
   type MobilePartnerActivity,
@@ -86,6 +87,7 @@ import {
 } from "./mobile-partner-directory";
 import { projectMobilePartnerProfileOptions, projectMobilePartnerProfileUpdate,
   type MobilePartnerProfileDraft, type MobilePartnerProfileOptions } from "./mobile-partner-profile";
+import { projectMobilePartnerTaskOutputs } from "./mobile-partner-task-outputs";
 import { projectMobilePartnerInitializationRetry } from "./mobile-partner-initialization";
 import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import { projectMobilePartnerWorkingStatus } from "./mobile-partner-working";
@@ -284,6 +286,7 @@ export interface MobileNetwork {
   markPartnerRead?(credential: PairedCredential, partnerId: string, throughCursor: bigint,
     signal?: AbortSignal): Promise<MobilePartnerActivity>;
   listPartnerSessions(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<ListPartnerSessionsResponse>;
+  listPartnerTaskOutputs?(credential: PairedCredential, partnerId: string, signal?: AbortSignal): Promise<import("./mobile-partner-task-outputs").MobilePartnerTaskOutputs>;
   controlPartnerSessionTask?(credential: PairedCredential, requestId: string, partnerId: string, partnerRevision: bigint, task: PartnerSessionTaskView,
     action: "pause" | "resume" | "cancel", signal?: AbortSignal): Promise<PartnerSessionTaskView>;
   listExtensions(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
@@ -1782,7 +1785,7 @@ export const mobileNetwork: MobileNetwork = {
           description: draft.description,
           avatar: protoMobilePartnerAvatar(draft.avatar), identitySource: draft.identitySource, templateId: draft.templateId,
           usesDirectoryDefaults: draft.usesDirectoryDefaults, ...(draft.usesDirectoryDefaults ? {} : { capabilities: {
-            modelChain: [...capabilities.modelChain], permissionMode: capabilities.permissionMode === "ask" ? PermissionMode.ASK : PermissionMode.AUTO,
+            modelChain: [...capabilities.modelChain], permissionMode: mobilePartnerPermissionToProto(capabilities.permissionMode),
             planMode: capabilities.planMode } }) } }, options(signal));
       signal?.throwIfAborted();
       projectMobilePartnerCreationOptions(response.directory);
@@ -1899,7 +1902,7 @@ export const mobileNetwork: MobileNetwork = {
         ...(typeof draft.avatar === "string" || "base64" in draft.avatar ? { avatar: protoMobilePartnerAvatar(draft.avatar) } : {}),
         usesDirectoryDefaults: draft.usesDirectoryDefaults,
         ...(draft.usesDirectoryDefaults ? {} : { modelChain: { routes: [...draft.capabilities.modelChain] },
-          permissionMode: draft.capabilities.permissionMode === "ask" ? PermissionMode.ASK : PermissionMode.AUTO,
+          permissionMode: mobilePartnerPermissionToProto(draft.capabilities.permissionMode),
           planMode: draft.capabilities.planMode })
       } }, options(signal));
     const partner = projectMobilePartnerProfileUpdate(partnerId, expectedRevision, response);
@@ -1955,6 +1958,14 @@ export const mobileNetwork: MobileNetwork = {
     if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
     return createClient(PartnerService, transport(credential.origin, credential.authKey))
       .listPartnerSessions({ partnerId }, options(signal));
+  },
+  async listPartnerTaskOutputs(credential, partnerId, signal) {
+    if (!validMobilePartnerId(partnerId)) throw new Error("A valid Partner is required.");
+    signal?.throwIfAborted();
+    const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
+      .listPartnerTaskOutputs({ partnerId }, options(signal));
+    signal?.throwIfAborted();
+    return projectMobilePartnerTaskOutputs(response, partnerId);
   },
   async controlPartnerSessionTask(credential, requestId, partnerId, partnerRevision, task, action, signal) {
     if (task.partnerId !== partnerId) throw new Error("The independent task belongs to another Partner.");

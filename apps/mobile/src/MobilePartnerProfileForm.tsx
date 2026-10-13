@@ -39,7 +39,7 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
   };
   const chainAxes = (effective?.modelChain ?? []).map(route => snapshot.taskModels?.find(model =>
     model.backendId === route.backendId && model.providerId === route.providerId && model.modelId === route.modelId) ?? snapshot);
-  const permissionModes = (["ask", "auto"] as const).filter(mode => chainAxes.every(axes => axes.permissionModes.includes(mode)));
+  const permissionModes = (["ask", "auto", "bypassPermissions"] as const).filter(mode => chainAxes.every(axes => axes.permissionModes.includes(mode)));
   const canSetPlanMode = chainAxes.every(axes => axes.canSetPlanMode);
   return <>
             {caption("name")}
@@ -149,11 +149,12 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
             </View>}
             {caption("permission")}
             <View style={styles.choices}>
-              {(["ask", "auto"] as const).map((permissionMode) => <View key={permissionMode}>{action(mobileMessage(locale,
-                permissionMode === "ask" ? "partnerProfile.ask" : "partnerProfile.auto"), () => change({ ...draft,
+              {(["ask", "auto", "bypassPermissions"] as const).map((permissionMode) => <View key={permissionMode}>{action(mobileMessage(locale,
+                permissionMode === "ask" ? "partnerProfile.ask" : permissionMode === "auto" ? "partnerProfile.auto" : "controls.permission.full"), () => change({ ...draft,
                   capabilities: { ...draft.capabilities, permissionMode } }), !capabilitiesEditable || !permissionModes.includes(permissionMode),
               effective?.permissionMode === permissionMode)}</View>)}
             </View>
+            {effective?.permissionMode === "bypassPermissions" && <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "controls.fullAccessBody")}</Text>}
             <View style={styles.toggle}>
               <Text style={[styles.body, styles.grow, { color: colors.ink }]}>{mobileMessage(locale, "partnerProfile.plan")}</Text>
               <Switch accessibilityLabel={mobileMessage(locale, "partnerProfile.plan")} value={effective?.planMode ?? false}

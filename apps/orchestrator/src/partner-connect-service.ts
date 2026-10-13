@@ -39,6 +39,7 @@ import { createPartnerConnectionMethods, type PartnerConnectionsManager } from "
 import { createPartnerSkillMethods, type PartnerSkillsManager } from "./partner-skills.js";
 import type { PartnerSessionTaskManager } from "./partner-session-tasks.js";
 import { createPartnerSessionTaskControl, toProtoSessionTask } from "./partner-session-task-connect.js";
+import { PartnerTaskOutputChangedError, type PartnerTaskOutputProjection, type PartnerTaskOutputRow } from "./partner-task-outputs.js";
 
 type PublicActivity = PartnerActivitySummary & { readonly workingStatus?: contract.SessionWorkingStatus };
 
@@ -50,7 +51,8 @@ export function createPartnerConnectService(
   memory?: PartnerMemoryManager,
   connections?: PartnerConnectionsManager,
   skills?: PartnerSkillsManager,
-  tasks?: PartnerSessionTaskManager
+  tasks?: PartnerSessionTaskManager,
+  outputs?: PartnerTaskOutputProjection
 ): ServiceImpl<typeof contract.PartnerService> {
   const owner = (): PartnerManager => {
     if (manager === undefined) throw new ConnectError("Partners are unavailable.", Code.Unimplemented);
@@ -60,12 +62,32 @@ export function createPartnerConnectService(
     const status = working?.status(partnerId);
     return { ...owner().activity(partnerId), ...(status === undefined ? {} : { workingStatus: status }) };
   };
+  const assertPermissionOwner = (context: HandlerContext): void => {
+    authenticate(context);
+    if (context.signal.aborted) throw new ConnectError("The Partner permission request was canceled.", Code.Canceled);
+  };
   return {
     ...createPartnerWorkbenchConnectMethods(workbench, authenticate),
     ...createPartnerMemoryConnectMethods(memory, authenticate),
     ...createPartnerConnectionMethods(connections, authenticate),
     ...createPartnerSkillMethods(skills, authenticate),
     controlPartnerSessionTask: createPartnerSessionTaskControl(tasks, authenticate),
+    listPartnerTaskOutputs: async (request, context) => {
+      authenticate(context);
+      return partnerRpc(async () => {
+        if (!outputs) throw new ConnectError("Partner task outputs are unavailable.", Code.Unimplemented);
+        if (!request.partnerId.trim()) throw new ConnectError("partner_id is required.", Code.InvalidArgument);
+        if (context.signal.aborted) throw new ConnectError("The task output read was canceled.", Code.Canceled);
+        const rows = await outputs.list(request.partnerId);
+        authenticate(context);
+        if (context.signal.aborted) throw new ConnectError("The task output read was canceled.", Code.Canceled);
+        return create(contract.ListPartnerTaskOutputsResponseSchema, {
+          partnerId: request.partnerId,
+          outputs: rows.slice(0, 200).map(toProtoTaskOutput),
+          truncated: rows.length > 200
+        });
+      });
+    },
     getPartnerDirectory: (_request, context) => {
       authenticate(context);
       return partnerRpc(() => create(contract.GetPartnerDirectoryResponseSchema, {
@@ -129,7 +151,7 @@ export function createPartnerConnectService(
       });
     },
     createPartner: async (request, context) => {
-      authenticate(context);
+      assertPermissionOwner(context);
       return partnerRpc(async () => {
         const active = owner();
         const draft = required(request.draft, "draft");
@@ -155,7 +177,8 @@ export function createPartnerConnectService(
           templateId: draft.templateId,
           capabilities,
           usesDirectoryDefaults: draft.usesDirectoryDefaults
-        });
+        }, () => assertPermissionOwner(context));
+        assertPermissionOwner(context);
         return create(contract.CreatePartnerResponseSchema, {
           partner: toProtoProfile(partner, activity(partner.id)),
           directory: toProtoDirectory(active.directory())
@@ -186,7 +209,7 @@ export function createPartnerConnectService(
       });
     },
     updatePartner: async (request, context) => {
-      authenticate(context);
+      assertPermissionOwner(context);
       return partnerRpc(async () => {
         const active = owner();
         const patch = required(request.patch, "patch");
@@ -224,8 +247,10 @@ export function createPartnerConnectService(
             ...(patch.usesDirectoryDefaults === undefined
               ? {}
               : { usesDirectoryDefaults: patch.usesDirectoryDefaults })
-          }
+          },
+          () => assertPermissionOwner(context)
         );
+        assertPermissionOwner(context);
         return create(contract.UpdatePartnerResponseSchema, {
           partner: toProtoProfile(partner, activity(partner.id)),
           directory: toProtoDirectory(active.directory())
@@ -334,13 +359,14 @@ export function createPartnerConnectService(
       });
     },
     updatePartnerDefaults: async (request, context) => {
-      authenticate(context);
+      assertPermissionOwner(context);
       return partnerRpc(async () => {
         const active = owner();
         const affected = await active.updateDirectoryDefaults(
           fromProtoRevision(request.expectedDirectoryRevision, "expected_directory_revision"),
           fromProtoCapabilities(required(request.capabilities, "capabilities"))
         );
+        assertPermissionOwner(context);
         return create(contract.UpdatePartnerDefaultsResponseSchema, {
           directory: toProtoDirectory(active.directory()),
           affectedPartners: affected.map((partner) => toProtoProfile(partner, activity(partner.id)))
@@ -638,7 +664,7 @@ function toProtoCapabilities(value: PartnerCapabilitiesRecord): contract.Partner
     modelChain: value.modelChain.map((route) => create(contract.PartnerModelRouteSchema, route)),
     permissionMode: value.permissionMode === "ask"
       ? contract.PermissionMode.ASK
-      : contract.PermissionMode.AUTO,
+      : value.permissionMode === "auto" ? contract.PermissionMode.AUTO : contract.PermissionMode.BYPASS_PERMISSIONS,
     planMode: value.planMode
   });
 }
@@ -661,10 +687,11 @@ function fromProtoRoute(value: contract.PartnerModelRoute): PartnerModelRouteRec
   };
 }
 
-function fromProtoPermission(value: contract.PermissionMode): "ask" | "auto" {
+function fromProtoPermission(value: contract.PermissionMode): PartnerCapabilitiesRecord["permissionMode"] {
   if (value === contract.PermissionMode.ASK) return "ask";
   if (value === contract.PermissionMode.AUTO) return "auto";
-  throw new ConnectError("Partner permission mode must be Ask or Auto.", Code.InvalidArgument);
+  if (value === contract.PermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";
+  throw new ConnectError("Partner permission mode is invalid.", Code.InvalidArgument);
 }
 
 function toProtoLifecycle(value: PartnerLifecycle): contract.PartnerLifecycle {
@@ -704,6 +731,24 @@ function toProtoInitializationError(value: PartnerInitializationErrorCode): cont
   return contract.PartnerInitializationErrorCode.STATE_CHANGED;
 }
 
+function toProtoTaskOutput(row: PartnerTaskOutputRow): contract.PartnerTaskOutput {
+  return create(contract.PartnerTaskOutputSchema, {
+    sourceKind: row.kind === "task" ? contract.PartnerTaskOutputSourceKind.SESSION_TASK : contract.PartnerTaskOutputSourceKind.DELEGATION,
+    sourceId: row.id,
+    parentSessionId: row.parentSessionId,
+    sessionId: row.sessionId,
+    execution: BigInt(row.execution),
+    runIds: [...row.runIds],
+    sourceRevision: toProtoRevision(row.revision),
+    title: row.title,
+    readiness: row.readiness === "ready" ? contract.PartnerTaskOutputReadiness.READY
+      : row.readiness === "pending" ? contract.PartnerTaskOutputReadiness.PENDING : contract.PartnerTaskOutputReadiness.UNAVAILABLE,
+    files: row.files.map(file => ({ path: file.path, status: file.status === "added" ? contract.PartnerTaskOutputFileStatus.ADDED
+      : file.status === "modified" ? contract.PartnerTaskOutputFileStatus.MODIFIED : contract.PartnerTaskOutputFileStatus.RENAMED })),
+    truncated: row.truncated
+  });
+}
+
 async function partnerRpc<T>(effect: () => Promise<T>): Promise<T>;
 function partnerRpc<T>(effect: () => T): T;
 function partnerRpc<T>(effect: () => T | Promise<T>): T | Promise<T> {
@@ -719,6 +764,7 @@ function partnerRpc<T>(effect: () => T | Promise<T>): T | Promise<T> {
 
 function partnerConnectError(error: unknown): ConnectError {
   if (error instanceof ConnectError) return error;
+  if (error instanceof PartnerTaskOutputChangedError) return new ConnectError("Partner task outputs changed. Read them again.", Code.Aborted);
   if (error instanceof PartnerManagerError) {
     return new ConnectError(error.message,
       error.code === "PARTNER_TEMPLATE_INVALID" || error.code === "PARTNER_AVATAR_INVALID"

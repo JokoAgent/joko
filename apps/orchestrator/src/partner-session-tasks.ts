@@ -25,7 +25,7 @@ export interface PartnerSessionTaskRecord {
   readonly route: PartnerModelRouteRecord; readonly routes: readonly PartnerModelRouteRecord[]; readonly explicitModel: boolean;
   readonly permissionMode: PartnerProfileRecord["capabilities"]["permissionMode"]; readonly planMode: boolean;
   readonly timeoutMs: number; readonly deadlineAt: number; readonly createdAt: number; readonly updatedAt: number;
-  readonly execution: number; readonly status: PartnerSessionTaskStatus;
+  readonly execution: number; readonly executionRunIds: readonly string[]; readonly status: PartnerSessionTaskStatus;
   readonly control: "active" | "pausing" | "paused" | "cancelling";
   readonly sessionId?: string; readonly runId?: string; readonly pauseAt?: number; readonly queuePauseRevision?: string;
   readonly result?: string; readonly error?: string; readonly deliveredExecution?: number;
@@ -154,7 +154,7 @@ export class PartnerSessionTaskManager {
         targetId, directory, realDirectory: actual, useWorktree: normalized.useWorktree, route,
         routes: selected || profile.taskModelOverride ? [route] : profile.capabilities.modelChain.map(item => ({ ...item })),
         explicitModel: selected !== undefined || profile.taskModelOverride !== undefined, permissionMode: profile.capabilities.permissionMode, planMode: profile.capabilities.planMode,
-        timeoutMs: normalized.timeoutMs, deadlineAt: createdAt + normalized.timeoutMs, createdAt, updatedAt: createdAt, execution: 1, status: "preparing", control: "active" };
+        timeoutMs: normalized.timeoutMs, deadlineAt: createdAt + normalized.timeoutMs, createdAt, updatedAt: createdAt, execution: 1, executionRunIds: [], status: "preparing", control: "active" };
       this.#save(task);
       try {
         await this.workspaces.register({ id: targetId, root: actual, displayName: basename(directory), trusted: true });
@@ -258,7 +258,8 @@ export class PartnerSessionTaskManager {
         if (body.sessionId !== task.sessionId || body.originSessionId !== sessionId || body.prompt?.text !== input.message || body.prompt?.disposition !== (input.mode === "steer" ? "steer" : "prompt")) throw invalid("This input identity belongs to another message.");
         return this.#reconcile(id);
       }
-      if (!isActive(task.status)) task = { ...task, execution: task.execution + 1, deadlineAt: this.now() + task.timeoutMs, status: "queued", result: undefined, error: undefined };
+      if (!isActive(task.status)) task = { ...task, execution: task.execution + 1, executionRunIds: [], runId: undefined,
+        deadlineAt: this.now() + task.timeoutMs, status: "queued", result: undefined, error: undefined };
       assertCaller(); this.#enqueue(task, operationId, input.message!, input.mode === "steer" ? "steer" : "prompt"); return this.#reconcile(id);
     });
   }
@@ -321,7 +322,8 @@ export class PartnerSessionTaskManager {
   #enqueue(task: PartnerSessionTaskRecord, operationId: string, text: string, disposition: PromptInput["disposition"] = "prompt") {
     this.#assertTaskSession(task);
     this.host.enqueueServiceInput({ operationId, sessionId: task.sessionId!, source: "system", originSessionId: task.parentSessionId, prompt: prompt(text, disposition),
-      onAdmitted: (_store, receipt) => this.#save({ ...task, runId: receipt.runId, status: "queued", updatedAt: this.now() }) });
+      onAdmitted: (_store, receipt) => this.#save({ ...task, runId: receipt.runId,
+        executionRunIds: [...new Set([...task.executionRunIds, receipt.runId])], status: "queued", updatedAt: this.now() }) });
     this.#arm(this.#read(task.id));
   }
   async #reconcile(id: string): Promise<PartnerSessionTaskRecord> {
@@ -375,10 +377,12 @@ export class PartnerSessionTaskManager {
     return event?.payload.type === "message_complete" ? redactSecrets(event.payload.blocks.filter(block => block.kind === "text").map(block => block.text).join("\n")).slice(0, 12_000) : "";
   }
   #recoverCreation(task: PartnerSessionTaskRecord) {
-    const creation = this.store.findOperation<{ sessionId: string }>(`${task.id}:create`), dispatch = this.store.findOperation<{ runId: string }>(`${task.id}:input`);
+    const creation = this.store.findOperation<{ sessionId: string }>(`${task.id}:create`),
+      dispatch = task.execution === 1 ? this.store.findOperation<{ runId: string }>(`${task.id}:input`) : undefined;
     const sessionId = task.sessionId ?? (creation?.status === "completed" ? creation.response?.sessionId : undefined);
     const runId = task.runId ?? (dispatch?.status === "completed" ? dispatch.response?.runId : undefined);
     this.#save({ ...task, ...(sessionId ? { sessionId } : {}), ...(runId ? { runId } : {}),
+      executionRunIds: runId === undefined ? task.executionRunIds : [...new Set([...task.executionRunIds, runId])],
       status: sessionId && runId ? "queued" : creation?.status === "started" || dispatch?.status === "started" || uncertain(creation?.error) || uncertain(dispatch?.error) ? "unknown" : "failed", updatedAt: this.now() });
   }
   #arm(task: PartnerSessionTaskRecord) {
@@ -437,7 +441,7 @@ function normalizeStart(input: StartPartnerSessionTask) {
 }
 function readRecord(value: unknown): PartnerSessionTaskRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw changed(); const row = value as Record<string, unknown>;
-  const required = ["version", "id", "partnerId", "parentSessionId", "requestFingerprint", "title", "objective", "contextRefs", "targetId", "directory", "realDirectory", "useWorktree", "route", "routes", "explicitModel", "permissionMode", "planMode", "timeoutMs", "deadlineAt", "createdAt", "updatedAt", "execution", "status", "control"];
+  const required = ["version", "id", "partnerId", "parentSessionId", "requestFingerprint", "title", "objective", "contextRefs", "targetId", "directory", "realDirectory", "useWorktree", "route", "routes", "explicitModel", "permissionMode", "planMode", "timeoutMs", "deadlineAt", "createdAt", "updatedAt", "execution", "executionRunIds", "status", "control"];
   const optional = ["sessionId", "runId", "pauseAt", "queuePauseRevision", "result", "error", "deliveredExecution"];
   if (required.some(key => !Object.hasOwn(row, key)) || Object.keys(row).some(key => !required.includes(key) && !optional.includes(key)) || row["version"] !== 1
     || ["id", "partnerId", "parentSessionId", "title", "objective", "targetId", "directory", "realDirectory"].some(key => typeof row[key] !== "string" || !row[key])
@@ -445,6 +449,9 @@ function readRecord(value: unknown): PartnerSessionTaskRecord {
     || !["active", "pausing", "paused", "cancelling"].includes(String(row["control"])) || !["ask", "auto", "bypassPermissions"].includes(String(row["permissionMode"]))
     || ["useWorktree", "explicitModel", "planMode"].some(key => typeof row[key] !== "boolean")
     || ["timeoutMs", "deadlineAt", "createdAt", "updatedAt", "execution"].some(key => !Number.isSafeInteger(row[key]) || Number(row[key]) < 1)
+    || !Array.isArray(row["executionRunIds"]) || row["executionRunIds"].some(id => typeof id !== "string" || id.length < 1 || id.length > 256)
+    || new Set(row["executionRunIds"]).size !== row["executionRunIds"].length
+    || (typeof row["runId"] === "string" && !row["executionRunIds"].includes(row["runId"]))
     || !Array.isArray(row["contextRefs"]) || row["contextRefs"].length > 32 || row["contextRefs"].some(item => typeof item !== "string" || item.length > 512)
     || !Array.isArray(row["routes"]) || row["routes"].length < 1 || row["routes"].length > 5
     || [row["route"], ...row["routes"]].some(route => !validRoute(route))

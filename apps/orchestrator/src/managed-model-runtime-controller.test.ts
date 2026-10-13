@@ -93,6 +93,20 @@ class FakeRuntimeManager implements ManagedModelRuntimeManagerPort {
 }
 
 describe("ManagedModelRuntimeController", () => {
+  it("includes exact Provider associations in the public snapshot revision", async () => {
+    const manager = new FakeRuntimeManager();
+    let routes = [{ backendId: "runtime-backend", providerId: "local-provider" }];
+    const controller = new ManagedModelRuntimeController({ manager, owner, providerRoutes: () => routes });
+    const connected = await controller.snapshot();
+    expect(connected.providerRoutes).toEqual(routes);
+    expect((await controller.snapshot()).revision).toBe(connected.revision);
+    routes = [];
+    const disconnected = await controller.snapshot();
+    expect(disconnected.providerRoutes).toEqual([]);
+    expect(disconnected.revision).toBe(connected.revision + 1n);
+    expect(connected.providerRoutes).toEqual([{ backendId: "runtime-backend", providerId: "local-provider" }]);
+  });
+
   it("projects installed, curated and resumable state entirely through capabilities", async () => {
     const manager = new FakeRuntimeManager();
     const controller = new ManagedModelRuntimeController({ manager, owner, freeDiskBytes: async () => 50_000, now: () => 100 });

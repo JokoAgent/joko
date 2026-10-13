@@ -36,6 +36,7 @@ describe("Connect service composition", () => {
 
     const expectedServices = [
       contract.ConnectionService,
+      contract.AppDefaultModelService,
       contract.EventService,
       contract.OperationService,
       contract.BackendService,
@@ -58,6 +59,9 @@ describe("Connect service composition", () => {
       contract.MessagingService,
       contract.ContactService,
       contract.PartnerService,
+      contract.PartnerRoutineService,
+      contract.PartnerGroupService,
+      contract.PartnerImportService,
       contract.CollaborationService,
       contract.ManagedModelRuntimeService,
       contract.ToolService,

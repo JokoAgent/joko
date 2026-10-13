@@ -387,6 +387,7 @@ export class RemoteHostRegistry {
     readonly leaseGeneration: number;
     readonly lease: RemoteSshTransportLease;
     readonly assertCurrent: () => void;
+    readonly assertFilesCurrent: () => void;
     readonly assertForwardingCurrent: () => void;
   }> {
     const { host, lease } = await this.transports(targetId, id, signal);
@@ -404,6 +405,13 @@ export class RemoteHostRegistry {
         throw new RemoteSshError("CONNECTION_FAILED", "The SSH process-stream capability is no longer active.", false);
       }
     };
+    const assertFilesCurrent = (): void => {
+      assertCurrent();
+      const current = managed.controller.transports(managed.scope);
+      if (!current.capabilities.fileTransfer || current.files === undefined || current.files !== lease.files) {
+        throw new RemoteSshError("CONNECTION_FAILED", "The SSH file capability is no longer active.", false);
+      }
+    };
     const assertForwardingCurrent = (): void => {
       assertCurrent();
       const current = managed.controller.transports(managed.scope);
@@ -412,7 +420,7 @@ export class RemoteHostRegistry {
       }
     };
     assertCurrent();
-    return Object.freeze({ host, hostRevision: host.revision, leaseGeneration, lease, assertCurrent, assertForwardingCurrent });
+    return Object.freeze({ host, hostRevision: host.revision, leaseGeneration, lease, assertCurrent, assertFilesCurrent, assertForwardingCurrent });
   }
 
   async disconnect(targetId: string, id: string, expectedRevision: bigint): Promise<RemoteHostRecord> {

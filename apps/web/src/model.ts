@@ -342,6 +342,52 @@ export interface ModelView {
   readonly cacheReadCostMicrosPerMillion?: number;
   readonly cacheWriteCostMicrosPerMillion?: number;
   readonly currencyCode: string;
+  /** Declared display facts are separate from the effective admission flags. */
+  readonly metadata?: ModelAdvancedMetadataView;
+}
+
+export interface ModelAdvancedMetadataView {
+  readonly description?: string;
+  readonly brand?: string;
+  readonly lifecycle?: string;
+  readonly defaultEffort?: string;
+  readonly displayEfforts?: readonly string[];
+  readonly imageInput?: boolean;
+  readonly fastMode?: boolean;
+  readonly inputModalities?: readonly string[];
+  readonly outputModalities?: readonly string[];
+  readonly referenceProtocol?: string;
+  readonly outboundProtocol?: string;
+  readonly protocolMode?: "matching" | "compatibility" | "unknown";
+  readonly contextWindowSource?: "declared" | "estimated";
+  readonly maxOutputTokensSource?: "declared" | "estimated";
+}
+
+export interface ModelWorkingContextRoute {
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+}
+export interface ModelWorkingContextTarget extends ModelWorkingContextRoute {
+  readonly relatedTargets?: readonly ModelWorkingContextRoute[];
+}
+export interface ModelWorkingContextView {
+  readonly target: ModelWorkingContextRoute;
+  readonly limitTokens?: number;
+  readonly defaultContextWindowTokens?: number;
+  readonly effectiveContextWindowTokens?: number;
+  readonly customized: boolean;
+  readonly mixed: boolean;
+  readonly revision: bigint;
+  readonly sourceRevision: string;
+  readonly canConfigure: boolean;
+  readonly blockedReason?: string;
+  readonly nativeContext?: {
+    readonly contextWindowTokens?: number;
+    readonly autoCompactLimitTokens?: number;
+    readonly source: "native_usage" | "native_configuration";
+    readonly pendingApply: boolean;
+  };
 }
 
 export type ModelInputModalityView = "text" | "image" | "file" | "audio";
@@ -468,7 +514,7 @@ export type PartnerInitializationErrorCodeView =
   | "sessionUnavailable"
   | "stateChanged";
 export type PartnerInvitationStageView = "home" | "avatar" | "session" | "ready" | "failed";
-export type PartnerPermissionModeView = Extract<PermissionMode, "ask" | "auto">;
+export type PartnerPermissionModeView = PermissionMode;
 export type PartnerSessionRoleView = "canonical" | "history" | "delegation";
 export type PartnerPrivateThreadStatusView = "active" | "closed";
 export type PartnerPrivateThreadCloseReasonView = "messageLimit" | "idleTimeout";
@@ -2914,6 +2960,8 @@ export interface ResourceView {
   readonly state: "discovered" | "awaitingApproval" | "approved" | "installing" | "installed" | "loaded" | "disabled" | "updateAvailable" | "error" | "removed";
   readonly enabled: boolean;
   readonly source: string;
+  readonly sourceKind?: "local" | "npm" | "git" | "extensionSource" | "skillMarket" | "learned" | "remoteProject";
+  readonly sourceIdentity?: string;
   readonly discoveredRevision: string;
   readonly compatibilityDetails: readonly ResourceCompatibilityDetailView[];
   readonly runtimeRequirements: readonly ResourceRuntimeRequirementView[];
@@ -3599,6 +3647,7 @@ export interface RuntimeCommandView {
   readonly description: string;
   readonly source: "extension" | "prompt" | "skill" | "backend" | "unknown";
   readonly resourceId?: string;
+  readonly inputMode: "text" | "resource_mention";
   readonly loaded: boolean;
 }
 
@@ -3890,6 +3939,33 @@ export interface ManagedModelRuntimeCapabilitiesView {
   readonly supportsCustomModels: boolean;
   readonly supportsCuratedCatalog: boolean;
   readonly supportsModelPreflight: boolean;
+  readonly canConfigure?: boolean;
+  readonly canStop?: boolean;
+  readonly canRestart?: boolean;
+  readonly supportsRepositoryModels?: boolean;
+  readonly startupPolicy?: "explicit" | "onUse";
+}
+
+export interface ManagedRepositoryModelView {
+  readonly repository: string;
+  readonly file: string;
+}
+export interface ManagedModelContextTarget {
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly repositoryModel: ManagedRepositoryModelView;
+  readonly relatedTargets?: readonly { readonly backendId: string; readonly providerId: string; readonly modelId: string; readonly repositoryModel: ManagedRepositoryModelView }[];
+}
+export interface ManagedModelContextView extends ManagedModelContextTarget {
+  readonly defaultContextWindowTokens: number;
+  readonly effectiveContextWindowTokens: number;
+  readonly maximumContextWindowTokens: number;
+  readonly presets: readonly number[];
+  readonly customized: boolean;
+  readonly canConfigure: boolean;
+  readonly pendingApply: boolean;
+  readonly mixed?: boolean;
 }
 
 export interface ManagedModelRuntimeModelView {
@@ -3900,6 +3976,7 @@ export interface ManagedModelRuntimeModelView {
   readonly supportsTools: boolean;
   readonly supportsImages: boolean;
   readonly requiredRuntimeVersion?: string;
+  readonly repositoryModel?: ManagedRepositoryModelView;
 }
 
 export interface ManagedModelRuntimeCatalogModelView {
@@ -3911,6 +3988,9 @@ export interface ManagedModelRuntimeCatalogModelView {
   readonly platformLimited: boolean;
   readonly recommended: boolean;
   readonly preflight: ManagedModelRuntimePreflightView;
+  readonly aliases?: readonly string[];
+  readonly descriptions?: Readonly<Record<string, string>>;
+  readonly variants?: readonly (ManagedRepositoryModelView & { readonly quantization: string; readonly sizeBytes: number })[];
 }
 
 export interface ManagedModelRuntimeTransferView {
@@ -3923,6 +4003,8 @@ export interface ManagedModelRuntimeTransferView {
   readonly bytesPerSecond?: number;
   readonly done: boolean;
   readonly errorCode?: ManagedModelRuntimeErrorCodeView;
+  readonly transferId?: string;
+  readonly repositoryModel?: ManagedRepositoryModelView;
 }
 
 export interface ManagedModelRuntimeView {
@@ -3939,6 +4021,10 @@ export interface ManagedModelRuntimeView {
   readonly errorCode?: ManagedModelRuntimeErrorCodeView;
   readonly errorMessage?: string;
   readonly revision: bigint;
+  readonly configureBlockedReason?: "ownedElsewhere" | "ownerUnknown" | "busy" | "stopUnconfirmed";
+  readonly providerRoutes?: readonly { readonly backendId: string; readonly providerId: string }[];
+  readonly hostProfile?: { readonly platform: string; readonly arch: string; readonly totalMemoryBytes: number;
+    readonly memoryGb: number; readonly appleSilicon: boolean; readonly chip?: string };
 }
 
 export interface CredentialView {
@@ -6244,6 +6330,19 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   deleteProvider(providerId: string): Promise<void>;
   refreshProviderModels(backendId: string, providerId?: string, automatic?: boolean): Promise<void>;
   refreshManagedModelRuntimes(signal?: AbortSignal): Promise<readonly ManagedModelRuntimeView[]>;
+  ensureManagedModelRuntimeProvider(runtimeId: string): Promise<ManagedModelRuntimeView>;
+  stopManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView>;
+  restartManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView>;
+  listManagedModelRepositoryFiles(runtimeId: string, repository: string, signal?: AbortSignal): Promise<{
+    readonly repository: string; readonly sourceRevision: string; readonly files: readonly { readonly file: string; readonly sizeBytes: number }[] }>;
+  downloadManagedRepositoryModel(runtimeId: string, model: ManagedRepositoryModelView): Promise<ManagedModelRuntimeView>;
+  controlManagedRepositoryDownload(runtimeId: string, transferId: string, model: ManagedRepositoryModelView, action: "pause" | "resume" | "cancel"): Promise<ManagedModelRuntimeView>;
+  getManagedModelContext(runtimeId: string, target: ManagedModelContextTarget, signal?: AbortSignal): Promise<ManagedModelContextView>;
+  getModelWorkingContext(target: ModelWorkingContextTarget, signal?: AbortSignal): Promise<ModelWorkingContextView>;
+  setModelWorkingContext(target: ModelWorkingContextTarget, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, tokens?: number, signal?: AbortSignal): Promise<ModelWorkingContextView>;
+  resetModelWorkingContext(target: ModelWorkingContextTarget, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, signal?: AbortSignal): Promise<ModelWorkingContextView>;
+  setManagedModelContext(runtimeId: string, target: ManagedModelContextTarget, tokens: number): Promise<ManagedModelContextView>;
+  resetManagedModelContext(runtimeId: string, target: ManagedModelContextTarget): Promise<ManagedModelContextView>;
   startManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView>;
   installManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView>;
   cancelManagedModelRuntimeInstall(runtimeId: string): Promise<ManagedModelRuntimeView>;

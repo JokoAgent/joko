@@ -8,6 +8,8 @@ import {
   NativeSessionBindingSchema,
   RevisionSchema,
   RuntimeCommandSchema,
+  RuntimeCommandInputMode,
+  ResourceKind,
   RuntimeCommandSource,
   SessionSchema,
   SessionState,
@@ -22,6 +24,9 @@ import { describe, expect, it } from "vitest";
 import {
   appendMobileSelectionQuote,
   insertMobileSessionMention,
+  insertMobileResourceMention,
+  normalizeMobileComposerDraft,
+  restoreMobileComposerInput,
   mobileComposerInput,
   plainTextMobileComposerDraft,
   replaceMobileComposerRange
@@ -35,6 +40,7 @@ import {
   mobileRuntimeCommandTesting,
   projectMobileRuntimeCommandCatalog,
   replaceMobileRuntimeCommandRun,
+  replaceMobileRuntimeResourceCommandRun,
   resolveMobileRuntimeCommandPaletteKey
 } from "./mobile-runtime-commands";
 
@@ -69,7 +75,7 @@ function snapshot(): Snapshot {
 }
 
 type RuntimeCommandOverrides = Partial<Pick<RuntimeCommand,
-  "commandId" | "name" | "description" | "source" | "resourceId" | "loaded" | "sessionId">>;
+  "commandId" | "name" | "description" | "source" | "resourceId" | "loaded" | "sessionId" | "inputMode">>;
 
 function command(overrides: RuntimeCommandOverrides = {}): RuntimeCommand {
   return create(RuntimeCommandSchema, {
@@ -77,6 +83,7 @@ function command(overrides: RuntimeCommandOverrides = {}): RuntimeCommand {
     name: "review",
     description: "Review current changes",
     source: RuntimeCommandSource.PROMPT,
+    inputMode: RuntimeCommandInputMode.TEXT,
     loaded: true,
     sessionId: "session",
     ...overrides
@@ -84,6 +91,16 @@ function command(overrides: RuntimeCommandOverrides = {}): RuntimeCommand {
 }
 
 describe("mobile runtime command authority and catalog", () => {
+  it("uses the explicit command input mode rather than a Skill usage association", () => {
+    const controls = createMobileRuntimeCommandControls("authority", snapshot(), snapshot(), "session")!;
+    const text = command({ source: RuntimeCommandSource.SKILL, resourceId: "skill", inputMode: RuntimeCommandInputMode.TEXT });
+    const resource = command({ source: RuntimeCommandSource.SKILL, resourceId: "skill", inputMode: RuntimeCommandInputMode.RESOURCE_MENTION });
+    expect(projectMobileRuntimeCommandCatalog(controls, [text]).items[0]!.inputMode).toBe(RuntimeCommandInputMode.TEXT);
+    expect(projectMobileRuntimeCommandCatalog(controls, [resource]).items).toEqual([]);
+    expect(projectMobileRuntimeCommandCatalog({ ...controls, resourceMentions: true }, [resource]).items).toHaveLength(1);
+    expect(() => projectMobileRuntimeCommandCatalog(controls, [command({ inputMode: RuntimeCommandInputMode.UNSPECIFIED })])).toThrow(/invalid/u);
+    expect(() => projectMobileRuntimeCommandCatalog(controls, [command({ inputMode: RuntimeCommandInputMode.RESOURCE_MENTION })])).toThrow(/invalid/u);
+  });
   it("requires one supported capability and exact Session, Target, Backend, and runtime generation", () => {
     const owner = snapshot();
     expect(createMobileRuntimeCommandControls("authority", owner, owner, "session")).toMatchObject({
@@ -204,6 +221,50 @@ describe("mobile runtime command authority and catalog", () => {
 });
 
 describe("mobile runtime command activation and replacement", () => {
+  it("retains a slash Skill as one full Resource occurrence across arguments, edits, restore and wire", () => {
+    const base = plainTextMobileComposerDraft("/old argument ");
+    const withOther = insertMobileResourceMention(base, { start: base.text.length, end: base.text.length }, {
+      resourceId: "other", displayText: "Other", discoveredRevision: "other-sha", resourceVersion: "2", runtimeGeneration: "7"
+    }, "other-occurrence").draft;
+    const activation = detectMobileRuntimeCommandActivation(withOther, { start: 4, end: 4 }, false)!;
+    const selected = replaceMobileRuntimeResourceCommandRun(withOther, activation, {
+      commandId: "skill", name: "analysis", description: "", source: RuntimeCommandSource.SKILL,
+      inputMode: RuntimeCommandInputMode.RESOURCE_MENTION, resourceId: "approved-skill"
+    }, {
+      kind: "resource", resourceKind: ResourceKind.SKILL, resourceId: "approved-skill", displayText: "Unrelated display name",
+      discoveredRevision: "frozen-sha", resourceVersion: "9", runtimeGeneration: "7"
+    }, "selected");
+    expect(selected.draft.text).toBe("/analysis argument @Other");
+    expect(selected.draft.slashCommands).toEqual([]);
+    expect(selected.draft.mentions).toMatchObject([
+      { mentionId: "selected", kind: "resource", start: 0, end: 9, resourceId: "approved-skill", displayText: "/analysis" },
+      { mentionId: "other-occurrence", resourceId: "other", start: 19, end: 25 }
+    ]);
+    const restored = normalizeMobileComposerDraft(JSON.parse(JSON.stringify(selected.draft)));
+    expect(restored).toEqual(selected.draft);
+    const wire = mobileComposerInput(restored);
+    expect(wire.parts.filter((part) => part.content.case === "resourceMention").map((part) => part.content.value))
+      .toMatchObject([{ resourceId: "approved-skill", discoveredRevision: "frozen-sha", resourceVersion: 9n, runtimeGeneration: 7n }, { resourceId: "other" }]);
+    expect(wire.mentionRanges).toMatchObject([{ start: 0, end: 9 }, { start: 19, end: 25 }]);
+    expect(restoreMobileComposerInput(wire, { sessionId: "session", messageId: "message", eventId: "event" }).text).toBe(restored.text);
+    const edited = replaceMobileComposerRange(restored, { start: 10, end: 18 }, "changed");
+    expect(edited.draft.mentions[0]).toEqual(restored.mentions[0]);
+    const sameTextReplacement = replaceMobileComposerRange(restored, { start: 0, end: 9 }, "/analysis");
+    expect(sameTextReplacement.draft.mentions.map((mention) => mention.mentionId)).toEqual(["other-occurrence"]);
+    expect(detectMobileRuntimeCommandActivation(restored, { start: 5, end: 5 }, false)).toBeUndefined();
+  });
+  it("preserves the complete bounded slash Skill name without granting oversized ordinary labels", () => {
+    const command = { commandId: "long", name: "a".repeat(256), description: "", source: RuntimeCommandSource.SKILL,
+      inputMode: RuntimeCommandInputMode.RESOURCE_MENTION, resourceId: "skill" };
+    const draft = plainTextMobileComposerDraft("/a");
+    const selection = replaceMobileRuntimeResourceCommandRun(draft, { from: 0, to: 2, caret: 2, query: "a" }, command,
+      { kind: "resource", resourceKind: ResourceKind.SKILL, resourceId: "skill", displayText: "Skill", discoveredRevision: "sha", resourceVersion: "1", runtimeGeneration: "7" }, "long");
+    expect(selection.draft.mentions[0]!.end).toBe(257);
+    expect(restoreMobileComposerInput(mobileComposerInput(selection.draft), { sessionId: "session", messageId: "message", eventId: "event" }).text).toBe(selection.draft.text);
+    expect(() => insertMobileResourceMention(draft, { start: 0, end: 2 }, {
+      resourceId: "skill", displayText: "a".repeat(257), discoveredRevision: "sha", resourceVersion: "1", runtimeGeneration: "7"
+    }, "invalid")).toThrow(/label/u);
+  });
   it("tracks the query at a UTF-16 caret while owning the complete slash run", () => {
     const draft = plainTextMobileComposerDraft("Before /release-notes after");
     const caret = "Before /rel".length;

@@ -3,15 +3,68 @@ import type { Transport } from "@connectrpc/connect";
 import {
   GetSnapshotResponseSchema,
   ListManagedModelRuntimesResponseSchema,
+  ManagedResourceSchema,
   OperationState,
+  ResourceAcquisitionKind,
+  ResourceKind,
+  ResourceScope,
+  ResourceState,
   SnapshotSchema,
   SubmitOperationResponseSchema
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
-import { createOrchestratorGateway } from "./gateway.js";
+import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 import type { ResourceDraft } from "./model.js";
 
 describe("managed resource acquisition gateway", () => {
+  it("preserves opaque remote project origins and independent same-name approval and loaded states", () => {
+    const remote = create(ManagedResourceSchema, {
+      resourceId: "resource-remote-one", backendId: "owner", targetId: "registered-project",
+      kind: ResourceKind.SKILL, name: "Review", state: ResourceState.AWAITING_APPROVAL,
+      discoveredRevision: "sha256:captured-tree",
+      source: { scope: ResourceScope.PROJECT, acquisitionKind: ResourceAcquisitionKind.REMOTE_PROJECT,
+        sourceDisplay: "review", sourceIdentity: "remote-source:one" }
+    });
+    const result = mapSnapshot(create(SnapshotSchema, { resources: [remote,
+      { ...remote, resourceId: "resource-remote-two", state: ResourceState.LOADED, enabled: true,
+        source: { ...remote.source!, sourceIdentity: "remote-source:two" } },
+      { ...remote, resourceId: "resource-service-local",
+        source: { ...remote.source!, acquisitionKind: ResourceAcquisitionKind.LOCAL, sourceDisplay: "service-node-directory" } }
+    ] }));
+    expect(result.resources).toMatchObject([
+      { id: "resource-remote-one", sourceKind: "remoteProject", sourceIdentity: "remote-source:one", state: "awaitingApproval", enabled: false },
+      { id: "resource-remote-two", sourceKind: "remoteProject", sourceIdentity: "remote-source:two", state: "loaded", enabled: true },
+      { id: "resource-service-local", sourceKind: "local", source: "service-node-directory" }
+    ]);
+  });
+
+  it.each(["path", "scope", "target", "identity", "unknown-kind"] as const)("rejects unsafe remote project output: %s", (problem) => {
+    const remote = create(ManagedResourceSchema, {
+      resourceId: "resource-remote", backendId: "owner", targetId: problem === "target" ? "" : "project",
+      kind: ResourceKind.SKILL, name: "Review", state: ResourceState.AWAITING_APPROVAL,
+      discoveredRevision: "sha256:captured",
+      source: { scope: problem === "scope" ? ResourceScope.GLOBAL : ResourceScope.PROJECT,
+        acquisitionKind: problem === "unknown-kind" ? 99 as ResourceAcquisitionKind : ResourceAcquisitionKind.REMOTE_PROJECT,
+        sourceDisplay: problem === "path" ? "/home/private/project/.agents/skills/review" : "review",
+        sourceIdentity: problem === "identity" ? "" : "remote-source:one" }
+    });
+    expect(() => mapSnapshot(create(SnapshotSchema, { resources: [remote] }))).toThrow(/source is invalid|kind is invalid/u);
+  });
+
+  it("rejects remote project acquisition input before dispatch while preserving service-node local input", async () => {
+    const submitted: any[] = [];
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret", {}, () => operationTransport(submitted)
+    );
+    await gateway.connect();
+    await expect(gateway.addResource({ backendId: "owner", targetId: "project", kind: "skill", scope: "project",
+      name: "Review", version: "", source: { kind: "remoteProject", serverPath: "/remote/private" }
+    } as unknown as ResourceDraft)).rejects.toThrow("source is invalid");
+    expect(submitted).toEqual([]);
+    gateway.disconnect();
+  });
+
   it("encodes local, npm, and Git drafts as typed acquisition oneofs", async () => {
     const submitted: any[] = [];
     const transport = operationTransport(submitted);

@@ -75,6 +75,7 @@ describe("shared composer palettes", () => {
       name: "review",
       description: "Review changes",
       source: "skill",
+      inputMode: "text",
       resourceId: "skill-1",
       loaded: true
     }];
@@ -89,6 +90,7 @@ describe("shared composer palettes", () => {
       name: "learn",
       description: "Runtime learning skill",
       source: "skill",
+      inputMode: "text",
       resourceId: "skill-learn",
       loaded: true
     };
@@ -117,6 +119,7 @@ describe("shared composer palettes", () => {
       name: "goal",
       description: "Runtime objective skill",
       source: "skill",
+      inputMode: "text",
       resourceId: "skill-goal",
       loaded: true
     };

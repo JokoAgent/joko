@@ -20,6 +20,7 @@ import type {
   ResourceView
 } from "../model.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
+import { resourceSourceKindLabel } from "../resource-presentation.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Modal, ModalBackButton, Pill, cx } from "./ui.js";
 
@@ -79,7 +80,7 @@ export function PiPackagesSection({
             <span className="package-row__identity">
               <strong>{resource.name}</strong>
               <small>{resourceKindLabel(resource, t)} · {resourceScopeLabel(resource, t)}{resource.version === undefined ? "" : ` · v${resource.version}`}</small>
-              <small className="package-row__source">{resource.source}</small>
+              <small className="package-row__source">{resourceSourceKindLabel(resource, t)}{resourceSourceKindLabel(resource, t) !== undefined ? " · " : ""}{resource.source}</small>
             </span>
             <span className="package-row__badges">
               {resource.compatibilityDetails.length > 0 && <Pill tone={compatibilityTone(compatibility)}>{compatibilityLabel(compatibility, t)}</Pill>}

@@ -993,6 +993,7 @@ message RuntimeCommand {
   // Product Session owning this live catalog observation. Required in owner
   // snapshots, where commands from multiple Sessions share one collection.
   string session_id = 7;
+  RuntimeCommandInputMode input_mode = 8;
 }
 
 // Display-safe exact identity for a resource proven loaded in one live task.
@@ -1031,6 +1032,12 @@ message RuntimeProcessUsage {
   bool terminable = 8;
   optional string process_instance_id = 9;
   RuntimeProcessRole role = 10;
+}
+
+enum RuntimeCommandInputMode {
+  RUNTIME_COMMAND_INPUT_MODE_UNSPECIFIED = 0;
+  RUNTIME_COMMAND_INPUT_MODE_TEXT = 1;
+  RUNTIME_COMMAND_INPUT_MODE_RESOURCE_MENTION = 2;
 }
 
 enum RuntimeCommandSource {

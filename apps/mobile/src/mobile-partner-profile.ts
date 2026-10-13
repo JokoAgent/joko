@@ -46,6 +46,8 @@ export interface MobilePartnerProfileTransport {
     signal: AbortSignal): Promise<MobilePartnerDirectoryProfile>;
   controlTask?(snapshot: MobilePartnerProfileSnapshot, task: import("@joko/contracts").PartnerSessionTaskView, action: "pause" | "resume" | "cancel", signal: AbortSignal): Promise<void>;
   openTask?(snapshot: MobilePartnerProfileSnapshot, task: import("@joko/contracts").PartnerSessionTaskView, signal: AbortSignal): Promise<void>;
+  listOutputs?(snapshot: MobilePartnerProfileSnapshot, signal: AbortSignal): Promise<import("./mobile-partner-task-outputs").MobilePartnerTaskOutputs>;
+  openOutputTask?(snapshot: MobilePartnerProfileSnapshot, row: import("./mobile-partner-task-outputs").MobilePartnerTaskOutput, signal: AbortSignal): Promise<void>;
 }
 
 const LABEL = /^[^\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]+$/u;
@@ -82,6 +84,13 @@ export function validateMobilePartnerProfileDraft(snapshot: MobilePartnerProfile
 
 export type MobilePartnerDraftFields = Omit<MobilePartnerProfileSnapshot, "partner">;
 
+export function mobilePartnerDraftCatalogIdentity(snapshot: MobilePartnerDraftFields): string {
+  return JSON.stringify({ options: snapshot.options, names: snapshot.names, models: snapshot.models, taskModels: snapshot.taskModels,
+    canSwitchModel: snapshot.canSwitchModel, canSetEffort: snapshot.canSetEffort, canSetFastMode: snapshot.canSetFastMode,
+    canSetPlanMode: snapshot.canSetPlanMode, permissionModes: snapshot.permissionModes },
+  (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value);
+}
+
 export function validateMobilePartnerDraftFields(snapshot: MobilePartnerDraftFields, draft: MobilePartnerProfileDraft,
   backendId: string | undefined, original?: MobilePartnerDirectoryProfile): MobilePartnerProfileDraft {
   const displayName = draft.displayName.normalize("NFKC").trim().replace(/\s+/gu, " ");
@@ -109,7 +118,7 @@ export function validateMobilePartnerDraftFields(snapshot: MobilePartnerDraftFie
   if (!capabilities) throw new MobilePartnerProfileValidationError("defaults", "Partner directory defaults are not configured.");
   const chain = capabilities.modelChain;
   if (chain.length < 1 || chain.length > 5 || new Set(chain.map((route) => `${route.backendId}\u001f${route.providerId}\u001f${route.modelId}`)).size !== chain.length
-    || !["ask", "auto"].includes(capabilities.permissionMode)) throw new MobilePartnerProfileValidationError("modelChain", "Select 1–5 unique Partner model routes.");
+    || !["ask", "auto", "bypassPermissions"].includes(capabilities.permissionMode)) throw new MobilePartnerProfileValidationError("modelChain", "Select 1–5 unique Partner model routes.");
   for (const route of chain) {
     const model = snapshot.models.find((candidate) => candidate.backendId === route.backendId
       && candidate.providerId === route.providerId && candidate.modelId === route.modelId);

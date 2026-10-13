@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { RuntimeCommandSource } from "@joko/contracts";
+import { RuntimeCommandInputMode, RuntimeCommandSource } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileRuntimeCommandPalette } from "./MobileRuntimeCommandPalette";
 
@@ -71,12 +71,14 @@ const colors = {
 const items = [
   {
     commandId: "release",
+    inputMode: RuntimeCommandInputMode.TEXT,
     name: "release",
     description: "Prepare release notes",
     source: RuntimeCommandSource.PROMPT
   },
   {
     commandId: "review",
+    inputMode: RuntimeCommandInputMode.TEXT,
     name: "review",
     description: "",
     source: RuntimeCommandSource.SKILL,

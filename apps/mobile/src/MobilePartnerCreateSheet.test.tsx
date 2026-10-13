@@ -11,6 +11,7 @@ import { creationSnapshot } from "./test/mobile-partner-creation";
 const alerts = vi.hoisted(() => ({ alert: vi.fn() }));
 const photo = vi.hoisted(() => ({ pick: vi.fn() }));
 const native = vi.hoisted(() => ({ os: "ios" as "ios" | "android", reduced: false, timing: vi.fn(),
+  state: "active", listeners: new Set<(state: string) => void>(),
   dismiss: undefined as undefined | (() => void), systemClose: undefined as undefined | (() => void) }));
 vi.mock("./mobile-partner-avatar", async (original) => ({ ...await original<typeof import("./mobile-partner-avatar")>(), pickMobilePartnerPhoto: photo.pick }));
 vi.mock("react-native", async () => {
@@ -19,6 +20,8 @@ vi.mock("react-native", async () => {
     children?: ReactNode; accessibilityLabel?: string; accessibilityRole?: string; disabled?: boolean; onPress?: () => void;
   }) => React.createElement(tag, { "aria-label": accessibilityLabel, role: accessibilityRole, disabled, onClick: onPress }, children);
   return { Alert: { alert: alerts.alert }, ActivityIndicator: () => null, Image: () => React.createElement("img"),
+    AppState: { get currentState() { return native.state; }, addEventListener: (_event: string, listener: (state: string) => void) => {
+      native.listeners.add(listener); return { remove: () => native.listeners.delete(listener) }; } },
     Platform: { get OS() { return native.os; } },
     AccessibilityInfo: { isReduceMotionEnabled: async () => native.reduced, addEventListener: () => ({ remove: () => undefined }) },
     Animated: { Value: class { constructor(_value: number) {} interpolate() { return 1; } setValue(_value: number) {} }, View: element("div"),
@@ -75,9 +78,32 @@ async function name(value = "Nova") {
 }
 afterEach(async () => { if (root) await act(async () => root.unmount()); container?.remove(); root = undefined as unknown as Root;
   close.mockReset(); created.mockReset(); alerts.alert.mockReset(); photo.pick.mockReset(); native.os = "ios"; native.reduced = false;
-  native.dismiss = undefined; native.systemClose = undefined; });
+  native.dismiss = undefined; native.systemClose = undefined; native.state = "active"; native.listeners.clear(); });
 
 describe("native Partner creation sheet", () => {
+  it.each(["android", "ios"] as const)("requires exact full-access creation confirmation including inherited defaults on %s", async platform => {
+    native.os = platform; const active = transport();
+    const full = { ...creationSnapshot, options: { ...creationSnapshot.options, defaultCapabilities: {
+      ...profilePartner.capabilities, permissionMode: "bypassPermissions" as const } },
+      backends: creationSnapshot.backends.map(backend => ({ ...backend, permissionModes: ["ask", "auto", "bypassPermissions"] as const })) };
+    vi.mocked(active.load).mockResolvedValue(full);
+    await render(active); await name(); await press("Invite Partner");
+    expect(active.create).not.toHaveBeenCalled();
+    const [title, body, buttons] = alerts.alert.mock.calls.at(-1)!;
+    expect(title).toBe("Full access removes approval prompts"); expect(body).toContain("not an OS sandbox"); expect(body).toContain("credentials");
+    await act(async () => buttons[0].onPress()); await act(async () => buttons[1].onPress()); expect(active.create).not.toHaveBeenCalled();
+    await press("Invite Partner"); const abandoned = alerts.alert.mock.calls.at(-1)![2][1].onPress;
+    await name("Changed draft"); await act(async () => abandoned()); expect(active.create).not.toHaveBeenCalled();
+    await press("Invite Partner"); const beforeRefresh = alerts.alert.mock.calls.at(-1)![2][1].onPress;
+    await press("Refresh"); await act(async () => beforeRefresh()); expect(active.create).not.toHaveBeenCalled();
+    await press("Invite Partner"); const beforeBackground = alerts.alert.mock.calls.at(-1)![2][1].onPress;
+    await act(() => { native.state = "background"; for (const listener of native.listeners) listener("background"); });
+    await act(() => { native.state = "active"; for (const listener of native.listeners) listener("active"); });
+    await act(async () => beforeBackground()); expect(active.create).not.toHaveBeenCalled();
+    await press("Invite Partner"); await act(async () => alerts.alert.mock.calls.at(-1)![2][1].onPress());
+    expect(active.create).toHaveBeenCalledOnce(); expect(vi.mocked(active.create).mock.calls[0]![1]).toMatchObject({
+      displayName: "Changed draft", usesDirectoryDefaults: true, capabilities: { permissionMode: "bypassPermissions" } });
+  });
   it("does not animate an Android sheet when reduced motion is enabled", async () => {
     native.os = "android"; native.reduced = true; native.timing.mockClear();
     const active = transport(); await render(active); expect(native.timing).not.toHaveBeenCalled();

@@ -63,6 +63,7 @@ export interface RemoteWorkspaceAuthority {
   readonly processes: RemoteProcessTransportPort;
   readonly forwarding?: RemoteForwardingTransportPort;
   assertCurrent(): void;
+  assertFilesCurrent(): void;
   assertForwardingCurrent(): void;
 }
 
@@ -138,7 +139,8 @@ export class RemoteExecutionRouter {
         ...(captured.lease.capabilities.tcpForwarding && captured.lease.forwarding !== undefined
           ? { forwarding: captured.lease.forwarding }
           : {}),
-        assertCurrent: captured.assertCurrent,
+        assertCurrent: () => { captured.assertCurrent(); captured.assertFilesCurrent(); },
+        assertFilesCurrent: captured.assertFilesCurrent,
         assertForwardingCurrent: captured.assertForwardingCurrent
       });
     }
@@ -163,6 +165,7 @@ export class RemoteExecutionRouter {
         ? { forwarding: ports.forwarding }
         : {}),
       assertCurrent: () => authority.assertCurrent(["files", "process"]),
+      assertFilesCurrent: () => authority.assertCurrent(["files"]),
       assertForwardingCurrent: () => authority.assertCurrent(["files", "process", "forwarding"])
     });
   }

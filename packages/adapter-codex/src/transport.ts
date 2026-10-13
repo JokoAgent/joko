@@ -31,6 +31,8 @@ export interface RpcRequestOptions {
   readonly signal?: AbortSignal;
   /** Synchronous owner check at the last boundary before writing this request. */
   readonly beforeDispatch?: () => void;
+  /** Private content proof at the actual write queue head; must not issue RPC. */
+  readonly beforeDispatchAsync?: (signal: AbortSignal) => Promise<void>;
   /** A write may have reached the app-server before a timeout or disconnect. */
   readonly mutation?: boolean;
 }
@@ -55,6 +57,12 @@ export interface JsonRpcRecordChannelHandlers {
   readonly onExit: (fault: TransportFault) => void | Promise<void>;
 }
 
+/** Private request admission at the channel's actual record-write queue head. */
+export interface JsonRpcRecordWriteAdmission {
+  readonly beforeWrite?: () => boolean | Promise<boolean>;
+  readonly finalBeforeWrite?: () => boolean;
+}
+
 /**
  * Process-boundary channel for the shared bounded JSON-RPC engine.
  * `write` receives exactly one UTF-8 JSONL record, including its final newline.
@@ -62,7 +70,7 @@ export interface JsonRpcRecordChannelHandlers {
 export interface JsonRpcRecordChannel {
   readonly running: boolean;
   start(handlers: JsonRpcRecordChannelHandlers): Promise<void>;
-  write(record: Buffer): Promise<void>;
+  write(record: Buffer, admission?: JsonRpcRecordWriteAdmission): Promise<void>;
   /** Hard stop for an already-fenced channel generation. */
   forceClose?(): Promise<void>;
   close(): Promise<void>;
@@ -98,6 +106,7 @@ interface PendingRequest {
   readonly reject: (error: unknown) => void;
   readonly timer: NodeJS.Timeout;
   readonly abortCleanup?: () => void;
+  readonly abortPreparation: () => void;
 }
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -299,6 +308,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
       id,
       ...(params === undefined ? {} : { params })
     };
+    const admission = new AbortController();
     return new Promise<JsonValue>((resolve, reject) => {
       const finishCancelled = (): void => {
         const pending = this.#pending.get(key);
@@ -306,6 +316,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
         clearTimeout(pending.timer);
         pending.abortCleanup?.();
         this.#pending.delete(key);
+        admission.abort();
         if (pending.dispatched) this.#addTombstone(key);
         reject(new TransportFault(
           "closed",
@@ -318,6 +329,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
         if (pending === undefined) return;
         pending.abortCleanup?.();
         this.#pending.delete(key);
+        admission.abort();
         if (pending.dispatched) this.#addTombstone(key);
         reject(new TransportFault(
           "request_timeout",
@@ -337,9 +349,10 @@ export class StdioJsonRpcTransport implements RpcTransport {
         resolve,
         reject,
         timer,
+        abortPreparation: () => admission.abort(),
         ...(abortCleanup === undefined ? {} : { abortCleanup })
       });
-      this.#enqueueWrite(writer, envelope, () => {
+      this.#enqueueWrite(writer, envelope, async () => {
         const pending = this.#pending.get(key);
         if (pending === undefined) return false;
         if (options.signal?.aborted) {
@@ -348,6 +361,10 @@ export class StdioJsonRpcTransport implements RpcTransport {
         }
         try {
           options.beforeDispatch?.();
+          if (options.beforeDispatchAsync !== undefined) {
+            const signal = options.signal === undefined ? admission.signal : AbortSignal.any([admission.signal, options.signal]);
+            await waitForWriteProof(options.beforeDispatchAsync(signal), signal);
+          }
         } catch (error) {
           clearTimeout(pending.timer);
           pending.abortCleanup?.();
@@ -355,12 +372,22 @@ export class StdioJsonRpcTransport implements RpcTransport {
           reject(error);
           return false;
         }
-        // A synchronous guard may itself retire its owner or cancel this wait.
-        if (this.#pending.get(key) !== pending) return false;
-        if (options.signal?.aborted) {
-          finishCancelled();
+        return true;
+      }, () => {
+        const pending = this.#pending.get(key);
+        if (pending === undefined) return false;
+        if (options.signal?.aborted) { finishCancelled(); return false; }
+        try { options.beforeDispatch?.(); }
+        catch (error) {
+          clearTimeout(pending.timer);
+          pending.abortCleanup?.();
+          this.#pending.delete(key);
+          admission.abort();
+          reject(error);
           return false;
         }
+        if (this.#pending.get(key) !== pending) return false;
+        if (options.signal?.aborted) { finishCancelled(); return false; }
         pending.dispatched = true;
         return true;
       }).catch((error: unknown) => {
@@ -515,7 +542,8 @@ export class StdioJsonRpcTransport implements RpcTransport {
     return writer;
   }
 
-  #enqueueWrite(writer: ChildProcessWithoutNullStreams | JsonRpcRecordChannel, envelope: JsonObject, beforeWrite?: () => boolean): Promise<void> {
+  #enqueueWrite(writer: ChildProcessWithoutNullStreams | JsonRpcRecordChannel, envelope: JsonObject,
+    beforeWrite?: () => boolean | Promise<boolean>, finalBeforeWrite?: () => boolean): Promise<void> {
     let bytes: Buffer;
     try {
       bytes = Buffer.from(`${JSON.stringify(envelope)}\n`, "utf8");
@@ -526,14 +554,29 @@ export class StdioJsonRpcTransport implements RpcTransport {
       return Promise.reject(new TransportFault("buffer_overflow", "A Codex JSON-RPC request exceeded the configured byte limit."));
     }
     const write = this.#writeTail.then(async () => {
-      if ((writer !== this.#child && writer !== this.#channel) || !this.running) {
-        throw new TransportFault("closed", "The Codex transport was closed before write.");
-      }
-      if (beforeWrite?.() === false) return;
       if (!("stdin" in writer)) {
-        await writer.write(bytes);
+        await writer.write(bytes, {
+          beforeWrite: async () => {
+            if (writer !== this.#channel || !this.running || this.#closing) throw new TransportFault("closed", "The Codex channel changed before write preparation.");
+            if (beforeWrite !== undefined && await beforeWrite() === false) return false;
+            if (writer !== this.#channel || !this.running || this.#closing) throw new TransportFault("closed", "The Codex channel changed during write preparation.");
+            return true;
+          },
+          finalBeforeWrite: () => {
+            if (writer !== this.#channel || !this.running || this.#closing) throw new TransportFault("closed", "The Codex channel changed before write.");
+            return finalBeforeWrite?.() !== false;
+          }
+        });
         return;
       }
+      if (writer !== this.#child || !this.running) {
+        throw new TransportFault("closed", "The Codex transport was closed before write.");
+      }
+      if (beforeWrite !== undefined && await beforeWrite() === false) return;
+      if (!this.running || this.#closing || writer !== (this.#channel ?? this.#child)) {
+        throw new TransportFault("closed", "The Codex transport changed during write preparation.");
+      }
+      if (finalBeforeWrite?.() === false) return;
       if (writer.stdin.write(bytes)) return;
       await once(writer.stdin, "drain");
     });
@@ -718,6 +761,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
     for (const pending of this.#pending.values()) {
       clearTimeout(pending.timer);
       pending.abortCleanup?.();
+      pending.abortPreparation();
       pending.reject(new TransportFault(fault.code, fault.message, {
         stateMayHaveChanged: pending.dispatched && (fault.stateMayHaveChanged || pending.mutation)
       }));
@@ -741,6 +785,17 @@ export class StdioJsonRpcTransport implements RpcTransport {
     this.#exitDelivered = true;
     void Promise.resolve(this.#handlers?.onExit(fault)).catch(() => undefined);
   }
+}
+
+async function waitForWriteProof(proof: Promise<void>, signal: AbortSignal): Promise<void> {
+  signal.throwIfAborted();
+  let onAbort: () => void = () => undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new TransportFault("closed", "The Codex write preparation was cancelled."));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try { await Promise.race([proof, aborted]); }
+  finally { signal.removeEventListener("abort", onAbort); }
 }
 
 function positiveInteger(value: number): boolean {

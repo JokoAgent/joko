@@ -99,6 +99,7 @@ class MobileRuntimeCommandFixtureAdapter extends InstrumentedFakeAdapter {
         name: "review",
         description: "Review current mobile changes",
         source: "skill" as const,
+        inputMode: "text" as const,
         resourceId: "mobile-review-skill",
         loaded: true
       },
@@ -106,6 +107,7 @@ class MobileRuntimeCommandFixtureAdapter extends InstrumentedFakeAdapter {
         name: "future",
         description: "Not loaded in this runtime",
         source: "prompt" as const,
+        inputMode: "text" as const,
         loaded: false
       }
     ];

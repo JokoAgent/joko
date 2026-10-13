@@ -3,11 +3,13 @@ import { join } from "node:path";
 
 import {
   LocalModelRuntimeManager,
+  LlamaCppRuntimeManager,
   OllamaLoopbackClient,
   OllamaRuntimeLauncher,
   type RuntimeAuditEvent,
   type RuntimeOwnerGeneration
 } from "@joko/local-model-runtime";
+import type { AdapterContext } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import type { ProviderCatalogManager } from "./credential-manager.js";
@@ -21,9 +23,15 @@ import {
   StoreRuntimeInstallLeaseRepository
 } from "./local-model-runtime-persistence.js";
 import { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
+import { ManagedModelRuntimeRegistry } from "./managed-model-runtime-registry.js";
+import { ManagedGgufRuntimeController } from "./managed-gguf-runtime-controller.js";
+import { ManagedGgufProviderCoordinator } from "./managed-gguf-provider-coordinator.js";
+import { MANAGED_GGUF_PROVIDER_ID } from "./managed-gguf-provider.js";
 
 export interface ManagedModelRuntimeSystem {
-  readonly controller: ManagedModelRuntimeController;
+  readonly registry: ManagedModelRuntimeRegistry;
+  prepareProviderRuntime(context: AdapterContext): Promise<void>;
+  removeProvider(providerId: string): Promise<boolean | undefined>;
   close(): Promise<void>;
 }
 
@@ -34,6 +42,8 @@ export interface ManagedModelRuntimeSystemOptions {
   readonly ownerId: string;
   readonly ownerGeneration: number;
   readonly onModelsChanged?: () => Promise<void>;
+  readonly onProviderChanged?: (backendIds: readonly string[]) => Promise<void>;
+  readonly fetchStreaming: typeof fetch;
 }
 
 /** Compose the node-owned runtime without any Desktop or renderer IPC. */
@@ -76,21 +86,76 @@ export async function createManagedModelRuntimeSystem(
   const controller = new ManagedModelRuntimeController({
     manager,
     owner,
+    providerRoutes: () => providerCoordinator.routes(owner),
     freeDiskBytes: async () => {
       const disk = await statfs(dataRoot, { bigint: true });
       const available = disk.bavail * disk.bsize;
       return available > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(available);
     }
   });
+  const ggufManager: LlamaCppRuntimeManager = new LlamaCppRuntimeManager({
+    dataRoot: join(dataRoot, "llama-cpp"), currentOwner: () => activeOwner, fetchStreaming: options.fetchStreaming, healthFetch: fetch,
+    validateConnection: async runtimeOwner => ggufProviders.assertConnection(runtimeOwner),
+    contextLimits: model => ggufProviders.contextLimits(model),
+    onModelsChanged: async (runtimeOwner, models) => {
+      const state = await ggufManager.snapshot(runtimeOwner);
+      await ggufProviders.sync(runtimeOwner, models, state.catalog);
+    }
+  });
+  const ggufProviders: ManagedGgufProviderCoordinator = new ManagedGgufProviderCoordinator({
+    providers: options.providers, currentOwner: () => activeOwner,
+    backendIds: () => options.store.listBackends().filter(backend => backend.descriptor.capabilities.get("provider.managed_catalog")?.supported === true)
+      .map(backend => backend.descriptor.id),
+    snapshot: runtimeOwner => ggufManager.snapshot(runtimeOwner),
+    configure: (runtimeOwner, effect) => ggufManager.configure(runtimeOwner, effect),
+    remove: (runtimeOwner, effect) => ggufManager.remove(runtimeOwner, effect),
+    onChanged: options.onProviderChanged
+  });
+  const ggufController = new ManagedGgufRuntimeController({
+    owner, currentOwner: () => activeOwner,
+    manager: {
+      snapshot: async runtimeOwner => {
+        const state = await ggufManager.snapshot(runtimeOwner);
+        await ggufProviders.sync(runtimeOwner, state.models, state.catalog);
+        return state;
+      },
+      listRepositoryFiles: (runtimeOwner, repository, signal) => ggufManager.listRepositoryFiles(runtimeOwner, repository, signal),
+      install: runtimeOwner => ggufManager.install(runtimeOwner),
+      download: (runtimeOwner, selection) => ggufManager.download(runtimeOwner, selection),
+      pause: (runtimeOwner, target) => ggufManager.pause(runtimeOwner, target),
+      resume: (runtimeOwner, target) => ggufManager.resume(runtimeOwner, target),
+      cancel: (runtimeOwner, target) => ggufManager.cancel(runtimeOwner, target),
+      start: async (runtimeOwner, startOptions) => {
+        await ggufManager.start(runtimeOwner, startOptions); ggufProviders.didStart();
+      },
+      stop: async runtimeOwner => { await ggufManager.stop(runtimeOwner); ggufProviders.didStop(); },
+      dispose: async runtimeOwner => { await ggufManager.dispose(runtimeOwner); ggufProviders.didStop(); }
+    },
+    providerRoutes: () => ggufProviders.routes(),
+    ensureProvider: signal => ggufProviders.ensure(owner, signal),
+    getModelContext: (targets, signal) => ggufProviders.getContext(owner, targets, signal),
+    setModelContext: (targets, limit, signal) => ggufProviders.setContext(owner, targets, limit, signal)
+  });
+  const registry = new ManagedModelRuntimeRegistry([controller, ggufController]);
   let closed = false;
   return {
-    controller,
+    registry,
+    async prepareProviderRuntime(context) {
+      if (context.target.remoteWorkspace !== undefined || context.modelSelection?.providerId !== MANAGED_GGUF_PROVIDER_ID) return;
+      ggufProviders.assertConnection(owner); context.signal.throwIfAborted();
+      const route = ggufProviders.routes().find(item => item.backendId === context.target.backendId && item.providerId === context.modelSelection!.providerId);
+      const state = await ggufManager.snapshot(owner); context.signal.throwIfAborted();
+      if (!route || !state.models.some(model => model.id === context.modelSelection!.modelId)) throw new Error("The selected managed local model is unavailable.");
+      await ggufManager.start(owner, { signal: context.signal });
+      ggufProviders.didStart(); context.signal.throwIfAborted(); ggufProviders.assertConnection(owner);
+    },
+    removeProvider: providerId => ggufProviders.removeProvider(owner, providerId),
     async close() {
       if (closed) return;
-      closed = true;
-      await controller.close();
+      await registry.close();
       launcher.stopManaged();
       activeOwner = undefined;
+      closed = true;
     }
   };
 }

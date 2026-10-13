@@ -3,6 +3,7 @@ import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@conn
 import * as contract from "@joko/contracts";
 import {
   LocalRuntimeError,
+  validLlamaCppFile, validLlamaCppRepository,
   type LocalRuntimeState,
   type ModelPullProgress,
   type PullPhase,
@@ -12,85 +13,149 @@ import {
 } from "@joko/local-model-runtime";
 
 import {
-  ManagedModelRuntimeController,
   managedModelRuntimeErrorMessage,
-  type ManagedModelRuntimeSnapshot
+  type ManagedModelRuntimeSnapshot, type ManagedRuntimeTransfer
 } from "./managed-model-runtime-controller.js";
+import type { ManagedModelRuntimePort, ManagedRepositoryModel, ManagedRuntimeModelContext, ManagedRuntimeModelTarget } from "./managed-model-runtime-port.js";
+import type { ManagedModelRuntimeRegistry } from "./managed-model-runtime-registry.js";
 
 export function createManagedModelRuntimeConnectService(
-  controller: ManagedModelRuntimeController | undefined,
+  registry: ManagedModelRuntimeRegistry | undefined,
   authenticate: (context: HandlerContext) => unknown
 ): ServiceImpl<typeof contract.ManagedModelRuntimeService> {
-  const requireController = (runtimeId?: string): ManagedModelRuntimeController => {
-    if (controller === undefined) throw new ConnectError("Managed local model runtimes are unavailable.", Code.Unimplemented);
-    if (runtimeId !== undefined && runtimeId !== controller.runtimeId) {
+  const requireController = (runtimeId: string): ManagedModelRuntimePort => {
+    if (registry === undefined) throw new ConnectError("Managed local model runtimes are unavailable.", Code.Unimplemented);
+    const controller = registry.get(runtimeId);
+    if (controller === undefined) {
       throw new ConnectError("Managed local model runtime not found.", Code.NotFound);
     }
     return controller;
   };
-  const invoke = async <T>(effect: () => Promise<T>): Promise<T> => {
+  const check = (context: HandlerContext): void => {
+    if (context.signal?.aborted) throw new ConnectError("The managed runtime request was cancelled.", Code.Canceled);
+    authenticate(context);
+  };
+  const invoke = async <T>(context: HandlerContext, effect: () => Promise<T>): Promise<T> => {
     try {
-      return await effect();
+      check(context); const result = await effect(); check(context); return result;
     } catch (error) {
+      if (context.signal?.aborted) throw new ConnectError("The managed runtime request was cancelled.", Code.Canceled);
       throw managedRuntimeConnectError(error);
     }
   };
   return {
+    ensureManagedModelRuntimeProvider: async (request, context) => invoke(context, async () => {
+      const active = requireController(request.runtimeId);
+      await requireCapability(active, "supportsRepositoryModels", context, check);
+      if (!active.ensureProvider) throw unsupported();
+      return { runtime: mapManagedModelRuntime(await active.ensureProvider(context.signal)) };
+    }),
+    stopManagedModelRuntime: async (request, context) => invoke(context, async () => {
+      const active = requireController(request.runtimeId);
+      await requireCapability(active, "canStop", context, check);
+      if (!active.stop) throw unsupported();
+      return { runtime: mapManagedModelRuntime(await active.stop(context.signal)) };
+    }),
+    restartManagedModelRuntime: async (request, context) => invoke(context, async () => {
+      const active = requireController(request.runtimeId);
+      await requireCapability(active, "canRestart", context, check);
+      if (!active.restart) throw unsupported();
+      return { runtime: mapManagedModelRuntime(await active.restart(context.signal)) };
+    }),
+    listManagedModelRepositoryFiles: async (request, context) => invoke(context, async () => {
+      const active = requireController(request.runtimeId);
+      await requireCapability(active, "supportsRepositoryModels", context, check);
+      if (!active.listRepositoryFiles) throw unsupported();
+      const value = await active.listRepositoryFiles(request.repository, context.signal); check(context);
+      if (value.repository !== request.repository) throw new ConnectError("The repository source changed.", Code.FailedPrecondition);
+      return { repository: value.repository, sourceRevision: value.sourceRevision,
+        files: value.files.map(file => ({ file: file.file, sizeBytes: BigInt(file.sizeBytes) })) };
+    }),
+    downloadManagedRepositoryModel: async (request, context) => invoke(context, async () => {
+      const active = requireController(request.runtimeId);
+      await requireCapability(active, "supportsRepositoryModels", context, check);
+      await requireCapability(active, "canPullModels", context, check);
+      if (!active.downloadRepositoryModel) throw unsupported();
+      return { runtime: mapManagedModelRuntime(await active.downloadRepositoryModel(repositoryModel(request.repositoryModel))) };
+    }),
+    controlManagedRepositoryDownload: async (request, context) => invoke(context, async () => {
+      const active = requireController(request.runtimeId);
+      const action = request.action === contract.ManagedRepositoryDownloadAction.PAUSE ? "pause"
+        : request.action === contract.ManagedRepositoryDownloadAction.RESUME ? "resume"
+          : request.action === contract.ManagedRepositoryDownloadAction.CANCEL ? "cancel" : undefined;
+      if (!action || !request.transferId || request.transferId.length > 160) throw invalid();
+      await requireCapability(active, action === "pause" ? "canPausePulls" : action === "resume" ? "canResumePulls" : "canCancelPulls", context, check);
+      if (!active.controlRepositoryDownload) throw unsupported();
+      return { runtime: mapManagedModelRuntime(await active.controlRepositoryDownload({ transferId: request.transferId,
+        repositoryModel: repositoryModel(request.repositoryModel) }, action)) };
+    }),
+    getManagedModelContext: async (request, context) => invoke(context, async () => {
+      const active = requireController(request.runtimeId);
+      await requireCapability(active, "supportsRepositoryModels", context, check);
+      if (!active.getModelContext) throw unsupported();
+      const targets = contextTargets(request.target, request.relatedTargets);
+      return { context: mapModelContext(await active.getModelContext(targets, context.signal)) };
+    }),
+    setManagedModelContext: async (request, context) => invoke(context, async () => {
+      const active = requireController(request.runtimeId);
+      await requireCapability(active, "canConfigure", context, check);
+      if (!active.setModelContext || request.contextWindowTokens < 1000n || request.contextWindowTokens > BigInt(Number.MAX_SAFE_INTEGER)) throw invalid();
+      return { context: mapModelContext(await active.setModelContext(contextTargets(request.target, request.relatedTargets),
+        Number(request.contextWindowTokens), context.signal)) };
+    }),
+    resetManagedModelContext: async (request, context) => invoke(context, async () => {
+      const active = requireController(request.runtimeId);
+      await requireCapability(active, "canConfigure", context, check);
+      if (!active.setModelContext) throw unsupported();
+      return { context: mapModelContext(await active.setModelContext(contextTargets(request.target, request.relatedTargets), undefined, context.signal)) };
+    }),
     listManagedModelRuntimes: async (_request, context) => {
-      authenticate(context);
-      if (controller === undefined) return { runtimes: [] };
-      return { runtimes: [mapManagedModelRuntime(await invoke(() => controller.snapshot()))] };
+      return invoke(context, async () => ({ runtimes: registry === undefined ? []
+        : await Promise.all(registry.list().map(async controller => mapManagedModelRuntime(await controller.snapshot()))) }));
     },
-    getManagedModelRuntime: async (request, context) => {
-      authenticate(context);
+    getManagedModelRuntime: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { runtime: mapManagedModelRuntime(await invoke(() => active.snapshot())) };
-    },
-    startManagedModelRuntime: async (request, context) => {
-      authenticate(context);
+      return { runtime: mapManagedModelRuntime(await active.snapshot()) };
+    }),
+    startManagedModelRuntime: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { runtime: mapManagedModelRuntime(await invoke(() => active.beginStart())) };
-    },
-    installManagedModelRuntime: async (request, context) => {
-      authenticate(context);
+      return { runtime: mapManagedModelRuntime(await active.beginStart()) };
+    }),
+    installManagedModelRuntime: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { runtime: mapManagedModelRuntime(await invoke(() => active.beginInstall())) };
-    },
-    cancelManagedModelRuntimeInstall: async (request, context) => {
-      authenticate(context);
+      return { runtime: mapManagedModelRuntime(await active.beginInstall()) };
+    }),
+    cancelManagedModelRuntimeInstall: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { runtime: mapManagedModelRuntime(await invoke(() => active.cancelInstall())) };
-    },
-    pullManagedModel: async (request, context) => {
-      authenticate(context);
+      return { runtime: mapManagedModelRuntime(await active.cancelInstall()) };
+    }),
+    pullManagedModel: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { runtime: mapManagedModelRuntime(await invoke(() => active.beginPull(request.modelName))) };
-    },
-    pauseManagedModelPull: async (request, context) => {
-      authenticate(context);
+      await requireCapability(active, "supportsCustomModels", context, check);
+      return { runtime: mapManagedModelRuntime(await active.beginPull(request.modelName)) };
+    }),
+    pauseManagedModelPull: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { runtime: mapManagedModelRuntime(await invoke(() => active.pausePull(request.modelName))) };
-    },
-    resumeManagedModelPull: async (request, context) => {
-      authenticate(context);
+      return { runtime: mapManagedModelRuntime(await active.pausePull(request.modelName)) };
+    }),
+    resumeManagedModelPull: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { runtime: mapManagedModelRuntime(await invoke(() => active.resumePull(request.modelName))) };
-    },
-    cancelManagedModelPull: async (request, context) => {
-      authenticate(context);
+      return { runtime: mapManagedModelRuntime(await active.resumePull(request.modelName)) };
+    }),
+    cancelManagedModelPull: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { runtime: mapManagedModelRuntime(await invoke(() => active.cancelPull(request.modelName))) };
-    },
-    deleteManagedModel: async (request, context) => {
-      authenticate(context);
+      return { runtime: mapManagedModelRuntime(await active.cancelPull(request.modelName)) };
+    }),
+    deleteManagedModel: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { runtime: mapManagedModelRuntime(await invoke(() => active.deleteModel(request.modelName))) };
-    },
-    getManagedModelPreflight: async (request, context) => {
-      authenticate(context);
+      await requireCapability(active, "canDeleteModels", context, check);
+      return { runtime: mapManagedModelRuntime(await active.deleteModel(request.modelName)) };
+    }),
+    getManagedModelPreflight: async (request, context) => invoke(context, async () => {
       const active = requireController(request.runtimeId);
-      return { preflight: mapPreflight(await invoke(() => active.preflight(request.catalogId))) };
-    }
+      await requireCapability(active, "supportsModelPreflight", context, check);
+      return { preflight: mapPreflight(await active.preflight(request.catalogId)) };
+    })
   };
 }
 
@@ -114,12 +179,18 @@ export function mapManagedModelRuntime(snapshot: ManagedModelRuntimeSnapshot): c
       canCancelPulls: snapshot.capabilities.canCancelPulls,
       supportsCustomModels: snapshot.capabilities.supportsCustomModels,
       supportsCuratedCatalog: snapshot.capabilities.supportsCuratedCatalog,
-      supportsModelPreflight: snapshot.capabilities.supportsModelPreflight
+      supportsModelPreflight: snapshot.capabilities.supportsModelPreflight,
+      canConfigure: snapshot.capabilities.canConfigure === true,
+      canStop: snapshot.capabilities.canStop === true, canRestart: snapshot.capabilities.canRestart === true,
+      supportsRepositoryModels: snapshot.capabilities.supportsRepositoryModels === true,
+      startupPolicy: snapshot.capabilities.startupPolicy === "on_use" ? contract.ManagedModelRuntimeStartupPolicy.ON_USE
+        : snapshot.capabilities.startupPolicy === "explicit" ? contract.ManagedModelRuntimeStartupPolicy.EXPLICIT : contract.ManagedModelRuntimeStartupPolicy.UNSPECIFIED
     }),
     installPreflight: mapPreflight(snapshot.installPreflight),
     installedModels: snapshot.installedModels.map((model) => create(contract.ManagedModelRuntimeModelSchema, {
       modelName: model.name,
-      displayName: model.name,
+      displayName: model.displayName ?? model.name,
+      ...(model.repositoryModel ? { repositoryModel: model.repositoryModel } : {}),
       ...(model.sizeBytes === undefined ? {} : { sizeBytes: BigInt(model.sizeBytes) }),
       ...(model.contextLength === undefined ? {} : { contextWindowTokens: BigInt(model.contextLength) }),
       supportsTools: model.capabilities.some((value) => value.toLowerCase() === "tools"),
@@ -134,9 +205,18 @@ export function mapManagedModelRuntime(snapshot: ManagedModelRuntimeSnapshot): c
       minimumMemoryGb: model.minimumMemoryGb,
       platformLimited: model.preflight.publicErrorCode === "UNSUPPORTED_PLATFORM",
       recommended: model.recommended,
-      preflight: mapPreflight(model.preflight)
+      preflight: mapPreflight(model.preflight),
+      aliases: [...model.aliases], descriptions: { ...model.descriptions },
+      variants: (model.variants ?? []).map(variant => ({ ...variant, sizeBytes: BigInt(variant.sizeBytes) }))
     })),
     transfers: snapshot.transfers.map(mapTransfer),
+    providerRoutes: (snapshot.providerRoutes ?? []).map(route => ({ ...route })),
+    ...(snapshot.hostProfile ? { hostProfile: { ...snapshot.hostProfile, totalMemoryBytes: BigInt(snapshot.hostProfile.totalMemoryBytes) } } : {}),
+    configureBlockedReason: snapshot.configureBlockedReason === undefined ? contract.ManagedModelRuntimeConfigureBlockedReason.UNSPECIFIED
+      : { owned_elsewhere: contract.ManagedModelRuntimeConfigureBlockedReason.OWNED_ELSEWHERE,
+        ownership_unknown: contract.ManagedModelRuntimeConfigureBlockedReason.OWNERSHIP_UNKNOWN,
+        operation_busy: contract.ManagedModelRuntimeConfigureBlockedReason.OPERATION_BUSY,
+        stop_unconfirmed: contract.ManagedModelRuntimeConfigureBlockedReason.STOP_UNCONFIRMED }[snapshot.configureBlockedReason],
     errorCode: mapRuntimeErrorCode(publicErrorCode),
     errorMessage: publicErrorCode === undefined ? "" : managedModelRuntimeErrorMessage(publicErrorCode),
     entityVersion: create(contract.EntityVersionSchema, {
@@ -149,13 +229,14 @@ export function mapManagedModelRuntime(snapshot: ManagedModelRuntimeSnapshot): c
   });
 }
 
-function mapTransfer(progress: ModelPullProgress | RuntimeInstallProgress): contract.ManagedModelRuntimeTransfer {
+function mapTransfer(progress: ManagedRuntimeTransfer): contract.ManagedModelRuntimeTransfer {
   const modelPull = "name" in progress;
   return create(contract.ManagedModelRuntimeTransferSchema, {
     kind: modelPull
       ? contract.ManagedModelRuntimeTransferKind.MODEL_PULL
       : contract.ManagedModelRuntimeTransferKind.RUNTIME_INSTALL,
     modelName: modelPull ? progress.name : "",
+    ...(progress.repositoryModel ? { repositoryModel: progress.repositoryModel } : {}), transferId: progress.transferId ?? "",
     phase: mapTransferPhase(progress.phase),
     ...(progress.completedBytes === undefined ? {} : { completedBytes: BigInt(Math.round(progress.completedBytes)) }),
     ...(progress.totalBytes === undefined ? {} : { totalBytes: BigInt(Math.round(progress.totalBytes)) }),
@@ -262,3 +343,34 @@ function managedRuntimeConnectError(error: unknown): ConnectError {
             : Code.FailedPrecondition;
   return new ConnectError(managedModelRuntimeErrorMessage(error.code), code);
 }
+
+async function requireCapability(active: ManagedModelRuntimePort, capability: keyof ManagedModelRuntimeSnapshot["capabilities"],
+  context: HandlerContext, check: (context: HandlerContext) => void): Promise<void> {
+  const state = await active.snapshot(); check(context);
+  if (state.runtimeId !== active.runtimeId || state.capabilities[capability] !== true) throw unsupported();
+}
+function repositoryModel(value: contract.ManagedRepositoryModel | undefined): ManagedRepositoryModel {
+  if (!value || !validLlamaCppRepository(value.repository) || !validLlamaCppFile(value.file)) throw invalid();
+  return { repository: value.repository, file: value.file };
+}
+function contextTargets(primary: contract.ManagedModelRuntimeModelTarget | undefined,
+  related: readonly contract.ManagedModelRuntimeModelTarget[]): readonly ManagedRuntimeModelTarget[] {
+  if (!primary || related.length > 2) throw invalid();
+  const ids = new Set<string>();
+  return [primary, ...related].map(value => {
+    if ([value.backendId, value.providerId, value.modelId].some(id => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(id))
+      || value.providerId !== primary.providerId || value.modelId !== primary.modelId || ids.has(value.backendId)) throw invalid();
+    ids.add(value.backendId);
+    const source = repositoryModel(value.repositoryModel);
+    if (source.repository !== primary.repositoryModel?.repository || source.file !== primary.repositoryModel.file) throw invalid();
+    return { backendId: value.backendId, providerId: value.providerId, modelId: value.modelId, repositoryModel: source };
+  });
+}
+function mapModelContext(value: ManagedRuntimeModelContext): contract.ManagedModelContext {
+  return create(contract.ManagedModelContextSchema, { target: value.target,
+    defaultContextWindowTokens: BigInt(value.defaultContextWindowTokens), effectiveContextWindowTokens: BigInt(value.effectiveContextWindowTokens),
+    maximumContextWindowTokens: BigInt(value.maximumContextWindowTokens), presets: value.presets.map(limit => BigInt(limit)),
+    customized: value.customized, canConfigure: value.canConfigure, pendingApply: value.pendingApply, mixed: value.mixed });
+}
+function invalid(): ConnectError { return new ConnectError("The managed model selection is invalid.", Code.InvalidArgument); }
+function unsupported(): ConnectError { return new ConnectError("The requested managed runtime capability is unavailable.", Code.FailedPrecondition); }

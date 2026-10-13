@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/managed_model_runtime.proto.
  */
 export const file_joko_v1_managed_model_runtime: GenFile = /*@__PURE__*/
-  fileDesc("CiNqb2tvL3YxL21hbmFnZWRfbW9kZWxfcnVudGltZS5wcm90bxIHam9rby52MSLjAgofTWFuYWdlZE1vZGVsUnVudGltZUNhcGFiaWxpdGllcxITCgtjYW5faW5zdGFsbBgBIAEoCBIaChJjYW5fY2FuY2VsX2luc3RhbGwYAiABKAgSEQoJY2FuX3N0YXJ0GAMgASgIEhcKD2Nhbl9saXN0X21vZGVscxgEIAEoCBIXCg9jYW5fcHVsbF9tb2RlbHMYBSABKAgSGQoRY2FuX2RlbGV0ZV9tb2RlbHMYBiABKAgSFwoPY2FuX3BhdXNlX3B1bGxzGAcgASgIEhgKEGNhbl9yZXN1bWVfcHVsbHMYCCABKAgSGAoQY2FuX2NhbmNlbF9wdWxscxgJIAEoCBIeChZzdXBwb3J0c19jdXN0b21fbW9kZWxzGAogASgIEiAKGHN1cHBvcnRzX2N1cmF0ZWRfY2F0YWxvZxgLIAEoCBIgChhzdXBwb3J0c19tb2RlbF9wcmVmbGlnaHQYDCABKAgi+wEKHE1hbmFnZWRNb2RlbFJ1bnRpbWVQcmVmbGlnaHQSDwoHYWxsb3dlZBgBIAEoCBI5CgZtZW1vcnkYAiABKA4yKS5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVSZXNvdXJjZVN0YXRlEjcKBGRpc2sYAyABKA4yKS5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVSZXNvdXJjZVN0YXRlEhsKE3JlcXVpcmVkX2Rpc2tfYnl0ZXMYBCABKAQSOQoKZXJyb3JfY29kZRgFIAEoDjIlLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZUVycm9yQ29kZSL9AQoYTWFuYWdlZE1vZGVsUnVudGltZU1vZGVsEhIKCm1vZGVsX25hbWUYASABKAkSFAoMZGlzcGxheV9uYW1lGAIgASgJEhcKCnNpemVfYnl0ZXMYAyABKARIAIgBARIiChVjb250ZXh0X3dpbmRvd190b2tlbnMYBCABKARIAYgBARIWCg5zdXBwb3J0c190b29scxgFIAEoCBIXCg9zdXBwb3J0c19pbWFnZXMYBiABKAgSIAoYcmVxdWlyZWRfcnVudGltZV92ZXJzaW9uGAcgASgJQg0KC19zaXplX2J5dGVzQhgKFl9jb250ZXh0X3dpbmRvd190b2tlbnMi9wEKH01hbmFnZWRNb2RlbFJ1bnRpbWVDYXRhbG9nTW9kZWwSEgoKY2F0YWxvZ19pZBgBIAEoCRISCgptb2RlbF9uYW1lGAIgASgJEhQKDGRpc3BsYXlfbmFtZRgDIAEoCRISCgpzaXplX2J5dGVzGAQgASgEEhkKEW1pbmltdW1fbWVtb3J5X2diGAUgASgNEhgKEHBsYXRmb3JtX2xpbWl0ZWQYBiABKAgSEwoLcmVjb21tZW5kZWQYByABKAgSOAoJcHJlZmxpZ2h0GAggASgLMiUuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lUHJlZmxpZ2h0Ip4DChtNYW5hZ2VkTW9kZWxSdW50aW1lVHJhbnNmZXISNgoEa2luZBgBIAEoDjIoLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZVRyYW5zZmVyS2luZBISCgptb2RlbF9uYW1lGAIgASgJEjgKBXBoYXNlGAMgASgOMikuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lVHJhbnNmZXJQaGFzZRIcCg9jb21wbGV0ZWRfYnl0ZXMYBCABKARIAIgBARIYCgt0b3RhbF9ieXRlcxgFIAEoBEgBiAEBEhQKB3BlcmNlbnQYBiABKA1IAogBARIdChBieXRlc19wZXJfc2Vjb25kGAcgASgESAOIAQESDAoEZG9uZRgIIAEoCBI5CgplcnJvcl9jb2RlGAkgASgOMiUuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lRXJyb3JDb2RlQhIKEF9jb21wbGV0ZWRfYnl0ZXNCDgoMX3RvdGFsX2J5dGVzQgoKCF9wZXJjZW50QhMKEV9ieXRlc19wZXJfc2Vjb25kIusEChNNYW5hZ2VkTW9kZWxSdW50aW1lEhIKCnJ1bnRpbWVfaWQYASABKAkSFAoMZGlzcGxheV9uYW1lGAIgASgJEjAKBXN0YXRlGAMgASgOMiEuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lU3RhdGUSMgoGc291cmNlGAQgASgOMiIuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lU291cmNlEg8KB3ZlcnNpb24YBSABKAkSPgoMY2FwYWJpbGl0aWVzGAYgASgLMiguam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lQ2FwYWJpbGl0aWVzEkAKEWluc3RhbGxfcHJlZmxpZ2h0GAcgASgLMiUuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lUHJlZmxpZ2h0EjsKEGluc3RhbGxlZF9tb2RlbHMYCCADKAsyIS5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVNb2RlbBI5CgdjYXRhbG9nGAkgAygLMiguam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lQ2F0YWxvZ01vZGVsEjcKCXRyYW5zZmVycxgKIAMoCzIkLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZVRyYW5zZmVyEjkKCmVycm9yX2NvZGUYCyABKA4yJS5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVFcnJvckNvZGUSFQoNZXJyb3JfbWVzc2FnZRgMIAEoCRIuCg5lbnRpdHlfdmVyc2lvbhgNIAEoCzIWLmpva28udjEuRW50aXR5VmVyc2lvbiIhCh9MaXN0TWFuYWdlZE1vZGVsUnVudGltZXNSZXF1ZXN0IlIKIExpc3RNYW5hZ2VkTW9kZWxSdW50aW1lc1Jlc3BvbnNlEi4KCHJ1bnRpbWVzGAEgAygLMhwuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lIjMKHUdldE1hbmFnZWRNb2RlbFJ1bnRpbWVSZXF1ZXN0EhIKCnJ1bnRpbWVfaWQYASABKAkiTwoeR2V0TWFuYWdlZE1vZGVsUnVudGltZVJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiNQofU3RhcnRNYW5hZ2VkTW9kZWxSdW50aW1lUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJIlEKIFN0YXJ0TWFuYWdlZE1vZGVsUnVudGltZVJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiNwohSW5zdGFsbE1hbmFnZWRNb2RlbFJ1bnRpbWVSZXF1ZXN0EhIKCnJ1bnRpbWVfaWQYASABKAkiUwoiSW5zdGFsbE1hbmFnZWRNb2RlbFJ1bnRpbWVSZXNwb25zZRItCgdydW50aW1lGAEgASgLMhwuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lIj0KJ0NhbmNlbE1hbmFnZWRNb2RlbFJ1bnRpbWVJbnN0YWxsUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJIlkKKENhbmNlbE1hbmFnZWRNb2RlbFJ1bnRpbWVJbnN0YWxsUmVzcG9uc2USLQoHcnVudGltZRgBIAEoCzIcLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZSJBChdQdWxsTWFuYWdlZE1vZGVsUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhIKCm1vZGVsX25hbWUYAiABKAkiSQoYUHVsbE1hbmFnZWRNb2RlbFJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiRgocUGF1c2VNYW5hZ2VkTW9kZWxQdWxsUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhIKCm1vZGVsX25hbWUYAiABKAkiTgodUGF1c2VNYW5hZ2VkTW9kZWxQdWxsUmVzcG9uc2USLQoHcnVudGltZRgBIAEoCzIcLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZSJHCh1SZXN1bWVNYW5hZ2VkTW9kZWxQdWxsUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhIKCm1vZGVsX25hbWUYAiABKAkiTwoeUmVzdW1lTWFuYWdlZE1vZGVsUHVsbFJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiRwodQ2FuY2VsTWFuYWdlZE1vZGVsUHVsbFJlcXVlc3QSEgoKcnVudGltZV9pZBgBIAEoCRISCgptb2RlbF9uYW1lGAIgASgJIk8KHkNhbmNlbE1hbmFnZWRNb2RlbFB1bGxSZXNwb25zZRItCgdydW50aW1lGAEgASgLMhwuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lIkMKGURlbGV0ZU1hbmFnZWRNb2RlbFJlcXVlc3QSEgoKcnVudGltZV9pZBgBIAEoCRISCgptb2RlbF9uYW1lGAIgASgJIksKGkRlbGV0ZU1hbmFnZWRNb2RlbFJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiSQofR2V0TWFuYWdlZE1vZGVsUHJlZmxpZ2h0UmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhIKCmNhdGFsb2dfaWQYAiABKAkiXAogR2V0TWFuYWdlZE1vZGVsUHJlZmxpZ2h0UmVzcG9uc2USOAoJcHJlZmxpZ2h0GAEgASgLMiUuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lUHJlZmxpZ2h0KusCChhNYW5hZ2VkTW9kZWxSdW50aW1lU3RhdGUSKwonTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX1VOU1BFQ0lGSUVEEAASJgoiTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX0FCU0VOVBABEicKI01BTkFHRURfTU9ERUxfUlVOVElNRV9TVEFURV9TVE9QUEVEEAISKAokTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX1NUQVJUSU5HEAMSJQohTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX1JFQURZEAQSLQopTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX1BPUlRfQ09ORkxJQ1QQBRIqCiZNQU5BR0VEX01PREVMX1JVTlRJTUVfU1RBVEVfSU5TVEFMTElORxAGEiUKIU1BTkFHRURfTU9ERUxfUlVOVElNRV9TVEFURV9FUlJPUhAHKqACChlNYW5hZ2VkTW9kZWxSdW50aW1lU291cmNlEiwKKE1BTkFHRURfTU9ERUxfUlVOVElNRV9TT1VSQ0VfVU5TUEVDSUZJRUQQABIoCiRNQU5BR0VEX01PREVMX1JVTlRJTUVfU09VUkNFX1JVTk5JTkcQARIsCihNQU5BR0VEX01PREVMX1JVTlRJTUVfU09VUkNFX0FQUExJQ0FUSU9OEAISJAogTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NPVVJDRV9DTEkQAxIwCixNQU5BR0VEX01PREVMX1JVTlRJTUVfU09VUkNFX01BTkFHRURfU0lERUNBUhAEEiUKIU1BTkFHRURfTU9ERUxfUlVOVElNRV9TT1VSQ0VfTk9ORRAFKsMBCh9NYW5hZ2VkTW9kZWxSdW50aW1lVHJhbnNmZXJLaW5kEjMKL01BTkFHRURfTU9ERUxfUlVOVElNRV9UUkFOU0ZFUl9LSU5EX1VOU1BFQ0lGSUVEEAASNwozTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX0tJTkRfUlVOVElNRV9JTlNUQUxMEAESMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX0tJTkRfTU9ERUxfUFVMTBACKr4FCiBNYW5hZ2VkTW9kZWxSdW50aW1lVHJhbnNmZXJQaGFzZRI0CjBNQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfVU5TUEVDSUZJRUQQABIxCi1NQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfU1RBUlRJTkcQARIyCi5NQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfUkVTT0xWSU5HEAISMQotTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX01BTklGRVNUEAMSNAowTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX0RPV05MT0FESU5HEAQSMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX1ZFUklGWUlORxAFEjMKL01BTkFHRURfTU9ERUxfUlVOVElNRV9UUkFOU0ZFUl9QSEFTRV9FWFRSQUNUSU5HEAYSMAosTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX1dSSVRJTkcQBxIyCi5NQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfUFJPTU9USU5HEAgSMAosTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX1NVQ0NFU1MQCRIvCitNQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfUEFVU0VEEAoSMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX0NBTkNFTExFRBALEi4KKk1BTkFHRURfTU9ERUxfUlVOVElNRV9UUkFOU0ZFUl9QSEFTRV9FUlJPUhAMKqwCCiBNYW5hZ2VkTW9kZWxSdW50aW1lUmVzb3VyY2VTdGF0ZRI0CjBNQU5BR0VEX01PREVMX1JVTlRJTUVfUkVTT1VSQ0VfU1RBVEVfVU5TUEVDSUZJRUQQABIzCi9NQU5BR0VEX01PREVMX1JVTlRJTUVfUkVTT1VSQ0VfU1RBVEVfU1VGRklDSUVOVBABEjQKME1BTkFHRURfTU9ERUxfUlVOVElNRV9SRVNPVVJDRV9TVEFURV9DT05TVFJBSU5FRBACEjUKMU1BTkFHRURfTU9ERUxfUlVOVElNRV9SRVNPVVJDRV9TVEFURV9JTlNVRkZJQ0lFTlQQAxIwCixNQU5BR0VEX01PREVMX1JVTlRJTUVfUkVTT1VSQ0VfU1RBVEVfVU5LTk9XThAEKtkIChxNYW5hZ2VkTW9kZWxSdW50aW1lRXJyb3JDb2RlEjAKLE1BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX1VOU1BFQ0lGSUVEEAASMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfT1dORVJfQ0hBTkdFRBABEjgKNE1BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX1JVTlRJTUVfVU5SRUFDSEFCTEUQAhIyCi5NQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9QT1JUX0NPTkZMSUNUEAMSOQo1TUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfVU5TVVBQT1JURURfUExBVEZPUk0QBBIxCi1NQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9JTlNUQUxMX0JVU1kQBRIuCipNQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9QVUxMX0JVU1kQBhIyCi5NQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9NT0RFTF9JTlZBTElEEAcSNAowTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfTU9ERUxfTk9UX0ZPVU5EEAgSNwozTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfTU9ERUxfVU5BVVRIT1JJWkVEEAkSNwozTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfTU9ERUxfSU5DT01QQVRJQkxFEAoSMwovTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfRElTS19TUEFDRV9MT1cQCxI2CjJNQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9ET1dOTE9BRF9SRUpFQ1RFRBAMEjcKM01BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX0RPV05MT0FEX1RPT19MQVJHRRANEjUKMU1BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX0RPV05MT0FEX1RJTUVPVVQQDhI2CjJNQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9DSEVDS1NVTV9NSVNNQVRDSBAPEjUKMU1BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX0FSQ0hJVkVfUkVKRUNURUQQEBIxCi1NQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9TVEFSVF9GQUlMRUQQERI4CjRNQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9PUEVSQVRJT05fQ0FOQ0VMTEVEEBISMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfUlVOVElNRV9FUlJPUhATYgZwcm90bzM", [file_joko_v1_common]);
+  fileDesc("CiNqb2tvL3YxL21hbmFnZWRfbW9kZWxfcnVudGltZS5wcm90bxIHam9rby52MSKIBAofTWFuYWdlZE1vZGVsUnVudGltZUNhcGFiaWxpdGllcxITCgtjYW5faW5zdGFsbBgBIAEoCBIaChJjYW5fY2FuY2VsX2luc3RhbGwYAiABKAgSEQoJY2FuX3N0YXJ0GAMgASgIEhcKD2Nhbl9saXN0X21vZGVscxgEIAEoCBIXCg9jYW5fcHVsbF9tb2RlbHMYBSABKAgSGQoRY2FuX2RlbGV0ZV9tb2RlbHMYBiABKAgSFwoPY2FuX3BhdXNlX3B1bGxzGAcgASgIEhgKEGNhbl9yZXN1bWVfcHVsbHMYCCABKAgSGAoQY2FuX2NhbmNlbF9wdWxscxgJIAEoCBIeChZzdXBwb3J0c19jdXN0b21fbW9kZWxzGAogASgIEiAKGHN1cHBvcnRzX2N1cmF0ZWRfY2F0YWxvZxgLIAEoCBIgChhzdXBwb3J0c19tb2RlbF9wcmVmbGlnaHQYDCABKAgSFQoNY2FuX2NvbmZpZ3VyZRgNIAEoCBIQCghjYW5fc3RvcBgOIAEoCBITCgtjYW5fcmVzdGFydBgPIAEoCBIiChpzdXBwb3J0c19yZXBvc2l0b3J5X21vZGVscxgQIAEoCBJBCg5zdGFydHVwX3BvbGljeRgRIAEoDjIpLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZVN0YXJ0dXBQb2xpY3kiOgoWTWFuYWdlZFJlcG9zaXRvcnlNb2RlbBISCgpyZXBvc2l0b3J5GAEgASgJEgwKBGZpbGUYAiABKAkiSwogTWFuYWdlZE1vZGVsUnVudGltZVByb3ZpZGVyUm91dGUSEgoKYmFja2VuZF9pZBgBIAEoCRITCgtwcm92aWRlcl9pZBgCIAEoCSKUAQoeTWFuYWdlZE1vZGVsUnVudGltZUhvc3RQcm9maWxlEhAKCHBsYXRmb3JtGAEgASgJEgwKBGFyY2gYAiABKAkSGgoSdG90YWxfbWVtb3J5X2J5dGVzGAMgASgEEhEKCW1lbW9yeV9nYhgEIAEoDRIVCg1hcHBsZV9zaWxpY29uGAUgASgIEgwKBGNoaXAYBiABKAkiiwEKJE1hbmFnZWRNb2RlbFJ1bnRpbWVSZXBvc2l0b3J5VmFyaWFudBI5ChByZXBvc2l0b3J5X21vZGVsGAEgASgLMh8uam9rby52MS5NYW5hZ2VkUmVwb3NpdG9yeU1vZGVsEhQKDHF1YW50aXphdGlvbhgCIAEoCRISCgpzaXplX2J5dGVzGAMgASgEIvsBChxNYW5hZ2VkTW9kZWxSdW50aW1lUHJlZmxpZ2h0Eg8KB2FsbG93ZWQYASABKAgSOQoGbWVtb3J5GAIgASgOMikuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lUmVzb3VyY2VTdGF0ZRI3CgRkaXNrGAMgASgOMikuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lUmVzb3VyY2VTdGF0ZRIbChNyZXF1aXJlZF9kaXNrX2J5dGVzGAQgASgEEjkKCmVycm9yX2NvZGUYBSABKA4yJS5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVFcnJvckNvZGUiuAIKGE1hbmFnZWRNb2RlbFJ1bnRpbWVNb2RlbBISCgptb2RlbF9uYW1lGAEgASgJEhQKDGRpc3BsYXlfbmFtZRgCIAEoCRIXCgpzaXplX2J5dGVzGAMgASgESACIAQESIgoVY29udGV4dF93aW5kb3dfdG9rZW5zGAQgASgESAGIAQESFgoOc3VwcG9ydHNfdG9vbHMYBSABKAgSFwoPc3VwcG9ydHNfaW1hZ2VzGAYgASgIEiAKGHJlcXVpcmVkX3J1bnRpbWVfdmVyc2lvbhgHIAEoCRI5ChByZXBvc2l0b3J5X21vZGVsGAggASgLMh8uam9rby52MS5NYW5hZ2VkUmVwb3NpdG9yeU1vZGVsQg0KC19zaXplX2J5dGVzQhgKFl9jb250ZXh0X3dpbmRvd190b2tlbnMi0AMKH01hbmFnZWRNb2RlbFJ1bnRpbWVDYXRhbG9nTW9kZWwSEgoKY2F0YWxvZ19pZBgBIAEoCRISCgptb2RlbF9uYW1lGAIgASgJEhQKDGRpc3BsYXlfbmFtZRgDIAEoCRISCgpzaXplX2J5dGVzGAQgASgEEhkKEW1pbmltdW1fbWVtb3J5X2diGAUgASgNEhgKEHBsYXRmb3JtX2xpbWl0ZWQYBiABKAgSEwoLcmVjb21tZW5kZWQYByABKAgSOAoJcHJlZmxpZ2h0GAggASgLMiUuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lUHJlZmxpZ2h0Eg8KB2FsaWFzZXMYCSADKAkSUAoMZGVzY3JpcHRpb25zGAogAygLMjouam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lQ2F0YWxvZ01vZGVsLkRlc2NyaXB0aW9uc0VudHJ5Ej8KCHZhcmlhbnRzGAsgAygLMi0uam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lUmVwb3NpdG9yeVZhcmlhbnQaMwoRRGVzY3JpcHRpb25zRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ASLuAwobTWFuYWdlZE1vZGVsUnVudGltZVRyYW5zZmVyEjYKBGtpbmQYASABKA4yKC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVUcmFuc2ZlcktpbmQSEgoKbW9kZWxfbmFtZRgCIAEoCRI4CgVwaGFzZRgDIAEoDjIpLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZVRyYW5zZmVyUGhhc2USHAoPY29tcGxldGVkX2J5dGVzGAQgASgESACIAQESGAoLdG90YWxfYnl0ZXMYBSABKARIAYgBARIUCgdwZXJjZW50GAYgASgNSAKIAQESHQoQYnl0ZXNfcGVyX3NlY29uZBgHIAEoBEgDiAEBEgwKBGRvbmUYCCABKAgSOQoKZXJyb3JfY29kZRgJIAEoDjIlLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZUVycm9yQ29kZRI5ChByZXBvc2l0b3J5X21vZGVsGAogASgLMh8uam9rby52MS5NYW5hZ2VkUmVwb3NpdG9yeU1vZGVsEhMKC3RyYW5zZmVyX2lkGAsgASgJQhIKEF9jb21wbGV0ZWRfYnl0ZXNCDgoMX3RvdGFsX2J5dGVzQgoKCF9wZXJjZW50QhMKEV9ieXRlc19wZXJfc2Vjb25kIsQGChNNYW5hZ2VkTW9kZWxSdW50aW1lEhIKCnJ1bnRpbWVfaWQYASABKAkSFAoMZGlzcGxheV9uYW1lGAIgASgJEjAKBXN0YXRlGAMgASgOMiEuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lU3RhdGUSMgoGc291cmNlGAQgASgOMiIuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lU291cmNlEg8KB3ZlcnNpb24YBSABKAkSPgoMY2FwYWJpbGl0aWVzGAYgASgLMiguam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lQ2FwYWJpbGl0aWVzEkAKEWluc3RhbGxfcHJlZmxpZ2h0GAcgASgLMiUuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lUHJlZmxpZ2h0EjsKEGluc3RhbGxlZF9tb2RlbHMYCCADKAsyIS5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVNb2RlbBI5CgdjYXRhbG9nGAkgAygLMiguam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lQ2F0YWxvZ01vZGVsEjcKCXRyYW5zZmVycxgKIAMoCzIkLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZVRyYW5zZmVyEjkKCmVycm9yX2NvZGUYCyABKA4yJS5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVFcnJvckNvZGUSFQoNZXJyb3JfbWVzc2FnZRgMIAEoCRIuCg5lbnRpdHlfdmVyc2lvbhgNIAEoCzIWLmpva28udjEuRW50aXR5VmVyc2lvbhJCCg9wcm92aWRlcl9yb3V0ZXMYDiADKAsyKS5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVQcm92aWRlclJvdXRlEj0KDGhvc3RfcHJvZmlsZRgPIAEoCzInLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZUhvc3RQcm9maWxlElQKGGNvbmZpZ3VyZV9ibG9ja2VkX3JlYXNvbhgQIAEoDjIyLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZUNvbmZpZ3VyZUJsb2NrZWRSZWFzb24iPgooRW5zdXJlTWFuYWdlZE1vZGVsUnVudGltZVByb3ZpZGVyUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJIloKKUVuc3VyZU1hbmFnZWRNb2RlbFJ1bnRpbWVQcm92aWRlclJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiNAoeU3RvcE1hbmFnZWRNb2RlbFJ1bnRpbWVSZXF1ZXN0EhIKCnJ1bnRpbWVfaWQYASABKAkiUAofU3RvcE1hbmFnZWRNb2RlbFJ1bnRpbWVSZXNwb25zZRItCgdydW50aW1lGAEgASgLMhwuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lIjcKIVJlc3RhcnRNYW5hZ2VkTW9kZWxSdW50aW1lUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJIlMKIlJlc3RhcnRNYW5hZ2VkTW9kZWxSdW50aW1lUmVzcG9uc2USLQoHcnVudGltZRgBIAEoCzIcLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZSJQCiZMaXN0TWFuYWdlZE1vZGVsUmVwb3NpdG9yeUZpbGVzUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhIKCnJlcG9zaXRvcnkYAiABKAkiPgoaTWFuYWdlZE1vZGVsUmVwb3NpdG9yeUZpbGUSDAoEZmlsZRgBIAEoCRISCgpzaXplX2J5dGVzGAIgASgEIooBCidMaXN0TWFuYWdlZE1vZGVsUmVwb3NpdG9yeUZpbGVzUmVzcG9uc2USEgoKcmVwb3NpdG9yeRgBIAEoCRIXCg9zb3VyY2VfcmV2aXNpb24YAiABKAkSMgoFZmlsZXMYAyADKAsyIy5qb2tvLnYxLk1hbmFnZWRNb2RlbFJlcG9zaXRvcnlGaWxlInYKJURvd25sb2FkTWFuYWdlZFJlcG9zaXRvcnlNb2RlbFJlcXVlc3QSEgoKcnVudGltZV9pZBgBIAEoCRI5ChByZXBvc2l0b3J5X21vZGVsGAIgASgLMh8uam9rby52MS5NYW5hZ2VkUmVwb3NpdG9yeU1vZGVsIlcKJkRvd25sb2FkTWFuYWdlZFJlcG9zaXRvcnlNb2RlbFJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUixwEKJ0NvbnRyb2xNYW5hZ2VkUmVwb3NpdG9yeURvd25sb2FkUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhMKC3RyYW5zZmVyX2lkGAIgASgJEjkKEHJlcG9zaXRvcnlfbW9kZWwYAyABKAsyHy5qb2tvLnYxLk1hbmFnZWRSZXBvc2l0b3J5TW9kZWwSOAoGYWN0aW9uGAQgASgOMiguam9rby52MS5NYW5hZ2VkUmVwb3NpdG9yeURvd25sb2FkQWN0aW9uIlkKKENvbnRyb2xNYW5hZ2VkUmVwb3NpdG9yeURvd25sb2FkUmVzcG9uc2USLQoHcnVudGltZRgBIAEoCzIcLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZSKWAQoeTWFuYWdlZE1vZGVsUnVudGltZU1vZGVsVGFyZ2V0EhIKCmJhY2tlbmRfaWQYASABKAkSEwoLcHJvdmlkZXJfaWQYAiABKAkSEAoIbW9kZWxfaWQYAyABKAkSOQoQcmVwb3NpdG9yeV9tb2RlbBgEIAEoCzIfLmpva28udjEuTWFuYWdlZFJlcG9zaXRvcnlNb2RlbCKnAgoTTWFuYWdlZE1vZGVsQ29udGV4dBI3CgZ0YXJnZXQYASABKAsyJy5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWVNb2RlbFRhcmdldBIlCh1kZWZhdWx0X2NvbnRleHRfd2luZG93X3Rva2VucxgCIAEoBBInCh9lZmZlY3RpdmVfY29udGV4dF93aW5kb3dfdG9rZW5zGAMgASgEEiUKHW1heGltdW1fY29udGV4dF93aW5kb3dfdG9rZW5zGAQgASgEEg8KB3ByZXNldHMYBSADKAQSEgoKY3VzdG9taXplZBgGIAEoCBIVCg1jYW5fY29uZmlndXJlGAcgASgIEhUKDXBlbmRpbmdfYXBwbHkYCCABKAgSDQoFbWl4ZWQYCSABKAgirgEKHUdldE1hbmFnZWRNb2RlbENvbnRleHRSZXF1ZXN0EhIKCnJ1bnRpbWVfaWQYASABKAkSNwoGdGFyZ2V0GAIgASgLMicuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lTW9kZWxUYXJnZXQSQAoPcmVsYXRlZF90YXJnZXRzGAMgAygLMicuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lTW9kZWxUYXJnZXQiTwoeR2V0TWFuYWdlZE1vZGVsQ29udGV4dFJlc3BvbnNlEi0KB2NvbnRleHQYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbENvbnRleHQizQEKHVNldE1hbmFnZWRNb2RlbENvbnRleHRSZXF1ZXN0EhIKCnJ1bnRpbWVfaWQYASABKAkSNwoGdGFyZ2V0GAIgASgLMicuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lTW9kZWxUYXJnZXQSHQoVY29udGV4dF93aW5kb3dfdG9rZW5zGAMgASgEEkAKD3JlbGF0ZWRfdGFyZ2V0cxgEIAMoCzInLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZU1vZGVsVGFyZ2V0Ik8KHlNldE1hbmFnZWRNb2RlbENvbnRleHRSZXNwb25zZRItCgdjb250ZXh0GAEgASgLMhwuam9rby52MS5NYW5hZ2VkTW9kZWxDb250ZXh0IrABCh9SZXNldE1hbmFnZWRNb2RlbENvbnRleHRSZXF1ZXN0EhIKCnJ1bnRpbWVfaWQYASABKAkSNwoGdGFyZ2V0GAIgASgLMicuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lTW9kZWxUYXJnZXQSQAoPcmVsYXRlZF90YXJnZXRzGAMgAygLMicuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lTW9kZWxUYXJnZXQiUQogUmVzZXRNYW5hZ2VkTW9kZWxDb250ZXh0UmVzcG9uc2USLQoHY29udGV4dBgBIAEoCzIcLmpva28udjEuTWFuYWdlZE1vZGVsQ29udGV4dCIhCh9MaXN0TWFuYWdlZE1vZGVsUnVudGltZXNSZXF1ZXN0IlIKIExpc3RNYW5hZ2VkTW9kZWxSdW50aW1lc1Jlc3BvbnNlEi4KCHJ1bnRpbWVzGAEgAygLMhwuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lIjMKHUdldE1hbmFnZWRNb2RlbFJ1bnRpbWVSZXF1ZXN0EhIKCnJ1bnRpbWVfaWQYASABKAkiTwoeR2V0TWFuYWdlZE1vZGVsUnVudGltZVJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiNQofU3RhcnRNYW5hZ2VkTW9kZWxSdW50aW1lUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJIlEKIFN0YXJ0TWFuYWdlZE1vZGVsUnVudGltZVJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiNwohSW5zdGFsbE1hbmFnZWRNb2RlbFJ1bnRpbWVSZXF1ZXN0EhIKCnJ1bnRpbWVfaWQYASABKAkiUwoiSW5zdGFsbE1hbmFnZWRNb2RlbFJ1bnRpbWVSZXNwb25zZRItCgdydW50aW1lGAEgASgLMhwuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lIj0KJ0NhbmNlbE1hbmFnZWRNb2RlbFJ1bnRpbWVJbnN0YWxsUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJIlkKKENhbmNlbE1hbmFnZWRNb2RlbFJ1bnRpbWVJbnN0YWxsUmVzcG9uc2USLQoHcnVudGltZRgBIAEoCzIcLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZSJBChdQdWxsTWFuYWdlZE1vZGVsUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhIKCm1vZGVsX25hbWUYAiABKAkiSQoYUHVsbE1hbmFnZWRNb2RlbFJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiRgocUGF1c2VNYW5hZ2VkTW9kZWxQdWxsUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhIKCm1vZGVsX25hbWUYAiABKAkiTgodUGF1c2VNYW5hZ2VkTW9kZWxQdWxsUmVzcG9uc2USLQoHcnVudGltZRgBIAEoCzIcLmpva28udjEuTWFuYWdlZE1vZGVsUnVudGltZSJHCh1SZXN1bWVNYW5hZ2VkTW9kZWxQdWxsUmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhIKCm1vZGVsX25hbWUYAiABKAkiTwoeUmVzdW1lTWFuYWdlZE1vZGVsUHVsbFJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiRwodQ2FuY2VsTWFuYWdlZE1vZGVsUHVsbFJlcXVlc3QSEgoKcnVudGltZV9pZBgBIAEoCRISCgptb2RlbF9uYW1lGAIgASgJIk8KHkNhbmNlbE1hbmFnZWRNb2RlbFB1bGxSZXNwb25zZRItCgdydW50aW1lGAEgASgLMhwuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lIkMKGURlbGV0ZU1hbmFnZWRNb2RlbFJlcXVlc3QSEgoKcnVudGltZV9pZBgBIAEoCRISCgptb2RlbF9uYW1lGAIgASgJIksKGkRlbGV0ZU1hbmFnZWRNb2RlbFJlc3BvbnNlEi0KB3J1bnRpbWUYASABKAsyHC5qb2tvLnYxLk1hbmFnZWRNb2RlbFJ1bnRpbWUiSQofR2V0TWFuYWdlZE1vZGVsUHJlZmxpZ2h0UmVxdWVzdBISCgpydW50aW1lX2lkGAEgASgJEhIKCmNhdGFsb2dfaWQYAiABKAkiXAogR2V0TWFuYWdlZE1vZGVsUHJlZmxpZ2h0UmVzcG9uc2USOAoJcHJlZmxpZ2h0GAEgASgLMiUuam9rby52MS5NYW5hZ2VkTW9kZWxSdW50aW1lUHJlZmxpZ2h0KusCChhNYW5hZ2VkTW9kZWxSdW50aW1lU3RhdGUSKwonTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX1VOU1BFQ0lGSUVEEAASJgoiTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX0FCU0VOVBABEicKI01BTkFHRURfTU9ERUxfUlVOVElNRV9TVEFURV9TVE9QUEVEEAISKAokTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX1NUQVJUSU5HEAMSJQohTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX1JFQURZEAQSLQopTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NUQVRFX1BPUlRfQ09ORkxJQ1QQBRIqCiZNQU5BR0VEX01PREVMX1JVTlRJTUVfU1RBVEVfSU5TVEFMTElORxAGEiUKIU1BTkFHRURfTU9ERUxfUlVOVElNRV9TVEFURV9FUlJPUhAHKqACChlNYW5hZ2VkTW9kZWxSdW50aW1lU291cmNlEiwKKE1BTkFHRURfTU9ERUxfUlVOVElNRV9TT1VSQ0VfVU5TUEVDSUZJRUQQABIoCiRNQU5BR0VEX01PREVMX1JVTlRJTUVfU09VUkNFX1JVTk5JTkcQARIsCihNQU5BR0VEX01PREVMX1JVTlRJTUVfU09VUkNFX0FQUExJQ0FUSU9OEAISJAogTUFOQUdFRF9NT0RFTF9SVU5USU1FX1NPVVJDRV9DTEkQAxIwCixNQU5BR0VEX01PREVMX1JVTlRJTUVfU09VUkNFX01BTkFHRURfU0lERUNBUhAEEiUKIU1BTkFHRURfTU9ERUxfUlVOVElNRV9TT1VSQ0VfTk9ORRAFKsMBCh9NYW5hZ2VkTW9kZWxSdW50aW1lVHJhbnNmZXJLaW5kEjMKL01BTkFHRURfTU9ERUxfUlVOVElNRV9UUkFOU0ZFUl9LSU5EX1VOU1BFQ0lGSUVEEAASNwozTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX0tJTkRfUlVOVElNRV9JTlNUQUxMEAESMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX0tJTkRfTU9ERUxfUFVMTBACKr4FCiBNYW5hZ2VkTW9kZWxSdW50aW1lVHJhbnNmZXJQaGFzZRI0CjBNQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfVU5TUEVDSUZJRUQQABIxCi1NQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfU1RBUlRJTkcQARIyCi5NQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfUkVTT0xWSU5HEAISMQotTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX01BTklGRVNUEAMSNAowTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX0RPV05MT0FESU5HEAQSMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX1ZFUklGWUlORxAFEjMKL01BTkFHRURfTU9ERUxfUlVOVElNRV9UUkFOU0ZFUl9QSEFTRV9FWFRSQUNUSU5HEAYSMAosTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX1dSSVRJTkcQBxIyCi5NQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfUFJPTU9USU5HEAgSMAosTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX1NVQ0NFU1MQCRIvCitNQU5BR0VEX01PREVMX1JVTlRJTUVfVFJBTlNGRVJfUEhBU0VfUEFVU0VEEAoSMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX1RSQU5TRkVSX1BIQVNFX0NBTkNFTExFRBALEi4KKk1BTkFHRURfTU9ERUxfUlVOVElNRV9UUkFOU0ZFUl9QSEFTRV9FUlJPUhAMKqwCCiBNYW5hZ2VkTW9kZWxSdW50aW1lUmVzb3VyY2VTdGF0ZRI0CjBNQU5BR0VEX01PREVMX1JVTlRJTUVfUkVTT1VSQ0VfU1RBVEVfVU5TUEVDSUZJRUQQABIzCi9NQU5BR0VEX01PREVMX1JVTlRJTUVfUkVTT1VSQ0VfU1RBVEVfU1VGRklDSUVOVBABEjQKME1BTkFHRURfTU9ERUxfUlVOVElNRV9SRVNPVVJDRV9TVEFURV9DT05TVFJBSU5FRBACEjUKMU1BTkFHRURfTU9ERUxfUlVOVElNRV9SRVNPVVJDRV9TVEFURV9JTlNVRkZJQ0lFTlQQAxIwCixNQU5BR0VEX01PREVMX1JVTlRJTUVfUkVTT1VSQ0VfU1RBVEVfVU5LTk9XThAEKtkIChxNYW5hZ2VkTW9kZWxSdW50aW1lRXJyb3JDb2RlEjAKLE1BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX1VOU1BFQ0lGSUVEEAASMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfT1dORVJfQ0hBTkdFRBABEjgKNE1BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX1JVTlRJTUVfVU5SRUFDSEFCTEUQAhIyCi5NQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9QT1JUX0NPTkZMSUNUEAMSOQo1TUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfVU5TVVBQT1JURURfUExBVEZPUk0QBBIxCi1NQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9JTlNUQUxMX0JVU1kQBRIuCipNQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9QVUxMX0JVU1kQBhIyCi5NQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9NT0RFTF9JTlZBTElEEAcSNAowTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfTU9ERUxfTk9UX0ZPVU5EEAgSNwozTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfTU9ERUxfVU5BVVRIT1JJWkVEEAkSNwozTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfTU9ERUxfSU5DT01QQVRJQkxFEAoSMwovTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfRElTS19TUEFDRV9MT1cQCxI2CjJNQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9ET1dOTE9BRF9SRUpFQ1RFRBAMEjcKM01BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX0RPV05MT0FEX1RPT19MQVJHRRANEjUKMU1BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX0RPV05MT0FEX1RJTUVPVVQQDhI2CjJNQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9DSEVDS1NVTV9NSVNNQVRDSBAPEjUKMU1BTkFHRURfTU9ERUxfUlVOVElNRV9FUlJPUl9DT0RFX0FSQ0hJVkVfUkVKRUNURUQQEBIxCi1NQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9TVEFSVF9GQUlMRUQQERI4CjRNQU5BR0VEX01PREVMX1JVTlRJTUVfRVJST1JfQ09ERV9PUEVSQVRJT05fQ0FOQ0VMTEVEEBISMgouTUFOQUdFRF9NT0RFTF9SVU5USU1FX0VSUk9SX0NPREVfUlVOVElNRV9FUlJPUhATKrwBCiBNYW5hZ2VkTW9kZWxSdW50aW1lU3RhcnR1cFBvbGljeRI0CjBNQU5BR0VEX01PREVMX1JVTlRJTUVfU1RBUlRVUF9QT0xJQ1lfVU5TUEVDSUZJRUQQABIxCi1NQU5BR0VEX01PREVMX1JVTlRJTUVfU1RBUlRVUF9QT0xJQ1lfRVhQTElDSVQQARIvCitNQU5BR0VEX01PREVMX1JVTlRJTUVfU1RBUlRVUF9QT0xJQ1lfT05fVVNFEAIq/QIKKU1hbmFnZWRNb2RlbFJ1bnRpbWVDb25maWd1cmVCbG9ja2VkUmVhc29uEj4KOk1BTkFHRURfTU9ERUxfUlVOVElNRV9DT05GSUdVUkVfQkxPQ0tFRF9SRUFTT05fVU5TUEVDSUZJRUQQABJCCj5NQU5BR0VEX01PREVMX1JVTlRJTUVfQ09ORklHVVJFX0JMT0NLRURfUkVBU09OX09XTkVEX0VMU0VXSEVSRRABEkQKQE1BTkFHRURfTU9ERUxfUlVOVElNRV9DT05GSUdVUkVfQkxPQ0tFRF9SRUFTT05fT1dORVJTSElQX1VOS05PV04QAhJBCj1NQU5BR0VEX01PREVMX1JVTlRJTUVfQ09ORklHVVJFX0JMT0NLRURfUkVBU09OX09QRVJBVElPTl9CVVNZEAMSQwo/TUFOQUdFRF9NT0RFTF9SVU5USU1FX0NPTkZJR1VSRV9CTE9DS0VEX1JFQVNPTl9TVE9QX1VOQ09ORklSTUVEEAQq4QEKH01hbmFnZWRSZXBvc2l0b3J5RG93bmxvYWRBY3Rpb24SMgouTUFOQUdFRF9SRVBPU0lUT1JZX0RPV05MT0FEX0FDVElPTl9VTlNQRUNJRklFRBAAEiwKKE1BTkFHRURfUkVQT1NJVE9SWV9ET1dOTE9BRF9BQ1RJT05fUEFVU0UQARItCilNQU5BR0VEX1JFUE9TSVRPUllfRE9XTkxPQURfQUNUSU9OX1JFU1VNRRACEi0KKU1BTkFHRURfUkVQT1NJVE9SWV9ET1dOTE9BRF9BQ1RJT05fQ0FOQ0VMEANiBnByb3RvMw", [file_joko_v1_common]);
 
 /**
  * @generated from message joko.v1.ManagedModelRuntimeCapabilities
@@ -77,6 +77,31 @@ export type ManagedModelRuntimeCapabilities = Message<"joko.v1.ManagedModelRunti
    * @generated from field: bool supports_model_preflight = 12;
    */
   supportsModelPreflight: boolean;
+
+  /**
+   * @generated from field: bool can_configure = 13;
+   */
+  canConfigure: boolean;
+
+  /**
+   * @generated from field: bool can_stop = 14;
+   */
+  canStop: boolean;
+
+  /**
+   * @generated from field: bool can_restart = 15;
+   */
+  canRestart: boolean;
+
+  /**
+   * @generated from field: bool supports_repository_models = 16;
+   */
+  supportsRepositoryModels: boolean;
+
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntimeStartupPolicy startup_policy = 17;
+   */
+  startupPolicy: ManagedModelRuntimeStartupPolicy;
 };
 
 /**
@@ -85,6 +110,119 @@ export type ManagedModelRuntimeCapabilities = Message<"joko.v1.ManagedModelRunti
  */
 export const ManagedModelRuntimeCapabilitiesSchema: GenMessage<ManagedModelRuntimeCapabilities> = /*@__PURE__*/
   messageDesc(file_joko_v1_managed_model_runtime, 0);
+
+/**
+ * @generated from message joko.v1.ManagedRepositoryModel
+ */
+export type ManagedRepositoryModel = Message<"joko.v1.ManagedRepositoryModel"> & {
+  /**
+   * @generated from field: string repository = 1;
+   */
+  repository: string;
+
+  /**
+   * @generated from field: string file = 2;
+   */
+  file: string;
+};
+
+/**
+ * Describes the message joko.v1.ManagedRepositoryModel.
+ * Use `create(ManagedRepositoryModelSchema)` to create a new message.
+ */
+export const ManagedRepositoryModelSchema: GenMessage<ManagedRepositoryModel> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 1);
+
+/**
+ * @generated from message joko.v1.ManagedModelRuntimeProviderRoute
+ */
+export type ManagedModelRuntimeProviderRoute = Message<"joko.v1.ManagedModelRuntimeProviderRoute"> & {
+  /**
+   * @generated from field: string backend_id = 1;
+   */
+  backendId: string;
+
+  /**
+   * @generated from field: string provider_id = 2;
+   */
+  providerId: string;
+};
+
+/**
+ * Describes the message joko.v1.ManagedModelRuntimeProviderRoute.
+ * Use `create(ManagedModelRuntimeProviderRouteSchema)` to create a new message.
+ */
+export const ManagedModelRuntimeProviderRouteSchema: GenMessage<ManagedModelRuntimeProviderRoute> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 2);
+
+/**
+ * @generated from message joko.v1.ManagedModelRuntimeHostProfile
+ */
+export type ManagedModelRuntimeHostProfile = Message<"joko.v1.ManagedModelRuntimeHostProfile"> & {
+  /**
+   * @generated from field: string platform = 1;
+   */
+  platform: string;
+
+  /**
+   * @generated from field: string arch = 2;
+   */
+  arch: string;
+
+  /**
+   * @generated from field: uint64 total_memory_bytes = 3;
+   */
+  totalMemoryBytes: bigint;
+
+  /**
+   * @generated from field: uint32 memory_gb = 4;
+   */
+  memoryGb: number;
+
+  /**
+   * @generated from field: bool apple_silicon = 5;
+   */
+  appleSilicon: boolean;
+
+  /**
+   * @generated from field: string chip = 6;
+   */
+  chip: string;
+};
+
+/**
+ * Describes the message joko.v1.ManagedModelRuntimeHostProfile.
+ * Use `create(ManagedModelRuntimeHostProfileSchema)` to create a new message.
+ */
+export const ManagedModelRuntimeHostProfileSchema: GenMessage<ManagedModelRuntimeHostProfile> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 3);
+
+/**
+ * @generated from message joko.v1.ManagedModelRuntimeRepositoryVariant
+ */
+export type ManagedModelRuntimeRepositoryVariant = Message<"joko.v1.ManagedModelRuntimeRepositoryVariant"> & {
+  /**
+   * @generated from field: joko.v1.ManagedRepositoryModel repository_model = 1;
+   */
+  repositoryModel?: ManagedRepositoryModel | undefined;
+
+  /**
+   * @generated from field: string quantization = 2;
+   */
+  quantization: string;
+
+  /**
+   * @generated from field: uint64 size_bytes = 3;
+   */
+  sizeBytes: bigint;
+};
+
+/**
+ * Describes the message joko.v1.ManagedModelRuntimeRepositoryVariant.
+ * Use `create(ManagedModelRuntimeRepositoryVariantSchema)` to create a new message.
+ */
+export const ManagedModelRuntimeRepositoryVariantSchema: GenMessage<ManagedModelRuntimeRepositoryVariant> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 4);
 
 /**
  * @generated from message joko.v1.ManagedModelRuntimePreflight
@@ -121,7 +259,7 @@ export type ManagedModelRuntimePreflight = Message<"joko.v1.ManagedModelRuntimeP
  * Use `create(ManagedModelRuntimePreflightSchema)` to create a new message.
  */
 export const ManagedModelRuntimePreflightSchema: GenMessage<ManagedModelRuntimePreflight> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 1);
+  messageDesc(file_joko_v1_managed_model_runtime, 5);
 
 /**
  * @generated from message joko.v1.ManagedModelRuntimeModel
@@ -161,6 +299,11 @@ export type ManagedModelRuntimeModel = Message<"joko.v1.ManagedModelRuntimeModel
    * @generated from field: string required_runtime_version = 7;
    */
   requiredRuntimeVersion: string;
+
+  /**
+   * @generated from field: joko.v1.ManagedRepositoryModel repository_model = 8;
+   */
+  repositoryModel?: ManagedRepositoryModel | undefined;
 };
 
 /**
@@ -168,7 +311,7 @@ export type ManagedModelRuntimeModel = Message<"joko.v1.ManagedModelRuntimeModel
  * Use `create(ManagedModelRuntimeModelSchema)` to create a new message.
  */
 export const ManagedModelRuntimeModelSchema: GenMessage<ManagedModelRuntimeModel> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 2);
+  messageDesc(file_joko_v1_managed_model_runtime, 6);
 
 /**
  * @generated from message joko.v1.ManagedModelRuntimeCatalogModel
@@ -213,6 +356,21 @@ export type ManagedModelRuntimeCatalogModel = Message<"joko.v1.ManagedModelRunti
    * @generated from field: joko.v1.ManagedModelRuntimePreflight preflight = 8;
    */
   preflight?: ManagedModelRuntimePreflight | undefined;
+
+  /**
+   * @generated from field: repeated string aliases = 9;
+   */
+  aliases: string[];
+
+  /**
+   * @generated from field: map<string, string> descriptions = 10;
+   */
+  descriptions: { [key: string]: string };
+
+  /**
+   * @generated from field: repeated joko.v1.ManagedModelRuntimeRepositoryVariant variants = 11;
+   */
+  variants: ManagedModelRuntimeRepositoryVariant[];
 };
 
 /**
@@ -220,7 +378,7 @@ export type ManagedModelRuntimeCatalogModel = Message<"joko.v1.ManagedModelRunti
  * Use `create(ManagedModelRuntimeCatalogModelSchema)` to create a new message.
  */
 export const ManagedModelRuntimeCatalogModelSchema: GenMessage<ManagedModelRuntimeCatalogModel> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 3);
+  messageDesc(file_joko_v1_managed_model_runtime, 7);
 
 /**
  * @generated from message joko.v1.ManagedModelRuntimeTransfer
@@ -270,6 +428,16 @@ export type ManagedModelRuntimeTransfer = Message<"joko.v1.ManagedModelRuntimeTr
    * @generated from field: joko.v1.ManagedModelRuntimeErrorCode error_code = 9;
    */
   errorCode: ManagedModelRuntimeErrorCode;
+
+  /**
+   * @generated from field: joko.v1.ManagedRepositoryModel repository_model = 10;
+   */
+  repositoryModel?: ManagedRepositoryModel | undefined;
+
+  /**
+   * @generated from field: string transfer_id = 11;
+   */
+  transferId: string;
 };
 
 /**
@@ -277,7 +445,7 @@ export type ManagedModelRuntimeTransfer = Message<"joko.v1.ManagedModelRuntimeTr
  * Use `create(ManagedModelRuntimeTransferSchema)` to create a new message.
  */
 export const ManagedModelRuntimeTransferSchema: GenMessage<ManagedModelRuntimeTransfer> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 4);
+  messageDesc(file_joko_v1_managed_model_runtime, 8);
 
 /**
  * @generated from message joko.v1.ManagedModelRuntime
@@ -347,6 +515,21 @@ export type ManagedModelRuntime = Message<"joko.v1.ManagedModelRuntime"> & {
    * @generated from field: joko.v1.EntityVersion entity_version = 13;
    */
   entityVersion?: EntityVersion | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.ManagedModelRuntimeProviderRoute provider_routes = 14;
+   */
+  providerRoutes: ManagedModelRuntimeProviderRoute[];
+
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntimeHostProfile host_profile = 15;
+   */
+  hostProfile?: ManagedModelRuntimeHostProfile | undefined;
+
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntimeConfigureBlockedReason configure_blocked_reason = 16;
+   */
+  configureBlockedReason: ManagedModelRuntimeConfigureBlockedReason;
 };
 
 /**
@@ -354,7 +537,494 @@ export type ManagedModelRuntime = Message<"joko.v1.ManagedModelRuntime"> & {
  * Use `create(ManagedModelRuntimeSchema)` to create a new message.
  */
 export const ManagedModelRuntimeSchema: GenMessage<ManagedModelRuntime> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 5);
+  messageDesc(file_joko_v1_managed_model_runtime, 9);
+
+/**
+ * @generated from message joko.v1.EnsureManagedModelRuntimeProviderRequest
+ */
+export type EnsureManagedModelRuntimeProviderRequest = Message<"joko.v1.EnsureManagedModelRuntimeProviderRequest"> & {
+  /**
+   * @generated from field: string runtime_id = 1;
+   */
+  runtimeId: string;
+};
+
+/**
+ * Describes the message joko.v1.EnsureManagedModelRuntimeProviderRequest.
+ * Use `create(EnsureManagedModelRuntimeProviderRequestSchema)` to create a new message.
+ */
+export const EnsureManagedModelRuntimeProviderRequestSchema: GenMessage<EnsureManagedModelRuntimeProviderRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 10);
+
+/**
+ * @generated from message joko.v1.EnsureManagedModelRuntimeProviderResponse
+ */
+export type EnsureManagedModelRuntimeProviderResponse = Message<"joko.v1.EnsureManagedModelRuntimeProviderResponse"> & {
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntime runtime = 1;
+   */
+  runtime?: ManagedModelRuntime | undefined;
+};
+
+/**
+ * Describes the message joko.v1.EnsureManagedModelRuntimeProviderResponse.
+ * Use `create(EnsureManagedModelRuntimeProviderResponseSchema)` to create a new message.
+ */
+export const EnsureManagedModelRuntimeProviderResponseSchema: GenMessage<EnsureManagedModelRuntimeProviderResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 11);
+
+/**
+ * @generated from message joko.v1.StopManagedModelRuntimeRequest
+ */
+export type StopManagedModelRuntimeRequest = Message<"joko.v1.StopManagedModelRuntimeRequest"> & {
+  /**
+   * @generated from field: string runtime_id = 1;
+   */
+  runtimeId: string;
+};
+
+/**
+ * Describes the message joko.v1.StopManagedModelRuntimeRequest.
+ * Use `create(StopManagedModelRuntimeRequestSchema)` to create a new message.
+ */
+export const StopManagedModelRuntimeRequestSchema: GenMessage<StopManagedModelRuntimeRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 12);
+
+/**
+ * @generated from message joko.v1.StopManagedModelRuntimeResponse
+ */
+export type StopManagedModelRuntimeResponse = Message<"joko.v1.StopManagedModelRuntimeResponse"> & {
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntime runtime = 1;
+   */
+  runtime?: ManagedModelRuntime | undefined;
+};
+
+/**
+ * Describes the message joko.v1.StopManagedModelRuntimeResponse.
+ * Use `create(StopManagedModelRuntimeResponseSchema)` to create a new message.
+ */
+export const StopManagedModelRuntimeResponseSchema: GenMessage<StopManagedModelRuntimeResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 13);
+
+/**
+ * @generated from message joko.v1.RestartManagedModelRuntimeRequest
+ */
+export type RestartManagedModelRuntimeRequest = Message<"joko.v1.RestartManagedModelRuntimeRequest"> & {
+  /**
+   * @generated from field: string runtime_id = 1;
+   */
+  runtimeId: string;
+};
+
+/**
+ * Describes the message joko.v1.RestartManagedModelRuntimeRequest.
+ * Use `create(RestartManagedModelRuntimeRequestSchema)` to create a new message.
+ */
+export const RestartManagedModelRuntimeRequestSchema: GenMessage<RestartManagedModelRuntimeRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 14);
+
+/**
+ * @generated from message joko.v1.RestartManagedModelRuntimeResponse
+ */
+export type RestartManagedModelRuntimeResponse = Message<"joko.v1.RestartManagedModelRuntimeResponse"> & {
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntime runtime = 1;
+   */
+  runtime?: ManagedModelRuntime | undefined;
+};
+
+/**
+ * Describes the message joko.v1.RestartManagedModelRuntimeResponse.
+ * Use `create(RestartManagedModelRuntimeResponseSchema)` to create a new message.
+ */
+export const RestartManagedModelRuntimeResponseSchema: GenMessage<RestartManagedModelRuntimeResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 15);
+
+/**
+ * @generated from message joko.v1.ListManagedModelRepositoryFilesRequest
+ */
+export type ListManagedModelRepositoryFilesRequest = Message<"joko.v1.ListManagedModelRepositoryFilesRequest"> & {
+  /**
+   * @generated from field: string runtime_id = 1;
+   */
+  runtimeId: string;
+
+  /**
+   * @generated from field: string repository = 2;
+   */
+  repository: string;
+};
+
+/**
+ * Describes the message joko.v1.ListManagedModelRepositoryFilesRequest.
+ * Use `create(ListManagedModelRepositoryFilesRequestSchema)` to create a new message.
+ */
+export const ListManagedModelRepositoryFilesRequestSchema: GenMessage<ListManagedModelRepositoryFilesRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 16);
+
+/**
+ * @generated from message joko.v1.ManagedModelRepositoryFile
+ */
+export type ManagedModelRepositoryFile = Message<"joko.v1.ManagedModelRepositoryFile"> & {
+  /**
+   * @generated from field: string file = 1;
+   */
+  file: string;
+
+  /**
+   * @generated from field: uint64 size_bytes = 2;
+   */
+  sizeBytes: bigint;
+};
+
+/**
+ * Describes the message joko.v1.ManagedModelRepositoryFile.
+ * Use `create(ManagedModelRepositoryFileSchema)` to create a new message.
+ */
+export const ManagedModelRepositoryFileSchema: GenMessage<ManagedModelRepositoryFile> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 17);
+
+/**
+ * @generated from message joko.v1.ListManagedModelRepositoryFilesResponse
+ */
+export type ListManagedModelRepositoryFilesResponse = Message<"joko.v1.ListManagedModelRepositoryFilesResponse"> & {
+  /**
+   * @generated from field: string repository = 1;
+   */
+  repository: string;
+
+  /**
+   * @generated from field: string source_revision = 2;
+   */
+  sourceRevision: string;
+
+  /**
+   * @generated from field: repeated joko.v1.ManagedModelRepositoryFile files = 3;
+   */
+  files: ManagedModelRepositoryFile[];
+};
+
+/**
+ * Describes the message joko.v1.ListManagedModelRepositoryFilesResponse.
+ * Use `create(ListManagedModelRepositoryFilesResponseSchema)` to create a new message.
+ */
+export const ListManagedModelRepositoryFilesResponseSchema: GenMessage<ListManagedModelRepositoryFilesResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 18);
+
+/**
+ * @generated from message joko.v1.DownloadManagedRepositoryModelRequest
+ */
+export type DownloadManagedRepositoryModelRequest = Message<"joko.v1.DownloadManagedRepositoryModelRequest"> & {
+  /**
+   * @generated from field: string runtime_id = 1;
+   */
+  runtimeId: string;
+
+  /**
+   * @generated from field: joko.v1.ManagedRepositoryModel repository_model = 2;
+   */
+  repositoryModel?: ManagedRepositoryModel | undefined;
+};
+
+/**
+ * Describes the message joko.v1.DownloadManagedRepositoryModelRequest.
+ * Use `create(DownloadManagedRepositoryModelRequestSchema)` to create a new message.
+ */
+export const DownloadManagedRepositoryModelRequestSchema: GenMessage<DownloadManagedRepositoryModelRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 19);
+
+/**
+ * @generated from message joko.v1.DownloadManagedRepositoryModelResponse
+ */
+export type DownloadManagedRepositoryModelResponse = Message<"joko.v1.DownloadManagedRepositoryModelResponse"> & {
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntime runtime = 1;
+   */
+  runtime?: ManagedModelRuntime | undefined;
+};
+
+/**
+ * Describes the message joko.v1.DownloadManagedRepositoryModelResponse.
+ * Use `create(DownloadManagedRepositoryModelResponseSchema)` to create a new message.
+ */
+export const DownloadManagedRepositoryModelResponseSchema: GenMessage<DownloadManagedRepositoryModelResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 20);
+
+/**
+ * @generated from message joko.v1.ControlManagedRepositoryDownloadRequest
+ */
+export type ControlManagedRepositoryDownloadRequest = Message<"joko.v1.ControlManagedRepositoryDownloadRequest"> & {
+  /**
+   * @generated from field: string runtime_id = 1;
+   */
+  runtimeId: string;
+
+  /**
+   * @generated from field: string transfer_id = 2;
+   */
+  transferId: string;
+
+  /**
+   * @generated from field: joko.v1.ManagedRepositoryModel repository_model = 3;
+   */
+  repositoryModel?: ManagedRepositoryModel | undefined;
+
+  /**
+   * @generated from field: joko.v1.ManagedRepositoryDownloadAction action = 4;
+   */
+  action: ManagedRepositoryDownloadAction;
+};
+
+/**
+ * Describes the message joko.v1.ControlManagedRepositoryDownloadRequest.
+ * Use `create(ControlManagedRepositoryDownloadRequestSchema)` to create a new message.
+ */
+export const ControlManagedRepositoryDownloadRequestSchema: GenMessage<ControlManagedRepositoryDownloadRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 21);
+
+/**
+ * @generated from message joko.v1.ControlManagedRepositoryDownloadResponse
+ */
+export type ControlManagedRepositoryDownloadResponse = Message<"joko.v1.ControlManagedRepositoryDownloadResponse"> & {
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntime runtime = 1;
+   */
+  runtime?: ManagedModelRuntime | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ControlManagedRepositoryDownloadResponse.
+ * Use `create(ControlManagedRepositoryDownloadResponseSchema)` to create a new message.
+ */
+export const ControlManagedRepositoryDownloadResponseSchema: GenMessage<ControlManagedRepositoryDownloadResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 22);
+
+/**
+ * @generated from message joko.v1.ManagedModelRuntimeModelTarget
+ */
+export type ManagedModelRuntimeModelTarget = Message<"joko.v1.ManagedModelRuntimeModelTarget"> & {
+  /**
+   * @generated from field: string backend_id = 1;
+   */
+  backendId: string;
+
+  /**
+   * @generated from field: string provider_id = 2;
+   */
+  providerId: string;
+
+  /**
+   * @generated from field: string model_id = 3;
+   */
+  modelId: string;
+
+  /**
+   * @generated from field: joko.v1.ManagedRepositoryModel repository_model = 4;
+   */
+  repositoryModel?: ManagedRepositoryModel | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ManagedModelRuntimeModelTarget.
+ * Use `create(ManagedModelRuntimeModelTargetSchema)` to create a new message.
+ */
+export const ManagedModelRuntimeModelTargetSchema: GenMessage<ManagedModelRuntimeModelTarget> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 23);
+
+/**
+ * @generated from message joko.v1.ManagedModelContext
+ */
+export type ManagedModelContext = Message<"joko.v1.ManagedModelContext"> & {
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntimeModelTarget target = 1;
+   */
+  target?: ManagedModelRuntimeModelTarget | undefined;
+
+  /**
+   * @generated from field: uint64 default_context_window_tokens = 2;
+   */
+  defaultContextWindowTokens: bigint;
+
+  /**
+   * @generated from field: uint64 effective_context_window_tokens = 3;
+   */
+  effectiveContextWindowTokens: bigint;
+
+  /**
+   * @generated from field: uint64 maximum_context_window_tokens = 4;
+   */
+  maximumContextWindowTokens: bigint;
+
+  /**
+   * @generated from field: repeated uint64 presets = 5;
+   */
+  presets: bigint[];
+
+  /**
+   * @generated from field: bool customized = 6;
+   */
+  customized: boolean;
+
+  /**
+   * @generated from field: bool can_configure = 7;
+   */
+  canConfigure: boolean;
+
+  /**
+   * @generated from field: bool pending_apply = 8;
+   */
+  pendingApply: boolean;
+
+  /**
+   * @generated from field: bool mixed = 9;
+   */
+  mixed: boolean;
+};
+
+/**
+ * Describes the message joko.v1.ManagedModelContext.
+ * Use `create(ManagedModelContextSchema)` to create a new message.
+ */
+export const ManagedModelContextSchema: GenMessage<ManagedModelContext> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 24);
+
+/**
+ * @generated from message joko.v1.GetManagedModelContextRequest
+ */
+export type GetManagedModelContextRequest = Message<"joko.v1.GetManagedModelContextRequest"> & {
+  /**
+   * @generated from field: string runtime_id = 1;
+   */
+  runtimeId: string;
+
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntimeModelTarget target = 2;
+   */
+  target?: ManagedModelRuntimeModelTarget | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.ManagedModelRuntimeModelTarget related_targets = 3;
+   */
+  relatedTargets: ManagedModelRuntimeModelTarget[];
+};
+
+/**
+ * Describes the message joko.v1.GetManagedModelContextRequest.
+ * Use `create(GetManagedModelContextRequestSchema)` to create a new message.
+ */
+export const GetManagedModelContextRequestSchema: GenMessage<GetManagedModelContextRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 25);
+
+/**
+ * @generated from message joko.v1.GetManagedModelContextResponse
+ */
+export type GetManagedModelContextResponse = Message<"joko.v1.GetManagedModelContextResponse"> & {
+  /**
+   * @generated from field: joko.v1.ManagedModelContext context = 1;
+   */
+  context?: ManagedModelContext | undefined;
+};
+
+/**
+ * Describes the message joko.v1.GetManagedModelContextResponse.
+ * Use `create(GetManagedModelContextResponseSchema)` to create a new message.
+ */
+export const GetManagedModelContextResponseSchema: GenMessage<GetManagedModelContextResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 26);
+
+/**
+ * @generated from message joko.v1.SetManagedModelContextRequest
+ */
+export type SetManagedModelContextRequest = Message<"joko.v1.SetManagedModelContextRequest"> & {
+  /**
+   * @generated from field: string runtime_id = 1;
+   */
+  runtimeId: string;
+
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntimeModelTarget target = 2;
+   */
+  target?: ManagedModelRuntimeModelTarget | undefined;
+
+  /**
+   * @generated from field: uint64 context_window_tokens = 3;
+   */
+  contextWindowTokens: bigint;
+
+  /**
+   * @generated from field: repeated joko.v1.ManagedModelRuntimeModelTarget related_targets = 4;
+   */
+  relatedTargets: ManagedModelRuntimeModelTarget[];
+};
+
+/**
+ * Describes the message joko.v1.SetManagedModelContextRequest.
+ * Use `create(SetManagedModelContextRequestSchema)` to create a new message.
+ */
+export const SetManagedModelContextRequestSchema: GenMessage<SetManagedModelContextRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 27);
+
+/**
+ * @generated from message joko.v1.SetManagedModelContextResponse
+ */
+export type SetManagedModelContextResponse = Message<"joko.v1.SetManagedModelContextResponse"> & {
+  /**
+   * @generated from field: joko.v1.ManagedModelContext context = 1;
+   */
+  context?: ManagedModelContext | undefined;
+};
+
+/**
+ * Describes the message joko.v1.SetManagedModelContextResponse.
+ * Use `create(SetManagedModelContextResponseSchema)` to create a new message.
+ */
+export const SetManagedModelContextResponseSchema: GenMessage<SetManagedModelContextResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 28);
+
+/**
+ * @generated from message joko.v1.ResetManagedModelContextRequest
+ */
+export type ResetManagedModelContextRequest = Message<"joko.v1.ResetManagedModelContextRequest"> & {
+  /**
+   * @generated from field: string runtime_id = 1;
+   */
+  runtimeId: string;
+
+  /**
+   * @generated from field: joko.v1.ManagedModelRuntimeModelTarget target = 2;
+   */
+  target?: ManagedModelRuntimeModelTarget | undefined;
+
+  /**
+   * @generated from field: repeated joko.v1.ManagedModelRuntimeModelTarget related_targets = 3;
+   */
+  relatedTargets: ManagedModelRuntimeModelTarget[];
+};
+
+/**
+ * Describes the message joko.v1.ResetManagedModelContextRequest.
+ * Use `create(ResetManagedModelContextRequestSchema)` to create a new message.
+ */
+export const ResetManagedModelContextRequestSchema: GenMessage<ResetManagedModelContextRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 29);
+
+/**
+ * @generated from message joko.v1.ResetManagedModelContextResponse
+ */
+export type ResetManagedModelContextResponse = Message<"joko.v1.ResetManagedModelContextResponse"> & {
+  /**
+   * @generated from field: joko.v1.ManagedModelContext context = 1;
+   */
+  context?: ManagedModelContext | undefined;
+};
+
+/**
+ * Describes the message joko.v1.ResetManagedModelContextResponse.
+ * Use `create(ResetManagedModelContextResponseSchema)` to create a new message.
+ */
+export const ResetManagedModelContextResponseSchema: GenMessage<ResetManagedModelContextResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_managed_model_runtime, 30);
 
 /**
  * @generated from message joko.v1.ListManagedModelRuntimesRequest
@@ -367,7 +1037,7 @@ export type ListManagedModelRuntimesRequest = Message<"joko.v1.ListManagedModelR
  * Use `create(ListManagedModelRuntimesRequestSchema)` to create a new message.
  */
 export const ListManagedModelRuntimesRequestSchema: GenMessage<ListManagedModelRuntimesRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 6);
+  messageDesc(file_joko_v1_managed_model_runtime, 31);
 
 /**
  * @generated from message joko.v1.ListManagedModelRuntimesResponse
@@ -384,7 +1054,7 @@ export type ListManagedModelRuntimesResponse = Message<"joko.v1.ListManagedModel
  * Use `create(ListManagedModelRuntimesResponseSchema)` to create a new message.
  */
 export const ListManagedModelRuntimesResponseSchema: GenMessage<ListManagedModelRuntimesResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 7);
+  messageDesc(file_joko_v1_managed_model_runtime, 32);
 
 /**
  * @generated from message joko.v1.GetManagedModelRuntimeRequest
@@ -401,7 +1071,7 @@ export type GetManagedModelRuntimeRequest = Message<"joko.v1.GetManagedModelRunt
  * Use `create(GetManagedModelRuntimeRequestSchema)` to create a new message.
  */
 export const GetManagedModelRuntimeRequestSchema: GenMessage<GetManagedModelRuntimeRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 8);
+  messageDesc(file_joko_v1_managed_model_runtime, 33);
 
 /**
  * @generated from message joko.v1.GetManagedModelRuntimeResponse
@@ -418,7 +1088,7 @@ export type GetManagedModelRuntimeResponse = Message<"joko.v1.GetManagedModelRun
  * Use `create(GetManagedModelRuntimeResponseSchema)` to create a new message.
  */
 export const GetManagedModelRuntimeResponseSchema: GenMessage<GetManagedModelRuntimeResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 9);
+  messageDesc(file_joko_v1_managed_model_runtime, 34);
 
 /**
  * @generated from message joko.v1.StartManagedModelRuntimeRequest
@@ -435,7 +1105,7 @@ export type StartManagedModelRuntimeRequest = Message<"joko.v1.StartManagedModel
  * Use `create(StartManagedModelRuntimeRequestSchema)` to create a new message.
  */
 export const StartManagedModelRuntimeRequestSchema: GenMessage<StartManagedModelRuntimeRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 10);
+  messageDesc(file_joko_v1_managed_model_runtime, 35);
 
 /**
  * @generated from message joko.v1.StartManagedModelRuntimeResponse
@@ -452,7 +1122,7 @@ export type StartManagedModelRuntimeResponse = Message<"joko.v1.StartManagedMode
  * Use `create(StartManagedModelRuntimeResponseSchema)` to create a new message.
  */
 export const StartManagedModelRuntimeResponseSchema: GenMessage<StartManagedModelRuntimeResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 11);
+  messageDesc(file_joko_v1_managed_model_runtime, 36);
 
 /**
  * @generated from message joko.v1.InstallManagedModelRuntimeRequest
@@ -469,7 +1139,7 @@ export type InstallManagedModelRuntimeRequest = Message<"joko.v1.InstallManagedM
  * Use `create(InstallManagedModelRuntimeRequestSchema)` to create a new message.
  */
 export const InstallManagedModelRuntimeRequestSchema: GenMessage<InstallManagedModelRuntimeRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 12);
+  messageDesc(file_joko_v1_managed_model_runtime, 37);
 
 /**
  * @generated from message joko.v1.InstallManagedModelRuntimeResponse
@@ -486,7 +1156,7 @@ export type InstallManagedModelRuntimeResponse = Message<"joko.v1.InstallManaged
  * Use `create(InstallManagedModelRuntimeResponseSchema)` to create a new message.
  */
 export const InstallManagedModelRuntimeResponseSchema: GenMessage<InstallManagedModelRuntimeResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 13);
+  messageDesc(file_joko_v1_managed_model_runtime, 38);
 
 /**
  * @generated from message joko.v1.CancelManagedModelRuntimeInstallRequest
@@ -503,7 +1173,7 @@ export type CancelManagedModelRuntimeInstallRequest = Message<"joko.v1.CancelMan
  * Use `create(CancelManagedModelRuntimeInstallRequestSchema)` to create a new message.
  */
 export const CancelManagedModelRuntimeInstallRequestSchema: GenMessage<CancelManagedModelRuntimeInstallRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 14);
+  messageDesc(file_joko_v1_managed_model_runtime, 39);
 
 /**
  * @generated from message joko.v1.CancelManagedModelRuntimeInstallResponse
@@ -520,7 +1190,7 @@ export type CancelManagedModelRuntimeInstallResponse = Message<"joko.v1.CancelMa
  * Use `create(CancelManagedModelRuntimeInstallResponseSchema)` to create a new message.
  */
 export const CancelManagedModelRuntimeInstallResponseSchema: GenMessage<CancelManagedModelRuntimeInstallResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 15);
+  messageDesc(file_joko_v1_managed_model_runtime, 40);
 
 /**
  * @generated from message joko.v1.PullManagedModelRequest
@@ -542,7 +1212,7 @@ export type PullManagedModelRequest = Message<"joko.v1.PullManagedModelRequest">
  * Use `create(PullManagedModelRequestSchema)` to create a new message.
  */
 export const PullManagedModelRequestSchema: GenMessage<PullManagedModelRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 16);
+  messageDesc(file_joko_v1_managed_model_runtime, 41);
 
 /**
  * @generated from message joko.v1.PullManagedModelResponse
@@ -559,7 +1229,7 @@ export type PullManagedModelResponse = Message<"joko.v1.PullManagedModelResponse
  * Use `create(PullManagedModelResponseSchema)` to create a new message.
  */
 export const PullManagedModelResponseSchema: GenMessage<PullManagedModelResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 17);
+  messageDesc(file_joko_v1_managed_model_runtime, 42);
 
 /**
  * @generated from message joko.v1.PauseManagedModelPullRequest
@@ -581,7 +1251,7 @@ export type PauseManagedModelPullRequest = Message<"joko.v1.PauseManagedModelPul
  * Use `create(PauseManagedModelPullRequestSchema)` to create a new message.
  */
 export const PauseManagedModelPullRequestSchema: GenMessage<PauseManagedModelPullRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 18);
+  messageDesc(file_joko_v1_managed_model_runtime, 43);
 
 /**
  * @generated from message joko.v1.PauseManagedModelPullResponse
@@ -598,7 +1268,7 @@ export type PauseManagedModelPullResponse = Message<"joko.v1.PauseManagedModelPu
  * Use `create(PauseManagedModelPullResponseSchema)` to create a new message.
  */
 export const PauseManagedModelPullResponseSchema: GenMessage<PauseManagedModelPullResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 19);
+  messageDesc(file_joko_v1_managed_model_runtime, 44);
 
 /**
  * @generated from message joko.v1.ResumeManagedModelPullRequest
@@ -620,7 +1290,7 @@ export type ResumeManagedModelPullRequest = Message<"joko.v1.ResumeManagedModelP
  * Use `create(ResumeManagedModelPullRequestSchema)` to create a new message.
  */
 export const ResumeManagedModelPullRequestSchema: GenMessage<ResumeManagedModelPullRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 20);
+  messageDesc(file_joko_v1_managed_model_runtime, 45);
 
 /**
  * @generated from message joko.v1.ResumeManagedModelPullResponse
@@ -637,7 +1307,7 @@ export type ResumeManagedModelPullResponse = Message<"joko.v1.ResumeManagedModel
  * Use `create(ResumeManagedModelPullResponseSchema)` to create a new message.
  */
 export const ResumeManagedModelPullResponseSchema: GenMessage<ResumeManagedModelPullResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 21);
+  messageDesc(file_joko_v1_managed_model_runtime, 46);
 
 /**
  * @generated from message joko.v1.CancelManagedModelPullRequest
@@ -659,7 +1329,7 @@ export type CancelManagedModelPullRequest = Message<"joko.v1.CancelManagedModelP
  * Use `create(CancelManagedModelPullRequestSchema)` to create a new message.
  */
 export const CancelManagedModelPullRequestSchema: GenMessage<CancelManagedModelPullRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 22);
+  messageDesc(file_joko_v1_managed_model_runtime, 47);
 
 /**
  * @generated from message joko.v1.CancelManagedModelPullResponse
@@ -676,7 +1346,7 @@ export type CancelManagedModelPullResponse = Message<"joko.v1.CancelManagedModel
  * Use `create(CancelManagedModelPullResponseSchema)` to create a new message.
  */
 export const CancelManagedModelPullResponseSchema: GenMessage<CancelManagedModelPullResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 23);
+  messageDesc(file_joko_v1_managed_model_runtime, 48);
 
 /**
  * @generated from message joko.v1.DeleteManagedModelRequest
@@ -698,7 +1368,7 @@ export type DeleteManagedModelRequest = Message<"joko.v1.DeleteManagedModelReque
  * Use `create(DeleteManagedModelRequestSchema)` to create a new message.
  */
 export const DeleteManagedModelRequestSchema: GenMessage<DeleteManagedModelRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 24);
+  messageDesc(file_joko_v1_managed_model_runtime, 49);
 
 /**
  * @generated from message joko.v1.DeleteManagedModelResponse
@@ -715,7 +1385,7 @@ export type DeleteManagedModelResponse = Message<"joko.v1.DeleteManagedModelResp
  * Use `create(DeleteManagedModelResponseSchema)` to create a new message.
  */
 export const DeleteManagedModelResponseSchema: GenMessage<DeleteManagedModelResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 25);
+  messageDesc(file_joko_v1_managed_model_runtime, 50);
 
 /**
  * @generated from message joko.v1.GetManagedModelPreflightRequest
@@ -737,7 +1407,7 @@ export type GetManagedModelPreflightRequest = Message<"joko.v1.GetManagedModelPr
  * Use `create(GetManagedModelPreflightRequestSchema)` to create a new message.
  */
 export const GetManagedModelPreflightRequestSchema: GenMessage<GetManagedModelPreflightRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 26);
+  messageDesc(file_joko_v1_managed_model_runtime, 51);
 
 /**
  * @generated from message joko.v1.GetManagedModelPreflightResponse
@@ -754,7 +1424,7 @@ export type GetManagedModelPreflightResponse = Message<"joko.v1.GetManagedModelP
  * Use `create(GetManagedModelPreflightResponseSchema)` to create a new message.
  */
 export const GetManagedModelPreflightResponseSchema: GenMessage<GetManagedModelPreflightResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_managed_model_runtime, 27);
+  messageDesc(file_joko_v1_managed_model_runtime, 52);
 
 /**
  * @generated from enum joko.v1.ManagedModelRuntimeState
@@ -1096,4 +1766,97 @@ export enum ManagedModelRuntimeErrorCode {
  */
 export const ManagedModelRuntimeErrorCodeSchema: GenEnum<ManagedModelRuntimeErrorCode> = /*@__PURE__*/
   enumDesc(file_joko_v1_managed_model_runtime, 5);
+
+/**
+ * @generated from enum joko.v1.ManagedModelRuntimeStartupPolicy
+ */
+export enum ManagedModelRuntimeStartupPolicy {
+  /**
+   * @generated from enum value: MANAGED_MODEL_RUNTIME_STARTUP_POLICY_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: MANAGED_MODEL_RUNTIME_STARTUP_POLICY_EXPLICIT = 1;
+   */
+  EXPLICIT = 1,
+
+  /**
+   * @generated from enum value: MANAGED_MODEL_RUNTIME_STARTUP_POLICY_ON_USE = 2;
+   */
+  ON_USE = 2,
+}
+
+/**
+ * Describes the enum joko.v1.ManagedModelRuntimeStartupPolicy.
+ */
+export const ManagedModelRuntimeStartupPolicySchema: GenEnum<ManagedModelRuntimeStartupPolicy> = /*@__PURE__*/
+  enumDesc(file_joko_v1_managed_model_runtime, 6);
+
+/**
+ * @generated from enum joko.v1.ManagedModelRuntimeConfigureBlockedReason
+ */
+export enum ManagedModelRuntimeConfigureBlockedReason {
+  /**
+   * @generated from enum value: MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_OWNED_ELSEWHERE = 1;
+   */
+  OWNED_ELSEWHERE = 1,
+
+  /**
+   * @generated from enum value: MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_OWNERSHIP_UNKNOWN = 2;
+   */
+  OWNERSHIP_UNKNOWN = 2,
+
+  /**
+   * @generated from enum value: MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_OPERATION_BUSY = 3;
+   */
+  OPERATION_BUSY = 3,
+
+  /**
+   * @generated from enum value: MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_STOP_UNCONFIRMED = 4;
+   */
+  STOP_UNCONFIRMED = 4,
+}
+
+/**
+ * Describes the enum joko.v1.ManagedModelRuntimeConfigureBlockedReason.
+ */
+export const ManagedModelRuntimeConfigureBlockedReasonSchema: GenEnum<ManagedModelRuntimeConfigureBlockedReason> = /*@__PURE__*/
+  enumDesc(file_joko_v1_managed_model_runtime, 7);
+
+/**
+ * @generated from enum joko.v1.ManagedRepositoryDownloadAction
+ */
+export enum ManagedRepositoryDownloadAction {
+  /**
+   * @generated from enum value: MANAGED_REPOSITORY_DOWNLOAD_ACTION_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: MANAGED_REPOSITORY_DOWNLOAD_ACTION_PAUSE = 1;
+   */
+  PAUSE = 1,
+
+  /**
+   * @generated from enum value: MANAGED_REPOSITORY_DOWNLOAD_ACTION_RESUME = 2;
+   */
+  RESUME = 2,
+
+  /**
+   * @generated from enum value: MANAGED_REPOSITORY_DOWNLOAD_ACTION_CANCEL = 3;
+   */
+  CANCEL = 3,
+}
+
+/**
+ * Describes the enum joko.v1.ManagedRepositoryDownloadAction.
+ */
+export const ManagedRepositoryDownloadActionSchema: GenEnum<ManagedRepositoryDownloadAction> = /*@__PURE__*/
+  enumDesc(file_joko_v1_managed_model_runtime, 8);
 

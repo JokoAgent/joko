@@ -5,6 +5,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { emptySnapshot, type AppSnapshot, type ModelView, type NewSessionLocalDraft } from "../model.js";
 import { readAppDefaultModelPreference, setAppDefaultModelPreference } from "../app-default-model-preferences.js";
+import { setModelConfiguration, resetModelPickerPreferencesForTests } from "../model-picker-preferences.js";
 import { NewSessionPage } from "./NewSessionPage.js";
 
 vi.mock("./ComposerRichTextEditor.js", () => ({ ComposerRichTextEditor: forwardRef(function Editor(_props, ref) {
@@ -13,7 +14,19 @@ vi.mock("./ComposerRichTextEditor.js", () => ({ ComposerRichTextEditor: forwardR
 }) }));
 vi.mock("./HomeUsageDashboard.js", () => ({ HomeUsageDashboard: () => null }));
 const roots: Root[] = [];
-afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); document.body.replaceChildren(); window.localStorage.clear(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(async () => { for (const root of roots.splice(0)) await act(async () => root.unmount()); document.body.replaceChildren(); window.localStorage.clear(); resetModelPickerPreferencesForTests(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+it("initializes a future task from exact model effort preferences only when no explicit default exists", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); window.localStorage.clear(); resetModelPickerPreferencesForTests();
+  setModelConfiguration("node", "primary", "provider", "first", { effort: "high" });
+  const snapshot: AppSnapshot = { ...emptySnapshot(), backends: [{ id: "primary", name: "Primary", version: "1", health: "healthy", instanceGeneration: 1, capabilities: new Map([...["input.text", "model.switch", "model.effort"].map(name => [name, { name, supported: true, options: [] as string[] }] as const), ["permission.modes", { name: "permission.modes", supported: true, options: ["ask"] }]]) }], targets: [{ id: "target", backendId: "primary", name: "Target", workspaceId: "workspace", workspaceName: "Workspace", revision: 1n, trusted: true, pinned: false, archived: false }], models: [{ ...model("primary", "first"), metadata: { defaultEffort: "low" } }] };
+  const save = vi.fn(async () => undefined);
+  const controller = { state: { activeProfile: { id: "connection", serverId: "node", origin: "http://127.0.0.1", deviceId: "device" }, snapshot, route: { kind: "newSession" }, navigationRevision: 1, connectionState: "connected", preferences: { locale: "en", newSessionWorktreeEnabled: false } }, readNewSessionDraft: vi.fn(async () => undefined), saveNewSessionDraft: save, prepareTargetWorkspace: vi.fn(async () => undefined), probeTargetWorktree: vi.fn(async () => ({ eligibility: "unavailable" })), listTargetWorktreeSources: vi.fn(async () => []), refreshProviderModels: vi.fn(async () => undefined), setNewSessionWorktreeEnabled: vi.fn(async () => undefined) } as unknown as AppController;
+  const container = document.body.appendChild(document.createElement("div")); const root = createRoot(container); roots.push(root);
+  await act(async () => root.render(<NewSessionPage controller={controller} snapshot={snapshot} navigationOpen t={key => key} onOpenNavigation={() => undefined} onClose={() => undefined} onSubmit={vi.fn()} />));
+  await vi.waitFor(() => expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ modelId: "first", effort: "high" })));
+  expect(readAppDefaultModelPreference("node").current).toMatchObject({ modelId: "first", effort: "high" });
+});
 
 it("uses the actual New Task picker preference for future tasks and preserves the current draft's other axes", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); window.localStorage.clear();

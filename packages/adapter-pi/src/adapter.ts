@@ -80,6 +80,7 @@ import {
   type PolicyDecisionResult
 } from "./policy-decision-bridge.js";
 import { isPiCompactionNoopRejection } from "./compaction.js";
+import { readPiWorkingContext, writePiWorkingContext } from "./working-context.js";
 import {
   assertCompatibleState,
   assertManagedBridgeHandshake,
@@ -496,6 +497,9 @@ export interface ProviderAuthenticationReconciliation {
 }
 
 interface SessionSpawnProfile {
+  readonly compactionThresholdPercent?: number;
+  readonly autoCompaction?: boolean;
+  readonly autoRetry?: boolean;
   readonly providerId?: string;
   readonly modelId?: string;
   readonly effort?: string;
@@ -573,6 +577,9 @@ interface PiRuntime {
   autoCompaction: boolean;
   readonly compactionMemoryEnabled: boolean;
   autoCompactionThresholdPercent: number;
+  workingContextWindow: number | undefined;
+  workingContextSelection: string | undefined;
+  workingContextUnconfirmed?: boolean;
   thresholdCheck?: Promise<void>;
   thresholdCompaction?: { readonly id: string };
   ready: boolean;
@@ -729,6 +736,8 @@ export class PiBackendAdapter implements
   readonly #runtimes = new Map<string, PiRuntime>();
   readonly #runtimeStarts = new Map<string, Promise<PiRuntime>>();
   readonly #spawnProfiles = new Map<string, SessionSpawnProfile>();
+  readonly #workingContextRecoveries = new Map<string, { readonly binding: NativeSessionBinding; readonly profile: SessionSpawnProfile;
+    readonly targetId: string; readonly workspaceRoot: string; readonly backendInstanceGeneration: number | undefined }>();
   readonly #artifactRefsBySession = new Map<string, Map<string, BlobRef>>();
   readonly #subagentObservers = new Map<string, ManagedSubagentObserver>();
   readonly #unresolvedRemoteSubagentOwners = new Map<string, number>();
@@ -1277,6 +1286,11 @@ export class PiBackendAdapter implements
       throw piError("PI_MENTION_KIND_UNSUPPORTED", "This native input supports regular workspace files and loaded task resources", "dispatch", {
         recovery: "Choose a regular workspace file or a resource from this task's current loaded catalog."
       });
+    }
+    const attached = this.#runtimes.get(context.sessionId);
+    if (input.disposition === "prompt" && (attached === undefined || attached.lifecycle === undefined
+      && attached.runningExtensionCommand === undefined && attached.userShell === undefined)) {
+      await this.refreshModelWorkingContext(context);
     }
     const runtime = this.#runtime(context);
     await runtime.nativeSkills?.assertFilesCurrent(context.signal);
@@ -1988,8 +2002,70 @@ export class PiBackendAdapter implements
         throw error;
       }
     });
-    await this.#compactAtConfiguredThreshold(runtime, context);
+    await this.refreshModelWorkingContext(context);
+    await this.#compactAtConfiguredThreshold(this.#runtime(context), context);
     return model;
+  }
+
+  async refreshModelWorkingContext(context: AdapterContext): Promise<void> {
+    this.#assertNotDisposed();
+    context.signal.throwIfAborted();
+    const retained = this.#workingContextRecoveries.get(context.sessionId);
+    let runtime = this.#runtimes.get(context.sessionId);
+    if (retained === undefined && runtime?.workingContextWindow === undefined && !runtime?.workingContextUnconfirmed
+      && context.resolveModelWorkingContext === undefined) return;
+    if (runtime === undefined && retained === undefined) return;
+    if (retained !== undefined) {
+      if (retained.binding.generation !== context.generation || context.binding?.opaqueRef !== retained.binding.opaqueRef
+        || retained.targetId !== context.target.id || retained.workspaceRoot !== context.target.workspaceRoot
+        || retained.backendInstanceGeneration !== context.backendInstanceGeneration) {
+        throw piError("PI_STALE_GENERATION", "The model context recovery belongs to another native binding", "dispatch");
+      }
+      if (runtime !== undefined) await this.#stopRuntime(context.sessionId, context.generation);
+      runtime = await this.#ensureRuntime(retained.binding, retained.profile, context);
+      await this.#confirmNativeSessionSwitch(runtime, retained.binding, context);
+      runtime.workingContextUnconfirmed = true;
+      await runtime.transport.request({ type: "set_auto_compaction", enabled: retained.profile.autoCompaction ?? runtime.autoCompaction }, { signal: context.signal, stateMayHaveChanged: true });
+      await runtime.transport.request({ type: "set_auto_retry", enabled: retained.profile.autoRetry ?? runtime.autoRetry }, { signal: context.signal, stateMayHaveChanged: true });
+      this.#workingContextRecoveries.delete(context.sessionId);
+      runtime.workingContextUnconfirmed = false;
+    }
+    await this.#runExclusiveSessionMutation(runtime!, context, async () => {
+      const state = await this.#requestState(runtime!, context);
+      if (runtime!.lifecycle !== undefined || runtime!.userShell !== undefined || runtime!.runningExtensionCommand !== undefined
+        || state.isStreaming || state.isCompacting || state.pendingMessageCount > 0) {
+        throw piError("PI_WORKING_CONTEXT_BUSY", "Model context refresh requires an idle native Session", "dispatch", { retryable: true });
+      }
+      const providerId = state.model?.provider;
+      const modelId = state.model?.id;
+      const desired = readPiWorkingContext(context, providerId, modelId);
+      const selection = providerId === undefined || modelId === undefined ? undefined : `${providerId}\0${modelId}`;
+      if (desired === runtime!.workingContextWindow && !runtime!.workingContextUnconfirmed
+        && (desired === undefined || selection === runtime!.workingContextSelection)) return;
+      const profile = { ...(this.#spawnProfiles.get(context.sessionId) ?? restoredSpawnProfile(context)), providerId, modelId,
+        effort: state.thinkingLevel, initialPermissionMode: runtime!.control.permissionMode,
+        initialPlanMode: runtime!.control.planMode, initialFastMode: runtime!.control.fastMode,
+        compactionThresholdPercent: runtime!.autoCompactionThresholdPercent,
+        autoCompaction: runtime!.autoCompaction, autoRetry: runtime!.autoRetry };
+      const binding = runtime!.binding;
+      const policy = { autoCompaction: runtime!.autoCompaction, autoRetry: runtime!.autoRetry, threshold: runtime!.autoCompactionThresholdPercent };
+      this.#workingContextRecoveries.set(context.sessionId, { binding, profile, targetId: context.target.id,
+        workspaceRoot: context.target.workspaceRoot, backendInstanceGeneration: context.backendInstanceGeneration });
+      runtime!.workingContextUnconfirmed = true;
+      await this.#stopRuntime(context.sessionId, context.generation);
+      context.signal.throwIfAborted();
+      const next = await this.#ensureRuntime(binding, profile, context);
+      await this.#confirmNativeSessionSwitch(next, binding, context);
+      next.workingContextUnconfirmed = true;
+      await next.transport.request({ type: "set_auto_compaction", enabled: policy.autoCompaction }, { signal: context.signal, stateMayHaveChanged: true });
+      await next.transport.request({ type: "set_auto_retry", enabled: policy.autoRetry }, { signal: context.signal, stateMayHaveChanged: true });
+      next.autoCompaction = policy.autoCompaction;
+      next.autoRetry = policy.autoRetry;
+      next.autoCompactionThresholdPercent = policy.threshold;
+      this.#spawnProfiles.set(context.sessionId, profile);
+      this.#workingContextRecoveries.delete(context.sessionId);
+      next.workingContextUnconfirmed = false;
+    });
   }
 
   async setEffort(level: string, context: AdapterContext): Promise<void> {
@@ -2311,7 +2387,7 @@ export class PiBackendAdapter implements
     if (!isRecord(stats)) return;
     const usage = usageFromStats(stats);
     const contextTokens = usage?.contextTokens;
-    const contextWindow = usage?.contextWindow;
+    const contextWindow = runtime.workingContextWindow ?? usage?.contextWindow;
     if (
       contextTokens === undefined
       || contextWindow === undefined
@@ -4491,6 +4567,8 @@ export class PiBackendAdapter implements
       releaseUnpublished();
       throw error;
     });
+    const workingContextWindow = readPiWorkingContext(context, profile.providerId, profile.modelId);
+    let workingNativeWindow: number | undefined;
     try {
       this.#assertProviderAuthenticationNotRevoked(options, profile.providerId);
       await this.validateTarget(context.target);
@@ -4754,6 +4832,15 @@ export class PiBackendAdapter implements
         managedGeneration,
         profile.providerId
       );
+      if (workingContextWindow !== undefined && profile.providerId !== undefined && profile.modelId !== undefined) {
+        const declared = mergeProviderModels(catalog.models, options.nativeModels ?? []).find((model) =>
+          model.providerId === profile.providerId && model.modelId === profile.modelId);
+        if (declared === undefined || declared.contextWindow <= 0) throw piError("PI_WORKING_CONTEXT_MODEL_UNAVAILABLE",
+          "The exact model capacity is unavailable for process-private configuration", "provision");
+        workingNativeWindow = await writePiWorkingContext(preparedAgentHome.path, { providerId: profile.providerId, modelId: profile.modelId },
+          workingContextWindow, declared?.contextWindow || workingContextWindow,
+          profile.compactionThresholdPercent ?? configuredAutoCompactionThresholdPercent(options.settings));
+      }
       redactValues = [
         ...[...secretNames]
           .map((name) => env[name])
@@ -4892,10 +4979,12 @@ export class PiBackendAdapter implements
         context,
         binding: temporaryBinding,
         control,
-        autoRetry: options.settings?.retry?.enabled ?? true,
-        autoCompaction: options.settings?.compaction?.enabled ?? true,
+        autoRetry: profile.autoRetry ?? options.settings?.retry?.enabled ?? true,
+        autoCompaction: profile.autoCompaction ?? options.settings?.compaction?.enabled ?? true,
         compactionMemoryEnabled: options.isCompactionMemoryEnabled?.(context) === true,
-        autoCompactionThresholdPercent: configuredAutoCompactionThresholdPercent(options.settings),
+        autoCompactionThresholdPercent: profile.compactionThresholdPercent ?? configuredAutoCompactionThresholdPercent(options.settings),
+        workingContextWindow,
+        workingContextSelection: profile.providerId === undefined || profile.modelId === undefined ? undefined : `${profile.providerId}\0${profile.modelId}`,
         ready: false,
         abortRequested: false,
         toolCatalogAssembler: new PiRuntimeToolCatalogAssembler(),
@@ -4919,6 +5008,10 @@ export class PiBackendAdapter implements
       );
       const state = responseData(response) as PiRpcState;
       assertCompatibleState(state);
+      if (workingNativeWindow !== undefined && (state.model?.provider !== profile.providerId
+        || state.model?.id !== profile.modelId || state.model?.contextWindow !== workingNativeWindow)) {
+        throw piError("PI_WORKING_CONTEXT_UNCONFIRMED", "Pi did not confirm the process-private model working context", "provision", { stateMayHaveChanged: true });
+      }
       const commandCatalog = responseData(await transport.request(
         { type: "get_commands" },
         { timeoutMs: options.startupTimeoutMs ?? 30_000, signal: context.signal }
@@ -5269,6 +5362,7 @@ export class PiBackendAdapter implements
 
   #runtime(context: AdapterContext): PiRuntime {
     const runtime = this.#runtimes.get(context.sessionId);
+    if (runtime?.workingContextUnconfirmed) throw piError("PI_WORKING_CONTEXT_UNCONFIRMED", "The native model working context could not be confirmed", "dispatch", { stateMayHaveChanged: true });
     if (!runtime || runtime.transport.closed) throw piError("PI_RUNTIME_NOT_ACTIVE", "Pi runtime is not active for this session", "dispatch", { retryable: true });
     if (!runtime.ready) {
       throw piError("PI_RUNTIME_NOT_READY", "Pi runtime did not complete its fenced startup handshake", "dispatch", {
@@ -6159,6 +6253,7 @@ export class PiBackendAdapter implements
       "model.list",
       "model.switch",
       "model.effort",
+      "model.working_context",
       "provider.managed_catalog",
       "permission.modes",
       "permission.change",
@@ -6273,6 +6368,7 @@ export class PiBackendAdapter implements
           name: command.name,
           description: command.description ?? "",
           source: command.source,
+          inputMode: "text" as const,
           path: command.sourceInfo?.path,
           ...(command.sourceInfo?.path === undefined
             ? {}
@@ -6801,8 +6897,13 @@ function modelFromRpc(model: PiRpcModel, authoritativeLevels?: readonly string[]
     modelId: model.id,
     displayName: model.name ?? model.id,
     api: model.api ?? "unknown",
+    ...(model.api === undefined ? {} : { referenceApi: model.api, protocolMode: "matching" as const }),
+    ...(Array.isArray(model.input) ? { declaredInputModalities: [...model.input], declaredSupportsImages: model.input.includes("image") } : {}),
+    ...(thinkingLevels.includes("medium") ? { defaultEffort: "medium" } : {}),
     contextWindow,
     maxOutputTokens: piModelOutputTokenLimit(optionalNumeric(model.maxTokens), contextWindow),
+    ...(model.contextWindow === undefined ? {} : { contextWindowSource: "declared" as const }),
+    ...(model.maxTokens === undefined ? {} : { maxOutputTokensSource: "declared" as const }),
     supportsImages: Array.isArray(model.input) && model.input.includes("image"),
     supportsFastMode,
     thinkingLevels,
@@ -7980,6 +8081,7 @@ function mergeProviderModels(managed: readonly ProviderModel[], native: readonly
 
 function cloneProviderModel(model: ProviderModel): ProviderModel {
   return {
+    ...model,
     providerId: model.providerId,
     modelId: model.modelId,
     ...(model.logicalId === undefined ? {} : { logicalId: model.logicalId }),

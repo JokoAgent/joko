@@ -1,5 +1,6 @@
 import {
   CapabilitySupport,
+  RuntimeCommandInputMode,
   RuntimeCommandSource,
   TargetState,
   capabilityNames,
@@ -9,12 +10,14 @@ import {
 } from "@joko/contracts";
 import {
   markMobileComposerSlashCommand,
+  insertMobileResourceMention,
   normalizeMobileComposerDraft,
   replaceMobileComposerRange,
   type MobileComposerDraft,
   type MobileComposerEditResult,
   type MobileComposerSelection
 } from "./mobile-composer-document";
+import { mobileCatalogMentionPolicy, type MobileResourceMentionCandidate } from "./mobile-catalog-mentions";
 
 export interface MobileRuntimeCommandControls {
   readonly authorityKey: string;
@@ -23,6 +26,7 @@ export interface MobileRuntimeCommandControls {
   readonly backendId: string;
   readonly targetId: string;
   readonly runtimeGeneration: string;
+  readonly resourceMentions: boolean;
 }
 
 export interface MobileRuntimeCommandCandidate {
@@ -30,6 +34,7 @@ export interface MobileRuntimeCommandCandidate {
   readonly name: string;
   readonly description: string;
   readonly source: RuntimeCommandSource;
+  readonly inputMode: RuntimeCommandInputMode;
   readonly resourceId?: string;
 }
 
@@ -102,6 +107,8 @@ export function createMobileRuntimeCommandControls(
     || entityKey(ownerTarget.version) !== entityKey(detailTarget.version)
     || !runtimeCommandsSupported(ownerBackend) || !runtimeCommandsSupported(detailBackend)) return undefined;
 
+  const resourceMentions = mobileCatalogMentionPolicy(ownerBackend)?.resources === true
+    && mobileCatalogMentionPolicy(detailBackend)?.resources === true;
   return {
     authorityKey,
     surfaceOwnerKey: [
@@ -110,12 +117,14 @@ export function createMobileRuntimeCommandControls(
       detailSession.sessionId,
       detailSession.backendId,
       detailSession.targetId,
-      generation.toString(10)
+      generation.toString(10),
+      resourceMentions ? "resource" : "text"
     ].join("\u001f"),
     sessionId: detailSession.sessionId,
     backendId: detailSession.backendId,
     targetId: detailSession.targetId,
-    runtimeGeneration: generation.toString(10)
+    runtimeGeneration: generation.toString(10),
+    resourceMentions
   };
 }
 
@@ -136,16 +145,20 @@ export function projectMobileRuntimeCommandCatalog(
       || !validIdentity(command.commandId, maximumCommandIdCharacters) || commandIds.has(command.commandId)
       || !validCommandName(command.name) || !validDescription(command.description)
       || command.resourceId !== "" && !validIdentity(command.resourceId, maximumResourceIdCharacters)
-      || !validCommandSource(command.source)) {
+      || !validCommandSource(command.source)
+      || command.inputMode !== RuntimeCommandInputMode.TEXT && command.inputMode !== RuntimeCommandInputMode.RESOURCE_MENTION
+      || command.inputMode === RuntimeCommandInputMode.RESOURCE_MENTION
+        && (command.source !== RuntimeCommandSource.SKILL || command.resourceId === "")) {
       throw new Error("The Joko node returned an invalid runtime command catalog.");
     }
     commandIds.add(command.commandId);
-    if (!command.loaded) return undefined;
+    if (!command.loaded || command.inputMode === RuntimeCommandInputMode.RESOURCE_MENTION && !controls.resourceMentions) return undefined;
     return {
       commandId: command.commandId,
       name: command.name,
       description: command.description,
       source: command.source,
+      inputMode: command.inputMode,
       ...(command.resourceId === "" ? {} : { resourceId: command.resourceId })
     };
   }).filter((candidate): candidate is MobileRuntimeCommandCandidate => candidate !== undefined)
@@ -221,7 +234,8 @@ export function assertMobileRuntimeCommandCandidate(
   }
   const matches = catalog.items.filter((candidate) => candidate.commandId === value.commandId
     && candidate.name === value.name && candidate.source === value.source
-    && candidate.resourceId === value.resourceId && candidate.description === value.description);
+    && candidate.resourceId === value.resourceId && candidate.description === value.description
+    && candidate.inputMode === value.inputMode);
   if (matches.length !== 1) throw new Error("The selected runtime command is no longer loaded.");
   return matches[0]!;
 }
@@ -276,6 +290,29 @@ export function replaceMobileRuntimeCommandRun<Command extends { readonly name: 
     ...result,
     draft: markMobileComposerSlashCommand(result.draft, from, commandText)
   };
+}
+
+export function replaceMobileRuntimeResourceCommandRun(
+  draft: MobileComposerDraft,
+  activation: MobileRuntimeCommandActivation,
+  command: MobileRuntimeCommandCandidate,
+  resource: MobileResourceMentionCandidate,
+  mentionId: string
+): MobileComposerEditResult {
+  if (command.inputMode !== RuntimeCommandInputMode.RESOURCE_MENTION || command.resourceId !== resource.resourceId) {
+    throw new Error("The selected command requires its exact loaded Skill identity.");
+  }
+  // The text replacement validates the original run and remaps adjacent occurrences.
+  const replaced = replaceMobileRuntimeCommandRun(draft, activation, command);
+  const commandText = `/${command.name}`;
+  const unmarked = normalizeMobileComposerDraft({
+    ...replaced.draft,
+    slashCommands: replaced.draft.slashCommands.filter((mark) => mark.start !== activation.from)
+  });
+  const inserted = insertMobileResourceMention(unmarked, {
+    start: activation.from, end: activation.from + commandText.length
+  }, { ...resource, displayText: commandText }, mentionId);
+  return { draft: inserted.draft, selection: replaced.selection };
 }
 
 export class MobileRuntimeCommandCatalogCache {

@@ -22,7 +22,7 @@ import type { OrchestratorApplication } from "./application.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+const profile = { ...PI_LIKE_PROFILE, permissionModes: ["ask", "auto", "bypassPermissions"], capabilities: [...PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
   ? { key: "permission.modes", supported: true, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true }] } as const;
 class OwnerProbeAdapter extends FakeBackendAdapter {
   constructor(readonly profiles: PartnerStore) { super(profile); }
@@ -56,6 +56,16 @@ async function fixture() {
   return { root, store, profiles, groups, artifacts, adapter, workspaces, host, runtime, partners, members, group, ensure };
 }
 describe("Hidden Partner group native execution", () => {
+  it("consumes exact Full access on its owned group lane and applies the next profile without rewriting old versions", async () => {
+    const f = await fixture(); const before = f.profiles.getPartner(f.members[0]!.id);
+    const full = await f.partners.updatePartner(before.id, before.revision, { capabilities: { ...before.capabilities, permissionMode: "bypassPermissions" } });
+    const lane = await f.ensure();
+    expect(f.store.getSession(lane.sessionId).descriptor.permissionMode).toBe("bypassPermissions");
+    await f.partners.updatePartner(full.id, full.revision, { capabilities: { ...full.capabilities, permissionMode: "ask" } });
+    const next = await f.ensure(); expect(next.sessionId).toBe(lane.sessionId);
+    expect(f.store.getSession(next.sessionId).descriptor.permissionMode).toBe("ask");
+    expect(f.profiles.listProfileVersions(full.id).find(row => row.version === full.profileVersion)?.capabilities.permissionMode).toBe("bypassPermissions");
+  });
   it("retires a persisted private preparation only after its original native owner proves no Session was created", async () => {
     const f = await fixture();
     await expect(f.runtime.ensureLane({ group: f.groups.get(f.group.id), partner: f.profiles.getPartner(f.members[0]!.id), signal: new AbortController().signal,

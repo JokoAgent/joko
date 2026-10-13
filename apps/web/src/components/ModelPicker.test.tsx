@@ -11,7 +11,9 @@ import {
   resetModelPickerPreferencesForTests,
   providerPreferenceKey,
   setProviderDisplayOrder,
-  setModelVisible
+  setModelVisible,
+  setModelConfiguration,
+  clearModelEffort
 } from "../model-picker-preferences.js";
 import type { ModelView } from "../model.js";
 import { ModelPicker, type ModelPickerSelection } from "./ModelPicker.js";
@@ -40,6 +42,34 @@ afterEach(async () => {
 });
 
 describe("ModelPicker", () => {
+  it("uses declared defaults and observes external exact-route effort changes and reset without a stale row cache", async () => {
+    const declared = { ...models[0]!, metadata: { defaultEffort: "high" } };
+    const onSelect = vi.fn();
+    await renderPicker(onSelect, "owner-one", undefined, false, undefined, [declared]); await openPicker();
+    await act(async () => findRow("Small").click());
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ effort: "high" }));
+    await openPicker();
+    await act(async () => required(findRow("Small").querySelector<HTMLButtonElement>(".model-picker__configure")).click());
+    const low = required([...required(document.querySelector(".model-picker__config-flyout")).querySelectorAll<HTMLButtonElement>("button")].find(button => button.textContent === "low"));
+    await act(async () => low.click());
+    await act(async () => setModelConfiguration("owner-one", declared.backendId, declared.providerId, declared.modelId, { effort: "high", fast: true }));
+    await act(async () => findRow("Small").click());
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ effort: "high", fastMode: true }));
+    await act(async () => clearModelEffort("owner-one", declared)); await openPicker(); await act(async () => findRow("Small").click());
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ effort: "high", fastMode: true }));
+  });
+
+  it("keeps selected and favorite explicit effort while another default is stored", async () => {
+    const declared = { ...models[0]!, metadata: { defaultEffort: "high" } };
+    setModelConfiguration("owner-one", declared.backendId, declared.providerId, declared.modelId, { effort: "high" });
+    addModelFavorite("owner-one", { backendId: declared.backendId, providerId: declared.providerId, modelId: declared.modelId, effort: "low" });
+    const onSelect = vi.fn();
+    await renderPicker(onSelect, "owner-one", undefined, false, undefined, [declared], { backendId: declared.backendId, providerId: declared.providerId, modelId: declared.modelId, effort: "low", fastMode: false }); await openPicker();
+    await act(async () => required(document.querySelector<HTMLElement>(".model-picker__row[data-row-key^='model:']") ?? [...document.querySelectorAll<HTMLElement>(".model-picker__row")].at(-1)).click());
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ effort: "low" }));
+    await openPicker(); await act(async () => required([...document.querySelectorAll<HTMLElement>(".model-picker__row")][0]).click());
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ effort: "low", favoriteUid: expect.any(String) }));
+  });
   it("opens an anchored portal and searches across model and Provider names", async () => {
     await renderPicker();
     await openPicker();

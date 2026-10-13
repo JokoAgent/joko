@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
-import type { AdapterContext, NativeSessionBinding, PromptInput } from "@joko/core";
+import type { AdapterContext, NativeSessionBinding, PromptInput, BackendAdapter, DurableNativeDispatchPreparation } from "@joko/core";
 import {
   OperationalStore,
   PartnerStore,
@@ -21,6 +21,7 @@ import { SessionHost } from "./session-host.js";
 const cleanups: Array<() => Promise<void> | void> = [];
 const PARTNER_PROFILE = {
   ...PI_LIKE_PROFILE,
+  permissionModes: ["ask", "auto", "bypassPermissions"],
   capabilities: [
     ...PI_LIKE_PROFILE.capabilities.map((capability) => capability.key === "permission.modes"
       ? { key: "permission.modes", supported: true, options: ["ask", "auto", "bypassPermissions"] }
@@ -64,6 +65,88 @@ afterEach(async () => {
 });
 
 describe("PartnerManager", () => {
+  it("retires a failed high-permission downgrade, preserves history and repairs the same canonical task", async () => {
+    const f = await createFixture();
+    let profile = await f.manager.createPartner({ ...createInput(f.partnerStore, "Permission owner"),
+      capabilities: { ...capabilities(), permissionMode: "bypassPermissions" } });
+    const sessionId = profile.canonicalSessionId!;
+    const original = f.operationalStore.getSession(sessionId).descriptor;
+    const setter = vi.spyOn(f.adapter, "setPermissionMode").mockRejectedValueOnce(new Error("Native policy rejected"));
+    const close = vi.spyOn(f.adapter, "closeSession");
+    profile = await f.manager.updatePartner(profile.id, profile.revision, { capabilities: { ...capabilities(), permissionMode: "ask" } });
+    expect(profile).toMatchObject({ initializationState: "error", capabilities: { permissionMode: "ask" }, canonicalSessionId: sessionId });
+    expect(close).toHaveBeenCalledOnce();
+    expect(close.mock.calls[0]![0]).toEqual(original.binding);
+    expect(f.operationalStore.getSession(sessionId).descriptor).toMatchObject({ archived: false, binding: original.binding });
+    await expect(f.sessionHost.getCommands(sessionId)).rejects.toThrow("confirmed recovery");
+    const restored = await f.manager.retryInitialization(profile.id, profile.revision);
+    expect(restored).toMatchObject({ initializationState: "ready", canonicalSessionId: sessionId, capabilities: { permissionMode: "ask" } });
+    expect(f.operationalStore.getSession(sessionId).descriptor.permissionMode).toBe("ask");
+    expect(setter.mock.calls.at(-1)?.[0]).toBe("ask");
+  });
+
+  it("retains unknown permission cleanup, rejects send and controls, and retries only the original binding", async () => {
+    const f = await createFixture();
+    let profile = await f.manager.createPartner({ ...createInput(f.partnerStore, "Unknown permission owner"),
+      capabilities: { ...capabilities(), permissionMode: "bypassPermissions" } });
+    const sessionId = profile.canonicalSessionId!, binding = f.operationalStore.getSession(sessionId).descriptor.binding;
+    vi.spyOn(f.adapter, "setPermissionMode").mockRejectedValueOnce(new Error("Native policy rejected"));
+    const originalClose = f.adapter.closeSession.bind(f.adapter);
+    const close = vi.spyOn(f.adapter, "closeSession").mockRejectedValueOnce(new Error("Native close unknown"));
+    profile = await f.manager.updatePartner(profile.id, profile.revision, { capabilities: { ...capabilities(), permissionMode: "ask" } });
+    expect(profile.initializationState).toBe("error");
+    expect(() => f.sessionHost.enqueueServiceInput({ operationId: "blocked-policy-input", sessionId, source: "system",
+      prompt: { text: "Must not dispatch", images: [], files: [], mentions: [], disposition: "prompt" } })).toThrow("permission policy");
+    await expect(f.sessionHost.getCommands(sessionId)).rejects.toThrow("confirmed recovery");
+    close.mockImplementation(originalClose);
+    const restored = await f.manager.retryInitialization(profile.id, profile.revision);
+    expect(restored.initializationState).toBe("ready");
+    expect(close.mock.calls.map(([value]) => value)).toEqual([binding, binding]);
+    const current = f.operationalStore.getSession(sessionId).descriptor;
+    expect(current).toMatchObject({ archived: false, permissionMode: "ask" });
+    expect(current.binding.nativeSessionId).toBe(binding.nativeSessionId);
+    expect(current.binding.generation).toBeGreaterThan(binding.generation);
+  });
+
+  it("refuses Full access for unsupported routes and an untrusted existing home before committing profile changes", async () => {
+    const f = await createFixture(); const profile = await f.manager.createPartner(createInput(f.partnerStore, "Trust owner"));
+    const backend = f.operationalStore.getBackend(f.adapter.id).descriptor;
+    f.operationalStore.upsertBackend({ ...backend, capabilities: new Map([...backend.capabilities].map(([key, value]) =>
+      [key, key === "permission.modes" ? { ...value, options: ["ask", "auto"] } : value])) });
+    await expect(f.manager.updatePartner(profile.id, profile.revision, { capabilities: { ...capabilities(), permissionMode: "bypassPermissions" } }))
+      .rejects.toMatchObject({ code: "PARTNER_MODEL_UNAVAILABLE" });
+    expect(f.partnerStore.getPartner(profile.id)).toEqual(profile);
+    f.operationalStore.upsertBackend(backend);
+    const target = f.operationalStore.getTarget(profile.homeTargetId);
+    f.operationalStore.upsertTarget({ ...target.descriptor, trusted: false }, target.metadata);
+    await expect(f.manager.updatePartner(profile.id, profile.revision, { capabilities: { ...capabilities(), permissionMode: "bypassPermissions" } }))
+      .rejects.toMatchObject({ code: "PARTNER_MODEL_UNAVAILABLE" });
+    expect(f.partnerStore.getPartner(profile.id)).toEqual(profile);
+  });
+
+  it.each(["pending", "error", "changed"] as const)("rechecks exact canonical policy at actual native dispatch after a late %s", async state => {
+    const adapter = new FakeBackendAdapter(PARTNER_PROFILE);
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const send = vi.spyOn(adapter, "send");
+    const fenced: NonNullable<BackendAdapter["sendWithDurableNativeDispatchFence"]> = async (input, context, persistFence) => {
+      entered(); await new Promise<void>(resolve => { release = resolve; });
+      await persistFence({} as DurableNativeDispatchPreparation);
+      return adapter.send(input, context);
+    };
+    Object.assign(adapter, { sendWithDurableNativeDispatchFence: fenced });
+    const f = await createFixture(undefined, adapter);
+    const profile = await f.manager.createPartner(createInput(f.partnerStore, `Policy ${state}`));
+    const queued = f.sessionHost.enqueueServiceInput({ operationId: `policy-late-${state}`, sessionId: profile.canonicalSessionId!, source: "system",
+      prompt: { text: "Must not reach native dispatch", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await started;
+    const updated = f.partnerStore.updatePartner(profile.id, profile.revision, { capabilities: { ...profile.capabilities, permissionMode: "auto" } });
+    if (state === "error") f.partnerStore.failInitialization(updated.id, updated.revision, "session_unavailable");
+    if (state === "changed") f.partnerStore.markReady(updated.id, updated.revision);
+    release();
+    await vi.waitFor(() => expect(f.operationalStore.getRun(queued.value.runId).descriptor.state).toBe("failed"));
+    expect(send).not.toHaveBeenCalled();
+  });
   it("freezes independent task routes, rejects unavailable overrides and inherits the effective live model", async () => {
     const secondary = new FakeBackendAdapter({ ...PARTNER_PROFILE, id: "task-backend", models: [{ ...PARTNER_PROFILE.models[0]!, modelId: "task-model" }] });
     const primary = new FakeBackendAdapter({ ...PARTNER_PROFILE, models: [...PARTNER_PROFILE.models, { ...PARTNER_PROFILE.models[0]!, modelId: "live-model" }] });
@@ -946,7 +1029,10 @@ async function createFixture(
       || partnerStore.isPartnerTargetRetiring(operationalStore.getSession(id).descriptor.targetId),
       partnerTargetRetired: (id) => partnerStore.isPartnerTargetRetired(id),
       partnerSessionRestarting: (id) => partnerStore.isPartnerSessionRestarting(id),
-      partnerSessionPaused: (id) => partnerStore.isPartnerSessionPaused(id) }
+      partnerSessionPaused: (id) => partnerStore.isPartnerSessionPaused(id),
+      partnerSessionPolicy: id => { const profile = partnerStore.findPartnerByCanonicalSession(id); return profile === undefined ? undefined : {
+        identity: JSON.stringify([profile.id, profile.homeTargetId, profile.canonicalSessionId, profile.profileVersion, profile.capabilities.permissionMode]),
+        status: profile.initializationState }; } }
   );
   await sessionHost.initialize();
   const homesRoot = join(directory, "partner-homes");

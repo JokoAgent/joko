@@ -2,10 +2,30 @@ import { create } from "@bufbuild/protobuf";
 import { PartnerDirectorySchema, PartnerModelRouteSchema, UpdatePartnerResponseSchema } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { mobilePartnerProfileDraft, projectMobilePartnerProfileOptions, projectMobilePartnerProfileUpdate,
-  validateMobilePartnerProfileDraft } from "./mobile-partner-profile";
+  validateMobilePartnerProfileDraft, mobilePartnerDraftCatalogIdentity } from "./mobile-partner-profile";
+import { PermissionMode } from "@joko/contracts";
+import { projectMobilePartnerCapabilities, mobilePartnerPermissionToProto } from "./mobile-partner-directory";
 import { profilePartner, profilePartnerWire, profileSnapshot } from "./test/mobile-partner-profile";
 
 describe("mobile Partner profile validation", () => {
+  it("keeps all three exact permission values and refuses full access after any selected route loses support", () => {
+    const snapshot = { ...profileSnapshot, permissionModes: ["ask", "auto", "bypassPermissions"] as const };
+    const draft = { ...mobilePartnerProfileDraft(profilePartner), capabilities: { ...profilePartner.capabilities, permissionMode: "bypassPermissions" as const } };
+    expect(validateMobilePartnerProfileDraft(snapshot, draft).capabilities.permissionMode).toBe("bypassPermissions");
+    const inherited = { ...snapshot, options: { ...snapshot.options, defaultCapabilities: draft.capabilities } };
+    expect(validateMobilePartnerProfileDraft(inherited, { ...draft, usesDirectoryDefaults: true }).capabilities.permissionMode).toBe("bypassPermissions");
+    expect(() => validateMobilePartnerProfileDraft(profileSnapshot, draft)).toThrow(/available/u);
+    const identity = mobilePartnerDraftCatalogIdentity(snapshot);
+    expect(mobilePartnerDraftCatalogIdentity({ ...snapshot, permissionModes: ["ask", "auto"] })).not.toBe(identity);
+    expect(mobilePartnerDraftCatalogIdentity({ ...snapshot, options: { ...snapshot.options, revision: 5n } })).not.toBe(identity);
+    expect(mobilePartnerDraftCatalogIdentity({ ...snapshot, models: snapshot.models.map(model => ({ ...model, supportsFastMode: false })) })).not.toBe(identity);
+    for (const [mode, wire] of [["ask", PermissionMode.ASK], ["auto", PermissionMode.AUTO], ["bypassPermissions", PermissionMode.BYPASS_PERMISSIONS]] as const) {
+      expect(mobilePartnerPermissionToProto(mode)).toBe(wire);
+      expect(projectMobilePartnerCapabilities({ ...profilePartnerWire().capabilities!, permissionMode: wire }).permissionMode).toBe(mode);
+    }
+    expect(() => projectMobilePartnerCapabilities({ ...profilePartnerWire().capabilities!, permissionMode: 99 as PermissionMode })).toThrow(/unsupported/u);
+    expect(() => mobilePartnerPermissionToProto("trusted" as never)).toThrow(/supported/u);
+  });
   it("admits the same model identity on two Backends and checks each route's actual capabilities", () => {
     const first = profilePartner.capabilities.modelChain[0]!, second = { ...first, backendId: "other-runtime" };
     const axes = { ...profileSnapshot.models[0]!, canSwitchModel: true, canSetEffort: true, canSetFastMode: true,

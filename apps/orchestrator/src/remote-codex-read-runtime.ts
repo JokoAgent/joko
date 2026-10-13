@@ -9,7 +9,8 @@ import {
   type CodexRemoteRuntime,
   type CodexRemoteRuntimePort,
   type JsonRpcRecordChannel,
-  type JsonRpcRecordChannelHandlers
+  type JsonRpcRecordChannelHandlers,
+  type JsonRpcRecordWriteAdmission
 } from "@joko/adapter-codex";
 import type { RemoteWorkspaceBinding, TargetDescriptor } from "@joko/core";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
@@ -21,6 +22,8 @@ import type { OperationalStore, StoredTarget } from "@joko/store";
 import { probeRemoteCodexInstallation } from "./remote-codex-installation.js";
 import type { CodexMcpBridgeManager } from "./remote-codex-mcp-bridge.js";
 import type { RemoteExecutionRouter, RemoteProcessAuthority } from "./remote-execution-router.js";
+import { RemoteNativeSkillOwner } from "./remote-native-skills.js";
+import type { RemoteSkillSourceAuthority } from "./remote-workspace-service.js";
 
 const PROBE_TIMEOUT_MS = 10_000;
 const DAEMON_BOOTSTRAP_TIMEOUT_MS = 30_000;
@@ -46,6 +49,8 @@ export interface RemoteCodexRuntimeResolverOptions {
   readonly store: Pick<OperationalStore, "getTarget">;
   readonly remoteExecution: Pick<RemoteExecutionRouter, "processes">;
   readonly mcpBridge?: Pick<CodexMcpBridgeManager, "open" | "shutdown">;
+  readonly captureSkillSourceAuthority?: (workspaceId: string, signal?: AbortSignal) => Promise<RemoteSkillSourceAuthority>;
+  readonly nativeSkillJournalRoot?: string;
 }
 
 /** Target- and SSH-generation-bound owner for a remote Codex runtime. */
@@ -53,6 +58,8 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
   readonly #store: Pick<OperationalStore, "getTarget">;
   readonly #remoteExecution: Pick<RemoteExecutionRouter, "processes">;
   readonly #mcpBridge: RemoteCodexRuntimeResolverOptions["mcpBridge"];
+  readonly #captureSkills: RemoteCodexRuntimeResolverOptions["captureSkillSourceAuthority"];
+  readonly #nativeSkills: RemoteNativeSkillOwner | undefined;
   readonly #entries = new Map<string, ResolverEntry>();
   readonly #flights = new Map<string, Promise<CodexRemoteRuntime>>();
   #closed = false;
@@ -61,6 +68,8 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     this.#store = options.store;
     this.#remoteExecution = options.remoteExecution;
     this.#mcpBridge = options.mcpBridge;
+    this.#captureSkills = options.captureSkillSourceAuthority;
+    this.#nativeSkills = options.nativeSkillJournalRoot === undefined ? undefined : new RemoteNativeSkillOwner({ journalRoot: options.nativeSkillJournalRoot });
   }
 
   async resolve(target: TargetDescriptor, signal?: AbortSignal): Promise<CodexRemoteRuntime> {
@@ -98,6 +107,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     if (this.#closed) return;
     this.#closed = true;
     await Promise.allSettled([...this.#flights.values()]);
+    await this.#nativeSkills?.shutdown();
     const entries = [...this.#entries.values()];
     this.#entries.clear();
     await this.#mcpBridge?.shutdown();
@@ -106,6 +116,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
 
   async forceShutdown(): Promise<void> {
     this.#closed = true;
+    await this.#nativeSkills?.shutdown();
     const entries = [...this.#entries.values()];
     this.#entries.clear();
     await this.#mcpBridge?.shutdown();
@@ -120,7 +131,17 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
     signal?: AbortSignal
   ): Promise<CodexRemoteRuntime> {
     const binding = requireRemoteBinding(target);
-    const authority = await this.#remoteExecution.processes(binding, signal);
+    const workspaceId = stored.metadata !== null && typeof stored.metadata === "object"
+      ? (stored.metadata as Record<string, unknown>)["workspaceId"] : undefined;
+    const skillAuthority = binding.kind === "ssh" && target.trusted && typeof workspaceId === "string"
+      && this.#captureSkills !== undefined && this.#nativeSkills !== undefined
+      ? await this.#captureSkills(workspaceId, signal) : undefined;
+    if (skillAuthority !== undefined && (skillAuthority.registration.remote?.targetId !== target.id
+      || JSON.stringify(skillAuthority.registration.remote.binding) !== JSON.stringify(binding)
+      || skillAuthority.registration.root !== binding.workspaceRoot)) throw remoteRuntimeFault("The remote Skill workspace authority changed.");
+    const authority: RemoteProcessAuthority = skillAuthority === undefined
+      ? await this.#remoteExecution.processes(binding, signal)
+      : Object.freeze({ ...skillAuthority, kind: "ssh" as const, binding, pathStyle: "posix" as const });
     const processes = authority.processes;
     authority.assertCurrent();
     const targetPaths = remotePaths(authority.pathStyle);
@@ -134,6 +155,7 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
       : await probeRemoteCodexInstallation(processes, binding.workspaceRoot, authority.assertCurrent, signal);
     authority.assertCurrent();
     if (installation.state !== "ready") throw remoteRuntimeFault("The fixed remote Codex runtime is unavailable.");
+    if (skillAuthority !== undefined && skillAuthority.registration.root !== installation.workspaceRoot) throw remoteRuntimeFault("The registered remote Skill workspace is not canonical.");
     if (signal?.aborted) throw remoteRuntimeFault("The remote Codex runtime lookup was cancelled.");
     const executionDomain = executionDomainFor(authority.executionIdentity, installation.profileRoot);
     const profileKey = createHash("sha256").update(executionDomain, "utf8").digest("hex");
@@ -167,6 +189,13 @@ export class RemoteCodexRuntimeResolver implements CodexRemoteRuntimePort {
       profileKey,
       executionDomain,
       assertCurrent,
+      ...(skillAuthority === undefined ? {} : {
+        prepareNativeSkills: (seeds: Parameters<RemoteNativeSkillOwner["prepare"]>[0]["seeds"], skillSignal: AbortSignal,
+          policy?: Parameters<RemoteNativeSkillOwner["prepare"]>[0]["policy"]) => this.#nativeSkills!.prepare({
+          authority: skillAuthority, profileRoot: installation.profileRoot, seeds, signal: skillSignal,
+          ...(policy === undefined ? {} : { policy }), assertRuntimeCurrent: assertCurrent
+        })
+      }),
       ...(this.#mcpBridge === undefined ? {} : {
         openMcpBridge: async (input: CodexMcpOpenInput) => {
           assertCurrent();
@@ -428,12 +457,12 @@ class RemoteCodexWebSocketChannel implements JsonRpcRecordChannel {
     }
   }
 
-  write(record: Buffer): Promise<void> {
+  write(record: Buffer, admission?: JsonRpcRecordWriteAdmission): Promise<void> {
     if (!this.running || record.byteLength < 2 || record.at(-1) !== 0x0a
       || record.subarray(0, record.byteLength - 1).includes(0x0a)) {
       return Promise.reject(new TransportFault("protocol_violation", "The remote Codex channel received an invalid JSONL record."));
     }
-    return this.#enqueueFrame(0x1, record.subarray(0, record.byteLength - 1));
+    return this.#enqueueFrame(0x1, record.subarray(0, record.byteLength - 1), admission);
   }
 
   async close(): Promise<void> {
@@ -611,12 +640,16 @@ class RemoteCodexWebSocketChannel implements JsonRpcRecordChannel {
     this.#handlers?.onData(Buffer.from(`${text}\n`, "utf8"));
   }
 
-  #enqueueFrame(opcode: number, payload: Buffer): Promise<void> {
+  #enqueueFrame(opcode: number, payload: Buffer, admission?: JsonRpcRecordWriteAdmission): Promise<void> {
     const operation = this.#writeTail.then(async () => {
       if (!this.running) throw new TransportFault("closed", "The remote Codex channel closed before write.");
       this.#options.assertCurrent();
       const processHandle = this.#process;
       if (processHandle === undefined) throw new TransportFault("closed", "The remote Codex proxy is unavailable.");
+      if (admission?.beforeWrite !== undefined && !await admission.beforeWrite()) return;
+      if (!this.running || this.#process !== processHandle) throw new TransportFault("closed", "The remote Codex proxy changed before write.");
+      this.#options.assertCurrent();
+      if (admission?.finalBeforeWrite !== undefined && !admission.finalBeforeWrite()) return;
       await writeProcessBytes(processHandle, clientFrame(opcode, payload));
     });
     this.#writeTail = operation.catch(() => undefined);

@@ -35,7 +35,7 @@ import {
   SetSessionPermissionMutationSchema, SetSessionPlanModeMutationSchema, TargetState, capabilityNames,
   StartReviewMutationSchema, TriggerScheduleMutationSchema, UpdateScheduleMutationSchema,
   UpdateVoiceInputServiceSettingsMutationSchema, VoiceInputServiceSettingsPatchSchema,
-  FileKind, ImageRefSchema,
+  FileKind, ImageRefSchema, ResourceKind, RuntimeCommandInputMode,
   type Artifact, type BackendDescriptor, type BlobRef, type Device, type DiscoveredNodeRecord, type Event, type EventCursor, type FilePreview, type FileRevision, type Interaction,
   type Operation, type OperationMutation, type QueueControl, type QueueItem, type Schedule, type Session, type Snapshot, type Target, type TaskTagDeletePreview,
   type WorkspaceEntry, type WorkspaceSearchMatch
@@ -102,9 +102,10 @@ import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport } fr
 import type { MobilePartnerDirectoryObservation } from "./mobile-partner-activity";
 import type { MobilePartnerWorkingTransport } from "./mobile-partner-working";
 import { projectSessionWorkingStatus, workingStatusTurnKey } from "@joko/contracts";
-import { validateMobilePartnerProfileDraft, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
+import { validateMobilePartnerProfileDraft, mobilePartnerDraftCatalogIdentity, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
+import { sameMobilePartnerTaskOutputSource } from "./mobile-partner-task-outputs";
 import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
-import { MobilePartnerCreationRejected, mobilePartnerCreationBackends, validateMobilePartnerCreationDraft,
+import { MobilePartnerCreationRejected, mobilePartnerCreationBackends, mobilePartnerCreationFields, validateMobilePartnerCreationDraft,
   type MobilePartnerCreationTransport, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import type { MobilePartnerCreationReceipts } from "./mobile-partner-creation-receipts";
 import type { MobilePartnerDeletionReceipts, MobilePartnerDeletionTransport } from "./mobile-partner-deletion";
@@ -256,7 +257,8 @@ import {
   type MobileArtifactMentionCandidate,
   type MobileCatalogMentionCandidate,
   type MobileCatalogMentionCatalog,
-  type MobileCatalogMentionControls
+  type MobileCatalogMentionControls,
+  type MobileResourceMentionCandidate
 } from "./mobile-catalog-mentions";
 import {
   assertMobileSessionMentionCandidate,
@@ -317,9 +319,11 @@ import {
   type MobileContextControls
 } from "./mobile-context-controls";
 import {
+  assertMobileRuntimeCommandCandidate,
   createMobileRuntimeCommandControls,
   projectMobileRuntimeCommandCatalog,
   type MobileRuntimeCommandCatalog,
+  type MobileRuntimeCommandCandidate,
   type MobileRuntimeCommandControls
 } from "./mobile-runtime-commands";
 import {
@@ -860,6 +864,9 @@ export class MobileClient {
   #automationHistoryAbort?: AbortController;
   #automationHistoryPageTokens = new Set<string>();
   #partnerPrivateEpoch = 0;
+  #partnerTaskOutputShellCredential?: PairedCredential;
+  #partnerTaskOutputShellOccurrence = 0;
+  #partnerTaskOutputOpenFlight?: symbol;
   #partnerGroupAttachments?: import("./mobile-partner-groups").MobileGroupAttachmentTransport;
   #partnerPrivateAbort?: AbortController;
   #partnerPrivateReadAbort?: AbortController;
@@ -967,7 +974,10 @@ export class MobileClient {
         if (snapshot.ownerKey !== ownerKey) throw new Error("The Partner creation draft belongs to another owner.");
         if (await pending(signal)) throw new Error("Check the retained Partner creation result before creating again.");
         const fresh = await load(signal);
-        if (fresh.options.revision !== snapshot.options.revision) throw new Error("Refresh the Partner form before creating.");
+        const previousFields = mobilePartnerCreationFields(snapshot, draft), freshFields = mobilePartnerCreationFields(fresh, draft);
+        if (!previousFields || !freshFields || mobilePartnerDraftCatalogIdentity(freshFields) !== mobilePartnerDraftCatalogIdentity(previousFields)) {
+          throw new Error("Refresh the Partner form before creating.");
+        }
         const validated = validateMobilePartnerCreationDraft(fresh, draft);
         const frozen = { ...validated, avatar: typeof validated.avatar === "string" ? validated.avatar : { base64: validated.avatar.base64 },
           capabilities: { ...validated.capabilities, modelChain: validated.capabilities.modelChain.map((route) => ({ ...route })) } };
@@ -1035,6 +1045,25 @@ export class MobileClient {
     if (this.#state.status !== "connected" && this.#state.status !== "offline") return undefined;
     const ownerKey = this.#partnerPrivateAuthorityKey({ ...this.#state, status: "connected" });
     return ownerKey && this.#state.owner ? { ownerKey, online: this.#state.status === "connected", snapshot: this.#state.owner } : undefined;
+  }
+
+  partnerTaskOutputsShellIdentity(): string | undefined {
+    if (!["connected", "offline", "connecting"].includes(this.#state.status)) return undefined;
+    const ownerKey = this.#partnerPrivateAuthorityKey({ ...this.#state, status: "connected" });
+    const owner = this.#state.owner;
+    const credential = this.#credential;
+    const sessionId = this.#state.selectedId;
+    if (!ownerKey || !owner || !credential || !sessionId) return undefined;
+    const sessions = owner.sessions.filter(session => session.sessionId === sessionId);
+    const session = sessions.length === 1 ? sessions[0] : undefined;
+    const generation = session?.nativeBinding?.runtimeGeneration;
+    if (!session || !generation || generation < 1n) return undefined;
+    if (this.#partnerTaskOutputShellCredential !== credential) {
+      this.#partnerTaskOutputShellCredential = credential;
+      this.#partnerTaskOutputShellOccurrence++;
+    }
+    return [ownerKey, this.#partnerTaskOutputShellOccurrence, sessionId, session.backendId,
+      session.targetId, generation.toString(10)].join("\u001f");
   }
 
   partnerDirectoryTransport(): MobilePartnerDirectoryTransport | undefined {
@@ -1276,10 +1305,58 @@ export class MobileClient {
         taskModels,
         canSwitchModel: controls?.canSwitchModel === true, canSetEffort: controls?.canSetEffort === true,
         canSetFastMode: controls?.canSetFastMode === true, canSetPlanMode: controls?.canSetPlanMode === true,
-        permissionModes: (controls?.permissionModes ?? []).filter((mode) => mode === PermissionMode.ASK || mode === PermissionMode.AUTO)
-          .map((mode) => mode === PermissionMode.ASK ? "ask" as const : "auto" as const) };
+        permissionModes: (controls?.permissionModes ?? []).filter((mode) => mode === PermissionMode.ASK || mode === PermissionMode.AUTO || mode === PermissionMode.BYPASS_PERMISSIONS)
+          .map((mode) => mode === PermissionMode.ASK ? "ask" as const : mode === PermissionMode.AUTO ? "auto" as const : "bypassPermissions" as const) };
+    };
+    const listOutputs: NonNullable<MobilePartnerProfileTransport["listOutputs"]> = async (snapshot, signal) => {
+      requireCurrent(signal);
+      if (snapshot.ownerKey !== ownerKey || !this.network.listPartnerTaskOutputs) throw new Error("Partner task outputs are unavailable.");
+      const partner = await conversation.resolve(signal); requireCurrent(signal);
+      if (!partner || mobilePartnerDirectoryIdentity(partner) !== mobilePartnerDirectoryIdentity(snapshot.partner)) {
+        throw new Error("The Partner output source owner changed.");
+      }
+      const outputs = await this.network.listPartnerTaskOutputs(context.credential, partner.partnerId, signal);
+      requireCurrent(signal);
+      const confirmed = await conversation.resolve(signal); requireCurrent(signal);
+      if (outputs.partnerId !== partner.partnerId || !confirmed
+        || mobilePartnerDirectoryIdentity(confirmed) !== mobilePartnerDirectoryIdentity(partner)) {
+        throw new Error("The Partner output source owner changed.");
+      }
+      return outputs;
     };
     return { ownerKey, load,
+      ...(this.network.listPartnerTaskOutputs ? ({ listOutputs, openOutputTask: async (snapshot, row, signal) => {
+        requireCurrent(signal);
+        if (this.#partnerTaskOutputOpenFlight) throw new Error("A Partner output source is already opening.");
+        const flight = Symbol("partner-output-open"); this.#partnerTaskOutputOpenFlight = flight;
+        try {
+          const outputs = await listOutputs(snapshot, signal); requireCurrent(signal);
+          const matches = outputs.rows.filter(candidate => candidate.kind === row.kind && candidate.id === row.id);
+          const fresh = matches.length === 1 ? matches[0] : undefined;
+          if (!fresh?.sessionId || !sameMobilePartnerTaskOutputSource(fresh, row)) throw new Error("The Partner task output source changed.");
+          const currentSession = this.#selectedSession()!;
+          const observed = await this.network.readOwner(context.credential, this.deviceNameSource(), signal);
+          requireCurrent(signal); this.#assertOwner(context.credential, observed, this.#state.node!);
+          const sameSession = (left: Session, right: Session): boolean => left.sessionId === right.sessionId
+            && left.backendId === right.backendId && left.targetId === right.targetId
+            && left.nativeBinding?.runtimeGeneration === right.nativeBinding?.runtimeGeneration;
+          const current = observed.snapshot.sessions.filter(candidate => candidate.sessionId === currentSession.sessionId);
+          const destinations = observed.snapshot.sessions.filter(candidate => candidate.sessionId === fresh.sessionId);
+          const destination = destinations.length === 1 ? destinations[0] : undefined;
+          if (this.#partnerPrivateAuthorityKey({ ...this.#state, owner: observed.snapshot }) !== context.authorityKey
+            || current.length !== 1 || !sameSession(current[0]!, currentSession)
+            || !destination?.nativeBinding?.runtimeGeneration || destination.nativeBinding.runtimeGeneration < 1n) {
+            throw new Error("The Partner output source task is unavailable in the current task directory.");
+          }
+          this.#set({ owner: observed.snapshot }); requireCurrent(signal);
+          await this.select(destination.sessionId);
+          signal.throwIfAborted();
+          const selected = this.#selectedSession();
+          if (this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey
+            || this.#state.selectedId !== destination.sessionId || !selected || !sameSession(selected, destination)
+            || !this.taskPresentationOwnerKey()) throw new Error("The Partner output source owner changed while opening.");
+        } finally { if (this.#partnerTaskOutputOpenFlight === flight) this.#partnerTaskOutputOpenFlight = undefined; }
+      } } satisfies Pick<MobilePartnerProfileTransport, "listOutputs" | "openOutputTask">) : {}),
       controlTask: async (snapshot, task, action, signal) => {
         requireCurrent(signal);
         if (snapshot.ownerKey !== ownerKey || task.partnerId !== snapshot.partner.partnerId || !this.network.controlPartnerSessionTask) throw new Error("Independent task control is unavailable.");
@@ -1297,7 +1374,7 @@ export class MobileClient {
       if (snapshot.ownerKey !== ownerKey) throw new Error("The Partner profile draft belongs to another owner.");
       const fresh = await load(snapshot.partner, signal);
       if (mobilePartnerDirectoryIdentity(fresh.partner) !== mobilePartnerDirectoryIdentity(snapshot.partner)
-        || fresh.options.revision !== snapshot.options.revision) {
+        || mobilePartnerDraftCatalogIdentity(fresh) !== mobilePartnerDraftCatalogIdentity(snapshot)) {
         throw new Error("The Partner profile changed; refresh settings before saving this draft.");
       }
       const validated = validateMobilePartnerProfileDraft(fresh, draft);
@@ -9663,6 +9740,36 @@ export class MobileClient {
       throw new Error("The task runtime changed while its command catalog was loading.");
     }
     return projectMobileRuntimeCommandCatalog(refreshed, commands);
+  }
+
+  async resolveTaskRuntimeCommandResource(
+    expectedSurfaceOwnerKey: string,
+    catalog: MobileRuntimeCommandCatalog,
+    candidate: MobileRuntimeCommandCandidate,
+    signal?: AbortSignal
+  ): Promise<MobileResourceMentionCandidate> {
+    signal?.throwIfAborted();
+    const context = this.#runtimeCommandContext(expectedSurfaceOwnerKey);
+    const command = assertMobileRuntimeCommandCandidate(context.controls, catalog, candidate);
+    const controls = this.taskCatalogMentionControls();
+    if (command.inputMode !== RuntimeCommandInputMode.RESOURCE_MENTION || !command.resourceId
+      || !context.controls.resourceMentions || !controls?.policy.resources
+      || controls.authorityKey !== context.controls.authorityKey || controls.sessionId !== context.controls.sessionId
+      || controls.backendId !== context.controls.backendId || controls.targetId !== context.controls.targetId
+      || controls.runtimeGeneration !== context.controls.runtimeGeneration) {
+      throw new Error("The selected command does not have a current Resource receiver.");
+    }
+    const resources = await this.network.listSessionResources(context.credential, controls.sessionId, signal);
+    signal?.throwIfAborted();
+    const current = this.#runtimeCommandContext(expectedSurfaceOwnerKey);
+    assertMobileRuntimeCommandCandidate(current.controls, catalog, command);
+    this.#catalogMentionContext(controls.surfaceOwnerKey);
+    const projected = projectMobileResourceMentionCatalog(controls, resources);
+    const matches = projected.items.filter((resource) => resource.resourceId === command.resourceId);
+    if (matches.length !== 1 || matches[0]!.resourceKind !== ResourceKind.SKILL) {
+      throw new Error("The selected Skill is no longer loaded in this task. Refresh its command list.");
+    }
+    return matches[0]!;
   }
 
   async executeTaskAppCommand(

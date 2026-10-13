@@ -18,6 +18,42 @@ import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 import * as contract from "@joko/contracts";
 
 describe("Partner gateway", () => {
+  it("strictly roundtrips all three Partner permission values for defaults create and profile writes", async () => {
+    const requests: Array<{ method: string; input: any; signal?: AbortSignal }> = [];
+    let mode = PermissionMode.ASK;
+    const gateway = connectedGateway(partnerTransport(method => {
+      const result = partnerResponse(method);
+      if (["getPartnerDirectory", "updatePartnerDefaults"].includes(method)) return { ...result, directory: { ...directory(), defaultCapabilities: { ...capabilities(), permissionMode: mode } }, affectedPartners: [] };
+      if (["getPartner", "createPartner", "updatePartner"].includes(method)) return { ...result, partner: { ...profile(), capabilities: { ...capabilities(), permissionMode: mode } } };
+      return result;
+    }, requests));
+    await gateway.connect();
+    for (const [wire, ui] of [[PermissionMode.ASK, "ask"], [PermissionMode.AUTO, "auto"], [PermissionMode.BYPASS_PERMISSIONS, "bypassPermissions"]] as const) {
+      mode = wire;
+      const caps = { ...capabilities(), permissionMode: ui };
+      expect((await gateway.getPartnerDirectory()).defaultCapabilities?.permissionMode).toBe(ui);
+      expect((await gateway.getPartner("partner-one")).capabilities.permissionMode).toBe(ui);
+      await gateway.updatePartnerDefaults(4n, caps);
+      await gateway.createPartner(4n, { displayName: "Aster", avatar: "orbit", identitySource: "You are Aster.", templateId: "general", capabilities: caps, usesDirectoryDefaults: false }, `permission-request-${ui}`);
+      await gateway.updatePartner("partner-one", 8n, { permissionMode: ui });
+      expect(requests.filter(request => request.method === "updatePartnerDefaults").at(-1)?.input.capabilities.permissionMode).toBe(wire);
+      expect(requests.filter(request => request.method === "createPartner").at(-1)?.input.draft.capabilities.permissionMode).toBe(wire);
+      expect(requests.filter(request => request.method === "updatePartner").at(-1)?.input.patch.permissionMode).toBe(wire);
+    }
+    gateway.disconnect();
+  });
+
+  it("rejects unknown Partner permission output and trusted alias input without dispatch", async () => {
+    const requests: Array<{ method: string; input: any }> = [];
+    const gateway = connectedGateway(partnerTransport(method => method === "getPartner"
+      ? { partner: { ...profile(), capabilities: { ...capabilities(), permissionMode: 99 } } } : partnerResponse(method), requests));
+    await gateway.connect();
+    await expect(gateway.getPartner("partner-one")).rejects.toThrow("unsupported Partner permission mode");
+    await expect(gateway.updatePartner("partner-one", 8n, { permissionMode: "trusted" as never })).rejects.toThrow("permission mode is invalid");
+    expect(requests.some(request => request.method === "updatePartner")).toBe(false);
+    gateway.disconnect();
+  });
+
   it("projects and sends one typed task model preference independently of primary defaults", async () => {
     const task = { backendId: "task-backend", providerId: "task-provider", modelId: "task-model", effort: "medium", fastMode: false };
     const requests: Array<{ method: string; input: any; signal?: AbortSignal }> = [];

@@ -12,7 +12,8 @@ export function normalizeComposerInlineMentionRanges(
     if (identities.has(mention.id)) return undefined;
     identities.add(mention.id);
     if (mention.kind === "message") continue;
-    if (mention.token.length < 2 || !mention.token.startsWith("@") || /[\u0000-\u001f\u007f]/u.test(mention.token)) return undefined;
+    const resourceCommand = mention.kind === "resource" && /^\/[^\s/\u0000-\u001f\u007f]+$/u.test(mention.token);
+    if (mention.token.length < 2 || (!mention.token.startsWith("@") && !resourceCommand) || /[\u0000-\u001f\u007f]/u.test(mention.token)) return undefined;
     byId.set(mention.id, mention.token);
   }
   if (value === undefined) return byId.size === 0 ? [] : undefined;

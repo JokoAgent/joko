@@ -15,12 +15,14 @@ import {
   type AppSnapshot,
   type PartnerDelegationView,
   type PartnerDirectoryView,
+  type PartnerCapabilitiesView,
   type PartnerMutationView,
   type PartnerPrivateThreadView,
   type PartnerProfileView,
   type PartnerSessionView
 } from "../model.js";
-import { PartnersPage } from "./PartnersPage.js";
+import { PartnersPage, PartnerSettingsDialog } from "./PartnersPage.js";
+import { translate } from "../i18n.js";
 import { ListPartnerGroupsResponseSchema, type PartnerGroupApi } from "@joko/contracts";
 import type { ConnectionsDetail, PartnerConnectionsApi } from "@joko/contracts";
 
@@ -37,6 +39,86 @@ afterEach(async () => {
 });
 
 describe("PartnersPage", () => {
+  it("autosaves all three Partner permission values and requires the exact Full access risk confirmation before escalation", async () => {
+    vi.useFakeTimers();
+    const view = await mountPermissionProfile();
+    await choosePermission(view.host, "auto");
+    await act(async () => { await vi.advanceTimersByTimeAsync(700); });
+    expect(view.updatePartner).toHaveBeenLastCalledWith("partner-one", 8n, expect.objectContaining({ permissionMode: "auto" }));
+    await choosePermission(view.host, "bypassPermissions");
+    await act(async () => { await vi.advanceTimersByTimeAsync(700); });
+    expect(view.updatePartner).toHaveBeenCalledTimes(1);
+    const alert = required(document.body.querySelector<HTMLElement>("[role='alertdialog']"));
+    expect(alert.textContent).toContain("Not an OS sandbox");
+    expect(alert.textContent).toContain("read credentials");
+    expect(alert.textContent).toContain("extra directories");
+    await act(async () => { button(alert, fullAccessConfirmLabel).click(); await settle(); });
+    expect(view.updatePartner).toHaveBeenLastCalledWith("partner-one", 9n, expect.objectContaining({ permissionMode: "bypassPermissions" }));
+    expect(document.body.querySelector("[role='alertdialog']")).toBeNull();
+    await choosePermission(view.host, "ask");
+    await act(async () => { await vi.advanceTimersByTimeAsync(700); });
+    expect(view.updatePartner).toHaveBeenLastCalledWith("partner-one", 10n, expect.objectContaining({ permissionMode: "ask" }));
+  });
+
+  it("preserves a cancelled Full access draft and requires a fresh explicit retry without changing saved permission", async () => {
+    vi.useFakeTimers(); const view = await mountPermissionProfile();
+    await choosePermission(view.host, "bypassPermissions");
+    await act(async () => { await vi.advanceTimersByTimeAsync(700); });
+    await act(async () => button(required(document.body.querySelector("[role='alertdialog']")), "Cancel").click());
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+    expect(view.updatePartner).not.toHaveBeenCalled();
+    expect(permissionSelect(view.host).value).toBe("bypassPermissions");
+    expect(view.host.textContent).toContain("Full access has not been saved");
+    await act(async () => { button(view.host, "Retry").click(); await settle(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(700); });
+    await act(async () => { button(required(document.body.querySelector("[role='alertdialog']")), fullAccessConfirmLabel).click(); await settle(); });
+    expect(view.updatePartner).toHaveBeenCalledExactlyOnceWith("partner-one", 8n, expect.objectContaining({ permissionMode: "bypassPermissions" }));
+  });
+
+  it.each(["draft", "catalog", "baseline", "owner", "unmount", "pagehide"] as const)("retires a captured Full access confirmation after %s changes", async (change) => {
+    vi.useFakeTimers(); const view = await mountPermissionProfile();
+    await choosePermission(view.host, "bypassPermissions");
+    await act(async () => { await vi.advanceTimersByTimeAsync(700); });
+    const staleConfirm = button(required(document.body.querySelector("[role='alertdialog']")), fullAccessConfirmLabel);
+    if (change === "draft") {
+      const name = required(view.host.querySelector<HTMLInputElement>("input[required]"));
+      await act(async () => { setNativeValue(name, "Changed draft"); name.dispatchEvent(new Event("input", { bubbles: true })); });
+    } else if (change === "catalog") await view.render({ catalog: { ...permissionSnapshot(), models: [] } });
+    else if (change === "baseline") await view.render({ profile: partner({ usesDirectoryDefaults: false, revision: 20n }) });
+    else if (change === "owner") await view.render({ owner: "another-owner" });
+    else if (change === "unmount") await act(async () => view.root.unmount());
+    else await act(async () => window.dispatchEvent(new Event("pagehide")));
+    await act(async () => { staleConfirm.click(); await settle(); });
+    expect(view.updatePartner).not.toHaveBeenCalled();
+    expect(document.body.querySelector("[role='alertdialog']")).toBeNull();
+  });
+
+  it("confirms Full access directory defaults and inherited creation at their existing write boundaries", async () => {
+    vi.useFakeTimers();
+    const full: PartnerCapabilitiesView = { ...capabilities(), permissionMode: "bypassPermissions" };
+    const updatePartnerDefaults = vi.fn(async () => ({ directory: { ...directory(), revision: 5n, defaultCapabilities: full }, affectedPartners: [] }));
+    const createPartner = vi.fn(async () => ({ partner: partner({ id: "new-partner", capabilities: full }), directory: directory() }));
+    const view = await mount({ partners: [], controllerOverrides: { updatePartnerDefaults }, createPartner, pageSnapshot: permissionSnapshot() });
+    await act(async () => { button(view.host, "partners.defaults").click(); await settle(); });
+    const defaults = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    await choosePermission(defaults, "bypassPermissions");
+    await act(async () => { button(defaults, "common.save").click(); await settle(); });
+    expect(updatePartnerDefaults).not.toHaveBeenCalled();
+    await act(async () => button(required(document.body.querySelector("[role='alertdialog']")), "common.cancel").click());
+    expect(updatePartnerDefaults).not.toHaveBeenCalled();
+    await act(async () => button(defaults, "common.save").click());
+    await act(async () => { button(required(document.body.querySelector("[role='alertdialog']")), "common.enable permission.full").click(); await settle(); });
+    expect(updatePartnerDefaults).toHaveBeenCalledExactlyOnceWith(4n, full);
+    await act(async () => { button(view.host, "partners.invite").click(); await settle(); });
+    const invite = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    const name = required(invite.querySelector<HTMLInputElement>("input[required]"));
+    await act(async () => { setNativeValue(name, "New full Partner"); name.dispatchEvent(new Event("input", { bubbles: true })); });
+    await act(async () => { required(invite.querySelector("form")).dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); await settle(); });
+    expect(createPartner).not.toHaveBeenCalled();
+    await act(async () => { button(required(document.body.querySelector("[role='alertdialog']")), "common.enable permission.full").click(); await settle(); });
+    expect(createPartner).toHaveBeenCalledWith(5n, expect.objectContaining({ usesDirectoryDefaults: true, displayName: "New full Partner" }), expect.any(String), expect.any(AbortSignal));
+  });
+
   it("keeps ordered fallback routes while selecting a primary on another Backend in actual profile settings", async () => {
     vi.useFakeTimers();
     const pageSnapshot = snapshot(), primary = capabilities().modelChain[0]!;
@@ -750,6 +832,45 @@ describe("Partner independent task activity", () => {
     expect(control).toHaveBeenCalledTimes(2); expect(task.control).toBe("active");
   });
 });
+
+const fullAccessConfirmLabel = `${translate("en", "common.enable")} ${translate("en", "permission.full")}`;
+const permissionTranslator = (key: Parameters<typeof translate>[1], values?: Readonly<Record<string, string | number>>) => translate("en", key, values);
+
+function permissionSnapshot(): AppSnapshot {
+  const value = snapshot();
+  return { ...value, backends: value.backends.map((backend) => ({ ...backend,
+    capabilities: new Map([...backend.capabilities, ["permission.modes", { name: "permission.modes", supported: true, options: ["ask", "auto", "bypassPermissions"] }]]) })) };
+}
+
+function permissionSelect(host: ParentNode): HTMLSelectElement {
+  return required([...host.querySelectorAll<HTMLSelectElement>("select")].find(select => [...select.options].some(option => option.value === "ask")));
+}
+
+async function choosePermission(host: ParentNode, mode: PartnerCapabilitiesView["permissionMode"]): Promise<void> {
+  const select = permissionSelect(host);
+  await act(async () => { select.value = mode; select.dispatchEvent(new Event("change", { bubbles: true })); });
+}
+
+async function mountPermissionProfile() {
+  const container = document.createElement("div"); document.body.append(container);
+  const root = createRoot(container); roots.push(root);
+  let profile = partner({ usesDirectoryDefaults: false });
+  let catalog = permissionSnapshot(); let owner = "permission-owner";
+  let savedProfile = profile;
+  const updatePartner = vi.fn<AppController["updatePartner"]>(async (_id, _revision, patch) => ({
+    partner: savedProfile = { ...savedProfile, displayName: patch.displayName ?? savedProfile.displayName,
+      revision: savedProfile.revision + 1n, profileVersion: savedProfile.profileVersion + 1n,
+      capabilities: { ...savedProfile.capabilities, permissionMode: patch.permissionMode ?? savedProfile.capabilities.permissionMode } }, directory: directory() }));
+  const app = controller({ updatePartner, getPartner: vi.fn(async () => savedProfile) });
+  const render = async (next?: { readonly profile?: PartnerProfileView; readonly catalog?: AppSnapshot; readonly owner?: string }): Promise<void> => {
+    profile = next?.profile ?? profile; catalog = next?.catalog ?? catalog; owner = next?.owner ?? owner;
+    await act(async () => { root.render(<PartnerSettingsDialog partner={profile} partners={[profile]} directory={directory()} snapshot={catalog}
+      controller={app} ownerKey={owner} t={permissionTranslator} initialSection="profile" onClose={() => undefined}
+      onUpdated={() => undefined} onActivityUpdated={() => undefined} />); await settle(); });
+  };
+  await render();
+  return { host: document.body, root, updatePartner, render };
+}
 
 async function mount(overrides: {
   readonly partners: readonly PartnerProfileView[];

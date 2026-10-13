@@ -929,7 +929,7 @@ describe("Connect security and protocol audit", () => {
 
   it("returns only exact loaded resources from the generation produced by first activation", async () => {
     let generation = 1;
-    const getResources = vi.fn(async () => {
+    const getResources = vi.fn(async (_sessionId: string) => {
       generation = 2;
       return [{
         id: "prompt-one",
@@ -974,11 +974,12 @@ describe("Connect security and protocol audit", () => {
       }];
     });
     const services = createConnectServices(stubApplication({
-      connections: { authenticate: () => ({ id: "connection-session-resources", authKeyDigest: "digest", state: "active" }) },
+      connections: { authenticate: () => ({ id: "connection-session-resources", authKeyDigest: "digest", state: "active" }), fence: () => undefined },
       store: {
         getSession: () => ({ descriptor: { binding: { generation } } })
       },
-      sessionHost: { getResources }
+      sessionHost: { getSessionResourceCatalog: async (sessionId: string) => ({ resources: await getResources(sessionId),
+        runtimeGeneration: generation, assertCurrent: () => undefined }) }
     }));
 
     const response = await invoke(services.session.listSessionResources, {
@@ -996,6 +997,53 @@ describe("Connect security and protocol audit", () => {
       resourceVersion: 7n,
       runtimeGeneration: 2n
     })]);
+  });
+
+  it.each(["revoke", "replace", "cancel", "catalog"] as const)("C109 suppresses a resource directory after awaited %s retirement", async retirement => {
+    const connections = revocableConnections();
+    let owner = connections.authenticated;
+    let release!: () => void;
+    let entered = false;
+    let catalogCurrent = true;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const assertCurrent = vi.fn(() => { if (!catalogCurrent) throw new ConnectError("The task resource observation retired.", Code.Aborted); });
+    const services = createConnectServices(stubApplication({ connections: { ...connections,
+      authenticate: () => { connections.authenticate(); return owner; } }, sessionHost: { getSessionResourceCatalog: async () => {
+        entered = true; await gate; return { resources: [], runtimeGeneration: 2, assertCurrent };
+      } } }));
+    const controller = new AbortController();
+    const pending = invoke(services.session.listSessionResources, { sessionId: "catalog-session" }, context(controller.signal));
+    expect(entered).toBe(true);
+    if (retirement === "revoke") connections.revoke();
+    else if (retirement === "replace") owner = { ...owner, id: "replacement-connection" };
+    else if (retirement === "cancel") controller.abort();
+    else catalogCurrent = false;
+    const rejected = retirement === "cancel" ? expect(pending).rejects.toMatchObject({ name: "AbortError" })
+      : expect(pending).rejects.toMatchObject({ code: retirement === "catalog" ? Code.Aborted : Code.Unauthenticated });
+    release(); await rejected;
+    expect(assertCurrent).toHaveBeenCalledTimes(retirement === "catalog" ? 1 : 0);
+  });
+
+  it.each(["revoke", "replace", "cancel"] as const)("suppresses an awaited command directory after %s retirement", async retirement => {
+    const connections = revocableConnections();
+    let owner = connections.authenticated;
+    let release!: () => void;
+    let entered = false;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const services = createConnectServices(stubApplication({ connections: { ...connections,
+      authenticate: () => { connections.authenticate(); return owner; } }, sessionHost: { getCommands: async () => {
+        entered = true; await gate; return [];
+      } } }));
+    const controller = new AbortController();
+    const pending = invoke(services.session.listRuntimeCommands, { sessionId: "catalog-session" }, context(controller.signal));
+    expect(entered).toBe(true);
+    if (retirement === "revoke") connections.revoke();
+    else if (retirement === "replace") owner = { ...owner, id: "replacement-connection" };
+    else controller.abort();
+    const rejected = retirement === "cancel" ? expect(pending).rejects.toMatchObject({ name: "AbortError" })
+      : expect(pending).rejects.toMatchObject({ code: Code.Unauthenticated });
+    release(); await rejected;
+    expect(connections.fence).not.toHaveBeenCalled();
   });
 
   it("maps authenticated owner-wide visible message search without Backend branching", async () => {

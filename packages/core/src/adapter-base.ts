@@ -51,6 +51,10 @@ export abstract class CapabilityDrivenBackendAdapter implements BackendAdapter {
     return this.unsupported("model.switch");
   }
 
+  refreshModelWorkingContext(_context: AdapterContext): Promise<void> {
+    return this.unsupported("model.working_context");
+  }
+
   setEffort(_level: string, _context: AdapterContext): Promise<void> {
     return this.unsupported("model.effort");
   }

@@ -9,7 +9,7 @@ import {
   RevisionSchema,
   RunSchema,
   RunState,
-  RuntimeCommandSource,
+  RuntimeCommandSource, RuntimeCommandInputMode,
   SessionSchema,
   SessionState,
   SnapshotSchema,
@@ -127,8 +127,8 @@ describe("mobile app command authority and palette", () => {
       "help", "jump-session", "cmd", "clear", "review"
     ]);
     const merged = mergeMobileCommandPaletteCandidates(controls, [
-      { commandId: "runtime-help", name: "HELP", description: "spoof", source: RuntimeCommandSource.BACKEND },
-      { commandId: "runtime-deploy", name: "deploy", description: "Deploy", source: RuntimeCommandSource.PROMPT }
+      { commandId: "runtime-help", name: "HELP", description: "spoof", source: RuntimeCommandSource.BACKEND, inputMode: RuntimeCommandInputMode.TEXT },
+      { commandId: "runtime-deploy", name: "deploy", description: "Deploy", source: RuntimeCommandSource.PROMPT, inputMode: RuntimeCommandInputMode.TEXT }
     ]);
     expect(merged.map((candidate) => candidate.commandId)).toEqual([
       "builtin:help", "builtin:jump-session", "builtin:cmd", "builtin:clear", "builtin:review", "runtime-deploy"
@@ -138,14 +138,14 @@ describe("mobile app command authority and palette", () => {
       mobileAppCommandCandidates(controls)[2]!)).toThrow(/no longer available/u);
     const withoutShell = { ...controls, policy: { ...controls.policy, userShell: false } };
     expect(mergeMobileCommandPaletteCandidates(withoutShell, [
-      { commandId: "runtime-cmd", name: "cmd", description: "spoof", source: RuntimeCommandSource.BACKEND }
+      { commandId: "runtime-cmd", name: "cmd", description: "spoof", source: RuntimeCommandSource.BACKEND, inputMode: RuntimeCommandInputMode.TEXT }
     ]).some((candidate) => candidate.commandId === "runtime-cmd")).toBe(false);
   });
 
   it("filters the merged catalog with stable order and a bounded visible result count", () => {
     const controls = createMobileAppCommandControls("authority", snapshot(), snapshot(), "session")!;
     const candidates = mergeMobileCommandPaletteCandidates(controls, [
-      { commandId: "release", name: "release", description: "Review a release", source: RuntimeCommandSource.PROMPT }
+      { commandId: "release", name: "release", description: "Review a release", source: RuntimeCommandSource.PROMPT, inputMode: RuntimeCommandInputMode.TEXT }
     ]);
     expect(filterMobileCommandPaletteCandidates(candidates, "re").items.map((candidate) => candidate.name)).toEqual([
       "review", "release"

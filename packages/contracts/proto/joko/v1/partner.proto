@@ -508,6 +508,53 @@ message ListPartnerSessionsResponse {
   repeated PartnerSessionTask tasks = 2;
 }
 
+enum PartnerTaskOutputSourceKind {
+  PARTNER_TASK_OUTPUT_SOURCE_KIND_UNSPECIFIED = 0;
+  PARTNER_TASK_OUTPUT_SOURCE_KIND_SESSION_TASK = 1;
+  PARTNER_TASK_OUTPUT_SOURCE_KIND_DELEGATION = 2;
+}
+
+enum PartnerTaskOutputReadiness {
+  PARTNER_TASK_OUTPUT_READINESS_UNSPECIFIED = 0;
+  PARTNER_TASK_OUTPUT_READINESS_PENDING = 1;
+  PARTNER_TASK_OUTPUT_READINESS_READY = 2;
+  PARTNER_TASK_OUTPUT_READINESS_UNAVAILABLE = 3;
+}
+
+enum PartnerTaskOutputFileStatus {
+  PARTNER_TASK_OUTPUT_FILE_STATUS_UNSPECIFIED = 0;
+  PARTNER_TASK_OUTPUT_FILE_STATUS_ADDED = 1;
+  PARTNER_TASK_OUTPUT_FILE_STATUS_MODIFIED = 2;
+  PARTNER_TASK_OUTPUT_FILE_STATUS_RENAMED = 3;
+}
+
+message PartnerTaskOutputFile {
+  string path = 1;
+  PartnerTaskOutputFileStatus status = 2;
+}
+
+// Display metadata from the source execution's sealed accepted Runs, never file contents.
+message PartnerTaskOutput {
+  PartnerTaskOutputSourceKind source_kind = 1;
+  string source_id = 2;
+  string parent_session_id = 3;
+  string session_id = 4;
+  uint64 execution = 5;
+  repeated string run_ids = 6;
+  Revision source_revision = 7;
+  string title = 8;
+  PartnerTaskOutputReadiness readiness = 9;
+  repeated PartnerTaskOutputFile files = 10;
+  bool truncated = 11;
+}
+
+message ListPartnerTaskOutputsRequest { string partner_id = 1; }
+message ListPartnerTaskOutputsResponse {
+  string partner_id = 1;
+  repeated PartnerTaskOutput outputs = 2;
+  bool truncated = 3;
+}
+
 enum PartnerSessionTaskStatus {
   PARTNER_SESSION_TASK_STATUS_UNSPECIFIED = 0;
   PARTNER_SESSION_TASK_STATUS_PREPARING = 1;

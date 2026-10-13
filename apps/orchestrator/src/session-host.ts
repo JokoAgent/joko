@@ -212,6 +212,15 @@ interface ActiveBackendSideEffectLease {
   readonly release: () => void;
 }
 
+function samePartnerPolicyBinding(left: NativeSessionBinding, right: NativeSessionBinding): boolean {
+  return left.nativeSessionId === right.nativeSessionId && left.generation === right.generation && left.opaqueRef === right.opaqueRef;
+}
+
+export interface PartnerSessionPolicyObservation {
+  readonly identity: string;
+  readonly status: "pending" | "ready" | "error";
+}
+
 interface ActiveResourceCatalog {
   readonly active: ActiveSession;
   readonly productGeneration: number;
@@ -845,6 +854,12 @@ export class SessionHost {
   readonly #nativeBindingLocks = new Map<string, Promise<void>>();
   readonly #nativeCatalogAdoptionFlights = new Set<string>();
   readonly #turnOverrideLeases = new Map<string, TurnOverrideLease>();
+  readonly #workingContextTurns = new Map<string, {
+    readonly generation: number;
+    readonly backendInstanceGeneration: number;
+    readonly runIds: Set<string>;
+    readonly budgets: ReadonlyMap<string, number | undefined>;
+  }>();
   readonly #sessionRuntimeControl = new SessionRuntimeControlRegistry();
   readonly #sessionRuntimeControlTails = new Map<string, Promise<void>>();
   readonly #sessionRuntimeControlEffects = new Set<string>();
@@ -894,11 +909,17 @@ export class SessionHost {
   readonly #partnerSessionRetiring: (sessionId: string) => boolean;
   readonly #partnerSessionRestarting: (sessionId: string) => boolean;
   readonly #partnerSessionPaused: (sessionId: string) => boolean;
+  readonly #partnerSessionPolicy: (sessionId: string) => PartnerSessionPolicyObservation | undefined;
+  readonly #partnerPolicyRetirements = new Map<string, {
+    readonly active: ActiveSession; readonly stored: StoredSession; readonly assertOwner: () => void;
+  }>();
   readonly #partnerPauseFlights = new Map<string, Promise<void>>();
   readonly #partnerTargetRetired: (targetId: string) => boolean;
   readonly #resolveServiceRuntimePrompt: ((session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>) | undefined;
   readonly #serviceRuntimePrompts = new Map<string, { readonly baseDigest: string; readonly text: string }>();
   readonly #resolveServiceRuntimeConfiguration: ((session: SessionDescriptor) => string | undefined) | undefined;
+  readonly #prepareManagedProviderRuntime: ((context: AdapterContext) => Promise<void>) | undefined;
+  readonly #resolveModelWorkingContext: ((target: { readonly backendId: string; readonly providerId: string; readonly modelId: string }) => number | undefined) | undefined;
   readonly #serviceRuntimeConfigurations = new Map<string, string>();
   readonly #serviceSessionRuntimeFallback: (input: {
     readonly sessionId: string;
@@ -969,11 +990,15 @@ export class SessionHost {
       readonly partnerSessionRetiring?: (sessionId: string) => boolean;
       readonly partnerSessionRestarting?: (sessionId: string) => boolean;
       readonly partnerSessionPaused?: (sessionId: string) => boolean;
+      readonly partnerSessionPolicy?: (sessionId: string) => PartnerSessionPolicyObservation | undefined;
       readonly partnerTargetRetired?: (targetId: string) => boolean;
       /** Private service identity resolved at native activation, never supplied through RPC or persisted in Session data. */
       readonly resolveServiceRuntimePrompt?: (session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>;
       /** Native resource selections are private identity, never natural-language prompt declarations. */
       readonly resolveServiceRuntimeConfiguration?: (session: SessionDescriptor) => string | undefined;
+      /** Node-owned local inference readiness, after durable Queue admission and before sending. */
+      readonly prepareManagedProviderRuntime?: (context: AdapterContext) => Promise<void>;
+      readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string }) => number | undefined;
       /** Service-owned fallback order, independent of the ordinary task preference. */
       readonly serviceSessionRuntimeFallback?: (input: {
         readonly sessionId: string;
@@ -1044,9 +1069,12 @@ export class SessionHost {
     this.#partnerSessionRetiring = options.partnerSessionRetiring ?? (() => false);
     this.#partnerSessionRestarting = options.partnerSessionRestarting ?? (() => false);
     this.#partnerSessionPaused = options.partnerSessionPaused ?? (() => false);
+    this.#partnerSessionPolicy = options.partnerSessionPolicy ?? (() => undefined);
     this.#partnerTargetRetired = options.partnerTargetRetired ?? (() => false);
     this.#resolveServiceRuntimePrompt = options.resolveServiceRuntimePrompt;
     this.#resolveServiceRuntimeConfiguration = options.resolveServiceRuntimeConfiguration;
+    this.#prepareManagedProviderRuntime = options.prepareManagedProviderRuntime;
+    this.#resolveModelWorkingContext = options.resolveModelWorkingContext;
     this.#serviceSessionRuntimeFallback = options.serviceSessionRuntimeFallback ?? (() => ({ owned: false }));
     this.#backendEnabled = options.backendEnabled ?? (() => true);
     this.#providerRoutingEnabled = options.providerRoutingEnabled ?? (() => true);
@@ -3670,6 +3698,56 @@ export class SessionHost {
     return task;
   }
 
+  /** Retires only the original native owner after an unconfirmed policy edit. */
+  async retirePartnerPolicyRuntime(sessionId: string, expectedBinding: NativeSessionBinding, assertOwner: () => void): Promise<void> {
+    this.#assertOpen(); assertOwner();
+    const stored = this.#store.getSession(sessionId);
+    if (!samePartnerPolicyBinding(stored.descriptor.binding, expectedBinding)) throw new StoreError("The permission cleanup binding changed.");
+    const existing = this.#partnerPolicyRetirements.get(sessionId);
+    if (existing !== undefined) {
+      if (!samePartnerPolicyBinding(existing.stored.descriptor.binding, expectedBinding)) throw new StoreError("The original permission cleanup is still pending.");
+    } else {
+      const active = this.#active.get(sessionId);
+      if (active === undefined) return;
+      this.#partnerPolicyRetirements.set(sessionId, { active, stored, assertOwner });
+    }
+    await this.retryPartnerPolicyRetirement(sessionId);
+  }
+
+  async retryPartnerPolicyRetirement(sessionId: string): Promise<void> {
+    this.#assertOpen();
+    const held = this.#partnerPolicyRetirements.get(sessionId);
+    if (held === undefined) return;
+    const assertCurrent = (): void => {
+      this.#assertOpen(); held.assertOwner();
+      const current = this.#store.getSession(sessionId);
+      if (this.#active.get(sessionId) !== held.active || this.#adapters.get(current.descriptor.backendId) !== held.active.adapter
+        || this.#adapterGenerations.get(current.descriptor.backendId) !== held.active.backendInstanceGeneration
+        || !samePartnerPolicyBinding(current.descriptor.binding, held.stored.descriptor.binding)) {
+        throw new StoreError("The original permission cleanup owner changed.");
+      }
+    };
+    assertCurrent();
+    this.clearRunSilenceWatchdog(sessionId);
+    const release = this.registerBackendSideEffectFlight(held.stored.descriptor.backendId, sessionId);
+    try {
+      await held.active.adapter.closeSession(held.stored.descriptor.binding, this.contextFor(held.stored));
+      assertCurrent();
+      this.deleteActiveSession(sessionId, held.active);
+      this.#partnerPolicyRetirements.delete(sessionId);
+      this.#nativeCompactions.delete(sessionId); this.clearTurnOverrideLeases(sessionId); this.#releaseSessionTools(sessionId);
+      this.failBackgroundTasksForRuntimeLoss(held.stored, held.stored.descriptor.binding.generation);
+    } finally { release(); }
+  }
+
+  private assertPartnerPolicyReady(sessionId: string, expected?: PartnerSessionPolicyObservation): void {
+    const current = this.#partnerSessionPolicy(sessionId);
+    if (this.#partnerPolicyRetirements.has(sessionId) || current?.status !== undefined && current.status !== "ready"
+      || expected !== undefined && current?.identity !== expected.identity) {
+      throw new StoreError("The Partner permission policy is not ready or changed before dispatch.");
+    }
+  }
+
   isPartnerSessionRetiring(sessionId: string): boolean {
     return this.#partnerSessionRetiring(sessionId);
   }
@@ -4018,6 +4096,39 @@ export class SessionHost {
       }
     }
     return applied;
+  }
+
+  /** Confirm changed budgets only on exact, idle, already attached runtimes. */
+  async refreshModelWorkingContexts(
+    targets: readonly { readonly backendId: string; readonly providerId: string; readonly modelId: string }[],
+    assertCurrent: () => void,
+    signal?: AbortSignal
+  ): Promise<void> {
+    this.#assertOpen(); assertCurrent();
+    const check = (): void => { signal?.throwIfAborted(); this.#assertOpen(); assertCurrent(); };
+    for (const sessionId of [...this.#active.keys()]) {
+      await this.#withSessionRuntimeControlLock(sessionId, async () => {
+        check();
+        const active = this.#active.get(sessionId);
+        if (!active || this.#sessionRuntimeMutationMustDefer(sessionId) || this.#activating.has(sessionId)
+          || this.#sessionResetLocks.has(sessionId) || this.#runtimeRestartFences.has(sessionId)
+          || this.#sessionLifecycleFences.has(sessionId) || this.#reaping.has(sessionId) || this.isReviewReadOnlySession(sessionId)) return;
+        const stored = this.#store.getSession(sessionId);
+        const session = stored.descriptor;
+        if (session.archived || session.deletedAt !== undefined || this.#runtimeHandoffs.read(sessionId)?.pending !== undefined
+          || this.#sessionRuntimeControl.snapshot(sessionId, sessionRuntimeBaseline(session)).pending !== undefined
+          || this.#store.findPendingSessionLifecycleCleanup(sessionId) !== undefined
+          || this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) return;
+        if (!targets.some(target => target.backendId === session.backendId && target.providerId === session.providerId && target.modelId === session.modelId)) return;
+        if (!active.adapter.refreshModelWorkingContext || this.#store.getBackend(session.backendId).descriptor.capabilities.get("model.working_context")?.supported !== true) return;
+        const lease = this.beginActiveBackendSideEffect(sessionId, active);
+        try {
+          check(); await active.adapter.refreshModelWorkingContext(lease.context);
+          this.assertActiveBackendSideEffectLease(lease); check();
+        } finally { lease.release(); }
+      });
+    }
+    check();
   }
 
   /**
@@ -5966,6 +6077,7 @@ export class SessionHost {
   }
 
   assertInputCapabilities(sessionId: string, prompt: PromptInput): void {
+    this.assertPartnerPolicyReady(sessionId);
     const stored = this.#store.getSession(sessionId);
     const capabilities = this.#store.getBackend(stored.descriptor.backendId).descriptor.capabilities;
     const required = new Set<string>();
@@ -6400,6 +6512,16 @@ export class SessionHost {
     active: ActiveSession,
     stored: StoredSession
   ): Promise<AdapterContext> {
+    if (this.#resolveModelWorkingContext !== undefined) {
+      const existing = this.#workingContextTurns.get(stored.descriptor.id);
+      const continuation = item.disposition !== "prompt" || item.body.automaticContinuation !== undefined;
+      if (!continuation || existing === undefined || existing.generation !== stored.descriptor.binding.generation
+        || existing.backendInstanceGeneration !== active.backendInstanceGeneration) {
+        this.#workingContextTurns.set(stored.descriptor.id, { generation: stored.descriptor.binding.generation,
+          backendInstanceGeneration: active.backendInstanceGeneration, runIds: new Set([item.runId]),
+          budgets: this.captureModelWorkingContexts(stored.descriptor.backendId) });
+      } else existing.runIds.add(item.runId);
+    }
     const overrides = item.executionOverrides;
     const baseContext = this.contextFor(
       stored,
@@ -6585,6 +6707,7 @@ export class SessionHost {
   }
 
   private clearTurnOverrideLeases(sessionId: string): void {
+    this.#workingContextTurns.delete(sessionId);
     for (const [runId, lease] of this.#turnOverrideLeases) {
       if (lease.sessionId === sessionId) this.#turnOverrideLeases.delete(runId);
     }
@@ -7573,6 +7696,7 @@ export class SessionHost {
     try {
       const commands = await this.refreshRuntimeCommands(sessionId, active);
       this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
+      this.assertActiveBackendSideEffectLease(lease);
       return commands;
     } finally {
       lease.release();
@@ -7648,6 +7772,42 @@ export class SessionHost {
     } finally {
       lease.release();
     }
+  }
+
+  /** Service-private observation proof; activation may legitimately advance the binding. */
+  async getSessionResourceCatalog(sessionId: string, providerAuthenticationRouteId?: string): Promise<{
+    readonly resources: readonly RuntimeResource[];
+    readonly runtimeGeneration: number;
+    readonly assertCurrent: () => void;
+  }> {
+    const review = this.isReviewReadOnlySession(sessionId);
+    const resources = await this.getResources(sessionId, providerAuthenticationRouteId);
+    const stored = this.#store.getSession(sessionId);
+    const generation = stored.descriptor.binding.generation;
+    const backendId = stored.descriptor.backendId;
+    const backendGeneration = this.#store.getBackend(backendId).descriptor.instanceGeneration;
+    const catalog = this.#activeResourceCatalogs.get(sessionId);
+    const assertCurrent = () => {
+      this.#assertOpen();
+      const current = this.#store.getSession(sessionId).descriptor;
+      if (current.backendId !== backendId || current.binding.generation !== generation
+        || this.#store.getBackend(backendId).descriptor.instanceGeneration !== backendGeneration
+        || this.isReviewReadOnlySession(sessionId) !== review) {
+        throw inputCapabilityError("INPUT_RESOURCE_CATALOG_STALE", "The task resource catalog observation has retired.");
+      }
+      this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId), providerAuthenticationRouteId);
+      if (review) return;
+      if (catalog === undefined || catalog.resources !== resources
+        || this.#activeResourceCatalogs.get(sessionId) !== catalog
+        || !this.activeResourceCatalogIsCurrent(catalog.active)
+        || catalog.productGeneration !== generation
+        || catalog.backendInstanceGeneration !== backendGeneration) {
+        throw inputCapabilityError("INPUT_RESOURCE_CATALOG_STALE", "The task resource catalog observation has retired.");
+      }
+      this.assertActiveBackendSideEffectOwner(sessionId, catalog.active, generation, false);
+    };
+    assertCurrent();
+    return { resources: Object.freeze(resources.map(resource => Object.freeze({ ...resource }))), runtimeGeneration: generation, assertCurrent };
   }
 
   /**
@@ -8026,6 +8186,9 @@ export class SessionHost {
     allowance: BackendSideEffectAdmissionAllowance = {}
   ): StoredSession {
     this.#assertOpen();
+    if (this.#partnerPolicyRetirements.has(sessionId) || this.#partnerSessionPolicy(sessionId)?.status === "error") {
+      throw new StoreError("The Partner permission runtime requires confirmed recovery.");
+    }
     const stored = this.#store.getSession(sessionId);
     if (requireAdmissionOpen) {
       if (allowance.backendReplacement !== true) {
@@ -9399,6 +9562,7 @@ export class SessionHost {
     for (const preparation of this.#dispatchPreparations.values()) preparation.resolve();
     this.#dispatchPreparations.clear();
     this.#turnOverrideLeases.clear();
+    this.#workingContextTurns.clear();
     await Promise.allSettled([...this.#sessionRuntimeControlTails.values()]);
     this.#sessionRuntimeControlTails.clear();
     this.#sessionRuntimeControlEffects.clear();
@@ -11174,6 +11338,9 @@ export class SessionHost {
     providerAuthenticationRouteId?: string
   ): Promise<ActiveSession> {
     this.#assertOpen();
+    if (this.#partnerPolicyRetirements.has(sessionId) || this.#partnerSessionPolicy(sessionId)?.status === "error") {
+      throw new StoreError("The Partner permission runtime requires confirmed recovery.");
+    }
     const pendingHandoff = this.#runtimeHandoffs.read(sessionId)?.pending;
     if (pendingHandoff !== undefined && pendingHandoff.phase !== "pending") {
       throw new StoreError("The task's native handoff must be resolved before activating its runtime.");
@@ -12409,6 +12576,8 @@ export class SessionHost {
           // re-observe the complete catalog after activation so both loaded
           // exposure and typed mentions bind to the exact runtime generation.
           // Review runtimes deliberately have no Resource surface.
+          const partnerPolicy = this.#partnerSessionPolicy(sessionId);
+          this.assertPartnerPolicyReady(sessionId, partnerPolicy);
           const resourceCapability = this.#store.getBackend(
             this.#store.getSession(sessionId).descriptor.backendId
           ).descriptor.capabilities.get("runtime.resources");
@@ -12464,15 +12633,40 @@ export class SessionHost {
           const artifactReferenceSnapshots = this.artifactReferencesForDispatch(sessionId, item.body);
           this.assertQueueProviderAuthentication(item, stored);
           const baseContext = await this.beginTurnOverrideLease(item, active, stored);
-          const context: AdapterContext = artifactReferenceSnapshots.length === 0
+          const referenceContext: AdapterContext = artifactReferenceSnapshots.length === 0
             ? baseContext
             : { ...baseContext, artifactReferenceSnapshots };
+          const admittedResources = item.body.mentions.filter((mention): mention is Extract<PromptInput["mentions"][number], { readonly kind: "resource" }> => mention.kind === "resource")
+            .map(mention => Object.freeze({ ...mention }));
+          const sameResourceMention = (left: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>,
+            right: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>) => left.kind === right.kind
+            && left.reference === right.reference && left.label === right.label && left.discoveredRevision === right.discoveredRevision
+            && left.resourceVersion === right.resourceVersion && left.runtimeGeneration === right.runtimeGeneration;
+          const context: AdapterContext = admittedResources.length === 0 ? referenceContext : {
+            ...referenceContext,
+            assertResourceMentionCurrent: mention => {
+              if (!admittedResources.some(original => sameResourceMention(original, mention))) {
+                throw inputCapabilityError("INPUT_RESOURCE_IDENTITY_INVALID", "The resource was not part of this durable input admission.");
+              }
+              this.assertDispatchAdmissionOwner(item, attemptId, active, stored.descriptor.binding.generation, partnerPolicy);
+              this.assertQueueProviderAuthentication(item, stored);
+              const current = this.#store.getQueueItem(item.id);
+              if (!current.body.mentions.some(value => value.kind === "resource" && sameResourceMention(value, mention))) {
+                throw inputCapabilityError("INPUT_RESOURCE_CATALOG_STALE", "The durable input no longer owns this resource reference.");
+              }
+            }
+          };
+          const runtimeContext = item.executionOverrides?.providerId !== undefined && item.executionOverrides.modelId !== undefined
+            ? { ...context, modelSelection: { providerId: item.executionOverrides.providerId, modelId: item.executionOverrides.modelId } }
+            : context;
+          await this.#prepareManagedProviderRuntime?.(runtimeContext);
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           this.assertDispatchAdmissionOwner(
             item,
             attemptId,
             active,
-            stored.descriptor.binding.generation
+            stored.descriptor.binding.generation,
+            partnerPolicy
           );
           this.assertQueueProviderAuthentication(item, stored);
           let dispatchBody = this.resolveSessionReferencesForDispatch(sessionId, item.body);
@@ -12493,7 +12687,8 @@ export class SessionHost {
                 item,
                 attemptId,
                 active,
-                stored.descriptor.binding.generation
+                stored.descriptor.binding.generation,
+                partnerPolicy
               );
               this.assertQueueProviderAuthentication(item, stored);
               return this.persistNativeDispatchRecoveryBaseline(
@@ -12701,6 +12896,16 @@ export class SessionHost {
     };
   }
 
+  private captureModelWorkingContexts(backendId: string): ReadonlyMap<string, number | undefined> {
+    const budgets = new Map<string, number | undefined>();
+    if (this.#resolveModelWorkingContext !== undefined) {
+      for (const model of this.#store.getBackend(backendId).descriptor.models) {
+        budgets.set(JSON.stringify([model.providerId, model.modelId]), this.#resolveModelWorkingContext({ backendId, providerId: model.providerId, modelId: model.modelId }));
+      }
+    }
+    return budgets;
+  }
+
   private contextFor(
     stored: StoredSession,
     runId?: string,
@@ -12780,11 +12985,24 @@ export class SessionHost {
       backend.instanceGeneration;
     const extraDirectoriesSupported = backend.capabilities.get("workspace.extra_dirs")?.supported === true;
     const originalArtifactAuthority = artifactWorkspaceAuthority(this.#store.getTarget(target.id).descriptor, target, worktree);
+    const turnBudget = this.#workingContextTurns.get(sessionId);
+    const workingBudgets = turnBudget !== undefined && turnBudget.generation === generation
+      && turnBudget.backendInstanceGeneration === backendInstanceGeneration
+      && (runId !== undefined && turnBudget.runIds.has(runId)
+        || this.#sessionRuntimeMutationMustDefer(sessionId))
+      ? turnBudget.budgets : this.captureModelWorkingContexts(target.backendId);
     return {
       sessionId,
       generation,
       backendInstanceGeneration,
       target,
+      ...(this.#resolveModelWorkingContext === undefined ? {} : {
+        resolveModelWorkingContext: (selection: { readonly providerId: string; readonly modelId: string }): number | undefined => {
+          if (this.#disposed || this.#store.getBackend(target.backendId).descriptor.instanceGeneration !== backendInstanceGeneration) throw staleBackendInstanceContextError();
+          const key = JSON.stringify([selection.providerId, selection.modelId]);
+          return workingBudgets.get(key);
+        }
+      }),
       policySnapshot: policySnapshotFor(this.#store, target),
       ...(runtimePolicy === undefined ? {} : { runtimePolicy }),
       ...(runtimePolicy === "review_read_only" || appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
@@ -14502,8 +14720,10 @@ export class SessionHost {
     admitted: QueueItemRecord,
     attemptId: string | undefined,
     active: ActiveSession,
-    productGeneration: number
+    productGeneration: number,
+    partnerPolicy?: PartnerSessionPolicyObservation
   ): void {
+    this.assertPartnerPolicyReady(admitted.sessionId, partnerPolicy);
     const current = this.#store.getQueueItem(admitted.id);
     const session = this.#store.getSession(admitted.sessionId);
     const attempt = attemptId === undefined ? undefined : this.#store.getAttempt(attemptId);

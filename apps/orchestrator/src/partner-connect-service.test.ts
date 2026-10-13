@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { mkdir, readFile, readdir, lstat, writeFile } from "node:fs/promises";
 
 import { create } from "@bufbuild/protobuf";
-import { Code, ConnectError, type HandlerContext } from "@connectrpc/connect";
+import { createClient, Code, ConnectError, type HandlerContext } from "@connectrpc/connect";
+import { createConnectTransport } from "@connectrpc/connect-node";
 import * as contract from "@joko/contracts";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { OperationalStore, PartnerStore } from "@joko/store";
@@ -33,7 +34,14 @@ import { PiResourceManager } from "./resource-manager.js";
 import { PartnerSkillsManager, PartnerSkillsToolProvider } from "./partner-skills.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { renderSkillFile } from "./skill-file.js";
-import { snapshotNativeSkills, type AdapterContext } from "@joko/core";
+import { snapshotNativeSkills, type AdapterContext, type PromptInput } from "@joko/core";
+import { PartnerTaskOutputProjection, PartnerTaskOutputChangedError, type PartnerTaskOutputRow } from "./partner-task-outputs.js";
+import { DurableWorkspaceRunCapture } from "./workspace-run-capture.js";
+import { WorkspaceChangeSetService } from "./workspace-change-set.js";
+import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-snapshots.js";
+import { ConnectionManager } from "./connection-manager.js";
+import { createPublicServer } from "./server.js";
+import type { OrchestratorApplication } from "./application.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 const PROFILE = {
@@ -52,6 +60,149 @@ afterEach(async () => {
 });
 
 describe("PartnerService", () => {
+  it("round-trips the three exact permission modes through defaults, create and profile updates", async () => {
+    const f = await createFixture(), service = createPartnerConnectService(f.manager, () => undefined);
+    const defaults = await service.updatePartnerDefaults(create(contract.UpdatePartnerDefaultsRequestSchema, {
+      expectedDirectoryRevision: revision(f.partnerStore.directoryState().revision),
+      capabilities: create(contract.PartnerCapabilitiesSchema, { ...protoCapabilities(), permissionMode: contract.PermissionMode.BYPASS_PERMISSIONS })
+    }), context());
+    expect(defaults.directory?.defaultCapabilities?.permissionMode).toBe(contract.PermissionMode.BYPASS_PERMISSIONS);
+    const created = await service.createPartner(create(contract.CreatePartnerRequestSchema, {
+      requestId: "full-permission-create", expectedDirectoryRevision: defaults.directory!.revision,
+      draft: { displayName: "Full permission owner", avatar: { value: { case: "presetId", value: "orbit" } }, identitySource: "Owned permission profile",
+        templateId: "general", usesDirectoryDefaults: true }
+    }), context());
+    let row = created.partner!;
+    expect(row.capabilities?.permissionMode).toBe(contract.PermissionMode.BYPASS_PERMISSIONS);
+    for (const permissionMode of [contract.PermissionMode.ASK, contract.PermissionMode.AUTO, contract.PermissionMode.BYPASS_PERMISSIONS]) {
+      const result = await service.updatePartner(create(contract.UpdatePartnerRequestSchema, { partnerId: row.partnerId, expectedRevision: row.revision,
+        patch: { usesDirectoryDefaults: false, permissionMode } }), context());
+      row = result.partner!; expect(row.capabilities?.permissionMode).toBe(permissionMode);
+    }
+    await expect(service.updatePartner(create(contract.UpdatePartnerRequestSchema, { partnerId: row.partnerId, expectedRevision: created.partner!.revision,
+      patch: { permissionMode: contract.PermissionMode.ASK } }), context())).rejects.toMatchObject({ code: Code.Aborted });
+    for (const permissionMode of [contract.PermissionMode.UNSPECIFIED, 999 as contract.PermissionMode]) {
+      await expect(service.updatePartner(create(contract.UpdatePartnerRequestSchema, { partnerId: row.partnerId, expectedRevision: row.revision,
+        patch: { permissionMode } }), context())).rejects.toMatchObject({ code: Code.InvalidArgument });
+    }
+  });
+
+  it.each(["abort", "revoke"] as const)("rejects a privileged profile mutation after actual serialization waits and late %s", async retirement => {
+    const f = await createFixture(); const profile = await f.manager.createPartner(partnerInput(f.partnerStore, "Awaiting permission owner"));
+    let release!: () => void, entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const blocker = f.manager.runOwnedManagement(profile.id, profile.revision, async () => {
+      entered(); await new Promise<void>(resolve => { release = resolve; });
+    });
+    await started;
+    let revoked = false;
+    const authorize = () => { if (revoked) throw new ConnectError("The connection was revoked.", Code.Unauthenticated); };
+    const controller = new AbortController();
+    const service = createPartnerConnectService(f.manager, authorize);
+    const pending = service.updatePartner(create(contract.UpdatePartnerRequestSchema, { partnerId: profile.id,
+      expectedRevision: revision(profile.revision), patch: { permissionMode: contract.PermissionMode.BYPASS_PERMISSIONS } }),
+      { ...context(), signal: controller.signal });
+    if (retirement === "abort") controller.abort(); else revoked = true;
+    release(); await blocker;
+    await expect(pending).rejects.toMatchObject({ code: retirement === "revoke" ? Code.Unauthenticated : Code.Canceled });
+    expect(f.manager.getPartner(profile.id)).toEqual(profile);
+    expect(f.operationalStore.getSession(profile.canonicalSessionId!).descriptor.permissionMode).toBe("ask");
+  });
+
+  it.each(["abort", "revoke"] as const)("rejects a Full access create after its asynchronous avatar validation and late %s", async retirement => {
+    const f = await createFixture(); let revoked = false;
+    const service = createPartnerConnectService(f.manager, () => {
+      if (revoked) throw new ConnectError("The connection was revoked.", Code.Unauthenticated);
+    });
+    const controller = new AbortController();
+    const pending = service.createPartner(create(contract.CreatePartnerRequestSchema, { requestId: "retired-permission-create",
+      expectedDirectoryRevision: revision(f.partnerStore.directoryState().revision), draft: {
+        displayName: "Not committed", avatar: { value: { case: "presetId", value: "orbit" } }, identitySource: "No effect", templateId: "general",
+        capabilities: { ...protoCapabilities(), permissionMode: contract.PermissionMode.BYPASS_PERMISSIONS }
+      } }), { ...context(), signal: controller.signal });
+    if (retirement === "abort") controller.abort(); else revoked = true;
+    await expect(pending).rejects.toMatchObject({ code: retirement === "revoke" ? Code.Unauthenticated : Code.Canceled });
+    expect(f.partnerStore.listPartners()).toEqual([]); expect(f.partnerStore.directoryState().revision).toBe(1n);
+  });
+
+  it("maps bounded task output metadata and authenticates again after the asynchronous projection", async () => {
+    const row: PartnerTaskOutputRow = { kind: "task", id: "task-output", partnerId: "requester", parentSessionId: "parent",
+      sessionId: "source", title: "Deliverables", execution: 2, revision: 7n, runIds: ["run-a", "run-b"],
+      readiness: "ready", files: [{ path: "reports/result.txt", status: "added" }], truncated: true };
+    const outputs = { list: vi.fn(async () => Array.from({ length: 201 }, (_, index) => ({ ...row, id: `task-${index}` }))) };
+    const authenticate = vi.fn();
+    const service = createPartnerConnectService(undefined, authenticate, undefined, undefined, undefined, undefined, undefined, undefined,
+      outputs as unknown as PartnerTaskOutputProjection);
+    const response = await service.listPartnerTaskOutputs(create(contract.ListPartnerTaskOutputsRequestSchema, { partnerId: row.partnerId }), context());
+    expect(outputs.list).toHaveBeenCalledWith(row.partnerId); expect(authenticate).toHaveBeenCalledTimes(2);
+    expect(response.outputs).toHaveLength(200); expect(response.truncated).toBe(true);
+    expect(response.outputs?.[0]).toMatchObject({ sourceKind: contract.PartnerTaskOutputSourceKind.SESSION_TASK, sourceId: "task-0",
+      parentSessionId: "parent", sessionId: "source", execution: 2n, runIds: ["run-a", "run-b"], sourceRevision: { value: 7n },
+      readiness: contract.PartnerTaskOutputReadiness.READY, files: [{ path: "reports/result.txt", status: contract.PartnerTaskOutputFileStatus.ADDED }], truncated: true });
+    const drift = createPartnerConnectService(undefined, authenticate, undefined, undefined, undefined, undefined, undefined, undefined,
+      { list: async () => { throw new PartnerTaskOutputChangedError(); } } as unknown as PartnerTaskOutputProjection);
+    await expect(drift.listPartnerTaskOutputs(create(contract.ListPartnerTaskOutputsRequestSchema, { partnerId: row.partnerId }), context()))
+      .rejects.toMatchObject({ code: Code.Aborted });
+    await expect(createPartnerConnectService(undefined, authenticate).listPartnerTaskOutputs(create(contract.ListPartnerTaskOutputsRequestSchema,
+      { partnerId: row.partnerId }), context())).rejects.toMatchObject({ code: Code.Unimplemented });
+  });
+
+  it.each(["abort", "revoke"] as const)("does not publish task output metadata after a late %s", async retirement => {
+    let release!: (value: readonly PartnerTaskOutputRow[]) => void;
+    const list = vi.fn(() => new Promise<readonly PartnerTaskOutputRow[]>(resolve => { release = resolve; }));
+    let revoked = false;
+    const authenticate = () => { if (revoked) throw new ConnectError("The connection was revoked.", Code.Unauthenticated); };
+    const signal = new AbortController();
+    const service = createPartnerConnectService(undefined, authenticate, undefined, undefined, undefined, undefined, undefined, undefined,
+      { list } as unknown as PartnerTaskOutputProjection);
+    const pending = service.listPartnerTaskOutputs(create(contract.ListPartnerTaskOutputsRequestSchema, { partnerId: "requester" }),
+      { signal: signal.signal } as HandlerContext);
+    if (retirement === "abort") signal.abort(); else revoked = true;
+    release([]);
+    await expect(pending).rejects.toMatchObject({ code: retirement === "revoke" ? Code.Unauthenticated : Code.Canceled });
+  });
+
+  it("serves an accepted sealed Task output over generated authenticated HTTP and preserves it across SQLite reopen", async () => {
+    const f = await createFixture(0, false, [], true);
+    const partner = await f.manager.createPartner(partnerInput(f.partnerStore, "Output requester"));
+    const tasks = new PartnerSessionTaskManager(f.operationalStore, f.manager, f.sessionHost,
+      { register: async input => input }, f.directory); await tasks.initialize(); cleanups.push(() => tasks.close());
+    const outputs = new PartnerTaskOutputProjection(f.operationalStore, tasks, f.partnerStore, f.workspaceCapture!);
+    const task = await tasks.start(partner.canonicalSessionId!, "output-http-task", { instruction: "Produce the report", title: "Report" }, () => undefined);
+    await vi.waitFor(async () => { await tasks.check(partner.canonicalSessionId!, task.id);
+      expect((await outputs.list(partner.id)).find(row => row.id === task.id)).toMatchObject({ readiness: "ready", files: [{ path: "task-report.txt", status: "added" }] }); });
+    const connections = new ConnectionManager(f.operationalStore), challenge = connections.issuePairing("Output reader");
+    const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Output reader" });
+    const server = await createPublicServer({ config: { publicOrigin: "http://127.0.0.1", allowInsecureLoopback: true, allowInsecureLan: false, corsOrigins: [],
+      webDirectory: join(f.directory, "no-web"), dataDirectory: f.directory }, store: f.operationalStore, connections, artifacts: {}, blobTransfers: {},
+      artifactRepository: {}, workspaces: {}, workspaceChanges: {}, scheduler: {}, adapters: [], browserActivity: [], sessionHost: f.sessionHost,
+      partners: f.manager, partnerSessionTasks: tasks, partnerTaskOutputs: outputs } as unknown as OrchestratorApplication); server.log.level = "silent";
+    try {
+      const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
+      const client = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1", interceptors: [next => request => {
+        request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request);
+      }] }));
+      const response = await client.listPartnerTaskOutputs({ partnerId: partner.id });
+      expect(response.partnerId).toBe(partner.id);
+      expect(response.outputs).toMatchObject([{ sourceId: task.id, sessionId: task.sessionId, execution: 1n,
+        readiness: contract.PartnerTaskOutputReadiness.READY, files: [{ path: "task-report.txt", status: contract.PartnerTaskOutputFileStatus.ADDED }] }]);
+      expect(JSON.stringify(response, (_, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Private report contents");
+      const unauthenticated = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1" }));
+      await expect(unauthenticated.listPartnerTaskOutputs({ partnerId: partner.id })).rejects.toMatchObject({ code: Code.Unauthenticated });
+    } finally { await server.close(); }
+    await tasks.close(); await f.close();
+    const reopened = new OperationalStore(join(f.directory, "operational.db")), reopenedPartners = new PartnerStore(join(f.directory, "partners.db"));
+    try {
+      const changes = new WorkspaceChangeSetService({ snapshotDirectory: join(f.directory, "snapshots"), repository: new OperationalWorkspaceSnapshotRepository(reopened) });
+      await changes.initialize();
+      const capture = new DurableWorkspaceRunCapture(reopened, changes);
+      const stored = reopened.findSetting("service", "partner.session-tasks", task.id)!.value as typeof task;
+      const restored = new PartnerTaskOutputProjection(reopened, { list: () => [stored] }, reopenedPartners, capture);
+      expect((await restored.list(partner.id))[0]).toMatchObject({ id: task.id, readiness: "ready", runIds: stored.executionRunIds,
+        files: [{ path: "task-report.txt", status: "added" }] });
+    } finally { reopenedPartners.close(); reopened.close(); }
+  });
+
   it("reads and patches the caller's own profile and full mixed model chain with private authority", async () => {
     const secondary = new FakeBackendAdapter({ ...PROFILE, id: "profile-secondary", streamDelayMs: 0 });
     const f = await createFixture(0, false, [secondary]), profile = await f.manager.createPartner({ ...partnerInput(f.partnerStore, "Own profile"), description: "Initial introduction" });
@@ -766,7 +917,7 @@ describe("PartnerService", () => {
       expectedDirectoryRevision: revision(1n),
       capabilities: create(contract.PartnerCapabilitiesSchema, {
         ...protoCapabilities(),
-        permissionMode: contract.PermissionMode.BYPASS_PERMISSIONS
+        permissionMode: 999 as contract.PermissionMode
       })
     }), context())).rejects.toMatchObject({ code: Code.InvalidArgument });
   });
@@ -867,18 +1018,28 @@ describe("PartnerService", () => {
   });
 });
 
-async function createFixture(streamDelayMs = 0, skillResources = false, additionalAdapters: readonly FakeBackendAdapter[] = []) {
+async function createFixture(streamDelayMs = 0, skillResources = false, additionalAdapters: readonly FakeBackendAdapter[] = [], captureRuns = false) {
   const directory = mkdtempSync(join(tmpdir(), "joko-partner-service-"));
   const operationalStore = new OperationalStore(join(directory, "operational.db"));
   const partnerStore = new PartnerStore(join(directory, "partners.db"));
   const repository = new OperationalArtifactRepository(operationalStore);
   const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository, ingestRoots: [directory] });
   await artifacts.initialize();
-  const sessionHost = new SessionHost(operationalStore, artifacts, [new FakeBackendAdapter({
+  const changes = new WorkspaceChangeSetService({ snapshotDirectory: join(directory, "snapshots"), repository: new OperationalWorkspaceSnapshotRepository(operationalStore) });
+  if (captureRuns) await changes.initialize();
+  const workspaceCapture = captureRuns ? new DurableWorkspaceRunCapture(operationalStore, changes) : undefined;
+  class OutputAdapter extends FakeBackendAdapter {
+    override async send(input: PromptInput, adapterContext: AdapterContext): Promise<void> {
+      if (captureRuns && adapterContext.target.id.startsWith("partner-task-target:"))
+        await writeFile(join(adapterContext.target.workspaceRoot, "task-report.txt"), "Private report contents");
+      return super.send(input, adapterContext);
+    }
+  }
+  const sessionHost = new SessionHost(operationalStore, artifacts, [new OutputAdapter({
     ...PROFILE,
     ...(skillResources ? { capabilities: [...PROFILE.capabilities.filter(item => item.key !== "runtime.resources"), { key: "runtime.resources", supported: true, options: ["skill"] }] } : {}),
     streamDelayMs
-    }), ...additionalAdapters], { partnerSessionRetiring: (id) => partnerStore.isPartnerSessionRetiring(id)
+    }), ...additionalAdapters], { ...(workspaceCapture === undefined ? {} : { workspaceCapture }), partnerSessionRetiring: (id) => partnerStore.isPartnerSessionRetiring(id)
     || partnerStore.isPartnerTargetRetiring(operationalStore.getSession(id).descriptor.targetId),
     partnerTargetRetired: (id) => partnerStore.isPartnerTargetRetired(id),
     partnerSessionRestarting: (id) => partnerStore.isPartnerSessionRestarting(id),
@@ -903,7 +1064,7 @@ async function createFixture(streamDelayMs = 0, skillResources = false, addition
     await close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { manager, partnerStore, sessionHost, operationalStore, directory, close };
+  return { manager, partnerStore, sessionHost, operationalStore, directory, workspaceCapture, close };
 }
 
 function resourcesRoot(f: { directory: string }) { return join(f.directory, "resources"); }

@@ -1853,9 +1853,23 @@ export function toProtoModelDescriptor(backendId: string, model: ProviderModel):
       effortId: level,
       displayName: level,
       order: index,
-      defaultLevel: index === 0
+      defaultLevel: level === model.defaultEffort
     })),
     supportsFastMode: model.supportsFastMode ?? false,
+    description: model.description,
+    defaultEffort: model.defaultEffort !== undefined && model.thinkingLevels.includes(model.defaultEffort) ? model.defaultEffort : undefined,
+    displayThinkingLevels: [...(model.displayThinkingLevels ?? [])],
+    declaredSupportsImages: model.declaredSupportsImages,
+    declaredSupportsFastMode: model.declaredSupportsFastMode,
+    declaredModalities: model.declaredInputModalities === undefined && model.declaredOutputModalities === undefined ? undefined
+      : { $typeName: "joko.v1.ModelDeclaredModalities",
+        input: model.declaredInputModalities === undefined ? undefined : { $typeName: "joko.v1.ModelModalityValues", values: [...model.declaredInputModalities] },
+        output: model.declaredOutputModalities === undefined ? undefined : { $typeName: "joko.v1.ModelModalityValues", values: [...model.declaredOutputModalities] } },
+    referenceApi: model.referenceApi,
+    api: model.api,
+    protocolMode: model.referenceApi === undefined || model.api === "" ? "unknown" : model.api === model.referenceApi ? "matching" : "compatibility",
+    contextWindowSource: model.contextWindowSource,
+    maxOutputTokensSource: model.maxOutputTokensSource,
     defaultVisible: model.defaultVisible,
     available: true,
     inputCostMicrosPerMillion: costMicros(model.cost.input),
@@ -2792,7 +2806,12 @@ export function toProtoRuntimeCommand(
   sessionId: string
 ): contract.RuntimeCommand {
   const normalizedSessionId = requireText(sessionId, "runtime_command.session_id");
-  const identity = `${normalizedSessionId}\u0000${item.source}\u0000${item.name}\u0000${item.path ?? ""}`;
+  const inputMode = item.inputMode === "text" ? contract.RuntimeCommandInputMode.TEXT
+    : item.inputMode === "resource_mention" ? contract.RuntimeCommandInputMode.RESOURCE_MENTION : undefined;
+  if (inputMode === undefined || (item.inputMode === "resource_mention" && (!item.loaded || !item.resourceId))) {
+    throw new ProtoMappingError("unsupported_mapping", "runtime_command.input_mode", "Runtime command input mode is invalid.");
+  }
+  const identity = `${normalizedSessionId}\u0000${item.source}\u0000${item.name}\u0000${item.path ?? ""}\u0000${item.resourceId ?? ""}\u0000${item.inputMode}`;
   return message<contract.RuntimeCommand>("joko.v1.RuntimeCommand", {
     commandId: createHash("sha256").update(identity).digest("hex"),
     name: item.name,
@@ -2803,12 +2822,18 @@ export function toProtoRuntimeCommand(
         ? contract.RuntimeCommandSource.SKILL
         : contract.RuntimeCommandSource.PROMPT,
     resourceId: item.resourceId ?? "",
+    inputMode,
     loaded: item.loaded,
     sessionId: normalizedSessionId
   });
 }
 
 export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRuntimeCommand {
+  const inputMode = item.inputMode === contract.RuntimeCommandInputMode.TEXT ? "text"
+    : item.inputMode === contract.RuntimeCommandInputMode.RESOURCE_MENTION ? "resource_mention" : undefined;
+  if (inputMode === undefined || (inputMode === "resource_mention" && (!item.loaded || !item.resourceId))) {
+    throw new ProtoMappingError("unsupported_mapping", "runtime_command.input_mode", "Runtime command input mode is invalid.");
+  }
   const source: CoreRuntimeCommand["source"] = item.source === contract.RuntimeCommandSource.EXTENSION
     ? "extension"
     : item.source === contract.RuntimeCommandSource.PROMPT
@@ -2826,6 +2851,7 @@ export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRunt
     name: requireText(item.name, "runtime_command.name"),
     description: item.description,
     source,
+    inputMode,
     ...(item.resourceId === "" ? {} : { resourceId: requireText(item.resourceId, "runtime_command.resource_id") }),
     loaded: item.loaded
   };

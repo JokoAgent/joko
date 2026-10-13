@@ -1,4 +1,6 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { ListPartnerTaskOutputsRequestSchema, ListPartnerTaskOutputsResponseSchema,
+  PartnerTaskOutputSourceKind, PartnerTaskOutputReadiness, PartnerTaskOutputFileStatus } from "@joko/contracts";
 import { createHash } from "node:crypto";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import {
@@ -149,6 +151,40 @@ import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
 import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
 import { creationSnapshot } from "./test/mobile-partner-creation";
 import { mobilePartnerCreationDraft, MobilePartnerCreationRejected } from "./mobile-partner-creation";
+
+describe("Partner task output network", () => {
+  it("uses the authenticated generated metadata RPC and rejects wrong owner, malformed paths and aborted reads", async () => {
+    const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+      connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
+    const value = create(ListPartnerTaskOutputsResponseSchema, { partnerId: "partner-a", outputs: [{
+      sourceKind: PartnerTaskOutputSourceKind.DELEGATION, sourceId: "delegation-a", parentSessionId: "parent",
+      sessionId: "child", execution: 1n, runIds: ["run"], sourceRevision: { value: 2n }, title: "Output",
+      readiness: PartnerTaskOutputReadiness.READY, files: [{ path: "report.md", status: PartnerTaskOutputFileStatus.ADDED }]
+    }] });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://node.example/joko.v1.PartnerService/ListPartnerTaskOutputs");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-only");
+      expect(fromBinary(ListPartnerTaskOutputsRequestSchema, new Uint8Array(init?.body as Uint8Array)).partnerId).toBe("partner-a");
+      return new Response(toBinary(ListPartnerTaskOutputsResponseSchema, value), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.listPartnerTaskOutputs!(credential, "partner-a")).resolves.toMatchObject({
+        partnerId: "partner-a", rows: [{ kind: "delegation", runIds: ["run"], files: [{ path: "report.md", status: "added" }] }] });
+      await expect(mobileNetwork.listPartnerTaskOutputs!(credential, "../invalid")).rejects.toThrow(/valid Partner/u);
+      const aborted = new AbortController(); aborted.abort();
+      await expect(mobileNetwork.listPartnerTaskOutputs!(credential, "partner-a", aborted.signal)).rejects.toThrow();
+      expect(fetcher).toHaveBeenCalledOnce();
+      value.partnerId = "partner-b";
+      await expect(mobileNetwork.listPartnerTaskOutputs!(credential, "partner-a")).rejects.toThrow(/metadata/u);
+      value.partnerId = "partner-a"; value.outputs[0]!.files[0]!.path = "../secret";
+      await expect(mobileNetwork.listPartnerTaskOutputs!(credential, "partner-a")).rejects.toThrow(/metadata/u);
+      value.outputs[0]!.files[0]!.path = "report.md";
+      const late = new AbortController(); fetcher.mockImplementationOnce(async () => { late.abort();
+        return new Response(toBinary(ListPartnerTaskOutputsResponseSchema, value), { headers: { "content-type": "application/proto" } }); });
+      await expect(mobileNetwork.listPartnerTaskOutputs!(credential, "partner-a", late.signal)).rejects.toThrow();
+    } finally { fetcher.mockRestore(); }
+  });
+});
 
 describe("Mobile Remote Desktop system action network", () => {
   it("maps exactly three actions through generated RPC and validates control, route and matching receipts", async () => {
@@ -388,6 +424,32 @@ describe("Mobile Remote Desktop exit authority network", () => {
 });
 
 describe("mobile Partner creation network", () => {
+  it("roundtrips exact full-access profile and creation fields through generated enum three", async () => {
+    const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
+      connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
+    const fullPartner = { ...profilePartner, capabilities: { ...profilePartner.capabilities, permissionMode: "bypassPermissions" as const } };
+    const wire = profilePartnerWire(fullPartner); wire.capabilities!.permissionMode = PermissionMode.BYPASS_PERMISSIONS;
+    const directory = { revision: { value: 5n }, templates: [...creationSnapshot.options.templates], avatarPresets: [...creationSnapshot.options.avatarPresets] };
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname; const headers = { "content-type": "application/proto" };
+      if (path.endsWith("/CreatePartner")) {
+        const request = fromBinary(CreatePartnerRequestSchema, new Uint8Array(init?.body as Uint8Array));
+        expect(request.draft?.capabilities?.permissionMode).toBe(PermissionMode.BYPASS_PERMISSIONS);
+        return new Response(toBinary(CreatePartnerResponseSchema, create(CreatePartnerResponseSchema, { partner: wire, directory })), { headers });
+      }
+      expect(path).toBe("/joko.v1.PartnerService/UpdatePartner");
+      const request = fromBinary(UpdatePartnerRequestSchema, new Uint8Array(init?.body as Uint8Array));
+      expect(request.patch?.permissionMode).toBe(PermissionMode.BYPASS_PERMISSIONS);
+      return new Response(toBinary(UpdatePartnerResponseSchema, create(UpdatePartnerResponseSchema, { partner: wire, directory })), { headers });
+    });
+    try {
+      const draft = { ...mobilePartnerProfileDraft(fullPartner) };
+      await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, draft)).resolves.toMatchObject({ capabilities: { permissionMode: "bypassPermissions" } });
+      await expect(mobileNetwork.createPartner!(credential, "creation-request-full-access", 4n,
+        { ...mobilePartnerCreationDraft(creationSnapshot)!, displayName: "Nova", usesDirectoryDefaults: false, capabilities: fullPartner.capabilities }))
+        .resolves.toMatchObject({ kind: "found", partner: { capabilities: { permissionMode: "bypassPermissions" } } });
+    } finally { fetcher.mockRestore(); }
+  });
   const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
     connectionId: "connection", deviceId: "phone", displayName: "Joko node", authKey: "partner-fixture-key" };
   const requestId = "creation-request-native-network";

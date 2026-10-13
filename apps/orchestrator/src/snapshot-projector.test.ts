@@ -59,7 +59,7 @@ describe("SnapshotProjector", () => {
       "session-1",
       SESSION_RUNTIME_COMMANDS_SETTING_KEY,
       runtimeCommandsObservation(7, [
-        { name: "review", description: "Review changes", source: "extension", path: "review.ts", loaded: true }
+        { name: "review", description: "Review changes", source: "extension", inputMode: "text", path: "review.ts", loaded: true }
       ], 9_700)
     );
     const beforeCursor = fixture.store.listEvents().at(-1)?.globalCursor ?? 0n;
@@ -371,7 +371,7 @@ describe("SnapshotProjector", () => {
       "session-1",
       SESSION_RUNTIME_COMMANDS_SETTING_KEY,
       runtimeCommandsObservation(7, [
-        { name: "review", description: "Review", source: "extension", loaded: true }
+        { name: "review", description: "Review", source: "extension", inputMode: "text", loaded: true }
       ], 9_700)
     );
     fixture.store.setSetting(
@@ -379,7 +379,7 @@ describe("SnapshotProjector", () => {
       "session-2",
       SESSION_RUNTIME_COMMANDS_SETTING_KEY,
       runtimeCommandsObservation(3, [
-        { name: "release", description: "Release", source: "prompt", loaded: true }
+        { name: "release", description: "Release", source: "prompt", inputMode: "text", loaded: true }
       ], 9_800)
     );
 

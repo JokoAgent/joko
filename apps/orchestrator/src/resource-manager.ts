@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createReadStream } from "node:fs";
 import { chmod, copyFile, lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from "node:fs/promises";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 
 import type { ProjectSkillCandidate } from "@joko/adapter-pi";
+import { CODEX_PROJECT_SKILL_ROOTS } from "@joko/adapter-codex";
 import { redactSecrets, type AdapterContext, type ApprovedSkillSeed, type RuntimeResource } from "@joko/core";
 import { SessionRuntimeHandoffStore, type OperationalStore } from "@joko/store";
 import { readSkillFile } from "./skill-file.js";
+import { RemoteSkillSourceOwner, remoteProjectSkillSourceIdentity, validateRemoteProjectSkillSource,
+  type StoredRemoteProjectSkillSource } from "./remote-skill-source.js";
 
 import {
   DefaultPiPackageAcquisition,
@@ -36,7 +39,7 @@ import {
 
 export type PiResourceKind = "extension" | "skill" | "prompt" | "theme" | "package";
 export type PiResourceScope = "user" | "global" | "project" | "managed";
-export type PiResourceSourceKind = PiPackageSource["kind"] | "extension_source" | "skill_market" | "learned";
+export type PiResourceSourceKind = PiPackageSource["kind"] | "extension_source" | "skill_market" | "learned" | "remote_project";
 export type PiResourceState =
   | "discovered"
   | "awaiting_approval"
@@ -131,7 +134,7 @@ interface StoredLearnedSkillSource {
   readonly slug: string;
 }
 
-type StoredResourceSource = PiPackageSource | StoredExtensionSourcePackage | StoredSkillMarketSource | StoredLearnedSkillSource;
+type StoredResourceSource = PiPackageSource | StoredExtensionSourcePackage | StoredSkillMarketSource | StoredLearnedSkillSource | StoredRemoteProjectSkillSource;
 
 interface StoredResource extends Omit<PiResourceDescriptor, "versionNumber" | "extensionSource" | "skillMarket"> {
   readonly importedSkill?: { readonly partnerId: string; readonly requestId: string; readonly entryId: string };
@@ -210,6 +213,7 @@ export interface PiResourceManagerOptions {
   readonly acquisition?: PiPackageAcquisition;
   /** Service-owned private source selection; never a client Target override. */
   readonly privateResourceTarget?: (owner: AdapterContext) => string | undefined;
+  readonly remoteProjectSkills?: RemoteSkillSourceOwner;
 }
 
 export interface DiscoverPiResourceInput {
@@ -633,6 +637,8 @@ export class PiResourceManager {
   readonly #maximumBytes: number;
   readonly #acquisition: PiPackageAcquisition;
   readonly #privateResourceTarget: PiResourceManagerOptions["privateResourceTarget"];
+  readonly #remoteProjectSkills: RemoteSkillSourceOwner | undefined;
+  readonly #remoteSourceGuards = new WeakMap<StoredResource, () => void>();
   readonly #records = new Map<string, StoredResource>();
   readonly #preparedMutations = new WeakMap<object, PreparedCatalogMutation<unknown>>();
   readonly #installedGenerationLeases = new Map<string, number>();
@@ -652,6 +658,7 @@ export class PiResourceManager {
     this.#maximumBytes = options.maximumBytes ?? 500 * 1024 * 1024;
     this.#acquisition = options.acquisition ?? new DefaultPiPackageAcquisition();
     this.#privateResourceTarget = options.privateResourceTarget;
+    this.#remoteProjectSkills = options.remoteProjectSkills;
     if (!Number.isSafeInteger(this.#maximumFiles) || this.#maximumFiles < 1) throw new RangeError("Resource file limit is invalid.");
     if (!Number.isSafeInteger(this.#maximumBytes) || this.#maximumBytes < 1) throw new RangeError("Resource byte limit is invalid.");
   }
@@ -669,6 +676,12 @@ export class PiResourceManager {
       if (setting.value.format !== 1 || !Array.isArray(setting.value.records)) throw new Error("Pi resource catalog has an unsupported format.");
       for (const raw of setting.value.records) {
         const record = validateStoredResource(raw);
+        if (record.source.kind === "remote_project") {
+          if (this.#remoteProjectSkills === undefined || record.canonicalPath !== this.#remoteProjectSkills.localPath(record.source)) {
+            throw new Error("Stored remote project Skill generation has no owning source.");
+          }
+          await this.#remoteProjectSkills.assertLocalGeneration(record.source);
+        }
         if (this.#records.has(record.id)) throw new Error("Pi resource catalog contains duplicate IDs.");
         this.#records.set(record.id, record);
       }
@@ -924,6 +937,7 @@ export class PiResourceManager {
   ): Promise<PreparedPiResourceMutation<PiSkillContentMutationResult>> {
     this.#assertInitialized();
     const current = this.#require(nonBlank(input.resourceId, "Resource ID"));
+    if (current.source.kind === "remote_project") throw new Error("Remote project Skill content is read-only.");
     this.#assertSkillContentAuthority(current, input.expectedResourceVersion);
     const expectedObservedRevision = normalizedContentRevision(input.expectedObservedRevision, "Observed Skill revision");
     const changedByConnectionId = nonBlank(input.changedByConnectionId, "Changing connection ID");
@@ -971,6 +985,7 @@ export class PiResourceManager {
   ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
     this.#assertInitialized();
     const current = this.#require(nonBlank(input.resourceId, "Resource ID"));
+    if (current.source.kind === "remote_project") throw new Error("Remote project Skill content is read-only.");
     this.#assertSkillContentAuthority(current, input.expectedResourceVersion);
     const expectedObservedRevision = normalizedContentRevision(input.expectedObservedRevision, "Observed Skill revision");
     const recoveryDestination = await canonicalDirectory(input.recoveryDestination, "Skill recovery destination");
@@ -1208,7 +1223,7 @@ export class PiResourceManager {
     const approvalRevision = piPackageSourceApprovalRevision(source);
     const now = this.#now();
     const previous = this.#records.get(id);
-    if (previous?.source.kind === "extension_source" || previous?.source.kind === "skill_market" || previous?.source.kind === "learned") {
+    if (previous?.source.kind === "extension_source" || previous?.source.kind === "skill_market" || previous?.source.kind === "learned" || previous?.source.kind === "remote_project") {
       throw new Error("Pi resource ID is already reserved by a source-owned Resource.");
     }
     if (previous !== undefined && (
@@ -1968,6 +1983,11 @@ export class PiResourceManager {
     assertTargetNotDeleted(target.metadata);
     if (target.descriptor.backendId !== backendId) throw new Error("Target does not belong to the requested Backend.");
     if (!target.descriptor.trusted) throw new Error("Project resources can only be discovered after the Target is trusted.");
+    if (target.descriptor.remoteWorkspace !== undefined) {
+      if (target.descriptor.remoteWorkspace.kind !== "ssh" || this.#store.getBackend(backendId).descriptor.adapterKind !== "codex"
+        || !kinds.has("skill") || this.#remoteProjectSkills === undefined) throw new Error("Registered remote project Skill discovery is unavailable.");
+      return this.#prepareRemoteProjectSkills(backendId, targetId);
+    }
     const workspaceRoot = await canonicalDirectory(target.descriptor.workspaceRoot, "Project resource workspace");
     const adapterKind = this.#store.getBackend(backendId).descriptor.adapterKind;
     const candidates = await discoverCanonicalProjectCandidates(workspaceRoot, this.#maximumFiles, kinds, adapterKind);
@@ -2019,6 +2039,57 @@ export class PiResourceManager {
     return this.#completePreparedStandalone(await this.prepareDiscoverProjectResources(input));
   }
 
+  async #prepareRemoteProjectSkills(backendId: string, targetId: string): Promise<PreparedPiResourceMutation<readonly PiResourceDescriptor[]>> {
+    const owner = this.#remoteProjectSkills!;
+    const candidates = await owner.discover(targetId);
+    const entries: PreparedCatalogEntry[] = [], values: PiResourceDescriptor[] = [];
+    const retained = new Set<StoredRemoteProjectSkillSource>();
+    try {
+      for (const candidate of candidates) {
+        candidate.assertCurrent();
+        const inspection = await inspectSkillPackage(candidate.localPath, this.#maximumFiles, this.#maximumBytes);
+        const sourceIdentity = remoteProjectSkillSourceIdentity(candidate.source);
+        const id = `resource_${createHash("sha256").update(JSON.stringify([backendId, targetId, sourceIdentity])).digest("hex")}`;
+        const previous = this.#records.get(id);
+        if (previous !== undefined && (previous.source.kind !== "remote_project" || previous.backendId !== backendId
+          || previous.targetId !== targetId || previous.scope !== "project" || previous.kind !== "skill" || previous.sourceIdentity !== sourceIdentity)) {
+          throw new Error("Remote project Resource identity is already owned.");
+        }
+        if (previous?.source.kind === "remote_project" && previous.state !== "removed"
+          && previous.source.sourceIncarnation === candidate.source.sourceIncarnation
+          && previous.source.sourceRevision === candidate.source.sourceRevision && previous.discoveredRevision === inspection.revision) {
+          await owner.assertLocalGeneration(previous.source);
+          candidate.assertCurrent();
+          await candidate.discard();
+          entries.push({ id, expected: previous, next: previous }); values.push(publicResource(previous));
+          continue;
+        }
+        const compatibility = await inspectPiResourceCompatibility("skill", inspection.canonicalPath, { contentFingerprint: inspection.revision });
+        candidate.assertCurrent();
+        const workspaceRoot = this.#store.getTarget(targetId).descriptor.remoteWorkspace!.workspaceRoot;
+        const record: StoredResource = {
+          id, backendId, targetId, kind: "skill", scope: "project", name: candidate.name,
+          sourceKind: "remote_project", sourceIdentity, sourceDisplay: candidate.name,
+          canonicalPathFingerprint: `sha256:${createHash("sha256").update(sourceIdentity).digest("hex")}`,
+          symbolicLinkDetected: false, specialFileDetected: false, discoveredRevision: inspection.revision,
+          ...compatibilityFields(compatibility, false), state: "awaiting_approval", enabled: false,
+          versionNumber: ((previous === undefined ? 0n : BigInt(previous.versionNumber)) + 1n).toString(), updatedAt: this.#now(),
+          source: candidate.source, canonicalPath: candidate.localPath, workspaceRoot
+        };
+        this.#remoteSourceGuards.set(record, candidate.assertCurrent);
+        entries.push({ id, expected: previous, next: record }); values.push(publicResource(record)); retained.add(candidate.source);
+      }
+      const assertCurrent = (): void => { for (const candidate of candidates) candidate.assertCurrent(); };
+      assertCurrent();
+      return this.#prepareMutation(entries, Object.freeze(values), assertCurrent, {
+        rollback: async () => { await Promise.all(candidates.filter(candidate => retained.has(candidate.source)).map(candidate => candidate.discard())); }
+      });
+    } catch (error) {
+      await Promise.allSettled(candidates.map(candidate => candidate.discard()));
+      throw error;
+    }
+  }
+
   async prepareApprove(
     resourceId: string,
     discoveredRevision: string,
@@ -2034,6 +2105,8 @@ export class PiResourceManager {
       && current.extensionContentFingerprint === discoveredRevision;
     if (installedExtensionApproval) {
       await this.#assertInstalledSafe(current);
+    } else if (current.source.kind === "remote_project") {
+      await this.#assertSourceUnchanged(current);
     } else if (current.source.kind === "local") {
       if (current.canonicalPath === undefined) throw new Error("Local resource is missing its canonical source path.");
       const inspection = await inspectResourceForKind(current.kind, current.canonicalPath, this.#filesFor(current), this.#maximumBytes);
@@ -2063,7 +2136,7 @@ export class PiResourceManager {
     return this.#prepareMutation(
       [{ id: resourceId, expected: current, next: updated }],
       publicResource(updated),
-      current.scope === "project" ? () => this.#assertStoredProjectTargetTrusted(current) : undefined
+      current.scope === "project" ? () => { this.#assertStoredProjectTargetTrusted(current); this.#remoteSourceGuards.get(current)?.(); } : undefined
     );
   }
 
@@ -2090,7 +2163,7 @@ export class PiResourceManager {
     if (!(current.state === "installed" || current.state === "loaded" || current.state === "disabled" || current.state === "update_available")) {
       throw new Error("Only an installed resource can be updated.");
     }
-    if (current.source.kind === "extension_source" || current.source.kind === "skill_market" || current.source.kind === "learned") {
+    if (current.source.kind === "extension_source" || current.source.kind === "skill_market" || current.source.kind === "learned" || current.source.kind === "remote_project") {
       throw new Error("Source-owned resources must be updated through their revision-fenced catalog entry.");
     }
     this.#assertStoredProjectTargetTrusted(current);
@@ -2201,7 +2274,7 @@ export class PiResourceManager {
       ) {
         throw new Error("Extension content must be approved at its current fingerprint before it can be enabled.");
       }
-      if (isDirectProjectResource(current)) {
+      if (isDirectProjectResource(current) || current.source.kind === "remote_project") {
         if (!(current.state === "approved" || current.state === "disabled" || current.state === "loaded")) throw new Error("Project resource is not approved.");
         await this.#assertSourceUnchanged(current);
       } else {
@@ -2214,14 +2287,14 @@ export class PiResourceManager {
     const updated: StoredResource = {
       ...current,
       enabled,
-      state: enabled ? (current.state === "loaded" ? "loaded" : isDirectProjectResource(current) ? "approved" : "installed") : "disabled",
+      state: enabled ? (current.state === "loaded" ? "loaded" : isDirectProjectResource(current) || current.source.kind === "remote_project" ? "approved" : "installed") : "disabled",
       versionNumber: (BigInt(current.versionNumber) + 1n).toString(10),
       updatedAt: this.#now()
     };
     return this.#prepareMutation(
       [{ id: resourceId, expected: current, next: updated }],
       publicResource(updated),
-      enabled && current.scope === "project" ? () => this.#assertStoredProjectTargetTrusted(current) : undefined
+      enabled && current.scope === "project" ? () => { this.#assertStoredProjectTargetTrusted(current); this.#remoteSourceGuards.get(current)?.(); } : undefined
     );
   }
 
@@ -2266,7 +2339,7 @@ export class PiResourceManager {
       this.#assertStoredProjectTargetTrusted(current);
       if (!current.enabled) throw new Error("Disabled resource cannot be marked loaded.");
       if (loaded) {
-        if (isDirectProjectResource(current)) await this.#assertSourceUnchanged(current);
+        if (isDirectProjectResource(current) || current.source.kind === "remote_project") await this.#assertSourceUnchanged(current);
         else await this.#assertInstalledSafe(current);
         // Filesystem validation yields. Recheck the live Session generation at
         // the final commit boundary so a concurrent restart cannot land an old
@@ -2494,8 +2567,10 @@ export class PiResourceManager {
         const root = await this.#runtimeTextRoot(record, signal);
         const inspection = await inspectResourceForKind("skill", root, this.#filesFor(record), this.#maximumBytes, signal);
         assertApprovedRuntimeTextInspection(record, root, inspection);
+        const remoteSourceGuard = this.#remoteSourceGuards.get(record);
         const authority = { ...record };
         const assertCurrent = () => {
+          remoteSourceGuard?.();
           this.#assertTargetOwner(backendId, targetId, runtimeOwner);
           const current = this.#records.get(authority.id);
           const sameIncarnation = current !== undefined && ((current.state === authority.state && current.versionNumber === authority.versionNumber)
@@ -3343,6 +3418,7 @@ export class PiResourceManager {
     expected: StoredResource,
     approved: StoredResource
   ): Promise<PreparedPiResourceMutation<PiResourceDescriptor>> {
+    if (approved.source.kind === "remote_project") throw new Error("Remote project Skills use their approved source snapshot.");
     if (isDirectProjectResource(approved)) throw new Error("Project-local resources are snapshotted by the Pi adapter and are not installed globally.");
     if (approved.state !== "approved") throw new Error("Resource must be approved before installation.");
     if (approved.approvedAt === undefined || approved.approvedByConnectionId === undefined) {
@@ -3469,6 +3545,10 @@ export class PiResourceManager {
     if (record.state === "removed") throw new Error("Removed Skill content is unavailable.");
     if (BigInt(record.versionNumber) !== expectedResourceVersion) throw new Error("Skill Resource revision is stale.");
     this.#assertStoredProjectTargetTrusted(record);
+    if (record.source.kind === "remote_project") {
+      if (!["awaiting_approval", "approved", "disabled", "loaded"].includes(record.state)) throw new Error("Remote project Skill content is unavailable.");
+      return;
+    }
     if (isDirectProjectResource(record)) {
       if (!(record.state === "approved" || record.state === "disabled" || record.state === "loaded")) {
         throw new Error("Project Skill is not approved.");
@@ -3485,6 +3565,13 @@ export class PiResourceManager {
 
   async #skillContentRoot(record: StoredResource, signal?: AbortSignal): Promise<string> {
     signal?.throwIfAborted();
+    if (record.source.kind === "remote_project") {
+      this.#assertStoredProjectTargetTrusted(record);
+      if (this.#remoteProjectSkills === undefined || record.canonicalPath !== this.#remoteProjectSkills.localPath(record.source)) throw new Error("Remote project Skill generation is unavailable.");
+      await this.#remoteProjectSkills.assertLocalGeneration(record.source);
+      signal?.throwIfAborted();
+      return record.canonicalPath;
+    }
     if (isDirectProjectResource(record)) {
       const workspaceRoot = this.#assertTrustedProjectTarget(record.backendId, record.targetId, record.workspaceRoot);
       assertWithin(workspaceRoot, record.canonicalPath, "Project Skill content");
@@ -3721,6 +3808,15 @@ export class PiResourceManager {
 
   async #assertSourceUnchanged(record: StoredResource): Promise<void> {
     this.#assertStoredProjectTargetTrusted(record);
+    if (record.source.kind === "remote_project") {
+      if (this.#remoteProjectSkills === undefined || record.canonicalPath !== this.#remoteProjectSkills.localPath(record.source)) throw new Error("Remote project Skill generation is unavailable.");
+      const guard = await this.#remoteProjectSkills.verify(record.source);
+      const inspection = await inspectSkillPackage(record.canonicalPath, this.#filesFor(record), this.#maximumBytes);
+      guard();
+      if (inspection.revision !== record.discoveredRevision) throw new Error("Remote project Skill snapshot changed.");
+      this.#remoteSourceGuards.set(record, guard);
+      return;
+    }
     if (
       record.canonicalPath === undefined
       || !(record.source.kind === "local" || record.source.kind === "skill_market" && record.scope === "project")
@@ -3744,6 +3840,14 @@ export class PiResourceManager {
 
   async #runtimeTextRoot(record: StoredResource, signal: AbortSignal): Promise<string> {
     signal.throwIfAborted();
+    if (record.source.kind === "remote_project") {
+      this.#assertStoredProjectTargetTrusted(record);
+      if (this.#remoteProjectSkills === undefined || record.canonicalPath !== this.#remoteProjectSkills.localPath(record.source)) throw new Error("Remote project Skill generation is unavailable.");
+      const guard = await this.#remoteProjectSkills.verify(record.source, signal);
+      guard(); signal.throwIfAborted();
+      this.#remoteSourceGuards.set(record, guard);
+      return record.canonicalPath;
+    }
     if (isDirectProjectResource(record)) {
       const workspaceRoot = this.#assertTrustedProjectTarget(record.backendId, record.targetId, record.workspaceRoot);
       assertWithin(workspaceRoot, record.canonicalPath, "Runtime text project resource");
@@ -3940,6 +4044,11 @@ export class PiResourceManager {
   #assertStoredProjectTargetTrusted(record: StoredResource): void {
     if (record.scope !== "project") return;
     if (record.targetId === undefined || record.workspaceRoot === undefined) throw new Error("Project resource is missing its Target trust boundary.");
+    if (record.source.kind === "remote_project") {
+      if (this.#remoteProjectSkills === undefined || record.targetId !== record.source.targetId) throw new Error("Remote project Skill source is unavailable.");
+      this.#remoteProjectSkills.assertTargetCurrent(record.source, record.backendId, record.workspaceRoot);
+      return;
+    }
     this.#assertTrustedProjectTarget(record.backendId, record.targetId, record.workspaceRoot);
   }
 
@@ -3965,6 +4074,7 @@ export class PiResourceManager {
     if (targetId === undefined) throw new Error("Project resources require a Target.");
     const target = this.#store.getTarget(targetId);
     assertTargetNotDeleted(target.metadata);
+    if (target.descriptor.remoteWorkspace !== undefined) throw new Error("Local project sources cannot acquire a remote workspace.");
     const targetWorkspaceRoot = normalizedAbsolute(target.descriptor.workspaceRoot, "Target workspace root");
     if (target.descriptor.backendId !== backendId || (workspaceRoot !== undefined && !samePath(targetWorkspaceRoot, workspaceRoot))) {
       throw new Error("Project resource does not match its durable Target boundary.");
@@ -5097,21 +5207,27 @@ function validateStoredResource(value: StoredResource): StoredResource {
       ? validateStoredSkillMarketSource(stored.source)
       : stored.source.kind === "learned"
         ? validateStoredLearnedSkillSource(stored.source)
+      : stored.source.kind === "remote_project"
+        ? validateRemoteProjectSkillSource(stored.source)
       : normalizePiPackageSource(stored.source);
   if (!sameFlatRecord(source, stored.source)) throw new Error("Stored Pi resource source is not canonical.");
-  if (source.kind !== "local" && source.kind !== "skill_market" && source.kind !== "learned" && stored.kind !== "package") {
+  if (source.kind !== "local" && source.kind !== "skill_market" && source.kind !== "learned" && source.kind !== "remote_project" && stored.kind !== "package") {
     throw new Error("Only package resources may use managed package acquisition.");
   }
   if (source.kind === "skill_market" && stored.kind !== "skill") throw new Error("Skill market provenance may only own a Skill Resource.");
   if (source.kind === "learned" && stored.kind !== "skill") throw new Error("Learning provenance may only own a Skill Resource.");
   let canonicalPath: string | undefined;
-  if (source.kind === "local" || source.kind === "skill_market" && stored.scope === "project") {
+  if (source.kind === "local" || source.kind === "remote_project" || source.kind === "skill_market" && stored.scope === "project") {
     canonicalPath = normalizedAbsolute(stored.canonicalPath!, "Stored canonical resource path");
   } else if (stored.canonicalPath !== undefined) {
     throw new Error("Stored remote resource contains a local canonical path.");
   }
   if (stored.installedPath !== undefined) normalizedAbsolute(stored.installedPath, "Stored installed resource path");
-  if (stored.workspaceRoot !== undefined) normalizedAbsolute(stored.workspaceRoot, "Stored project workspace root");
+  if (stored.workspaceRoot !== undefined) {
+    if (source.kind === "remote_project") {
+      if (!posix.isAbsolute(stored.workspaceRoot) || posix.normalize(stored.workspaceRoot) !== stored.workspaceRoot || /[\u0000-\u001f\u007f]/u.test(stored.workspaceRoot)) throw new Error("Stored remote project root is invalid.");
+    } else normalizedAbsolute(stored.workspaceRoot, "Stored project workspace root");
+  }
   if (stored.scope === "project" && (stored.targetId === undefined || stored.workspaceRoot === undefined)) {
     throw new Error("Stored project resource is missing its Target trust boundary.");
   }
@@ -5125,12 +5241,18 @@ function validateStoredResource(value: StoredResource): StoredResource {
   if (source.kind === "learned" && (stored.scope !== "global" || stored.installedPath === undefined)) {
     throw new Error("Stored learned Skill has an invalid install scope.");
   }
+  if (source.kind === "remote_project" && (stored.kind !== "skill" || stored.scope !== "project"
+    || stored.targetId !== source.targetId || stored.installedPath !== undefined || stored.importedSkill !== undefined || stored.partnerSkill !== undefined)) {
+    throw new Error("Stored remote project Skill provenance is invalid.");
+  }
   const sourceIdentity = source.kind === "extension_source"
     ? extensionSourcePackageIdentity(source)
     : source.kind === "skill_market"
       ? skillMarketSourceIdentity(source)
     : source.kind === "learned"
       ? learnedSkillSourceIdentity(source)
+    : source.kind === "remote_project"
+      ? remoteProjectSkillSourceIdentity(source)
     : stored.kind === "package"
       ? piPackageSourceIdentity(source)
     : `${stored.kind}:${pathIdentity(canonicalPath!)}`;
@@ -5145,6 +5267,8 @@ function validateStoredResource(value: StoredResource): StoredResource {
         ? skillMarketSourceDisplay(source)
       : source.kind === "learned"
         ? learnedSkillSourceDisplay(source)
+      : source.kind === "remote_project"
+        ? source.packageKey
       : piPackageSourceDisplay(source);
   const canonicalPathFingerprint = source.kind === "local"
     ? pathFingerprint(canonicalPath!)
@@ -5171,7 +5295,7 @@ function validateStoredResource(value: StoredResource): StoredResource {
   const storedCompatibility = validateStoredCompatibility(stored);
   let pendingUpdate: StoredResourceUpdateIntent | undefined;
   if (stored.pendingUpdate !== undefined) {
-    if (source.kind === "extension_source" || source.kind === "skill_market" || source.kind === "learned") {
+    if (source.kind === "extension_source" || source.kind === "skill_market" || source.kind === "learned" || source.kind === "remote_project") {
       throw new Error("Stored source-owned resources cannot contain a generic update intent.");
     }
     if (!stored.pendingUpdate || typeof stored.pendingUpdate !== "object") {
@@ -5631,6 +5755,15 @@ async function discoverCanonicalProjectCandidates(
       }
     }
     return candidates.sort((left, right) => left.kind.localeCompare(right.kind, "en") || left.sourcePath.localeCompare(right.sourcePath, "en"));
+  }
+  if (adapterKind === "codex") {
+    if (!kinds.has("skill")) return [];
+    for (const declaredRoot of CODEX_PROJECT_SKILL_ROOTS) {
+      const root = join(workspaceRoot, ...declaredRoot.split("/"));
+      await assertOptionalSafeDirectory(workspaceRoot, dirname(root), "Project resource root");
+      for (const sourcePath of await discoverSkillEntries(workspaceRoot, root)) push("skill", sourcePath);
+    }
+    return candidates.sort((a, b) => a.sourcePath.localeCompare(b.sourcePath, "en"));
   }
   if (adapterKind !== "pi") throw new Error(`Backend adapter does not define project resource discovery: ${adapterKind}`);
 
