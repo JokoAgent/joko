@@ -3,9 +3,9 @@ import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@conn
 import * as contract from "@joko/contracts";
 import type { ConnectionRecord } from "@joko/store";
 
-import type { ConnectionManager } from "./connection-manager.js";
+import { ConnectionAuthenticationError, type ConnectionManager } from "./connection-manager.js";
 import { fromProtoRouteIdentity } from "./device-peer-connect-service.js";
-import type { DevicePeerOwner, DevicePeerSelectionIdentity, DevicePeerSelectionView } from "./device-peer-owner.js";
+import { DevicePeerAuthorityError, type DevicePeerOwner, type DevicePeerSelectionIdentity, type DevicePeerSelectionView } from "./device-peer-owner.js";
 import {
   RemoteDesktopCoordinatorError,
   type RemoteDesktopCoordinator
@@ -48,6 +48,25 @@ export function createRemoteDesktopConnectService(
         peer: toProtoRouteIdentity(peer),
         capabilities
       });
+    }),
+
+    getRemoteDesktopLockState: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      const result = await dependencies.coordinator.getLockState(connection, peer, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.GetRemoteDesktopLockStateResponseSchema, { peer: toProtoRouteIdentity(peer), result });
+    }),
+
+    requestRemoteDesktopCredentials: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      if (request.request === undefined) {
+        throw new ConnectError("Remote Desktop credential envelope is required.", Code.InvalidArgument);
+      }
+      const result = await dependencies.coordinator.requestCredentials(connection, peer, request.request, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.RequestRemoteDesktopCredentialsResponseSchema, { peer: toProtoRouteIdentity(peer), result });
     }),
 
     getRemoteDesktopPermissions: (request, context) => remoteDesktopRpc(async () => {
@@ -100,7 +119,9 @@ export function createRemoteDesktopConnectService(
     stopRemoteDesktop: (request, context) => remoteDesktopRpc(async () => {
       const connection = authenticate(dependencies.connections, context);
       const peer = fromProtoRouteIdentity(request.peer);
-      await dependencies.coordinator.stop(connection, peer, request.leaseId, context.signal);
+      await dependencies.coordinator.stop(connection, peer, {
+        leaseId: request.leaseId, lockScreen: request.lockScreen, controlGeneration: request.controlGeneration
+      }, context.signal);
       dependencies.connections.fence(connection);
       return create(contract.StopRemoteDesktopResponseSchema, { peer: toProtoRouteIdentity(peer) });
     }),
@@ -117,6 +138,59 @@ export function createRemoteDesktopConnectService(
         peer: toProtoRouteIdentity(peer),
         state
       });
+    }),
+
+    setRemoteDesktopHostMute: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      if (request.request === undefined) {
+        throw new ConnectError("Remote Desktop host mute request is required.", Code.InvalidArgument);
+      }
+      const result = await dependencies.coordinator.setHostMute(connection, peer, request.request, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.SetRemoteDesktopHostMuteResponseSchema, {
+        peer: toProtoRouteIdentity(peer), result
+      });
+    }),
+
+    setRemoteDesktopPrivacyScreen: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      if (request.request === undefined) {
+        throw new ConnectError("Remote Desktop privacy screen request is required.", Code.InvalidArgument);
+      }
+      const result = await dependencies.coordinator.setPrivacyScreen(connection, peer, request.request, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.SetRemoteDesktopPrivacyScreenResponseSchema, { peer: toProtoRouteIdentity(peer), result });
+    }),
+
+    performRemoteDesktopSystemAction: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      if (request.request === undefined) {
+        throw new ConnectError("Remote Desktop system action request is required.", Code.InvalidArgument);
+      }
+      const result = await dependencies.coordinator.performSystemAction(connection, peer, request.request, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.PerformRemoteDesktopSystemActionResponseSchema, { peer: toProtoRouteIdentity(peer), result });
+    }),
+
+    setRemoteDesktopClipboardSync: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      if (request.request === undefined) throw new ConnectError("Remote Desktop clipboard sync request is required.", Code.InvalidArgument);
+      const result = await dependencies.coordinator.setClipboardSync(connection, peer, request.request, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.SetRemoteDesktopClipboardSyncResponseSchema, { peer: toProtoRouteIdentity(peer), result });
+    }),
+
+    getRemoteDesktopClipboardVersion: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      if (request.request === undefined) throw new ConnectError("Remote Desktop clipboard version request is required.", Code.InvalidArgument);
+      const result = await dependencies.coordinator.getClipboardVersion(connection, peer, request.request, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.GetRemoteDesktopClipboardVersionResponseSchema, { peer: toProtoRouteIdentity(peer), result });
     }),
 
     setRemoteDesktopPresentation: (request, context) => remoteDesktopRpc(async () => {
@@ -227,15 +301,37 @@ export function createRemoteDesktopConnectService(
     setRemoteDesktopDisplayMode: (request, context) => remoteDesktopRpc(async () => {
       const connection = authenticate(dependencies.connections, context);
       const peer = fromProtoRouteIdentity(request.peer);
-      await dependencies.coordinator.setDisplayMode(connection, peer, {
+      const result = await dependencies.coordinator.setDisplayMode(connection, peer, {
         leaseId: request.leaseId,
         controlGeneration: request.controlGeneration,
-        modeId: request.modeId
+        modeId: request.modeId,
+        temporary: request.temporary
       }, context.signal);
       dependencies.connections.fence(connection);
       return create(contract.SetRemoteDesktopDisplayModeResponseSchema, {
-        peer: toProtoRouteIdentity(peer)
+        peer: toProtoRouteIdentity(peer), result
       });
+    }),
+
+    setRemoteDesktopViewerDisplay: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      const result = await dependencies.coordinator.setViewerDisplay(connection, peer, {
+        leaseId: request.leaseId, controlGeneration: request.controlGeneration,
+        width: request.width, height: request.height
+      }, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.SetRemoteDesktopViewerDisplayResponseSchema, { peer: toProtoRouteIdentity(peer), result });
+    }),
+
+    restoreRemoteDesktopViewerDisplay: (request, context) => remoteDesktopRpc(async () => {
+      const connection = authenticate(dependencies.connections, context);
+      const peer = fromProtoRouteIdentity(request.peer);
+      const result = await dependencies.coordinator.restoreViewerDisplay(connection, peer, {
+        leaseId: request.leaseId, controlGeneration: request.controlGeneration
+      }, context.signal);
+      dependencies.connections.fence(connection);
+      return create(contract.RestoreRemoteDesktopViewerDisplayResponseSchema, { peer: toProtoRouteIdentity(peer), result });
     }),
 
     transferRemoteDesktopClipboardText: (request, context) => remoteDesktopRpc(async () => {
@@ -286,6 +382,16 @@ async function remoteDesktopRpc<T>(callback: () => Promise<T>): Promise<T> {
   try {
     return await callback();
   } catch (error) {
+    if (error instanceof ConnectionAuthenticationError) {
+      throw new ConnectError(error.message, Code.Unauthenticated);
+    }
+    if (error instanceof DevicePeerAuthorityError) {
+      const code = error.code === "invalid_identity" ? Code.InvalidArgument
+        : error.code === "access_revoked" ? Code.PermissionDenied
+          : error.code === "route_unavailable" ? Code.Unavailable
+            : error.code === "capability_unavailable" ? Code.FailedPrecondition : Code.Aborted;
+      throw new ConnectError(error.message, code);
+    }
     if (!(error instanceof RemoteDesktopCoordinatorError)) throw error;
     const code = error.code === "invalid_argument" ? Code.InvalidArgument
       : error.code === "not_found" ? Code.NotFound

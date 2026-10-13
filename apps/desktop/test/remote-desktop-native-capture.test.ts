@@ -1,16 +1,62 @@
 import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { PassThrough } from "node:stream";
-import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("electron", () => ({ app: {} }));
 
-import { DesktopRemoteDesktopNativeCapture, parseDesktopRemoteDesktopNativeFrame } from
+import { DesktopRemoteDesktopNativeCapture, parseDesktopRemoteDesktopNativeFrame, type DesktopRemoteDesktopNativeCaptureRuntime } from
   "../src/remote-desktop-native-capture.js";
 
 describe("Remote Desktop native capture boundary", () => {
+  it("retires an unfiltered pull and proves exclusions only after a current filtered frame", async () => {
+    const children: ReturnType<typeof fakeChild>[] = [];
+    const arguments_: string[][] = [];
+    const capture = new DesktopRemoteDesktopNativeCapture({
+      platform: "darwin", resolveBinary: async () => "/capture",
+      spawn: (_binary, values) => {
+        arguments_.push([...values]);
+        const child = fakeChild(); children.push(child); return child.process;
+      }
+    });
+    const previous = capture.frame("1", false, false);
+    await vi.waitFor(() => expect(children).toHaveLength(1));
+    capture.setExcludedWindows([20, 10]);
+    expect(capture.privacyReady).toBe(false);
+    await expect(previous).resolves.toBeNull();
+    children[0]!.stdout.write(`${JSON.stringify({ jpeg: "AQ==", width: 1, height: 1, cursor: null })}\n`);
+    expect(capture.privacyReady).toBe(false);
+    const filtered = capture.frame("1", false, false);
+    await vi.waitFor(() => expect(children).toHaveLength(2));
+    expect(arguments_).toEqual([["1"], ["1", "10,20"]]);
+    expect(capture.privacyReady).toBe(false);
+    children[1]!.stdout.write(`${JSON.stringify({ jpeg: "AQ==", width: 1, height: 1, cursor: null })}\n`);
+    await expect(filtered).resolves.toMatchObject({ width: 1 });
+    expect(capture.privacyReady).toBe(true);
+    capture.setExcludedWindows([]);
+    expect(capture.privacyReady).toBe(false);
+    capture.stop();
+  });
+
+  it("keeps failed filtered streams unconfirmed and never dispatches an unfiltered fallback", async () => {
+    const child = fakeChild();
+    const spawn = vi.fn<DesktopRemoteDesktopNativeCaptureRuntime["spawn"]>(() => child.process);
+    const capture = new DesktopRemoteDesktopNativeCapture({ platform: "darwin", resolveBinary: async () => "/capture", spawn });
+    capture.setExcludedWindows([123]);
+    const pending = capture.frame("1", true, false, { fps: 30, quality: "auto", audio: false });
+    const failure = expect(pending).rejects.toThrow("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce());
+    child.process.emit("exit", 5);
+    await failure;
+    expect(capture.privacyReady).toBe(false);
+    expect(spawn.mock.calls[0]![1]).toEqual(["1", "native-video", "30", "0.8", "2560", "1500000", "123"]);
+    expect(() => capture.setExcludedWindows([0])).toThrow("PRIVACY_UNAVAILABLE");
+    expect(() => capture.setExcludedWindows([1, 1])).toThrow("PRIVACY_UNAVAILABLE");
+    capture.stop();
+  });
+
   it("accepts a bounded cursor only when its first PNG chunk is a bounded IHDR", () => {
     const value = frame(cursorPng(32, 48).toString("base64"));
     expect(parseDesktopRemoteDesktopNativeFrame(value, true, true).cursor)
@@ -102,6 +148,13 @@ describe("Remote Desktop native capture boundary", () => {
     expect(source).toContain("width >= 1 && width <= 512 && height >= 1 && height <= 512");
   });
 });
+
+function fakeChild() {
+  const stdin = new PassThrough(), stdout = new PassThrough(), stderr = new PassThrough();
+  const stdio: [PassThrough, PassThrough, PassThrough] = [stdin, stdout, stderr];
+  const process = Object.assign(new ChildProcess(), { stdin, stdout, stderr, stdio, kill: vi.fn(() => true) });
+  return { stdin, stdout, stderr, process };
+}
 
 function frame(png: string): Record<string, unknown> {
   return {

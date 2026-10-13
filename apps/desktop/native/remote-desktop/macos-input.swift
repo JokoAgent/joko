@@ -3,16 +3,50 @@ import ApplicationServices
 import AppKit
 import IOKit.graphics
 import Security
+import Darwin
 
 guard let inputCaller = DesktopInputCaller.authenticate() else { exit(77) }
 
-func unlockedSession() -> Bool {
+func ownedConsoleSession() -> [String: Any]? {
   guard let state = CGSessionCopyCurrentDictionary() as? [String: Any],
     (state[kCGSessionUserIDKey as String] as? NSNumber)?.uint32Value == geteuid(),
     state[kCGSessionOnConsoleKey as String] as? Bool == true,
     state[kCGSessionLoginDoneKey as String] as? Bool == true,
-    let locked = state["CGSSessionScreenIsLocked"] as? Bool else { return false }
-  return !locked
+    state["CGSSessionScreenIsLocked"] as? Bool != nil else { return nil }
+  return state
+}
+
+func unlockedSession() -> Bool {
+  return ownedConsoleSession()?["CGSSessionScreenIsLocked"] as? Bool == false
+}
+
+func clipboardCounter(portable: Bool) -> String {
+  guard unlockedSession() else { return "unavailable" }
+  if portable && (NSPasteboard.general.pasteboardItems?.count ?? 0) > 1 { return "unsupported" }
+  return String(NSPasteboard.general.changeCount)
+}
+
+if CommandLine.arguments == [CommandLine.arguments[0], "--clipboard-counter"] {
+  var bytes: [UInt8] = []
+  while true {
+    var descriptor = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+    guard poll(&descriptor, 1, 5000) > 0 else { exit(0) }
+    var byte: UInt8 = 0
+    guard read(STDIN_FILENO, &byte, 1) == 1 else { exit(0) }
+    if byte != 10 {
+      bytes.append(byte)
+      if bytes.count > 32 { exit(2) }
+      continue
+    }
+    autoreleasepool {
+      guard inputCaller.code() != nil else { exit(77) }
+      let parts = String(bytes: bytes, encoding: .utf8)?.split(separator: " ") ?? []
+      guard parts.count == 2, parts[0].count <= 16, UInt64(parts[0]) != nil,
+        parts[1] == "0" || parts[1] == "1" else { exit(2) }
+      print("\(parts[0]) \(clipboardCounter(portable: parts[1] == "1"))"); fflush(stdout)
+    }
+    bytes.removeAll(keepingCapacity: true)
+  }
 }
 
 // Expose only the change counter. Clipboard bytes never cross the helper's
@@ -67,10 +101,11 @@ if CommandLine.arguments.count == 2 &&
 
 // Display configuration is a separate authenticated one-shot command. It
 // never acquires input ownership or prompts for Accessibility permission.
-// Only a mode from a fresh enumeration may be applied and it lasts only for
-// the current login session.
+// Ordinary selection uses the UI enumeration. Captured cleanup validates the
+// original against all modes and may restore this UID's locked login session.
 if (CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--display-modes") ||
-  (CommandLine.arguments.count == 4 && CommandLine.arguments[1] == "--display-mode") {
+  (CommandLine.arguments.count == 4 &&
+    (CommandLine.arguments[1] == "--display-mode" || CommandLine.arguments[1] == "--restore-display-mode")) {
   guard let display = UInt32(CommandLine.arguments[2]), CGDisplayIsOnline(display) != 0,
     let modes = CGDisplayCopyAllDisplayModes(
       display,
@@ -105,7 +140,11 @@ if (CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--display-m
     print(json)
     exit(0)
   }
-  guard unlockedSession(), let modeID = UInt32(CommandLine.arguments[3]),
+  let restoring = CommandLine.arguments[1] == "--restore-display-mode"
+  func modeSessionAllowed() -> Bool {
+    return inputCaller.code() != nil && (restoring ? ownedConsoleSession() != nil : unlockedSession())
+  }
+  guard modeSessionAllowed(), let modeID = UInt32(CommandLine.arguments[3]),
     let mode = modes.first(where: {
       $0.ioDisplayModeID == modeID && $0.isUsableForDesktopGUI()
     }) else { exit(2) }
@@ -116,6 +155,7 @@ if (CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--display-m
     CGCancelDisplayConfiguration(configuration)
     exit(3)
   }
+  guard modeSessionAllowed() else { CGCancelDisplayConfiguration(configuration); exit(2) }
   guard CGCompleteDisplayConfiguration(configuration, .forSession) == .success else { exit(3) }
   print("ready")
   exit(0)
@@ -142,9 +182,134 @@ if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--lock-state
   exit(0)
 }
 
-guard CommandLine.arguments.count == 1 else { exit(2) }
+if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--lock-screen" {
+  func ownedSession() -> [String: Any]? {
+    guard let state = CGSessionCopyCurrentDictionary() as? [String: Any],
+      (state[kCGSessionUserIDKey as String] as? NSNumber)?.uint32Value == geteuid(),
+      state[kCGSessionOnConsoleKey as String] as? Bool == true,
+      state[kCGSessionLoginDoneKey as String] as? Bool == true,
+      state["CGSSessionScreenIsLocked"] as? Bool != nil else { return nil }
+    return state
+  }
+  guard let state = ownedSession(), inputCaller.code() != nil else { exit(2) }
+  if state["CGSSessionScreenIsLocked"] as? Bool == true { print("locked"); exit(0) }
+  guard AXIsProcessTrusted(), ownedSession() != nil else { exit(2) }
+  let lockSource = CGEventSource(stateID: .privateState)
+  var pressed = Set<CGKeyCode>()
+  func lockKey(_ code: CGKeyCode, _ down: Bool) {
+    if down { pressed.insert(code) } else { pressed.remove(code) }
+    guard let event = CGEvent(keyboardEventSource: lockSource, virtualKey: code, keyDown: down) else { return }
+    var flags: CGEventFlags = []
+    if pressed.contains(59) { flags.insert(.maskControl) }
+    if pressed.contains(55) { flags.insert(.maskCommand) }
+    event.flags = flags
+    event.post(tap: .cghidEventTap)
+    usleep(8_000)
+  }
+  // Fixed system lock shortcut, followed by positive owned-session proof.
+  lockKey(59, true); lockKey(55, true); lockKey(12, true)
+  lockKey(12, false); lockKey(55, false); lockKey(59, false)
+  let deadline = Date().addingTimeInterval(3)
+  while Date() < deadline {
+    guard let current = ownedSession(), inputCaller.code() != nil else { exit(2) }
+    if current["CGSSessionScreenIsLocked"] as? Bool == true { print("locked"); exit(0) }
+    usleep(50_000)
+  }
+  exit(2)
+}
+
+guard CommandLine.arguments.count == 1 || CommandLine.arguments == [CommandLine.arguments[0], "--privacy-input"] else { exit(2) }
 guard unlockedSession() else { print("locked"); fflush(stdout); exit(2) }
+struct PrivacyInputGate {
+  var phase = 0
+  var swallowed = Set<Int64>()
+  mutating func consume(physical: Bool, press: Int64?, down: Bool, trigger: Bool, scroll: Bool = false) -> (Bool, Bool) {
+    if !physical { return (phase == 2, false) }
+    if scroll {
+      let notify = phase == 0
+      if notify { phase = 1 }
+      return (true, notify)
+    }
+    if let press = press, swallowed.contains(press) {
+      if !down { swallowed.remove(press) }
+      return (true, false)
+    }
+    if phase == 0 && trigger {
+      phase = 1
+      if let press = press, down { swallowed.insert(press) }
+      return (true, true)
+    }
+    if phase == 1 {
+      if let press = press, down { swallowed.insert(press) }
+      return (true, false)
+    }
+    return (false, false)
+  }
+}
 guard AXIsProcessTrusted() else { print("permission"); fflush(stdout); exit(2) }
+if CommandLine.arguments == [CommandLine.arguments[0], "--privacy-input"] {
+  var heartbeat = Date()
+  var previousApp: NSRunningApplication?
+  let events: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp,
+    .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .mouseMoved,
+    .leftMouseDragged, .rightMouseDragged, .otherMouseDragged, .scrollWheel]
+  let mask = events.reduce(CGEventMask(0)) { $0 | (CGEventMask(1) << $1.rawValue) }
+  // Context remains alive on this run loop until process exit; callbacks never
+  // wait on stdin, Main or network and never print event contents.
+  let context = UnsafeMutablePointer<PrivacyInputGate>.allocate(capacity: 1)
+  context.initialize(to: PrivacyInputGate())
+  guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+    options: .defaultTap, eventsOfInterest: mask, callback: { _, type, event, info in
+      if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+        print("error"); fflush(stdout); exit(2)
+      }
+      let state = info!.assumingMemoryBound(to: PrivacyInputGate.self)
+      let physical = event.getIntegerValueField(.eventSourceUnixProcessID) == 0
+        && event.getIntegerValueField(.eventSourceStateID) == Int64(CGEventSourceStateID.hidSystemState.rawValue)
+      let key = type == .keyDown || type == .keyUp
+      let mouseDown = [.leftMouseDown, .rightMouseDown, .otherMouseDown].contains(type)
+      let mouseUp = [.leftMouseUp, .rightMouseUp, .otherMouseUp].contains(type)
+      let press: Int64? = key ? event.getIntegerValueField(.keyboardEventKeycode)
+        : (mouseDown || mouseUp ? 100000 + event.getIntegerValueField(.mouseEventButtonNumber) : nil)
+      let (consume, notify) = state.pointee.consume(physical: physical, press: press,
+        down: type == .keyDown || mouseDown, trigger: type == .keyDown || mouseDown || type == .flagsChanged, scroll: type == .scrollWheel)
+      if notify { print("local-input"); fflush(stdout) }
+      return consume ? nil : Unmanaged.passUnretained(event)
+    }, userInfo: context), let runSource = CFMachPortCreateRunLoopSource(nil, tap, 0) else {
+      print("error"); fflush(stdout); exit(2)
+    }
+  CFRunLoopAddSource(CFRunLoopGetMain(), runSource, .commonModes)
+  CGEvent.tapEnable(tap: tap, enable: true)
+  print("ready"); fflush(stdout)
+  DispatchQueue.global().async {
+    while let command = readLine() {
+      guard command.utf8.count <= 16 else { exit(2) }
+      DispatchQueue.main.async {
+        heartbeat = Date()
+        switch command {
+        case "ping": break
+        case "confirm":
+          previousApp = NSWorkspace.shared.frontmostApplication
+          context.pointee.phase = 2; print("confirmed"); fflush(stdout)
+        case "resume":
+          _ = previousApp?.activate(options: [.activateIgnoringOtherApps])
+          previousApp = nil
+          context.pointee.phase = 0; print("ready"); fflush(stdout)
+        default: exit(2)
+        }
+      }
+    }
+    exit(0) // Process exit removes the tap, even if Main died with a dialog up.
+  }
+  let timer = DispatchSource.makeTimerSource(queue: .main)
+  timer.schedule(deadline: .now() + 1, repeating: 1)
+  timer.setEventHandler {
+    if Date().timeIntervalSince(heartbeat) > 5 || inputCaller.code() == nil || !AXIsProcessTrusted() || !unlockedSession() { exit(2) }
+  }
+  timer.resume()
+  CFRunLoopRun()
+  exit(0)
+}
 
 let source = CGEventSource(stateID: .privateState)
 let keyMetadataSource = CGEventSource(stateID: .privateState)

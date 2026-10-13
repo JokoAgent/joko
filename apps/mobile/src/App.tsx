@@ -5,6 +5,7 @@ import {
   useWindowDimensions, View
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
+import { MobileAdaptiveWindowProvider } from "./MobileAdaptiveWindow";
 import { SvgXml } from "react-native-svg";
 import { StatusBar } from "expo-status-bar";
 import Constants from "expo-constants";
@@ -309,7 +310,7 @@ import { mobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
 import { MobileFilesClipboard, type MobileFilesClipboardLease, type MobileFilesClipboardResult } from "./mobile-files-clipboard";
 import type { MobileFilesPreferences } from "./mobile-files-presentation";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
-import { MobileRemoteDesktopScreen } from "./MobileRemoteDesktopScreen";
+import { MobileRemoteDesktopScreen, type MobileRemoteDesktopLifecycleHandler } from "./MobileRemoteDesktopScreen";
 import { mobileRemoteDesktopCopy, mobileRemoteDesktopSessionDeviceId } from "./remote-desktop-presentation";
 import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
 import { mobileReadOnlyDictionarySources } from "./mobile-voice-dictionary-readonly";
@@ -389,6 +390,7 @@ interface MobileRemoteDesktopEntry {
   readonly ownerKey: string;
   readonly returnPage: "device" | "task";
   readonly preferredDeviceId?: string;
+  readonly retained?: boolean;
 }
 
 interface MobilePhotoLibraryLease {
@@ -562,6 +564,11 @@ export function App() {
   const [remoteDesktopEntry, setRemoteDesktopEntry] = useState<MobileRemoteDesktopEntry>();
   const [foreground, setForeground] = useState(AppState.currentState === "active");
   const [remoteDesktopForeground, setRemoteDesktopForeground] = useState(AppState.currentState === "active");
+  const remoteDesktopLifecycle = useRef<MobileRemoteDesktopLifecycleHandler | undefined>(undefined);
+  const registerRemoteDesktopLifecycle = useCallback((handler: MobileRemoteDesktopLifecycleHandler) => {
+    remoteDesktopLifecycle.current = handler;
+    return () => { if (remoteDesktopLifecycle.current === handler) remoteDesktopLifecycle.current = undefined; };
+  }, []);
   const dictionaryTransport = client.voiceDictionaryTransport();
   useEffect(() => {
     readOnlyDictionary.setSources(mobileReadOnlyDictionarySources(state.saved));
@@ -642,6 +649,7 @@ export function App() {
     const subscription = AppState.addEventListener("change", (status) => {
       const transition = lifecycle.transition(status);
       const foreground = transition.interactive;
+      if (!foreground) remoteDesktopLifecycle.current?.(transition);
       diagnosticsState = status;
       diagnosticsTick = performance.now();
       setForeground(foreground);
@@ -650,6 +658,7 @@ export function App() {
         client.setForeground(transition.transportForeground);
         setRemoteDesktopForeground(transition.transportForeground);
       }
+      if (foreground) remoteDesktopLifecycle.current?.(transition);
       void mobileUpdates.handleAppStateChange(status);
       mobileDiagnostics.record("app.lifecycle", { state: mobileDiagnosticAppState(status) });
       if (foreground) void mobileIncomingShare.refresh().catch(() => undefined);
@@ -731,7 +740,7 @@ export function App() {
       },
       selectSession: (sessionId) => client.select(sessionId),
       loadGroup: async groupId => { const api = client.partnerGroupApi(); if (!api) throw new Error("The group owner is unavailable."); await api.get(groupId, undefined, new AbortController().signal); },
-      showGroup: groupId => { setNativeIntentGroupId(groupId); setPage("partner-directory"); },
+      showGroup: groupId => { setRemoteDesktopEntry(undefined); setNativeIntentGroupId(groupId); setPage("partner-directory"); },
       loadAround: (eventId) => client.around(eventId),
       loadOlder: () => client.older(),
       returnLatest: () => client.latest(),
@@ -769,6 +778,7 @@ export function App() {
     if (!foreground || !navigationKey || openedIncomingShareRef.current === navigationKey || !state.activeProfileId
       || !externalIntentFenceRef.current!.shareMayNavigate()) return;
     openedIncomingShareRef.current = navigationKey;
+    setRemoteDesktopEntry(undefined);
     setPage("new");
   }, [foreground, incomingShare.batch, incomingShare.busy, incomingShareRequestRevision, state.activeProfileId]);
 
@@ -820,17 +830,27 @@ export function App() {
   const common = { colors, state, locale: locale.effectiveLocale };
   const connectionRequired = !state.activeProfileId;
   const remoteDesktopTransport = client.remoteDesktopTransport();
+  useEffect(() => {
+    if (remoteDesktopEntry && (updates.forced || !state.activeProfileId
+      || remoteDesktopTransport?.ownerKey !== remoteDesktopEntry.ownerKey
+      || (page !== "remote-desktop" && !remoteDesktopEntry.retained))) setRemoteDesktopEntry(undefined);
+  }, [remoteDesktopEntry, remoteDesktopTransport?.ownerKey, updates.forced, state.activeProfileId, page]);
   const openRemoteDesktop = (returnPage: MobileRemoteDesktopEntry["returnPage"], preferredDeviceId?: string): void => {
     const transport = client.remoteDesktopTransport();
     if (!transport || !foreground || state.status !== "connected") return;
     setRemoteDesktopEntry({ ownerKey: transport.ownerKey, returnPage, ...(preferredDeviceId ? { preferredDeviceId } : {}) });
     setPage("remote-desktop");
   };
-  const closeRemoteDesktop = (): void => {
+  const closeRemoteDesktop = (retained = false): void => {
     const target = remoteDesktopEntry?.returnPage;
-    setRemoteDesktopEntry(undefined);
-    setPage(target === "device" && deviceId && state.owner?.devices.some((device) => device.deviceId === deviceId)
+    setRemoteDesktopEntry(retained && remoteDesktopEntry ? { ...remoteDesktopEntry, retained: true } : undefined);
+    if (page === "remote-desktop") setPage(target === "device" && deviceId && state.owner?.devices.some((device) => device.deviceId === deviceId)
       ? "device" : target === "task" && state.selectedId ? "task" : "home");
+  };
+  const restoreRemoteDesktop = (): void => {
+    if (!remoteDesktopEntry || remoteDesktopTransport?.ownerKey !== remoteDesktopEntry.ownerKey) return;
+    setRemoteDesktopEntry({ ...remoteDesktopEntry, retained: false });
+    setPage("remote-desktop");
   };
   const queueHomeMenuAction = (action: () => void): void => {
     if (pendingHomeMenuActionRef.current) return;
@@ -840,6 +860,7 @@ export function App() {
   const handleComposerFocused = useCallback(() => setFocusTaskComposer(false), []);
   return (
     <SafeAreaProvider>
+      <MobileAdaptiveWindowProvider>
       <MobilePartnerAvatarProvider transport={client.partnerAvatarTransport()}>
       <View style={[styles.root, { backgroundColor: colors.background }]}>
         <StatusBar style={dark ? "light" : "dark"} />
@@ -893,12 +914,7 @@ export function App() {
                   onOpenDerivationOrigin={openDerivationOrigin}
                   onRemoteDesktop={(targetDeviceId) => openRemoteDesktop("task", targetDeviceId)}
                   messageFocus={nativeIntentMessageFocus} /> :
-                page === "remote-desktop" && remoteDesktopEntry ? <MobileRemoteDesktopScreen
-                  transport={remoteDesktopTransport?.ownerKey === remoteDesktopEntry.ownerKey ? remoteDesktopTransport : undefined}
-                  preferredDeviceId={remoteDesktopEntry.preferredDeviceId} interactive={foreground}
-                  foreground={remoteDesktopForeground}
-                  online={state.status === "connected"} colors={colors} locale={locale.effectiveLocale}
-                  onClose={closeRemoteDesktop} /> :
+                page === "remote-desktop" && remoteDesktopEntry ? <View style={styles.fill} /> :
                 page === "files" ? <FilesScreen {...common} initialSource={filesInitialSource} onBack={() => setPage("task")}
                   onAdded={() => {
                     setFocusTaskComposer(true);
@@ -990,6 +1006,25 @@ export function App() {
                   onMenu={() => { pendingHomeMenuActionRef.current = undefined; setMenuOpen(true); }} />}
             </SafeAreaView>}
         </View>
+        {remoteDesktopEntry && <SafeAreaView style={[StyleSheet.absoluteFill,
+          { backgroundColor: colors.background, opacity: page === "remote-desktop" ? 1 : 0 }]}
+          edges={["top", "left", "right", "bottom"]} pointerEvents={page === "remote-desktop" ? "auto" : "none"}
+          accessibilityElementsHidden={page !== "remote-desktop"}
+          importantForAccessibility={page === "remote-desktop" ? "auto" : "no-hide-descendants"}>
+          <MobileRemoteDesktopScreen
+            transport={remoteDesktopTransport?.ownerKey === remoteDesktopEntry.ownerKey ? remoteDesktopTransport : undefined}
+            preferredDeviceId={remoteDesktopEntry.preferredDeviceId} routeFocused={page === "remote-desktop"}
+            interactive={foreground && page === "remote-desktop"} foreground={remoteDesktopForeground}
+            online={state.status === "connected"} colors={colors} locale={locale.effectiveLocale}
+            registerLifecycle={registerRemoteDesktopLifecycle}
+            onClose={closeRemoteDesktop} onRestore={restoreRemoteDesktop} onEnded={() => closeRemoteDesktop(false)} />
+        </SafeAreaView>}
+        {remoteDesktopEntry?.retained && page !== "remote-desktop" && <Pressable accessibilityRole="button"
+          accessibilityLabel={mobileRemoteDesktopCopy(locale.effectiveLocale).returnToDesktop} onPress={restoreRemoteDesktop}
+          style={{ position: "absolute", bottom: 24, right: 16, padding: 12, borderRadius: 16,
+            backgroundColor: colors.surface, borderColor: colors.border, borderWidth: StyleSheet.hairlineWidth }}>
+          <Text style={{ color: colors.ink }}>{mobileRemoteDesktopCopy(locale.effectiveLocale).returnToDesktop}</Text>
+        </Pressable>}
         {!updates.prompt && nativeIntentRecovery && <MobileNativeIntentNotice colors={colors} locale={locale.effectiveLocale}
           recovery={nativeIntentRecovery} onDismiss={() => setNativeIntentRecovery(undefined)} />}
         <HomeMenu visible={!updates.prompt && !connectionRequired && menuOpen} colors={colors} state={state}
@@ -1019,6 +1054,7 @@ export function App() {
         </>}
       </View>
       </MobilePartnerAvatarProvider>
+      </MobileAdaptiveWindowProvider>
     </SafeAreaProvider>
   );
 }

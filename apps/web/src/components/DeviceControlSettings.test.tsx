@@ -26,6 +26,17 @@ afterEach(async () => {
 });
 
 describe("DeviceControlSettings", () => {
+  it("opens an online consented Desktop peer using the active connection owner", async () => {
+    const api = { bind: vi.fn(async () => undefined), open: vi.fn(async () => ({ focusedExisting: false })), retire: vi.fn() };
+    Object.defineProperty(window, "jokoDesktop", { configurable: true, value: { remoteDesktopViewer: api } });
+    try {
+      const value = snapshot([device("self", "This desktop", "online"), device("peer", "Peer", "online", { remoteControlEnabled: true })]);
+      const rendered = await renderSettings({ ...value, deviceControlRelations: [{ id: "relation", controllerDeviceId: "self",
+        targetDeviceId: "peer", outboundEnabled: true, inboundAllowed: true, effective: true, revision: 1n }] }, {});
+      await clickButton(rendered.container, "Remote desktop"); await rendered.flush();
+      expect(api.open).toHaveBeenCalledWith(expect.objectContaining({ profileId: "profile", serverId: "server", connectionGeneration: 1 }), { deviceId: "peer", name: "Peer" });
+    } finally { Reflect.deleteProperty(window, "jokoDesktop"); }
+  });
   it("uses an explicit permissive preference but an ineffective route when no relation was persisted", () => {
     expect(deviceControlRelation([], "controller", "target")).toEqual({
       id: "controller:target",
@@ -311,6 +322,7 @@ async function renderSettings(snapshotValue: AppSnapshot, methods: Record<string
   const actionKeys: string[] = [];
   const controller = {
     state: {
+      ready: true,
       connectionGeneration: 1,
       connectionState: "connected",
       activeProfile: {

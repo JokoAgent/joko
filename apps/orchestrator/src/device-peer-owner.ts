@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 
-import { clone, isMessage } from "@bufbuild/protobuf";
-import { DevicePeerCommandSchema, type DevicePeerCommand } from "@joko/contracts";
+import { clone, create, isMessage } from "@bufbuild/protobuf";
+import { DevicePeerCommandSchema, DevicePeerCloseRemoteDesktopCredentialsActionSchema,
+  DevicePeerCapabilityKind, RemoteDesktopCredentialResultSchema,
+  DevicePeerEffectKind as ContractDevicePeerEffectKind, type DevicePeerCommand } from "@joko/contracts";
 import {
   DevicePeerRegistryError,
+  isRemoteDesktopCredentialHandle,
   DevicePeerRouteRegistry,
   type DevicePeerAgentOutcome,
   type DevicePeerCapability,
@@ -229,6 +232,11 @@ export class DevicePeerOwner {
     }
   ): Promise<DevicePeerResponseFrame> {
     authority.assertCurrent([input.capability]);
+    const nativeCleanup = input.action === "requestRemoteDesktopCredentials"
+      && isMessage(input.payload, DevicePeerCommandSchema)
+      && input.payload.action.case === "requestRemoteDesktopCredentials"
+      && input.payload.action.value.request.case === "open"
+      ? this.captureRemoteDesktopCredentialCleanup(authority) : undefined;
     const claim = this.#routes.registerClaim({
       requestId: input.requestId ?? randomUUID(),
       controllerDeviceId: authority.controllerDeviceId,
@@ -245,6 +253,13 @@ export class DevicePeerOwner {
         authority.assertCurrent([input.capability]);
       } catch (error) {
         if (response.outcome === "outcome_unknown") return response;
+        if (nativeCleanup !== undefined && response.outcome === "completed") {
+          const payload = response.value as { readonly case?: unknown; readonly value?: unknown } | undefined;
+          if (payload?.case === "remoteDesktopCredentials" && isMessage(payload.value, RemoteDesktopCredentialResultSchema)
+            && payload.value.result.case === "opened" && isRemoteDesktopCredentialHandle(payload.value.result.value.handle)) {
+            void nativeCleanup(payload.value.result.value.handle, AbortSignal.timeout(2_000)).catch(() => undefined);
+          }
+        }
         if (input.effectKind === "side_effect" && response.outcome !== "aborted") {
           return responseFromAuthorityLoss(authority, claim.requestId);
         }
@@ -256,6 +271,37 @@ export class DevicePeerOwner {
         if (!(error instanceof DevicePeerRegistryError)) throw error;
       }
     }
+  }
+
+  /** Capture termination authority while the pairing is valid. The resulting
+   * closure can only close a handle owned by this controller on this route;
+   * it cannot restore revoked business authority or target a replacement. */
+  captureRemoteDesktopCredentialCleanup(
+    authority: DevicePeerAuthority
+  ): (handle: string, signal?: AbortSignal) => Promise<void> {
+    authority.assertCurrent(["remote_desktop"]);
+    const route = this.#routes.getRoute(authority.identity.targetDeviceId);
+    if (route === undefined || route.routeGeneration !== authority.identity.routeGeneration) throw accessRevoked();
+    const controllerDeviceId = authority.controllerDeviceId;
+    return async (handle, signal) => {
+      if (!isRemoteDesktopCredentialHandle(handle)) throw new DevicePeerAuthorityError("invalid_identity", "Invalid native handle.");
+      if (this.#routes.getRoute(route.targetDeviceId) !== route) return;
+      const command = create(DevicePeerCommandSchema, {
+        capability: DevicePeerCapabilityKind.REMOTE_DESKTOP,
+        effect: ContractDevicePeerEffectKind.SIDE_EFFECT,
+        action: { case: "closeRemoteDesktopCredentials", value: create(DevicePeerCloseRemoteDesktopCredentialsActionSchema, { handle }) }
+      });
+      const claim = this.#routes.registerClaim({
+        requestId: randomUUID(), controllerDeviceId, targetDeviceId: route.targetDeviceId,
+        routeGeneration: route.routeGeneration, capability: "remote_desktop", effectKind: "side_effect",
+        action: "closeRemoteDesktopCredentials", payload: injectControllerIdentity(command, controllerDeviceId)
+      });
+      try { await this.#routes.dispatch(claim, signal); }
+      finally {
+        try { this.#routes.forgetClaim(claim); }
+        catch (error) { if (!(error instanceof DevicePeerRegistryError)) throw error; }
+      }
+    };
   }
 
   async dispatchStream(

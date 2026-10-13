@@ -24,6 +24,16 @@ afterEach(async () => {
 });
 
 describe("MachineSwitcherMenu", () => {
+  it("exposes paired remote desktops with one saved node and keeps that action separate from node switching", async () => {
+    const open = vi.fn();
+    const view = await renderMenu({ profiles: [local], remoteDesktops: [
+      { deviceId: "desk", name: "Remote desk", enabled: true }, { deviceId: "offline", name: "Offline desk", enabled: false }
+    ], onRemoteDesktop: open });
+    const buttons = [...view.container.querySelectorAll<HTMLButtonElement>(".machine-switcher__remote-desktops button")];
+    expect(buttons[1]?.disabled).toBe(true);
+    await act(async () => buttons[0]?.click());
+    expect(open).toHaveBeenCalledWith("desk"); expect(view.onSwitch).not.toHaveBeenCalled();
+  });
   it("uses the full machine row for a single-machine switch", async () => {
     const fixture = await renderMenu({ selection: "all" });
     const row = machineRow(fixture.container, "Alpha");

@@ -1,3 +1,6 @@
 android/
+!modules/joko-remote-presentation/android/
+!modules/joko-remote-presentation/android/**
+modules/joko-remote-presentation/android/build/
 /ios/
 dist/

@@ -4,7 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
 
-import { create } from "@bufbuild/protobuf";
+import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import {
   DevicePeerCapabilityKind,
   type DevicePeerCommand,
@@ -14,6 +14,8 @@ import {
   DevicePeerExchangeRemoteDesktopIceActionSchema,
   DevicePeerFailureCode,
   DevicePeerGetRemoteDesktopCapabilitiesActionSchema,
+  DevicePeerGetRemoteDesktopLockStateActionSchema,
+  DevicePeerCloseRemoteDesktopCredentialsActionSchema,
   DevicePeerGetRemoteDesktopFrameActionSchema,
   DevicePeerGetRemoteDesktopPermissionsActionSchema,
   DevicePeerHeartbeatRemoteDesktopActionSchema,
@@ -26,12 +28,18 @@ import {
   DevicePeerSetRemoteDesktopControlActionSchema,
   DevicePeerSetRemoteDesktopPresentationActionSchema,
   DevicePeerSetRemoteDesktopDisplayModeActionSchema,
+  DevicePeerSetRemoteDesktopViewerDisplayActionSchema,
+  DevicePeerRestoreRemoteDesktopViewerDisplayActionSchema,
   DevicePeerProbeRemoteDesktopPresentationActionSchema,
   DevicePeerShowRemoteDesktopPermissionGuideActionSchema,
   DevicePeerStartRemoteDesktopActionSchema,
   DevicePeerStartProcessActionSchema,
   DevicePeerStopRemoteDesktopActionSchema,
   RemoteDesktopCapabilitiesSchema,
+  RemoteDesktopLockState,
+  RemoteDesktopLockStateResultSchema,
+  RemoteDesktopCredentialResultSchema,
+  RemoteDesktopCredentialRequestSchema,
   RemoteDesktopClipboardContentBeginActionSchema,
   RemoteDesktopClipboardContentCancelActionSchema,
   RemoteDesktopClipboardContentCommitActionSchema,
@@ -41,6 +49,11 @@ import {
   type RemoteDesktopClipboardContentRequest,
   RemoteDesktopClipboardContentRequestSchema,
   RemoteDesktopClipboardContentWriteActionSchema,
+  RemoteDesktopClipboardContentPasteActionSchema,
+  RemoteDesktopClipboardSyncRequestSchema,
+  RemoteDesktopClipboardSyncResultSchema,
+  RemoteDesktopClipboardVersionRequestSchema,
+  RemoteDesktopClipboardVersionResultSchema,
   RemoteDesktopClipboardTextCopyActionSchema,
   RemoteDesktopClipboardTextPasteActionSchema,
   type RemoteDesktopClipboardTextRequest,
@@ -49,9 +62,18 @@ import {
   RemoteDesktopCursorSchema,
   RemoteDesktopDisplaySchema,
   RemoteDesktopDisplayModeSchema,
+  RemoteDesktopDisplayModeResultSchema,
+  RemoteDesktopViewerDisplayResultSchema,
   RemoteDesktopFailureReason,
   RemoteDesktopFrameResultSchema,
   RemoteDesktopFrameSchema,
+  RemoteDesktopHostMuteRequestSchema,
+  RemoteDesktopHostMuteResultSchema,
+  RemoteDesktopSystemActionKind,
+  RemoteDesktopSystemActionRequestSchema,
+  RemoteDesktopSystemActionResultSchema,
+  RemoteDesktopPrivacyScreenRequestSchema,
+  RemoteDesktopPrivacyScreenResultSchema,
   RemoteDesktopIceCandidateSchema,
   RemoteDesktopIceExchangeResultSchema,
   RemoteDesktopInputEventSchema,
@@ -90,6 +112,66 @@ afterEach(async () => {
 });
 
 describe("Node Device peer recent project ownership", () => {
+  it("credentials admit authenticated controller and preserve the signal without a media lease", async () => {
+    const root = await testRoot(); const fixture = remoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "credentials.json"), remoteDesktop: fixture.port });
+    const signal = new AbortController().signal;
+    const request = create(RemoteDesktopCredentialRequestSchema, { request: { case: "prepare", value: {} } });
+    const command = remoteDesktopCommand({ case: "requestRemoteDesktopCredentials", value: request }, DevicePeerEffectKind.SIDE_EFFECT);
+    const results: NodeDevicePeerAgentEmission[] = [];
+    await executor.execute(command, signal, async result => { results.push(result); });
+    expect(results.at(-1)?.payload).toMatchObject({ case: "remoteDesktopCredentials", value: { result: { case: "prepared" } } });
+    expect(fixture.state.calls[0]).toMatchObject({ method: "requestCredentials", request: { controllerDeviceId: "controller-device", request, signal } });
+    const status = remoteDesktopCommand({ case: "getRemoteDesktopLockState", value: create(DevicePeerGetRemoteDesktopLockStateActionSchema) }, DevicePeerEffectKind.READ_ONLY);
+    expect((await execute(executor, status)).at(-1)?.payload).toMatchObject({ case: "remoteDesktopLockState", value: { state: RemoteDesktopLockState.LOCKED } });
+    await executor.retire();
+  });
+
+  it("credentials reject invalid identity, effect, missing operation and bounded opaque inputs before dispatch", async () => {
+    const root = await testRoot(); const fixture = remoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "credential-bounds.json"), remoteDesktop: fixture.port });
+    const request = create(RemoteDesktopCredentialRequestSchema, { request: { case: "prepare", value: {} } });
+    const command = remoteDesktopCommand({ case: "requestRemoteDesktopCredentials", value: request }, DevicePeerEffectKind.SIDE_EFFECT);
+    await expect(execute(executor, { ...command, controllerDeviceId: "" })).rejects.toBeDefined();
+    await expect(execute(executor, { ...command, effect: DevicePeerEffectKind.READ_ONLY })).rejects.toBeDefined();
+    for (const bad of [
+      create(RemoteDesktopCredentialRequestSchema),
+      create(RemoteDesktopCredentialRequestSchema, { request: { case: "open", value: { offer: "x".repeat(4_097) } } }),
+      create(RemoteDesktopCredentialRequestSchema, { request: { case: "open", value: { offer: "signed.offer", descriptor: "界".repeat(1_366) } } }),
+      create(RemoteDesktopCredentialRequestSchema, { request: { case: "exchange", value: { handle: "old-handle", ciphertext: "opaque" } } }),
+      create(RemoteDesktopCredentialRequestSchema, { request: { case: "exchange", value: { handle: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", ciphertext: "非ASCII" } } })
+    ]) await expect(execute(executor, remoteDesktopCommand({ case: "requestRemoteDesktopCredentials", value: bad }, DevicePeerEffectKind.SIDE_EFFECT))).rejects.toBeDefined();
+    expect(fixture.state.calls).toEqual([]); await executor.retire();
+  });
+
+  it("credentials preserve typed native failure and reject a reply for the wrong operation", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({ requestCredentials: vi.fn(async () => { throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.CREDENTIAL_INVALID_IDENTITY, false); }) });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "credential-result.json"), remoteDesktop: fixture.port });
+    const command = remoteDesktopCommand({ case: "requestRemoteDesktopCredentials", value: create(RemoteDesktopCredentialRequestSchema, {
+      request: { case: "prepare", value: {} }
+    }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    expect((await execute(executor, command)).at(-1)?.payload).toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CREDENTIAL_INVALID_IDENTITY } } });
+    vi.mocked(fixture.port.requestCredentials).mockResolvedValueOnce(create(RemoteDesktopCredentialResultSchema, { result: { case: "closed", value: {} } }));
+    expect((await execute(executor, command)).at(-1)?.payload).toMatchObject({ case: "failure", value: { code: DevicePeerFailureCode.INTERNAL } });
+    await executor.retire();
+  });
+
+  it("credentials cleanup dispatches only exact authenticated handle and reports native outcome unknown without retry", async () => {
+    const root = await testRoot(); const fixture = remoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "credential-cleanup.json"), remoteDesktop: fixture.port });
+    const cleanup = (handle: string) => remoteDesktopCommand({ case: "closeRemoteDesktopCredentials",
+      value: create(DevicePeerCloseRemoteDesktopCredentialsActionSchema, { handle }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    await expect(execute(executor, cleanup("unbound"))).rejects.toBeDefined();
+    expect(fixture.state.calls).toHaveLength(0);
+    expect((await execute(executor, cleanup("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"))).at(-1)?.payload.case).toBe("acknowledgement");
+    expect(fixture.state.calls[0]).toMatchObject({ method: "closeCredentials", request: { controllerDeviceId: "controller-device", handle: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee" } });
+    fixture.port.requestCredentials = async () => { throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.CREDENTIAL_OUTCOME_UNKNOWN, false); };
+    const command = remoteDesktopCommand({ case: "requestRemoteDesktopCredentials", value: create(RemoteDesktopCredentialRequestSchema, { request: { case: "prepare", value: {} } }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    expect((await execute(executor, command)).at(-1)).toMatchObject({ phase: DevicePeerResponsePhase.OUTCOME_UNKNOWN,
+      payload: { case: "failure", value: { code: DevicePeerFailureCode.UNAVAILABLE, retryable: false, remoteDesktop: { reason: RemoteDesktopFailureReason.CREDENTIAL_OUTCOME_UNKNOWN } } } });
+    await executor.retire();
+  });
   it("records the canonical cwd of a successfully owned process", async () => {
     const root = await testRoot();
     const cwd = join(root, "project");
@@ -194,6 +276,215 @@ describe("Node Device peer account-home ownership", () => {
 });
 
 describe("Node Device peer Remote Desktop host ownership", () => {
+  it.each(["set", "restore"])("dispatches %s viewer display as an exact control-scoped effect", async operation => {
+    const root = await testRoot(); const fixture = viewerRemoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "viewer-display.json"), remoteDesktop: fixture.port });
+    const command = operation === "set" ? remoteDesktopCommand({ case: "setRemoteDesktopViewerDisplay",
+      value: create(DevicePeerSetRemoteDesktopViewerDisplayActionSchema, { leaseId: "lease-1", controlGeneration: 1n, width: 1280, height: 720 }) }, DevicePeerEffectKind.SIDE_EFFECT)
+      : remoteDesktopCommand({ case: "restoreRemoteDesktopViewerDisplay",
+        value: create(DevicePeerRestoreRemoteDesktopViewerDisplayActionSchema, { leaseId: "lease-1", controlGeneration: 1n }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    const results = await execute(executor, command);
+    expect(fixture.state.calls).toContainEqual(expect.objectContaining({ method: operation === "set" ? "setViewerDisplay" : "restoreViewerDisplay",
+      request: expect.objectContaining({ controllerDeviceId: "controller-device", leaseId: "lease-1", controlGeneration: 1n }) }));
+    expect(results.at(-1)?.payload).toMatchObject({ case: "remoteDesktopViewerDisplay", value: { lease: {
+      leaseId: "lease-1", controlling: false, controlGeneration: 2n, display: { displayId: operation === "set" ? "mirror-1" : "display-1" } } } });
+    await executor.retire();
+  });
+  it("rejects invalid viewer dimensions before effect dispatch and treats an invalid geometry receipt as unknown", async () => {
+    const root = await testRoot(); const fixture = viewerRemoteDesktopHost("darwin", { setViewerDisplay: vi.fn(async () => create(RemoteDesktopViewerDisplayResultSchema, {
+      lease: { leaseId: "lease-1", controlling: false, controlGeneration: 2n, display: { displayId: "mirror-1", name: "Display", width: 1280, height: 800 } }
+    })) });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "viewer-boundary.json"), remoteDesktop: fixture.port });
+    const command = (width: number) => remoteDesktopCommand({ case: "setRemoteDesktopViewerDisplay",
+      value: create(DevicePeerSetRemoteDesktopViewerDisplayActionSchema, { leaseId: "lease-1", controlGeneration: 1n, width, height: 720 }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    for (const width of [319, 2561]) await expect(execute(executor, command(width))).rejects.toBeDefined();
+    expect(fixture.port.setViewerDisplay).not.toHaveBeenCalled();
+    const results = await execute(executor, command(1280));
+    expect(results.at(-1)?.phase).toBe(DevicePeerResponsePhase.OUTCOME_UNKNOWN);
+    await executor.retire();
+  });
+  it.each([
+    { platform: "darwin" as const, width: 640, height: 360, accepted: true },
+    { platform: "darwin" as const, width: 1280, height: 721, accepted: true },
+    { platform: "darwin" as const, width: 4096, height: 2304, accepted: true },
+    { platform: "darwin" as const, width: 1280, height: 722, accepted: false },
+    { platform: "darwin" as const, width: 4097, height: 2304, accepted: false },
+    { platform: "linux" as const, width: 1280, height: 720, accepted: true },
+    { platform: "linux" as const, width: 640, height: 360, accepted: false }
+  ])("validates viewer receipt $width x $height using trusted $platform capabilities", async ({ platform, width, height, accepted }) => {
+    const root = await testRoot(); const fixture = viewerRemoteDesktopHost(platform, {
+      setViewerDisplay: vi.fn(async () => create(RemoteDesktopViewerDisplayResultSchema, {
+        lease: { leaseId: "lease-1", controlling: false, controlGeneration: 2n,
+          display: { displayId: "mirror-1", name: "Viewer", width, height } }
+      }))
+    });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "viewer-geometry.json"), remoteDesktop: fixture.port });
+    const result = await execute(executor, viewerFitCommand());
+    expect(fixture.state.calls[0]?.method).toBe("getCapabilities");
+    expect(fixture.port.setViewerDisplay).toHaveBeenCalledOnce();
+    expect(result.at(-1)?.phase).toBe(accepted ? DevicePeerResponsePhase.COMPLETED : DevicePeerResponsePhase.OUTCOME_UNKNOWN);
+    if (accepted) expect(result.at(-1)?.payload).toMatchObject({ case: "remoteDesktopViewerDisplay",
+      value: { lease: { display: { width, height } } } });
+    await executor.retire();
+  });
+
+  it.each(["win32", "invalid", "failed"])("does not dispatch Fit without trusted supported platform evidence: %s", async condition => {
+    const root = await testRoot(); const fixture = viewerRemoteDesktopHost(); const read = fixture.port.getCapabilities;
+    fixture.port.setViewerDisplay = vi.fn(fixture.port.setViewerDisplay);
+    fixture.port.getCapabilities = async request => {
+      if (condition === "failed") throw new Error("No platform receipt");
+      const value = await read(request); value.platform = condition === "win32" ? "win32" : "unsupported";
+      if (condition === "win32") {
+        value.viewerDisplay = false; value.viewerDisplayRestore = false; value.displayModes = false;
+        value.resolutionRestore = false; value.nativeCredentials = false; value.lockOnExit = false;
+      }
+      return value;
+    };
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "viewer-platform.json"), remoteDesktop: fixture.port });
+    const result = await execute(executor, viewerFitCommand());
+    expect(fixture.port.setViewerDisplay).not.toHaveBeenCalled(); expect(result.at(-1)?.phase).toBe(DevicePeerResponsePhase.FAILED);
+    await executor.retire();
+  });
+
+  it.each(["control", "retired", "cancelled"])("rechecks %s authority after platform read before Fit dispatch", async condition => {
+    const root = await testRoot(); const fixture = viewerRemoteDesktopHost(); const read = fixture.port.getCapabilities;
+    let finish!: () => void;
+    fixture.port.getCapabilities = async request => { await new Promise<void>(resolve => { finish = resolve; }); return read(request); };
+    fixture.port.setViewerDisplay = vi.fn(fixture.port.setViewerDisplay);
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "viewer-fence.json"), remoteDesktop: fixture.port });
+    const abort = new AbortController(); const results: NodeDevicePeerAgentEmission[] = [];
+    const pending = executor.execute(viewerFitCommand(), abort.signal, result => { results.push(result); });
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    if (condition === "control") fixture.port.isControlCurrent = () => false;
+    if (condition === "retired") await executor.retire();
+    if (condition === "cancelled") abort.abort();
+    finish(); await pending;
+    expect(fixture.port.setViewerDisplay).not.toHaveBeenCalled();
+    expect(results.at(-1)?.phase).toBe(condition === "cancelled" ? DevicePeerResponsePhase.ABORTED : DevicePeerResponsePhase.FAILED);
+    await executor.retire();
+  });
+
+  it("retains unknown Fit outcome when a returned display belongs to the physical directory", async () => {
+    const root = await testRoot(); const fixture = viewerRemoteDesktopHost("darwin", { setViewerDisplay: async () => create(RemoteDesktopViewerDisplayResultSchema, {
+      lease: { leaseId: "lease-1", controlGeneration: 2n, display: { displayId: "display-1", name: "Source", width: 640, height: 360 } }
+    }) });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "viewer-source.json"), remoteDesktop: fixture.port });
+    expect((await execute(executor, viewerFitCommand())).at(-1)?.phase).toBe(DevicePeerResponsePhase.OUTCOME_UNKNOWN);
+    await executor.retire();
+  });
+  it.each([RemoteDesktopSystemActionKind.WORKSPACE_LEFT, RemoteDesktopSystemActionKind.WORKSPACE_RIGHT,
+    RemoteDesktopSystemActionKind.SYSTEM_MENU])("dispatches typed system action %s with exact controller and control", async action => {
+    const root = await testRoot(); const fixture = remoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "system-action.json"), remoteDesktop: fixture.port });
+    const results = await execute(executor, remoteDesktopCommand({ case: "performRemoteDesktopSystemAction",
+      value: create(RemoteDesktopSystemActionRequestSchema, { leaseId: "lease-1", controlGeneration: 1n, action }) }, DevicePeerEffectKind.SIDE_EFFECT));
+    expect(fixture.state.calls).toContainEqual(expect.objectContaining({ method: "performSystemAction", request: expect.objectContaining({
+      controllerDeviceId: "controller-device", leaseId: "lease-1", controlGeneration: 1n, action }) }));
+    expect(results.at(-1)?.payload).toMatchObject({ case: "remoteDesktopSystemAction", value: { action } });
+    await executor.retire();
+  });
+
+  it("rejects malformed or retired system actions before dispatch and never replays a wrong receipt", async () => {
+    const root = await testRoot(); const fixture = remoteDesktopHost({ performSystemAction: vi.fn(async () =>
+      create(RemoteDesktopSystemActionResultSchema, { action: RemoteDesktopSystemActionKind.WORKSPACE_RIGHT })) });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "system-action-invalid.json"), remoteDesktop: fixture.port });
+    const command = (action: RemoteDesktopSystemActionKind, generation = 1n) => remoteDesktopCommand({ case: "performRemoteDesktopSystemAction",
+      value: create(RemoteDesktopSystemActionRequestSchema, { leaseId: "lease-1", controlGeneration: generation, action }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    await expect(execute(executor, command(RemoteDesktopSystemActionKind.UNSPECIFIED))).rejects.toBeDefined();
+    await expect(execute(executor, command(RemoteDesktopSystemActionKind.WORKSPACE_LEFT, 0n))).rejects.toBeDefined();
+    expect(fixture.port.performSystemAction).not.toHaveBeenCalled();
+    const current = fixture.port.isControlCurrent;
+    fixture.port.isControlCurrent = () => false;
+    expect((await execute(executor, command(RemoteDesktopSystemActionKind.WORKSPACE_LEFT))).at(-1)?.payload)
+      .toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.SYSTEM_ACTION_EXPIRED } } });
+    expect(fixture.port.performSystemAction).not.toHaveBeenCalled();
+    fixture.port.isControlCurrent = current;
+    expect((await execute(executor, command(RemoteDesktopSystemActionKind.WORKSPACE_LEFT))).at(-1)?.phase).toBe(DevicePeerResponsePhase.OUTCOME_UNKNOWN);
+    expect(fixture.port.performSystemAction).toHaveBeenCalledOnce();
+    await executor.retire();
+  });
+
+  it.each(["linux", "win32"])("admits implemented %s capabilities without granting unsupported system actions", async platform => {
+    const root = await testRoot(); const fixture = remoteDesktopHost(); const base = fixture.port.getCapabilities;
+    fixture.port.getCapabilities = async request => {
+      const value = await base(request); value.platform = platform;
+      value.displayModes = platform === "linux"; value.resolutionRestore = platform === "linux"; value.lockOnExit = platform === "linux";
+      value.nativeCredentials = platform === "linux"; value.workspaceNavigation = platform === "linux"; value.systemMenu = platform === "linux";
+      return value;
+    };
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "current-capabilities.json"), remoteDesktop: fixture.port });
+    const result = await execute(executor, remoteDesktopCommands().find(item => item.method === "getCapabilities")!.command);
+    expect(result.at(-1)?.payload).toMatchObject({ case: "remoteDesktopCapabilities", value: {
+      platform, cursorOverlay: true, hostMute: true, privacyScreen: true, nativeCredentials: platform === "linux",
+      workspaceNavigation: platform === "linux", systemMenu: platform === "linux" } });
+    await executor.retire();
+  });
+
+  it.each(["linux", "darwin"])("admits %s physical modes and viewer capabilities through the generated producer boundary", async platform => {
+    const root = await testRoot(); const fixture = remoteDesktopHost(); const base = fixture.port.getCapabilities;
+    fixture.port.getCapabilities = async request => { const value = await base(request); value.platform = platform;
+      value.hostMute = false; value.lockOnExit = false; value.privacyScreen = false; value.nativeCredentials = false;
+      value.viewerDisplay = true; value.viewerDisplayRestore = true; return value; };
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "linux-modes.json"), remoteDesktop: fixture.port });
+    const result = await execute(executor, remoteDesktopCommands().find(item => item.method === "getCapabilities")!.command);
+    expect(result.at(-1)?.payload).toMatchObject({ case: "remoteDesktopCapabilities", value: { platform,
+      displayModes: true, resolutionRestore: true, viewerDisplay: true, viewerDisplayRestore: true } });
+    await executor.retire();
+  });
+  it.each(["linux", "win32"])("keeps independent terminal lock capability within its %s producer boundary", async platform => {
+    const root = await testRoot(); const fixture = remoteDesktopHost(); const base = fixture.port.getCapabilities;
+    fixture.port.getCapabilities = async request => { const value = await base(request); value.platform = platform;
+      value.canControl = false; value.displayModes = false; value.resolutionRestore = false; value.cursorOverlay = false;
+      value.hostMute = false; value.privacyScreen = false; value.nativeCredentials = false; value.lockOnExit = true;
+      return value; };
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "lock-capability.json"), remoteDesktop: fixture.port });
+    const result = await execute(executor, remoteDesktopCommands().find(item => item.method === "getCapabilities")!.command);
+    expect(result.at(-1)?.payload).toMatchObject(platform === "linux"
+      ? { case: "remoteDesktopCapabilities", value: { platform, lockOnExit: true, canControl: false, nativeCredentials: false } }
+      : { case: "failure" });
+    await executor.retire();
+  });
+  it("temporary display mode dispatch adopts only a same-lease view-only monotonic receipt", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({ setDisplayMode: vi.fn(async () => create(RemoteDesktopDisplayModeResultSchema, {
+      lease: { leaseId: "lease-1", controlling: false, controlGeneration: 2n,
+        display: { displayId: "display-1", name: "Display", width: 1_024, height: 640 } }
+    })) });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "temporary-mode.json"), remoteDesktop: fixture.port });
+    const results = await execute(executor, remoteDesktopCommand({ case: "setRemoteDesktopDisplayMode",
+      value: create(DevicePeerSetRemoteDesktopDisplayModeActionSchema, {
+        leaseId: "lease-1", controlGeneration: 1n, modeId: "102", temporary: true
+      }) }, DevicePeerEffectKind.SIDE_EFFECT));
+    expect(fixture.port.setDisplayMode).toHaveBeenCalledWith(expect.objectContaining({
+      controllerDeviceId: "controller-device", leaseId: "lease-1", controlGeneration: 1n, modeId: "102", temporary: true
+    }));
+    expect(results.at(-1)?.payload).toMatchObject({ case: "remoteDesktopDisplayMode", value: { lease: { leaseId: "lease-1", controlling: false } } });
+    await executor.retire();
+  });
+  it.each(["wrong-lease", "controlling", "old-generation", "missing"])("temporary display mode rejects an invalid %s host receipt", async (kind) => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({ setDisplayMode: vi.fn(async () => create(RemoteDesktopDisplayModeResultSchema, kind === "missing" ? {} : {
+      lease: { leaseId: kind === "wrong-lease" ? "other-lease" : "lease-1", controlling: kind === "controlling",
+        controlGeneration: kind === "old-generation" ? 1n : 2n,
+        display: { displayId: "display-1", name: "Display", width: 1_024, height: 640 } }
+    })) });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "invalid-temporary.json"), remoteDesktop: fixture.port });
+    const results = await execute(executor, remoteDesktopCommand({ case: "setRemoteDesktopDisplayMode",
+      value: create(DevicePeerSetRemoteDesktopDisplayModeActionSchema, {
+        leaseId: "lease-1", controlGeneration: 1n, modeId: "102", temporary: true
+      }) }, DevicePeerEffectKind.SIDE_EFFECT));
+    expect(results.at(-1)?.phase).toBe(DevicePeerResponsePhase.OUTCOME_UNKNOWN);
+    expect(results.at(-1)?.payload.case).toBe("failure");
+    await executor.retire();
+  });
+  it("temporary restore failure preserves its finite typed reason through Node dispatch", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({ start: vi.fn(async () => { throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.DISPLAY_RESTORE_UNAVAILABLE, false); }) });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "restore-rejected.json"), remoteDesktop: fixture.port });
+    const results = await execute(executor, remoteDesktopCommands().find((item) => item.method === "start")!.command);
+    expect(results.at(-1)?.payload).toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.DISPLAY_RESTORE_UNAVAILABLE, retryable: false } } });
+    await executor.retire();
+  });
   it("advertises only an installed host port and maps every typed action and result", async () => {
     const root = await testRoot();
     const withoutHost = new NodeDevicePeerAgentExecutor({
@@ -345,6 +636,51 @@ describe("Node Device peer Remote Desktop host ownership", () => {
     await executor.retire();
   });
 
+  it("Linux system audio capability and finite failure cross Node without losing the view host", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({ createOffer: vi.fn(async request => {
+      if (request.settings?.audio) throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.AUDIO_UNAVAILABLE, false);
+      return create(RemoteDesktopOfferResultSchema, { attemptId: request.attemptId, answerSdp: "v=0\r\n" });
+    }) });
+    const capabilities = fixture.port.getCapabilities;
+    fixture.port.getCapabilities = async request => {
+      const value = await capabilities(request);
+      value.platform = "linux"; value.displayModes = false; value.resolutionRestore = false;
+      value.hostMute = false; value.lockOnExit = false; value.privacyScreen = false; value.nativeCredentials = false;
+      return value;
+    };
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "linux-audio.json"), remoteDesktop: fixture.port });
+    const commands = remoteDesktopCommands();
+    const capabilityResults = await execute(executor, commands.find(item => item.method === "getCapabilities")!.command);
+    expect(capabilityResults.at(-1)?.payload).toMatchObject({ case: "remoteDesktopCapabilities", value: { platform: "linux", systemAudio: true } });
+    const offer = (audio: boolean, attemptId: string) => remoteDesktopCommand({ case: "createRemoteDesktopOffer",
+      value: create(DevicePeerCreateRemoteDesktopOfferActionSchema, { leaseId: "lease-1", attemptId, offerSdp: "v=0\r\n",
+        settings: { fps: 30, quality: RemoteDesktopVideoQuality.AUTO, audio }, cursorOverlay: false }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    const failure = await execute(executor, offer(true, "audio-attempt"));
+    expect(failure.at(-1)).toMatchObject({ phase: DevicePeerResponsePhase.FAILED, payload: { case: "failure", value: {
+      code: DevicePeerFailureCode.UNAVAILABLE, remoteDesktop: { reason: RemoteDesktopFailureReason.AUDIO_UNAVAILABLE, retryable: false } } } });
+    const muted = await execute(executor, offer(false, "muted-attempt"));
+    expect(muted.at(-1)).toMatchObject({ phase: DevicePeerResponsePhase.COMPLETED, payload: { case: "remoteDesktopOffer",
+      value: { attemptId: "muted-attempt" } } });
+    await execute(executor, commands.find(item => item.method === "heartbeat")!.command);
+    expect(fixture.state.calls.some(call => call.method === "stop")).toBe(false);
+    await executor.retire();
+  });
+
+  it("preserves capture pending as a retryable timeout without an unknown video effect", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({ createOffer: vi.fn(async () => {
+      throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.CAPTURE_PENDING, true);
+    }) });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "pending.json"), remoteDesktop: fixture.port });
+    const command = remoteDesktopCommand({ case: "createRemoteDesktopOffer", value: create(DevicePeerCreateRemoteDesktopOfferActionSchema,
+      { leaseId: "lease", attemptId: "portal-attempt", offerSdp: "offer", cursorOverlay: false }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    const results = await execute(executor, command);
+    expect(results.at(-1)).toMatchObject({ payload: { case: "failure", value: { code: DevicePeerFailureCode.TIMEOUT,
+      remoteDesktop: { reason: RemoteDesktopFailureReason.CAPTURE_PENDING, retryable: true } } } });
+    await executor.retire();
+  });
+
   it("preserves a bounded typed Remote Desktop domain failure", async () => {
     const root = await testRoot();
     const fixture = remoteDesktopHost({
@@ -371,6 +707,288 @@ describe("Node Device peer Remote Desktop host ownership", () => {
       }
     });
     await executor.retire();
+  });
+
+  it.each([
+    [RemoteDesktopFailureReason.HOST_MUTE_UNAVAILABLE, true, DevicePeerFailureCode.CAPABILITY_UNAVAILABLE],
+    [RemoteDesktopFailureReason.HOST_MUTE_EXPIRED, false, DevicePeerFailureCode.NOT_FOUND]
+  ] as const)("preserves typed host-mute failure %s", async (reason, retryable, code) => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({
+      setHostMute: async () => { throw new DevicePeerRemoteDesktopHostError(reason, retryable); }
+    });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "mute-failure-host.json"), remoteDesktop: fixture.port
+    });
+    const command = remoteDesktopCommands().find((item) => item.method === "setHostMute")!.command;
+    expect((await execute(executor, command)).at(-1)).toMatchObject({
+      phase: DevicePeerResponsePhase.FAILED,
+      payload: { case: "failure", value: { code, retryable, remoteDesktop: { reason, retryable } } }
+    });
+    await executor.retire();
+  });
+
+  it("validates host-mute authority, side effect and exact generation before native dispatch", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "mute-admission-host.json"), remoteDesktop: fixture.port
+    });
+    for (const generation of [0n]) {
+      const command = remoteDesktopCommand({
+        case: "setRemoteDesktopHostMute",
+        value: create(RemoteDesktopHostMuteRequestSchema, {
+          leaseId: "lease-1", controlGeneration: generation, enabled: true
+        })
+      }, DevicePeerEffectKind.SIDE_EFFECT);
+      await expect(execute(executor, command)).rejects.toBeDefined();
+    }
+    const command = remoteDesktopCommands().find((item) => item.method === "setHostMute")!.command;
+    await expect(execute(executor, { ...command, controllerDeviceId: "" })).rejects.toBeDefined();
+    await expect(execute(executor, { ...command, effect: DevicePeerEffectKind.READ_ONLY })).rejects.toBeDefined();
+    expect(fixture.state.calls).toEqual([]);
+    expect((await execute(executor, command)).at(-1)?.payload).toMatchObject({
+      case: "remoteDesktopHostMute", value: { enabled: true }
+    });
+    expect(fixture.state.calls[0]).toMatchObject({
+      method: "setHostMute", request: { controllerDeviceId: "controller-device", leaseId: "lease-1", controlGeneration: 1n }
+    });
+    await executor.retire();
+  });
+
+  it("rejects a malformed native host-mute result", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({
+      setHostMute: async () => ({ enabled: "yes" } as never)
+    });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "mute-result-host.json"), remoteDesktop: fixture.port
+    });
+    const command = remoteDesktopCommands().find((item) => item.method === "setHostMute")!.command;
+    expect((await execute(executor, command)).at(-1)?.payload).toMatchObject({
+      case: "failure", value: { code: DevicePeerFailureCode.INTERNAL }
+    });
+    await executor.retire();
+  });
+
+  it("privacy dispatch validates exact authority and preserves the command cancellation signal", async () => {
+    const root = await testRoot(); const fixture = remoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "privacy-host.json"), remoteDesktop: fixture.port });
+    const command = (generation: bigint) => remoteDesktopCommand({ case: "setRemoteDesktopPrivacyScreen", value: create(RemoteDesktopPrivacyScreenRequestSchema, {
+      leaseId: "lease-1", controlGeneration: generation, enabled: true, lockOnExit: true
+    }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    await expect(execute(executor, command(0n))).rejects.toBeDefined();
+    await expect(execute(executor, { ...command(1n), effect: DevicePeerEffectKind.READ_ONLY })).rejects.toBeDefined();
+    expect(fixture.state.calls).toEqual([]);
+    expect((await execute(executor, command(7n))).at(-1)?.payload).toMatchObject({ case: "remoteDesktopPrivacyScreen", value: { enabled: true } });
+    expect(fixture.state.calls[0]).toMatchObject({ method: "setPrivacyScreen", request: {
+      controllerDeviceId: "controller-device", leaseId: "lease-1", controlGeneration: 7n, enabled: true, lockOnExit: true, signal: expect.any(AbortSignal)
+    } });
+    await executor.retire();
+  });
+
+  it.each([
+    [RemoteDesktopFailureReason.PRIVACY_UNAVAILABLE, DevicePeerFailureCode.CAPABILITY_UNAVAILABLE],
+    [RemoteDesktopFailureReason.PRIVACY_FAILED, DevicePeerFailureCode.UNAVAILABLE],
+    [RemoteDesktopFailureReason.PRIVACY_EXPIRED, DevicePeerFailureCode.NOT_FOUND]
+  ] as const)("privacy maps native typed failure %s without dropping its reason", async (reason, code) => {
+    const root = await testRoot(); const fixture = remoteDesktopHost({ setPrivacyScreen: async () => { throw new DevicePeerRemoteDesktopHostError(reason, false); } });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "privacy-failure.json"), remoteDesktop: fixture.port });
+    const command = remoteDesktopCommand({ case: "setRemoteDesktopPrivacyScreen", value: create(RemoteDesktopPrivacyScreenRequestSchema, {
+      leaseId: "lease-1", controlGeneration: 1n, enabled: true
+    }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    expect((await execute(executor, command)).at(-1)?.payload).toMatchObject({ case: "failure", value: { code, retryable: false, remoteDesktop: { reason, retryable: false } } });
+    await executor.retire();
+  });
+
+  it("dispatches lock exit with exact generation and ordinary stop without lock intent", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "lock-exit-host.json"), remoteDesktop: fixture.port
+    });
+    const action = (lockScreen: boolean, controlGeneration: bigint) => remoteDesktopCommand({
+      case: "stopRemoteDesktop", value: create(DevicePeerStopRemoteDesktopActionSchema, {
+        leaseId: "lease-1", lockScreen, controlGeneration
+      })
+    }, DevicePeerEffectKind.SIDE_EFFECT);
+    await expect(execute(executor, action(true, 0n))).rejects.toBeDefined();
+    expect(fixture.state.calls).toEqual([]);
+    await execute(executor, action(true, 7n));
+    expect(fixture.state.calls[0]).toMatchObject({ method: "stop", request: {
+      controllerDeviceId: "controller-device", leaseId: "lease-1", lockScreen: true, controlGeneration: 7n
+    } });
+    await execute(executor, action(false, 0n));
+    expect(fixture.state.calls[1]).toMatchObject({ method: "stop", request: { lockScreen: false, controlGeneration: 0n } });
+    await executor.retire();
+  });
+
+  it.each([
+    [RemoteDesktopFailureReason.LOCK_UNAVAILABLE, DevicePeerFailureCode.CAPABILITY_UNAVAILABLE],
+    [RemoteDesktopFailureReason.LOCK_FAILED, DevicePeerFailureCode.UNAVAILABLE],
+    [RemoteDesktopFailureReason.LOCK_EXPIRED, DevicePeerFailureCode.NOT_FOUND]
+  ] as const)("preserves typed terminal lock failure %s", async (reason, code) => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({ stop: async () => { throw new DevicePeerRemoteDesktopHostError(reason, false); } });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "lock-failure-host.json"), remoteDesktop: fixture.port
+    });
+    const command = remoteDesktopCommand({ case: "stopRemoteDesktop", value: create(DevicePeerStopRemoteDesktopActionSchema, {
+      leaseId: "lease-1", lockScreen: true, controlGeneration: 1n
+    }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    expect((await execute(executor, command)).at(-1)?.payload).toMatchObject({
+      case: "failure", value: { code, retryable: false, remoteDesktop: { reason, retryable: false } }
+    });
+    await executor.retire();
+  });
+
+  it("uses the sync token and expected version for inline and staged writes without replaying an unsettled effect", async () => {
+    const root = await testRoot();
+    let enabled = false;
+    let generation = 3n;
+    let finish!: () => void;
+    const pasted = vi.fn(async () => { await new Promise<void>((resolve) => { finish = resolve; }); return "2"; });
+    const fixture = remoteDesktopHost({
+      setClipboardSync: async (request) => {
+        if (enabled !== request.enabled) generation += 1n;
+        enabled = request.enabled;
+        return create(RemoteDesktopClipboardSyncResultSchema, { enabled, syncGeneration: generation });
+      },
+      isClipboardSyncCurrent: (request) => enabled && request.syncGeneration === generation,
+      pasteClipboardContent: pasted
+    });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "sync-host.json"), remoteDesktop: fixture.port });
+    const set = (value: boolean) => execute(executor, remoteDesktopCommand({ case: "setRemoteDesktopClipboardSync",
+      value: create(RemoteDesktopClipboardSyncRequestSchema, { leaseId: "lease-1", controlGeneration: 1n, enabled: value }) }, DevicePeerEffectKind.SIDE_EFFECT));
+    await set(true);
+    const token = generation;
+    const call = (action: RemoteDesktopClipboardContentRequest["action"], options: MessageInitShape<typeof RemoteDesktopClipboardContentRequestSchema> = {}) =>
+      execute(executor, remoteDesktopCommand({ case: "transferRemoteDesktopClipboardContent", value: create(RemoteDesktopClipboardContentRequestSchema, {
+        leaseId: "lease-1", controlGeneration: 1n, sync: true, syncGeneration: token, action,
+        ...(["copy", "begin", "paste"].includes(action.case ?? "") ? { version: "1" } : {}), ...options
+      }) }, DevicePeerEffectKind.SIDE_EFFECT));
+    expect((await call({ case: "copy", value: create(RemoteDesktopClipboardContentCopyActionSchema) }, { inline: true })).at(-1)?.payload)
+      .toMatchObject({ case: "remoteDesktopClipboardContent", value: { data: '{"text":"rich text"}', length: 20 } });
+    const json = '{"text":"new"}';
+    const began = (await call({ case: "begin", value: create(RemoteDesktopClipboardContentBeginActionSchema, { length: json.length }) })).at(-1)?.payload;
+    if (began?.case !== "remoteDesktopClipboardContent" || began.value.transferId === undefined) throw new Error("Missing sync staging.");
+    const transferId = began.value.transferId;
+    expect((await call({ case: "paste", value: create(RemoteDesktopClipboardContentPasteActionSchema, { data: json }) })).at(-1)?.payload)
+      .toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_BUSY } } });
+    await call({ case: "write", value: create(RemoteDesktopClipboardContentWriteActionSchema, { transferId, offset: 0, data: json }) });
+    const pending = call({ case: "commit", value: create(RemoteDesktopClipboardContentCommitActionSchema, { transferId }) });
+    await vi.waitFor(() => expect(pasted).toHaveBeenCalledOnce());
+    expect((await call({ case: "commit", value: create(RemoteDesktopClipboardContentCommitActionSchema, { transferId }) })).at(-1)?.payload)
+      .toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_BUSY } } });
+    await set(false); await set(true);
+    finish();
+    expect((await pending).at(-1)?.payload).toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } } });
+    expect(pasted).toHaveBeenCalledOnce();
+    expect((await call({ case: "commit", value: create(RemoteDesktopClipboardContentCommitActionSchema, { transferId }) }, { syncGeneration: generation })).at(-1)?.payload)
+      .toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } } });
+    expect(pasted).toHaveBeenCalledOnce();
+    await executor.retire();
+  });
+
+  it("validates sync-only inline requests and preserves typed counter conflicts", async () => {
+    const root = await testRoot();
+    const fixture = remoteDesktopHost({ pasteClipboardContent: async () => { throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.CLIPBOARD_CHANGED, false); } });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "sync-validation.json"), remoteDesktop: fixture.port });
+    const request = { leaseId: "lease-1", controlGeneration: 1n, sync: true, syncGeneration: 3n, version: "1",
+      action: { case: "paste" as const, value: create(RemoteDesktopClipboardContentPasteActionSchema, { data: '{"text":"new"}' }) } };
+    const call = (change: MessageInitShape<typeof RemoteDesktopClipboardContentRequestSchema> = {}) => execute(executor, remoteDesktopCommand({
+      case: "transferRemoteDesktopClipboardContent", value: create(RemoteDesktopClipboardContentRequestSchema, { ...request, ...change }) }, DevicePeerEffectKind.SIDE_EFFECT));
+    for (const change of [{ sync: false }, { syncGeneration: 0n }, { version: undefined }, { version: "nonnumeric" }, { inline: true }]) {
+      await expect(call(change)).rejects.toMatchObject({ code: DevicePeerFailureCode.INVALID_REQUEST });
+    }
+    expect((await call()).at(-1)?.payload).toMatchObject({ case: "failure", value: { code: DevicePeerFailureCode.CONFLICT,
+      retryable: false, remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_CHANGED } } });
+    await executor.retire();
+  });
+
+  it("Linux clipboard carries opaque versions and capability opt-ins through the generated Node boundary", async () => {
+    const root = await testRoot(); const fingerprint = "abcdef01".repeat(8);
+    const fixture = remoteDesktopHost({
+      getClipboardVersion: async () => create(RemoteDesktopClipboardVersionResultSchema, { version: fingerprint }),
+      pasteClipboardContent: async request => { expect(request.version).toBe(fingerprint); return fingerprint; }
+    });
+    const readCapabilities = fixture.port.getCapabilities;
+    fixture.port.getCapabilities = async request => {
+      const value = await readCapabilities(request); value.platform = "linux";
+      value.hostMute = false; value.lockOnExit = false; value.privacyScreen = false; value.nativeCredentials = false;
+      value.displayModes = false; value.resolutionRestore = false; value.systemAudio = false; value.cursorOverlay = false; return value;
+    };
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "linux-version.json"), remoteDesktop: fixture.port });
+    expect((await execute(executor, remoteDesktopCommand({ case: "getRemoteDesktopCapabilities",
+      value: create(DevicePeerGetRemoteDesktopCapabilitiesActionSchema) }, DevicePeerEffectKind.READ_ONLY))).at(-1)?.payload)
+      .toMatchObject({ case: "remoteDesktopCapabilities", value: { platform: "linux", clipboardSync: true, clipboardInline: true } });
+    expect((await execute(executor, remoteDesktopCommand({ case: "getRemoteDesktopClipboardVersion",
+      value: create(RemoteDesktopClipboardVersionRequestSchema, { leaseId: "lease-1", controlGeneration: 1n, syncGeneration: 3n }) }, DevicePeerEffectKind.READ_ONLY))).at(-1)?.payload)
+      .toMatchObject({ case: "remoteDesktopClipboardVersion", value: { version: fingerprint } });
+    const call = (version: string) => execute(executor, remoteDesktopCommand({ case: "transferRemoteDesktopClipboardContent",
+      value: create(RemoteDesktopClipboardContentRequestSchema, { leaseId: "lease-1", controlGeneration: 1n,
+        sync: true, syncGeneration: 3n, version,
+        action: { case: "paste", value: create(RemoteDesktopClipboardContentPasteActionSchema, { data: '{"text":"new"}' }) } }) }, DevicePeerEffectKind.SIDE_EFFECT));
+    expect((await call(fingerprint)).at(-1)?.payload).toMatchObject({ case: "remoteDesktopClipboardContent", value: { version: fingerprint } });
+    await expect(call(fingerprint.toUpperCase())).rejects.toMatchObject({ code: DevicePeerFailureCode.INVALID_REQUEST });
+    await executor.retire();
+  });
+
+  it("Linux unknown clipboard writes keep the shared effect occupied until settlement and consume their stage once", async () => {
+    const root = await testRoot(); let settle!: () => void;
+    const pasted = vi.fn(async () => { await new Promise<void>(resolve => { settle = resolve; });
+      throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, false, true); });
+    const fixture = remoteDesktopHost({ pasteClipboardContent: pasted });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "linux-unknown.json"), remoteDesktop: fixture.port });
+    const call = (action: RemoteDesktopClipboardContentRequest["action"]) => execute(executor, remoteDesktopCommand({
+      case: "transferRemoteDesktopClipboardContent", value: create(RemoteDesktopClipboardContentRequestSchema, {
+        leaseId: "lease-1", controlGeneration: 1n, sync: true, syncGeneration: 3n,
+        ...(action.case === "begin" ? { version: "a".repeat(64) } : {}), action }) }, DevicePeerEffectKind.SIDE_EFFECT));
+    const data = '{"text":"once"}';
+    const began = (await call({ case: "begin", value: create(RemoteDesktopClipboardContentBeginActionSchema, { length: data.length }) })).at(-1)?.payload;
+    if (began?.case !== "remoteDesktopClipboardContent" || began.value.transferId === undefined) throw new Error("Missing clipboard stage.");
+    const transferId = began.value.transferId;
+    await call({ case: "write", value: create(RemoteDesktopClipboardContentWriteActionSchema, { transferId, offset: 0, data }) });
+    const commit = { case: "commit" as const, value: create(RemoteDesktopClipboardContentCommitActionSchema, { transferId }) };
+    const pending = call(commit); await vi.waitFor(() => expect(pasted).toHaveBeenCalledOnce());
+    expect((await call(commit)).at(-1)?.payload).toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_BUSY } } });
+    settle(); expect((await pending).at(-1)).toMatchObject({ phase: DevicePeerResponsePhase.OUTCOME_UNKNOWN,
+      payload: { case: "failure", value: { retryable: false, remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, retryable: false } } } });
+    expect((await call(commit)).at(-1)?.payload).toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } } });
+    expect(pasted).toHaveBeenCalledOnce(); await executor.retire();
+  });
+
+  it("clears only retired sync staging on local host authority changes and unsubscribes on retirement", async () => {
+    const root = await testRoot();
+    let syncCurrent = true;
+    let changed!: () => void;
+    const unsubscribe = vi.fn();
+    const fixture = remoteDesktopHost({
+      onClipboardAuthorityChanged: (listener) => { changed = listener; return unsubscribe; },
+      isClipboardSyncCurrent: () => syncCurrent
+    });
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "sync-retirement.json"), remoteDesktop: fixture.port });
+    const call = (action: RemoteDesktopClipboardContentRequest["action"], sync = true) => execute(executor, remoteDesktopCommand({
+      case: "transferRemoteDesktopClipboardContent", value: create(RemoteDesktopClipboardContentRequestSchema, {
+        leaseId: "lease-1", controlGeneration: 1n, sync, syncGeneration: sync ? 3n : 0n,
+        ...(sync && action.case === "copy" ? { version: "1" } : {}), action
+      }) }, DevicePeerEffectKind.SIDE_EFFECT));
+    const copied = (await call({ case: "copy", value: create(RemoteDesktopClipboardContentCopyActionSchema) })).at(-1)?.payload;
+    if (copied?.case !== "remoteDesktopClipboardContent" || copied.value.transferId === undefined) throw new Error("Missing sync staging.");
+    const oldId = copied.value.transferId;
+    syncCurrent = false;
+    changed();
+    syncCurrent = true;
+    expect((await call({ case: "read", value: create(RemoteDesktopClipboardContentReadActionSchema, { transferId: oldId, offset: 0 }) })).at(-1)?.payload)
+      .toMatchObject({ case: "failure", value: { remoteDesktop: { reason: RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } } });
+    const explicit = (await call({ case: "copy", value: create(RemoteDesktopClipboardContentCopyActionSchema) }, false)).at(-1)?.payload;
+    if (explicit?.case !== "remoteDesktopClipboardContent" || explicit.value.transferId === undefined) throw new Error("Missing explicit staging.");
+    syncCurrent = false;
+    changed();
+    expect((await call({ case: "read", value: create(RemoteDesktopClipboardContentReadActionSchema, { transferId: explicit.value.transferId, offset: 0 }) }, false)).at(-1)?.payload)
+      .toMatchObject({ case: "remoteDesktopClipboardContent", value: { data: '{"text":"rich text"}' } });
+    await executor.retire();
+    expect(unsubscribe).toHaveBeenCalledOnce();
   });
 
   it("keeps explicit text and rich clipboard transfers bounded and consumes paste before effect", async () => {
@@ -648,6 +1266,19 @@ function realpathCommand(path: string): DevicePeerCommand {
   });
 }
 
+function viewerFitCommand() {
+  return remoteDesktopCommand({ case: "setRemoteDesktopViewerDisplay",
+    value: create(DevicePeerSetRemoteDesktopViewerDisplayActionSchema, { leaseId: "lease-1", controlGeneration: 1n, width: 1280, height: 720 }) }, DevicePeerEffectKind.SIDE_EFFECT);
+}
+
+function viewerRemoteDesktopHost(platform: "darwin" | "linux" = "darwin", overrides: Partial<DevicePeerRemoteDesktopHostPort> = {}) {
+  const fixture = remoteDesktopHost(overrides); const read = fixture.port.getCapabilities;
+  fixture.port.getCapabilities = async request => {
+    const value = await read(request); value.platform = platform; value.viewerDisplay = true; value.viewerDisplayRestore = true; return value;
+  };
+  return fixture;
+}
+
 function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> = {}): {
   readonly port: DevicePeerRemoteDesktopHostPort;
   readonly state: {
@@ -673,6 +1304,15 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
     state.calls.push({ method, request });
   };
   const port: DevicePeerRemoteDesktopHostPort = {
+    async getLockState(request) {
+      record("getLockState", request);
+      return create(RemoteDesktopLockStateResultSchema, { state: RemoteDesktopLockState.LOCKED });
+    },
+    async requestCredentials(request) {
+      record("requestCredentials", request);
+      return create(RemoteDesktopCredentialResultSchema, { result: { case: "prepared", value: { descriptor: "identity" } } });
+    },
+    async closeCredentials(request) { record("closeCredentials", request); },
     async getCapabilities(request) {
       record("getCapabilities", request);
       return create(RemoteDesktopCapabilitiesSchema, {
@@ -693,7 +1333,10 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
         systemAudio: true,
         backgroundViewing: true,
         displayModes: true,
-        cursorOverlay: true
+        cursorOverlay: true,
+        hostMute: true,
+        lockOnExit: true,
+        clipboardSync: true, clipboardInline: true, privacyScreen: true, nativeCredentials: true, resolutionRestore: true
       });
     },
     async getPermissions(request) {
@@ -721,6 +1364,18 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
         controlling: request.enabled,
         controlGeneration: 2n
       });
+    },
+    async setHostMute(request) {
+      record("setHostMute", request);
+      return create(RemoteDesktopHostMuteResultSchema, { enabled: request.enabled });
+    },
+    async performSystemAction(request) {
+      record("performSystemAction", request);
+      return create(RemoteDesktopSystemActionResultSchema, { action: request.action });
+    },
+    async setPrivacyScreen(request) {
+      record("setPrivacyScreen", request);
+      return create(RemoteDesktopPrivacyScreenResultSchema, { enabled: request.enabled });
     },
     async setPresentation(request) {
       record("setPresentation", request);
@@ -781,8 +1436,24 @@ function remoteDesktopHost(overrides: Partial<DevicePeerRemoteDesktopHostPort> =
         native: true
       })];
     },
-    async setDisplayMode(request) { record("setDisplayMode", request); },
+    async setDisplayMode(request) { record("setDisplayMode", request); return create(RemoteDesktopDisplayModeResultSchema); },
+    async setViewerDisplay(request) { record("setViewerDisplay", request); return create(RemoteDesktopViewerDisplayResultSchema, {
+      lease: { leaseId: request.leaseId, controlling: false, controlGeneration: request.controlGeneration + 1n,
+        display: { displayId: "mirror-1", name: "Display", width: request.width, height: request.height } }
+    }); },
+    async restoreViewerDisplay(request) { record("restoreViewerDisplay", request); return create(RemoteDesktopViewerDisplayResultSchema, {
+      lease: { leaseId: request.leaseId, controlling: false, controlGeneration: request.controlGeneration + 1n, display }
+    }); },
     isControlCurrent() { return true; },
+    isClipboardSyncCurrent() { return true; },
+    async setClipboardSync(request) {
+      record("setClipboardSync", request);
+      return create(RemoteDesktopClipboardSyncResultSchema, { enabled: request.enabled, syncGeneration: 3n });
+    },
+    async getClipboardVersion(request) {
+      record("getClipboardVersion", request);
+      return create(RemoteDesktopClipboardVersionResultSchema, { version: "1" });
+    },
     async copyClipboardText(request) { record("copyClipboardText", request); return "text"; },
     async pasteClipboardText(request) { record("pasteClipboardText", request); },
     async copyClipboardContent(request) {
@@ -860,6 +1531,22 @@ function remoteDesktopCommands(): readonly {
         case: "setRemoteDesktopControl",
         value: create(DevicePeerSetRemoteDesktopControlActionSchema, { leaseId: "lease-1", enabled: false })
       }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "setHostMute",
+      payload: "remoteDesktopHostMute",
+      command: remoteDesktopCommand({
+        case: "setRemoteDesktopHostMute",
+        value: create(RemoteDesktopHostMuteRequestSchema, {
+          leaseId: "lease-1", controlGeneration: 1n, enabled: true
+        })
+      }, DevicePeerEffectKind.SIDE_EFFECT)
+    },
+    {
+      method: "setPrivacyScreen", payload: "remoteDesktopPrivacyScreen",
+      command: remoteDesktopCommand({ case: "setRemoteDesktopPrivacyScreen", value: create(RemoteDesktopPrivacyScreenRequestSchema, {
+        leaseId: "lease-1", controlGeneration: 1n, enabled: true, lockOnExit: false
+      }) }, DevicePeerEffectKind.SIDE_EFFECT)
     },
     {
       method: "setPresentation",
@@ -949,7 +1636,7 @@ function remoteDesktopCommands(): readonly {
     },
     {
       method: "setDisplayMode",
-      payload: "acknowledgement",
+      payload: "remoteDesktopDisplayMode",
       command: remoteDesktopCommand({
         case: "setRemoteDesktopDisplayMode",
         value: create(DevicePeerSetRemoteDesktopDisplayModeActionSchema, {

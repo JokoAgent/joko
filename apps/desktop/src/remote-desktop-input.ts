@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { access, copyFile, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import type { Readable } from "node:stream";
 
 import { app, screen } from "electron";
 import type {
@@ -13,6 +14,11 @@ import type {
 
 import type { DesktopRemoteDesktopInputPort } from "./remote-desktop-host.js";
 import { verifyPackagedDesktopRemoteDesktopBinary } from "./remote-desktop-native-manifest.js";
+import {
+  linuxRemoteDesktopInputMapping, readDesktopRemoteDesktopLinuxInputSupport,
+  readDesktopRemoteDesktopLinuxMonitors, readDesktopRemoteDesktopLinuxSessionState,
+  resolveDesktopRemoteDesktopLinuxBinary, type DesktopRemoteDesktopLinuxMonitor
+} from "./remote-desktop-linux.js";
 
 const exec = promisify(execFile);
 const MAXIMUM_QUEUE_BYTES = 32_768;
@@ -37,6 +43,9 @@ export interface DesktopRemoteDesktopInputRuntime {
     readonly x: number;
     readonly y: number;
   };
+  linuxSupport?(signal: AbortSignal): Promise<boolean>;
+  linuxSession?(signal: AbortSignal): Promise<DesktopRemoteDesktopSessionState>;
+  linuxMonitors?(signal: AbortSignal): Promise<readonly DesktopRemoteDesktopLinuxMonitor[]>;
 }
 
 export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort {
@@ -47,7 +56,14 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
   #generation = 0;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
   #stopping: Promise<void> = Promise.resolve();
+  readonly #pendingInputReleases = new Set<ChildProcessWithoutNullStreams>();
   #retired = false;
+  #privacyPaused = false;
+  #linuxMapping: ((x: number, y: number) => { x: number; y: number }) | undefined;
+  #linuxLayout = "";
+  #linuxQueue: Promise<void> = Promise.resolve();
+  #linuxQueueBytes = 0;
+  #linuxAck: ((error?: Error) => void) | undefined;
 
   constructor(onFailure: () => void, runtime: DesktopRemoteDesktopInputRuntime = electronInputRuntime()) {
     this.#onFailure = onFailure;
@@ -57,7 +73,7 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
   async start(displayId: string, signal: AbortSignal): Promise<void> {
     if (this.#retired) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
     this.stop();
-    if (this.#runtime.platform !== "darwin" && this.#runtime.platform !== "win32") {
+    if (this.#runtime.platform !== "darwin" && this.#runtime.platform !== "win32" && this.#runtime.platform !== "linux") {
       throw new Error("REMOTE_DESKTOP_INPUT_UNSUPPORTED");
     }
     const generation = this.#generation;
@@ -65,11 +81,27 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     throwIfAborted(signal);
     if (generation !== this.#generation) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
     const binary = await this.#runtime.resolveBinary();
+    let linuxMapping: ((x: number, y: number) => { x: number; y: number }) | undefined;
+    let linuxLayout = "";
+    if (this.#runtime.platform === "linux") {
+      if (!await (this.#runtime.linuxSupport ?? readDesktopRemoteDesktopLinuxInputSupport)(signal)
+        || await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal) !== "unlocked") {
+        throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+      }
+      const monitors = await (this.#runtime.linuxMonitors ?? readDesktopRemoteDesktopLinuxMonitors)(signal);
+      linuxMapping = linuxRemoteDesktopInputMapping(monitors, displayId);
+      linuxLayout = JSON.stringify(monitors);
+      if (await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal) !== "unlocked") {
+        throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+      }
+    }
     throwIfAborted(signal);
     if (generation !== this.#generation) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
     const child = this.#runtime.spawn(binary);
     this.#child = child;
     this.#displayId = displayId;
+    this.#linuxMapping = linuxMapping;
+    this.#linuxLayout = linuxLayout;
     child.stderr.resume();
     child.stdin.on("error", () => {
       if (this.#child === child) this.#failed();
@@ -119,7 +151,21 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
       if (generation !== this.#generation || this.#child !== child) {
         throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
       }
-      child.stdout.on("data", (chunk: Buffer) => {
+      if (this.#runtime.platform === "linux") {
+        if (await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal) !== "unlocked"
+          || generation !== this.#generation || this.#child !== child) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+        let output = "";
+        child.stdout.on("data", (chunk: Buffer) => {
+          if (this.#child !== child) return;
+          output += chunk.toString("ascii");
+          if (output.length > 1_024) { this.#failed(); return; }
+          for (let newline = output.indexOf("\n"); newline >= 0; newline = output.indexOf("\n")) {
+            const status = output.slice(0, newline); output = output.slice(newline + 1);
+            if (status !== "ok" || this.#linuxAck === undefined) { this.#failed(); return; }
+            this.#linuxAck();
+          }
+        });
+      } else child.stdout.on("data", (chunk: Buffer) => {
         if (this.#child === child && chunk.byteLength > 0) this.#failed();
       });
       this.#heartbeat = setInterval(() => this.#write([]), 2_000);
@@ -131,6 +177,19 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
   }
 
   send(events: readonly RemoteDesktopInput[]): void {
+    if (this.#privacyPaused) return;
+    if (this.#runtime.platform === "linux") {
+      if (this.#linuxMapping === undefined || this.#child === undefined) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+      const projected = events.flatMap((event) => {
+        if (event.kind === "move" || event.kind === "button") return [{ ...event, ...this.#linuxMapping!(event.x, event.y) }];
+        if (event.kind !== "text") return [event];
+        const scalars = Array.from(event.text); const parts: RemoteDesktopInput[] = [];
+        for (let index = 0; index < scalars.length; index += 256) parts.push({ kind: "text", text: scalars.slice(index, index + 256).join("") });
+        return parts;
+      });
+      for (let index = 0; index < projected.length; index += 256) this.#write(projected.slice(index, index + 256));
+      return;
+    }
     const display = this.#runtime.display(this.#displayId);
     if (display === undefined || this.#child === undefined) {
       throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
@@ -148,12 +207,17 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
 
   stop(): void {
     this.#generation += 1;
+    this.#privacyPaused = false;
     if (this.#heartbeat !== undefined) clearInterval(this.#heartbeat);
     this.#heartbeat = undefined;
     const child = this.#child;
     this.#child = undefined;
     this.#displayId = "";
+    this.#linuxMapping = undefined;
+    this.#linuxLayout = "";
+    this.#linuxAck?.(new Error("REMOTE_DESKTOP_LEASE_EXPIRED"));
     if (child === undefined) return;
+    this.#pendingInputReleases.add(child);
     this.#stopping = new Promise<void>((resolveStopped) => {
       let finished = false;
       const finish = (): void => {
@@ -162,31 +226,134 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
         clearTimeout(timer);
         resolveStopped();
       };
+      const confirmed = (): void => {
+        this.#pendingInputReleases.delete(child);
+        child.off("exit", confirmed);
+      };
+      const closed = (): void => {
+        confirmed();
+        finish();
+      };
       const timer = setTimeout(() => {
         try { child.kill(); } catch { /* Process already retired. */ }
-        finish();
+        if (this.#runtime.platform !== "linux") finish();
       }, HELPER_STOP_MS);
       timer.unref?.();
-      child.once("close", finish);
-      if (!child.pid || child.exitCode !== null || child.signalCode !== null) finish();
+      if (this.#runtime.platform !== "linux") child.once("exit", confirmed);
+      child.once("close", closed);
+      if (this.#runtime.platform !== "linux" && (!child.pid || child.exitCode !== null || child.signalCode !== null)) {
+        confirmed();
+        finish();
+      }
       else {
         try { child.stdin.end('[{"kind":"release"}]\n'); }
-        catch { finish(); }
+        catch { try { child.kill(); } catch { /* Actual close owns Linux settlement. */ } if (this.#runtime.platform !== "linux") finish(); }
       }
     });
   }
 
   async retire(): Promise<void> {
-    if (this.#retired) return;
+    if (this.#retired) { if (this.#runtime.platform === "linux") await this.#stopping; return; }
     this.#retired = true;
     this.stop();
     await this.#stopping;
+  }
+
+  async release(): Promise<void> {
+    this.stop();
+    await this.#stopping;
+    if (this.#pendingInputReleases.size > 0) throw new Error("REMOTE_DESKTOP_LOCK_FAILED");
+  }
+
+  async pauseForPrivacy(current: () => boolean, signal: AbortSignal): Promise<() => Promise<void>> {
+    if (this.#child === undefined || !current() || signal.aborted) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+    const displayId = this.#displayId;
+    this.stop();
+    this.#privacyPaused = true;
+    const generation = this.#generation;
+    await this.#stopping;
+    if (this.#pendingInputReleases.size > 0) throw new Error("REMOTE_DESKTOP_PRIVACY_FAILED");
+    if (generation !== this.#generation || !current() || signal.aborted) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+    return async () => {
+      if (generation !== this.#generation || !current() || signal.aborted) return;
+      const restoring = generation + 1;
+      try {
+        await this.start(displayId, signal);
+        if (!current() || signal.aborted) {
+          if (this.#generation === restoring) this.stop();
+          throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+        }
+      } catch (error) {
+        if (this.#generation === restoring) this.#failed();
+        throw error;
+      }
+    };
+  }
+
+  async resumeAfterPrivacy(displayId: string, current: () => boolean, signal: AbortSignal): Promise<void> {
+    if (!this.#privacyPaused) return;
+    const generation = this.#generation;
+    const check = (): void => {
+      if (generation !== this.#generation || !current() || signal.aborted) {
+        throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+      }
+    };
+    check();
+    await this.#stopping;
+    check();
+    if (this.#pendingInputReleases.size > 0) {
+      this.#failed();
+      throw new Error("REMOTE_DESKTOP_PRIVACY_FAILED");
+    }
+    const restoring = generation + 1;
+    try {
+      // start joins actual helper retirement and clears the paused flag.
+      await this.start(displayId, signal);
+      if (restoring !== this.#generation || !current() || signal.aborted) {
+        if (this.#generation === restoring) {
+          this.stop();
+          await this.#stopping;
+        }
+        throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+      }
+    } catch (error) {
+      if (this.#generation === restoring) this.#failed();
+      throw error;
+    }
   }
 
   #write(events: readonly unknown[]): void {
     const child = this.#child;
     if (child === undefined) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
     const line = `${JSON.stringify(events)}\n`;
+    if (this.#runtime.platform === "linux") {
+      const size = Buffer.byteLength(line, "utf8");
+      if (size > MAXIMUM_QUEUE_BYTES || this.#linuxQueueBytes + size > MAXIMUM_QUEUE_BYTES) {
+        this.#failed(); throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+      }
+      this.#linuxQueueBytes += size;
+      const generation = this.#generation;
+      this.#linuxQueue = this.#linuxQueue.then(async () => {
+        if (generation !== this.#generation || this.#child !== child) return;
+        const signal = new AbortController().signal;
+        const monitors = await (this.#runtime.linuxMonitors ?? readDesktopRemoteDesktopLinuxMonitors)(signal);
+        // The final system receipt is the lock proof; a directory await must not outlive it.
+        const state = await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal);
+        if (generation !== this.#generation || this.#child !== child) return;
+        if (state !== "unlocked" || JSON.stringify(monitors) !== this.#linuxLayout) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+        await new Promise<void>((resolveAck, rejectAck) => {
+          const timer = setTimeout(() => finish(new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE")), 10_000);
+          const finish = (error?: Error): void => {
+            clearTimeout(timer); if (this.#linuxAck === finish) this.#linuxAck = undefined;
+            if (error === undefined) resolveAck(); else rejectAck(error);
+          };
+          this.#linuxAck = finish;
+          try { child.stdin.write(line); } catch { finish(new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE")); }
+        });
+      }).catch(() => { if (generation === this.#generation && this.#child === child) this.#failed(); })
+        .finally(() => { this.#linuxQueueBytes -= size; });
+      return;
+    }
     if (Buffer.byteLength(line, "utf8") > MAXIMUM_QUEUE_BYTES
       || child.stdin.destroyed
       || child.stdin.writableLength + Buffer.byteLength(line, "utf8") > MAXIMUM_QUEUE_BYTES) {
@@ -219,6 +386,42 @@ export async function readDesktopRemoteDesktopInputPermission(
     return value === "ready" ? "granted" : value === "permission" ? "missing" : "unknown";
   } catch {
     return "unknown";
+  }
+}
+
+export interface DesktopRemoteDesktopLockRuntime {
+  readonly platform: NodeJS.Platform;
+  resolveBinary(): Promise<string>;
+  execute(binary: string, args: readonly string[], signal: AbortSignal): Promise<{ readonly stdout: string }>;
+}
+
+/** One trusted fixed command; no caller-provided keys, password or shell. */
+export async function lockDesktopRemoteDesktopScreen(
+  current: () => boolean,
+  signal: AbortSignal,
+  runtime: DesktopRemoteDesktopLockRuntime = {
+    platform: process.platform,
+    resolveBinary: resolveDesktopRemoteDesktopInputBinary,
+    execute: (binary, args, cancellation) => exec(binary, args, {
+      timeout: 5_000, maxBuffer: 1_024, windowsHide: true, signal: cancellation
+    })
+  }
+): Promise<void> {
+  if (runtime.platform !== "darwin") throw new Error("REMOTE_DESKTOP_LOCK_UNAVAILABLE");
+  const check = (): void => {
+    if (signal.aborted || !current()) throw new Error("REMOTE_DESKTOP_LOCK_EXPIRED");
+  };
+  check();
+  try {
+    const binary = await runtime.resolveBinary();
+    check();
+    const { stdout } = await runtime.execute(binary, ["--lock-screen"], signal);
+    check();
+    if (stdout.trim() !== "locked") throw new Error("REMOTE_DESKTOP_LOCK_FAILED");
+  } catch {
+    check();
+    // execFile errors can contain native stdout/stderr. Keep only the code.
+    throw new Error("REMOTE_DESKTOP_LOCK_FAILED");
   }
 }
 
@@ -310,33 +513,48 @@ export async function readDesktopRemoteDesktopDisplayModes(
 
 let changingDisplayMode = false;
 
-/** Re-enumerates immediately before the session-scoped native effect. */
+export interface DesktopRemoteDesktopDisplayModeProcess {
+  readonly stdout: Readable;
+  readonly stderr: Readable;
+  once(event: "error", listener: (error: Error) => void): this;
+  once(event: "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): this;
+  kill(signal?: NodeJS.Signals): boolean;
+}
+
+export interface DesktopRemoteDesktopDisplayModeRuntime {
+  readonly platform: NodeJS.Platform;
+  resolveBinary(): Promise<string>;
+  readModes(displayId: string, signal: AbortSignal): Promise<readonly RemoteDesktopDisplayMode[]>;
+  spawn(binary: string, arguments_: readonly string[]): DesktopRemoteDesktopDisplayModeProcess;
+  display(displayId: string): RemoteDesktopDisplay | undefined;
+}
+
+/** Re-enumerates, drains old input, then waits for actual native close and geometry. */
 export async function setDesktopRemoteDesktopDisplayMode(
   displayId: string,
   modeId: string,
-  beforeChange: () => void,
+  beforeChange: () => void | Promise<void>,
   signal: AbortSignal,
-  resolveBinary: (prepare?: boolean) => Promise<string> = resolveDesktopRemoteDesktopInputBinary
-): Promise<void> {
+  expected?: { readonly width: number; readonly height: number },
+  runtime: DesktopRemoteDesktopDisplayModeRuntime = electronDisplayModeRuntime()
+): Promise<RemoteDesktopDisplay> {
   if (changingDisplayMode) throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
   changingDisplayMode = true;
   try {
-    const modes = await readDesktopRemoteDesktopDisplayModes(displayId, signal, resolveBinary);
-    if (!modes.some((mode) => mode.id === modeId)) {
+    validateDisplayModeTarget(displayId, modeId, runtime);
+    throwIfAborted(signal);
+    const modes = await runtime.readModes(displayId, signal);
+    const mode = modes.find((candidate) => candidate.id === modeId);
+    if (mode === undefined || (expected !== undefined
+      && (mode.width !== expected.width || mode.height !== expected.height))) {
       throw new Error("REMOTE_DESKTOP_DISPLAY_MODE_MISSING");
     }
-    const binary = await resolveBinary();
+    const binary = await runtime.resolveBinary();
     throwIfAborted(signal);
-    // This callback revalidates exact control authority and ends the old lease;
-    // the geometry-changing native effect can therefore never race old input.
-    beforeChange();
-    const { stdout } = await exec(binary, ["--display-mode", displayId, modeId], {
-      timeout: 5_000,
-      maxBuffer: 1_024,
-      windowsHide: true,
-      signal
-    });
-    if (stdout.trim() !== "ready") throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+    await beforeChange();
+    throwIfAborted(signal);
+    await writeDesktopDisplayMode(binary, ["--display-mode", displayId, modeId], signal, runtime);
+    return await waitForDesktopDisplayGeometry(displayId, expected ?? mode, () => true, signal, runtime);
   } catch (error) {
     if (signal.aborted) {
       throw signal.reason ?? new Error("Remote Desktop display mode request was aborted.");
@@ -352,6 +570,124 @@ export async function setDesktopRemoteDesktopDisplayMode(
   } finally {
     changingDisplayMode = false;
   }
+}
+
+/** Original mode IDs are validated by native full CG enumeration, without UI deduplication. */
+export async function restoreDesktopRemoteDesktopDisplayMode(
+  displayId: string,
+  modeId: string,
+  current: () => boolean,
+  expected: { readonly width: number; readonly height: number },
+  signal: AbortSignal,
+  runtime: DesktopRemoteDesktopDisplayModeRuntime = electronDisplayModeRuntime()
+): Promise<RemoteDesktopDisplay> {
+  if (changingDisplayMode) throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
+  changingDisplayMode = true;
+  try {
+    validateDisplayModeTarget(displayId, modeId, runtime);
+    const check = (): void => {
+      if (!current() || signal.aborted) throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE");
+    };
+    check();
+    const binary = await runtime.resolveBinary();
+    check();
+    await writeDesktopDisplayMode(binary, ["--restore-display-mode", displayId, modeId], signal, runtime);
+    check();
+    return await waitForDesktopDisplayGeometry(displayId, expected, current, signal, runtime);
+  } catch {
+    throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE");
+  } finally {
+    changingDisplayMode = false;
+  }
+}
+
+function validateDisplayModeTarget(
+  displayId: string,
+  modeId: string,
+  runtime: DesktopRemoteDesktopDisplayModeRuntime
+): void {
+  if (runtime.platform !== "darwin") throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+  if (!/^[0-9]{1,10}$/u.test(displayId) || !/^[0-9]{1,10}$/u.test(modeId)) {
+    throw new Error("REMOTE_DESKTOP_DISPLAY_MODE_MISSING");
+  }
+}
+
+async function writeDesktopDisplayMode(
+  binary: string,
+  arguments_: readonly string[],
+  signal: AbortSignal,
+  runtime: DesktopRemoteDesktopDisplayModeRuntime
+): Promise<void> {
+  throwIfAborted(signal);
+  const child = runtime.spawn(binary, arguments_);
+  // Killing a dispatched helper is not proof that its display write did not happen.
+  // The global write slot remains occupied until this exact child actually closes.
+  await new Promise<void>((resolveWrite, rejectWrite) => {
+    let failed = false;
+    let output = Buffer.alloc(0);
+    const stop = (): void => {
+      failed = true;
+      try { child.kill("SIGKILL"); } catch { /* Actual close still owns settlement. */ }
+    };
+    const data = (chunk: Buffer | string): void => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (output.length + bytes.length > 1_024) { stop(); return; }
+      output = Buffer.concat([output, bytes]);
+    };
+    const timer = setTimeout(stop, 5_000);
+    signal.addEventListener("abort", stop, { once: true });
+    child.stderr.resume();
+    child.stderr.on("error", stop);
+    child.stdout.on("data", data);
+    child.stdout.on("error", stop);
+    child.once("error", stop);
+    child.once("close", (code, termination) => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", stop);
+      child.stdout.removeListener("data", data);
+      child.stdout.removeListener("error", stop);
+      child.stderr.removeListener("error", stop);
+      if (signal.aborted) rejectWrite(signal.reason ?? new Error("REMOTE_DESKTOP_LEASE_EXPIRED"));
+      else if (failed || code !== 0 || termination !== null || output.toString("utf8").trim() !== "ready") {
+        rejectWrite(new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE"));
+      } else resolveWrite();
+    });
+    if (signal.aborted) stop();
+  });
+}
+
+async function waitForDesktopDisplayGeometry(
+  displayId: string,
+  expected: { readonly width: number; readonly height: number },
+  current: () => boolean,
+  signal: AbortSignal,
+  runtime: DesktopRemoteDesktopDisplayModeRuntime
+): Promise<RemoteDesktopDisplay> {
+  for (let attempt = 0; attempt <= 60; attempt += 1) {
+    throwIfAborted(signal);
+    if (!current()) throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE");
+    const display = runtime.display(displayId);
+    if (display === undefined) throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+    if (display.width === expected.width && display.height === expected.height) return display;
+    if (attempt < 60) await new Promise<void>((resolveWait) => setTimeout(resolveWait, 50));
+  }
+  throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
+}
+
+function electronDisplayModeRuntime(): DesktopRemoteDesktopDisplayModeRuntime {
+  return {
+    platform: process.platform,
+    resolveBinary: resolveDesktopRemoteDesktopInputBinary,
+    readModes: readDesktopRemoteDesktopDisplayModes,
+    spawn: (binary, arguments_) => spawn(binary, [...arguments_], { stdio: "pipe", windowsHide: true }),
+    display: (displayId) => {
+      const display = screen.getAllDisplays().find((candidate) => String(candidate.id) === displayId);
+      return display === undefined ? undefined : Object.freeze({
+        id: String(display.id), name: display.label || `Display ${displayId}`,
+        width: display.size.width, height: display.size.height
+      });
+    }
+  };
 }
 
 /** Reads only the native clipboard change counter; clipboard content never enters helper output. */
@@ -443,6 +779,7 @@ let inputBuild: Promise<string> | undefined;
 
 export async function resolveDesktopRemoteDesktopInputBinary(prepare = true): Promise<string> {
   const platform = process.platform;
+  if (platform === "linux") return resolveDesktopRemoteDesktopLinuxBinary("input");
   if (platform !== "darwin" && platform !== "win32") {
     throw new Error("REMOTE_DESKTOP_INPUT_UNSUPPORTED");
   }

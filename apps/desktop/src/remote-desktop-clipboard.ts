@@ -1,5 +1,8 @@
 import { clipboard, nativeImage, type NativeImage } from "electron";
+import { createHash } from "node:crypto";
 import type { RemoteDesktopInput } from "@joko/device-peer";
+import { isRemoteDesktopClipboardVersion } from "@joko/contracts";
+import { desktopRemoteDesktopLinuxClipboard } from "./remote-desktop-linux-clipboard.js";
 
 import {
   readDesktopRemoteDesktopClipboardVersion,
@@ -45,19 +48,36 @@ export interface DesktopRemoteDesktopClipboardRuntime {
   imageFromBuffer(bytes: Buffer): NativeImage;
 }
 
+export interface DesktopRemoteDesktopLinuxClipboardPort {
+  supports(): boolean;
+  snapshot(primary: boolean, current: () => boolean, signal: AbortSignal): Promise<{
+    readonly formats: readonly string[];
+    readonly content: DesktopRemoteDesktopClipboardContent;
+  }>;
+  write(content: DesktopRemoteDesktopClipboardContent, current: () => boolean, signal: AbortSignal): Promise<void>;
+  version(current: () => boolean, signal: AbortSignal): Promise<string>;
+}
+
 /**
  * The only Main-process adapter allowed to touch the host system clipboard for
- * Remote Desktop. Content remains in memory and is transferred only after an
- * explicit Copy or Paste request.
+ * Remote Desktop. Content remains in memory under an exact control occurrence.
  */
 export class DesktopRemoteDesktopClipboard {
   readonly #runtime: DesktopRemoteDesktopClipboardRuntime;
+  readonly #linux: DesktopRemoteDesktopLinuxClipboardPort;
 
   constructor(
     sendInput: (events: readonly RemoteDesktopInput[]) => void,
-    runtime: DesktopRemoteDesktopClipboardRuntime = electronClipboardRuntime(sendInput)
+    runtime: DesktopRemoteDesktopClipboardRuntime = electronClipboardRuntime(sendInput),
+    linux: DesktopRemoteDesktopLinuxClipboardPort = desktopRemoteDesktopLinuxClipboard
   ) {
     this.#runtime = runtime;
+    this.#linux = linux;
+  }
+
+  get available(): boolean {
+    return this.#runtime.platform === "darwin" || this.#runtime.platform === "win32"
+      || this.#runtime.platform === "linux" && this.#linux.supports();
   }
 
   async copyText(
@@ -66,22 +86,28 @@ export class DesktopRemoteDesktopClipboard {
   ): Promise<string> {
     this.#check(current, signal);
     this.#runtime.releaseInput();
-    const selected = await this.#runtime.readSelection(false, signal);
+    const selected = this.#runtime.platform === "linux"
+      ? (await this.#linux.snapshot(true, current, signal)).content.text ?? ""
+      : await this.#runtime.readSelection(false, signal);
     this.#check(current, signal);
     if (selected.length > 0) {
       assertLegacyText(selected);
-      this.#runtime.writeText(selected);
+      if (this.#runtime.platform === "linux") await this.#linux.write({ text: selected }, current, signal);
+      else this.#runtime.writeText(selected);
+      this.#check(current, signal);
       return selected;
     }
 
     // Only a successful native selection read returning an empty string may
     // fall back to the general clipboard. Protected fields and unsupported or
     // failed selection APIs throw before this branch.
-    const before = await this.#runtime.readVersion(false, signal);
+    const before = await this.#version(false, current, signal);
     this.#check(current, signal);
-    const text = this.#runtime.readText();
+    const text = this.#runtime.platform === "linux"
+      ? (await this.#linux.snapshot(false, current, signal)).content.text ?? ""
+      : this.#runtime.readText();
     assertLegacyText(text);
-    const after = await this.#runtime.readVersion(false, signal);
+    const after = await this.#version(false, current, signal);
     this.#check(current, signal);
     if (before !== after) throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
     return text;
@@ -95,10 +121,14 @@ export class DesktopRemoteDesktopClipboard {
     this.#check(current, signal);
     assertLegacyText(text);
     this.#runtime.releaseInput();
-    await this.#runtime.readVersion(false, signal);
+    await this.#version(false, current, signal);
     this.#check(current, signal);
-    this.#runtime.writeText(text);
-    if (this.#runtime.readText() !== text) {
+    if (this.#runtime.platform === "linux") await this.#linux.write({ text }, current, signal);
+    else this.#runtime.writeText(text);
+    const written = this.#runtime.platform === "linux"
+      ? (await this.#linux.snapshot(false, current, signal)).content.text
+      : this.#runtime.readText();
+    if (written !== text) {
       throw new Error("REMOTE_DESKTOP_CLIPBOARD_WRITE_FAILED");
     }
     this.#check(current, signal);
@@ -111,12 +141,42 @@ export class DesktopRemoteDesktopClipboard {
   ): Promise<DesktopRemoteDesktopClipboardContent> {
     this.#check(current, signal);
     this.#runtime.releaseInput();
-    const selected = await this.#runtime.readSelection(true, signal);
+    const selected = this.#runtime.platform === "linux"
+      ? (await this.#linux.snapshot(true, current, signal)).content.text ?? ""
+      : await this.#runtime.readSelection(true, signal);
     this.#check(current, signal);
-    if (selected.length > 0) return parseClipboardContent({ text: selected });
+    if (selected.length > 0) {
+      if (this.#runtime.platform === "linux") assertLegacyText(selected);
+      return parseClipboardContent({ text: selected });
+    }
 
-    const before = await this.#runtime.readVersion(true, signal);
+    return this.readSystemContent(current, signal);
+  }
+
+  /** System-only snapshot: no focused selection or synthetic input. */
+  async readSystemContent(
+    current: () => boolean,
+    signal: AbortSignal,
+    expectedVersion?: string
+  ): Promise<DesktopRemoteDesktopClipboardContent> {
     this.#check(current, signal);
+    if (expectedVersion !== undefined && !isRemoteDesktopClipboardVersion(expectedVersion)) {
+      throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    }
+    const before = await this.#version(true, current, signal);
+    this.#check(current, signal);
+    if (expectedVersion !== undefined && before !== expectedVersion) {
+      throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    }
+    if (this.#runtime.platform === "linux") {
+      const snapshot = await this.#linux.snapshot(false, current, signal);
+      const after = await this.#version(true, current, signal);
+      this.#check(current, signal);
+      if (before !== after) throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+      if (Object.keys(snapshot.content).length === 0) throw new Error(snapshot.formats.length > 0
+        ? "REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED" : "REMOTE_DESKTOP_CLIPBOARD_EMPTY");
+      return parseClipboardContent(snapshot.content);
+    }
     const formats = this.#runtime.availableFormats();
     const fileBacked = formats.some(isFileClipboardFormat);
     const image = this.#runtime.readImage();
@@ -146,7 +206,7 @@ export class DesktopRemoteDesktopClipboard {
       content.png = png.toString("base64");
     }
 
-    const after = await this.#runtime.readVersion(true, signal);
+    const after = await this.#version(true, current, signal);
     this.#check(current, signal);
     if (before !== after) throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
     if (Object.keys(content).length === 0) {
@@ -163,8 +223,46 @@ export class DesktopRemoteDesktopClipboard {
     signal: AbortSignal
   ): Promise<void> {
     this.#check(current, signal);
-    const content = parseClipboardContent(raw);
     this.#runtime.releaseInput();
+    await this.#writeContent(raw, current, signal);
+    this.#check(current, signal);
+    this.#runtime.pasteInput();
+  }
+
+  /** Version-conditioned system write; never injects a Paste shortcut. */
+  async writeSystemContent(
+    raw: DesktopRemoteDesktopClipboardContent,
+    expectedVersion: string,
+    current: () => boolean,
+    signal: AbortSignal
+  ): Promise<string> {
+    if (!isRemoteDesktopClipboardVersion(expectedVersion)) throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    return (await this.#writeContent(raw, current, signal, expectedVersion))!;
+  }
+
+  async #writeContent(
+    raw: DesktopRemoteDesktopClipboardContent,
+    current: () => boolean,
+    signal: AbortSignal,
+    expectedVersion?: string
+  ): Promise<string | undefined> {
+    this.#check(current, signal);
+    const content = parseClipboardContent(raw);
+
+    if (this.#runtime.platform === "linux") {
+      const before = await this.#version(true, current, signal);
+      this.#check(current, signal);
+      if (expectedVersion !== undefined && before !== expectedVersion) throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+      await this.#linux.write(content, current, signal);
+      this.#check(current, signal);
+      if (expectedVersion === undefined) return undefined;
+      const written = await this.#linux.snapshot(false, current, signal);
+      const version = await this.#version(true, current, signal);
+      const confirmed = await this.#linux.snapshot(false, current, signal);
+      this.#check(current, signal);
+      if (JSON.stringify(written) !== JSON.stringify(confirmed)) throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+      return version;
+    }
 
     let image: NativeImage | undefined;
     if (content.png !== undefined) {
@@ -177,8 +275,11 @@ export class DesktopRemoteDesktopClipboard {
 
     // The native counter refuses access on a secure/locked session before the
     // Electron clipboard can be mutated.
-    await this.#runtime.readVersion(false, signal);
+    const before = await this.#version(false, current, signal);
     this.#check(current, signal);
+    if (expectedVersion !== undefined && before !== expectedVersion) {
+      throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    }
     const effectiveText = content.text ?? content.url;
     this.#runtime.write({
       ...(effectiveText === undefined ? {} : { text: effectiveText }),
@@ -191,7 +292,36 @@ export class DesktopRemoteDesktopClipboard {
       throw new Error("REMOTE_DESKTOP_CLIPBOARD_WRITE_FAILED");
     }
     this.#check(current, signal);
-    this.#runtime.pasteInput();
+    if (expectedVersion === undefined) return undefined;
+    const written = this.#fingerprint();
+    const version = await this.#version(true, current, signal);
+    this.#check(current, signal);
+    if (written !== this.#fingerprint()) throw new Error("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    return version;
+  }
+
+  async #version(portable: boolean, current: () => boolean, signal: AbortSignal): Promise<string> {
+    const value = this.#runtime.platform === "linux"
+      ? await this.#linux.version(current, signal)
+      : await this.#runtime.readVersion(portable, signal);
+    this.#check(current, signal);
+    if (!isRemoteDesktopClipboardVersion(value)) throw new Error("REMOTE_DESKTOP_CLIPBOARD_UNAVAILABLE");
+    return value;
+  }
+
+  #fingerprint(): string {
+    const image = this.#runtime.readImage();
+    let png: Buffer = Buffer.alloc(0);
+    if (!image.isEmpty()) {
+      const size = image.getSize();
+      assertImageDimensions(size.width, size.height);
+      png = image.toPNG();
+      assertPngBytes(png);
+    }
+    return createHash("sha256").update(JSON.stringify([
+      this.#runtime.availableFormats(), this.#runtime.readText(),
+      this.#runtime.readHtml(), this.#runtime.readRtf()
+    ])).update(png).digest("hex");
   }
 
   #check(current: () => boolean, signal: AbortSignal): void {

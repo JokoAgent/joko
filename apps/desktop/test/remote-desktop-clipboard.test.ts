@@ -7,7 +7,8 @@ import {
   REMOTE_DESKTOP_CLIPBOARD_TEXT_CODE_UNITS,
   parseClipboardContent,
   type DesktopRemoteDesktopClipboardImage,
-  type DesktopRemoteDesktopClipboardRuntime
+  type DesktopRemoteDesktopClipboardRuntime,
+  type DesktopRemoteDesktopLinuxClipboardPort
 } from "../src/remote-desktop-clipboard.js";
 
 const SIGNAL = new AbortController().signal;
@@ -151,7 +152,115 @@ describe("Desktop Remote Desktop clipboard", () => {
     }, () => true, SIGNAL)).rejects.toThrowError("REMOTE_DESKTOP_CLIPBOARD_TOO_LARGE");
     expect(malformed.runtime.imageFromBuffer).not.toHaveBeenCalled();
   });
+
+  it("reads the system snapshot without selection or releasing keys and compares its expected counter", async () => {
+    const value = fixture({ selection: "selection", text: "system", versions: ["5", "5"] });
+    await expect(value.clipboard.readSystemContent(() => true, SIGNAL, "5")).resolves.toEqual({ text: "system" });
+    expect(value.runtime.readSelection).not.toHaveBeenCalled();
+    expect(value.inputs).toHaveLength(0);
+    const changed = fixture({ versions: ["6"] });
+    await expect(changed.clipboard.readSystemContent(() => true, SIGNAL, "5"))
+      .rejects.toThrowError("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    expect(changed.runtime.readText).not.toHaveBeenCalled();
+  });
+
+  it("writes a version-conditioned system item once and confirms its actual new counter without Paste", async () => {
+    const value = fixture({ versions: ["4", "5"] });
+    await expect(value.clipboard.writeSystemContent({ text: "new" }, "4", () => true, SIGNAL)).resolves.toBe("5");
+    expect(value.runtime.write).toHaveBeenCalledOnce();
+    expect(value.inputs).toHaveLength(0);
+    const changed = fixture({ versions: ["6"] });
+    await expect(changed.clipboard.writeSystemContent({ text: "stale" }, "4", () => true, SIGNAL))
+      .rejects.toThrowError("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    expect(changed.runtime.write).not.toHaveBeenCalled();
+  });
+
+  it("refuses a stale occurrence and a concurrent rewrite during post-write counter confirmation", async () => {
+    const retired = fixture();
+    let current = true;
+    vi.mocked(retired.runtime.readVersion).mockImplementationOnce(async () => { current = false; return "1"; });
+    await expect(retired.clipboard.writeSystemContent({ text: "stale" }, "1", () => current, SIGNAL))
+      .rejects.toThrowError("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
+    expect(retired.runtime.write).not.toHaveBeenCalled();
+    const raced = fixture();
+    vi.mocked(raced.runtime.readVersion).mockResolvedValueOnce("1").mockImplementationOnce(async () => {
+      raced.runtime.writeText("another local copy");
+      return "3";
+    });
+    await expect(raced.clipboard.writeSystemContent({ text: "new" }, "1", () => true, SIGNAL))
+      .rejects.toThrowError("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    expect(raced.runtime.write).toHaveBeenCalledOnce();
+    expect(raced.inputs).toHaveLength(0);
+  });
+
+  it("Linux explicit Copy uses PRIMARY text and only a confirmed empty PRIMARY falls back to system", async () => {
+    const lower = linuxPort();
+    lower.snapshot.mockResolvedValueOnce({ formats: ["text/plain"], content: { text: "selected" } });
+    const value = fixture({ platform: "linux", linux: lower });
+    expect(value.clipboard.available).toBe(true);
+    await expect(value.clipboard.copyText(() => true, SIGNAL)).resolves.toBe("selected");
+    expect(lower.snapshot).toHaveBeenCalledWith(true, expect.any(Function), SIGNAL);
+    expect(lower.write).toHaveBeenCalledExactlyOnceWith({ text: "selected" }, expect.any(Function), SIGNAL);
+    expect(value.runtime.readSelection).not.toHaveBeenCalled();
+    expect(value.runtime.writeText).not.toHaveBeenCalled();
+    lower.snapshot.mockResolvedValueOnce({ formats: [], content: {} });
+    await expect(value.clipboard.copyText(() => true, SIGNAL)).resolves.toBe("system");
+    expect(lower.snapshot.mock.calls.slice(1).map(call => call[0])).toEqual([true, false]);
+    lower.snapshot.mockRejectedValueOnce(new Error("REMOTE_DESKTOP_CLIPBOARD_UNAVAILABLE"));
+    const reads = lower.version.mock.calls.length;
+    await expect(value.clipboard.copyText(() => true, SIGNAL)).rejects.toThrowError("REMOTE_DESKTOP_CLIPBOARD_UNAVAILABLE");
+    expect(lower.version).toHaveBeenCalledTimes(reads);
+  });
+
+  it("Linux explicit Paste waits for actual system readback and refuses late authority before input", async () => {
+    const lower = linuxPort(); const value = fixture({ platform: "linux", linux: lower });
+    lower.snapshot.mockResolvedValueOnce({ formats: ["text/plain"], content: { text: "paste" } });
+    await value.clipboard.pasteText("paste", () => true, SIGNAL);
+    expect(lower.write).toHaveBeenCalledWith({ text: "paste" }, expect.any(Function), SIGNAL);
+    expect(value.inputs).toHaveLength(2);
+    let current = true;
+    lower.write.mockImplementationOnce(async () => { current = false; });
+    lower.snapshot.mockResolvedValueOnce({ formats: ["text/plain"], content: { text: "late" } });
+    await expect(value.clipboard.pasteText("late", () => current, SIGNAL)).rejects.toThrowError("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
+    expect(value.inputs).toHaveLength(3);
+    expect(value.runtime.writeText).not.toHaveBeenCalled();
+  });
+
+  it("Linux system sync compares opaque fingerprints without PRIMARY, selection or input", async () => {
+    const lower = linuxPort(); const value = fixture({ platform: "linux", linux: lower });
+    const fingerprint = "a".repeat(64);
+    await expect(value.clipboard.readSystemContent(() => true, SIGNAL, fingerprint)).resolves.toEqual({ text: "system" });
+    lower.version.mockResolvedValueOnce(fingerprint).mockResolvedValueOnce("b".repeat(64));
+    await expect(value.clipboard.writeSystemContent({ url: "https://example.test/" }, fingerprint, () => true, SIGNAL)).resolves.toBe("b".repeat(64));
+    expect(lower.write).toHaveBeenCalledExactlyOnceWith({ url: "https://example.test/" }, expect.any(Function), SIGNAL);
+    expect(lower.snapshot.mock.calls.every(call => call[0] === false)).toBe(true);
+    expect(value.runtime.readSelection).not.toHaveBeenCalled();
+    expect(value.inputs).toHaveLength(0);
+    await expect(value.clipboard.writeSystemContent({ text: "bad" }, "A".repeat(64), () => true, SIGNAL)).rejects.toThrowError("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    expect(lower.write).toHaveBeenCalledOnce();
+  });
+
+  it("Linux preserves settled unknown-write metadata without replay and detects post-write snapshot races", async () => {
+    const lower = linuxPort(); const value = fixture({ platform: "linux", linux: lower });
+    const unknown = Object.assign(new Error("REMOTE_DESKTOP_CLIPBOARD_OUTCOME_UNKNOWN"), { outcomeUnknown: true });
+    lower.write.mockRejectedValueOnce(unknown);
+    await expect(value.clipboard.writeSystemContent({ text: "once" }, "a".repeat(64), () => true, SIGNAL)).rejects.toBe(unknown);
+    expect(lower.write).toHaveBeenCalledOnce();
+    lower.snapshot.mockResolvedValueOnce({ formats: ["text/plain"], content: { text: "new" } })
+      .mockResolvedValueOnce({ formats: ["text/plain"], content: { text: "another" } });
+    await expect(value.clipboard.writeSystemContent({ text: "new" }, "a".repeat(64), () => true, SIGNAL)).rejects.toThrowError("REMOTE_DESKTOP_CLIPBOARD_CHANGED");
+    expect(value.inputs).toHaveLength(0);
+  });
 });
+
+function linuxPort() {
+  return {
+    supports: vi.fn(() => true),
+    snapshot: vi.fn<DesktopRemoteDesktopLinuxClipboardPort["snapshot"]>(async () => ({ formats: ["text/plain"], content: { text: "system" } })),
+    write: vi.fn<DesktopRemoteDesktopLinuxClipboardPort["write"]>(async () => undefined),
+    version: vi.fn<DesktopRemoteDesktopLinuxClipboardPort["version"]>(async () => "a".repeat(64))
+  };
+}
 
 function fixture(options: {
   readonly selection?: string;
@@ -161,13 +270,15 @@ function fixture(options: {
   readonly formats?: readonly string[];
   readonly image?: DesktopRemoteDesktopClipboardImage;
   readonly versions?: readonly string[];
+  readonly platform?: NodeJS.Platform;
+  readonly linux?: DesktopRemoteDesktopLinuxClipboardPort;
 } = {}) {
   let text = options.text ?? "clipboard text";
   let image = options.image ?? emptyImage();
   const versions = [...(options.versions ?? ["1", "1"])];
   const inputs: unknown[][] = [];
   const runtime: DesktopRemoteDesktopClipboardRuntime = {
-    platform: "win32",
+    platform: options.platform ?? "win32",
     releaseInput: vi.fn(() => { inputs.push([{ kind: "release" }]); }),
     pasteInput: vi.fn(() => {
       inputs.push([
@@ -199,7 +310,7 @@ function fixture(options: {
   return {
     runtime,
     inputs,
-    clipboard: new DesktopRemoteDesktopClipboard(() => undefined, runtime)
+    clipboard: new DesktopRemoteDesktopClipboard(() => undefined, runtime, options.linux)
   };
 }
 

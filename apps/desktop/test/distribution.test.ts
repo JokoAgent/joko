@@ -31,6 +31,9 @@ interface BuilderConfig {
   readonly files: readonly string[];
   readonly extraResources: readonly BuilderFileSet[];
   readonly afterPack: string;
+  readonly afterSign: string;
+  readonly nsis: { readonly oneClick: boolean; readonly perMachine: boolean; readonly selectPerMachineByDefault: boolean;
+    readonly allowElevation: boolean; readonly allowToChangeInstallationDirectory: boolean; readonly include: string };
   readonly win: { readonly icon: string; readonly forceCodeSigning: boolean; readonly target: readonly string[] };
   readonly mac: { readonly icon: string; readonly identity: unknown; readonly target: readonly string[] };
   readonly linux: { readonly icon: string; readonly target: readonly string[] };
@@ -71,6 +74,7 @@ describe("Desktop distribution", () => {
       "@connectrpc/connect-node": "2.1.2",
       "@joko/contracts": "workspace:*",
       "@joko/device-peer": "workspace:*",
+      "@joko/remote-desktop-sync": "workspace:*",
       "electron-updater": "6.8.9",
       "electron-window-state": "5.0.3",
       loudness: "0.4.2",
@@ -128,7 +132,13 @@ describe("Desktop distribution", () => {
     ]);
     expect(config.extraResources.find(item => item.to === "native-remote-desktop")?.filter).toEqual([
       "manifest.json", "joko-macos-remote-desktop-capture", "joko-macos-remote-desktop-input",
-      "joko-windows-remote-desktop-input.exe"
+      "joko-macos-remote-credentials", "JokoRemoteCredentials_JokoRemoteCredentials.bundle/**/*",
+      "joko-windows-remote-desktop-input.exe",
+      "joko-windows-remote-desktop-host.exe", "joko-windows-remote-desktop-host.node",
+      "joko-linux-remote-desktop-input", "joko-linux-remote-desktop-capture", "joko-linux-remote-desktop-clipboard",
+      "linux-viewer-display.py", "linux-credentials/main.py", "linux-credentials/channel.py", "linux-credentials/host.py",
+      "linux-credentials/storage.py", "linux-credentials/platform_linux.py", "linux-credentials/requirements.txt",
+      "joko-hyprland-privacy.so", "joko-hyprland-privacy.json"
     ]);
     expect(config.extraResources.find(item => item.to === "native-simulator-h264")?.filter).toEqual([
       "manifest.json", "joko-simulator-h264"
@@ -144,6 +154,7 @@ describe("Desktop distribution", () => {
             "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"]) })
       ]));
     expect(config.afterPack).toBe("scripts/audit-packaged.cjs");
+    expect(config.afterSign).toBe("scripts/seal-windows-native-remote-desktop.cjs");
   });
 
   it("builds and packages the fixed macOS native gamepad target without claiming other platforms", () => {
@@ -210,6 +221,8 @@ describe("Desktop distribution", () => {
   });
 
   it("builds and audits only the fixed Remote Desktop native helpers", () => {
+    expect(manifest.devDependencies?.["sharp"]).toBe("0.35.3");
+    expect(manifest.dependencies?.["sharp"]).toBeUndefined();
     expect(manifest.scripts?.["build:native-remote-desktop"])
       .toBe("node scripts/build-native-remote-desktop.mjs");
     expect(manifest.scripts?.build).toContain("pnpm build:native-remote-desktop");
@@ -219,10 +232,20 @@ describe("Desktop distribution", () => {
     expect(nativeRemoteDesktopBuild)
       .toContain('const macCaptureHelper = "joko-macos-remote-desktop-capture"');
     expect(nativeRemoteDesktopBuild).toContain('const windowsHelper = "joko-windows-remote-desktop-input.exe"');
+    expect(nativeRemoteDesktopBuild).toContain('const windowsHostService = "joko-windows-remote-desktop-host.exe"');
+    expect(nativeRemoteDesktopBuild).toContain('const windowsHostAddon = "joko-windows-remote-desktop-host.node"');
     expect(nativeRemoteDesktopBuild).toContain("export function buildNativeRemoteDesktop(");
     expect(packagedAudit).toContain("buildNativeRemoteDesktop({");
     expect(packagedAudit).toContain('output: resolve(resourcesRoot, "native-remote-desktop")');
     expect(packagedAudit).toContain("auditNativeRemoteDesktop(");
+  });
+
+  it("allows an explicit all-users protected installation while retaining the current-user default", () => {
+    expect(config.nsis).toMatchObject({ oneClick: false, perMachine: false, selectPerMachineByDefault: false,
+      allowElevation: true, allowToChangeInstallationDirectory: false, include: "resources/installer.nsh" });
+    expect(existsSync(new URL("../resources/installer.nsh", import.meta.url))).toBe(true);
+    expect(existsSync(new URL("../resources/installer-directory.nsh", import.meta.url))).toBe(true);
+    expect(existsSync(new URL("../resources/installer-directory-messages.nsh", import.meta.url))).toBe(true);
   });
 
   it("binds native gamepad ownership to preload occurrences and the shared complete-exit barrier", () => {
@@ -360,7 +383,7 @@ describe("Desktop distribution", () => {
     expect(desktopMain).toContain("}, packagedSmokeTimeoutMs);");
     expect(desktopMain).toContain("Math.max(30_000, packagedSmokeTimeoutMs - 30_000)");
     expect(desktopMain).toContain("Date.now() + ${packagedSmokeManagedReadyTimeoutMs}");
-    expect(packagedSmoke).toContain("const smokeDeadline = Date.now() + timeoutMs");
+    expect(packagedSmoke).toContain("smokeDeadline = Date.now() + timeoutMs");
     expect(packagedSmoke).toContain("async function terminateChildTree(child, options = {})");
     expect(packagedSmoke).toContain("await Promise.allSettled([secondInstance])");
     expect(packagedSmoke).toContain("function removeMarkerDirectory(directory)");
@@ -421,7 +444,8 @@ describe("Desktop distribution", () => {
     expect(config.directories).toEqual({ output: "release", buildResources: "../../packages/brand-assets/src" });
     expect(existsSync(new URL("../../../packages/brand-assets/src/icon-light.svg", import.meta.url))).toBe(true);
     expect(config.win).toMatchObject({ icon: "icon-light.svg", forceCodeSigning: false, target: ["nsis", "zip"] });
-    expect(config.mac).toMatchObject({ icon: "icon-light.svg", identity: null, target: ["dmg", "zip"] });
+    expect(config.mac).toMatchObject({ icon: "icon-light.svg", hardenedRuntime: true,
+      sign: "scripts/sign-mac-native-credentials.cjs", target: ["dmg", "zip"] });
     expect(config.linux).toMatchObject({ icon: "icon-light.svg", target: ["AppImage", "tar.gz"] });
   });
 });

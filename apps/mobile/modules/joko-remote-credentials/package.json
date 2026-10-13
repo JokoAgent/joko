@@ -1,0 +1,11 @@
+{
+  "name": "@joko/mobile-remote-credentials",
+  "version": "0.1.0",
+  "description": "Joko-owned native remote desktop credentials and protected authentication.",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "src/index.ts",
+  "peerDependencies": {
+    "expo": "*"
+  }
+}

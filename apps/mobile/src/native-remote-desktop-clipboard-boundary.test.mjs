@@ -9,20 +9,42 @@ const binding = readFileSync(new URL("src/index.ts", moduleRoot), "utf8");
 const swift = readFileSync(new URL("ios/JokoRemotePresentationModule.swift", moduleRoot), "utf8");
 const size = readFileSync(new URL("ios/RemoteClipboardSize.swift", moduleRoot), "utf8");
 describe("native Remote Desktop clipboard boundary", () => {
-  it("autolinks one optional Joko-owned Apple module with bounded clipboard methods", () => {
+  it("autolinks the optional native clipboard module on Apple and Android", () => {
     expect(config).toEqual({
-      platforms: ["apple"],
+      platforms: ["apple", "android"],
       apple: {
         podspecPath: "./ios/JokoRemotePresentation.podspec",
         modules: ["JokoRemotePresentationModule"]
-      }
+      },
+      android: { modules: ["com.joko.remotepresentation.JokoRemotePresentationModule"] }
     });
     expect(packageJson.name).toBe("@joko/mobile-remote-presentation");
     expect(binding).toContain('"JokoRemotePresentation"');
     expect(swift).toContain('Name("JokoRemotePresentation")');
     expect(swift).toContain('AsyncFunction("readClipboard")');
     expect(swift).toContain('AsyncFunction("writeClipboard")');
+    expect(swift).toContain('AsyncFunction("clipboardVersion")');
+    expect(swift).toContain('AsyncFunction("syncClipboard")');
+    expect(swift).toContain("String(UIPasteboard.general.changeCount) != expectedVersion");
     expect(swift).not.toContain('AsyncFunction("rotate")');
+  });
+
+  it("registers only the Android clipboard module and its non-exported managed image provider", () => {
+    const android = new URL("android/", moduleRoot);
+    const manifest = readFileSync(new URL("src/main/AndroidManifest.xml", android), "utf8");
+    const paths = readFileSync(new URL("src/main/res/xml/joko_remote_clipboard_paths.xml", android), "utf8");
+    const provider = readFileSync(new URL("src/main/java/com/joko/remotepresentation/RemoteClipboardProvider.kt", android), "utf8");
+    const kotlin = readFileSync(new URL("src/main/java/com/joko/remotepresentation/JokoRemotePresentationModule.kt", android), "utf8");
+    expect(manifest).toContain('android:name="com.joko.remotepresentation.RemoteClipboardProvider"');
+    expect(manifest).toContain('android:exported="false"');
+    expect(manifest).toContain('android:grantUriPermissions="true"');
+    expect(manifest).toContain('@xml/joko_remote_clipboard_paths');
+    expect(paths).toContain('path="remote-clipboard/"');
+    expect(provider).toContain("class RemoteClipboardProvider : FileProvider()");
+    expect(kotlin).toContain('Name("JokoRemotePresentation")');
+    expect(kotlin).toContain('AsyncFunction("syncClipboard")');
+    expect(kotlin).toContain("expectedVersion != null && clipboardVersion() != expectedVersion");
+    expect(kotlin).toContain("appContext.currentActivity?.hasWindowFocus() != true");
   });
 
   it("reads and writes one foreground-fenced portable item without file or URL fetching", () => {

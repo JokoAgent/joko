@@ -12,6 +12,8 @@ import {
   desktopRemoteDesktopVideoFramerate,
   desktopRemoteDesktopVideoProfile
 } from "./remote-desktop-quality.js";
+import { DesktopRemoteDesktopLinuxCapture } from "./remote-desktop-linux-capture.js";
+import { DesktopRemoteDesktopWindowsCapture } from "./remote-desktop-windows-capture.js";
 
 const exec = promisify(execFile);
 const CAPTURE_HELPER = "joko-macos-remote-desktop-capture";
@@ -40,6 +42,8 @@ export interface DesktopRemoteDesktopNativeCaptureRuntime {
   readonly platform: NodeJS.Platform;
   resolveBinary(): Promise<string>;
   spawn(binary: string, arguments_: readonly string[]): ChildProcessWithoutNullStreams;
+  readonly linuxCapture?: DesktopRemoteDesktopLinuxCapture;
+  readonly windowsCapture?: DesktopRemoteDesktopWindowsCapture;
 }
 
 /** One cursor-free native stream for the current media/session generation. */
@@ -51,17 +55,39 @@ export class DesktopRemoteDesktopNativeCapture {
   #generation = 0;
   #pending = false;
   #cancel: ((error?: Error) => void) | undefined;
+  #excludedWindows = "";
+  #confirmedExclusion = "";
+  readonly #linux: DesktopRemoteDesktopLinuxCapture | undefined;
+  readonly #windows: DesktopRemoteDesktopWindowsCapture | undefined;
+
+  get privacyReady(): boolean {
+    return this.#excludedWindows.length > 0 && this.#confirmedExclusion === this.#excludedWindows;
+  }
+
+  setExcludedWindows(ids: readonly number[]): void {
+    if (ids.length > 256 || ids.some(id => !Number.isSafeInteger(id) || id < 1 || id > 0xffff_ffff)
+      || new Set(ids).size !== ids.length) throw new Error("REMOTE_DESKTOP_PRIVACY_UNAVAILABLE");
+    const next = [...ids].sort((left, right) => left - right).join(",");
+    if (next === this.#excludedWindows) return;
+    this.stop();
+    this.#excludedWindows = next;
+  }
 
   constructor(runtime: DesktopRemoteDesktopNativeCaptureRuntime = nativeCaptureRuntime()) {
     this.#runtime = runtime;
+    this.#linux = runtime.platform === "linux" ? runtime.linuxCapture ?? new DesktopRemoteDesktopLinuxCapture() : undefined;
+    this.#windows = runtime.platform === "win32" ? runtime.windowsCapture ?? new DesktopRemoteDesktopWindowsCapture() : undefined;
   }
 
   async frame(
     displayId: string,
     streaming: boolean,
     cursorOverlay: boolean,
-    settings?: DesktopRemoteDesktopVideoSettings
+    settings?: DesktopRemoteDesktopVideoSettings,
+    signal?: AbortSignal
   ): Promise<DesktopRemoteDesktopNativeFrame | null> {
+    if (this.#linux !== undefined) return this.#linux.frame(displayId, streaming, cursorOverlay, settings, signal);
+    if (this.#windows !== undefined) return this.#windows.frame(displayId, streaming, cursorOverlay, settings, signal);
     if (this.#runtime.platform !== "darwin" || !/^[0-9]{1,10}$/u.test(displayId)) return null;
     const profile = desktopRemoteDesktopVideoProfile(settings);
     const fps = desktopRemoteDesktopVideoFramerate(settings);
@@ -84,6 +110,7 @@ export class DesktopRemoteDesktopNativeCapture {
               String(fps), String(profile.jpegQuality), String(profile.physicalMaxEdge),
               String(profile.maxFrameBytes)]
           : [displayId];
+        if (this.#excludedWindows) arguments_.push(this.#excludedWindows);
         const child = this.#runtime.spawn(binary, arguments_);
         this.#child = child;
         this.#displayId = displayId;
@@ -138,6 +165,7 @@ export class DesktopRemoteDesktopNativeCapture {
               cursorOverlay,
               settings
             );
+            if (generation === this.#generation) this.#confirmedExclusion = this.#excludedWindows;
             finish(generation === this.#generation ? frame : null);
           } catch {
             this.stop();
@@ -156,6 +184,8 @@ export class DesktopRemoteDesktopNativeCapture {
   }
 
   stop(): void {
+    this.#linux?.stop();
+    this.#windows?.stop();
     this.#generation += 1;
     this.#cancel?.();
     this.#cancel = undefined;
@@ -163,11 +193,17 @@ export class DesktopRemoteDesktopNativeCapture {
     this.#child = undefined;
     this.#displayId = "";
     this.#configuration = "";
+    this.#confirmedExclusion = "";
     this.#pending = false;
     if (child !== undefined) {
       try { child.stdin.destroy(); } catch { /* The child already retired. */ }
       try { child.kill(); } catch { /* The child already retired. */ }
     }
+  }
+
+  async release(): Promise<void> {
+    this.stop();
+    await this.#windows?.release();
   }
 }
 
@@ -204,7 +240,8 @@ export async function resolveDesktopRemoteDesktopCaptureBinary(): Promise<string
         "--sdk", "macosx", "clang", source, "-fobjc-arc", "-fblocks", "-O2",
         "-framework", "Foundation", "-framework", "AppKit", "-framework", "CoreGraphics",
         "-framework", "CoreImage", "-framework", "IOSurface", "-framework", "ImageIO",
-        "-framework", "IOKit", "-o", temporary
+        "-framework", "IOKit", "-framework", "ScreenCaptureKit",
+        "-framework", "CoreMedia", "-framework", "CoreVideo", "-o", temporary
       ], { timeout: 120_000, windowsHide: true });
       await rename(temporary, binary);
     } finally {

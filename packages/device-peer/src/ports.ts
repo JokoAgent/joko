@@ -7,6 +7,7 @@ import {
   type RemoteDesktopControlState,
   type RemoteDesktopDisplayMode,
   type RemoteDesktopFrameResult,
+  type RemoteDesktopHostMuteResult,
   type RemoteDesktopIceCandidate,
   type RemoteDesktopIceExchangeResult,
   type RemoteDesktopInputEvent,
@@ -147,6 +148,12 @@ export interface DevicePeerRemoteDesktopLeaseRequest extends DevicePeerRemoteDes
  * transient and must never be persisted or exposed to a renderer bridge.
  */
 export interface DevicePeerRemoteDesktopHostPort {
+  getLockState(request: DevicePeerRemoteDesktopHostRequest): Promise<import("@joko/contracts").RemoteDesktopLockStateResult>;
+  requestCredentials(request: DevicePeerRemoteDesktopHostRequest & {
+    readonly request: import("@joko/contracts").RemoteDesktopCredentialRequest;
+  }): Promise<import("@joko/contracts").RemoteDesktopCredentialResult>;
+  /** Service-owned retirement only; cannot prepare or authenticate a channel. */
+  closeCredentials(request: DevicePeerRemoteDesktopHostRequest & { readonly handle: string }): Promise<void>;
   getCapabilities(request: DevicePeerRemoteDesktopHostRequest): Promise<RemoteDesktopCapabilities>;
   getPermissions(request: DevicePeerRemoteDesktopHostRequest): Promise<RemoteDesktopPermissions>;
   showPermissionGuide(request: DevicePeerRemoteDesktopHostRequest): Promise<void>;
@@ -155,10 +162,21 @@ export interface DevicePeerRemoteDesktopHostPort {
     readonly mode: RemoteDesktopStartMode;
   }): Promise<RemoteDesktopLease>;
   heartbeat(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopControlState>;
-  stop(request: DevicePeerRemoteDesktopLeaseRequest): Promise<void>;
+  stop(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly lockScreen: boolean;
+    readonly controlGeneration: bigint;
+  }): Promise<void>;
   setControl(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly enabled: boolean;
   }): Promise<RemoteDesktopControlState>;
+  setHostMute(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly enabled: boolean;
+  }): Promise<RemoteDesktopHostMuteResult>;
+  performSystemAction(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly action: import("@joko/contracts").RemoteDesktopSystemActionKind;
+  }): Promise<import("@joko/contracts").RemoteDesktopSystemActionResult>;
   setPresentation(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly enabled: boolean;
   }): Promise<RemoteDesktopControlState>;
@@ -184,14 +202,20 @@ export interface DevicePeerRemoteDesktopHostPort {
   }): Promise<RemoteDesktopFrameResult>;
   listDisplayModes(request: DevicePeerRemoteDesktopLeaseRequest): Promise<readonly RemoteDesktopDisplayMode[]>;
   /**
-   * A display-mode write is terminal for the exact old lease. The host must
-   * retire that lease before mutating native display state and must keep new
-   * starts fenced until the native result is known.
+   * Permanent writes end the old lease. Temporary writes retain that exact
+   * lease with actual geometry and a new, view-only control generation.
    */
   setDisplayMode(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
     readonly modeId: string;
-  }): Promise<void>;
+    readonly temporary: boolean;
+  }): Promise<import("@joko/contracts").RemoteDesktopDisplayModeResult>;
+  setViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint; readonly width: number; readonly height: number;
+  }): Promise<import("@joko/contracts").RemoteDesktopViewerDisplayResult>;
+  restoreViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+  }): Promise<import("@joko/contracts").RemoteDesktopViewerDisplayResult>;
   /**
    * Synchronous target-side fence for control-scoped effects. This must read
    * the host's current authority directly and must not perform the effect.
@@ -199,6 +223,23 @@ export interface DevicePeerRemoteDesktopHostPort {
   isControlCurrent(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
   }): boolean;
+  setClipboardSync(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly enabled: boolean;
+  }): Promise<import("@joko/contracts").RemoteDesktopClipboardSyncResult>;
+  setPrivacyScreen(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint; readonly enabled: boolean; readonly lockOnExit: boolean;
+  }): Promise<import("@joko/contracts").RemoteDesktopPrivacyScreenResult>;
+  getClipboardVersion(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly syncGeneration: bigint;
+  }): Promise<import("@joko/contracts").RemoteDesktopClipboardVersionResult>;
+  isClipboardSyncCurrent(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly syncGeneration: bigint;
+  }): boolean;
+  /** Local host control/session changes retire only the captured sync staging. */
+  onClipboardAuthorityChanged?(listener: () => void): () => void;
   copyClipboardText(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
   }): Promise<string>;
@@ -208,11 +249,17 @@ export interface DevicePeerRemoteDesktopHostPort {
   }): Promise<void>;
   copyClipboardContent(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
+    readonly sync?: boolean;
+    readonly syncGeneration?: bigint;
+    readonly version?: string;
   }): Promise<RemoteDesktopClipboardContent>;
   pasteClipboardContent(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
     readonly content: RemoteDesktopClipboardContent;
-  }): Promise<void>;
+    readonly sync?: boolean;
+    readonly syncGeneration?: bigint;
+    readonly version?: string;
+  }): Promise<string | void>;
   /** Route retirement is a hard media/input ownership boundary. */
   retire(): Promise<void>;
 }
@@ -221,7 +268,8 @@ export interface DevicePeerRemoteDesktopHostPort {
 export class DevicePeerRemoteDesktopHostError extends Error {
   constructor(
     readonly reason: RemoteDesktopFailureReason,
-    readonly retryable: boolean
+    readonly retryable: boolean,
+    readonly outcomeUnknown = false
   ) {
     super("Remote Desktop host request failed.");
     this.name = "DevicePeerRemoteDesktopHostError";

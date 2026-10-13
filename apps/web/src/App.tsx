@@ -9,6 +9,8 @@ import type { ComposerDraft, ComposerFileSelectionQuoteDraft, InteractionView, S
 import { fileAttachmentInsertionFor, type FileAttachmentInsertion } from "./file-attachment-insertion.js";
 import { fileSelectionQuoteInsertionFor, type FileSelectionQuoteInsertion } from "./file-selection-quote-insertion.js";
 import { ConnectionScreen } from "./components/ConnectionScreen.js";
+import { DesktopRemoteDesktopViewerBridge } from "./components/DesktopRemoteDesktopViewerBridge.js";
+import { desktopRemoteDesktopViewerOwner, openDesktopRemoteDesktopViewer } from "./remote-desktop-viewer-bridge.js";
 import { AppErrorBoundary, routeErrorBoundaryKey } from "./components/ErrorBoundary.js";
 import { resolveComposerAttachmentPolicy } from "./components/composer-behavior.js";
 import { reviewRunForReviewerSession } from "./components/reviewer-session.js";
@@ -239,7 +241,7 @@ function ConnectedAppControllerRoot(): JSX.Element {
   const applicationWindowOwner = typeof window !== "undefined"
     && !isSessionApplicationWindow(window.location)
     && !isExtensionApplicationWindow(window.location);
-  return <><RuntimeProcessMonitorBroker controller={controller} /><StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t} /></>;
+  return <><RuntimeProcessMonitorBroker controller={controller} />{applicationWindowOwner && <DesktopRemoteDesktopViewerBridge controller={controller} />}<StartupUpdateOverlay t={t} />{applicationWindowOwner && <DesktopGlobalVoiceBridge controller={controller} />}<AppWithController controller={controller} /><DesktopWindowControls t={t} /></>;
 }
 
 /** Injectable application shell used by deterministic development harnesses. */
@@ -2195,6 +2197,16 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         t={t}
         probeRuntimeActivity={controller.probeRuntimeActivity}
         machineControl={{
+          ...(!auxiliaryApplicationWindow && window.jokoDesktop?.remoteDesktopViewer !== undefined ? {
+            remoteDesktops: state.snapshot.devices.filter((device) => device.kind === "desktop" && !device.revoked && device.id !== state.activeProfile?.deviceId)
+              .map((device) => ({ deviceId: device.id, name: device.name, enabled: device.presence === "online" && device.remoteControlEnabled &&
+                state.snapshot.deviceControlRelations.some((relation) => relation.controllerDeviceId === state.activeProfile?.deviceId && relation.targetDeviceId === device.id && relation.effective) })),
+            onRemoteDesktop: (deviceId: string) => {
+              const peer = state.snapshot.devices.find((device) => device.id === deviceId);
+              if (peer !== undefined) runAction(`remote-desktop:${deviceId}`, () => openDesktopRemoteDesktopViewer(controller,
+                desktopRemoteDesktopViewerOwner(state), { deviceId, name: peer.name }));
+            }
+          } : {}),
           profiles: state.profiles,
           activeProfile: state.activeProfile,
           presenceByProfile: state.machinePresenceByProfile,

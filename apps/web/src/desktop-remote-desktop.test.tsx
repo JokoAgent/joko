@@ -23,6 +23,7 @@ afterEach(async () => {
   if (previousDesktop === undefined) Reflect.deleteProperty(window, "jokoDesktop");
   else Object.defineProperty(window, "jokoDesktop", { configurable: true, value: previousDesktop });
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+  vi.useRealTimers();
 });
 
 describe("desktop Remote Desktop state", () => {
@@ -109,16 +110,64 @@ describe("desktop Remote Desktop state", () => {
     await act(async () => oldRead.resolve(snapshot({ enabled: true })));
     expect(harness.state().enabled).toBe(false);
   });
+
+  it("refreshes service support only for settings and fences an older poll during authorization", async () => {
+    vi.useFakeTimers();
+    const poll = deferred<JokoDesktopRemoteDesktopSnapshot>();
+    const authorization = deferred<JokoDesktopRemoteDesktopSnapshot>();
+    const fixture = createRemoteDesktop(snapshot({ enabled: true, windowsSupport: "missing" }));
+    fixture.api.getState = vi.fn()
+      .mockResolvedValueOnce(snapshot({ enabled: true, windowsSupport: "missing" }))
+      .mockImplementationOnce(() => poll.promise);
+    fixture.api.configureWindowsSupport = vi.fn(() => authorization.promise);
+    installDesktop(fixture.api);
+    const harness = await renderHarness(true);
+    expect(fixture.api.getState).toHaveBeenCalledExactlyOnceWith(true);
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    expect(fixture.api.getState).toHaveBeenCalledTimes(2);
+    await act(async () => vi.advanceTimersByTimeAsync(4_000));
+    expect(fixture.api.getState).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      void harness.actions().configureWindowsSupport(true);
+      void harness.actions().configureWindowsSupport(false);
+      void harness.actions().setEnabled(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(fixture.api.configureWindowsSupport).toHaveBeenCalledExactlyOnceWith(true);
+    expect(fixture.api.setEnabled).not.toHaveBeenCalled();
+    expect(fixture.api.getState).toHaveBeenCalledTimes(2);
+    await act(async () => fixture.publish(snapshot({ enabled: true, windowsSupport: "missing" })));
+    await act(async () => authorization.resolve(snapshot({ enabled: true, windowsSupport: "ready" })));
+    await act(async () => poll.resolve(snapshot({ enabled: true, windowsSupport: "missing" })));
+    expect(harness.state()).toMatchObject({ windowsSupport: "ready", saving: false });
+  });
+
+  it("keeps service setup failure visible after the host retires an active session", async () => {
+    const authorization = deferred<JokoDesktopRemoteDesktopSnapshot>();
+    const active = snapshot({ enabled: true, active: true, controlling: true, controllerDeviceId: "phone", displayId: "display", windowsSupport: "missing" });
+    const stopped = snapshot({ enabled: true, windowsSupport: "missing" });
+    const fixture = createRemoteDesktop(active);
+    fixture.api.getState = vi.fn().mockResolvedValueOnce(active).mockResolvedValue(stopped);
+    fixture.api.configureWindowsSupport = vi.fn(() => authorization.promise);
+    installDesktop(fixture.api);
+    const harness = await renderHarness(true);
+    await act(async () => { void harness.actions().configureWindowsSupport(true); });
+    await act(async () => fixture.publish(stopped));
+    await act(async () => authorization.reject(new Error("private UAC details")));
+    expect(harness.state()).toMatchObject({ enabled: true, active: false, windowsSupport: "missing", saving: false, error: "windowsSupport" });
+  });
 });
 
 interface HarnessActions {
   readonly reload: () => Promise<void>;
   readonly setEnabled: (enabled: boolean) => Promise<void>;
+  readonly configureWindowsSupport: (enabled: boolean) => Promise<void>;
   readonly disconnect: () => Promise<void>;
   readonly showPermissionGuide: () => Promise<void>;
 }
 
-async function renderHarness(): Promise<{
+async function renderHarness(refreshWindowsSupport = false): Promise<{
   readonly actions: () => HarnessActions;
   readonly state: () => DesktopRemoteDesktopState;
   readonly rerender: () => Promise<void>;
@@ -129,7 +178,7 @@ async function renderHarness(): Promise<{
   let actions: HarnessActions | undefined;
   let current: DesktopRemoteDesktopState | undefined;
   function Harness(): JSX.Element {
-    const value = useDesktopRemoteDesktop();
+    const value = useDesktopRemoteDesktop(refreshWindowsSupport);
     actions = value;
     current = value.state;
     return <output>{value.state.enabled ? "on" : "off"}</output>;
@@ -172,6 +221,7 @@ function createRemoteDesktop(
   const api: JokoDesktopApi["remoteDesktop"] = {
     getState: vi.fn(async () => initial),
     setEnabled: vi.fn(async (enabled) => snapshot({ ...initial, enabled })),
+    configureWindowsSupport: vi.fn(async (enabled) => snapshot({ ...initial, windowsSupport: enabled ? "ready" : "missing" })),
     disconnect: vi.fn(async () => snapshot({ ...initial, active: false, controlling: false })),
     getPermissions: vi.fn(async () => initial.permissions),
     showPermissionGuide: vi.fn(async () => initial.permissions),

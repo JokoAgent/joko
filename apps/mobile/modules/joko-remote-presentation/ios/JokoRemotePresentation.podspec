@@ -15,6 +15,7 @@ Pod::Spec.new do |s|
   s.source           = { :path => '.' }
   s.static_framework = true
   s.dependency 'ExpoModulesCore'
-  s.source_files     = '**/*.swift'
+  s.dependency 'WebRTC-SDK', '150.7871.01'
+  s.source_files     = '**/*.{h,m,swift}'
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
 end

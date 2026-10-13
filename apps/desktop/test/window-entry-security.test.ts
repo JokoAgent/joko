@@ -18,8 +18,20 @@ import {
   isAllowedSessionWindowNavigation,
   runtimeProcessMonitorEntryUrl
 } from "../src/security.js";
+import { remoteDesktopViewerEntryUrl, isAllowedRemoteDesktopViewerNavigation } from "../src/security.js";
 
 describe("trusted auxiliary window entries", () => {
+  it("loads the standalone remote viewer with a dedicated query and rejects primary or mixed entries", () => {
+    const policy = createNavigationPolicy(resolve("dist/web/index.html"));
+    const entry = remoteDesktopViewerEntryUrl("joko://app/index.html?old=1#/tasks/example");
+    expect(entry).toBe("joko://app/index.html?remoteDesktopViewer=1");
+    expect(isAllowedPackagedBundleResource(entry, policy)).toBe(true);
+    expect(isAllowedRemoteDesktopViewerNavigation(entry, policy)).toBe(true);
+    expect(isAllowedPrimaryWindowNavigation(entry, policy)).toBe(false);
+    for (const value of [entry + "&runtimeProcessMonitor=1", entry + "#/tasks/example", "joko://app/index.html?remoteDesktopViewer=0"]) {
+      expect(isAllowedRemoteDesktopViewerNavigation(value, policy)).toBe(false);
+    }
+  });
   it("accepts only current-v1 Extension identities", () => {
     expect(isDesktopExtensionId("extension_0123456789abcdef0123456789abcdef")).toBe(true);
     expect(isDesktopExtensionId("extension_0123456789ABCDEF0123456789ABCDEF")).toBe(false);

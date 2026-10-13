@@ -29,12 +29,14 @@ describe("Desktop Remote Desktop media settings", () => {
     })).toThrowError("video settings are invalid");
   });
 
-  it("limits system audio to Windows and macOS 14.2 or newer", () => {
+  it("limits system audio to actual supported native Linux, Windows and macOS 14.2 or newer", () => {
     expect(desktopSupportsSystemAudio("win32")).toBe(true);
     expect(desktopSupportsSystemAudio("darwin", "14.1.9")).toBe(false);
     expect(desktopSupportsSystemAudio("darwin", "14.2.0")).toBe(true);
     expect(desktopSupportsSystemAudio("darwin", "15.0.0")).toBe(true);
     expect(desktopSupportsSystemAudio("darwin", "unknown")).toBe(false);
     expect(desktopSupportsSystemAudio("linux", "99.0")).toBe(false);
+    expect(desktopSupportsSystemAudio("linux", "", true)).toBe(true);
+    expect(desktopSupportsSystemAudio("freebsd", "", true)).toBe(false);
   });
 });

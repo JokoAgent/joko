@@ -7,5 +7,6 @@ export * from "./protocol.js";
 export * from "./registry.js";
 export * from "./remote-desktop.js";
 export * from "./remote-desktop-controller.js";
+export * from "./remote-desktop-credentials.js";
 export * from "./remote-desktop-ice.js";
 export * from "./remote-desktop-ice-config.js";

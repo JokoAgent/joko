@@ -7,8 +7,7 @@ pub enum DesktopStatus {
     Error(u32),
 }
 
-// First-batch control is deliberately restricted to the ordinary unlocked
-// user desktop. No service, SYSTEM worker, or secure-desktop path is present.
+// Ordinary user input and clipboard remain restricted to the unlocked desktop.
 pub fn require_unlocked() -> Result<(), DesktopStatus> {
     unsafe {
         let desktop = OpenInputDesktop(0, 0, DESKTOP_READOBJECTS);

@@ -145,21 +145,10 @@ interface JokoDesktopAutoRelaunchSettings {
   readonly defaultAutoRelaunchOnIdle: boolean;
 }
 
-type JokoDesktopRemoteDesktopPermissionStatus = "granted" | "missing" | "unknown" | "notRequired";
-
-interface JokoDesktopRemoteDesktopPermissions {
-  readonly screenRecording: JokoDesktopRemoteDesktopPermissionStatus;
-  readonly accessibility: JokoDesktopRemoteDesktopPermissionStatus;
-}
-
-interface JokoDesktopRemoteDesktopSnapshot {
-  readonly enabled: boolean;
-  readonly active: boolean;
-  readonly controlling: boolean;
-  readonly controllerDeviceId?: string;
-  readonly displayId?: string;
-  readonly permissions: JokoDesktopRemoteDesktopPermissions;
-}
+type JokoDesktopRemoteDesktopPermissionStatus = import("@joko/contracts").DesktopRemoteDesktopPermissionStatus;
+type JokoDesktopRemoteDesktopPermissions = import("@joko/contracts").DesktopRemoteDesktopPermissions;
+type JokoDesktopRemoteDesktopSnapshot = import("@joko/contracts").DesktopRemoteDesktopSnapshot;
+type JokoDesktopRemoteDesktopWindowsSupport = import("@joko/contracts").DesktopRemoteDesktopWindowsSupport;
 
 interface JokoDesktopUpdateChannelSettings {
   readonly enableBeta: boolean;
@@ -263,6 +252,7 @@ type JokoDesktopCapability =
   | "runtime.desktopProcessUsage"
   | "runtime.processMonitorWindow"
   | "remote.desktopHost"
+  | "remote.desktopViewer"
   | "selection.quote.contextMenu"
   | "session.windows"
   | "voice.globalDictation"
@@ -487,6 +477,12 @@ interface JokoDesktopApi {
     onRequest(listener: (request: DesktopRuntimeProcessMonitorRequest) => void): () => void;
     respond(response: DesktopRuntimeProcessMonitorResponse): Promise<void>;
   };
+  readonly remoteDesktopViewer?: {
+    bind(owner: import("@joko/contracts").DesktopRemoteDesktopViewerOwner): Promise<void>;
+    retire(owner: import("@joko/contracts").DesktopRemoteDesktopViewerOwner): Promise<void>;
+    open(owner: import("@joko/contracts").DesktopRemoteDesktopViewerOwner,
+      target: { readonly deviceId: string; readonly name: string }): Promise<{ readonly focusedExisting: boolean }>;
+  };
   readonly layout: {
     reset(): Promise<void>;
     onReset(listener: () => void): () => void;
@@ -653,14 +649,7 @@ interface JokoDesktopApi {
     adoptConnection(connection: JokoDesktopManagedOrchestratorConnection): Promise<JokoDesktopManagedOrchestratorStatus>;
     completeLogout(): Promise<JokoDesktopManagedOrchestratorStatus>;
   };
-  readonly remoteDesktop: {
-    getState(): Promise<JokoDesktopRemoteDesktopSnapshot>;
-    setEnabled(enabled: boolean): Promise<JokoDesktopRemoteDesktopSnapshot>;
-    disconnect(): Promise<JokoDesktopRemoteDesktopSnapshot>;
-    getPermissions(): Promise<JokoDesktopRemoteDesktopPermissions>;
-    showPermissionGuide(): Promise<JokoDesktopRemoteDesktopPermissions>;
-    onStateChanged(listener: (state: JokoDesktopRemoteDesktopSnapshot) => void): () => void;
-  };
+  readonly remoteDesktop: import("@joko/contracts").DesktopRemoteDesktopApi;
   readonly credentials: {
     get(profileId: string): Promise<string | undefined>;
     set(profileId: string, secret: string): Promise<void>;
@@ -728,6 +717,7 @@ interface JokoRuntimeProcessDiagnosticsApi {
 }
 
 interface Window {
+  readonly jokoRemoteDesktopViewer?: import("@joko/contracts").DesktopRemoteDesktopViewerApi;
   readonly jokoDesktop?: JokoDesktopApi;
   readonly jokoInspectorDesktop?: JokoInspectorDesktopApi;
   readonly jokoVoiceOverlay?: JokoVoiceOverlayApi;

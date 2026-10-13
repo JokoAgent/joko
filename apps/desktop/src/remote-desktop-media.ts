@@ -23,6 +23,7 @@ import {
   parseRemoteDesktopIceCandidates,
   parseRemoteDesktopIceReply,
   parseRemoteDesktopRequest,
+  isBoundedRemoteDesktopJpegFrame,
   type RemoteDesktopIceCandidate,
   type RemoteDesktopInput,
   type RemoteDesktopJpegFrame
@@ -47,16 +48,48 @@ import {
   DesktopRemoteDesktopNativeCapture,
   type DesktopRemoteDesktopNativeFrame
 } from "./remote-desktop-native-capture.js";
+import { WAYLAND_REMOTE_DESKTOP_DISPLAY_ID, supportsDesktopRemoteDesktopLinuxCapture,
+  readDesktopRemoteDesktopLinuxSessionState } from "./remote-desktop-linux.js";
+import { DesktopRemoteDesktopLinuxAudio } from "./remote-desktop-linux-audio.js";
+import type { DesktopRemoteDesktopSessionState } from "./remote-desktop-input.js";
+import { desktopRemoteDesktopWindowsHost } from "./remote-desktop-windows-host.js";
 
 const CAPTURE_URL = "https://remote-desktop.joko.invalid/capture";
 const CAPTURE_HTML = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body></body></html>";
 
 interface PendingCaptureRequest {
   readonly id: string;
-  readonly op: "offer" | "ice";
+  readonly op: "offer" | "ice" | "nativeSource" | "frame";
   readonly resolve: (value: DesktopRemoteDesktopCaptureReply) => void;
   readonly reject: (error: Error) => void;
   readonly timer: ReturnType<typeof setTimeout>;
+}
+
+interface PortalCaptureOwner {
+  readonly leaseId: string;
+  current: () => boolean;
+  readonly generation: number;
+  grant: boolean;
+  selecting: boolean;
+  ready: Promise<void>;
+}
+export interface DesktopRemoteDesktopNativeAudioPort {
+  supports(): boolean;
+  start(owner: object, current: () => boolean, signal: AbortSignal): Promise<void>;
+  read(owner: object, current: () => boolean, signal: AbortSignal): Promise<Uint8Array>;
+  stop(owner?: object): Promise<void>;
+}
+interface NativeAudioOwner {
+  readonly token: object;
+  readonly revision: number;
+  readonly generation: number;
+  readonly sessionRevision: number;
+  readonly window: WebContents;
+  readonly leaseId: string;
+  readonly attemptId: string;
+  readonly current: () => boolean;
+  readonly abort: AbortController;
+  started: boolean;
 }
 
 /** Hidden, isolated WebRTC owner. It never loads the product renderer or network resources. */
@@ -88,16 +121,30 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     readonly settings?: DesktopRemoteDesktopVideoSettings;
     readonly current: () => boolean;
   } | undefined;
-  readonly #nativeCapture = new DesktopRemoteDesktopNativeCapture();
+  readonly #nativeCapture: DesktopRemoteDesktopNativeCapture;
+  #privacy: { readonly owner: object; readonly revision: number } | undefined;
+  #sourceRevision = 0;
   #inputHandler: ((leaseId: string, sequence: number, events: readonly RemoteDesktopInput[]) => void) | undefined;
   #presentationPongHandler: ((leaseId: string) => void) | undefined;
   #presentationLease: string | undefined;
   #nativeOnly = false;
+  #portal: PortalCaptureOwner | undefined;
   #generation = 0;
   #retired = false;
+  readonly #nativeAudio: DesktopRemoteDesktopNativeAudioPort;
+  #audio: NativeAudioOwner | undefined;
+  #audioRevision = 0;
+  #sessionRevision = 0;
+  readonly #audioStops = new Set<Promise<void>>();
+  #retirement: Promise<void> | undefined;
 
-  constructor(preloadPath: string) {
+  constructor(preloadPath: string, nativeCapture = new DesktopRemoteDesktopNativeCapture(),
+    readonly captureStopped?: (leaseId: string) => void,
+    nativeAudio: DesktopRemoteDesktopNativeAudioPort = new DesktopRemoteDesktopLinuxAudio(),
+    readonly audioSession: (signal: AbortSignal) => Promise<DesktopRemoteDesktopSessionState> = readDesktopRemoteDesktopLinuxSessionState) {
     this.#preloadPath = preloadPath;
+    this.#nativeCapture = nativeCapture;
+    this.#nativeAudio = nativeAudio;
     ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.ready, (event) => this.#registered(event));
     ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.reply, (event, id, reply) => {
       this.#receiveReply(event, id, reply);
@@ -106,8 +153,12 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       this.#receiveInput(event, leaseId, sequence, events);
     });
     ipcMain.handle(
+      REMOTE_DESKTOP_CAPTURE_CHANNELS.nativeAudio,
+      (event, leaseId, attemptId, revision) => this.#readNativeAudio(event, leaseId, attemptId, revision)
+    );
+    ipcMain.handle(
       REMOTE_DESKTOP_CAPTURE_CHANNELS.nativeFrame,
-      (event, leaseId, attemptId) => this.#nativeFrame(event, leaseId, attemptId)
+      (event, leaseId, attemptId, sourceRevision) => this.#nativeFrame(event, leaseId, attemptId, sourceRevision)
     );
     ipcMain.handle(
       REMOTE_DESKTOP_CAPTURE_CHANNELS.presentationPong,
@@ -115,8 +166,12 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         this.#receivePresentationPong(event, leaseId, attemptId);
       }
     );
-    ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.stopped, (event) => {
+    ipcMain.handle(REMOTE_DESKTOP_CAPTURE_CHANNELS.stopped, (event, leaseId: unknown) => {
       this.#assertSender(event);
+      const portal = this.#portal;
+      if (portal !== undefined && (leaseId === undefined || leaseId === portal.leaseId)) {
+        this.captureStopped?.(portal.leaseId);
+      }
       this.stop();
     });
   }
@@ -149,32 +204,111 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     };
   }
 
-  setSessionState(nativeOnly: boolean): void {
+  setSessionState(nativeOnly: boolean, state?: DesktopRemoteDesktopSessionState): void {
+    ++this.#sessionRevision;
+    const attempt = this.#attempt;
+    if (process.platform === "linux" && attempt?.settings?.audio && attempt.nativeCapture
+      && this.#pending === undefined && (state === "unknown" || state === "unlocked" || state === "locked-logged-in")) {
+      this.#retireAudio();
+      this.#nativeOnly = nativeOnly;
+      this.#nativeCapture.stop();
+      const revision = ++this.#sourceRevision;
+      const owner = this.#window?.webContents;
+      if (owner !== undefined && !owner.isDestroyed()) owner.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command,
+        { op: "captureReset", leaseId: attempt.leaseId, attemptId: attempt.attemptId,
+          sourceRevision: revision, resume: state !== "unknown" } satisfies DesktopRemoteDesktopCaptureCommand);
+      if (state === "unlocked") this.#startAudio(attempt);
+      return;
+    }
     this.stop();
     this.#nativeOnly = nativeOnly;
   }
 
-  async frame(
-    displayId: string,
-    cursorOverlay: boolean,
-    signal: AbortSignal
-  ): Promise<RemoteDesktopJpegFrame | null> {
+  setPrivacyExclusions(owner: object, ids: readonly number[]): void {
     this.#assertAvailable();
-    assertCapturePermission();
-    if (process.platform === "darwin" && (this.#nativeOnly || cursorOverlay)) {
-      const frame = await this.#nativeCapture.frame(displayId, cursorOverlay, cursorOverlay);
+    if (process.platform !== "darwin" || ids.length === 0) throw new Error("REMOTE_DESKTOP_PRIVACY_UNAVAILABLE");
+    this.#nativeCapture.setExcludedWindows(ids);
+    this.#privacy = { owner, revision: ++this.#sourceRevision };
+  }
+
+  clearPrivacyExclusions(owner: object): void {
+    if (this.#privacy?.owner !== owner) return;
+    this.#privacy = undefined;
+    this.#nativeCapture.setExcludedWindows([]);
+  }
+
+  async preparePrivacy(owner: object, displayId: string, current: () => boolean, signal: AbortSignal): Promise<void> {
+    const privacy = this.#privacy;
+    const generation = this.#generation;
+    const attempt = this.#attempt;
+    const check = (): void => {
       throwIfAborted(signal);
+      if (privacy?.owner !== owner || this.#privacy !== privacy || generation !== this.#generation || !current()) {
+        throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+      }
+    };
+    check();
+    const deadline = Date.now() + 5_000;
+    if (attempt !== undefined) {
+      if (attempt.displayId !== displayId) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+      // An in-flight offer/ICE owns the bounded command slot. It must settle
+      // before a source ACK can be attributed to this exact media attempt.
+      while (this.#pending !== undefined && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        check();
+      }
+      check();
+      if (this.#attempt !== attempt || this.#pending !== undefined) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+      const receipt = await this.#command({ op: "nativeSource", id: randomUUID(), leaseId: attempt.leaseId,
+        attemptId: attempt.attemptId, sourceRevision: privacy!.revision }, 5_000, signal);
+      check();
+      if (this.#attempt !== attempt || receipt.kind !== "nativeSource" || receipt.sourceRevision !== privacy!.revision
+        || !this.#nativeCapture.privacyReady) throw new Error("REMOTE_DESKTOP_PRIVACY_UNAVAILABLE");
+    } else {
+      let frame: DesktopRemoteDesktopNativeFrame | null = null;
+      do {
+        check();
+        frame = await this.#nativeCapture.frame(displayId, false, false);
+        check();
+        if (frame !== null && this.#nativeCapture.privacyReady) return;
+        if (Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+      } while (Date.now() < deadline);
+      throw new Error("REMOTE_DESKTOP_PRIVACY_UNAVAILABLE");
+    }
+  }
+
+  async frame(request: Parameters<DesktopRemoteDesktopMediaPort["frame"]>[0]): Promise<RemoteDesktopJpegFrame | null> {
+    const { displayId, cursorOverlay, signal } = request;
+    this.#assertAvailable();
+    if (!request.current()) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
+    if (process.platform === "linux" && displayId === WAYLAND_REMOTE_DESKTOP_DISPLAY_ID) {
+      const portal = await this.#ensurePortal(request);
+      const reply = await this.#command({ op: "frame", id: randomUUID(), leaseId: request.leaseId }, 2_000, signal);
+      if (this.#portal !== portal || !request.current()) return null;
+      if (reply.kind !== "frame") throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
+      return reply.frame;
+    }
+    assertCapturePermission();
+    const privacy = this.#privacy;
+    if ((process.platform === "darwin" && (privacy !== undefined || this.#nativeOnly || cursorOverlay))
+      || (process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture())
+      || (process.platform === "win32" && (this.#nativeOnly || await desktopRemoteDesktopWindowsHost.readSupport(signal) === "ready"))) {
+      const frame = await this.#nativeCapture.frame(displayId, cursorOverlay, cursorOverlay, undefined, signal);
+      throwIfAborted(signal);
+      if (this.#privacy !== privacy || !request.current()) return null;
       return encodeNativeRelayFrame(frame);
     }
     try {
       const sources = await enumerateDesktopSources(true, signal);
       const source = exactDesktopSource(sources, displayId);
       throwIfAborted(signal);
+      if (this.#privacy !== privacy || !request.current()) return null;
       return source === null ? null : encodeDesktopFrame(source.thumbnail);
     } catch (error) {
       if (process.platform !== "darwin" || !capturePermissionGranted()) throw error;
-      const frame = await this.#nativeCapture.frame(displayId, cursorOverlay, cursorOverlay);
+      const frame = await this.#nativeCapture.frame(displayId, cursorOverlay, cursorOverlay, undefined, signal);
       throwIfAborted(signal);
+      if (this.#privacy !== privacy || !request.current()) return null;
       return encodeNativeRelayFrame(frame);
     }
   }
@@ -194,15 +328,25 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     const settings = parseDesktopRemoteDesktopVideoSettings(request.settings);
     const profile = desktopRemoteDesktopVideoProfile(settings);
     assertCapturePermission();
-    this.stop();
+    const portalCapture = process.platform === "linux" && request.displayId === WAYLAND_REMOTE_DESKTOP_DISPLAY_ID;
+    if (portalCapture) {
+      await this.#ensurePortal(request);
+      const first = await this.frame(request);
+      if (first === null) throw new Error("REMOTE_DESKTOP_CAPTURE_PENDING");
+      this.#resetAttempt();
+    } else this.stop();
     const generation = this.#generation;
     if (settings?.audio === true && !readDesktopSystemAudioSupport()) {
       throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE");
     }
     let source: DesktopCapturerSource | null = null;
-    const nativeAvailable = process.platform === "darwin";
-    const nativeVideo = nativeAvailable && (this.#nativeOnly || request.cursorOverlay);
-    if (!nativeVideo || settings?.audio === true) {
+    const nativeAvailable = process.platform === "darwin"
+      || (process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture())
+      || (process.platform === "win32" && await desktopRemoteDesktopWindowsHost.readSupport(request.signal) === "ready");
+    let nativeVideo = nativeAvailable && (process.platform === "linux" || process.platform === "win32" || this.#privacy !== undefined || this.#nativeOnly || request.cursorOverlay);
+    const nativeAudio = process.platform === "linux" && !portalCapture && nativeAvailable && settings?.audio === true;
+    if (!portalCapture && (!nativeVideo || settings?.audio === true && !nativeAudio)
+      && !(process.platform === "win32" && this.#nativeOnly)) {
       try {
         const sources = await enumerateDesktopSources(false, request.signal,
           nativeAvailable ? 2_000 : REMOTE_DESKTOP_OFFER_BUDGET.sourcesMs);
@@ -211,14 +355,15 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         if (!nativeAvailable || !capturePermissionGranted()) throw error;
       }
     }
-    if (source === null && !nativeAvailable) throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
+    if (source === null && !nativeAvailable && !portalCapture) throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
     throwIfAborted(request.signal);
     if (!request.current()) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
-    await this.#startWindow(generation, request.signal);
+    if (!portalCapture) await this.#startWindow(generation, request.signal);
     if (generation !== this.#generation || !request.current()) {
       throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
     }
     const requestId = randomUUID();
+    nativeVideo ||= nativeAvailable && this.#privacy !== undefined;
     this.#grant = source === null || (nativeVideo && settings?.audio !== true) ? undefined : {
       source,
       leaseId: request.leaseId,
@@ -232,10 +377,11 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       attemptId: request.attemptId,
       displayId: request.displayId,
       nativeCapture: nativeAvailable,
-      cursorOverlay: request.cursorOverlay && process.platform === "darwin",
+      cursorOverlay: request.cursorOverlay && nativeAvailable,
       ...(settings === undefined ? {} : { settings }),
       current: request.current
     };
+    const audio = nativeAudio ? this.#startAudio(this.#attempt) : undefined;
     try {
       const reply = await this.#command({
         op: "offer",
@@ -249,8 +395,11 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         nativeCapture: nativeAvailable,
         nativeVideo,
         chromiumCapture: this.#grant !== undefined,
-        cursorOverlay: request.cursorOverlay && process.platform === "darwin",
+        portalCapture,
+        sourceRevision: this.#sourceRevision,
+        cursorOverlay: request.cursorOverlay && nativeAvailable,
         profile,
+        ...(nativeAudio ? { nativeAudio: true, audioRevision: audio!.revision } : {}),
         ...(settings === undefined ? {} : { settings })
       }, REMOTE_DESKTOP_OFFER_BUDGET.hostMs, request.signal);
       if (reply.kind !== "offer" || Buffer.byteLength(reply.answerSdp, "utf8") > 64 * 1_024) {
@@ -258,7 +407,9 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       }
       return reply.answerSdp;
     } catch (error) {
-      if (generation === this.#generation) this.stop();
+      if (generation === this.#generation) {
+        if (portalCapture) this.#resetAttempt(); else this.stop();
+      }
       throw error;
     }
   }
@@ -310,16 +461,8 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
 
   stop(): void {
     this.#generation += 1;
-    this.#nativeCapture.stop();
-    this.#grant = undefined;
-    this.#attempt = undefined;
-    this.#presentationLease = undefined;
-    const pending = this.#pending;
-    this.#pending = undefined;
-    if (pending !== undefined) {
-      clearTimeout(pending.timer);
-      pending.reject(new Error("REMOTE_DESKTOP_VIDEO_STOPPED"));
-    }
+    this.#portal = undefined;
+    this.#resetAttempt();
     const ready = this.#ready;
     this.#ready = undefined;
     if (ready !== undefined) {
@@ -331,8 +474,54 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     if (owner !== undefined && !owner.isDestroyed()) owner.destroy();
   }
 
+  #resetAttempt(): void {
+    this.#retireAudio();
+    this.#nativeCapture.stop();
+    this.#grant = undefined;
+    this.#attempt = undefined;
+    this.#presentationLease = undefined;
+    const pending = this.#pending;
+    this.#pending = undefined;
+    if (pending !== undefined) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("REMOTE_DESKTOP_VIDEO_STOPPED"));
+    }
+    const owner = this.#window?.webContents;
+    if (owner !== undefined && !owner.isDestroyed()) owner.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command,
+      { op: "stop" } satisfies DesktopRemoteDesktopCaptureCommand);
+  }
+
+  async #ensurePortal(request: { readonly leaseId: string; readonly current: () => boolean;
+    readonly signal: AbortSignal }): Promise<PortalCaptureOwner> {
+    throwIfAborted(request.signal);
+    if (!request.current()) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
+    if (this.#portal?.leaseId === request.leaseId) {
+      const portal = this.#portal;
+      portal.current = request.current;
+      await portal.ready;
+      if (this.#portal !== portal || !request.current()) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
+      return portal;
+    }
+    this.stop();
+    const generation = this.#generation;
+    const portal = { leaseId: request.leaseId, current: request.current, generation,
+      grant: true, selecting: false, ready: Promise.resolve() };
+    this.#portal = portal;
+    portal.ready = this.#startWindow(generation, request.signal).then(() => {
+      if (this.#portal !== portal || !portal.current()) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
+      this.#window!.webContents.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command,
+        { op: "preparePortal", leaseId: request.leaseId } satisfies DesktopRemoteDesktopCaptureCommand);
+    });
+    await portal.ready;
+    return portal;
+  }
+
   async retire(): Promise<void> {
-    if (this.#retired) return;
+    if (this.#retirement !== undefined) return this.#retirement;
+    if (this.#retired) {
+      await Promise.all([...this.#audioStops, this.#nativeAudio.stop(), this.#nativeCapture.release()]);
+      return;
+    }
     this.#retired = true;
     this.stop();
     this.#inputHandler = undefined;
@@ -341,6 +530,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.reply);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.input);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.nativeFrame);
+    ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.nativeAudio);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.presentationPong);
     ipcMain.removeHandler(REMOTE_DESKTOP_CAPTURE_CHANNELS.stopped);
     const captureSession = this.#captureSession;
@@ -348,6 +538,77 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     if (captureSession !== undefined) {
       try { captureSession.protocol.unhandle("https"); }
       catch { /* The isolated session already retired its protocol handler. */ }
+    }
+    this.#retirement = Promise.all([...this.#audioStops, this.#nativeAudio.stop(), this.#nativeCapture.release()]).then(() => undefined,
+      error => { this.#retirement = undefined; throw error; });
+    await this.#retirement;
+  }
+
+  async release(): Promise<void> {
+    this.stop();
+    await this.#nativeCapture.release();
+  }
+
+  #startAudio(attempt: { readonly leaseId: string; readonly attemptId: string; readonly current: () => boolean }): NativeAudioOwner {
+    this.#retireAudio();
+    const audio: NativeAudioOwner = { token: Object.freeze({}), revision: ++this.#audioRevision,
+      generation: this.#generation, sessionRevision: this.#sessionRevision,
+      window: this.#window!.webContents, leaseId: attempt.leaseId, attemptId: attempt.attemptId,
+      current: attempt.current, abort: new AbortController(), started: false };
+    this.#audio = audio;
+    const valid = (): boolean => this.#audioCurrent(audio);
+    void this.#nativeAudio.start(audio.token, valid, audio.abort.signal).then(() => {
+      if (!valid()) return;
+      audio.started = true;
+      this.#sendAudio(audio, true);
+    }).catch(() => { if (this.#audio === audio) this.#sendAudio(audio, false); });
+    return audio;
+  }
+
+  #audioCurrent(audio: NativeAudioOwner): boolean {
+    return !this.#retired && !audio.abort.signal.aborted && this.#audio === audio
+      && audio.generation === this.#generation && audio.sessionRevision === this.#sessionRevision
+      && this.#window?.webContents === audio.window && !audio.window.isDestroyed()
+      && this.#attempt?.leaseId === audio.leaseId && this.#attempt.attemptId === audio.attemptId
+      && this.#attempt.settings?.audio === true && audio.current();
+  }
+
+  #sendAudio(audio: NativeAudioOwner, enabled: boolean): void {
+    if (this.#audio !== audio || this.#window?.webContents !== audio.window || audio.window.isDestroyed()) return;
+    audio.window.send(REMOTE_DESKTOP_CAPTURE_CHANNELS.command, { op: "nativeAudio", leaseId: audio.leaseId,
+      attemptId: audio.attemptId, audioRevision: audio.revision, enabled } satisfies DesktopRemoteDesktopCaptureCommand);
+  }
+
+  #retireAudio(): void {
+    const audio = this.#audio;
+    if (audio === undefined) return;
+    this.#sendAudio(audio, false);
+    this.#audio = undefined;
+    audio.abort.abort();
+    const stop = this.#nativeAudio.stop(audio.token);
+    this.#audioStops.add(stop);
+    void stop.then(() => this.#audioStops.delete(stop), () => undefined);
+  }
+
+  async #readNativeAudio(event: IpcMainInvokeEvent, leaseId: unknown, attemptId: unknown, revision: unknown): Promise<Uint8Array> {
+    this.#assertSender(event);
+    const audio = this.#audio;
+    if (audio === undefined || !audio.started || leaseId !== audio.leaseId || attemptId !== audio.attemptId
+      || revision !== audio.revision || !this.#audioCurrent(audio)) throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE");
+    const valid = (): boolean => this.#audioCurrent(audio);
+    try {
+      const before = await this.audioSession(audio.abort.signal);
+      if (!valid()) throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE");
+      if (before !== "unlocked") { this.#retireAudio(); throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE"); }
+      const pcm = await this.#nativeAudio.read(audio.token, valid, audio.abort.signal);
+      const after = await this.audioSession(audio.abort.signal);
+      if (!valid()) throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE");
+      if (after !== "unlocked") { this.#retireAudio(); throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE"); }
+      if (!(pcm instanceof Uint8Array) || pcm.byteLength > 38_400 || pcm.byteLength % 8 !== 0) throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE");
+      return pcm;
+    } catch {
+      if (this.#audio === audio) this.#retireAudio();
+      throw new Error("REMOTE_DESKTOP_AUDIO_UNAVAILABLE");
     }
   }
 
@@ -380,6 +641,8 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     this.#window = owner;
     const failed = (): void => {
       if (this.#window !== owner) return;
+      const portal = this.#portal;
+      if (portal !== undefined) this.captureStopped?.(portal.leaseId);
       this.stop();
     };
     owner.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
@@ -425,6 +688,25 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         && permission === "media" && Array.isArray(mediaTypes) && mediaTypes.length === 0);
     });
     captureSession.setDisplayMediaRequestHandler((request, callback) => {
+      const portal = this.#portal;
+      if (portal !== undefined) {
+        const owner = this.#window?.webContents;
+        if (!portal.grant || portal.selecting || owner === undefined || owner.isDestroyed()
+          || request.frame !== owner.mainFrame || !request.videoRequested || request.audioRequested
+          || request.securityOrigin !== "https://remote-desktop.joko.invalid" || !portal.current()) {
+          callback({}); return;
+        }
+        portal.grant = false;
+        portal.selecting = true;
+        void desktopCapturer.getSources({ types: ["screen"], thumbnailSize: { width: 0, height: 0 },
+          fetchWindowIcons: false }).then(sources => {
+          const source = sources.length === 1 && sources[0]?.id.startsWith("screen:") ? sources[0] : undefined;
+          if (source === undefined || this.#portal !== portal || this.#window?.webContents !== owner
+            || owner.isDestroyed() || !portal.current()) callback({});
+          else callback({ video: source });
+        }).catch(() => callback({})).finally(() => { portal.selecting = false; });
+        return;
+      }
       const grant = this.#grant;
       this.#grant = undefined;
       const owner = this.#window?.webContents;
@@ -502,7 +784,8 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
   async #nativeFrame(
     event: IpcMainInvokeEvent,
     leaseId: unknown,
-    attemptId: unknown
+    attemptId: unknown,
+    sourceRevision: unknown
   ): Promise<DesktopRemoteDesktopNativeFrame | null> {
     this.#assertSender(event);
     const attempt = this.#attempt;
@@ -511,6 +794,10 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       || !attempt.nativeCapture) {
       throw new Error("Remote Desktop native frame request is stale.");
     }
+    if (!Number.isSafeInteger(sourceRevision) || (sourceRevision as number) < 0
+      || (sourceRevision as number) > this.#sourceRevision
+      || (this.#privacy !== undefined && sourceRevision !== this.#sourceRevision)) return null;
+    const privacy = this.#privacy;
     let current = false;
     try { current = attempt.current(); } catch { /* Authority lookup failed closed. */ }
     if (!current) throw new Error("Remote Desktop native frame request is stale.");
@@ -523,7 +810,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     );
     let stillCurrent = false;
     try { stillCurrent = attempt.current(); } catch { /* Authority lookup failed closed. */ }
-    if (generation !== this.#generation || this.#attempt !== attempt || !stillCurrent) return null;
+    if (generation !== this.#generation || this.#attempt !== attempt || !stillCurrent || this.#privacy !== privacy) return null;
     return frame;
   }
 
@@ -552,7 +839,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
   }
 
   #command(
-    command: Extract<DesktopRemoteDesktopCaptureCommand, { readonly op: "offer" | "ice" }>,
+    command: Extract<DesktopRemoteDesktopCaptureCommand, { readonly op: "offer" | "ice" | "nativeSource" | "frame" }>,
     timeoutMs: number,
     signal: AbortSignal
   ): Promise<DesktopRemoteDesktopCaptureReply> {
@@ -668,16 +955,20 @@ export function encodeNativeRelayFrame(
   bytes.fill(0);
   return encoded === null ? null : Object.freeze({
     ...encoded,
-    ...(frame.cursor === null ? {} : { cursor: frame.cursor })
+    cursor: frame.cursor
   });
 }
 
 function parseCaptureReply(
   value: unknown,
-  expected: "offer" | "ice"
+  expected: "offer" | "ice" | "nativeSource" | "frame"
 ): DesktopRemoteDesktopCaptureReply {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("invalid");
   const record = value as Record<string, unknown>;
+  if (expected === "frame" && record["kind"] === "frame" && exactKeys(record, ["kind", "frame"])
+    && (record["frame"] === null || isBoundedRemoteDesktopJpegFrame(record["frame"]))) {
+    return { kind: "frame", frame: record["frame"] };
+  }
   if (record["kind"] === "error"
     && ((expected === "offer" && record["code"] === "audio-unavailable")
       || record["code"] === "unavailable" || record["code"] === "stopped"
@@ -689,6 +980,11 @@ function parseCaptureReply(
     && exactKeys(record, ["kind", "answerSdp"]) && typeof record["answerSdp"] === "string"
     && record["answerSdp"].length >= 1 && Buffer.byteLength(record["answerSdp"], "utf8") <= 64 * 1_024) {
     return { kind: "offer", answerSdp: record["answerSdp"] };
+  }
+  if (expected === "nativeSource" && record["kind"] === "nativeSource"
+    && exactKeys(record, ["kind", "sourceRevision"]) && Number.isSafeInteger(record["sourceRevision"])
+    && (record["sourceRevision"] as number) >= 0) {
+    return { kind: "nativeSource", sourceRevision: record["sourceRevision"] as number };
   }
   if (expected === "ice" && record["kind"] === "ice"
     && exactKeys(record, ["kind", "attemptId", "candidates", "next", "complete"])) {

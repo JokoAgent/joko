@@ -1,4 +1,8 @@
 import "./protobuf-text-encoding.js";
+export * from "./remote-desktop-viewer.js";
+export * from "./desktop-remote-desktop.js";
+export * from "./remote-desktop-system-action.js";
+export * from "./remote-desktop-clipboard-version.js";
 export * from "./partner-session-tasks.js";
 export * from "./session-handoff-messages.js";
 

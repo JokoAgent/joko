@@ -6,6 +6,7 @@ import { createPartnerRoutineApi, newRoutineDefinition, ListPartnerRoutinesRespo
 import { createPartnerMemoryApi, ListPartnerMemoriesResponseSchema, PartnerMemoryKind, ReadPartnerMemoryResponseSchema, UpdatePartnerMemoryResponseSchema, DeletePartnerMemoryResponseSchema,
   GetPartnerMemoryPreferencesResponseSchema, UpdatePartnerMemoryPreferencesResponseSchema } from "@joko/contracts";
 import { Code } from "@connectrpc/connect";
+import { DevicePeerDescriptorSchema, RemoteDesktopControlStateSchema, type RemoteDesktopControlState } from "@joko/contracts";
 import { createPartnerConnectionsApi, GetPartnerConnectionsResponseSchema, UpdatePartnerConnectionsResponseSchema, PartnerConnectionMode } from "@joko/contracts";
 import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSkillResponseSchema, UpdatePartnerSkillResponseSchema, DeletePartnerSkillResponseSchema } from "@joko/contracts";
 import { createHash } from "node:crypto";
@@ -1818,6 +1819,90 @@ function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient
   return instance;
 }
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); vi.useRealTimers(); });
+
+describe("Mobile Remote Desktop presentation transition authority", () => {
+  function setup() {
+    const host = create(DevicePeerDescriptorSchema, { platform: "darwin", route: {
+      targetDeviceId: "desktop", relationId: "relation", targetDeviceRevision: { value: 2n, etag: "device-2" },
+      relationRevision: { value: 3n, etag: "relation-3" }, routeGeneration: 4n
+    } });
+    const network = fakeNetwork(), ordinary = vi.fn(async () => { throw new Error("Ordinary request was dispatched."); });
+    const presentation = vi.fn<NonNullable<MobileNetwork["setRemoteDesktopPresentation"]>>(async () =>
+      create(RemoteDesktopControlStateSchema, { controlling: false, controlGeneration: 2n }));
+    Object.assign(network, {
+      listRemoteDesktopHosts: ordinary, getRemoteDesktopCapabilities: ordinary, getRemoteDesktopPermissions: ordinary,
+      showRemoteDesktopPermissionGuide: ordinary, startRemoteDesktop: ordinary, heartbeatRemoteDesktop: ordinary,
+      stopRemoteDesktop: ordinary, setRemoteDesktopControl: ordinary, setRemoteDesktopPresentation: presentation,
+      setRemoteDesktopHostMute: ordinary, sendRemoteDesktopInput: ordinary, getRemoteDesktopIceConfiguration: ordinary,
+      createRemoteDesktopOffer: ordinary, exchangeRemoteDesktopIce: ordinary, getRemoteDesktopFrame: ordinary,
+      listRemoteDesktopDisplayModes: ordinary, setRemoteDesktopDisplayMode: ordinary,
+      transferRemoteDesktopClipboardText: ordinary, transferRemoteDesktopClipboardContent: ordinary
+    });
+    return { network, ordinary, presentation, host };
+  }
+  it("permits only the captured iOS lease presentation while ordinary background requests stay fenced", async () => {
+    const value = setup(), instance = iosClient(value.network, memoryStorage(credential).storage);
+    await instance.start();
+    const transport = instance.remoteDesktopTransport()!;
+    const ticket = transport.beginBackgroundTransition!(value.host, "lease")!;
+    instance.setForeground(false);
+    expect(transport.isCurrent()).toBe(false);
+    expect(ticket.isCurrent()).toBe(true);
+    await expect(transport.capabilities(value.host)).rejects.toThrow();
+    await expect(transport.frame(value.host, "lease", true)).rejects.toThrow();
+    await expect(transport.presentation(value.host, "other", true)).rejects.toThrow();
+    const changed = clone(DevicePeerDescriptorSchema, value.host); changed.route!.relationRevision!.value += 1n;
+    await expect(transport.presentation(changed, "lease", true)).rejects.toThrow();
+    await expect(transport.presentation(value.host, "lease", true)).resolves.toMatchObject({ controlling: false });
+    expect(value.presentation).toHaveBeenCalledOnce();
+    expect(value.ordinary).not.toHaveBeenCalled();
+    ticket.close();
+    await expect(transport.presentation(value.host, "lease", false)).rejects.toThrow();
+  });
+  it("retires the actual four-second ticket and cannot mint another ticket in background", async () => {
+    const value = setup(), instance = iosClient(value.network, memoryStorage(credential).storage);
+    await instance.start(); vi.useFakeTimers();
+    const transport = instance.remoteDesktopTransport()!;
+    const ticket = transport.beginBackgroundTransition!(value.host, "lease")!;
+    instance.setForeground(false);
+    expect(transport.beginBackgroundTransition!(value.host, "lease")).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(ticket.isCurrent()).toBe(false);
+    await expect(transport.presentation(value.host, "lease", true)).rejects.toThrow();
+    expect(value.presentation).not.toHaveBeenCalled();
+  });
+  it("rejects a late presentation receipt after ticket retirement without repeating its effect", async () => {
+    const value = setup(), instance = iosClient(value.network, memoryStorage(credential).storage);
+    await instance.start();
+    let settle!: (value: RemoteDesktopControlState) => void;
+    value.presentation.mockImplementationOnce(() => new Promise(resolve => { settle = resolve; }));
+    const transport = instance.remoteDesktopTransport()!;
+    const ticket = transport.beginBackgroundTransition!(value.host, "lease")!;
+    const pending = transport.presentation(value.host, "lease", true);
+    instance.setForeground(false); ticket.close();
+    settle(create(RemoteDesktopControlStateSchema, { controlling: false, controlGeneration: 2n }));
+    await expect(pending).rejects.toThrow();
+    expect(value.presentation).toHaveBeenCalledOnce();
+  });
+  it("retires older tickets, preserves the new owner on old close and revokes all grants on disposal", async () => {
+    const value = setup(), instance = iosClient(value.network, memoryStorage(credential).storage);
+    await instance.start();
+    const transport = instance.remoteDesktopTransport()!;
+    const old = transport.beginBackgroundTransition!(value.host, "old")!;
+    const current = transport.beginBackgroundTransition!(value.host, "lease")!;
+    expect(old.isCurrent()).toBe(false); old.close(); expect(current.isCurrent()).toBe(true);
+    instance.dispose(); expect(current.isCurrent()).toBe(false);
+  });
+  it("does not admit native presentation transitions for Android", async () => {
+    const value = setup(), instance = client(value.network, memoryStorage(credential).storage);
+    await instance.start();
+    const transport = instance.remoteDesktopTransport()!;
+    expect(transport.beginBackgroundTransition!(value.host, "lease")).toBeUndefined();
+    instance.setForeground(false);
+    await expect(transport.presentation(value.host, "lease", true)).rejects.toThrow();
+    expect(value.presentation).not.toHaveBeenCalled();
+  });
+});
 
 describe("mobile Extension catalog authority", () => {
   it("lists and opens only an exact current installed descriptor", async () => {

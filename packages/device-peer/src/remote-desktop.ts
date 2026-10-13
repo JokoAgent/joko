@@ -4,7 +4,7 @@ import {
   parseRemoteDesktopIceCandidates,
   type RemoteDesktopIceRequest
 } from "./remote-desktop-ice.js";
-import type { RemoteDesktopClipboardContent } from "@joko/contracts";
+import type { RemoteDesktopClipboardContent, RemoteDesktopSystemAction } from "@joko/contracts";
 
 export const REMOTE_DESKTOP_PROTOCOL_VERSION = 1 as const;
 export const REMOTE_DESKTOP_LEASE_MS = 12_000;
@@ -51,6 +51,22 @@ export type RemoteDesktopKeyCode = (typeof REMOTE_DESKTOP_KEY_CODES)[number];
 const REMOTE_DESKTOP_KEY_CODE_SET = new Set<string>(REMOTE_DESKTOP_KEY_CODES);
 
 export type RemoteDesktopPlatform = "darwin" | "win32" | "linux";
+
+/** Native viewer Fit may report adjusted Mac logical geometry. */
+export function isRemoteDesktopViewerDisplayGeometry(
+  platform: string,
+  requestedWidth: number,
+  requestedHeight: number,
+  actualWidth: number,
+  actualHeight: number
+): boolean {
+  if (![requestedWidth, requestedHeight].every(size => Number.isSafeInteger(size) && size >= 320 && size <= 2560)) return false;
+  if (platform === "linux") return actualWidth === requestedWidth && actualHeight === requestedHeight;
+  return platform === "darwin"
+    && [actualWidth, actualHeight].every(size => Number.isSafeInteger(size) && size >= 1 && size <= 4096)
+    && Math.abs(actualWidth * requestedHeight - actualHeight * requestedWidth) <= Math.max(requestedWidth, requestedHeight);
+}
+export type { RemoteDesktopSystemAction } from "@joko/contracts";
 export type RemoteDesktopPermission = "screenRecording" | "accessibility";
 export type RemoteDesktopPermissionStatus = "granted" | "missing" | "unknown" | "notRequired";
 
@@ -104,6 +120,17 @@ export interface RemoteDesktopCapabilities {
   readonly backgroundViewing: boolean;
   readonly displayModes: boolean;
   readonly cursorOverlay: boolean;
+  readonly hostMute: boolean;
+  readonly lockOnExit: boolean;
+  readonly clipboardSync: boolean;
+  readonly clipboardInline: boolean;
+  readonly privacyScreen: boolean;
+  readonly nativeCredentials: boolean;
+  readonly resolutionRestore: boolean;
+  readonly viewerDisplay: boolean;
+  readonly viewerDisplayRestore: boolean;
+  readonly workspaceNavigation: boolean;
+  readonly systemMenu: boolean;
 }
 
 export interface RemoteDesktopVideoSettings {
@@ -142,10 +169,21 @@ export type RemoteDesktopRequest =
   | { readonly op: "permissions"; readonly action: "check" | "guide" }
   | { readonly op: "start"; readonly displayId: string; readonly resume?: boolean; readonly takeover?: boolean }
   | { readonly op: "heartbeat"; readonly lease: string }
-  | { readonly op: "stop"; readonly lease: string }
+  | { readonly op: "stop"; readonly lease: string; readonly lockScreen?: false }
+  | { readonly op: "stop"; readonly lease: string; readonly lockScreen: true; readonly controlGeneration: number }
   | { readonly op: "frame"; readonly lease: string; readonly cursorOverlay: boolean }
   | { readonly op: "control"; readonly lease: string; readonly enabled: boolean }
   | { readonly op: "presentation"; readonly lease: string; readonly enabled: boolean }
+  | { readonly op: "clipboardSync"; readonly lease: string; readonly controlGeneration: number; readonly enabled: boolean }
+  | { readonly op: "clipboardVersion"; readonly lease: string; readonly controlGeneration: number; readonly syncGeneration: number }
+  | { readonly op: "privacyScreen"; readonly lease: string; readonly controlGeneration: number; readonly enabled: boolean; readonly lockOnExit: boolean }
+  | { readonly op: "systemAction"; readonly lease: string; readonly controlGeneration: number; readonly action: RemoteDesktopSystemAction }
+  | {
+      readonly op: "hostMute";
+      readonly lease: string;
+      readonly controlGeneration: number;
+      readonly enabled: boolean;
+    }
   | {
       readonly op: "input";
       readonly lease: string;
@@ -161,11 +199,14 @@ export type RemoteDesktopRequest =
       readonly cursorOverlay: boolean;
     }
   | { readonly op: "displayModes"; readonly lease: string }
+  | { readonly op: "viewerDisplay"; readonly lease: string; readonly controlGeneration: number; readonly width: number; readonly height: number }
+  | { readonly op: "restoreViewerDisplay"; readonly lease: string; readonly controlGeneration: number }
   | {
       readonly op: "resolution";
       readonly lease: string;
       readonly controlGeneration: number;
       readonly modeId: string;
+      readonly temporary: boolean;
     };
 
 export function isRemoteDesktopPermission(value: unknown): value is RemoteDesktopPermission {
@@ -202,6 +243,17 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     || typeof value.backgroundViewing !== "boolean"
     || typeof value.displayModes !== "boolean"
     || typeof value.cursorOverlay !== "boolean"
+    || typeof value.hostMute !== "boolean"
+    || typeof value.lockOnExit !== "boolean"
+    || typeof value.clipboardSync !== "boolean"
+    || typeof value.clipboardInline !== "boolean"
+    || typeof value.privacyScreen !== "boolean"
+    || typeof value.nativeCredentials !== "boolean"
+    || typeof value.resolutionRestore !== "boolean"
+    || typeof value.viewerDisplay !== "boolean"
+    || typeof value.viewerDisplayRestore !== "boolean"
+    || typeof value.workspaceNavigation !== "boolean"
+    || typeof value.systemMenu !== "boolean"
     || (value.platform !== "darwin" && value.platform !== "win32" && value.platform !== "linux")
     || !Array.isArray(value.displays)
     || value.displays.length > REMOTE_DESKTOP_MAX_DISPLAYS
@@ -209,9 +261,20 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     || value.permissions === undefined) {
     throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
   }
-  if (value.platform !== "darwin" && (value.displayModes || value.cursorOverlay)) {
+  if (value.platform === "win32" && value.displayModes) {
     throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
   }
+  if (value.platform === "win32" && value.lockOnExit) throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
+  if (value.clipboardInline && !value.clipboardSync) throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
+  if (value.platform !== "darwin" && value.platform !== "linux" && value.nativeCredentials) throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
+  if (value.resolutionRestore && (value.platform === "win32" || !value.displayModes)) {
+    throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
+  }
+  if ((value.platform === "win32" && (value.viewerDisplay || value.viewerDisplayRestore))
+    || (value.viewerDisplayRestore && !value.viewerDisplay)) throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
+  if ((value.platform !== "linux" && (value.workspaceNavigation || value.systemMenu))
+    || ((value.workspaceNavigation || value.systemMenu) && !value.canControl)
+    || (value.systemMenu && !value.workspaceNavigation)) throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
   const displays = value.displays.map(parseRemoteDesktopDisplay);
   if (new Set(displays.map((display) => display.id)).size !== displays.length) {
     throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
@@ -227,6 +290,17 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     backgroundViewing: value.backgroundViewing,
     displayModes: value.displayModes,
     cursorOverlay: value.cursorOverlay,
+    hostMute: value.hostMute,
+    lockOnExit: value.lockOnExit,
+    clipboardSync: value.clipboardSync,
+    clipboardInline: value.clipboardInline,
+    privacyScreen: value.privacyScreen,
+    nativeCredentials: value.nativeCredentials,
+    resolutionRestore: value.resolutionRestore,
+    viewerDisplay: value.viewerDisplay,
+    viewerDisplayRestore: value.viewerDisplayRestore,
+    workspaceNavigation: value.workspaceNavigation,
+    systemMenu: value.systemMenu,
     platform: value.platform,
     displays: Object.freeze(displays),
     permissions: parseRemoteDesktopPermissions(value.permissions)
@@ -293,10 +367,46 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
   if (!boundedIdentifier(value.lease)) throw new Error("INVALID_REMOTE_DESKTOP_LEASE");
   const lease = value.lease;
   switch (value.op) {
+    case "systemAction": {
+      requireExactKeys(value, ["op", "lease", "controlGeneration", "action"]);
+      if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1
+        || !isRemoteDesktopSystemAction(value.action)) throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+      return Object.freeze({ op: value.op, lease, controlGeneration: value.controlGeneration as number,
+        action: value.action });
+    }
+    case "privacyScreen": {
+      requireExactKeys(value, ["op", "lease", "controlGeneration", "enabled", "lockOnExit"]);
+      if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1
+        || typeof value.enabled !== "boolean" || typeof value.lockOnExit !== "boolean") throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+      return Object.freeze({ op: value.op, lease, controlGeneration: value.controlGeneration as number,
+        enabled: value.enabled, lockOnExit: value.lockOnExit });
+    }
+    case "clipboardSync":
+    case "clipboardVersion": {
+      requireExactKeys(value, ["op", "lease", "controlGeneration", value.op === "clipboardSync" ? "enabled" : "syncGeneration"]);
+      if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1
+        || (value.op === "clipboardSync" ? typeof value.enabled !== "boolean"
+          : !Number.isSafeInteger(value.syncGeneration) || (value.syncGeneration as number) < 1)) {
+        throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+      }
+      return value.op === "clipboardSync"
+        ? Object.freeze({ op: value.op, lease, controlGeneration: value.controlGeneration as number, enabled: value.enabled as boolean })
+        : Object.freeze({ op: value.op, lease, controlGeneration: value.controlGeneration as number, syncGeneration: value.syncGeneration as number });
+    }
     case "heartbeat":
-    case "stop":
       requireExactKeys(value, ["op", "lease"]);
       return Object.freeze({ op: value.op, lease });
+    case "stop":
+      if (value.lockScreen === true) {
+        requireExactKeys(value, ["op", "lease", "lockScreen", "controlGeneration"]);
+        if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1) {
+          throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+        }
+        return Object.freeze({ op: "stop", lease, lockScreen: true, controlGeneration: value.controlGeneration as number });
+      }
+      requireExactKeys(value, ["op", "lease"], ["lockScreen"]);
+      if (value.lockScreen !== undefined && value.lockScreen !== false) throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+      return Object.freeze({ op: "stop", lease });
     case "frame":
       requireExactKeys(value, ["op", "lease", "cursorOverlay"]);
       if (typeof value.cursorOverlay !== "boolean") {
@@ -310,25 +420,47 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
     case "displayModes":
       requireExactKeys(value, ["op", "lease"]);
       return Object.freeze({ op: "displayModes", lease });
+    case "viewerDisplay":
+      requireExactKeys(value, ["op", "lease", "controlGeneration", "width", "height"]);
+      if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1
+        || !Number.isSafeInteger(value.width) || (value.width as number) < 320 || (value.width as number) > 2560
+        || !Number.isSafeInteger(value.height) || (value.height as number) < 320 || (value.height as number) > 2560) {
+        throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+      }
+      return Object.freeze({ op: "viewerDisplay", lease, controlGeneration: value.controlGeneration as number,
+        width: value.width as number, height: value.height as number });
+    case "restoreViewerDisplay":
+      requireExactKeys(value, ["op", "lease", "controlGeneration"]);
+      if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1) {
+        throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+      }
+      return Object.freeze({ op: "restoreViewerDisplay", lease, controlGeneration: value.controlGeneration as number });
     case "resolution":
-      requireExactKeys(value, ["op", "lease", "controlGeneration", "modeId"]);
+      requireExactKeys(value, ["op", "lease", "controlGeneration", "modeId", "temporary"]);
       if (!Number.isSafeInteger(value.controlGeneration)
         || (value.controlGeneration as number) < 1
         || typeof value.modeId !== "string"
-        || !/^[0-9]{1,10}$/u.test(value.modeId)) {
+        || !/^[0-9]{1,10}$/u.test(value.modeId) || typeof value.temporary !== "boolean") {
         throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       }
       return Object.freeze({
         op: "resolution",
         lease,
         controlGeneration: value.controlGeneration as number,
-        modeId: value.modeId
+        modeId: value.modeId,
+        temporary: value.temporary
       });
     case "control":
     case "presentation":
       requireExactKeys(value, ["op", "lease", "enabled"]);
       if (typeof value.enabled !== "boolean") throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       return Object.freeze({ op: value.op, lease, enabled: value.enabled });
+    case "hostMute":
+      requireExactKeys(value, ["op", "lease", "controlGeneration", "enabled"]);
+      if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1
+        || typeof value.enabled !== "boolean") throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
+      return Object.freeze({ op: "hostMute", lease, controlGeneration: value.controlGeneration as number,
+        enabled: value.enabled });
     case "input": {
       requireExactKeys(value, ["op", "lease", "sequence", "events"]);
       if (!Number.isSafeInteger(value.sequence)
@@ -381,6 +513,10 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
     default:
       throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
   }
+}
+
+export function isRemoteDesktopSystemAction(value: unknown): value is RemoteDesktopSystemAction {
+  return value === "workspaceLeft" || value === "workspaceRight" || value === "systemMenu";
 }
 
 export function parseRemoteDesktopVideoSettings(value: unknown): RemoteDesktopVideoSettings {
@@ -523,7 +659,7 @@ export function stringifyRemoteDesktopClipboardContent(value: RemoteDesktopClipb
   return json;
 }
 
-function parseRemoteDesktopDisplay(value: unknown): RemoteDesktopDisplay {
+export function parseRemoteDesktopDisplay(value: unknown): RemoteDesktopDisplay {
   if (!isRecord(value)
     || !boundedIdentifier(value.id)
     || typeof value.name !== "string"

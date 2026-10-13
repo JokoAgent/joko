@@ -357,6 +357,14 @@ message DevicePeerCloseLoopbackListenerAction {
 
 message DevicePeerGetRemoteDesktopCapabilitiesAction {}
 
+message DevicePeerGetRemoteDesktopLockStateAction {}
+
+// Service-owned retirement of one previously opened native handle. This
+// action cannot create a session, authenticate or acquire desktop control.
+message DevicePeerCloseRemoteDesktopCredentialsAction {
+  string handle = 1;
+}
+
 message DevicePeerGetRemoteDesktopPermissionsAction {}
 
 message DevicePeerShowRemoteDesktopPermissionGuideAction {}
@@ -372,6 +380,8 @@ message DevicePeerHeartbeatRemoteDesktopAction {
 
 message DevicePeerStopRemoteDesktopAction {
   string lease_id = 1;
+  bool lock_screen = 2;
+  uint64 control_generation = 3;
 }
 
 message DevicePeerSetRemoteDesktopControlAction {
@@ -422,6 +432,19 @@ message DevicePeerSetRemoteDesktopDisplayModeAction {
   string lease_id = 1;
   uint64 control_generation = 2;
   string mode_id = 3;
+  bool temporary = 4;
+}
+
+message DevicePeerSetRemoteDesktopViewerDisplayAction {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
+message DevicePeerRestoreRemoteDesktopViewerDisplayAction {
+  string lease_id = 1;
+  uint64 control_generation = 2;
 }
 
 message DevicePeerCommand {
@@ -475,6 +498,16 @@ message DevicePeerCommand {
     DevicePeerProbeRemoteDesktopPresentationAction probe_remote_desktop_presentation = 64;
     DevicePeerListRemoteDesktopDisplayModesAction list_remote_desktop_display_modes = 65;
     DevicePeerSetRemoteDesktopDisplayModeAction set_remote_desktop_display_mode = 66;
+    RemoteDesktopHostMuteRequest set_remote_desktop_host_mute = 67;
+    RemoteDesktopClipboardSyncRequest set_remote_desktop_clipboard_sync = 68;
+    RemoteDesktopClipboardVersionRequest get_remote_desktop_clipboard_version = 69;
+    RemoteDesktopPrivacyScreenRequest set_remote_desktop_privacy_screen = 70;
+    DevicePeerGetRemoteDesktopLockStateAction get_remote_desktop_lock_state = 71;
+    RemoteDesktopCredentialRequest request_remote_desktop_credentials = 72;
+    DevicePeerCloseRemoteDesktopCredentialsAction close_remote_desktop_credentials = 73;
+    DevicePeerSetRemoteDesktopViewerDisplayAction set_remote_desktop_viewer_display = 74;
+    DevicePeerRestoreRemoteDesktopViewerDisplayAction restore_remote_desktop_viewer_display = 75;
+    RemoteDesktopSystemActionRequest perform_remote_desktop_system_action = 76;
   }
 }
 
@@ -659,6 +692,15 @@ message DevicePeerAgentResult {
     RemoteDesktopClipboardContentResult remote_desktop_clipboard_content = 48;
     RemoteDesktopPresentationProof remote_desktop_presentation_proof = 49;
     DevicePeerRemoteDesktopDisplayModesResult remote_desktop_display_modes = 50;
+    RemoteDesktopHostMuteResult remote_desktop_host_mute = 51;
+    RemoteDesktopClipboardSyncResult remote_desktop_clipboard_sync = 52;
+    RemoteDesktopClipboardVersionResult remote_desktop_clipboard_version = 53;
+    RemoteDesktopPrivacyScreenResult remote_desktop_privacy_screen = 54;
+    RemoteDesktopLockStateResult remote_desktop_lock_state = 55;
+    RemoteDesktopCredentialResult remote_desktop_credentials = 56;
+    RemoteDesktopDisplayModeResult remote_desktop_display_mode = 57;
+    RemoteDesktopViewerDisplayResult remote_desktop_viewer_display = 58;
+    RemoteDesktopSystemActionResult remote_desktop_system_action = 59;
     DevicePeerFailure failure = 30;
   }
 }

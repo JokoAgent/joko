@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type JSX } from "react";
-import { Check, ChevronDown, Laptop, RefreshCw } from "lucide-react";
+import { Check, ChevronDown, Laptop, RefreshCw, Monitor } from "lucide-react";
 import type { ConnectionProfile, MachineCacheView, MachinePresenceView } from "../model.js";
 import {
   toggleMachineProfile,
@@ -20,6 +20,8 @@ export interface MachineSwitcherMenuProps {
   readonly onRefresh: () => void;
   readonly onSwitch: (profile: ConnectionProfile) => void;
   readonly onRepair?: (profile: ConnectionProfile) => void;
+  readonly remoteDesktops?: readonly { readonly deviceId: string; readonly name: string; readonly enabled: boolean }[];
+  readonly onRemoteDesktop?: (deviceId: string) => void;
 }
 
 export function MachineSwitcherMenu(props: MachineSwitcherMenuProps): JSX.Element | null {
@@ -42,7 +44,7 @@ export function MachineSwitcherMenu(props: MachineSwitcherMenuProps): JSX.Elemen
       setUnavailableProfileId(undefined);
     }
   }, [unavailablePresence, unavailableProfile]);
-  if (profiles.length < 2) return null;
+  if (profiles.length < 2 && !props.remoteDesktops?.length) return null;
 
   const switchMachine = (profile: ConnectionProfile): void => {
     const presence = props.presenceByProfile[profile.id];
@@ -119,6 +121,12 @@ export function MachineSwitcherMenu(props: MachineSwitcherMenuProps): JSX.Elemen
           </div>;
         })}
       </div>
+      {!!props.remoteDesktops?.length && <div className="machine-switcher__remote-desktops" role="group" aria-label={props.t("settings.remoteDesktop.open")}>
+        {props.remoteDesktops.map((device) => <button type="button" key={device.deviceId} disabled={!device.enabled}
+          onClick={() => { detailsRef.current?.removeAttribute("open"); props.onRemoteDesktop?.(device.deviceId); }}>
+          <Monitor aria-hidden="true" /><span>{device.name}</span><small>{props.t("settings.remoteDesktop.open")}</small>
+        </button>)}
+      </div>}
     </div>
   </details>;
 }

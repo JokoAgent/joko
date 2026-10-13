@@ -137,6 +137,7 @@ export const DESKTOP_CHANNELS = {
   managedOrchestratorCompleteLogout: "joko:managed-orchestrator:complete-logout",
   remoteDesktopGetState: "joko:remote-desktop:get-state",
   remoteDesktopSetEnabled: "joko:remote-desktop:set-enabled",
+  remoteDesktopConfigureWindowsSupport: "joko:remote-desktop:configure-windows-support",
   remoteDesktopDisconnect: "joko:remote-desktop:disconnect",
   remoteDesktopGetPermissions: "joko:remote-desktop:get-permissions",
   remoteDesktopShowPermissionGuide: "joko:remote-desktop:show-permission-guide",
@@ -171,25 +172,12 @@ export function isInspectorWindowOpenRequest(url: unknown, frameName: unknown): 
 export type DesktopLocale = "en" | "zh-CN" | "en-XA";
 export type DesktopSystemLocale = Exclude<DesktopLocale, "en-XA">;
 
-export type DesktopRemoteDesktopPermissionStatus =
-  | "granted"
-  | "missing"
-  | "unknown"
-  | "notRequired";
-
-export interface DesktopRemoteDesktopPermissions {
-  readonly screenRecording: DesktopRemoteDesktopPermissionStatus;
-  readonly accessibility: DesktopRemoteDesktopPermissionStatus;
-}
-
-export interface DesktopRemoteDesktopSnapshot {
-  readonly enabled: boolean;
-  readonly active: boolean;
-  readonly controlling: boolean;
-  readonly controllerDeviceId?: string;
-  readonly displayId?: string;
-  readonly permissions: DesktopRemoteDesktopPermissions;
-}
+export type {
+  DesktopRemoteDesktopPermissionStatus,
+  DesktopRemoteDesktopPermissions,
+  DesktopRemoteDesktopSnapshot,
+  DesktopRemoteDesktopWindowsSupport
+} from "@joko/contracts";
 
 export const DESKTOP_PAGE_SEARCH_MAX_TEXT_LENGTH = 4_096;
 

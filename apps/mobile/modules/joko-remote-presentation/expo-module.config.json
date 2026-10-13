@@ -1,7 +1,10 @@
 {
-  "platforms": ["apple"],
+  "platforms": ["apple", "android"],
   "apple": {
     "podspecPath": "./ios/JokoRemotePresentation.podspec",
     "modules": ["JokoRemotePresentationModule"]
+  },
+  "android": {
+    "modules": ["com.joko.remotepresentation.JokoRemotePresentationModule"]
   }
 }

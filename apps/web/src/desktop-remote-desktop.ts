@@ -4,10 +4,10 @@ const DESKTOP_REMOTE_DESKTOP_CAPABILITY = "remote.desktopHost" satisfies JokoDes
 
 type DesktopRemoteDesktopApi = Pick<
   JokoDesktopApi["remoteDesktop"],
-  "getState" | "setEnabled" | "disconnect" | "showPermissionGuide" | "onStateChanged"
+  "getState" | "setEnabled" | "configureWindowsSupport" | "disconnect" | "showPermissionGuide" | "onStateChanged"
 >;
 
-export type DesktopRemoteDesktopError = "load" | "save" | "disconnect" | "permissions";
+export type DesktopRemoteDesktopError = "load" | "save" | "disconnect" | "permissions" | "windowsSupport";
 
 export interface DesktopRemoteDesktopState extends JokoDesktopRemoteDesktopSnapshot {
   readonly available: boolean;
@@ -45,6 +45,7 @@ export function desktopRemoteDesktopApi(): DesktopRemoteDesktopApi | undefined {
   const api = desktop.remoteDesktop;
   return typeof api?.getState === "function"
     && typeof api.setEnabled === "function"
+    && typeof api.configureWindowsSupport === "function"
     && typeof api.disconnect === "function"
     && typeof api.showPermissionGuide === "function"
     && typeof api.onStateChanged === "function"
@@ -52,10 +53,11 @@ export function desktopRemoteDesktopApi(): DesktopRemoteDesktopApi | undefined {
     : undefined;
 }
 
-export function useDesktopRemoteDesktop(): {
+export function useDesktopRemoteDesktop(refreshWindowsSupport = false): {
   readonly state: DesktopRemoteDesktopState;
   readonly reload: () => Promise<void>;
   readonly setEnabled: (enabled: boolean) => Promise<void>;
+  readonly configureWindowsSupport: (enabled: boolean) => Promise<void>;
   readonly disconnect: () => Promise<void>;
   readonly showPermissionGuide: () => Promise<void>;
 } {
@@ -69,29 +71,34 @@ export function useDesktopRemoteDesktop(): {
   const ownerEpochRef = useRef(0);
   const confirmedRef = useRef<JokoDesktopRemoteDesktopSnapshot | undefined>(undefined);
   const mutationFlightRef = useRef<object | undefined>(undefined);
+  const readFlightRef = useRef<object | undefined>(undefined);
 
-  const reload = useCallback(async (initialRevision?: number): Promise<void> => {
+  const reload = useCallback(async (initialRevision?: number, background = false): Promise<void> => {
     const api = activeApiRef.current;
-    if (api === undefined || mutationFlightRef.current !== undefined) return;
+    if (api === undefined || mutationFlightRef.current !== undefined || (background && readFlightRef.current !== undefined)) return;
+    const readFlight = {};
+    readFlightRef.current = readFlight;
     const requestEpoch = ++requestEpochRef.current;
     const snapshotRevision = initialRevision ?? snapshotRevisionRef.current;
-    if (snapshotRevisionRef.current === snapshotRevision) {
+    if (!background && snapshotRevisionRef.current === snapshotRevision) {
       setState((current) => current.available
         ? { ...current, loading: confirmedRef.current === undefined, error: undefined }
         : current);
     }
     try {
-      const snapshot = normalizeSnapshot(await api.getState());
+      const snapshot = normalizeSnapshot(await (refreshWindowsSupport ? api.getState(true) : api.getState()));
       if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)
         || snapshotRevisionRef.current !== snapshotRevision) return;
       confirmedRef.current = snapshot;
-      setState(readyState(snapshot));
+      setState((current) => ({ ...readyState(snapshot), ...(background && current.error !== undefined ? { error: current.error } : {}) }));
     } catch {
       if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)
         || snapshotRevisionRef.current !== snapshotRevision) return;
-      setState((current) => ({ ...current, loading: false, saving: false, error: "load" }));
+      if (!background) setState((current) => ({ ...current, loading: false, saving: false, error: "load" }));
+    } finally {
+      if (readFlightRef.current === readFlight) readFlightRef.current = undefined;
     }
-  }, []);
+  }, [refreshWindowsSupport]);
 
   useEffect(() => {
     const api = desktopRemoteDesktopApi();
@@ -99,6 +106,7 @@ export function useDesktopRemoteDesktop(): {
     const ownerEpoch = ++ownerEpochRef.current;
     confirmedRef.current = undefined;
     mutationFlightRef.current = undefined;
+    readFlightRef.current = undefined;
     snapshotRevisionRef.current += 1;
     const initialRevision = snapshotRevisionRef.current;
     requestEpochRef.current += 1;
@@ -130,6 +138,7 @@ export function useDesktopRemoteDesktop(): {
       if (activeApiRef.current === api) activeApiRef.current = undefined;
       requestEpochRef.current += 1;
       mutationFlightRef.current = undefined;
+      readFlightRef.current = undefined;
       try {
         unsubscribe?.();
       } catch {
@@ -137,6 +146,12 @@ export function useDesktopRemoteDesktop(): {
       }
     };
   }, [initialApi, reload]);
+
+  useEffect(() => {
+    if (!refreshWindowsSupport || initialApi === undefined) return;
+    const timer = window.setInterval(() => { void reload(undefined, true); }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [initialApi, refreshWindowsSupport, reload]);
 
   const mutate = useCallback(async (
     operation: (api: DesktopRemoteDesktopApi) => Promise<JokoDesktopRemoteDesktopSnapshot>,
@@ -153,20 +168,26 @@ export function useDesktopRemoteDesktop(): {
       : current);
     try {
       const snapshot = normalizeSnapshot(await operation(api));
-      if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)
-        || snapshotRevisionRef.current !== snapshotRevision) return;
-      confirmedRef.current = snapshot;
-      setState({ ...readyState(snapshot), saving: true });
+      if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
+      const hasNewerSnapshot = snapshotRevisionRef.current !== snapshotRevision;
+      if (hasNewerSnapshot && error !== "windowsSupport") return;
+      const adopted = hasNewerSnapshot && confirmedRef.current !== undefined
+        ? { ...confirmedRef.current, ...(snapshot.windowsSupport === undefined ? {} : { windowsSupport: snapshot.windowsSupport }) }
+        : snapshot;
+      confirmedRef.current = adopted;
+      setState({ ...readyState(adopted), saving: true });
     } catch {
       if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)
-        || snapshotRevisionRef.current !== snapshotRevision) return;
+        || (snapshotRevisionRef.current !== snapshotRevision && error !== "windowsSupport")) return;
       const recoveryRevision = snapshotRevisionRef.current;
       try {
-        const snapshot = normalizeSnapshot(await api.getState());
+        const snapshot = normalizeSnapshot(await (refreshWindowsSupport ? api.getState(true) : api.getState()));
         if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
         if (snapshotRevisionRef.current === recoveryRevision) {
           confirmedRef.current = snapshot;
           setState({ ...readyState(snapshot), saving: true, error });
+        } else if (error === "windowsSupport") {
+          setState((current) => ({ ...current, saving: true, error }));
         }
       } catch {
         if (!requestIsCurrent(api, requestEpoch, activeApiRef, requestEpochRef)) return;
@@ -181,10 +202,12 @@ export function useDesktopRemoteDesktop(): {
         setState((current) => ({ ...current, saving: false }));
       }
     }
-  }, []);
+  }, [refreshWindowsSupport]);
 
   const setEnabled = useCallback((enabled: boolean): Promise<void> =>
     mutate((api) => api.setEnabled(enabled), "save"), [mutate]);
+  const configureWindowsSupport = useCallback((enabled: boolean): Promise<void> =>
+    mutate((api) => api.configureWindowsSupport(enabled), "windowsSupport"), [mutate]);
   const disconnect = useCallback((): Promise<void> =>
     mutate((api) => api.disconnect(), "disconnect"), [mutate]);
   const showPermissionGuide = useCallback((): Promise<void> => mutate(async (api) => {
@@ -194,7 +217,7 @@ export function useDesktopRemoteDesktop(): {
     return { ...snapshot, permissions };
   }, "permissions"), [mutate]);
 
-  return { state, reload, setEnabled, disconnect, showPermissionGuide };
+  return { state, reload, setEnabled, configureWindowsSupport, disconnect, showPermissionGuide };
 }
 
 function requestIsCurrent(
@@ -222,6 +245,10 @@ function normalizeSnapshot(value: unknown): JokoDesktopRemoteDesktopSnapshot {
   }
   const controllerDeviceId = optionalIdentity(record["controllerDeviceId"]);
   const displayId = optionalIdentity(record["displayId"]);
+  const windowsSupport = record["windowsSupport"];
+  if (Object.hasOwn(record, "windowsSupport") && !isWindowsSupport(windowsSupport)) {
+    throw new TypeError("Invalid Remote Desktop service support.");
+  }
   if ((!record["active"] && record["controlling"])
     || (record["active"] && (controllerDeviceId === undefined || displayId === undefined))) {
     throw new TypeError("Invalid Remote Desktop state.");
@@ -232,8 +259,13 @@ function normalizeSnapshot(value: unknown): JokoDesktopRemoteDesktopSnapshot {
     controlling: record["controlling"],
     ...(controllerDeviceId === undefined ? {} : { controllerDeviceId }),
     ...(displayId === undefined ? {} : { displayId }),
+    ...(isWindowsSupport(windowsSupport) ? { windowsSupport } : {}),
     permissions: normalizePermissions(record["permissions"])
   };
+}
+
+function isWindowsSupport(value: unknown): value is JokoDesktopRemoteDesktopWindowsSupport {
+  return value === "ready" || value === "missing" || value === "installRequired" || value === "unavailable";
 }
 
 function normalizePermissions(value: unknown): JokoDesktopRemoteDesktopPermissions {

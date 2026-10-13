@@ -956,12 +956,33 @@ async function auditNativeRemoteDesktop(root, platform, targetArch) {
     ? "joko-macos-remote-desktop-input"
     : platform === "win32"
       ? "joko-windows-remote-desktop-input.exe"
-      : null;
-  const captureHelper = platform === "darwin" ? "joko-macos-remote-desktop-capture" : null;
+      : platform === "linux" ? "joko-linux-remote-desktop-input" : null;
+  const captureHelper = platform === "darwin" ? "joko-macos-remote-desktop-capture"
+    : platform === "linux" ? "joko-linux-remote-desktop-capture" : null;
+  const credentialHelper = platform === "darwin" ? "joko-macos-remote-credentials" : null;
+  const clipboardHelper = platform === "linux" ? "joko-linux-remote-desktop-clipboard" : null;
+  const viewerScript = platform === "linux" ? "linux-viewer-display.py" : null;
+  const credentialBundle = platform === "darwin" ? "JokoRemoteCredentials_JokoRemoteCredentials.bundle" : null;
+  const linuxCredentials = platform === "linux" ? "linux-credentials" : null;
+  const windowsHostService = platform === "win32" ? "joko-windows-remote-desktop-host.exe" : null;
+  const windowsHostAddon = platform === "win32" ? "joko-windows-remote-desktop-host.node" : null;
+  const manifestPath = resolve(root, "manifest.json");
+  await assertCanonicalRegularFile(manifestPath, "The packaged Remote Desktop manifest is unsafe.");
+  const manifestInfo = await lstat(manifestPath);
+  if (manifestInfo.size < 1 || manifestInfo.size > 4_096) throw new Error("The packaged Remote Desktop manifest exceeds its bounds.");
+  const manifest = await readJsonManifest(manifestPath, "Remote Desktop helper");
+  const privacyPlugin = platform === "linux" && manifest.privacyPlugin !== null ? "joko-hyprland-privacy.so" : null;
+  const privacyMetadata = privacyPlugin === null ? null : "joko-hyprland-privacy.json";
   const expected = [
     "manifest.json",
     ...(inputHelper === null ? [] : [inputHelper]),
-    ...(captureHelper === null ? [] : [captureHelper])
+    ...(captureHelper === null ? [] : [captureHelper]),
+    ...(clipboardHelper === null ? [] : [clipboardHelper]),
+    ...(viewerScript === null ? [] : [viewerScript]),
+    ...(linuxCredentials === null ? [] : [linuxCredentials]),
+    ...(windowsHostService === null ? [] : [windowsHostService, windowsHostAddon]),
+    ...(privacyPlugin === null ? [] : [privacyPlugin, privacyMetadata]),
+    ...(credentialHelper === null ? [] : [credentialHelper, credentialBundle])
   ].sort();
   const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
   const names = entries.map(entry => entry.name).sort();
@@ -969,32 +990,88 @@ async function auditNativeRemoteDesktop(root, platform, targetArch) {
     throw new Error("The packaged Remote Desktop helper directory is incomplete or contains unexpected files.");
   }
   for (const entry of entries) {
+    if (entry.name === credentialBundle || entry.name === linuxCredentials) continue;
     await assertCanonicalRegularFile(resolve(root, entry.name),
       "The packaged Remote Desktop helper file is unsafe.");
   }
-  const manifest = await readJsonManifest(resolve(root, "manifest.json"), "Remote Desktop helper");
   if (Object.keys(manifest).sort().join(",") !== [
-    "architecture", "captureHelper", "captureSha256", "inputHelper", "inputSha256",
-    "platform", "protocolVersion"
+    "architecture", "captureHelper", "captureSha256", "clipboardHelper", "clipboardSha256", "credentialHelper", "credentialSha256",
+    "credentialBundle", "credentialBundleSha256", "inputHelper", "inputSha256",
+    "platform", "protocolVersion", "viewerDisplayScript", "viewerDisplaySha256", "viewerDisplayInterpreter",
+    "privacyPlugin", "privacySha256", "privacyMetadata", "privacyMetadataSha256",
+    "linuxCredentialDirectory", "linuxCredentialInterpreter", "linuxCredentialFiles",
+    "windowsHostService", "windowsHostServiceSha256", "windowsHostAddon", "windowsHostAddonSha256", "windowsHostNodeApiVersion"
   ].sort().join(",")
     || manifest.platform !== platform || manifest.architecture !== targetArch
+    || (inputHelper !== null && !["x64", "arm64"].includes(targetArch))
     || manifest.protocolVersion !== 1 || manifest.inputHelper !== inputHelper
     || manifest.captureHelper !== captureHelper
     || (inputHelper === null ? manifest.inputSha256 !== null
       : typeof manifest.inputSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.inputSha256))
     || (captureHelper === null ? manifest.captureSha256 !== null
-      : typeof manifest.captureSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.captureSha256))) {
+      : typeof manifest.captureSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.captureSha256))
+    || manifest.clipboardHelper !== clipboardHelper
+    || (clipboardHelper === null ? manifest.clipboardSha256 !== null
+      : typeof manifest.clipboardSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.clipboardSha256))
+    || manifest.viewerDisplayScript !== viewerScript
+    || manifest.viewerDisplayInterpreter !== (viewerScript === null ? null : "/usr/bin/python3")
+    || (viewerScript === null ? manifest.viewerDisplaySha256 !== null
+      : typeof manifest.viewerDisplaySha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.viewerDisplaySha256))
+    || manifest.credentialHelper !== credentialHelper || manifest.credentialBundle !== credentialBundle
+    || manifest.linuxCredentialDirectory !== linuxCredentials
+    || manifest.linuxCredentialInterpreter !== (linuxCredentials === null ? null : "/usr/bin/python3")
+    || (linuxCredentials === null && manifest.linuxCredentialFiles !== null)
+    || manifest.windowsHostService !== windowsHostService || manifest.windowsHostAddon !== windowsHostAddon
+    || manifest.windowsHostNodeApiVersion !== (windowsHostService === null ? null : 6)
+    || (windowsHostService === null ? manifest.windowsHostServiceSha256 !== null || manifest.windowsHostAddonSha256 !== null
+      : typeof manifest.windowsHostServiceSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.windowsHostServiceSha256)
+        || typeof manifest.windowsHostAddonSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.windowsHostAddonSha256))
+    || manifest.privacyPlugin !== privacyPlugin || manifest.privacyMetadata !== privacyMetadata
+    || (privacyPlugin === null ? manifest.privacySha256 !== null || manifest.privacyMetadataSha256 !== null
+      : typeof manifest.privacySha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.privacySha256)
+        || typeof manifest.privacyMetadataSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.privacyMetadataSha256))
+    || (credentialHelper === null ? manifest.credentialSha256 !== null || manifest.credentialBundleSha256 !== null
+      : typeof manifest.credentialSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.credentialSha256)
+        || typeof manifest.credentialBundleSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(manifest.credentialBundleSha256))) {
     throw new Error("The packaged Remote Desktop helper identity does not match the artifact target.");
+  }
+  if (linuxCredentials !== null) await auditNativeLinuxCredentials(resolve(root, linuxCredentials), manifest.linuxCredentialFiles);
+  if (privacyMetadata !== null) {
+    const path = resolve(root, privacyMetadata);
+    const info = await lstat(path);
+    if (info.size < 1 || info.size > 4_096) throw new Error("The packaged Remote Desktop privacy metadata exceeds its bounds.");
+    const bytes = await readFile(path);
+    const metadata = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    if (createHash("sha256").update(bytes).digest("hex") !== manifest.privacyMetadataSha256
+      || metadata === null || typeof metadata !== "object" || Array.isArray(metadata)
+      || Object.keys(metadata).sort().join(",") !== "hash,source,version"
+      || metadata.version !== "0.56.2" || typeof metadata.hash !== "string" || !/^[a-f0-9]{40}$/u.test(metadata.hash)
+      || typeof metadata.source !== "string" || !/^[a-f0-9]{64}$/u.test(metadata.source)) {
+      throw new Error("The packaged Remote Desktop privacy metadata does not match its pinned identity.");
+    }
+  }
+  if (viewerScript !== null) {
+    const bytes = await readFile(resolve(root, viewerScript));
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if (bytes.length < 1 || bytes.length > 128_000 || !text.startsWith("#!/usr/bin/python3\n") || text.includes("\0")
+      || createHash("sha256").update(bytes).digest("hex") !== manifest.viewerDisplaySha256) {
+      throw new Error("The packaged Remote Desktop mirror script does not match its identity.");
+    }
   }
   for (const [helper, digest] of [
     [inputHelper, manifest.inputSha256],
-    [captureHelper, manifest.captureSha256]
+    [captureHelper, manifest.captureSha256],
+    [clipboardHelper, manifest.clipboardSha256],
+    [privacyPlugin, manifest.privacySha256],
+    [credentialHelper, manifest.credentialSha256],
+    [windowsHostService, manifest.windowsHostServiceSha256],
+    [windowsHostAddon, manifest.windowsHostAddonSha256]
   ]) {
     if (helper === null) continue;
     const path = resolve(root, helper);
     const info = await lstat(path);
     if (info.size < 64 || info.size > 16 * 1024 * 1024
-      || (platform === "darwin" && (info.mode & 0o111) === 0)) {
+      || (platform !== "win32" && process.platform !== "win32" && (info.mode & 0o111) === 0)) {
       throw new Error("The packaged Remote Desktop helper binary does not match its identity.");
     }
     const bytes = await readFile(path);
@@ -1008,11 +1085,76 @@ async function auditNativeRemoteDesktop(root, platform, targetArch) {
       }
       continue;
     }
+    if (platform === "linux") {
+      if (bytes[0] !== 0x7f || bytes.toString("ascii", 1, 4) !== "ELF"
+        || bytes[4] !== 2 || bytes[5] !== 1 || bytes[6] !== 1
+        || ![2, 3].includes(bytes.readUInt16LE(16))
+        || (helper === privacyPlugin && bytes.readUInt16LE(16) !== 3)
+        || bytes.readUInt16LE(18) !== (targetArch === "x64" ? 62 : targetArch === "arm64" ? 183 : -1)
+        || bytes.readUInt32LE(20) !== 1 || bytes.readUInt16LE(52) !== 64) {
+        throw new Error("The packaged Remote Desktop helper does not match the Linux target.");
+      }
+      continue;
+    }
     const offset = bytes.readUInt32LE(0x3c);
     const expectedMachine = targetArch === "arm64" ? 0xaa64 : targetArch === "x64" ? 0x8664 : -1;
-    if (offset + 6 > bytes.length || bytes.readUInt32LE(offset) !== 0x00004550
-      || bytes.readUInt16LE(offset + 4) !== expectedMachine) {
+    if (bytes.readUInt16LE(0) !== 0x5a4d || offset + 24 > bytes.length || bytes.readUInt32LE(offset) !== 0x00004550
+      || bytes.readUInt16LE(offset + 4) !== expectedMachine
+      || ((bytes.readUInt16LE(offset + 22) & 0x2000) !== 0) !== (helper === windowsHostAddon)) {
       throw new Error("The packaged Remote Desktop helper does not match the Windows target.");
+    }
+  }
+  if (credentialBundle !== null) {
+    const hash = createHash("sha256");
+    let count = 0;
+    let size = 0;
+    async function visit(location, relative) {
+      const info = await lstat(location);
+      if (info.isSymbolicLink()) throw new Error("The native credential resource is unsafe.");
+      if (info.isDirectory()) {
+        for (const entry of (await readdir(location)).sort()) {
+          if (!/^[A-Za-z0-9_.-]+$/u.test(entry)) throw new Error("The native credential resource name is invalid.");
+          await visit(resolve(location, entry), relative.length === 0 ? entry : `${relative}/${entry}`);
+        }
+      } else {
+        await assertCanonicalRegularFile(location, "The native credential resource is unsafe.");
+        if (++count > 16 || (size += info.size) > 1024 * 1024) throw new Error("The native credential resources exceed their bounds.");
+        hash.update(relative).update("\0").update(await readFile(location));
+      }
+    }
+    const bundlePath = resolve(root, credentialBundle);
+    if (!(await lstat(bundlePath)).isDirectory()) throw new Error("The native credential bundle is missing.");
+    await visit(bundlePath, "");
+    if (count === 0 || hash.digest("hex") !== manifest.credentialBundleSha256) throw new Error("The native credential resource digest does not match its manifest.");
+  }
+}
+
+module.exports.auditNativeRemoteDesktop = auditNativeRemoteDesktop;
+
+async function auditNativeLinuxCredentials(root, identity) {
+  const names = ["main.py", "channel.py", "host.py", "storage.py", "platform_linux.py", "requirements.txt"].sort();
+  if (identity === null || typeof identity !== "object" || Array.isArray(identity)
+    || Object.keys(identity).sort().join(",") !== names.join(",")) {
+    throw new Error("The packaged Linux credential identity is invalid.");
+  }
+  const [info, canonical, entries] = await Promise.all([lstat(root), realpath(root), readdir(root)]);
+  if (!info.isDirectory() || info.isSymbolicLink() || canonical !== root
+    || entries.sort().join(",") !== names.join(",")) {
+    throw new Error("The packaged Linux credential directory is incomplete or contains unexpected files.");
+  }
+  for (const name of names) {
+    const path = resolve(root, name);
+    await assertCanonicalRegularFile(path, "The packaged Linux credential file is unsafe.");
+    const metadata = await lstat(path);
+    if (metadata.size < 1 || metadata.size > (name === "requirements.txt" ? 4_096 : 128_000)
+      || typeof identity[name] !== "string" || !/^[a-f0-9]{64}$/u.test(identity[name])) {
+      throw new Error("The packaged Linux credential file exceeds its identity bounds.");
+    }
+    const bytes = await readFile(path);
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if (text.includes("\0") || (name === "main.py" && !text.startsWith("#!/usr/bin/python3\n"))
+      || createHash("sha256").update(bytes).digest("hex") !== identity[name]) {
+      throw new Error("The packaged Linux credential file does not match its identity.");
     }
   }
 }
