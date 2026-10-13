@@ -1,3 +1,6 @@
+import { supportsDesktopRemoteDesktopLinuxAudio } from "./remote-desktop-linux-audio.js";
+import { supportsDesktopRemoteDesktopLinuxCapture } from "./remote-desktop-linux.js";
+
 export const REMOTE_DESKTOP_VIDEO_FRAME_RATES = Object.freeze([30, 60] as const);
 export const REMOTE_DESKTOP_VIDEO_QUALITIES = Object.freeze(["auto", "saver", "hd"] as const);
 
@@ -35,9 +38,11 @@ export function parseDesktopRemoteDesktopVideoSettings(
 
 export function desktopSupportsSystemAudio(
   platform: NodeJS.Platform,
-  systemVersion = ""
+  systemVersion = "",
+  linuxAudio = false
 ): boolean {
   if (platform === "win32") return true;
+  if (platform === "linux") return linuxAudio;
   if (platform !== "darwin") return false;
   const match = /^(\d+)\.(\d+)(?:\.|$)/u.exec(systemVersion);
   if (match === null) return false;
@@ -57,7 +62,8 @@ export function readDesktopSystemAudioSupport(): boolean {
       systemVersion = "";
     }
   }
-  return desktopSupportsSystemAudio(process.platform, systemVersion);
+  return desktopSupportsSystemAudio(process.platform, systemVersion, process.platform === "linux"
+    && supportsDesktopRemoteDesktopLinuxCapture() && supportsDesktopRemoteDesktopLinuxAudio());
 }
 
 function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {

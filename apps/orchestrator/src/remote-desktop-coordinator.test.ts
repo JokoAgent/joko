@@ -33,6 +33,206 @@ afterEach(async () => {
 });
 
 describe("RemoteDesktopCoordinator", () => {
+  it("Linux system audio failure preserves view and heartbeat for the same lease muted offer", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    fake.dispatchHandler = async (_authority, input) => {
+      if (input.action === "getRemoteDesktopCapabilities") return completed(result("remoteDesktopCapabilities",
+        create(contract.RemoteDesktopCapabilitiesSchema, { protocolVersion: 1, platform: "linux", systemAudio: true,
+          videoSettings: true, permissions: { screenRecording: contract.RemoteDesktopPermissionStatus.GRANTED,
+            accessibility: contract.RemoteDesktopPermissionStatus.GRANTED } })));
+      if (input.action === "createRemoteDesktopOffer") {
+        const command = input.payload as contract.DevicePeerCommand;
+        if (command.action.case !== "createRemoteDesktopOffer") throw new Error("Unexpected command.");
+        if (command.action.value.settings?.audio) return failedRemoteDesktop(contract.RemoteDesktopFailureReason.AUDIO_UNAVAILABLE);
+        return completed(result("remoteDesktopOffer", create(contract.RemoteDesktopOfferResultSchema,
+          { attemptId: command.action.value.attemptId, answerSdp: "v=0\r\n" })));
+      }
+      return defaultResponse(input);
+    };
+    await expect(coordinator.getCapabilities(connection, identity, signal)).resolves.toMatchObject({ platform: "linux", systemAudio: true });
+    const lease = await start(coordinator);
+    const offer = (audio: boolean, attemptId: string) => coordinator.createOffer(connection, identity,
+      { leaseId: lease.leaseId, attemptId, offerSdp: "v=0\r\n", cursorOverlay: false,
+        settings: create(contract.RemoteDesktopVideoSettingsSchema, { fps: 30, quality: contract.RemoteDesktopVideoQuality.AUTO, audio }) }, signal);
+    await expect(offer(true, "audio-attempt")).rejects.toMatchObject({ code: "unavailable",
+      detail: { reason: contract.RemoteDesktopFailureReason.AUDIO_UNAVAILABLE, retryable: false } });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toBeDefined();
+    await expect(coordinator.getFrame(connection, identity, { leaseId: lease.leaseId, cursorOverlay: false }, signal))
+      .resolves.toMatchObject({ frame: { jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]) } });
+    await expect(offer(false, "muted-attempt")).resolves.toMatchObject({ attemptId: "muted-attempt" });
+    expect(stoppedLeaseIds(fake)).toHaveLength(0);
+  });
+
+  it("preserves a portal lease and heartbeat through finite capture pending until a real frame arrives", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+    let pending = true;
+    fake.dispatchHandler = async (_authority, input) => {
+      if (pending && (input.action === "getRemoteDesktopFrame" || input.action === "createRemoteDesktopOffer")) {
+        return { ...failedRemoteDesktop(contract.RemoteDesktopFailureReason.CAPTURE_PENDING),
+          failure: create(contract.DevicePeerFailureSchema, { code: contract.DevicePeerFailureCode.CONFLICT, retryable: true,
+            remoteDesktop: { reason: contract.RemoteDesktopFailureReason.CAPTURE_PENDING, retryable: true } }) };
+      }
+      return defaultResponse(input);
+    };
+    await expect(coordinator.getFrame(connection, identity, { leaseId: lease.leaseId, cursorOverlay: false }, signal))
+      .rejects.toMatchObject({ code: "failed_precondition", detail: { reason: contract.RemoteDesktopFailureReason.CAPTURE_PENDING, retryable: true } });
+    await expect(coordinator.createOffer(connection, identity, { leaseId: lease.leaseId, attemptId: "portal-attempt", offerSdp: "v=0\r\n", cursorOverlay: false }, signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.CAPTURE_PENDING } });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toBeDefined();
+    pending = false;
+    await expect(coordinator.getFrame(connection, identity, { leaseId: lease.leaseId, cursorOverlay: false }, signal))
+      .resolves.toMatchObject({ frame: { jpeg: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]) } });
+    expect(stoppedLeaseIds(fake)).toHaveLength(0);
+    fake.replaceRoute(Object.freeze({ ...identity, routeGeneration: identity.routeGeneration + 1 }));
+    await expect(coordinator.getFrame(connection, identity, { leaseId: lease.leaseId, cursorOverlay: false }, signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.STOPPED } });
+  });
+
+  it("admits Linux cursor, physical modes and mirror capabilities while retaining exact platform gates", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const capabilities = create(contract.RemoteDesktopCapabilitiesSchema, { protocolVersion: 1, platform: "linux", cursorOverlay: true,
+      permissions: create(contract.RemoteDesktopPermissionsSchema, {
+        screenRecording: contract.RemoteDesktopPermissionStatus.GRANTED,
+        accessibility: contract.RemoteDesktopPermissionStatus.GRANTED
+      }) });
+    fake.dispatchHandler = async () => completed(result("remoteDesktopCapabilities", capabilities));
+    await expect(coordinator.getCapabilities(connection, identity, signal)).resolves.toMatchObject({ cursorOverlay: true });
+    capabilities.displayModes = true;
+    capabilities.viewerDisplay = true;
+    capabilities.viewerDisplayRestore = true;
+    await expect(coordinator.getCapabilities(connection, identity, signal)).resolves.toMatchObject({ displayModes: true, viewerDisplay: true });
+    capabilities.displayModes = false;
+    capabilities.platform = "win32";
+    await expect(coordinator.getCapabilities(connection, identity, signal)).rejects.toMatchObject({ code: "internal" });
+  });
+
+  it("accepts the implemented Windows native cursor capability without widening Linux-only actions", async () => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+    const capabilities = create(contract.RemoteDesktopCapabilitiesSchema, { protocolVersion: 1, platform: "win32", cursorOverlay: true,
+      permissions: { screenRecording: contract.RemoteDesktopPermissionStatus.GRANTED, accessibility: contract.RemoteDesktopPermissionStatus.GRANTED } });
+    fake.dispatchHandler = async () => completed(result("remoteDesktopCapabilities", capabilities));
+    await expect(coordinator.getCapabilities(connection, identity, signal)).resolves.toMatchObject({ cursorOverlay: true });
+    capabilities.workspaceNavigation = true;
+    await expect(coordinator.getCapabilities(connection, identity, signal)).rejects.toMatchObject({ code: "internal" });
+  });
+
+  it("forwards native credential preparation, opening and exchange without a media or control lease", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const handle = "12345678-1234-4234-8234-123456789abc";
+    fake.dispatchHandler = async (_authority, input) => {
+      const command = input.payload as contract.DevicePeerCommand;
+      if (command.action.case === "getRemoteDesktopLockState") return completed(result("remoteDesktopLockState",
+        create(contract.RemoteDesktopLockStateResultSchema, { state: contract.RemoteDesktopLockState.LOCKED })));
+      if (command.action.case !== "requestRemoteDesktopCredentials") throw new Error("Unexpected credential action.");
+      const request = command.action.value.request;
+      return completed(result("remoteDesktopCredentials", create(contract.RemoteDesktopCredentialResultSchema, {
+        result: request.case === "prepare" ? { case: "prepared", value: { descriptor: '{"publicKey":"key"}' } }
+          : request.case === "open" ? { case: "opened", value: { handle, offer: "signed.offer" } }
+            : { case: "exchanged", value: { ciphertext: "sealed.reply" } }
+      })));
+    };
+    await expect(coordinator.getLockState(connection, identity, signal)).resolves.toMatchObject({ state: contract.RemoteDesktopLockState.LOCKED });
+    for (const request of [
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "prepare", value: {} } }),
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "open", value: { offer: "signed.offer", descriptor: "public identity" } } }),
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "exchange", value: { handle, ciphertext: "sealed.request" } } })
+    ]) await coordinator.requestCredentials(connection, identity, request, signal);
+    expect(fake.actions()).toEqual(["getRemoteDesktopLockState", "requestRemoteDesktopCredentials", "requestRemoteDesktopCredentials", "requestRemoteDesktopCredentials"]);
+    expect(fake.calls[0]).toMatchObject({ authority: { controllerDeviceId: connection.deviceId }, input: { effectKind: "read_only" } });
+    expect(fake.calls[1]).toMatchObject({ authority: { controllerDeviceId: connection.deviceId }, input: { effectKind: "side_effect" } });
+    fake.dispatchHandler = async () => completed(result("remoteDesktopCredentials", create(contract.RemoteDesktopCredentialResultSchema,
+      { result: { case: "closed", value: {} } })));
+    await expect(coordinator.requestCredentials(connection, identity, create(contract.RemoteDesktopCredentialRequestSchema,
+      { request: { case: "exchange", value: { handle, ciphertext: "sealed.revoke" } } }), signal)).resolves.toMatchObject({ result: { case: "closed" } });
+  });
+
+  it("rejects missing, oversized UTF8 and invalid native credential envelopes before dispatch", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const handle = "12345678-1234-4234-8234-123456789abc";
+    const requests = [
+      create(contract.RemoteDesktopCredentialRequestSchema),
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "open", value: { offer: "" } } }),
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "open", value: { offer: "signed.offer", descriptor: "中".repeat(1_366) } } }),
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "open", value: { offer: "x".repeat(4_097) } } }),
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "exchange", value: { handle: "caller-id", ciphertext: "ciphertext" } } }),
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "exchange", value: { handle, ciphertext: "非ASCII" } } }),
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "exchange", value: { handle, ciphertext: "x".repeat(2 * 1_024 * 1_024 + 1) } } })
+    ];
+    for (const request of requests) await expect(coordinator.requestCredentials(connection, identity, request, signal)).rejects.toMatchObject({ code: "invalid_argument" });
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it("rejects mismatched native credential replies and invalid lock state", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    fake.dispatchHandler = async () => completed(result("remoteDesktopCredentials", create(contract.RemoteDesktopCredentialResultSchema,
+      { result: { case: "closed", value: {} } })));
+    await expect(coordinator.requestCredentials(connection, identity, create(contract.RemoteDesktopCredentialRequestSchema,
+      { request: { case: "prepare", value: {} } }), signal)).rejects.toMatchObject({ code: "internal" });
+    fake.dispatchHandler = async () => completed(result("remoteDesktopCredentials", create(contract.RemoteDesktopCredentialResultSchema,
+      { result: { case: "opened", value: { handle: "not-a-native-handle", offer: "signed.offer" } } })));
+    await expect(coordinator.requestCredentials(connection, identity, create(contract.RemoteDesktopCredentialRequestSchema,
+      { request: { case: "open", value: { offer: "signed.offer" } } }), signal)).rejects.toMatchObject({ code: "internal" });
+    fake.dispatchHandler = async () => completed(result("remoteDesktopLockState", create(contract.RemoteDesktopLockStateResultSchema)));
+    await expect(coordinator.getLockState(connection, identity, signal)).rejects.toMatchObject({ code: "internal" });
+  });
+
+  it("rejects a late native credential receipt after exact route replacement", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    let complete!: (value: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = async () => new Promise((resolve) => { complete = resolve; });
+    const pending = coordinator.requestCredentials(connection, identity, create(contract.RemoteDesktopCredentialRequestSchema,
+      { request: { case: "prepare", value: {} } }), signal);
+    const rejected = expect(pending).rejects.toThrow("route authority changed");
+    fake.replaceRoute({ ...identity, routeGeneration: identity.routeGeneration + 1 });
+    complete(completed(result("remoteDesktopCredentials", create(contract.RemoteDesktopCredentialResultSchema,
+      { result: { case: "prepared", value: { descriptor: "public identity" } } }))));
+    await rejected;
+  });
+
+  it("retires exact native credential handles on connection revoke without closing another controller", async () => {
+    const fake = new FakeDevicePeerOwner(), revocations = new RevocationHarness();
+    const coordinator = fakeCoordinator(fake, { onRevoked: revocations.subscribe }).coordinator;
+    const handle = "12345678-1234-4234-8234-123456789abc";
+    fake.dispatchHandler = async (_authority, input) => input.action === "closeRemoteDesktopCredentials"
+      ? completed(acknowledgementResult()) : completed(result("remoteDesktopCredentials", create(contract.RemoteDesktopCredentialResultSchema,
+        { result: { case: "opened", value: { handle, offer: "signed.offer" } } })));
+    await coordinator.requestCredentials(connection, identity, create(contract.RemoteDesktopCredentialRequestSchema,
+      { request: { case: "open", value: { offer: "signed.offer" } } }), signal);
+    await expect(coordinator.requestCredentials(connectionRecord("other-connection", "other-device"), identity,
+      create(contract.RemoteDesktopCredentialRequestSchema, { request: { case: "exchange", value: { handle, ciphertext: "ciphertext" } } }), signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.CREDENTIAL_EXPIRED } });
+    revocations.revoke(connection.id);
+    await Promise.resolve();
+    expect(fake.calls.at(-1)).toMatchObject({ authority: { controllerDeviceId: connection.deviceId }, input: {
+      action: "closeRemoteDesktopCredentials", payload: { action: { value: { handle } } } } });
+    await expect(coordinator.requestCredentials(connection, identity, create(contract.RemoteDesktopCredentialRequestSchema,
+      { request: { case: "exchange", value: { handle, ciphertext: "ciphertext" } } }), signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.CREDENTIAL_EXPIRED } });
+  });
+
+  it("marks an accepted native credential effect with unknown outcome for receipt-only recovery", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const handle = "12345678-1234-4234-8234-123456789abc";
+    fake.dispatchHandler = async () => completed(result("remoteDesktopCredentials", create(contract.RemoteDesktopCredentialResultSchema,
+      { result: { case: "opened", value: { handle, offer: "signed.offer" } } })));
+    await coordinator.requestCredentials(connection, identity, create(contract.RemoteDesktopCredentialRequestSchema,
+      { request: { case: "open", value: { offer: "signed.offer" } } }), signal);
+    fake.dispatchHandler = async () => ({ ...completed(undefined), outcome: "outcome_unknown", errorCode: "authority_changed" });
+    await expect(coordinator.requestCredentials(connection, identity, create(contract.RemoteDesktopCredentialRequestSchema,
+      { request: { case: "exchange", value: { handle, ciphertext: "sealed.password" } } }), signal))
+      .rejects.toMatchObject({ code: "aborted", detail: { reason: contract.RemoteDesktopFailureReason.CREDENTIAL_OUTCOME_UNKNOWN, retryable: false } });
+    expect(fake.actions()).toEqual(["requestRemoteDesktopCredentials", "requestRemoteDesktopCredentials"]);
+  });
+
   it("delivers start with the authenticated controller Device identity", async () => {
     const store = new OperationalStore(":memory:");
     stores.push(store);
@@ -93,6 +293,409 @@ describe("RemoteDesktopCoordinator", () => {
       capability: contract.DevicePeerCapabilityKind.REMOTE_DESKTOP,
       action: { case: "startRemoteDesktop" }
     });
+  });
+
+  it.each([contract.RemoteDesktopSystemActionKind.WORKSPACE_LEFT, contract.RemoteDesktopSystemActionKind.WORKSPACE_RIGHT,
+    contract.RemoteDesktopSystemActionKind.SYSTEM_MENU])("forwards system action %s only for the owning exact control", async action => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    const request = create(contract.RemoteDesktopSystemActionRequestSchema, {
+      leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, action
+    });
+    await expect(coordinator.performSystemAction(connection, identity, request, signal)).resolves.toMatchObject({ action });
+    expect(fake.calls.at(-1)).toMatchObject({ authority: { controllerDeviceId: connection.deviceId }, input: {
+      action: "performRemoteDesktopSystemAction", effectKind: "side_effect",
+      payload: { action: { case: "performRemoteDesktopSystemAction", value: request } }
+    } });
+    await expect(coordinator.performSystemAction({ ...connection, id: "another-controller" }, identity, request, signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.AUTHORITY_CHANGED } });
+    await expect(coordinator.performSystemAction(connection, { ...identity, relationRevision: identity.relationRevision + 1n }, request, signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.AUTHORITY_CHANGED } });
+    await expect(coordinator.performSystemAction(connection, identity, { ...request, controlGeneration: 99n }, signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.SYSTEM_ACTION_EXPIRED } });
+    expect(fake.actions().filter(value => value === "performRemoteDesktopSystemAction")).toHaveLength(1);
+    await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: false }, signal);
+    await expect(coordinator.performSystemAction(connection, identity, request, signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.VIEW_ONLY } });
+  });
+
+  it.each([0, -1, 4, Number.NaN])("rejects invalid system action %s before any target effect", async action => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+    await expect(coordinator.performSystemAction(connection, identity, create(contract.RemoteDesktopSystemActionRequestSchema,
+      { leaseId: "lease-1", controlGeneration: 1n, action }), signal)).rejects.toMatchObject({ code: "invalid_argument" });
+    expect(fake.calls).toHaveLength(0);
+  });
+
+  it.each(["failed", "outcome_unknown", "wrong echo", "wrong result"] as const)(
+    "returns system action %s without replay or retiring the viewer", async outcome => {
+      const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+      const action = contract.RemoteDesktopSystemActionKind.WORKSPACE_RIGHT;
+      fake.dispatchHandler = async (_authority, input) => {
+        if (input.action !== "performRemoteDesktopSystemAction") return defaultResponse(input);
+        if (outcome === "failed") return failedRemoteDesktop(contract.RemoteDesktopFailureReason.SYSTEM_ACTION_UNAVAILABLE);
+        if (outcome === "outcome_unknown") return { ...completed(undefined), outcome: "outcome_unknown", errorCode: "outcome_unknown" };
+        if (outcome === "wrong echo") return completed(result("remoteDesktopSystemAction",
+          create(contract.RemoteDesktopSystemActionResultSchema, { action: contract.RemoteDesktopSystemActionKind.WORKSPACE_LEFT })));
+        return completed(result("remoteDesktopHostMute", create(contract.RemoteDesktopHostMuteResultSchema, { enabled: true })));
+      };
+      await expect(coordinator.performSystemAction(connection, identity, create(contract.RemoteDesktopSystemActionRequestSchema,
+        { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, action }), signal)).rejects.toMatchObject({
+        code: outcome === "failed" ? "unavailable" : outcome === "outcome_unknown" ? "aborted" : "internal"
+      });
+      await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toMatchObject({ controlling: true });
+      expect(fake.actions().filter(value => value === "performRemoteDesktopSystemAction")).toHaveLength(1);
+      expect(stoppedLeaseIds(fake)).toHaveLength(0);
+    });
+
+  it.each(["control", "presentation", "route", "revoke", "stop", "display"] as const)(
+    "rejects a late system action acknowledgement after %s changes", async retirement => {
+      const fake = new FakeDevicePeerOwner(), revocations = new RevocationHarness();
+      const coordinator = fakeCoordinator(fake, { onRevoked: revocations.subscribe }).coordinator, lease = await start(coordinator);
+      let complete!: (response: DevicePeerResponseFrame) => void;
+      fake.dispatchHandler = async (_authority, input) => input.action === "performRemoteDesktopSystemAction"
+        ? new Promise(resolve => { complete = resolve; }) : defaultResponse(input);
+      const action = contract.RemoteDesktopSystemActionKind.WORKSPACE_LEFT;
+      const pending = coordinator.performSystemAction(connection, identity, create(contract.RemoteDesktopSystemActionRequestSchema,
+        { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, action }), signal);
+      const reason = retirement === "control" || retirement === "presentation" || retirement === "display"
+        ? contract.RemoteDesktopFailureReason.SYSTEM_ACTION_EXPIRED : contract.RemoteDesktopFailureReason.STOPPED;
+      const rejected = expect(pending).rejects.toMatchObject({ detail: { reason } });
+      if (retirement === "control") await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+      else if (retirement === "presentation") await coordinator.setPresentation(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+      else if (retirement === "route") fake.replaceRoute({ ...identity, routeGeneration: identity.routeGeneration + 1 });
+      else if (retirement === "revoke") revocations.revoke(connection.id);
+      else if (retirement === "stop") await coordinator.stop(connection, identity, { leaseId: lease.leaseId, lockScreen: false, controlGeneration: 0n }, signal);
+      else {
+        fake.dispatchHandler = async (_authority, input) => input.action === "setRemoteDesktopDisplayMode"
+          ? completed(result("remoteDesktopDisplayMode", create(contract.RemoteDesktopDisplayModeResultSchema, { lease: {
+            leaseId: lease.leaseId, display: lease.display, controlling: false, controlGeneration: 2n
+          } }))) : defaultResponse(input);
+        await coordinator.setDisplayMode(connection, identity, { leaseId: lease.leaseId, controlGeneration: 1n, modeId: "101", temporary: true }, signal);
+      }
+      complete(completed(result("remoteDesktopSystemAction", create(contract.RemoteDesktopSystemActionResultSchema, { action }))));
+      await rejected;
+    });
+
+  it("rejects a late failed system effect from an earlier control without changing the current viewer", async () => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    let complete!: (response: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = async (_authority, input) => input.action === "performRemoteDesktopSystemAction"
+      ? new Promise(resolve => { complete = resolve; }) : defaultResponse(input);
+    const pending = coordinator.performSystemAction(connection, identity, create(contract.RemoteDesktopSystemActionRequestSchema,
+      { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, action: contract.RemoteDesktopSystemActionKind.SYSTEM_MENU }), signal);
+    const rejected = expect(pending).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.SYSTEM_ACTION_EXPIRED } });
+    await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+    complete(failedRemoteDesktop(contract.RemoteDesktopFailureReason.SYSTEM_ACTION_UNAVAILABLE));
+    await rejected;
+    expect(stoppedLeaseIds(fake)).toHaveLength(0);
+  });
+
+  it("snapshots the requested system action and control while awaiting its exact result", async () => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    let complete!: (response: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = async () => new Promise(resolve => { complete = resolve; });
+    const action = contract.RemoteDesktopSystemActionKind.WORKSPACE_LEFT;
+    const request = create(contract.RemoteDesktopSystemActionRequestSchema, { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, action });
+    const pending = coordinator.performSystemAction(connection, identity, request, signal);
+    request.action = contract.RemoteDesktopSystemActionKind.WORKSPACE_RIGHT;
+    request.controlGeneration = 99n;
+    complete(completed(result("remoteDesktopSystemAction", create(contract.RemoteDesktopSystemActionResultSchema, { action }))));
+    await expect(pending).resolves.toMatchObject({ action });
+    expect((fake.calls.at(-1)!.input.payload as contract.DevicePeerCommand).action).toMatchObject({ value: { controlGeneration: 1n, action } });
+    fake.dispatchHandler = async (_authority, input) => defaultResponse(input);
+  });
+
+  it.each(["darwin", "win32", "view only", "menu alone", "missing navigation", "missing menu"])(
+    "rejects system action capabilities with %s", async defect => {
+      const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+      const capabilities = create(contract.RemoteDesktopCapabilitiesSchema, { protocolVersion: 1, platform: "linux", canControl: true,
+        workspaceNavigation: true, systemMenu: true, permissions: { screenRecording: contract.RemoteDesktopPermissionStatus.GRANTED,
+          accessibility: contract.RemoteDesktopPermissionStatus.GRANTED } });
+      if (defect === "darwin" || defect === "win32") capabilities.platform = defect;
+      if (defect === "view only") capabilities.canControl = false;
+      if (defect === "menu alone") capabilities.workspaceNavigation = false;
+      if (defect === "missing navigation") delete (capabilities as Partial<contract.RemoteDesktopCapabilities>).workspaceNavigation;
+      if (defect === "missing menu") delete (capabilities as Partial<contract.RemoteDesktopCapabilities>).systemMenu;
+      fake.dispatchHandler = async () => completed(result("remoteDesktopCapabilities", capabilities));
+      await expect(coordinator.getCapabilities(connection, identity, signal)).rejects.toMatchObject({ code: "internal" });
+    });
+
+  it.each([false, true])("admits independently optional Linux system menu %s with workspace navigation", async systemMenu => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+    fake.dispatchHandler = async () => completed(result("remoteDesktopCapabilities", create(contract.RemoteDesktopCapabilitiesSchema,
+      { protocolVersion: 1, platform: "linux", canControl: true, workspaceNavigation: true, systemMenu,
+        permissions: { screenRecording: contract.RemoteDesktopPermissionStatus.GRANTED, accessibility: contract.RemoteDesktopPermissionStatus.GRANTED } })));
+    await expect(coordinator.getCapabilities(connection, identity, signal)).resolves.toMatchObject({ workspaceNavigation: true, systemMenu });
+  });
+
+  it("forwards host mute for authenticated exact control and preserves the lease on host failure", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+    const request = create(contract.RemoteDesktopHostMuteRequestSchema, {
+      leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, enabled: true
+    });
+    await expect(coordinator.setHostMute(connection, identity, request, signal)).resolves.toMatchObject({ enabled: true });
+    expect(fake.calls.at(-1)).toMatchObject({
+      authority: { controllerDeviceId: connection.deviceId },
+      input: { action: "setRemoteDesktopHostMute", effectKind: "side_effect", payload: { action: {
+        case: "setRemoteDesktopHostMute", value: request
+      } } }
+    });
+    fake.dispatchHandler = async (_authority, input) => input.action === "setRemoteDesktopHostMute"
+      ? failedRemoteDesktop(contract.RemoteDesktopFailureReason.HOST_MUTE_UNAVAILABLE) : defaultResponse(input);
+    await expect(coordinator.setHostMute(connection, identity, request, signal)).rejects.toMatchObject({
+      code: "unavailable", detail: { reason: contract.RemoteDesktopFailureReason.HOST_MUTE_UNAVAILABLE }
+    });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toMatchObject({ controlling: true });
+    await expect(coordinator.setHostMute(connection, identity,
+      create(contract.RemoteDesktopHostMuteRequestSchema, { ...request, controlGeneration: 99n }), signal
+    )).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.HOST_MUTE_EXPIRED } });
+    expect(fake.actions().filter((action) => action === "setRemoteDesktopHostMute")).toHaveLength(2);
+    await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: false }, signal);
+    await expect(coordinator.setHostMute(connection, identity, request, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.VIEW_ONLY }
+    });
+  });
+
+  it.each(["control", "route", "revoke"] as const)("rejects a late host mute acknowledgement after %s retirement", async (retirement) => {
+    const fake = new FakeDevicePeerOwner();
+    const revocations = new RevocationHarness();
+    const coordinator = fakeCoordinator(fake, { onRevoked: revocations.subscribe }).coordinator;
+    const lease = await start(coordinator);
+    let complete!: (value: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = async (_authority, input) => input.action === "setRemoteDesktopHostMute"
+      ? new Promise((resolve) => { complete = resolve; }) : defaultResponse(input);
+    const pending = coordinator.setHostMute(connection, identity, create(contract.RemoteDesktopHostMuteRequestSchema, {
+      leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, enabled: true
+    }), signal);
+    const reason = retirement === "control" ? contract.RemoteDesktopFailureReason.HOST_MUTE_EXPIRED
+      : contract.RemoteDesktopFailureReason.STOPPED;
+    const rejected = expect(pending).rejects.toMatchObject({ detail: { reason } });
+    if (retirement === "control") {
+      await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+    } else if (retirement === "route") {
+      fake.replaceRoute({ ...identity, routeGeneration: identity.routeGeneration + 1 });
+    } else {
+      revocations.revoke(connection.id);
+    }
+    complete(completed(result("remoteDesktopHostMute", create(contract.RemoteDesktopHostMuteResultSchema, { enabled: true }))));
+    await rejected;
+  });
+
+  it("rejects a host mute result that does not acknowledge the requested effect", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+    fake.dispatchHandler = async () => completed(result("remoteDesktopHostMute", create(contract.RemoteDesktopHostMuteResultSchema, { enabled: false })));
+    await expect(coordinator.setHostMute(connection, identity, create(contract.RemoteDesktopHostMuteRequestSchema, {
+      leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, enabled: true
+    }), signal)).rejects.toMatchObject({ code: "internal" });
+  });
+
+  it("forwards privacy intent and latest lock preference only for exact control, preserving viewing after native failure", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    const request = create(contract.RemoteDesktopPrivacyScreenRequestSchema, {
+      leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, enabled: true, lockOnExit: true
+    });
+    await expect(coordinator.setPrivacyScreen(connection, identity, request, signal)).resolves.toMatchObject({ enabled: true });
+    expect(fake.calls.at(-1)).toMatchObject({ authority: { controllerDeviceId: connection.deviceId },
+      input: { action: "setRemoteDesktopPrivacyScreen", effectKind: "side_effect", payload: { action: { value: request } } } });
+    fake.dispatchHandler = async (_authority, input) => input.action === "setRemoteDesktopPrivacyScreen"
+      ? failedRemoteDesktop(contract.RemoteDesktopFailureReason.PRIVACY_FAILED) : defaultResponse(input);
+    await expect(coordinator.setPrivacyScreen(connection, identity, request, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.PRIVACY_FAILED }
+    });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toMatchObject({ controlling: true });
+    await expect(coordinator.setPrivacyScreen(connection, identity, create(contract.RemoteDesktopPrivacyScreenRequestSchema, {
+      ...request, controlGeneration: 99n
+    }), signal)).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.PRIVACY_EXPIRED } });
+    expect(fake.actions().filter(action => action === "setRemoteDesktopPrivacyScreen")).toHaveLength(2);
+    await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: false }, signal);
+    await expect(coordinator.setPrivacyScreen(connection, identity, request, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.VIEW_ONLY }
+    });
+  });
+
+  it.each(["control", "presentation", "route", "revoke"] as const)("rejects a late privacy acknowledgement after %s retirement", async (retirement) => {
+    const fake = new FakeDevicePeerOwner(), revocations = new RevocationHarness();
+    const coordinator = fakeCoordinator(fake, { onRevoked: revocations.subscribe }).coordinator, lease = await start(coordinator);
+    let complete!: (value: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = async (_authority, input) => input.action === "setRemoteDesktopPrivacyScreen"
+      ? new Promise(resolve => { complete = resolve; }) : defaultResponse(input);
+    const pending = coordinator.setPrivacyScreen(connection, identity, create(contract.RemoteDesktopPrivacyScreenRequestSchema, {
+      leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, enabled: true
+    }), signal);
+    const reason = retirement === "control" || retirement === "presentation" ? contract.RemoteDesktopFailureReason.PRIVACY_EXPIRED
+      : contract.RemoteDesktopFailureReason.STOPPED;
+    const rejected = expect(pending).rejects.toMatchObject({ detail: { reason } });
+    if (retirement === "control") await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+    else if (retirement === "presentation") await coordinator.setPresentation(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+    else if (retirement === "route") fake.replaceRoute({ ...identity, routeGeneration: identity.routeGeneration + 1 });
+    else revocations.revoke(connection.id);
+    complete(completed(result("remoteDesktopPrivacyScreen", create(contract.RemoteDesktopPrivacyScreenResultSchema, { enabled: true }))));
+    await rejected;
+  });
+
+  it.each(["completed", "failed"] as const)("rejects an old privacy %s receipt superseded by a newer off request on the same control", async (outcome) => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    let complete!: (value: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = async (_authority, input) => {
+      const command = input.payload as contract.DevicePeerCommand;
+      return command.action.case === "setRemoteDesktopPrivacyScreen" && command.action.value.enabled
+        ? new Promise(resolve => { complete = resolve; }) : defaultResponse(input);
+    };
+    const request = create(contract.RemoteDesktopPrivacyScreenRequestSchema, { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, enabled: true });
+    const pending = coordinator.setPrivacyScreen(connection, identity, request, signal);
+    const rejected = expect(pending).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.PRIVACY_EXPIRED } });
+    await expect(coordinator.setPrivacyScreen(connection, identity, create(contract.RemoteDesktopPrivacyScreenRequestSchema, { ...request, enabled: false }), signal))
+      .resolves.toMatchObject({ enabled: false });
+    complete(outcome === "failed" ? failedRemoteDesktop(contract.RemoteDesktopFailureReason.PRIVACY_FAILED)
+      : completed(result("remoteDesktopPrivacyScreen", create(contract.RemoteDesktopPrivacyScreenResultSchema, { enabled: true }))));
+    await rejected;
+  });
+
+  it("rejects a privacy result that does not acknowledge the requested effect", async () => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    fake.dispatchHandler = async () => completed(result("remoteDesktopPrivacyScreen", create(contract.RemoteDesktopPrivacyScreenResultSchema, { enabled: false })));
+    await expect(coordinator.setPrivacyScreen(connection, identity, create(contract.RemoteDesktopPrivacyScreenRequestSchema, {
+      leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, enabled: true
+    }), signal)).rejects.toMatchObject({ code: "internal" });
+  });
+
+  it("routes opt-in counters and inline content with authenticated control and sync occurrence", async () => {
+    const fake = new FakeDevicePeerOwner(); installClipboardSyncResponses(fake);
+    const coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    const scope = { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration };
+    const enabled = await coordinator.setClipboardSync(connection, identity,
+      create(contract.RemoteDesktopClipboardSyncRequestSchema, { ...scope, enabled: true }), signal);
+    const versionRequest = create(contract.RemoteDesktopClipboardVersionRequestSchema, { ...scope, syncGeneration: enabled.syncGeneration });
+    await expect(coordinator.getClipboardVersion(connection, identity, versionRequest, signal)).resolves.toMatchObject({ version: "7" });
+    expect(fake.calls.at(-1)).toMatchObject({ authority: { controllerDeviceId: connection.deviceId }, input: {
+      action: "getRemoteDesktopClipboardVersion", effectKind: "read_only", payload: { action: { value: versionRequest } }
+    } });
+    const copied = await coordinator.transferClipboardContent(connection, identity, create(contract.RemoteDesktopClipboardContentRequestSchema, {
+      ...scope, sync: true, syncGeneration: enabled.syncGeneration, version: "7", inline: true, action: { case: "copy", value: {} }
+    }), signal);
+    expect(copied).toMatchObject({ data: '{"text":"system clipboard"}', length: 27 });
+    await expect(coordinator.transferClipboardContent(connection, identity, create(contract.RemoteDesktopClipboardContentRequestSchema, {
+      ...scope, sync: true, syncGeneration: enabled.syncGeneration, version: "7", action: { case: "paste", value: { data: '{"text":"new copy"}' } }
+    }), signal)).resolves.toMatchObject({ version: "8" });
+    expect(fake.calls.at(-1)?.input.payload).toMatchObject({ action: { case: "transferRemoteDesktopClipboardContent", value: {
+      ...scope, sync: true, syncGeneration: enabled.syncGeneration, version: "7", inline: false,
+      action: { case: "paste", value: { data: '{"text":"new copy"}' } }
+    } } });
+  });
+
+  it("routes opaque clipboard fingerprints through version reads and conditional system writes", async () => {
+    const fake = new FakeDevicePeerOwner(); installClipboardSyncResponses(fake);
+    const coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    const scope = { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration };
+    const enabled = await coordinator.setClipboardSync(connection, identity,
+      create(contract.RemoteDesktopClipboardSyncRequestSchema, { ...scope, enabled: true }), signal);
+    const version = "abcdef0123456789".repeat(4), next = "fedcba9876543210".repeat(4);
+    const original = fake.dispatchHandler;
+    fake.dispatchHandler = async (authority, input) => input.action === "getRemoteDesktopClipboardVersion"
+      ? completed(result("remoteDesktopClipboardVersion", create(contract.RemoteDesktopClipboardVersionResultSchema, { version })))
+      : input.action === "transferRemoteDesktopClipboardContent"
+        ? completed(result("remoteDesktopClipboardContent", create(contract.RemoteDesktopClipboardContentResultSchema, { version: next })))
+        : original(authority, input);
+    await expect(coordinator.getClipboardVersion(connection, identity, create(contract.RemoteDesktopClipboardVersionRequestSchema, {
+      ...scope, syncGeneration: enabled.syncGeneration
+    }), signal)).resolves.toMatchObject({ version });
+    await expect(coordinator.transferClipboardContent(connection, identity, create(contract.RemoteDesktopClipboardContentRequestSchema, {
+      ...scope, sync: true, syncGeneration: enabled.syncGeneration, version,
+      action: { case: "paste", value: { data: '{"text":"new system copy"}' } }
+    }), signal)).resolves.toMatchObject({ version: next });
+    expect(fake.calls.at(-1)?.input.payload).toMatchObject({ action: { value: { version } } });
+  });
+
+  it("keeps viewing after an unknown clipboard write without authorizing automatic effect replay", async () => {
+    const fake = new FakeDevicePeerOwner(); installClipboardSyncResponses(fake);
+    const coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    const scope = { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration };
+    const enabled = await coordinator.setClipboardSync(connection, identity,
+      create(contract.RemoteDesktopClipboardSyncRequestSchema, { ...scope, enabled: true }), signal);
+    const original = fake.dispatchHandler;
+    fake.dispatchHandler = async (authority, input) => input.action === "transferRemoteDesktopClipboardContent"
+      ? { protocolVersion: 1, kind: "response", requestId: "unknown-clipboard", targetDeviceId: identity.targetDeviceId,
+        routeGeneration: identity.routeGeneration, outcome: "outcome_unknown", errorCode: "target_failed" }
+      : original(authority, input);
+    await expect(coordinator.transferClipboardContent(connection, identity, create(contract.RemoteDesktopClipboardContentRequestSchema, {
+      ...scope, sync: true, syncGeneration: enabled.syncGeneration, version: "abcdef0123456789".repeat(4),
+      action: { case: "paste", value: { data: '{"text":"unknown system copy"}' } }
+    }), signal)).rejects.toMatchObject({ code: "aborted", detail: {
+      reason: contract.RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, retryable: false
+    } });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toBeDefined();
+    expect(fake.actions().filter(action => action === "transferRemoteDesktopClipboardContent")).toHaveLength(1);
+  });
+
+  it("rejects an old counter receipt after off/on even with the same current control generation", async () => {
+    const fake = new FakeDevicePeerOwner(); installClipboardSyncResponses(fake);
+    const coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    const scope = { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration };
+    const enabled = await coordinator.setClipboardSync(connection, identity,
+      create(contract.RemoteDesktopClipboardSyncRequestSchema, { ...scope, enabled: true }), signal);
+    const original = fake.dispatchHandler;
+    let complete!: (value: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = async (authority, input) => input.action === "getRemoteDesktopClipboardVersion"
+      ? new Promise(resolve => { complete = resolve; }) : original(authority, input);
+    const request = create(contract.RemoteDesktopClipboardVersionRequestSchema, { ...scope, syncGeneration: enabled.syncGeneration });
+    const pending = coordinator.getClipboardVersion(connection, identity, request, signal);
+    const rejected = expect(pending).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.CLIPBOARD_EXPIRED } });
+    await coordinator.setClipboardSync(connection, identity, create(contract.RemoteDesktopClipboardSyncRequestSchema, { ...scope, enabled: false }), signal);
+    await coordinator.setClipboardSync(connection, identity, create(contract.RemoteDesktopClipboardSyncRequestSchema, { ...scope, enabled: true }), signal);
+    complete(completed(result("remoteDesktopClipboardVersion", create(contract.RemoteDesktopClipboardVersionResultSchema, { version: "7" }))));
+    await rejected;
+    await expect(coordinator.getClipboardVersion(connection, identity, request, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.CLIPBOARD_EXPIRED }
+    });
+    expect(fake.actions().filter(action => action === "getRemoteDesktopClipboardVersion")).toHaveLength(1);
+  });
+
+  it.each(["control", "route", "revoke"] as const)("rejects an old sync write receipt after %s retirement", async retirement => {
+    const fake = new FakeDevicePeerOwner(); installClipboardSyncResponses(fake);
+    const revocations = new RevocationHarness();
+    const coordinator = fakeCoordinator(fake, { onRevoked: revocations.subscribe }).coordinator, lease = await start(coordinator);
+    const scope = { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration };
+    const enabled = await coordinator.setClipboardSync(connection, identity,
+      create(contract.RemoteDesktopClipboardSyncRequestSchema, { ...scope, enabled: true }), signal);
+    const original = fake.dispatchHandler;
+    let complete!: (value: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = async (authority, input) => input.action === "transferRemoteDesktopClipboardContent"
+      ? new Promise(resolve => { complete = resolve; }) : original(authority, input);
+    const pending = coordinator.transferClipboardContent(connection, identity, create(contract.RemoteDesktopClipboardContentRequestSchema, {
+      ...scope, sync: true, syncGeneration: enabled.syncGeneration, version: "7", action: { case: "paste", value: { data: '{"text":"new copy"}' } }
+    }), signal);
+    const rejected = expect(pending).rejects.toMatchObject({ detail: { reason: retirement === "control"
+      ? contract.RemoteDesktopFailureReason.CLIPBOARD_EXPIRED : contract.RemoteDesktopFailureReason.STOPPED } });
+    if (retirement === "control") await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: false }, signal);
+    else if (retirement === "route") fake.replaceRoute({ ...identity, routeGeneration: identity.routeGeneration + 1 });
+    else revocations.revoke(connection.id);
+    complete(completed(result("remoteDesktopClipboardContent", create(contract.RemoteDesktopClipboardContentResultSchema, { version: "8" }))));
+    await rejected;
+    expect(fake.actions().filter(action => action === "transferRemoteDesktopClipboardContent")).toHaveLength(1);
+  });
+
+  it("validates sync options before dispatch and requires the native version acknowledgement", async () => {
+    const fake = new FakeDevicePeerOwner(); installClipboardSyncResponses(fake);
+    const coordinator = fakeCoordinator(fake).coordinator, lease = await start(coordinator);
+    const scope = { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration };
+    const enabled = await coordinator.setClipboardSync(connection, identity,
+      create(contract.RemoteDesktopClipboardSyncRequestSchema, { ...scope, enabled: true }), signal);
+    for (const options of [
+      { sync: false, syncGeneration: enabled.syncGeneration, version: "7" },
+      { sync: true, syncGeneration: enabled.syncGeneration },
+      { sync: true, syncGeneration: enabled.syncGeneration, version: "invalid" }
+    ]) await expect(coordinator.transferClipboardContent(connection, identity, create(contract.RemoteDesktopClipboardContentRequestSchema, {
+      ...scope, ...options, action: { case: "copy", value: {} }
+    }), signal)).rejects.toMatchObject({ code: "invalid_argument" });
+    expect(fake.actions().filter(action => action === "transferRemoteDesktopClipboardContent")).toHaveLength(0);
+    fake.dispatchHandler = async () => completed(result("remoteDesktopClipboardContent", create(contract.RemoteDesktopClipboardContentResultSchema)));
+    await expect(coordinator.transferClipboardContent(connection, identity, create(contract.RemoteDesktopClipboardContentRequestSchema, {
+      ...scope, sync: true, syncGeneration: enabled.syncGeneration, version: "7", action: { case: "paste", value: { data: '{"text":"new copy"}' } }
+    }), signal)).rejects.toMatchObject({ code: "internal" });
   });
 
   it("forwards explicit clipboard requests only for the exact active control generation", async () => {
@@ -176,6 +779,193 @@ describe("RemoteDesktopCoordinator", () => {
     });
   });
 
+  it("adopts mirror geometry and restores only the immutable source while preserving source-based resume", async () => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+    const original = await start(coordinator);
+    let current = original;
+    fake.dispatchHandler = async (_authority, input) => {
+      const command = input.payload as contract.DevicePeerCommand;
+      if (command.action.case === "setRemoteDesktopViewerDisplay" || command.action.case === "restoreRemoteDesktopViewerDisplay") {
+        const restored = command.action.case === "restoreRemoteDesktopViewerDisplay";
+        current = create(contract.RemoteDesktopLeaseSchema, { ...current, controlling: false,
+          controlGeneration: current.controlGeneration + 1n,
+          display: { ...original.display!, displayId: restored ? original.display!.displayId : "mirror-1",
+            width: restored ? 1920 : 800, height: restored ? 1080 : 1200 } });
+        return completed(result("remoteDesktopViewerDisplay", create(contract.RemoteDesktopViewerDisplayResultSchema, { lease: current })));
+      }
+      if (command.action.case === "startRemoteDesktop") {
+        current = create(contract.RemoteDesktopLeaseSchema, { ...current, leaseId: "restored-resume",
+          display: original.display, controlling: false, controlGeneration: current.controlGeneration + 1n });
+        return completed(result("remoteDesktopLease", current));
+      }
+      if (command.action.case === "setRemoteDesktopControl") {
+        current = create(contract.RemoteDesktopLeaseSchema, { ...current, controlling: true, controlGeneration: current.controlGeneration + 1n });
+        return completed(result("remoteDesktopControlState", create(contract.RemoteDesktopControlStateSchema, {
+          controlling: current.controlling, controlGeneration: current.controlGeneration
+        })));
+      }
+      return defaultResponse(input);
+    };
+    await expect(coordinator.setViewerDisplay(connection, identity, { leaseId: original.leaseId,
+      controlGeneration: original.controlGeneration, width: 800, height: 1200 }, signal)).resolves.toMatchObject({
+      lease: { leaseId: original.leaseId, controlling: false, controlGeneration: 2n, display: { displayId: "mirror-1", width: 800, height: 1200 } }
+    });
+    await expect(coordinator.start(connection, identity, { displayId: "mirror-1", mode: contract.RemoteDesktopStartMode.RESUME }, signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.STOPPED } });
+    const control = await coordinator.setControl(connection, identity, { leaseId: original.leaseId, enabled: true }, signal);
+    await expect(coordinator.restoreViewerDisplay(connection, identity, { leaseId: original.leaseId,
+      controlGeneration: control.controlGeneration }, signal)).resolves.toMatchObject({ lease: {
+      leaseId: original.leaseId, controlling: false, controlGeneration: 4n, display: original.display
+    } });
+    const refitControl = await coordinator.setControl(connection, identity, { leaseId: original.leaseId, enabled: true }, signal);
+    await coordinator.setViewerDisplay(connection, identity, { leaseId: original.leaseId,
+      controlGeneration: refitControl.controlGeneration, width: 800, height: 1200 }, signal);
+    await expect(coordinator.start(connection, identity, { displayId: original.display!.displayId, mode: contract.RemoteDesktopStartMode.RESUME }, signal))
+      .resolves.toMatchObject({ leaseId: "restored-resume", controlling: false, controlGeneration: 7n, display: original.display });
+    await expect(coordinator.heartbeat(connection, identity, original.leaseId, signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.STOPPED } });
+    await expect(coordinator.heartbeat(connection, identity, "restored-resume", signal)).resolves.toBeDefined();
+  });
+
+  it.each(["old-mirror", "third-display", "old-lease", "stale-generation", "controlling"] as const)(
+    "rejects a fitted RESUME %s receipt instead of adopting unrelated or unrestored geometry", async invalid => {
+      const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+      const original = await start(coordinator);
+      fake.dispatchHandler = async (_authority, input) => {
+        if (input.action === "setRemoteDesktopViewerDisplay") return completed(result("remoteDesktopViewerDisplay",
+          create(contract.RemoteDesktopViewerDisplayResultSchema, { lease: { ...original, controlling: false,
+            controlGeneration: 2n, display: { ...original.display!, displayId: "mirror-1" } } })));
+        if (input.action === "startRemoteDesktop") return completed(result("remoteDesktopLease", create(contract.RemoteDesktopLeaseSchema, {
+          ...original, leaseId: invalid === "old-lease" ? original.leaseId : "resumed-lease",
+          controlling: invalid === "controlling", controlGeneration: invalid === "stale-generation" ? 2n : 3n,
+          display: { ...original.display!, displayId: invalid === "old-mirror" ? "mirror-1"
+            : invalid === "third-display" ? "unrelated-display" : original.display!.displayId }
+        })));
+        return defaultResponse(input);
+      };
+      await coordinator.setViewerDisplay(connection, identity, { leaseId: original.leaseId,
+        controlGeneration: original.controlGeneration, width: 800, height: 1200 }, signal);
+      await expect(coordinator.start(connection, identity, { displayId: original.display!.displayId,
+        mode: contract.RemoteDesktopStartMode.RESUME }, signal)).rejects.toMatchObject({ code: "internal" });
+    }
+  );
+
+  it("allows a fitted physical-mode receipt to return to its immutable source", async () => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator), previous = fake.dispatchHandler;
+    fake.dispatchHandler = async (authority, input) => input.action === "setRemoteDesktopViewerDisplay"
+      ? completed(result("remoteDesktopViewerDisplay", create(contract.RemoteDesktopViewerDisplayResultSchema, {
+        lease: { ...lease, controlling: false, controlGeneration: 2n, display: { ...lease.display!, displayId: "mirror-1" } }
+      }))) : input.action === "setRemoteDesktopControl"
+        ? completed(result("remoteDesktopControlState", create(contract.RemoteDesktopControlStateSchema, { controlling: true, controlGeneration: 3n })))
+        : input.action === "setRemoteDesktopDisplayMode"
+          ? completed(result("remoteDesktopDisplayMode", create(contract.RemoteDesktopDisplayModeResultSchema, {
+            lease: { ...lease, controlling: false, controlGeneration: 4n, display: { ...lease.display!, width: 1280, height: 720 } }
+          }))) : previous(authority, input);
+    await coordinator.setViewerDisplay(connection, identity, { leaseId: lease.leaseId, controlGeneration: 1n, width: 800, height: 1200 }, signal);
+    await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+    await expect(coordinator.setDisplayMode(connection, identity, { leaseId: lease.leaseId,
+      controlGeneration: 3n, modeId: "102", temporary: true }, signal)).resolves.toMatchObject({ lease: { display: { displayId: lease.display!.displayId } } });
+  });
+
+  it.each(["setRemoteDesktopViewerDisplay", "restoreRemoteDesktopViewerDisplay", "setRemoteDesktopDisplayMode"] as const)(
+    "retains an unknown %s occurrence until an actual stop and blocks media, control and replacement", async (action) => {
+      const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+      const lease = await start(coordinator), previous = fake.dispatchHandler;
+      let generation = lease.controlGeneration;
+      if (action === "setRemoteDesktopDisplayMode") {
+        fake.dispatchHandler = async (authority, input) => input.action === "setRemoteDesktopViewerDisplay"
+          ? completed(result("remoteDesktopViewerDisplay", create(contract.RemoteDesktopViewerDisplayResultSchema, { lease: {
+            ...lease, controlling: false, controlGeneration: 2n, display: { ...lease.display!, displayId: "mirror-1" }
+          } }))) : input.action === "setRemoteDesktopControl"
+            ? completed(result("remoteDesktopControlState", create(contract.RemoteDesktopControlStateSchema, { controlling: true, controlGeneration: 3n })))
+            : previous(authority, input);
+        await coordinator.setViewerDisplay(connection, identity, { leaseId: lease.leaseId, controlGeneration: 1n, width: 800, height: 1200 }, signal);
+        await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal);
+        generation = 3n;
+      }
+      let stopFails = true;
+      fake.dispatchHandler = async (authority, input) => input.action === action
+        ? { protocolVersion: 1, kind: "response", requestId: "mirror-unknown", targetDeviceId: identity.targetDeviceId,
+          routeGeneration: identity.routeGeneration, outcome: "outcome_unknown", errorCode: "receipt_lost" }
+        : input.action === "stopRemoteDesktop" && stopFails
+          ? failedRemoteDesktop(contract.RemoteDesktopFailureReason.DISPLAY_RESTORE_UNAVAILABLE) : previous(authority, input);
+      const input = { leaseId: lease.leaseId, controlGeneration: generation, width: 800, height: 1200 };
+      await expect(action === "setRemoteDesktopViewerDisplay" ? coordinator.setViewerDisplay(connection, identity, input, signal)
+        : action === "restoreRemoteDesktopViewerDisplay" ? coordinator.restoreViewerDisplay(connection, identity, input, signal)
+          : coordinator.setDisplayMode(connection, identity, { ...input, modeId: "102", temporary: true }, signal)).rejects.toMatchObject({ code: "aborted" });
+      await expect(coordinator.getFrame(connection, identity, { leaseId: lease.leaseId, cursorOverlay: false }, signal))
+        .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_BUSY } });
+      await expect(coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: true }, signal))
+        .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_BUSY } });
+      await expect(start(coordinator)).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_BUSY } });
+      const exit = { leaseId: lease.leaseId, controlGeneration: generation, lockScreen: false };
+      await expect(coordinator.stop(connection, identity, exit, signal)).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_RESTORE_UNAVAILABLE } });
+      await expect(start(coordinator)).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_BUSY } });
+      stopFails = false;
+      await coordinator.stop(connection, identity, exit, signal);
+      await expect(start(coordinator)).resolves.toMatchObject({ leaseId: lease.leaseId });
+      expect(fake.actions().filter(value => value === action)).toHaveLength(1);
+    });
+
+  it("adopts a temporary physical mode on the same lease with actual geometry and a fresh control generation", async () => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator), previous = fake.dispatchHandler;
+    const updated = create(contract.RemoteDesktopLeaseSchema, { ...lease, controlling: false,
+      controlGeneration: lease.controlGeneration + 1n, display: { ...lease.display!, width: 1280, height: 720 } });
+    fake.dispatchHandler = async (authority, input) => input.action === "setRemoteDesktopDisplayMode"
+      ? completed(result("remoteDesktopDisplayMode", create(contract.RemoteDesktopDisplayModeResultSchema, { lease: updated })))
+      : previous(authority, input);
+    await expect(coordinator.setDisplayMode(connection, identity, { leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration, modeId: "102", temporary: true }, signal)).resolves.toMatchObject({ lease: updated });
+    expect(fake.calls.at(-1)?.input.payload).toMatchObject({ action: { value: { temporary: true } } });
+    await expect(coordinator.setHostMute(connection, identity, create(contract.RemoteDesktopHostMuteRequestSchema,
+      { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, enabled: true }), signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.VIEW_ONLY } });
+    await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).resolves.toMatchObject({
+      controlling: false, controlGeneration: updated.controlGeneration });
+  });
+
+  it("blocks media and controls during a temporary write and rejects an old-geometry frame receipt", async () => {
+    const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator), previous = fake.dispatchHandler;
+    let completeFrame!: (value: DevicePeerResponseFrame) => void, completeMode!: (value: DevicePeerResponseFrame) => void;
+    fake.dispatchHandler = (authority, input) => input.action === "getRemoteDesktopFrame"
+      ? new Promise(resolve => { completeFrame = resolve; })
+      : input.action === "setRemoteDesktopDisplayMode" ? new Promise(resolve => { completeMode = resolve; }) : previous(authority, input);
+    const frame = coordinator.getFrame(connection, identity, { leaseId: lease.leaseId, cursorOverlay: false }, signal);
+    const staleFrame = expect(frame).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.LEASE_EXPIRED } });
+    const mode = coordinator.setDisplayMode(connection, identity, { leaseId: lease.leaseId,
+      controlGeneration: lease.controlGeneration, modeId: "102", temporary: true }, signal);
+    await expect(coordinator.getFrame(connection, identity, { leaseId: lease.leaseId, cursorOverlay: false }, signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_BUSY } });
+    await expect(coordinator.setHostMute(connection, identity, create(contract.RemoteDesktopHostMuteRequestSchema,
+      { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, enabled: true }), signal))
+      .rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_BUSY } });
+    completeFrame(completed(result("remoteDesktopFrame", create(contract.RemoteDesktopFrameResultSchema))));
+    await staleFrame;
+    completeMode(completed(result("remoteDesktopDisplayMode", create(contract.RemoteDesktopDisplayModeResultSchema, {
+      lease: { ...lease, controlling: false, controlGeneration: 2n, display: { ...lease.display!, width: 1280, height: 720 } }
+    }))));
+    await expect(mode).resolves.toMatchObject({ lease: { leaseId: lease.leaseId, controlGeneration: 2n } });
+  });
+
+  it.each(["other-lease", "other-display", "controlling", "same-generation"] as const)(
+    "rejects a temporary mode receipt with %s and retires the old coordinates", async (kind) => {
+      const fake = new FakeDevicePeerOwner(), coordinator = fakeCoordinator(fake).coordinator;
+      const lease = await start(coordinator);
+      const updated = create(contract.RemoteDesktopLeaseSchema, { ...lease,
+        leaseId: kind === "other-lease" ? "replacement" : lease.leaseId, controlling: kind === "controlling",
+        controlGeneration: lease.controlGeneration + (kind === "same-generation" ? 0n : 1n),
+        display: { ...lease.display!, displayId: kind === "other-display" ? "other" : lease.display!.displayId } });
+      fake.dispatchHandler = async () => completed(result("remoteDesktopDisplayMode",
+        create(contract.RemoteDesktopDisplayModeResultSchema, { lease: updated })));
+      await expect(coordinator.setDisplayMode(connection, identity, { leaseId: lease.leaseId,
+        controlGeneration: lease.controlGeneration, modeId: "102", temporary: true }, signal)).rejects.toMatchObject({ code: "internal" });
+      await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
+        detail: { reason: contract.RemoteDesktopFailureReason.STOPPED } });
+    });
+
   it("lists lease-bound modes and retires the exact controlling lease after a successful mode write", async () => {
     const fake = new FakeDevicePeerOwner();
     const coordinator = fakeCoordinator(fake).coordinator;
@@ -197,7 +987,7 @@ describe("RemoteDesktopCoordinator", () => {
     await expect(coordinator.setDisplayMode(connection, identity, {
       leaseId: lease.leaseId,
       controlGeneration: lease.controlGeneration + 1n,
-      modeId: "101"
+      modeId: "101", temporary: false
     }, signal)).rejects.toMatchObject({
       detail: { reason: contract.RemoteDesktopFailureReason.LEASE_EXPIRED }
     });
@@ -206,8 +996,8 @@ describe("RemoteDesktopCoordinator", () => {
     await expect(coordinator.setDisplayMode(connection, identity, {
       leaseId: lease.leaseId,
       controlGeneration: lease.controlGeneration,
-      modeId: "101"
-    }, signal)).resolves.toBeUndefined();
+      modeId: "101", temporary: false
+    }, signal)).resolves.toEqual(create(contract.RemoteDesktopDisplayModeResultSchema));
     const command = fake.calls.at(-1)?.input.payload as contract.DevicePeerCommand;
     expect(command).toMatchObject({
       action: {
@@ -215,7 +1005,7 @@ describe("RemoteDesktopCoordinator", () => {
         value: {
           leaseId: lease.leaseId,
           controlGeneration: lease.controlGeneration,
-          modeId: "101"
+          modeId: "101", temporary: false
         }
       }
     });
@@ -236,7 +1026,7 @@ describe("RemoteDesktopCoordinator", () => {
     await expect(coordinator.setDisplayMode(connection, identity, {
       leaseId: lease.leaseId,
       controlGeneration: lease.controlGeneration,
-      modeId: "999"
+      modeId: "999", temporary: false
     }, signal)).rejects.toMatchObject({
       code: "not_found",
       detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_MODE_MISSING }
@@ -260,19 +1050,19 @@ describe("RemoteDesktopCoordinator", () => {
     const first = coordinator.setDisplayMode(connection, identity, {
       leaseId: lease.leaseId,
       controlGeneration: lease.controlGeneration,
-      modeId: "101"
+      modeId: "101", temporary: false
     }, signal);
     await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
     await expect(coordinator.setDisplayMode(connection, identity, {
       leaseId: lease.leaseId,
       controlGeneration: lease.controlGeneration,
-      modeId: "101"
+      modeId: "101", temporary: false
     }, signal)).rejects.toMatchObject({
       detail: { reason: contract.RemoteDesktopFailureReason.DISPLAY_BUSY }
     });
     expect(fake.actions().filter((action) => action === "setRemoteDesktopDisplayMode")).toHaveLength(1);
-    finish?.(completed(acknowledgementResult()));
-    await expect(first).resolves.toBeUndefined();
+    finish?.(completed(result("remoteDesktopDisplayMode", create(contract.RemoteDesktopDisplayModeResultSchema))));
+    await expect(first).resolves.toEqual(create(contract.RemoteDesktopDisplayModeResultSchema));
   });
 
   it.each([
@@ -305,7 +1095,7 @@ describe("RemoteDesktopCoordinator", () => {
     await expect(coordinator.setDisplayMode(connection, identity, {
       leaseId: lease.leaseId,
       controlGeneration: lease.controlGeneration,
-      modeId: "101"
+      modeId: "101", temporary: false
     }, signal)).rejects.toMatchObject({ code: errorCode });
     await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
       detail: { reason: contract.RemoteDesktopFailureReason.STOPPED }
@@ -340,7 +1130,7 @@ describe("RemoteDesktopCoordinator", () => {
     await expect(coordinator.setDisplayMode(connection, identity, {
       leaseId: lease.leaseId,
       controlGeneration: lease.controlGeneration,
-      modeId: "101"
+      modeId: "101", temporary: false
     }, signal)).rejects.toMatchObject({ code: "aborted" });
     await expect(coordinator.heartbeat(connection, identity, lease.leaseId, signal)).rejects.toMatchObject({
       detail: { reason: contract.RemoteDesktopFailureReason.STOPPED }
@@ -800,7 +1590,7 @@ describe("RemoteDesktopCoordinator", () => {
     expect(fake.actions().filter((action) => action === "startRemoteDesktop")).toHaveLength(startsAfterExpiry);
 
     await expect(start(coordinator)).resolves.toMatchObject({ leaseId: "lease-1" });
-    await coordinator.stop(connection, identity, "lease-1", signal);
+    await coordinator.stop(connection, identity, { leaseId: "lease-1", lockScreen: false, controlGeneration: 0n }, signal);
     await expect(coordinator.start(connection, identity, {
       displayId: "display-1",
       mode: contract.RemoteDesktopStartMode.RESUME
@@ -837,7 +1627,7 @@ describe("RemoteDesktopCoordinator", () => {
       ? new Promise<DevicePeerResponseFrame>((resolve) => { finishStop = resolve; })
       : previousDispatch(authority, input);
 
-    const stopping = coordinator.stop(connection, identity, "lease-1", signal);
+    const stopping = coordinator.stop(connection, identity, { leaseId: "lease-1", lockScreen: false, controlGeneration: 0n }, signal);
     expect(finishStop).toBeTypeOf("function");
     await expect(coordinator.heartbeat(connection, identity, "lease-1", signal)).rejects.toMatchObject({
       detail: { reason: contract.RemoteDesktopFailureReason.STOPPED }
@@ -845,6 +1635,69 @@ describe("RemoteDesktopCoordinator", () => {
 
     finishStop?.(completed(acknowledgementResult()));
     await expect(stopping).resolves.toBeUndefined();
+  });
+
+  it("fences lock on exit by the exact lease generation while allowing view-only exit", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+    const state = await coordinator.setControl(connection, identity, { leaseId: lease.leaseId, enabled: false }, signal);
+    expect(state.controlling).toBe(false);
+    for (const generation of [0n, lease.controlGeneration, 2n ** 63n]) {
+      await expect(coordinator.stop(connection, identity, {
+        leaseId: lease.leaseId, lockScreen: true, controlGeneration: generation
+      }, signal)).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.LOCK_EXPIRED } });
+    }
+    expect(fake.actions()).not.toContain("stopRemoteDesktop");
+    const exit = { leaseId: lease.leaseId, lockScreen: true, controlGeneration: state.controlGeneration };
+    await expect(coordinator.stop(connection, identity, exit, signal)).resolves.toBeUndefined();
+    expect(fake.calls.at(-1)).toMatchObject({ input: { action: "stopRemoteDesktop", effectKind: "side_effect",
+      payload: { action: { case: "stopRemoteDesktop", value: exit } } } });
+    await expect(coordinator.stop(connection, identity, exit, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.LOCK_EXPIRED }
+    });
+    expect(fake.actions().filter((action) => action === "stopRemoteDesktop")).toHaveLength(1);
+  });
+
+  it.each(["revoke", "route", "shutdown"] as const)("cancels a captured lock exit after %s and rejects its late acknowledgement", async (retirement) => {
+    const fake = new FakeDevicePeerOwner();
+    const revocations = new RevocationHarness();
+    const coordinator = fakeCoordinator(fake, { onRevoked: revocations.subscribe }).coordinator;
+    const lease = await start(coordinator);
+    let finish!: (value: DevicePeerResponseFrame) => void;
+    let targetSignal: AbortSignal | undefined;
+    fake.dispatchHandler = async (_authority, input) => {
+      targetSignal = input.signal;
+      return new Promise((resolve) => { finish = resolve; });
+    };
+    const pending = coordinator.stop(connection, identity, {
+      leaseId: lease.leaseId, lockScreen: true, controlGeneration: lease.controlGeneration
+    }, signal);
+    const rejected = expect(pending).rejects.toMatchObject({ detail: { reason: contract.RemoteDesktopFailureReason.LOCK_EXPIRED } });
+    expect(targetSignal?.aborted).toBe(false);
+    if (retirement === "revoke") revocations.revoke(connection.id);
+    else if (retirement === "route") fake.replaceRoute({ ...identity, routeGeneration: identity.routeGeneration + 1 });
+    else await coordinator.close();
+    expect(targetSignal?.aborted).toBe(true);
+    finish(completed(acknowledgementResult()));
+    await rejected;
+    expect(fake.activeRouteSubscriptions()).toBe(0);
+    expect(revocations.active(connection.id)).toBe(false);
+  });
+
+  it("reports native lock failure without restoring a reusable or retryable ending lease", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const coordinator = fakeCoordinator(fake).coordinator;
+    const lease = await start(coordinator);
+    fake.dispatchHandler = async () => failedRemoteDesktop(contract.RemoteDesktopFailureReason.LOCK_FAILED);
+    const exit = { leaseId: lease.leaseId, lockScreen: true, controlGeneration: lease.controlGeneration };
+    await expect(coordinator.stop(connection, identity, exit, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.LOCK_FAILED }
+    });
+    await expect(coordinator.stop(connection, identity, exit, signal)).rejects.toMatchObject({
+      detail: { reason: contract.RemoteDesktopFailureReason.LOCK_EXPIRED }
+    });
+    expect(fake.actions().filter((action) => action === "stopRemoteDesktop")).toHaveLength(1);
   });
 
   it("preserves typed target failure detail and maps its public error code", async () => {
@@ -1110,6 +1963,19 @@ class FakeDevicePeerOwner {
     return this.calls.map(({ input }) => input.action);
   }
 
+  captureRemoteDesktopCredentialCleanup(authority: DevicePeerAuthority): (handle: string) => Promise<void> {
+    authority.assertCurrent(["remote_desktop"]);
+    return async (handle) => {
+      if (this.#currentIdentity === undefined || !sameSelectionIdentity(this.#currentIdentity, authority.identity)) return;
+      const command = create(contract.DevicePeerCommandSchema, { capability: contract.DevicePeerCapabilityKind.REMOTE_DESKTOP,
+        effect: contract.DevicePeerEffectKind.SIDE_EFFECT, action: { case: "closeRemoteDesktopCredentials",
+          value: { handle } } });
+      const input: DispatchInput = { capability: "remote_desktop", effectKind: "side_effect", action: "closeRemoteDesktopCredentials", payload: command };
+      this.calls.push({ authority, input });
+      await this.dispatchHandler(authority, input);
+    };
+  }
+
   #emitRouteClosed(
     closed: DevicePeerSelectionIdentity,
     reason: "replaced" | "connection_closed" | "authority_changed" | "shutdown"
@@ -1194,6 +2060,23 @@ function sameSelectionIdentity(left: DevicePeerSelectionIdentity, right: DeviceP
     && left.routeGeneration === right.routeGeneration;
 }
 
+function installClipboardSyncResponses(fake: FakeDevicePeerOwner): void {
+  let generation = 0n;
+  fake.dispatchHandler = async (_authority, input) => {
+    const command = input.payload as contract.DevicePeerCommand;
+    if (command.action.case === "setRemoteDesktopClipboardSync") return completed(result("remoteDesktopClipboardSync",
+      create(contract.RemoteDesktopClipboardSyncResultSchema, { enabled: command.action.value.enabled, syncGeneration: ++generation })));
+    if (command.action.case === "getRemoteDesktopClipboardVersion") return completed(result("remoteDesktopClipboardVersion",
+      create(contract.RemoteDesktopClipboardVersionResultSchema, { version: "7" })));
+    if (command.action.case === "transferRemoteDesktopClipboardContent" && command.action.value.sync) {
+      const request = command.action.value, data = '{"text":"system clipboard"}';
+      return completed(result("remoteDesktopClipboardContent", create(contract.RemoteDesktopClipboardContentResultSchema,
+        request.action.case === "copy" && request.inline ? { data, length: data.length } : { version: "8" })));
+    }
+    return defaultResponse(input);
+  };
+}
+
 function defaultResponse(input: DispatchInput): DevicePeerResponseFrame {
   const command = input.payload as contract.DevicePeerCommand;
   switch (input.action) {
@@ -1240,7 +2123,19 @@ function defaultResponse(input: DispatchInput): DevicePeerResponseFrame {
         }
       )));
     case "setRemoteDesktopDisplayMode":
-      return completed(acknowledgementResult());
+      return completed(result("remoteDesktopDisplayMode", create(contract.RemoteDesktopDisplayModeResultSchema)));
+    case "setRemoteDesktopHostMute":
+      return completed(result("remoteDesktopHostMute", create(contract.RemoteDesktopHostMuteResultSchema, {
+        enabled: command.action.case === "setRemoteDesktopHostMute" && command.action.value.enabled
+      })));
+    case "performRemoteDesktopSystemAction":
+      return completed(result("remoteDesktopSystemAction", create(contract.RemoteDesktopSystemActionResultSchema, {
+        action: command.action.case === "performRemoteDesktopSystemAction" ? command.action.value.action : contract.RemoteDesktopSystemActionKind.UNSPECIFIED
+      })));
+    case "setRemoteDesktopPrivacyScreen":
+      return completed(result("remoteDesktopPrivacyScreen", create(contract.RemoteDesktopPrivacyScreenResultSchema, {
+        enabled: command.action.case === "setRemoteDesktopPrivacyScreen" && command.action.value.enabled
+      })));
     case "transferRemoteDesktopClipboardText":
       return completed(result("remoteDesktopClipboardText", create(
         contract.RemoteDesktopClipboardTextResultSchema,

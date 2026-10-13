@@ -105,6 +105,10 @@ import {
 import { InspectorWindowLifecycle } from "./inspector-window-lifecycle.js";
 import { DesktopRuntimeProcessSampler } from "./desktop-runtime-processes.js";
 import { projectDirectoryAuthorityMatches } from "./project-directory-authority.js";
+import { DesktopRemoteDesktopViewerWindows } from "./remote-desktop-viewer-windows.js";
+import { DesktopRemoteDesktopViewerPrewarmScheduler } from "./remote-desktop-viewer-prewarm.js";
+import { DesktopRemoteCredentialsNative } from "./remote-desktop-credentials-native.js";
+import { createDesktopRemoteDesktopViewerPreferencesStore } from "./remote-desktop-viewer-preferences.js";
 import {
   DESKTOP_DEEP_LINK_SCHEME,
   DesktopDeepLinkDeliveryBuffer,
@@ -346,9 +350,11 @@ import {
 } from "./device-peer-runtime-executables.js";
 import {
   createDesktopRemoteDesktopMainHost,
+  closeDesktopRemoteDesktopClipboardWriter,
   readDesktopRemoteDesktopPermissions,
   showDesktopRemoteDesktopPermissionGuide
 } from "./remote-desktop-main.js";
+import { desktopRemoteDesktopWindowsHost, type DesktopRemoteDesktopWindowsSupport } from "./remote-desktop-windows-host.js";
 import type { DesktopRemoteDesktopHost } from "./remote-desktop-host.js";
 import {
   createDesktopRemoteDesktopSettingsStore,
@@ -515,6 +521,18 @@ const desktopUpdateReleaseFeedUrl = resolveDesktopUpdateFeedUrl(process.env["JOK
 const desktopUpdateBetaFeedUrl = resolveDesktopUpdateFeedUrl(process.env["JOKO_DESKTOP_UPDATE_BETA_FEED_URL"]);
 const packagedEntryPath = resolve(sourceDirectory, "web", "index.html");
 const navigationPolicy = createNavigationPolicy(packagedEntryPath, developmentUrl);
+const desktopRemoteDesktopViewerPreferences = createDesktopRemoteDesktopViewerPreferencesStore(
+  () => join(app.getPath("userData"), "remote-desktop-viewer-preferences.json")
+);
+const desktopRemoteDesktopViewers = new DesktopRemoteDesktopViewerWindows({
+  sourceDirectory, entryUrl: navigationPolicy.developmentUrl ?? DESKTOP_APP_ENTRY_URL,
+  navigation: navigationPolicy,
+  assertSource: (event, occurrence) => { assertCurrentMainApplicationDocumentSender(event, occurrence); },
+  readAuthKey: readCredential, preferences: desktopRemoteDesktopViewerPreferences,
+  locale: () => applicationMenuLocale, quitting: () => quitting,
+  credentialNative: () => new DesktopRemoteCredentialsNative(),
+  onOwnerRetired: () => desktopRemoteDesktopViewerPrewarm.cancel()
+});
 const nativeTaskStatusDevelopmentPreview = !app.isPackaged &&
   process.env["JOKO_DESKTOP_TASK_STATUS_PREVIEW"] === "1";
 const nativeTaskStatusSupported = isNativeTaskStatusAvailable({
@@ -526,6 +544,10 @@ const nativeTaskStatusSupported = isNativeTaskStatusAvailable({
 const desktopAttentionBadgeSupported = process.platform === "darwin" || process.platform === "win32"
   || process.platform === "linux";
 let mainWindow: BrowserWindow | undefined;
+const desktopRemoteDesktopViewerPrewarm = new DesktopRemoteDesktopViewerPrewarmScheduler<BrowserWindow>({
+  isCurrent: (window) => window === mainWindow && !quitting,
+  prewarm: () => desktopRemoteDesktopViewers.prewarm()
+});
 const mainWindowContentsByWindow = new WeakMap<BrowserWindow, WebContents>();
 const mainWindowDocuments = new DesktopMainDocumentOccurrenceAuthority<WebContents>(() => randomUUID());
 const desktopDeepLinkDelivery = new DesktopDeepLinkDeliveryBuffer();
@@ -653,7 +675,7 @@ const globalVoiceShortcutRecovery = new GlobalVoiceShortcutRecovery({
   onFailure: recordGlobalVoiceShortcutRecoveryFailure,
   onRecovered: completeGlobalVoiceShortcutRecovery
 });
-const globalVoiceSystemAudio = new SystemAudioMuteGuard<number>(createSystemAudioMuteBackend());
+const globalVoiceSystemAudio = new SystemAudioMuteGuard<number | object>(createSystemAudioMuteBackend());
 let globalVoiceMuteSystemAudio = true;
 let globalVoiceSystemAudioOwner: number | undefined;
 let globalVoiceSystemAudioOwnerSequence = 0;
@@ -720,7 +742,11 @@ let managedOrchestratorInitialization: Promise<DesktopManagedOrchestratorStatus>
 let desktopDevicePeerAgentLifecycle: DesktopDevicePeerAgentLifecycle | undefined;
 let desktopRemoteDesktopSettings: DesktopRemoteDesktopSettingsStore | undefined;
 let desktopRemoteDesktopHost: DesktopRemoteDesktopHost | undefined;
+const capturedDesktopRemoteDesktopHosts = new Set<DesktopRemoteDesktopHost>();
 let desktopRemoteDesktopBroadcastGeneration = 0;
+let desktopRemoteDesktopWindowsSupport: DesktopRemoteDesktopWindowsSupport | undefined;
+let desktopRemoteDesktopWindowsSupportGeneration = 0;
+let desktopRemoteDesktopWindowsSetupBusy = false;
 const managedOrchestratorExitFence = createManagedExitFence({
   getInitialization: () => managedOrchestratorInitialization,
   clearInitialization: (initialization) => {
@@ -868,6 +894,8 @@ if (!app.requestSingleInstanceLock()) {
     nativeArtifactSourceRevealer?.cancelPending();
     mainWindowCloseController?.cancelPending();
     quitting = true;
+    desktopRemoteDesktopViewerPrewarm.cancel();
+    desktopRemoteDesktopViewers.dispose();
     // Route authority ends at quit admission, before renderer beforeunload can
     // delay or cancel the later managed-runtime handoff.
     desktopDevicePeerAgentLifecycle?.setConnection(undefined);
@@ -999,6 +1027,7 @@ if (!app.requestSingleInstanceLock()) {
       join(app.getPath("userData"), "remote-desktop-settings.json")
     );
     await desktopRemoteDesktopSettings.initialize();
+    await desktopRemoteDesktopViewerPreferences.initialize();
     registerIpc();
     installMicrophoneLifecycle();
     installProviderModelPowerLifecycle();
@@ -1023,8 +1052,14 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 function createWindow(): void {
+  desktopRemoteDesktopViewerPrewarm.cancel();
   const retiredDocument = mainWindowDocuments.retireCurrent();
+  const retiredContents = mainWindow === undefined ? undefined : mainWindowContentsByWindow.get(mainWindow);
+  if (retiredDocument === undefined && retiredContents !== undefined) {
+    desktopRemoteDesktopViewers.retireSource(retiredContents);
+  }
   if (retiredDocument !== undefined) {
+    desktopRemoteDesktopViewers.retireSource(retiredDocument.endpoint);
     desktopNotifications.retireOwner(retiredDocument.endpoint, retiredDocument.occurrence);
     retireDedicatedHardwareCatalogOwner(retiredDocument.endpoint, retiredDocument.occurrence);
   }
@@ -1519,7 +1554,10 @@ function createWindow(): void {
       });
     });
   } else {
-    window.once("ready-to-show", () => window.show());
+    window.once("ready-to-show", () => {
+      window.show();
+      desktopRemoteDesktopViewerPrewarm.schedule(window);
+    });
   }
   if (packagedSmoke) {
     void loadUi(window).catch((error: unknown) => {
@@ -5628,6 +5666,8 @@ function retireMainWindowDocument(window: BrowserWindow, contents: WebContents):
   // The captured endpoint remains exact after BrowserWindow.closed, when
   // Electron's webContents getter itself throws Object has been destroyed.
   if (mainWindow !== window || mainWindowContentsByWindow.get(window) !== contents) return;
+  desktopRemoteDesktopViewerPrewarm.cancel();
+  desktopRemoteDesktopViewers.retireSource(contents);
   const retired = mainWindowDocuments.retire(contents);
   if (retired !== undefined) {
     desktopNotifications.retireOwner(retired.endpoint, retired.occurrence);
@@ -6826,19 +6866,26 @@ function requireDesktopRemoteDesktopSettings(): DesktopRemoteDesktopSettingsStor
   return settings;
 }
 
-async function desktopRemoteDesktopSnapshot(): Promise<DesktopRemoteDesktopSnapshot> {
+async function desktopRemoteDesktopSnapshot(refreshWindowsSupport = false): Promise<DesktopRemoteDesktopSnapshot> {
+  if (refreshWindowsSupport) {
+    const generation = ++desktopRemoteDesktopWindowsSupportGeneration;
+    const support = await desktopRemoteDesktopWindowsHost.readSupport();
+    if (generation === desktopRemoteDesktopWindowsSupportGeneration) desktopRemoteDesktopWindowsSupport = support;
+  }
   const permissions = await readDesktopRemoteDesktopPermissions() as DesktopRemoteDesktopPermissions;
   const enabled = requireDesktopRemoteDesktopSettings().get().enabled;
   const state = desktopRemoteDesktopHost?.state;
   return state === undefined
-    ? Object.freeze({ enabled, active: false, controlling: false, permissions })
+    ? Object.freeze({ enabled, active: false, controlling: false, permissions,
+        ...(desktopRemoteDesktopWindowsSupport === undefined ? {} : { windowsSupport: desktopRemoteDesktopWindowsSupport }) })
     : Object.freeze({
         enabled,
         active: true,
         controlling: state.controlling,
         controllerDeviceId: state.controllerDeviceId,
         displayId: state.displayId,
-        permissions
+        permissions,
+        ...(desktopRemoteDesktopWindowsSupport === undefined ? {} : { windowsSupport: desktopRemoteDesktopWindowsSupport })
       });
 }
 
@@ -6868,7 +6915,7 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
   let terminalPort: ReturnType<typeof createAuditedDesktopDevicePeerTerminalPort> | undefined;
   let runtimeExecutables: ReturnType<typeof createAuditedDesktopDevicePeerRuntimeExecutables> | undefined;
   desktopDevicePeerAgentLifecycle = new DesktopDevicePeerAgentLifecycle({
-    async createExecutor() {
+    async createExecutor(connection) {
       const runtimeRoot = resolveDesktopDevicePeerRuntimeRoot({
         packaged: app.isPackaged,
         resourcesPath: process.resourcesPath,
@@ -6888,11 +6935,15 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
         environment: process.env
       });
       const [terminals, locatedExecutables] = await Promise.all([terminalPort, runtimeExecutables]);
+      await settleCompleteExitOperations([...capturedDesktopRemoteDesktopHosts].map((host) => () => host.retire()));
       const settings = requireDesktopRemoteDesktopSettings();
       let remoteDesktop!: DesktopRemoteDesktopHost;
       remoteDesktop = createDesktopRemoteDesktopMainHost({
+        connectionsAllowed: () => !desktopRemoteDesktopWindowsSetupBusy,
         sourceDirectory,
         settings,
+        credentialsOwner: { profileId: connection.profileId, serverId: connection.serverId, deviceId: connection.deviceId },
+        systemAudioMute: globalVoiceSystemAudio,
         getMainWindow: () => mainWindow,
         changed: () => {
           if (desktopRemoteDesktopHost === remoteDesktop) {
@@ -6901,12 +6952,14 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
           }
         },
         retired: () => {
+          capturedDesktopRemoteDesktopHosts.delete(remoteDesktop);
           if (desktopRemoteDesktopHost !== remoteDesktop) return;
           desktopRemoteDesktopHost = undefined;
           void broadcastDesktopRemoteDesktopSnapshot();
           refreshTrayContextMenu();
         }
       });
+      capturedDesktopRemoteDesktopHosts.add(remoteDesktop);
       desktopRemoteDesktopHost = remoteDesktop;
       void broadcastDesktopRemoteDesktopSnapshot();
       return new DesktopDevicePeerAgentExecutor({
@@ -7056,6 +7109,8 @@ async function stopManagedOrchestratorForCompleteExit(): Promise<void> {
   await settleCompleteExitOperations([
     cancelGlobalVoiceForExit,
     () => desktopDevicePeerAgentLifecycle?.stop() ?? Promise.resolve(),
+    () => settleCompleteExitOperations([...capturedDesktopRemoteDesktopHosts].map((host) => () => host.retire())),
+    closeDesktopRemoteDesktopClipboardWriter,
     () => managedOrchestratorExitFence.stop(),
     stopDedicatedHardwareForQuitHandoff,
     stopNativeGamepadForQuitHandoff,
@@ -7230,6 +7285,7 @@ function bindDesktopPageSearchResults(contents: WebContents): Map<number, number
 }
 
 function registerIpc(): void {
+  desktopRemoteDesktopViewers.register();
   ipcMain.on(DESKTOP_CHANNELS.preferredSystemLocaleGet, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 0) {
@@ -7294,6 +7350,7 @@ function registerIpc(): void {
     const localeChanged = applicationMenuLocale !== locale;
     setSelectionContextMenuLocale(locale);
     applicationMenuLocale = locale;
+    if (localeChanged) desktopRemoteDesktopViewers.refreshLocale();
     const overlay = globalVoiceOverlayWindow;
     if (localeChanged && overlay !== undefined && !overlay.isDestroyed() && !overlay.webContents.isDestroyed()) {
       try {
@@ -8342,9 +8399,29 @@ function registerIpc(): void {
     return completeCurrentManagedOrchestratorLogout();
   });
   ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopGetState, async (event, ...parameters: unknown[]) => {
-    if (parameters.length !== 1) throw new TypeError("Remote Desktop state requires one Document occurrence.");
+    if ((parameters.length !== 1 && parameters.length !== 2)
+      || parameters.length === 2 && typeof parameters[1] !== "boolean") {
+      throw new TypeError("Remote Desktop state requires one Document occurrence and an optional boolean.");
+    }
     assertCurrentMainApplicationDocumentSender(event, parameters[0]);
-    return desktopRemoteDesktopSnapshot();
+    return desktopRemoteDesktopSnapshot(parameters[1] === true);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopConfigureWindowsSupport, async (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 2 || typeof parameters[1] !== "boolean") {
+      throw new TypeError("Remote Desktop Windows support requires one Document occurrence and one boolean.");
+    }
+    assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    if (desktopRemoteDesktopWindowsSetupBusy) throw new Error("REMOTE_DESKTOP_SYSTEM_SERVICE_BUSY");
+    desktopRemoteDesktopWindowsSetupBusy = true;
+    ++desktopRemoteDesktopWindowsSupportGeneration;
+    try {
+      await Promise.all([...capturedDesktopRemoteDesktopHosts].map(host => host.disconnectAndRelease()));
+      assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+      await desktopRemoteDesktopWindowsHost.configure(parameters[1]);
+      const snapshot = await desktopRemoteDesktopSnapshot(true);
+      void broadcastDesktopRemoteDesktopSnapshot();
+      return snapshot;
+    } finally { desktopRemoteDesktopWindowsSetupBusy = false; }
   });
   ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopSetEnabled, async (event, ...parameters: unknown[]) => {
     if (parameters.length !== 2 || typeof parameters[1] !== "boolean") {

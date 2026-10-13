@@ -18,6 +18,8 @@ import {
   DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema,
   LAN_DISCOVERY_PEER_TTL_MS,
+  RemoteDesktopHostMuteRequestSchema,
+  RemoteDesktopPrivacyScreenRequestSchema,
   ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   ModelFavoriteConfigurationSchema, UpdateModelFavoritesMutationSchema,
   DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
@@ -806,6 +808,11 @@ export class MobileClient {
   #streamSequence?: bigint;
   #streamGeneration?: bigint;
   #foreground = true;
+  #remoteDesktopPresentationTransition?: {
+    isCurrent(): boolean;
+    close(): void;
+    matches(host: Parameters<MobileRemoteDesktopTransport["capabilities"]>[0], leaseId: string): boolean;
+  };
   #disposed = false;
   #lastAuthenticatedAt?: number;
   #durableSnapshotAt?: number;
@@ -2544,6 +2551,7 @@ export class MobileClient {
       || !this.network.getRemoteDesktopPermissions || !this.network.showRemoteDesktopPermissionGuide
       || !this.network.startRemoteDesktop || !this.network.heartbeatRemoteDesktop || !this.network.stopRemoteDesktop
       || !this.network.setRemoteDesktopControl || !this.network.setRemoteDesktopPresentation
+      || !this.network.setRemoteDesktopHostMute
       || !this.network.sendRemoteDesktopInput
       || !this.network.getRemoteDesktopIceConfiguration || !this.network.createRemoteDesktopOffer
       || !this.network.exchangeRemoteDesktopIce || !this.network.getRemoteDesktopFrame
@@ -2563,10 +2571,44 @@ export class MobileClient {
       if (!host.route) throw new Error("The selected Remote Desktop host has no current route.");
       return host.route;
     };
+    const routeKey = (host: Parameters<MobileRemoteDesktopTransport["capabilities"]>[0]): string => {
+      const value = route(host);
+      return JSON.stringify([value.targetDeviceId, value.relationId,
+        value.targetDeviceRevision?.value.toString(10), value.targetDeviceRevision?.etag,
+        value.relationRevision?.value.toString(10), value.relationRevision?.etag, value.routeGeneration.toString(10)]);
+    };
+    // Only the captured presentation request can cross a short Home transition.
+    // The ordinary current/checked boundary remains foreground-only.
+    const beginBackgroundTransition = (host: Parameters<MobileRemoteDesktopTransport["capabilities"]>[0], leaseId: string) => {
+      if (this.platform !== "ios" || !current() || !leaseId || leaseId.length > 256) return undefined;
+      const key = routeKey(host), deadline = performance.now() + 4_000;
+      this.#remoteDesktopPresentationTransition?.close();
+      let closed = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const ticket = {
+        isCurrent: (): boolean => !closed && this.#remoteDesktopPresentationTransition === ticket
+          && performance.now() < deadline && authoritySame() && this.#state.status === "connected"
+          && routeKey(host) === key,
+        close: (): void => {
+          closed = true;
+          if (timer !== undefined) clearTimeout(timer);
+          timer = undefined;
+          if (this.#remoteDesktopPresentationTransition === ticket) this.#remoteDesktopPresentationTransition = undefined;
+        },
+        matches: (candidate: Parameters<MobileRemoteDesktopTransport["capabilities"]>[0], lease: string): boolean =>
+          lease === leaseId && ticket.isCurrent() && routeKey(candidate) === key
+      };
+      this.#remoteDesktopPresentationTransition = ticket;
+      timer = setTimeout(ticket.close, 4_000);
+      return ticket;
+    };
     return {
       ownerKey,
+      preferenceOwner: Object.freeze({ profileId: credential.profileId, serverId: credential.serverId,
+        controllerDeviceId: credential.deviceId }),
       isCurrent: current,
       canStop: authoritySame,
+      beginBackgroundTransition,
       listHosts: (signal) => checked(() => this.network.listRemoteDesktopHosts!(credential, signal)),
       capabilities: (host, signal) => checked(() => this.network.getRemoteDesktopCapabilities!(credential, route(host), signal)),
       permissions: (host, signal) => checked(() => this.network.getRemoteDesktopPermissions!(credential, route(host), signal)),
@@ -2575,14 +2617,49 @@ export class MobileClient {
         this.network.startRemoteDesktop!(credential, route(host), displayId, mode, signal)),
       heartbeat: (host, leaseId, signal) => checked(() =>
         this.network.heartbeatRemoteDesktop!(credential, route(host), leaseId, signal)),
-      stop: async (host, leaseId, signal) => {
+      stop: async (host, leaseId, exit, signal) => {
         if (!authoritySame()) throw new MobileRemoteDesktopAuthorityError();
-        await this.network.stopRemoteDesktop!(credential, route(host), leaseId, signal);
+        await this.network.stopRemoteDesktop!(credential, route(host), leaseId, exit, signal);
+        if (!authoritySame()) throw new MobileRemoteDesktopAuthorityError();
       },
       control: (host, leaseId, enabled, signal) => checked(() =>
         this.network.setRemoteDesktopControl!(credential, route(host), leaseId, enabled, signal)),
-      presentation: (host, leaseId, enabled, signal) => checked(() =>
-        this.network.setRemoteDesktopPresentation!(credential, route(host), leaseId, enabled, signal)),
+      setHostMute: (host, leaseId, controlGeneration, enabled, signal) => checked(() =>
+        this.network.setRemoteDesktopHostMute!(credential, route(host),
+          create(RemoteDesktopHostMuteRequestSchema, { leaseId, controlGeneration, enabled }), signal)),
+      setPrivacyScreen: (host, leaseId, controlGeneration, enabled, lockOnExit, signal) => checked(() => {
+        if (!this.network.setRemoteDesktopPrivacyScreen) throw new Error("Remote Desktop privacy screen is unavailable.");
+        return this.network.setRemoteDesktopPrivacyScreen(credential, route(host),
+          create(RemoteDesktopPrivacyScreenRequestSchema, { leaseId, controlGeneration, enabled, lockOnExit }), signal);
+      }),
+      lockState: (host, signal) => checked(() => {
+        if (!this.network.getRemoteDesktopLockState) throw new Error("CREDENTIAL_UNAVAILABLE");
+        return this.network.getRemoteDesktopLockState(credential, route(host), signal);
+      }),
+      credentials: (host, request, signal) => checked(() => {
+        if (!this.network.requestRemoteDesktopCredentials) throw new Error("CREDENTIAL_UNAVAILABLE");
+        return this.network.requestRemoteDesktopCredentials(credential, route(host), request, signal);
+      }),
+      setClipboardSync: async (host, request, signal) => {
+        if (!this.network.setRemoteDesktopClipboardSync) throw new Error("Remote Desktop clipboard sync is unavailable.");
+        if (request.enabled) return checked(() => this.network.setRemoteDesktopClipboardSync!(credential, route(host), request, signal));
+        if (!authoritySame()) throw new MobileRemoteDesktopAuthorityError();
+        const result = await this.network.setRemoteDesktopClipboardSync(credential, route(host), request, signal);
+        if (!authoritySame()) throw new MobileRemoteDesktopAuthorityError();
+        return result;
+      },
+      clipboardVersion: (host, request, signal) => checked(() => {
+        if (!this.network.getRemoteDesktopClipboardVersion) throw new Error("Remote Desktop clipboard version is unavailable.");
+        return this.network.getRemoteDesktopClipboardVersion(credential, route(host), request, signal);
+      }),
+      presentation: async (host, leaseId, enabled, signal) => {
+        const transition = this.#remoteDesktopPresentationTransition;
+        const permitted = (): boolean => authoritySame() && (current() || transition?.matches(host, leaseId) === true);
+        if (!permitted()) throw new MobileRemoteDesktopAuthorityError();
+        const value = await this.network.setRemoteDesktopPresentation!(credential, route(host), leaseId, enabled, signal);
+        if (!permitted()) throw new MobileRemoteDesktopAuthorityError();
+        return value;
+      },
       input: (host, leaseId, sequence, events, signal) => checked(() =>
         this.network.sendRemoteDesktopInput!(credential, route(host), leaseId, sequence, events, signal)),
       iceConfiguration: (host, leaseId, signal) => checked(() =>
@@ -2596,8 +2673,20 @@ export class MobileClient {
         this.network.getRemoteDesktopFrame!(credential, route(host), leaseId, cursorOverlay, signal)),
       listDisplayModes: (host, leaseId, signal) => checked(() =>
         this.network.listRemoteDesktopDisplayModes!(credential, route(host), leaseId, signal)),
-      setDisplayMode: (host, leaseId, controlGeneration, modeId, signal) => checked(() =>
-        this.network.setRemoteDesktopDisplayMode!(credential, route(host), leaseId, controlGeneration, modeId, signal)),
+      setDisplayMode: (host, leaseId, controlGeneration, modeId, temporary, signal) => checked(() =>
+        this.network.setRemoteDesktopDisplayMode!(credential, route(host), leaseId, controlGeneration, modeId, temporary, signal)),
+      fitViewerDisplay: (host, leaseId, controlGeneration, width, height, signal) => checked(() => {
+        if (!this.network.setRemoteDesktopViewerDisplay) throw new Error("Remote Desktop viewer display is unavailable.");
+        return this.network.setRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, width, height, signal);
+      }),
+      restoreViewerDisplay: (host, leaseId, controlGeneration, signal) => checked(() => {
+        if (!this.network.restoreRemoteDesktopViewerDisplay) throw new Error("Remote Desktop viewer display restore is unavailable.");
+        return this.network.restoreRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, signal);
+      }),
+      systemAction: (host, leaseId, controlGeneration, action, signal) => checked(() => {
+        if (!this.network.performRemoteDesktopSystemAction) throw new Error("Remote Desktop system actions are unavailable.");
+        return this.network.performRemoteDesktopSystemAction(credential, route(host), leaseId, controlGeneration, action, signal);
+      }),
       clipboardText: (host, transferValue, signal) => checked(() =>
         this.network.transferRemoteDesktopClipboardText!(credential, route(host), transferValue, signal)),
       clipboardContent: (host, transferValue, signal) => checked(() =>
@@ -13583,6 +13672,7 @@ export class MobileClient {
   }
 
   dispose(): void {
+    this.#remoteDesktopPresentationTransition?.close();
     if (this.#queueEditLease) this.#releaseQueueEditLeaseDetached(this.#queueEditLease);
     if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
     this.#disposed = true;

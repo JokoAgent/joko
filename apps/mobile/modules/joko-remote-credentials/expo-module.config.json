@@ -1,0 +1,15 @@
+{
+  "platforms": [
+    "apple"
+  ],
+  "apple": {
+    "podspecPath": [
+      "./ios/JokoRemoteCredentialsModule.podspec",
+      "../../../../packages/remote-credentials-native/JokoRemoteCredentials.podspec"
+    ],
+    "swiftModuleName": "JokoRemoteCredentialsModule",
+    "modules": [
+      "JokoRemoteCredentialsModule"
+    ]
+  }
+}

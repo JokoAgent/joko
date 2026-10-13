@@ -4,6 +4,8 @@ import { create } from "@bufbuild/protobuf";
 import {
   RemoteDesktopCapabilitiesSchema,
   RemoteDesktopClipboardContentSchema,
+  RemoteDesktopClipboardSyncResultSchema,
+  RemoteDesktopClipboardVersionResultSchema,
   RemoteDesktopControlStateSchema,
   RemoteDesktopCursorSchema,
   RemoteDesktopDisplaySchema,
@@ -11,15 +13,24 @@ import {
   RemoteDesktopFailureReason,
   RemoteDesktopFrameResultSchema,
   RemoteDesktopFrameSchema,
+  RemoteDesktopHostMuteResultSchema,
+  RemoteDesktopPrivacyScreenResultSchema,
+  RemoteDesktopLockState,
+  RemoteDesktopLockStateResultSchema,
+  type RemoteDesktopCredentialRequest,
   RemoteDesktopIceCandidateSchema,
   RemoteDesktopIceExchangeResultSchema,
   RemoteDesktopLeaseSchema,
+  RemoteDesktopDisplayModeResultSchema,
+  RemoteDesktopViewerDisplayResultSchema,
   RemoteDesktopMouseButton,
   RemoteDesktopOfferResultSchema,
   RemoteDesktopPermissionsSchema,
   RemoteDesktopPermissionStatus,
   RemoteDesktopPresentationProofSchema,
   RemoteDesktopStartMode,
+  RemoteDesktopSystemActionKind,
+  RemoteDesktopSystemActionResultSchema,
   RemoteDesktopVideoQuality,
   type RemoteDesktopClipboardContent,
   type RemoteDesktopInputEvent,
@@ -38,7 +49,8 @@ import {
   type RemoteDesktopIceCandidate,
   type RemoteDesktopInput,
   type RemoteDesktopJpegFrame,
-  type RemoteDesktopPermissions
+  type RemoteDesktopPermissions,
+  type RemoteDesktopSystemAction
 } from "@joko/device-peer";
 
 import type { DesktopRemoteDesktopClipboardContent } from "./remote-desktop-clipboard.js";
@@ -47,13 +59,17 @@ import type {
   DesktopRemoteDesktopVideoSettings
 } from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopSessionState } from "./remote-desktop-input.js";
+import { DesktopRemoteDesktopCredentialsHost } from "./remote-desktop-credentials-host.js";
+import type { DesktopRemoteCredentialsNative, DesktopRemoteCredentialsNativeOwner } from "./remote-desktop-credentials-native.js";
 
 export interface DesktopRemoteDesktopMediaPort {
-  frame(
-    displayId: string,
-    cursorOverlay: boolean,
-    signal: AbortSignal
-  ): Promise<RemoteDesktopJpegFrame | null>;
+  frame(request: {
+    readonly displayId: string;
+    readonly leaseId: string;
+    readonly cursorOverlay: boolean;
+    readonly current: () => boolean;
+    readonly signal: AbortSignal;
+  }): Promise<RemoteDesktopJpegFrame | null>;
   offer(request: {
     readonly displayId: string;
     readonly leaseId: string;
@@ -83,15 +99,21 @@ export interface DesktopRemoteDesktopMediaPort {
   ) => void): () => void;
   setPresentationPongHandler(handler: (leaseId: string) => void): () => void;
   setPresentation(leaseId: string, enabled: boolean): void;
-  setSessionState(nativeOnly: boolean): void;
+  setSessionState(nativeOnly: boolean, state?: DesktopRemoteDesktopSessionState): void;
+  setPrivacyExclusions(owner: object, ids: readonly number[]): void;
+  preparePrivacy(owner: object, displayId: string, current: () => boolean, signal: AbortSignal): Promise<void>;
+  clearPrivacyExclusions(owner: object): void;
   stop(): void;
+  release?(): Promise<void>;
   retire(): Promise<void>;
 }
 
 export interface DesktopRemoteDesktopInputPort {
   start(displayId: string, signal: AbortSignal): Promise<void>;
+  resumeAfterPrivacy?(displayId: string, current: () => boolean, signal: AbortSignal): Promise<void>;
   send(events: readonly RemoteDesktopInput[]): void;
   stop(): void;
+  release(): Promise<void>;
   retire(): Promise<void>;
 }
 
@@ -107,6 +129,9 @@ export interface DesktopRemoteDesktopClipboardPort {
     current: () => boolean,
     signal: AbortSignal
   ): Promise<void>;
+  readSystemContent(current: () => boolean, signal: AbortSignal, expectedVersion?: string): Promise<DesktopRemoteDesktopClipboardContent>;
+  writeSystemContent(content: DesktopRemoteDesktopClipboardContent, expectedVersion: string,
+    current: () => boolean, signal: AbortSignal): Promise<string>;
 }
 
 export interface DesktopRemoteDesktopHostDependencies {
@@ -114,22 +139,62 @@ export interface DesktopRemoteDesktopHostDependencies {
   readonly systemAudio: boolean;
   enabled(): boolean;
   sessionState(signal: AbortSignal): Promise<DesktopRemoteDesktopSessionState>;
-  displays(): readonly RemoteDesktopDisplay[];
+  lockSessionState?(signal: AbortSignal): Promise<DesktopRemoteDesktopSessionState>;
+  displays(signal: AbortSignal): readonly RemoteDesktopDisplay[] | Promise<readonly RemoteDesktopDisplay[]>;
+  linuxCapabilities?(signal: AbortSignal): Promise<{ readonly canControl: boolean; readonly cursorOverlay: boolean;
+    readonly displayModes?: boolean; readonly viewerDisplay?: boolean; readonly lockOnExit?: boolean; readonly privacyScreen?: boolean;
+    readonly workspaceNavigation?: boolean; readonly systemMenu?: boolean }>;
+  windowsCapabilities?(signal: AbortSignal): Promise<{ readonly canControl: boolean; readonly cursorOverlay: boolean }>;
+  viewerDisplaySupported?(signal: AbortSignal): Promise<boolean>;
+  prepare?(current: () => boolean, signal: AbortSignal): Promise<void>;
   permissions(signal: AbortSignal): Promise<RemoteDesktopPermissions>;
   showPermissionGuide(signal: AbortSignal): Promise<void>;
   readonly media: DesktopRemoteDesktopMediaPort;
   readonly input: DesktopRemoteDesktopInputPort;
   readonly clipboard?: DesktopRemoteDesktopClipboardPort;
+  readonly credentials?: {
+    readonly native: Pick<DesktopRemoteCredentialsNative, "request" | "close">;
+    readonly owner: DesktopRemoteCredentialsNativeOwner;
+    lockState?(signal: AbortSignal): Promise<"locked" | "unlocked" | "unavailable">;
+  };
+  readonly clipboardCounter?: {
+    read(portable: boolean, signal: AbortSignal, current?: () => boolean): Promise<string>;
+    stop(): void;
+  };
+  readonly hostMute?: {
+    set(owner: object, enabled: boolean, current: () => boolean, signal: AbortSignal): Promise<void>;
+    release(owner: object): Promise<void>;
+  };
+  readonly privacyScreen?: {
+    set(owner: object, displayId: string, current: () => boolean, signal: AbortSignal): Promise<void>;
+    release(owner: object): Promise<void>;
+  };
+  workspaceAction?(action: RemoteDesktopSystemAction, displayId: string, current: () => boolean,
+    signal: AbortSignal): Promise<void>;
+  stopWorkspaceActions?(): Promise<void>;
+  lockScreen?(current: () => boolean, signal: AbortSignal): Promise<void>;
   displayModes?(displayId: string, signal: AbortSignal): Promise<readonly RemoteDesktopDisplayMode[]>;
   setDisplayMode?(
     displayId: string,
     modeId: string,
-    beforeChange: () => void,
+    beforeChange: () => void | Promise<void>,
+    signal: AbortSignal,
+    expected?: { readonly width: number; readonly height: number; readonly current?: () => boolean }
+  ): Promise<RemoteDesktopDisplay | void>;
+  restoreDisplayMode?(
+    displayId: string,
+    modeId: string,
+    current: () => boolean,
+    expected: { readonly width: number; readonly height: number },
     signal: AbortSignal
-  ): Promise<void>;
+  ): Promise<RemoteDesktopDisplay>;
+  displayPresent?(displayId: string): boolean | Promise<boolean>;
+  createViewerDisplay?(sourceDisplayId: string, current: () => boolean, onFailure: () => void,
+    signal: AbortSignal): Promise<import("@joko/device-peer").RemoteDesktopViewerDisplayHandle>;
   changed(state: DesktopRemoteDesktopState | undefined): void;
   retired?(): void;
-  onDisplayChange?(listener: (displayId: string, geometryChanged: boolean) => void): () => void;
+  onDisplayChange?(listener: (displayId: string, geometryChanged: boolean,
+    geometry?: { readonly width: number; readonly height: number; readonly metrics: readonly string[] }) => void): () => void;
   onSessionStateChange?(listener: () => void): () => void;
   now?(): number;
   createLeaseId?(): string;
@@ -152,8 +217,10 @@ const NEVER_ABORTED = new AbortController().signal;
 export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort {
   readonly #dependencies: DesktopRemoteDesktopHostDependencies;
   readonly #controller: RemoteDesktopController;
+  readonly #credentials: DesktopRemoteDesktopCredentialsHost | undefined;
   readonly #signals = new AsyncLocalStorage<AbortSignal>();
   readonly #lifecycleToken = Object.freeze({});
+  readonly #clipboardAuthorityListeners = new Set<() => void>();
   readonly #stopInputHandler: () => void;
   readonly #stopPresentationPongHandler: () => void;
   readonly #stopSubscriptions: readonly (() => void)[];
@@ -161,7 +228,10 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   #sessionState: DesktopRemoteDesktopSessionState = "unknown";
   #sessionGeneration = 0;
   #sessionTransitionGeneration: number | undefined;
+  #terminalLockCurrent: (() => boolean) | undefined;
   #retired = false;
+  #retirement: Promise<void> | undefined;
+  #retirementReported = false;
 
   constructor(dependencies: DesktopRemoteDesktopHostDependencies) {
     this.#dependencies = dependencies;
@@ -169,26 +239,153 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       authorityCurrent: (authority) => !this.#retired
         && authority.lifecycleToken === this.#lifecycleToken
         && validControllerId(authority.controllerDeviceId),
+      authenticationSession: (authority) => authority.authenticationOwner === undefined ? undefined
+        : this.#credentials?.authenticationSession(authority.authenticationOwner) ?? null,
       capabilities: async () => this.#capabilities(),
       permissions: async (action) => {
         this.#requireEnabled();
         if (action === "guide") await dependencies.showPermissionGuide(this.#signal());
         return dependencies.permissions(this.#signal());
       },
-      frame: (displayId, cursorOverlay) => this.#whileSessionViewable(
-        () => dependencies.media.frame(
-          displayId,
-          cursorOverlay,
-          this.#signal()
-        ),
+      frame: (request) => this.#whileSessionViewable(
+        (sessionGeneration) => dependencies.media.frame({ ...request, signal: this.#signal(),
+          current: () => request.current() && sessionGeneration === this.#sessionGeneration
+            && isViewableSession(this.#sessionState) }),
         () => null
       ),
-      startInput: (displayId) => this.#whileSessionUnlocked(
+      startInput: (displayId) => this.#whileSessionControllable(
         () => dependencies.input.start(displayId, this.#signal())
       ),
       input: (events) => dependencies.input.send(events),
       stopInput: () => dependencies.input.stop(),
+      releaseInput: () => dependencies.input.release(),
       stopVideo: () => dependencies.media.stop(),
+      ...(dependencies.prepare === undefined && !(dependencies.platform === "linux" && dependencies.credentials !== undefined) ? {} : {
+        prepare: async (current: () => boolean) => {
+          if (!dependencies.enabled()) return;
+          await this.#refreshSessionState();
+          this.#requireSessionViewable();
+          if (dependencies.prepare === undefined) return;
+          const generation = this.#sessionGeneration;
+          const signal = this.#signal();
+          const valid = (): boolean => !this.#retired && !signal.aborted && current()
+            && this.#sessionState === "unlocked" && generation === this.#sessionGeneration
+            && this.#sessionTransitionGeneration === undefined;
+          if (!valid()) {
+            // Ordinary locked viewing has no compositor mutation authority.
+            if (this.#sessionState === "locked-logged-in" && !signal.aborted && current()) return;
+            throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+          }
+          await dependencies.prepare!(valid, signal);
+          await this.#refreshSessionState();
+          if (!valid()) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+        }
+      }),
+      ...(dependencies.privacyScreen === undefined ? {} : {
+        privacyScreen: async (owner: object, displayId: string, current: () => boolean) => {
+          await this.#refreshSessionState();
+          const generation = this.#sessionGeneration;
+          const signal = this.#signal();
+          const valid = (): boolean => !this.#retired && !signal.aborted && current()
+            && this.#sessionState === "unlocked" && generation === this.#sessionGeneration
+            && this.#sessionTransitionGeneration === undefined;
+          if (!valid()) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+          await dependencies.privacyScreen!.set(owner, displayId, valid, signal);
+          await this.#refreshSessionState();
+          if (!valid()) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+        },
+        stopPrivacyScreen: (owner: object) => dependencies.privacyScreen!.release(owner),
+        ...(dependencies.input.resumeAfterPrivacy === undefined ? {} : {
+          resumeInputAfterPrivacy: async (displayId: string, current: () => boolean) => {
+            await this.#refreshSessionState();
+            const generation = this.#sessionGeneration;
+            const signal = this.#signal();
+            const valid = (): boolean => !this.#retired && !signal.aborted && current()
+              && this.#sessionState === "unlocked" && generation === this.#sessionGeneration
+              && this.#sessionTransitionGeneration === undefined;
+            if (!valid()) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+            await dependencies.input.resumeAfterPrivacy!(displayId, valid, signal);
+            await this.#refreshSessionState();
+            if (!valid()) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+          }
+        })
+      }),
+      ...(dependencies.clipboard === undefined || dependencies.clipboardCounter === undefined ? {} : {
+        clipboardVersion: (current: () => boolean) => this.#whileSessionUnlocked(async () => {
+          const sessionGeneration = this.#sessionGeneration;
+          const valid = (): boolean => current() && this.#sessionState === "unlocked"
+            && this.#sessionGeneration === sessionGeneration && this.#sessionTransitionGeneration === undefined;
+          if (!valid()) throw new Error("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
+          const version = await dependencies.clipboardCounter!.read(false, this.#signal(), valid);
+          if (!valid()) throw new Error("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
+          return version;
+        }),
+        stopClipboardVersion: () => dependencies.clipboardCounter!.stop()
+      }),
+      ...((dependencies.platform !== "darwin" && dependencies.platform !== "linux") || dependencies.lockScreen === undefined
+        || (dependencies.platform === "linux" && dependencies.lockSessionState === undefined) ? {} : {
+        lockScreen: async (current: () => boolean, cancellation: AbortSignal) => {
+          const signal = AbortSignal.any([cancellation, this.#signal()]);
+          if (dependencies.platform === "linux") {
+            const valid = (): boolean => !this.#retired && !signal.aborted && current()
+              && this.#terminalLockCurrent === valid;
+            this.#terminalLockCurrent = valid;
+            try {
+              const before = await dependencies.lockSessionState!(signal);
+              if (!valid() || !isViewableSession(before)) throw new Error("REMOTE_DESKTOP_LOCK_EXPIRED");
+              await dependencies.lockScreen!(valid, signal);
+              const after = await dependencies.lockSessionState!(signal);
+              if (!valid() || after !== "locked-logged-in") throw new Error("REMOTE_DESKTOP_LOCK_EXPIRED");
+            } finally {
+              if (this.#terminalLockCurrent === valid && !current()) this.#terminalLockCurrent = undefined;
+            }
+            return;
+          }
+          await this.#refreshSessionState();
+          if (!isViewableSession(this.#sessionState)) throw new Error("REMOTE_DESKTOP_LOCK_EXPIRED");
+          const valid = (): boolean => !this.#retired && !signal.aborted && current()
+            && (isViewableSession(this.#sessionState)
+              || (this.#sessionState === "unknown" && this.#sessionTransitionGeneration !== undefined));
+          if (!valid() || !isViewableSession(this.#sessionState)) throw new Error("REMOTE_DESKTOP_LOCK_EXPIRED");
+          await dependencies.lockScreen!(valid, signal);
+          // The expected owned-session transition to locked is valid for this
+          // terminal occurrence; ordinary unlocked input guards cannot apply.
+          await this.#refreshSessionState();
+          if (!valid() || !isViewableSession(this.#sessionState)) throw new Error("REMOTE_DESKTOP_LOCK_EXPIRED");
+        }
+      }),
+      ...(dependencies.hostMute === undefined ? {} : {
+        hostMute: async (owner: object, enabled: boolean, current: () => boolean) => {
+          await this.#refreshSessionState();
+          if (this.#sessionState !== "unlocked") throw new Error("REMOTE_DESKTOP_HOST_MUTE_EXPIRED");
+          const generation = this.#sessionGeneration;
+          const signal = this.#signal();
+          const valid = (): boolean => !this.#retired && !signal.aborted
+            && this.#sessionState === "unlocked"
+            && this.#sessionTransitionGeneration === undefined
+            && generation === this.#sessionGeneration && current();
+          if (!valid()) throw new Error("REMOTE_DESKTOP_HOST_MUTE_EXPIRED");
+          await dependencies.hostMute!.set(owner, enabled, valid, signal);
+          await this.#refreshSessionState();
+          if (!valid()) throw new Error("REMOTE_DESKTOP_HOST_MUTE_EXPIRED");
+        },
+        stopHostMute: (owner: object) => dependencies.hostMute!.release(owner)
+      }),
+      ...(dependencies.workspaceAction === undefined || dependencies.stopWorkspaceActions === undefined ? {} : {
+        workspaceAction: async (action: RemoteDesktopSystemAction, displayId: string, current: () => boolean) => {
+          await this.#refreshSessionState();
+          const generation = this.#sessionGeneration;
+          const signal = this.#signal();
+          const valid = (): boolean => !this.#retired && !signal.aborted && current()
+            && dependencies.platform === "linux" && this.#sessionState === "unlocked"
+            && generation === this.#sessionGeneration && this.#sessionTransitionGeneration === undefined;
+          if (!valid()) throw new Error("REMOTE_DESKTOP_SYSTEM_ACTION_EXPIRED");
+          await dependencies.workspaceAction!(action, displayId, valid, signal);
+          await this.#refreshSessionState();
+          if (!valid()) throw new Error("REMOTE_DESKTOP_SYSTEM_ACTION_EXPIRED");
+        },
+        stopWorkspaceActions: () => dependencies.stopWorkspaceActions!()
+      }),
       offer: (lease, sdp, attemptId, settings, cursorOverlay, authority) =>
         this.#whileSessionViewable((sessionGeneration) => dependencies.media.offer({
           displayId: lease.display.id,
@@ -197,7 +394,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
           offerSdp: sdp,
           cursorOverlay,
           ...(settings === undefined ? {} : { settings }),
-          current: () => sessionGeneration === this.#sessionGeneration
+          current: () => (sessionGeneration === this.#sessionGeneration
+            || dependencies.platform === "linux" && dependencies.systemAudio && settings?.audio === true)
             && isViewableSession(this.#sessionState)
             && this.#controller.hasLease(authority, lease.lease),
           signal: this.#signal()
@@ -216,18 +414,60 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         )
       }),
       ...(dependencies.displayModes === undefined || dependencies.setDisplayMode === undefined ? {} : {
-        setDisplayMode: (displayId: string, modeId: string, beforeChange: () => void) =>
+        setDisplayMode: (displayId: string, modeId: string, beforeChange: () => void | Promise<void>,
+          _authority: RemoteDesktopAuthority, expected?: { readonly width: number; readonly height: number; readonly current?: () => boolean }) =>
           this.#whileSessionUnlocked(() => dependencies.setDisplayMode!(
             displayId,
             modeId,
             beforeChange,
-            this.#signal()
+            this.#signal(),
+            expected
           ))
       }),
-      changed: () => dependencies.changed(this.state),
+      ...(dependencies.restoreDisplayMode === undefined ? {} : {
+        restoreDisplayMode: async (displayId: string, modeId: string, current: () => boolean,
+          expected: { readonly width: number; readonly height: number }) => {
+          const session = await dependencies.sessionState(NEVER_ABORTED);
+          if (!current() || !isViewableSession(session)) throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE");
+          const actual = await dependencies.restoreDisplayMode!(displayId, modeId, current, expected, NEVER_ABORTED);
+          const after = await dependencies.sessionState(NEVER_ABORTED);
+          if (!current() || !isViewableSession(after)) throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE");
+          return actual;
+        },
+        displayPresent: async (displayId: string) => dependencies.displayPresent === undefined
+          ? (await dependencies.displays(NEVER_ABORTED)).some((display) => display.id === displayId)
+          : dependencies.displayPresent(displayId)
+      }),
+      ...(dependencies.createViewerDisplay === undefined ? {} : {
+        createViewerDisplay: async (sourceDisplayId: string, current: () => boolean, onFailure: () => void) => {
+          await this.#refreshSessionState(); this.#requireSessionUnlocked();
+          // The handle belongs to the lease; a unary request ending cannot retire its cleanup responsibility.
+          return dependencies.createViewerDisplay!(sourceDisplayId, current, onFailure, NEVER_ABORTED);
+        }
+      }),
+      changed: () => {
+        if (this.#controller.state === undefined) this.#terminalLockCurrent = undefined;
+        for (const listener of this.#clipboardAuthorityListeners) listener();
+        dependencies.changed(this.state);
+      },
       ...(dependencies.now === undefined ? {} : { now: dependencies.now }),
       ...(dependencies.createLeaseId === undefined ? {} : { createLeaseId: dependencies.createLeaseId })
     });
+    this.#credentials = (dependencies.platform === "darwin" || dependencies.platform === "linux"
+      && dependencies.credentials?.lockState !== undefined) && dependencies.credentials !== undefined
+      ? new DesktopRemoteDesktopCredentialsHost({
+        ...dependencies.credentials,
+        current: () => !this.#retired && dependencies.enabled(),
+        invalidated: () => this.#controller.tick(),
+        execute: async (peer, body, authenticationOwner, signal) => {
+          try {
+            return await this.#signals.run(signal, () => this.#controller.request(
+              Object.freeze({ ...this.#authority(peer), authenticationOwner }), body
+            ));
+          } catch (error) { throw translateFailure(error); }
+        },
+        ...(dependencies.now === undefined ? {} : { now: dependencies.now })
+      }) : undefined;
     this.#stopInputHandler = dependencies.media.setInputHandler((leaseId, sequence, events) => {
       const state = this.#controller.state;
       if (this.#retired || state === undefined || state.lease !== leaseId) return;
@@ -244,9 +484,21 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     });
     const subscriptions: (() => void)[] = [];
     if (dependencies.onDisplayChange !== undefined) {
-      subscriptions.push(dependencies.onDisplayChange((displayId, geometryChanged) => {
+      subscriptions.push(dependencies.onDisplayChange((displayId, geometryChanged, geometry) => {
+        const managed = this.#controller.managedViewerDisplay;
+        if (managed?.sourceDisplayId === displayId && geometry?.metrics.includes("removed")) {
+          this.#controller.stop();
+          return;
+        }
+        if (this.#controller.changingDisplay && geometry !== undefined
+          && geometry.metrics.every((metric) => metric === "bounds" || metric === "workArea" || metric === "scaleFactor")) return;
         const state = this.#controller.state;
-        if (state?.displayId === displayId && geometryChanged) this.#controller.stop();
+        if (state?.displayId === displayId && geometryChanged
+          && !(geometry !== undefined
+            && geometry.metrics.every((metric) => metric === "bounds" || metric === "workArea" || metric === "scaleFactor")
+            && this.#controller.displayGeometryMatches(displayId, geometry.width, geometry.height))) {
+          this.#controller.stop();
+        }
       }));
     }
     if (dependencies.onSessionStateChange !== undefined) {
@@ -267,16 +519,76 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     });
   }
 
+  /** Main's compositor poll must not invalidate a change already owned by this lease. */
+  managesDisplayGeometry(displayId: string, width: number, height: number): boolean {
+    return this.#controller.changingDisplay
+      || this.#controller.displayGeometryMatches(displayId, width, height);
+  }
+
+  get managedViewerDisplay() { return this.#controller.managedViewerDisplay; }
+  get changingDisplay(): boolean { return this.#controller.changingDisplay; }
+
   /** Explicit local Disconnect also fences RESUME for the ended lease. */
   disconnect(): void {
     if (this.#retired) return;
     this.#controller.stopByUser();
   }
 
+  async disconnectAndRelease(): Promise<void> {
+    this.disconnect();
+    await Promise.all([this.#controller.stopAndRestore(), this.#dependencies.input.release(), this.#dependencies.media.release?.()]);
+  }
+
+  async stopPrivacyByUser(owner: object): Promise<void> {
+    if (this.#retired) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+    await this.#controller.stopPrivacyByUser(owner);
+  }
+
+  displayCoverageChanged(): void {
+    if (!this.#retired) this.#controller.stop();
+  }
+
   /** Native injection failure is control-scoped; picture and lease stay alive. */
   releaseControl(): void {
     if (this.#retired) return;
     this.#controller.releaseControl();
+  }
+
+  async getLockState(request: DevicePeerRemoteDesktopHostRequest) {
+    this.#requireCredentialAuthority(request);
+    if (this.#dependencies.platform === "linux") {
+      const state = this.#credentials === undefined ? "unavailable"
+        : await this.#dependencies.credentials!.lockState!(request.signal);
+      this.#requireCredentialAuthority(request);
+      return create(RemoteDesktopLockStateResultSchema, { state: state === "locked" ? RemoteDesktopLockState.LOCKED
+        : state === "unlocked" ? RemoteDesktopLockState.UNLOCKED : RemoteDesktopLockState.UNAVAILABLE });
+    }
+    if (this.#dependencies.platform !== "darwin") {
+      return create(RemoteDesktopLockStateResultSchema, { state: RemoteDesktopLockState.UNAVAILABLE });
+    }
+    await this.#signals.run(request.signal, () => this.#refreshSessionState());
+    this.#requireCredentialAuthority(request);
+    return create(RemoteDesktopLockStateResultSchema, { state: this.#sessionState === "unlocked"
+      ? RemoteDesktopLockState.UNLOCKED : this.#sessionState === "locked-logged-in"
+        ? RemoteDesktopLockState.LOCKED : RemoteDesktopLockState.UNAVAILABLE });
+  }
+
+  async requestCredentials(request: DevicePeerRemoteDesktopHostRequest & { readonly request: RemoteDesktopCredentialRequest }) {
+    this.#requireCredentialAuthority(request);
+    if (this.#credentials === undefined) throw failure(RemoteDesktopFailureReason.CREDENTIAL_UNAVAILABLE, false);
+    const result = await this.#credentials.request(request.controllerDeviceId, request.request, request.signal);
+    this.#requireCredentialAuthority(request);
+    return result;
+  }
+
+  async closeCredentials(request: DevicePeerRemoteDesktopHostRequest & { readonly handle: string }): Promise<void> {
+    throwIfAborted(request.signal);
+    if (!validControllerId(request.controllerDeviceId)) throw failure(RemoteDesktopFailureReason.AUTHORITY_CHANGED, false);
+    // Retirement may arrive after permission was revoked. It only closes an
+    // already captured handle and must never create authentication authority.
+    if (this.#retired) { await this.#credentials?.retire(); return; }
+    if (this.#credentials === undefined) return;
+    await this.#credentials.closeHandle(request.controllerDeviceId, request.handle);
   }
 
   async getCapabilities(request: DevicePeerRemoteDesktopHostRequest) {
@@ -299,6 +611,17 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       readonly backgroundViewing: boolean;
       readonly displayModes: boolean;
       readonly cursorOverlay: boolean;
+      readonly hostMute: boolean;
+      readonly lockOnExit: boolean;
+      readonly clipboardSync: boolean;
+      readonly clipboardInline: boolean;
+      readonly privacyScreen: boolean;
+      readonly nativeCredentials: boolean;
+      readonly resolutionRestore: boolean;
+      readonly viewerDisplay: boolean;
+      readonly viewerDisplayRestore: boolean;
+      readonly workspaceNavigation: boolean;
+      readonly systemMenu: boolean;
     };
     return create(RemoteDesktopCapabilitiesSchema, {
       protocolVersion: value.version,
@@ -323,7 +646,18 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       systemAudio: value.systemAudio,
       backgroundViewing: value.backgroundViewing,
       displayModes: value.displayModes,
-      cursorOverlay: value.cursorOverlay
+      resolutionRestore: value.resolutionRestore,
+      viewerDisplay: value.viewerDisplay,
+      viewerDisplayRestore: value.viewerDisplayRestore,
+      cursorOverlay: value.cursorOverlay,
+      hostMute: value.hostMute,
+      lockOnExit: value.lockOnExit,
+      clipboardSync: value.clipboardSync,
+      clipboardInline: value.clipboardInline,
+      privacyScreen: value.privacyScreen,
+      nativeCredentials: value.nativeCredentials,
+      workspaceNavigation: value.workspaceNavigation,
+      systemMenu: value.systemMenu
     });
   }
 
@@ -375,8 +709,17 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     });
   }
 
-  async stop(request: DevicePeerRemoteDesktopLeaseRequest): Promise<void> {
-    await this.#request(request, { op: "stop", lease: request.leaseId });
+  async stop(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly lockScreen?: boolean;
+    readonly controlGeneration?: bigint;
+  }): Promise<void> {
+    if (request.lockScreen && (request.controlGeneration === undefined || request.controlGeneration < 1n
+      || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER))) {
+      throw failure(RemoteDesktopFailureReason.LOCK_EXPIRED, false);
+    }
+    await this.#request(request, request.lockScreen ? {
+      op: "stop", lease: request.leaseId, lockScreen: true, controlGeneration: Number(request.controlGeneration)
+    } : { op: "stop", lease: request.leaseId });
   }
 
   async setControl(request: DevicePeerRemoteDesktopLeaseRequest & { readonly enabled: boolean }) {
@@ -390,6 +733,85 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       controlling: value.controlling,
       controlGeneration: BigInt(value.controlGeneration)
     });
+  }
+
+  async setHostMute(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+    readonly enabled: boolean;
+  }) {
+    if (request.controlGeneration < 1n
+      || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw failure(RemoteDesktopFailureReason.HOST_MUTE_EXPIRED, false);
+    }
+    const value = await this.#request(request, {
+      op: "hostMute",
+      lease: request.leaseId,
+      controlGeneration: Number(request.controlGeneration),
+      enabled: request.enabled
+    }) as { readonly enabled: boolean };
+    return create(RemoteDesktopHostMuteResultSchema, { enabled: value.enabled });
+  }
+
+  async setPrivacyScreen(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint; readonly enabled: boolean; readonly lockOnExit: boolean;
+  }) {
+    if (!exactGeneration(request.controlGeneration)) throw failure(RemoteDesktopFailureReason.PRIVACY_EXPIRED, false);
+    const value = await this.#request(request, { op: "privacyScreen", lease: request.leaseId,
+      controlGeneration: Number(request.controlGeneration), enabled: request.enabled, lockOnExit: request.lockOnExit }) as { enabled: boolean };
+    return create(RemoteDesktopPrivacyScreenResultSchema, value);
+  }
+
+  async performSystemAction(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint; readonly action: RemoteDesktopSystemActionKind;
+  }) {
+    if (!exactGeneration(request.controlGeneration)) {
+      throw failure(RemoteDesktopFailureReason.SYSTEM_ACTION_EXPIRED, false);
+    }
+    const action = request.action === RemoteDesktopSystemActionKind.WORKSPACE_LEFT ? "workspaceLeft"
+      : request.action === RemoteDesktopSystemActionKind.WORKSPACE_RIGHT ? "workspaceRight"
+      : request.action === RemoteDesktopSystemActionKind.SYSTEM_MENU ? "systemMenu" : undefined;
+    if (action === undefined) throw failure(RemoteDesktopFailureReason.SYSTEM_ACTION_UNAVAILABLE, false);
+    const value = await this.#request(request, { op: "systemAction", lease: request.leaseId,
+      controlGeneration: Number(request.controlGeneration), action }) as { readonly action: RemoteDesktopSystemAction };
+    const result = value.action === "workspaceLeft" ? RemoteDesktopSystemActionKind.WORKSPACE_LEFT
+      : value.action === "workspaceRight" ? RemoteDesktopSystemActionKind.WORKSPACE_RIGHT
+      : value.action === "systemMenu" ? RemoteDesktopSystemActionKind.SYSTEM_MENU : undefined;
+    if (result === undefined) throw failure(RemoteDesktopFailureReason.SYSTEM_ACTION_UNAVAILABLE, false);
+    return create(RemoteDesktopSystemActionResultSchema, { action: result });
+  }
+
+  async setClipboardSync(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint; readonly enabled: boolean;
+  }) {
+    if (!exactGeneration(request.controlGeneration)) throw failure(RemoteDesktopFailureReason.CLIPBOARD_EXPIRED, false);
+    const value = await this.#request(request, { op: "clipboardSync", lease: request.leaseId,
+      controlGeneration: Number(request.controlGeneration), enabled: request.enabled }) as { enabled: boolean; syncGeneration: number };
+    return create(RemoteDesktopClipboardSyncResultSchema, { enabled: value.enabled, syncGeneration: BigInt(value.syncGeneration) });
+  }
+
+  async getClipboardVersion(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint; readonly syncGeneration: bigint;
+  }) {
+    if (!exactGeneration(request.controlGeneration) || !exactGeneration(request.syncGeneration)) {
+      throw failure(RemoteDesktopFailureReason.CLIPBOARD_EXPIRED, false);
+    }
+    const value = await this.#request(request, { op: "clipboardVersion", lease: request.leaseId,
+      controlGeneration: Number(request.controlGeneration), syncGeneration: Number(request.syncGeneration) }) as { version: string };
+    return create(RemoteDesktopClipboardVersionResultSchema, value);
+  }
+
+  isClipboardSyncCurrent(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint; readonly syncGeneration: bigint;
+  }): boolean {
+    return !this.#retired && !request.signal.aborted && exactGeneration(request.controlGeneration)
+      && exactGeneration(request.syncGeneration) && this.#controller.isClipboardSyncCurrent(
+        this.#authority(request.controllerDeviceId), request.leaseId,
+        Number(request.controlGeneration), Number(request.syncGeneration));
+  }
+
+  onClipboardAuthorityChanged(listener: () => void): () => void {
+    this.#clipboardAuthorityListeners.add(listener);
+    return () => { this.#clipboardAuthorityListeners.delete(listener); };
   }
 
   async setPresentation(
@@ -552,17 +974,50 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   async setDisplayMode(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
     readonly modeId: string;
-  }): Promise<void> {
+    readonly temporary: boolean;
+  }) {
     if (request.controlGeneration < 1n
       || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw failure(RemoteDesktopFailureReason.LEASE_EXPIRED, false);
     }
-    await this.#request(request, {
+    const value = await this.#request(request, {
       op: "resolution",
       lease: request.leaseId,
       controlGeneration: Number(request.controlGeneration),
-      modeId: request.modeId
+      modeId: request.modeId,
+      temporary: request.temporary
+    }) as { readonly lease?: import("@joko/device-peer").RemoteDesktopLease };
+    return create(RemoteDesktopDisplayModeResultSchema, value.lease === undefined ? {} : {
+      lease: create(RemoteDesktopLeaseSchema, {
+        leaseId: value.lease.lease,
+        display: create(RemoteDesktopDisplaySchema, { displayId: value.lease.display.id,
+          name: value.lease.display.name, width: value.lease.display.width, height: value.lease.display.height }),
+        controlling: value.lease.controlling,
+        controlGeneration: BigInt(value.lease.controlGeneration)
+      })
     });
+  }
+
+  async setViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint; readonly width: number; readonly height: number;
+  }) { return this.#viewerDisplayRequest(request, { op: "viewerDisplay", width: request.width, height: request.height }); }
+
+  async restoreViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
+    readonly controlGeneration: bigint;
+  }) { return this.#viewerDisplayRequest(request, { op: "restoreViewerDisplay" }); }
+
+  async #viewerDisplayRequest(request: DevicePeerRemoteDesktopLeaseRequest & { readonly controlGeneration: bigint },
+    operation: { readonly op: "viewerDisplay"; readonly width: number; readonly height: number } | { readonly op: "restoreViewerDisplay" }) {
+    if (request.controlGeneration < 1n || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
+      throw failure(RemoteDesktopFailureReason.LEASE_EXPIRED, false);
+    }
+    const value = await this.#request(request, { ...operation, lease: request.leaseId,
+      controlGeneration: Number(request.controlGeneration) }) as { readonly lease: import("@joko/device-peer").RemoteDesktopLease };
+    return create(RemoteDesktopViewerDisplayResultSchema, { lease: create(RemoteDesktopLeaseSchema, {
+      leaseId: value.lease.lease, display: create(RemoteDesktopDisplaySchema, { displayId: value.lease.display.id,
+        name: value.lease.display.name, width: value.lease.display.width, height: value.lease.display.height }),
+      controlling: value.lease.controlling, controlGeneration: BigInt(value.lease.controlGeneration)
+    }) });
   }
 
   isControlCurrent(request: DevicePeerRemoteDesktopLeaseRequest & {
@@ -597,16 +1052,19 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
 
   async copyClipboardContent(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
+    readonly sync?: boolean; readonly syncGeneration?: bigint; readonly version?: string;
   }): Promise<RemoteDesktopClipboardContent> {
     const value = await this.#clipboardRequest(request, (clipboard, current) =>
-      clipboard.copyContent(current, request.signal));
+      request.sync ? clipboard.readSystemContent(current, request.signal, request.version)
+        : clipboard.copyContent(current, request.signal));
     return create(RemoteDesktopClipboardContentSchema, value);
   }
 
   async pasteClipboardContent(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
     readonly content: RemoteDesktopClipboardContent;
-  }): Promise<void> {
+    readonly sync?: boolean; readonly syncGeneration?: bigint; readonly version?: string;
+  }): Promise<string | void> {
     const content: DesktopRemoteDesktopClipboardContent = Object.freeze({
       ...(request.content.text === undefined ? {} : { text: request.content.text }),
       ...(request.content.html === undefined ? {} : { html: request.content.html }),
@@ -614,23 +1072,41 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       ...(request.content.url === undefined ? {} : { url: request.content.url }),
       ...(request.content.png === undefined ? {} : { png: request.content.png })
     });
-    await this.#clipboardRequest(request, (clipboard, current) =>
-      clipboard.pasteContent(content, current, request.signal));
+    return this.#clipboardRequest<string | void>(request, (clipboard, current) =>
+      request.sync ? clipboard.writeSystemContent(content, request.version!, current, request.signal)
+        : clipboard.pasteContent(content, current, request.signal));
   }
 
-  async retire(): Promise<void> {
-    if (this.#retired) return;
-    this.#retired = true;
-    clearInterval(this.#timer);
-    this.#stopInputHandler();
-    this.#stopPresentationPongHandler();
-    for (const stop of this.#stopSubscriptions) stop();
-    this.#controller.stop();
-    await Promise.allSettled([
-      this.#dependencies.input.retire(),
-      this.#dependencies.media.retire()
+  retire(): Promise<void> {
+    if (this.#retirement !== undefined) return this.#retirement;
+    if (!this.#retired) {
+      this.#retired = true;
+      clearInterval(this.#timer);
+      this.#stopInputHandler();
+      this.#stopPresentationPongHandler();
+      for (const stop of this.#stopSubscriptions) stop();
+    }
+    const pending = this.#finishRetire();
+    this.#retirement = pending;
+    void pending.finally(() => { if (this.#retirement === pending) this.#retirement = undefined; }).catch(() => undefined);
+    return pending;
+  }
+
+  async #finishRetire(): Promise<void> {
+    const results = await Promise.allSettled([
+      this.#controller.stopAndRestore(),
+      this.#dependencies.input.release().then(() => this.#dependencies.input.retire()),
+      this.#dependencies.media.retire(),
+      this.#credentials?.retire()
     ]);
-    this.#dependencies.retired?.();
+    if (results[0]?.status === "rejected") throw translateFailure(results[0].reason);
+    if (results[1]?.status === "rejected") throw results[1].reason;
+    if (results[2]?.status === "rejected") throw results[2].reason;
+    if (results[3]?.status === "rejected") throw results[3].reason;
+    if (!this.#retirementReported) {
+      this.#retirementReported = true;
+      this.#dependencies.retired?.();
+    }
   }
 
   async #request(
@@ -667,31 +1143,85 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
           && this.#dependencies.displayModes !== undefined
           && this.#dependencies.setDisplayMode !== undefined,
         cursorOverlay: this.#dependencies.platform === "darwin",
+        hostMute: this.#dependencies.hostMute !== undefined,
+        lockOnExit: this.#dependencies.platform === "darwin" && this.#dependencies.lockScreen !== undefined,
+        clipboardSync: false,
+        clipboardInline: false,
+        privacyScreen: false,
+        nativeCredentials: this.#dependencies.platform === "darwin" && this.#credentials !== undefined,
+        resolutionRestore: this.#dependencies.platform === "darwin"
+          && this.#dependencies.displayModes !== undefined && this.#dependencies.setDisplayMode !== undefined
+          && this.#dependencies.restoreDisplayMode !== undefined,
+        viewerDisplay: false,
+        viewerDisplayRestore: false,
+        workspaceNavigation: false,
+        systemMenu: false,
         platform: this.#dependencies.platform,
         displays: Object.freeze([]),
         permissions: disabledPermissions(this.#dependencies.platform)
       });
     }
     await this.#refreshSessionState();
-    const generation = this.#requireSessionViewable();
+    // A trusted Linux locker may be unlocked before capture. Metadata never grants pixels or input.
+    const credentialOnly = this.#dependencies.platform === "linux" && this.#sessionState === "unsupported"
+      && this.#credentials !== undefined && await this.#dependencies.credentials!.lockState!(this.#signal()) === "locked";
+    const generation = credentialOnly ? this.#sessionGeneration : this.#requireSessionViewable();
+    const validate = async (): Promise<void> => {
+      if (credentialOnly) {
+        const locked = await this.#dependencies.credentials!.lockState!(this.#signal());
+        if (this.#retired || !this.#dependencies.enabled() || this.#sessionState !== "unsupported"
+          || generation !== this.#sessionGeneration
+          || locked !== "locked") staleHostOperation();
+      } else if (this.#validateSessionCompletion(generation) === "stale") staleHostOperation();
+    };
     const permissions = await this.#dependencies.permissions(this.#signal());
     await this.#refreshSessionState();
-    if (this.#validateSessionCompletion(generation) === "stale") staleHostOperation();
-    const displays = this.#dependencies.displays();
-    if (this.#validateSessionCompletion(generation) === "stale") staleHostOperation();
+    await validate();
+    const displays = await this.#dependencies.displays(this.#signal());
+    const linux = this.#dependencies.platform === "linux"
+      ? await this.#dependencies.linuxCapabilities?.(this.#signal()) : undefined;
+    const windows = this.#dependencies.platform === "win32"
+      ? await this.#dependencies.windowsCapabilities?.(this.#signal()) : undefined;
+    const viewerDisplay = this.#dependencies.platform === "darwin" && this.#dependencies.createViewerDisplay !== undefined
+      ? await this.#dependencies.viewerDisplaySupported?.(this.#signal()) === true : linux?.viewerDisplay === true;
+    const nativeCredentials = this.#credentials !== undefined && (this.#dependencies.platform !== "linux"
+      || await this.#dependencies.credentials!.lockState!(this.#signal()) !== "unavailable");
+    await this.#refreshSessionState();
+    await validate();
     return Object.freeze({
       version: 1,
       enabled: true,
-      canControl: this.#sessionState === "unlocked" && this.#dependencies.platform !== "linux",
+      canControl: (this.#sessionState === "unlocked" && (this.#dependencies.platform !== "linux" || linux?.canControl === true))
+        || this.#sessionState === "locked-logged-in" && windows?.canControl === true,
       clipboardText: this.#sessionState === "unlocked" && this.#dependencies.clipboard !== undefined,
       clipboardContent: this.#sessionState === "unlocked" && this.#dependencies.clipboard !== undefined,
       videoSettings: true,
       systemAudio: this.#dependencies.systemAudio,
       backgroundViewing: true,
-      displayModes: this.#dependencies.platform === "darwin"
+      displayModes: (this.#dependencies.platform === "darwin" || linux?.displayModes === true)
         && this.#dependencies.displayModes !== undefined
         && this.#dependencies.setDisplayMode !== undefined,
-      cursorOverlay: this.#dependencies.platform === "darwin",
+      cursorOverlay: this.#dependencies.platform === "darwin" || linux?.cursorOverlay === true || windows?.cursorOverlay === true,
+      hostMute: this.#sessionState === "unlocked" && this.#dependencies.hostMute !== undefined,
+      lockOnExit: (this.#dependencies.platform === "darwin" || linux?.lockOnExit === true)
+        && this.#dependencies.lockScreen !== undefined
+        && (this.#dependencies.platform !== "linux" || this.#dependencies.lockSessionState !== undefined),
+      clipboardSync: this.#sessionState === "unlocked" && this.#dependencies.clipboard !== undefined
+        && this.#dependencies.clipboardCounter !== undefined,
+      privacyScreen: this.#sessionState === "unlocked" && this.#dependencies.privacyScreen !== undefined
+        && (this.#dependencies.platform !== "linux" || linux?.privacyScreen === true),
+      nativeCredentials,
+      resolutionRestore: (this.#dependencies.platform === "darwin" || linux?.displayModes === true)
+        && this.#dependencies.displayModes !== undefined && this.#dependencies.setDisplayMode !== undefined
+        && this.#dependencies.restoreDisplayMode !== undefined,
+      viewerDisplay: viewerDisplay && this.#dependencies.createViewerDisplay !== undefined,
+      viewerDisplayRestore: viewerDisplay && this.#dependencies.createViewerDisplay !== undefined,
+      workspaceNavigation: this.#sessionState === "unlocked" && linux?.workspaceNavigation === true
+        && this.#dependencies.workspaceAction !== undefined && this.#dependencies.stopWorkspaceActions !== undefined,
+      systemMenu: this.#sessionState === "unlocked" && linux?.workspaceNavigation === true && linux.systemMenu === true
+        && this.#dependencies.workspaceAction !== undefined && this.#dependencies.stopWorkspaceActions !== undefined,
+      clipboardInline: this.#sessionState === "unlocked" && this.#dependencies.clipboard !== undefined
+        && this.#dependencies.clipboardCounter !== undefined,
       platform: this.#dependencies.platform,
       displays,
       permissions
@@ -702,8 +1232,15 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     if (!this.#dependencies.enabled()) throw new Error("REMOTE_DESKTOP_DISABLED");
   }
 
+  #requireCredentialAuthority(request: DevicePeerRemoteDesktopHostRequest): void {
+    throwIfAborted(request.signal);
+    if (this.#retired || !validControllerId(request.controllerDeviceId)) throw failure(RemoteDesktopFailureReason.AUTHORITY_CHANGED, false);
+    if (!this.#dependencies.enabled()) throw failure(RemoteDesktopFailureReason.DISABLED, false);
+  }
+
   async #clipboardRequest<T>(
-    request: DevicePeerRemoteDesktopLeaseRequest & { readonly controlGeneration: bigint },
+    request: DevicePeerRemoteDesktopLeaseRequest & { readonly controlGeneration: bigint;
+      readonly sync?: boolean; readonly syncGeneration?: bigint },
     operation: (
       clipboard: DesktopRemoteDesktopClipboardPort,
       current: () => boolean
@@ -721,20 +1258,27 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     }
     const generation = Number(request.controlGeneration);
     const authority = this.#authority(request.controllerDeviceId);
-    const current = (): boolean => this.#controller.isControlCurrent(
-      authority,
-      request.leaseId,
-      generation
-    );
+    if (this.#dependencies.platform === "linux") await this.#refreshSessionState();
+    const sessionGeneration = this.#sessionGeneration;
+    const current = (): boolean => !request.signal.aborted && this.#sessionState === "unlocked"
+      && this.#sessionGeneration === sessionGeneration && this.#sessionTransitionGeneration === undefined && (request.sync
+      ? request.syncGeneration !== undefined && exactGeneration(request.syncGeneration)
+        && this.#controller.isClipboardSyncCurrent(authority, request.leaseId, generation, Number(request.syncGeneration))
+      : this.#controller.isControlCurrent(authority, request.leaseId, generation));
     if (!current()) throw failure(RemoteDesktopFailureReason.CLIPBOARD_EXPIRED, false);
     try {
       return await this.#signals.run(request.signal, async () => {
         const value = await operation(clipboard, current);
+        if (this.#dependencies.platform === "linux") await this.#refreshSessionState();
         throwIfAborted(request.signal);
         if (!current()) throw new Error("REMOTE_DESKTOP_CLIPBOARD_EXPIRED");
         return value;
       });
     } catch (error) {
+      if (error instanceof Error && error.message === "REMOTE_DESKTOP_CLIPBOARD_OUTCOME_UNKNOWN"
+        && "outcomeUnknown" in error && error.outcomeUnknown === true) {
+        throw new DevicePeerRemoteDesktopHostError(RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, false, true);
+      }
       if (request.signal.aborted) throw request.signal.reason;
       throw translateFailure(error);
     }
@@ -744,25 +1288,48 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     operation: (sessionGeneration: number) => Promise<T>,
     stale: () => T
   ): Promise<T> {
+    if (this.#dependencies.platform === "linux") await this.#refreshSessionState();
     if (this.#sessionTransitionGeneration !== undefined) return stale();
     const generation = this.#requireSessionViewable();
     try {
       const value = await operation(generation);
+      if (this.#dependencies.platform === "linux") await this.#refreshSessionState();
       if (this.#validateSessionCompletion(generation) === "stale") return stale();
       return value;
     } catch (error) {
+      if (this.#dependencies.platform === "linux") await this.#refreshSessionState();
       if (this.#validateSessionCompletion(generation) === "stale") return stale();
       throw error;
     }
   }
 
+  async #whileSessionControllable<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.#dependencies.platform !== "win32") return this.#whileSessionUnlocked(operation);
+    await this.#refreshSessionState();
+    const generation = this.#requireSessionViewable();
+    const proof = await this.#dependencies.windowsCapabilities?.(this.#signal());
+    if (generation !== this.#sessionGeneration || this.#sessionState !== "unlocked" && proof?.canControl !== true) {
+      throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
+    }
+    const value = await operation();
+    await this.#refreshSessionState();
+    if (generation !== this.#sessionGeneration || !isViewableSession(this.#sessionState)) {
+      this.#dependencies.input.stop();
+      throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
+    }
+    return value;
+  }
+
   async #whileSessionUnlocked<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.#dependencies.platform === "linux") await this.#refreshSessionState();
     const generation = this.#requireSessionUnlocked();
     try {
       const value = await operation();
+      if (this.#dependencies.platform === "linux") await this.#refreshSessionState();
       this.#revalidateSessionUnlocked(generation);
       return value;
     } catch (error) {
+      if (this.#dependencies.platform === "linux") await this.#refreshSessionState();
       this.#revalidateSessionUnlocked(generation);
       throw error;
     }
@@ -770,7 +1337,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
 
   #requireSessionViewable(): number {
     if (!isViewableSession(this.#sessionState)) {
-      if (this.#controller.state !== undefined) this.#controller.stop();
+      this.#stopUnviewableSession();
       throw new Error("REMOTE_DESKTOP_LOCKED_SESSION_UNSUPPORTED");
     }
     return this.#sessionGeneration;
@@ -782,7 +1349,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       return "stale";
     }
     if (!isViewableSession(this.#sessionState)) {
-      if (this.#controller.state !== undefined) this.#controller.stop();
+      this.#stopUnviewableSession();
       throw new Error("REMOTE_DESKTOP_LOCKED_SESSION_UNSUPPORTED");
     }
     return "current";
@@ -816,7 +1383,9 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     // Fence control/clipboard and clear all old pixels/native cursor state
     // before the asynchronous native session probe begins.
     this.#controller.releaseControl();
-    this.#dependencies.media.setSessionState(false);
+    if (this.#dependencies.platform === "linux" && this.#dependencies.systemAudio) {
+      this.#dependencies.media.setSessionState(false, "unknown");
+    } else this.#dependencies.media.setSessionState(false);
     void this.#probeSessionState(generation, NEVER_ABORTED);
   }
 
@@ -836,7 +1405,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       this.#sessionTransitionGeneration = undefined;
     }
     if (state === this.#sessionState) {
-      if (!isViewableSession(state) && this.#controller.state !== undefined) this.#controller.stop();
+      if (!isViewableSession(state)) this.#stopUnviewableSession();
       return;
     }
     // A change discovered by the fresh probe is fenced before any subsequent
@@ -844,10 +1413,19 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     this.#sessionGeneration += 1;
     this.#sessionState = state;
     this.#controller.releaseControl();
-    this.#dependencies.media.setSessionState(state === "locked-logged-in");
+    if (this.#dependencies.platform === "linux" && this.#dependencies.systemAudio) {
+      this.#dependencies.media.setSessionState(state === "locked-logged-in", state);
+    } else this.#dependencies.media.setSessionState(state === "locked-logged-in");
     if (!isViewableSession(state) && this.#controller.state !== undefined) {
-      this.#controller.stop();
+      this.#stopUnviewableSession();
     }
+  }
+
+  #stopUnviewableSession(): void {
+    // A Linux lock ending owns its independent raw session proof. Preserve only
+    // that captured terminal occurrence; ordinary pixels and input still fail.
+    if (this.#terminalLockCurrent?.() === true) return;
+    if (this.#controller.state !== undefined) this.#controller.stop();
   }
 
   #signal(): AbortSignal {
@@ -872,6 +1450,10 @@ function desktopVideoQualityFromContract(
 
 function isViewableSession(state: DesktopRemoteDesktopSessionState): boolean {
   return state === "unlocked" || state === "locked-logged-in";
+}
+
+function exactGeneration(value: bigint): boolean {
+  return typeof value === "bigint" && value > 0n && value <= BigInt(Number.MAX_SAFE_INTEGER);
 }
 
 function staleVideoOperation(): never {
@@ -968,6 +1550,7 @@ function translateFailure(error: unknown): unknown {
     case "REMOTE_DESKTOP_VIDEO_BUSY": return failure(RemoteDesktopFailureReason.VIDEO_BUSY, true);
     case "REMOTE_DESKTOP_VIDEO_TIMEOUT": return failure(RemoteDesktopFailureReason.VIDEO_TIMEOUT, true);
     case "REMOTE_DESKTOP_VIDEO_UNAVAILABLE": return failure(RemoteDesktopFailureReason.VIDEO_UNAVAILABLE, true);
+    case "REMOTE_DESKTOP_CAPTURE_PENDING": return failure(RemoteDesktopFailureReason.CAPTURE_PENDING, true);
     case "REMOTE_DESKTOP_AUDIO_UNAVAILABLE": return failure(RemoteDesktopFailureReason.AUDIO_UNAVAILABLE, true);
     case "REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE":
       return failure(RemoteDesktopFailureReason.DISPLAY_MODES_UNAVAILABLE, false);
@@ -977,6 +1560,8 @@ function translateFailure(error: unknown): unknown {
       return failure(RemoteDesktopFailureReason.DISPLAY_BUSY, true);
     case "REMOTE_DESKTOP_ACCESS_REVOKED":
       return failure(RemoteDesktopFailureReason.AUTHORITY_CHANGED, false);
+    case "REMOTE_DESKTOP_AUTHENTICATION_REQUIRED":
+      return failure(RemoteDesktopFailureReason.AUTHENTICATION_REQUIRED, false);
     case "REMOTE_DESKTOP_INPUT_UNSUPPORTED":
       return failure(RemoteDesktopFailureReason.UNSUPPORTED, false);
     case "REMOTE_DESKTOP_LOCKED_SESSION_UNSUPPORTED":
@@ -985,8 +1570,14 @@ function translateFailure(error: unknown): unknown {
     case "REMOTE_DESKTOP_CLIPBOARD_COPY_FAILED":
     case "REMOTE_DESKTOP_CLIPBOARD_WRITE_FAILED":
       return failure(RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, true);
+    case "REMOTE_DESKTOP_PRIVACY_UNAVAILABLE":
+      return failure(RemoteDesktopFailureReason.PRIVACY_UNAVAILABLE, false);
+    case "REMOTE_DESKTOP_PRIVACY_FAILED":
+      return failure(RemoteDesktopFailureReason.PRIVACY_FAILED, false);
+    case "REMOTE_DESKTOP_PRIVACY_EXPIRED":
+      return failure(RemoteDesktopFailureReason.PRIVACY_EXPIRED, false);
     case "REMOTE_DESKTOP_CLIPBOARD_CHANGED":
-      return failure(RemoteDesktopFailureReason.CLIPBOARD_UNAVAILABLE, true);
+      return failure(RemoteDesktopFailureReason.CLIPBOARD_CHANGED, false);
     case "REMOTE_DESKTOP_CLIPBOARD_EMPTY":
       return failure(RemoteDesktopFailureReason.CLIPBOARD_EMPTY, false);
     case "REMOTE_DESKTOP_CLIPBOARD_TOO_LARGE":
@@ -995,6 +1586,22 @@ function translateFailure(error: unknown): unknown {
       return failure(RemoteDesktopFailureReason.CLIPBOARD_UNSUPPORTED, false);
     case "REMOTE_DESKTOP_CLIPBOARD_EXPIRED":
       return failure(RemoteDesktopFailureReason.CLIPBOARD_EXPIRED, false);
+    case "REMOTE_DESKTOP_HOST_MUTE_UNAVAILABLE":
+      return failure(RemoteDesktopFailureReason.HOST_MUTE_UNAVAILABLE, true);
+    case "REMOTE_DESKTOP_HOST_MUTE_EXPIRED":
+      return failure(RemoteDesktopFailureReason.HOST_MUTE_EXPIRED, false);
+    case "REMOTE_DESKTOP_SYSTEM_ACTION_UNAVAILABLE":
+      return failure(RemoteDesktopFailureReason.SYSTEM_ACTION_UNAVAILABLE, true);
+    case "REMOTE_DESKTOP_SYSTEM_ACTION_EXPIRED":
+      return failure(RemoteDesktopFailureReason.SYSTEM_ACTION_EXPIRED, false);
+    case "REMOTE_DESKTOP_LOCK_UNAVAILABLE":
+      return failure(RemoteDesktopFailureReason.LOCK_UNAVAILABLE, false);
+    case "REMOTE_DESKTOP_LOCK_FAILED":
+      return failure(RemoteDesktopFailureReason.LOCK_FAILED, false);
+    case "REMOTE_DESKTOP_LOCK_EXPIRED":
+      return failure(RemoteDesktopFailureReason.LOCK_EXPIRED, false);
+    case "REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE":
+      return failure(RemoteDesktopFailureReason.DISPLAY_RESTORE_UNAVAILABLE, false);
     default: return error;
   }
 }

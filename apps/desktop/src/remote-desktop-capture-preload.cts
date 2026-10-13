@@ -17,6 +17,7 @@ const CHANNELS = Object.freeze({
   reply: "joko:remote-desktop-capture:reply",
   input: "joko:remote-desktop-capture:input",
   nativeFrame: "joko:remote-desktop-capture:native-frame",
+  nativeAudio: "joko:remote-desktop-capture:native-audio",
   presentationPong: "joko:remote-desktop-capture:presentation-pong",
   stopped: "joko:remote-desktop-capture:stopped"
 });
@@ -34,12 +35,188 @@ let presentationChallenge: string | undefined;
 let inputChannel: RTCDataChannel | undefined;
 let exchanging = false;
 let native: Awaited<ReturnType<typeof nativeCaptureStream>> | undefined;
+let nativeGeneration = 0;
+let sourceRevision = 0;
+let switchNativeSource: ((revision: number) => Promise<void>) | undefined;
 let recoverCapture: (() => void) | undefined;
 let latestCursor: DesktopRemoteDesktopCursor | null | undefined;
 let cursorTimer: ReturnType<typeof setInterval> | undefined;
+let audio: Awaited<ReturnType<typeof nativeAudioStream>> | undefined;
+let audioAbort: AbortController | undefined;
+let audioDesired: { readonly revision: number; readonly enabled: boolean } | undefined;
+let resetAudio: (() => void) | undefined;
+
+/** Output-monitor PCM enters the existing RTC stream and never the host speakers. */
+async function nativeAudioStream(
+  read: () => Promise<Uint8Array>, current: () => boolean, signal: AbortSignal
+): Promise<{ readonly track: MediaStreamTrack; stop(): void }> {
+  const context = new AudioContext({ sampleRate: 48_000, latencyHint: "interactive" });
+  const destination = context.createMediaStreamDestination();
+  const sources = new Set<AudioBufferSourceNode>();
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let next = 0;
+  const stopAudio = (): void => {
+    if (stopped) return;
+    stopped = true;
+    clearTimeout(timer);
+    signal.removeEventListener("abort", stopAudio);
+    for (const source of sources) source.stop();
+    sources.clear();
+    destination.stream.getTracks().forEach(track => { track.onended = null; track.stop(); });
+    void context.close().catch(() => undefined);
+  };
+  signal.addEventListener("abort", stopAudio, { once: true });
+  const poll = async (): Promise<void> => {
+    if (stopped || signal.aborted || !current()) return stopAudio();
+    try {
+      const bytes = await read();
+      if (stopped || signal.aborted || !current()) return stopAudio();
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength > 38_400 || bytes.byteLength % 8 !== 0) throw new Error("audio-unavailable");
+      if (bytes.length > 0) {
+        const frames = bytes.byteLength / 8;
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        const buffer = context.createBuffer(2, frames, 48_000);
+        for (let channel = 0; channel < 2; channel += 1) {
+          const output = buffer.getChannelData(channel);
+          for (let frame = 0; frame < frames; frame += 1) {
+            const value = view.getFloat32(frame * 8 + channel * 4, true);
+            output[frame] = Number.isFinite(value) ? Math.max(-1, Math.min(1, value)) : 0;
+          }
+        }
+        if (next > context.currentTime + 0.15) {
+          for (const source of sources) source.stop();
+          sources.clear(); next = 0;
+        }
+        next = Math.max(context.currentTime + 0.02, next);
+        const source = context.createBufferSource();
+        source.buffer = buffer; source.connect(destination);
+        source.onended = () => { sources.delete(source); source.disconnect(); };
+        sources.add(source); source.start(next);
+        next += frames / 48_000;
+      }
+      timer = setTimeout(() => { void poll(); }, 20);
+    } catch { stopAudio(); }
+  };
+  try {
+    if (signal.aborted) throw new Error("audio-unavailable");
+    await context.resume();
+    await poll();
+    if (stopped || !current()) throw new Error("audio-unavailable");
+    const track = destination.stream.getAudioTracks()[0];
+    if (track === undefined) throw new Error("audio-unavailable");
+    return { track, stop: stopAudio };
+  } catch {
+    stopAudio(); throw new Error("audio-unavailable");
+  }
+}
+
+/** The original consent stream belongs to the lease; RTC owns only clones. */
+class PortalCaptureStream {
+  #lease: string | undefined;
+  #pending: Promise<MediaStream> | undefined;
+  #stream: MediaStream | undefined;
+  #video: HTMLVideoElement | undefined;
+  #error: Error | undefined;
+  #timer: ReturnType<typeof setTimeout> | undefined;
+  #generation = 0;
+
+  prepare(lease: string): void {
+    if (this.#lease === lease) return;
+    this.stop();
+    this.#lease = lease;
+    const current = this.#generation;
+    const ended = (): void => {
+      if (current !== this.#generation) return;
+      this.stop();
+      void ipcRenderer.invoke(CHANNELS.stopped, lease).catch(() => undefined);
+    };
+    this.#timer = setTimeout(ended, 120_000);
+    this.#pending = navigator.mediaDevices.getDisplayMedia({ audio: false,
+      video: { frameRate: { ideal: 30, max: 60 } } }).then((value) => {
+      if (current !== this.#generation) {
+        value.getTracks().forEach(track => track.stop());
+        throw new Error("stopped");
+      }
+      clearTimeout(this.#timer);
+      this.#timer = undefined;
+      this.#stream = value;
+      const track = value.getVideoTracks()[0];
+      if (track === undefined) {
+        value.getTracks().forEach(item => item.stop());
+        throw new Error("unavailable");
+      }
+      track.addEventListener("ended", ended, { once: true });
+      const video = document.createElement("video");
+      video.muted = true;
+      video.srcObject = value;
+      this.#video = video;
+      void video.play().catch(ended);
+      return value;
+    }).catch((error: unknown) => {
+      if (current === this.#generation) {
+        clearTimeout(this.#timer);
+        this.#timer = undefined;
+        this.#error = new Error("unavailable");
+        this.#stream?.getTracks().forEach(track => track.stop());
+        this.#stream = undefined;
+      }
+      throw error;
+    });
+    void this.#pending.catch(() => undefined);
+  }
+
+  async capture(lease: string): Promise<MediaStream> {
+    if (this.#lease !== lease || this.#pending === undefined) throw new Error("stopped");
+    const current = this.#generation;
+    const value = await this.#pending;
+    if (current !== this.#generation || this.#error !== undefined || !value.active) throw new Error("stopped");
+    return value.clone();
+  }
+
+  frame(lease: string): Extract<DesktopRemoteDesktopCaptureReply, { kind: "frame" }>["frame"] {
+    if (this.#lease !== lease || this.#pending === undefined) throw new Error("stopped");
+    if (this.#error !== undefined) throw this.#error;
+    const video = this.#video;
+    const track = this.#stream?.getVideoTracks()[0];
+    if (video === undefined || track === undefined || track.muted || track.readyState !== "live"
+      || video.readyState < 2 || video.videoWidth < 1 || video.videoHeight < 1) return null;
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (context === null) return null;
+    let scale = Math.min(1, 1280 / Math.max(video.videoWidth, video.videoHeight));
+    for (let index = 0; index < 4; index += 1) {
+      canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+      canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const jpeg = canvas.toDataURL("image/jpeg", 0.55).slice("data:image/jpeg;base64,".length);
+      if (jpeg.length > 0 && jpeg.length <= 180_000) return { jpeg, width: canvas.width, height: canvas.height };
+      scale *= 0.75;
+    }
+    return null;
+  }
+
+  stop(): void {
+    this.#generation += 1;
+    clearTimeout(this.#timer);
+    this.#timer = undefined;
+    this.#stream?.getTracks().forEach(track => track.stop());
+    this.#stream = undefined;
+    this.#pending = undefined;
+    this.#error = undefined;
+    this.#lease = undefined;
+    this.#video?.pause();
+    if (this.#video !== undefined) this.#video.srcObject = null;
+    this.#video = undefined;
+  }
+}
+
+const portal = new PortalCaptureStream();
+window.addEventListener("unload", () => portal.stop(), { once: true });
 
 function stop(): void {
   generation += 1;
+  nativeGeneration += 1;
   exchanging = false;
   clearTimeout(disconnectedTimer);
   clearInterval(presentationTimer);
@@ -53,7 +230,14 @@ function stop(): void {
   latestCursor = undefined;
   native?.stop();
   native = undefined;
+  audioAbort?.abort();
+  audioAbort = undefined;
+  audio?.stop();
+  audio = undefined;
+  audioDesired = undefined;
+  resetAudio = undefined;
   recoverCapture = undefined;
+  switchNativeSource = undefined;
   attempt = undefined;
   candidates = [];
   remoteCandidates = new Set();
@@ -63,8 +247,26 @@ function stop(): void {
   stream = undefined;
 }
 
+function retireNativeStream(value: MediaStream): void {
+  const capture = native;
+  if (capture?.stream !== value) return;
+  capture.stop();
+  if (native === capture) native = undefined;
+}
+
 ipcRenderer.on(CHANNELS.command, (_event: IpcRendererEvent, raw: unknown) => {
   const command = raw as DesktopRemoteDesktopCaptureCommand;
+  if (command?.op === "preparePortal") {
+    portal.prepare(command.leaseId);
+    return;
+  }
+  if (command?.op === "frame") {
+    let reply: DesktopRemoteDesktopCaptureReply;
+    try { reply = { kind: "frame", frame: portal.frame(command.leaseId) }; }
+    catch (error) { reply = { kind: "error", code: error instanceof Error && error.message === "stopped" ? "stopped" : "unavailable" }; }
+    void ipcRenderer.invoke(CHANNELS.reply, command.id, reply).catch(() => undefined);
+    return;
+  }
   if (command?.op === "stop") {
     stop();
     return;
@@ -77,6 +279,32 @@ ipcRenderer.on(CHANNELS.command, (_event: IpcRendererEvent, raw: unknown) => {
     setPresentation(command);
     return;
   }
+  if (command?.op === "nativeSource") {
+    void replaceNativeSource(command);
+    return;
+  }
+  if (command?.op === "nativeAudio") {
+    if (attempt?.leaseId !== command.leaseId || attempt.attemptId !== command.attemptId
+      || !Number.isSafeInteger(command.audioRevision) || command.audioRevision < 1
+      || typeof command.enabled !== "boolean" || (audioDesired !== undefined && command.audioRevision < audioDesired.revision)) return;
+    audioDesired = { revision: command.audioRevision, enabled: command.enabled };
+    resetAudio?.();
+    return;
+  }
+  if (command?.op === "captureReset") {
+    if (attempt?.leaseId !== command.leaseId || attempt.attemptId !== command.attemptId
+      || !Number.isSafeInteger(command.sourceRevision) || command.sourceRevision < sourceRevision
+      || typeof command.resume !== "boolean") return;
+    nativeGeneration += 1;
+    for (const track of stream?.getVideoTracks() ?? []) { track.onended = null; track.onmute = null; }
+    native?.stop(); native = undefined; latestCursor = null;
+    if (!command.resume) { sourceRevision = command.sourceRevision; return; }
+    const current = generation;
+    void switchNativeSource?.(command.sourceRevision).catch(() => {
+      if (current === generation) latestCursor = null;
+    });
+    return;
+  }
   if (command?.op !== "offer") return;
   void createAnswer(command);
 });
@@ -86,7 +314,13 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
   const current = generation;
   attempt = { leaseId: command.leaseId, attemptId: command.attemptId };
   try {
+    if (!Number.isSafeInteger(command.sourceRevision) || command.sourceRevision < 0) throw new Error("unavailable");
+    sourceRevision = command.sourceRevision;
     const settings = videoSettings(command.settings);
+    if (command.nativeAudio !== undefined && (command.nativeAudio !== true || !settings.audio
+      || !command.nativeCapture || command.portalCapture || command.chromiumCapture
+      || !Number.isSafeInteger(command.audioRevision) || command.audioRevision! < 1)) throw new Error("unavailable");
+    if (command.nativeAudio === true) audioDesired = { revision: command.audioRevision!, enabled: true };
     const profile = videoProfile(command.profile, settings.quality);
     const fps = Math.min(settings.fps, profile.maxFramerate) as 30 | 60;
     let moving = true;
@@ -136,14 +370,19 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       }
     };
     const captureNative = async (): Promise<MediaStream> => {
+      const revision = sourceRevision;
+      const occurrence = ++nativeGeneration;
+      const alive = (): boolean => current === generation && occurrence === nativeGeneration && revision === sourceRevision;
       const result = await nativeCaptureStream(
         () => ipcRenderer.invoke(
           CHANNELS.nativeFrame,
           command.leaseId,
-          command.attemptId
+          command.attemptId,
+          revision
         ) as Promise<DesktopRemoteDesktopCaptureNativeFrame | null>,
-        () => current === generation,
+        alive,
         () => {
+          if (!alive()) return;
           stop();
           void ipcRenderer.invoke(CHANNELS.stopped).catch(() => undefined);
         },
@@ -152,7 +391,7 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
         profile.maxFrameBytes,
         profile.sharpWhenStill ? onMotion : undefined
       );
-      if (current !== generation) {
+      if (!alive()) {
         result.stop();
         throw new Error("stopped");
       }
@@ -160,13 +399,15 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       return result.stream;
     };
     let captured: MediaStream;
-    if (command.nativeVideo) {
+    if (command.portalCapture) {
+      captured = await portal.capture(command.leaseId);
+    } else if (command.nativeVideo) {
       // Chromium exposes no reliable cursor exclusion constraint in this
       // runtime. Native video is always cursor-free; a Chromium stream, when
       // requested, contributes only its loopback audio track.
       let audioSource: MediaStream | undefined;
       try {
-        if (settings.audio) {
+        if (settings.audio && command.nativeAudio !== true) {
           try { audioSource = await boundedCapture(); }
           catch (error) { if (current !== generation) throw error; }
         }
@@ -194,7 +435,7 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       captured.getTracks().forEach((track) => track.stop());
       throw new Error("unavailable");
     }
-    if (settings.audio && captured.getAudioTracks().length === 0) {
+    if (settings.audio && command.nativeAudio !== true && captured.getAudioTracks().length === 0) {
       captured.getTracks().forEach((track) => track.stop());
       throw new Error("audio-unavailable");
     }
@@ -252,7 +493,9 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
           oldTrack.onended = null;
           oldTrack.onmute = null;
           oldTrack.stop();
+          captured.removeTrack(oldTrack);
         });
+        captured.addTrack(track);
       })().catch(() => {
         if (current === generation) {
           stop();
@@ -261,6 +504,48 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       }).finally(() => {
         if (current === generation) recovering = false;
       });
+    };
+    switchNativeSource = async (revision) => {
+      if (!command.nativeCapture || current !== generation || peer !== rtc
+        || revision < sourceRevision) throw new Error("stopped");
+      sourceRevision = revision;
+      const oldNative = native;
+      native = undefined;
+      const previousTracks = captured.getVideoTracks();
+      const previousHandlers = previousTracks.map(track => ({ track, ended: track.onended, muted: track.onmute }));
+      for (const oldTrack of previousTracks) {
+        oldTrack.onended = null;
+        oldTrack.onmute = null;
+      }
+      oldNative?.stop();
+      let replacement: MediaStream | undefined;
+      try { replacement = await captureNative(); }
+      catch (error) {
+        if (current === generation) for (const item of previousHandlers) { item.track.onended = item.ended; item.track.onmute = item.muted; }
+        throw error;
+      }
+      const track = replacement.getVideoTracks()[0];
+      const sender = rtc.getSenders().find(candidate => candidate.track?.kind === "video");
+      if (sender === undefined || track === undefined || current !== generation || sourceRevision !== revision) {
+        retireNativeStream(replacement);
+        replacement.getTracks().forEach(item => item.stop());
+        throw new Error("stopped");
+      }
+      try {
+        track.contentHint = profile.contentHint;
+        await sender.replaceTrack(track);
+        if (current !== generation || sourceRevision !== revision) throw new Error("stopped");
+        for (const oldTrack of previousTracks) {
+          captured.removeTrack(oldTrack);
+          oldTrack.stop();
+        }
+        captured.addTrack(track);
+      } catch (error) {
+        retireNativeStream(replacement);
+        replacement.getTracks().forEach(item => item.stop());
+        if (current === generation) for (const item of previousHandlers) { item.track.onended = item.ended; item.track.onmute = item.muted; }
+        throw error;
+      }
     };
     rtc.ondatachannel = ({ channel }) => {
       if (channel.label !== "input-v1" || channel.ordered !== true) {
@@ -331,6 +616,10 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
     captured.getTracks().forEach((track) => {
       track.onended = () => {
         if (current === generation) {
+          if (track.kind === "audio" && command.nativeAudio === true) {
+            audio?.stop(); audio = undefined;
+            return;
+          }
           if (track.kind === "video" && native === undefined && command.nativeCapture) {
             recoverCapture?.();
           } else {
@@ -344,6 +633,47 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       rtc.addTrack(track, captured);
     });
     await rtc.setRemoteDescription({ type: "offer", sdp: command.offerSdp });
+    if (command.nativeAudio === true) {
+      const transceiver = rtc.getTransceivers().find(value => value.receiver.track.kind === "audio");
+      const sender = transceiver?.sender ?? rtc.getSenders().find(value => value.track?.kind === "audio");
+      if (transceiver !== undefined && sender !== undefined) {
+        transceiver.direction = "sendonly";
+        sender.setStreams(captured);
+      }
+      if (sender !== undefined) {
+        let revision = 0;
+        resetAudio = () => {
+          const occurrence = ++revision;
+          audioAbort?.abort(); audio?.stop(); audio = undefined;
+          const controller = new AbortController(); audioAbort = controller;
+          const desired = audioDesired;
+          const valid = (): boolean => current === generation && occurrence === revision && !controller.signal.aborted
+            && desired === audioDesired && peer === rtc;
+          if (desired?.enabled !== true) {
+            void sender.replaceTrack(null).catch(() => undefined);
+            captured.getAudioTracks().forEach(track => { track.onended = null; captured.removeTrack(track); track.stop(); });
+            return;
+          }
+          void (async () => {
+            let replacement: Awaited<ReturnType<typeof nativeAudioStream>> | undefined;
+            try {
+              replacement = await nativeAudioStream(() => ipcRenderer.invoke(CHANNELS.nativeAudio,
+                command.leaseId, command.attemptId, desired.revision) as Promise<Uint8Array>, valid, controller.signal);
+              if (!valid()) return;
+              await sender.replaceTrack(replacement.track);
+              if (!valid()) return;
+              captured.getAudioTracks().forEach(track => { track.onended = null; captured.removeTrack(track); track.stop(); });
+              captured.addTrack(replacement.track);
+              const installed = replacement;
+              installed.track.onended = () => { if (valid() && audio === installed) { installed.stop(); audio = undefined; } };
+              audio = installed; replacement = undefined;
+            } catch { /* Optional audio leaves the video peer and input channel alive. */ }
+            finally { replacement?.stop(); }
+          })();
+        };
+        resetAudio();
+      }
+    }
     await rtc.setLocalDescription(await rtc.createAnswer());
     if (current !== generation) return;
     for (const sender of rtc.getSenders()) {
@@ -369,6 +699,22 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       : "unavailable";
     stop();
     await reply(command.id, { kind: "error", code }).catch(() => undefined);
+  }
+}
+
+async function replaceNativeSource(
+  command: Extract<DesktopRemoteDesktopCaptureCommand, { readonly op: "nativeSource" }>
+): Promise<void> {
+  const current = generation;
+  try {
+    if (attempt?.leaseId !== command.leaseId || attempt.attemptId !== command.attemptId
+      || !Number.isSafeInteger(command.sourceRevision) || command.sourceRevision < sourceRevision
+      || switchNativeSource === undefined) throw new Error("stopped");
+    await switchNativeSource(command.sourceRevision);
+    if (current !== generation || sourceRevision !== command.sourceRevision) throw new Error("stopped");
+    await reply(command.id, { kind: "nativeSource", sourceRevision: command.sourceRevision });
+  } catch {
+    await reply(command.id, { kind: "error", code: "unavailable" }).catch(() => undefined);
   }
 }
 
@@ -576,7 +922,13 @@ async function nativeCaptureStream(
       bitmap.close();
     }
   };
-  if (!(await draw())) throw new Error("unavailable");
+  const initialDeadline = performance.now() + 3_000;
+  let initialFrame = false;
+  while (!initialFrame && alive() && performance.now() < initialDeadline) {
+    initialFrame = await draw();
+    if (!initialFrame) await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  if (!initialFrame || !alive()) throw new Error("unavailable");
   const captured = canvas.captureStream(fps);
   const stopNative = (): void => {
     if (stopped) return;

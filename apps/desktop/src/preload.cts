@@ -1,3 +1,4 @@
+import type { DesktopRemoteDesktopViewerOwner } from "@joko/contracts";
 import type {
   DesktopAppInfo,
   DesktopAttentionKey,
@@ -229,6 +230,7 @@ const DESKTOP_CHANNELS = {
   managedOrchestratorCompleteLogout: "joko:managed-orchestrator:complete-logout",
   remoteDesktopGetState: "joko:remote-desktop:get-state",
   remoteDesktopSetEnabled: "joko:remote-desktop:set-enabled",
+  remoteDesktopConfigureWindowsSupport: "joko:remote-desktop:configure-windows-support",
   remoteDesktopDisconnect: "joko:remote-desktop:disconnect",
   remoteDesktopGetPermissions: "joko:remote-desktop:get-permissions",
   remoteDesktopShowPermissionGuide: "joko:remote-desktop:show-permission-guide",
@@ -313,6 +315,7 @@ const desktopCapabilities = Object.freeze([
   "runtime.desktopProcessUsage",
   "runtime.processMonitorWindow",
   "remote.desktopHost",
+  ...(mainDocumentOccurrence === undefined ? [] : ["remote.desktopViewer"]),
   "session.windows",
   "extension.windows",
   "extension.libraryLocationPicker",
@@ -326,6 +329,14 @@ const desktopApi = Object.freeze({
   platform: process.platform,
   preferredSystemLocale,
   capabilities: desktopCapabilities,
+  ...(mainDocumentOccurrence === undefined ? {} : { remoteDesktopViewer: Object.freeze({
+    bind: (owner: DesktopRemoteDesktopViewerOwner): Promise<void> =>
+      ipcRenderer.invoke("joko:remote-desktop-viewer:bind", mainDocumentOccurrence, owner),
+    retire: (owner: DesktopRemoteDesktopViewerOwner): Promise<void> =>
+      ipcRenderer.invoke("joko:remote-desktop-viewer:retire", mainDocumentOccurrence, owner),
+    open: (owner: DesktopRemoteDesktopViewerOwner, target: { readonly deviceId: string; readonly name: string }): Promise<{ readonly focusedExisting: boolean }> =>
+      ipcRenderer.invoke("joko:remote-desktop-viewer:open", mainDocumentOccurrence, owner, target)
+  }) }),
   appInfo: Object.freeze({
     get: (): Promise<DesktopAppInfo> => ipcRenderer.invoke(DESKTOP_CHANNELS.appGetInfo)
   }),
@@ -945,10 +956,18 @@ const desktopApi = Object.freeze({
       ipcRenderer.invoke(DESKTOP_CHANNELS.managedOrchestratorCompleteLogout)
   }),
   remoteDesktop: Object.freeze({
-    getState: (): Promise<DesktopRemoteDesktopSnapshot> => mainDocumentOccurrence === undefined
-      ? Promise.reject(new Error("Remote Desktop settings are unavailable outside the main Joko window."))
-      : ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopGetState, mainDocumentOccurrence)
-        .then(parseDesktopRemoteDesktopSnapshot),
+    getState: (refreshWindowsSupport?: boolean): Promise<DesktopRemoteDesktopSnapshot> => {
+      if (refreshWindowsSupport !== undefined && typeof refreshWindowsSupport !== "boolean") {
+        return Promise.reject(new TypeError("Remote Desktop support refresh must be boolean."));
+      }
+      if (mainDocumentOccurrence === undefined) {
+        return Promise.reject(new Error("Remote Desktop settings are unavailable outside the main Joko window."));
+      }
+      return (refreshWindowsSupport === undefined
+        ? ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopGetState, mainDocumentOccurrence)
+        : ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopGetState, mainDocumentOccurrence, refreshWindowsSupport))
+        .then(parseDesktopRemoteDesktopSnapshot);
+    },
     setEnabled: (enabled: boolean): Promise<DesktopRemoteDesktopSnapshot> => {
       if (typeof enabled !== "boolean") {
         return Promise.reject(new TypeError("Remote Desktop enabled state must be boolean."));
@@ -957,6 +976,16 @@ const desktopApi = Object.freeze({
         return Promise.reject(new Error("Remote Desktop settings are unavailable outside the main Joko window."));
       }
       return ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopSetEnabled, mainDocumentOccurrence, enabled)
+        .then(parseDesktopRemoteDesktopSnapshot);
+    },
+    configureWindowsSupport: (enabled: boolean): Promise<DesktopRemoteDesktopSnapshot> => {
+      if (typeof enabled !== "boolean") {
+        return Promise.reject(new TypeError("Remote Desktop service authorization must be boolean."));
+      }
+      if (mainDocumentOccurrence === undefined) {
+        return Promise.reject(new Error("Remote Desktop settings are unavailable outside the main Joko window."));
+      }
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopConfigureWindowsSupport, mainDocumentOccurrence, enabled)
         .then(parseDesktopRemoteDesktopSnapshot);
     },
     disconnect: (): Promise<DesktopRemoteDesktopSnapshot> => mainDocumentOccurrence === undefined
@@ -1072,16 +1101,21 @@ function parseDesktopRemoteDesktopSnapshot(value: unknown): DesktopRemoteDesktop
   const keys = candidate["active"] === true
     ? ["enabled", "active", "controlling", "controllerDeviceId", "displayId", "permissions"]
     : ["enabled", "active", "controlling", "permissions"];
+  const hasWindowsSupport = Object.hasOwn(candidate, "windowsSupport");
+  if (hasWindowsSupport) keys.push("windowsSupport");
   if (!exactRemoteDesktopRecord(candidate, keys)
     || typeof candidate["enabled"] !== "boolean"
     || typeof candidate["active"] !== "boolean"
     || typeof candidate["controlling"] !== "boolean"
+    || (hasWindowsSupport && !isRemoteDesktopWindowsSupport(candidate["windowsSupport"]))
     || (!candidate["active"] && candidate["controlling"])
     || (candidate["active"] && (!boundedRemoteDesktopIdentity(candidate["controllerDeviceId"])
       || !boundedRemoteDesktopIdentity(candidate["displayId"])))) {
     throw new TypeError("Remote Desktop state is invalid.");
   }
   const permissions = parseDesktopRemoteDesktopPermissions(candidate["permissions"]);
+  const windowsSupport = isRemoteDesktopWindowsSupport(candidate["windowsSupport"])
+    ? { windowsSupport: candidate["windowsSupport"] } : {};
   return candidate["active"]
     ? Object.freeze({
         enabled: candidate["enabled"],
@@ -1089,14 +1123,20 @@ function parseDesktopRemoteDesktopSnapshot(value: unknown): DesktopRemoteDesktop
         controlling: candidate["controlling"],
         controllerDeviceId: candidate["controllerDeviceId"] as string,
         displayId: candidate["displayId"] as string,
-        permissions
+        permissions,
+        ...windowsSupport
       })
     : Object.freeze({
         enabled: candidate["enabled"],
         active: false,
         controlling: false,
-        permissions
+        permissions,
+        ...windowsSupport
       });
+}
+
+function isRemoteDesktopWindowsSupport(value: unknown): value is NonNullable<DesktopRemoteDesktopSnapshot["windowsSupport"]> {
+  return value === "ready" || value === "missing" || value === "installRequired" || value === "unavailable";
 }
 
 function exactRemoteDesktopRecord(

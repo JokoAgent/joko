@@ -2,6 +2,7 @@ import type { Locale } from "./model.js";
 import { presentJokoServiceTerminology } from "./i18n/service-terminology.js";
 
 const en = {
+  "settings.remoteDesktop.open": "Remote desktop",
   "workbench.title": "Workbench",
   "workbench.pullRequest": "Pull request",
   "workbench.openItem": "Open “{title}” · {state}",
@@ -4753,6 +4754,14 @@ const en = {
   "settings.remoteDesktop.saveFailed": "The Remote Desktop setting could not be saved.",
   "settings.remoteDesktop.disconnectFailed": "The Remote Desktop session could not be disconnected.",
   "settings.remoteDesktop.permissionsFailed": "The Remote Desktop permission guide could not be opened.",
+  "settings.remoteDesktop.windowsTitle": "Lock screen control",
+  "settings.remoteDesktop.windowsReady": "Enabled for this Joko process. Restarting Joko requires administrator authorization again.",
+  "settings.remoteDesktop.windowsMissing": "Allow control of the lock screen and administrator prompts. Administrator authorization is required.",
+  "settings.remoteDesktop.windowsInstallRequired": "Install Joko for all users in Program Files to enable this feature.",
+  "settings.remoteDesktop.windowsUnavailable": "The system service is unavailable. Reinstall Joko and try again.",
+  "settings.remoteDesktop.windowsEnable": "Authorize",
+  "settings.remoteDesktop.windowsDisable": "Remove service",
+  "settings.remoteDesktop.windowsFailed": "Authorization was not completed. Try again on this computer.",
   "settings.remoteDesktop.disconnect": "Disconnect Remote Desktop",
   "settings.remoteDesktop.statusAria": "Remote Desktop session",
   "settings.deviceControl.title": "Remote control",
@@ -5836,6 +5845,7 @@ export type MessageKey = keyof typeof en;
 export const messageKeys: readonly MessageKey[] = Object.freeze(Object.keys(en) as MessageKey[]);
 
 const zhBase: Record<MessageKey, string> = {
+  "settings.remoteDesktop.open": "远程桌面",
   "queue.editLockLost": "编辑权限已失效。草稿已保留，请重新取得编辑锁后保存。",
   "queue.reacquireEditLock": "恢复编辑",
   "settings.dedicatedHardware.title": "专用硬件",
@@ -8665,6 +8675,14 @@ const zhBase: Record<MessageKey, string> = {
   "settings.remoteDesktop.saveFailed": "无法保存远程桌面设置。",
   "settings.remoteDesktop.disconnectFailed": "无法断开远程桌面会话。",
   "settings.remoteDesktop.permissionsFailed": "无法打开远程桌面权限指南。",
+  "settings.remoteDesktop.windowsTitle": "锁屏控制",
+  "settings.remoteDesktop.windowsReady": "已为本次 Joko 进程启用。重启 Joko 后需要再次获得管理员授权。",
+  "settings.remoteDesktop.windowsMissing": "允许控制锁屏和管理员提示。需要管理员授权。",
+  "settings.remoteDesktop.windowsInstallRequired": "将 Joko 安装到 Program Files，并选择为所有用户安装，以启用此功能。",
+  "settings.remoteDesktop.windowsUnavailable": "系统服务不可用。请重新安装 Joko 后重试。",
+  "settings.remoteDesktop.windowsEnable": "授权",
+  "settings.remoteDesktop.windowsDisable": "移除服务",
+  "settings.remoteDesktop.windowsFailed": "授权未完成。请在这台电脑上重试。",
   "settings.remoteDesktop.disconnect": "断开远程桌面",
   "settings.remoteDesktop.statusAria": "远程桌面会话",
   "settings.deviceControl.title": "远程控制",

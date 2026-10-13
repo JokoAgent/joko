@@ -12,12 +12,19 @@ import "joko/v1/remote_desktop_types.proto";
 service RemoteDesktopService {
   rpc ListRemoteDesktopHosts(ListRemoteDesktopHostsRequest) returns (ListRemoteDesktopHostsResponse);
   rpc GetRemoteDesktopCapabilities(GetRemoteDesktopCapabilitiesRequest) returns (GetRemoteDesktopCapabilitiesResponse);
+  rpc GetRemoteDesktopLockState(GetRemoteDesktopLockStateRequest) returns (GetRemoteDesktopLockStateResponse);
+  rpc RequestRemoteDesktopCredentials(RequestRemoteDesktopCredentialsRequest) returns (RequestRemoteDesktopCredentialsResponse);
   rpc GetRemoteDesktopPermissions(GetRemoteDesktopPermissionsRequest) returns (GetRemoteDesktopPermissionsResponse);
   rpc ShowRemoteDesktopPermissionGuide(ShowRemoteDesktopPermissionGuideRequest) returns (ShowRemoteDesktopPermissionGuideResponse);
   rpc StartRemoteDesktop(StartRemoteDesktopRequest) returns (StartRemoteDesktopResponse);
   rpc HeartbeatRemoteDesktop(HeartbeatRemoteDesktopRequest) returns (HeartbeatRemoteDesktopResponse);
   rpc StopRemoteDesktop(StopRemoteDesktopRequest) returns (StopRemoteDesktopResponse);
   rpc SetRemoteDesktopControl(SetRemoteDesktopControlRequest) returns (SetRemoteDesktopControlResponse);
+  rpc SetRemoteDesktopHostMute(SetRemoteDesktopHostMuteRequest) returns (SetRemoteDesktopHostMuteResponse);
+  rpc PerformRemoteDesktopSystemAction(PerformRemoteDesktopSystemActionRequest) returns (PerformRemoteDesktopSystemActionResponse);
+  rpc SetRemoteDesktopPrivacyScreen(SetRemoteDesktopPrivacyScreenRequest) returns (SetRemoteDesktopPrivacyScreenResponse);
+  rpc SetRemoteDesktopClipboardSync(SetRemoteDesktopClipboardSyncRequest) returns (SetRemoteDesktopClipboardSyncResponse);
+  rpc GetRemoteDesktopClipboardVersion(GetRemoteDesktopClipboardVersionRequest) returns (GetRemoteDesktopClipboardVersionResponse);
   rpc SetRemoteDesktopPresentation(SetRemoteDesktopPresentationRequest) returns (SetRemoteDesktopPresentationResponse);
   rpc SendRemoteDesktopInput(SendRemoteDesktopInputRequest) returns (SendRemoteDesktopInputResponse);
   rpc GetRemoteDesktopIceConfiguration(GetRemoteDesktopIceConfigurationRequest) returns (GetRemoteDesktopIceConfigurationResponse);
@@ -26,6 +33,8 @@ service RemoteDesktopService {
   rpc GetRemoteDesktopFrame(GetRemoteDesktopFrameRequest) returns (GetRemoteDesktopFrameResponse);
   rpc ListRemoteDesktopDisplayModes(ListRemoteDesktopDisplayModesRequest) returns (ListRemoteDesktopDisplayModesResponse);
   rpc SetRemoteDesktopDisplayMode(SetRemoteDesktopDisplayModeRequest) returns (SetRemoteDesktopDisplayModeResponse);
+  rpc SetRemoteDesktopViewerDisplay(SetRemoteDesktopViewerDisplayRequest) returns (SetRemoteDesktopViewerDisplayResponse);
+  rpc RestoreRemoteDesktopViewerDisplay(RestoreRemoteDesktopViewerDisplayRequest) returns (RestoreRemoteDesktopViewerDisplayResponse);
   rpc TransferRemoteDesktopClipboardText(TransferRemoteDesktopClipboardTextRequest) returns (TransferRemoteDesktopClipboardTextResponse);
   rpc TransferRemoteDesktopClipboardContent(TransferRemoteDesktopClipboardContentRequest) returns (TransferRemoteDesktopClipboardContentResponse);
 }
@@ -46,6 +55,25 @@ message GetRemoteDesktopCapabilitiesRequest {
 message GetRemoteDesktopCapabilitiesResponse {
   DevicePeerRouteIdentity peer = 1;
   RemoteDesktopCapabilities capabilities = 2;
+}
+
+message GetRemoteDesktopLockStateRequest {
+  DevicePeerRouteIdentity peer = 1;
+}
+
+message GetRemoteDesktopLockStateResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopLockStateResult result = 2;
+}
+
+message RequestRemoteDesktopCredentialsRequest {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopCredentialRequest request = 2;
+}
+
+message RequestRemoteDesktopCredentialsResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopCredentialResult result = 2;
 }
 
 message GetRemoteDesktopPermissionsRequest {
@@ -90,6 +118,8 @@ message HeartbeatRemoteDesktopResponse {
 message StopRemoteDesktopRequest {
   DevicePeerRouteIdentity peer = 1;
   string lease_id = 2;
+  bool lock_screen = 3;
+  uint64 control_generation = 4;
 }
 
 message StopRemoteDesktopResponse {
@@ -105,6 +135,56 @@ message SetRemoteDesktopControlRequest {
 message SetRemoteDesktopControlResponse {
   DevicePeerRouteIdentity peer = 1;
   RemoteDesktopControlState state = 2;
+}
+
+message SetRemoteDesktopHostMuteRequest {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopHostMuteRequest request = 2;
+}
+
+message PerformRemoteDesktopSystemActionRequest {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopSystemActionRequest request = 2;
+}
+
+message PerformRemoteDesktopSystemActionResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopSystemActionResult result = 2;
+}
+
+message SetRemoteDesktopPrivacyScreenRequest {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopPrivacyScreenRequest request = 2;
+}
+
+message SetRemoteDesktopPrivacyScreenResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopPrivacyScreenResult result = 2;
+}
+
+message SetRemoteDesktopHostMuteResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopHostMuteResult result = 2;
+}
+
+message SetRemoteDesktopClipboardSyncRequest {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopClipboardSyncRequest request = 2;
+}
+
+message SetRemoteDesktopClipboardSyncResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopClipboardSyncResult result = 2;
+}
+
+message GetRemoteDesktopClipboardVersionRequest {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopClipboardVersionRequest request = 2;
+}
+
+message GetRemoteDesktopClipboardVersionResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopClipboardVersionResult result = 2;
 }
 
 message SetRemoteDesktopPresentationRequest {
@@ -187,17 +267,45 @@ message ListRemoteDesktopDisplayModesResponse {
   repeated RemoteDesktopDisplayMode modes = 2;
 }
 
-// Changing display geometry is terminal for the old lease. The caller must
-// start a fresh lease after either success or an outcome-unknown response.
+// Temporary physical mode changes return the same lease with actual geometry
+// and a new control generation. Permanent changes terminate the old lease.
 message SetRemoteDesktopDisplayModeRequest {
   DevicePeerRouteIdentity peer = 1;
   string lease_id = 2;
   uint64 control_generation = 3;
   string mode_id = 4;
+  bool temporary = 5;
 }
 
 message SetRemoteDesktopDisplayModeResponse {
   DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopDisplayModeResult result = 2;
+}
+
+// Each Fit edge is an integer from 320 through 2560. Success returns actual
+// capture geometry with the same lease, view-only and a new control generation.
+message SetRemoteDesktopViewerDisplayRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+  uint64 control_generation = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+}
+
+message SetRemoteDesktopViewerDisplayResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopViewerDisplayResult result = 2;
+}
+
+message RestoreRemoteDesktopViewerDisplayRequest {
+  DevicePeerRouteIdentity peer = 1;
+  string lease_id = 2;
+  uint64 control_generation = 3;
+}
+
+message RestoreRemoteDesktopViewerDisplayResponse {
+  DevicePeerRouteIdentity peer = 1;
+  RemoteDesktopViewerDisplayResult result = 2;
 }
 
 message TransferRemoteDesktopClipboardTextRequest {

@@ -16,7 +16,8 @@ export interface MobileRemoteClipboardItem {
 }
 
 export type MobileRemoteClipboardFailureCode =
-  | "empty" | "unsupported" | "too-long" | "changed" | "retired" | "unavailable" | "failed";
+  | "empty" | "unsupported" | "too-long" | "changed" | "retired" | "unavailable" | "failed"
+  | "permission" | "temporary-focus";
 
 export class MobileRemoteClipboardError extends Error {
   constructor(readonly code: MobileRemoteClipboardFailureCode) {
@@ -26,6 +27,9 @@ export class MobileRemoteClipboardError extends Error {
 
 export interface MobileRemoteClipboardSystem {
   readonly richAvailable: boolean;
+  readonly syncAvailable: boolean;
+  version(check: () => void): Promise<string>;
+  writeExpected(item: MobileRemoteClipboardItem, version: string, check: () => void): Promise<string>;
   readPortable(check: () => void): Promise<MobileRemoteClipboardItem>;
   writePortable(item: MobileRemoteClipboardItem, check: () => void): Promise<void>;
   readLegacyText(check: () => void): Promise<string>;
@@ -41,6 +45,8 @@ interface LegacyClipboard {
 interface NativeRemoteClipboard {
   readClipboard?(): Promise<string>;
   writeClipboard?(json: string): Promise<void>;
+  clipboardVersion?(): Promise<string>;
+  syncClipboard?(json: string, version: string): Promise<string>;
 }
 
 export function createMobileRemoteClipboardSystem(
@@ -49,8 +55,31 @@ export function createMobileRemoteClipboardSystem(
 ): MobileRemoteClipboardSystem {
   const richAvailable = typeof native?.readClipboard === "function"
     && typeof native.writeClipboard === "function";
+  const syncAvailable = richAvailable && typeof native?.clipboardVersion === "function"
+    && typeof native.syncClipboard === "function";
   return Object.freeze({
     richAvailable,
+    syncAvailable,
+    async version(check: () => void): Promise<string> {
+      if (!syncAvailable) throw new MobileRemoteClipboardError("unavailable");
+      check();
+      let version: string;
+      try { version = await native!.clipboardVersion!(); }
+      catch (error) { throw normalizeMobileRemoteClipboardError(error); }
+      check();
+      return assertClipboardVersion(version);
+    },
+    async writeExpected(item: MobileRemoteClipboardItem, version: string, check: () => void): Promise<string> {
+      if (!syncAvailable) throw new MobileRemoteClipboardError("unavailable");
+      const json = serializeMobileRemoteClipboardItem(item);
+      assertClipboardVersion(version);
+      check();
+      let written: string;
+      try { written = await native!.syncClipboard!(json, version); }
+      catch (error) { throw normalizeMobileRemoteClipboardError(error); }
+      check();
+      return assertClipboardVersion(written);
+    },
     async readPortable(check: () => void): Promise<MobileRemoteClipboardItem> {
       if (!richAvailable) throw new MobileRemoteClipboardError("unavailable");
       check();
@@ -155,12 +184,20 @@ export function serializeMobileRemoteClipboardItem(item: MobileRemoteClipboardIt
 
 export function normalizeMobileRemoteClipboardError(error: unknown): MobileRemoteClipboardError {
   if (error instanceof MobileRemoteClipboardError) return error;
-  const message = error instanceof Error ? error.message : "";
+  const code = error && typeof error === "object" && "code" in error && typeof error.code === "string" ? error.code : "";
+  const message = `${error instanceof Error ? error.message : ""} ${code}`;
   if (message.includes("REMOTE_DESKTOP_CLIPBOARD_EMPTY")) return new MobileRemoteClipboardError("empty");
   if (message.includes("REMOTE_DESKTOP_CLIPBOARD_TOO_LONG")) return new MobileRemoteClipboardError("too-long");
   if (message.includes("REMOTE_DESKTOP_CLIPBOARD_CHANGED")) return new MobileRemoteClipboardError("changed");
   if (message.includes("REMOTE_DESKTOP_CLIPBOARD_RETIRED")) return new MobileRemoteClipboardError("retired");
   if (message.includes("REMOTE_DESKTOP_CLIPBOARD_UNSUPPORTED")) return new MobileRemoteClipboardError("unsupported");
+  if (message.includes("CLIPBOARD_NOT_ALLOWED")) return new MobileRemoteClipboardError("temporary-focus");
+  if (/PASTE_DENIED|PERMISSION|DENIED|NOT_ALLOWED/u.test(message)) return new MobileRemoteClipboardError("permission");
+  if (message.includes("CLIPBOARD_EMPTY")) return new MobileRemoteClipboardError("empty");
+  if (message.includes("CLIPBOARD_TOO_LONG")) return new MobileRemoteClipboardError("too-long");
+  if (message.includes("CLIPBOARD_CHANGED")) return new MobileRemoteClipboardError("changed");
+  if (message.includes("CLIPBOARD_UNSUPPORTED")) return new MobileRemoteClipboardError("unsupported");
+  if (message.includes("CLIPBOARD_UNAVAILABLE")) return new MobileRemoteClipboardError("unavailable");
   return new MobileRemoteClipboardError("failed");
 }
 
@@ -169,6 +206,12 @@ function assertMobileRemoteClipboardText(value: string): string {
   if (value.length > MOBILE_REMOTE_CLIPBOARD_TEXT_CHARS) {
     throw new MobileRemoteClipboardError("too-long");
   }
+  return value;
+}
+
+function assertClipboardVersion(value: unknown): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 128
+    || /[\u0000-\u0020\u007f]/u.test(value)) throw new MobileRemoteClipboardError("unsupported");
   return value;
 }
 

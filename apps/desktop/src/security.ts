@@ -122,6 +122,7 @@ export function resolvePackagedAppResource(value: string, policy: DesktopNavigat
 export function isAllowedDesktopAppEntrySearch(search: string): boolean {
   if (search === "") return true;
   const query = new URLSearchParams(search);
+  if ([...query.keys()].join(",") === "remoteDesktopViewer") return query.get("remoteDesktopViewer") === "1";
   if ([...query.keys()].join(",") === "runtimeProcessMonitor") {
     return query.get("runtimeProcessMonitor") === "1";
   }
@@ -254,6 +255,15 @@ export function runtimeProcessMonitorEntryUrl(value: string): string {
   url.hash = "";
   url.searchParams.set("runtimeProcessMonitor", "1");
   return url.href;
+}
+
+export function remoteDesktopViewerEntryUrl(value: string): string {
+  const url = new URL(value); url.search = ""; url.hash = "";
+  url.searchParams.set("remoteDesktopViewer", "1"); return url.href;
+}
+
+export function isAllowedRemoteDesktopViewerNavigation(value: string, policy: DesktopNavigationPolicy): boolean {
+  return isAllowedMainFrameNavigation(value, policy) && value === remoteDesktopViewerEntryUrl(policy.developmentUrl ?? DESKTOP_APP_ENTRY_URL);
 }
 
 export function isTrustedIpcSenderIdentity<TWindow, TContents, TFrame>(

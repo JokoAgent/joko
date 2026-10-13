@@ -107,7 +107,23 @@
         "manifest.json",
         "joko-macos-remote-desktop-capture",
         "joko-macos-remote-desktop-input",
-        "joko-windows-remote-desktop-input.exe"
+        "joko-macos-remote-credentials",
+        "JokoRemoteCredentials_JokoRemoteCredentials.bundle/**/*",
+        "joko-windows-remote-desktop-input.exe",
+        "joko-windows-remote-desktop-host.exe",
+        "joko-windows-remote-desktop-host.node",
+        "joko-linux-remote-desktop-input",
+        "joko-linux-remote-desktop-capture",
+        "joko-linux-remote-desktop-clipboard",
+        "linux-viewer-display.py",
+        "linux-credentials/main.py",
+        "linux-credentials/channel.py",
+        "linux-credentials/host.py",
+        "linux-credentials/storage.py",
+        "linux-credentials/platform_linux.py",
+        "linux-credentials/requirements.txt",
+        "joko-hyprland-privacy.so",
+        "joko-hyprland-privacy.json"
       ]
     },
     {
@@ -155,6 +171,7 @@
     }
   ],
   "afterPack": "scripts/audit-packaged.cjs",
+  "afterSign": "scripts/seal-windows-native-remote-desktop.cjs",
   "win": {
     "icon": "icon-light.svg",
     "forceCodeSigning": false,
@@ -166,14 +183,17 @@
   "nsis": {
     "oneClick": false,
     "perMachine": false,
-    "allowElevation": false,
-    "allowToChangeInstallationDirectory": true,
+    "selectPerMachineByDefault": false,
+    "allowElevation": true,
+    "allowToChangeInstallationDirectory": false,
+    "include": "resources/installer.nsh",
     "deleteAppDataOnUninstall": false
   },
   "mac": {
     "icon": "icon-light.svg",
-    "identity": null,
-    "hardenedRuntime": false,
+    "hardenedRuntime": true,
+    "sign": "scripts/sign-mac-native-credentials.cjs",
+    "binaries": ["Contents/Resources/native-remote-desktop/joko-macos-remote-credentials"],
     "extendInfo": {
       "NSMicrophoneUsageDescription": "Joko uses the microphone only while you choose to dictate into the composer.",
       "NSAudioCaptureUsageDescription": "Joko shares computer audio only when you enable audio in Remote Desktop."

@@ -49,12 +49,13 @@ describe("SystemAudioMuteGuard", () => {
 
   it("keeps audio muted until all overlapping owners release", async () => {
     const backend = fakeBackend(false);
-    const guard = new SystemAudioMuteGuard<string>(backend);
+    const guard = new SystemAudioMuteGuard<number | object>(backend);
+    const viewer = {};
 
-    await Promise.all([guard.acquire("first"), guard.acquire("second")]);
-    await guard.release("first");
+    await Promise.all([guard.acquire(viewer), guard.acquire(1)]);
+    await guard.release(viewer);
     expect(backend.muted).toBe(true);
-    await guard.release("second");
+    await guard.release(1);
 
     expect(backend.writes).toEqual([true, false]);
   });
@@ -67,6 +68,82 @@ describe("SystemAudioMuteGuard", () => {
     await guard.acquire("second");
     await guard.releaseAll();
 
+    expect(backend.muted).toBe(false);
+    expect(backend.writes).toEqual([true, false]);
+  });
+
+  it("retries a rejected restore after its owner was already removed", async () => {
+    const backend = fakeBackend(false);
+    const guard = new SystemAudioMuteGuard<object>(backend);
+    const owner = {};
+    let rejectRestore = true;
+    backend.setMuted = async (muted) => {
+      backend.writes.push(muted);
+      if (!muted && rejectRestore) { rejectRestore = false; throw new Error("Restore unavailable"); }
+      backend.muted = muted;
+    };
+    await guard.acquire(owner);
+    await expect(guard.release(owner)).rejects.toThrow("Restore unavailable");
+    expect(backend.muted).toBe(true);
+    await guard.release(owner);
+    expect(backend.muted).toBe(false);
+    expect(backend.writes).toEqual([true, false, false]);
+  });
+
+  it("reasserts mute for a new owner when a rejected restore may have reached the OS", async () => {
+    const backend = fakeBackend(false);
+    const guard = new SystemAudioMuteGuard<number | object>(backend);
+    const viewer = {};
+    let rejectRestore = true;
+    backend.setMuted = async (muted) => {
+      backend.writes.push(muted);
+      backend.muted = muted;
+      if (!muted && rejectRestore) { rejectRestore = false; throw new Error("Restore outcome unknown"); }
+    };
+    await guard.acquire(viewer);
+    await expect(guard.release(viewer)).rejects.toThrow("Restore outcome unknown");
+    expect(backend.muted).toBe(false);
+    await guard.acquire(1);
+    expect(backend.muted).toBe(true);
+    await guard.release(viewer);
+    expect(backend.muted).toBe(true);
+    await guard.release(1);
+    expect(backend.muted).toBe(false);
+    expect(backend.writes).toEqual([true, false, true, false]);
+  });
+
+  it("rechecks authority after reading native state before performing mute", async () => {
+    const backend = fakeBackend(false);
+    const guard = new SystemAudioMuteGuard<object>(backend);
+    let finishRead!: (muted: boolean) => void;
+    backend.getMuted = () => new Promise((resolve) => { finishRead = resolve; });
+    let current = true;
+    const check = (): void => { if (!current) throw new Error("Retired"); };
+    const pending = guard.acquire({}, check);
+    const rejected = expect(pending).rejects.toThrow("Retired");
+    await Promise.resolve();
+    current = false;
+    finishRead(false);
+    await rejected;
+    expect(backend.writes).toEqual([]);
+  });
+
+  it.each(["retired", "native failure"])("preserves recovery after mute reaches the OS with %s", async (failure) => {
+    const backend = fakeBackend(false);
+    const guard = new SystemAudioMuteGuard<object>(backend);
+    const owner = {};
+    let current = true;
+    backend.setMuted = async (muted) => {
+      backend.writes.push(muted);
+      backend.muted = muted;
+      if (muted) {
+        current = false;
+        if (failure === "native failure") throw new Error("Native outcome unknown");
+      }
+    };
+    await expect(guard.acquire(owner, () => { if (!current) throw new Error("Retired"); })).rejects.toThrow();
+    expect(backend.muted).toBe(true);
+    await guard.release(owner);
     expect(backend.muted).toBe(false);
     expect(backend.writes).toEqual([true, false]);
   });

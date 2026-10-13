@@ -27,7 +27,7 @@ message RemoteDesktopDisplay {
   uint32 height = 4;
 }
 
-// A host-enumerated macOS display mode. IDs are opaque to controllers and are
+// A host-enumerated physical display mode. IDs are opaque to controllers and are
 // valid only for the exact display and lease that produced this list.
 message RemoteDesktopDisplayMode {
   string mode_id = 1;
@@ -56,6 +56,137 @@ message RemoteDesktopCapabilities {
   bool background_viewing = 16;
   bool display_modes = 17;
   bool cursor_overlay = 18;
+  bool host_mute = 19;
+  bool lock_on_exit = 20;
+  bool clipboard_sync = 21;
+  bool clipboard_inline = 22;
+  bool privacy_screen = 23;
+  bool native_credentials = 24;
+  bool resolution_restore = 25;
+  bool viewer_display = 26;
+  bool viewer_display_restore = 27;
+  bool workspace_navigation = 28;
+  bool system_menu = 29;
+}
+
+enum RemoteDesktopSystemActionKind {
+  REMOTE_DESKTOP_SYSTEM_ACTION_KIND_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_SYSTEM_ACTION_KIND_WORKSPACE_LEFT = 1;
+  REMOTE_DESKTOP_SYSTEM_ACTION_KIND_WORKSPACE_RIGHT = 2;
+  REMOTE_DESKTOP_SYSTEM_ACTION_KIND_SYSTEM_MENU = 3;
+}
+
+// A bounded system effect belongs to the exact current viewer control. The
+// display is derived from the lease and is never selected by this request.
+message RemoteDesktopSystemActionRequest {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  RemoteDesktopSystemActionKind action = 3;
+}
+
+message RemoteDesktopSystemActionResult {
+  RemoteDesktopSystemActionKind action = 1;
+}
+
+enum RemoteDesktopLockState {
+  REMOTE_DESKTOP_LOCK_STATE_UNSPECIFIED = 0;
+  REMOTE_DESKTOP_LOCK_STATE_UNLOCKED = 1;
+  REMOTE_DESKTOP_LOCK_STATE_LOCKED = 2;
+  REMOTE_DESKTOP_LOCK_STATE_UNAVAILABLE = 3;
+}
+
+message RemoteDesktopLockStateResult {
+  RemoteDesktopLockState state = 1;
+}
+
+message RemoteDesktopCredentialPrepare {}
+
+// Public identity material and signed offers contain no account password or
+// private key. The target validates the authenticated controller separately.
+message RemoteDesktopCredentialOpen {
+  string offer = 1;
+  optional string descriptor = 2;
+}
+
+message RemoteDesktopCredentialExchange {
+  string handle = 1;
+  string ciphertext = 2;
+}
+
+// Only native endpoints decrypt these messages. They are ephemeral; neither
+// this envelope nor its replies may be persisted or included in diagnostics.
+message RemoteDesktopCredentialRequest {
+  oneof request {
+    RemoteDesktopCredentialPrepare prepare = 1;
+    RemoteDesktopCredentialOpen open = 2;
+    RemoteDesktopCredentialExchange exchange = 3;
+  }
+}
+
+message RemoteDesktopCredentialPrepared {
+  string descriptor = 1;
+}
+
+message RemoteDesktopCredentialOpened {
+  string handle = 1;
+  string offer = 2;
+}
+
+message RemoteDesktopCredentialExchanged {
+  string ciphertext = 1;
+}
+
+message RemoteDesktopCredentialClosed {}
+
+message RemoteDesktopCredentialResult {
+  oneof result {
+    RemoteDesktopCredentialPrepared prepared = 1;
+    RemoteDesktopCredentialOpened opened = 2;
+    RemoteDesktopCredentialExchanged exchanged = 3;
+    RemoteDesktopCredentialClosed closed = 4;
+  }
+}
+
+message RemoteDesktopPrivacyScreenRequest {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  bool enabled = 3;
+  bool lock_on_exit = 4;
+}
+
+message RemoteDesktopPrivacyScreenResult {
+  bool enabled = 1;
+}
+
+message RemoteDesktopClipboardSyncRequest {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  bool enabled = 3;
+}
+
+message RemoteDesktopClipboardSyncResult {
+  bool enabled = 1;
+  uint64 sync_generation = 2;
+}
+
+message RemoteDesktopClipboardVersionRequest {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  uint64 sync_generation = 3;
+}
+
+message RemoteDesktopClipboardVersionResult {
+  string version = 1;
+}
+
+message RemoteDesktopHostMuteRequest {
+  string lease_id = 1;
+  uint64 control_generation = 2;
+  bool enabled = 3;
+}
+
+message RemoteDesktopHostMuteResult {
+  bool enabled = 1;
 }
 
 enum RemoteDesktopStartMode {
@@ -132,6 +263,18 @@ message RemoteDesktopLease {
   RemoteDesktopDisplay display = 2;
   bool controlling = 3;
   uint64 control_generation = 4;
+}
+
+// A successful temporary change retains its lease; permanent changes have no
+// lease. All input and presentation owners must adopt the new generation.
+message RemoteDesktopDisplayModeResult {
+  RemoteDesktopLease lease = 1;
+}
+
+// A managed viewer surface changes capture identity while retaining the exact
+// lease. The physical source is owned by the host and never selected here.
+message RemoteDesktopViewerDisplayResult {
+  RemoteDesktopLease lease = 1;
 }
 
 message RemoteDesktopControlState {
@@ -219,9 +362,17 @@ message RemoteDesktopClipboardContentCancelAction {
   string transfer_id = 1;
 }
 
+message RemoteDesktopClipboardContentPasteAction {
+  string data = 1;
+}
+
 message RemoteDesktopClipboardContentRequest {
   string lease_id = 1;
   uint64 control_generation = 2;
+  bool sync = 3;
+  optional string version = 4;
+  bool inline = 5;
+  uint64 sync_generation = 6;
   oneof action {
     RemoteDesktopClipboardContentCopyAction copy = 10;
     RemoteDesktopClipboardContentBeginAction begin = 11;
@@ -229,6 +380,7 @@ message RemoteDesktopClipboardContentRequest {
     RemoteDesktopClipboardContentWriteAction write = 13;
     RemoteDesktopClipboardContentCommitAction commit = 14;
     RemoteDesktopClipboardContentCancelAction cancel = 15;
+    RemoteDesktopClipboardContentPasteAction paste = 16;
   }
 }
 
@@ -236,6 +388,7 @@ message RemoteDesktopClipboardContentResult {
   optional string transfer_id = 1;
   optional uint32 length = 2;
   optional string data = 3;
+  optional string version = 4;
 }
 
 message RemoteDesktopOfferResult {
@@ -304,6 +457,27 @@ enum RemoteDesktopFailureReason {
   REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MODES_UNAVAILABLE = 24;
   REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_MODE_MISSING = 25;
   REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_BUSY = 26;
+  REMOTE_DESKTOP_FAILURE_REASON_HOST_MUTE_UNAVAILABLE = 27;
+  REMOTE_DESKTOP_FAILURE_REASON_HOST_MUTE_EXPIRED = 28;
+  REMOTE_DESKTOP_FAILURE_REASON_LOCK_UNAVAILABLE = 29;
+  REMOTE_DESKTOP_FAILURE_REASON_LOCK_FAILED = 30;
+  REMOTE_DESKTOP_FAILURE_REASON_LOCK_EXPIRED = 31;
+  REMOTE_DESKTOP_FAILURE_REASON_CLIPBOARD_CHANGED = 32;
+  REMOTE_DESKTOP_FAILURE_REASON_PRIVACY_UNAVAILABLE = 33;
+  REMOTE_DESKTOP_FAILURE_REASON_PRIVACY_FAILED = 34;
+  REMOTE_DESKTOP_FAILURE_REASON_PRIVACY_EXPIRED = 35;
+  REMOTE_DESKTOP_FAILURE_REASON_AUTHENTICATION_REQUIRED = 36;
+  REMOTE_DESKTOP_FAILURE_REASON_CREDENTIAL_UNAVAILABLE = 37;
+  REMOTE_DESKTOP_FAILURE_REASON_CREDENTIAL_INVALID_MESSAGE = 38;
+  REMOTE_DESKTOP_FAILURE_REASON_CREDENTIAL_INVALID_IDENTITY = 39;
+  REMOTE_DESKTOP_FAILURE_REASON_CREDENTIAL_EXPIRED = 40;
+  REMOTE_DESKTOP_FAILURE_REASON_CREDENTIAL_CANCELLED = 41;
+  REMOTE_DESKTOP_FAILURE_REASON_CREDENTIAL_UNLOCK_UNAVAILABLE = 42;
+  REMOTE_DESKTOP_FAILURE_REASON_CREDENTIAL_OUTCOME_UNKNOWN = 43;
+  REMOTE_DESKTOP_FAILURE_REASON_DISPLAY_RESTORE_UNAVAILABLE = 44;
+  REMOTE_DESKTOP_FAILURE_REASON_CAPTURE_PENDING = 45;
+  REMOTE_DESKTOP_FAILURE_REASON_SYSTEM_ACTION_UNAVAILABLE = 46;
+  REMOTE_DESKTOP_FAILURE_REASON_SYSTEM_ACTION_EXPIRED = 47;
 }
 
 message RemoteDesktopFailure {

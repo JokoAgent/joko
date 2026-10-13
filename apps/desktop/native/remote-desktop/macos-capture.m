@@ -4,6 +4,9 @@
 #import <CoreImage/CoreImage.h>
 #import <IOSurface/IOSurface.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <ScreenCaptureKit/ScreenCaptureKit.h>
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
 #import <dlfcn.h>
 #import <signal.h>
 #import <stdatomic.h>
@@ -21,6 +24,20 @@ typedef void (^FrameHandler)(int32_t, uint64_t, IOSurfaceRef, const void *);
 typedef CFTypeRef (*CreateStream)(CGDirectDisplayID, size_t, size_t, int32_t,
                                  CFDictionaryRef, dispatch_queue_t, FrameHandler);
 typedef CGError (*StartStream)(CFTypeRef);
+
+@interface PrivacyCaptureOutput : NSObject <SCStreamOutput, SCStreamDelegate>
+@property(copy) FrameHandler handler;
+@property(strong) SCStream *stream;
+@end
+@implementation PrivacyCaptureOutput
+- (void)stream:(SCStream *)stream didOutputSampleBuffer:(CMSampleBufferRef)sample ofType:(SCStreamOutputType)type {
+  if (type != SCStreamOutputTypeScreen || !CMSampleBufferIsValid(sample)) return;
+  CVPixelBufferRef buffer = CMSampleBufferGetImageBuffer(sample);
+  IOSurfaceRef surface = buffer ? CVPixelBufferGetIOSurface(buffer) : NULL;
+  if (surface) self.handler(0, 0, surface, NULL);
+}
+- (void)stream:(SCStream *)stream didStopWithError:(NSError *)error { _exit(5); }
+@end
 
 static BOOL ownedLoggedInSession(void) {
   NSDictionary *state = CFBridgingRelease(CGSessionCopyCurrentDictionary());
@@ -68,11 +85,25 @@ static NSDictionary *readCursor(CGDirectDisplayID display) {
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     // Stream: <display> <native-video|cursor-overlay> <fps> <quality>
-    //         <physical max edge, 0 = logical> <max JPEG bytes>
-    BOOL nativeVideo = argc == 7 &&
+    //         <physical max edge, 0 = logical> <max JPEG bytes> [excluded windows]
+    BOOL nativeVideo = (argc == 7 || argc == 8) &&
       (strcmp(argv[2], "native-video") == 0 || strcmp(argv[2], "cursor-overlay") == 0);
     BOOL overlay = nativeVideo && strcmp(argv[2], "cursor-overlay") == 0;
-    if ((argc != 2 && !nativeVideo) || !ownedLoggedInSession()) return 2;
+    if ((argc != 2 && argc != 3 && !nativeVideo) || !ownedLoggedInSession()) return 2;
+    NSString *excluded = (nativeVideo && argc == 8) || (!nativeVideo && argc == 3)
+      ? [NSString stringWithUTF8String:argv[argc - 1]] : @"";
+    if ((argc == 3 || argc == 8) && excluded.length == 0) return 2;
+    NSArray<NSString *> *excludedIds = excluded.length ? [excluded componentsSeparatedByString:@","] : @[];
+    if (excludedIds.count > 256) return 2;
+    NSMutableSet<NSNumber *> *validatedIds = [NSMutableSet set];
+    for (NSString *identifier in excludedIds) {
+      const char *raw = identifier.UTF8String;
+      char *identifierEnd = NULL;
+      unsigned long identifierValue = strtoul(raw, &identifierEnd, 10);
+      if (!*raw || *identifierEnd || identifierValue == 0 || identifierValue > UINT32_MAX
+          || [validatedIds containsObject:@(identifierValue)]) return 2;
+      [validatedIds addObject:@(identifierValue)];
+    }
     int fps = 15;
     double quality = 0.55;
     long physicalMaxEdge = 0;
@@ -108,7 +139,7 @@ int main(int argc, const char *argv[]) {
     const CFStringRef *intervalKey = dlsym(RTLD_DEFAULT,
       "kCGDisplayStreamMinimumFrameTime");
     const CFStringRef *cursorKey = dlsym(RTLD_DEFAULT, "kCGDisplayStreamShowCursor");
-    if (!create || !start || !intervalKey || !cursorKey) return 4;
+    if (!excluded.length && (!create || !start || !intervalKey || !cursorKey)) return 4;
 
     CGDirectDisplayID display = (uint32_t)value;
     size_t width = CGDisplayPixelsWide(display), height = CGDisplayPixelsHigh(display);
@@ -173,11 +204,7 @@ int main(int argc, const char *argv[]) {
       }
     };
 
-    CFTypeRef stream = create(display, width, height, 'BGRA',
-      (__bridge CFDictionaryRef)@{
-        (__bridge NSString *)*intervalKey: @(1.0 / fps),
-        (__bridge NSString *)*cursorKey: @NO
-      }, queue, ^(int32_t status, uint64_t timestamp, IOSurfaceRef surface, const void *update) {
+    FrameHandler receiveFrame = ^(int32_t status, uint64_t timestamp, IOSurfaceRef surface, const void *update) {
         @autoreleasepool {
           if (status == 3) _exit(5);
           if (status == 2) {
@@ -213,8 +240,45 @@ int main(int argc, const char *argv[]) {
           }
           reply();
         }
-      });
-    if (!stream || start(stream) != kCGErrorSuccess) return 5;
+      };
+    if (excluded.length) {
+      // Masks must be explicitly excluded from ScreenCaptureKit. Missing masks
+      // or a failed filtered stream never fall back to ordinary capture.
+      [SCShareableContent getShareableContentExcludingDesktopWindows:NO onScreenWindowsOnly:NO
+        completionHandler:^(SCShareableContent *content, NSError *error) {
+          if (error) _exit(5);
+          SCDisplay *selected = nil;
+          for (SCDisplay *candidate in content.displays) if (candidate.displayID == display) selected = candidate;
+          NSMutableArray<SCWindow *> *windows = [NSMutableArray array];
+          for (SCWindow *window in content.windows)
+            if ([validatedIds containsObject:@(window.windowID)]) [windows addObject:window];
+          // Other displays may be absent from this snapshot, but zero matching
+          // windows cannot prove that the selected display excludes its mask.
+          if (!selected || windows.count == 0) _exit(5);
+          SCContentFilter *filter = [[SCContentFilter alloc] initWithDisplay:selected excludingWindows:windows];
+          SCStreamConfiguration *config = [SCStreamConfiguration new];
+          config.width = width;
+          config.height = height;
+          config.minimumFrameInterval = CMTimeMake(1, fps);
+          config.showsCursor = NO;
+          config.pixelFormat = kCVPixelFormatType_32BGRA;
+          config.queueDepth = 3;
+          PrivacyCaptureOutput *output = [PrivacyCaptureOutput new];
+          output.handler = receiveFrame;
+          output.stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:output];
+          NSError *failure = nil;
+          if (![output.stream addStreamOutput:output type:SCStreamOutputTypeScreen sampleHandlerQueue:queue error:&failure]) _exit(5);
+          CFRetain((__bridge CFTypeRef)output);
+          [output.stream startCaptureWithCompletionHandler:^(NSError *failure) { if (failure) _exit(5); }];
+        }];
+    } else {
+      CFTypeRef stream = create(display, width, height, 'BGRA',
+        (__bridge CFDictionaryRef)@{
+          (__bridge NSString *)*intervalKey: @(1.0 / fps),
+          (__bridge NSString *)*cursorKey: @NO
+        }, queue, receiveFrame);
+      if (!stream || start(stream) != kCGErrorSuccess) return 5;
+    }
     signal(SIGPIPE, SIG_IGN);
 
     // stdin is a private parent pipe: one byte requests the newest frame. EOF,

@@ -1,6 +1,8 @@
 import { join } from "node:path";
+import { release as osRelease } from "node:os";
 
 import {
+  app,
   BrowserWindow,
   dialog,
   powerMonitor,
@@ -16,17 +18,56 @@ import {
   type DesktopRemoteDesktopState
 } from "./remote-desktop-host.js";
 import { DesktopRemoteDesktopClipboard } from "./remote-desktop-clipboard.js";
+import { DesktopRemoteDesktopClipboardCounter } from "./remote-desktop-clipboard-counter.js";
+import { desktopRemoteDesktopLinuxClipboard, supportsDesktopRemoteDesktopLinuxClipboard } from "./remote-desktop-linux-clipboard.js";
+import { DesktopRemoteDesktopPrivacyScreen } from "./remote-desktop-privacy-screen.js";
+import { DesktopRemoteCredentialsNative, type DesktopRemoteCredentialsNativeOwner } from "./remote-desktop-credentials-native.js";
+import { readDesktopRemoteDesktopLinuxCredentialLockState } from "./remote-desktop-linux-credentials.js";
 import {
   DesktopRemoteDesktopInput,
+  lockDesktopRemoteDesktopScreen,
   readDesktopRemoteDesktopDisplayModes,
   readDesktopRemoteDesktopInputPermission,
   readDesktopRemoteDesktopSessionState,
+  restoreDesktopRemoteDesktopDisplayMode,
   setDesktopRemoteDesktopDisplayMode,
   type DesktopRemoteDesktopSessionState
 } from "./remote-desktop-input.js";
 import { DesktopRemoteDesktopMedia } from "./remote-desktop-media.js";
+import { DesktopRemoteDesktopWindowsInput } from "./remote-desktop-windows-input.js";
+import { desktopRemoteDesktopWindowsHost } from "./remote-desktop-windows-host.js";
 import { readDesktopSystemAudioSupport } from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopSettingsStore } from "./remote-desktop-settings.js";
+import type { SystemAudioMuteGuard } from "./system-audio-mute.js";
+import { DesktopRemoteDesktopLinuxMute, supportsDesktopRemoteDesktopLinuxMute
+} from "./remote-desktop-linux-mute.js";
+import { DesktopRemoteDesktopLinuxWorkspace, readDesktopRemoteDesktopLinuxWorkspaceSupport
+} from "./remote-desktop-linux-workspace.js";
+import { DesktopRemoteDesktopLinuxPrivacyScreen, supportsDesktopRemoteDesktopLinuxPrivacy,
+  prepareDesktopRemoteDesktopLinuxPrivacy } from "./remote-desktop-linux-privacy.js";
+import {
+  WAYLAND_REMOTE_DESKTOP_DISPLAY_ID,
+  isDesktopRemoteDesktopWayland,
+  supportsDesktopRemoteDesktopLinuxCapture,
+  readDesktopRemoteDesktopLinuxSessionState,
+  readDesktopRemoteDesktopLinuxLockSessionState,
+  readDesktopRemoteDesktopLinuxMonitors,
+  readDesktopRemoteDesktopLinuxInputSupport,
+  readDesktopRemoteDesktopLinuxCursorSupport,
+  linuxRemoteDesktopDisplay
+} from "./remote-desktop-linux.js";
+import { lockDesktopRemoteDesktopLinuxScreen, supportsDesktopRemoteDesktopLinuxLock
+} from "./remote-desktop-linux-lock.js";
+import { createDesktopRemoteDesktopLinuxViewerDisplay, supportsDesktopRemoteDesktopLinuxViewerDisplay
+} from "./remote-desktop-linux-viewer-display.js";
+import { createDesktopRemoteDesktopMacViewerDisplay, supportsDesktopRemoteDesktopMacViewerDisplay
+} from "./remote-desktop-macos-viewer-display.js";
+import {
+  readDesktopRemoteDesktopLinuxDisplayModes,
+  setDesktopRemoteDesktopLinuxDisplayMode,
+  restoreDesktopRemoteDesktopLinuxDisplayMode,
+  supportsDesktopRemoteDesktopLinuxDisplayModes
+} from "./remote-desktop-linux-display.js";
 
 const MAC_SCREEN_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
 const MAC_ACCESSIBILITY_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
@@ -34,6 +75,9 @@ const MAC_ACCESSIBILITY_SETTINGS = "x-apple.systempreferences:com.apple.preferen
 export interface DesktopRemoteDesktopMainOptions {
   readonly sourceDirectory: string;
   readonly settings: DesktopRemoteDesktopSettingsStore;
+  readonly connectionsAllowed?: () => boolean;
+  readonly credentialsOwner?: DesktopRemoteCredentialsNativeOwner;
+  readonly systemAudioMute: SystemAudioMuteGuard<number | object>;
   readonly getMainWindow: () => BrowserWindow | undefined;
   readonly changed: (state: DesktopRemoteDesktopState | undefined) => void;
   readonly retired?: () => void;
@@ -48,32 +92,153 @@ export function createDesktopRemoteDesktopMainHost(
   }
   let host: DesktopRemoteDesktopHost | undefined;
   let displayAwake: number | undefined;
-  const media = new DesktopRemoteDesktopMedia(join(options.sourceDirectory, "remote-desktop-capture-preload.cjs"));
-  const input = new DesktopRemoteDesktopInput(() => host?.releaseControl());
+  const media = new DesktopRemoteDesktopMedia(join(options.sourceDirectory, "remote-desktop-capture-preload.cjs"),
+    undefined, (leaseId) => { if (host?.state?.leaseId === leaseId) host.disconnect(); });
+  const input = process.platform === "win32"
+    ? new DesktopRemoteDesktopWindowsInput(() => host?.releaseControl())
+    : new DesktopRemoteDesktopInput(() => host?.releaseControl());
+  const linuxMute = process.platform === "linux" && supportsDesktopRemoteDesktopLinuxMute()
+    ? new DesktopRemoteDesktopLinuxMute() : undefined;
+  const linuxWorkspace = process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture()
+    ? new DesktopRemoteDesktopLinuxWorkspace() : undefined;
+  const supportsPrivacy = (process.platform === "darwin" && typeof process.getSystemVersion === "function"
+    && Number(process.getSystemVersion().split(".")[0]) >= 14)
+    || (process.platform === "win32" && Number(osRelease().split(".")[2]) >= 19041);
+  const privacy = process.platform === "linux" ? new DesktopRemoteDesktopLinuxPrivacyScreen({
+    stopped: async (owner) => { await host!.stopPrivacyByUser(owner); },
+    suspendInput: (current, signal) => input.pauseForPrivacy(current, signal)
+  }) : supportsPrivacy ? new DesktopRemoteDesktopPrivacyScreen({
+    excluded: (owner, ids) => { if (process.platform === "darwin") media.setPrivacyExclusions(owner, ids); },
+    cleared: (owner) => { if (process.platform === "darwin") media.clearPrivacyExclusions(owner); },
+    prepare: async (owner, displayId, current, signal) => {
+      if (process.platform === "darwin") await media.preparePrivacy(owner, displayId, current, signal);
+    },
+    stopped: async (owner) => { await host!.stopPrivacyByUser(owner); },
+    suspendInput: (current, signal) => input.pauseForPrivacy(current, signal)
+  }) : undefined;
   const clipboard = process.platform === "darwin" || process.platform === "win32"
+    || process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture() && supportsDesktopRemoteDesktopLinuxClipboard()
     ? new DesktopRemoteDesktopClipboard((events) => input.send(events))
     : undefined;
+  let linuxLayout: string | undefined;
+  let linuxInputLayout: string | undefined;
+  let linuxDisplays: readonly RemoteDesktopDisplay[] = Object.freeze([]);
+  let linuxMonitors: Awaited<ReturnType<typeof readDesktopRemoteDesktopLinuxMonitors>> = Object.freeze([]);
+  const linuxDisplayListeners = new Set<(displayId: string, geometryChanged: boolean,
+    geometry?: { readonly width: number; readonly height: number; readonly metrics: readonly string[] }) => void>();
+  const readLinuxDisplays = async (signal: AbortSignal): Promise<readonly RemoteDesktopDisplay[]> => {
+    if (!supportsDesktopRemoteDesktopLinuxCapture()) {
+      if (!isDesktopRemoteDesktopWayland()) throw new Error("REMOTE_DESKTOP_UNSUPPORTED");
+      return Object.freeze([{ id: WAYLAND_REMOTE_DESKTOP_DISPLAY_ID, name: "Shared screen",
+        width: 1280, height: 720 }]);
+    }
+    const before = await readDesktopRemoteDesktopLinuxSessionState(signal);
+    if (before !== "unlocked" && before !== "locked-logged-in") throw new Error("REMOTE_DESKTOP_LOCKED_SESSION_UNSUPPORTED");
+    const monitors = await readDesktopRemoteDesktopLinuxMonitors(signal);
+    const allMonitors = await readDesktopRemoteDesktopLinuxMonitors(signal, undefined, true);
+    const after = await readDesktopRemoteDesktopLinuxSessionState(signal);
+    if (after !== before) throw new Error("REMOTE_DESKTOP_LOCKED_SESSION_UNSUPPORTED");
+    const layout = JSON.stringify(monitors);
+    const inputLayout = JSON.stringify(monitors.map(({ name, x, y, scale, transform }) =>
+      ({ name, x, y, scale, transform })));
+    const displays = Object.freeze(monitors.map(linuxRemoteDesktopDisplay));
+    const managed = host?.managedViewerDisplay;
+    const sourcePresent = managed !== undefined && allMonitors.some(m => linuxRemoteDesktopDisplay(m).id === managed.sourceDisplayId);
+    const ordinary = (items: typeof monitors) => items.filter(m => {
+      const id = linuxRemoteDesktopDisplay(m).id;
+      return id !== managed?.sourceDisplayId && id !== managed?.displayId;
+    });
+    const managedTransition = managed !== undefined && sourcePresent
+      && JSON.stringify(ordinary(linuxMonitors)) === JSON.stringify(ordinary(monitors))
+      && monitors.every(m => {
+        const id = linuxRemoteDesktopDisplay(m).id;
+        return id === managed.sourceDisplayId || id === managed.displayId || linuxMonitors.some(previous => previous.name === m.name);
+      });
+    if (managed !== undefined && !sourcePresent) host?.displayCoverageChanged();
+    if (linuxLayout !== undefined && linuxLayout !== layout) {
+      const old = linuxDisplays;
+      const managedGeometry = linuxInputLayout === inputLayout && old.length === displays.length
+        && old.every(display => {
+          const next = displays.find(value => value.id === display.id);
+          return next !== undefined && (next.width === display.width && next.height === display.height
+            || host?.managesDisplayGeometry(display.id, next.width, next.height) === true);
+        });
+      if (!managedGeometry && !managedTransition) host?.releaseControl();
+      if (readDesktopSystemAudioSupport()) media.setSessionState(after === "locked-logged-in", after);
+      else media.setSessionState(after === "locked-logged-in");
+      for (const display of old) {
+        const next = displays.find(value => value.id === display.id);
+        if (next === undefined || next.width !== display.width || next.height !== display.height) {
+          if (managedTransition && (display.id === managed.sourceDisplayId || display.id === managed.displayId)) continue;
+          for (const listener of linuxDisplayListeners) listener(display.id, true, { width: next?.width ?? display.width,
+            height: next?.height ?? display.height, metrics: [next === undefined ? "removed" : "bounds"] });
+        }
+      }
+    }
+    linuxLayout = layout;
+    linuxInputLayout = inputLayout;
+    linuxDisplays = displays;
+    linuxMonitors = monitors;
+    return Object.freeze(allMonitors.map(linuxRemoteDesktopDisplay).filter(display => display.id !== managed?.displayId));
+  };
   const subscriptions = {
-    display: (listener: (displayId: string, geometryChanged: boolean) => void): (() => void) => {
+    display: (listener: (displayId: string, geometryChanged: boolean, geometry?: {
+      readonly width: number; readonly height: number; readonly metrics: readonly string[];
+    }) => void): (() => void) => {
+      if (process.platform === "linux") {
+        linuxDisplayListeners.add(listener);
+        return () => { linuxDisplayListeners.delete(listener); };
+      }
       const removed = (_event: Electron.Event, display: Electron.Display): void => {
-        listener(String(display.id), true);
+        if (privacy?.active) host?.displayCoverageChanged();
+        listener(String(display.id), true, {
+          width: display.size.width, height: display.size.height, metrics: ["removed"]
+        });
       };
+      const added = (): void => { if (privacy?.active) host?.displayCoverageChanged(); };
       const changed = (
         _event: Electron.Event,
         display: Electron.Display,
         metrics: string[]
       ): void => {
         listener(String(display.id), metrics.some((metric) =>
-          metric === "bounds" || metric === "scaleFactor" || metric === "rotation"));
+          metric === "bounds" || metric === "workArea" || metric === "scaleFactor" || metric === "rotation"), {
+            width: display.size.width, height: display.size.height, metrics: Object.freeze([...metrics])
+          });
       };
       screen.on("display-removed", removed);
+      screen.on("display-added", added);
       screen.on("display-metrics-changed", changed);
       return () => {
         screen.removeListener("display-removed", removed);
+        screen.removeListener("display-added", added);
         screen.removeListener("display-metrics-changed", changed);
       };
     },
     session: (listener: () => void): (() => void) => {
+      if (process.platform === "linux") {
+        let previous: DesktopRemoteDesktopSessionState | undefined;
+        let pending = false;
+        let retired = false;
+        const refresh = async (): Promise<void> => {
+          if (pending || retired || !options.settings.get().enabled) return;
+          pending = true;
+          try {
+            const current = await readDesktopRemoteDesktopLinuxSessionState(new AbortController().signal);
+            if (retired) return;
+            if (previous !== undefined && previous !== current) listener();
+            previous = current;
+            if (host?.state !== undefined && (current === "unlocked" || current === "locked-logged-in")) {
+              try { await readLinuxDisplays(new AbortController().signal); } catch { if (!retired) listener(); }
+            }
+          } catch { if (!retired) listener(); }
+          finally { pending = false; }
+        };
+        const timer = setInterval(() => { void refresh(); }, 1_000);
+        timer.unref?.();
+        void refresh();
+        return () => { retired = true; clearInterval(timer); };
+      }
       const locked = (): void => { listener(); };
       const unlocked = (): void => { listener(); };
       powerMonitor.on("lock-screen", locked);
@@ -87,17 +252,89 @@ export function createDesktopRemoteDesktopMainHost(
   host = new DesktopRemoteDesktopHost({
     platform: process.platform,
     systemAudio: readDesktopSystemAudioSupport(),
-    enabled: () => options.settings.get().enabled,
+    enabled: () => options.settings.get().enabled && (options.connectionsAllowed?.() ?? true),
     sessionState: desktopSessionState,
-    displays: desktopDisplays,
+    displays: process.platform === "linux" ? readLinuxDisplays : desktopDisplays,
+    ...(process.platform === "win32" ? { windowsCapabilities: async (signal: AbortSignal) => {
+      const ready = await desktopRemoteDesktopWindowsHost.readSupport(signal) === "ready";
+      return { canControl: ready, cursorOverlay: ready };
+    } } : {}),
+    ...(process.platform === "linux" ? { linuxCapabilities: async (signal: AbortSignal) => ({
+      ...(linuxWorkspace === undefined ? { workspaceNavigation: false, systemMenu: false }
+        : await readDesktopRemoteDesktopLinuxWorkspaceSupport(signal)),
+      lockOnExit: await supportsDesktopRemoteDesktopLinuxLock(signal),
+      canControl: supportsDesktopRemoteDesktopLinuxCapture() && await readDesktopRemoteDesktopLinuxInputSupport(signal),
+      cursorOverlay: supportsDesktopRemoteDesktopLinuxCapture() && await readDesktopRemoteDesktopLinuxCursorSupport(signal),
+      displayModes: supportsDesktopRemoteDesktopLinuxCapture() && await supportsDesktopRemoteDesktopLinuxDisplayModes(signal),
+      viewerDisplay: supportsDesktopRemoteDesktopLinuxCapture() && await supportsDesktopRemoteDesktopLinuxViewerDisplay(signal),
+      privacyScreen: supportsDesktopRemoteDesktopLinuxCapture() && await supportsDesktopRemoteDesktopLinuxPrivacy(signal)
+    }), prepare: async (current: () => boolean, signal: AbortSignal) => {
+      if (!supportsDesktopRemoteDesktopLinuxCapture() || !await supportsDesktopRemoteDesktopLinuxPrivacy(signal)) return;
+      try { await prepareDesktopRemoteDesktopLinuxPrivacy(current, signal, true); }
+      catch {
+        // A plugin unavailable at preparation time preserves ordinary viewing.
+        if (signal.aborted || !current()) throw new Error("REMOTE_DESKTOP_PRIVACY_EXPIRED");
+      }
+    } } : {}),
     permissions: readDesktopRemoteDesktopPermissions,
     showPermissionGuide: (signal) => showDesktopRemoteDesktopPermissionGuide(options.getMainWindow(), signal),
     media,
     input,
-    ...(clipboard === undefined ? {} : { clipboard }),
+    ...(options.credentialsOwner !== undefined && (process.platform === "linux" || process.platform === "darwin"
+      && typeof process.getSystemVersion === "function" && Number(process.getSystemVersion().split(".")[0]) >= 12)
+      ? { credentials: { native: new DesktopRemoteCredentialsNative(), owner: options.credentialsOwner,
+        ...(process.platform === "linux" ? { lockState: readDesktopRemoteDesktopLinuxCredentialLockState } : {}) } } : {}),
+    ...(privacy === undefined ? {} : { privacyScreen: privacy }),
+    ...(clipboard === undefined ? {} : { clipboard, clipboardCounter: new DesktopRemoteDesktopClipboardCounter() }),
+    ...(linuxMute === undefined ? {} : { hostMute: linuxMute }),
+    ...(linuxWorkspace === undefined ? {} : {
+      workspaceAction: (action, displayId, current, signal) => linuxWorkspace.request(action, displayId, current, signal),
+      stopWorkspaceActions: () => linuxWorkspace.stop()
+    }),
+    ...(process.platform === "darwin" || process.platform === "win32" ? {
+      hostMute: {
+        set: async (owner: object, enabled: boolean, current: () => boolean, signal: AbortSignal) => {
+          const check = (): void => {
+            if (signal.aborted || !current()) throw new Error("REMOTE_DESKTOP_HOST_MUTE_EXPIRED");
+          };
+          try {
+            if (enabled) await options.systemAudioMute.acquire(owner, check);
+            else await options.systemAudioMute.release(owner, check);
+            check();
+          } catch (error) {
+            if (error instanceof Error && error.message === "REMOTE_DESKTOP_HOST_MUTE_EXPIRED") throw error;
+            throw new Error("REMOTE_DESKTOP_HOST_MUTE_UNAVAILABLE");
+          }
+        },
+        release: async (owner: object) => {
+          try { await options.systemAudioMute.release(owner); }
+          catch { throw new Error("REMOTE_DESKTOP_HOST_MUTE_UNAVAILABLE"); }
+        }
+      }
+    } : {}),
     ...(process.platform === "darwin" ? {
+      lockScreen: lockDesktopRemoteDesktopScreen,
       displayModes: readDesktopRemoteDesktopDisplayModes,
-      setDisplayMode: setDesktopRemoteDesktopDisplayMode
+      setDisplayMode: setDesktopRemoteDesktopDisplayMode,
+      restoreDisplayMode: restoreDesktopRemoteDesktopDisplayMode,
+      displayPresent: (displayId: string) => screen.getAllDisplays().some((display) => String(display.id) === displayId)
+    } : {}),
+    ...(process.platform === "darwin" && !app.isPackaged ? {
+      viewerDisplaySupported: supportsDesktopRemoteDesktopMacViewerDisplay,
+      createViewerDisplay: createDesktopRemoteDesktopMacViewerDisplay
+    } : {}),
+    ...(process.platform === "linux" ? {
+      lockScreen: lockDesktopRemoteDesktopLinuxScreen,
+      lockSessionState: readDesktopRemoteDesktopLinuxLockSessionState
+    } : {}),
+    ...(process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture() ? {
+      displayModes: readDesktopRemoteDesktopLinuxDisplayModes,
+      setDisplayMode: setDesktopRemoteDesktopLinuxDisplayMode,
+      restoreDisplayMode: restoreDesktopRemoteDesktopLinuxDisplayMode,
+      createViewerDisplay: createDesktopRemoteDesktopLinuxViewerDisplay,
+      displayPresent: async (displayId: string) =>
+        (await readDesktopRemoteDesktopLinuxMonitors(new AbortController().signal, undefined, true))
+          .some(monitor => linuxRemoteDesktopDisplay(monitor).id === displayId)
     } : {}),
     changed: (state) => {
       if (state !== undefined && displayAwake === undefined) {
@@ -115,15 +352,23 @@ export function createDesktopRemoteDesktopMainHost(
   return host;
 }
 
+export async function closeDesktopRemoteDesktopClipboardWriter(): Promise<void> {
+  await desktopRemoteDesktopLinuxClipboard.closePublishedWriter();
+}
+
 async function desktopSessionState(signal: AbortSignal): Promise<DesktopRemoteDesktopSessionState> {
   if (process.platform === "darwin") return readDesktopRemoteDesktopSessionState(signal);
+  if (process.platform === "linux") {
+    const state = await readDesktopRemoteDesktopLinuxSessionState(signal);
+    return state === "locked-logged-in" && !supportsDesktopRemoteDesktopLinuxCapture() ? "unsupported" : state;
+  }
   throwIfAborted(signal);
   try {
     const state = powerMonitor.getSystemIdleState(1);
     return state === "active" || state === "idle"
       ? "unlocked"
       : state === "locked"
-        ? "unsupported"
+        ? await desktopRemoteDesktopWindowsHost.readSupport(signal) === "ready" ? "locked-logged-in" : "unsupported"
         : "unknown";
   } catch {
     // Unknown current session ownership is never allowed to expose pixels.

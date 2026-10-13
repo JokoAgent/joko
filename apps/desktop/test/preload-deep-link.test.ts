@@ -3,6 +3,7 @@ import { runInNewContext } from "node:vm";
 import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { describe, expect, it, vi } from "vitest";
 import { DESKTOP_CHANNELS } from "../src/channels.js";
+import type { DesktopRemoteDesktopApi } from "@joko/contracts";
 
 interface DeepLinkApi {
   takePending(): Promise<unknown>;
@@ -162,6 +163,17 @@ function loadPreload(
 }
 
 describe("main application preload deep-link occurrence fence", () => {
+  it("exposes the remote desktop opening bridge only to a captured primary document", async () => {
+    const primary = loadPreload("document-current"), auxiliary = loadPreload("");
+    expect(primary.exposed["capabilities"]).toContain("remote.desktopViewer");
+    expect(auxiliary.exposed["capabilities"]).not.toContain("remote.desktopViewer");
+    expect(auxiliary.exposed["remoteDesktopViewer"]).toBeUndefined();
+    const owner = { profileId: "profile", serverId: "node", deviceId: "device", origin: "https://node.example", connectionGeneration: 1 };
+    const bridge = primary.exposed["remoteDesktopViewer"] as { bind(value: unknown): Promise<void> };
+    await bridge.bind(owner);
+    expect(primary.invoke).toHaveBeenCalledWith("joko:remote-desktop-viewer:bind", "document-current", owner);
+  });
+
   it("captures the host-owned occurrence once before any other bridge query without exposing capture", () => {
     const loaded = loadPreload("document-current");
 
@@ -416,5 +428,55 @@ describe("main application preload keep-awake observer", () => {
 
     expect(() => subscribe(null)).toThrow(/listener must be a function/u);
     expect(loaded.listeners.has(DESKTOP_CHANNELS.keepAwakeChanged)).toBe(false);
+  });
+});
+
+describe("main application preload Remote Desktop service authorization", () => {
+  const snapshot = { enabled: true, active: false, controlling: false,
+    permissions: { screenRecording: "notRequired", accessibility: "notRequired" }, windowsSupport: "missing" };
+
+  it("binds fresh support and explicit setup to the captured primary document", async () => {
+    const loaded = loadPreload("document-current");
+    const api = loaded.exposed["remoteDesktop"] as DesktopRemoteDesktopApi;
+    loaded.invoke.mockResolvedValue(snapshot);
+    await expect(api.getState(true)).resolves.toEqual(snapshot);
+    expect(loaded.invoke).toHaveBeenCalledExactlyOnceWith(DESKTOP_CHANNELS.remoteDesktopGetState, "document-current", true);
+    await expect(api.configureWindowsSupport(true)).resolves.toEqual(snapshot);
+    expect(loaded.invoke).toHaveBeenLastCalledWith(DESKTOP_CHANNELS.remoteDesktopConfigureWindowsSupport, "document-current", true);
+    await expect(api.configureWindowsSupport(false)).resolves.toEqual(snapshot);
+    expect(loaded.invoke).toHaveBeenLastCalledWith(DESKTOP_CHANNELS.remoteDesktopConfigureWindowsSupport, "document-current", false);
+    const count = loaded.invoke.mock.calls.length;
+    await expect(api.getState("true" as unknown as boolean)).rejects.toThrow(/must be boolean/u);
+    await expect(api.configureWindowsSupport(1 as unknown as boolean)).rejects.toThrow(/must be boolean/u);
+    expect(loaded.invoke).toHaveBeenCalledTimes(count);
+
+    const auxiliary = loadPreload("");
+    const unavailable = auxiliary.exposed["remoteDesktop"] as DesktopRemoteDesktopApi;
+    await expect(unavailable.getState(true)).rejects.toThrow(/unavailable/u);
+    await expect(unavailable.configureWindowsSupport(true)).rejects.toThrow(/unavailable/u);
+    expect(auxiliary.invoke).not.toHaveBeenCalled();
+  });
+
+  it("accepts only strict known support states on replies and observer messages", async () => {
+    const loaded = loadPreload("document-current");
+    const api = loaded.exposed["remoteDesktop"] as DesktopRemoteDesktopApi;
+    const listener = vi.fn();
+    const unsubscribe = api.onStateChanged(listener);
+    const wrapped = loaded.listeners.get(DESKTOP_CHANNELS.remoteDesktopStateChanged);
+    for (const windowsSupport of ["ready", "missing", "installRequired", "unavailable"]) {
+      loaded.invoke.mockResolvedValue({ ...snapshot, windowsSupport });
+      await expect(api.getState()).resolves.toEqual({ ...snapshot, windowsSupport });
+      wrapped?.({}, { ...snapshot, windowsSupport });
+    }
+    expect(listener).toHaveBeenCalledTimes(4);
+    for (const malformed of [{ ...snapshot, windowsSupport: "autoStart" }, { ...snapshot, windowsSupport: undefined },
+      { ...snapshot, privileged: true }, { ...snapshot, controlling: true }]) {
+      loaded.invoke.mockResolvedValue(malformed);
+      await expect(api.getState()).rejects.toThrow(/state is invalid/u);
+      wrapped?.({}, malformed);
+    }
+    expect(listener).toHaveBeenCalledTimes(4);
+    unsubscribe();
+    expect(loaded.listeners.has(DESKTOP_CHANNELS.remoteDesktopStateChanged)).toBe(false);
   });
 });

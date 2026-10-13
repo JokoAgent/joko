@@ -1068,6 +1068,7 @@ function commandMetadata(command: contract.DevicePeerCommand): {
           || action === "getRemoteDesktopFrame" || action === "transferRemoteDesktopClipboardText"
           || action === "transferRemoteDesktopClipboardContent"
           || action === "listRemoteDesktopDisplayModes" || action === "setRemoteDesktopDisplayMode"
+          || action === "setRemoteDesktopViewerDisplay" || action === "restoreRemoteDesktopViewerDisplay"
           ? "remote_desktop"
           : "files";
   const effectKind: DevicePeerEffectKind = readOnly ? "read_only" : "side_effect";
@@ -1110,6 +1111,8 @@ function completedPayloadCase(
     case "transferRemoteDesktopClipboardText": return "remoteDesktopClipboardText";
     case "transferRemoteDesktopClipboardContent": return "remoteDesktopClipboardContent";
     case "listRemoteDesktopDisplayModes": return "remoteDesktopDisplayModes";
+    case "setRemoteDesktopViewerDisplay":
+    case "restoreRemoteDesktopViewerDisplay": return "remoteDesktopViewerDisplay";
     case "writeProcess":
     case "signalProcess":
     case "writeTerminal":

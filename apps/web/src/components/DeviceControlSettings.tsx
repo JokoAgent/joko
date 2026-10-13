@@ -3,6 +3,7 @@ import type { AppController } from "../controller.js";
 import type { AppSnapshot, DeviceControlRelationView, DeviceView } from "../model.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, Pill, StatusDot, cx, formatRelativeTime, SwitchControl } from "./ui.js";
+import { desktopRemoteDesktopViewerOwner, openDesktopRemoteDesktopViewer } from "../remote-desktop-viewer-bridge.js";
 
 const PRESENCE_REFRESH_MS = 30_000;
 
@@ -42,6 +43,7 @@ export function DeviceControlSettings({ controller, snapshot, locale, runAction,
   const activeProfile = controller.state.activeProfile;
   const currentDeviceId = activeProfile?.deviceId;
   const currentDevice = snapshot.devices.find((device) => device.id === currentDeviceId);
+  const viewerOwner = desktopRemoteDesktopViewerOwner(controller.state);
   const drafts = useRef(new Map<string, DeviceNameDraft>());
   const nameOwner = `${activeProfile?.serverId ?? ""}\u0000${activeProfile?.origin ?? ""}\u0000${activeProfile?.id ?? ""}`;
   const nameOccurrence = `${nameOwner}\u0000${controller.state.connectionGeneration ?? 0}`;
@@ -111,6 +113,10 @@ export function DeviceControlSettings({ controller, snapshot, locale, runAction,
           </header>
           <DeviceNameEditor key={`${nameOccurrence}\u0000${peer.id}`} device={peer} controller={controller}
             ownerId={`${nameOwner}\u0000${peer.id}`} drafts={drafts.current} t={t} />
+          {peer.kind === "desktop" && window.jokoDesktop?.remoteDesktopViewer !== undefined && <Button
+            disabled={peer.presence !== "online" || !outbound.effective || !peer.remoteControlEnabled}
+            onClick={() => runAction(`remote-desktop:${peer.id}`, () => openDesktopRemoteDesktopViewer(controller,
+              viewerOwner, { deviceId: peer.id, name: peer.name }))}>{t("settings.remoteDesktop.open")}</Button>}
           <div className={cx("device-control-toggle-row", !targetCanReceive && "is-disabled")}>
             <span>
               <strong>{t("settings.deviceControl.controlPeer")}</strong>

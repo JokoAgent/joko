@@ -350,6 +350,8 @@ export interface SidebarProps {
   readonly onResetWidth: () => void;
   readonly onDisconnect: () => void;
   readonly machineControl?: {
+    readonly remoteDesktops?: readonly { readonly deviceId: string; readonly name: string; readonly enabled: boolean }[];
+    readonly onRemoteDesktop?: (deviceId: string) => void;
     readonly profiles: readonly ConnectionProfile[];
     readonly activeProfile: ConnectionProfile;
     readonly presenceByProfile: Readonly<Record<string, MachinePresenceView>>;

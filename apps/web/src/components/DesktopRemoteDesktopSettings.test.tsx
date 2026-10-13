@@ -84,6 +84,40 @@ describe("DesktopRemoteDesktopSettings", () => {
     expect(fixture.api.setEnabled).toHaveBeenCalledExactlyOnceWith(true);
     expect(switchControl(host).getAttribute("aria-checked")).toBe("true");
   });
+
+  it("authorizes and removes the current process service with explicit local failure recovery", async () => {
+    const fixture = remoteDesktopFixture(snapshot({ enabled: true, windowsSupport: "missing" }));
+    fixture.api.configureWindowsSupport = vi.fn()
+      .mockRejectedValueOnce(new Error("private elevation output"))
+      .mockResolvedValueOnce(snapshot({ enabled: true, windowsSupport: "ready" }))
+      .mockResolvedValueOnce(snapshot({ enabled: true, windowsSupport: "missing" }));
+    installDesktop(fixture.api);
+    const { host } = await render(<DesktopRemoteDesktopSettings t={t} />);
+    expect(fixture.api.getState).toHaveBeenCalledExactlyOnceWith(true);
+    expect(host.textContent).toContain("Allow control of the lock screen and administrator prompts.");
+    expect(host.textContent).not.toContain("Host permissions");
+    await act(async () => button(host, "Authorize").click());
+    expect(host.querySelector('[role="alert"]')?.textContent).toBe("Authorization was not completed. Try again on this computer.");
+    expect(host.textContent).not.toContain("private elevation output");
+    expect(button(host, "Authorize").disabled).toBe(false);
+    await act(async () => button(host, "Authorize").click());
+    expect(host.textContent).toContain("Restarting Joko requires administrator authorization again.");
+    await act(async () => button(host, "Remove service").click());
+    expect(fixture.api.configureWindowsSupport).toHaveBeenNthCalledWith(3, false);
+    expect(button(host, "Authorize").disabled).toBe(false);
+  });
+
+  it.each([
+    ["installRequired", "Install Joko for all users in Program Files"],
+    ["unavailable", "The system service is unavailable"]
+  ] as const)("shows %s recovery without offering authorization", async (windowsSupport, message) => {
+    const fixture = remoteDesktopFixture(snapshot({ enabled: true, windowsSupport }));
+    installDesktop(fixture.api);
+    const { host } = await render(<DesktopRemoteDesktopSettings t={t} />);
+    expect(host.textContent).toContain(message);
+    expect(button(host, "Authorize").disabled).toBe(true);
+    expect(fixture.api.configureWindowsSupport).not.toHaveBeenCalled();
+  });
 });
 
 describe("DesktopRemoteDesktopStatus", () => {
@@ -152,6 +186,7 @@ function remoteDesktopFixture(initial: JokoDesktopRemoteDesktopSnapshot): {
     api: {
       getState: vi.fn(async () => current),
       setEnabled: vi.fn(async (enabled) => publish(snapshot({ ...current, enabled }))),
+      configureWindowsSupport: vi.fn(async (enabled) => publish(snapshot({ ...current, windowsSupport: enabled ? "ready" : "missing" }))),
       disconnect: vi.fn(async () => publish(snapshot({
         ...current,
         active: false,

@@ -39,21 +39,32 @@ export class SystemAudioMuteGuard<Owner> {
     this.#backend = backend;
   }
 
-  acquire(owner: Owner): Promise<void> {
+  acquire(owner: Owner, check: () => void = () => undefined): Promise<void> {
     return this.#enqueue(async () => {
+      check();
       if (!this.#backend.supported || this.#owners.has(owner)) return;
       if (this.#owners.size === 0 && this.#originalMuted === undefined) {
         const muted = await this.#backend.getMuted();
-        if (!muted) await this.#backend.setMuted(true);
+        check();
+        // Preserve recovery even if the native mute reaches the OS and rejects.
         this.#originalMuted = muted;
+        if (!muted) await this.#backend.setMuted(true);
+      } else if (this.#owners.size === 0) {
+        check();
+        // A rejected restore may have reached the OS. Keep its original
+        // snapshot while reasserting mute for the new exact owner.
+        await this.#backend.setMuted(true);
       }
+      check();
       this.#owners.add(owner);
     });
   }
 
-  release(owner: Owner): Promise<void> {
+  release(owner: Owner, check: () => void = () => undefined): Promise<void> {
     return this.#enqueue(async () => {
-      if (!this.#owners.delete(owner) || this.#owners.size !== 0) return;
+      check();
+      this.#owners.delete(owner);
+      if (this.#owners.size !== 0) return;
       await this.#restoreOriginalState();
     });
   }

@@ -9,7 +9,9 @@ use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*};
 
 mod desktop;
+mod worker_desktop;
 mod selection;
+mod privacy;
 
 static FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -105,7 +107,49 @@ fn desktop_ready() -> bool {
     }
 }
 
+fn clipboard_counter() -> Result<u32, ()> {
+    desktop::require_unlocked().map_err(|_| ())?;
+    Ok(unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() })
+}
+
+fn counter_session() {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut input = io::stdin().lock();
+        loop {
+            let mut line = Vec::new();
+            match input.by_ref().take(34).read_until(b'\n', &mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) if line.len() > 33 || line.last() != Some(&b'\n') => break,
+                Ok(_) => if sender.send(line).is_err() { break; },
+            }
+        }
+    });
+    while let Ok(line) = receiver.recv_timeout(Duration::from_secs(5)) {
+        let Ok(line) = std::str::from_utf8(&line) else { break; };
+        let parts: Vec<_> = line.trim_end().split(' ').collect();
+        if parts.len() != 2 || parts[0].len() > 16 || parts[0].parse::<u64>().is_err()
+            || !["0", "1"].contains(&parts[1]) { break; }
+        let value = clipboard_counter().map(|v| v.to_string()).unwrap_or_else(|_| "unavailable".into());
+        println!("{} {}", parts[0], value);
+        if io::stdout().flush().is_err() { break; }
+    }
+}
+
 fn main() {
+    let service_worker = std::env::args().nth(1).as_deref() == Some("--service-worker");
+    if service_worker && (std::env::args().len() != 2 || !authorized_worker()) {
+        std::process::exit(2);
+    }
+    if std::env::args().nth(1).as_deref() == Some("--privacy-input") {
+        if desktop::require_unlocked().is_err() { std::process::exit(2); }
+        privacy::run();
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("--clipboard-counter") {
+        counter_session();
+        return;
+    }
     if matches!(
         std::env::args().nth(1).as_deref(),
         Some("--clipboard-selection" | "--clipboard-content-selection")
@@ -129,7 +173,10 @@ fn main() {
         return;
     }
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2); }
-    if !desktop_ready() { return; }
+    let mut bound_desktop = worker_desktop::InputDesktop::new();
+    if service_worker {
+        if bound_desktop.bind().is_err() { std::process::exit(2); }
+    } else if !desktop_ready() { return; }
 
     let (sender, receiver) = mpsc::sync_channel(64);
     std::thread::spawn(move || {
@@ -154,13 +201,17 @@ fn main() {
             Ok(line) => line,
             Err(_) => break,
         };
-        if !desktop_ready() { break; }
+        if service_worker {
+            if !authorized_worker() || bound_desktop.bind() != Ok(false) { break; }
+        } else if !desktop_ready() { break; }
         let events: Vec<Value> = match serde_json::from_slice::<Vec<Value>>(&line) {
             Ok(events) if events.len() <= 64 => events,
             _ => break,
         };
         for event in events {
-            if desktop::require_unlocked().is_err() { break 'input; }
+            if service_worker {
+                if !authorized_worker() || bound_desktop.bind() != Ok(false) { break 'input; }
+            } else if desktop::require_unlocked().is_err() { break 'input; }
             if FAILED.load(std::sync::atomic::Ordering::SeqCst) { break 'input; }
             match event["kind"].as_str().unwrap_or("") {
                 "release" => release(&mut keys, &mut buttons),
@@ -197,7 +248,9 @@ fn main() {
                 "text" => {
                     if let Some(text) = event["text"].as_str() {
                         for value in text.encode_utf16().take(4_096) {
-                            if desktop::require_unlocked().is_err() { break 'input; }
+                            if service_worker {
+                                if !authorized_worker() || bound_desktop.bind() != Ok(false) { break 'input; }
+                            } else if desktop::require_unlocked().is_err() { break 'input; }
                             key(value, true, true); key(value, false, true);
                         }
                     }
@@ -211,6 +264,33 @@ fn main() {
                 _ => (),
             }
         }
+        if service_worker {
+            if FAILED.load(std::sync::atomic::Ordering::SeqCst) { break; }
+            println!("ok");
+            if io::stdout().flush().is_err() { break; }
+        }
     }
     release(&mut keys, &mut buttons);
+}
+
+// A command-line flag never elevates ordinary input. Only the broker's SYSTEM
+// process in a kernel-owned job on the active console can enter this mode.
+fn authorized_worker() -> bool {
+    use windows_sys::Win32::{Foundation::*, Security::*, System::{Threading::*, RemoteDesktop::*, JobObjects::*}};
+    unsafe {
+        let process = GetCurrentProcess();
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 { return false; }
+        let mut user = [0usize; 128];
+        let mut size = 0;
+        let mut session = 0u32;
+        let mut in_job = 0;
+        let system = GetTokenInformation(token, TokenUser, user.as_mut_ptr().cast(),
+            std::mem::size_of_val(&user) as u32, &mut size) != 0
+            && IsWellKnownSid((*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid, WinLocalSystemSid) != 0;
+        let active = GetTokenInformation(token, TokenSessionId, (&mut session as *mut u32).cast(),
+            4, &mut size) != 0 && session != 0 && session == WTSGetActiveConsoleSessionId();
+        CloseHandle(token);
+        system && active && IsProcessInJob(process, std::ptr::null_mut(), &mut in_job) != 0 && in_job != 0
+    }
 }

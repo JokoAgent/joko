@@ -64,6 +64,43 @@ describe("Mobile Remote Desktop clipboard", () => {
     await expect(system.readPortable(check)).rejects.toMatchObject({ code: "unavailable" });
   });
 
+  it("requires native version and expected-write methods without using text fallback for sync", async () => {
+    const native = {
+      readClipboard: vi.fn(async () => '{"text":"native"}'), writeClipboard: vi.fn(async () => undefined),
+      clipboardVersion: vi.fn(async () => "epoch:1:12"), syncClipboard: vi.fn(async () => "epoch:2:13")
+    };
+    const fallback = legacy();
+    const system = createMobileRemoteClipboardSystem(native, fallback);
+    const check = vi.fn();
+    expect(system.syncAvailable).toBe(true);
+    await expect(system.version(check)).resolves.toBe("epoch:1:12");
+    await expect(system.writeExpected({ text: "portable" }, "epoch:1:12", check)).resolves.toBe("epoch:2:13");
+    expect(native.syncClipboard).toHaveBeenCalledWith('{"text":"portable"}', "epoch:1:12");
+    expect(check).toHaveBeenCalledTimes(4);
+    const partial = createMobileRemoteClipboardSystem({ readClipboard: native.readClipboard, writeClipboard: native.writeClipboard }, fallback);
+    expect(partial.richAvailable).toBe(true);
+    expect(partial.syncAvailable).toBe(false);
+    await expect(partial.version(check)).rejects.toMatchObject({ code: "unavailable" });
+    expect(fallback.getStringAsync).not.toHaveBeenCalled();
+  });
+
+  it("preserves typed permission, temporary focus and CAS failure without repeated native writes", async () => {
+    const native = {
+      readClipboard: vi.fn(async () => '{"text":"native"}'), writeClipboard: vi.fn(async () => undefined),
+      clipboardVersion: vi.fn(async () => "1"), syncClipboard: vi.fn(async () => "2")
+    };
+    const system = createMobileRemoteClipboardSystem(native, legacy());
+    native.clipboardVersion.mockRejectedValueOnce({ code: "PASTE_DENIED" });
+    await expect(system.version(() => undefined)).rejects.toMatchObject({ code: "permission" });
+    native.clipboardVersion.mockRejectedValueOnce(new Error("CLIPBOARD_NOT_ALLOWED"));
+    await expect(system.version(() => undefined)).rejects.toMatchObject({ code: "temporary-focus" });
+    native.syncClipboard.mockRejectedValueOnce(new Error("CLIPBOARD_CHANGED"));
+    await expect(system.writeExpected({ text: "native" }, "1", () => undefined)).rejects.toMatchObject({ code: "changed" });
+    expect(native.syncClipboard).toHaveBeenCalledTimes(1);
+    native.clipboardVersion.mockResolvedValueOnce("bad version");
+    await expect(system.version(() => undefined)).rejects.toMatchObject({ code: "unsupported" });
+  });
+
   it("rechecks the caller fence around every native effect", async () => {
     const native = {
       readClipboard: vi.fn(async () => JSON.stringify({ text: "private" })),

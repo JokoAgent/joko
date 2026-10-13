@@ -300,7 +300,10 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "create_remote_desktop_offer", "exchange_remote_desktop_ice", "get_remote_desktop_frame",
     "transfer_remote_desktop_clipboard_text", "transfer_remote_desktop_clipboard_content",
     "set_remote_desktop_presentation", "probe_remote_desktop_presentation",
-    "list_remote_desktop_display_modes", "set_remote_desktop_display_mode"
+    "list_remote_desktop_display_modes", "set_remote_desktop_display_mode", "set_remote_desktop_host_mute",
+    "set_remote_desktop_clipboard_sync", "get_remote_desktop_clipboard_version", "set_remote_desktop_privacy_screen",
+    "get_remote_desktop_lock_state", "request_remote_desktop_credentials", "close_remote_desktop_credentials",
+    "set_remote_desktop_viewer_display", "restore_remote_desktop_viewer_display"
   ]);
   assert.deepEqual(oneofMembers(contract.DevicePeerAgentResultSchema, "payload"), [
     "acknowledgement", "recent_directories", "directories", "directory_inspection", "directory_created",
@@ -314,7 +317,9 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "remote_desktop_control_state", "remote_desktop_offer", "remote_desktop_ice",
     "remote_desktop_frame", "remote_desktop_clipboard_text",
     "remote_desktop_clipboard_content", "remote_desktop_presentation_proof",
-    "remote_desktop_display_modes", "failure"
+    "remote_desktop_display_modes", "remote_desktop_host_mute", "remote_desktop_clipboard_sync",
+    "remote_desktop_clipboard_version", "remote_desktop_privacy_screen", "remote_desktop_lock_state",
+    "remote_desktop_credentials", "remote_desktop_display_mode", "remote_desktop_viewer_display", "failure"
   ]);
   assert.deepEqual([...fieldNames(contract.OpenDevicePeerAgentRouteRequestSchema)], [
     "target_device_id", "route_generation", "request_id", "hello", "result", "heartbeat"
@@ -374,12 +379,19 @@ test("Remote Desktop keeps public controller identity implicit and target comman
     [
       ["listRemoteDesktopHosts", "unary"],
       ["getRemoteDesktopCapabilities", "unary"],
+      ["getRemoteDesktopLockState", "unary"],
+      ["requestRemoteDesktopCredentials", "unary"],
       ["getRemoteDesktopPermissions", "unary"],
       ["showRemoteDesktopPermissionGuide", "unary"],
       ["startRemoteDesktop", "unary"],
       ["heartbeatRemoteDesktop", "unary"],
       ["stopRemoteDesktop", "unary"],
       ["setRemoteDesktopControl", "unary"],
+      ["setRemoteDesktopHostMute", "unary"],
+      ["performRemoteDesktopSystemAction", "unary"],
+      ["setRemoteDesktopPrivacyScreen", "unary"],
+      ["setRemoteDesktopClipboardSync", "unary"],
+      ["getRemoteDesktopClipboardVersion", "unary"],
       ["setRemoteDesktopPresentation", "unary"],
       ["sendRemoteDesktopInput", "unary"],
       ["getRemoteDesktopIceConfiguration", "unary"],
@@ -388,6 +400,8 @@ test("Remote Desktop keeps public controller identity implicit and target comman
       ["getRemoteDesktopFrame", "unary"],
       ["listRemoteDesktopDisplayModes", "unary"],
       ["setRemoteDesktopDisplayMode", "unary"],
+      ["setRemoteDesktopViewerDisplay", "unary"],
+      ["restoreRemoteDesktopViewerDisplay", "unary"],
       ["transferRemoteDesktopClipboardText", "unary"],
       ["transferRemoteDesktopClipboardContent", "unary"]
     ]
@@ -395,12 +409,19 @@ test("Remote Desktop keeps public controller identity implicit and target comman
 
   const targetRequests = [
     contract.GetRemoteDesktopCapabilitiesRequestSchema,
+    contract.GetRemoteDesktopLockStateRequestSchema,
+    contract.RequestRemoteDesktopCredentialsRequestSchema,
     contract.GetRemoteDesktopPermissionsRequestSchema,
     contract.ShowRemoteDesktopPermissionGuideRequestSchema,
     contract.StartRemoteDesktopRequestSchema,
     contract.HeartbeatRemoteDesktopRequestSchema,
     contract.StopRemoteDesktopRequestSchema,
     contract.SetRemoteDesktopControlRequestSchema,
+    contract.SetRemoteDesktopHostMuteRequestSchema,
+    contract.PerformRemoteDesktopSystemActionRequestSchema,
+    contract.SetRemoteDesktopPrivacyScreenRequestSchema,
+    contract.SetRemoteDesktopClipboardSyncRequestSchema,
+    contract.GetRemoteDesktopClipboardVersionRequestSchema,
     contract.SetRemoteDesktopPresentationRequestSchema,
     contract.SendRemoteDesktopInputRequestSchema,
     contract.GetRemoteDesktopIceConfigurationRequestSchema,
@@ -409,6 +430,8 @@ test("Remote Desktop keeps public controller identity implicit and target comman
     contract.GetRemoteDesktopFrameRequestSchema,
     contract.ListRemoteDesktopDisplayModesRequestSchema,
     contract.SetRemoteDesktopDisplayModeRequestSchema,
+    contract.SetRemoteDesktopViewerDisplayRequestSchema,
+    contract.RestoreRemoteDesktopViewerDisplayRequestSchema,
     contract.TransferRemoteDesktopClipboardTextRequestSchema,
     contract.TransferRemoteDesktopClipboardContentRequestSchema
   ];
@@ -434,7 +457,7 @@ test("Remote Desktop keeps public controller identity implicit and target comman
   ]);
   assert.deepEqual(oneofMembers(contract.RemoteDesktopClipboardTextRequestSchema, "action"), ["copy", "paste"]);
   assert.deepEqual(oneofMembers(contract.RemoteDesktopClipboardContentRequestSchema, "action"), [
-    "copy", "begin", "read", "write", "commit", "cancel"
+    "copy", "begin", "read", "write", "commit", "cancel", "paste"
   ]);
   assert.equal(field(contract.RemoteDesktopLeaseSchema, "control_generation").number, 4);
   assert.equal(field(contract.RemoteDesktopControlStateSchema, "control_generation").number, 2);
@@ -450,6 +473,37 @@ test("Remote Desktop keeps public controller identity implicit and target comman
   assert.deepEqual([...fieldNames(contract.RemoteDesktopDisplayModeSchema)], [
     "mode_id", "width", "height", "current", "native"
   ]);
+  assert.equal(field(contract.RemoteDesktopCapabilitiesSchema, "resolution_restore").number, 25);
+  assert.equal(field(contract.SetRemoteDesktopDisplayModeRequestSchema, "temporary").number, 5);
+  assert.equal(field(contract.DevicePeerSetRemoteDesktopDisplayModeActionSchema, "temporary").number, 4);
+  assert.equal(field(contract.DevicePeerAgentResultSchema, "remote_desktop_display_mode").number, 57);
+  assert.equal(field(contract.SetRemoteDesktopDisplayModeResponseSchema, "result").message.typeName,
+    "joko.v1.RemoteDesktopDisplayModeResult");
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopDisplayModeResultSchema)], ["lease"]);
+  assert.equal(field(contract.RemoteDesktopCapabilitiesSchema, "viewer_display").number, 26);
+  assert.equal(field(contract.RemoteDesktopCapabilitiesSchema, "viewer_display_restore").number, 27);
+  assert.equal(field(contract.RemoteDesktopCapabilitiesSchema, "workspace_navigation").number, 28);
+  assert.equal(field(contract.RemoteDesktopCapabilitiesSchema, "system_menu").number, 29);
+  const systemAction = { leaseId: "lease-1", controlGeneration: 7n, action: contract.RemoteDesktopSystemActionKind.WORKSPACE_RIGHT };
+  assert.deepEqual(roundTrip(contract.RemoteDesktopSystemActionRequestSchema, systemAction),
+    create(contract.RemoteDesktopSystemActionRequestSchema, systemAction));
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopSystemActionRequestSchema)], ["lease_id", "control_generation", "action"]);
+  assert.equal(field(contract.DevicePeerCommandSchema, "perform_remote_desktop_system_action").number, 76);
+  assert.equal(field(contract.DevicePeerAgentResultSchema, "remote_desktop_system_action").number, 59);
+  assert.deepEqual([...fieldNames(contract.PerformRemoteDesktopSystemActionRequestSchema)], ["peer", "request"]);
+  assert.equal(contract.RemoteDesktopFailureReason.SYSTEM_ACTION_UNAVAILABLE, 46);
+  assert.equal(contract.RemoteDesktopFailureReason.SYSTEM_ACTION_EXPIRED, 47);
+  assert.deepEqual([...fieldNames(contract.SetRemoteDesktopViewerDisplayRequestSchema)], [
+    "peer", "lease_id", "control_generation", "width", "height"
+  ]);
+  assert.deepEqual([...fieldNames(contract.RestoreRemoteDesktopViewerDisplayRequestSchema)], ["peer", "lease_id", "control_generation"]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopViewerDisplayResultSchema)], ["lease"]);
+  assert.equal(field(contract.DevicePeerAgentResultSchema, "remote_desktop_viewer_display").number, 58);
+  assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_RESTORE_UNAVAILABLE, 44);
+  assert.equal(contract.RemoteDesktopFailureReason.CAPTURE_PENDING, 45);
+  assert.equal(roundTrip(contract.RemoteDesktopFailureSchema, {
+    reason: contract.RemoteDesktopFailureReason.CAPTURE_PENDING, retryable: true
+  }).reason, contract.RemoteDesktopFailureReason.CAPTURE_PENDING);
   assert.deepEqual([...fieldNames(contract.RemoteDesktopCursorSchema)], [
     "visible", "x", "y", "width", "height", "hot_x", "hot_y", "png"
   ]);
@@ -463,19 +517,94 @@ test("Remote Desktop keeps public controller identity implicit and target comman
   assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_MODES_UNAVAILABLE, 24);
   assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_MODE_MISSING, 25);
   assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_BUSY, 26);
+  assert.equal(contract.RemoteDesktopFailureReason.HOST_MUTE_UNAVAILABLE, 27);
+  assert.equal(contract.RemoteDesktopFailureReason.HOST_MUTE_EXPIRED, 28);
+  assert.equal(contract.RemoteDesktopFailureReason.LOCK_UNAVAILABLE, 29);
+  assert.equal(contract.RemoteDesktopFailureReason.LOCK_FAILED, 30);
+  assert.equal(contract.RemoteDesktopFailureReason.LOCK_EXPIRED, 31);
+  assert.equal(contract.RemoteDesktopFailureReason.CLIPBOARD_CHANGED, 32);
+  assert.equal(contract.RemoteDesktopFailureReason.PRIVACY_UNAVAILABLE, 33);
+  assert.equal(contract.RemoteDesktopFailureReason.PRIVACY_FAILED, 34);
+  assert.equal(contract.RemoteDesktopFailureReason.PRIVACY_EXPIRED, 35);
+  assert.equal(field(contract.RemoteDesktopCapabilitiesSchema, "native_credentials").number, 24);
+  assert.deepEqual(oneofMembers(contract.RemoteDesktopCredentialRequestSchema, "request"), ["prepare", "open", "exchange"]);
+  assert.deepEqual(oneofMembers(contract.RemoteDesktopCredentialResultSchema, "result"), ["prepared", "opened", "exchanged", "closed"]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopCredentialOpenSchema)], ["offer", "descriptor"]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopCredentialExchangeSchema)], ["handle", "ciphertext"]);
+  assertNoFields([
+    ...publicRequests, contract.RemoteDesktopCredentialRequestSchema, contract.RemoteDesktopCredentialResultSchema,
+    contract.RemoteDesktopCredentialOpenSchema, contract.RemoteDesktopCredentialExchangeSchema,
+    contract.RemoteDesktopCredentialPreparedSchema, contract.RemoteDesktopCredentialOpenedSchema,
+    contract.RemoteDesktopCredentialExchangedSchema, contract.RemoteDesktopCredentialClosedSchema
+  ], ["password", "private_key", "authentication_session", "record_id", "binding_digest"]);
+  assert.deepEqual([contract.RemoteDesktopLockState.UNLOCKED, contract.RemoteDesktopLockState.LOCKED,
+    contract.RemoteDesktopLockState.UNAVAILABLE], [1, 2, 3]);
+  assert.deepEqual([
+    contract.RemoteDesktopFailureReason.AUTHENTICATION_REQUIRED,
+    contract.RemoteDesktopFailureReason.CREDENTIAL_UNAVAILABLE,
+    contract.RemoteDesktopFailureReason.CREDENTIAL_INVALID_MESSAGE,
+    contract.RemoteDesktopFailureReason.CREDENTIAL_INVALID_IDENTITY,
+    contract.RemoteDesktopFailureReason.CREDENTIAL_EXPIRED,
+    contract.RemoteDesktopFailureReason.CREDENTIAL_CANCELLED,
+    contract.RemoteDesktopFailureReason.CREDENTIAL_UNLOCK_UNAVAILABLE,
+    contract.RemoteDesktopFailureReason.CREDENTIAL_OUTCOME_UNKNOWN
+  ], [36, 37, 38, 39, 40, 41, 42, 43]);
+  assert.equal(field(contract.RemoteDesktopCapabilitiesSchema, "privacy_screen").number, 23);
+  assert.equal(field(contract.DevicePeerCommandSchema, "set_remote_desktop_privacy_screen").number, 70);
+  assert.equal(field(contract.DevicePeerAgentResultSchema, "remote_desktop_privacy_screen").number, 54);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopPrivacyScreenRequestSchema)], ["lease_id", "control_generation", "enabled", "lock_on_exit"]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopPrivacyScreenResultSchema)], ["enabled"]);
+  assert.equal(field(contract.DevicePeerCommandSchema, "set_remote_desktop_clipboard_sync").number, 68);
+  assert.equal(field(contract.DevicePeerCommandSchema, "get_remote_desktop_clipboard_version").number, 69);
+  assert.equal(field(contract.DevicePeerAgentResultSchema, "remote_desktop_clipboard_sync").number, 52);
+  assert.equal(field(contract.DevicePeerAgentResultSchema, "remote_desktop_clipboard_version").number, 53);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopClipboardSyncRequestSchema)], ["lease_id", "control_generation", "enabled"]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopClipboardSyncResultSchema)], ["enabled", "sync_generation"]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopClipboardVersionRequestSchema)], ["lease_id", "control_generation", "sync_generation"]);
+  assert.deepEqual(["sync", "version", "inline", "sync_generation"].map((name) => field(contract.RemoteDesktopClipboardContentRequestSchema, name).number), [3, 4, 5, 6]);
+  assert.equal(field(contract.RemoteDesktopClipboardContentRequestSchema, "paste").number, 16);
+  assert.equal(field(contract.RemoteDesktopClipboardContentResultSchema, "version").number, 4);
+  const syncPaste = roundTrip(contract.RemoteDesktopClipboardContentRequestSchema, {
+    leaseId: "lease-1", controlGeneration: 9n, sync: true, version: "12", syncGeneration: 15n,
+    action: { case: "paste", value: { data: '{"text":"portable"}' } }
+  });
+  assert.equal(syncPaste.syncGeneration, 15n);
+  assert.equal(syncPaste.version, "12");
+  assert.equal(syncPaste.action.case, "paste");
+  assert.equal(field(contract.StopRemoteDesktopRequestSchema, "lock_screen").number, 3);
+  assert.equal(field(contract.StopRemoteDesktopRequestSchema, "control_generation").number, 4);
+  assert.equal(field(contract.DevicePeerStopRemoteDesktopActionSchema, "lock_screen").number, 2);
+  assert.equal(field(contract.DevicePeerStopRemoteDesktopActionSchema, "control_generation").number, 3);
+  const exit = roundTrip(contract.DevicePeerStopRemoteDesktopActionSchema, {
+    leaseId: "lease-1", lockScreen: true, controlGeneration: 10n
+  });
+  assert.equal(exit.lockScreen, true);
+  assert.equal(exit.controlGeneration, 10n);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopHostMuteRequestSchema)], [
+    "lease_id", "control_generation", "enabled"
+  ]);
+  assert.deepEqual([...fieldNames(contract.RemoteDesktopHostMuteResultSchema)], ["enabled"]);
+  assert.equal(field(contract.DevicePeerCommandSchema, "set_remote_desktop_host_mute").number, 67);
+  assert.equal(field(contract.DevicePeerAgentResultSchema, "remote_desktop_host_mute").number, 51);
+  const hostMute = roundTrip(contract.RemoteDesktopHostMuteRequestSchema, {
+    leaseId: "lease-1", controlGeneration: 9n, enabled: true
+  });
+  assert.equal(hostMute.leaseId, "lease-1");
+  assert.equal(hostMute.controlGeneration, 9n);
+  assert.equal(hostMute.enabled, true);
   assert.deepEqual(
-    ["video_settings", "system_audio", "background_viewing", "display_modes", "cursor_overlay"].map((name) => field(
+    ["video_settings", "system_audio", "background_viewing", "display_modes", "cursor_overlay", "host_mute", "lock_on_exit", "clipboard_sync", "clipboard_inline"].map((name) => field(
       contract.RemoteDesktopCapabilitiesSchema,
       name
     ).number),
-    [14, 15, 16, 17, 18]
+    [14, 15, 16, 17, 18, 19, 20, 21, 22]
   );
   assertNoFields([
     contract.StartRemoteDesktopRequestSchema,
     contract.StopRemoteDesktopRequestSchema
   ], [
     "presentation", "clipboard", "display_modes", "system_audio", "background_viewing",
-    "auto_unlock", "lock_screen"
+    "auto_unlock"
   ]);
 
   const input = roundTrip(contract.SendRemoteDesktopInputRequestSchema, {

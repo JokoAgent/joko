@@ -5,7 +5,7 @@ import type { Translator } from "./types.js";
 import { Button, Pill, Spinner, SwitchControl } from "./ui.js";
 
 export function DesktopRemoteDesktopSettings({ t }: { readonly t: Translator }): JSX.Element | null {
-  const { state, reload, setEnabled, disconnect, showPermissionGuide } = useDesktopRemoteDesktop();
+  const { state, reload, setEnabled, configureWindowsSupport, disconnect, showPermissionGuide } = useDesktopRemoteDesktop(true);
   if (!state.available) return null;
 
   const disabled = state.loading || state.saving || state.error === "load";
@@ -24,7 +24,20 @@ export function DesktopRemoteDesktopSettings({ t }: { readonly t: Translator }):
             onChange={(event) => { void setEnabled(event.currentTarget.checked); }}
           />}
     </div>
-    <div className="setting-row">
+    {state.enabled && state.windowsSupport !== undefined && <div className="setting-row">
+      <div>
+        <strong>{t("settings.remoteDesktop.windowsTitle")}</strong>
+        <span>{windowsSupportMessage(state.windowsSupport, t)}</span>
+      </div>
+      <Button
+        tone="ghost"
+        disabled={disabled || state.windowsSupport === "installRequired" || state.windowsSupport === "unavailable"}
+        onClick={() => { void configureWindowsSupport(state.windowsSupport !== "ready"); }}
+      >
+        {state.windowsSupport === "ready" ? t("settings.remoteDesktop.windowsDisable") : t("settings.remoteDesktop.windowsEnable")}
+      </Button>
+    </div>}
+    {state.windowsSupport === undefined && <div className="setting-row">
       <div>
         <strong>{t("settings.remoteDesktop.permissions")}</strong>
         <span>{t("settings.remoteDesktop.permissionsBody")}</span>
@@ -36,7 +49,7 @@ export function DesktopRemoteDesktopSettings({ t }: { readonly t: Translator }):
           {t("settings.remoteDesktop.openGuide")}
         </Button>
       </div>
-    </div>
+    </div>}
     {state.active && <div className="setting-row">
       <div>
         <strong>{state.controlling ? t("settings.remoteDesktop.controlled") : t("settings.remoteDesktop.viewed")}</strong>
@@ -82,5 +95,13 @@ function errorMessage(error: DesktopRemoteDesktopError, t: Translator): string {
   if (error === "load") return t("settings.remoteDesktop.loadFailed");
   if (error === "disconnect") return t("settings.remoteDesktop.disconnectFailed");
   if (error === "permissions") return t("settings.remoteDesktop.permissionsFailed");
+  if (error === "windowsSupport") return t("settings.remoteDesktop.windowsFailed");
   return t("settings.remoteDesktop.saveFailed");
+}
+
+function windowsSupportMessage(support: JokoDesktopRemoteDesktopWindowsSupport, t: Translator): string {
+  if (support === "ready") return t("settings.remoteDesktop.windowsReady");
+  if (support === "missing") return t("settings.remoteDesktop.windowsMissing");
+  if (support === "installRequired") return t("settings.remoteDesktop.windowsInstallRequired");
+  return t("settings.remoteDesktop.windowsUnavailable");
 }

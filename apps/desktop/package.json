@@ -9,7 +9,7 @@
     "package.json"
   ],
   "scripts": {
-    "build": "pnpm build:native-voice-shortcut && pnpm build:native-system-frontmost-input && pnpm build:native-hardware && pnpm build:native-gamepad && pnpm build:native-remote-desktop && pnpm build:native-simulator-hid && pnpm build:native-simulator-h264 && tsc -p tsconfig.json && node --check dist/main.js && node --check dist/preload.cjs && node --check dist/remote-desktop-capture-preload.cjs && node --check dist/voice-overlay-preload.cjs && node --check dist/runtime-process-monitor-preload.cjs && node scripts/stage-web.mjs",
+    "build": "pnpm build:native-voice-shortcut && pnpm build:native-system-frontmost-input && pnpm build:native-hardware && pnpm build:native-gamepad && pnpm build:native-remote-desktop && pnpm build:native-simulator-hid && pnpm build:native-simulator-h264 && tsc -p tsconfig.json && node --check dist/main.js && node --check dist/preload.cjs && node --check dist/remote-desktop-capture-preload.cjs && node --check dist/remote-desktop-viewer-preload.cjs && node --check dist/voice-overlay-preload.cjs && node --check dist/runtime-process-monitor-preload.cjs && node scripts/stage-web.mjs",
     "build:native-voice-shortcut": "node scripts/build-native-voice-shortcut.mjs",
     "build:native-system-frontmost-input": "node scripts/build-native-system-frontmost-input.mjs",
     "build:native-hardware": "node scripts/build-native-hardware.mjs",
@@ -34,6 +34,7 @@
     "@connectrpc/connect-node": "2.1.2",
     "@joko/contracts": "workspace:*",
     "@joko/device-peer": "workspace:*",
+    "@joko/remote-desktop-sync": "workspace:*",
     "electron-updater": "6.8.9",
     "electron-window-state": "5.0.3",
     "loudness": "0.4.2",
@@ -45,6 +46,7 @@
     "@types/node": "24.12.4",
     "electron": "43.6.0",
     "electron-builder": "26.15.3",
+    "sharp": "0.35.3",
     "tsx": "4.22.1",
     "typescript": "5.9.3",
     "vitest": "4.1.9"

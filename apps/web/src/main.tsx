@@ -1,7 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import "@fontsource-variable/jetbrains-mono";
-import { App } from "./App.js";
+import { isDesktopRemoteDesktopViewerWindow } from "./remote-desktop-viewer-window.js";
 import "./styles.css";
 import {
   connectDesktopActivationClickPreference,
@@ -18,7 +18,11 @@ window.addEventListener("pagehide", () => {
 const root = document.getElementById("root");
 if (root === null) throw new Error("Missing application root.");
 
-if (new URLSearchParams(window.location.search).get("globalVoiceOverlay") === "1") {
+if (isDesktopRemoteDesktopViewerWindow(window.location)) {
+  void import("./components/DesktopRemoteDesktopViewerWindow.js").then(({ DesktopRemoteDesktopViewerWindow }) => {
+    createRoot(root).render(<StrictMode><DesktopRemoteDesktopViewerWindow /></StrictMode>);
+  });
+} else if (new URLSearchParams(window.location.search).get("globalVoiceOverlay") === "1") {
   void import("./components/GlobalVoiceOverlay.js").then(({ GlobalVoiceOverlay }) => {
     const fixture = import.meta.env.DEV ? globalVoiceOverlayFixture(new URLSearchParams(window.location.search).get("fixture")) : undefined;
     createRoot(root).render(<StrictMode><GlobalVoiceOverlay initialStatus={fixture} /></StrictMode>);
@@ -28,7 +32,7 @@ if (new URLSearchParams(window.location.search).get("globalVoiceOverlay") === "1
     createRoot(root).render(<StrictMode><VisualHarness /></StrictMode>);
   });
 } else {
-  createRoot(root).render(<StrictMode><App /></StrictMode>);
+  void import("./App.js").then(({ App }) => createRoot(root).render(<StrictMode><App /></StrictMode>));
 }
 
 function globalVoiceOverlayFixture(value: string | null): JokoDesktopGlobalVoiceStatus | undefined {

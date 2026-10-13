@@ -3,6 +3,32 @@ import { createHash } from "node:crypto";
 import { TimestampSchema } from "@bufbuild/protobuf/wkt";
 import {
   ArtifactKind,
+  DevicePeerRouteIdentitySchema,
+  RemoteDesktopHostMuteRequestSchema,
+  RemoteDesktopClipboardSyncRequestSchema,
+  RemoteDesktopClipboardVersionRequestSchema,
+  SetRemoteDesktopClipboardSyncRequestSchema,
+  SetRemoteDesktopClipboardSyncResponseSchema,
+  GetRemoteDesktopClipboardVersionRequestSchema,
+  GetRemoteDesktopClipboardVersionResponseSchema,
+  RemoteDesktopClipboardContentRequestSchema,
+  RemoteDesktopClipboardContentPasteActionSchema,
+  TransferRemoteDesktopClipboardContentRequestSchema,
+  TransferRemoteDesktopClipboardContentResponseSchema,
+  SetRemoteDesktopHostMuteRequestSchema,
+  SetRemoteDesktopHostMuteResponseSchema,
+  StopRemoteDesktopRequestSchema,
+  StopRemoteDesktopResponseSchema,
+  StartRemoteDesktopRequestSchema,
+  StartRemoteDesktopResponseSchema,
+  RemoteDesktopStartMode,
+  RemoteDesktopSystemActionKind,
+  PerformRemoteDesktopSystemActionRequestSchema,
+  PerformRemoteDesktopSystemActionResponseSchema,
+  SetRemoteDesktopViewerDisplayRequestSchema,
+  SetRemoteDesktopViewerDisplayResponseSchema,
+  RestoreRemoteDesktopViewerDisplayRequestSchema,
+  RestoreRemoteDesktopViewerDisplayResponseSchema,
   ArtifactSchema,
   BlobDisposition,
   BlobRefSchema,
@@ -95,6 +121,7 @@ import {
   GetSettingsResponseSchema, BeginCredentialUploadResponseSchema, BeginCredentialUploadRequestSchema, TestVoiceInputConnectionResponseSchema
 } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
+import type { RemoteDesktopSystemAction } from "@joko/contracts";
 import {
   MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES,
   MOBILE_FILE_SHARE_MAXIMUM_BYTES,
@@ -122,6 +149,243 @@ import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
 import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
 import { creationSnapshot } from "./test/mobile-partner-creation";
 import { mobilePartnerCreationDraft, MobilePartnerCreationRejected } from "./mobile-partner-creation";
+
+describe("Mobile Remote Desktop system action network", () => {
+  it("maps exactly three actions through generated RPC and validates control, route and matching receipts", async () => {
+    const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+      connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
+    const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop", relationId: "relation",
+      targetDeviceRevision: { value: 1n }, relationRevision: { value: 0n }, routeGeneration: 2n });
+    let mismatchRoute = false, mismatchAction = false;
+    const expected = { workspaceLeft: RemoteDesktopSystemActionKind.WORKSPACE_LEFT,
+      workspaceRight: RemoteDesktopSystemActionKind.WORKSPACE_RIGHT, systemMenu: RemoteDesktopSystemActionKind.SYSTEM_MENU };
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/joko.v1.RemoteDesktopService/PerformRemoteDesktopSystemAction");
+      const request = fromBinary(PerformRemoteDesktopSystemActionRequestSchema, new Uint8Array(init?.body as Uint8Array));
+      expect(request).toMatchObject({ peer, request: { leaseId: "lease", controlGeneration: 5n } });
+      return new Response(toBinary(PerformRemoteDesktopSystemActionResponseSchema,
+        create(PerformRemoteDesktopSystemActionResponseSchema, { peer: mismatchRoute ? { ...peer, routeGeneration: 3n } : peer,
+          result: { action: mismatchAction ? RemoteDesktopSystemActionKind.UNSPECIFIED : request.request!.action } })),
+      { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      for (const action of Object.keys(expected) as RemoteDesktopSystemAction[]) {
+        await expect(mobileNetwork.performRemoteDesktopSystemAction!(credential, peer, "lease", 5n, action)).resolves.toBe(action);
+        const sent = fromBinary(PerformRemoteDesktopSystemActionRequestSchema, new Uint8Array(fetcher.mock.calls.at(-1)?.[1]?.body as Uint8Array));
+        expect(sent.request?.action).toBe(expected[action]);
+      }
+      await expect(mobileNetwork.performRemoteDesktopSystemAction!(credential, peer, "lease", 0n, "systemMenu")).rejects.toThrow("authority");
+      await expect(mobileNetwork.performRemoteDesktopSystemAction!(credential, peer, "lease", 5n, "other" as RemoteDesktopSystemAction)).rejects.toThrow("invalid");
+      expect(fetcher).toHaveBeenCalledTimes(3);
+      mismatchRoute = true;
+      await expect(mobileNetwork.performRemoteDesktopSystemAction!(credential, peer, "lease", 5n, "workspaceLeft")).rejects.toThrow("route");
+      mismatchRoute = false; mismatchAction = true;
+      await expect(mobileNetwork.performRemoteDesktopSystemAction!(credential, peer, "lease", 5n, "systemMenu")).rejects.toThrow("invalid Remote Desktop system action result");
+    } finally { fetcher.mockRestore(); }
+  });
+});
+
+describe("Mobile Remote Desktop viewer display network", () => {
+  const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+    connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
+  const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop", relationId: "relation",
+    targetDeviceRevision: { value: 1n }, relationRevision: { value: 0n }, routeGeneration: 2n });
+  it.each([RemoteDesktopStartMode.NEW, RemoteDesktopStartMode.RESUME])(
+    "accepts source-based start %s through generated RPC and rejects mirror or unrelated captures", async mode => {
+    let captureDisplayId = "physical";
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/joko.v1.RemoteDesktopService/StartRemoteDesktop");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-only");
+      expect(fromBinary(StartRemoteDesktopRequestSchema, new Uint8Array(init?.body as Uint8Array)))
+        .toMatchObject({ peer, displayId: "physical", mode });
+      return new Response(toBinary(StartRemoteDesktopResponseSchema, create(StartRemoteDesktopResponseSchema, {
+        peer, lease: { leaseId: "restored-resume", controlling: false, controlGeneration: 4n,
+          display: { displayId: captureDisplayId, name: "Display", width: 1920, height: 1080 } }
+      })), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.startRemoteDesktop!(credential, peer, "physical", mode))
+        .resolves.toMatchObject({ leaseId: "restored-resume", controlling: false, controlGeneration: 4n,
+          display: { displayId: "physical" } });
+      for (const invalidCapture of ["mirror", "unrelated"]) {
+        captureDisplayId = invalidCapture;
+        await expect(mobileNetwork.startRemoteDesktop!(credential, peer, "physical", mode))
+          .rejects.toThrow("invalid Remote Desktop lease");
+      }
+    } finally { fetcher.mockRestore(); }
+    }
+  );
+  it("sends exact fit and restore authority through generated RPC and rejects a mismatched route", async () => {
+    let mismatch = false;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const body = new Uint8Array(init?.body as Uint8Array);
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-only");
+      const lease = { leaseId: "lease", controlling: false, controlGeneration: 4n,
+        display: { displayId: "mirror", name: "Display", width: 800, height: 1200 } };
+      if (path.endsWith("/SetRemoteDesktopViewerDisplay")) {
+        expect(fromBinary(SetRemoteDesktopViewerDisplayRequestSchema, body)).toMatchObject({ peer,
+          leaseId: "lease", controlGeneration: 3n, width: 800, height: 1200 });
+        return new Response(toBinary(SetRemoteDesktopViewerDisplayResponseSchema,
+          create(SetRemoteDesktopViewerDisplayResponseSchema, { peer: mismatch ? { ...peer, routeGeneration: 3n } : peer, result: { lease } })),
+        { headers: { "content-type": "application/proto" } });
+      }
+      expect(path).toBe("/joko.v1.RemoteDesktopService/RestoreRemoteDesktopViewerDisplay");
+      expect(fromBinary(RestoreRemoteDesktopViewerDisplayRequestSchema, body)).toMatchObject({ peer, leaseId: "lease", controlGeneration: 5n });
+      return new Response(toBinary(RestoreRemoteDesktopViewerDisplayResponseSchema,
+        create(RestoreRemoteDesktopViewerDisplayResponseSchema, { peer, result: { lease: { ...lease, controlGeneration: 6n, display: {
+          displayId: "physical", name: "Display", width: 1920, height: 1080
+        } } } })), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.setRemoteDesktopViewerDisplay!(credential, peer, "lease", 3n, 800, 1200))
+        .resolves.toMatchObject({ lease: { controlling: false, controlGeneration: 4n, display: { displayId: "mirror" } } });
+      await expect(mobileNetwork.restoreRemoteDesktopViewerDisplay!(credential, peer, "lease", 5n))
+        .resolves.toMatchObject({ lease: { controlGeneration: 6n, display: { displayId: "physical" } } });
+      await expect(mobileNetwork.setRemoteDesktopViewerDisplay!(credential, peer, "lease", 3n, 319, 1200)).rejects.toThrow("dimensions");
+      await expect(mobileNetwork.restoreRemoteDesktopViewerDisplay!(credential, peer, "lease", 0n)).rejects.toThrow("authority");
+      mismatch = true;
+      await expect(mobileNetwork.setRemoteDesktopViewerDisplay!(credential, peer, "lease", 3n, 800, 1200)).rejects.toThrow("route");
+      expect(fetcher).toHaveBeenCalledTimes(3);
+    } finally { fetcher.mockRestore(); }
+  });
+});
+
+describe("Mobile Remote Desktop clipboard sync network", () => {
+  const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+    connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
+  const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop", relationId: "relation",
+    targetDeviceRevision: { value: 1n }, relationRevision: { value: 0n }, routeGeneration: 2n });
+  it.each(["19", "a".repeat(64)])("maps exact sync/control generation and opaque version %s through generated RPC", async (version) => {
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      const body = new Uint8Array(init?.body as Uint8Array);
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-only");
+      if (path.endsWith("/SetRemoteDesktopClipboardSync")) {
+        expect(fromBinary(SetRemoteDesktopClipboardSyncRequestSchema, body)).toMatchObject({ peer,
+          request: { leaseId: "lease", controlGeneration: 3n, enabled: true } });
+        return new Response(toBinary(SetRemoteDesktopClipboardSyncResponseSchema,
+          create(SetRemoteDesktopClipboardSyncResponseSchema, { peer, result: { enabled: true, syncGeneration: 7n } })),
+        { headers: { "content-type": "application/proto" } });
+      }
+      if (path.endsWith("/GetRemoteDesktopClipboardVersion")) {
+        expect(fromBinary(GetRemoteDesktopClipboardVersionRequestSchema, body)).toMatchObject({ peer,
+          request: { leaseId: "lease", controlGeneration: 3n, syncGeneration: 7n } });
+        return new Response(toBinary(GetRemoteDesktopClipboardVersionResponseSchema,
+          create(GetRemoteDesktopClipboardVersionResponseSchema, { peer, result: { version } })),
+        { headers: { "content-type": "application/proto" } });
+      }
+      expect(path).toBe("/joko.v1.RemoteDesktopService/TransferRemoteDesktopClipboardContent");
+      expect(fromBinary(TransferRemoteDesktopClipboardContentRequestSchema, body)).toMatchObject({ peer,
+        transfer: { leaseId: "lease", controlGeneration: 3n, sync: true, version, inline: false,
+          syncGeneration: 7n, action: { case: "paste", value: { data: '{"text":"portable"}' } } } });
+      return new Response(toBinary(TransferRemoteDesktopClipboardContentResponseSchema,
+        create(TransferRemoteDesktopClipboardContentResponseSchema, { peer, result: { version: "20" } })),
+      { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.setRemoteDesktopClipboardSync!(credential, peer,
+        create(RemoteDesktopClipboardSyncRequestSchema, { leaseId: "lease", controlGeneration: 3n, enabled: true })))
+        .resolves.toMatchObject({ enabled: true, syncGeneration: 7n });
+      await expect(mobileNetwork.getRemoteDesktopClipboardVersion!(credential, peer,
+        create(RemoteDesktopClipboardVersionRequestSchema, { leaseId: "lease", controlGeneration: 3n, syncGeneration: 7n })))
+        .resolves.toMatchObject({ version });
+      await expect(mobileNetwork.transferRemoteDesktopClipboardContent!(credential, peer,
+        create(RemoteDesktopClipboardContentRequestSchema, { leaseId: "lease", controlGeneration: 3n,
+          sync: true, syncGeneration: 7n, version, action: { case: "paste",
+            value: create(RemoteDesktopClipboardContentPasteActionSchema, { data: '{"text":"portable"}' }) } })))
+        .resolves.toMatchObject({ version: "20" });
+    } finally { fetcher.mockRestore(); }
+  });
+  it("rejects invalid tokens and missing/mismatched acknowledgements before adopting a sync owner", async () => {
+    let mismatch = false, version = "invalid";
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(
+      toBinary(GetRemoteDesktopClipboardVersionResponseSchema, create(GetRemoteDesktopClipboardVersionResponseSchema,
+        { peer: mismatch ? { ...peer, routeGeneration: 4n } : peer, result: { version } })),
+      { headers: { "content-type": "application/proto" } }));
+    const request = create(RemoteDesktopClipboardVersionRequestSchema, { leaseId: "lease", controlGeneration: 3n, syncGeneration: 7n });
+    try {
+      await expect(mobileNetwork.getRemoteDesktopClipboardVersion!(credential, peer, request)).rejects.toThrow("version");
+      for (version of ["", "a".repeat(63), "A".repeat(64), "g".repeat(64), "9".repeat(129)]) {
+        await expect(mobileNetwork.getRemoteDesktopClipboardVersion!(credential, peer, request)).rejects.toThrow("version");
+      }
+      mismatch = true;
+      await expect(mobileNetwork.getRemoteDesktopClipboardVersion!(credential, peer, request)).rejects.toThrow("route");
+      await expect(mobileNetwork.getRemoteDesktopClipboardVersion!(credential, peer, { ...request, syncGeneration: 0n })).rejects.toThrow("request");
+      await expect(mobileNetwork.getRemoteDesktopClipboardVersion!(credential, peer, { ...request, controlGeneration: 0n })).rejects.toThrow("request");
+      expect(fetcher).toHaveBeenCalledTimes(7);
+    } finally { fetcher.mockRestore(); }
+  });
+});
+
+describe("Mobile Remote Desktop host mute network", () => {
+  const credential: PairedCredential = { profileId: "profile-1", serverId: "server-1", deviceId: "phone-1",
+    connectionId: "connection-1", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
+  const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop-1", relationId: "relation-1",
+    targetDeviceRevision: { value: 1n, etag: "target" }, relationRevision: { value: 0n, etag: "relation" }, routeGeneration: 2n });
+  const request = create(RemoteDesktopHostMuteRequestSchema, { leaseId: "lease-1", controlGeneration: 3n, enabled: true });
+
+  it("sends the generated request with exact route and control generation and adopts its result", async () => {
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/joko.v1.RemoteDesktopService/SetRemoteDesktopHostMute");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-only");
+      expect(fromBinary(SetRemoteDesktopHostMuteRequestSchema, new Uint8Array(init?.body as Uint8Array)))
+        .toMatchObject({ peer, request });
+      return new Response(toBinary(SetRemoteDesktopHostMuteResponseSchema,
+        create(SetRemoteDesktopHostMuteResponseSchema, { peer, result: { enabled: true } })),
+      { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.setRemoteDesktopHostMute!(credential, peer, request)).resolves.toMatchObject({ enabled: true });
+    } finally { fetcher.mockRestore(); }
+  });
+
+  it("rejects missing or mismatched acknowledgements and invalid control generations", async () => {
+    let mismatch = false;
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(
+      toBinary(SetRemoteDesktopHostMuteResponseSchema, create(SetRemoteDesktopHostMuteResponseSchema, {
+        peer: mismatch ? { ...peer, routeGeneration: 4n } : peer,
+        ...(mismatch ? { result: { enabled: true } } : {})
+      })), { headers: { "content-type": "application/proto" } }));
+    try {
+      await expect(mobileNetwork.setRemoteDesktopHostMute!(credential, peer, request)).rejects.toThrow("result");
+      mismatch = true;
+      await expect(mobileNetwork.setRemoteDesktopHostMute!(credential, peer, request)).rejects.toThrow();
+      await expect(mobileNetwork.setRemoteDesktopHostMute!(credential, peer, { ...request, controlGeneration: 0n }))
+        .rejects.toThrow("request");
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally { fetcher.mockRestore(); }
+  });
+});
+
+describe("Mobile Remote Desktop exit authority network", () => {
+  const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone",
+    connectionId: "connection", origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
+  const peer = create(DevicePeerRouteIdentitySchema, { targetDeviceId: "desktop", relationId: "relation",
+    targetDeviceRevision: { value: 1n }, relationRevision: { value: 0n }, routeGeneration: 1n });
+  it("maps exact numeric generations only for explicit lock and verifies the stop peer acknowledgement", async () => {
+    let mismatch = false;
+    const sent: ReturnType<typeof fromBinary<typeof StopRemoteDesktopRequestSchema>>[] = [];
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(new URL(String(input)).pathname).toBe("/joko.v1.RemoteDesktopService/StopRemoteDesktop");
+      sent.push(fromBinary(StopRemoteDesktopRequestSchema, new Uint8Array(init?.body as Uint8Array)));
+      return new Response(toBinary(StopRemoteDesktopResponseSchema, create(StopRemoteDesktopResponseSchema,
+        { peer: mismatch ? { ...peer, routeGeneration: 2n } : peer })), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await mobileNetwork.stopRemoteDesktop!(credential, peer, "lease", { lockScreen: true, controlGeneration: 3n });
+      await mobileNetwork.stopRemoteDesktop!(credential, peer, "lease", { lockScreen: false, controlGeneration: 0n });
+      expect(sent).toMatchObject([{ leaseId: "lease", lockScreen: true, controlGeneration: 3n },
+        { leaseId: "lease", lockScreen: false, controlGeneration: 0n }]);
+      mismatch = true;
+      await expect(mobileNetwork.stopRemoteDesktop!(credential, peer, "lease", { lockScreen: true, controlGeneration: 3n }))
+        .rejects.toThrow("route");
+      await expect(mobileNetwork.stopRemoteDesktop!(credential, peer, "lease", { lockScreen: true, controlGeneration: 0n })).rejects.toThrow("authority");
+      await expect(mobileNetwork.stopRemoteDesktop!(credential, peer, "lease", { lockScreen: false, controlGeneration: 3n })).rejects.toThrow("authority");
+      expect(fetcher).toHaveBeenCalledTimes(3);
+    } finally { fetcher.mockRestore(); }
+  });
+});
 
 describe("mobile Partner creation network", () => {
   const credential: PairedCredential = { profileId: "profile", origin: "https://node.example", serverId: "server",
