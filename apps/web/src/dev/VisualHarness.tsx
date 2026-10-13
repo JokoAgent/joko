@@ -4373,8 +4373,8 @@ function visualSnapshot(parameters: HarnessParameters, files: VisualWorkspaceFil
     extensions: parameters.scenario === "extensions" ? visualExtensions() : [],
     extensionCatalogRevision: parameters.scenario === "extensions" ? 12n : 0n,
     commands: [
-      { id: "command-review", name: "review", description: "Review the current changes", source: "backend", loaded: true },
-      { id: "command-test", name: "test", description: "Run the narrow checks", source: "backend", loaded: true }
+      { id: "command-review", name: "review", description: "Review the current changes", source: "backend", inputMode: "text", loaded: true },
+      { id: "command-test", name: "test", description: "Run the narrow checks", source: "backend", inputMode: "text", loaded: true }
     ]
   };
 }

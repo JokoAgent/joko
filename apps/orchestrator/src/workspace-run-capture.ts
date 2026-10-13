@@ -24,11 +24,26 @@ interface RunCaptureReference {
   readonly dialogueAnchor?: import("@joko/core").NativeNavigationAnchor;
 }
 
+export type WorkspaceRunOutputReadiness = "pending" | "ready" | "unavailable";
+interface RunOutputSeal {
+  readonly version: 1;
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly queueItemId?: string;
+  readonly changeSetId?: string;
+  readonly state: WorkspaceRunOutputReadiness;
+}
+export interface WorkspaceRunOutput {
+  readonly readiness: WorkspaceRunOutputReadiness;
+  readonly changes: readonly { readonly path: string; readonly status: "added" | "modified" | "deleted" | "renamed" }[];
+}
+
 export class DurableWorkspaceRunCapture implements WorkspaceRunCapture {
   readonly #store: OperationalStore;
   readonly #changes: WorkspaceChangeSetService;
   readonly #workspaceService: WorkspaceService | undefined;
   readonly #gitSafety: GitSafetyCoordinator | undefined;
+  readonly #afterFlights = new Map<string, Promise<void>>();
 
   constructor(
     store: OperationalStore,
@@ -43,75 +58,154 @@ export class DurableWorkspaceRunCapture implements WorkspaceRunCapture {
   }
 
   async captureBeforeRun(input: { readonly sessionId: string; readonly runId: string; readonly target: TargetDescriptor; readonly navigationAnchor?: import("@joko/core").NativeNavigationAnchor }): Promise<void> {
-    if (input.target.remoteWorkspace === undefined) {
-      await this.#gitSafety?.onTurnStart({
-        sessionId: input.sessionId,
-        runId: input.runId,
-        workspaceRoot: input.target.workspaceRoot
-      }).catch(() => undefined);
+    this.outputSeal(input.sessionId, input.runId);
+    const queue = this.#store.findQueueItemByRunId(input.sessionId, input.runId);
+    this.saveOutputSeal({ version: 1, sessionId: input.sessionId, runId: input.runId, state: "pending",
+      ...(queue === undefined ? {} : { queueItemId: queue.id }) });
+    try {
+      if (input.target.remoteWorkspace === undefined) {
+        await this.#gitSafety?.onTurnStart({
+          sessionId: input.sessionId,
+          runId: input.runId,
+          workspaceRoot: input.target.workspaceRoot
+        }).catch(() => undefined);
+      }
+      if (this.reference(input.sessionId, input.runId) !== undefined) return;
+      const workspaceId = workspaceIdFor(this.#store, input.target, input.sessionId);
+      const baseline = await this.#changes.captureBaseline(workspaceId, input.target.workspaceRoot, input.navigationAnchor);
+      this.#store.setSetting("session", input.sessionId, referenceKey(input.runId), {
+        baselineId: baseline.id,
+        changeSetId: stableChangeSetId(input.runId),
+        workspaceId,
+        ...(input.navigationAnchor === undefined ? {} : { dialogueAnchor: input.navigationAnchor })
+      } satisfies RunCaptureReference);
+    } catch (error) {
+      this.saveOutputSeal({ version: 1, sessionId: input.sessionId, runId: input.runId, state: "unavailable",
+        ...(queue === undefined ? {} : { queueItemId: queue.id }) });
+      throw error;
     }
-    if (this.reference(input.sessionId, input.runId) !== undefined) return;
-    const workspaceId = workspaceIdFor(this.#store, input.target, input.sessionId);
-    const baseline = await this.#changes.captureBaseline(workspaceId, input.target.workspaceRoot, input.navigationAnchor);
-    this.#store.setSetting("session", input.sessionId, referenceKey(input.runId), {
-      baselineId: baseline.id,
-      changeSetId: stableChangeSetId(input.runId),
-      workspaceId,
-      ...(input.navigationAnchor === undefined ? {} : { dialogueAnchor: input.navigationAnchor })
-    } satisfies RunCaptureReference);
   }
 
   async captureAfterRun(input: { readonly sessionId: string; readonly runId: string; readonly target: TargetDescriptor }): Promise<void> {
-    if (input.target.remoteWorkspace === undefined) {
-      await this.#gitSafety?.onTurnSettled({
-        sessionId: input.sessionId,
-        runId: input.runId,
-        workspaceRoot: input.target.workspaceRoot
-      }).catch(() => undefined);
-    }
-    const reference = this.reference(input.sessionId, input.runId);
-    if (reference === undefined) return;
-    let changeSet = await this.#changes.getChangeSet(reference.changeSetId);
-    changeSet ??= await this.#changes.captureChangeSet(reference.baselineId, input.sessionId, input.runId, reference.changeSetId);
-    if (this.#store.hasVisibleWorkspaceDiff(input.sessionId, changeSet.id)) return;
-    const session = this.#store.getSession(input.sessionId);
-    const target = this.#store.getTarget(session.descriptor.targetId);
-    const git = await this.captureGitProjection(reference.workspaceId);
-    this.#store.transaction((store) => {
-      if (store.hasVisibleWorkspaceDiff(input.sessionId, changeSet.id)) return;
-      store.appendEvent({
-        backendId: session.descriptor.backendId,
-        targetId: session.descriptor.targetId,
-        sessionId: input.sessionId,
-        runId: input.runId,
-        generation: session.descriptor.binding.generation,
-        traceId: randomUUID(),
-        payload: {
-          type: "workspace_diff",
-          changeSetId: changeSet.id,
-          summary: `${changeSet.changes.length} workspace file${changeSet.changes.length === 1 ? "" : "s"} changed`,
-          changeSet: projectChangeSet(changeSet),
-          diff: projectDiff(changeSet),
-          workspace: {
-            workspaceId: reference.workspaceId,
-            targetId: target.descriptor.id,
-            displayName: target.descriptor.displayName,
-            kind: target.descriptor.managed ? "managed_dialogue" : "user_project",
-            serverPathDisplay: "",
-            trusted: target.descriptor.trusted,
-            ...(git === undefined ? {} : { git }),
-            revision: target.revision.toString(10),
-            generation: String(session.descriptor.binding.generation),
-            updatedAt: target.updatedAt
-          } satisfies WorkspaceDescriptorProjection,
-          entriesRevision: store.health().revision.toString(10),
-          upsertedEntries: projectUpsertedEntries(changeSet),
-          removedRelativePaths: changeSet.changes
-            .filter((change) => change.kind === "deleted")
-            .map((change) => change.path)
-        }
+    const key = JSON.stringify([input.sessionId, input.runId]);
+    const pending = this.#afterFlights.get(key); if (pending !== undefined) return pending;
+    const flight = this.captureSettledRun(input); this.#afterFlights.set(key, flight);
+    try { await flight; } finally { if (this.#afterFlights.get(key) === flight) this.#afterFlights.delete(key); }
+  }
+
+  private async captureSettledRun(input: { readonly sessionId: string; readonly runId: string; readonly target: TargetDescriptor }): Promise<void> {
+    const previous = this.outputSeal(input.sessionId, input.runId);
+    if (previous?.state === "ready" && previous.changeSetId !== undefined
+      && this.#store.hasVisibleWorkspaceDiff(input.sessionId, previous.changeSetId)) return;
+    try {
+      if (input.target.remoteWorkspace === undefined) {
+        await this.#gitSafety?.onTurnSettled({
+          sessionId: input.sessionId,
+          runId: input.runId,
+          workspaceRoot: input.target.workspaceRoot
+        }).catch(() => undefined);
+      }
+      const reference = this.reference(input.sessionId, input.runId);
+      if (reference === undefined) {
+        this.saveOutputSeal({ version: 1, sessionId: input.sessionId, runId: input.runId, state: "unavailable",
+          ...(previous?.queueItemId === undefined ? {} : { queueItemId: previous.queueItemId }) });
+        return;
+      }
+      let changeSet = await this.#changes.getChangeSet(reference.changeSetId);
+      changeSet ??= await this.#changes.captureChangeSet(reference.baselineId, input.sessionId, input.runId, reference.changeSetId);
+      if (changeSet.sessionId !== input.sessionId || changeSet.runId !== input.runId || changeSet.baselineId !== reference.baselineId
+        || changeSet.id !== reference.changeSetId || changeSet.workspaceId !== reference.workspaceId) throw new Error("Workspace Run capture authority changed.");
+      const session = this.#store.getSession(input.sessionId);
+      const target = this.#store.getTarget(session.descriptor.targetId);
+      const git = await this.captureGitProjection(reference.workspaceId);
+      this.#store.transaction((store) => {
+        const queueItemId = previous?.queueItemId ?? store.findQueueItemByRunId(input.sessionId, input.runId)?.id;
+        const queue = queueItemId === undefined ? undefined : store.getQueueItem(queueItemId);
+        const accepted = queue?.sessionId === input.sessionId && queue.runId === input.runId && queue.backendAcceptedAt !== undefined;
+        this.saveOutputSeal({ version: 1, sessionId: input.sessionId, runId: input.runId,
+          ...(queueItemId === undefined ? {} : { queueItemId }), changeSetId: changeSet.id,
+          state: accepted && changeSet.complete ? "ready" : "unavailable" });
+        if (store.hasVisibleWorkspaceDiff(input.sessionId, changeSet.id)) return;
+        store.appendEvent({
+          backendId: session.descriptor.backendId,
+          targetId: session.descriptor.targetId,
+          sessionId: input.sessionId,
+          runId: input.runId,
+          generation: session.descriptor.binding.generation,
+          traceId: randomUUID(),
+          payload: {
+            type: "workspace_diff",
+            changeSetId: changeSet.id,
+            summary: `${changeSet.changes.length} workspace file${changeSet.changes.length === 1 ? "" : "s"} changed`,
+            changeSet: projectChangeSet(changeSet),
+            diff: projectDiff(changeSet),
+            workspace: {
+              workspaceId: reference.workspaceId,
+              targetId: target.descriptor.id,
+              displayName: target.descriptor.displayName,
+              kind: target.descriptor.managed ? "managed_dialogue" : "user_project",
+              serverPathDisplay: "",
+              trusted: target.descriptor.trusted,
+              ...(git === undefined ? {} : { git }),
+              revision: target.revision.toString(10),
+              generation: String(session.descriptor.binding.generation),
+              updatedAt: target.updatedAt
+            } satisfies WorkspaceDescriptorProjection,
+            entriesRevision: store.health().revision.toString(10),
+            upsertedEntries: projectUpsertedEntries(changeSet),
+            removedRelativePaths: changeSet.changes
+              .filter((change) => change.kind === "deleted")
+              .map((change) => change.path)
+          }
+        });
       });
-    });
+    } catch (error) {
+      this.saveOutputSeal({ version: 1, sessionId: input.sessionId, runId: input.runId, state: "unavailable",
+        ...(previous?.queueItemId === undefined ? {} : { queueItemId: previous.queueItemId }) });
+      throw error;
+    }
+  }
+
+  /** Reads only durable accepted/sealed metadata; never scans a workspace. */
+  async readRunOutput(sessionId: string, runId: string): Promise<WorkspaceRunOutput> {
+    const unavailable: WorkspaceRunOutput = { readiness: "unavailable", changes: [] };
+    const seal = this.outputSeal(sessionId, runId);
+    if (seal === undefined) return unavailable;
+    if (seal.state === "pending") return { readiness: "pending", changes: [] };
+    if (seal.queueItemId === undefined || seal.changeSetId === undefined) return unavailable;
+    const queue = this.#store.getQueueItem(seal.queueItemId), run = this.#store.getRun(runId);
+    if (queue.sessionId !== sessionId || queue.runId !== runId || queue.backendAcceptedAt === undefined || run.descriptor.sessionId !== sessionId) return unavailable;
+    const changeSet = await this.#changes.getChangeSet(seal.changeSetId);
+    const current = this.outputSeal(sessionId, runId);
+    if (current === undefined || current.state !== seal.state || current.queueItemId !== seal.queueItemId || current.changeSetId !== seal.changeSetId) return unavailable;
+    const reference = this.reference(sessionId, runId);
+    if (changeSet === undefined || reference === undefined || changeSet.id !== reference.changeSetId
+      || changeSet.baselineId !== reference.baselineId || changeSet.sessionId !== sessionId || changeSet.runId !== runId
+      || changeSet.workspaceId !== reference.workspaceId || !this.#store.hasVisibleWorkspaceDiff(sessionId, changeSet.id)
+      || !Array.isArray(changeSet.changes) || changeSet.changes.some(change => !isRecord(change)
+        || typeof change["path"] !== "string" || !["created", "updated", "deleted"].includes(String(change["kind"])))) return unavailable;
+    return { readiness: seal.state === "ready" && changeSet.complete === true ? "ready" : "unavailable",
+      changes: changeSet.changes.map(change => ({ path: change.path,
+        status: change.kind === "created" ? "added" : change.kind === "deleted" ? "deleted" : "modified" })) };
+  }
+
+  private outputSeal(sessionId: string, runId: string): RunOutputSeal | undefined {
+    const value = this.#store.findSetting<unknown>("session", sessionId, outputSealKey(runId))?.value;
+    if (value === undefined) return undefined;
+    if (!isRecord(value) || value["version"] !== 1 || value["sessionId"] !== sessionId || value["runId"] !== runId
+      || !["pending", "ready", "unavailable"].includes(String(value["state"]))
+      || Object.keys(value).some(key => !["version", "sessionId", "runId", "queueItemId", "changeSetId", "state"].includes(key))
+      || ["queueItemId", "changeSetId"].some(key => value[key] !== undefined && (typeof value[key] !== "string" || value[key] === ""))
+      || value["state"] === "ready" && (value["queueItemId"] === undefined || value["changeSetId"] === undefined)) {
+      throw new Error("Workspace Run output seal is unavailable.");
+    }
+    return value as unknown as RunOutputSeal;
+  }
+
+  private saveOutputSeal(value: RunOutputSeal): void {
+    // A late failed capture cannot overwrite an already committed seal.
+    if (this.outputSeal(value.sessionId, value.runId)?.state === "ready") return;
+    this.#store.setSetting("session", value.sessionId, outputSealKey(value.runId), value);
   }
 
   abortRun(input: { readonly sessionId: string; readonly runId: string }): void {
@@ -256,6 +350,8 @@ function mediaTypeForPath(path: string): string {
 function referenceKey(runId: string): string {
   return `workspace_capture.${runId}`;
 }
+
+function outputSealKey(runId: string): string { return `workspace_output_seal.${runId}`; }
 
 function stableChangeSetId(runId: string): string {
   return `change-${createHash("sha256").update(runId).digest("hex").slice(0, 32)}`;

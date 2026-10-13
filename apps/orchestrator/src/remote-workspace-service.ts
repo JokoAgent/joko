@@ -62,6 +62,20 @@ const MAXIMUM_PROCESS_OUTPUT = 16 * 1024 * 1024;
 const MAXIMUM_TREE_ENTRIES = 100_000;
 const MAXIMUM_COPY_BYTES = 256 * 1024 * 1024;
 
+/** Private registered-workspace authority shared by Skill source and runtime owners. */
+export interface RemoteSkillSourceAuthority {
+  readonly registration: WorkspaceRegistration;
+  readonly rootRegistrationId: string;
+  readonly files: RemoteFileTransportPort;
+  readonly processes: RemoteProcessTransportPort;
+  readonly executionIdentity: string;
+  readonly authorityIdentity: string;
+  readonly forwarding?: import("@joko/remote-ssh").RemoteForwardingTransportPort;
+  readonly assertCurrent: () => void;
+  readonly assertFilesCurrent: () => void;
+  readonly assertForwardingCurrent: () => void;
+}
+
 export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   readonly #remoteExecution: RemoteExecutionRouter;
   readonly #registrations = new Map<string, WorkspaceRegistration>();
@@ -89,6 +103,39 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   async close(): Promise<void> {
     this.#closed = true;
     this.#registrations.clear();
+  }
+
+  async captureSkillSourceAuthority(workspaceId: string, signal?: AbortSignal): Promise<RemoteSkillSourceAuthority> {
+    signal?.throwIfAborted();
+    this.#assertOpen();
+    const registration = this.#require(workspaceId);
+    const binding = registration.remote?.binding;
+    if (!registration.trusted || binding?.kind !== "ssh" || binding.workspaceRoot !== registration.root) {
+      throw new Error("Skill sources require a registered trusted SSH workspace.");
+    }
+    const authority = await this.#remoteExecution.workspace(binding, signal);
+    signal?.throwIfAborted();
+    if (authority.kind !== "ssh" || authority.pathStyle !== "posix") throw new Error("Skill source transport is unavailable.");
+    await validateCapturedWorkspaceRoot(registration, authority.files, authority.assertFilesCurrent, signal);
+    signal?.throwIfAborted();
+    const assertRegistration = (): void => {
+      this.#assertOpen();
+      if (this.#registrations.get(workspaceId) !== registration) throw new Error("The registered Skill workspace changed.");
+    };
+    const assertCurrent = (): void => { assertRegistration(); authority.assertCurrent(); authority.assertFilesCurrent(); };
+    const assertFilesCurrent = (): void => { assertRegistration(); authority.assertFilesCurrent(); };
+    assertCurrent();
+    return Object.freeze({
+      registration,
+      rootRegistrationId: `sha256:${createHash("sha256").update(JSON.stringify([
+        registration.id, registration.remote!.targetId, registration.root, binding, authority.executionIdentity
+      ])).digest("hex")}`,
+      files: authority.files, processes: authority.processes,
+      executionIdentity: authority.executionIdentity, authorityIdentity: authority.authorityIdentity,
+      ...(authority.forwarding === undefined ? {} : { forwarding: authority.forwarding }),
+      assertCurrent, assertFilesCurrent,
+      assertForwardingCurrent: () => { assertRegistration(); authority.assertForwardingCurrent(); }
+    });
   }
 
   async capturePreviewAuthority(workspaceId: string, signal?: AbortSignal): Promise<WorkspacePreviewAuthority> {

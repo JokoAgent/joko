@@ -1,0 +1,172 @@
+// @vitest-environment jsdom
+import { act, createElement, forwardRef, type ComponentProps, type ReactNode } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { create } from "@bufbuild/protobuf";
+import { RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { MobileComposerDraftStore } from "./composer-draft-store";
+import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
+import type { MobileComposerRichInput } from "./MobileComposerRichInput";
+import type { MobileRuntimeCommandPalette } from "./MobileRuntimeCommandPalette";
+import type { MobileState } from "./mobile-client";
+import { mobileMessage } from "./mobile-messages";
+
+let input: ComponentProps<typeof MobileComposerRichInput>;
+let palette: ComponentProps<typeof MobileRuntimeCommandPalette>;
+let root: Root;
+let host: HTMLDivElement;
+let TaskScreen: typeof import("./App").TaskScreen;
+const identity = { profileId: "profile", sessionId: "session" };
+const values = new Map<string, string>();
+const drafts = new MobileComposerDraftStore({
+  getItem: async (key) => values.get(key) ?? null,
+  setItem: async (key, value) => { values.set(key, value); },
+  removeItem: async (key) => { values.delete(key); }
+});
+const runtime = { authorityKey: "authority", surfaceOwnerKey: "runtime-owner", sessionId: "session", backendId: "backend", targetId: "target", runtimeGeneration: "7", resourceMentions: true };
+const command = { commandId: "skill-analysis", name: "analysis", description: "Analyze", source: RuntimeCommandSource.SKILL,
+  resourceId: "opaque-skill", inputMode: RuntimeCommandInputMode.RESOURCE_MENTION };
+const catalog = { surfaceOwnerKey: runtime.surfaceOwnerKey, sessionId: "session", runtimeGeneration: "7", items: [command] };
+const resource = { kind: "resource" as const, resourceId: "opaque-skill", displayText: "Native catalog display", resourceKind: ResourceKind.SKILL,
+  discoveredRevision: "content-sha", resourceVersion: "11", runtimeGeneration: "7" };
+let current = true;
+const appControls = { ...runtime, surfaceOwnerKey: "app-owner", session: create(SessionSchema, { sessionId: "session" }),
+  policy: { help: true as const, jumpSession: true as const, userShell: false, sessionReset: false, review: false }, jumpSessionIds: ["session"] };
+const resolveResource = vi.fn(async () => resource);
+const send = vi.fn(async () => true);
+const empty = Object.freeze([]);
+const client = new Proxy({
+  taskAppCommandControls: () => current ? appControls : undefined,
+  taskRuntimeCommandControls: () => current ? runtime : undefined,
+  listTaskRuntimeCommands: vi.fn(async () => catalog),
+  resolveTaskRuntimeCommandResource: resolveResource,
+  taskQueueItems: () => empty, taskQueueCapabilities: () => ({}), taskInteractions: () => empty, subscribe: () => () => {},
+  taskPendingImagePasteCount: () => 0, taskForeground: () => true,
+  taskNativeTreeControls: () => undefined, send, taskContextControls: () => undefined,
+  taskCatalogMentionControls: () => undefined, taskTimelineRows: () => empty
+}, { get: (object, key) => key in object ? object[key as keyof typeof object] : () => undefined });
+const session = create(SessionSchema, { sessionId: "session", backendId: "backend", targetId: "target", state: SessionState.IDLE });
+const snapshot = create(SnapshotSchema, { sessions: [session] });
+const state = { status: "connected", activeProfileId: "profile", selectedId: "session", owner: snapshot, detail: snapshot,
+  saved: [], pending: [], older: [], live: [], busy: false, historyBusy: false, historyEnd: true, readReceipts: {} } as unknown as MobileState;
+const colors = { background: "#fff", surface: "#fff", ink: "#111", muted: "#666", border: "#ccc", accent: "#f80", negative: "#c00", brandBackground: "#ffe", dark: false };
+const surface = ({ children }: { children?: ReactNode }) => createElement("div", null, children);
+
+beforeAll(async () => {
+  vi.stubGlobal("__DEV__", false);
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.doMock("react-native", () => ({
+    View: surface, Text: surface, ScrollView: surface, SectionList: surface, Image: surface, ActivityIndicator: surface,
+    FlatList: forwardRef(() => null), TextInput: forwardRef(() => null),
+    Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible ? createElement("div", null, children) : null,
+    Pressable: ({ children, onPress, disabled, accessibilityLabel }: { children?: ReactNode; onPress?: () => void; disabled?: boolean; accessibilityLabel?: string }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel }, children),
+    StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1 }, Platform: { OS: "android", select: (value: Record<string, unknown>) => value.android ?? value.default },
+    AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) }, BackHandler: { addEventListener: () => ({ remove() {} }) },
+    Keyboard: { dismiss() {}, addListener: () => ({ remove() {} }) }, PanResponder: { create: () => ({ panHandlers: {} }) },
+    AccessibilityInfo: { announceForAccessibility() {}, setAccessibilityFocus() {}, addEventListener: () => ({ remove() {} }) },
+    Linking: {}, Alert: { alert() {} }, findNodeHandle: () => null, useColorScheme: () => "light", useWindowDimensions: () => ({ width: 390, height: 844, scale: 1, fontScale: 1 })
+  }));
+  vi.doMock("react-native-safe-area-context", () => ({ SafeAreaProvider: surface, SafeAreaView: surface, useSafeAreaInsets: () => ({ top: 0, left: 0, bottom: 0, right: 0 }) }));
+  vi.doMock("react-native-svg", () => ({ SvgXml: () => null }));
+  vi.doMock("expo-status-bar", () => ({ StatusBar: () => null }));
+  vi.doMock("expo-constants", () => ({ default: {} }));
+  vi.doMock("expo-crypto", () => ({ randomUUID: () => "selected-occurrence" }));
+  vi.doMock("expo-clipboard", () => ({}));
+  for (const name of ["expo-image-picker", "expo-image-manipulator", "expo-image", "expo-sharing", "expo-file-system", "expo-media-library", "expo-audio", "expo-network", "expo-secure-store", "expo-notifications", "expo-application"]) vi.doMock(name, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => undefined }));
+  vi.doMock("expo-modules-core", () => ({ requireNativeModule: () => ({}), requireOptionalNativeModule: () => ({}), NativeModule: class {}, EventEmitter: class {} }));
+  vi.doMock("expo", () => ({ requireOptionalNativeModule: () => null }));
+  vi.doMock("./mobile-client", () => ({ MobileClient: class { constructor() { return client; } } }));
+  vi.doMock("./storage", () => new Proxy({ mobileComposerDrafts: drafts, mobileLocalePreferences: { snapshot: { effectiveLocale: "en" } } }, {
+    get: (object, key) => key in object ? object[key as keyof typeof object] : {},
+    has: () => true,
+    getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} })
+  }));
+  const nativeModules = ["network", "native-lan-discovery", "native-notifications", "mobile-media-preview", "mobile-pdf-preview", "mobile-model-preview", "mobile-file-share", "mobile-files-thumbnail-cache", "mobile-incoming-share"];
+  for (const name of nativeModules) vi.doMock(`./${name}`, () => new Proxy({}, { get: () => ({}), has: () => true, getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: {} }) }));
+  vi.doMock("./mobile-push-controller", () => ({ MobilePushController: class {} }));
+  vi.doMock("./mobile-voice-dictionary-readonly-controller", () => ({ MobileVoiceDictionaryReadOnlyController: class {} }));
+  vi.doMock("./MobileComposerRichInput", () => ({
+    MobileComposerRichInput: forwardRef((_props: ComponentProps<typeof MobileComposerRichInput>, ref) => {
+      input = _props;
+      if (ref && typeof ref !== "function") ref.current = { focus() {}, blur() {} } as never;
+      return createElement("div", { "data-input": "composer" }, _props.draft.text);
+    }), MobileComposerAtomChips: () => null, MobileAttachmentTray: () => null
+  }));
+  vi.doMock("./MobileRuntimeCommandPalette", () => ({ MobileRuntimeCommandPalette: (_props: ComponentProps<typeof MobileRuntimeCommandPalette>) => { palette = _props; return null; } }));
+  const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileActionSheet", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileTaskHeader", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet", "MobileRuntimeControlsSheet", "MobileContextSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "SwipeableSessionRow", "MobileMarkdownMessage", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerConversationRow", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobileConversationSearchSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
+  for (const name of screens) vi.doMock(`./${name}`, () => new Proxy({}, {
+    get: (_object, key) => key === "then" ? undefined : () => null,
+    has: () => true,
+    getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: () => null })
+  }));
+  vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
+  vi.doMock("./MobilePartnerAvatar", () => ({ MobilePartnerAvatar: () => null, MobilePartnerAvatarProvider: surface }));
+  vi.doMock("./MobileKeyboardAvoidingView", () => ({ MobileKeyboardAvoidingView: surface, useMobileKeyboardState: () => ({ shown: false, height: 0 }) }));
+  vi.doMock("./use-mobile-voice-input", () => ({ useMobileVoiceInput: () => ({ busy: false, recording: false, preparing: false, error: undefined }) }));
+  vi.doMock("./use-mobile-partner-read", () => ({ useMobilePartnerIdentity: () => ({ ready: true }), useMobilePartnerRead: () => ({ ready: true }) }));
+  vi.doMock("./use-mobile-audio-artwork", () => ({ useMobileAudioArtwork: () => new Map() }));
+  vi.doMock("./mobile-delegated-reader", () => ({ useMobileDelegatedTasks: () => ({ entries: empty, loading: false }) }));
+  vi.doMock("./use-mobile-hidden-history", () => ({ useMobileHiddenHistory: () => false }));
+  vi.doMock("./use-mobile-conversation-share", () => ({ useMobileConversationShare: () => ({ active: false, busy: false, selectedIds: [], enterVisible() {} }) }));
+  vi.doMock("./use-mobile-screenshot-selection", () => ({ useMobileScreenshotSelection() {} }));
+  ({ TaskScreen } = await import("./App"));
+});
+beforeEach(async () => {
+  current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockClear();
+  drafts.save(identity, plainTextMobileComposerDraft("/an arguments")); await drafts.flush(identity);
+  host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
+});
+afterEach(async () => { await act(async () => root?.unmount()); host?.remove(); });
+async function render(assertPalette = true): Promise<void> {
+  await act(async () => root.render(createElement(TaskScreen, { colors, state, locale: "en", onBack() {}, onHome() {}, onNew() {}, onFiles() {}, onOpenPartnerThread() {}, onRemoteDesktop() {}, focusComposer: false, onComposerFocused() {}, onOpenDerivationOrigin: async () => false })));
+  await act(async () => {});
+  await act(async () => input.onFocus?.());
+  await act(async () => input.onSelectionChange({ start: 3, end: 3 }, input.draft));
+  await act(async () => {});
+  if (assertPalette) { expect(input.editable).toBe(true); expect(input.selection).toEqual({ start: 3, end: 3 }); expect(palette.visible).toBe(true); expect(palette.checkingDraft).toBe(false); }
+}
+describe("actual App slash Skill selection", () => {
+  it("adopts fresh full identity into the retained draft, restores it and only sends after explicit action", async () => {
+    await render();
+    await act(async () => input.onCommandPaletteKey?.("Enter"));
+    expect(resolveResource).toHaveBeenCalledWith(runtime.surfaceOwnerKey, catalog, command, expect.any(AbortSignal));
+    expect(input.draft.text).toBe("/analysis arguments");
+    expect(input.draft.mentions).toMatchObject([{ kind: "resource", resourceId: "opaque-skill", discoveredRevision: "content-sha", resourceVersion: "11", runtimeGeneration: "7", start: 0, end: 9 }]);
+    expect(input.draft.slashCommands).toEqual([]); expect(send).not.toHaveBeenCalled();
+    const retained = drafts.readSync(identity)!; expect(retained).toEqual(input.draft);
+    expect(mobileComposerInput(retained).mentionRanges).toMatchObject([{ start: 0, end: 9 }]);
+    await act(async () => root.unmount()); root = createRoot(host); await render(false);
+    expect(input.draft).toEqual(retained);
+    const button = Array.from(host.querySelectorAll("button")).find((element) => element.textContent === mobileMessage("en", "composer.send"));
+    expect(button).toBeDefined();
+    await act(async () => button!.click());
+    expect(send).toHaveBeenCalledWith(retained, expect.objectContaining({ operationId: "selected-occurrence" }));
+  });
+  it("keeps a failed slash Skill draft editable and can retry the formal selection without sending", async () => {
+    await render();
+    resolveResource.mockRejectedValueOnce(new Error("Skill unavailable"));
+    await act(async () => palette.onSelect(command));
+    expect(input.draft.text).toBe("/an arguments"); expect(input.draft.mentions).toEqual([]);
+    expect(host.textContent).toContain("Skill unavailable"); expect(input.editable).toBe(true);
+    vi.mocked(client.listTaskRuntimeCommands).mockResolvedValueOnce({ ...catalog });
+    await act(async () => palette.onRetry());
+    await act(async () => palette.onSelect(command));
+    expect(input.draft.mentions[0]).toMatchObject({ resourceId: "opaque-skill" }); expect(send).not.toHaveBeenCalled();
+  });
+  it.each(["edit", "owner", "cancel", "ime"] as const)("does not adopt a late formal Skill after %s retirement", async (retirement) => {
+    await render();
+    let finish!: (value: typeof resource) => void;
+    resolveResource.mockReturnValueOnce(new Promise((resolve) => { finish = resolve; }));
+    const original = input.draft;
+    await act(async () => palette.onSelect(command));
+    await act(async () => {
+      if (retirement === "edit") input.onEdit(replaceMobileComposerRange(original, { start: original.text.length, end: original.text.length }, " changed"), original);
+      if (retirement === "owner") current = false;
+      if (retirement === "cancel") palette.onClose();
+      if (retirement === "ime") input.onCompositionChange?.(true);
+      finish(resource);
+    });
+    expect(input.draft.text).toBe(retirement === "edit" ? "/an arguments changed" : "/an arguments");
+    expect(input.draft.mentions).toEqual([]); expect(send).not.toHaveBeenCalled();
+  });
+});

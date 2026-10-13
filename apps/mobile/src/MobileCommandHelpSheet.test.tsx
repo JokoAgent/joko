@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { RuntimeCommandSource } from "@joko/contracts";
+import { RuntimeCommandInputMode, RuntimeCommandSource } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobileCommandHelpSheet } from "./MobileCommandHelpSheet";
 
@@ -94,6 +94,7 @@ describe("MobileCommandHelpSheet", () => {
           name: "skill:review",
           description: "",
           source: RuntimeCommandSource.SKILL,
+          inputMode: RuntimeCommandInputMode.TEXT,
           resourceId: "review-skill"
         }
       ],
@@ -122,6 +123,7 @@ describe("MobileCommandHelpSheet", () => {
       name: "skill:review",
       description: "Review the active change",
       source: RuntimeCommandSource.SKILL,
+      inputMode: RuntimeCommandInputMode.TEXT,
       resourceId: "review-skill"
     }];
     container = document.createElement("div");

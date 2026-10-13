@@ -249,6 +249,40 @@ describe("RemoteHostRegistry owner-private catalog", () => {
 });
 
 describe("RemoteHostRegistry credential and lifecycle boundary", () => {
+  it("rechecks file capability and exact file port within the captured process lease without reconnecting", async () => {
+    const fixture = createFixture();
+    const unavailable = async (): Promise<never> => { throw new Error("No transport I/O in authority test."); };
+    const files: RemoteFileTransportPort = { realpath: unavailable, stat: unavailable, list: unavailable, read: unavailable,
+      write: unavailable, mkdir: unavailable, rename: unavailable, remove: unavailable };
+    const processes: RemoteProcessTransportPort = { open: unavailable };
+    const capabilities = { commandExecution: false, processStreaming: true, fileTransfer: true, tcpForwarding: false, interactiveTerminal: false };
+    const connection = { capabilities, files, processes, close: async () => undefined };
+    const connect = vi.fn(async (request: ResolvedAgentAuthConnectorRequest) => {
+      await request.verifyHostKey({ algorithm: "ssh-ed25519", key: Uint8Array.of(7, 8, 9) });
+      request.onAuthenticating(); return connection;
+    });
+    const registry = fixture.registry({ connector: { capabilities, connect } });
+    const host = registry.create(hostCreate());
+    const captured = await registry.captureProcessAuthority(host.targetId, host.id);
+    expect(captured.lease.files).toBe(files);
+    expect(captured.lease.processes).toBe(processes);
+    expect(() => captured.assertCurrent()).not.toThrow();
+    expect(() => captured.assertFilesCurrent()).not.toThrow();
+    capabilities.fileTransfer = false;
+    expect(() => captured.assertCurrent()).not.toThrow();
+    expect(() => captured.assertFilesCurrent()).toThrow(/file capability/u);
+    capabilities.fileTransfer = true;
+    connection.files = { ...files };
+    expect(() => captured.assertCurrent()).not.toThrow();
+    expect(() => captured.assertFilesCurrent()).toThrow(/file capability/u);
+    connection.files = files;
+    expect(() => captured.assertFilesCurrent()).not.toThrow();
+    connection.processes = { ...processes };
+    expect(() => captured.assertCurrent()).toThrow(/process-stream capability/u);
+    expect(() => captured.assertFilesCurrent()).toThrow(/process-stream capability/u);
+    expect(connect).toHaveBeenCalledOnce();
+  });
+
   it("captures the exact process-stream authority and invalidates it without reconnecting during checks", async () => {
     const fixture = createFixture();
     const firstProcesses: RemoteProcessTransportPort = { open: vi.fn(async () => { throw new Error("unused"); }) };

@@ -6,7 +6,8 @@ import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
-import type { AppSnapshot, BackendView, ResourceView } from "../model.js";
+import { emptySnapshot, type AppSnapshot, type BackendView, type ResourceView } from "../model.js";
+import { PiPackagesSection } from "./PiPackagesSection.js";
 import { ToolsPage } from "./ToolsPage.js";
 
 const roots: Root[] = [];
@@ -22,6 +23,45 @@ afterEach(async () => {
 });
 
 describe("Tools resource actions", () => {
+  it("keeps same-name remote project approvals distinct and renders remote and service-node origins in both existing resource entries", async () => {
+    const approveResource = vi.fn(async () => undefined);
+    const setResourceEnabled = vi.fn(async () => undefined);
+    const controller = { state: { preferences: { navigationOpen: true } }, approveResource, setResourceEnabled } as unknown as AppController;
+    const first: ResourceView = { ...managedResource(), id: "remote-one", name: "Review", kind: "skill", scope: "project",
+      targetId: "project-one", source: "review", sourceKind: "remoteProject", sourceIdentity: "remote-source:one" };
+    const second: ResourceView = { ...first, id: "remote-two", targetId: "project-two", sourceIdentity: "remote-source:two", discoveredRevision: "sha256:second" };
+    const local: ResourceView = { ...managedResource(), source: "review", sourceKind: "local" };
+    let snapshot = { ...emptySnapshot(), backends: [resourceBackend(first.backendId, ["skill", "prompt"])],
+      targets: [{ id: "project-one", name: "Project One" }, { id: "project-two", name: "Project Two" }].map((target) => ({ ...target,
+        backendId: first.backendId, revision: 1n, workspaceId: "workspace", workspaceName: "Project", trusted: true, pinned: false, archived: false })),
+      resources: [first, second, local] };
+    let pending: Promise<void> | undefined;
+    const runAction = (_key: string, action: () => Promise<void>) => { pending = action(); };
+    const t = (key: Parameters<typeof translate>[1], values?: Readonly<Record<string, string | number>>) => translate("en", key, values);
+    const container = document.createElement("div"); document.body.append(container);
+    const root = createRoot(container); roots.push(root);
+    const render = () => act(async () => root.render(<ToolsPage controller={controller} snapshot={snapshot} locale="en" t={t} runAction={runAction} onOpenNavigation={() => undefined} />));
+    await render();
+    await act(async () => required(container.querySelector<HTMLButtonElement>("#tools-tab-resources")).click());
+    const secondCard = required([...container.querySelectorAll<HTMLElement>(".resource-card")].find((card) => card.textContent?.includes("remote-two")));
+    expect(secondCard.textContent).toContain("Remote project (SSH)");
+    expect(secondCard.textContent).toContain("Project Two");
+    expect(secondCard.textContent).toContain("Awaiting approval");
+    expect(secondCard.textContent).toContain("Not loaded");
+    expect(container.textContent).toContain("Service-node path");
+    await act(async () => { buttonWithText(secondCard, "Approve resource").click(); await pending; });
+    expect(approveResource).toHaveBeenCalledExactlyOnceWith(second.id, second.discoveredRevision);
+    snapshot = { ...snapshot, resources: [first, { ...second, state: "approved", canToggle: true }, local] };
+    await render();
+    const approvedCard = required([...container.querySelectorAll<HTMLElement>(".resource-card")].find((card) => card.textContent?.includes("remote-two")));
+    await act(async () => { buttonWithText(approvedCard, "Enable").click(); await pending; });
+    expect(setResourceEnabled).toHaveBeenCalledExactlyOnceWith(second.id, true);
+    expect(approvedCard.textContent).toContain("Not loaded");
+    await act(async () => root.render(<PiPackagesSection controller={controller} backends={snapshot.backends} resources={snapshot.resources} runAction={runAction} t={t} />));
+    expect(container.textContent).toContain("Remote project (SSH)");
+    expect(container.textContent).toContain("Service-node path");
+  });
+
   it("binds approval to the revision rendered on the resource card", async () => {
     const approveResource = vi.fn(async () => undefined);
     const controller = {

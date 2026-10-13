@@ -10,6 +10,21 @@ type MobilePartnerMessageRow = readonly [
 ];
 
 const rows = [
+  ["partnerOutputs.title", "Outputs", "成果", "成果", "成果物", "결과물"],
+  ["partnerOutputs.loading", "Loading outputs…", "正在加载成果…", "正在載入成果…", "成果物を読み込み中…", "결과물 불러오는 중…"],
+  ["partnerOutputs.empty", "No outputs yet. Ask your Partner to create something.", "还没有成果，可以让伙伴创作一些内容。", "尚無成果，可以請夥伴創作一些內容。", "成果物はまだありません。パートナーに作成を頼んでみましょう。", "아직 결과물이 없습니다. 파트너에게 만들어 달라고 요청하세요."],
+  ["partnerOutputs.failed", "Could not load outputs. Retry to read the current list.", "无法加载成果，请重试以读取当前清单。", "無法載入成果，請重試以讀取目前清單。", "成果物を読み込めませんでした。再試行してください。", "결과물을 불러오지 못했습니다. 다시 시도하세요."],
+  ["partnerOutputs.offline", "Reconnect to refresh outputs or open a source task.", "请重新连接以刷新成果或打开来源任务。", "請重新連線以重新整理成果或開啟來源任務。", "再接続して成果物を更新するか、元のタスクを開いてください。", "다시 연결하여 결과물을 새로 고치거나 원본 작업을 여세요."],
+  ["partnerOutputs.pending", "Outputs are still being confirmed. Refresh shortly.", "成果仍在确认中，请稍后刷新。", "成果仍在確認中，請稍後重新整理。", "成果物を確認中です。しばらくしてから更新してください。", "결과물을 확인 중입니다. 잠시 후 새로 고치세요."],
+  ["partnerOutputs.unavailable", "Outputs could not be confirmed for this execution.", "无法确认本次执行的成果。", "無法確認本次執行的成果。", "この実行の成果物を確認できませんでした。", "이번 실행의 결과물을 확인할 수 없습니다."],
+  ["partnerOutputs.refresh", "Refresh outputs", "刷新成果", "重新整理成果", "成果物を更新", "결과물 새로 고침"],
+  ["partnerOutputs.openSource", "Open source task", "打开来源任务", "開啟來源任務", "元のタスクを開く", "원본 작업 열기"],
+  ["partnerOutputs.openFailed", "The source task could not be opened. Reopen outputs and refresh before trying again.", "无法打开来源任务，请重新打开成果并刷新后再试。", "無法開啟來源任務，請重新開啟成果並重新整理後再試。", "元のタスクを開けませんでした。成果物を開き直して更新してください。", "원본 작업을 열지 못했습니다. 결과물을 다시 열고 새로 고친 후 시도하세요."],
+  ["partnerOutputs.filesTruncated", "Showing the first 64 changed files.", "仅显示前 64 个变更文件。", "僅顯示前 64 個變更檔案。", "最初の64件の変更ファイルを表示しています。", "처음 64개의 변경 파일을 표시합니다."],
+  ["partnerOutputs.rowsTruncated", "More output tasks are available than this list can display.", "成果任务超过本清单的显示上限。", "成果任務超過本清單的顯示上限。", "一覧の表示上限を超える成果物タスクがあります。", "목록 표시 한도를 넘는 결과물 작업이 있습니다."],
+  ["partnerOutputs.added", "Added", "新增", "新增", "追加", "추가됨"],
+  ["partnerOutputs.modified", "Modified", "修改", "修改", "変更", "수정됨"],
+  ["partnerOutputs.renamed", "Renamed", "重命名", "重新命名", "名前変更", "이름 변경됨"],
   ["partnerRestart.action", "Restart Partner", "重启伙伴", "重啟夥伴", "パートナーを再起動", "파트너 다시 시작"],
   ["partnerRestart.title", "Restart {name}?", "重启 {name}？", "重啟 {name}？", "{name} を再起動しますか？", "{name} 다시 시작할까요?"],
   ["partnerRestart.body", "Stop current work and rebuild context on your next message. History, memory and files stay. Independent tasks continue; queued input stays paused.", "停止当前工作，在下一条消息时重建上下文。历史、记忆和文件会保留，独立任务继续运行；排队输入会保持暂停。", "停止目前工作，在下一則訊息時重建上下文。歷史、記憶和檔案會保留，獨立任務繼續執行；排隊輸入會保持暫停。", "現在の作業を停止し、次のメッセージでコンテキストを再構築します。履歴、メモリー、ファイルは保持されます。独立タスクは継続し、入力キューは一時停止します。", "현재 작업을 중지하고 다음 메시지에서 컨텍스트를 다시 구성합니다. 기록, 메모리, 파일은 유지됩니다. 독립 작업은 계속되며 입력 대기열은 일시 중지됩니다."],

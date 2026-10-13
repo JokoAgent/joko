@@ -199,6 +199,45 @@ describe("RemoteCodexRuntimeResolver", () => {
     await fixture.resolver.forceShutdown();
     expect(shutdown).toHaveBeenCalledOnce();
   });
+
+  it("rechecks the original mutation authority after async proof at the actual WebSocket frame head", async () => {
+    const fixture = createFixture({});
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    await runtime.host.ensureStarted();
+    let release!: () => void;
+    let entered!: () => void;
+    const proofEntered = new Promise<void>(resolve => { entered = resolve; });
+    const proof = new Promise<void>(resolve => { release = resolve; });
+    let queueCurrent = true;
+    const request = runtime.host.request("turn/start", { threadId: "thread-one", input: [] }, {
+      mutation: true,
+      beforeDispatch: () => { if (!queueCurrent) throw new Error("Original Queue authority changed."); },
+      beforeDispatchAsync: async () => { entered(); await proof; }
+    });
+    const outcome = request.catch((error: unknown) => error);
+    await proofEntered; queueCurrent = false; release();
+    await expect(outcome).resolves.toMatchObject({ message: "Original Queue authority changed." });
+    expect(fixture.processes.clientMessages.some(message => message.method === "turn/start")).toBe(false);
+  });
+
+  it("does not write a remote mutation whose request was cancelled while the file proof was pending", async () => {
+    const fixture = createFixture({});
+    cleanups.push(() => fixture.resolver.forceShutdown());
+    const runtime = await fixture.resolver.resolve(fixture.target);
+    await runtime.host.ensureStarted();
+    let release!: () => void;
+    let entered!: () => void;
+    const proofEntered = new Promise<void>(resolve => { entered = resolve; });
+    const proof = new Promise<void>(resolve => { release = resolve; });
+    const controller = new AbortController();
+    const outcome = runtime.host.request("turn/start", { threadId: "thread-one", input: [] }, {
+      mutation: true, signal: controller.signal, beforeDispatchAsync: async () => { entered(); await proof; }
+    }).catch((error: unknown) => error);
+    await proofEntered; controller.abort(); release();
+    await expect(outcome).resolves.toMatchObject({ stateMayHaveChanged: false });
+    expect(fixture.processes.clientMessages.some(message => message.method === "turn/start")).toBe(false);
+  });
 });
 
 interface FixtureOptions {

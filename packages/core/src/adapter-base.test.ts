@@ -3,6 +3,11 @@ import { CapabilityDrivenBackendAdapter } from "./index.js";
 import { describe, expect, it } from "vitest";
 
 describe("CapabilityDrivenBackendAdapter", () => {
+  it("fails an unadvertised working-context refresh without claiming a native apply", async () => {
+    await expect(new MinimalAdapter().refreshModelWorkingContext({} as AdapterContext)).rejects.toMatchObject({ publicError: {
+      code: "BACKEND_CAPABILITY_UNAVAILABLE", phase: "capability", stateMayHaveChanged: false
+    } });
+  });
   it("fails an unadvertised native operation explicitly", async () => {
     const value = new MinimalAdapter();
     await expect(value.setPlanMode(true, {} as AdapterContext)).rejects.toMatchObject({

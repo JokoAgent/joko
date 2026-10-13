@@ -4,7 +4,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type SessionView, type TargetView } from "../model.js";
+import { emptySnapshot, type ResourceView, type SessionView, type TargetView } from "../model.js";
+import { translate } from "../i18n.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT } from "../sidebar-layout.js";
 import { ProjectsPage } from "./ProjectsPage.js";
 
@@ -13,6 +14,38 @@ beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
 afterEach(async () => {
   await act(async () => { for (const root of roots.splice(0)) root.unmount(); });
   document.body.replaceChildren(); vi.unstubAllGlobals();
+});
+
+it("discovers registered remote project resources through the existing trust and capability gate with visible retry and approval status", async () => {
+  const discoverProjectResources = vi.fn().mockRejectedValueOnce(new Error("Remote project is offline.")).mockResolvedValue(undefined);
+  const controller = { state: { connectionState: "connected", preferences: DEFAULT_UI_PREFERENCES }, discoverProjectResources } as unknown as AppController;
+  const target: TargetView = { id: "remote-project", backendId: "backend", name: "Remote Project", workspaceId: "remote-workspace",
+    revision: 1n, workspaceName: "Registered project", trusted: true, pinned: false, archived: false,
+    remoteWorkspace: { kind: "ssh", hostTargetId: "registered-host-target", hostId: "registered-host", workspaceRoot: "/registered/project" } };
+  const resource = { id: "opaque-resource", backendId: target.backendId, targetId: target.id, state: "awaitingApproval" } as ResourceView;
+  let snapshot = { ...emptySnapshot(), targets: [target], resources: [resource],
+    workspaces: [{ id: target.workspaceId, targetId: target.id, name: "Registered project", kind: "userProject" as const,
+      serverPath: "", trusted: true, dirty: false, entries: [] }],
+    backends: [{ id: target.backendId, name: "Agent", version: "1", health: "healthy" as const,
+      capabilities: new Map([["runtime.resources", { name: "runtime.resources", supported: true, options: ["skill"] }]]) }] };
+  const container = document.createElement("div"); document.body.append(container);
+  const root = createRoot(container); roots.push(root);
+  let pending: Promise<void> = Promise.resolve();
+  const errors: Error[] = [];
+  const render = () => act(async () => root.render(<ProjectsPage controller={controller} snapshot={snapshot}
+    t={(key, values) => translate("en", key, values)} onOpenNavigation={() => undefined}
+    runAction={(_key, action) => { pending = action().catch((error: Error) => { errors.push(error); }); }}
+    prepareSessionRemoval={async () => undefined} />));
+  await render();
+  expect(container.textContent).toContain("Remote project (SSH) · 1 resources awaiting approval");
+  await act(async () => { button(container, "Discover resources · 1").click(); await pending; });
+  expect(errors[0]?.message).toBe("Remote project is offline.");
+  await act(async () => { button(container, "Discover resources · 1").click(); await pending; });
+  expect(discoverProjectResources.mock.calls).toEqual([[target.id], [target.id]]);
+  snapshot = { ...snapshot, backends: [] }; await render();
+  expect(container.textContent).not.toContain("Discover resources");
+  snapshot = { ...snapshot, workspaces: [{ ...snapshot.workspaces[0]!, trusted: false }] }; await render();
+  expect(container.textContent).not.toContain("Discover resources");
 });
 
 it("restores the same project once and includes it in the current sidebar filter after persistence", async () => {

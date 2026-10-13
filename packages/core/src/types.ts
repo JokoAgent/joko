@@ -70,6 +70,7 @@ export const CAPABILITIES = [
   "model.switch",
   "model.effort",
   "model.fast_mode",
+  "model.working_context",
   "provider.managed_catalog",
   "provider.account_usage",
   "provider.login",
@@ -403,6 +404,8 @@ export interface ProviderModel {
     | string;
   readonly contextWindow: number;
   readonly maxOutputTokens: number;
+  readonly contextWindowSource?: "declared" | "estimated";
+  readonly maxOutputTokensSource?: "declared" | "estimated";
   readonly supportsImages: boolean;
   /** Explicit catalog denial used by tool-dependent routing; absence remains unknown. */
   readonly supportsTools?: boolean;
@@ -411,6 +414,15 @@ export interface ProviderModel {
   /** Explicit Backend support; absence is conservatively treated as false. */
   readonly supportsFastMode?: boolean;
   readonly thinkingLevels: readonly string[];
+  readonly defaultEffort?: string;
+  readonly displayThinkingLevels?: readonly string[];
+  readonly description?: string;
+  readonly declaredInputModalities?: readonly string[];
+  readonly declaredOutputModalities?: readonly string[];
+  readonly declaredSupportsImages?: boolean;
+  readonly declaredSupportsFastMode?: boolean;
+  readonly referenceApi?: string;
+  readonly protocolMode?: "matching" | "compatibility" | "unknown";
   readonly cost: {
     readonly input: number;
     readonly output: number;

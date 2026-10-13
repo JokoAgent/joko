@@ -6,6 +6,49 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 
 import * as contract from "../dist/index.js";
 
+test("Runtime command input modes preserve explicit text and selected Resource semantics without private metadata", () => {
+  assert.equal(contract.RuntimeCommandInputMode.UNSPECIFIED, 0);
+  assert.equal(create(contract.RuntimeCommandSchema).inputMode, contract.RuntimeCommandInputMode.UNSPECIFIED);
+  assert.equal(contract.RuntimeCommandSchema.fields.find(field => field.name === "input_mode").number, 8);
+  for (const inputMode of [contract.RuntimeCommandInputMode.TEXT, contract.RuntimeCommandInputMode.RESOURCE_MENTION]) {
+    const command = create(contract.RuntimeCommandSchema, { name: "report", resourceId: "opaque-resource", loaded: true, inputMode });
+    assert.deepEqual(fromBinary(contract.RuntimeCommandSchema, toBinary(contract.RuntimeCommandSchema, command)), command);
+  }
+  assert.deepEqual([...fieldNames(contract.RuntimeCommandSchema)], ["command_id", "name", "description", "source", "resource_id", "loaded", "session_id", "input_mode"]);
+});
+
+test("Model working context and declared metadata preserve strict optional presence and exact route CAS", () => {
+  for (const name of ["getModelWorkingContext", "setModelWorkingContext", "resetModelWorkingContext"]) assert.ok(methodNames(contract.BackendService).has(name));
+  const target = { backendId: "one", providerId: "provider", modelId: "model-one" };
+  const value = create(contract.SetModelWorkingContextRequestSchema, { target, relatedTargets: [{ ...target, backendId: "two", modelId: "model-two" }],
+    operationId: "edit", expectedRevision: { value: 17n }, expectedSourceRevision: "source-exact", contextWindowTokens: 256000n });
+  assert.deepEqual(fromBinary(contract.SetModelWorkingContextRequestSchema, toBinary(contract.SetModelWorkingContextRequestSchema, value)), value);
+  assert.equal(roundTrip(contract.SetModelWorkingContextRequestSchema, { target }).contextWindowTokens, undefined);
+  const metadata = roundTrip(contract.ModelDescriptorSchema, { defaultEffort: "high", description: "Native", declaredSupportsImages: false,
+    declaredSupportsFastMode: false, declaredModalities: { input: { values: [] } }, contextWindowSource: "estimated" });
+  assert.equal(metadata.declaredSupportsImages, false); assert.equal(metadata.declaredSupportsFastMode, false);
+  assert.deepEqual(metadata.declaredModalities.input.values, []); assert.equal(metadata.declaredModalities.output, undefined);
+  assert.equal(roundTrip(contract.ModelDescriptorSchema, {}).declaredModalities, undefined);
+});
+
+test("Managed repository runtime contracts preserve exact sources, transfers, capabilities and one context transaction", () => {
+  assert.deepEqual([...methodNames(contract.ManagedModelRuntimeService)], [
+    "ensureManagedModelRuntimeProvider", "stopManagedModelRuntime", "restartManagedModelRuntime", "listManagedModelRepositoryFiles",
+    "downloadManagedRepositoryModel", "controlManagedRepositoryDownload", "getManagedModelContext", "setManagedModelContext", "resetManagedModelContext",
+    "listManagedModelRuntimes", "getManagedModelRuntime", "startManagedModelRuntime", "installManagedModelRuntime", "cancelManagedModelRuntimeInstall",
+    "pullManagedModel", "pauseManagedModelPull", "resumeManagedModelPull", "cancelManagedModelPull", "deleteManagedModel", "getManagedModelPreflight"
+  ]);
+  const source = { repository: "Owner/Model-GGUF", file: "nested/Model-Q4.gguf" };
+  const primary = { backendId: "backend-a", providerId: "managed-provider", modelId: "model-exact", repositoryModel: source };
+  const value = create(contract.SetManagedModelContextRequestSchema, { runtimeId: "llama-cpp", target: primary,
+    relatedTargets: [{ ...primary, backendId: "backend-b" }], contextWindowTokens: 262144n });
+  assert.deepEqual(fromBinary(contract.SetManagedModelContextRequestSchema, toBinary(contract.SetManagedModelContextRequestSchema, value)), value);
+  const transfer = create(contract.ControlManagedRepositoryDownloadRequestSchema, { runtimeId: "llama-cpp", repositoryModel: source,
+    transferId: "transfer-exact", action: contract.ManagedRepositoryDownloadAction.PAUSE });
+  assert.deepEqual(fromBinary(contract.ControlManagedRepositoryDownloadRequestSchema, toBinary(contract.ControlManagedRepositoryDownloadRequestSchema, transfer)), transfer);
+  assert.deepEqual([...fieldNames(contract.ManagedModelRepositoryFileSchema)], ["file", "size_bytes"]);
+});
+
 test("Device name contracts preserve manual presence and typed self sources", () => {
   const roundTrip = (schema, value) => fromBinary(schema, toBinary(schema, create(schema, value)));
   const plain = roundTrip(contract.DeviceSchema, { deviceId: "phone", displayName: "Native phone", defaultDisplayName: "Native phone" });
@@ -785,6 +828,17 @@ test("Contacts exposes revision-fenced local and explicit device-sync authority 
   assert.equal(field(contract.ContactVCardImportDecisionSchema, "target_contact_id").proto.proto3Optional, true);
 });
 
+test("Partner task output metadata preserves execution, ordered Runs, typed status and bounded inventory fields", () => {
+  const value = create(contract.ListPartnerTaskOutputsResponseSchema, { partnerId: "partner-a", truncated: true, outputs: [{
+    sourceKind: contract.PartnerTaskOutputSourceKind.DELEGATION, sourceId: "delegation", parentSessionId: "parent", sessionId: "child",
+    execution: 2n, runIds: ["run-one", "run-two"], sourceRevision: { value: 7n }, title: "Task output",
+    readiness: contract.PartnerTaskOutputReadiness.READY, files: [{ path: "report.md", status: contract.PartnerTaskOutputFileStatus.ADDED }], truncated: true
+  }] });
+  assert.deepEqual(fromBinary(contract.ListPartnerTaskOutputsResponseSchema, toBinary(contract.ListPartnerTaskOutputsResponseSchema, value)), value);
+  assert.deepEqual([...fieldNames(contract.ListPartnerTaskOutputsRequestSchema)], ["partner_id"]);
+  assertNoFields([contract.PartnerTaskOutputSchema, contract.PartnerTaskOutputFileSchema], ["blob", "content", "download_url", "navigation_action"]);
+});
+
 test("Partners exposes revision-fenced durable profiles without private home or runtime authority", () => {
   assert.deepEqual([...methodNames(contract.PartnerService)], [
     "listPartnerMemories", "readPartnerMemory", "updatePartnerMemory", "deletePartnerMemory", "getPartnerMemoryPreferences", "updatePartnerMemoryPreferences",
@@ -808,6 +862,8 @@ test("Partners exposes revision-fenced durable profiles without private home or 
     "retryPartnerInitialization",
     "updatePartnerDefaults",
     "listPartnerSessions",
+    "listPartnerTaskOutputs",
+    "controlPartnerSessionTask",
     "markPartnerRead",
     "listPartnerPrivateThreads",
     "getPartnerPrivateThread",

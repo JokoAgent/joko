@@ -12,7 +12,7 @@ import Constants from "expo-constants";
 import { randomUUID } from "expo-crypto";
 import * as Clipboard from "expo-clipboard";
 import {
-  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, SessionState, TargetState, capabilityNames, partnerResumeMessages,
+  CapabilitySupport, ConnectionState, DeviceKind, DevicePresenceState, FileKind, QueueItemState, RuntimeCommandInputMode, SessionState, TargetState, capabilityNames, partnerResumeMessages,
   type QueueItem, type Session
 } from "@joko/contracts";
 import { MobileSharedConnectionScreen } from "./MobileSharedConnectionScreen";
@@ -212,6 +212,7 @@ import {
   assertMobileRuntimeCommandCandidate,
   detectMobileRuntimeCommandActivation,
   replaceMobileRuntimeCommandRun,
+  replaceMobileRuntimeResourceCommandRun,
   resolveMobileRuntimeCommandPaletteKey,
   type MobileRuntimeCommandActivation,
   type MobileRuntimeCommandCatalog
@@ -300,6 +301,7 @@ import { mobilePartnerWorkingStatus } from "./mobile-partner-working";
 import { mobilePartnerConversationRows, mobilePartnerTimeGroups, mobilePublicConversationInputs } from "./mobile-partner-presentation";
 import { useMobileHiddenHistory } from "./use-mobile-hidden-history";
 import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
+import type { MobilePartnerProfileSnapshot, MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import { MobileConversationSearchSheet } from "./MobileConversationSearchSheet";
 import type { MobileConversationSearchHit } from "./mobile-conversation-search";
 import { MobilePartnerResourcesScreen } from "./MobilePartnerResourcesScreen";
@@ -3152,7 +3154,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
   </ScrollView>;
 }
 
-function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused,
+export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused,
   messageFocus, onOpenDerivationOrigin }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
   onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
@@ -3201,6 +3203,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const [interactionVisible, setInteractionVisible] = useState(initialInteractions.length > 0);
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
   const [partnerSettingsOwner, setPartnerSettingsOwner] = useState<string>();
+  const [partnerOutputsShell, setPartnerOutputsShell] = useState<{ readonly identity: string; readonly owner: string;
+    readonly partner: MobilePartnerProfileSnapshot["partner"]; readonly transport: MobilePartnerProfileTransport }>();
   const [taskTagsVisible, setTaskTagsVisible] = useState(false);
   const [contextVisible, setContextVisible] = useState(false);
   const [nativeTreeVisible, setNativeTreeVisible] = useState(false);
@@ -3275,6 +3279,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
   const composerFocusedRef = useRef(false);
   const runtimeCommandControlsRef = useRef(client.taskRuntimeCommandControls());
   const runtimeCommandAbortRef = useRef<AbortController | undefined>(undefined);
+  const runtimeCommandCommitAbortRef = useRef<AbortController | undefined>(undefined);
   const runtimeCommandRequestRef = useRef(0);
   const runtimeCommandPaletteRef = useRef<MobileRuntimeCommandPaletteSnapshot>({
     visible: false,
@@ -3576,6 +3581,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     command.description,
     command.source,
     command.resourceId,
+    command.inputMode,
     command.loaded
   ]));
   const voiceTransport = state.status === "connected" ? client.taskVoiceTransport() : undefined;
@@ -3918,7 +3924,10 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     setComposerSelection({ start: next.text.length, end: next.text.length });
     setDraftReady(true);
   }, [state.restoredComposerDraft]);
-  const partnerSettingsVisible = partnerSettingsOwner !== undefined && partnerSettingsOwner === partnerConversationTransport?.ownerKey;
+  const offlineOutputsShell = state.status !== "connected" && partnerOutputsShell?.identity === client.partnerTaskOutputsShellIdentity()
+    && partnerOutputsShell?.owner === partnerSettingsOwner ? partnerOutputsShell : undefined;
+  const partnerSettingsVisible = partnerSettingsOwner !== undefined
+    && (partnerSettingsOwner === partnerConversationTransport?.ownerKey || offlineOutputsShell !== undefined);
   const partnerRead = useMobilePartnerRead(partnerConversationTransport, partnerIdentity, state.window ?? taskTimelineEvents,
     state.owner?.generation ?? 0n,
     visiblePartnerRows.ownerKey === partnerConversationTransport?.ownerKey ? visiblePartnerRows.ids : new Set<string>(),
@@ -4007,6 +4016,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       taskMountedRef.current = false;
       copyGenerationRef.current += 1;
       runtimeCommandAbortRef.current?.abort();
+      runtimeCommandCommitAbortRef.current?.abort();
       runtimeCommandAbortRef.current = undefined;
       runtimeCommandRequestRef.current += 1;
       attachmentAbortRef.current?.abort();
@@ -4201,6 +4211,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
     ...(currentRuntimeCommandDraftLease === undefined ? {} : { draftLease: currentRuntimeCommandDraftLease })
   };
   const dismissRuntimeCommandPalette = useCallback(() => {
+    runtimeCommandCommitAbortRef.current?.abort();
     const palette = runtimeCommandPaletteRef.current;
     if (!palette.visible || !palette.ownerKey || !palette.activation) return;
     setRuntimeCommandDismissal({
@@ -4219,6 +4230,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       || !lease || !identity || palette.runtimeCatalog !== lease.runtimeCatalog
       || palette.ownerKey !== lease.ownerKey || mobileComposerDraftIdentityKey(identity) !== lease.draftIdentityKey) return;
     runtimeCommandCommittingRef.current = true;
+    const request = new AbortController();
+    runtimeCommandCommitAbortRef.current = request;
     setRuntimeCommandCommitting(true);
     setLocalError("");
     try {
@@ -4241,7 +4254,28 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
             palette.status === "ready" ? lease.runtimeCatalog : undefined,
             candidate
           );
-      const result = replaceMobileRuntimeCommandRun(lease.sourceDraft, lease.activation, exact);
+      const resource = !isMobileAppCommandCandidate(exact) && exact.inputMode === RuntimeCommandInputMode.RESOURCE_MENTION
+        ? await client.resolveTaskRuntimeCommandResource(
+            palette.runtimeCatalog!.surfaceOwnerKey, palette.runtimeCatalog!, exact, request.signal
+          )
+        : undefined;
+      request.signal.throwIfAborted();
+      const after = client.taskAppCommandControls();
+      if (!taskMountedRef.current || AppState.currentState !== "active" || !composerFocusedRef.current
+        || composerComposingRef.current || after?.surfaceOwnerKey !== lease.ownerKey
+        || draftIdentityRef.current === undefined
+        || mobileComposerDraftIdentityKey(draftIdentityRef.current) !== lease.draftIdentityKey
+        || composerDraftRef.current !== lease.sourceDraft
+        || !sameComposerSelection(composerSelectionRef.current, lease.selection)
+        || runtimeCommandPaletteRef.current.runtimeCatalog !== lease.runtimeCatalog
+        || !sameRuntimeCommandActivation(detectMobileRuntimeCommandActivation(
+          composerDraftRef.current, composerSelectionRef.current, composerComposingRef.current
+        ), lease.activation)) {
+        throw new Error(mobileMessage(locale, "task.error.commandOwnerChanged"));
+      }
+      const result = resource && !isMobileAppCommandCandidate(exact)
+        ? replaceMobileRuntimeResourceCommandRun(lease.sourceDraft, lease.activation, exact, resource, randomUUID())
+        : replaceMobileRuntimeCommandRun(lease.sourceDraft, lease.activation, exact);
       if (!mobileComposerDrafts.saveIfRevision(identity, result.draft, lease.revision)) {
         throw new Error(mobileMessage(locale, "task.error.commandInsertChanged"));
       }
@@ -4271,7 +4305,9 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         }, 0);
       }
     } catch (failure) {
-      if (taskMountedRef.current) {
+      if (taskMountedRef.current && !request.signal.aborted && draftIdentityRef.current
+        && mobileComposerDraftIdentityKey(draftIdentityRef.current) === lease.draftIdentityKey
+        && client.taskAppCommandControls()?.surfaceOwnerKey === lease.ownerKey) {
         const retained = mobileComposerDrafts.readSync(identity);
         if (retained && !mobileComposerDraftsEqual(retained, composerDraftRef.current)) {
           composerDraftRef.current = retained;
@@ -4284,6 +4320,7 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         setLocalError(errorText(failure));
       }
     } finally {
+      if (runtimeCommandCommitAbortRef.current === request) runtimeCommandCommitAbortRef.current = undefined;
       runtimeCommandCommittingRef.current = false;
       if (taskMountedRef.current) setRuntimeCommandCommitting(false);
     }
@@ -5814,7 +5851,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         onPress={() => setInteractionVisible(true)} />
     </View> : <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
       {partnerRead.partner && <Action label={[partnerRead.partner.capabilities.modelChain[0]?.modelId,
-        mobileMessage(locale, partnerRead.partner.capabilities.permissionMode === "ask" ? "partnerProfile.ask" : "partnerProfile.auto"),
+        mobileMessage(locale, partnerRead.partner.capabilities.permissionMode === "ask" ? "partnerProfile.ask"
+          : partnerRead.partner.capabilities.permissionMode === "auto" ? "partnerProfile.auto" : "controls.permission.full"),
         ...(partnerRead.partner.capabilities.planMode ? [mobileMessage(locale, "partnerProfile.plan")] : [])].filter(Boolean).join(" · ")}
         colors={colors} compact disabled={!partnerProfileTransport || state.busy || attachmentBusy || voice.busy}
         onPress={openRuntimeControls} />}
@@ -6142,7 +6180,8 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
         return completed;
       }}
       onError={setLocalError} />
-    <MobilePartnerProfileSheet visible={partnerSettingsVisible} partner={partnerRead.partner} transport={partnerProfileTransport}
+    <MobilePartnerProfileSheet visible={partnerSettingsVisible} partner={offlineOutputsShell?.partner ?? partnerRead.partner}
+      transport={offlineOutputsShell?.transport ?? partnerProfileTransport} online={state.status === "connected"}
       routineFactory={(partnerId, ownerKey) => client.partnerRoutineEditor(partnerId, mobilePlainStorage, ownerKey)}
       memoryFactory={(partner, ownerKey) => client.partnerMemoryEditor(partner, ownerKey)}
       connectionsFactory={(partner, ownerKey) => client.partnerConnectionsEditor(partner, ownerKey)}
@@ -6150,7 +6189,15 @@ function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onO
       deletionTransport={client.partnerDeletionTransport()}
       restartTransport={client.partnerRestartTransport()}
       resumeFactory={partner => client.partnerResumeEditor(partner, partnerProfileTransport?.ownerKey)}
-      colors={colors} locale={locale} onClose={() => setPartnerSettingsOwner(undefined)} onSaved={() => partnerRead.retry()} onSearch={openConversationSearch} />
+      colors={colors} locale={locale} onClose={() => { setPartnerSettingsOwner(undefined); setPartnerOutputsShell(undefined); }}
+      onSaved={() => partnerRead.retry()} onSearch={openConversationSearch} onOpenOutputError={setLocalError}
+      onOutputsPageChange={open => {
+        if (!open) { setPartnerOutputsShell(undefined); return; }
+        const identity = client.partnerTaskOutputsShellIdentity();
+        if (identity && partnerSettingsOwner && partnerRead.partner && partnerProfileTransport) {
+          setPartnerOutputsShell({ identity, owner: partnerSettingsOwner, partner: partnerRead.partner, transport: partnerProfileTransport });
+        }
+      }} />
     <MobileConversationSearchSheet key={searchScope} visible={searchVisible} rows={displayRows} colors={colors} locale={locale}
       additional={delegatedControls && partnerIdentity.ready ? delegatedAffinity.orphanEntries.map((entry) => {
         const card = projectMobileDelegated(entry); return { itemKey: `delegated/${entry.key}`, sourceKey: entry.key, text: [card.title, card.assignment, card.summary, card.statusText, card.error].filter(Boolean).join("\n") };

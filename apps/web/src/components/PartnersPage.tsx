@@ -40,6 +40,7 @@ import { currentPartnerWorkingStatus } from "../partner-working-status.js";
 import { PartnerWorkingLabel } from "./PartnerWorkingStatus.js";
 import { usePartnerDocumentForeground } from "./use-partner-working-status.js";
 import { AvatarPicker } from "./PartnerAvatarPicker.js";
+import { usePartnerPermissionConfirmation } from "./use-partner-permission-confirmation.js";
 
 import type { AppController } from "../controller.js";
 import type {
@@ -467,6 +468,10 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
   const modelsAvailable = partnerModels(snapshot).length > 0;
   const valid = validPartnerDraft(draft) && modelsAvailable;
   const locked = submitting || receiptUnavailable || receipts.length > 0;
+  const effectiveCapabilities = draft.usesDirectoryDefaults ? formDirectory.defaultCapabilities : draft.capabilities;
+  const permissionCatalog = useMemo(() => partnerPermissionCatalogKey(snapshot), [snapshot.backends, snapshot.models, snapshot.generation]);
+  const permissionConfirmation = usePartnerPermissionConfirmation(JSON.stringify([ownerKey, open, formDirectory.revision.toString(), directory.revision.toString(), draft, permissionCatalog]),
+    open && !locked && !avatarPreparing && valid && effectiveCapabilities !== undefined && partnerCapabilitiesAvailable(effectiveCapabilities, snapshot), t);
   const begin = (): { readonly signal: AbortSignal; readonly current: () => boolean } | undefined => {
     const abort = abortRef.current;
     if (flightRef.current || abort === undefined || abort.signal.aborted || !open) return undefined;
@@ -483,7 +488,7 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
     flightRef.current = false;
     setSubmitting(false);
   };
-  const submit = async (): Promise<void> => {
+  const submitConfirmed = async (): Promise<void> => {
     const store = receiptStoreRef.current;
     if (!valid || locked || avatarPreparingRef.current || store === undefined) return;
     const action = begin();
@@ -517,6 +522,11 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
     } finally {
       finish(action);
     }
+  };
+  const submit = (): void => {
+    if (!valid || locked || avatarPreparingRef.current || effectiveCapabilities === undefined || !partnerCapabilitiesAvailable(effectiveCapabilities, snapshot)) return;
+    if (effectiveCapabilities.permissionMode === "bypassPermissions") permissionConfirmation.request(() => { void submitConfirmed(); });
+    else void submitConfirmed();
   };
   const recover = async (): Promise<void> => {
     const store = receiptStoreRef.current;
@@ -573,7 +583,8 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
     identitySource: template.identitySource
   }));
   return <Modal open={open} title={t("partners.inviteTitle")} description={t("partners.inviteBody")} size="large" onClose={submitting || avatarPreparing ? () => undefined : onClose}>
-    <form ref={formRef} className="partner-editor" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
+    {permissionConfirmation.dialog}
+    <form ref={(node) => { formRef.current = node; permissionConfirmation.rootRef.current = node; }} className="partner-editor" onSubmit={(event) => { event.preventDefault(); submit(); }}>
       <fieldset disabled={locked}><legend>{t("partners.template")}</legend><div className="partner-template-grid">{formDirectory.templates.map((template) => <button type="button" key={template.id} className={cx(draft.templateId === template.id && "is-selected")} aria-pressed={draft.templateId === template.id} onClick={() => selectTemplate(template)}><strong>{template.displayName}</strong><span>{template.description}</span></button>)}</div></fieldset>
       <div className="partner-editor__identity-row"><label className="field"><span>{t("partners.name")}</span><input required disabled={locked} maxLength={200} value={draft.displayName} onChange={(event) => setDraft((current) => ({ ...current, displayName: event.target.value }))} /></label><AvatarPicker ownerKey={ownerKey} value={draft.avatar} options={formDirectory.avatarPresets} disabled={locked} t={t} onPreparing={preparingAvatar} onChange={(avatar) => setDraft((current) => ({ ...current, avatar }))} /></div>
       <label className="field"><span>{t("partners.description")}</span><textarea disabled={locked} rows={2} maxLength={12_000} value={draft.description ?? ""} onChange={(event) => setDraft((current) => ({ ...current, description: event.target.value }))} /></label>
@@ -603,13 +614,16 @@ function PartnerDefaultsDialog({ open, directory, snapshot, controller, ownerKey
   const [error, setError] = useState<string>();
   const ownerRef = useRef(ownerKey);
   ownerRef.current = ownerKey;
+  const permissionCatalog = useMemo(() => partnerPermissionCatalogKey(snapshot), [snapshot.backends, snapshot.models, snapshot.generation]);
+  const permissionConfirmation = usePartnerPermissionConfirmation(JSON.stringify([ownerKey, open, directory.revision.toString(), value, permissionCatalog]),
+    open && !saving && validPartnerCapabilities(value) && partnerCapabilitiesAvailable(value, snapshot), t);
   useEffect(() => {
     if (!open) return;
     setValue(directory.defaultCapabilities ?? defaultCapabilities(snapshot));
     setSaving(false);
     setError(undefined);
   }, [open, directory.revision, ownerKey]);
-  const save = async (): Promise<void> => {
+  const saveConfirmed = async (): Promise<void> => {
     if (!validPartnerCapabilities(value) || saving) return;
     const expectedOwner = ownerRef.current;
     setSaving(true);
@@ -623,7 +637,12 @@ function PartnerDefaultsDialog({ open, directory, snapshot, controller, ownerKey
       if (ownerRef.current === expectedOwner) setSaving(false);
     }
   };
-  return <Modal open={open} title={t("partners.defaultsTitle")} description={t("partners.defaultsBody")} size="large" onClose={saving ? () => undefined : onClose}><div className="partner-editor"><CapabilitiesEditor value={value} snapshot={snapshot} disabled={saving} t={t} onChange={setValue} />{error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}<div className="modal__actions"><Button onClick={onClose} disabled={saving}>{t("common.cancel")}</Button><Button tone="primary" disabled={saving || !validPartnerCapabilities(value)} onClick={() => void save()}>{saving ? t("common.working") : t("common.save")}</Button></div></div></Modal>;
+  const save = (): void => {
+    if (!validPartnerCapabilities(value) || saving || !partnerCapabilitiesAvailable(value, snapshot)) return;
+    if (value.permissionMode === "bypassPermissions") permissionConfirmation.request(() => { void saveConfirmed(); });
+    else void saveConfirmed();
+  };
+  return <Modal open={open} title={t("partners.defaultsTitle")} description={t("partners.defaultsBody")} size="large" onClose={saving ? () => undefined : onClose}>{permissionConfirmation.dialog}<div ref={(node) => { permissionConfirmation.rootRef.current = node; }} className="partner-editor"><CapabilitiesEditor value={value} snapshot={snapshot} disabled={saving} t={t} onChange={setValue} />{error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}<div className="modal__actions"><Button onClick={onClose} disabled={saving}>{t("common.cancel")}</Button><Button tone="primary" disabled={saving || !validPartnerCapabilities(value) || !partnerCapabilitiesAvailable(value, snapshot)} onClick={save}>{saving ? t("common.working") : t("common.save")}</Button></div></div></Modal>;
 }
 
 export function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, initialSection = "activity", initialPrivateThreadId, showClose = false, onClose, onUpdated, onActivityUpdated }: {
@@ -669,17 +688,23 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   const baselineKey = editorDraftKey(editorDraft(baseline));
   const dirty = draftKey !== baselineKey;
   const valid = !avatarPreparing && validEditorDraft(draft, directory);
+  const effectiveCapabilities = draft.usesDirectoryDefaults ? directory.defaultCapabilities ?? draft.capabilities : draft.capabilities;
+  const permissionCatalog = useMemo(() => partnerPermissionCatalogKey(snapshot), [snapshot.backends, snapshot.models, snapshot.generation]);
+  const permissionScope = JSON.stringify([ownerKey, partner.id, partner.revision.toString(), baseline.revision.toString(), directory.revision.toString(), draftKey, permissionCatalog]);
+  const permissionAvailable = valid && partnerCapabilitiesAvailable(effectiveCapabilities, snapshot) && restartForeground && controller.state.connectionState === "connected";
+  const permissionConfirmation = usePartnerPermissionConfirmation(permissionScope, permissionAvailable && !saving && !restartBusy && !resumeBusy && !memoryVisible && !connectionsVisible && !conflict && saveError === undefined, t);
 
   useEffect(() => {
-    if (!dirty || !valid || saving || restartBusy || resumeBusy || memoryVisible || connectionsVisible || conflict || saveError !== undefined) return;
+    if (!dirty || !valid || !permissionAvailable || saving || restartBusy || resumeBusy || memoryVisible || connectionsVisible || conflict || saveError !== undefined) return;
     setSaved(false);
     const timer = window.setTimeout(() => {
       const token = aliveRef.current;
       const expectedOwner = ownerRef.current;
       const captured = draftRef.current;
       const capturedKey = editorDraftKey(captured);
-      setSaving(true);
-      void controller.updatePartner(partner.id, baseline.revision, editorPatch(captured)).then((result) => {
+      const write = (): void => {
+        setSaving(true);
+        void controller.updatePartner(partner.id, baseline.revision, editorPatch(captured)).then((result) => {
         if (token !== aliveRef.current || expectedOwner !== ownerRef.current) return;
         setBaseline(result.partner);
         onUpdated(result);
@@ -691,9 +716,13 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
       }).finally(() => {
         if (token === aliveRef.current && expectedOwner === ownerRef.current) setSaving(false);
       });
+      };
+      if (effectiveCapabilities.permissionMode === "bypassPermissions" && baseline.capabilities.permissionMode !== "bypassPermissions") {
+        permissionConfirmation.request(write, () => setSaveError(t("partners.fullAccessConfirmationRequired")));
+      } else write();
     }, 650);
     return () => window.clearTimeout(timer);
-  }, [baseline.revision, conflict, draftKey, dirty, saveError, saving, restartBusy, resumeBusy, memoryVisible, connectionsVisible, valid]);
+  }, [baseline.revision, conflict, draftKey, dirty, saveError, saving, restartBusy, resumeBusy, memoryVisible, connectionsVisible, valid, permissionAvailable, permissionScope]);
 
   const reconcile = async (preserveDraft: boolean): Promise<void> => {
     const token = aliveRef.current;
@@ -713,12 +742,13 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   };
   const status = conflict ? t("partners.conflict") : saveError !== undefined ? t("partners.notSaved") : saving ? t("partners.saving") : dirty ? t("partners.unsaved") : saved ? t("partners.saved") : t("partners.unsaved");
   return <Modal open title={t(initialSection === "profile" ? "partners.settingsTitle" : "partners.workspaceTitle", { name: partner.displayName })} description={section === "profile" ? t("partners.settingsBody") : t("partners.workspaceBody")} size="large" onClose={restartBusy || routinesVisible || resumeVisible || memoryVisible || connectionsVisible ? () => undefined : onClose} showClose={showClose} closeLabel={t("common.close")}>
+    {permissionConfirmation.dialog}
     {connectionsVisible && <PartnerConnectionsDialog key={`${ownerKey}:${partner.id}`} controller={controller} partner={baseline} ownerKey={ownerKey} onClose={() => setConnectionsVisible(false)} />}
     {memoryVisible && <PartnerMemoryDialog key={`${ownerKey}:${partner.id}`} controller={controller} partner={baseline} ownerKey={ownerKey} onClose={() => setMemoryVisible(false)} />}
     {resumeVisible && <PartnerResumeDialog controller={controller} ownerKey={ownerKey} foreground={restartForeground} partner={baseline}
       onBusyChange={setResumeBusy} onClose={() => setResumeVisible(false)} onChanged={(profile) => { setBaseline(profile); setDraft(editorDraft(profile)); onActivityUpdated(profile); }} />}
     {routinesVisible && <PartnerRoutineDialog key={`${ownerKey}:${partner.id}`} controller={controller} partnerId={partner.id} ownerKey={ownerKey} onClose={() => setRoutinesVisible(false)} />}
-    <div className="partner-workspace">
+    <div ref={(node) => { permissionConfirmation.rootRef.current = node; }} className="partner-workspace">
       <div className="segmented partner-workspace__tabs" role="tablist" aria-label={t("partners.workspaceSections")} onKeyDown={(event) => {
         if (restartBusy) return;
         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -1148,8 +1178,7 @@ function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: 
 }): JSX.Element {
   const models = partnerModels(snapshot);
   const chainBackends = value.modelChain.map(route => snapshot.backends.find(candidate => candidate.id === route.backendId));
-  const permissionOptions = ["ask", "auto"].filter(mode => chainBackends.every(candidate => candidate?.capabilities.get("permission.modes")?.options?.includes(mode)))
-    .filter((mode): mode is "ask" | "auto" => mode === "ask" || mode === "auto");
+  const permissionOptions = (["ask", "auto", "bypassPermissions"] as const).filter(mode => chainBackends.every(candidate => candidate?.capabilities.get("permission.modes")?.supported === true && candidate.capabilities.get("permission.modes")?.options?.includes(mode)));
   const planSupported = chainBackends.every(candidate => candidate?.capabilities.get("plan_mode")?.supported === true);
   const modelLabel = (model: ModelView): string => `${new Set(models.map(candidate => candidate.backendId)).size > 1
     ? `${snapshot.backends.find(candidate => candidate.id === model.backendId)?.name ?? model.backendId} · ` : ""}${model.providerName} · ${model.name}`;
@@ -1200,7 +1229,7 @@ function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: 
       </div>;
     })}</div>
     {value.modelChain.length < 5 && models.some((model) => canSelectModel(model) && !value.modelChain.some((route) => routeKey(route) === modelKey(model))) && <Button tone="ghost" onClick={addFallback}><Plus aria-hidden="true" />{t("partners.addFallback")}</Button>}
-    <div className="partner-capabilities__axes"><label className="field"><span>{t("controls.permission")}</span><SelectControl value={value.permissionMode} onChange={(event) => onChange({ ...value, permissionMode: event.target.value as "ask" | "auto" })}>{permissionOptions.map((mode) => <option value={mode} key={mode}>{t(mode === "ask" ? "permission.ask" : "permission.auto")}</option>)}</SelectControl></label><label className="check-row"><CheckboxControl checked={value.planMode} disabled={!planSupported} onChange={(event) => onChange({ ...value, planMode: event.target.checked })} /><span><strong>{t("controls.plan")}</strong><small>{planSupported ? t("partners.planHelp") : t("partners.planUnavailable")}</small></span></label></div>
+    <div className="partner-capabilities__axes"><label className="field"><span>{t("controls.permission")}</span><SelectControl value={value.permissionMode} onChange={(event) => { const mode = permissionOptions.find(candidate => candidate === event.target.value); if (mode !== undefined) onChange({ ...value, permissionMode: mode }); }}>{!permissionOptions.includes(value.permissionMode) && <option value={value.permissionMode} disabled>{t(value.permissionMode === "ask" ? "permission.ask" : value.permissionMode === "auto" ? "permission.auto" : "permission.full")} · {t("common.unavailable")}</option>}{permissionOptions.map((mode) => <option value={mode} key={mode}>{t(mode === "ask" ? "permission.ask" : mode === "auto" ? "permission.auto" : "permission.full")}</option>)}</SelectControl></label><label className="check-row"><CheckboxControl checked={value.planMode} disabled={!planSupported} onChange={(event) => onChange({ ...value, planMode: event.target.checked })} /><span><strong>{t("controls.plan")}</strong><small>{planSupported ? t("partners.planHelp") : t("partners.planUnavailable")}</small></span></label></div>
   </fieldset>;
 }
 
@@ -1225,7 +1254,7 @@ function defaultCapabilities(snapshot: AppSnapshot): PartnerCapabilitiesView {
   const permissionOptions = backend?.capabilities.get("permission.modes")?.options ?? [];
   return {
     modelChain: model === undefined ? [] : [routeForModel(model)],
-    permissionMode: permissionOptions.includes("ask") ? "ask" : "auto",
+    permissionMode: permissionOptions.includes("ask") ? "ask" : permissionOptions.includes("auto") ? "auto" : "bypassPermissions",
     planMode: false
   };
 }
@@ -1237,7 +1266,7 @@ function partnerModels(snapshot: Pick<AppSnapshot, "backends" | "models">): read
     return model.available && model.routingEnabled !== false && backend !== undefined
       && backend.health !== "unavailable" && backend.installationState === "installed"
       && (backend.authenticationState === "authenticated" || backend.authenticationState === "notRequired")
-      && modes?.supported === true && modes.options.some((mode) => mode === "ask" || mode === "auto")
+      && modes?.supported === true && modes.options.some((mode) => mode === "ask" || mode === "auto" || mode === "bypassPermissions")
       && (model.efforts.length === 0 || backend.capabilities.get("model.effort")?.supported === true);
   });
 }
@@ -1265,6 +1294,25 @@ function validPartnerCapabilities(value: PartnerCapabilitiesView): boolean {
   const keys = new Set(value.modelChain.map(routeKey));
   return keys.size === value.modelChain.length && value.modelChain.every((route) => route.backendId.trim() !== "" && route.providerId.trim() !== "" && route.modelId.trim() !== ""
     && (route.effort === undefined || route.effort.trim() !== ""));
+}
+
+function partnerCapabilitiesAvailable(value: PartnerCapabilitiesView, snapshot: AppSnapshot): boolean {
+  if (!validPartnerCapabilities(value)) return false;
+  const availableModels = partnerModels(snapshot);
+  return value.modelChain.every((route) => {
+    const backend = snapshot.backends.find((candidate) => candidate.id === route.backendId);
+    const model = availableModels.find((candidate) => modelKey(candidate) === routeKey(route));
+    return model !== undefined && backend?.capabilities.get("permission.modes")?.supported === true
+      && backend.capabilities.get("permission.modes")?.options.includes(value.permissionMode) === true
+      && (route.effort === undefined || model.efforts.includes(route.effort))
+      && (!route.fastMode || model.supportsFast === true && backend.capabilities.get("model.fast_mode")?.supported === true)
+      && (!value.planMode || backend.capabilities.get("plan_mode")?.supported === true);
+  });
+}
+
+function partnerPermissionCatalogKey(snapshot: AppSnapshot): string {
+  return JSON.stringify([snapshot.generation, snapshot.backends, snapshot.models], (_key, value: unknown) =>
+    typeof value === "bigint" ? value.toString() : value instanceof Map ? [...value.entries()] : value);
 }
 
 function validPartnerDraft(draft: PartnerDraftView): boolean {

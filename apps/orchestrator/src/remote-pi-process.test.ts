@@ -166,6 +166,7 @@ describe("RemotePiProcessFactory", () => {
             }
           },
           assertCurrent: () => undefined,
+          assertFilesCurrent: () => undefined,
           assertForwardingCurrent: () => undefined
         })
       }
@@ -1761,6 +1762,7 @@ function remoteFactory(registry: Pick<RemoteHostRegistry, "transports">, authori
             ? { forwarding: lease.forwarding }
             : {}),
           assertCurrent: () => undefined,
+          assertFilesCurrent: () => undefined,
           assertForwardingCurrent: () => undefined
         } satisfies RemoteWorkspaceAuthority;
       }

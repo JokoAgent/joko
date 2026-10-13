@@ -16,6 +16,51 @@ afterEach(async () => {
 });
 
 describe("PartnerStore", () => {
+  it("persists three exact permission modes across defaults, inherited profiles, versions, CAS and reopen", async () => {
+    const f = await fileStore();
+    f.store.setDirectoryDefaults(f.store.directoryState().revision, { ...capabilities(), permissionMode: "bypassPermissions" });
+    let inherited = f.store.createPartner({ ...draft("Permission follower"), expectedDirectoryRevision: f.store.directoryState().revision,
+      usesDirectoryDefaults: true });
+    expect(inherited.capabilities.permissionMode).toBe("bypassPermissions");
+    const explicit = f.store.createPartner({ ...draft("Explicit permission"), expectedDirectoryRevision: f.store.directoryState().revision });
+    for (const permissionMode of ["ask", "auto", "bypassPermissions"] as const) {
+      const baseline = f.store.directoryState().revision;
+      f.store.setDirectoryDefaults(baseline, { ...capabilities(), permissionMode });
+      expectStoreError(() => f.store.setDirectoryDefaults(baseline, { ...capabilities(), permissionMode: "auto" }), "PARTNER_DIRECTORY_CHANGED");
+      inherited = f.store.getPartner(inherited.id);
+      expect(inherited.capabilities.permissionMode).toBe(permissionMode);
+      expect(f.store.listProfileVersions(inherited.id)[0]?.capabilities.permissionMode).toBe(permissionMode);
+      expect(f.store.getPartner(explicit.id).capabilities.permissionMode).toBe("ask");
+    }
+    const edited = f.store.updatePartner(explicit.id, explicit.revision, { capabilities: { ...capabilities(), permissionMode: "bypassPermissions" } });
+    expectStoreError(() => f.store.updatePartner(explicit.id, explicit.revision, { capabilities: capabilities() }), "PARTNER_CHANGED");
+    for (const invalid of ["trusted", "full_access", "unknown"]) {
+      expectStoreError(() => f.store.updatePartner(explicit.id, edited.revision, {
+        capabilities: { ...capabilities(), permissionMode: invalid as PartnerCapabilitiesRecord["permissionMode"] }
+      }), "PARTNER_INVALID");
+    }
+    f.store.close(); const reopened = new PartnerStore(f.path); cleanups.push(async () => reopened.close());
+    expect(reopened.directoryState().defaultCapabilities?.permissionMode).toBe("bypassPermissions");
+    expect(reopened.getPartner(explicit.id).capabilities.permissionMode).toBe("bypassPermissions");
+    expect(reopened.listProfileVersions(explicit.id).map(version => version.capabilities.permissionMode)).toEqual(["bypassPermissions", "ask"]);
+  });
+
+  it("rejects the exact prior two-mode development baseline without altering its records", async () => {
+    const f = await fileStore(); const profile = readyPartner(f.store, "old-baseline-owner", "Baseline owner", "baseline-canonical");
+    f.store.close();
+    const database = new DatabaseSync(f.path);
+    database.prepare("UPDATE partner_schema_version SET baseline_id = ? WHERE singleton = 1")
+      .run("4a3630a6dfc08c6dbcce8faa757895125063c252e8eafe4bd3ce513820a06603");
+    database.close();
+    expect(() => new PartnerStore(f.path)).toThrow("Rebuild incompatible development data explicitly");
+    const unchanged = new DatabaseSync(f.path);
+    expect(unchanged.prepare("SELECT permission_mode, revision FROM partners WHERE id = ?").get(profile.id))
+      .toMatchObject({ permission_mode: "ask", revision: Number(profile.revision) });
+    expect(unchanged.prepare("SELECT baseline_id FROM partner_schema_version").get())
+      .toMatchObject({ baseline_id: "4a3630a6dfc08c6dbcce8faa757895125063c252e8eafe4bd3ce513820a06603" });
+    unchanged.close();
+  });
+
   it("fences hidden group profile links independently of canonical and history ownership", async () => {
     const f = await fileStore(), profile = readyPartner(f.store, "group-owner", "Group owner", "group-canonical");
     const link = f.store.bindGroupSession({ partnerId: profile.id, expectedRevision: profile.revision, profileVersion: profile.profileVersion, sessionId: "group-lane" });

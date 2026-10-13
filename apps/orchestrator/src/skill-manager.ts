@@ -405,14 +405,17 @@ export class SkillManager {
     return this.#mutate(async () => {
       const session = await this.#requireSession(connectionId, sessionId);
       const parent = resolvePortableKey(session.root, parentKey, true);
-      return listVisibleChildren(session.root, parent, parentKey, this.#maximumEditBytes);
+      const files = await listVisibleChildren(session.root, parent, parentKey, this.#maximumEditBytes);
+      return session.lease.resource.sourceKind === "remote_project"
+        ? files.map(file => ({ ...file, editable: false })) : files;
     });
   }
 
   async readFile(connectionId: string, sessionId: string, key: string): Promise<SkillFileContent> {
     return this.#mutate(async () => {
       const session = await this.#requireSession(connectionId, sessionId);
-      return readVisibleTextFile(session.root, key, this.#maximumPreviewBytes, this.#maximumEditBytes);
+      const file = await readVisibleTextFile(session.root, key, this.#maximumPreviewBytes, this.#maximumEditBytes);
+      return session.lease.resource.sourceKind === "remote_project" ? { ...file, editable: false } : file;
     });
   }
 
@@ -440,6 +443,7 @@ export class SkillManager {
   }): Promise<SkillDraftPreview> {
     return this.#mutate(async () => {
       const session = await this.#requireSession(input.connectionId, input.sessionId);
+      if (session.lease.resource.sourceKind === "remote_project") throw new Error("Remote project Skill content is read-only.");
       await session.lease.assertCurrent();
       if (this.#drafts.size >= this.#maximumDrafts) throw new Error("Too many Skill drafts are open.");
       const current = await readVisibleTextFile(session.root, input.key, this.#maximumEditBytes, this.#maximumEditBytes);
@@ -472,6 +476,7 @@ export class SkillManager {
   }): Promise<SkillDraftPreview> {
     return this.#mutate(async () => {
       const session = await this.#requireSession(input.connectionId, input.sessionId);
+      if (session.lease.resource.sourceKind === "remote_project") throw new Error("Remote project Skill content is read-only.");
       await session.lease.assertCurrent();
       if (this.#drafts.size >= this.#maximumDrafts) throw new Error("Too many Skill drafts are open.");
       const name = portableSkillName(input.name);
@@ -884,6 +889,7 @@ export class SkillManager {
 export function skillCatalogEntryFromResource(resource: PiResourceDescriptor): SkillCatalogEntry {
   const contentAvailable = resource.scope === "project"
     ? resource.state === "approved" || resource.state === "disabled" || resource.state === "loaded"
+      || resource.sourceKind === "remote_project" && resource.state === "awaiting_approval"
     : resource.state === "installed" || resource.state === "disabled" || resource.state === "loaded";
   const standalone = resource.sourceKind === "local" || resource.sourceKind === "skill_market";
   return {

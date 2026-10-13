@@ -83,6 +83,9 @@ service BackendService {
   rpc GetModelPriceOverride(GetModelPriceOverrideRequest) returns (GetModelPriceOverrideResponse);
   rpc SetModelPriceOverride(SetModelPriceOverrideRequest) returns (SetModelPriceOverrideResponse);
   rpc ResetModelPriceOverride(ResetModelPriceOverrideRequest) returns (ResetModelPriceOverrideResponse);
+  rpc GetModelWorkingContext(GetModelWorkingContextRequest) returns (GetModelWorkingContextResponse);
+  rpc SetModelWorkingContext(SetModelWorkingContextRequest) returns (SetModelWorkingContextResponse);
+  rpc ResetModelWorkingContext(ResetModelWorkingContextRequest) returns (ResetModelWorkingContextResponse);
   rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
   rpc GetProviderLoginFlow(GetProviderLoginFlowRequest) returns (GetProviderLoginFlowResponse);
 }
@@ -324,6 +327,7 @@ service PartnerService {
   rpc RetryPartnerInitialization(RetryPartnerInitializationRequest) returns (RetryPartnerInitializationResponse);
   rpc UpdatePartnerDefaults(UpdatePartnerDefaultsRequest) returns (UpdatePartnerDefaultsResponse);
   rpc ListPartnerSessions(ListPartnerSessionsRequest) returns (ListPartnerSessionsResponse);
+  rpc ListPartnerTaskOutputs(ListPartnerTaskOutputsRequest) returns (ListPartnerTaskOutputsResponse);
   rpc ControlPartnerSessionTask(ControlPartnerSessionTaskRequest) returns (ControlPartnerSessionTaskResponse);
   rpc MarkPartnerRead(MarkPartnerReadRequest) returns (MarkPartnerReadResponse);
   rpc ListPartnerPrivateThreads(ListPartnerPrivateThreadsRequest) returns (ListPartnerPrivateThreadsResponse);
@@ -367,6 +371,15 @@ service CollaborationService {
 // action through ManagedModelRuntimeCapabilities and never infer behavior from
 // a concrete runtime_id.
 service ManagedModelRuntimeService {
+  rpc EnsureManagedModelRuntimeProvider(EnsureManagedModelRuntimeProviderRequest) returns (EnsureManagedModelRuntimeProviderResponse);
+  rpc StopManagedModelRuntime(StopManagedModelRuntimeRequest) returns (StopManagedModelRuntimeResponse);
+  rpc RestartManagedModelRuntime(RestartManagedModelRuntimeRequest) returns (RestartManagedModelRuntimeResponse);
+  rpc ListManagedModelRepositoryFiles(ListManagedModelRepositoryFilesRequest) returns (ListManagedModelRepositoryFilesResponse);
+  rpc DownloadManagedRepositoryModel(DownloadManagedRepositoryModelRequest) returns (DownloadManagedRepositoryModelResponse);
+  rpc ControlManagedRepositoryDownload(ControlManagedRepositoryDownloadRequest) returns (ControlManagedRepositoryDownloadResponse);
+  rpc GetManagedModelContext(GetManagedModelContextRequest) returns (GetManagedModelContextResponse);
+  rpc SetManagedModelContext(SetManagedModelContextRequest) returns (SetManagedModelContextResponse);
+  rpc ResetManagedModelContext(ResetManagedModelContextRequest) returns (ResetManagedModelContextResponse);
   rpc ListManagedModelRuntimes(ListManagedModelRuntimesRequest) returns (ListManagedModelRuntimesResponse);
   rpc GetManagedModelRuntime(GetManagedModelRuntimeRequest) returns (GetManagedModelRuntimeResponse);
   rpc StartManagedModelRuntime(StartManagedModelRuntimeRequest) returns (StartManagedModelRuntimeResponse);
@@ -1141,6 +1154,30 @@ message GetModelPriceOverrideRequest {
   string provider_id = 2;
   string model_id = 3;
 }
+
+message GetModelWorkingContextRequest {
+  ModelWorkingContextTarget target = 1;
+  repeated ModelWorkingContextTarget related_targets = 2;
+  optional string session_id = 3;
+}
+message GetModelWorkingContextResponse { ModelWorkingContextView context = 1; }
+message SetModelWorkingContextRequest {
+  string operation_id = 1;
+  ModelWorkingContextTarget target = 2;
+  repeated ModelWorkingContextTarget related_targets = 3;
+  optional uint64 context_window_tokens = 4;
+  Revision expected_revision = 5;
+  string expected_source_revision = 6;
+}
+message SetModelWorkingContextResponse { ModelWorkingContextView context = 1; }
+message ResetModelWorkingContextRequest {
+  string operation_id = 1;
+  ModelWorkingContextTarget target = 2;
+  repeated ModelWorkingContextTarget related_targets = 3;
+  Revision expected_revision = 4;
+  string expected_source_revision = 5;
+}
+message ResetModelWorkingContextResponse { ModelWorkingContextView context = 1; }
 
 message GetModelPriceOverrideResponse {
   ModelPriceOverrideView price = 1;

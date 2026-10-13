@@ -46,6 +46,13 @@ export interface LocalModelProviderBindings {
 export class LocalModelProviderCoordinator {
   constructor(private readonly options: LocalModelProviderCoordinatorOptions) {}
 
+  routes(owner: RuntimeOwnerGeneration): readonly { readonly backendId: string; readonly providerId: string }[] {
+    this.assertOwner(owner);
+    const provider = this.options.providers.list(this.options.backendId).find(item => item.provider.id === MANAGED_LOCAL_PROVIDER_ID);
+    return provider !== undefined && isOwnedProvider(provider)
+      ? [{ backendId: this.options.backendId, providerId: provider.provider.id }] : [];
+  }
+
   async sync(owner: RuntimeOwnerGeneration, inputModels: readonly ManagedRuntimeModel[]): Promise<void> {
     this.assertOwner(owner);
     const models = validateModels(inputModels);

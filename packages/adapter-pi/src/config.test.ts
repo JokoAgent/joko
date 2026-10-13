@@ -11,6 +11,17 @@ import {
 import { mkdtemp } from "./test-paths.js";
 
 describe("managed Pi catalog", () => {
+  it("preserves declared advanced metadata while keeping product fields out of native model configuration", async () => {
+    const home = await mkdtemp(join(tmpdir(), "joko-pi-advanced-metadata-"));
+    const result = await provisionManagedCatalog(home, [{ id: "gateway", api: "openai-completions", models: [{ id: "declared-model", reasoning: true,
+      contextWindow: 32_000, maxTokens: 4_000, input: ["text"], description: "Declared description", defaultEffort: "medium", supportsFastMode: false,
+      referenceApi: "anthropic-messages", displayThinkingLevels: ["high"], declaredOutputModalities: ["text"] }, { id: "unknown-model" }] }]);
+    expect(result.models[0]).toMatchObject({ description: "Declared description", defaultEffort: "medium", displayThinkingLevels: ["high"], declaredInputModalities: ["text"], declaredSupportsImages: false,
+      declaredSupportsFastMode: false, protocolMode: "compatibility", contextWindowSource: "declared", maxOutputTokensSource: "declared" });
+    expect(result.models[1]!.defaultEffort).toBeUndefined(); expect(result.models[1]!.declaredInputModalities).toBeUndefined();
+    const native = JSON.parse(await readFile(join(home, "models.json"), "utf8")).providers.gateway.models[0];
+    for (const key of ["description", "defaultEffort", "displayThinkingLevels", "referenceApi", "declaredOutputModalities", "supportsFastMode"]) expect(native[key]).toBeUndefined();
+  });
   it("writes a current object output schema and rejects non-object roots", async () => {
     const home = await mkdtemp(join(tmpdir(), "joko-pi-mcp-schema-"));
     const path = join(home, "mcp.json");

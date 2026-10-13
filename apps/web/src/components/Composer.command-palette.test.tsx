@@ -135,6 +135,7 @@ const commands: readonly RuntimeCommandView[] = [{
   name: "deploy",
   description: "Deploy an exact build",
   source: "skill",
+  inputMode: "text",
   resourceId: "resource-skill",
   loaded: true
 }];
@@ -210,6 +211,7 @@ it("refreshes command ownership at dispatch and sends a loaded runtime /learn ex
     name: "learn",
     description: "Runtime learning skill",
     source: "skill",
+    inputMode: "text",
     resourceId: "runtime-learn-resource",
     loaded: true
   };
@@ -383,6 +385,7 @@ it("hands a freshly loaded runtime /goal Skill the complete invocation exactly o
     name: "goal",
     description: "Runtime goal Skill",
     source: "skill",
+    inputMode: "text",
     resourceId: "runtime-goal-resource",
     loaded: true
   }]);

@@ -266,7 +266,8 @@ export function normalizeMobileComposerDraft(value: MobileComposerDraft): Mobile
     assertIdentity(candidate.mentionId, "reference occurrence");
     if (mentionIds.has(candidate.mentionId)) throw new Error("The local Joko task reference occurrence is duplicated.");
     mentionIds.add(candidate.mentionId);
-    const displayText = normalizeDisplayText(candidate.displayText);
+    const displayText = normalizeDisplayText(candidate.displayText, candidate.kind === "resource" && resourceCommandLabel(candidate.displayText)
+      ? maximumSlashCommandCharacters : maximumDisplayCharacters);
     const normalized = candidate.kind === "session"
       ? normalizeSessionMention(candidate, displayText)
       : candidate.kind === "workspace"
@@ -550,7 +551,7 @@ export function insertMobileResourceMention(
   const range = expandedAtomicRange(current, normalizeSelection(selection, current.text));
   const mention = normalizeResourceMention({
     kind: "resource", mentionId, ...candidate, start: 0, end: 0
-  }, normalizeDisplayText(candidate.displayText));
+  }, normalizeDisplayText(candidate.displayText, resourceCommandLabel(candidate.displayText) ? maximumSlashCommandCharacters : maximumDisplayCharacters));
   return insertMobileComposerMention(current, range, { ...mention, mentionId, start: 0, end: 0 });
 }
 
@@ -1557,6 +1558,7 @@ export function mobileVisibleSelectionQuoteText(
 
 function mobileComposerMentionToken(mention: Pick<MobileComposerMention, "kind" | "displayText">
   & Partial<Pick<MobileComposerWorkspaceMention, "directory" | "lineRange">>): string {
+  if (mention.kind === "resource" && resourceCommandLabel(mention.displayText)) return mention.displayText;
   return mention.kind === "workspace"
     ? mobileWorkspaceMentionToken({
         displayText: mention.displayText,
@@ -1893,10 +1895,14 @@ function normalizeSelection(selection: MobileComposerSelection, text: string): M
   return { start, end };
 }
 
-function normalizeDisplayText(value: string): string {
+function resourceCommandLabel(value: string): boolean {
+  return /^\/[^\s/\u0000-\u001f\u007f]+$/u.test(value);
+}
+
+function normalizeDisplayText(value: string, maximum = maximumDisplayCharacters): string {
   if (typeof value !== "string") throw new Error("The local Joko reference label is invalid.");
   const exact = value.trim();
-  if (!exact || exact.length > maximumDisplayCharacters || /[\u0000-\u001f\u007f]/u.test(exact)) {
+  if (!exact || exact.length > maximum || /[\u0000-\u001f\u007f]/u.test(exact)) {
     throw new Error("The local Joko reference label is invalid.");
   }
   return exact;

@@ -32,6 +32,8 @@ export interface AdapterContext {
   /** Complete service-owned durable selection for restoring this Session's route.
    * Native-default Sessions leave this absent; never infer a Provider from a model. */
   readonly modelSelection?: { readonly providerId: string; readonly modelId: string };
+  /** Private route-aware working budget; declared model capacity remains separate. */
+  readonly resolveModelWorkingContext?: (selection: { readonly providerId: string; readonly modelId: string }) => number | undefined;
   /** Stable host operation identity for idempotent Backend mutations. */
   readonly operationId?: string;
   /** Private immutable creation snapshot used only to restore native runtime launch state. */
@@ -45,6 +47,11 @@ export interface AdapterContext {
   /** Queue-private grants for cross-task Artifact mentions in this invocation.
    * These are captured and validated by Store/Host, never by a client. */
   readonly artifactReferenceSnapshots?: readonly ArtifactReferenceSnapshot[];
+  /** Private exact Queue admission fence for a structured loaded Resource.
+   * Native consumers revalidate it immediately before dispatch. */
+  readonly assertResourceMentionCurrent?: (
+    mention: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>
+  ) => void;
   readonly signal: AbortSignal;
   readonly emit: (payload: EventPayload, metadata?: AdapterEventMetadata) => Promise<void>;
   readonly requestInteraction: (
@@ -286,10 +293,13 @@ export interface ContextRebuildInput {
   readonly handoff: string;
 }
 
+export type RuntimeCommandInputMode = "text" | "resource_mention";
+
 export interface RuntimeCommand {
   readonly name: string;
   readonly description: string;
   readonly source: "extension" | "skill" | "prompt";
+  readonly inputMode: RuntimeCommandInputMode;
   readonly path?: string;
   /** Exact managed Resource owner resolved inside the live runtime. */
   readonly resourceId?: string;
@@ -507,6 +517,8 @@ export interface BackendAdapter {
   ): Promise<void>;
   abort(context: AdapterContext): Promise<void>;
   setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel>;
+  /** Refresh an already attached idle runtime. Resolve only after native configuration is confirmed. */
+  refreshModelWorkingContext?(context: AdapterContext): Promise<void>;
   setEffort(level: string, context: AdapterContext): Promise<void>;
   /** Apply the service-tier policy for subsequent Provider requests. */
   setFastMode(enabled: boolean, context: AdapterContext): Promise<void>;

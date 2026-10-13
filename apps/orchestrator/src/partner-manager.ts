@@ -145,6 +145,7 @@ export interface PartnerManagerOptions {
     | "retirePartnerSession" | "quiescePartnerTargetCreations"
     | "restartPartnerSession" | "canRestartPartnerSession"
     | "preparePartnerPauseQueue" | "pausePartnerSession" | "restorePartnerQueue" | "wakePartnerSession"
+    | "retirePartnerPolicyRuntime" | "retryPartnerPolicyRetirement"
   >;
   readonly workspaceService: Pick<WorkspaceService, "register" | "unregister">;
   readonly homesRoot: string;
@@ -565,8 +566,8 @@ export class PartnerManager {
     });
   }
 
-  async createPartner(input: CreatePartnerInput): Promise<PartnerProfileRecord> {
-    return this.#createPartner(input, false);
+  async createPartner(input: CreatePartnerInput, assertCurrent?: () => void): Promise<PartnerProfileRecord> {
+    return this.#createPartner(input, false, assertCurrent);
   }
 
   async createImportedPartner(input: CreatePartnerInput): Promise<PartnerProfileRecord> {
@@ -575,11 +576,13 @@ export class PartnerManager {
     return this.#createPartner(input, true);
   }
 
-  async #createPartner(input: CreatePartnerInput, acceptedImport: boolean): Promise<PartnerProfileRecord> {
+  async #createPartner(input: CreatePartnerInput, acceptedImport: boolean, assertCurrent?: () => void): Promise<PartnerProfileRecord> {
     if (!PARTNER_TEMPLATES.some((template) => template.templateId === input.templateId)) {
       throw new PartnerManagerError("PARTNER_TEMPLATE_INVALID", "The selected partner template is unavailable.");
     }
     await assertAvatar(input.avatar);
+    assertCurrent?.();
+    if (input.capabilities.permissionMode === "bypassPermissions") this.#validateCapabilities(input.capabilities);
     const existing = this.#store.getPartnerCreation(input.requestId);
     const created = acceptedImport ? this.#store.createImportedPartner(input) : this.#store.createPartner(input, this.#followingDefaults());
     if (existing !== undefined) return created;
@@ -610,6 +613,9 @@ export class PartnerManager {
         throw new PartnerManagerError("PARTNER_MODEL_UNAVAILABLE", "Partner directory defaults are not configured.");
       }
       this.#validateCapabilities(capabilities);
+      if (capabilities.permissionMode === "bypassPermissions" && current.canonicalSessionId !== undefined) {
+        this.#assertFullAccessTarget(current);
+      }
       const taskModel = patch.taskModelOverride === null ? undefined : patch.taskModelOverride ?? current.taskModelOverride;
       if (taskModel !== undefined && (JSON.stringify(taskModel) !== JSON.stringify(current.taskModelOverride)
         || capabilities.permissionMode !== current.capabilities.permissionMode || capabilities.planMode !== current.capabilities.planMode)) {
@@ -898,6 +904,11 @@ export class PartnerManager {
     capabilities: PartnerCapabilitiesRecord
   ): Promise<readonly PartnerProfileRecord[]> {
     this.#validateCapabilities(capabilities);
+    if (capabilities.permissionMode === "bypassPermissions") {
+      for (const profile of this.#store.listPartners().filter(profile => profile.usesDirectoryDefaults && profile.canonicalSessionId !== undefined)) {
+        this.#assertFullAccessTarget(profile);
+      }
+    }
     const affected = this.#store.setDirectoryDefaults(expectedDirectoryRevision, capabilities);
     const reconciled: PartnerProfileRecord[] = [];
     for (const partner of affected) {
@@ -1168,6 +1179,10 @@ export class PartnerManager {
     let current = this.#store.getPartner(partnerId);
     if (current.lifecycle === "paused") { await this.#preparePausedProfile(current); return this.#store.getPartner(partnerId); }
     if (current.lifecycle !== "active" || current.initializationState === "ready") return current;
+    if (current.canonicalSessionId !== undefined) {
+      try { await this.#sessionHost.retryPartnerPolicyRetirement(current.canonicalSessionId); }
+      catch { return this.#recordFailure(current, "session_unavailable"); }
+    }
 
     try {
       this.#validateCapabilities(current.capabilities);
@@ -1321,40 +1336,57 @@ export class PartnerManager {
     if (runtime.handoffState === "pending") {
       await this.#sessionHost.setSessionRuntimeControl({ sessionId, expectedGeneration: runtime.generation, patch: { ...primary } });
     }
-    const state = await this.#sessionHost.applySessionSettings(sessionId, {
-      providerId: primary.providerId,
-      modelId: primary.modelId,
-      ...(primary.effort === undefined ? {} : { effort: primary.effort }),
-      fastMode: primary.fastMode,
-      permissionMode: profile.capabilities.permissionMode,
-      planMode: profile.capabilities.planMode
-    }, { requireNativeObservation: true, reconcileNativePolicy: runtime.handoffState === "pending" });
-    if (state === undefined
-      || state.providerId !== primary.providerId
-      || state.modelId !== primary.modelId
-      || !matchesPartnerEffort(primary.effort, state.effort)
-      || state.fastMode !== primary.fastMode
-      || (state.permissionMode !== undefined && state.permissionMode !== profile.capabilities.permissionMode)
-      || (state.planMode !== undefined && state.planMode !== profile.capabilities.planMode)) {
-      throw new Error("The canonical Session did not report the requested partner settings.");
+    try {
+      const state = await this.#sessionHost.applySessionSettings(sessionId, {
+        providerId: primary.providerId,
+        modelId: primary.modelId,
+        ...(primary.effort === undefined ? {} : { effort: primary.effort }),
+        fastMode: primary.fastMode,
+        permissionMode: profile.capabilities.permissionMode,
+        planMode: profile.capabilities.planMode
+      }, { requireNativeObservation: true, reconcileNativePolicy: runtime.handoffState === "pending" });
+      if (state === undefined
+        || state.providerId !== primary.providerId
+        || state.modelId !== primary.modelId
+        || !matchesPartnerEffort(primary.effort, state.effort)
+        || state.fastMode !== primary.fastMode
+        || (state.permissionMode !== undefined && state.permissionMode !== profile.capabilities.permissionMode)
+        || (state.planMode !== undefined && state.planMode !== profile.capabilities.planMode)) {
+        throw new Error("The canonical Session did not report the requested partner settings.");
+      }
+      const latest = this.#operationalStore.getSession(sessionId);
+      if (latest.descriptor.targetId !== profile.homeTargetId
+        || latest.descriptor.backendId !== primary.backendId
+        || latest.descriptor.archived
+        || latest.descriptor.deletedAt !== undefined
+        || !sameSessionAxes(before.descriptor, latest.descriptor)) {
+        throw new PartnerStoreError("PARTNER_CHANGED", "The canonical Session changed while partner settings were applied.");
+      }
+      this.#operationalStore.updateSession(sessionId, {
+        title: profile.displayName,
+        providerId: state.providerId,
+        modelId: state.modelId,
+        effort: primary.effort ?? null,
+        fastMode: state.fastMode,
+        permissionMode: profile.capabilities.permissionMode,
+        planMode: profile.capabilities.planMode
+      }, latest.revision);
+    } catch (error) {
+      await this.#sessionHost.retirePartnerPolicyRuntime(sessionId, before.descriptor.binding, () => {
+        const owner = this.#store.getPartner(profile.id);
+        if (owner.canonicalSessionId !== sessionId || owner.homeTargetId !== profile.homeTargetId || owner.lifecycle === "deleted") {
+          throw new PartnerStoreError("PARTNER_CHANGED", "The canonical permission owner changed.");
+        }
+      });
+      throw error;
     }
-    const latest = this.#operationalStore.getSession(sessionId);
-    if (latest.descriptor.targetId !== profile.homeTargetId
-      || latest.descriptor.backendId !== primary.backendId
-      || latest.descriptor.archived
-      || latest.descriptor.deletedAt !== undefined
-      || !sameSessionAxes(before.descriptor, latest.descriptor)) {
-      throw new PartnerStoreError("PARTNER_CHANGED", "The canonical Session changed while partner settings were applied.");
-    }
-    this.#operationalStore.updateSession(sessionId, {
-      title: profile.displayName,
-      providerId: state.providerId,
-      modelId: state.modelId,
-      effort: primary.effort ?? null,
-      fastMode: state.fastMode,
-      permissionMode: profile.capabilities.permissionMode,
-      planMode: profile.capabilities.planMode
-    }, latest.revision);
+  }
+
+  #assertFullAccessTarget(profile: PartnerProfileRecord): void {
+    const target = this.#operationalStore.getTarget(profile.homeTargetId);
+    const metadata = target.metadata as Record<string, unknown>;
+    if (!target.descriptor.trusted || !target.descriptor.managed || target.descriptor.remoteWorkspace !== undefined
+      || metadata?.["kind"] !== "partner_home" || metadata?.["partnerId"] !== profile.id) throw modelUnavailable();
   }
 
   #target(profile: PartnerProfileRecord, backendId: string, homePath: string): TargetDescriptor {

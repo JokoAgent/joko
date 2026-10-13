@@ -3,6 +3,16 @@ import { projectCodexNativeHistory } from "./native-history.js";
 import type { NativeThread } from "./protocol.js";
 
 describe("Codex native history projection", () => {
+  it("projects native Skill input as a safe name without exposing its private mount or body", () => {
+    const privatePath = "C:\\private-runtime\\approved-copy\\SKILL.md";
+    const thread: NativeThread = { id: "skill-input", turns: [{ id: "turn", status: "completed", items: [{
+      id: "user", type: "userMessage", content: [{ type: "skill", name: "native-report", path: privatePath, body: "Private instructions" }]
+    }] }] };
+    const result = projectCodexNativeHistory(thread, { maximumEvents: 10 });
+    expect(JSON.stringify(result)).toContain("[Skill: native-report]");
+    expect(JSON.stringify(result)).not.toContain("private-runtime");
+    expect(JSON.stringify(result)).not.toContain("Private instructions");
+  });
   it("projects file-change history with the same ordered source, target, and diff identity as live events", () => {
     const thread: NativeThread = { id: "file-changes", turns: [{ id: "turn", status: "completed", items: [{
       id: "change-one",

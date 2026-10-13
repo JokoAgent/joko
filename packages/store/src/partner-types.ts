@@ -51,7 +51,7 @@ export type PartnerInitializationErrorCode =
   | "model_unavailable"
   | "session_unavailable"
   | "state_changed";
-export type PartnerPermissionMode = "ask" | "auto";
+export type PartnerPermissionMode = "ask" | "auto" | "bypassPermissions";
 export interface PartnerAvatarImageRecord {
   readonly sha256: string;
   readonly mimeType: "image/jpeg" | "image/png" | "image/webp";

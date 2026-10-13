@@ -11,7 +11,7 @@ import { base64Encode } from "@bufbuild/protobuf/wire";
 import { mapPartnerAvatar, protoPartnerAvatar, type PartnerAvatarImageView } from "./partner-avatar.js";
 import { mapPartnerWorkingStatus } from "./partner-working-status.js";
 import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
-import { createClient, ConnectError, Code, type Interceptor, type Transport } from "@connectrpc/connect";
+import { createClient, ConnectError, Code, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
@@ -170,6 +170,10 @@ import {
   MessageInputDelivery as ProtoMessageInputDelivery,
   MemoryResetScope,
   ManagedModelRuntimeErrorCode,
+  ManagedModelRuntimeStartupPolicy,
+  ManagedModelRuntimeConfigureBlockedReason,
+  ManagedRepositoryDownloadAction,
+  type ManagedModelContext,
   ManagedModelRuntimeResourceState,
   ManagedModelRuntimeService,
   ManagedModelRuntimeSource,
@@ -669,6 +673,9 @@ import type {
   ModelPriceQuoteView,
   ModelView,
   ManagedModelRuntimeView,
+  ManagedRepositoryModelView,
+  ManagedModelContextTarget,
+  ManagedModelContextView,
   MessagingConnectionTestResultView,
   MessagingConnectionView,
   MessagingRouteDraftView,
@@ -923,6 +930,8 @@ import { normalizeResourceDraft } from "./resource-draft.js";
 import { isInsecureLanOrigin, isLoopbackHostname, normalizeOrchestratorOrigin } from "./connection-origin.js";
 import { scheduleEpochFromLocalDateTime } from "./schedule-time.js";
 import { randomUuid, sha256Hex } from "./web-crypto.js";
+import type { ModelWorkingContextView as ProtoModelWorkingContextView } from "@joko/contracts";
+import type { ModelWorkingContextRoute, ModelWorkingContextTarget, ModelWorkingContextView } from "./model.js";
 import { compareExtensionStateOrder } from "./extension-ui-presentation.js";
 import { projectSessionRuntimeRecovery } from "./runtime-recovery.js";
 
@@ -6656,7 +6665,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async refreshManagedModelRuntimes(signal?: AbortSignal): Promise<readonly ManagedModelRuntimeView[]> {
-    const values = await loadManagedModelRuntimes(this.requireTransport(), signal ?? this.#abort?.signal);
+    const scope = this.captureActionScope(signal);
+    const received = await loadManagedModelRuntimes(scope.transport, scope.signal);
+    scope.signal.throwIfAborted();
+    const values = received.map((value) => {
+      const current = this.#snapshot?.managedModelRuntimes?.find((item) => item.id === value.id);
+      return current !== undefined && current.revision > value.revision ? current : value;
+    });
     if (this.#snapshot !== undefined) {
       const snapshot = { ...this.#snapshot, managedModelRuntimes: values };
       this.#snapshot = snapshot;
@@ -6665,22 +6680,90 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     return values;
   }
 
+  async ensureManagedModelRuntimeProvider(runtimeId: string): Promise<ManagedModelRuntimeView> {
+    return this.mutateManagedModelRuntime((client, signal) => client.ensureManagedModelRuntimeProvider({ runtimeId }, { signal }));
+  }
+
+  async stopManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView> {
+    return this.mutateManagedModelRuntime((client, signal) => client.stopManagedModelRuntime({ runtimeId }, { signal }));
+  }
+
+  async restartManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView> {
+    return this.mutateManagedModelRuntime((client, signal) => client.restartManagedModelRuntime({ runtimeId }, { signal }));
+  }
+
+  async listManagedModelRepositoryFiles(runtimeId: string, repository: string, signal?: AbortSignal): Promise<{ readonly repository: string; readonly sourceRevision: string; readonly files: readonly { readonly file: string; readonly sizeBytes: number }[] }> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ManagedModelRuntimeService, scope.transport).listManagedModelRepositoryFiles({ runtimeId, repository }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.repository !== repository || response.sourceRevision === "") throw new GatewayError("Repository query ownership changed.");
+    return { repository: response.repository, sourceRevision: response.sourceRevision, files: response.files.map((file) => ({ file: file.file, sizeBytes: numberValue(file.sizeBytes) })) };
+  }
+
+  async downloadManagedRepositoryModel(runtimeId: string, repositoryModel: ManagedRepositoryModelView): Promise<ManagedModelRuntimeView> {
+    return this.mutateManagedModelRuntime((client, signal) => client.downloadManagedRepositoryModel({ runtimeId, repositoryModel }, { signal }));
+  }
+
+  async controlManagedRepositoryDownload(runtimeId: string, transferId: string, repositoryModel: ManagedRepositoryModelView, action: "pause" | "resume" | "cancel"): Promise<ManagedModelRuntimeView> {
+    return this.mutateManagedModelRuntime((client, signal) => client.controlManagedRepositoryDownload({ runtimeId, transferId, repositoryModel, action: action === "pause" ? ManagedRepositoryDownloadAction.PAUSE : action === "resume" ? ManagedRepositoryDownloadAction.RESUME : ManagedRepositoryDownloadAction.CANCEL }, { signal }));
+  }
+
+  async getManagedModelContext(runtimeId: string, target: ManagedModelContextTarget, signal?: AbortSignal): Promise<ManagedModelContextView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ManagedModelRuntimeService, scope.transport).getManagedModelContext({ runtimeId, target: protoManagedModelContextTarget(target), relatedTargets: (target.relatedTargets ?? []).map(protoManagedModelContextTarget) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapManagedModelContext(response.context, target);
+  }
+
+  async getModelWorkingContext(target: ModelWorkingContextTarget, signal?: AbortSignal): Promise<ModelWorkingContextView> {
+    validateWorkingContextTarget(target);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(BackendService, scope.transport).getModelWorkingContext({ target: workingContextRoute(target), relatedTargets: (target.relatedTargets ?? []).map(workingContextRoute) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapModelWorkingContext(response.context, target);
+  }
+
+  async setModelWorkingContext(target: ModelWorkingContextTarget, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, tokens?: number, signal?: AbortSignal): Promise<ModelWorkingContextView> {
+    validateWorkingContextTarget(target); validateWorkingContextObservation(observed);
+    if (tokens !== undefined && (!Number.isSafeInteger(tokens) || tokens < 1_000 || tokens > 100_000_000)) throw new GatewayError("Invalid working context budget.");
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(BackendService, scope.transport).setModelWorkingContext({ operationId: randomUuid(), target: workingContextRoute(target), relatedTargets: (target.relatedTargets ?? []).map(workingContextRoute), expectedRevision: { value: observed.revision }, expectedSourceRevision: observed.sourceRevision, ...(tokens === undefined ? {} : { contextWindowTokens: BigInt(tokens) }) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapModelWorkingContext(response.context, target);
+  }
+
+  async resetModelWorkingContext(target: ModelWorkingContextTarget, observed: Pick<ModelWorkingContextView, "revision" | "sourceRevision">, signal?: AbortSignal): Promise<ModelWorkingContextView> {
+    validateWorkingContextTarget(target); validateWorkingContextObservation(observed);
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(BackendService, scope.transport).resetModelWorkingContext({ operationId: randomUuid(), target: workingContextRoute(target), relatedTargets: (target.relatedTargets ?? []).map(workingContextRoute), expectedRevision: { value: observed.revision }, expectedSourceRevision: observed.sourceRevision }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapModelWorkingContext(response.context, target);
+  }
+
+  async setManagedModelContext(runtimeId: string, target: ManagedModelContextTarget, tokens: number): Promise<ManagedModelContextView> {
+    const scope = this.captureActionScope();
+    const response = await createClient(ManagedModelRuntimeService, scope.transport).setManagedModelContext({ runtimeId, target: protoManagedModelContextTarget(target), relatedTargets: (target.relatedTargets ?? []).map(protoManagedModelContextTarget), contextWindowTokens: BigInt(tokens) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapManagedModelContext(response.context, target);
+  }
+
+  async resetManagedModelContext(runtimeId: string, target: ManagedModelContextTarget): Promise<ManagedModelContextView> {
+    const scope = this.captureActionScope();
+    const response = await createClient(ManagedModelRuntimeService, scope.transport).resetManagedModelContext({ runtimeId, target: protoManagedModelContextTarget(target), relatedTargets: (target.relatedTargets ?? []).map(protoManagedModelContextTarget) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return mapManagedModelContext(response.context, target);
+  }
+
   async startManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView> {
-    const client = createClient(ManagedModelRuntimeService, this.requireTransport());
-    const response = await client.startManagedModelRuntime({ runtimeId }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
-    return this.commitManagedModelRuntime(response.runtime);
+    return this.mutateManagedModelRuntime((client, signal) => client.startManagedModelRuntime({ runtimeId }, { signal }));
   }
 
   async installManagedModelRuntime(runtimeId: string): Promise<ManagedModelRuntimeView> {
-    const client = createClient(ManagedModelRuntimeService, this.requireTransport());
-    const response = await client.installManagedModelRuntime({ runtimeId }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
-    return this.commitManagedModelRuntime(response.runtime);
+    return this.mutateManagedModelRuntime((client, signal) => client.installManagedModelRuntime({ runtimeId }, { signal }));
   }
 
   async cancelManagedModelRuntimeInstall(runtimeId: string): Promise<ManagedModelRuntimeView> {
-    const client = createClient(ManagedModelRuntimeService, this.requireTransport());
-    const response = await client.cancelManagedModelRuntimeInstall({ runtimeId }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
-    return this.commitManagedModelRuntime(response.runtime);
+    return this.mutateManagedModelRuntime((client, signal) => client.cancelManagedModelRuntimeInstall({ runtimeId }, { signal }));
   }
 
   async pullManagedModel(runtimeId: string, modelName: string): Promise<ManagedModelRuntimeView> {
@@ -10029,6 +10112,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   private commitManagedModelRuntime(runtime: ManagedModelRuntime | undefined): ManagedModelRuntimeView {
     if (runtime === undefined) throw new GatewayError("Orchestrator returned no managed model runtime state.");
     const value = mapManagedModelRuntime(runtime);
+    const current = this.#snapshot?.managedModelRuntimes?.find((item) => item.id === value.id);
+    if (current !== undefined && current.revision > value.revision) return current;
     if (this.#snapshot !== undefined) {
       const snapshot = {
         ...this.#snapshot,
@@ -10038,6 +10123,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       this.#callbacks.onSnapshot?.(snapshot);
     }
     return value;
+  }
+
+  private async mutateManagedModelRuntime(effect: (client: Client<typeof ManagedModelRuntimeService>, signal: AbortSignal) => Promise<{ runtime?: ManagedModelRuntime }>): Promise<ManagedModelRuntimeView> {
+    const scope = this.captureActionScope();
+    const response = await effect(createClient(ManagedModelRuntimeService, scope.transport), scope.signal);
+    scope.signal.throwIfAborted();
+    return this.commitManagedModelRuntime(response.runtime);
   }
 
   private requireTransport(): Transport {
@@ -13175,7 +13267,21 @@ function mapModel(
     outputCostMicrosPerMillion: numberValueSigned(model.outputCostMicrosPerMillion),
     cacheReadCostMicrosPerMillion: numberValueSigned(model.cacheReadCostMicrosPerMillion),
     cacheWriteCostMicrosPerMillion: numberValueSigned(model.cacheWriteCostMicrosPerMillion),
-    currencyCode: model.currencyCode || "USD"
+    currencyCode: model.currencyCode || "USD",
+    metadata: {
+      ...(model.description === undefined ? {} : { description: model.description }),
+      ...(model.defaultEffort === undefined ? {} : { defaultEffort: model.defaultEffort }),
+      displayEfforts: [...model.displayThinkingLevels],
+      ...(model.declaredModalities?.input === undefined ? {} : { inputModalities: [...model.declaredModalities.input.values] }),
+      ...(model.declaredModalities?.output === undefined ? {} : { outputModalities: [...model.declaredModalities.output.values] }),
+      ...(model.declaredSupportsImages === undefined ? {} : { imageInput: model.declaredSupportsImages }),
+      ...(model.declaredSupportsFastMode === undefined ? {} : { fastMode: model.declaredSupportsFastMode }),
+      ...(model.referenceApi === undefined ? {} : { referenceProtocol: model.referenceApi }),
+      ...(model.api ? { outboundProtocol: model.api } : {}),
+      ...(model.protocolMode === "matching" || model.protocolMode === "compatibility" || model.protocolMode === "unknown" ? { protocolMode: model.protocolMode } : {}),
+      ...(model.contextWindowSource === "declared" || model.contextWindowSource === "estimated" ? { contextWindowSource: model.contextWindowSource } : {}),
+      ...(model.maxOutputTokensSource === "declared" || model.maxOutputTokensSource === "estimated" ? { maxOutputTokensSource: model.maxOutputTokensSource } : {})
+    }
   };
 }
 
@@ -14703,6 +14809,12 @@ function mapBrowserTransfer(transfer: BrowserTransfer): BrowserTransferView {
 }
 
 function mapResource(resource: ManagedResource): ResourceView {
+  const sourceKind = resourceAcquisitionKind(resource.source?.acquisitionKind);
+  if (sourceKind === "remoteProject" && (resource.source?.scope !== ResourceScope.PROJECT
+    || resource.targetId.trim() === "" || resource.source.sourceIdentity.trim() === ""
+    || resource.source.sourceDisplay.trim() === "" || privatePathLikeLabel(resource.source.sourceDisplay))) {
+    throw new Error("Remote project resource source is invalid.");
+  }
   return {
     id: resource.resourceId,
     backendId: resource.backendId,
@@ -14714,6 +14826,8 @@ function mapResource(resource: ManagedResource): ResourceView {
     state: resourceState(resource.state),
     enabled: resource.enabled,
     source: resource.source?.sourceDisplay ?? "",
+    ...(sourceKind === undefined ? {} : { sourceKind }),
+    ...(resource.source?.sourceIdentity ? { sourceIdentity: resource.source.sourceIdentity } : {}),
     discoveredRevision: resource.discoveredRevision,
     compatibilityDetails: resource.compatibilityDetails.map((detail) => ({
       kind: resourceKind(detail.kind),
@@ -14744,6 +14858,21 @@ function mapResource(resource: ManagedResource): ResourceView {
     postMutationNotice: resource.postMutationNotice,
     ...(resource.error?.message ? { error: presentJokoServiceTerminology(resource.error.message) } : {})
   };
+}
+
+function resourceAcquisitionKind(value: ResourceAcquisitionKind | undefined): ResourceView["sourceKind"] {
+  switch (value) {
+    case undefined:
+    case ResourceAcquisitionKind.UNSPECIFIED: return undefined;
+    case ResourceAcquisitionKind.LOCAL: return "local";
+    case ResourceAcquisitionKind.NPM: return "npm";
+    case ResourceAcquisitionKind.GIT: return "git";
+    case ResourceAcquisitionKind.EXTENSION_SOURCE: return "extensionSource";
+    case ResourceAcquisitionKind.SKILL_MARKET: return "skillMarket";
+    case ResourceAcquisitionKind.LEARNED: return "learned";
+    case ResourceAcquisitionKind.REMOTE_PROJECT: return "remoteProject";
+    default: throw new Error("Resource acquisition kind is invalid.");
+  }
 }
 
 const RESOURCE_USAGE_COUNT_KEYS = [
@@ -17233,12 +17362,17 @@ function extensionSetupFieldKind(value: ProtoExtensionSetupFieldKind): Extension
 }
 
 function mapRuntimeCommand(command: RuntimeCommand): RuntimeCommandView {
+  const inputMode = command.inputMode === 1 ? "text" : command.inputMode === 2 ? "resource_mention" : undefined;
+  if (inputMode === undefined || (inputMode === "resource_mention" && (!command.loaded || !command.resourceId))) {
+    throw new GatewayError("Orchestrator returned an invalid runtime command input mode.");
+  }
   return {
     id: command.commandId,
     ...(command.sessionId === "" ? {} : { sessionId: command.sessionId }),
     name: command.name,
     description: command.description,
     source: runtimeCommandSource(command.source),
+    inputMode,
     ...(command.resourceId.length > 0 ? { resourceId: command.resourceId } : {}),
     loaded: command.loaded
   };
@@ -17480,7 +17614,12 @@ export function mapManagedModelRuntime(runtime: ManagedModelRuntime): ManagedMod
       canCancelPulls: runtime.capabilities?.canCancelPulls ?? false,
       supportsCustomModels: runtime.capabilities?.supportsCustomModels ?? false,
       supportsCuratedCatalog: runtime.capabilities?.supportsCuratedCatalog ?? false,
-      supportsModelPreflight: runtime.capabilities?.supportsModelPreflight ?? false
+      supportsModelPreflight: runtime.capabilities?.supportsModelPreflight ?? false,
+      canConfigure: runtime.capabilities?.canConfigure ?? false,
+      canStop: runtime.capabilities?.canStop ?? false,
+      canRestart: runtime.capabilities?.canRestart ?? false,
+      supportsRepositoryModels: runtime.capabilities?.supportsRepositoryModels ?? false,
+      startupPolicy: runtime.capabilities?.startupPolicy === ManagedModelRuntimeStartupPolicy.ON_USE ? "onUse" : "explicit"
     },
     installPreflight: mapManagedModelPreflight(runtime.installPreflight),
     installedModels: runtime.installedModels.map((model) => ({
@@ -17490,7 +17629,8 @@ export function mapManagedModelRuntime(runtime: ManagedModelRuntime): ManagedMod
       ...(model.contextWindowTokens === undefined ? {} : { contextWindowTokens: numberValue(model.contextWindowTokens) }),
       supportsTools: model.supportsTools,
       supportsImages: model.supportsImages,
-      ...(model.requiredRuntimeVersion === "" ? {} : { requiredRuntimeVersion: model.requiredRuntimeVersion })
+      ...(model.requiredRuntimeVersion === "" ? {} : { requiredRuntimeVersion: model.requiredRuntimeVersion }),
+      ...(model.repositoryModel === undefined ? {} : { repositoryModel: { repository: model.repositoryModel.repository, file: model.repositoryModel.file } })
     })),
     catalog: runtime.catalog.map((model) => ({
       id: model.catalogId,
@@ -17500,7 +17640,10 @@ export function mapManagedModelRuntime(runtime: ManagedModelRuntime): ManagedMod
       minimumMemoryGb: model.minimumMemoryGb,
       platformLimited: model.platformLimited,
       recommended: model.recommended,
-      preflight: mapManagedModelPreflight(model.preflight)
+      preflight: mapManagedModelPreflight(model.preflight),
+      aliases: model.aliases,
+      descriptions: model.descriptions,
+      variants: model.variants.flatMap((variant) => variant.repositoryModel === undefined ? [] : [{ repository: variant.repositoryModel.repository, file: variant.repositoryModel.file, quantization: variant.quantization, sizeBytes: numberValue(variant.sizeBytes) }])
     })),
     transfers: runtime.transfers.map((transfer) => ({
       kind: transfer.kind === ManagedModelRuntimeTransferKind.RUNTIME_INSTALL ? "runtimeInstall" : "modelPull",
@@ -17511,12 +17654,61 @@ export function mapManagedModelRuntime(runtime: ManagedModelRuntime): ManagedMod
       ...(transfer.percent === undefined ? {} : { percent: transfer.percent }),
       ...(transfer.bytesPerSecond === undefined ? {} : { bytesPerSecond: numberValue(transfer.bytesPerSecond) }),
       done: transfer.done,
+      ...(transfer.transferId === "" ? {} : { transferId: transfer.transferId }),
+      ...(transfer.repositoryModel === undefined ? {} : { repositoryModel: { repository: transfer.repositoryModel.repository, file: transfer.repositoryModel.file } }),
       ...managedModelRuntimeError(transfer.errorCode)
     })),
     ...managedModelRuntimeError(runtime.errorCode),
     ...(runtime.errorMessage === "" ? {} : { errorMessage: runtime.errorMessage }),
+    providerRoutes: runtime.providerRoutes.map((route) => ({ backendId: route.backendId, providerId: route.providerId })),
+    ...(runtime.hostProfile === undefined ? {} : { hostProfile: { platform: runtime.hostProfile.platform, arch: runtime.hostProfile.arch, totalMemoryBytes: numberValue(runtime.hostProfile.totalMemoryBytes), memoryGb: runtime.hostProfile.memoryGb, appleSilicon: runtime.hostProfile.appleSilicon, ...(runtime.hostProfile.chip === "" ? {} : { chip: runtime.hostProfile.chip }) } }),
+    ...(runtime.configureBlockedReason === ManagedModelRuntimeConfigureBlockedReason.OWNED_ELSEWHERE ? { configureBlockedReason: "ownedElsewhere" as const }
+      : runtime.configureBlockedReason === ManagedModelRuntimeConfigureBlockedReason.OWNERSHIP_UNKNOWN ? { configureBlockedReason: "ownerUnknown" as const }
+      : runtime.configureBlockedReason === ManagedModelRuntimeConfigureBlockedReason.OPERATION_BUSY ? { configureBlockedReason: "busy" as const }
+      : runtime.configureBlockedReason === ManagedModelRuntimeConfigureBlockedReason.STOP_UNCONFIRMED ? { configureBlockedReason: "stopUnconfirmed" as const } : {}),
     revision: runtime.entityVersion?.revision?.value ?? 0n
   };
+}
+
+function mapManagedModelContext(context: ManagedModelContext | undefined, target: ManagedModelContextTarget): ManagedModelContextView {
+  const actual = context?.target;
+  if (context === undefined || actual === undefined || actual.backendId !== target.backendId || actual.providerId !== target.providerId || actual.modelId !== target.modelId || actual.repositoryModel?.repository !== target.repositoryModel.repository || actual.repositoryModel.file !== target.repositoryModel.file) throw new GatewayError("Model context ownership changed.");
+  return { ...target, defaultContextWindowTokens: numberValue(context.defaultContextWindowTokens), effectiveContextWindowTokens: numberValue(context.effectiveContextWindowTokens), maximumContextWindowTokens: numberValue(context.maximumContextWindowTokens), presets: context.presets.map(numberValue), customized: context.customized, canConfigure: context.canConfigure, pendingApply: context.pendingApply, mixed: context.mixed };
+}
+
+function protoManagedModelContextTarget(target: Omit<ManagedModelContextTarget, "relatedTargets">) {
+  return { backendId: target.backendId, providerId: target.providerId, modelId: target.modelId, repositoryModel: { repository: target.repositoryModel.repository, file: target.repositoryModel.file } };
+}
+
+function workingContextRoute(target: ModelWorkingContextRoute): ModelWorkingContextRoute { return { backendId: target.backendId, providerId: target.providerId, modelId: target.modelId }; }
+function validateWorkingContextTarget(target: ModelWorkingContextTarget): void {
+  const routes = [target, ...(target.relatedTargets ?? [])];
+  if (routes.length > 3 || new Set(routes.map(route => route.backendId)).size !== routes.length || routes.some(route => route.providerId !== target.providerId || [route.backendId, route.providerId, route.modelId].some(value => !value || value !== value.trim() || value.length > 512 || /[\p{Cc}]/u.test(value)))) throw new GatewayError("Invalid working context routes.");
+}
+function validateWorkingContextObservation(view: Pick<ModelWorkingContextView, "revision" | "sourceRevision">): void {
+  if (view.revision < 0n || !validCatalogSnapshotToken(view.sourceRevision)) throw new GatewayError("Invalid working context observation.");
+}
+function mapModelWorkingContext(context: ProtoModelWorkingContextView | undefined, target: ModelWorkingContextTarget): ModelWorkingContextView {
+  if (context?.target === undefined || context.revision === undefined || context.target.backendId !== target.backendId || context.target.providerId !== target.providerId || context.target.modelId !== target.modelId) throw new GatewayError("Working context ownership changed.");
+  const tokens = (value: bigint | undefined): number | undefined => { if (value === undefined) return undefined; const number = Number(value); if (!Number.isSafeInteger(number) || number <= 0) throw new GatewayError("Invalid working context value."); return number; };
+  const view: ModelWorkingContextView = {
+    target: workingContextRoute(target), revision: context.revision.value, sourceRevision: context.sourceRevision,
+    ...(context.limitTokens === undefined ? {} : { limitTokens: tokens(context.limitTokens) }),
+    ...(context.defaultContextWindowTokens === undefined ? {} : { defaultContextWindowTokens: tokens(context.defaultContextWindowTokens) }),
+    ...(context.effectiveContextWindowTokens === undefined ? {} : { effectiveContextWindowTokens: tokens(context.effectiveContextWindowTokens) }),
+    customized: context.customized, mixed: context.mixed, canConfigure: context.canConfigure,
+    ...(context.blockedReason === undefined ? {} : { blockedReason: context.blockedReason }),
+    ...(context.nativeContext === undefined ? {} : {
+      nativeContext: {
+        ...(context.nativeContext.contextWindowTokens === undefined ? {} : { contextWindowTokens: tokens(context.nativeContext.contextWindowTokens) }),
+        ...(context.nativeContext.autoCompactLimitTokens === undefined ? {} : { autoCompactLimitTokens: tokens(context.nativeContext.autoCompactLimitTokens) }),
+        source: context.nativeContext.source === "native_usage" ? "native_usage" : "native_configuration", pendingApply: context.nativeContext.pendingApply
+      }
+    })
+  };
+  validateWorkingContextObservation(view);
+  if (view.limitTokens !== undefined && (view.limitTokens < 1_000 || view.limitTokens > 100_000_000) || context.nativeContext !== undefined && context.nativeContext.source !== "native_usage" && context.nativeContext.source !== "native_configuration") throw new GatewayError("Invalid working context metadata.");
+  return view;
 }
 
 function mapManagedModelPreflight(
@@ -20204,7 +20396,7 @@ function protoPartnerRoute(value: PartnerModelRouteView) {
 function protoPartnerCapabilities(value: PartnerCapabilitiesView) {
   return {
     modelChain: value.modelChain.map(protoPartnerRoute),
-    permissionMode: protoPermission(value.permissionMode),
+    permissionMode: protoPartnerPermission(value.permissionMode),
     planMode: value.planMode
   };
 }
@@ -20218,10 +20410,19 @@ function protoPartnerPatch(value: PartnerPatchView) {
     ...(value.avatar === undefined ? {} : { avatar: protoPartnerAvatar(value.avatar) }),
     ...(value.identitySource === undefined ? {} : { identitySource: value.identitySource }),
     ...(value.modelChain === undefined ? {} : { modelChain: { routes: value.modelChain.map(protoPartnerRoute) } }),
-    ...(value.permissionMode === undefined ? {} : { permissionMode: protoPermission(value.permissionMode) }),
+    ...(value.permissionMode === undefined ? {} : { permissionMode: protoPartnerPermission(value.permissionMode) }),
     ...(value.planMode === undefined ? {} : { planMode: value.planMode }),
     ...(value.usesDirectoryDefaults === undefined ? {} : { usesDirectoryDefaults: value.usesDirectoryDefaults })
   };
+}
+
+function protoPartnerPermission(mode: PartnerCapabilitiesView["permissionMode"]): ProtoPermissionMode {
+  switch (mode) {
+    case "ask": return ProtoPermissionMode.ASK;
+    case "auto": return ProtoPermissionMode.AUTO;
+    case "bypassPermissions": return ProtoPermissionMode.BYPASS_PERMISSIONS;
+    default: throw new GatewayError("Partner permission mode is invalid.");
+  }
 }
 
 function mapPartnerRoute(route: ProtoPartnerCapabilities["modelChain"][number]): PartnerModelRouteView {
@@ -20248,7 +20449,8 @@ function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined): Pa
     throw new GatewayError("Orchestrator returned an inconsistent Partner model chain.");
   }
   const permissionMode = value.permissionMode === ProtoPermissionMode.ASK ? "ask" as const
-    : value.permissionMode === ProtoPermissionMode.AUTO ? "auto" as const : undefined;
+    : value.permissionMode === ProtoPermissionMode.AUTO ? "auto" as const
+      : value.permissionMode === ProtoPermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions" as const : undefined;
   if (permissionMode === undefined) throw new GatewayError("Orchestrator returned an unsupported Partner permission mode.");
   return { modelChain: routes, permissionMode, planMode: value.planMode };
 }

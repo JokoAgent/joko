@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createAppDefaultModelConnectService } from "./app-default-model-connect-service.js";
+import { createModelWorkingContextConnectMethods } from "./model-working-context-connect-service.js";
+import type { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -438,7 +440,7 @@ import { createPartnerImportConnectService } from "./partner-import-connect-serv
 import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
 import { createCollaborationConnectService } from "./collaboration-connect-service.js";
 import { createObjectiveConnectService } from "./objective-connect-service.js";
-import type { ManagedModelRuntimeController } from "./managed-model-runtime-controller.js";
+import type { ManagedModelRuntimeRegistry } from "./managed-model-runtime-registry.js";
 import { PortableSessionPackageError } from "./portable-session-package.js";
 import { PortableSessionExportTooLargeError } from "./portable-session-transfer.js";
 import type { RemoteHostRegistry } from "./remote-host-registry.js";
@@ -518,7 +520,9 @@ interface ConnectServiceDependencies {
   readonly browserState?: OperationalBrowserState;
   readonly credentials?: CredentialManager;
   readonly providers?: ProviderCatalogManager;
-  readonly managedModelRuntime?: ManagedModelRuntimeController;
+  readonly managedModelRuntime?: ManagedModelRuntimeRegistry;
+  readonly modelWorkingContext?: ModelWorkingContextCoordinator;
+  readonly removeManagedModelProvider?: (providerId: string) => Promise<boolean | undefined>;
   readonly mcpRouter?: McpRouter;
   readonly piResources?: PiResourceManager;
   readonly skills?: SkillManager;
@@ -1263,6 +1267,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.credentials === undefined ? {} : { credentials: application.credentials }),
     ...(application.providers === undefined ? {} : { providers: application.providers }),
     ...(application.managedModelRuntime === undefined ? {} : { managedModelRuntime: application.managedModelRuntime }),
+    ...(application.modelWorkingContext === undefined ? {} : { modelWorkingContext: application.modelWorkingContext }),
+    ...(application.removeManagedModelProvider === undefined ? {} : { removeManagedModelProvider: application.removeManagedModelProvider }),
     ...(application.mcpRouter === undefined ? {} : { mcpRouter: application.mcpRouter }),
     ...(application.piResources === undefined ? {} : { piResources: application.piResources }),
     ...(application.skills === undefined ? {} : { skills: application.skills }),
@@ -1453,7 +1459,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
       ? new PartnerMemoryManager(application.partners, application.store, application.makerMemory, application.partnerMemoryPreferences) : undefined,
     application.partnerConnections,
     application.partnerSkills,
-    application.partnerSessionTasks
+    application.partnerSessionTasks,
+    application.partnerTaskOutputs
   );
   const partnerRoutine = createPartnerRoutineConnectService(application.partnerRoutines, context => authenticate(context));
   const partnerGroup = createPartnerGroupConnectService(application.partnerGroups, application.store, context => authenticate(context),
@@ -1952,6 +1959,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
   } satisfies ServiceImpl<typeof contract.OperationService>;
 
   const backend = {
+    ...createModelWorkingContextConnectMethods(dependencies.modelWorkingContext, authenticate,
+      connection => dependencies.connections.fence(connection),
+      (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener)),
     listBackends: (request, context) => {
       authenticate(context);
       const result = paginate(dependencies.store.listBackends().map(toProtoBackend), request.page);
@@ -2536,21 +2546,33 @@ export function createConnectServices(application: OrchestratorApplication, proj
       return { statistics: await sessionStatistics(dependencies, request.sessionId) };
     },
     listRuntimeCommands: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
+      context.signal.throwIfAborted();
       const commands = await dependencies.sessionHost.getCommands(request.sessionId);
+      context.signal.throwIfAborted();
+      const currentConnection = authenticate(context);
+      if (currentConnection.id !== connection.id || currentConnection.authKeyDigest !== connection.authKeyDigest) {
+        throw new ConnectError("The command catalog connection authority changed.", Code.Unauthenticated);
+      }
+      dependencies.connections.fence(connection);
       return { commands: commands.map((command) => toProtoRuntimeCommand(command, request.sessionId)) };
     },
     listSessionResources: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
       const sessionId = request.sessionId.trim();
       if (sessionId === "") throw invalidArgument("session_id is required");
-      const resources = await dependencies.sessionHost.getResources(sessionId);
-      // Activation may advance the binding generation, so read it after the
-      // live runtime catalog has been acquired.
-      const session = dependencies.store.getSession(sessionId).descriptor;
+      context.signal.throwIfAborted();
+      const catalog = await dependencies.sessionHost.getSessionResourceCatalog(sessionId);
+      context.signal.throwIfAborted();
+      const currentConnection = authenticate(context);
+      if (currentConnection.id !== connection.id || currentConnection.authKeyDigest !== connection.authKeyDigest) {
+        throw new ConnectError("The resource catalog connection authority changed.", Code.Unauthenticated);
+      }
+      dependencies.connections.fence(connection);
+      catalog.assertCurrent();
       return {
-        resources: resources.flatMap((resource) => {
-          const mapped = toProtoSessionResource(resource, sessionId, session.binding.generation);
+        resources: catalog.resources.flatMap((resource) => {
+          const mapped = toProtoSessionResource(resource, sessionId, catalog.runtimeGeneration);
           return mapped === undefined ? [] : [mapped];
         })
       };
@@ -15301,6 +15323,7 @@ function protoResourceAcquisitionKind(value: NativePiResourceDescriptor["sourceK
     case "extension_source": return contract.ResourceAcquisitionKind.EXTENSION_SOURCE;
     case "skill_market": return contract.ResourceAcquisitionKind.SKILL_MARKET;
     case "learned": return contract.ResourceAcquisitionKind.LEARNED;
+    case "remote_project": return contract.ResourceAcquisitionKind.REMOTE_PROJECT;
     default: return contract.ResourceAcquisitionKind.UNSPECIFIED;
   }
 }
@@ -19711,7 +19734,8 @@ async function dispatchMutation(
         accepted: true,
         resultCase: "acknowledgement"
       }, async () => {
-        if (!await dependencies.providers!.delete(payload.value.providerId)) throw new ConnectError("Provider not found.", Code.NotFound);
+        const managedRemoved = await dependencies.removeManagedModelProvider?.(payload.value.providerId);
+        if (!(managedRemoved ?? await dependencies.providers!.delete(payload.value.providerId))) throw new ConnectError("Provider not found.", Code.NotFound);
         clearManagedProviderRateLimit(dependencies, payload.value.providerId);
         await refreshManagedProviderBackends(dependencies, changedBackends);
         dependencies.messageSearch?.reconcileAvailability();

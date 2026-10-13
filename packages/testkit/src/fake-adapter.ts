@@ -362,7 +362,7 @@ export class FakeBackendAdapter implements BackendAdapter {
   }
 
   async getCommands(_context: AdapterContext): Promise<readonly RuntimeCommand[]> {
-    return [{ name: "review", description: "Run a fake review", source: "extension", loaded: true }];
+    return [{ name: "review", description: "Run a fake review", source: "extension", inputMode: "text", loaded: true }];
   }
 
   async getResources(_context: AdapterContext): Promise<readonly RuntimeResource[]> {

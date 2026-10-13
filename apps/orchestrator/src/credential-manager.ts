@@ -10,6 +10,7 @@ import {
 import type { OperationalStore } from "@joko/store";
 
 import { CredentialVault, type EncryptedCredential } from "./credential-vault.js";
+import { isOwnedGgufProvider } from "./managed-gguf-provider.js";
 import {
   ProviderModelDiscoveryError,
   fetchProviderModels,
@@ -1615,11 +1616,13 @@ export class ProviderCatalogManager {
     });
   }
 
-  async delete(providerId: string, options: { readonly stillActive?: () => boolean } = {}): Promise<boolean> {
+  async delete(providerId: string, options: { readonly stillActive?: () => boolean; readonly expectedVersion?: bigint } = {}): Promise<boolean> {
     this.#assertInitialized();
     return this.#mutate(async () => {
       if (options.stillActive?.() === false) throw new Error("Provider mutation owner changed.");
       const existing = [...this.#entries].filter(([, entry]) => entry.provider.id === providerId);
+      const revision = existing.reduce((maximum, [, entry]) => entry.version > maximum ? entry.version : maximum, 0n);
+      if (options.expectedVersion !== undefined && revision !== options.expectedVersion) throw new Error("Provider configuration changed concurrently.");
       if (existing.length === 0) return false;
       for (const [key] of existing) this.#entries.delete(key);
       await this.#bumpAndPersist(() => { for (const [key, entry] of existing) this.#entries.set(key, entry); });
@@ -2616,7 +2619,10 @@ function validateProviderEntry(entry: ManagedProviderEntry): void {
     }
     normalizeReference(entry.nativeCredentialReferenceId);
   }
-  if (!Array.isArray(entry.provider.models) || entry.provider.models.length === 0) throw new Error("Provider must declare at least one model.");
+  if (!Array.isArray(entry.provider.models) || entry.provider.models.length === 0
+    && !isOwnedGgufProvider({ provider: entry.provider, kind: entry.kind, credentialReferenceIds: Object.values(entry.credentialBindings) })) {
+    throw new Error("Provider must declare at least one model.");
+  }
   assertProviderContainsNoSecret(entry.provider);
 }
 

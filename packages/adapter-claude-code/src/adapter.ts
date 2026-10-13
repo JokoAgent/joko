@@ -546,6 +546,7 @@ interface NativeRuntime {
   readonly remote: boolean;
   readonly assertRuntimeCurrent: () => void;
   readonly baseContext: AdapterContext;
+  readonly workingContextWindow: number | undefined;
   readonly nativeTasks: ClaudeNativeTaskProjection;
   readonly managedChildren: Map<string, ManagedChildTask>;
   readonly managedChildByToolUseId: Map<string, ManagedChildTask>;
@@ -638,6 +639,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   readonly #now: () => number;
   readonly #oauthAccount: ClaudeCodeOAuthAccount | undefined;
   readonly #sessions = new Map<string, NativeRuntime>();
+  readonly #workingContextRecoveries = new Map<string, { readonly runtime: NativeRuntime; readonly providerId: string; readonly modelId: string }>();
   readonly #models = new Map<string, ClaudeSdkModelInfo>();
   readonly #toolNames = new Set<string>();
   readonly #catalogSources = new WeakMap<NativeSessionCatalogEntry, CatalogBindingSource>();
@@ -1693,6 +1695,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
     validatePrompt(input);
     if (input.disposition === "steer") return this.#steer(input, context);
+    if (this.#workingContextRecoveries.has(context.sessionId)) await this.refreshModelWorkingContext(context);
     let runtime = this.#requireIdleRuntime(context);
     assertRemotePromptSupported(input, runtime);
     if (runtime.managedRoute !== undefined && (context.modelSelection?.providerId !== runtime.managedRoute.providerId
@@ -1713,6 +1716,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         runtime = this.#requireIdleRuntime(context);
       }
     }
+    await this.refreshModelWorkingContext(context);
+    runtime = this.#requireIdleRuntime(context);
     if (runtime.runtimePolicy === "standard" && runtime.mcpLease === undefined
       && this.#mcpBridge !== undefined) {
       runtime = await this.#bindProductMcp(runtime, context);
@@ -2764,7 +2769,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     providerId: string,
     modelId: string,
     context: AdapterContext,
-    replacementEffort?: string
+    replacementEffort?: string,
+    forceWorkingContext = false
   ): Promise<ProviderModel> {
     const managed = providerId !== PROVIDER_ID;
     const model = managed ? this.#managedProviders?.listModels().find((entry) => entry.providerId === providerId && entry.modelId === modelId)
@@ -2776,7 +2782,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       validateManagedThinkingMap(mapping);
       if (replacementEffort !== undefined) managedNativeEffort(model, mapping, replacementEffort);
     }
-    if (replacementEffort === undefined
+    if (!forceWorkingContext && replacementEffort === undefined
       && runtime.managedRoute?.providerId === providerId && runtime.managedRoute.model.modelId === modelId) {
       try {
         runtime.managedRoute.assertCurrent();
@@ -2813,6 +2819,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         }
       }
       retired = true;
+      if (forceWorkingContext) this.#workingContextRecoveries.set(context.sessionId, { runtime, providerId, modelId });
       await this.#retireRuntime(runtime);
       if (!runtime.remote && runtime.storedSessionAccess === undefined && runtime.freshContext === undefined) {
         await waitFor(runtime.sdkRuntime.retireQuery(runtime.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
@@ -2842,13 +2849,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       const retainedEffort = replacementEffort ?? normalizeProductEffort(runtime.effort);
       const replacement = await this.#startRuntime(runtime.binding, context, {
         resume: !restartFresh, providerId, modelId,
-        permissionMode: runtime.permissionMode, fastMode: false,
+        permissionMode: runtime.permissionMode, fastMode: forceWorkingContext ? runtime.fastMode : false,
         ...(retainedEffort !== undefined && model.thinkingLevels.includes(retainedEffort) ? { effort: retainedEffort } : {}),
         additionalDirectories: runtime.additionalDirectories,
         ...(context.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: context.appendSystemPrompt }),
         runtimePolicy: runtime.runtimePolicy
       });
       if (runtime.planMode) await this.setPlanMode(true, context);
+      if (forceWorkingContext) this.#workingContextRecoveries.delete(context.sessionId);
       return replacement.managedRoute === undefined ? model : managedProviderModel(replacement.managedRoute.model, replacement.managedRoute.thinkingLevelMap);
     } catch (error) {
       if (retired) {
@@ -2860,6 +2868,43 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     } finally {
       if (runtime.pendingControl === token) runtime.pendingControl = undefined;
     }
+  }
+
+  override async refreshModelWorkingContext(context: AdapterContext): Promise<void> {
+    this.#assertUsable();
+    context.signal.throwIfAborted();
+    this.#assertBackendInstance(context);
+    const retained = this.#workingContextRecoveries.get(context.sessionId);
+    if (retained !== undefined) {
+      const previous = retained.runtime;
+      if (previous.sessionGeneration !== context.generation || context.binding?.opaqueRef !== previous.binding.opaqueRef
+        || previous.backendInstanceGeneration !== this.#instanceGeneration || previous.target.id !== context.target.id
+        || previous.target.workspaceRoot !== context.target.workspaceRoot) throw continuityGap();
+      previous.assertRuntimeCurrent();
+      await this.#retireRuntime(previous);
+      if (!previous.remote && previous.storedSessionAccess === undefined && previous.freshContext === undefined) {
+        await waitFor(previous.sdkRuntime.retireQuery(previous.query, this.#teardownTimeoutMs), this.#teardownTimeoutMs,
+          context.signal, () => managedRouteUnavailable(true));
+      }
+      const info = await this.#sessionInfo(previous.nativeSessionId, previous.target, context.signal, targetRuntimeOf(previous), previous.storedSessionAccess);
+      if (info === undefined && (!previous.freshSessionCanRestart || await this.#sessionHasHistory(previous, context.signal))) throw continuityGap();
+      if (info !== undefined) assertSessionInfoIdentity(info, previous.nativeSessionId);
+      await this.#startRuntime(previous.binding, context, { resume: info !== undefined,
+        providerId: retained.providerId, modelId: retained.modelId, permissionMode: previous.permissionMode,
+        fastMode: previous.fastMode, ...(previous.effort === undefined ? {} : { effort: previous.effort }),
+        additionalDirectories: previous.additionalDirectories, runtimePolicy: previous.runtimePolicy,
+        ...(previous.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: previous.appendSystemPrompt }) });
+      if (previous.planMode) await this.setPlanMode(true, context);
+      this.#workingContextRecoveries.delete(context.sessionId);
+    }
+    const attached = this.#sessions.get(context.sessionId);
+    if (attached === undefined) return;
+    const runtime = this.#requireIdleRuntime(context);
+    if (runtime.runtimePolicy !== "standard" || runtime.modelId === undefined) return;
+    const providerId = runtime.managedRoute?.providerId ?? PROVIDER_ID;
+    const desired = readClaudeWorkingContext(context, providerId, runtime.modelId);
+    if (desired === runtime.workingContextWindow) return;
+    await this.#replaceModelRoute(runtime, providerId, runtime.modelId, context, undefined, true);
   }
 
   async #bindProductMcp(runtime: NativeRuntime, context: AdapterContext): Promise<NativeRuntime> {
@@ -3388,6 +3433,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         remote: scoped.remote,
         assertRuntimeCurrent: scoped.assertCurrent,
         baseContext: context,
+        workingContextWindow: startedQuery.workingContextWindow,
         nativeTasks: new ClaudeNativeTaskProjection({
           sessionId: context.sessionId,
           projection: this.#projection,
@@ -3508,6 +3554,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     context: AdapterContext,
     launch: {
       readonly resume: boolean;
+      readonly providerId?: string;
       readonly modelId?: string;
       readonly effort?: string;
       readonly fastMode?: boolean;
@@ -3541,6 +3588,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     readonly subagentModel: string | undefined;
     readonly nativeMemoryEnabled: boolean | undefined;
     readonly managedEffortSnapshot: ManagedQueryEffortSnapshot | undefined;
+    readonly workingContextWindow: number | undefined;
     releaseAuthorization(): void;
   }> {
     let subagentModel: string | undefined;
@@ -3616,6 +3664,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       const managedLimitEnvironment = managedRoute === undefined
         ? undefined
         : managedEffortSnapshot!.limitEnvironment;
+      const workingContextWindow = readClaudeWorkingContext(context, managedRoute?.providerId ?? launch.providerId ?? PROVIDER_ID, launch.modelId);
+      const workingEnvironment: Record<string, string> = workingContextWindow === undefined ? {} : {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(workingContextWindow),
+        CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(workingContextWindow),
+        CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: String(90 * Math.min(1, workingContextWindow / 100_000))
+      };
       const query = await scoped.runtime.query({
         prompt: gate,
         options: {
@@ -3638,7 +3692,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
               managedLimitEnvironment!
             )),
             CLAUDE_CODE_SUBAGENT_MODEL: subagentModel,
-            CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined
+            CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined,
+            ...workingEnvironment
           },
           ...(launch.runtimePolicy === "review_read_only"
             ? {
@@ -3688,9 +3743,9 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
                   ...(nativeMemoryEnabled === undefined
                     ? {}
                     : { autoMemoryEnabled: nativeMemoryEnabled, autoDreamEnabled: nativeMemoryEnabled }),
-                  ...(managedLimitEnvironment === undefined || Object.keys(managedLimitEnvironment).length === 0
+                  ...(managedLimitEnvironment === undefined && workingContextWindow === undefined
                     ? {}
-                    : { env: { ...managedLimitEnvironment } }),
+                    : { env: { ...managedLimitEnvironment, ...workingEnvironment } }),
                   ...(launch.fastMode === undefined ? {} : { fastMode: launch.fastMode })
                 }
               }),
@@ -3748,6 +3803,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         subagentModel,
         nativeMemoryEnabled,
         managedEffortSnapshot,
+        workingContextWindow,
         releaseAuthorization: () => runtimeAuthorization?.release()
       };
     } catch (error) {
@@ -6786,6 +6842,7 @@ function capabilityManifest(
   textResourcesSupported: boolean
 ): ReadonlyMap<string, Capability> {
   const supported = new Set<string>([
+    "model.working_context",
     "session.resume",
     "session.clone",
     "session.fork",
@@ -7866,6 +7923,15 @@ function managedProviderModel(model: ProviderModel, mapping: Readonly<Record<str
   validateManagedThinkingMap(mapping);
   managedModelLimitEnvironment(model);
   return { ...model, supportsFastMode: false, thinkingLevels: model.thinkingLevels.filter((level) => mapping[level] !== null && normalizeEffort(mapping[level] ?? level) !== undefined) };
+}
+
+function readClaudeWorkingContext(context: AdapterContext, providerId: string, modelId: string | undefined): number | undefined {
+  if (modelId === undefined) return undefined;
+  const value = context.resolveModelWorkingContext?.({ providerId, modelId });
+  if (value !== undefined && (!Number.isSafeInteger(value) || value < 1_000 || value > 100_000_000)) {
+    throw claudeCodeError("WORKING_CONTEXT_INVALID", "The committed model working context is invalid.", "session_start");
+  }
+  return value;
 }
 
 export function managedModelLimitEnvironment(model: ProviderModel): Readonly<Record<string, string>> {

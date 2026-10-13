@@ -21,6 +21,7 @@ import {
 import type { AppController } from "../controller.js";
 import type {
   BackendView,
+  ResourceView,
   SkillDescriptorView,
   SkillDiffChangeView,
   SkillDraftView,
@@ -40,6 +41,8 @@ import { SkillCollaborationTools } from "./SkillCollaborationTools.js";
 import { SkillPublicationDialog } from "./SkillPublicationTools.js";
 import { SkillUsagePanel } from "./SkillUsagePanel.js";
 import { SkillLearningTools } from "./SkillLearningTools.js";
+import { resourceKindsForBackend } from "../resource-capabilities.js";
+import { resourceSourceKindLabel, resourceStateLabel } from "../resource-presentation.js";
 import { Button, EmptyState, IconButton, Modal, Pill, SelectControl, cx, formatRelativeTime } from "./ui.js";
 
 type LoadState<T> =
@@ -81,10 +84,11 @@ export function groupSkillCatalog(
   ];
 }
 
-export function SkillTools({ controller, backends, targets, locale, t }: {
+export function SkillTools({ controller, backends, targets, resources = [], locale, t }: {
   readonly controller: AppController;
   readonly backends: readonly BackendView[];
   readonly targets: readonly TargetView[];
+  readonly resources?: readonly ResourceView[];
   readonly locale: string;
   readonly t: Translator;
 }): JSX.Element {
@@ -114,7 +118,7 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
         onClick={() => { if (value === "learning") setLearningSource(undefined); setTab(value); }}
       >{t(`skills.sections.${value}`)}</button>)}
     </div>
-    {tab === "installed" && <LocalSkillTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} onOpenPublished={openPublishedEntry} />}
+    {tab === "installed" && <LocalSkillTools controller={controller} backends={backends} targets={targets} resources={resources} locale={locale} t={t} onOpenPublished={openPublishedEntry} />}
     {tab === "market" && <SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale={locale} t={t} initialSelection={marketHandoff} onOpenSources={() => setTab("sources")} onLearn={(identity) => { setLearningSource(identity); setTab("learning"); }} />}
     {tab === "learning" && <SkillLearningTools controller={controller} backends={backends} targets={targets} marketIdentity={learningSource} t={t} />}
     {tab === "sources" && <SkillMarketSourcesTools controller={controller} locale={locale} t={t} onOpenMarket={() => setTab("market")} />}
@@ -122,10 +126,11 @@ export function SkillTools({ controller, backends, targets, locale, t }: {
   </div>;
 }
 
-function LocalSkillTools({ controller, backends, targets, locale, t, onOpenPublished }: {
+function LocalSkillTools({ controller, backends, targets, resources, locale, t, onOpenPublished }: {
   readonly controller: AppController;
   readonly backends: readonly BackendView[];
   readonly targets: readonly TargetView[];
+  readonly resources: readonly ResourceView[];
   readonly locale: string;
   readonly t: Translator;
   readonly onOpenPublished: (result: SkillPublicationResultView) => void;
@@ -204,6 +209,10 @@ function LocalSkillTools({ controller, backends, targets, locale, t, onOpenPubli
   const skills = allSkills.filter((skill) => (scope === "all" || skill.scope === scope)
     && (normalizedQuery === "" || `${skill.name}\n${skill.sourceLabel}\n${skill.backendId}`.toLocaleLowerCase("en-US").includes(normalizedQuery)));
   const selected = allSkills.find((skill) => skill.id === selectedId);
+  const selectedResource = resources.find((resource) => resource.kind === "skill"
+    && resource.scope === "project"
+    && resource.id === selected?.id && resource.backendId === selected.backendId
+    && resource.targetId === selected.targetId && resource.scope === selected.scope);
   const groups = useMemo(() => groupSkillCatalog(
     skills,
     targets,
@@ -229,7 +238,7 @@ function LocalSkillTools({ controller, backends, targets, locale, t, onOpenPubli
       return () => abort.abort();
     }
     if (!selected.contentAvailable) {
-      setSessionState({ kind: "error", message: t("skills.contentUnavailable") });
+      setSessionState(selectedResource === undefined ? { kind: "error", message: t("skills.contentUnavailable") } : undefined);
       return () => abort.abort();
     }
     setSessionState({ kind: "loading" });
@@ -256,7 +265,7 @@ function LocalSkillTools({ controller, backends, targets, locale, t, onOpenPubli
         void controller.closeSkill(opened.id).catch(() => undefined);
       }
     };
-  }, [controller, selected?.id, selected?.revision, t]);
+  }, [controller, selected?.id, selected?.revision, selected?.contentAvailable, selectedResource?.id, t]);
 
   const session = sessionState?.kind === "ready" ? sessionState.value : undefined;
 
@@ -424,11 +433,20 @@ function LocalSkillTools({ controller, backends, targets, locale, t, onOpenPubli
       <section className="skill-detail-pane">
         <button type="button" className="skill-detail__back" onClick={leaveDetail}><ArrowLeft aria-hidden="true" />{t("common.back")}</button>
         {selected === undefined && <EmptyState icon={<Sparkles />} title={t("skills.selectTitle")} body={t("skills.selectBody")} />}
+        {selectedResource !== undefined && <SkillResourceSummary
+          controller={controller}
+          resource={selectedResource}
+          backends={backends}
+          targets={targets}
+          t={t}
+          onChanged={loadCatalog}
+        />}
         {selected !== undefined && sessionState?.kind === "loading" && <CatalogStatus label={t("skills.opening")} />}
         {selected !== undefined && sessionState?.kind === "error" && <CatalogStatus error label={sessionState.message} action={<Button onClick={loadCatalog}>{t("common.refresh")}</Button>} />}
         {session !== undefined && <SkillDetail
           controller={controller}
           session={session}
+          sourceKind={selectedResource?.sourceKind}
           backends={backends}
           locale={locale}
           headingRef={detailHeading}
@@ -494,9 +512,60 @@ function LocalSkillTools({ controller, backends, targets, locale, t, onOpenPubli
   </>;
 }
 
-function SkillDetail({ controller, session, backends, locale, headingRef, selectedFileKey, fileState, editing, editorText, dirty, busy, actionError, t, onSelectFile, onEditorText, onEdit, onCancelEdit, onPrepareEdit, onRetryFile, onToggle, onRename, onPublish, onDelete }: {
+function SkillResourceSummary({ controller, resource, backends, targets, t, onChanged }: {
+  readonly controller: AppController;
+  readonly resource: ResourceView;
+  readonly backends: readonly BackendView[];
+  readonly targets: readonly TargetView[];
+  readonly t: Translator;
+  readonly onChanged: () => void;
+}): JSX.Element {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>();
+  const owner = useRef<object | undefined>(undefined);
+  const allowed = resourceKindsForBackend(backends.find((backend) => backend.id === resource.backendId)).includes("skill");
+  useEffect(() => {
+    const current = {};
+    owner.current = current;
+    setBusy(false);
+    setError(undefined);
+    return () => { if (owner.current === current) owner.current = undefined; };
+  }, [controller, controller.state?.activeProfile, controller.state?.connectionState, resource.id, resource.backendId, resource.targetId, resource.sourceIdentity, resource.discoveredRevision, resource.state, allowed]);
+  const approve = async (): Promise<void> => {
+    const current = owner.current;
+    if (current === undefined || busy || !allowed) return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await controller.approveResource(resource.id, resource.discoveredRevision);
+      if (owner.current === current) onChanged();
+    } catch (failure: unknown) {
+      if (owner.current === current) setError(errorMessage(failure, t));
+    } finally {
+      if (owner.current === current) setBusy(false);
+    }
+  };
+  const approvalNeeded = resource.state === "discovered" || resource.state === "awaitingApproval";
+  return <article className="skill-detail" data-resource-summary={resource.id}>
+    <header className="skill-detail__header"><div><h2>{resource.name}</h2><p>{resource.sourceKind === "remoteProject" ? t("resource.remoteProjectBody") : t("resource.projectApprovalBody")}</p></div>
+      {approvalNeeded && allowed && <Button tone="primary" disabled={busy} onClick={() => { void approve(); }}>{busy ? t("common.working") : t("resource.approve")}</Button>}
+    </header>
+    <dl className="skill-detail__metadata">
+      <div><dt>{t("common.source")}</dt><dd>{resourceSourceKindLabel(resource, t)}{resourceSourceKindLabel(resource, t) !== undefined ? " · " : ""}{resource.source}</dd></div>
+      <div><dt>{t("skills.project")}</dt><dd>{targetName(resource.targetId, targets, t("skills.scopeGlobal"))}</dd></div>
+      <div><dt>{t("common.state")}</dt><dd>{resourceStateLabel(resource.state, t)}</dd></div>
+      <div><dt>{t("common.runtime")}</dt><dd>{resource.state === "loaded" ? t("tools.reportedRuntime") : t("tools.notLoaded")}</dd></div>
+      <div><dt>{t("resource.reviewedRevision")}</dt><dd><code>{resource.discoveredRevision}</code></dd></div>
+      <div><dt>{t("resource.identity")}</dt><dd><code>{resource.id}</code></dd></div>
+    </dl>
+    {(error ?? resource.error) !== undefined && <InlineError message={(error ?? resource.error) as string} />}
+  </article>;
+}
+
+function SkillDetail({ controller, session, sourceKind, backends, locale, headingRef, selectedFileKey, fileState, editing, editorText, dirty, busy, actionError, t, onSelectFile, onEditorText, onEdit, onCancelEdit, onPrepareEdit, onRetryFile, onToggle, onRename, onPublish, onDelete }: {
   readonly controller: AppController;
   readonly session: SkillSessionView;
+  readonly sourceKind?: ResourceView["sourceKind"];
   readonly backends: readonly BackendView[];
   readonly locale: string;
   readonly headingRef: RefObject<HTMLHeadingElement | null>;
@@ -523,7 +592,7 @@ function SkillDetail({ controller, session, backends, locale, headingRef, select
   return <article className="skill-detail">
     <header className="skill-detail__header">
       <span className="skill-detail__icon"><Sparkles aria-hidden="true" /></span>
-      <div><p className="eyebrow">{t("skills.detailEyebrow")}</p><h2 ref={headingRef} tabIndex={-1}>{skill.name}</h2><p>{session.metadata.description ?? t("skills.noDescription")}</p></div>
+      <div><p className="eyebrow">{sourceKind === "remoteProject" ? t("resource.sourceRemoteProject") : t("skills.detailEyebrow")}</p><h2 ref={headingRef} tabIndex={-1}>{skill.name}</h2><p>{session.metadata.description ?? t("skills.noDescription")}</p></div>
       <div className="skill-detail__actions">
         {skill.canToggle && <Button disabled={busy} onClick={onToggle}>{skill.enabled ? t("common.disable") : t("common.enable")}</Button>}
         {skill.canEdit && <Button disabled={busy || editing || !skill.contentAvailable} onClick={onPublish}><Upload aria-hidden="true" />{t("skills.publish.open")}</Button>}
@@ -646,9 +715,9 @@ function targetName(id: string | undefined, targets: readonly TargetView[], fall
 }
 
 function skillStateLabel(skill: SkillDescriptorView, t: Translator): string {
+  if (skill.state === "discovered" || skill.state === "awaitingApproval" || skill.state === "error") return resourceStateLabel(skill.state, t);
   if (!skill.enabled || skill.state === "disabled") return t("common.disabled");
   if (skill.state === "loaded") return t("skills.loaded");
-  if (skill.state === "error") return t("skills.errorState");
   return t("common.enabled");
 }
 

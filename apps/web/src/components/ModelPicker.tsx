@@ -25,6 +25,8 @@ import {
   addModelFavorite,
   isModelVisible,
   readModelConfiguration,
+  defaultModelEffort,
+  preferredModelEffort,
   removeModelFavorite,
   seedModelFavorite,
   setModelConfiguration,
@@ -139,7 +141,6 @@ export function ModelPicker({
   const [rail, setRail] = useState<RailSelection>("all");
   const [activeRowKey, setActiveRowKey] = useState<string>();
   const [configRowKey, setConfigRowKey] = useState<string>();
-  const [rowConfigurations, setRowConfigurations] = useState<ReadonlyMap<string, RowConfiguration>>(new Map());
   const [justFavoritedKey, setJustFavoritedKey] = useState<string>();
   const [favoriteBusy, setFavoriteBusy] = useState(false);
   const [favoriteError, setFavoriteError] = useState(false);
@@ -231,12 +232,12 @@ export function ModelPicker({
     const storedConfiguration = readModelConfiguration(preferences, model.backendId, model.providerId, model.modelId);
     const configured = selected
       ? undefined
-      : rowConfigurations.get(key) ?? (storedConfiguration === undefined ? undefined : {
+      : (storedConfiguration === undefined ? undefined : {
           ...(storedConfiguration.effort === undefined ? {} : { effort: storedConfiguration.effort }),
           fastMode: storedConfiguration.fast === true
         });
     const effort = effortEnabled
-      ? configured?.effort ?? (selected ? validEffort(model, value.effort) : model.efforts[0])
+      ? selected ? validEffort(model, value.effort) : preferredModelEffort(preferences, model)
       : undefined;
     return {
       key,
@@ -244,7 +245,7 @@ export function ModelPicker({
       ...(effort === undefined ? {} : { effort }),
       fastMode: fastEnabled && (configured?.fastMode ?? (selected && value.fastMode && model.supportsFast))
     };
-  }), [orderedVisibleModels, rowConfigurations, value]);
+  }), [orderedVisibleModels, preferences, value, effortEnabled, fastEnabled]);
 
   const filteredRows = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -400,11 +401,6 @@ export function ModelPicker({
     setModelConfiguration(ownerId, row.model.backendId, row.model.providerId, row.model.modelId, {
       ...(effortEnabled ? { effort } : storedConfiguration?.effort === undefined ? {} : { effort: storedConfiguration.effort }),
       fast: fastEnabled ? fastMode : storedConfiguration?.fast === true
-    });
-    setRowConfigurations((current) => {
-      const next = new Map(current);
-      next.set(row.key, { ...(effort === undefined ? {} : { effort }), fastMode });
-      return next;
     });
     if (isSelectedRow(row, value)) onSelect({
       backendId: row.model.backendId,
@@ -955,7 +951,7 @@ function modelPickerWidth(layout: ModelPickerLayout): number {
 }
 
 function validEffort(model: ModelView, effort: string | undefined): string | undefined {
-  return effort !== undefined && model.efforts.includes(effort) ? effort : model.efforts[0];
+  return effort !== undefined && model.efforts.includes(effort) ? effort : defaultModelEffort(model);
 }
 
 function binaryThinkingEfforts(model: ModelView): BinaryThinkingEfforts | undefined {

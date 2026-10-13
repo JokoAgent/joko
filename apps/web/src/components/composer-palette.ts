@@ -13,6 +13,8 @@ export interface ComposerPaletteItem {
   readonly value: string;
   readonly meta: string;
   readonly mention?: ComposerMentionDraft;
+  /** Explicit runtime input semantics; the Resource identity is read at selection. */
+  readonly resourceCommand?: RuntimeCommandView;
 }
 
 export interface ComposerCommandActivation {
@@ -25,6 +27,7 @@ export interface ComposerCommandActivation {
 }
 
 export interface ComposerCommandItemOptions {
+  readonly resourceMentionSupported?: boolean;
   /** Application-owned help surface; independent of the selected Backend. */
   readonly helpSupported?: boolean;
   /** Application-owned Skill learning command for the selected writable Target. */
@@ -125,12 +128,15 @@ export function composerCommandItems(
       : [])
   ];
   items.push(...commands
-    .filter((command) => command.loaded)
+    .filter((command) => command.loaded && (command.inputMode === "text"
+      || command.inputMode === "resource_mention" && options.resourceMentionSupported === true
+        && command.resourceId !== undefined && command.resourceId.length > 0))
     .map((command) => ({
       id: `command:${command.id}`,
       label: slashName(command.name),
       value: slashName(command.name),
-      meta: command.description || command.source
+      meta: command.description || command.source,
+      ...(command.inputMode === "resource_mention" ? { resourceCommand: command } : {})
     })));
   return uniquePaletteItems(items);
 }

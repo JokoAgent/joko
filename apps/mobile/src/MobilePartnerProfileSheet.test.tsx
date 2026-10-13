@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, createElement, type ReactNode } from "react";
+import { act, createElement, useState, type ReactNode, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
@@ -11,23 +11,30 @@ import { PartnerRoutineEditor, RoutineCreationReceipts, ListPartnerRoutinesRespo
 import { create } from "@bufbuild/protobuf";
 import { PartnerConnectionsEditor, type PartnerConnectionsApi, type ConnectionsDetail } from "@joko/contracts";
 import { PartnerSkillsEditor, type PartnerSkillsApi, type PersonalSkillDetail } from "@joko/contracts";
+import type { MobilePartnerTaskOutput, MobilePartnerTaskOutputs } from "./mobile-partner-task-outputs";
+import { mobileMessage } from "./mobile-messages";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const alerts = vi.hoisted(() => ({ alert: vi.fn() }));
 const photo = vi.hoisted(() => ({ pick: vi.fn() }));
-const native = vi.hoisted(() => ({ state: "active", platform: "android", dismiss: undefined as (() => void) | undefined, listeners: new Set<(state: string) => void>() }));
+const native = vi.hoisted(() => ({ state: "active", platform: "android", dismiss: undefined as (() => void) | undefined,
+  requestClose: undefined as (() => void) | undefined, listeners: new Set<(state: string) => void>() }));
 vi.mock("./mobile-partner-avatar", async (original) => ({ ...await original<typeof import("./mobile-partner-avatar")>(), pickMobilePartnerPhoto: photo.pick }));
 vi.mock("react-native", async () => {
   const React = await import("react");
-  const element = (tag: string) => ({ children, accessibilityLabel, accessibilityRole, disabled, onPress }: {
+  const element = (tag: string) => ({ children, accessibilityLabel, accessibilityRole, disabled, onPress, style, testID, selectable }: {
     children?: ReactNode; accessibilityLabel?: string; accessibilityRole?: string; disabled?: boolean; onPress?: () => void;
-  }) => React.createElement(tag, { "aria-label": accessibilityLabel, role: accessibilityRole, disabled, onClick: onPress }, children);
+    style?: React.CSSProperties | readonly React.CSSProperties[]; testID?: string; selectable?: boolean;
+  }) => React.createElement(tag, { "aria-label": accessibilityLabel, role: accessibilityRole, disabled, onClick: onPress,
+    style: Array.isArray(style) ? Object.assign({}, ...style.filter(Boolean)) : style, "data-testid": testID,
+    "data-selectable": selectable ? "true" : undefined }, children);
   return { Platform: { get OS() { return native.platform; } }, Alert: { alert: alerts.alert }, AppState: { get currentState() { return native.state; },
     addEventListener: (_event: string, listener: (state: string) => void) => { native.listeners.add(listener); return { remove: () => native.listeners.delete(listener) }; } },
     ActivityIndicator: () => null, Image: () => React.createElement("img"),
     FlatList: ({ data, renderItem, ListHeaderComponent, ListFooterComponent, ListEmptyComponent }: { data: readonly unknown[]; renderItem: (value: { item: unknown }) => ReactNode; ListHeaderComponent: ReactNode; ListFooterComponent?: ReactNode; ListEmptyComponent?: ReactNode }) => React.createElement("div", {}, ListHeaderComponent,
       ...data.map((item, index) => React.createElement("div", { key: index }, renderItem({ item }))), data.length === 0 ? ListEmptyComponent : null, ListFooterComponent),
-    Modal: ({ visible, children, onDismiss }: { visible: boolean; children: ReactNode; onDismiss?: () => void }) => { native.dismiss = onDismiss; return visible ? children : null; },
+    Modal: ({ visible, children, onDismiss, onRequestClose }: { visible: boolean; children: ReactNode; onDismiss?: () => void; onRequestClose?: () => void }) => {
+      native.dismiss = onDismiss; native.requestClose = onRequestClose; return visible ? children : null; },
     Pressable: element("button"), ScrollView: element("div"), Text: element("span"), View: element("div"),
     StyleSheet: { create: <T,>(value: T) => value, hairlineWidth: 1 },
     Switch: ({ value, disabled, accessibilityLabel, onValueChange }: { value: boolean; disabled?: boolean;
@@ -76,7 +83,149 @@ async function editName(name: string) {
   await act(async () => { input.value = name; input.dispatchEvent(new Event("input", { bubbles: true })); });
 }
 afterEach(() => { if (root) act(() => root.unmount()); container?.remove(); root = undefined as unknown as Root;
-  close.mockReset(); saved.mockReset(); alerts.alert.mockReset(); photo.pick.mockReset(); native.state = "active"; native.platform = "android"; native.dismiss = undefined; native.listeners.clear(); });
+  close.mockReset(); saved.mockReset(); alerts.alert.mockReset(); photo.pick.mockReset(); native.state = "active"; native.platform = "android";
+  native.dismiss = undefined; native.requestClose = undefined; native.listeners.clear(); vi.unstubAllGlobals(); });
+
+const outputRow: MobilePartnerTaskOutput = { kind: "session-task", id: "independent-task", parentSessionId: "session", sessionId: "source-session",
+  execution: 1, revision: 3n, runIds: ["run-1"], title: "Updated report", readiness: "ready",
+  files: [{ path: "reports/summary.md", status: "modified" }, { path: "reports/new.md", status: "added" }, { path: "reports/renamed.md", status: "renamed" }], truncated: true };
+const outputCatalog = (rows: readonly MobilePartnerTaskOutput[] = [outputRow], truncated = false): MobilePartnerTaskOutputs => ({ partnerId: profilePartner.partnerId, rows, truncated });
+function deferred<T>() {
+  let resolve!: (value: T) => void, reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail; }); return { promise, resolve, reject };
+}
+async function drawOutputs(active: MobilePartnerProfileTransport, options: Partial<ComponentProps<typeof MobilePartnerProfileSheet>> = {}) {
+  if (!root) { container = document.createElement("div"); document.body.append(container); root = createRoot(container); }
+  await act(async () => root.render(createElement(MobilePartnerProfileSheet, { visible: true, partner: profilePartner,
+    transport: active, colors, locale: "en", onClose: close, onSaved: saved, ...options })));
+}
+
+describe("Mobile Partner outputs", () => {
+  it.each(["android", "ios"])("submits full access only after current explicit risk confirmation on %s", async platform => {
+    native.platform = platform; const active = transport();
+    vi.mocked(active.load).mockResolvedValue({ ...profileSnapshot, permissionModes: ["ask", "auto", "bypassPermissions"] });
+    await render(active); await press("Full access"); await press("Save Partner");
+    expect(active.save).not.toHaveBeenCalled();
+    const [title, body, buttons] = alerts.alert.mock.calls.at(-1)!;
+    expect(title).toBe("Full access removes approval prompts"); expect(body).toContain("not an OS sandbox");
+    expect(body).toContain("credentials"); expect(body).toContain("extra directories");
+    await act(async () => buttons[0].onPress()); await act(async () => buttons[1].onPress()); expect(active.save).not.toHaveBeenCalled();
+    await press("Save Partner"); const staleDraft = alerts.alert.mock.calls.at(-1)![2][1].onPress;
+    await editName("New draft"); await act(async () => staleDraft()); expect(active.save).not.toHaveBeenCalled();
+    await press("Save Partner"); const staleForeground = alerts.alert.mock.calls.at(-1)![2][1].onPress;
+    await act(() => { native.state = "background"; for (const listener of native.listeners) listener("background"); });
+    await act(() => { native.state = "active"; for (const listener of native.listeners) listener("active"); });
+    await act(async () => staleForeground()); expect(active.save).not.toHaveBeenCalled();
+    await press("Save Partner"); await act(async () => alerts.alert.mock.calls.at(-1)![2][1].onPress());
+    expect(active.save).toHaveBeenCalledOnce(); expect(vi.mocked(active.save).mock.calls[0]![1]).toMatchObject({
+      displayName: "New draft", capabilities: { permissionMode: "bypassPermissions" } });
+  });
+
+  it("retires full-access confirmation on profile owner, baseline and offline changes", async () => {
+    const active = transport(); vi.mocked(active.load).mockResolvedValue({ ...profileSnapshot, permissionModes: ["ask", "auto", "bypassPermissions"] });
+    await drawOutputs(active); await press("Full access"); await press("Save Partner");
+    const offline = alerts.alert.mock.calls.at(-1)![2][1].onPress;
+    await drawOutputs(active, { online: false }); await drawOutputs(active); await act(async () => offline()); expect(active.save).not.toHaveBeenCalled();
+    await press("Save Partner"); const baseline = alerts.alert.mock.calls.at(-1)![2][1].onPress;
+    await drawOutputs(active, { partner: { ...profilePartner, revision: profilePartner.revision + 1n } });
+    await act(async () => baseline()); expect(active.save).not.toHaveBeenCalled();
+    await drawOutputs(active); await press("Save Partner"); const owner = alerts.alert.mock.calls.at(-1)![2][1].onPress;
+    await drawOutputs(transport("replacement-owner")); await act(async () => owner()); expect(active.save).not.toHaveBeenCalled();
+  });
+  it.each(["android", "ios"])("renders selectable output metadata in five languages on %s and preserves the parent draft", async platform => {
+    native.platform = platform; const active = transport(), read = deferred<MobilePartnerTaskOutputs>();
+    active.listOutputs = vi.fn(() => read.promise); active.openOutputTask = vi.fn(async () => undefined);
+    await drawOutputs(active); await editName("Unsubmitted name"); await press("Outputs");
+    expect(container.textContent).toContain(mobileMessage("en", "partnerOutputs.loading"));
+    await act(async () => read.resolve(outputCatalog([outputRow,
+      { ...outputRow, id: "pending-task", title: "Pending report", readiness: "pending", files: [], truncated: false },
+      { ...outputRow, id: "unavailable-task", title: "Unavailable report", readiness: "unavailable", files: [], truncated: false }], true)));
+    for (const locale of ["en", "zh-CN", "zh-TW", "ja", "ko"] as const) {
+      await drawOutputs(active, { locale });
+      for (const key of ["title", "pending", "unavailable", "filesTruncated", "rowsTruncated", "added", "modified", "renamed"] as const) {
+        expect(container.textContent).toContain(mobileMessage(locale, `partnerOutputs.${key}`));
+      }
+      expect(Array.from(container.querySelectorAll('[data-selectable="true"]')).map(node => node.textContent)).toContain("reports/summary.md");
+      const source = container.querySelector<HTMLButtonElement>(`button[aria-label="${mobileMessage(locale, "partnerOutputs.openSource")}"]`)!;
+      expect(source.disabled).toBe(false); expect(source.style.minHeight).toBe("44px"); expect(source.style.backgroundColor).toBe("rgb(255, 255, 255)");
+    }
+    expect(active.listOutputs).toHaveBeenCalledOnce(); await drawOutputs(active);
+    if (platform === "android") await act(() => native.requestClose?.());
+    else await press(mobileMessage("en", "common.backTo", { label: mobileMessage("en", "partnerProfile.title") }));
+    expect(container.querySelector<HTMLInputElement>('input[aria-label="Name"]')?.value).toBe("Unsubmitted name");
+    expect(close).not.toHaveBeenCalled(); expect(active.save).not.toHaveBeenCalled();
+  });
+
+  it("distinguishes loading, failure, ready empty and pending, and keeps the output draft through offline reconnecting", async () => {
+    const active = transport(); active.listOutputs = vi.fn(async () => { throw new Error("private failure"); }); active.openOutputTask = vi.fn(async () => undefined);
+    await drawOutputs(active); await editName("Retained draft"); await press("Outputs"); expect(container.textContent).toContain(mobileMessage("en", "partnerOutputs.failed"));
+    expect(container.textContent).not.toContain("private failure");
+    const read = deferred<MobilePartnerTaskOutputs>(); vi.mocked(active.listOutputs).mockImplementationOnce(() => read.promise);
+    await press("Retry"); expect(container.textContent).toContain(mobileMessage("en", "partnerOutputs.loading"));
+    await act(async () => read.resolve(outputCatalog([]))); expect(container.textContent).toContain(mobileMessage("en", "partnerOutputs.empty"));
+    vi.mocked(active.listOutputs).mockResolvedValueOnce(outputCatalog([{ ...outputRow, readiness: "pending", files: [] }]));
+    await press("Refresh outputs"); expect(container.textContent).toContain(mobileMessage("en", "partnerOutputs.pending"));
+    expect(container.textContent).not.toContain(mobileMessage("en", "partnerOutputs.empty"));
+    vi.mocked(active.listOutputs).mockResolvedValueOnce(outputCatalog()); await press("Refresh outputs");
+    await drawOutputs(active, { online: false }); expect(container.textContent).toContain(mobileMessage("en", "partnerOutputs.offline"));
+    expect(container.textContent).toContain("reports/summary.md");
+    for (const label of ["Refresh outputs", "Open source task"]) expect(container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`)?.disabled).toBe(true);
+    await press("Refresh outputs"); await press("Open source task"); expect(active.listOutputs).toHaveBeenCalledTimes(4); expect(active.openOutputTask).not.toHaveBeenCalled();
+    await drawOutputs(active, { online: false }); expect(container.textContent).toContain("reports/summary.md");
+    vi.mocked(active.listOutputs).mockResolvedValueOnce(outputCatalog()); await drawOutputs(active);
+    expect(active.listOutputs).toHaveBeenCalledTimes(5); expect(container.querySelector<HTMLButtonElement>('button[aria-label="Open source task"]')?.disabled).toBe(false);
+    await press(mobileMessage("en", "common.backTo", { label: mobileMessage("en", "partnerProfile.title") }));
+    expect(container.querySelector<HTMLInputElement>('input[aria-label="Name"]')?.value).toBe("Retained draft"); expect(active.save).not.toHaveBeenCalled();
+  });
+
+  it.each(["android", "ios"])("opens the source only after dirty confirmation and actual %s closing, and exposes a closed navigation failure", async platform => {
+    native.platform = platform; const active = transport(), opening = deferred<void>(), errors = vi.fn();
+    active.listOutputs = vi.fn(async () => outputCatalog()); active.openOutputTask = vi.fn(() => opening.promise);
+    let frame: FrameRequestCallback | undefined;
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { frame = callback; return 1; }); vi.stubGlobal("cancelAnimationFrame", () => undefined);
+    function Fixture() {
+      const [visible, setVisible] = useState(true), [error, setError] = useState("");
+      return createElement("div", {}, createElement(MobilePartnerProfileSheet, { visible, partner: profilePartner, transport: active,
+        colors, locale: "en", onSaved: saved, onClose: () => { close(); setVisible(false); },
+        onOpenOutputError: message => { errors(message); setError(message); } }), error && createElement("div", { role: "alert" }, error));
+    }
+    await drawOutputs(active); await act(async () => root.render(createElement(Fixture)));
+    await editName("Dirty name"); await press("Outputs"); await press("Open source task");
+    expect(alerts.alert).toHaveBeenCalledOnce(); expect(close).not.toHaveBeenCalled(); expect(active.openOutputTask).not.toHaveBeenCalled();
+    await act(async () => alerts.alert.mock.calls.at(-1)![2][1].onPress()); expect(close).toHaveBeenCalledOnce(); expect(active.openOutputTask).not.toHaveBeenCalled();
+    if (platform === "ios") await act(() => native.dismiss?.()); else await act(() => frame?.(0));
+    expect(active.openOutputTask).toHaveBeenCalledOnce(); const request = vi.mocked(active.openOutputTask).mock.calls[0]![2];
+    expect(request.aborted).toBe(false); expect(active.openOutputTask).toHaveBeenCalledWith(expect.objectContaining({ partner: profilePartner }), outputRow, request);
+    await act(async () => opening.reject(new Error("private source failure")));
+    expect(errors).toHaveBeenCalledWith(mobileMessage("en", "partnerOutputs.openFailed"));
+    expect(container.querySelector('[role="alert"]')?.textContent).toBe(mobileMessage("en", "partnerOutputs.openFailed"));
+    expect(container.textContent).not.toContain("private source failure");
+  });
+
+  it.each(["owner", "offline", "background", "unmount"])("retires an output handoff before dismissal after %s", async boundary => {
+    native.platform = "ios"; const active = transport(); active.listOutputs = vi.fn(async () => outputCatalog()); active.openOutputTask = vi.fn(async () => undefined);
+    await drawOutputs(active); await press("Outputs"); await press("Open source task"); await drawOutputs(active, { visible: false });
+    const dismiss = native.dismiss;
+    if (boundary === "owner") await drawOutputs(transport("next-owner"), { visible: false });
+    if (boundary === "offline") await drawOutputs(active, { visible: false, online: false });
+    if (boundary === "background") await act(() => { native.state = "background"; for (const listener of native.listeners) listener(native.state); });
+    if (boundary === "unmount") await act(() => root.render(null));
+    await act(() => dismiss?.()); expect(active.openOutputTask).not.toHaveBeenCalled();
+  });
+
+  it("discards late output reads after background or source owner retirement", async () => {
+    const active = transport(), first = deferred<MobilePartnerTaskOutputs>(), second = deferred<MobilePartnerTaskOutputs>();
+    active.listOutputs = vi.fn().mockImplementationOnce(() => first.promise).mockImplementationOnce(() => second.promise); active.openOutputTask = vi.fn(async () => undefined);
+    await drawOutputs(active); await press("Outputs");
+    const firstSignal = vi.mocked(active.listOutputs).mock.calls[0]![1];
+    await act(() => { native.state = "background"; for (const listener of native.listeners) listener(native.state); });
+    expect(firstSignal.aborted).toBe(true); await act(async () => first.resolve(outputCatalog())); expect(container.textContent).not.toContain("reports/summary.md");
+    await act(() => { native.state = "active"; for (const listener of native.listeners) listener(native.state); });
+    expect(active.listOutputs).toHaveBeenCalledTimes(2); const secondSignal = vi.mocked(active.listOutputs).mock.calls[1]![1];
+    await drawOutputs(transport("next-owner")); expect(secondSignal.aborted).toBe(true);
+    await act(async () => second.resolve(outputCatalog())); expect(container.textContent).not.toContain("reports/summary.md"); expect(active.openOutputTask).not.toHaveBeenCalled();
+  });
+});
 
 describe("MobilePartnerProfileSheet", () => {
   it.each(["android", "ios"])("hands conversation search over after its %s profile closes and retires an old owner", async (platform) => {

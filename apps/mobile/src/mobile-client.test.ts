@@ -27,7 +27,7 @@ import {
   VoiceInputServiceSettingsSchema, VoiceInputServiceSettingsPatchSchema, VoiceInputTranscriptionProtocol,
   VoiceInputSaucSettingsSchema, VoiceInputSaucMode, VoiceInputSaucAuthentication,
   QueueControlSchema, QueueDeliveryMode, QueueDispatchState, QueueItemSchema, QueueItemState, QueueSourceKind, ResourceKind, ResourceState,
-  ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandSource, SessionResourceSchema,
+  ReviewRunSchema, ReviewRunState, RuntimeCommandSchema, RuntimeCommandInputMode, RuntimeCommandSource, SessionResourceSchema,
   RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleMisfirePolicy, ScheduleOverlapPolicy,
   ScheduleGeneratedSessionDisposition,
   ScheduleDeletionResultSchema, ScheduleRunCostAttribution, ScheduleRunHistorySchema, ScheduleRunOutcome, ScheduleRunPhase, ScheduleSchema,
@@ -100,6 +100,7 @@ import { createMobileAutomationDraft } from "./mobile-automation-authoring";
 import { parseMobileNativeIntent } from "./mobile-native-intent";
 import type { MobileExtension, MobileExtensionMainViewSurface } from "./mobile-extensions";
 import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
+import type { MobilePartnerTaskOutput, MobilePartnerTaskOutputs } from "./mobile-partner-task-outputs";
 import { profilePartner, profileSnapshot } from "./test/mobile-partner-profile";
 import type {
   MobileExtensionLibraryLocationValidation,
@@ -1820,6 +1821,106 @@ function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient
 }
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); vi.useRealTimers(); });
 
+describe("Partner task output client", () => {
+  async function fixture(platform: "android" | "ios" = "android") {
+    const network = fakeNetwork();
+    const child = create(SessionSchema, { ...runtimeSession, sessionId: "output-child",
+      nativeBinding: create(NativeSessionBindingSchema, { runtimeGeneration: 9n }) });
+    const state = { sessions: [runtimeSession, child] };
+    const owner = () => create(SnapshotSchema, { ...runtimeControlProjection(), sessions: state.sessions });
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner() }));
+    network.readSession = vi.fn(async (_credential, id) => create(SnapshotSchema, {
+      ...runtimeControlProjection(id === "session" ? runtimeSession : child, true),
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: id, recentTimelineItems: 120 }) } })
+    }));
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1,
+      archivedCount: 0, errorCount: 0, updatedAt: 2_000 }, partners: [profilePartner] }));
+    network.getPartnerProfileOptions = vi.fn(async () => profileSnapshot.options);
+    network.updatePartnerProfile = vi.fn(async () => profilePartner);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{
+      partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL,
+      profileVersion: 1n, available: true, displayName: "Ada task", createdAt: { seconds: 1n }
+    }] }));
+    const row: MobilePartnerTaskOutput = { kind: "session-task", id: "task-a", parentSessionId: "session",
+      sessionId: child.sessionId, execution: 2, revision: 7n, runIds: ["first-run", "last-run"],
+      title: "Output source", readiness: "ready", files: [{ path: "report.md", status: "added" }], truncated: false };
+    const outputs: MobilePartnerTaskOutputs = { partnerId: "partner-a", rows: [row], truncated: false };
+    network.listPartnerTaskOutputs = vi.fn(async () => outputs);
+    const saved = memoryStorage(credential);
+    const app = platform === "ios" ? iosClient(network, saved.storage) : client(network, saved.storage);
+    await app.start(); await app.select("session");
+    const transport = app.partnerProfileTransport()!;
+    const profile = await transport.load(profilePartner, new AbortController().signal);
+    return { app, network, saved, state, child, row, outputs, transport, profile };
+  }
+  it.each(["android", "ios"] as const)("opens an exact freshly queried source on %s despite legitimate old conversation retirement", async platform => {
+    const f = await fixture(platform); const old = f.transport.ownerKey;
+    expect(f.network.listPartnerTaskOutputs).not.toHaveBeenCalled();
+    await expect(f.transport.listOutputs!(f.profile, new AbortController().signal)).resolves.toEqual(f.outputs);
+    await expect(f.transport.openOutputTask!(f.profile, f.row, new AbortController().signal)).resolves.toBeUndefined();
+    expect(f.app.state.selectedId).toBe(f.child.sessionId);
+    expect(f.network.listPartnerTaskOutputs).toHaveBeenCalledTimes(2);
+    expect(f.network.readOwner).toHaveBeenCalled();
+    expect(f.app.partnerConversationTransport()?.ownerKey).not.toBe(old);
+    expect(f.network.submit).not.toHaveBeenCalled(); expect(f.saved.pending()).toEqual([]);
+  });
+  it.each(["first-run", "execution", "revision", "session", "parent", "missing"] as const)("refuses a changed %s source before navigation", async change => {
+    const f = await fixture(); const row = { ...f.row };
+    if (change === "first-run") row.runIds = ["replacement", "last-run"];
+    else if (change === "execution") row.execution++;
+    else if (change === "revision") row.revision++;
+    else if (change === "session") row.sessionId = "foreign";
+    else if (change === "parent") row.parentSessionId = "foreign";
+    vi.mocked(f.network.listPartnerTaskOutputs!).mockResolvedValue({ ...f.outputs, rows: change === "missing" ? [] : [row] });
+    const select = vi.spyOn(f.app, "select");
+    await expect(f.transport.openOutputTask!(f.profile, f.row, new AbortController().signal)).rejects.toThrow(/source changed/u);
+    expect(select).not.toHaveBeenCalled(); expect(f.app.state.selectedId).toBe("session");
+  });
+  it.each(["missing", "duplicate", "owner-generation"] as const)("refuses a %s fresh Session catalog", async failure => {
+    const f = await fixture();
+    if (failure === "missing") f.state.sessions = [runtimeSession];
+    else if (failure === "duplicate") f.state.sessions.push(f.child);
+    else vi.mocked(f.network.readOwner).mockResolvedValue({ connection, device,
+      snapshot: create(SnapshotSchema, { ...runtimeControlProjection(), generation: 2n, sessions: f.state.sessions }) });
+    const select = vi.spyOn(f.app, "select");
+    await expect(f.transport.openOutputTask!(f.profile, f.row, new AbortController().signal)).rejects.toThrow(/directory/u);
+    expect(select).not.toHaveBeenCalled();
+  });
+  it.each(["background", "session", "credential", "abort"] as const)("retires a late output read after %s", async reason => {
+    const f = await fixture(); let finish!: (value: MobilePartnerTaskOutputs) => void;
+    vi.mocked(f.network.listPartnerTaskOutputs!).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const abort = new AbortController(); const pending = f.transport.listOutputs!(f.profile, abort.signal);
+    await vi.waitFor(() => expect(f.network.listPartnerTaskOutputs).toHaveBeenCalledOnce());
+    if (reason === "background") f.app.setForeground(false);
+    else if (reason === "session") await f.app.select(undefined);
+    else if (reason === "credential") { await f.app.forgetConnection(credential.profileId); expect(f.app.partnerTaskOutputsShellIdentity()).toBeUndefined(); }
+    else abort.abort();
+    finish(f.outputs); await expect(pending).rejects.toThrow();
+    expect(f.app.state.selectedId).not.toBe(f.child.sessionId);
+  });
+  it("keeps only the same readonly output shell through offline and connecting, while read authority retires", async () => {
+    const f = await fixture(); const identity = f.app.partnerTaskOutputsShellIdentity(); expect(identity).toBeTruthy();
+    vi.mocked(f.network.inspect).mockRejectedValueOnce(new Error("radio slept")); await f.app.refresh();
+    expect(f.app.state.status).toBe("offline"); expect(f.app.partnerTaskOutputsShellIdentity()).toBe(identity);
+    expect(f.app.partnerProfileTransport()).toBeUndefined();
+    await expect(f.transport.listOutputs!(f.profile, new AbortController().signal)).rejects.toThrow(/owner/u);
+    let finish!: (value: NodeIdentity) => void;
+    vi.mocked(f.network.inspect).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const pending = f.app.refresh(); await vi.waitFor(() => expect(f.app.state.status).toBe("connecting"));
+    expect(f.app.partnerTaskOutputsShellIdentity()).toBe(identity); expect(f.app.partnerProfileTransport()).toBeUndefined();
+    finish(node); await pending; expect(f.app.partnerTaskOutputsShellIdentity()).toBe(identity);
+    f.app.setForeground(false); expect(f.app.partnerTaskOutputsShellIdentity()).toBeUndefined();
+  });
+  it("rejects concurrent source opens and permits the first complete handoff", async () => {
+    const f = await fixture(); let finish!: (value: MobilePartnerTaskOutputs) => void;
+    vi.mocked(f.network.listPartnerTaskOutputs!).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const first = f.transport.openOutputTask!(f.profile, f.row, new AbortController().signal);
+    await vi.waitFor(() => expect(f.network.listPartnerTaskOutputs).toHaveBeenCalledOnce());
+    await expect(f.transport.openOutputTask!(f.profile, f.row, new AbortController().signal)).rejects.toThrow(/already opening/u);
+    finish(f.outputs); await expect(first).resolves.toBeUndefined();
+  });
+});
+
 describe("Mobile Remote Desktop presentation transition authority", () => {
   function setup() {
     const host = create(DevicePeerDescriptorSchema, { platform: "darwin", route: {
@@ -2841,6 +2942,22 @@ describe("mobile Partner creation authority", () => {
     expect(f.network.createPartner).toHaveBeenCalledOnce(); expect(f.network.getPartnerCreation).toHaveBeenCalledOnce();
     expect(f.data.size).toBe(0); expect(await active.pending(signal)).toBeUndefined();
   });
+  it("keeps full-access creation tied to the confirmed catalog before claiming a receipt", async () => {
+    const f = fixture(); const app = f.makeClient(); await app.start();
+    const active = app.partnerCreationTransport()!, signal = new AbortController().signal;
+    const snapshot = await active.load(signal);
+    expect(snapshot.backends[0]!.permissionModes).toContain("bypassPermissions");
+    const draft = { ...mobilePartnerCreationDraft(snapshot)!, displayName: "Nova", usesDirectoryDefaults: false,
+      capabilities: { ...mobilePartnerCreationDraft(snapshot)!.capabilities, permissionMode: "bypassPermissions" as const } };
+    const stale = { ...snapshot, backends: snapshot.backends.map(backend => ({ ...backend,
+      models: backend.models.map(model => ({ ...model, displayName: "Earlier catalog label" })) })) };
+    await expect(active.create(stale, draft, signal)).rejects.toThrow(/Refresh/u);
+    expect(f.network.createPartner).not.toHaveBeenCalled(); expect(f.data.size).toBe(0);
+    await expect(active.create(snapshot, draft, signal)).resolves.toMatchObject({ kind: "found" });
+    expect(f.network.createPartner).toHaveBeenCalledOnce();
+    expect(vi.mocked(f.network.createPartner!).mock.calls[0]![3]).toMatchObject({ capabilities: { permissionMode: "bypassPermissions" } });
+    expect(f.data.size).toBe(0);
+  });
   it("recovers unknown across a new Client, never resends and preserves the current edited Partner", async () => {
     const f = fixture(); const app = f.makeClient(); await app.start();
     f.network.createPartner = vi.fn(async () => { throw new Error("lost acknowledgement"); });
@@ -3232,6 +3349,31 @@ describe("mobile Partner private authority", () => {
     expect(rpc.getPartnerRoutineCreation).toHaveBeenCalledWith({ partnerId: profilePartner.partnerId, requestId }, expect.anything());
     expect(values.size).toBe(0); expect(rpc.savePartnerRoutine).toHaveBeenCalledOnce();
     editor.dispose(); recovered.dispose(); home.dispose();
+  });
+
+  it("requires the exact fresh catalog before saving a confirmed full-access Partner profile", async () => {
+    const network = fakeNetwork(); let currentPartner = profilePartner;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0,
+      errorCount: 0, updatedAt: 2000 }, partners: [currentPartner] }));
+    network.getPartnerProfileOptions = vi.fn(async () => profileSnapshot.options);
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{
+      partnerId: "partner-a", sessionId: "session", role: PartnerSessionRole.CANONICAL, profileVersion: 1n,
+      available: true, displayName: "Ada task", createdAt: { seconds: 1n } }] }));
+    network.updatePartnerProfile = vi.fn(async (_credential, _id, _revision, draft) => currentPartner = {
+      ...currentPartner, ...draft, revision: currentPartner.revision + 1n, profileVersion: currentPartner.profileVersion + 1n });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const transport = app.partnerProfileTransport()!, initial = await transport.load(currentPartner, new AbortController().signal);
+    expect(initial.permissionModes).toContain("bypassPermissions");
+    const draft = { ...mobilePartnerProfileDraft(currentPartner), capabilities: { ...currentPartner.capabilities, permissionMode: "bypassPermissions" as const } };
+    const stale = { ...initial, models: initial.models.map(model => ({ ...model, displayName: "Earlier catalog label" })) };
+    await expect(transport.save(stale, draft, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(network.updatePartnerProfile).not.toHaveBeenCalled();
+    await expect(transport.save(initial, draft, new AbortController().signal)).resolves.toMatchObject({ capabilities: { permissionMode: "bypassPermissions" } });
+    expect(network.updatePartnerProfile).toHaveBeenCalledOnce();
+    app.setForeground(false); await expect(transport.save(initial, draft, new AbortController().signal)).rejects.toThrow(/owner changed/u);
+    expect(network.updatePartnerProfile).toHaveBeenCalledOnce();
   });
 
   it("saves canonical profile settings with fresh CAS, confirms them and does not replay unknown updates", async () => {
@@ -7603,6 +7745,7 @@ describe("native current-task message and Queue actions", () => {
     vi.mocked(network.listRuntimeCommands).mockResolvedValue([
       create(RuntimeCommandSchema, {
         commandId: "skill-review",
+        inputMode: RuntimeCommandInputMode.TEXT,
         name: "skill:review",
         description: "Review current changes",
         source: RuntimeCommandSource.SKILL,
@@ -7612,6 +7755,7 @@ describe("native current-task message and Queue actions", () => {
       }),
       create(RuntimeCommandSchema, {
         commandId: "not-loaded",
+        inputMode: RuntimeCommandInputMode.TEXT,
         name: "future",
         description: "Not loaded",
         source: RuntimeCommandSource.PROMPT,
@@ -7636,10 +7780,100 @@ describe("native current-task message and Queue actions", () => {
       .toBeLessThan(vi.mocked(network.readSession).mock.invocationCallOrder.at(-1)!);
   });
 
+  function resourceCommandNetwork(): MobileNetwork {
+    const projected = create(SnapshotSchema, {
+      ...runtimeCommandSnapshot,
+      backends: [create(BackendDescriptorSchema, {
+        ...runtimeCommandSnapshot.backends[0]!,
+        capabilities: create(CapabilityManifestSchema, {
+          ...runtimeCommandSnapshot.backends[0]!.capabilities!,
+          capabilities: [
+            ...runtimeCommandSnapshot.backends[0]!.capabilities!.capabilities,
+            create(CapabilitySchema, {
+              name: capabilityNames.inputMention, support: CapabilitySupport.SUPPORTED,
+              options: create(CapabilityOptionsSchema, {
+                kind: { case: "input", value: create(InputCapabilityOptionsSchema, { mediaTypes: ["resource"] }) }
+              })
+            })
+          ]
+        })
+      })]
+    });
+    const network = projectedNetwork(projected);
+    vi.mocked(network.listRuntimeCommands).mockResolvedValue([create(RuntimeCommandSchema, {
+      commandId: "native-analysis", name: "analysis", description: "Analyze", source: RuntimeCommandSource.SKILL,
+      resourceId: "opaque-skill", loaded: true, sessionId: "session", inputMode: RuntimeCommandInputMode.RESOURCE_MENTION
+    })]);
+    vi.mocked(network.listSessionResources).mockResolvedValue([create(SessionResourceSchema, {
+      sessionId: "session", resourceId: "opaque-skill", name: "Different catalog label", kind: ResourceKind.SKILL,
+      discoveredRevision: "content-sha", resourceVersion: 11n, runtimeGeneration: 8n
+    })]);
+    return network;
+  }
+
+  it("selects a slash Skill through a fresh formal opaque catalog and retains its full identity in the send wire", async () => {
+    const network = resourceCommandNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskRuntimeCommandControls()!;
+    const catalog = await app.listTaskRuntimeCommands(controls.surfaceOwnerKey);
+    expect(network.listSessionResources).not.toHaveBeenCalled();
+    const resource = await app.resolveTaskRuntimeCommandResource(controls.surfaceOwnerKey, catalog, catalog.items[0]!);
+    expect(resource).toMatchObject({ resourceId: "opaque-skill", displayText: "Different catalog label", resourceVersion: "11", runtimeGeneration: "8" });
+    expect(network.listSessionResources).toHaveBeenCalledWith(credential, "session", undefined);
+    const draft = insertMobileResourceMention(plainTextMobileComposerDraft("/an arguments"), { start: 0, end: 3 }, {
+      ...resource, displayText: "/analysis"
+    }, "native-skill-occurrence").draft;
+    await expect(app.send(draft)).resolves.toBe(true);
+    const mutation = vi.mocked(network.submit).mock.calls[0]![2].payload;
+    expect(mutation.case).toBe("sendInput");
+    if (mutation.case !== "sendInput") throw new Error("Expected input.");
+    expect(mutation.value.input?.parts.map((part) => part.content)).toMatchObject([
+      { case: "text", value: "/analysis arguments" },
+      { case: "resourceMention", value: { resourceId: "opaque-skill", discoveredRevision: "content-sha", resourceVersion: 11n, runtimeGeneration: 8n } }
+    ]);
+    expect(mutation.value.input?.mentionRanges).toMatchObject([{ start: 0, end: 9 }]);
+  });
+
+  it.each(["missing", "duplicate", "kind", "generation"] as const)("rejects a slash Skill formal catalog with %s identity", async (failure) => {
+    const network = resourceCommandNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskRuntimeCommandControls()!;
+    const catalog = await app.listTaskRuntimeCommands(controls.surfaceOwnerKey);
+    const resource = create(SessionResourceSchema, {
+      sessionId: "session", resourceId: "opaque-skill", name: "analysis", kind: ResourceKind.SKILL,
+      discoveredRevision: "content-sha", resourceVersion: 11n, runtimeGeneration: 8n,
+      ...(failure === "kind" ? { kind: ResourceKind.PROMPT_TEMPLATE } : {}),
+      ...(failure === "generation" ? { runtimeGeneration: 9n } : {})
+    });
+    vi.mocked(network.listSessionResources).mockResolvedValue(failure === "missing" ? [] : failure === "duplicate" ? [resource, resource] : [resource]);
+    await expect(app.resolveTaskRuntimeCommandResource(controls.surfaceOwnerKey, catalog, catalog.items[0]!)).rejects.toThrow();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it.each(["foreground", "cancel"] as const)("retires the awaited slash Skill selection after %s loss", async (retirement) => {
+    const network = resourceCommandNetwork();
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const controls = app.taskRuntimeCommandControls()!;
+    const catalog = await app.listTaskRuntimeCommands(controls.surfaceOwnerKey);
+    let finish!: (value: Awaited<ReturnType<MobileNetwork["listSessionResources"]>>) => void;
+    vi.mocked(network.listSessionResources).mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    const controller = new AbortController();
+    const pending = app.resolveTaskRuntimeCommandResource(controls.surfaceOwnerKey, catalog, catalog.items[0]!, controller.signal);
+    if (retirement === "foreground") app.setForeground(false); else controller.abort();
+    finish([create(SessionResourceSchema, { sessionId: "session", resourceId: "opaque-skill", kind: ResourceKind.SKILL,
+      name: "analysis", discoveredRevision: "content-sha", resourceVersion: 11n, runtimeGeneration: 8n })]);
+    await expect(pending).rejects.toThrow();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
   it("retires a runtime command response when the fresh Session generation no longer matches its owner", async () => {
     const network = projectedNetwork(runtimeCommandSnapshot);
     vi.mocked(network.listRuntimeCommands).mockResolvedValue([create(RuntimeCommandSchema, {
       commandId: "review",
+      inputMode: RuntimeCommandInputMode.TEXT,
       name: "review",
       description: "Review",
       source: RuntimeCommandSource.PROMPT,
@@ -7680,6 +7914,7 @@ describe("native current-task message and Queue actions", () => {
     app.setForeground(false);
     resolveCommands([create(RuntimeCommandSchema, {
       commandId: "review",
+      inputMode: RuntimeCommandInputMode.TEXT,
       name: "review",
       description: "Review",
       source: RuntimeCommandSource.PROMPT,

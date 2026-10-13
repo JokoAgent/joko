@@ -5,12 +5,14 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   AdapterContext,
+  ApprovedSkillSeed,
   CreateNativeSessionInput,
   EventPayload,
   InteractionDecision,
   InteractionPayload,
   MentionInput,
   NativeSessionBinding,
+  NativeSkillSnapshot,
   ManagedProviderRuntimePort,
   ManagedProviderRouteBinding,
   ManagedProviderSmartRoutingBinding,
@@ -22,6 +24,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CodexBackendAdapter,
   CODEX_MANAGED_PROVIDER_SUPPORT,
+  CODEX_PROJECT_SKILL_ROOTS,
   type CodexAdapterOptions,
   type CodexMcpOpenInput,
   type CodexRemoteRuntime
@@ -39,6 +42,59 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it("preserves native model metadata presence and marks known capacity estimates without inventing declarations", async () => {
+    const setup = await createSetup(); const original = setup.fake.modelList[0]!;
+    setup.fake.modelList = [{ ...original, model: "gpt-5.4", description: "Native description", inputModalities: [], serviceTiers: [] },
+      { id: "unknown-record", model: "future-model", displayName: "Future", supportedReasoningEfforts: [{ reasoningEffort: "high", description: "" }], defaultReasoningEffort: "medium" }];
+    const models = await setup.adapter.listModels();
+    expect(models[0]).toMatchObject({ description: "Native description", defaultEffort: "medium", declaredInputModalities: [], declaredSupportsImages: false, declaredSupportsFastMode: false, contextWindowSource: "estimated", maxOutputTokensSource: "estimated", protocolMode: "matching" });
+    expect(models[1]!.defaultEffort).toBeUndefined(); expect(models[1]!.declaredSupportsFastMode).toBeUndefined();
+    expect(models[1]!.declaredInputModalities).toBeUndefined(); expect(models[1]!.contextWindowSource).toBeUndefined();
+    expect(models).toHaveLength(2);
+  });
+  it("applies working context only at a safe turn through confirmed cold resume of the same thread", async () => {
+    const setup = await createSetup(); let budget: number | undefined = 10_000;
+    const base = { ...context(setup.target, [], { backendInstanceGeneration: 7 }),
+      resolveModelWorkingContext: () => budget };
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), base);
+    const bound = { ...base, binding, operationId: "budget-first" };
+    expect(setup.fake.transport!.requests.find(request => request.method === "thread/start")!.params)
+      .toMatchObject({ config: { model_context_window: 10_000, model_auto_compact_token_limit: 9_000 } });
+    await setup.adapter.send(prompt("first"), bound);
+    budget = 100_000_000;
+    await expect(setup.adapter.refreshModelWorkingContext(bound)).rejects.toMatchObject({ publicError: { code: "CODEX_WORKING_CONTEXT_BUSY" } });
+    await setup.adapter.send({ ...prompt("steer"), disposition: "steer" }, { ...bound, operationId: "budget-steer" });
+    expect(setup.fake.transport!.requests.filter(request => request.method === "thread/resume")).toHaveLength(0);
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    await setup.adapter.send(prompt("second"), { ...bound, operationId: "budget-second" });
+    const requests = setup.fake.transport!.requests;
+    const resume = requests.findLastIndex(request => request.method === "thread/resume");
+    expect(requests[resume - 1]).toMatchObject({ method: "thread/unsubscribe", params: { threadId: binding.nativeSessionId } });
+    expect(requests[resume]!.params).toMatchObject({ threadId: binding.nativeSessionId, config: { model_context_window: 100_000_000, model_auto_compact_token_limit: 90_000_000 } });
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    budget = undefined; await setup.adapter.refreshModelWorkingContext(bound);
+    const reset = requests.findLast(request => request.method === "thread/resume")!.params as JsonObject;
+    expect((reset["config"] as JsonObject)["model_context_window"]).toBeUndefined();
+    expect(requests.filter(request => request.method === "thread/start")).toHaveLength(1);
+    expect(await setup.adapter.inspectSession(binding, bound)).toMatchObject({ binding, modelId: "gpt-test" });
+  });
+
+  it("retains exact thread cleanup responsibility when working context unload is unconfirmed", async () => {
+    const setup = await createSetup(); let budget = 12_000;
+    const base = { ...context(setup.target, [], { backendInstanceGeneration: 7 }), resolveModelWorkingContext: () => budget };
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), base), bound = { ...base, binding };
+    const transport = setup.fake.transport!, request = transport.request.bind(transport); let deny = true;
+    transport.request = async (method, params, options) => method === "thread/unsubscribe" && deny
+      ? { status: "unknown" } : request(method, params, options);
+    budget = 20_000;
+    await expect(setup.adapter.refreshModelWorkingContext(bound)).rejects.toBeDefined();
+    expect(transport.requests.filter(entry => entry.method === "thread/resume")).toHaveLength(0);
+    budget = 12_000; deny = false;
+    await setup.adapter.refreshModelWorkingContext(bound);
+    expect(transport.requests.findLast(entry => entry.method === "thread/resume")!.params).toMatchObject({ threadId: binding.nativeSessionId, config: { model_context_window: 12_000 } });
+    await setup.adapter.send(prompt("recovered"), { ...bound, operationId: "recovered-budget" });
+    expect(setup.fake.threads.size).toBe(1);
+  });
   it("isolates explicit skill mounts from a refreshed ambient native catalog and fails closed on invalid paths", async () => {
     const source = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-explicit-"))); cleanups.push(() => rm(source, { recursive: true, force: true }));
     const body = "---\nname: report\ndescription: Reports\n---\nFull instructions.\n"; await writeFile(join(source, "SKILL.md"), body);
@@ -71,9 +127,238 @@ describe("CodexBackendAdapter", () => {
     const path = entries[0]!["path"] as string; expect(path).toContain("personal-skill-library");
     setup.fake.reviewSkills.push({ path, name: "personal-skill-library", enabled: true });
     const active = context(setup.target, [], { binding, backendInstanceGeneration: 7 }); expect(await setup.adapter.getResources(active)).toEqual([]);
+    expect(await setup.adapter.getCommands(active)).toEqual([]);
     const sourceText = await readFile(path, "utf8"); expect(sourceText).toContain("list_partner_skills");
     await setup.adapter.closeSession(binding, active); await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFile(join(source, "SKILL.md"), "utf8")).toBe(body);
+  });
+
+  it("publishes Resource commands only for exact enabled approved Skill mounts without private metadata", async () => {
+    const setup = await createSkillInputSetup();
+    setup.fake.reviewSkills[0]!["description"] = "Prepare reports";
+    setup.fake.reviewSkills[0]!["interface"] = { defaultPrompt: "Private default invocation" };
+    expect((await setup.adapter.describe()).capabilities.get("runtime.commands")?.supported).toBe(true);
+    expect(await setup.adapter.getCommands(setup.active)).toEqual([{ name: "native-report", description: "Prepare reports", source: "skill",
+      resourceId: "approved-report", loaded: true, inputMode: "resource_mention" }]);
+    setup.fake.reviewSkills[0]!["enabled"] = false;
+    expect(await setup.adapter.getCommands(setup.active)).toEqual([]);
+    setup.fake.reviewSkills[0]!["enabled"] = true;
+    setup.fake.reviewSkills[0]!["path"] = join(setup.source, "SKILL.md");
+    expect(await setup.adapter.getCommands(setup.active)).toEqual([]);
+    const unconfigured = await createSetup();
+    expect((await unconfigured.adapter.describe()).capabilities.get("runtime.commands")?.supported).toBe(false);
+  });
+
+  it("keeps same-name Skill identities separate and rejects malformed private native defaults", async () => {
+    const duplicate = await createSkillInputSetup(true);
+    expect(await duplicate.adapter.getCommands(duplicate.active)).toEqual([
+      { name: "native-report", description: "", source: "skill", resourceId: "approved-report", loaded: true, inputMode: "resource_mention" },
+      { name: "native-report", description: "", source: "skill", resourceId: "second-report", loaded: true, inputMode: "resource_mention" }
+    ]);
+    const setup = await createSkillInputSetup();
+    setup.fake.reviewSkills[0]!["interface"] = { defaultPrompt: 42 };
+    await expect(setup.adapter.getCommands(setup.active)).rejects.toBeDefined();
+  });
+
+  it("consumes only a selected whole leading Skill token and preserves args, native defaults and skill-only start or steer", async () => {
+    const setup = await createSkillInputSetup(), token = "/native-report";
+    setup.fake.reviewSkills[0]!["interface"] = { defaultPrompt: "  Private native default  \n" };
+    await setup.adapter.send({ ...prompt(` \t${token}  \n  User arguments  \n`), mentions: [setup.mention],
+      mentionRanges: [{ start: 2, end: 2 + token.length, mentionIndex: 0 }] }, setup.active);
+    await setup.adapter.send({ ...prompt(`${token} \n `), disposition: "steer", mentions: [setup.mention],
+      mentionRanges: [{ start: 0, end: token.length, mentionIndex: 0 }] }, { ...setup.active, operationId: "slash-steer" });
+    await setup.fake.completeTurn(setup.active.binding!.nativeSessionId!);
+    setup.fake.reviewSkills[0]!["interface"] = { defaultPrompt: " \n " };
+    await setup.adapter.send({ ...prompt(token), mentions: [setup.mention], mentionRanges: [{ start: 0, end: token.length, mentionIndex: 0 }] },
+      { ...setup.active, operationId: "slash-skill-only" });
+    const requests = setup.fake.transport!.requests.filter(request => request.method === "turn/start" || request.method === "turn/steer");
+    expect(requests.map(request => ((request.params as JsonObject)["input"] as JsonObject[]).filter(part => part["type"] === "text").map(part => part["text"])))
+      .toEqual([["User arguments"], ["Private native default"], []]);
+    for (const request of requests) expect((request.params as JsonObject)["input"]).toContainEqual({ type: "skill", name: "native-report", path: setup.mountedPath });
+  });
+
+  it("keeps unselected slash, ordinary mentions and middle or partial Resource occurrences as their original text", async () => {
+    const setup = await createSkillInputSetup(), token = "/native-report";
+    setup.fake.reviewSkills[0]!["interface"] = { defaultPrompt: "Must not replace ordinary text" };
+    const scenarios = [
+      { text: token, mentions: [], mentionRanges: [] },
+      { text: "@Report", mentions: [setup.mention], mentionRanges: [{ start: 0, end: 7, mentionIndex: 0 }] },
+      { text: `Explain ${token} now`, mentions: [setup.mention], mentionRanges: [{ start: 8, end: 8 + token.length, mentionIndex: 0 }] },
+      { text: `${token} arguments`, mentions: [setup.mention], mentionRanges: [{ start: 0, end: 4, mentionIndex: 0 }] },
+      { text: token, mentions: [setup.mention] }
+    ];
+    for (const [index, scenario] of scenarios.entries()) {
+      await setup.adapter.send({ ...prompt(scenario.text), ...scenario }, { ...setup.active, operationId: `literal-${index}` });
+      await setup.fake.completeTurn(setup.active.binding!.nativeSessionId!);
+    }
+    const requests = setup.fake.transport!.requests.filter(request => request.method === "turn/start");
+    expect(requests.map(request => ((request.params as JsonObject)["input"] as JsonObject[]).filter(part => part["type"] === "text").map(part => part["text"])))
+      .toEqual(scenarios.map(scenario => [scenario.text]));
+    expect(((requests[0]!.params as JsonObject)["input"] as JsonObject[]).some(part => part["type"] === "skill")).toBe(false);
+    for (const ranges of [[{ start: 0, end: token.length + 1, mentionIndex: 0 }], [{ start: 0, end: token.length, mentionIndex: 9 }]]) {
+      await expect(setup.adapter.send({ ...prompt(token), mentions: [setup.mention], mentionRanges: ranges }, setup.active))
+        .rejects.toMatchObject({ publicError: { code: "CODEX_MENTION_RANGE_INVALID" } });
+    }
+    expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(scenarios.length);
+  });
+
+  it("dispatches an approved Skill with its exact loaded native name and file path for start and steer", async () => {
+    const setup = await createSkillInputSetup();
+    const authority = vi.fn();
+    const active = { ...setup.active, assertResourceMentionCurrent: authority };
+    expect((await setup.adapter.describe()).capabilities.get("input.mention")?.options).toContain("resource");
+    await setup.adapter.send({ ...prompt("Use it"), mentions: [setup.mention] }, active);
+    await setup.adapter.send({ ...prompt("Continue"), disposition: "steer", mentions: [setup.mention] }, { ...active, operationId: "skill-steer" });
+    const requests = setup.fake.transport!.requests.filter(request => request.method === "turn/start" || request.method === "turn/steer");
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect((request.params as JsonObject)["input"]).toContainEqual({ type: "skill", name: "native-report", path: setup.mountedPath });
+      expect(JSON.stringify(request.params)).not.toContain("Untrusted client label");
+      expect(JSON.stringify(request.params)).not.toContain("Complete private instructions");
+      expect(request.options.beforeDispatchAsync).toBeTypeOf("function");
+    }
+    expect(authority).toHaveBeenCalledWith(setup.mention);
+  });
+
+  it("loads approved remote Skill generations through the same SSH factory and consumes Resource input for start and steer", async () => {
+    const setup = await createRemoteSkillInputSetup();
+    expect(CODEX_PROJECT_SKILL_ROOTS).toEqual([".agents/skills", ".codex/skills"]);
+    expect(Object.isFrozen(CODEX_PROJECT_SKILL_ROOTS)).toBe(true);
+    expect(setup.prepareNativeSkills).toHaveBeenCalledWith([setup.seed], expect.any(AbortSignal), expect.objectContaining({ mode: "explicit" }));
+    expect(setup.seed.sourcePath).not.toBe(setup.snapshots[0]!.snapshot.pluginRoot);
+    const resume = setup.remoteFake.transport!.requests.find(request => request.method === "thread/resume")!;
+    const entries = ((resume.params as JsonObject)["config"] as JsonObject)["skills.config"] as JsonObject[];
+    expect(entries).toContainEqual({ path: "/home/remote/.agents/skills/ambient/SKILL.md", enabled: false });
+    expect(entries).toContainEqual({ path: setup.snapshots[0]!.filePath, enabled: true });
+    const methods = setup.remoteFake.transport!.requests.map(request => request.method);
+    expect(methods.indexOf("thread/unsubscribe")).toBeLessThan(methods.indexOf("thread/resume"));
+    expect(await setup.adapter.getCommands(setup.active)).toEqual([]);
+    await setup.adapter.send({ ...prompt("@selected use it"), mentions: [setup.mention] }, setup.active);
+    await setup.adapter.send({ ...prompt("continue"), disposition: "steer", mentions: [setup.mention] }, { ...setup.active, operationId: "remote-skill-steer" });
+    const turns = setup.remoteFake.transport!.requests.filter(request => request.method === "turn/start" || request.method === "turn/steer");
+    expect(turns).toHaveLength(2);
+    for (const request of turns) {
+      expect((request.params as JsonObject)["input"]).toContainEqual({ type: "skill", name: "RemoteReport", path: setup.snapshots[0]!.filePath });
+      expect(request.options.beforeDispatchAsync).toBeTypeOf("function");
+      expect(JSON.stringify(request.params)).not.toContain(setup.seed.sourcePath);
+    }
+    await setup.remoteFake.completeTurn(setup.binding.nativeSessionId!, "completed");
+    await setup.adapter.closeSession(setup.binding, setup.active);
+    expect(setup.snapshots[0]!.dispose).toHaveBeenCalledOnce();
+    expect(setup.localFake.transport?.requests.filter(request => request.method === "turn/start") ?? []).toEqual([]);
+  });
+
+  it("rebuilds remote Skill mounts on cold resume and retains a mount when native release is unconfirmed", async () => {
+    const setup = await createRemoteSkillInputSetup();
+    await setup.adapter.closeSession(setup.binding, setup.active);
+    await setup.adapter.resumeSession(setup.binding, setup.active);
+    expect(setup.prepareNativeSkills).toHaveBeenCalledTimes(2);
+    expect(setup.snapshots[1]!.filePath).not.toBe(setup.snapshots[0]!.filePath);
+    expect((await setup.adapter.getResources(setup.active))[0]!.runtimePath).toBe(setup.snapshots[1]!.snapshot.skills[0]!.path);
+    const transport = setup.remoteFake.transport!, request = transport.request.bind(transport);
+    transport.request = async (method, params, options) => method === "thread/unsubscribe" ? { status: "unknown" } : request(method, params, options);
+    await expect(setup.adapter.closeSession(setup.binding, setup.active)).rejects.toMatchObject({ code: "protocol_violation", stateMayHaveChanged: true });
+    expect(setup.snapshots[1]!.dispose).not.toHaveBeenCalled();
+    transport.request = request;
+  });
+
+  it("requires exact POSIX loaded remote Skill identity and rejects all other remote typed input", async () => {
+    const setup = await createRemoteSkillInputSetup();
+    const transport = setup.remoteFake.transport!, request = transport.request.bind(transport);
+    const mount = { path: setup.snapshots[0]!.filePath, name: "RemoteReport", enabled: true };
+    for (const native of [{ ...mount, enabled: false }, { ...mount, path: mount.path.toLowerCase() }]) {
+      setup.remoteFake.reviewSkills.splice(0, setup.remoteFake.reviewSkills.length, native);
+      await expect(setup.adapter.send({ ...prompt("use it"), mentions: [setup.mention] }, setup.active)).rejects.toBeDefined();
+    }
+    setup.remoteFake.reviewSkills.splice(0, setup.remoteFake.reviewSkills.length, mount);
+    transport.request = async (method, params, options) => {
+      const value = await request(method, params, options);
+      return method === "skills/list" ? { data: [{ cwd: "/srv/joko-project", skills: [mount], errors: [] }] } : value;
+    };
+    await expect(setup.adapter.send({ ...prompt("case mismatch"), mentions: [setup.mention] }, setup.active)).rejects.toBeDefined();
+    transport.request = request;
+    await expect(setup.adapter.send({ ...prompt("wrong revision"), mentions: [{ ...setup.mention, discoveredRevision: `sha256:${"0".repeat(64)}` }] }, setup.active)).rejects.toBeDefined();
+    await expect(setup.adapter.send({ ...prompt("file"), mentions: [{ kind: "workspace_file", reference: "notes.txt", label: "notes" }] }, setup.active))
+      .rejects.toMatchObject({ publicError: { code: "CODEX_REMOTE_MUTATION_UNSUPPORTED" } });
+    expect(transport.requests.filter(value => value.method === "turn/start" || value.method === "turn/steer")).toEqual([]);
+    const noFactory = await createRemoteSetup({ resolveNativeSkills: async () => [setup.seed] });
+    const threadId = noFactory.remoteFake.seedThread("/srv/joko-project");
+    const candidate = (await noFactory.adapter.listNativeSessions(noFactory.target))[0]!;
+    const binding = await noFactory.adapter.resolveNativeSessionReference(candidate.nativeReference, noFactory.target, 1);
+    const active = { ...context(noFactory.target, [], { binding, operationId: "missing-remote-factory", backendInstanceGeneration: 7 }), assertResourceMentionCurrent: () => undefined };
+    await noFactory.adapter.resumeSession(binding, active);
+    expect(await noFactory.adapter.getResources(active)).toEqual([]);
+    await expect(noFactory.adapter.send({ ...prompt("not granted"), mentions: [setup.mention] }, active)).rejects.toBeDefined();
+    expect(noFactory.remoteFake.threads.get(threadId)!.turns).toHaveLength(0);
+  });
+
+  it.each(["mounted copy", "approval", "Queue owner"] as const)("rechecks remote Skill %s after asynchronous preparation", async boundary => {
+    const setup = await createRemoteSkillInputSetup();
+    const transport = setup.remoteFake.transport!, request = transport.request.bind(transport);
+    let entered!: () => void, release!: () => void;
+    const queued = new Promise<void>(resolve => { release = resolve; }), atQueue = new Promise<void>(resolve => { entered = resolve; });
+    transport.request = async (method, params, options) => {
+      if (method === "turn/start") { entered(); await queued; }
+      return request(method, params, options);
+    };
+    const pending = setup.adapter.send({ ...prompt("use it"), mentions: [setup.mention] }, setup.active).catch((error: unknown) => error);
+    await atQueue;
+    if (boundary === "mounted copy") setup.authority.files = false;
+    if (boundary === "approval") setup.authority.approved = false;
+    if (boundary === "Queue owner") setup.authority.queue = false;
+    release();
+    expect(await pending).toBeInstanceOf(Error);
+    expect(transport.requests.filter(value => value.method === "turn/start")).toEqual([]);
+  });
+
+  it("admits only one enabled native mount with the original complete Resource identity", async () => {
+    const setup = await createSkillInputSetup();
+    const catalog = { path: setup.mountedPath, name: "native-report", enabled: true };
+    const attempts: { readonly catalog: JsonObject[]; readonly mention: typeof setup.mention }[] = [
+      { catalog: [{ ...catalog, enabled: false }], mention: setup.mention },
+      { catalog: [{ ...catalog, path: join(setup.source, "SKILL.md") }], mention: setup.mention },
+      { catalog: [{ path: setup.mountedPath, enabled: true }], mention: setup.mention },
+      { catalog: [catalog, catalog], mention: setup.mention },
+      { catalog: [catalog], mention: { ...setup.mention, discoveredRevision: `sha256:${"0".repeat(64)}` } },
+      { catalog: [catalog], mention: { ...setup.mention, resourceVersion: "03" } },
+      { catalog: [catalog], mention: { ...setup.mention, runtimeGeneration: 2 } },
+      { catalog: [catalog], mention: { ...setup.mention, reference: "foreign-resource" } }
+    ];
+    for (const attempt of attempts) {
+      setup.fake.reviewSkills.splice(0, setup.fake.reviewSkills.length, ...attempt.catalog);
+      await expect(setup.adapter.send({ ...prompt(""), mentions: [attempt.mention] }, setup.active)).rejects.toBeDefined();
+    }
+    setup.fake.reviewSkills.splice(0, setup.fake.reviewSkills.length, catalog);
+    const { assertResourceMentionCurrent: _authority, ...missingAuthority } = setup.active;
+    await expect(setup.adapter.send({ ...prompt(""), mentions: [setup.mention] }, missingAuthority)).rejects.toMatchObject({ publicError: { code: "CODEX_MENTION_KIND_UNSUPPORTED" } });
+    expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start" || request.method === "turn/steer")).toEqual([]);
+  });
+
+  it.each(["source incarnation", "mounted file", "approval", "Queue owner", "cancel"] as const)("rechecks Skill %s after preparation and before native dispatch", async boundary => {
+    const setup = await createSkillInputSetup();
+    const transport = setup.fake.transport!, request = transport.request.bind(transport);
+    let release!: () => void, entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; }), atWrite = new Promise<void>(resolve => { entered = resolve; });
+    const cancellation = new AbortController();
+    const steer = boundary === "Queue owner";
+    if (steer) await setup.adapter.send(prompt("Running"), { ...setup.active, operationId: "initial-text" });
+    transport.request = async (method, params, options) => {
+      if ((method === "turn/start" || method === "turn/steer") && options?.beforeDispatchAsync !== undefined) {
+        entered(); await held;
+      }
+      return request(method, params, options);
+    };
+    const pending = setup.adapter.send({ ...prompt("Use it"), disposition: steer ? "steer" : "prompt", mentions: [setup.mention] },
+      { ...setup.active, signal: cancellation.signal }).catch((error: unknown) => error);
+    await atWrite;
+    if (boundary === "source incarnation") setup.authority.sourceIncarnation += 1;
+    if (boundary === "mounted file") await writeFile(join(dirname(setup.mountedPath), "helper.txt"), "Replaced mounted helper");
+    if (boundary === "approval") setup.authority.approved = false;
+    if (boundary === "Queue owner") setup.authority.dispatch = false;
+    if (boundary === "cancel") cancellation.abort();
+    release();
+    expect(await pending).toBeInstanceOf(Error);
+    expect(transport.requests.filter(request => (request.params as JsonObject | undefined)?.["clientUserMessageId"] === setup.active.operationId)).toEqual([]);
   });
 
   it("mounts approved native skills per thread, confirms exact paths and rebuilds them on resume", async () => {
@@ -5322,6 +5607,32 @@ async function createSetup(
   return { adapter, fake, host, target };
 }
 
+async function createSkillInputSetup(duplicateCommandName = false) {
+  const source = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-input-skill-")));
+  cleanups.push(() => rm(source, { recursive: true, force: true }));
+  const body = "---\nname: seed-name\ndescription: Private reports\n---\nComplete private instructions.\n", helper = "Private helper";
+  await writeFile(join(source, "SKILL.md"), body); await writeFile(join(source, "helper.txt"), helper);
+  const revision = `sha256:${createHash("sha256").update(`D\0\0F\0helper.txt\0${Buffer.byteLength(helper)}\0`).update(helper)
+    .update(`F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+  const authority = { approved: true, dispatch: true, sourceIncarnation: 1 };
+  const capturedSourceIncarnation = authority.sourceIncarnation;
+  const seed = { sourcePath: source,
+    resource: { id: "approved-report", name: "Resource label", kind: "skill", source: "managed", state: "approved", revision, resourceVersion: 3n },
+    assertCurrent: () => { if (!authority.approved || authority.sourceIncarnation !== capturedSourceIncarnation) throw new Error("Approval or source incarnation retired"); } } as const;
+  const setup = await createSetup(7, { resolveNativeSkills: async () => duplicateCommandName
+    ? [seed, { ...seed, resource: { ...seed.resource, id: "second-report" } }] : [seed] });
+  const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+  const config = (setup.fake.transport!.requests.find(request => request.method === "thread/start")!.params as JsonObject)["config"] as JsonObject;
+  const mountedPath = (config["skills.config"] as JsonObject[])[0]!["path"] as string;
+  setup.fake.reviewSkills.push({ path: mountedPath, name: "native-report", enabled: true });
+  if (duplicateCommandName) setup.fake.reviewSkills.push({ path: (config["skills.config"] as JsonObject[])[1]!["path"] as string, name: "native-report", enabled: true });
+  const mention = { kind: "resource" as const, reference: "approved-report", label: "Untrusted client label", discoveredRevision: revision, resourceVersion: "3", runtimeGeneration: 1 };
+  const active = { ...context(setup.target, [], { binding, backendInstanceGeneration: 7, operationId: "skill-start" }),
+    assertResourceMentionCurrent: () => { if (!authority.dispatch) throw new Error("Queue owner retired"); } };
+  expect(await setup.adapter.getResources(active)).toHaveLength(duplicateCommandName ? 2 : 1);
+  return { ...setup, active, mention, source, mountedPath, authority };
+}
+
 async function createSmartAuthenticationSetup(includeNativeRoute: boolean) {
   const managedModel: ProviderModel = {
     providerId: "managed-smart",
@@ -5393,11 +5704,51 @@ async function createSmartAuthenticationSetup(includeNativeRoute: boolean) {
   };
 }
 
+async function createRemoteSkillInputSetup() {
+  const sourcePath = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-remote-approved-")));
+  cleanups.push(() => rm(sourcePath, { recursive: true, force: true }));
+  const body = "---\nname: source-name\ndescription: Remote private report\n---\nComplete instructions.\n";
+  await writeFile(join(sourcePath, "SKILL.md"), body);
+  const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+  const authority = { approved: true, files: true, queue: true };
+  const seed: ApprovedSkillSeed = { sourcePath, resource: { id: "remote-approved-report", kind: "skill", name: "Source label", source: "managed", state: "approved", revision, resourceVersion: 4n },
+    assertCurrent: () => { if (!authority.approved) throw new Error("Remote approval retired"); } };
+  const snapshots: { readonly snapshot: NativeSkillSnapshot; readonly filePath: string; readonly dispose: ReturnType<typeof vi.fn> }[] = [];
+  let setup: Awaited<ReturnType<typeof createRemoteSetup>>;
+  const prepareNativeSkills = vi.fn<NonNullable<CodexRemoteRuntime["prepareNativeSkills"]>>(async (seeds, signal, policy) => {
+    signal.throwIfAborted();
+    const root = `/home/remote/.joko/runtime/v1/codex-home/approved-skills/Owned-${snapshots.length}`;
+    const path = `${root}/skills/Report`, filePath = `${path}/SKILL.md`;
+    let disposed = false;
+    const assertCurrent = () => { if (disposed) throw new Error("Remote mount retired"); policy?.assertCurrent(); for (const approved of seeds) approved.assertCurrent(); };
+    const dispose = vi.fn(async () => { disposed = true; });
+    const snapshot: NativeSkillSnapshot = { restrictImplicit: false, skillOverrides: {}, pluginRoot: root,
+      skills: [{ seed: seeds[0]!, path, filePath }], indexedResourceIds: [], assertCurrent,
+      assertFilesCurrent: async inputSignal => { inputSignal.throwIfAborted(); assertCurrent(); if (!authority.files) throw new Error("Remote immutable copy changed"); }, dispose };
+    snapshots.push({ snapshot, filePath, dispose });
+    setup.remoteFake.reviewSkills.push({ path: filePath, name: "RemoteReport", description: "Native report", scope: "repo", enabled: true });
+    return snapshot;
+  });
+  setup = await createRemoteSetup({ targetWorkspaceRoot: "/srv/Joko-project", prepareNativeSkills, resolveNativeSkills: async () => [seed] });
+  setup.remoteFake.reviewConfig = { skills: { config: [{ path: "/home/remote/.agents/skills/ambient/SKILL.md", enabled: true }] } };
+  setup.remoteFake.reviewSkills.push({ path: "/home/remote/.agents/skills/ambient/SKILL.md", name: "ambient", scope: "user", enabled: true });
+  setup.remoteFake.seedThread("/srv/Joko-project");
+  const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+  const binding = await setup.adapter.createSession({ ...sessionInput(setup.target), nativeStart: { kind: "attach", nativeReference: candidate.nativeReference } }, context(setup.target, [], { backendInstanceGeneration: 7 }));
+  const active = { ...context(setup.target, [], { binding, operationId: "remote-resource-start", backendInstanceGeneration: 7 }),
+    assertResourceMentionCurrent: () => { if (!authority.queue) throw new Error("Remote Queue owner retired"); } };
+  const mention = { kind: "resource" as const, reference: seed.resource.id, label: "Untrusted display", discoveredRevision: revision, resourceVersion: "4", runtimeGeneration: 1 };
+  expect(await setup.adapter.getResources(active)).toHaveLength(1);
+  return { ...setup, seed, active, binding, mention, snapshots, authority, prepareNativeSkills };
+}
+
 async function createRemoteSetup(options: {
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly resolveNativeMemoryEnabled?: CodexAdapterOptions["resolveNativeMemoryEnabled"];
   readonly targetWorkspaceRoot?: string;
   readonly remoteWorkspace?: NonNullable<TargetDescriptor["remoteWorkspace"]>;
+  readonly prepareNativeSkills?: CodexRemoteRuntime["prepareNativeSkills"];
+  readonly resolveNativeSkills?: CodexAdapterOptions["resolveNativeSkills"];
 } = {}) {
   const serviceRoot = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-remote-target-")));
   const localFake = new FakeCodexAppServer();
@@ -5423,7 +5774,8 @@ async function createRemoteSetup(options: {
       profileKey,
       executionDomain: "ssh-codex-profile-fixture",
       assertCurrent: () => { if (!current) throw new Error("remote authority changed"); },
-      ...(options.openMcpBridge === undefined ? {} : { openMcpBridge: options.openMcpBridge })
+      ...(options.openMcpBridge === undefined ? {} : { openMcpBridge: options.openMcpBridge }),
+      ...(options.prepareNativeSkills === undefined ? {} : { prepareNativeSkills: options.prepareNativeSkills })
     };
   });
   const adapter = new CodexBackendAdapter({
@@ -5437,7 +5789,8 @@ async function createRemoteSetup(options: {
     },
     ...(options.resolveNativeMemoryEnabled === undefined
       ? {}
-      : { resolveNativeMemoryEnabled: options.resolveNativeMemoryEnabled })
+      : { resolveNativeMemoryEnabled: options.resolveNativeMemoryEnabled }),
+    ...(options.resolveNativeSkills === undefined ? {} : { resolveNativeSkills: options.resolveNativeSkills })
   });
   const target: TargetDescriptor = {
     id: "target-codex",

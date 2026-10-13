@@ -10,9 +10,12 @@ import {
   JokoError,
   snapshotNativeSkills,
   type ApprovedSkillResolver,
+  type ApprovedSkillSeed,
+  type NativeSkillPolicy,
   type NativeSkillPolicyResolver,
   type NativeSkillSnapshot,
   type RuntimeResource,
+  type RuntimeCommand,
   MEMORY_NATIVE_DEFAULT_DISABLED_OPTION,
   MEMORY_NATIVE_LIVE_LOCAL_OPTION,
   MEMORY_NATIVE_RESET_LOCAL_OPTION,
@@ -94,6 +97,7 @@ import {
   interactionFromServerRequest,
   translatePromptInput,
   type CodexInputResolvers,
+  type ResolvedCodexSkill,
   type TranslatorState
 } from "./translator.js";
 import {
@@ -113,7 +117,7 @@ import {
   type CodexSmartRoutingPreparation
 } from "./smart-subagent-routing.js";
 
-export interface CodexAdapterOptions extends CodexInputResolvers {
+export interface CodexAdapterOptions extends Omit<CodexInputResolvers, "resolveSkillMention"> {
   readonly managedProviders?: ManagedProviderRuntimePort;
   /** Spawn-time catalog and runtime revision owned by this exact Backend instance. */
   readonly smartRouting?: CodexSmartRoutingPreparation;
@@ -162,7 +166,12 @@ export interface CodexRemoteRuntime {
   readonly assertCurrent: () => void;
   /** Owner-private, Target-bound standard MCP route factory. */
   readonly openMcpBridge?: (input: CodexMcpOpenInput) => Promise<CodexMcpRuntimeLease>;
+  /** Uploads service-owned approved generations through this exact SSH lease. */
+  readonly prepareNativeSkills?: (seeds: readonly ApprovedSkillSeed[], signal: AbortSignal, policy?: NativeSkillPolicy) => Promise<NativeSkillSnapshot>;
 }
+
+/** Fixed project roots; native catalog paths do not grant additional roots. */
+export const CODEX_PROJECT_SKILL_ROOTS = Object.freeze([".agents/skills", ".codex/skills"] as const);
 
 export interface CodexMcpCallLease {
   readonly signal: AbortSignal;
@@ -246,10 +255,18 @@ export interface ProviderAuthenticationRevocation {
   revokeProviderAuthentication(providerId: string): Promise<void>;
 }
 
+interface LoadedCodexSkill {
+  readonly name: string;
+  readonly path: string;
+  readonly description: string;
+  readonly defaultPrompt?: string;
+}
+
 interface SessionRuntime {
   readonly host: AppServerHost;
   readonly profileKey: string;
   readonly remote: boolean;
+  readonly prepareNativeSkills?: CodexRemoteRuntime["prepareNativeSkills"];
   readonly nativeAuthenticationAdmission: number | undefined;
   readonly assertExecutionCurrent: () => void;
   managedRoute: ManagedProviderRouteBinding | undefined;
@@ -277,6 +294,7 @@ interface SessionRuntime {
   /** Local create isolated the native profile before the durable Session existed. */
   readonly mcpPending: boolean;
   readonly nativeConfiguration?: JsonObject;
+  readonly workingContextWindow: number | undefined;
   readonly nativeSkills?: NativeSkillSnapshot | undefined;
   readonly nativeMemoryDirectory?: string;
   providerId?: string;
@@ -373,6 +391,7 @@ interface CodexReadScope {
   readonly remote: boolean;
   readonly pathStyle: "posix" | "win32";
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
+  readonly prepareNativeSkills?: CodexRemoteRuntime["prepareNativeSkills"];
   readonly assertAuthorityCurrent: () => void;
   readonly assertCurrent: () => void;
 }
@@ -560,6 +579,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #nativeAuthenticationRevoked = false;
   #nativeAuthenticationLogoutCompletedEpoch: number | undefined;
   #disposed = false;
+  readonly #releasedRemoteSkillSnapshots = new WeakSet<NativeSkillSnapshot>();
   #disposeFlight: Promise<void> | undefined;
   #forceDisposeFlight: Promise<void> | undefined;
 
@@ -1144,6 +1164,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     if (smartRoute !== undefined) (request.params as JsonObject)["modelProvider"] = smartRoute.modelProviderId;
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
+    nativeConfiguration = workingContextConfiguration(nativeConfiguration, context, input.providerId, input.modelId);
     const initialConfiguration: JsonObject = {
       ...(managedConfiguration ?? {}),
       ...(nativeConfiguration ?? {}),
@@ -1313,8 +1334,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       smartRoute,
       nativeAuthenticationEpoch
     );
-    const mustReloadConfiguration = managedRoute !== undefined || smartRoute !== undefined
-      || (!inspection.scope.remote && (inspection.scope.openMcpBridge !== undefined || this.#resolveNativeSkills !== undefined));
+    const workingContextWindow = resolveWorkingContext(context, context.modelSelection?.providerId, context.modelSelection?.modelId);
+    const mustReloadConfiguration = workingContextWindow !== undefined || managedRoute !== undefined || smartRoute !== undefined
+      || (!inspection.scope.remote && (inspection.scope.openMcpBridge !== undefined || this.#resolveNativeSkills !== undefined))
+      || (inspection.scope.prepareNativeSkills !== undefined && this.#resolveNativeSkills !== undefined);
     if (mustReloadConfiguration) {
       if (inspection.thread.status?.["type"] === "active") {
         managedRoute?.dispose(); smartRoute?.dispose();
@@ -1337,12 +1360,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const preparedSkills = await this.#prepareSkills(inspection.scope, context, preparedMcp.nativeConfiguration).catch(async (error) => {
       managedRoute?.dispose(); smartRoute?.dispose(); await mcp?.release().catch(() => undefined); throw error;
     });
-    const nativeConfiguration = preparedSkills.nativeConfiguration;
+    const nativeConfiguration = workingContextConfiguration(preparedSkills.nativeConfiguration, context,
+      context.modelSelection?.providerId, context.modelSelection?.modelId);
     const nativeSkills = preparedSkills.nativeSkills;
     if (mustReloadConfiguration) {
       try {
         if (current !== undefined) await this.#releaseRuntimeSubscription(current, false);
         await inspection.scope.host.releaseUnboundThread(threadId, inspection.hostGeneration);
+        inspection.scope.assertCurrent();
+        if (current?.remote && current.nativeSkills !== undefined && current.host === inspection.scope.host
+          && current.hostGeneration === inspection.hostGeneration) this.#releasedRemoteSkillSnapshots.add(current.nativeSkills);
       } catch {
         managedRoute?.dispose(); smartRoute?.dispose();
         await nativeSkills?.dispose();
@@ -1366,7 +1393,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     ).catch(async (error) => {
       managedRoute?.dispose();
       smartRoute?.dispose();
-      await nativeSkills?.dispose();
+      await this.#disposePreparedSkillsAfterNativeRelease(inspection.scope, threadId, inspection.hostGeneration, nativeSkills);
       await mcp?.release().catch(() => undefined);
       if (!inspection.scope.remote && inspection.scope.openMcpBridge !== undefined) {
         throw mcpUnavailable(false, true);
@@ -1432,7 +1459,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       managedRoute?.dispose();
       smartRoute?.dispose();
       await mcp?.release().catch(() => undefined);
-      await nativeSkills?.dispose();
+      await this.#disposePreparedSkillsAfterNativeRelease(inspection.scope, threadId, inspection.hostGeneration, nativeSkills);
       throw error;
     }
   }
@@ -1752,7 +1779,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       throw reservedYieldContinuationClientId();
     }
     if (context.target.remoteWorkspace !== undefined
-      && (input.images.length !== 0 || input.files.length !== 0 || input.mentions.length !== 0)) {
+      && (input.images.length !== 0 || input.files.length !== 0
+        || input.mentions.some(mention => mention.kind !== "resource"))) {
       throw remoteMutationUnsupported("dispatch attachments or typed mentions");
     }
     // Steering owns the currently attached turn before any asynchronous preparation.
@@ -1784,6 +1812,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       catch {
         runtime = await this.#switchNativeRoute(runtime, runtime.managedRoute.providerId, runtime.managedRoute.model.modelId, context);
       }
+    }
+    if (input.disposition !== "steer" && yieldDispatch === undefined) {
+      await this.refreshModelWorkingContext(context);
+      runtime = this.#sessions.get(context.sessionId)!;
     }
     if (runtime.routeUnknown) throw managedRouteUnavailable(true);
     const hostGeneration = runtime.hostGeneration;
@@ -1826,7 +1858,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         recovery: "Retry through the durable Joko Queue so the native client message can be reconciled."
       });
     }
-    const nativeInput = await waitForDispatchPreparation(translatePromptInput(input, context, this.#resolvers), dispatchSignal);
+    const nativeInput = await waitForDispatchPreparation(translatePromptInput(input, context, {
+      ...this.#resolvers,
+      ...(this.#resolveNativeSkills === undefined ? {} : {
+        resolveSkillMention: (mention, dispatchContext) => this.#resolveSkillMention(runtime, mention, dispatchContext)
+      })
+    }), dispatchSignal);
     const assertNativeDispatchReady = (): void => {
       assertDispatchReady();
       nativeInput.assertCurrent();
@@ -1851,7 +1888,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           clientUserMessageId,
           input: [...nativeInput.input],
           expectedTurnId: expectedTurnId!
-        }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertNativeDispatchReady });
+        }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertNativeDispatchReady,
+          ...(input.mentions.some(mention => mention.kind === "resource") ? { beforeDispatchAsync: nativeInput.assertFilesCurrent } : {}) });
         this.#assertRuntimeFence(runtime, context, response.hostGeneration);
         acceptedResponseShapePending = true;
         if (parseTurnSteer(response.value) !== expectedTurnId) {
@@ -1891,6 +1929,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }, {
         mutation: true,
         signal: dispatchSignal,
+        ...(input.mentions.some(mention => mention.kind === "resource") ? { beforeDispatchAsync: nativeInput.assertFilesCurrent } : {}),
         beforeDispatch: () => {
           assertNativeDispatchReady();
           if (yieldDispatch !== undefined) yieldDispatch.claim.dispatchStarted = true;
@@ -2846,7 +2885,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     nativeConfiguration?: JsonObject,
     smartRoute?: ManagedProviderSmartRoutingBinding,
     developerInstructions?: string,
-    nativeAuthenticationAdmission?: number
+    nativeAuthenticationAdmission?: number,
+    permissionMode?: PermissionMode
   ) {
     const assertCurrent = () => {
       scope.assertCurrent();
@@ -2862,6 +2902,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const response = await scope.host.request("thread/resume", {
       threadId,
       cwd: workspaceRoot,
+      ...(permissionMode === undefined ? {} : permissionParams(permissionMode)),
       excludeTurns: true,
       ...(selection === undefined
         ? smartRoute === undefined ? {} : { modelProvider: smartRoute.modelProviderId }
@@ -2989,6 +3030,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         remote: true,
         pathStyle,
         ...(runtime.openMcpBridge === undefined ? {} : { openMcpBridge: runtime.openMcpBridge }),
+        ...(target.remoteWorkspace.kind === "ssh" && runtime.prepareNativeSkills !== undefined
+          ? { prepareNativeSkills: runtime.prepareNativeSkills } : {}),
         assertAuthorityCurrent: () => {
           this.#assertOpen();
           try {
@@ -3066,6 +3109,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         ? remoteWorkspacePathStyle(runtime.context.target.remoteWorkspace) ?? "posix"
         : nativeRuntimePathStyle(runtime.host),
       ...(!runtime.remote && this.#localMcpBridge !== undefined ? { openMcpBridge: this.#localMcpBridge } : {}),
+      ...(runtime.prepareNativeSkills === undefined ? {} : { prepareNativeSkills: runtime.prepareNativeSkills }),
       assertAuthorityCurrent,
       assertCurrent: () => {
         assertAuthorityCurrent();
@@ -3341,12 +3385,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #prepareSkills(scope: CodexReadScope, context: AdapterContext, nativeConfiguration?: JsonObject): Promise<{
     readonly nativeSkills?: NativeSkillSnapshot; readonly nativeConfiguration?: JsonObject
   }> {
-    if (scope.remote || context.runtimePolicy === "review_read_only" || this.#resolveNativeSkills === undefined) {
+    if (context.runtimePolicy === "review_read_only" || this.#resolveNativeSkills === undefined
+      || (scope.remote && scope.prepareNativeSkills === undefined)) {
       return nativeConfiguration === undefined ? {} : { nativeConfiguration };
     }
-    const policy = await this.#resolveNativeSkillPolicy?.(context);
-    const snapshot = await snapshotNativeSkills(await this.#resolveNativeSkills(context, context.signal), context.signal, undefined, policy);
+    const selectedPolicy = await this.#resolveNativeSkillPolicy?.(context);
+    const policy: NativeSkillPolicy | undefined = scope.remote
+      ? { mode: "explicit", ...(selectedPolicy?.overrides === undefined ? {} : { overrides: selectedPolicy.overrides }),
+          assertCurrent: () => { scope.assertCurrent(); selectedPolicy?.assertCurrent(); } }
+      : selectedPolicy;
+    const seeds = await this.#resolveNativeSkills(context, context.signal);
+    if (scope.remote && seeds.some(seed => seed.personal !== undefined)) throw skillMentionUnavailable();
+    const snapshot = scope.remote
+      ? await scope.prepareNativeSkills!(seeds, context.signal, policy)
+      : await snapshotNativeSkills(seeds, context.signal, undefined, policy);
     try {
+      if (scope.remote && (!isNormalizedAbsoluteRemotePath(snapshot.pluginRoot, "posix")
+        || snapshot.skills.some(mount => !isNormalizedAbsoluteRemotePath(mount.path, "posix")
+          || mount.filePath !== posixPath.join(mount.path, "SKILL.md")
+          || !mount.path.startsWith(`${snapshot.pluginRoot}/`)))) throw skillMentionUnavailable();
+      const restrictImplicit = scope.remote || snapshot.restrictImplicit;
       const response = await scope.host.request("config/read", { cwd: scope.workspaceRoot, includeLayers: false }, {
         signal: context.signal, beforeDispatch: () => { scope.assertCurrent(); snapshot.assertCurrent(); }
       });
@@ -3357,9 +3415,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const paths = new Map<string, JsonObject>();
       for (const raw of (entries ?? []) as JsonValue[]) {
         if (!isJsonObject(raw) || typeof raw["path"] !== "string" || typeof raw["enabled"] !== "boolean") throw invalidReviewProfile();
-        paths.set(raw["path"], { path: raw["path"], enabled: snapshot.restrictImplicit ? false : raw["enabled"] });
+        paths.set(raw["path"], { path: raw["path"], enabled: restrictImplicit ? false : raw["enabled"] });
       }
-      if (snapshot.restrictImplicit) {
+      if (restrictImplicit) {
         const response = await scope.host.request("skills/list", { cwds: [scope.workspaceRoot], forceReload: true }, {
           signal: context.signal, beforeDispatch: () => { scope.assertCurrent(); snapshot.assertCurrent(); }
         });
@@ -3367,11 +3425,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         const value = objectValue(response.value, "skill catalog"), data = value["data"];
         if (!Array.isArray(data) || data.length !== 1) throw new ProtocolShapeError("Skill catalog is unavailable.");
         const row = objectValue(data[0]!, "skill catalog entry");
-        if (typeof row["cwd"] !== "string" || !equalNativePaths(row["cwd"], scope.workspaceRoot)
+        if (typeof row["cwd"] !== "string" || !equalSkillPaths(row["cwd"], scope.workspaceRoot, scope.remote)
           || !Array.isArray(row["skills"]) || !Array.isArray(row["errors"])) throw new ProtocolShapeError("Skill catalog is unavailable.");
         for (const raw of [...row["skills"], ...row["errors"]]) {
           const item = objectValue(raw, "native skill"), path = item["path"];
-          if (typeof path !== "string" || !isAbsolute(path) || path.includes("\0") || path.length > 4_096) throw new ProtocolShapeError("Skill catalog path is invalid.");
+          if (typeof path !== "string" || !validSkillPath(path, scope.remote) || path.includes("\0") || path.length > 4_096) throw new ProtocolShapeError("Skill catalog path is invalid.");
           paths.set(path, { path, enabled: false });
         }
       }
@@ -3386,6 +3444,30 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#assertStandardRuntime(runtime, "list approved skills");
     const snapshot = runtime.nativeSkills;
     if (snapshot === undefined || snapshot.skills.length === 0) return [];
+    const observed = await this.#loadedSkillCatalog(runtime, context);
+    return snapshot.skills.filter((mount) => !mount.discovery && observed.has(mount.filePath)).map((mount) => ({
+      ...mount.seed.resource, state: "loaded" as const, runtimePath: mount.path, runtimeGeneration: context.generation
+    }));
+  }
+
+  override async getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]> {
+    const runtime = await this.#requireRuntime(context);
+    if (runtime.remote || runtime.runtimePolicy !== "standard" || runtime.nativeSkills === undefined) return [];
+    const observed = await this.#loadedSkillCatalog(runtime, context);
+    const commands: RuntimeCommand[] = [];
+    for (const mount of runtime.nativeSkills.skills) {
+      if (mount.discovery) continue;
+      const native = observed.get(mount.filePath);
+      if (native === undefined || !/^[^\s/\\]+$/u.test(native.name)) continue;
+      commands.push({ name: native.name, description: native.description, source: "skill", resourceId: mount.seed.resource.id,
+        loaded: true, inputMode: "resource_mention" });
+    }
+    return commands;
+  }
+
+  async #loadedSkillCatalog(runtime: SessionRuntime, context: AdapterContext): Promise<ReadonlyMap<string, LoadedCodexSkill>> {
+    const snapshot = runtime.nativeSkills;
+    if (snapshot === undefined) return new Map();
     await snapshot.assertFilesCurrent(context.signal);
     const response = await runtime.host.request("skills/list", {
       cwds: [runtime.targetWorkspaceRoot], forceReload: true,
@@ -3394,20 +3476,64 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (response.hostGeneration !== runtime.hostGeneration) throw mcpRuntimeGenerationStale();
     const value = objectValue(response.value, "skill catalog");
     if (!Array.isArray(value["data"])) throw new ProtocolShapeError("Skill catalog has no data.");
-    const observed = new Set<string>();
+    const observed = new Map<string, LoadedCodexSkill>();
+    const paths = new Set<string>();
+    let matchingRows = 0;
     for (const raw of value["data"]) {
       const row = objectValue(raw, "skill catalog entry");
-      if (row["cwd"] !== runtime.targetWorkspaceRoot) continue;
+      if (typeof row["cwd"] !== "string" || !equalSkillPaths(row["cwd"], runtime.targetWorkspaceRoot, runtime.remote)) continue;
+      if (++matchingRows !== 1) throw new ProtocolShapeError("Skill catalog is ambiguous.");
       if (!Array.isArray(row["skills"]) || !Array.isArray(row["errors"]) || row["errors"].length > 0) throw new ProtocolShapeError("Skill catalog is unavailable.");
       for (const rawSkill of row["skills"]) {
         const skill = objectValue(rawSkill, "native skill");
-        if (skill["enabled"] === true && typeof skill["path"] === "string") observed.add(skill["path"]);
+        const path = skill["path"], name = skill["name"];
+        if (typeof path !== "string" || !validSkillPath(path, runtime.remote) || path.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(path)
+          || typeof name !== "string" || name.trim().length === 0 || name.length > 256 || /[\u0000-\u001f\u007f]/u.test(name)
+          || typeof skill["enabled"] !== "boolean" || paths.has(path)) throw new ProtocolShapeError("Skill catalog identity is invalid.");
+        paths.add(path);
+        const description = skill["description"] ?? "", nativeInterface = skill["interface"];
+        if (typeof description !== "string" || description.length > 4_096
+          || (nativeInterface !== undefined && nativeInterface !== null && !isJsonObject(nativeInterface))) throw new ProtocolShapeError("Skill catalog metadata is invalid.");
+        const defaultPrompt = isJsonObject(nativeInterface) ? nativeInterface["defaultPrompt"] : undefined;
+        if (defaultPrompt !== undefined && defaultPrompt !== null && (typeof defaultPrompt !== "string"
+          || Buffer.byteLength(defaultPrompt, "utf8") > 4 * 1024 * 1024)) throw new ProtocolShapeError("Skill catalog prompt is invalid.");
+        if (skill["enabled"] === true) observed.set(path, { name, path, description,
+          ...(typeof defaultPrompt === "string" ? { defaultPrompt } : {}) });
       }
     }
     this.#assertRuntimeFence(runtime, context, runtime.hostGeneration); snapshot.assertCurrent();
-    return snapshot.skills.filter((mount) => !mount.discovery && observed.has(mount.filePath)).map((mount) => ({
-      ...mount.seed.resource, state: "loaded" as const, runtimePath: mount.path, runtimeGeneration: context.generation
-    }));
+    return observed;
+  }
+
+  async #resolveSkillMention(runtime: SessionRuntime,
+    mention: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>, context: AdapterContext
+  ): Promise<ResolvedCodexSkill> {
+    this.#assertStandardRuntime(runtime, "invoke approved skills");
+    const snapshot = runtime.nativeSkills;
+    const assertCurrent = (): void => {
+      this.#assertRuntimeDispatchFence(runtime, context, runtime.hostGeneration);
+      if (context.assertResourceMentionCurrent === undefined || context.binding === undefined
+        || context.binding.opaqueRef !== runtime.binding.opaqueRef || context.binding.generation !== runtime.binding.generation) throw skillMentionUnavailable();
+      context.assertResourceMentionCurrent(mention);
+      snapshot?.assertCurrent();
+    };
+    assertCurrent();
+    const mounts = snapshot?.skills.filter(mount => !mount.discovery && mount.seed.resource.id === mention.reference) ?? [];
+    const mount = mounts[0];
+    if (mount === undefined || mounts.length !== 1 || mention.lineRange !== undefined
+      || mention.runtimeGeneration !== context.generation || !Number.isSafeInteger(mention.runtimeGeneration)
+      || mention.discoveredRevision !== mount.seed.resource.revision
+      || mention.resourceVersion !== mount.seed.resource.resourceVersion.toString()) throw skillMentionUnavailable();
+    const native = (await this.#loadedSkillCatalog(runtime, context)).get(mount.filePath);
+    assertCurrent();
+    if (native === undefined) throw skillMentionUnavailable();
+    return { name: native.name, path: native.path, ...(native.defaultPrompt === undefined ? {} : { defaultPrompt: native.defaultPrompt }), assertCurrent,
+      assertFilesCurrent: async (signal) => {
+        assertCurrent();
+        await snapshot!.assertFilesCurrent(signal);
+        signal.throwIfAborted();
+        assertCurrent();
+      } };
   }
 
   async #openMcpRuntime(
@@ -3541,6 +3667,21 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#releaseManagedOperation(runtime);
   }
 
+  override async refreshModelWorkingContext(context: AdapterContext): Promise<void> {
+    this.#assertOpen();
+    context.signal.throwIfAborted();
+    const runtime = this.#sessions.get(context.sessionId);
+    if (runtime === undefined) return;
+    this.#assertRuntimeFence(runtime, context, runtime.hostGeneration);
+    if (runtime.runtimePolicy !== "standard" || runtime.providerId === undefined || runtime.modelId === undefined) return;
+    if (runtimeHasProductWork(runtime) || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) {
+      throw adapterError({ code: "CODEX_WORKING_CONTEXT_BUSY", message: "Model context refresh requires an idle native thread.", phase: "dispatch", retryable: true, recovery: "Wait for the current native work to finish." });
+    }
+    const desired = resolveWorkingContext(context, runtime.providerId, runtime.modelId);
+    if (desired === runtime.workingContextWindow && !runtime.routeUnknown) return;
+    await this.#withNativeMutation(context, () => this.#switchNativeRoute(runtime, runtime.providerId!, runtime.modelId!, context));
+  }
+
   async #switchNativeRoute(runtime: SessionRuntime, providerId: string, modelId: string, context: AdapterContext): Promise<SessionRuntime> {
     const nativeAuthenticationEpoch = this.#nativeAuthenticationEpoch;
     if (runtimeHasProductWork(runtime) || runtime.compaction !== undefined || runtime.nativeTasks.hasActiveTasks()) throw managedRouteUnavailable();
@@ -3567,10 +3708,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       assertCurrent();
       await runtime.host.releaseUnboundThread(runtime.threadId, generation);
       assertCurrent();
+      if (runtime.remote && runtime.nativeSkills !== undefined) this.#releasedRemoteSkillSnapshots.add(runtime.nativeSkills);
       const preparedMcp = await this.#openMcpRuntime(this.#scopeForRuntime(runtime), runtime.threadId, context, true);
       mcp = preparedMcp.mcp;
       const preparedSkills = await this.#prepareSkills(this.#scopeForRuntime(runtime), context, preparedMcp.nativeConfiguration);
       nativeSkills = preparedSkills.nativeSkills;
+      const nativeConfiguration = workingContextConfiguration({ ...preparedSkills.nativeConfiguration,
+        ...(runtime.effort === undefined ? {} : { model_reasoning_effort: runtime.effort }),
+        service_tier: runtime.fastMode ? "fast" : null
+      }, context, providerId, modelId);
       const response = await this.#resumeNativeThread(
         { ...this.#scopeForRuntime(runtime), assertCurrent: () => { assertCurrent(); nativeSkills?.assertCurrent(); } },
         runtime.threadId,
@@ -3578,10 +3724,11 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         generation,
         { providerId, modelId },
         route,
-        preparedSkills.nativeConfiguration,
+        nativeConfiguration,
         smartRoute,
         context.appendSystemPrompt,
-        nativeAuthenticationAdmission
+        nativeAuthenticationAdmission,
+        runtime.permissionMode
       );
       assertCurrent();
       const record = objectValue(response.value, "route resume response");
@@ -3595,7 +3742,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         scope: this.#scopeForRuntime(runtime),
         thread: parseThreadResult(response.value), binding: runtime.binding, context, hostGeneration: generation,
         permissionMode: runtime.permissionMode, providerId, modelId, managedRoute: route, smartRoute,
-        mcp, nativeConfiguration: preparedSkills.nativeConfiguration, nativeSkills: preparedSkills.nativeSkills,
+        mcp, nativeConfiguration, nativeSkills: preparedSkills.nativeSkills,
         effort: runtime.effort, fastMode: runtime.fastMode, name: runtime.name,
         nativeAuthenticationAdmission
       });
@@ -3923,7 +4070,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       this.#sessions.delete(input.context.sessionId);
       this.#cancelPendingServerRequests(previous);
       await this.#releaseRuntimeSubscription(previous, false);
-      await previous.nativeSkills?.dispose();
+      if (!previous.remote || previous.nativeSkills !== undefined && this.#releasedRemoteSkillSnapshots.has(previous.nativeSkills)) await previous.nativeSkills?.dispose();
       this.#assertNativeAuthenticationAdmission(input.nativeAuthenticationAdmission);
     }
     const state = createTranslatorState(input.thread.id);
@@ -3953,6 +4100,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       host: input.scope.host,
       profileKey: input.scope.profileKey,
       remote: input.scope.remote,
+      ...(input.scope.prepareNativeSkills === undefined ? {} : { prepareNativeSkills: input.scope.prepareNativeSkills }),
       nativeAuthenticationAdmission: input.nativeAuthenticationAdmission,
       assertExecutionCurrent: input.scope.assertAuthorityCurrent,
       managedRoute: input.managedRoute,
@@ -3976,6 +4124,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       nativeTasks,
       ...(input.mcp === undefined ? {} : { mcp: input.mcp }),
       mcpPending: input.mcpPending === true,
+      workingContextWindow: typeof input.nativeConfiguration?.["model_context_window"] === "number"
+        ? input.nativeConfiguration["model_context_window"] : undefined,
       ...(input.nativeConfiguration === undefined ? {} : { nativeConfiguration: input.nativeConfiguration }),
       ...(input.nativeSkills === undefined ? {} : { nativeSkills: input.nativeSkills }),
       ...(nativeMemoryDirectory === undefined ? {} : { nativeMemoryDirectory }),
@@ -4788,15 +4938,42 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const flight = runtime.subscriptionFlight;
       const subscription = runtime.subscription ?? (flight === undefined ? undefined : await flight.catch(() => undefined));
       runtime.subscriptionFlight = undefined;
-      if (subscription === undefined) return;
-      runtime.subscription = subscription;
-      await subscription.release({ unsubscribe });
+      if (subscription !== undefined) {
+        runtime.subscription = subscription;
+        await subscription.release({ unsubscribe: unsubscribe && !(runtime.remote && runtime.nativeSkills !== undefined) });
+      }
+      if (unsubscribe && runtime.remote && runtime.nativeSkills !== undefined) {
+        runtime.assertExecutionCurrent();
+        if (!runtime.host.isActiveGeneration(runtime.hostGeneration)) throw remoteRuntimeStale();
+        await runtime.host.releaseUnboundThread(runtime.threadId, runtime.hostGeneration);
+        runtime.assertExecutionCurrent();
+        if (!runtime.host.isActiveGeneration(runtime.hostGeneration)) throw remoteRuntimeStale();
+        this.#releasedRemoteSkillSnapshots.add(runtime.nativeSkills);
+      }
     } finally {
-      if (unsubscribe) await runtime.nativeSkills?.dispose();
+      if (unsubscribe && (!runtime.remote || runtime.nativeSkills !== undefined && this.#releasedRemoteSkillSnapshots.has(runtime.nativeSkills))) await runtime.nativeSkills?.dispose();
       if (runtime.reviewWorkingDirectory !== undefined) {
         await removeReviewWorkingDirectory(runtime.reviewWorkingDirectory);
       }
     }
+  }
+
+  async #disposePreparedSkillsAfterNativeRelease(scope: CodexReadScope, threadId: string, generation: number,
+    snapshot: NativeSkillSnapshot | undefined): Promise<void> {
+    if (snapshot === undefined) return;
+    if (scope.remote) {
+      try {
+        scope.assertCurrent();
+        if (!scope.host.isActiveGeneration(generation)) return;
+        await scope.host.releaseUnboundThread(threadId, generation);
+        scope.assertCurrent();
+        if (!scope.host.isActiveGeneration(generation)) return;
+      } catch {
+        // The remote factory retains this exact mount when native release is unknown.
+        return;
+      }
+    }
+    await snapshot.dispose();
   }
 
   async #reconcileClientMessage(
@@ -5329,6 +5506,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   #capabilities(installed: boolean): ReadonlyMap<string, Capability> {
     const supported = new Set<KnownCapability>([
+      "model.working_context",
       "session.discovery",
       "session.catalog",
       "session.preview",
@@ -5359,7 +5537,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       "interaction.question"
     ]);
     if (this.#managedProviders !== undefined) supported.add("provider.managed_catalog");
-    if (this.#resolveNativeSkills !== undefined) supported.add("runtime.resources");
+    if (this.#resolveNativeSkills !== undefined) { supported.add("runtime.resources"); supported.add("runtime.commands"); }
     if (this.#resolveNativeMemoryEnabled !== undefined && supportsNativeMemoryRuntime(this.#host)) {
       supported.add("memory.native");
     }
@@ -5414,7 +5592,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         ...(key === "permission.modes" ? { options: ["ask", "auto", "bypassPermissions"] } : {}),
         ...(key === "runtime.resources" && available ? { options: ["skill"] } : {}),
         ...(key === "input.mention" && available
-          ? { options: ["workspace_file", ...(this.#resolvers.resolveArtifactMention === undefined ? [] : ["artifact"])] }
+          ? { options: ["workspace_file", ...(this.#resolvers.resolveArtifactMention === undefined ? [] : ["artifact"]),
+              ...(this.#resolveNativeSkills === undefined ? [] : ["resource"])] }
           : {}),
         ...(key === "provider.login" && this.#account?.supportsLogin === true
           ? { options: [...this.#account.loginMethods] }
@@ -5886,6 +6065,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
   }
+}
+
+function skillMentionUnavailable(): JokoError {
+  return adapterError({ code: "CODEX_SKILL_MENTION_UNAVAILABLE",
+    message: "The selected Skill is unavailable in this task's current native runtime.",
+    phase: "dispatch", recovery: "Refresh the task's Skill catalog and explicitly select the Skill again." });
 }
 
 function managedRouteUnavailable(stateMayHaveChanged = false): JokoError {
@@ -6881,6 +7066,14 @@ function equalNativePaths(left: string, right: string): boolean {
     : normalizedLeft === normalizedRight;
 }
 
+function equalSkillPaths(left: string, right: string, remote: boolean): boolean {
+  return remote ? left === right : equalNativePaths(left, right);
+}
+
+function validSkillPath(path: string, remote: boolean): boolean {
+  return remote ? isNormalizedAbsoluteRemotePath(path, "posix") : isAbsolute(path);
+}
+
 function smartRouteUnavailable(stateMayHaveChanged = false): JokoError {
   return adapterError({
     code: stateMayHaveChanged ? "CODEX_SMART_ROUTING_UNKNOWN" : "CODEX_SMART_ROUTING_UNAVAILABLE",
@@ -7552,8 +7745,20 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
     modelId: model.model,
     displayName: model.displayName,
     api: "openai-responses",
+    referenceApi: "openai-responses",
+    protocolMode: "matching",
+    ...(model.description === undefined ? {} : { description: model.description }),
+    ...(model.defaultReasoningEffort === undefined ? {} : { defaultEffort: model.defaultReasoningEffort }),
+    ...(model.inputModalitiesDeclared !== true ? {} : {
+      declaredInputModalities: [...model.inputModalities],
+      declaredSupportsImages: model.inputModalities.includes("image")
+    }),
+    ...(model.serviceTiersDeclared !== true ? {} : {
+      declaredSupportsFastMode: model.serviceTiers.some((tier) => tier.id === "fast" || tier.id === "priority")
+    }),
     contextWindow: estimate?.contextWindow ?? 0,
     maxOutputTokens: estimate?.maximumOutputTokens ?? 0,
+    ...(estimate === undefined ? {} : { contextWindowSource: "estimated" as const, maxOutputTokensSource: "estimated" as const }),
     supportsImages: model.inputModalities.includes("image"),
     defaultVisible: estimate?.defaultVisible ?? !model.hidden,
     supportsFastMode: model.serviceTiers.some((tier) => tier.id === "fast" || tier.id === "priority")
@@ -7577,6 +7782,28 @@ function modelFromNative(model: NativeModel, providerId: string): ProviderModel 
       }
     })
   };
+}
+
+function resolveWorkingContext(context: AdapterContext, providerId: string | undefined, modelId: string | undefined): number | undefined {
+  if (providerId === undefined || modelId === undefined) return undefined;
+  const value = context.resolveModelWorkingContext?.({ providerId, modelId });
+  if (value !== undefined && (!Number.isSafeInteger(value) || value < 1_000 || value > 100_000_000)) {
+    throw adapterError({ code: "CODEX_WORKING_CONTEXT_INVALID", message: "The committed model working context is invalid.", phase: "provision", recovery: "Reload the committed model configuration." });
+  }
+  return value;
+}
+
+function workingContextConfiguration(configuration: JsonObject | undefined, context: AdapterContext,
+  providerId: string | undefined, modelId: string | undefined): JsonObject {
+  const result = { ...configuration };
+  delete result["model_context_window"];
+  delete result["model_auto_compact_token_limit"];
+  const tokens = resolveWorkingContext(context, providerId, modelId);
+  if (tokens !== undefined) {
+    result["model_context_window"] = tokens;
+    result["model_auto_compact_token_limit"] = Math.floor(tokens * 0.9);
+  }
+  return result;
 }
 
 function isFastServiceTier(value: JsonValue | undefined): boolean {

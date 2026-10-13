@@ -77,6 +77,27 @@ enum ManagedModelRuntimeErrorCode {
   MANAGED_MODEL_RUNTIME_ERROR_CODE_RUNTIME_ERROR = 19;
 }
 
+enum ManagedModelRuntimeStartupPolicy {
+  MANAGED_MODEL_RUNTIME_STARTUP_POLICY_UNSPECIFIED = 0;
+  MANAGED_MODEL_RUNTIME_STARTUP_POLICY_EXPLICIT = 1;
+  MANAGED_MODEL_RUNTIME_STARTUP_POLICY_ON_USE = 2;
+}
+
+enum ManagedModelRuntimeConfigureBlockedReason {
+  MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_UNSPECIFIED = 0;
+  MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_OWNED_ELSEWHERE = 1;
+  MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_OWNERSHIP_UNKNOWN = 2;
+  MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_OPERATION_BUSY = 3;
+  MANAGED_MODEL_RUNTIME_CONFIGURE_BLOCKED_REASON_STOP_UNCONFIRMED = 4;
+}
+
+enum ManagedRepositoryDownloadAction {
+  MANAGED_REPOSITORY_DOWNLOAD_ACTION_UNSPECIFIED = 0;
+  MANAGED_REPOSITORY_DOWNLOAD_ACTION_PAUSE = 1;
+  MANAGED_REPOSITORY_DOWNLOAD_ACTION_RESUME = 2;
+  MANAGED_REPOSITORY_DOWNLOAD_ACTION_CANCEL = 3;
+}
+
 message ManagedModelRuntimeCapabilities {
   bool can_install = 1;
   bool can_cancel_install = 2;
@@ -90,6 +111,36 @@ message ManagedModelRuntimeCapabilities {
   bool supports_custom_models = 10;
   bool supports_curated_catalog = 11;
   bool supports_model_preflight = 12;
+  bool can_configure = 13;
+  bool can_stop = 14;
+  bool can_restart = 15;
+  bool supports_repository_models = 16;
+  ManagedModelRuntimeStartupPolicy startup_policy = 17;
+}
+
+message ManagedRepositoryModel {
+  string repository = 1;
+  string file = 2;
+}
+
+message ManagedModelRuntimeProviderRoute {
+  string backend_id = 1;
+  string provider_id = 2;
+}
+
+message ManagedModelRuntimeHostProfile {
+  string platform = 1;
+  string arch = 2;
+  uint64 total_memory_bytes = 3;
+  uint32 memory_gb = 4;
+  bool apple_silicon = 5;
+  string chip = 6;
+}
+
+message ManagedModelRuntimeRepositoryVariant {
+  ManagedRepositoryModel repository_model = 1;
+  string quantization = 2;
+  uint64 size_bytes = 3;
 }
 
 message ManagedModelRuntimePreflight {
@@ -108,6 +159,7 @@ message ManagedModelRuntimeModel {
   bool supports_tools = 5;
   bool supports_images = 6;
   string required_runtime_version = 7;
+  ManagedRepositoryModel repository_model = 8;
 }
 
 message ManagedModelRuntimeCatalogModel {
@@ -119,6 +171,9 @@ message ManagedModelRuntimeCatalogModel {
   bool platform_limited = 6;
   bool recommended = 7;
   ManagedModelRuntimePreflight preflight = 8;
+  repeated string aliases = 9;
+  map<string, string> descriptions = 10;
+  repeated ManagedModelRuntimeRepositoryVariant variants = 11;
 }
 
 message ManagedModelRuntimeTransfer {
@@ -131,6 +186,8 @@ message ManagedModelRuntimeTransfer {
   optional uint64 bytes_per_second = 7;
   bool done = 8;
   ManagedModelRuntimeErrorCode error_code = 9;
+  ManagedRepositoryModel repository_model = 10;
+  string transfer_id = 11;
 }
 
 message ManagedModelRuntime {
@@ -147,7 +204,80 @@ message ManagedModelRuntime {
   ManagedModelRuntimeErrorCode error_code = 11;
   string error_message = 12;
   EntityVersion entity_version = 13;
+  repeated ManagedModelRuntimeProviderRoute provider_routes = 14;
+  ManagedModelRuntimeHostProfile host_profile = 15;
+  ManagedModelRuntimeConfigureBlockedReason configure_blocked_reason = 16;
 }
+
+message EnsureManagedModelRuntimeProviderRequest { string runtime_id = 1; }
+message EnsureManagedModelRuntimeProviderResponse { ManagedModelRuntime runtime = 1; }
+message StopManagedModelRuntimeRequest { string runtime_id = 1; }
+message StopManagedModelRuntimeResponse { ManagedModelRuntime runtime = 1; }
+message RestartManagedModelRuntimeRequest { string runtime_id = 1; }
+message RestartManagedModelRuntimeResponse { ManagedModelRuntime runtime = 1; }
+
+message ListManagedModelRepositoryFilesRequest {
+  string runtime_id = 1;
+  string repository = 2;
+}
+message ManagedModelRepositoryFile {
+  string file = 1;
+  uint64 size_bytes = 2;
+}
+message ListManagedModelRepositoryFilesResponse {
+  string repository = 1;
+  string source_revision = 2;
+  repeated ManagedModelRepositoryFile files = 3;
+}
+message DownloadManagedRepositoryModelRequest {
+  string runtime_id = 1;
+  ManagedRepositoryModel repository_model = 2;
+}
+message DownloadManagedRepositoryModelResponse { ManagedModelRuntime runtime = 1; }
+message ControlManagedRepositoryDownloadRequest {
+  string runtime_id = 1;
+  string transfer_id = 2;
+  ManagedRepositoryModel repository_model = 3;
+  ManagedRepositoryDownloadAction action = 4;
+}
+message ControlManagedRepositoryDownloadResponse { ManagedModelRuntime runtime = 1; }
+
+message ManagedModelRuntimeModelTarget {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+  ManagedRepositoryModel repository_model = 4;
+}
+message ManagedModelContext {
+  ManagedModelRuntimeModelTarget target = 1;
+  uint64 default_context_window_tokens = 2;
+  uint64 effective_context_window_tokens = 3;
+  uint64 maximum_context_window_tokens = 4;
+  repeated uint64 presets = 5;
+  bool customized = 6;
+  bool can_configure = 7;
+  bool pending_apply = 8;
+  bool mixed = 9;
+}
+message GetManagedModelContextRequest {
+  string runtime_id = 1;
+  ManagedModelRuntimeModelTarget target = 2;
+  repeated ManagedModelRuntimeModelTarget related_targets = 3;
+}
+message GetManagedModelContextResponse { ManagedModelContext context = 1; }
+message SetManagedModelContextRequest {
+  string runtime_id = 1;
+  ManagedModelRuntimeModelTarget target = 2;
+  uint64 context_window_tokens = 3;
+  repeated ManagedModelRuntimeModelTarget related_targets = 4;
+}
+message SetManagedModelContextResponse { ManagedModelContext context = 1; }
+message ResetManagedModelContextRequest {
+  string runtime_id = 1;
+  ManagedModelRuntimeModelTarget target = 2;
+  repeated ManagedModelRuntimeModelTarget related_targets = 3;
+}
+message ResetManagedModelContextResponse { ManagedModelContext context = 1; }
 
 message ListManagedModelRuntimesRequest {}
 

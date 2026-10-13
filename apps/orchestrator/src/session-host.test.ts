@@ -97,6 +97,7 @@ import {
 import { materializedSessionRuntimeState, SESSION_RUNTIME_STATE_SETTING_KEY } from "./session-runtime-state.js";
 import { materializedRuntimeCommands, SESSION_RUNTIME_COMMANDS_SETTING_KEY } from "./runtime-command-state.js";
 import { providerRateLimitSettingKey } from "./provider-rate-limit.js";
+import { MANAGED_GGUF_PROVIDER_ID } from "./managed-gguf-provider.js";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -966,6 +967,63 @@ describe("SessionHost", () => {
     fixture.host.requestQueueDrain(destinationSessionId);
     await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "failed");
     expect(adapter.inputs).toEqual([]);
+  });
+
+  it.each(["catalog", "attempt", "provider"] as const)("C109 retains the original resource admission until native dispatch after %s retirement", async (retirement) => {
+    const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, capabilities: [
+      ...PI_LIKE_PROFILE.capabilities.filter(value => value.key !== "input.mention" && value.key !== "runtime.resources"),
+      { key: "runtime.resources", supported: true, options: ["skill"] },
+      { key: "input.mention", supported: true, options: ["resource"] }
+    ] });
+    const f = await createFixture(adapter);
+    vi.spyOn(adapter, "getResources").mockImplementation(async context => [{
+      id: "approved-report", kind: "skill", name: "Report", source: "managed", state: "loaded",
+      revision: "sha256:approved", resourceVersion: 5n, runtimeGeneration: context.generation
+    }]);
+    const sessionId = (await f.host.createSession({ operationId: `c109-create-${retirement}`, connection: f.connection,
+      targetId: "target-one", title: "Report", permissionMode: "ask", fastMode: false, planMode: false })).value.sessionId;
+    const catalog = await f.host.getSessionResourceCatalog(sessionId);
+    const mention = { kind: "resource" as const, reference: "approved-report", label: "Report", discoveredRevision: "sha256:approved",
+      resourceVersion: "5", runtimeGeneration: catalog.runtimeGeneration };
+    let dispatchedContext: AdapterContext | undefined;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const consume = vi.fn(adapter.send.bind(adapter));
+    vi.spyOn(adapter, "send").mockImplementation(async (input, context) => {
+      dispatchedContext = context;
+      context.assertResourceMentionCurrent!(mention);
+      await gate;
+      context.assertResourceMentionCurrent!(mention);
+      await consume(input, context);
+    });
+    const admitted = f.host.enqueueInput({ operationId: `c109-send-${retirement}`, connection: f.connection, sessionId,
+      prompt: { text: "Use @Report", images: [], files: [], mentions: [mention], disposition: "prompt",
+        mentionRanges: [{ start: 4, end: 11, mentionIndex: 0 }] } }).value;
+    try {
+      await eventually(() => dispatchedContext !== undefined);
+      expect(f.store.getQueueItem(admitted.queueItemId).state).toBe("dispatching");
+      expect(() => dispatchedContext!.assertResourceMentionCurrent!({ ...mention, resourceVersion: "6" })).toThrow(/admission/u);
+      if (retirement === "catalog") f.host.fenceBackendResourceCatalogs(adapter.id);
+      else if (retirement === "attempt") f.store.finishAttempt(f.store.getQueueItem(admitted.queueItemId).attemptId!);
+      else f.store.upsertBackend({ ...f.store.getBackend(adapter.id).descriptor, authenticationState: "signed_out" });
+      expect(() => dispatchedContext!.assertResourceMentionCurrent!(mention)).toThrow();
+    } finally { release(); }
+    await eventually(() => f.store.getQueueItem(admitted.queueItemId).state === "failed");
+    expect(consume).not.toHaveBeenCalled();
+  });
+
+  it("C109 captures a resource directory proof without adopting a later binding generation", async () => {
+    const f = await createFixture();
+    vi.spyOn(f.adapter, "getResources").mockResolvedValue([]);
+    const sessionId = (await f.host.createSession({ operationId: "c109-empty-catalog", connection: f.connection,
+      targetId: "target-one", title: "Catalog", permissionMode: "ask", fastMode: false, planMode: false })).value.sessionId;
+    const catalog = await f.host.getSessionResourceCatalog(sessionId);
+    expect(catalog.resources).toEqual([]);
+    expect(() => catalog.assertCurrent()).not.toThrow();
+    const stored = f.store.getSession(sessionId);
+    f.store.updateSession(sessionId, { binding: { ...stored.descriptor.binding, generation: catalog.runtimeGeneration + 1 } }, stored.revision);
+    expect(() => catalog.assertCurrent()).toThrow(/observation has retired/u);
+    expect(catalog.runtimeGeneration).toBe(stored.descriptor.binding.generation);
   });
 
   it("admits only an exact resource identity from this task's current live catalog", async () => {
@@ -5024,6 +5082,156 @@ describe("SessionHost", () => {
       rpcEventType: "extension_command_completed",
       payload: { case: "diagnostic", value: { nativeEventType: "extension_command_completed" } }
     });
+  });
+
+  it("refreshes working contexts only on exact idle active routes and never activates sleeping sessions", async () => {
+    const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "model.working_context", supported: true }] };
+    const adapter = new SettingsTrackingFakeAdapter(); Object.assign(adapter, { describe: async () => new FakeBackendAdapter(profile).describe() });
+    const refresh = vi.fn(async (context: AdapterContext) => { expect(context.resolveModelWorkingContext?.({ providerId: "test", modelId: "text" })).toBe(64000); });
+    Object.assign(adapter, { refreshModelWorkingContext: refresh });
+    const fixture = await createFixture(adapter, { resolveModelWorkingContext: () => 64000 });
+    const createSession = async (id: string) => (await fixture.host.createSession({ operationId: id, connection: fixture.connection, targetId: "target-one", title: id,
+      providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const active = await createSession("working-active"), sleeping = await createSession("working-sleeping");
+    await fixture.host.closeIfActive(sleeping); const resumes = adapter.resumeCalls;
+    const current = vi.fn(); await fixture.host.refreshModelWorkingContexts([{ backendId: adapter.id, providerId: "test", modelId: "text" }], current);
+    expect(refresh).toHaveBeenCalledTimes(1); expect(refresh).toHaveBeenCalledWith(expect.objectContaining({ sessionId: active })); expect(adapter.resumeCalls).toBe(resumes);
+    await fixture.host.refreshModelWorkingContexts([{ backendId: adapter.id, providerId: "test", modelId: "other" }], current);
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps every route budget captured while a turn is active and uses the exact next-turn override after editing", async () => {
+    const adapter = new SendCountingFakeAdapter(PROVIDER_AUTH_FENCE_PROFILE), gate = new AsyncGate();
+    let budget = 32000; let firstContext: AdapterContext | undefined;
+    const send = adapter.send.bind(adapter);
+    Object.assign(adapter, { send: async (input: PromptInput, context: AdapterContext) => {
+      if (firstContext === undefined) { firstContext = context; gate.enter(); await gate.wait; }
+      expect(context.resolveModelWorkingContext?.({ providerId: "provider-b", modelId: "model-b" })).toBe(budget);
+      return send(input, context);
+    } });
+    const fixture = await createFixture(adapter, { resolveModelWorkingContext: () => budget });
+    const sessionId = (await fixture.host.createSession({ operationId: "working-capture-create", connection: fixture.connection, targetId: "target-one", title: "Budget capture",
+      providerId: "provider-a", modelId: "model-a", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const first = fixture.host.enqueueInput({ operationId: "working-capture-send", connection: fixture.connection, sessionId,
+      prompt: { text: "capture", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await gate.entered; budget = 64000;
+    try {
+      expect(firstContext!.resolveModelWorkingContext?.({ providerId: "provider-b", modelId: "model-b" })).toBe(32000);
+      const inspect = vi.spyOn(adapter, "inspectSession"); await fixture.host.inspect(sessionId);
+      expect(inspect.mock.calls.at(-1)?.[1].resolveModelWorkingContext?.({ providerId: "provider-b", modelId: "model-b" })).toBe(32000);
+      const refresh = vi.fn(); Object.assign(adapter, { refreshModelWorkingContext: refresh });
+      await fixture.host.refreshModelWorkingContexts([{ backendId: adapter.id, providerId: "provider-a", modelId: "model-a" }], () => {}); expect(refresh).not.toHaveBeenCalled();
+    } finally { budget = 32000; gate.release(); }
+    await eventually(() => fixture.store.getRun(first.value.runId).descriptor.state === "completed"); budget = 64000;
+    const next = fixture.host.enqueueInput({ operationId: "working-capture-next", connection: fixture.connection, sessionId, overrides: { providerId: "provider-b", modelId: "model-b" },
+      prompt: { text: "next", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(next.value.runId).descriptor.state === "completed");
+    expect(adapter.sendCalls).toBe(2);
+  });
+
+  it("keeps joined steer and follow-up contexts on the active native turn budget", async () => {
+    const adapter = new SingleSettlementFakeAdapter(); let budget = 32000;
+    const send = vi.spyOn(adapter, "send"), fixture = await createFixture(adapter, { resolveModelWorkingContext: () => budget });
+    const sessionId = (await fixture.host.createSession({ operationId: "working-steer-create", connection: fixture.connection, targetId: "target-one", title: "Steer budget",
+      providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const enqueue = (id: string, disposition: PromptInput["disposition"]) => fixture.host.enqueueInput({ operationId: id, connection: fixture.connection, sessionId,
+      prompt: { text: id, images: [], files: [], mentions: [], disposition } });
+    const prompt = enqueue("working-steer-prompt", "prompt"); await eventually(() => fixture.store.getQueueItem(prompt.value.queueItemId).state === "backend_accepted"); budget = 64000;
+    const steer = enqueue("working-steer-input", "steer"), follow = enqueue("working-steer-follow", "follow_up");
+    await eventually(() => [steer, follow].every(item => fixture.store.getQueueItem(item.value.queueItemId).state === "backend_accepted"));
+    expect(send.mock.calls.map(call => call[1].resolveModelWorkingContext?.({ providerId: "test", modelId: "text" }))).toEqual([32000, 32000, 32000]);
+    await adapter.settle(sessionId); await eventually(() => [prompt, steer, follow].every(item => fixture.store.getRun(item.value.runId).descriptor.state === "completed"));
+    const next = enqueue("working-steer-next", "prompt"); await eventually(() => fixture.store.getQueueItem(next.value.queueItemId).state === "backend_accepted");
+    expect(send.mock.calls.at(-1)?.[1].resolveModelWorkingContext?.({ providerId: "test", modelId: "text" })).toBe(64000);
+    await adapter.settle(sessionId);
+  });
+
+  it("rejects a late working-context refresh when its settings observation retires", async () => {
+    const profile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities, { key: "model.working_context", supported: true }] };
+    const adapter = new FakeBackendAdapter(profile), gate = new AsyncGate(); let current = true;
+    Object.assign(adapter, { refreshModelWorkingContext: async () => { gate.enter(); await gate.wait; } });
+    const fixture = await createFixture(adapter, { resolveModelWorkingContext: () => 64000 });
+    await fixture.host.createSession({ operationId: "working-late-create", connection: fixture.connection, targetId: "target-one", title: "Late settings",
+      providerId: "test", modelId: "text", fastMode: false, permissionMode: "ask", planMode: false });
+    const pending = fixture.host.refreshModelWorkingContexts([{ backendId: adapter.id, providerId: "test", modelId: "text" }], () => { if (!current) throw new Error("Settings retired"); });
+    await gate.entered; current = false; gate.release(); await expect(pending).rejects.toThrow("Settings retired");
+  });
+
+  it.each(["ordinary", "fenced"] as const)("awaits managed runtime readiness after durable admission before %s Backend send", async mode => {
+    const adapter = new SendCountingFakeAdapter(), gate = new AsyncGate();
+    const fenced = vi.fn(async (input: PromptInput, context: AdapterContext) => adapter.send(input, context));
+    if (mode === "fenced") Object.assign(adapter, { sendWithDurableNativeDispatchFence: fenced });
+    const prepare = vi.fn(async (_context: AdapterContext) => { gate.enter(); await gate.wait; });
+    const fixture = await createFixture(adapter, { prepareManagedProviderRuntime: prepare });
+    const sessionId = (await fixture.host.createSession({ operationId: `managed-ready-${mode}`, connection: fixture.connection,
+      targetId: "target-one", title: "Managed runtime readiness", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const queued = fixture.host.enqueueInput({ operationId: `managed-ready-send-${mode}`, connection: fixture.connection, sessionId,
+      prompt: { text: "await local readiness", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await gate.entered;
+    try {
+      expect(fixture.store.getQueueItem(queued.value.queueItemId).state).toBe("dispatching");
+      expect(fixture.store.getRun(queued.value.runId).descriptor).toMatchObject({ id: queued.value.runId });
+      expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ sessionId, operationId: `managed-ready-send-${mode}` }));
+      expect(adapter.sendCalls).toBe(0); expect(fenced).not.toHaveBeenCalled();
+    } finally { gate.release(); }
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    expect(adapter.sendCalls).toBe(1); expect(fenced).toHaveBeenCalledTimes(mode === "fenced" ? 1 : 0);
+  });
+
+  it("records a definite managed runtime preparation failure without dispatching Backend input", async () => {
+    const adapter = new SendCountingFakeAdapter();
+    const fixture = await createFixture(adapter, { prepareManagedProviderRuntime: async () => { throw new Error("Local runtime unavailable"); } });
+    const sessionId = (await fixture.host.createSession({ operationId: "managed-ready-failure", connection: fixture.connection,
+      targetId: "target-one", title: "Managed runtime preparation failure", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const queued = fixture.host.enqueueInput({ operationId: "managed-ready-failed-send", connection: fixture.connection, sessionId,
+      prompt: { text: "do not send", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "failed");
+    expect(fixture.store.getQueueItem(queued.value.queueItemId)).toMatchObject({ state: "failed",
+      error: { code: "BACKEND_DISPATCH_FAILED", stateMayHaveChanged: false } });
+    expect(fixture.store.getAttempt(queued.value.attemptId).descriptor).toMatchObject({ endedAt: expect.any(Number),
+      error: { code: "BACKEND_DISPATCH_FAILED", stateMayHaveChanged: false } });
+    expect(adapter.sendCalls).toBe(0);
+  });
+
+  it("rejects late managed runtime readiness after its exact Provider admission is retired", async () => {
+    const adapter = new ProviderAuthFenceFakeAdapter(), gate = new AsyncGate();
+    const availableProviderIds = new Set(["provider-a", "provider-b"]);
+    const fixture = await createFixture(adapter, { prepareManagedProviderRuntime: async () => { gate.enter(); await gate.wait; },
+      sessionRuntimeFallbackContext: () => ({ availableProviderIds }) });
+    const sessionId = (await fixture.host.createSession({ operationId: "managed-ready-retirement", connection: fixture.connection,
+      targetId: "target-one", title: "Managed readiness retirement", providerId: "provider-a", modelId: "model-a",
+      fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const queued = fixture.host.enqueueInput({ operationId: "managed-ready-retired-send", connection: fixture.connection, sessionId,
+      prompt: { text: "retire while waiting", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await gate.entered; availableProviderIds.delete("provider-a");
+    fixture.host.fenceBackendProviderAuthentication(adapter.id, "provider-a"); gate.release();
+    await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "failed");
+    expect(fixture.store.getQueueItem(queued.value.queueItemId)).toMatchObject({ state: "failed",
+      error: { code: "BACKEND_PROVIDER_AUTHENTICATION_REQUIRED", stateMayHaveChanged: false } });
+    expect(adapter.sendCalls).toBe(0);
+  });
+
+  it.each([
+    { direction: "ordinary to managed local", baselineProvider: "provider-a", baselineModel: "model-a", providerId: MANAGED_GGUF_PROVIDER_ID, modelId: "model-b" },
+    { direction: "managed local to ordinary", baselineProvider: MANAGED_GGUF_PROVIDER_ID, baselineModel: "model-b", providerId: "provider-a", modelId: "model-a" }
+  ])("prepares the exact effective turn override for $direction without changing the existing Adapter context", async ({ baselineProvider, baselineModel, providerId, modelId }) => {
+    const profile = { ...PROVIDER_AUTH_FENCE_PROFILE, models: PROVIDER_AUTH_FENCE_PROFILE.models.map(model => model.providerId === "provider-b"
+      ? { ...model, providerId: MANAGED_GGUF_PROVIDER_ID } : model) };
+    const adapter = new SendCountingFakeAdapter(profile), readinessForLocal = vi.fn();
+    const send = vi.spyOn(adapter, "send"), prepare = vi.fn(async (context: AdapterContext) => {
+      if (context.modelSelection?.providerId === MANAGED_GGUF_PROVIDER_ID) readinessForLocal(context.modelSelection.modelId);
+    });
+    const fixture = await createFixture(adapter, { prepareManagedProviderRuntime: prepare });
+    const sessionId = (await fixture.host.createSession({ operationId: `managed-override-create-${providerId}`, connection: fixture.connection,
+      targetId: "target-one", title: "Managed runtime effective turn", providerId: baselineProvider, modelId: baselineModel,
+      fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const queued = fixture.host.enqueueInput({ operationId: `managed-override-send-${providerId}`, connection: fixture.connection, sessionId,
+      overrides: { providerId, modelId }, prompt: { text: "use this turn route", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ modelSelection: { providerId, modelId } }));
+    expect(readinessForLocal).toHaveBeenCalledTimes(providerId === MANAGED_GGUF_PROVIDER_ID ? 1 : 0);
+    expect(send).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ modelSelection: { providerId: baselineProvider, modelId: baselineModel } }));
+    expect(fixture.store.getSession(sessionId).descriptor).toMatchObject({ providerId: baselineProvider, modelId: baselineModel });
   });
 
   it("returns from a paused drain without polling claimNextQueueItem", async () => {
@@ -13512,8 +13720,8 @@ describe("SessionHost", () => {
 
   it("persists normalized runtime commands and emits exactly once only when the live catalog changes", async () => {
     const adapter = new RuntimeCommandsFakeAdapter([
-      { name: "zeta", description: "Last", source: "prompt", path: "z.md", loaded: true },
-      { name: "alpha", description: "First", source: "skill", path: "a/SKILL.md", loaded: true }
+      { name: "zeta", description: "Last", source: "prompt", inputMode: "text", path: "z.md", loaded: true },
+      { name: "alpha", description: "First", source: "skill", inputMode: "text", path: "a/SKILL.md", loaded: true }
     ]);
     const fixture = await createFixture(adapter);
     const sessionId = (await fixture.host.createSession({
@@ -13561,8 +13769,8 @@ describe("SessionHost", () => {
       if (observation !== undefined) observationsAtPublication.push(observation);
     });
     adapter.commands = [
-      { name: "review", description: "Review", source: "extension", path: "review.ts", loaded: true },
-      { name: "alpha", description: "First", source: "skill", path: "a/SKILL.md", loaded: true }
+      { name: "review", description: "Review", source: "extension", inputMode: "text", path: "review.ts", loaded: true },
+      { name: "alpha", description: "First", source: "skill", inputMode: "text", path: "a/SKILL.md", loaded: true }
     ];
     await expect(fixture.host.getCommands(sessionId)).resolves.toEqual(adapter.commands);
     unsubscribe();
@@ -13624,7 +13832,7 @@ describe("SessionHost", () => {
 
   it("ignores a command observation that returns after its runtime generation is stale", async () => {
     const adapter = new RuntimeCommandsFakeAdapter([
-      { name: "before", description: "Before", source: "prompt", loaded: true }
+      { name: "before", description: "Before", source: "prompt", inputMode: "text", loaded: true }
     ]);
     const fixture = await createFixture(adapter);
     const sessionId = (await fixture.host.createSession({
@@ -13636,7 +13844,7 @@ describe("SessionHost", () => {
       permissionMode: "ask",
       planMode: false
     })).value.sessionId;
-    adapter.commands = [{ name: "after", description: "After", source: "prompt", loaded: true }];
+    adapter.commands = [{ name: "after", description: "After", source: "prompt", inputMode: "text", loaded: true }];
     const gate = adapter.holdNextCommands();
     const pending = fixture.host.getCommands(sessionId);
     await gate.entered;
@@ -13646,9 +13854,7 @@ describe("SessionHost", () => {
     }, stored.revision);
     gate.release();
 
-    await expect(pending).resolves.toEqual([
-      { name: "before", description: "Before", source: "prompt", loaded: true }
-    ]);
+    await expect(pending).rejects.toThrow();
     expect(materializedRuntimeCommands(fixture.store.getSetting(
       "session",
       sessionId,
@@ -13661,7 +13867,7 @@ describe("SessionHost", () => {
 
   it("keeps the durable catalog equal across host restart and generation refresh", async () => {
     const commands: readonly RuntimeCommand[] = [
-      { name: "review", description: "Review", source: "extension", path: "review.ts", loaded: true }
+      { name: "review", description: "Review", source: "extension", inputMode: "text", path: "review.ts", loaded: true }
     ];
     const fixture = await createFixture(new RuntimeCommandsFakeAdapter(commands));
     const sessionId = (await fixture.host.createSession({
@@ -14893,6 +15099,8 @@ async function createFixture(
     };
     readonly sessionRuntimeRecoveryDelayMs?: (attempt: number) => number;
     readonly backendDispatchBlocked?: (backendId: string) => boolean;
+    readonly prepareManagedProviderRuntime?: (context: AdapterContext) => Promise<void>;
+    readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string }) => number | undefined;
     readonly onBackendMayBeIdle?: (backendId: string) => void;
     readonly onServiceRunSettled?: (input: {
       readonly sessionId: string;

@@ -39,6 +39,11 @@ export class ScriptedRpcTransport implements RpcTransport {
     if (!this.#running) throw new TransportFault("not_started", "The scripted transport is not running.");
     if (options.signal?.aborted) throw new TransportFault("closed", "The scripted request was cancelled before dispatch.");
     options.beforeDispatch?.();
+    if (options.beforeDispatchAsync !== undefined) {
+      await options.beforeDispatchAsync(options.signal ?? new AbortController().signal);
+      if (!this.#running || options.signal?.aborted) throw new TransportFault("closed", "The scripted request retired during preparation.");
+      options.beforeDispatch?.();
+    }
     this.requests.push({ method, params, options });
     return this.#handler(method, params, options);
   }

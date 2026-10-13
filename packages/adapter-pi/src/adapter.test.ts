@@ -564,6 +564,58 @@ class ScriptedPiProcess extends EventEmitter {
 }
 
 describe("PiBackendAdapter", () => {
+  it("uses a process-private working context and compaction reserve while preserving the same binding and public capacity", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-working-context-")); const processes: ScriptedPiProcess[] = [];
+    let budget: number | undefined = 16_000;
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1",
+      providers: [{ id: "local", api: "openai-completions", baseUrl: "http://127.0.0.1:1234/v1", models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 2_048 }] }],
+      processFactory: spec => {
+        const child = new ScriptedPiProcess(spec);
+        const models = JSON.parse(readFileSync(join(spec.env["PI_CODING_AGENT_DIR"]!, "models.json"), "utf8"));
+        child.model.contextWindow = models.providers.local.models[0].contextWindow;
+        if (processes.length > 0) child.sessionId = processes[0]!.sessionId;
+        processes.push(child); return child as unknown as PiProcessHandle;
+      } });
+    const target: TargetDescriptor = { id: "working-target", backendId: adapter.id, displayName: "Working", workspaceRoot: directory, managed: true, trusted: true };
+    const base = { ...makeContext(target, []), resolveModelWorkingContext: () => budget };
+    try {
+      const binding = await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" }, base), bound = { ...base, binding };
+      const privateHome = processes[0]!.spec.env["PI_CODING_AGENT_DIR"]!;
+      expect(JSON.parse(await readFile(join(privateHome, "settings.json"), "utf8")).compaction.reserveTokens).toBe(32_768 - 12_000);
+      expect((await adapter.describe()).models.find(model => model.modelId === "test-model")!.contextWindow).toBe(32_768);
+      budget = 100_000_000; await adapter.refreshModelWorkingContext(bound);
+      expect(processes[0]!.exitCode).toBe(0);
+      expect(processes[1]!.sessionFile).toBe(binding.opaqueRef);
+      expect(processes[1]!.model.contextWindow).toBe(100_000_000);
+      expect((await adapter.inspectSession(binding, bound)).binding).toEqual(binding);
+      budget = undefined; await adapter.refreshModelWorkingContext(bound);
+      expect(processes[2]!.model.contextWindow).toBe(32_768);
+      expect(JSON.parse(await readFile(join(processes[2]!.spec.env["PI_CODING_AGENT_DIR"]!, "settings.json"), "utf8")).compaction.reserveTokens).toBe(0);
+    } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("retains a live Pi process fence when working context retirement is unconfirmed", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-working-retirement-")); const processes: ScriptedPiProcess[] = []; let budget = 12_000;
+    let permitExit = false;
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1", shutdownTimeoutMs: 10,
+      providers: [{ id: "local", api: "openai-completions", baseUrl: "http://127.0.0.1:1234/v1", models: [{ id: "test-model", contextWindow: 32_768 }] }],
+      processFactory: spec => {
+        const child = new ScriptedPiProcess(spec), original = child.kill.bind(child);
+        child.kill = signal => permitExit ? original(signal) : true;
+        if (processes.length > 0) child.sessionId = processes[0]!.sessionId;
+        processes.push(child); return child as unknown as PiProcessHandle;
+      } });
+    const target: TargetDescriptor = { id: "retirement-target", backendId: adapter.id, displayName: "Working", workspaceRoot: directory, managed: true, trusted: true };
+    const base = { ...makeContext(target, []), resolveModelWorkingContext: () => budget };
+    try {
+      const binding = await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" }, base), bound = { ...base, binding };
+      budget = 20_000; await expect(adapter.refreshModelWorkingContext(bound)).rejects.toBeDefined();
+      expect(processes).toHaveLength(1);
+      await expect(adapter.send({ text: "retained", images: [], files: [], mentions: [], disposition: "steer" }, bound)).rejects.toMatchObject({ publicError: { code: "PI_WORKING_CONTEXT_UNCONFIRMED" } });
+      permitExit = true; budget = 12_000; await adapter.refreshModelWorkingContext(bound);
+      expect(processes).toHaveLength(2); expect(processes[1]!.sessionFile).toBe(binding.opaqueRef);
+    } finally { permitExit = true; await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
   it("isolates explicit skills for an empty shelf while retaining the native policy bridge", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-pi-explicit-")); const specs: PiProcessSpec[] = [];
     const adapter = createPiAdapter({ agentHome: join(root, "agent"), sessionRoot: join(root, "sessions"), versionProbe: async () => "pi 99.99.99-latest-test",
@@ -2584,6 +2636,7 @@ describe("PiBackendAdapter", () => {
   });
 
   it("records an exact native Skill command outcome without command text or runtime paths", async () => {
+    let nativeProcess: ScriptedPiProcess | undefined;
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-skill-usage-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-skill-usage-workspace-"));
     const resources = await mkdtemp(join(tmpdir(), "joko-pi-skill-usage-resources-"));
@@ -2629,14 +2682,15 @@ describe("PiBackendAdapter", () => {
       },
       processFactory: (spec) => {
         const runtimeSkill = valuesForArgument(spec.args, "--skill")[0]!;
-        return new ScriptedPiProcess(spec, {
+        nativeProcess = new ScriptedPiProcess(spec, {
           commands: [{
             name: "review",
             description: "Run the managed review Skill",
             source: "skill",
             sourceInfo: { path: join(runtimeSkill, "SKILL.md"), scope: "temporary" }
           }]
-        }) as unknown as PiProcessHandle;
+        });
+        return nativeProcess as unknown as PiProcessHandle;
       }
     });
     const target: TargetDescriptor = {
@@ -2656,6 +2710,9 @@ describe("PiBackendAdapter", () => {
         fastMode: false,
         permissionMode: "ask"
       }, context);
+      expect(await adapter.getCommands({ ...context, binding })).toEqual([expect.objectContaining({
+        name: "review", resourceId: "native-review-skill", inputMode: "text", loaded: true
+      })]);
       await adapter.send({
         text: "/review private command detail",
         images: [],
@@ -2663,6 +2720,9 @@ describe("PiBackendAdapter", () => {
         mentions: [],
         disposition: "prompt"
       }, { ...context, binding });
+      expect(nativeProcess!.commands.findLast(command => command.type === "prompt")).toMatchObject({
+        message: "/review private command detail"
+      });
       await vi.waitFor(() => expect(events.some((event) =>
         event.type === "resource_usage" && event.source === "native_skill_command"
       )).toBe(true));
@@ -5358,10 +5418,10 @@ describe("PiBackendAdapter", () => {
 
   it("allows only live catalogued commands through prompt Composer input", () => {
     const commands = [
-      { name: "skill:review", description: "", source: "skill" as const, resourceId: "review-skill", loaded: true },
-      { name: "release-notes", description: "", source: "prompt" as const, loaded: true },
-      { name: "plan", description: "", source: "extension" as const, loaded: true },
-      { name: "unsafe-extension", description: "", source: "extension" as const, loaded: true }
+      { name: "skill:review", description: "", source: "skill" as const, inputMode: "text" as const, resourceId: "review-skill", loaded: true },
+      { name: "release-notes", description: "", source: "prompt" as const, inputMode: "text" as const, loaded: true },
+      { name: "plan", description: "", source: "extension" as const, inputMode: "text" as const, loaded: true },
+      { name: "unsafe-extension", description: "", source: "extension" as const, inputMode: "text" as const, loaded: true }
     ];
     const managedInternalNames = new Set(["plan", "joko-navigate-tree"]);
     expect(escapePiComposerSlashCommand("/skill:review now", commands)).toBe("/skill:review now");
@@ -6072,6 +6132,7 @@ describe("PiBackendAdapter", () => {
       name: "working",
       description: "Only one valid leaf",
       source: "prompt",
+      inputMode: "text",
       path: promptPath,
       loaded: true
     }])).toBe(false);

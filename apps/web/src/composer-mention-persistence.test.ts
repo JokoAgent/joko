@@ -5,6 +5,20 @@ import { plainTextToComposerDocument } from "./composer-quote-document.js";
 import type { ComposerDraft, ComposerMentionDraft, NewSessionLocalDraft } from "./model.js";
 
 describe("durable composer mention inventory", () => {
+  it("stores selected Skill slash occurrences with their exact Resource identity while rejecting slash tokens for other mention kinds", async () => {
+    const state = memoryLocalState();
+    const selected: ComposerDraft = { text: "/Release args @Earlier", deliveryMode: "prompt", attachments: [], mentions: [
+      { id: "selected", kind: "resource", reference: "opaque", label: "/Release", token: "/Release", discoveredRevision: "approved-revision", resourceVersion: "9", runtimeGeneration: 3 },
+      { id: "earlier", kind: "session", reference: "previous", label: "Earlier", token: "@Earlier" }
+    ], inlineMentionRanges: [{ mentionId: "selected", from: 0, to: 8 }, { mentionId: "earlier", from: 14, to: 22 }] };
+    await state.saveDraft("server", "profile", "session", selected);
+    expect(await state.readDraft("server", "profile", "session")).toMatchObject(selected);
+    const current = await state.readDraftSnapshot("server", "profile", "session");
+    await expect(state.saveDraftIfRevision("server", "profile", "session", { ...selected, mentions: [
+      { id: "selected", kind: "artifact", reference: "opaque", sourceSessionId: "previous", label: "/Release", token: "/Release" }, selected.mentions[1]!
+    ] }, current.revision)).rejects.toThrow("mention occurrences");
+    expect(await state.readDraft("server", "profile", "session")).toMatchObject(selected);
+  });
   it("atomically rejects stale replacement and rollback writes even when the draft text returns to its previous value", async () => {
     const state = memoryLocalState();
     const draft = { text: "Original", deliveryMode: "prompt" as const, mentions: [], attachments: [] };

@@ -131,7 +131,7 @@ describe("NewSessionPage typed slash commands", () => {
     await renderPage(onSubmit, {
       skillCapable: true,
       commands: [{
-        id: "runtime-learn", name: "learn", description: "Runtime learning", source: "skill", loaded: true
+        id: "runtime-learn", name: "learn", description: "Runtime learning", source: "skill", inputMode: "text", loaded: true
       }]
     });
     await edit("/learn runtime-owned", 20, false);
@@ -220,7 +220,7 @@ describe("NewSessionPage typed slash commands", () => {
   });
 
   it("lets the explicit Add action bypass a loaded /goal Skill, accepts an empty composer, and clears accepted draft media", async () => {
-    const runtimeGoal = { id: "goal-skill", name: "goal", description: "Runtime objective", source: "skill" as const, loaded: true, resourceId: "skill-goal" };
+    const runtimeGoal = { id: "goal-skill", name: "goal", description: "Runtime objective", source: "skill" as const, inputMode: "text" as const, loaded: true, resourceId: "skill-goal" };
     const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, owner: NewSessionSubmissionOwner) => {
       expect(owner.firstInputDisposition).toMatchObject({ kind: "objective", source: "dialog", action: "set", text: "Finish autonomously" });
       owner.onFirstInputAccepted?.({ kind: "sent", sessionId: "session-1" });
@@ -750,8 +750,8 @@ function snapshot(
       serverPath: "/workspace", trusted: true, dirty: false, revision: "workspace-1", entries: []
     }],
     commands: commands ?? [
-      { id: "review", name: "review", description: "Review changes", source: "backend", loaded: true },
-      { id: "replace", name: "replace", description: "Replace a run", source: "backend", loaded: true }
+      { id: "review", name: "review", description: "Review changes", source: "backend", inputMode: "text", loaded: true },
+      { id: "replace", name: "replace", description: "Replace a run", source: "backend", inputMode: "text", loaded: true }
     ]
   };
 }

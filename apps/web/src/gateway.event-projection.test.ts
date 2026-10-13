@@ -46,6 +46,7 @@ import {
   RunState,
   RuntimeRecoveryState,
   RuntimeCommandSource,
+  RuntimeCommandInputMode,
   SessionAttentionKind,
   SessionState,
   SnapshotInvalidationReason,
@@ -816,8 +817,8 @@ describe("incremental event projection", () => {
         { sessionId: "session-keep", backendId: "pi", targetId: "target", location: serviceNodeLocation, state: SessionState.IDLE }
       ],
       runtimeCommands: [
-        { commandId: "clear-old", sessionId: "session-clear", name: "old", source: RuntimeCommandSource.EXTENSION, loaded: true },
-        { commandId: "keep-command", sessionId: "session-keep", name: "keep", source: RuntimeCommandSource.EXTENSION, loaded: true }
+        { commandId: "clear-old", sessionId: "session-clear", name: "old", source: RuntimeCommandSource.EXTENSION, inputMode: RuntimeCommandInputMode.TEXT, loaded: true },
+        { commandId: "keep-command", sessionId: "session-keep", name: "keep", source: RuntimeCommandSource.EXTENSION, inputMode: RuntimeCommandInputMode.TEXT, loaded: true }
       ],
       timeline: [timelineEvent("session-clear", 1n), timelineEvent("session-keep", 2n)]
     });
@@ -852,8 +853,8 @@ describe("incremental event projection", () => {
         { sessionId: "session-retained", backendId: "pi", targetId: "target", location: serviceNodeLocation, state: SessionState.IDLE }
       ],
       runtimeCommands: [
-        { commandId: "pruned-command", sessionId: "session-pruned", name: "old", source: RuntimeCommandSource.EXTENSION, loaded: true },
-        { commandId: "retained-command", sessionId: "session-retained", name: "keep", source: RuntimeCommandSource.EXTENSION, loaded: true }
+        { commandId: "pruned-command", sessionId: "session-pruned", name: "old", source: RuntimeCommandSource.EXTENSION, inputMode: RuntimeCommandInputMode.TEXT, loaded: true },
+        { commandId: "retained-command", sessionId: "session-retained", name: "keep", source: RuntimeCommandSource.EXTENSION, inputMode: RuntimeCommandInputMode.TEXT, loaded: true }
       ],
       timeline: [timelineEvent("session-pruned", 1n), timelineEvent("session-retained", 2n)]
     });
@@ -1064,6 +1065,7 @@ describe("incremental event projection", () => {
           name: "review",
           description: "Review",
           source: RuntimeCommandSource.EXTENSION,
+          inputMode: RuntimeCommandInputMode.TEXT,
           loaded: true
         },
         {
@@ -1072,6 +1074,7 @@ describe("incremental event projection", () => {
           name: "old",
           description: "Old",
           source: RuntimeCommandSource.PROMPT,
+          inputMode: RuntimeCommandInputMode.TEXT,
           loaded: true
         }
       ]
@@ -1093,6 +1096,8 @@ describe("incremental event projection", () => {
               name: "new",
               description: "New",
               source: RuntimeCommandSource.SKILL,
+              inputMode: RuntimeCommandInputMode.RESOURCE_MENTION,
+              resourceId: "approved-skill",
               loaded: true
             }]
           }
@@ -1103,13 +1108,22 @@ describe("incremental event projection", () => {
     const projected = projectSnapshotEvent(raw, snapshot, event);
     expect(projected.snapshot.commands).toEqual([
       expect.objectContaining({ id: "session-1-review", sessionId: "session-1", name: "review" }),
-      expect.objectContaining({ id: "session-2-new", sessionId: "session-2", name: "new" })
+      expect.objectContaining({ id: "session-2-new", sessionId: "session-2", name: "new", inputMode: "resource_mention", resourceId: "approved-skill" })
     ]);
     expect(projected.snapshot.commands.some((command) => command.name === "old")).toBe(false);
     expect(projected.rawSnapshot.runtimeCommands.map((command) => command.sessionId)).toEqual([
       "session-1",
       "session-2"
     ]);
+  });
+
+  it("rejects a command catalog with an unknown or unbound input mode", () => {
+    for (const command of [
+      { commandId: "unknown-mode", sessionId: "session-1", name: "review", source: RuntimeCommandSource.SKILL, inputMode: 0, loaded: true },
+      { commandId: "unbound-mode", sessionId: "session-1", name: "review", source: RuntimeCommandSource.SKILL, inputMode: RuntimeCommandInputMode.RESOURCE_MENTION, loaded: true }
+    ]) {
+      expect(() => mapSnapshot(create(SnapshotSchema, { runtimeCommands: [command] }))).toThrow(/invalid runtime command input mode/u);
+    }
   });
 
   it("applies live tool output modes and keeps the terminal result authoritative", () => {

@@ -59,6 +59,52 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("preserves native model metadata presence independently of known capacity estimates", async () => {
+    const runtime = new FakeSdkRuntime(), adapter = adapterFor(runtime);
+    runtime.probeInitialization = { ...initialization(), models: [{ value: "claude-opus-5-5", displayName: "Native model", description: "Native description", supportsEffort: true, supportedEffortLevels: ["high"], supportsFastMode: false }, { value: "future-model", displayName: "Future", description: "Future description" }] };
+    try {
+      const models = (await adapter.describe()).models;
+      expect(models[0]).toMatchObject({ description: "Native description", declaredSupportsFastMode: false, contextWindowSource: "estimated", maxOutputTokensSource: "estimated", protocolMode: "matching" });
+      expect(models[0]!.defaultEffort).toBeUndefined(); expect(models[0]!.declaredSupportsImages).toBeUndefined();
+      expect(models[1]!.declaredSupportsFastMode).toBeUndefined(); expect(models[1]!.contextWindowSource).toBeUndefined();
+      expect(models).toHaveLength(2);
+    } finally { await adapter.dispose(); }
+  });
+  test("applies working context to same UUID Query replacements and retains the active turn budget", async () => {
+    const runtime = new FakeSdkRuntime(), adapter = adapterFor(runtime); let budget: number | undefined = 20_000;
+    const base = { ...contextFor().context, resolveModelWorkingContext: () => budget };
+    try {
+      const binding = await adapter.createSession(createInput({ providerId: "claude-code", modelId: "model-a" }), base);
+      const bound = { ...base, binding, operationId: "context-first" };
+      expect(runtime.queries[0]!.params.options.env).toMatchObject({ CLAUDE_CODE_MAX_CONTEXT_TOKENS: "20000", CLAUDE_CODE_AUTO_COMPACT_WINDOW: "20000", CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "18" });
+      await adapter.send({ text: "first", images: [], files: [], mentions: [], disposition: "prompt" }, bound);
+      budget = 100_000_000;
+      await expect(adapter.refreshModelWorkingContext(bound)).rejects.toBeDefined();
+      expect(runtime.queries).toHaveLength(1);
+      runtime.queries[0]!.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
+      await vi.waitFor(async () => expect((await adapter.inspectSession(binding, bound)).streaming).toBe(false));
+      await adapter.refreshModelWorkingContext(bound);
+      expect(runtime.retiredQueries).toContain(runtime.queries[0]);
+      expect(runtime.queries[1]!.params.options).toMatchObject({ resume: binding.nativeSessionId, env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: "100000000", CLAUDE_CODE_AUTO_COMPACT_WINDOW: "100000000", CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: "90" } });
+      budget = undefined; await adapter.refreshModelWorkingContext(bound);
+      expect(runtime.queries[2]!.params.options.resume).toBe(binding.nativeSessionId);
+      expect(runtime.queries[2]!.params.options.env?.["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]).toBeUndefined();
+    } finally { await adapter.dispose(); }
+  });
+
+  test("fences unconfirmed working context Query exit and restores the committed budget on exact retry", async () => {
+    const runtime = new FakeSdkRuntime(), adapter = adapterFor(runtime); let budget = 12_000;
+    const base = { ...contextFor().context, resolveModelWorkingContext: () => budget };
+    try {
+      const binding = await adapter.createSession(createInput({ providerId: "claude-code", modelId: "model-a" }), base), bound = { ...base, binding };
+      budget = 30_000; runtime.retirementFailure = true;
+      await expect(adapter.refreshModelWorkingContext(bound)).rejects.toBeDefined();
+      expect(runtime.queries).toHaveLength(1);
+      budget = 12_000; runtime.retirementFailure = false;
+      await adapter.refreshModelWorkingContext(bound);
+      expect(runtime.queries[1]!.params.options).toMatchObject({ resume: binding.nativeSessionId, env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: "12000" } });
+    } finally { await adapter.dispose(); }
+  });
   test("isolates explicit skills with native setting sources and frozen command overrides even for an empty shelf", async () => {
     const runtime = new FakeSdkRuntime(), adapter = adapterFor(runtime, { resolveNativeSkills: async () => [],
       resolveNativeSkillPolicy: () => ({ mode: "explicit", overrides: { report: "off" }, assertCurrent: () => undefined }) });

@@ -41,6 +41,21 @@ import {
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it("preserves declared model metadata presence, exact effort defaults and estimated capacities", () => {
+    const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-responses", contextWindow: 128000,
+      maxOutputTokens: 16000, contextWindowSource: "estimated", maxOutputTokensSource: "estimated", supportsImages: true, supportsFastMode: true,
+      thinkingLevels: ["low", "high"], defaultEffort: "high", displayThinkingLevels: ["medium"], description: "Native description",
+      declaredSupportsImages: false, declaredSupportsFastMode: false, declaredInputModalities: [], referenceApi: "anthropic-messages",
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+    const value = toProtoModelDescriptor("backend", model);
+    expect(value).toMatchObject({ description: "Native description", defaultEffort: "high", declaredSupportsImages: false, declaredSupportsFastMode: false,
+      contextWindowSource: "estimated", maxOutputTokensSource: "estimated", api: "openai-responses", referenceApi: "anthropic-messages", protocolMode: "compatibility" });
+    expect(value.declaredModalities?.input?.values).toEqual([]); expect(value.declaredModalities?.output).toBeUndefined();
+    expect(value.effortLevels.map(level => level.defaultLevel)).toEqual([false, true]);
+    const unknown = toProtoModelDescriptor("backend", { ...model, defaultEffort: undefined, declaredInputModalities: undefined, declaredSupportsImages: undefined, declaredSupportsFastMode: undefined, referenceApi: undefined });
+    expect(unknown.declaredModalities).toBeUndefined(); expect(unknown.declaredSupportsImages).toBeUndefined(); expect(unknown.declaredSupportsFastMode).toBeUndefined();
+    expect(unknown.effortLevels.every(level => !level.defaultLevel)).toBe(true); expect(unknown.protocolMode).toBe("unknown");
+  });
   it.each(["user", "assistant"] as const)("round-trips Host-authored %s private provenance and independent global cursors", (role) => {
     const partnerPrivateOrigin = { messageId: "private", threadId: "thread", senderPartnerId: "sender", recipientPartnerId: "recipient", senderDisplayName: "Sender" };
     const event: PersistedEvent = { id: "private-event", sequence: 3n, globalCursor: 91n, revision: 3n, emittedAt: 1_000,
@@ -1580,8 +1595,10 @@ describe("proto mapper", () => {
     const payload: EventPayload = {
       type: "runtime_commands_changed",
       commands: [
-        { name: "review", description: "Review changes", source: "extension", loaded: true },
-        { name: "release", description: "Release notes", source: "prompt", loaded: false }
+        { name: "review", description: "Review changes", source: "extension", inputMode: "text", loaded: true },
+        { name: "release", description: "Release notes", source: "prompt", inputMode: "text", loaded: false },
+        { name: "review", description: "Approved Skill", source: "skill", inputMode: "resource_mention", resourceId: "approved-review", loaded: true },
+        { name: "review", description: "Independent Skill", source: "skill", inputMode: "resource_mention", resourceId: "other-approved-review", loaded: true }
       ]
     };
     const event: PersistedEvent = {
@@ -1604,13 +1621,20 @@ describe("proto mapper", () => {
       value: {
         commands: [
           expect.objectContaining({ sessionId: "session-1", name: "review", loaded: true }),
-          expect.objectContaining({ sessionId: "session-1", name: "release", loaded: false })
+          expect.objectContaining({ sessionId: "session-1", name: "release", loaded: false, inputMode: 1 }),
+          expect.objectContaining({ sessionId: "session-1", name: "review", resourceId: "approved-review", loaded: true, inputMode: 2 }),
+          expect.objectContaining({ sessionId: "session-1", name: "review", resourceId: "other-approved-review", loaded: true, inputMode: 2 })
         ]
       }
     });
     expect(fromProtoEvent(proto).payload).toEqual(payload);
 
     if (proto.payload?.kind.case === "runtimeCommandsChanged") {
+      const skill = proto.payload.kind.value.commands[2]!;
+      expect(skill.commandId).not.toBe(proto.payload.kind.value.commands[3]!.commandId);
+      skill.inputMode = 0;
+      expect(() => fromProtoEvent(proto)).toThrow(/input mode is invalid/u);
+      skill.inputMode = 2;
       proto.payload.kind.value.commands[0]!.sessionId = "other-session";
     }
     expect(() => fromProtoEvent(proto)).toThrow(/does not match the event identity/u);

@@ -42,6 +42,7 @@ export const capabilityNames = {
   modelSwitch: "model.switch",
   modelEffort: "model.effort",
   modelFastMode: "model.fast_mode",
+  modelWorkingContext: "model.working_context",
   modelPricing: "model.pricing",
   providerManagedCatalog: "provider.managed_catalog",
   providerAccountUsage: "provider.account_usage",

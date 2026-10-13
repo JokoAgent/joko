@@ -3,13 +3,104 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { StdioJsonRpcTransport, type JsonRpcRecordChannelHandlers } from "./transport.js";
+import { StdioJsonRpcTransport, type JsonRpcRecordChannelHandlers, type JsonRpcRecordWriteAdmission } from "./transport.js";
 import { AppServerHost } from "./host.js";
 import { TransportFault } from "./errors.js";
 
 const fixture = fileURLToPath(new URL("./fixtures/fake-app-server.mjs", import.meta.url));
 
 describe("StdioJsonRpcTransport", () => {
+  it.each(["tamper", "revoke", "cancel", "timeout"] as const)("checks queued asynchronous proof and final synchronous ownership after %s", async boundary => {
+    let handlers: JsonRpcRecordChannelHandlers | undefined, running = false;
+    let releasePrior!: () => void, releaseProof!: () => void, entered!: () => void;
+    const prior = new Promise<void>(resolve => { releasePrior = resolve; }), proof = new Promise<void>(resolve => { releaseProof = resolve; });
+    const atProof = new Promise<void>(resolve => { entered = resolve; });
+    const records: { readonly method: string; readonly id?: number }[] = [];
+    let contentCurrent = true, ownerCurrent = true, proofStarted = false;
+    const channel = {
+      get running() { return running; },
+      async start(next: JsonRpcRecordChannelHandlers) { handlers = next; running = true; },
+      async write(record: Buffer, admission?: JsonRpcRecordWriteAdmission) {
+        if (admission?.beforeWrite !== undefined && await admission.beforeWrite() === false) return;
+        if (admission?.finalBeforeWrite?.() === false) return;
+        const envelope = JSON.parse(record.toString("utf8")) as { readonly method: string; readonly id?: number };
+        records.push(envelope);
+        if (envelope.method === "held-write") await prior;
+        if (envelope.id !== undefined) handlers!.onData(`${JSON.stringify({ id: envelope.id, result: {} })}\n`);
+      },
+      async close() { running = false; }
+    };
+    const transport = new StdioJsonRpcTransport({ channelFactory: () => channel }), cancellation = new AbortController();
+    try {
+      await transport.start({ onNotification: () => undefined, onRequest: () => undefined, onExit: () => undefined });
+      const held = transport.notify("held-write", {});
+      const pending = transport.request("turn/start", {}, { mutation: true, signal: cancellation.signal,
+        timeoutMs: boundary === "timeout" ? 80 : 2_000,
+        beforeDispatchAsync: async () => {
+          proofStarted = true; entered(); await proof;
+          if (!contentCurrent) throw new Error("Immutable content changed");
+        },
+        beforeDispatch: () => { if (!ownerCurrent) throw new Error("Original admission retired"); }
+      }).catch((error: unknown) => error);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(proofStarted).toBe(false);
+      if (boundary === "tamper") contentCurrent = false;
+      releasePrior(); await held; await atProof;
+      if (boundary === "revoke") ownerCurrent = false;
+      if (boundary === "cancel") cancellation.abort();
+      if (boundary === "tamper" || boundary === "revoke") releaseProof();
+      const failure = await pending;
+      if (boundary === "tamper" || boundary === "revoke") expect(failure).toMatchObject({ message: boundary === "tamper" ? "Immutable content changed" : "Original admission retired" });
+      else expect(failure).toMatchObject({ code: boundary === "cancel" ? "closed" : "request_timeout", stateMayHaveChanged: false });
+      // A cancelled proof that ignores its signal cannot hold subsequent writes.
+      await expect(transport.request("read", {})).resolves.toEqual({});
+      releaseProof(); await new Promise<void>(resolve => setImmediate(resolve));
+      expect(records.map(record => record.method)).toEqual(["held-write", "read"]);
+    } finally { releasePrior(); releaseProof(); await transport.close(); }
+  });
+
+  it.each(["revoke", "cancel", "timeout"] as const)("carries original admission to the channel's actual queue head after %s", async boundary => {
+    let handlers: JsonRpcRecordChannelHandlers | undefined, running = false;
+    let entered!: () => void, release!: () => void;
+    const atChannel = new Promise<void>(resolve => { entered = resolve; });
+    const queued = new Promise<void>(resolve => { release = resolve; });
+    const records: string[] = [], proof = vi.fn(async () => undefined);
+    let current = true;
+    const channel = {
+      get running() { return running; },
+      async start(next: JsonRpcRecordChannelHandlers) { handlers = next; running = true; },
+      async write(record: Buffer, admission?: JsonRpcRecordWriteAdmission) {
+        const envelope = JSON.parse(record.toString("utf8")) as { readonly method: string; readonly id: number };
+        if (envelope.method === "turn/start") { entered(); await queued; }
+        if (admission?.beforeWrite !== undefined && await admission.beforeWrite() === false) return;
+        if (admission?.finalBeforeWrite?.() === false) return;
+        records.push(envelope.method);
+        handlers!.onData(`${JSON.stringify({ id: envelope.id, result: {} })}\n`);
+      },
+      async close() { running = false; }
+    };
+    const transport = new StdioJsonRpcTransport({ channelFactory: () => channel }), cancellation = new AbortController();
+    try {
+      await transport.start({ onNotification: () => undefined, onRequest: () => undefined, onExit: () => undefined });
+      const pending = transport.request("turn/start", {}, { mutation: true, signal: cancellation.signal,
+        timeoutMs: boundary === "timeout" ? 40 : 2_000, beforeDispatchAsync: proof,
+        beforeDispatch: () => { if (!current) throw new Error("The original Resource Queue owner retired"); }
+      }).catch((error: unknown) => error);
+      await atChannel;
+      expect(proof).not.toHaveBeenCalled();
+      if (boundary === "revoke") current = false;
+      if (boundary === "cancel") cancellation.abort();
+      if (boundary === "timeout") expect(await pending).toMatchObject({ code: "request_timeout", stateMayHaveChanged: false });
+      release();
+      expect(await pending).toMatchObject(boundary === "revoke"
+        ? { message: "The original Resource Queue owner retired" }
+        : { code: boundary === "cancel" ? "closed" : "request_timeout", stateMayHaveChanged: false });
+      await expect(transport.request("read", {})).resolves.toEqual({});
+      expect(records).toEqual(["read"]);
+      expect(proof).not.toHaveBeenCalled();
+    } finally { release(); await transport.close(); }
+  });
+
   it("keeps the bounded JSON-RPC engine authoritative over an alternate record channel", async () => {
     let handlers: JsonRpcRecordChannelHandlers | undefined;
     let running = false;
@@ -17,7 +108,9 @@ describe("StdioJsonRpcTransport", () => {
     const channel = {
       get running() { return running; },
       async start(next: JsonRpcRecordChannelHandlers) { handlers = next; running = true; },
-      async write(record: Buffer) {
+      async write(record: Buffer, admission?: JsonRpcRecordWriteAdmission) {
+        if (admission?.beforeWrite !== undefined && await admission.beforeWrite() === false) return;
+        if (admission?.finalBeforeWrite?.() === false) return;
         writes.push(record.toString("utf8"));
         const request = JSON.parse(record.toString("utf8")) as { readonly id: number; readonly method: string };
         if (request.method === "disconnect") {

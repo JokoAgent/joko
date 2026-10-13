@@ -24,7 +24,7 @@ import {
   normalizeComposerDocument,
   plainTextToComposerDocument
 } from "../composer-quote-document.js";
-import { modelPreferenceOwnerId } from "../model-picker-preferences.js";
+import { defaultModelEffort, modelPreferenceOwnerId, preferredModelEffort, readModelPickerOwnerPreferences } from "../model-picker-preferences.js";
 import { readAppDefaultModelPreference, setAppDefaultModelPreference, useAppDefaultModelPreference } from "../app-default-model-preferences.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { composerMentionsAllowed, resolveComposerMentionPolicy } from "../composer-mention-policy.js";
@@ -700,7 +700,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     modelId: pickerDefaultModel.modelId,
     ...(pickerBackendDefaults?.model?.effort !== undefined && pickerDefaultModel.efforts.includes(pickerBackendDefaults.model.effort)
       ? { effort: pickerBackendDefaults.model.effort }
-      : pickerDefaultModel.efforts[0] === undefined ? {} : { effort: pickerDefaultModel.efforts[0] }),
+      : defaultModelEffort(pickerDefaultModel) === undefined ? {} : { effort: defaultModelEffort(pickerDefaultModel) }),
     fastMode: execution.fastModeSupported && pickerDefaultModel.supportsFast && (pickerBackendDefaults?.model?.fastMode ?? false)
   };
   const attachmentPolicy = useMemo(
@@ -1170,7 +1170,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       setModelKey(restoredModelKey);
       const restoredEffort = restoredModel === undefined ? restored.effort ?? "" : restoredOptions.effortSupported && restored.effort !== undefined && restoredModel.efforts.includes(restored.effort)
         ? restored.effort
-        : restoredOptions.effortSupported ? restoredModel?.efforts[0] ?? "" : "";
+        : restoredOptions.effortSupported ? defaultModelEffort(restoredModel) ?? "" : "";
       const restoredFast = restoredModel === undefined ? restored.fastMode : restoredOptions.fastModeSupported && restoredModel.supportsFast && restored.fastMode;
       setEffort(restoredEffort);
       setFastMode(restoredFast);
@@ -1213,12 +1213,13 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     setModelKey(!options.modelSwitchSupported ? "" : defaultRoute !== undefined
       ? modelKeyFor(defaultRoute.providerId, defaultRoute.modelId)
       : initialModel === undefined ? "" : modelKeyFor(initialModel.providerId, initialModel.modelId));
-    setEffort(options.effortSupported ? defaultRoute?.effort ?? initialModel?.efforts[0] ?? "" : "");
+    const initialEffort = initialModel === undefined ? "" : preferredModelEffort(readModelPickerOwnerPreferences(pickerOwnerId), initialModel) ?? "";
+    setEffort(options.effortSupported ? defaultRoute?.effort ?? initialEffort : "");
     setFastMode(initialModel === undefined && defaultRoute !== undefined ? defaultRoute.fastMode
       : options.fastModeSupported && initialModel?.supportsFast === true && (defaultRoute?.fastMode ?? false));
     if (!preference && initialModel?.available) setAppDefaultModelPreference(controllerRef.current.state.activeProfile?.serverId, {
       backendId: backend.id, providerId: initialModel.providerId, modelId: initialModel.modelId,
-      effort: options.effortSupported ? defaultRoute?.effort ?? initialModel.efforts[0] ?? "" : "", fastMode: options.fastModeSupported && initialModel.supportsFast && (defaultRoute?.fastMode ?? false)
+      effort: options.effortSupported ? defaultRoute?.effort ?? initialEffort : "", fastMode: options.fastModeSupported && initialModel.supportsFast && (defaultRoute?.fastMode ?? false)
     });
     const defaultPermission = defaults?.permissionMode ?? snapshot.settings.policy.defaultMode;
     setPermissionMode(options.permissionModes.includes(defaultPermission) ? defaultPermission : options.permissionModes[0] ?? "ask");
@@ -1346,7 +1347,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   useEffect(() => {
     if (selectedModel === undefined) return;
-    if (!selectedModel.efforts.includes(effort)) setEffort(selectedModel.efforts[0] ?? "");
+    if (!selectedModel.efforts.includes(effort)) setEffort(defaultModelEffort(selectedModel) ?? "");
     if (!selectedModel.supportsFast) setFastMode(false);
   }, [modelKey, selectedModel?.modelId, selectedModel?.providerId]);
 
@@ -2793,7 +2794,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
                     setModelKey(modelKeyFor(nextModel.providerId, nextModel.modelId));
                     const nextEffort = selection.effort !== undefined && nextModel.efforts.includes(selection.effort)
                       ? selection.effort
-                      : nextModel.efforts[0] ?? "";
+                      : defaultModelEffort(nextModel) ?? "";
                     const nextFast = execution.fastModeSupported && nextModel.supportsFast && selection.fastMode;
                     setEffort(nextEffort);
                     setFastMode(nextFast);

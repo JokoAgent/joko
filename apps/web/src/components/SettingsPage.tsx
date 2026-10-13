@@ -86,6 +86,7 @@ import { ContactsSettings } from "./ContactsSettings.js";
 import { MessagingSettings } from "./MessagingSettings.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelPriceOverrideDialog, type ModelPriceVariant } from "./ModelPriceOverrideDialog.js";
+import { ModelAdvancedButton, ModelAdvancedDrawer } from "./ModelAdvancedDrawer.js";
 import { PiPackagesSection } from "./PiPackagesSection.js";
 import { writeActivationClickPreference } from "../window-activation-click.js";
 import { ManagedModelRuntimeSettings } from "./ManagedModelRuntimeSettings.js";
@@ -3381,6 +3382,11 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
   const [editor, setEditor] = useState<ProviderConfigurationView | "new">();
   const [addWizardOpen, setAddWizardOpen] = useState(false);
   const [runtimeOnboardingId, setRuntimeOnboardingId] = useState<string>();
+  const [runtimeAddError, setRuntimeAddError] = useState(false);
+  const [runtimeAdding, setRuntimeAdding] = useState(false);
+  const runtimeAddPending = useRef(false);
+  const runtimeAddRequest = useRef<symbol | undefined>(undefined);
+  const runtimeAddLifetime = useRef<AbortController | undefined>(undefined);
   const [loginTarget, setLoginTarget] = useState<ProviderSettingsEntry>();
   const [loginFromAddWizard, setLoginFromAddWizard] = useState(false);
   const [pendingProviderSelection, setPendingProviderSelection] = useState<string>();
@@ -3390,6 +3396,8 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
   }>();
   const [credentialEditorOpen, setCredentialEditorOpen] = useState(false);
   const [priceModel, setPriceModel] = useState<ModelView>();
+  const [advancedModel, setAdvancedModel] = useState<{ readonly ownerKey: string; readonly model: ProviderLogicalModel }>();
+  const [advancedPriceRevision, setAdvancedPriceRevision] = useState(0);
   const [modelQuery, setModelQuery] = useState("");
   const [selectedItem, setSelectedItem] = useState(() => {
     const catalog = providerSettingsEntries(snapshot);
@@ -3417,6 +3425,15 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
     [snapshot.managedModelRuntimes]
   );
   const pickerOwnerId = modelPreferenceOwnerId(controller.state.activeProfile?.serverId);
+  useEffect(() => {
+    const abort = new AbortController();
+    runtimeAddLifetime.current = abort;
+    runtimeAddPending.current = false;
+    runtimeAddRequest.current = undefined;
+    setRuntimeAdding(false);
+    setRuntimeAddError(false);
+    return () => abort.abort();
+  }, [controller, pickerOwnerId]);
   const pickerPreferences = useModelPickerOwnerPreferences(pickerOwnerId);
   const providerOrderingAvailable = configuredProviders.every((entry) => entry.runtime !== undefined);
   const orderedProviders = useMemo(
@@ -3524,6 +3541,34 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
     ? []
     : snapshot.providers.filter((runtime) => providerRuntimesRelated(providerRuntime, runtime));
   const relatedProviderRouteKeys = new Set(relatedProviderRuntimes.map((runtime) => providerPreferenceKey(runtime.backendId, runtime.id)));
+  const selectedManagedRuntime = availableModelRuntimes.find((runtime) => runtime.providerRoutes?.some((route) => relatedProviderRouteKeys.has(providerPreferenceKey(route.backendId, route.providerId))));
+  const advancedOwnerKey = JSON.stringify([pickerOwnerId, controller.state.activeProfile?.id, controller.state.connectionGeneration, selectedProviderEntry?.id]);
+  const chooseManagedRuntime = (runtimeId: string): void => {
+    const runtime = availableModelRuntimes.find((candidate) => candidate.id === runtimeId);
+    if (runtime === undefined || runtimeAddPending.current) return;
+    if (!runtime.capabilities.supportsRepositoryModels) { setAddWizardOpen(false); setRuntimeOnboardingId(runtimeId); return; }
+    const configured = configuredProviders.find((entry) => entry.runtime !== undefined && runtime.providerRoutes?.some((route) => route.backendId === entry.runtime!.backendId && route.providerId === entry.provider.id));
+    if (configured !== undefined) { setAddWizardOpen(false); selectProviderItem(`provider:${configured.id}`); return; }
+    const signal = runtimeAddLifetime.current?.signal;
+    const occurrence = Symbol();
+    runtimeAddRequest.current = occurrence;
+    runtimeAddPending.current = true;
+    setRuntimeAdding(true);
+    setRuntimeAddError(false);
+    runAction(`ensure-managed-runtime-provider:${runtimeId}`, async () => {
+      try {
+        const ensured = await controller.ensureManagedModelRuntimeProvider(runtimeId);
+        if (signal?.aborted || runtimeAddRequest.current !== occurrence) return;
+        await controller.refresh();
+        if (signal?.aborted || runtimeAddRequest.current !== occurrence) return;
+        const route = ensured.providerRoutes?.[0];
+        if (route === undefined) throw new Error("Managed Provider route is unavailable.");
+        setAddWizardOpen(false);
+        selectProviderItem(`provider:${providerPreferenceKey(route.backendId, route.providerId)}`, true);
+      } catch { if (!signal?.aborted && runtimeAddRequest.current === occurrence) setRuntimeAddError(true); }
+      finally { if (!signal?.aborted && runtimeAddRequest.current === occurrence) { runtimeAddPending.current = false; setRuntimeAdding(false); } }
+    });
+  };
   const providerModelRoutes = selectedProvider === undefined ? [] : snapshot.models.filter((model) =>
     relatedProviderRouteKeys.has(providerPreferenceKey(model.backendId, model.providerId)));
   const credentialSurfaceModels = providerRuntime === undefined ? [] : providerCredentialSurfaceModels(snapshot, providerRuntime);
@@ -3641,7 +3686,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
                   locale={controller.state.effectiveLocale}
                   onRefresh={providerRuntime?.supportsRefresh === true ? () => runAction(`refresh-provider:${selectedProvider.id}`, () => controller.refreshProviderCredential(providerRuntime.backendId, selectedProvider.id)) : undefined}
                   onEdit={providerConfigurationEditable(selectedProvider) ? () => setEditor(selectedProvider) : undefined}
-                  onDelete={providerConfigurationEditable(selectedProvider) ? () => setProviderRemovalTarget({ entry: selectedProviderEntry!, kind: "configuration" }) : undefined}
+                  onDelete={providerConfigurationEditable(selectedProvider) || selectedManagedRuntime !== undefined ? () => setProviderRemovalTarget({ entry: selectedProviderEntry!, kind: "configuration" }) : undefined}
                   enabled={selectedProviderEnabled}
                   onSetEnabled={(enabled) => runAction(`${enabled ? "enable" : "disable"}-provider:${selectedProviderEntry!.id}`, () => setSelectedProviderEnabled(enabled))}
                   t={t}
@@ -3661,6 +3706,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
           {!selectedProviderEnabled && <div className="provider-detail__banner"><span>{t("settings.providerDisabledBody")}</span><Button onClick={() => runAction(`enable-provider:${selectedProviderEntry!.id}`, () => setSelectedProviderEnabled(true))}>{t("settings.providerEnableAction")}</Button></div>}
           {selectedProviderEnabled && providerRuntime?.error !== undefined && <div className="provider-detail__banner provider-detail__banner--error" role="alert"><span>{providerRuntime.error}</span>{providerRuntime.supportsModelRefresh === true && <Button disabled={refreshingProviderKey !== undefined} onClick={() => void refreshModels(selectedProviderEntry!)}>{t("common.retry")}</Button>}</div>}
           {selectedProviderEnabled && <div className="provider-detail__scroll">
+            {selectedManagedRuntime !== undefined && <ManagedModelRuntimeSettings controller={controller} runtimes={[selectedManagedRuntime]} runAction={runAction} />}
             <section className="provider-detail-section provider-models" aria-label={t("settings.modelCatalog")}>
               {(refreshingProviderKey === selectedProviderEntry!.id || modelRefreshFeedback?.providerKey === selectedProviderEntry!.id) && <div className={cx("provider-model-feedback", modelRefreshFeedback?.state === "error" && "danger-text")} role={modelRefreshFeedback?.state === "error" ? "alert" : "status"}>{refreshingProviderKey === selectedProviderEntry!.id ? t("settings.refreshingModels") : modelRefreshFeedback?.state === "success" ? t("settings.modelsRefreshed") : t("settings.modelsRefreshFailed")}</div>}
               <ProviderModelCatalog
@@ -3676,7 +3722,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
                 refreshing={refreshingProviderKey !== undefined}
                 refreshActive={refreshingProviderKey === selectedProviderEntry!.id}
                 onRefresh={providerRuntime?.supportsModelRefresh === true ? () => void refreshModels(selectedProviderEntry!) : undefined}
-                onEditPrice={setPriceModel}
+                onAdvanced={(model) => setAdvancedModel({ ownerKey: advancedOwnerKey, model })}
                 onSetModelEnabled={(routes, enabled) => runAction(`${enabled ? "enable" : "disable"}-model:${routes.map((route) => `${route.backendId}:${route.providerId}:${route.modelId}`).join(",")}`, () => Promise.all(routes.map((route) => controller.updateBackendSettings(route.backendId, { modelAccessUpdate: { providerId: route.providerId, modelId: route.modelId, enabled } }))).then(() => undefined))}
                 t={t}
               />
@@ -3685,7 +3731,7 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
         </> : <div className="provider-detail-empty provider-detail-empty--page"><Server aria-hidden="true" /><strong>{t("settings.noProviders")}</strong><span>{t("settings.providerEmptyBody")}</span><Button tone="primary" onClick={() => setAddWizardOpen(true)}>{t("settings.addProvider")}</Button></div>}
       </div>
     </section>
-    <ProviderAddWizard open={addWizardOpen} providers={availableProviders} runtimes={availableModelRuntimes} t={t} onClose={() => setAddWizardOpen(false)} onChoose={(entry) => { setAddWizardOpen(false); selectProviderItem(`provider:${entry.id}`); setLoginFromAddWizard(true); setLoginTarget(entry); }} onChooseRuntime={(runtimeId) => { setAddWizardOpen(false); setRuntimeOnboardingId(runtimeId); }} onCustom={() => { setAddWizardOpen(false); setEditor("new"); }} />
+    <ProviderAddWizard open={addWizardOpen} providers={availableProviders} runtimes={availableModelRuntimes} runtimePending={runtimeAdding} runtimeError={runtimeAddError} t={t} onClose={() => { runtimeAddRequest.current = undefined; runtimeAddPending.current = false; setRuntimeAdding(false); setAddWizardOpen(false); }} onChoose={(entry) => { setAddWizardOpen(false); selectProviderItem(`provider:${entry.id}`); setLoginFromAddWizard(true); setLoginTarget(entry); }} onChooseRuntime={chooseManagedRuntime} onCustom={() => { setAddWizardOpen(false); setEditor("new"); }} />
     <ProviderEditor open={editor !== undefined} provider={editor === "new" ? undefined : editor} credentials={snapshot.settings.credentials} providerIds={providers.map((item) => item.id)} backends={snapshot.backends} saveCredential={controller.saveCredential} saveProvider={controller.saveProvider} t={t} onClose={() => setEditor(undefined)} onBack={editor === "new" ? () => { setEditor(undefined); setAddWizardOpen(true); } : undefined} onSaved={() => setEditor(undefined)} />
     <Modal
       open={runtimeOnboardingId !== undefined}
@@ -3698,7 +3744,17 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
     ><div className="provider-runtime-onboarding">{snapshot.managedModelRuntimes?.find((runtime) => runtime.id === runtimeOnboardingId) !== undefined && <ManagedModelRuntimeSettings controller={controller} runtimes={[snapshot.managedModelRuntimes!.find((runtime) => runtime.id === runtimeOnboardingId)!]} runAction={runAction} />}</div></Modal>
     <Modal open={providerRemovalTarget !== undefined} title={providerRemovalTarget?.kind === "authorization" ? t("settings.removeProviderAuthorizationTitle", { name: providerRemovalTarget.entry.provider.name }) : t("settings.deleteProviderTitle", { name: providerRemovalTarget?.entry.provider.name ?? "" })} description={providerRemovalTarget?.kind === "authorization" ? t("settings.removeProviderAuthorizationBody") : t("settings.deleteProviderBody")} size="small" onClose={() => setProviderRemovalTarget(undefined)} headerLeading={<ModalBackButton label={t("common.back")} onClick={() => setProviderRemovalTarget(undefined)} />}><div className="modal__actions"><Button tone="danger" onClick={() => { const target = providerRemovalTarget; if (target === undefined) return; setProviderRemovalTarget(undefined); if (target.kind === "authorization") { const runtime = target.entry.runtime; if (runtime !== undefined) runAction(`remove-provider-authorization:${target.entry.id}`, () => controller.logoutProvider(runtime.backendId, target.entry.provider.id)); } else runAction(`delete-provider:${target.entry.provider.id}`, () => controller.deleteProvider(target.entry.provider.id)); }}>{providerRemovalTarget?.kind === "authorization" ? t("settings.removeProviderAuthorizationConfirm") : t("common.delete")}</Button></div></Modal>
     <CredentialEditor open={credentialEditorOpen} initialProviderId={selectedProvider?.id} providers={snapshot.settings.providers} t={t} onClose={() => setCredentialEditorOpen(false)} onSave={(draft) => { setCredentialEditorOpen(false); runAction(`save-credential:${draft.id}`, () => controller.saveCredential(draft)); }} />
-    <ModelPriceOverrideDialog controller={controller} model={priceModel} variants={priceVariants} t={t} onClose={() => setPriceModel(undefined)} />
+    <ModelPriceOverrideDialog controller={controller} model={priceModel} variants={priceVariants} t={t} onClose={() => { setPriceModel(undefined); setAdvancedPriceRevision(value => value + 1); }} />
+    {advancedModel !== undefined && advancedModel.ownerKey === advancedOwnerKey && <ModelAdvancedDrawer
+      key={`${advancedOwnerKey}:${advancedModel.model.id}`}
+      controller={controller} snapshot={snapshot}
+      routes={providerLogicalModels(providerModels).find((model) => model.id === advancedModel.model.id)?.routes ?? advancedModel.model.routes.map((route) => ({ ...route, available: false }))}
+      configuration={snapshot.settings.providers.find((provider) => provider.id === selectedProvider?.id && selectedProviderEntry?.runtime?.ownerManaged === true)}
+      ownerId={pickerOwnerId} ownerKey={advancedOwnerKey} priceRevision={advancedPriceRevision} t={t}
+      onClose={() => setAdvancedModel(undefined)}
+      onEditPrice={setPriceModel}
+      onSetEnabled={(routes, enabled) => Promise.all(routes.map((route) => controller.updateBackendSettings(route.backendId, { modelAccessUpdate: { providerId: route.providerId, modelId: route.modelId, enabled } }))).then(() => undefined)}
+    />}
     <ProviderLoginDialog
       controller={controller}
       backendId={loginTarget?.runtime?.backendId}
@@ -4076,7 +4132,7 @@ type ProviderModelGroupId = "chat" | "image" | "audio";
 const PROVIDER_MODEL_GROUP_COLLAPSE_STORAGE_KEY = "joko:provider-model-groups:v1";
 const DEFAULT_COLLAPSED_PROVIDER_MODEL_GROUPS = new Set<ProviderModelGroupId>(["image", "audio"]);
 
-function ProviderModelCatalog({ models, filteredModels, disabledAccessRoutes, runtimes, backends, query, onQueryChange, pickerOwnerId, pickerPreferences, refreshing, refreshActive, onRefresh, onEditPrice, onSetModelEnabled, t }: {
+function ProviderModelCatalog({ models, filteredModels, disabledAccessRoutes, runtimes, backends, query, onQueryChange, pickerOwnerId, pickerPreferences, refreshing, refreshActive, onRefresh, onAdvanced, onSetModelEnabled, t }: {
   readonly models: readonly ModelView[];
   readonly filteredModels: readonly ModelView[];
   readonly disabledAccessRoutes: readonly ProviderModelRouteReference[];
@@ -4089,7 +4145,7 @@ function ProviderModelCatalog({ models, filteredModels, disabledAccessRoutes, ru
   readonly refreshing: boolean;
   readonly refreshActive: boolean;
   readonly onRefresh?: () => void;
-  readonly onEditPrice: (model: ModelView) => void;
+  readonly onAdvanced: (model: ProviderLogicalModel) => void;
   readonly onSetModelEnabled: (routes: readonly ProviderModelRouteReference[], enabled: boolean) => void;
   readonly t: Translator;
 }): JSX.Element {
@@ -4125,7 +4181,7 @@ function ProviderModelCatalog({ models, filteredModels, disabledAccessRoutes, ru
   const allVisible = toggleRoutes.length > 0 && toggleRoutes.every((model) => modelVisible(pickerPreferences, model));
   const groupName = runtimes[0]?.name ?? models[0]?.providerName ?? "";
   const showSearch = logicalModels.length > 8;
-  const rowProps = { pickerOwnerId, pickerPreferences, onEditPrice, onSetModelEnabled, t };
+  const rowProps = { pickerOwnerId, pickerPreferences, onAdvanced, onSetModelEnabled, t };
   const modelGroups = [
     ...(chatModels.length > 0 ? [{ id: "chat" as const, title: groupName, models: chatModels, capability: false }] : []),
     ...(imageModels.length > 0 ? [{ id: "image" as const, title: t("settings.imageModels"), models: imageModels, capability: true }] : []),
@@ -4168,7 +4224,7 @@ function ProviderModelCatalog({ models, filteredModels, disabledAccessRoutes, ru
       })}
       {disabledModelCount > 0 && <details className="provider-model-group provider-model-group--disabled" open>
         <summary><span><strong>{t("settings.disabledModels")}</strong><span>{disabledModelCount}</span></span><Button tone="ghost" onClick={(event) => { event.preventDefault(); onSetModelEnabled(enableAllRoutes, true); }}>{t("settings.enableAllModels")}</Button></summary>
-        <div className="provider-model-list">{disabledModels.map((model) => <ProviderDisabledModelRow key={model.id} model={model} groupName={groupName} onSetModelEnabled={onSetModelEnabled} t={t} />)}</div>
+        <div className="provider-model-list">{disabledModels.map((model) => <ProviderDisabledModelRow key={model.id} model={model} groupName={groupName} onAdvanced={onAdvanced} onSetModelEnabled={onSetModelEnabled} t={t} />)}</div>
       </details>}
     </div>}
   </>;
@@ -4200,7 +4256,7 @@ function ProviderModelSplitHeader({ backendIds, backendNames }: {
   return <div className="provider-model-split-header" style={providerModelSplitStyle(backendIds.length)}><span />{backendIds.map((backendId) => <span key={backendId}>{backendNames.get(backendId) ?? backendId}</span>)}<span /></div>;
 }
 
-function ProviderUnifiedModelRow({ model, capability = false, pickerOwnerId, pickerPreferences, backendIds, backendNames, onAdjustSeparately, onEditPrice, onSetModelEnabled, t }: {
+function ProviderUnifiedModelRow({ model, capability = false, pickerOwnerId, pickerPreferences, backendIds, backendNames, onAdjustSeparately, onAdvanced, onSetModelEnabled, t }: {
   readonly model: ProviderLogicalModel;
   readonly capability?: boolean;
   readonly pickerOwnerId?: string;
@@ -4208,7 +4264,7 @@ function ProviderUnifiedModelRow({ model, capability = false, pickerOwnerId, pic
   readonly backendIds?: readonly string[];
   readonly backendNames?: ReadonlyMap<string, string>;
   readonly onAdjustSeparately?: () => void;
-  readonly onEditPrice: (model: ModelView) => void;
+  readonly onAdvanced: (model: ProviderLogicalModel) => void;
   readonly onSetModelEnabled: (routes: readonly ProviderModelRouteReference[], enabled: boolean) => void;
   readonly t: Translator;
 }): JSX.Element {
@@ -4231,7 +4287,7 @@ function ProviderUnifiedModelRow({ model, capability = false, pickerOwnerId, pic
     <span className="provider-model-row__name"><strong>{model.name}</strong>{!capability && unsupportedRuntimeNames.length > 0 && <small>{t("settings.modelUnsupportedBy", { agents: unsupportedRuntimeNames.join(" / ") })}</small>}</span>
     {differs && onAdjustSeparately !== undefined && <button type="button" className="provider-model-row__divergence" title={divergenceLabel} onClick={onAdjustSeparately}>{divergenceLabel}</button>}
     <span className="provider-model-row__context">{maximumContext <= 0 ? "" : formatCompactTokenCount(maximumContext)}</span>
-    <ProviderModelMenu model={model} enabled={enabled} onEditPrice={capability ? undefined : onEditPrice} onSetModelEnabled={onSetModelEnabled} t={t} />
+    <ModelAdvancedButton name={model.name} onClick={() => onAdvanced(model)} t={t} />
     {!capability && activeRoutes.length === 0 && <span className="provider-model-route-empty">—</span>}
     {!capability && activeRoutes.length > 0 && <Tip className="provider-model-row__toggle-tip" focusable={pickerOwnerId === undefined} text={pickerOwnerId === undefined ? t("settings.modelVisibilityBody") : undefined}><button type="button" role="switch" className="model-visibility-toggle" aria-checked={visible} aria-pressed={visible} aria-label={visible ? t("settings.hideModel", { name: model.name }) : t("settings.showModel", { name: model.name })} disabled={pickerOwnerId === undefined} onClick={() => {
       for (const route of activeRoutes) setModelVisible(pickerOwnerId, route.backendId, route.providerId, route.modelId, !visible, route.defaultVisible ?? true);
@@ -4239,9 +4295,10 @@ function ProviderUnifiedModelRow({ model, capability = false, pickerOwnerId, pic
   </article>;
 }
 
-function ProviderDisabledModelRow({ model, groupName, onSetModelEnabled, t }: {
+function ProviderDisabledModelRow({ model, groupName, onAdvanced, onSetModelEnabled, t }: {
   readonly model: ProviderLogicalModel;
   readonly groupName: string;
+  readonly onAdvanced: (model: ProviderLogicalModel) => void;
   readonly onSetModelEnabled: (routes: readonly ProviderModelRouteReference[], enabled: boolean) => void;
   readonly t: Translator;
 }): JSX.Element {
@@ -4253,17 +4310,18 @@ function ProviderDisabledModelRow({ model, groupName, onSetModelEnabled, t }: {
     <span className="provider-model-row__name"><strong>{model.name}</strong></span>
     <span className="provider-model-row__category">{category}</span>
     <span className="provider-model-row__context">{maximumContext <= 0 ? "" : formatCompactTokenCount(maximumContext)}</span>
+    <ModelAdvancedButton name={model.name} onClick={() => onAdvanced(model)} t={t} />
     <button type="button" className="provider-model-row__enable" onClick={() => onSetModelEnabled(model.routes, true)}>{t("settings.enableModel")}</button>
   </article>;
 }
 
-function ProviderSplitModelRow({ model, backendIds, backendNames, pickerOwnerId, pickerPreferences, onEditPrice, onSetModelEnabled, t }: {
+function ProviderSplitModelRow({ model, backendIds, backendNames, pickerOwnerId, pickerPreferences, onAdvanced, onSetModelEnabled, t }: {
   readonly model: ProviderLogicalModel;
   readonly backendIds: readonly string[];
   readonly backendNames: ReadonlyMap<string, string>;
   readonly pickerOwnerId?: string;
   readonly pickerPreferences: ReturnType<typeof useModelPickerOwnerPreferences>;
-  readonly onEditPrice?: (model: ModelView) => void;
+  readonly onAdvanced: (model: ProviderLogicalModel) => void;
   readonly onSetModelEnabled: (routes: readonly ProviderModelRouteReference[], enabled: boolean) => void;
   readonly t: Translator;
 }): JSX.Element {
@@ -4276,21 +4334,8 @@ function ProviderSplitModelRow({ model, backendIds, backendNames, pickerOwnerId,
       const runtimeName = backendNames.get(backendId) ?? backendId;
       return <button key={backendId} type="button" role="switch" className="model-visibility-toggle" aria-checked={visible} aria-pressed={visible} aria-label={visible ? t("settings.hideModel", { name: `${model.name} · ${runtimeName}` }) : t("settings.showModel", { name: `${model.name} · ${runtimeName}` })} disabled={pickerOwnerId === undefined} onClick={() => setModelVisible(pickerOwnerId, route.backendId, route.providerId, route.modelId, !visible, route.defaultVisible ?? true)}><span /></button>;
     })}
-    <ProviderModelMenu model={model} enabled onEditPrice={onEditPrice} onSetModelEnabled={onSetModelEnabled} t={t} />
+    <ModelAdvancedButton name={model.name} onClick={() => onAdvanced(model)} t={t} />
   </article>;
-}
-
-function ProviderModelMenu({ model, enabled, onEditPrice, onSetModelEnabled, t }: {
-  readonly model: ProviderLogicalModel;
-  readonly enabled: boolean;
-  readonly onEditPrice?: (model: ModelView) => void;
-  readonly onSetModelEnabled: (routes: readonly ProviderModelRouteReference[], enabled: boolean) => void;
-  readonly t: Translator;
-}): JSX.Element {
-  return <details className="provider-model-row__menu"><summary aria-label={t("common.more")} title={t("common.more")}><MoreHorizontal aria-hidden="true" /></summary><div>
-    {onEditPrice !== undefined && <button type="button" onClick={(event) => { event.currentTarget.closest("details")?.removeAttribute("open"); onEditPrice(model.routes[0]!); }}>{t("settings.modelPrice.menu")}</button>}
-    <button type="button" className={enabled ? "is-danger" : undefined} onClick={(event) => { event.currentTarget.closest("details")?.removeAttribute("open"); onSetModelEnabled(model.routes, !enabled); }}>{enabled ? t("settings.disableModel") : t("settings.enableModel")}</button>
-  </div></details>;
 }
 
 function providerLogicalModels(models: readonly ModelView[]): ProviderLogicalModel[] {
@@ -4331,7 +4376,7 @@ function uniqueProviderModelRoutes(routes: readonly ProviderModelRouteReference[
 }
 
 function providerModelSplitStyle(columnCount: number): CSSProperties {
-  return { gridTemplateColumns: `minmax(0, 1fr) repeat(${columnCount}, minmax(56px, 80px)) 32px` };
+  return { gridTemplateColumns: `minmax(0, 1fr) repeat(${columnCount}, minmax(56px, 80px)) 44px` };
 }
 
 function providerModelCountLabel(count: number, t: Translator): string {
@@ -4402,7 +4447,7 @@ function CredentialVaultPanel({ controller, snapshot, runAction, onAdd, t }: { r
   return <><div className="provider-detail__scroll provider-vault"><div className="provider-vault-header"><span><strong>{t("settings.credentials")}</strong><small>{t("settings.credentialsBody")}</small></span><Button tone="primary" onClick={onAdd}>{t("settings.addCredential")}</Button></div><CredentialList credentials={snapshot.settings.credentials} controller={controller} onDelete={setRemovalTarget} t={t} emptyLabel={t("settings.noCredentials")} /><section className="credential-assurance"><div className="credential-assurance__icon"><KeyRound aria-hidden="true" /></div><div><strong>{t("settings.secretAssurance")}</strong><p>{t("settings.secretAssuranceBody")}</p><ul><li><Check aria-hidden="true" />{t("settings.credentialProjection")}</li><li><Check aria-hidden="true" />{t("settings.ticketSafety")}</li><li><Check aria-hidden="true" />{t("settings.secretUnreadable")}</li></ul></div></section></div><Modal open={removalTarget !== undefined} title={t("settings.deleteCredentialTitle", { name: removalTarget?.name ?? "" })} description={t("settings.deleteCredentialBody")} size="small" onClose={() => setRemovalTarget(undefined)} headerLeading={<ModalBackButton label={t("common.back")} onClick={() => setRemovalTarget(undefined)} />}><div className="modal__actions"><Button tone="danger" onClick={() => { const target = removalTarget; if (target === undefined) return; setRemovalTarget(undefined); runAction(`delete-credential:${target.id}`, () => controller.deleteCredential(target.id)); }}>{t("common.delete")}</Button></div></Modal></>;
 }
 
-function ProviderAddWizard({ open, providers, runtimes, onClose, onChoose, onChooseRuntime, onCustom, t }: { readonly open: boolean; readonly providers: readonly ProviderSettingsEntry[]; readonly runtimes: NonNullable<AppSnapshot["managedModelRuntimes"]>; readonly onClose: () => void; readonly onChoose: (provider: ProviderSettingsEntry) => void; readonly onChooseRuntime: (runtimeId: string) => void; readonly onCustom: () => void; readonly t: Translator }): JSX.Element {
+function ProviderAddWizard({ open, providers, runtimes, runtimePending = false, runtimeError = false, onClose, onChoose, onChooseRuntime, onCustom, t }: { readonly open: boolean; readonly providers: readonly ProviderSettingsEntry[]; readonly runtimes: NonNullable<AppSnapshot["managedModelRuntimes"]>; readonly runtimePending?: boolean; readonly runtimeError?: boolean; readonly onClose: () => void; readonly onChoose: (provider: ProviderSettingsEntry) => void; readonly onChooseRuntime: (runtimeId: string) => void; readonly onCustom: () => void; readonly t: Translator }): JSX.Element {
   const [query, setQuery] = useState("");
   useEffect(() => { if (open) setQuery(""); }, [open]);
   const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -4416,7 +4461,9 @@ function ProviderAddWizard({ open, providers, runtimes, onClose, onChoose, onCho
     { id: "account", label: t("settings.providerWizard.accountGroup"), providers: filtered.filter((entry) => entry.provider.kind === "oauth" || entry.provider.kind === "subscription" || entry.runtime?.loginMethods.some((method) => method !== "apiKey") === true) },
     { id: "api", label: t("settings.providerWizard.apiGroup"), providers: filtered.filter((entry) => entry.runtime?.loginMethods.some((method) => method !== "apiKey") !== true && (entry.provider.kind === "apiKey" || entry.provider.kind === "managed" || entry.runtime?.loginMethods.includes("apiKey") === true)) }
   ].filter((group) => group.providers.length > 0 || (group.runtimes?.length ?? 0) > 0);
-  return <Modal open={open} title={t("settings.addProvider")} size="large" className="provider-flow-modal provider-add-wizard-modal" onClose={onClose} headerLeading={<ProviderFlowBackButton onBack={onClose} t={t} />} headerTrailing={<ProviderWizardProgress activeStep={1} t={t} />}><div className="provider-add-wizard"><label className="provider-add-wizard__search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("settings.providerWizard.search")} aria-label={t("settings.providerWizard.search")} /></label><div className="provider-add-wizard__catalog">{groups.map((group) => <section key={group.id}><h3>{group.label}</h3>{group.runtimes?.map((runtime) => <button type="button" key={`runtime:${runtime.id}`} onClick={() => onChooseRuntime(runtime.id)}><span className="provider-catalog-icon" aria-hidden="true"><Server /></span><span><strong>{runtime.name}</strong><small>{t("settings.providerWizard.localSuggestion")}</small></span><Pill>BETA</Pill><ChevronRight aria-hidden="true" /></button>)}{group.providers.map((entry) => <button type="button" key={entry.id} onClick={() => onChoose(entry)}><span className="provider-catalog-icon" aria-hidden="true"><ProviderMark providerId={entry.provider.id} name={entry.provider.name} /></span><span><strong>{entry.provider.name}</strong><small>{[entry.backendName, providerConnectionLabel(entry.provider, t)].filter(Boolean).join(" · ")}</small></span><ChevronRight aria-hidden="true" /></button>)}</section>)}{groups.length === 0 && <p className="provider-add-wizard__empty">{t("settings.providerWizard.noMatches")}</p>}</div><button type="button" className="provider-add-wizard__custom" onClick={onCustom}><span className="provider-catalog-icon"><CirclePlus aria-hidden="true" /></span><span><strong>{t("settings.providerWizard.customTitle")}</strong><small>{t("settings.providerWizard.customBody")}</small></span><ChevronRight aria-hidden="true" /></button><p className="provider-add-wizard__note">{t("settings.providerWizard.authNote")}</p></div></Modal>;
+  return <Modal open={open} title={t("settings.addProvider")} size="large" className="provider-flow-modal provider-add-wizard-modal" onClose={onClose} headerLeading={<ProviderFlowBackButton onBack={onClose} t={t} />} headerTrailing={<ProviderWizardProgress activeStep={1} t={t} />}><div className="provider-add-wizard">
+    {runtimePending && <p role="status">{t("common.loading")}</p>}{runtimeError && <p className="danger-text" role="alert">{t("settings.localRuntime.actionFailed")}</p>}
+    <label className="provider-add-wizard__search"><Search aria-hidden="true" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("settings.providerWizard.search")} aria-label={t("settings.providerWizard.search")} /></label><div className="provider-add-wizard__catalog">{groups.map((group) => <section key={group.id}><h3>{group.label}</h3>{group.runtimes?.map((runtime) => <button type="button" key={`runtime:${runtime.id}`} disabled={runtimePending} onClick={() => onChooseRuntime(runtime.id)}><span className="provider-catalog-icon" aria-hidden="true"><Server /></span><span><strong>{runtime.name}</strong><small>{t("settings.providerWizard.localSuggestion")}</small></span><Pill>BETA</Pill><ChevronRight aria-hidden="true" /></button>)}{group.providers.map((entry) => <button type="button" key={entry.id} disabled={runtimePending} onClick={() => onChoose(entry)}><span className="provider-catalog-icon" aria-hidden="true"><ProviderMark providerId={entry.provider.id} name={entry.provider.name} /></span><span><strong>{entry.provider.name}</strong><small>{[entry.backendName, providerConnectionLabel(entry.provider, t)].filter(Boolean).join(" · ")}</small></span><ChevronRight aria-hidden="true" /></button>)}</section>)}{groups.length === 0 && <p className="provider-add-wizard__empty">{t("settings.providerWizard.noMatches")}</p>}</div><button type="button" className="provider-add-wizard__custom" disabled={runtimePending} onClick={onCustom}><span className="provider-catalog-icon"><CirclePlus aria-hidden="true" /></span><span><strong>{t("settings.providerWizard.customTitle")}</strong><small>{t("settings.providerWizard.customBody")}</small></span><ChevronRight aria-hidden="true" /></button><p className="provider-add-wizard__note">{t("settings.providerWizard.authNote")}</p></div></Modal>;
 }
 
 function ProviderAccountUsageDetails({

@@ -5,7 +5,7 @@ import {
   mergeObservedProviderDisplayOrder,
   normalizeProviderDisplayOrder
 } from "./provider-display-order.js";
-import type { ModelFavoriteConfigurationView } from "./model.js";
+import type { ModelFavoriteConfigurationView, ModelView } from "./model.js";
 
 export type ModelPickerLayout = "original" | "classic" | "badge";
 
@@ -114,6 +114,21 @@ export function readModelConfiguration(
   modelId: string
 ): ModelRowConfiguration | undefined {
   return preferences.configurations[modelPreferenceKey(backendId, providerId, modelId)];
+}
+
+export function defaultModelEffort(model: Pick<ModelView, "efforts" | "metadata">): string | undefined {
+  const declared = model.metadata?.defaultEffort;
+  return declared !== undefined && model.efforts.includes(declared) ? declared : model.efforts[0];
+}
+
+export function preferredModelEffort(preferences: Pick<ModelPickerOwnerPreferences, "configurations">, model: ModelView): string | undefined {
+  const effort = readModelConfiguration(preferences, model.backendId, model.providerId, model.modelId)?.effort;
+  return effort !== undefined && model.efforts.includes(effort) ? effort : defaultModelEffort(model);
+}
+
+export function clearModelEffort(ownerId: string | undefined, model: ModelView): void {
+  const current = readModelConfiguration(readModelPickerOwnerPreferences(ownerId), model.backendId, model.providerId, model.modelId);
+  setModelConfiguration(ownerId, model.backendId, model.providerId, model.modelId, { fast: current?.fast === true });
 }
 
 export function setModelConfiguration(

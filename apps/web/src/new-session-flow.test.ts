@@ -63,7 +63,7 @@ describe("lazy new-session dispatch", () => {
       createSession: vi.fn(async () => ({ sessionId: "runtime-goal", generation: 22n })),
       listCommands: vi.fn(async () => [{
         id: "runtime-goal-command", name: "/goal", description: "Runtime goal",
-        source: "skill" as const, loaded: true
+        source: "skill" as const, inputMode: "text" as const, loaded: true
       }]),
       setObjective: vi.fn(async () => objectiveView("runtime-goal", 22n, "unused")),
       send: vi.fn(async () => undefined),
@@ -319,7 +319,7 @@ describe("lazy new-session dispatch", () => {
       createSession: vi.fn(async () => ({ sessionId: "runtime-learn", generation: 12n })),
       listCommands: vi.fn(async () => [{
         id: "runtime-learn-command", name: "/learn", description: "Runtime Skill command",
-        source: "skill" as const, loaded: true
+        source: "skill" as const, inputMode: "text" as const, loaded: true
       }]),
       startSkillLearning: vi.fn(async () => learningRun("unused")),
       send: vi.fn(async () => undefined),
