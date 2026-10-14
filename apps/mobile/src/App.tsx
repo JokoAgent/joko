@@ -235,6 +235,9 @@ import {
 } from "./mobile-composer-quote";
 import { MobileInteractionSheet } from "./MobileInteractionSheet";
 import { MobileRuntimeControlsSheet } from "./MobileRuntimeControlsSheet";
+import { MobileAccountUsageSummary } from "./MobileAccountUsageSummary";
+import { mobileUsageProviderKey } from "./mobile-account-usage";
+import { useMobileAccountUsage } from "./use-mobile-account-usage";
 import { MobileContextSheet } from "./MobileContextSheet";
 import { MobileObjectiveSheet } from "./MobileObjectiveSheet";
 import { MobileCollaborationSheet } from "./MobileCollaborationSheet";
@@ -3775,6 +3778,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const queueCapabilities = workerReadOnly ? { ...advertisedQueueCapabilities, edit: false, cancel: false, reorder: false } : advertisedQueueCapabilities;
   const interactions = state.status === "connected" ? client.taskInteractions() : [];
   const runtimeControls = state.status === "connected" ? client.taskRuntimeControls() : undefined;
+  const providerUsageTransport = state.status === "connected" ? client.taskProviderUsageTransport() : undefined;
+  const usageProviders = providerUsageTransport?.providers.filter(provider => provider.providerId === session?.model?.model?.providerId) ?? [];
+  const usageProvider = usageProviders.length === 1 ? usageProviders[0] : undefined;
+  const taskAccountUsage = useMobileAccountUsage(providerUsageTransport, taskActionsVisible,
+    usageProvider ? [usageProvider.providerId] : []);
   const runtimeControlsOwnerRef = useRef(runtimeControls?.surfaceOwnerKey);
   const contextControls = state.status === "connected" ? client.taskContextControls() : undefined;
   const objectiveApi = state.status === "connected" && partnerIdentity.ready && !partnerIdentity.partner
@@ -6076,6 +6084,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       quickSwitch={homeLayout.mode === "drawer" ? { label: mobileMessage(locale, "task.openList"), ref: drawerMenuRef,
         onOpen: () => { if (!taskHomeNavigator.busy) setDrawerOpen(true); } } : undefined}
       disabled={session === undefined} colors={colors} locale={locale} onMenuVisibilityChange={setTaskActionsVisible}
+      menuHeader={usageProvider && <MobileAccountUsageSummary snapshot={taskAccountUsage.snapshots[mobileUsageProviderKey(usageProvider)]}
+        modelId={session?.model?.model?.modelId} providerName={usageProvider.displayName} loading={taskAccountUsage.loading}
+        failed={taskAccountUsage.failed} now={taskAccountUsage.now} colors={colors} locale={locale} />}
       actions={[
         { id: "search", label: mobileMessage(locale, "conversationSearch.title"), onPress: openConversationSearch,
           disabled: !partnerIdentity.ready || state.detail === undefined || state.busy || attachmentBusy || voice.busy },
@@ -6650,6 +6661,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       onClose={() => { if (searchOwnerRef.current.scope === searchScope) setSearchOwner(undefined); }} onFocus={focusSearchHit}
       onLoadEarlier={async () => { if (searchOwnerRef.current.scope === searchScope && searchOwnerRef.current.open) await client.older(); }} />
     <MobileRuntimeControlsSheet visible={!workerReadOnly && runtimeControlsVisible && runtimeControls !== undefined && partnerRead.ready && !partnerRead.partner} locale={locale}
+      providerUsageTransport={providerUsageTransport}
       controls={runtimeControls} busy={state.busy || runtimeControlPending || modelFavoritePending || attachmentBusy} colors={colors}
       onClose={() => setRuntimeControlsVisible(false)}
       onSetModel={(authorityKey, selection) => client.setTaskModel(authorityKey, selection)}

@@ -72,6 +72,9 @@ service OperationService {
 }
 
 service BackendService {
+  rpc ProbeLocalRuntime(ProbeLocalRuntimeRequest) returns (ProbeLocalRuntimeResponse);
+  rpc InstallLocalRuntime(InstallLocalRuntimeRequest) returns (stream InstallLocalRuntimeResponse);
+  rpc CancelLocalRuntimeInstall(CancelLocalRuntimeInstallRequest) returns (CancelLocalRuntimeInstallResponse);
   rpc ListBackends(ListBackendsRequest) returns (ListBackendsResponse);
   rpc GetBackend(GetBackendRequest) returns (GetBackendResponse);
   rpc ListRuntimeProcesses(ListRuntimeProcessesRequest) returns (ListRuntimeProcessesResponse);

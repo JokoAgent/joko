@@ -183,6 +183,8 @@ import { createManagedModelRuntimeSystem, type ManagedModelRuntimeSystem } from 
 import type { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { composeModelWorkingContext } from "./model-working-context-system.js";
 import { createOutboundStreamingFetch } from "./outbound-streaming-fetch.js";
+import { LocalCodexRuntime } from "./local-codex-runtime.js";
+import { ManagedChildWorktreeOwner } from "./managed-child-worktree-owner.js";
 import { McpRouter, type PiMcpBridgeSnapshot } from "./mcp-router.js";
 import { NativeAuthRecoveryStore } from "./native-auth-recovery.js";
 import { ProviderCredentialSurfaceResolver } from "./provider-credential-surface.js";
@@ -410,6 +412,7 @@ export interface OrchestratorApplication {
   readonly remoteExecution?: RemoteExecutionRouter;
   readonly remoteHosts?: RemoteHostRegistry;
   readonly remoteBackendRuntimeSetup?: RemoteBackendRuntimeSetupManager;
+  readonly localBackendRuntimeSetup?: LocalCodexRuntime;
   readonly sshKeys?: SshKeyManager;
   readonly terminals?: TerminalProvider;
   readonly simulatorViewer?: SimulatorViewerServiceOwner;
@@ -1337,6 +1340,35 @@ export async function createOrchestratorApplication(
   };
   const codexBackendId = "codex";
   const claudeCodeBackendId = "claude-code";
+  const managedChildWorkspaces = new ManagedChildWorktreeOwner({
+    store,
+    worktrees: () => sessionWorktrees,
+    storageRoot: join(config.dataDirectory, "native-managed-child-worktrees"),
+    currentBackend: backendId => {
+      const current = backendInstances.get(backendId);
+      return { generation: current.generation, available: current.state === "available" };
+    }
+  });
+  let restartBackend!: (backendId: string, expectedGeneration?: number) => Promise<void>;
+  const localBackendRuntimeSetup = new LocalCodexRuntime({
+    rootDirectory: join(config.dataDirectory, "backend-runtime", codexBackendId, "installed-packages"),
+    backendId: codexBackendId,
+    ...(process.env["JOKO_CODEX_EXECUTABLE"] === undefined || config.codexExecutable === undefined ? {} : { manualExecutable: config.codexExecutable }),
+    ...(config.codexExecutable === undefined ? {} : { fallbackExecutable: config.codexExecutable }),
+    fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
+      environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }),
+    currentGeneration: () => store.getBackend(codexBackendId).descriptor.instanceGeneration!,
+    adopt: async expectedGeneration => {
+      try { await restartBackend(codexBackendId, expectedGeneration); }
+      catch (error) {
+        // Post-publication recovery can fail after the new instance is already
+        // authoritative. Its exact current publication must not be rolled back.
+        const current = backendInstances.get(codexBackendId);
+        if (current.generation === expectedGeneration || current.state !== "available"
+          || current.descriptor.version !== "0.159.2") throw error;
+      }
+    }
+  });
   const remoteBackendRuntimeSetup = new RemoteBackendRuntimeSetupManager({
     store,
     registry: remoteHosts,
@@ -1434,9 +1466,9 @@ export async function createOrchestratorApplication(
             profileDirectory: codexHome,
             appServer: {
               transport: {
-                ...(config.codexExecutable === undefined ? {} : { command: config.codexExecutable }),
+                command: await localBackendRuntimeSetup.resolveExecutable() ?? "codex",
                 processOwner: {
-                  rootDirectory: join(config.dataDirectory, "backend-runtime", instanceId),
+                  rootDirectory: join(config.dataDirectory, "backend-runtime", instanceId, "processes"),
                   instanceId,
                   generation,
                   recoverStale: backendInstances.adapter(instanceId) === undefined,
@@ -1508,6 +1540,7 @@ export async function createOrchestratorApplication(
         managedProviders: managedRuntime(instanceId, generation, CLAUDE_MANAGED_PROVIDER_SUPPORT),
         credentialPort: claudeCodeCredentialPort,
         resolveSubagentModel: (providerId) => subagentModels.resolve(instanceId, providerId),
+        prepareManagedChildWorkspace: input => managedChildWorkspaces.prepare(input),
         resolveNativeMemoryEnabled: () => makerMemory.nativeEnabledForBackend(instanceId),
         oauthFetch: claudeCodeOAuthFetch,
         readBlob: (blob) => artifacts.readBlob(blob),
@@ -1874,9 +1907,10 @@ export async function createOrchestratorApplication(
     readonly target: Promise<PiBackendAdapter>;
     publishDescriptor: boolean;
   } | undefined;
-  const restartBackend = async (backendId: string): Promise<void> => {
+  restartBackend = async (backendId: string, expectedGeneration?: number): Promise<void> => {
     await runBackendLifecycle(async () => {
       const previous = backendInstances.get(backendId);
+      if (expectedGeneration !== undefined && previous.generation !== expectedGeneration) throw new Error("The Backend instance changed before runtime adoption.");
       const previousAdapter = backendInstances.adapter(backendId);
       let resolveReplacementTarget: ((target: PiBackendAdapter) => void) | undefined;
       let replacementTargetResolved = false;
@@ -2486,6 +2520,10 @@ export async function createOrchestratorApplication(
     }
     await reviewCoordinator.reconcileStartup();
     await sessionWorktrees.initialize();
+    await managedChildWorkspaces.initialize().catch(() => {
+      store.appendDiagnostic({ severity: "warning", component: "child-workspace", code: "MANAGED_CHILD_WORKSPACE_UNAVAILABLE",
+        message: "Native child workspace isolation is unavailable; its existing leases remain retained.", details: {} });
+    });
     await partnerWorkbenches.initialize();
     await sessionHost.initialize();
     await partnerGroups.start();
@@ -2798,6 +2836,8 @@ export async function createOrchestratorApplication(
     await attempt(() => remoteDesktop.close());
     await attempt(() => devicePeers.shutdown());
     await attempt(() => remoteBackendRuntimeSetup.close());
+    await attempt(() => localBackendRuntimeSetup.close());
+    managedChildWorkspaces.close();
     await attempt(() => remoteHosts.close());
     await attempt(() => runtimeActivity.close());
     await attempt(() => voiceDictionaryPeers.close());
@@ -2847,6 +2887,7 @@ export async function createOrchestratorApplication(
     remoteExecution,
     remoteHosts,
     remoteBackendRuntimeSetup,
+    localBackendRuntimeSetup,
     sshKeys,
     terminals,
     simulatorViewer,
@@ -2983,6 +3024,7 @@ export async function createOrchestratorApplication(
         await attempt(() => auxiliaryText.dispose());
         await attempt(() => providerAuth.beginShutdown());
         await attempt(() => providerAccountUsage.invalidate());
+        await attempt(() => localBackendRuntimeSetup.close());
         await attempt(() => managedModelRuntimeSystem.close());
         await attempt(() => objectives?.close());
         await attempt(() => collaborationGoals.close());
@@ -2994,6 +3036,7 @@ export async function createOrchestratorApplication(
         await attempt(() => artifactMaintenance.close());
         await attempt(() => historyMaintenance.close());
         await attempt(() => sessionHost.dispose());
+        managedChildWorkspaces.close();
         await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => managedProviderProxy.close());
         await attempt(() => sessionWorktrees.dispose());

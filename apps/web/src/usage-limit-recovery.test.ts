@@ -37,6 +37,21 @@ describe("usage-limit recovery", () => {
     ], "provider-one", NOW)).toBeUndefined();
   });
 
+  it("uses the exact Backend and waits for reached quota buckets and the selected model", () => {
+    const base = providerUsage(20, NOW + 3_600_000, 30, NOW + 7_200_000);
+    const owned = { ...base, backendId: "backend-owned", accountUsage: { ...base.accountUsage,
+      buckets: [{ id: "metered", primaryWindow: { usedPercent: 100, resetAt: NOW + 10_800_000 } }],
+      modelWindows: [
+        { modelId: "selected", displayName: "Selected", window: { usedPercent: 100, resetAt: NOW + 14_400_000 } },
+        { modelId: "other", displayName: "Other", window: { usedPercent: 100, resetAt: NOW + 18_000_000 } }
+      ]
+    } };
+    const foreign = { ...providerUsage(100, NOW + 21_600_000, 30, NOW + 7_200_000), backendId: "backend-foreign" };
+    expect(providerAccountUsageResetAt([foreign, owned], "provider-one", NOW)).toBeUndefined();
+    expect(providerAccountUsageResetAt([foreign, owned], "provider-one", NOW,
+      { backendId: "backend-owned", modelId: "selected" })).toBe(NOW + 14_400_000);
+  });
+
   it("extracts a conservative reset hint and excludes billing depletion", () => {
     expect(usageLimitRecoveryHint(error("usage_limit_reached; try again in 1 h 5 min"), NOW))
       .toEqual({ resetAtMs: NOW + 3_900_000 });

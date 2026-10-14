@@ -1,4 +1,5 @@
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { GetProviderUsageRequestSchema, GetProviderUsageResponseSchema } from "@joko/contracts";
 import { ListPartnerTaskOutputsRequestSchema, ListPartnerTaskOutputsResponseSchema,
   PartnerTaskOutputSourceKind, PartnerTaskOutputReadiness, PartnerTaskOutputFileStatus } from "@joko/contracts";
 import { createHash } from "node:crypto";
@@ -151,6 +152,30 @@ import { mobilePartnerProfileDraft } from "./mobile-partner-profile";
 import { profilePartner, profilePartnerWire } from "./test/mobile-partner-profile";
 import { creationSnapshot } from "./test/mobile-partner-creation";
 import { mobilePartnerCreationDraft, MobilePartnerCreationRejected } from "./mobile-partner-creation";
+
+describe("Mobile account usage network", () => {
+  it("reads the exact generated Backend Provider route and rejects foreign account snapshots", async () => {
+    const credential: PairedCredential = { profileId: "profile", serverId: "server", deviceId: "phone", connectionId: "connection",
+      origin: "https://node.example", displayName: "Node", authKey: "fixture-only" };
+    const response = create(GetProviderUsageResponseSchema, { accountUsage: { providerId: "provider", primaryWindow: { usedPercent: 80 },
+      modelWindows: [{ modelId: "model", displayName: "Model", window: { usedPercent: 90 } }] } });
+    const fetcher = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("https://node.example/joko.v1.BackendService/GetProviderUsage");
+      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer fixture-only");
+      expect(fromBinary(GetProviderUsageRequestSchema, new Uint8Array(init?.body as Uint8Array))).toMatchObject({ backendId: "backend", providerId: "provider" });
+      return new Response(toBinary(GetProviderUsageResponseSchema, response), { headers: { "content-type": "application/proto" } });
+    });
+    try {
+      await expect(mobileNetwork.getProviderUsage!(credential, "backend", "provider")).resolves.toMatchObject({ providerId: "provider",
+        modelWindows: [{ modelId: "model", window: { usedPercent: 90 } }] });
+      response.accountUsage!.providerId = "foreign";
+      await expect(mobileNetwork.getProviderUsage!(credential, "backend", "provider")).rejects.toThrow(/Provider changed/u);
+      const aborted = new AbortController(); aborted.abort();
+      await expect(mobileNetwork.getProviderUsage!(credential, "backend", "provider", aborted.signal)).rejects.toThrow();
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    } finally { fetcher.mockRestore(); }
+  });
+});
 
 describe("Partner task output network", () => {
   it("uses the authenticated generated metadata RPC and rejects wrong owner, malformed paths and aborted reads", async () => {

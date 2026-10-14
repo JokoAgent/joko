@@ -1,3 +1,5 @@
+import type { ProviderAccountCreditsSnapshot, ProviderAccountUsageBucket, ProviderAccountUsageSnapshot, ProviderAccountUsageWindow } from "@joko/core";
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
@@ -73,27 +75,9 @@ export interface NativeInitializeResult {
   readonly codexHome?: string;
 }
 
-export interface NativeAccountUsageWindow {
-  readonly usedPercent: number;
-  readonly windowMinutes?: number;
-  readonly resetAt?: number;
-}
-
-export interface NativeAccountCreditsSnapshot {
-  readonly hasCredits?: boolean;
-  readonly unlimited?: boolean;
-  readonly balance?: string;
-  readonly observedAt: number;
-}
-
-export interface NativeAccountUsageSnapshot {
-  readonly primaryWindow?: NativeAccountUsageWindow;
-  readonly secondaryWindow?: NativeAccountUsageWindow;
-  readonly limitReached?: boolean;
-  readonly planType?: string;
-  readonly credits?: NativeAccountCreditsSnapshot;
-  readonly observedAt: number;
-}
+export type NativeAccountUsageWindow = ProviderAccountUsageWindow;
+export type NativeAccountCreditsSnapshot = ProviderAccountCreditsSnapshot;
+export type NativeAccountUsageSnapshot = Omit<ProviderAccountUsageSnapshot, "providerId">;
 
 export type ScalarCommandApprovalDecision = "accept" | "acceptForSession" | "decline" | "cancel";
 
@@ -344,9 +328,7 @@ const MAXIMUM_ACCOUNT_TEXT_LENGTH = 128;
 const MAXIMUM_PROTO_TIMESTAMP_SECONDS = 253_402_300_799;
 
 /**
- * Projects the stable account quota response into the small public shape used
- * by Joko. Per-limit buckets, reset-credit records, and unknown upstream fields
- * deliberately never leave this protocol boundary.
+ * Projects native quota facts; unrelated upstream fields remain private.
  */
 export function parseAccountRateLimits(
   value: JsonValue,
@@ -367,11 +349,40 @@ export function parseAccountRateLimits(
     rateLimits["rateLimitReachedType"],
     "account rate-limit reached type"
   );
+  const buckets: ProviderAccountUsageBucket[] = [];
+  const rawBuckets = root["rateLimitsByLimitId"];
+  if (rawBuckets !== undefined && rawBuckets !== null) {
+    const entries = Object.entries(objectValue(rawBuckets, "account quota buckets"));
+    if (entries.length > 128) throw new ProtocolShapeError("account quota bucket count is invalid");
+    for (const [key, value] of entries) {
+      const id = optionalBoundedProtocolText(key, "account quota bucket identity");
+      if (id === undefined) throw new ProtocolShapeError("account quota bucket identity is invalid");
+      const bucket = objectValue(value, "account quota bucket");
+      const displayName = optionalBoundedProtocolText(bucket["limitName"], "account quota bucket name");
+      const bucketPrimary = accountUsageWindow(bucket["primary"], "primary bucket window");
+      const bucketSecondary = accountUsageWindow(bucket["secondary"], "secondary bucket window");
+      const bucketPlan = optionalBoundedProtocolText(bucket["planType"], "bucket plan type");
+      const bucketCredits = accountCreditsSnapshot(bucket["credits"], observedAt);
+      const bucketReached = optionalBoundedProtocolText(bucket["rateLimitReachedType"], "bucket limit reached type");
+      buckets.push({
+        id,
+        ...(displayName === undefined ? {} : { displayName }),
+        ...(bucketPrimary === undefined ? {} : { primaryWindow: bucketPrimary }),
+        ...(bucketSecondary === undefined ? {} : { secondaryWindow: bucketSecondary }),
+        ...(bucketPlan === undefined ? {} : { planType: bucketPlan }),
+        ...(bucketCredits === undefined ? {} : { credits: bucketCredits }),
+        ...(bucketReached === undefined ? {} : { limitReached: true })
+      });
+    }
+  }
+  const resetCredits = accountResetCredits(root["rateLimitResetCredits"], observedAt);
   if (primaryWindow === undefined
     && secondaryWindow === undefined
     && planType === undefined
     && credits === undefined
-    && reachedType === undefined) {
+    && reachedType === undefined
+    && buckets.length === 0
+    && resetCredits === undefined) {
     throw new ProtocolShapeError("account rate limits contain no supported fields");
   }
   return {
@@ -380,8 +391,36 @@ export function parseAccountRateLimits(
     ...(reachedType === undefined ? {} : { limitReached: true }),
     ...(planType === undefined ? {} : { planType }),
     ...(credits === undefined ? {} : { credits }),
+    ...(buckets.length === 0 ? {} : { buckets }),
+    ...(resetCredits === undefined ? {} : { resetCredits }),
     observedAt
   };
+}
+
+function accountResetCredits(
+  value: JsonValue | undefined,
+  observedAt: number
+): NativeAccountUsageSnapshot["resetCredits"] {
+  if (value === undefined || value === null) return undefined;
+  const summary = objectValue(value, "account reset credits");
+  const availableCount = summary["availableCount"];
+  if (typeof availableCount !== "number" || !Number.isSafeInteger(availableCount)
+    || availableCount < 0 || availableCount > 0xffff_ffff) {
+    throw new ProtocolShapeError("account reset credit count is invalid");
+  }
+  const rows = summary["credits"];
+  if (rows !== undefined && rows !== null && (!Array.isArray(rows) || rows.length > 4_096)) {
+    throw new ProtocolShapeError("account reset credit details are invalid");
+  }
+  let earliestExpiryAt: number | undefined;
+  if (Array.isArray(rows)) for (const value of rows) {
+    const row = objectValue(value, "account reset credit");
+    if (row["status"] !== "available" || row["expiresAt"] === undefined || row["expiresAt"] === null) continue;
+    const expiryAt = boundedPositiveProtocolInteger(row["expiresAt"]!, MAXIMUM_PROTO_TIMESTAMP_SECONDS, "reset credit expiry") * 1_000;
+    if (expiryAt <= observedAt) continue;
+    earliestExpiryAt = earliestExpiryAt === undefined ? expiryAt : Math.min(earliestExpiryAt, expiryAt);
+  }
+  return { availableCount, ...(earliestExpiryAt === undefined ? {} : { earliestExpiryAt }) };
 }
 
 function accountUsageWindow(

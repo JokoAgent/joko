@@ -98,7 +98,7 @@ describe("Codex stable protocol guards", () => {
       .toMatchObject({ malformed: true, decisions: [] });
   });
 
-  it("normalizes only bounded provider-level account quota fields", () => {
+  it("preserves bounded account quota buckets and reset-credit facts", () => {
     expect(parseAccountRateLimits({
       rateLimits: {
         planType: "  plus  ",
@@ -118,7 +118,31 @@ describe("Codex stable protocol guards", () => {
       limitReached: true,
       planType: "plus",
       credits: { hasCredits: true, unlimited: false, balance: "12.5", observedAt: 1_700_000_000_000 },
+      buckets: [{ id: "unrelated", primaryWindow: { usedPercent: 99, windowMinutes: 60 } }],
+      resetCredits: { availableCount: 7 },
       observedAt: 1_700_000_000_000
+    });
+  });
+
+  it("preserves independent buckets and reports only actual available-credit expiry", () => {
+    expect(parseAccountRateLimits({
+      rateLimits: {},
+      rateLimitsByLimitId: {
+        coding: { limitName: "Coding", primary: { usedPercent: 10, windowMinutes: 300 } },
+        review: { secondary: { usedPercent: 80, windowMinutes: 10_080 } }
+      },
+      rateLimitResetCredits: { availableCount: 3, credits: [
+        { status: "available", expiresAt: 1_800_000_000 },
+        { status: "available", expiresAt: null },
+        { status: "redeemed", expiresAt: 1_700_000_100 },
+        { status: "available", expiresAt: 1_600_000_000 }
+      ] }
+    }, 1_700_000_000_000)).toMatchObject({
+      buckets: [
+        { id: "coding", displayName: "Coding", primaryWindow: { usedPercent: 10, windowMinutes: 300 } },
+        { id: "review", secondaryWindow: { usedPercent: 80, windowMinutes: 10_080 } }
+      ],
+      resetCredits: { availableCount: 3, earliestExpiryAt: 1_800_000_000_000 }
     });
   });
 

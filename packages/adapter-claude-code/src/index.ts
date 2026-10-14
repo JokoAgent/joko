@@ -23,6 +23,8 @@ export {
   type ClaudeSdkQueryParams,
   type ClaudeSdkProbe,
   type ClaudeSdkProbeInput,
+  type ClaudeSdkAccountUsageInput,
+  type ClaudeSdkAccountUsage,
   type ClaudeSdkSessionInfo,
   type ClaudeSdkSessionMessage,
   type ClaudeSdkListSessionsOptions,
@@ -62,6 +64,11 @@ export {
   type ClaudeTextResourceResolver,
   type ClaudeTextResourceSeed
 } from "./resources.js";
+export type {
+  ClaudeManagedChildWorkspace,
+  ClaudeManagedChildWorkspaceInput,
+  ClaudeManagedChildWorkspaceFactory
+} from "./managed-child-workspace.js";
 export {
   ClaudeCodeOAuthAccount,
   type ClaudeCodeAccountSnapshot,

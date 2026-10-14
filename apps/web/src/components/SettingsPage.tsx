@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
+import { LocalBackendRuntimeSetup } from "./LocalBackendRuntimeSetup.js";
 import { UsageHistorySection } from "./UsageHistorySection.js";
 import { NativeCatalogAdoptionRecovery } from "./NativeCatalogAdoptionRecovery.js";
 import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
@@ -3354,6 +3355,7 @@ function BackendSettings({ controller, snapshot, runAction, showHeading = true, 
           <div className="backend-setting__identity"><StatusDot state={backend.health} label={backend.health} /><span><strong>{backend.name}</strong><small>v{backend.version} · {backend.id}</small><small>{backend.installationState ?? "unknown"} · {backend.authenticationState ?? "unknown"}{backend.instanceGeneration === undefined ? "" : ` · g${backend.instanceGeneration}`}</small>{backend.error === undefined ? null : <small className="danger-text">{backend.error}</small>}</span></div>
           <div className="backend-setting__actions"><Pill tone={backend.health === "healthy" ? "success" : backend.health === "degraded" ? "warning" : "danger"}>{backend.health}</Pill><Button onClick={() => runAction(`restart-backend:${backend.id}`, () => controller.restartBackend(backend.id))}>{t("common.restart")}</Button></div>
         </header>
+        <LocalBackendRuntimeSetup backend={backend} controller={controller} t={t} />
         {settings !== undefined && <div className="backend-setting__controls">
           <div className="backend-setting__permission"><span>{t("settings.backendDefaultModel")}</span><ModelPicker
             models={backendModels}
@@ -4507,19 +4509,26 @@ function ProviderAccountUsageDetails({
   const usage = runtime.accountUsage;
   if (!runtime.capabilities.has(capabilityNames.providerAccountUsage) || usage === undefined) return null;
   const percent = new Intl.NumberFormat(locale, { maximumFractionDigits: 1 });
-  const windowRows = [
+  const buckets = usage.buckets ?? [];
+  const windowRows = (buckets.length === 0 ? [
     { key: "primary", label: t("settings.accountUsagePrimary"), window: usage.primaryWindow },
     { key: "secondary", label: t("settings.accountUsageSecondary"), window: usage.secondaryWindow }
-  ].filter((row) => row.window !== undefined);
-  const creditLabel = usage.credits?.unlimited === true
+  ] : buckets.flatMap((bucket) => [
+    { key: `bucket:${bucket.id}:primary`, label: `${bucket.displayName ?? bucket.id} · ${t("settings.accountUsagePrimary")}`, window: bucket.primaryWindow },
+    { key: `bucket:${bucket.id}:secondary`, label: `${bucket.displayName ?? bucket.id} · ${t("settings.accountUsageSecondary")}`, window: bucket.secondaryWindow }
+  ])).concat((usage.modelWindows ?? []).map((entry, index) => ({
+    key: `model:${index}`, label: entry.displayName, window: entry.window
+  }))).filter((row) => row.window !== undefined);
+  const formatCredits = (credits: typeof usage.credits): string | undefined => credits?.unlimited === true
     ? t("settings.accountCreditsUnlimited")
-    : usage.credits?.balance !== undefined
-      ? t("settings.accountCreditsBalance", { balance: usage.credits.balance })
-      : usage.credits?.hasCredits === false
+    : credits?.balance !== undefined
+      ? t("settings.accountCreditsBalance", { balance: credits.balance })
+      : credits?.hasCredits === false
         ? t("settings.accountCreditsNone")
-        : usage.credits?.hasCredits === true
+        : credits?.hasCredits === true
           ? t("settings.accountCreditsAvailable")
           : undefined;
+  const creditLabel = formatCredits(usage.credits);
   const observedAt = usage.credits?.observedAt ?? usage.observedAt;
   return <div className="provider-account-usage" role="list" aria-label={t("settings.accountUsage")}>
     {(usage.planType !== undefined || usage.limitReached === true) && <span role="listitem">{[
@@ -4534,9 +4543,26 @@ function ProviderAccountUsageDetails({
         : t("settings.accountUsageWindowMinutes", { minutes: new Intl.NumberFormat(locale).format(row.window!.windowMinutes) }),
       row.window!.resetAt === undefined
         ? undefined
-        : t("settings.accountUsageReset", { time: formatRelativeTime(row.window!.resetAt, locale) })
+        : t("settings.accountUsageReset", { time: formatRelativeTime(row.window!.resetAt, locale) }),
+      row.window!.severity
+    ].filter(Boolean).join(" · ")}</span>)}
+    {buckets.map((bucket) => <span role="listitem" key={`bucket:${bucket.id}:details`}>{[
+      bucket.displayName ?? bucket.id,
+      bucket.planType === undefined ? undefined : t("settings.accountPlan", { plan: bucket.planType }),
+      bucket.limitReached === true ? t("settings.accountLimitReached") : undefined,
+      formatCredits(bucket.credits)
     ].filter(Boolean).join(" · ")}</span>)}
     {creditLabel !== undefined && <span role="listitem">{creditLabel}</span>}
+    {usage.resetCredits !== undefined && <span role="listitem">{[
+      t("settings.accountResetCredits", { count: new Intl.NumberFormat(locale).format(usage.resetCredits.availableCount) }),
+      usage.resetCredits.earliestExpiryAt === undefined ? undefined : t("settings.accountResetCreditExpiry", { time: formatRelativeTime(usage.resetCredits.earliestExpiryAt, locale) })
+    ].filter(Boolean).join(" · ")}</span>}
+    {usage.extraUsage !== undefined && <span role="listitem">{[
+      t(usage.extraUsage.enabled ? "settings.accountExtraUsageEnabled" : "settings.accountExtraUsageDisabled"),
+      usage.extraUsage.usedPercent === undefined ? undefined : t("settings.accountUsagePercent", { percent: percent.format(usage.extraUsage.usedPercent) }),
+      usage.extraUsage.usedCredits === undefined ? undefined : t("settings.accountExtraUsageUsed", { credits: new Intl.NumberFormat(locale).format(usage.extraUsage.usedCredits) }),
+      usage.extraUsage.monthlyLimit === undefined ? undefined : t("settings.accountExtraUsageLimit", { credits: new Intl.NumberFormat(locale).format(usage.extraUsage.monthlyLimit) })
+    ].filter(Boolean).join(" · ")}</span>}
     {observedAt !== undefined && <span role="listitem">{t("settings.accountUsageObserved", { time: formatRelativeTime(observedAt, locale) })}</span>}
   </div>;
 }

@@ -414,6 +414,7 @@ import {
 } from "./mobile-timeline-artifacts";
 import type { MobileFileShare, MobileFileShareProgress } from "./mobile-file-share";
 import type { MobileOfflineCache, MobileOfflineCacheSnapshot } from "./mobile-offline-cache";
+import { mobileProviderUsageIdentity, mobileProviderUsageSupported, type MobileProviderUsageTransport } from "./mobile-account-usage";
 import {
   canRestartMobileAutomationRun,
   emptyMobileAutomationsState,
@@ -9239,6 +9240,46 @@ export class MobileClient {
       deviceId: credential.deviceId,
       serverId: credential.serverId
     }, this.#state.owner, this.#state.detail, this.#state.selectedId);
+  }
+
+  taskProviderUsageTransport(): MobileProviderUsageTransport | undefined {
+    const credential = this.#credential;
+    const ownerKey = this.#taskProviderUsageOwnerKey();
+    const session = this.#selectedSession();
+    if (!credential || !ownerKey || !session || !this.network.getProviderUsage) return undefined;
+    const providers = this.#state.owner!.providers.filter(provider => provider.backendId === session.backendId
+      && mobileProviderUsageSupported(provider));
+    return { ownerKey, providers, read: async (backendId, providerId, signal) => {
+      const current = (): void => {
+        signal.throwIfAborted();
+        if (this.#disposed || this.#credential !== credential || this.#taskProviderUsageOwnerKey() !== ownerKey) {
+          throw new Error("The account usage task owner changed.");
+        }
+      };
+      current();
+      const matches = providers.filter(provider => provider.backendId === backendId && provider.providerId === providerId);
+      if (matches.length !== 1 || backendId !== session.backendId) throw new Error("The account usage Provider is unavailable.");
+      const result = await this.network.getProviderUsage!(credential, backendId, providerId, signal);
+      current();
+      if (result && result.providerId !== providerId) throw new Error("The account usage Provider changed.");
+      return result;
+    } };
+  }
+
+  #taskProviderUsageOwnerKey(): string | undefined {
+    const credential = this.#credential;
+    const session = this.#selectedSession();
+    const owner = this.#state.owner;
+    if (!credential || !session || !owner || !this.#taskAuthorityKey()) return undefined;
+    const providers = owner.providers.filter(provider => provider.backendId === session.backendId && mobileProviderUsageSupported(provider));
+    if (providers.length === 0 || providers.length > 256) return undefined;
+    const backend = this.#selectedBackend(session);
+    if (!backend) return undefined;
+    return JSON.stringify([credential.profileId, credential.connectionId, credential.deviceId, credential.serverId,
+      owner.generation.toString(), session.sessionId, session.backendId, session.targetId, session.nativeBinding?.runtimeGeneration.toString(),
+      session.model?.model?.providerId, session.model?.model?.modelId, backendAuthorityKey(backend),
+      providers.map(mobileProviderUsageIdentity).sort(), owner.models.filter(model => model.backendId === session.backendId)
+        .map(model => JSON.stringify([model.key?.providerId, model.key?.modelId, model.available])).sort()]);
   }
 
   newTaskVoiceTransport(targetId: string): MobileVoiceTransport | undefined {

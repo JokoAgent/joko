@@ -480,12 +480,14 @@ import {
   validatedProviderCredentialSurfaces,
   type ResolvedProviderCredentialSurface
 } from "./provider-credential-surface.js";
+import type { LocalCodexRuntime, LocalBackendRuntimeSnapshot } from "./local-codex-runtime.js";
 
 interface ConnectServiceDependencies {
   readonly connections: ConnectionManager;
   readonly store: OperationalStore;
   readonly adapters: () => readonly BackendAdapter[];
   readonly restartBackend?: (backendId: string) => Promise<void>;
+  readonly localBackendRuntimeSetup?: LocalCodexRuntime;
   readonly refreshBackendDescriptor?: (backendId: string) => Promise<void>;
   readonly projectBackendProviderAuthentication?: (
     backendId: string,
@@ -1231,6 +1233,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     devicePeers,
     adapters: () => application.adapters,
     restartBackend: application.restartBackend,
+    ...(application.localBackendRuntimeSetup === undefined ? {} : { localBackendRuntimeSetup: application.localBackendRuntimeSetup }),
     refreshBackendDescriptor: application.refreshBackendDescriptor,
     projectBackendProviderAuthentication: application.projectBackendProviderAuthentication,
     holdSubagentSmartRoutingDispatch: application.holdSubagentSmartRoutingDispatch,
@@ -1962,6 +1965,36 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...createModelWorkingContextConnectMethods(dependencies.modelWorkingContext, authenticate,
       connection => dependencies.connections.fence(connection),
       (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener)),
+    probeLocalRuntime: async (request, context) => {
+      const connection = authenticate(context);
+      dependencies.store.getBackend(request.backendId);
+      const owner = dependencies.localBackendRuntimeSetup;
+      if (owner === undefined) throw new ConnectError("Local runtime setup is unavailable.", Code.Unimplemented);
+      const runtime = await owner.probe(request.backendId);
+      dependencies.connections.fence(connection);
+      return { runtime: mapLocalBackendRuntime(runtime) };
+    },
+    installLocalRuntime: async function* (request, context) {
+      const connection = authenticate(context);
+      dependencies.store.getBackend(request.backendId);
+      const owner = dependencies.localBackendRuntimeSetup;
+      if (owner === undefined) throw new ConnectError("Local runtime setup is unavailable.", Code.Unimplemented);
+      const expectedGeneration = Number(request.expectedInstanceGeneration);
+      if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) throw invalidArgument("Expected Backend instance generation is invalid.");
+      const events = owner.install({ backendId: request.backendId, requestId: request.requestId, expectedGeneration, repair: request.repair },
+        context.signal, () => { dependencies.connections.fence(connection); });
+      for await (const event of events) {
+        dependencies.connections.fence(connection);
+        yield { sequence: event.sequence, runtime: mapLocalBackendRuntime(event.runtime) };
+      }
+    },
+    cancelLocalRuntimeInstall: (request, context) => {
+      const connection = authenticate(context);
+      dependencies.connections.fence(connection);
+      const owner = dependencies.localBackendRuntimeSetup;
+      if (owner === undefined) throw new ConnectError("Local runtime setup is unavailable.", Code.Unimplemented);
+      return { cancelled: owner.cancel(request.backendId, request.requestId) };
+    },
     listBackends: (request, context) => {
       authenticate(context);
       const result = paginate(dependencies.store.listBackends().map(toProtoBackend), request.page);
@@ -9008,6 +9041,28 @@ async function backendProviderDescriptorWithAccountUsage(
   });
 }
 
+function mapLocalBackendRuntime(runtime: LocalBackendRuntimeSnapshot): contract.LocalBackendRuntime {
+  const states: Record<LocalBackendRuntimeSnapshot["state"], contract.LocalBackendRuntimeState> = {
+    not_supported: contract.LocalBackendRuntimeState.NOT_SUPPORTED,
+    not_installed: contract.LocalBackendRuntimeState.NOT_INSTALLED,
+    ready: contract.LocalBackendRuntimeState.READY,
+    downloading: contract.LocalBackendRuntimeState.DOWNLOADING,
+    extracting: contract.LocalBackendRuntimeState.EXTRACTING,
+    validating: contract.LocalBackendRuntimeState.VALIDATING,
+    activating: contract.LocalBackendRuntimeState.ACTIVATING,
+    complete: contract.LocalBackendRuntimeState.COMPLETE,
+    failed: contract.LocalBackendRuntimeState.FAILED,
+    cancelled: contract.LocalBackendRuntimeState.CANCELLED
+  };
+  return create(contract.LocalBackendRuntimeSchema, {
+    ...runtime,
+    state: states[runtime.state],
+    instanceGeneration: BigInt(runtime.instanceGeneration),
+    receivedBytes: BigInt(runtime.receivedBytes),
+    totalBytes: BigInt(runtime.totalBytes)
+  });
+}
+
 function mapProviderAccountUsageSnapshot(
   snapshot: NativeProviderAccountUsageSnapshot
 ): contract.ProviderAccountUsageSnapshot {
@@ -9015,6 +9070,7 @@ function mapProviderAccountUsageSnapshot(
     window === undefined ? undefined : create(contract.ProviderAccountUsageWindowSchema, {
       usedPercent: window.usedPercent,
       windowMinutes: window.windowMinutes,
+      severity: window.severity,
       resetAt: window.resetAt === undefined ? undefined : toProtoTimestamp(window.resetAt)
     });
   return create(contract.ProviderAccountUsageSnapshotSchema, {
@@ -9028,6 +9084,25 @@ function mapProviderAccountUsageSnapshot(
       unlimited: snapshot.credits.unlimited,
       balance: snapshot.credits.balance,
       observedAt: toProtoTimestamp(snapshot.credits.observedAt)
+    }),
+    buckets: (snapshot.buckets ?? []).map((bucket) => create(contract.ProviderAccountUsageBucketSchema, {
+      id: bucket.id,
+      displayName: bucket.displayName,
+      primaryWindow: mapWindow(bucket.primaryWindow),
+      secondaryWindow: mapWindow(bucket.secondaryWindow),
+      limitReached: bucket.limitReached,
+      planType: bucket.planType,
+      credits: bucket.credits === undefined ? undefined : create(contract.ProviderAccountCreditsSnapshotSchema, {
+        ...bucket.credits, observedAt: toProtoTimestamp(bucket.credits.observedAt)
+      })
+    })),
+    modelWindows: (snapshot.modelWindows ?? []).map((entry) => create(contract.ProviderAccountModelUsageWindowSchema, {
+      modelId: entry.modelId, displayName: entry.displayName, window: mapWindow(entry.window)
+    })),
+    extraUsage: snapshot.extraUsage === undefined ? undefined : create(contract.ProviderAccountExtraUsageSchema, snapshot.extraUsage),
+    resetCredits: snapshot.resetCredits === undefined ? undefined : create(contract.ProviderAccountResetCreditsSchema, {
+      availableCount: snapshot.resetCredits.availableCount,
+      earliestExpiryAt: snapshot.resetCredits.earliestExpiryAt === undefined ? undefined : toProtoTimestamp(snapshot.resetCredits.earliestExpiryAt)
     }),
     observedAt: toProtoTimestamp(snapshot.observedAt)
   });

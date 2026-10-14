@@ -19,7 +19,7 @@ export interface MobileTaskHeaderAction {
 }
 
 export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationRef, quickSwitch, persistentNavigation,
-  onNavigate, actions, titleAccessory, identity, disabled, colors, locale, onMenuVisibilityChange,
+  onNavigate, actions, titleAccessory, menuHeader, identity, disabled, colors, locale, onMenuVisibilityChange,
   pinned = false, syncing = false, notice, detailsOnly = false, primaryActionsReady = true, drawerMounted = false, selection }: {
   readonly title: string;
   readonly subtitle: string;
@@ -30,6 +30,7 @@ export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationR
   readonly onNavigate: () => void;
   readonly actions: readonly MobileTaskHeaderAction[];
   readonly titleAccessory?: ReactNode;
+  readonly menuHeader?: ReactNode;
   readonly identity?: { readonly mark: ReactNode; readonly label: string; readonly settingsLabel: string;
     readonly disabled: boolean; readonly onOpen: () => void };
   readonly disabled: boolean;
@@ -154,6 +155,7 @@ export function MobileTaskHeader({ title, subtitle, navigationLabel, navigationR
     <MobileActionSheet key={menuGeneration} visible={menuVisible && !disabled && !selection} items={actions.filter(action =>
       detailsOnly ? ["collaboration", "search", "copy-link", "refresh"].includes(action.id) : (action.id !== "files" && action.id !== "remote-desktop") || primaryActionsReady)} colors={colors} locale={locale}
       maximumContentHeight={Math.max(54, height - insets.top - insets.bottom - 100)}
+      header={menuHeader}
       cancelAccessibilityLabel={mobileMessage(locale, "task.closeActions")} onClose={() => setMenuVisible(false)}
       onAction={(id) => {
         activate(id as MobileTaskHeaderAction["id"]);

@@ -16,6 +16,7 @@ import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSki
 import { createHash } from "node:crypto";
 import sharp from "sharp";
 import {
+  AuthenticationState, ProviderAccountUsageSnapshotSchema,
   AcknowledgementSchema, ArtifactKind, ArtifactSchema, AudioArtifactKind, BackendDescriptorSchema, BackendModelAccessSettingsSchema, BackendSettingsSchema, BlobDisposition, BlobRefSchema,
   CapabilityManifestSchema, CapabilityOptionsSchema, CapabilitySchema, CapabilitySupport, CompactSessionOutcome, ConnectionSchema, ConnectionState,
   ContextUsageSchema, DeviceKind, DevicePresenceState, DeviceSchema, EntityKind, EntityVersionSchema,
@@ -9313,6 +9314,38 @@ describe("native current-task Interaction ownership", () => {
 });
 
 describe("native current-task runtime controls", () => {
+  it("retires readonly account usage on background and never sends a model or user input mutation", async () => {
+    const network = fakeNetwork();
+    const withQuota = (detail: boolean) => {
+      const projection = runtimeControlProjection(runtimeSession, detail);
+      if (!detail) projection.providers = projection.providers.map(provider => create(ProviderDescriptorSchema, {
+        ...provider, authenticationState: AuthenticationState.AUTHENTICATED,
+        version: create(EntityVersionSchema, { generation: 0n, revision: create(RevisionSchema, { value: 1n }) }),
+        capabilities: create(CapabilityManifestSchema, { schemaVersion: "joko.provider.v1", capabilities: [create(CapabilitySchema, { name: capabilityNames.providerAccountUsage, support: CapabilitySupport.SUPPORTED })] })
+      }));
+      return projection;
+    };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: withQuota(false) }));
+    network.readSession = vi.fn(async () => withQuota(true));
+    let release!: () => void;
+    network.getProviderUsage = vi.fn(async (_credential, _backendId, providerId) => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return create(ProviderAccountUsageSnapshotSchema, { providerId, primaryWindow: { usedPercent: 70 } });
+    });
+    const app = client(network, memoryStorage(credential).storage);
+    await app.start();
+    const transport = app.taskProviderUsageTransport();
+    expect(transport).toBeDefined();
+    await expect(transport!.read("foreign-backend", "alpha", new AbortController().signal)).rejects.toThrow(/unavailable/u);
+    const reading = transport!.read("backend", "alpha", new AbortController().signal);
+    app.setForeground(false);
+    release();
+    await expect(reading).rejects.toThrow(/owner changed/u);
+    expect(app.taskProviderUsageTransport()).toBeUndefined();
+    expect(network.getProviderUsage).toHaveBeenCalledOnce();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
   const ids = () => {
     let value = 0;
     return () => `runtime-control-${++value}`;

@@ -467,6 +467,12 @@ export class SessionWorktreeCoordinator {
     return lease.path;
   }
 
+  /** Private exact source lease for an independently owned child checkout. */
+  activeSourceLease(sessionId: string, expectedBinding: SessionWorktreeBinding) {
+    if (this.activeWorkspacePath(sessionId, expectedBinding) === undefined) return undefined;
+    return this.#service.snapshot().active.find(lease => lease.sessionId === sessionId && lease.id === expectedBinding.leaseId);
+  }
+
   async previewRemoval(
     sessionId: string,
     options?: WorktreeCallOptions

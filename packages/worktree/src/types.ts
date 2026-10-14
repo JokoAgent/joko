@@ -10,6 +10,9 @@ export interface WorktreeCallOptions {
 }
 
 export interface WorktreeInitializeOptions extends WorktreeCallOptions {
+  /** Private external-writer owners must retain unclaimed leases until an
+   * exact retirement receipt authorizes cleanup; initialization is read-only. */
+  readonly preserveUnclaimed?: boolean;
   /** Live Product Sessions whose existing leases must be restored for use. */
   readonly retainSessionIds?: readonly string[];
   /** Archived Product Sessions whose branch/snapshot ownership remains restorable. */

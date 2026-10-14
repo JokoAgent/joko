@@ -31,7 +31,8 @@ export function MobileActionSheet<Action extends string>({
   onClose,
   onAction,
   cancelAccessibilityLabel,
-  maximumContentHeight
+  maximumContentHeight,
+  header
 }: {
   readonly visible: boolean;
   readonly items: readonly MobileSheetActionItem<Action>[];
@@ -41,6 +42,7 @@ export function MobileActionSheet<Action extends string>({
   readonly onAction: (action: Action) => void;
   readonly cancelAccessibilityLabel?: string;
   readonly maximumContentHeight?: number;
+  readonly header?: import("react").ReactNode;
 }) {
   const reducedMotion = useReducedMotion();
   const insets = useSafeAreaInsets();
@@ -118,8 +120,8 @@ export function MobileActionSheet<Action extends string>({
       <Animated.View accessibilityViewIsModal importantForAccessibility="yes"
         style={[styles.area, { paddingBottom: Math.max(12, insets.bottom), transform: [{ translateY }] }]}>
         <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-          {maximumContentHeight === undefined ? rows
-            : <ScrollView style={{ maxHeight: maximumContentHeight }} bounces={false}>{rows}</ScrollView>}
+          {maximumContentHeight === undefined ? <>{header}{rows}</>
+            : <ScrollView style={{ maxHeight: maximumContentHeight }} bounces={false}>{header}{rows}</ScrollView>}
         </View>
         <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "common.cancel")} onPress={cancel}
           style={({ pressed }) => [styles.cancel, { backgroundColor: colors.surface, borderColor: colors.border }, pressed && styles.pressed]}>

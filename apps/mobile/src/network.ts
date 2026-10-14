@@ -22,7 +22,7 @@ import { createPartnerMemoryApi, type PartnerMemoryApi } from "@joko/contracts";
 import { createPartnerConnectionsApi, type PartnerConnectionsApi } from "@joko/contracts";
 import { createPartnerSkillsApi, type PartnerSkillsApi } from "@joko/contracts";
 import {
-  ArtifactKind, ArtifactService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
+  ArtifactKind, ArtifactService, BackendService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
   MobilePushProvider, OperationService, OperationState, PartnerService, PartnerLifecycle, PermissionMode, RemoteDesktopService, ExtensionService,
   ExtensionLibraryLocationKind,
@@ -185,6 +185,8 @@ export interface MobilePushCapabilityResult {
 }
 
 export interface MobileNetwork {
+  getProviderUsage?(credential: PairedCredential, backendId: string, providerId: string,
+    signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountUsageSnapshot | undefined>;
   objectiveRpc?(credential: PairedCredential, sessionId: string, generation: bigint,
     assertCurrent: (signal: AbortSignal) => void): MobileObjectiveRpc;
   getServiceOperation?(credential: PairedCredential, operationId: string, signal?: AbortSignal): Promise<Operation | undefined>;
@@ -1490,6 +1492,16 @@ export const mobileNetwork: MobileNetwork = {
       throw new Error("The Joko node returned an incomplete or ambiguous owner snapshot.");
     }
     return { connection: connections[0]!, device: devices[0]!, snapshot };
+  },
+  async getProviderUsage(credential, backendId, providerId, signal) {
+    signal?.throwIfAborted();
+    if (!backendId || !providerId || backendId.length > 256 || providerId.length > 256
+      || /[\x00-\x1f\x7f]/u.test(backendId + providerId)) throw new Error("The account usage route is invalid.");
+    const result = await createClient(BackendService, transport(credential.origin, credential.authKey))
+      .getProviderUsage({ backendId, providerId }, options(signal));
+    signal?.throwIfAborted();
+    if (result.accountUsage && result.accountUsage.providerId !== providerId) throw new Error("The account usage Provider changed.");
+    return result.accountUsage;
   },
   async listRemoteDesktopHosts(credential, signal) {
     const client = createClient(RemoteDesktopService, transport(credential.origin, credential.authKey));

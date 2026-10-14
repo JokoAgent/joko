@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
@@ -21,6 +22,7 @@ import {
   type ClaudeFreshContextSource
 } from "./fresh-context-owner.js";
 import type { ClaudeMcpCallResult, ClaudeMcpTool } from "./mcp-bridge.js";
+import { locateClaudeNativeRuntime } from "./native-runtime-locator.js";
 import {
   CLAUDE_SESSION_STORE_LIMITS,
   createClaudeDurableSessionStore,
@@ -129,6 +131,8 @@ export interface ClaudeSdkManagedAgentInput {
 export interface ClaudeSdkManagedAgentResult {
   readonly text: string;
   readonly isError?: boolean;
+  readonly worktreePath?: string;
+  readonly worktreeBranch?: string;
 }
 
 export type ClaudeSdkManagedAgentTool = (
@@ -326,6 +330,21 @@ export interface ClaudeSdkProbe {
   readonly diagnostic?: string;
 }
 
+export interface ClaudeSdkAccountUsageInput {
+  readonly cwd: string;
+  readonly env: Readonly<Record<string, string | undefined>>;
+  readonly getOAuthToken: ClaudeSdkOAuthTokenProvider;
+  readonly pathToClaudeCodeExecutable?: string;
+  readonly signal?: AbortSignal;
+  readonly timeoutMs: number;
+}
+
+export interface ClaudeSdkAccountUsage {
+  readonly rateLimitsAvailable: boolean;
+  readonly rateLimits: unknown;
+  readonly subscriptionType?: string;
+}
+
 /** Lifecycle operations run at the durable Owner, which may live on the selected remote route. */
 export interface ClaudeSdkFreshContextRuntime {
   reserve(identity: ClaudeFreshContextIdentity): ClaudeFreshContextSnapshot | Promise<ClaudeFreshContextSnapshot>;
@@ -361,6 +380,9 @@ export interface ClaudeSdkRuntime {
   prepareFreshContextRecovery?(): Promise<void>;
   /** True only for exact local Query roots owned by this runtime. */
   readonly processInspectionSupported?: boolean;
+  readonly supportsAccountUsage?: boolean;
+  /** Isolated local CLI control request; no model input or transcript scan. */
+  readAccountUsage?(input: ClaudeSdkAccountUsageInput): Promise<ClaudeSdkAccountUsage>;
   probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe>;
   query(params: ClaudeSdkQueryParams): Promise<ClaudeSdkQuery>;
   /** Confirm retirement of this exact Query before resuming its native Session. */
@@ -586,11 +608,101 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
     return this.#processOwner?.inspectionSupported === true;
   }
 
+  get supportsAccountUsage(): boolean { return this.#processOwner !== undefined; }
+
   async prepareFreshContextRecovery(): Promise<void> {
     if (this.#processOwner === undefined || this.freshContexts === undefined) {
       throw new Error("The durable fresh context process authority is unavailable.");
     }
     await this.#processOwner.prepare(this.#retirementTimeoutMs);
+  }
+
+  async readAccountUsage(input: ClaudeSdkAccountUsageInput): Promise<ClaudeSdkAccountUsage> {
+    const owner = this.#processOwner;
+    if (owner === undefined) throw new Error("The native account usage process owner is unavailable.");
+    const abortController = new AbortController();
+    const leases: DurableProcessLease[] = [];
+    const onAbort = (): void => abortController.abort();
+    input.signal?.addEventListener("abort", onAbort, { once: true });
+    if (input.signal?.aborted) onAbort();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let warmQuery: NativeWarmQuery | undefined;
+    let query: NativeQuery | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      const rejectAborted = (): void => reject(new Error("The native account usage read was cancelled or timed out."));
+      abortController.signal.addEventListener("abort", rejectAborted, { once: true });
+      if (abortController.signal.aborted) rejectAborted();
+    });
+    timer = setTimeout(onAbort, positiveTimeout(input.timeoutMs, 20_000));
+    try {
+      const read = (async () => {
+        await owner.prepare(this.#retirementTimeoutMs);
+        const loaded = await this.#load();
+        abortController.signal.throwIfAborted();
+        const executable = input.pathToClaudeCodeExecutable ?? (await locateClaudeNativeRuntime({
+          sdkEntry: fileURLToPath(import.meta.resolve(CLAUDE_AGENT_SDK_PACKAGE))
+        })).executable;
+        abortController.signal.throwIfAborted();
+        const versionProcess = this.#spawnOwnedProcess({ command: executable, args: ["--version"], cwd: input.cwd,
+          env: { ...input.env }, signal: abortController.signal }, lease => leases.push(lease));
+        const version = await readAccountUsageVersion(versionProcess);
+        if (version !== CLAUDE_AGENT_SDK_CLI_VERSION) throw new Error("The native account usage CLI version is unsupported.");
+        abortController.signal.throwIfAborted();
+        warmQuery = await loaded.startup({
+          initializeTimeoutMs: input.timeoutMs,
+          options: {
+            abortController,
+            allowDangerouslySkipPermissions: false,
+            cwd: input.cwd,
+            env: { ...input.env },
+            getOAuthToken: input.getOAuthToken,
+            pathToClaudeCodeExecutable: executable,
+            permissionMode: "dontAsk",
+            persistSession: false,
+            strictMcpConfig: true,
+            mcpServers: {},
+            settingSources: [],
+            settings: { apiKeyHelper: "", autoMemoryEnabled: false, autoDreamEnabled: false },
+            tools: [],
+            spawnClaudeCodeProcess: options => {
+              abortController.signal.throwIfAborted();
+              return this.#spawnOwnedProcess(options, lease => leases.push(lease));
+            }
+          }
+        });
+        abortController.signal.throwIfAborted();
+        query = warmQuery.query(accountUsageSdkInput(abortController.signal));
+        await query.initializationResult();
+        const response = await query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true });
+        abortController.signal.throwIfAborted();
+        if (!isRecord(response) || typeof response["rate_limits_available"] !== "boolean") {
+          throw new Error("The native account usage response is unavailable.");
+        }
+        if (response["rate_limits_available"] && !isRecord(response["rate_limits"])) {
+          throw new Error("The native account usage response has no rate limits.");
+        }
+        const subscriptionType = response["subscription_type"];
+        return {
+          rateLimitsAvailable: response["rate_limits_available"],
+          rateLimits: response["rate_limits"],
+          ...(typeof subscriptionType === "string" && subscriptionType.length > 0 && subscriptionType.length <= 128
+            ? { subscriptionType } : {})
+        };
+      })();
+      return await Promise.race([read, aborted]);
+    } catch {
+      throw new Error("The native account usage read did not complete.");
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      input.signal?.removeEventListener("abort", onAbort);
+      try { query?.close(); } catch { /* Exact process leases own cleanup. */ }
+      if (query === undefined) try { warmQuery?.close(); } catch { /* Exact process leases own cleanup. */ }
+      abortController.abort();
+      const retirement = await Promise.allSettled(leases.map(lease => owner.retireLease(lease, this.#retirementTimeoutMs)));
+      if (retirement.some(result => result.status === "rejected")) {
+        throw new Error("The native account usage process retirement was not confirmed.");
+      }
+    }
   }
 
   async probe(input: ClaudeSdkProbeInput): Promise<ClaudeSdkProbe> {
@@ -976,8 +1088,19 @@ function createManagedAgentServer(
           || (result["isError"] !== undefined && typeof result["isError"] !== "boolean")) {
           throw new Error("The managed Agent callback returned an invalid result.");
         }
+        const workspace = result.worktreePath === undefined ? undefined : {
+          worktreePath: result.worktreePath,
+          ...(result.worktreeBranch === undefined ? {} : { worktreeBranch: result.worktreeBranch })
+        };
+        if (workspace !== undefined && (typeof workspace.worktreePath !== "string" || workspace.worktreePath.length > 16_384
+          || (workspace.worktreeBranch !== undefined && (typeof workspace.worktreeBranch !== "string" || workspace.worktreeBranch.length > 512)))) {
+          throw new Error("The managed Agent workspace result is invalid.");
+        }
+        const suffix = workspace === undefined ? "" : `\n\n${JSON.stringify(workspace)}`;
+        const maximumTextBytes = MAXIMUM_MANAGED_AGENT_RESULT_BYTES - Buffer.byteLength(suffix, "utf8");
+        const text = Buffer.from(result.text, "utf8").subarray(0, maximumTextBytes).toString("utf8").replace(/\uFFFD$/u, "") + suffix;
         return {
-          content: [{ type: "text", text: result["text"] }],
+          content: [{ type: "text", text }],
           ...(result["isError"] === true ? { isError: true } : {})
         };
       }
@@ -1069,6 +1192,29 @@ function cloneAgentDefinitions(
 
 async function* emptySdkInput(): AsyncGenerator<NativeSdkUserMessage> {
   // Intentionally empty: startup discovery must never dispatch a user prompt.
+}
+
+async function* accountUsageSdkInput(signal: AbortSignal): AsyncGenerator<NativeSdkUserMessage> {
+  // Keep stdin open for the control reply without ever submitting a model prompt.
+  if (signal.aborted) return;
+  await new Promise<void>(resolvePromise => signal.addEventListener("abort", () => resolvePromise(), { once: true }));
+}
+
+async function readAccountUsageVersion(child: NativeSpawnedProcess): Promise<string> {
+  return new Promise<string>((resolvePromise, reject) => {
+    let text = "";
+    child.stdout.on("data", (chunk: Buffer | string) => {
+      text += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+      if (Buffer.byteLength(text, "utf8") > 1_024) {
+        child.kill("SIGTERM");
+        reject(new Error("The native account usage CLI version is invalid."));
+      }
+    });
+    child.once("error", () => reject(new Error("The native account usage CLI version could not be read.")));
+    child.once("exit", (code: number | null) => code === 0
+      ? resolvePromise(text.trim().split(/\s+/u)[0] ?? "")
+      : reject(new Error("The native account usage CLI version could not be read.")));
+  });
 }
 
 async function observeStartupInitialization(

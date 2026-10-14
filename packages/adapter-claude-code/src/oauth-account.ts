@@ -151,6 +151,7 @@ export class ClaudeCodeOAuthAccount {
   readonly #redactionValues = new Set<string>();
   #mutationTail: Promise<void> = Promise.resolve();
   #transitionTail: Promise<void> = Promise.resolve();
+  #usageIdentity: { readonly serialized: string; readonly generation: number; readonly key: string } | undefined;
 
   constructor(options: ClaudeCodeOAuthAccountOptions) {
     this.#credentials = options.credentials;
@@ -295,6 +296,20 @@ export class ClaudeCodeOAuthAccount {
       release();
       throw error;
     }
+  }
+
+  /** Private cache owner; never projects an account identifier or credential digest. */
+  async readUsageIdentity(): Promise<string | undefined> {
+    const generation = this.#generation;
+    if (this.#revoking || this.#disposed || this.#activeLogin !== undefined) return undefined;
+    const serialized = await this.#credentials.readSerialized();
+    if (serialized === undefined || generation !== this.#generation || this.#revoking || this.#disposed) return undefined;
+    const credential = parseCredential(serialized);
+    if (credential.expiresAt <= this.#now()) return undefined;
+    if (this.#usageIdentity?.serialized !== serialized || this.#usageIdentity.generation !== generation) {
+      this.#usageIdentity = { serialized, generation, key: randomUUID() };
+    }
+    return this.#usageIdentity.key;
   }
 
   async beginLogin(beforeStart?: () => Promise<void>): Promise<ClaudeCodeBrowserLogin> {

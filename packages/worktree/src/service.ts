@@ -131,6 +131,10 @@ export class EphemeralWorktreeService {
       const records: WorktreeSweepRecord[] = [];
       for (const entry of store.entries()) {
         control.check();
+        if (options?.preserveUnclaimed === true && !retained.has(entry.sessionId) && !preservedOwners.has(entry.sessionId)) {
+          records.push(sweepRecord(entry, "preserved", "external_writer_unconfirmed"));
+          continue;
+        }
         try {
           if (preservedOwners.has(entry.sessionId)) {
             const release = await this.#releaseEntry(entry, true, control);
@@ -326,6 +330,39 @@ export class EphemeralWorktreeService {
         },
         control
       );
+    });
+  }
+
+  /** Clone a checkout owned by another service's exact lease. The composition
+   * owner supplies a synchronous durable-authority fence at every boundary. */
+  deriveFromOwnedCheckout(
+    sessionId: string,
+    sourceLease: WorktreeLease,
+    assertSourceCurrent: () => void,
+    options?: WorktreeCallOptions
+  ): Promise<WorktreeResult<WorktreeAcquisition>> {
+    return this.#serialize(options, true, async control => {
+      validateSessionId(sessionId);
+      const source = validateExactReleaseRequest({ sessionId: sourceLease.sessionId, leaseId: sourceLease.id,
+        path: sourceLease.path, repositoryRoot: sourceLease.repositoryRoot, branch: sourceLease.branch,
+        source: sourceLease.source, acquiredAt: sourceLease.acquiredAt });
+      assertSourceCurrent();
+      const sourceDetection = await probeWorktreeCwd(source.path, control);
+      const repositoryDetection = await probeWorktreeCwd(source.repositoryRoot, control);
+      if (!sourceDetection.isLinkedWorktree || !samePath(sourceDetection.repositoryRoot, source.path)
+        || repositoryDetection.isLinkedWorktree || !samePath(repositoryDetection.repositoryRoot, source.repositoryRoot)
+        || !samePath(sourceDetection.gitCommonDirectory, repositoryDetection.gitCommonDirectory)
+        || await attachedWorktreeBranch(source.path, control) !== source.branch) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The external owned checkout identity changed.");
+      }
+      this.#assertRepositorySeparated(repositoryDetection.repositoryRoot);
+      const head = await worktreeHeadCommit(source.path, control);
+      if (head === undefined) throw new WorktreeServiceError("SESSION_CONFLICT", "The owned checkout has no stable HEAD.");
+      return this.#deriveCapturedCheckout(sessionId, source, repositoryDetection, head, async snapshot => {
+        assertSourceCurrent();
+        return await attachedWorktreeBranch(source.path, control) === source.branch
+          && await this.#sourceSnapshotStillCurrent(source, head, snapshot, control);
+      }, control);
     });
   }
 
