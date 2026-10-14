@@ -1,3 +1,6 @@
+import type { ProviderAccountCreditsSnapshot, ProviderAccountUsageSnapshot, ProviderAccountUsageWindow } from "@joko/core";
+export type { ProviderAccountCreditsSnapshot, ProviderAccountUsageSnapshot, ProviderAccountUsageWindow } from "@joko/core";
+
 const ACCOUNT_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_BODY_LIMIT_BYTES = 64 * 1024;
@@ -7,29 +10,6 @@ const DEFAULT_MAXIMUM_BACKOFF_MS = 5 * 60_000;
 const DEFAULT_MAXIMUM_ENTRIES = 32;
 
 export const PROVIDER_ACCOUNT_USAGE_CAPABILITY = "provider.account_usage";
-
-export interface ProviderAccountUsageWindow {
-  readonly usedPercent: number;
-  readonly windowMinutes?: number;
-  readonly resetAt?: number;
-}
-
-export interface ProviderAccountCreditsSnapshot {
-  readonly hasCredits?: boolean;
-  readonly unlimited?: boolean;
-  readonly balance?: string;
-  readonly observedAt: number;
-}
-
-export interface ProviderAccountUsageSnapshot {
-  readonly providerId: string;
-  readonly primaryWindow?: ProviderAccountUsageWindow;
-  readonly secondaryWindow?: ProviderAccountUsageWindow;
-  readonly limitReached?: boolean;
-  readonly planType?: string;
-  readonly credits?: ProviderAccountCreditsSnapshot;
-  readonly observedAt: number;
-}
 
 export interface ProviderAccountUsageCredentialIdentity {
   readonly providerId: string;

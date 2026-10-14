@@ -15,6 +15,9 @@ import { PermissionMode } from "@joko/contracts";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
+import { mobileUsageProviderKey, type MobileProviderUsageTransport } from "./mobile-account-usage";
+import { MobileAccountUsageSummary, mobileModelAccountQuotaLabel } from "./MobileAccountUsageSummary";
+import { useMobileAccountUsage } from "./use-mobile-account-usage";
 import { mobileMessage } from "./mobile-messages";
 import {
   assertMobileModelSelection,
@@ -49,7 +52,8 @@ export function MobileRuntimeControlsSheet({
   newFavoriteId,
   onSetPermission,
   onSetPlanMode,
-  onError
+  onError,
+  providerUsageTransport
 }: {
   readonly visible: boolean;
   readonly controls?: MobileRuntimeControls;
@@ -67,6 +71,7 @@ export function MobileRuntimeControlsSheet({
   readonly onSetPermission: (authorityKey: string, mode: PermissionMode) => Promise<boolean>;
   readonly onSetPlanMode: (authorityKey: string, enabled: boolean) => Promise<boolean>;
   readonly onError: (message: string) => void;
+  readonly providerUsageTransport?: MobileProviderUsageTransport;
 }) {
   const [view, setView] = useState<RuntimeControlsView>({ kind: "root" });
   const [query, setQuery] = useState("");
@@ -90,6 +95,7 @@ export function MobileRuntimeControlsSheet({
     ? controls?.favorites.find((favorite) => favorite.favoriteId === view.favoriteId)
     : undefined;
   const disabled = busy || settling;
+  const accountUsage = useMobileAccountUsage(providerUsageTransport, visible, controls?.models.map(route => route.providerId) ?? []);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -219,6 +225,7 @@ export function MobileRuntimeControlsSheet({
             if (view.kind === "root") rootScrollOffsetRef.current = event.nativeEvent.contentOffset.y;
           }}>
           {view.kind === "root" && <RootControls controls={controls} routes={routes} query={query}
+            providerUsageTransport={providerUsageTransport} accountUsage={accountUsage}
             disabled={disabled} colors={colors} locale={locale} onQuery={setQuery} onOpenModel={openModel}
             onOpenPermission={() => setView({ kind: "permission" })}
             onSetPlanMode={(enabled) => void settle((authorityKey) => onSetPlanMode(authorityKey, enabled))} />}
@@ -232,6 +239,10 @@ export function MobileRuntimeControlsSheet({
               favoriteId: newFavoriteId(), backendId: controls.backend.backendId, ...selection
             } })}
             onRemoveFavorite={() => activeFavorite && mutateFavorite({ kind: "remove", favoriteId: activeFavorite.favoriteId })} />}
+          {view.kind === "model" && activeRoute && providerUsageTransport?.providers.some(provider => provider.backendId === activeRoute.backendId && provider.providerId === activeRoute.providerId)
+            && <MobileAccountUsageSummary snapshot={accountUsage.snapshots[mobileUsageProviderKey(activeRoute)]}
+              modelId={activeRoute.modelId} providerName={activeRoute.providerName} loading={accountUsage.loading} failed={accountUsage.failed}
+              now={accountUsage.now} colors={colors} locale={locale} />}
           {view.kind === "permission" && <PermissionOptions controls={controls} disabled={disabled} locale={locale}
             colors={colors} onSelect={choosePermission} />}
           {view.kind === "permission-confirm" && <PermissionConfirmation disabled={disabled} colors={colors} locale={locale}
@@ -243,7 +254,8 @@ export function MobileRuntimeControlsSheet({
   </Modal>;
 }
 
-function RootControls({ controls, routes, query, disabled, colors, locale, onQuery, onOpenModel, onOpenPermission, onSetPlanMode }: {
+function RootControls({ controls, routes, query, disabled, colors, locale, onQuery, onOpenModel, onOpenPermission, onSetPlanMode,
+  providerUsageTransport, accountUsage }: {
   readonly controls: MobileRuntimeControls;
   readonly routes: readonly MobileModelRoute[];
   readonly query: string;
@@ -254,6 +266,8 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
   readonly onOpenModel: (route: MobileModelRoute, favorite?: MobileModelFavoriteConfiguration) => void;
   readonly onOpenPermission: () => void;
   readonly onSetPlanMode: (enabled: boolean) => void;
+  readonly providerUsageTransport?: MobileProviderUsageTransport;
+  readonly accountUsage: ReturnType<typeof useMobileAccountUsage>;
 }) {
   const current = controls.currentModel;
   const configurableCurrent = current?.route !== undefined && current.selectable
@@ -311,8 +325,12 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
         const showProvider = route.providerId !== previousProvider;
         previousProvider = route.providerId;
         const selected = current?.providerId === route.providerId && current.modelId === route.modelId;
+        const modelQuota = mobileModelAccountQuotaLabel(accountUsage.snapshots[mobileUsageProviderKey(route)], route.modelId, accountUsage.now, locale, accountUsage.failed);
         return <View key={route.key}>
           {showProvider && <Text style={[styles.providerHeading, { color: colors.muted }]}>{route.providerName}</Text>}
+          {showProvider && providerUsageTransport?.providers.some(provider => provider.backendId === route.backendId && provider.providerId === route.providerId)
+            && <MobileAccountUsageSummary snapshot={accountUsage.snapshots[mobileUsageProviderKey(route)]} providerName={route.providerName}
+              loading={accountUsage.loading} failed={accountUsage.failed} now={accountUsage.now} colors={colors} locale={locale} />}
           <Pressable accessibilityRole="radio" accessibilityState={{ selected, disabled }} disabled={disabled}
             accessibilityLabel={`${route.displayName}, ${route.providerName}`}
             onPress={() => onOpenModel(route)}
@@ -320,6 +338,7 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
             <View style={styles.flex}>
               <Text style={[styles.rowLabel, { color: colors.ink }]}>{route.displayName}</Text>
               <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens, locale)} · {route.modelId}</Text>
+              {modelQuota && <Text style={[styles.caption, { color: colors.muted }]}>{modelQuota}</Text>}
             </View>
             <Text style={[styles.disclosure, { color: selected ? colors.accent : colors.muted }]}>{selected ? "✓" : "›"}</Text>
           </Pressable>

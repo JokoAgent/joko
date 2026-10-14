@@ -27,6 +27,7 @@ import {
   type ClaudeSessionStoreSessionAccess
 } from "./claude-session-store.js";
 import type { ClaudeMcpBridgePort, ClaudeMcpRuntimeLease } from "./mcp-bridge.js";
+import type { ClaudeManagedChildWorkspaceInput } from "./managed-child-workspace.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
 import { ClaudeFreshContextOwner } from "./fresh-context-owner.js";
 import {
@@ -60,6 +61,127 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("projects native system compaction and retry facts once without dispatching another input", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime);
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const active = contextFor(binding, { operationId: "native-system-facts" });
+      await adapter.send(textPrompt("one input"), active.context);
+      const query = runtime.queries[0]!;
+      const started = { type: "system", subtype: "status", status: "compacting", uuid: randomUUID(), session_id: binding.nativeSessionId };
+      query.push(started); query.push(started);
+      await eventually(() => active.events.some(event => event.type === "compaction" && event.state === "started"));
+      expect((await adapter.inspectSession(binding, active.context)).compacting).toBe(true);
+      const retry = { type: "system", subtype: "api_retry", attempt: 2, max_retries: 4, retry_delay_ms: 2500,
+        error_status: 529, error: "overloaded_error", uuid: randomUUID(), session_id: binding.nativeSessionId };
+      query.push(retry); query.push(retry);
+      query.push({ ...retry, attempt: -1, uuid: randomUUID() });
+      query.push({ ...retry, max_retries: 1.5, uuid: randomUUID() });
+      const boundary = { type: "system", subtype: "compact_boundary", compact_metadata: {
+        trigger: "auto", pre_tokens: 12000, post_tokens: 3000 }, uuid: randomUUID(), session_id: binding.nativeSessionId };
+      query.push(boundary); query.push(boundary);
+      await eventually(() => active.events.some(event => event.type === "compaction" && event.state === "completed"));
+      const compactions = active.events.filter(event => event.type === "compaction");
+      expect(compactions).toEqual([
+        expect.objectContaining({ type: "compaction", state: "started", reason: "native" }),
+        expect.objectContaining({ type: "compaction", state: "completed", reason: "auto", automatic: true,
+          boundaryEntryId: boundary.uuid, tokensBefore: 12000, tokensAfter: 3000 })
+      ]);
+      expect(compactions[0]!.compactionId).toBe(compactions[1]!.compactionId);
+      expect((await adapter.inspectSession(binding, active.context)).compacting).toBe(false);
+      expect(active.events.filter(event => event.type === "retry")).toEqual([
+        expect.objectContaining({ state: "waiting", attempt: 2, maxAttempts: 4, delayMs: 2500 })
+      ]);
+      expect(active.events.some(event => event.type === "done")).toBe(false);
+      query.push(assistantMessage(binding.nativeSessionId!, randomUUID(), [{ type: "text", text: "Recovered response" }]));
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Done", totalCostUsd: 0.03 }));
+      await eventually(() => active.events.some(event => event.type === "done"));
+      expect(active.events.filter(event => event.type === "retry").map(event => event.state)).toEqual(["waiting", "succeeded"]);
+      expect(active.events.filter(event => event.type === "done")).toEqual([{ type: "done", outcome: "completed" }]);
+      expect(active.events.find(event => event.type === "usage")).toMatchObject({ usage: { contextTokens: 3000 } });
+      expect(query.receivedInputs).toHaveLength(1);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("retains native system failure and exhausted retry facts without exposing native error text", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime);
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const active = contextFor(binding, { operationId: "native-system-failure" });
+      await adapter.send(textPrompt("one input"), active.context);
+      const query = runtime.queries[0]!;
+      query.push({ type: "system", subtype: "api_retry", attempt: 3, max_retries: 3, retry_delay_ms: 100,
+        error_status: 529, error: "private-native-token", uuid: randomUUID(), session_id: binding.nativeSessionId });
+      query.push({ type: "system", subtype: "status", status: "compacting", uuid: randomUUID(), session_id: binding.nativeSessionId });
+      query.push({ type: "system", subtype: "status", status: null, compact_result: "failed", compact_error: "private-native-token",
+        uuid: randomUUID(), session_id: binding.nativeSessionId });
+      await eventually(() => active.events.some(event => event.type === "compaction" && event.state === "failed"));
+      expect((await adapter.inspectSession(binding, active.context)).compacting).toBe(false);
+      const failed = active.events.find(event => event.type === "compaction" && event.state === "failed");
+      expect(failed).toMatchObject({ error: { code: "CLAUDE_CODE_COMPACTION_FAILED", stateMayHaveChanged: true } });
+      expect(failed).not.toHaveProperty("tokensAfter");
+      query.push({ ...resultMessage(binding.nativeSessionId!, { result: "", totalCostUsd: 0 }), is_error: true, subtype: "error_during_execution" });
+      await eventually(() => active.events.some(event => event.type === "done"));
+      expect(active.events.filter(event => event.type === "retry").map(event => event.state)).toEqual(["waiting", "exhausted"]);
+      expect(JSON.stringify(active.events)).not.toContain("private-native-token");
+      expect(query.receivedInputs).toHaveLength(1);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("keeps native system compaction unknown when a null status and Result lack a terminal receipt", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime);
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const active = contextFor(binding, { operationId: "native-system-unknown" });
+      await adapter.send(textPrompt("one input"), active.context);
+      const query = runtime.queries[0]!;
+      query.push({ type: "system", subtype: "status", status: "compacting", uuid: randomUUID(), session_id: binding.nativeSessionId });
+      query.push({ type: "system", subtype: "status", status: null, uuid: randomUUID(), session_id: binding.nativeSessionId });
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Unconfirmed compact", totalCostUsd: 0.03 }));
+      await eventually(() => active.events.some(event => event.type === "done"));
+      expect(active.events.filter(event => event.type === "compaction").map(event => event.state)).toEqual(["started"]);
+      expect(active.events).toContainEqual(expect.objectContaining({ type: "error", terminal: true,
+        error: expect.objectContaining({ code: "CLAUDE_CODE_COMPACTION_OUTCOME_UNKNOWN", stateMayHaveChanged: true }) }));
+      expect(active.events.filter(event => event.type === "done")).toEqual([{ type: "done", outcome: "failed" }]);
+      expect(active.events.find(event => event.type === "usage")).toMatchObject({ usage: { cost: 0.03 } });
+      expect(active.events.some(event => event.type === "message_complete")).toBe(false);
+      await eventually(() => query.closeCalls > 0);
+      expect(query.receivedInputs).toHaveLength(1);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("projects native system idle compaction on its Query owner and keeps absent counters absent", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime);
+    try {
+      const owner = contextFor();
+      const binding = await adapter.createSession(createInput(), owner.context);
+      const first = contextFor(binding, { operationId: "native-system-idle-first" });
+      await adapter.send(textPrompt("first"), first.context);
+      const query = runtime.queries[0]!;
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Done", totalCostUsd: 0.03 }));
+      await eventually(() => first.events.some(event => event.type === "done"));
+      query.push({ type: "system", subtype: "status", status: "compacting", uuid: randomUUID(), session_id: binding.nativeSessionId });
+      await eventually(() => owner.events.some(event => event.type === "compaction" && event.state === "started"));
+      const next = contextFor(binding, { operationId: "native-system-idle-next" });
+      await expect(adapter.send(textPrompt("next"), next.context)).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
+      expect(query.receivedInputs).toHaveLength(1);
+      query.push({ type: "system", subtype: "status", status: null, compact_result: "success", uuid: randomUUID(), session_id: binding.nativeSessionId });
+      await eventually(() => owner.events.some(event => event.type === "compaction" && event.state === "completed"));
+      const completed = owner.events.find(event => event.type === "compaction" && event.state === "completed");
+      expect(completed).not.toHaveProperty("tokensBefore");
+      expect(completed).not.toHaveProperty("tokensAfter");
+      expect((await adapter.inspectSession(binding, next.context)).compacting).toBe(false);
+      await adapter.send(textPrompt("next"), next.context);
+      query.push(resultMessage(binding.nativeSessionId!, { result: "Done", totalCostUsd: 0.04 }));
+      await eventually(() => next.events.some(event => event.type === "done"));
+      expect(query.receivedInputs).toHaveLength(2);
+    } finally { await adapter.dispose(); }
+  });
+
   test("accounts fresh root and native child frames once and excludes saved usage after Query resume and reopen", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const adapter = adapterFor(runtime);
@@ -867,6 +989,144 @@ describe("ClaudeCodeAdapter", () => {
     } finally {
       await adapter.dispose();
     }
+  });
+
+  test("routes nested managed background completion only to its true parent Query", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model", effort: "low" }), contextFor().context);
+      const active = contextFor(binding, { operationId: "nested-managed-background" });
+      await adapter.send(textPrompt("Delegate nested work"), { ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" } });
+      const root = runtime.queries[0]!;
+      const foreground = root.params.options.managedAgentTool!({ description: "Parent child", prompt: "Own the nested work.", model: "second-model" },
+        { toolUseId: "parent-child", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      const parent = runtime.queries[1]!;
+      await expect(parent.params.options.managedAgentTool!({ description: "Nested background", prompt: "Complete nested work.", model: "inherit", run_in_background: true },
+        { toolUseId: "nested-background", signal: new AbortController().signal })).resolves.toMatchObject({ text: expect.stringContaining("managed-agent-") });
+      const child = runtime.queries[2]!;
+      expect(child.params.options.model).toBe("second-model");
+      expect(child.receivedInputs[0]!.origin).toMatchObject({ kind: "peer", from: parent.params.options.sessionId });
+      parent.push(resultMessage(parent.params.options.sessionId!, { result: "Nested work launched.", totalCostUsd: 0 }));
+      await vi.waitFor(() => expect(parent.receivedInputs).toHaveLength(1));
+      child.push(resultMessage(child.params.options.sessionId!, { result: "Nested exact result.", totalCostUsd: 0 }));
+      await vi.waitFor(() => expect(parent.receivedInputs).toHaveLength(2));
+      expect(parent.receivedInputs[1]).toMatchObject({ origin: { kind: "task-notification" },
+        message: { content: expect.stringContaining("Nested exact result.") } });
+      expect(root.receivedInputs).toHaveLength(1);
+      parent.push(assistantMessage(parent.params.options.sessionId!, "nested-parent-continuation", [{ type: "text", text: "Parent own final result." }]));
+      parent.push({ ...resultMessage(parent.params.options.sessionId!, { result: "Parent own final result.", totalCostUsd: 0 }), origin: null });
+      await expect(foreground).resolves.toEqual({ text: "Parent own final result." });
+      expect(runtime.retiredQueries).toContain(child);
+      expect(runtime.retiredQueries).toContain(parent);
+      expect(active.events.filter(event => event.type === "message_complete")).toEqual([]);
+      const runs = active.events.filter((event): event is Extract<EventPayload, { type: "subagent_run" }> => event.type === "subagent_run");
+      expect(runs.some(event => event.run.parentTaskId !== undefined)).toBe(true);
+      root.push(resultMessage(binding.nativeSessionId!, { result: "Root completed.", totalCostUsd: 0 }));
+      await eventually(() => active.events.some(event => event.type === "done"));
+      expect(root.receivedInputs).toHaveLength(1);
+    } finally { await adapter.dispose(); }
+  });
+
+  test("recursively retires nested managed work when its parent task is stopped", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const adapter = adapterFor(runtime, { managedProviders: managed.port });
+    try {
+      const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model", effort: "low" }), contextFor().context);
+      const active = contextFor(binding, { operationId: "nested-managed-stop" });
+      const context = { ...active.context, modelSelection: { providerId: "configured-provider", modelId: "configured-model" } };
+      await adapter.send(textPrompt("Delegate nested work"), context);
+      const root = runtime.queries[0]!;
+      await root.params.options.managedAgentTool!({ description: "Parent background", prompt: "Keep working.", model: "second-model", run_in_background: true },
+        { toolUseId: "parent-background", signal: new AbortController().signal });
+      const parent = runtime.queries[1]!;
+      const taskId = active.events.find((event): event is Extract<EventPayload, { type: "background_task" }> => event.type === "background_task")!.taskId;
+      await parent.params.options.managedAgentTool!({ description: "Nested background", prompt: "Keep nested work alive.", model: "inherit", run_in_background: true },
+        { toolUseId: "nested-background-stop", signal: new AbortController().signal });
+      const child = runtime.queries[2]!;
+      await adapter.cancelBackgroundTask(context, taskId);
+      expect(parent.params.options.abortController.signal.aborted).toBe(true);
+      expect(child.params.options.abortController.signal.aborted).toBe(true);
+      expect(runtime.retiredQueries).toContain(child);
+      expect(runtime.retiredQueries).toContain(parent);
+      for (const lease of managed.subtaskActivations) expect(lease.release).toHaveBeenCalledOnce();
+      child.push(resultMessage(child.params.options.sessionId!, { result: "Late nested result", totalCostUsd: 0 }));
+      expect(root.receivedInputs).toHaveLength(1);
+    } finally { await adapter.dispose(); }
+  });
+
+  test.each([[false, false], [false, true], [true, false]])("retires the exact isolated managed Query before cleanup; retirement unknown=%s preserved=%s", async (unknown, preserved) => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const rootDirectory = await mkdtemp(join(tmpdir(), "joko-managed-isolated-"));
+    const verify = vi.fn(async (signal: AbortSignal) => signal.throwIfAborted());
+    const assertCurrent = vi.fn();
+    const release = vi.fn(async () => {
+      expect(runtime.retiredQueries).toContain(runtime.queries[1]);
+      return preserved ? "preserved" as const : "released" as const;
+    });
+    const prepare = vi.fn(async (_input: ClaudeManagedChildWorkspaceInput) => ({ workspaceRoot: rootDirectory, branch: "joko/isolated-child", verify, assertCurrent, release }));
+    const adapter = adapterFor(runtime, { managedProviders: managed.port, prepareManagedChildWorkspace: prepare });
+    try {
+      const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model", effort: "low" }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-isolation-authority" });
+      await adapter.send(textPrompt("Isolate delegated work"), { ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" } });
+      const result = runtime.queries[0]!.params.options.managedAgentTool!({ description: "Isolated child", prompt: "Work only in your checkout.", isolation: "worktree" },
+        { toolUseId: "isolated-child", signal: new AbortController().signal });
+      await vi.waitFor(() => expect(runtime.queries).toHaveLength(2));
+      expect(prepare.mock.calls[0]![0]).toMatchObject({ context: expect.objectContaining({ operationId: "managed-isolation-authority" }),
+        childTaskId: expect.stringContaining("managed-agent-"), childSessionId: runtime.queries[1]!.params.options.sessionId, sourceWorkspaceRoot: target.workspaceRoot });
+      expect(runtime.queries[1]!.params.options.cwd).toBe(rootDirectory);
+      expect(verify).toHaveBeenCalledTimes(2);
+      runtime.retirementFailure = unknown;
+      runtime.queries[1]!.push(resultMessage(runtime.queries[1]!.params.options.sessionId!, { result: "Isolated work completed.", totalCostUsd: 0 }));
+      if (unknown) {
+        await expect(result).resolves.toMatchObject({ isError: true });
+        expect(release).not.toHaveBeenCalled();
+      } else {
+        const value = await result;
+        expect(value).toEqual({ text: "Isolated work completed.", ...(preserved ? { worktreePath: rootDirectory, worktreeBranch: "joko/isolated-child" } : {}) });
+        expect(release).toHaveBeenCalledWith({ writerRetired: true });
+        if (preserved) {
+          const paths = [rootDirectory, JSON.stringify(rootDirectory).slice(1, -1), rootDirectory.replaceAll("\\", "/")];
+          runtime.queries[0]!.push(userToolResult(binding.nativeSessionId!, "preserved-worktree-result", "isolated-child",
+            `${JSON.stringify(value)}\n${rootDirectory}\n${paths[2]}`, false));
+          await eventually(() => active.events.some(event => event.type === "tool_result"));
+          const output = active.events.find((event): event is Extract<EventPayload, { type: "tool_result" }> => event.type === "tool_result")!.output;
+          for (const path of paths) expect(output).not.toContain(path);
+          expect(output).toContain("[REDACTED]");
+        }
+      }
+      expect(assertCurrent).toHaveBeenCalled();
+    } finally {
+      runtime.retirementFailure = false;
+      await adapter.dispose();
+      await rm(rootDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("preserves an isolated managed Query checkout when creation fails without a writer retirement proof", async () => {
+    const managed = managedProviderFixture();
+    const runtime = new FakeSdkRuntime({ initialFrameOverrides: { model: "configured-model", effort: "low" } });
+    const release = vi.fn(async () => "released" as const);
+    const adapter = adapterFor(runtime, { managedProviders: managed.port, prepareManagedChildWorkspace: async () => ({
+      workspaceRoot: target.workspaceRoot, branch: "joko/isolated-child", verify: async () => undefined, assertCurrent: () => undefined, release
+    }) });
+    try {
+      const binding = await adapter.createSession(createInput({ providerId: "configured-provider", modelId: "configured-model", effort: "low" }), contextFor().context);
+      const active = contextFor(binding, { operationId: "managed-isolated-creation-unknown" });
+      await adapter.send(textPrompt("Isolate delegated work"), { ...active.context,
+        modelSelection: { providerId: "configured-provider", modelId: "configured-model" } });
+      vi.spyOn(runtime, "query").mockRejectedValueOnce(new Error("No authoritative Query handle was returned."));
+      await expect(runtime.queries[0]!.params.options.managedAgentTool!({ description: "Isolated child", prompt: "Owned work", isolation: "worktree" },
+        { toolUseId: "isolated-creation-unknown", signal: new AbortController().signal })).resolves.toMatchObject({ isError: true });
+      expect(release).not.toHaveBeenCalled();
+    } finally { await adapter.dispose(); }
   });
 
   test("serializes completed background child notifications across automatic continuation segments", async () => {

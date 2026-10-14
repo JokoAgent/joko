@@ -256,6 +256,7 @@ message ProviderAccountUsageWindow {
   double used_percent = 1;
   optional uint32 window_minutes = 2;
   google.protobuf.Timestamp reset_at = 3;
+  optional string severity = 4;
 }
 
 message ProviderAccountCreditsSnapshot {
@@ -273,6 +274,38 @@ message ProviderAccountUsageSnapshot {
   optional string plan_type = 5;
   ProviderAccountCreditsSnapshot credits = 6;
   google.protobuf.Timestamp observed_at = 7;
+  repeated ProviderAccountUsageBucket buckets = 8;
+  repeated ProviderAccountModelUsageWindow model_windows = 9;
+  ProviderAccountExtraUsage extra_usage = 10;
+  ProviderAccountResetCredits reset_credits = 11;
+}
+
+message ProviderAccountUsageBucket {
+  string id = 1;
+  optional string display_name = 2;
+  ProviderAccountUsageWindow primary_window = 3;
+  ProviderAccountUsageWindow secondary_window = 4;
+  optional bool limit_reached = 5;
+  optional string plan_type = 6;
+  ProviderAccountCreditsSnapshot credits = 7;
+}
+
+message ProviderAccountModelUsageWindow {
+  optional string model_id = 1;
+  string display_name = 2;
+  ProviderAccountUsageWindow window = 3;
+}
+
+message ProviderAccountExtraUsage {
+  bool enabled = 1;
+  optional double used_percent = 2;
+  optional double used_credits = 3;
+  optional double monthly_limit = 4;
+}
+
+message ProviderAccountResetCredits {
+  uint32 available_count = 1;
+  google.protobuf.Timestamp earliest_expiry_at = 2;
 }
 
 enum ModelPriceCurrency {

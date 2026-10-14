@@ -18,6 +18,7 @@ import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 import { normalizeExtensionRecommendation } from "./extension-suggestion-handoff.js";
 import { UsageReportGroup } from "@joko/contracts";
+import { localRuntimeGateway } from "./local-runtime-gateway.js";
 import { projectVoiceInputSaucSettings, protoVoiceInputSaucSettings, type VoiceInputRecognitionContextView } from "@joko/contracts";
 import { nextVoiceDictionaryWatchSequence, projectVoiceDictionaryPeerStatus, readVoiceDictionaryPeerInvitation, type VoiceDictionaryPeerListener, type VoiceDictionaryPeerStatusView } from "@joko/contracts";
 import { SshKeyService, SshAgentState, SshAgentHostPlatform, SshKeyPassphrasePurpose, SshInstallShell, type SshKey, type CredentialUploadTicket } from "@joko/contracts";
@@ -6432,6 +6433,18 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async restartBackend(backendId: string): Promise<void> {
     await this.submit({ case: "restartBackend", value: { backendId } }, true);
+  }
+
+  probeLocalBackendRuntime(backendId: string, signal?: AbortSignal) {
+    return localRuntimeGateway(this.requireTransport(), () => this.refresh()).probe(backendId, signal);
+  }
+
+  installLocalBackendRuntime(backendId: string, requestId: string, expectedGeneration: number, repair: boolean, signal?: AbortSignal) {
+    return localRuntimeGateway(this.requireTransport(), () => this.refresh()).install(backendId, requestId, expectedGeneration, repair, signal);
+  }
+
+  cancelLocalBackendRuntimeInstall(backendId: string, requestId: string) {
+    return localRuntimeGateway(this.requireTransport(), () => this.refresh()).cancel(backendId, requestId);
   }
 
   async updateBackendSettings(backendId: string, patch: BackendSettingsUpdate): Promise<void> {
@@ -13708,6 +13721,30 @@ function mapProviderRuntime(provider: ProviderDescriptor, routingEnabled = true)
         balance: accountUsage.credits.balance,
         ...(accountUsage.credits.observedAt === undefined ? {} : { observedAt: timestampMs(accountUsage.credits.observedAt) })
       } }),
+      ...(accountUsage.buckets.length === 0 ? {} : { buckets: accountUsage.buckets.map((bucket) => ({
+        id: bucket.id,
+        displayName: bucket.displayName,
+        primaryWindow: bucket.primaryWindow === undefined ? undefined : mapProviderAccountUsageWindow(bucket.primaryWindow),
+        secondaryWindow: bucket.secondaryWindow === undefined ? undefined : mapProviderAccountUsageWindow(bucket.secondaryWindow),
+        limitReached: bucket.limitReached,
+        planType: bucket.planType,
+        credits: bucket.credits === undefined ? undefined : {
+          hasCredits: bucket.credits.hasCredits, unlimited: bucket.credits.unlimited, balance: bucket.credits.balance,
+          observedAt: bucket.credits.observedAt === undefined ? undefined : timestampMs(bucket.credits.observedAt)
+        }
+      })) }),
+      ...(accountUsage.modelWindows.length === 0 ? {} : { modelWindows: accountUsage.modelWindows.map((entry) => {
+        if (entry.window === undefined) throw new GatewayError("Orchestrator returned a model quota without its window.");
+        return { modelId: entry.modelId, displayName: entry.displayName, window: mapProviderAccountUsageWindow(entry.window)! };
+      }) }),
+      ...(accountUsage.extraUsage === undefined ? {} : { extraUsage: {
+        enabled: accountUsage.extraUsage.enabled, usedPercent: accountUsage.extraUsage.usedPercent,
+        usedCredits: accountUsage.extraUsage.usedCredits, monthlyLimit: accountUsage.extraUsage.monthlyLimit
+      } }),
+      ...(accountUsage.resetCredits === undefined ? {} : { resetCredits: {
+        availableCount: accountUsage.resetCredits.availableCount,
+        earliestExpiryAt: accountUsage.resetCredits.earliestExpiryAt === undefined ? undefined : timestampMs(accountUsage.resetCredits.earliestExpiryAt)
+      } }),
       ...(accountUsage.observedAt === undefined ? {} : { observedAt: timestampMs(accountUsage.observedAt) })
     } }),
     ...(provider.error?.message ? { error: presentJokoServiceTerminology(provider.error.message) } : {})
@@ -13723,6 +13760,7 @@ function mapProviderAccountUsageWindow(
   return {
     usedPercent: window.usedPercent,
     windowMinutes: window.windowMinutes,
+    severity: window.severity,
     ...(window.resetAt === undefined ? {} : { resetAt: timestampMs(window.resetAt) })
   };
 }

@@ -544,6 +544,58 @@ export interface BackendToolDescriptor {
   readonly enabled: boolean;
 }
 
+export interface ProviderAccountUsageWindow {
+  readonly usedPercent: number;
+  readonly windowMinutes?: number;
+  readonly resetAt?: number;
+  readonly severity?: string;
+}
+
+export interface ProviderAccountCreditsSnapshot {
+  readonly hasCredits?: boolean;
+  readonly unlimited?: boolean;
+  readonly balance?: string;
+  readonly observedAt: number;
+}
+
+export interface ProviderAccountUsageBucket {
+  readonly id: string;
+  readonly displayName?: string;
+  readonly primaryWindow?: ProviderAccountUsageWindow;
+  readonly secondaryWindow?: ProviderAccountUsageWindow;
+  readonly limitReached?: boolean;
+  readonly planType?: string;
+  readonly credits?: ProviderAccountCreditsSnapshot;
+}
+
+export interface ProviderAccountModelUsageWindow {
+  readonly modelId?: string;
+  readonly displayName: string;
+  readonly window: ProviderAccountUsageWindow;
+}
+
+export interface ProviderAccountUsageSnapshot {
+  readonly providerId: string;
+  readonly primaryWindow?: ProviderAccountUsageWindow;
+  readonly secondaryWindow?: ProviderAccountUsageWindow;
+  readonly limitReached?: boolean;
+  readonly planType?: string;
+  readonly credits?: ProviderAccountCreditsSnapshot;
+  readonly buckets?: readonly ProviderAccountUsageBucket[];
+  readonly modelWindows?: readonly ProviderAccountModelUsageWindow[];
+  readonly extraUsage?: {
+    readonly enabled: boolean;
+    readonly usedPercent?: number;
+    readonly usedCredits?: number;
+    readonly monthlyLimit?: number;
+  };
+  readonly resetCredits?: {
+    readonly availableCount: number;
+    readonly earliestExpiryAt?: number;
+  };
+  readonly observedAt: number;
+}
+
 export interface UsageSnapshot {
   /** Native accounting-stream provenance for the Adapter/Host port, never a service Run total. */
   readonly nativeAccounting?: {

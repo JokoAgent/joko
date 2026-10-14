@@ -59,7 +59,11 @@ describe("Backend-native Provider account usage", () => {
     expect(usage.accountUsage).toMatchObject({
       providerId: "provider-shared",
       planType: "team",
-      primaryWindow: { usedPercent: 65, windowMinutes: 300 }
+      primaryWindow: { usedPercent: 65, windowMinutes: 300 },
+      buckets: [{ id: "metered", displayName: "Metered", primaryWindow: { usedPercent: 65, windowMinutes: 300 } }],
+      modelWindows: [{ modelId: "model-scoped", displayName: "Scoped model", window: { usedPercent: 40, windowMinutes: 10_080, severity: "warning" } }],
+      extraUsage: { enabled: false, usedCredits: 0, monthlyLimit: 100 },
+      resetCredits: { availableCount: 3, earliestExpiryAt: { seconds: 1_800_000_000n } }
     });
 
     const snapshot = await invoke<any>(fixture.services.event.getSnapshot, {});
@@ -141,6 +145,10 @@ function accountUsageAdapter(
       primaryWindow: { usedPercent, windowMinutes: 300, resetAt: 1_800_000_000_000 },
       planType,
       credits: { hasCredits: true, unlimited: false, balance: "5", observedAt: 1_700_000_000_000 },
+      buckets: [{ id: "metered", displayName: "Metered", primaryWindow: { usedPercent, windowMinutes: 300 } }],
+      modelWindows: [{ modelId: "model-scoped", displayName: "Scoped model", window: { usedPercent: 40, windowMinutes: 10_080, severity: "warning" } }],
+      extraUsage: { enabled: false, usedCredits: 0, monthlyLimit: 100 },
+      resetCredits: { availableCount: 3, earliestExpiryAt: 1_800_000_000_000 },
       observedAt: 1_700_000_000_000
     }))
   };

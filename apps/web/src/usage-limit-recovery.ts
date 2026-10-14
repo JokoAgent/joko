@@ -22,14 +22,20 @@ const USED_PERCENT_LIMIT_EPSILON = 1e-6;
 export function providerAccountUsageResetAt(
   providers: readonly ProviderRuntimeView[],
   providerId: string | undefined,
-  now = Date.now()
+  now = Date.now(),
+  scope?: { readonly backendId: string; readonly modelId?: string }
 ): number | undefined {
   if (providerId === undefined) return undefined;
-  const provider = providers.find((candidate) => candidate.id === providerId
+  const candidates = providers.filter((candidate) => candidate.id === providerId
+    && (scope === undefined || candidate.backendId === scope.backendId)
     && candidate.capabilities.has(capabilityNames.providerAccountUsage));
+  const provider = candidates.length === 1 ? candidates[0] : undefined;
   const usage = provider?.accountUsage;
   if (usage === undefined) return undefined;
-  const reached = [usage.primaryWindow, usage.secondaryWindow]
+  const reached = [usage.primaryWindow, usage.secondaryWindow,
+    ...(usage.buckets ?? []).flatMap((bucket) => [bucket.primaryWindow, bucket.secondaryWindow]),
+    ...(usage.modelWindows ?? []).filter((entry) => scope?.modelId !== undefined && entry.modelId === scope.modelId)
+      .map((entry) => entry.window)]
     .filter((window): window is NonNullable<typeof window> => window !== undefined
       && Number.isFinite(window.usedPercent)
       && window.usedPercent >= 100 - USED_PERCENT_LIMIT_EPSILON);

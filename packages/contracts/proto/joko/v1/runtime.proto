@@ -1133,3 +1133,53 @@ message SchedulePreRunResult {
   string spawn_error = 11;
   string error = 12;
 }
+
+enum LocalBackendRuntimeState {
+  LOCAL_BACKEND_RUNTIME_STATE_UNSPECIFIED = 0;
+  LOCAL_BACKEND_RUNTIME_STATE_NOT_SUPPORTED = 1;
+  LOCAL_BACKEND_RUNTIME_STATE_NOT_INSTALLED = 2;
+  LOCAL_BACKEND_RUNTIME_STATE_READY = 3;
+  LOCAL_BACKEND_RUNTIME_STATE_DOWNLOADING = 4;
+  LOCAL_BACKEND_RUNTIME_STATE_EXTRACTING = 5;
+  LOCAL_BACKEND_RUNTIME_STATE_VALIDATING = 6;
+  LOCAL_BACKEND_RUNTIME_STATE_ACTIVATING = 7;
+  LOCAL_BACKEND_RUNTIME_STATE_COMPLETE = 8;
+  LOCAL_BACKEND_RUNTIME_STATE_FAILED = 9;
+  LOCAL_BACKEND_RUNTIME_STATE_CANCELLED = 10;
+}
+
+// Local means the authenticated service node, independently of the client OS.
+message LocalBackendRuntime {
+  string backend_id = 1;
+  uint64 instance_generation = 2;
+  string platform = 3;
+  string expected_version = 4;
+  optional string installed_version = 5;
+  LocalBackendRuntimeState state = 6;
+  bool can_install = 7;
+  bool can_repair = 8;
+  bool manual_override = 9;
+  uint64 received_bytes = 10;
+  uint64 total_bytes = 11;
+  optional string request_id = 12;
+  optional string failure_code = 13;
+}
+
+message ProbeLocalRuntimeRequest { string backend_id = 1; }
+message ProbeLocalRuntimeResponse { LocalBackendRuntime runtime = 1; }
+message InstallLocalRuntimeRequest {
+  string backend_id = 1;
+  string request_id = 2;
+  uint64 expected_instance_generation = 3;
+  bool repair = 4;
+}
+// Closing this observation stream does not cancel the service-owned install.
+message InstallLocalRuntimeResponse {
+  uint64 sequence = 1;
+  LocalBackendRuntime runtime = 2;
+}
+message CancelLocalRuntimeInstallRequest {
+  string backend_id = 1;
+  string request_id = 2;
+}
+message CancelLocalRuntimeInstallResponse { bool cancelled = 1; }

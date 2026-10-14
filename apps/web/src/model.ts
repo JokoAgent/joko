@@ -70,6 +70,22 @@ export interface CapabilityView {
   readonly maximumItems?: number;
 }
 
+export interface LocalBackendRuntimeView {
+  readonly backendId: string;
+  readonly instanceGeneration: number;
+  readonly platform: string;
+  readonly expectedVersion: string;
+  readonly installedVersion?: string;
+  readonly state: "not_supported" | "not_installed" | "ready" | "downloading" | "extracting" | "validating" | "activating" | "complete" | "failed" | "cancelled";
+  readonly canInstall: boolean;
+  readonly canRepair: boolean;
+  readonly manualOverride: boolean;
+  readonly receivedBytes: number;
+  readonly totalBytes: number;
+  readonly requestId?: string;
+  readonly failureCode?: string;
+}
+
 export interface BackendView {
   readonly id: string;
   readonly name: string;
@@ -3873,6 +3889,32 @@ export interface ProviderRuntimeView {
       readonly balance?: string;
       readonly observedAt?: number;
     };
+    readonly buckets?: readonly {
+      readonly id: string;
+      readonly displayName?: string;
+      readonly primaryWindow?: ProviderAccountUsageWindowView;
+      readonly secondaryWindow?: ProviderAccountUsageWindowView;
+      readonly limitReached?: boolean;
+      readonly planType?: string;
+      readonly credits?: {
+        readonly hasCredits?: boolean;
+        readonly unlimited?: boolean;
+        readonly balance?: string;
+        readonly observedAt?: number;
+      };
+    }[];
+    readonly modelWindows?: readonly {
+      readonly modelId?: string;
+      readonly displayName: string;
+      readonly window: ProviderAccountUsageWindowView;
+    }[];
+    readonly extraUsage?: {
+      readonly enabled: boolean;
+      readonly usedPercent?: number;
+      readonly usedCredits?: number;
+      readonly monthlyLimit?: number;
+    };
+    readonly resetCredits?: { readonly availableCount: number; readonly earliestExpiryAt?: number };
     readonly observedAt?: number;
   };
   readonly error?: string;
@@ -3893,6 +3935,7 @@ export interface ProviderAccountUsageWindowView {
   readonly usedPercent: number;
   readonly windowMinutes?: number;
   readonly resetAt?: number;
+  readonly severity?: string;
 }
 
 export type ManagedModelRuntimeStateView =
@@ -6324,6 +6367,9 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   previewWorkspaceRewind(workspaceId: string, changeSetId: string): Promise<WorkspaceRewindPreviewView>;
   executeWorkspaceRewind(workspaceId: string, previewId: string, changeSetId: string, dialogueOnly: boolean): Promise<void>;
   restartBackend(backendId: string): Promise<void>;
+  probeLocalBackendRuntime(backendId: string, signal?: AbortSignal): Promise<LocalBackendRuntimeView>;
+  installLocalBackendRuntime(backendId: string, requestId: string, expectedGeneration: number, repair: boolean, signal?: AbortSignal): AsyncIterable<LocalBackendRuntimeView>;
+  cancelLocalBackendRuntimeInstall(backendId: string, requestId: string): Promise<boolean>;
   updateBackendSettings(backendId: string, patch: BackendSettingsUpdate): Promise<void>;
   renameDevice(deviceId: string, name: string, expectedRevision: bigint): Promise<DeviceView>;
   resetDeviceName(deviceId: string, expectedRevision: bigint): Promise<DeviceView>;

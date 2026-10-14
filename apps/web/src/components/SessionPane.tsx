@@ -687,7 +687,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     : [];
   const accountUsageResetAt = providerAccountUsageResetAt(
     controller.state.snapshot.providers,
-    session.model?.providerId
+    session.model?.providerId,
+    Date.now(),
+    { backendId: session.backendId, modelId: session.model?.modelId }
   );
   const errorTailUsageLimitRecovery = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? usageLimitRecoveryHint(errorTailProjection.item.error, Date.now(), accountUsageResetAt)

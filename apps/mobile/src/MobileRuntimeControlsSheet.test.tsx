@@ -2,9 +2,10 @@
 import { act, createElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { BackendDescriptorSchema, PermissionMode, SessionSchema } from "@joko/contracts";
+import { AuthenticationState, BackendDescriptorSchema, CapabilitySupport, PermissionMode, ProviderAccountUsageSnapshotSchema, ProviderDescriptorSchema, SessionSchema, capabilityNames, type ProviderAccountUsageSnapshot } from "@joko/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileRuntimeControls } from "./mobile-runtime-controls";
+import type { MobileProviderUsageTransport } from "./mobile-account-usage";
 
 vi.mock("react-native", async () => {
   const React = await import("react");
@@ -18,6 +19,7 @@ vi.mock("react-native", async () => {
     return element("div", { "data-scroll-view": "true" }, _props.children);
   });
   return {
+    AppState: { currentState: "active", addEventListener: () => ({ remove: () => undefined }) },
     Modal: ({ visible, children }: { readonly visible: boolean; readonly children?: ReactNode }) =>
       visible ? element("div", { role: "dialog" }, children) : null,
     Platform: { OS: "web" },
@@ -161,12 +163,14 @@ afterEach(async () => {
   await act(async () => root.unmount());
   host.remove();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
 });
 
-async function render(value: MobileRuntimeControls = controls): Promise<void> {
+async function render(value: MobileRuntimeControls = controls, transport?: MobileProviderUsageTransport, visible = true): Promise<void> {
   await act(async () => root.render(createElement(MobileRuntimeControlsSheet, {
-    visible: true,
+    visible,
+    providerUsageTransport: transport,
     controls: value,
     busy: false,
     colors,
@@ -200,6 +204,55 @@ async function clickText(text: string): Promise<void> {
 }
 
 describe("MobileRuntimeControlsSheet model favorites", () => {
+  it("keeps a same-owner observation marked stale when the visible quota refresh fails", async () => {
+    vi.useFakeTimers();
+    const provider = create(ProviderDescriptorSchema, { backendId: "backend", providerId: "alpha", displayName: "Alpha",
+      authenticationState: AuthenticationState.AUTHENTICATED, version: { generation: 0n, revision: { value: 1n } },
+      capabilities: { schemaVersion: "joko.provider.v1", capabilities: [{ name: capabilityNames.providerAccountUsage, support: CapabilitySupport.SUPPORTED }] } });
+    const snapshot = create(ProviderAccountUsageSnapshotSchema, { providerId: "alpha", primaryWindow: { usedPercent: 25 },
+      observedAt: { seconds: BigInt(Math.floor(Date.now() / 1000)) } });
+    const read = vi.fn<MobileProviderUsageTransport["read"]>().mockResolvedValueOnce(snapshot).mockRejectedValueOnce(new Error("Temporary connection failure"));
+    await render(controls, { ownerKey: "same-owner", providers: [provider], read });
+    expect(host.textContent).toContain("75% remaining");
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(host.textContent).toContain("75% remaining");
+    expect(host.textContent).toContain("Last known account limits");
+    expect(host.textContent).toContain("Observed");
+    expect(setModel).not.toHaveBeenCalled();
+  });
+
+  it("reads catalog account limits only while visible and discards a late response from a retired owner", async () => {
+    const provider = create(ProviderDescriptorSchema, { backendId: "backend", providerId: "alpha", displayName: "Alpha",
+      authenticationState: AuthenticationState.AUTHENTICATED, version: { generation: 0n, revision: { value: 1n } },
+      capabilities: { schemaVersion: "joko.provider.v1", capabilities: [{ name: capabilityNames.providerAccountUsage, support: CapabilitySupport.SUPPORTED }] } });
+    let release!: (value: ProviderAccountUsageSnapshot) => void;
+    const read = vi.fn((_backendId: string, _providerId: string, _signal: AbortSignal) => new Promise<ProviderAccountUsageSnapshot>(resolve => { release = resolve; }));
+    const transport: MobileProviderUsageTransport = { ownerKey: "account-owner-one", providers: [provider], read };
+    await render(controls, transport, false);
+    expect(read).not.toHaveBeenCalled();
+    await render(controls, transport);
+    expect(read).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledWith("backend", "alpha", expect.any(AbortSignal));
+    const replacement = { ...transport, ownerKey: "account-owner-two", read: vi.fn(async () => create(ProviderAccountUsageSnapshotSchema, {
+      providerId: "alpha", primaryWindow: { usedPercent: 25 }, observedAt: { seconds: BigInt(Math.floor(Date.now() / 1000)) },
+      modelWindows: [{ modelId: "a", displayName: "Alpha Model", window: { usedPercent: 40 } },
+        { modelId: "a-other", displayName: "Other Model", window: { usedPercent: 99 } }]
+    })) };
+    await render({ ...controls, surfaceOwnerKey: "owner-two" }, replacement);
+    expect(read.mock.calls[0]![2].aborted).toBe(true);
+    expect(host.textContent).toContain("75% remaining");
+    expect(host.textContent).toContain("60% remaining");
+    expect(host.textContent).not.toContain("1% remaining");
+    await act(async () => release(create(ProviderAccountUsageSnapshotSchema, { providerId: "alpha", primaryWindow: { usedPercent: 98 } })));
+    expect(host.textContent).not.toContain("2% remaining");
+    await render({ ...controls, surfaceOwnerKey: "owner-two" }, replacement, false);
+    expect(host.querySelector('[role="dialog"]')).toBeNull();
+    expect(replacement.read).toHaveBeenCalledOnce();
+    expect(setModel).not.toHaveBeenCalled();
+    expect(mutateFavorite).not.toHaveBeenCalled();
+  });
+
   it("edits a shared favorite without applying it and preserves the search on return", async () => {
     await render();
     const search = host.querySelector<HTMLInputElement>('input[aria-label="Search task models"]')!;

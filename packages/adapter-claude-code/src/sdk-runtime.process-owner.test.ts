@@ -34,6 +34,41 @@ afterEach(async () => {
 });
 
 describe("Claude SDK owned custom spawn", () => {
+  it("reads quota through an isolated control Query and retires its exact owned process", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-quota-owner-"));
+    roots.push(root);
+    let child: ReturnType<typeof spawnOwnedClaudeCodeProcess> | undefined;
+    let input: AsyncIterator<unknown> | undefined;
+    const usage = vi.fn(async () => ({ rate_limits_available: true, subscription_type: "max",
+      rate_limits: { five_hour: { utilization: 25, resets_at: null } } }));
+    const close = vi.fn();
+    sdk.startup.mockImplementationOnce(async ({ options }) => {
+      child = options.spawnClaudeCodeProcess({ command: process.execPath,
+        args: ["-e", "setInterval(() => undefined, 1000)"], cwd: process.cwd(), env: {}, signal: options.abortController.signal });
+      return { query: (prompt: AsyncIterable<unknown>) => {
+        input = prompt[Symbol.asyncIterator]();
+        return { initializationResult: async () => ({}), usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: usage, close };
+      }, close };
+    });
+    const runtime = new DefaultClaudeSdkRuntime({ processOwner: { rootDirectory: root, instanceId: "quota-owner", generation: 1,
+      recoverStale: false, supervisor: { capture: async pid => `quota-${pid}`, captureSync: pid => `quota-${pid}`,
+        terminate: async (pid, identity) => {
+          if (identity !== `quota-${pid}`) return "identity_mismatch";
+          try { process.kill(pid, "SIGKILL"); return "terminated"; } catch { return "not_running"; }
+        } } } });
+    try {
+      await expect(runtime.readAccountUsage({ cwd: process.cwd(), env: {}, getOAuthToken: async () => null, timeoutMs: 10_000 }))
+        .resolves.toEqual({ rateLimitsAvailable: true, subscriptionType: "max", rateLimits: { five_hour: { utilization: 25, resets_at: null } } });
+      expect(usage).toHaveBeenCalledWith({ skipBehaviors: true });
+      expect(sdk.startup.mock.calls.at(-1)![0].options).toMatchObject({ persistSession: false, settingSources: [],
+        strictMcpConfig: true, mcpServers: {}, tools: [], permissionMode: "dontAsk" });
+      expect(await input!.next()).toEqual({ done: true, value: undefined });
+      expect(close).toHaveBeenCalled();
+      expect(child!.killed).toBe(true);
+      await expectOwnerRootEmpty(root);
+    } finally { await runtime.retireOwnedProcesses(1_000); await runtime.closeSessionOperations(); }
+  });
+
   it("forwards only the Query-owned local plugin mounts to the native SDK", async () => {
     sdk.query.mockRejectedValueOnce(new Error("bounded plugin fixture stop"));
     const runtime = new DefaultClaudeSdkRuntime();

@@ -1,4 +1,4 @@
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import {
   ArtifactKind,
   AudioArtifactKind,
@@ -2692,6 +2692,26 @@ describe("provider and model projection", () => {
     expect(snapshot.providers[0]).toMatchObject({ backendId: "backend-custom", authenticationState: "authenticated", supportsLogin: true, loginMethods: ["apiKey"], supportsLogout: true, supportsRefresh: true, capabilities: new Set(["provider.account_usage"]), accountUsage: { planType: "pro", limitReached: false, primaryWindow: { usedPercent: 42, windowMinutes: 300, resetAt: 1_800_003_600_000 }, secondaryWindow: { usedPercent: 75, windowMinutes: 10_080 }, credits: { hasCredits: true, unlimited: false, balance: "4.50", observedAt: 1_800_000_000_000 } }, rateLimit: { requestLimit: 100, requestsRemaining: 77 }, usage: { inputTokens: 12, outputTokens: 8, cost: 0.025, currency: "USD", estimated: true } });
     expect(snapshot.models[0]).toMatchObject({ backendId: "backend-custom", inputModalities: ["text", "image", "file"], outputModalities: ["text"], maximumOutputTokens: 16_000, inputCostMicrosPerMillion: 10, supportsFast: true });
     expect(snapshot.settings.providers[0]).toMatchObject({ revision: 3n, runtimes: [{ backendId: "backend-custom", credentialOrigin: "https://example.test", headers: [{ headerName: "X-Key", environmentName: "CUSTOM_KEY" }], models: [{ modelId: "model-a", reasoning: true, inputModalities: ["text", "image"], contextWindowTokens: 128_000, maximumOutputTokens: 16_000, thinkingLevels: [{ effortId: "high", nativeLevel: "xhigh" }], sampling: { temperature: 0.2, topP: 0.9, seed: 4 }, compatibilityOptions: { supportsDeveloperRole: true, supportsStrictTools: false, thinkingFormat: "openai" }, supportsFastMode: true, supportsTools: false }] }] });
+  });
+
+  it("keeps native quota buckets, model windows and reset credits through the generated snapshot", () => {
+    const wire = create(SnapshotSchema, { providers: [{
+      backendId: "backend-native", providerId: "native-provider", displayName: "Native provider",
+      accountUsage: { providerId: "native-provider", observedAt: { seconds: 1_800_000_000n },
+        buckets: [{ id: "metered", displayName: "Metered", primaryWindow: { usedPercent: 20, windowMinutes: 300 } }],
+        modelWindows: [{ modelId: "scoped-model", displayName: "Scoped model", window: { usedPercent: 40, windowMinutes: 10_080, severity: "warning" } }],
+        resetCredits: { availableCount: 3, earliestExpiryAt: { seconds: 1_800_001_000n } },
+        extraUsage: { enabled: false, usedCredits: 0, monthlyLimit: 100 }
+      }
+    }], settings: currentSettings });
+    const snapshot = mapSnapshot(fromBinary(SnapshotSchema, toBinary(SnapshotSchema, wire)));
+    expect(snapshot.providers[0]?.accountUsage).toMatchObject({
+      buckets: [{ id: "metered", displayName: "Metered", primaryWindow: { usedPercent: 20, windowMinutes: 300 } }],
+      modelWindows: [{ modelId: "scoped-model", displayName: "Scoped model", window: { usedPercent: 40, windowMinutes: 10_080, severity: "warning" } }],
+      resetCredits: { availableCount: 3, earliestExpiryAt: 1_800_001_000_000 },
+      extraUsage: { enabled: false, usedCredits: 0, monthlyLimit: 100 }
+    });
+    expect(snapshot.providers[0]?.accountUsage?.primaryWindow).toBeUndefined();
   });
 
   it("projects subscription access and missing upstream pricing onto model rows", () => {
