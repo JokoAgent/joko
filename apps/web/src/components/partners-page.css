@@ -1,4 +1,11 @@
 .partners-page { background: var(--bg); }
+.partner-source { min-width: 0; }
+.partner-source__header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 24px; }
+.partner-source__header > div { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.partner-source__header h2 { margin: 0; font-size: var(--text-14); overflow-wrap: anywhere; }
+.partner-source__state { display: flex; align-items: center; gap: 8px; color: var(--text-soft); padding: 0 24px; }
+.partner-source__state > svg { width: 16px; height: 16px; flex: none; }
+.partner-source .partner-card h3 { margin: 0; font-size: var(--text-14); }
 .partner-summary { display: grid; grid-template-columns: repeat(3, minmax(112px, 180px)) minmax(0, 1fr); align-items: center; gap: 9px; padding: 18px 24px 12px; }
 .partner-summary > div { min-width: 0; display: flex; align-items: baseline; gap: 7px; border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; background: var(--surface); }
 .partner-summary > div.is-warning { border-color: color-mix(in srgb, var(--amber) 34%, var(--line)); background: var(--amber-soft); }

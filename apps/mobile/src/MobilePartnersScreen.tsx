@@ -4,6 +4,7 @@ import {
   BackHandler,
   FlatList,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -13,6 +14,7 @@ import {
 } from "react-native";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
+import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
 import type {
   MobilePartner,
   MobilePartnerPrivateState,
@@ -41,7 +43,7 @@ export interface MobilePartnersScreenProps {
   readonly onClosePartner: () => void;
   readonly onOpenThread: (partnerId: string, threadId: string) => void;
   readonly onCloseThread: () => void;
-  readonly onRefresh: () => void;
+  readonly onRefresh: () => void | Promise<void>;
   readonly onDetailVisible: (partnerId: string, threadId: string, lastVisibleSequence: number) => void;
 }
 
@@ -63,6 +65,17 @@ function formatTime(value: number, locale: MobileSupportedLocale): string {
   const date = new Date(value);
   if (Number.isNaN(date.valueOf())) return mobileMessage(locale, "common.unknown");
   return date.toLocaleString(locale, { dateStyle: "medium", timeStyle: "short" });
+}
+
+function formatMessageTime(timestamp: number, locale: MobileSupportedLocale): string {
+  const value = new Date(timestamp), current = new Date();
+  const sameDay = value.getFullYear() === current.getFullYear() && value.getMonth() === current.getMonth()
+    && value.getDate() === current.getDate();
+  return new Intl.DateTimeFormat(locale, {
+    ...(sameDay ? {} : value.getFullYear() === current.getFullYear()
+      ? { month: "short", day: "numeric" } as const : { year: "numeric", month: "short", day: "numeric" } as const),
+    hour: "2-digit", minute: "2-digit"
+  }).format(value);
 }
 
 function partnerName(partners: readonly MobilePartner[], partnerId: string, locale: MobileSupportedLocale): string {
@@ -181,38 +194,30 @@ function ThreadRow({ thread, partners, selected, colors, locale, onPress }: {
   </Pressable>;
 }
 
-function MessageRow({ message, detail, partners, colors, locale }: {
+function MessageRow({ message, viewerPartnerId, partners, colors, locale }: {
   readonly message: MobilePrivateMessage;
-  readonly detail: MobilePrivateDetail;
+  readonly viewerPartnerId: string;
   readonly partners: readonly MobilePartner[];
   readonly colors: MobilePartnersColors;
   readonly locale: MobileSupportedLocale;
 }) {
-  const readState = detail.readState;
-  const recipientRead = readState?.partnerId === message.recipientPartnerId;
-  const recipientName = partnerName(partners, message.recipientPartnerId, locale);
-  return <View style={[styles.message, { backgroundColor: colors.surface, borderColor: colors.border }]}>
-    <View style={styles.messageHeader}>
-      <Text style={[styles.label, styles.grow, { color: colors.ink }]}>
-        {partnerName(partners, message.senderPartnerId, locale)}
+  const ownSide = message.senderPartnerId === viewerPartnerId;
+  const sender = partners.find(partner => partner.partnerId === message.senderPartnerId);
+  const avatar = <MobilePartnerAvatar preset={sender?.avatar ?? "orbit"} partner={sender} colors={colors} size={28} />;
+  return <View testID={`partner.privateMessage.${ownSide ? "own" : "peer"}`}
+    style={[styles.messageRow, ownSide ? styles.messageRowOwn : styles.messageRowPeer]}>
+    {!ownSide && avatar}
+    <View style={[styles.messageColumn, ownSide ? styles.messageColumnOwn : styles.messageColumnPeer]}>
+      <Text style={[styles.messageMeta, { color: colors.muted }]}>
+        {partnerName(partners, message.senderPartnerId, locale)} · {formatMessageTime(message.createdAt, locale)}
       </Text>
-      <Text style={[styles.caption, { color: colors.muted }]}>
-        {mobileMessage(locale, "partner.messageNumber", { sequence: message.sequence })}
-      </Text>
+      <Text selectable style={[styles.messageBubble, { color: colors.ink, borderColor: colors.border,
+        backgroundColor: ownSide ? colors.surface : colors.background }]}>{message.content}</Text>
+      {message.deliveryStatus === "pending" && <Text style={[styles.messageMeta, { color: colors.muted }]}>
+        {mobileMessage(locale, "partner.delivery.pending")}
+      </Text>}
     </View>
-    <Text selectable style={[styles.body, { color: colors.ink }]}>{message.content}</Text>
-    <Text style={[styles.caption, { color: colors.muted }]}>
-      {mobileMessage(locale, "partner.sentAt", { time: formatTime(message.createdAt, locale) })}
-      {" · "}{mobileMessage(locale, message.deliveryStatus === "pending"
-        ? "partner.delivery.pending" : "partner.delivery.delivered")}
-    </Text>
-    {message.deliveredAt !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>
-      {mobileMessage(locale, "partner.deliveredAt", { time: formatTime(message.deliveredAt, locale) })}
-    </Text>}
-    {recipientRead && <Text style={[styles.caption, { color: colors.muted }]}>
-      {mobileMessage(locale, message.sequence <= readState.throughSequence
-        ? "partner.messageRead" : "partner.messageUnread", { name: recipientName })}
-    </Text>}
+    {ownSide && avatar}
   </View>;
 }
 
@@ -221,6 +226,42 @@ export function MobilePartnersScreen({ colors, locale, view, onBack, onOpenPartn
   const { width } = useWindowDimensions();
   const wide = width >= 780;
   const [route, setRoute] = useState<NarrowRoute>(() => initialRoute(view));
+  const [pulling, setPulling] = useState(false);
+  const refreshBinding = JSON.stringify([view.open, route]);
+  const refreshBindingRef = useRef(refreshBinding); refreshBindingRef.current = refreshBinding;
+  const refreshFlight = useRef<object | undefined>(undefined);
+  const pullFallback = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => {
+    refreshFlight.current = undefined; setPulling(false);
+    return () => {
+      refreshFlight.current = undefined;
+      clearTimeout(pullFallback.current); pullFallback.current = undefined;
+    };
+  }, [refreshBinding]);
+  const refresh = (pull = false): void => {
+    if (!view.open || refreshBindingRef.current !== refreshBinding || refreshFlight.current
+      || pull && (view.status === "offline" || view.detailStatus === "offline")) return;
+    const flight = {}; refreshFlight.current = flight;
+    if (pull) {
+      setPulling(true);
+      clearTimeout(pullFallback.current);
+      pullFallback.current = setTimeout(() => {
+        if (refreshFlight.current === flight && refreshBindingRef.current === refreshBinding) setPulling(false);
+      }, 8000);
+    }
+    const finish = (): void => {
+      if (refreshFlight.current !== flight || refreshBindingRef.current !== refreshBinding) return;
+      refreshFlight.current = undefined; clearTimeout(pullFallback.current); pullFallback.current = undefined;
+      setPulling(false);
+    };
+    try {
+      const pending = onRefresh();
+      if (pending === undefined) finish();
+      else void pending.catch(() => undefined).finally(finish);
+    }
+    catch { finish(); }
+  };
+  const refreshAction = (): void => refresh();
   const previousThread = useRef(view.selectedThreadId);
   const previousPartner = useRef(view.selectedPartnerId);
   const visibleContext = useRef<{
@@ -322,15 +363,15 @@ export function MobilePartnersScreen({ colors, locale, view, onBack, onOpenPartn
         <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale, "partner.title")}</Text>
         <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "partner.readOnly")}</Text>
       </View>
-      <Action label={mobileMessage(locale, "partner.refresh")} colors={colors} onPress={onRefresh}
+      <Action label={mobileMessage(locale, "partner.refresh")} colors={colors} onPress={refreshAction}
         disabled={view.status === "loading"} />
     </View>
     {view.status === "offline" && <Notice colors={colors} text={mobileMessage(locale, "partner.offline")} />}
     {view.status === "offline" && <Action label={mobileMessage(locale, "partner.retry")}
-      colors={colors} onPress={onRefresh} />}
+      colors={colors} onPress={refreshAction} />}
     {view.status === "error" && <Notice colors={colors} error text={mobileMessage(locale, "partner.error")} />}
     {view.status === "error" && <Action label={mobileMessage(locale, "partner.retry")}
-      colors={colors} onPress={onRefresh} />}
+      colors={colors} onPress={refreshAction} />}
     {view.status === "loading" || view.status === "idle"
       ? <Centered colors={colors} text={mobileMessage(locale, "partner.loadingDirectory")} loading />
       : view.status === "ready" && view.partners.length === 0
@@ -362,12 +403,12 @@ export function MobilePartnersScreen({ colors, locale, view, onBack, onOpenPartn
     {view.status === "offline"
       ? <View style={styles.errorBody}>
         <Notice colors={colors} text={mobileMessage(locale, "partner.offline")} />
-        <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={onRefresh} />
+        <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={refreshAction} />
       </View>
       : view.status === "error"
         ? <View style={styles.errorBody}>
           <Notice colors={colors} error text={mobileMessage(locale, "partner.error")} />
-          <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={onRefresh} />
+          <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={refreshAction} />
         </View>
         : !partnerIdForThreads
           ? <Centered colors={colors} text={mobileMessage(locale, "partner.selectPartner")} />
@@ -398,17 +439,17 @@ export function MobilePartnersScreen({ colors, locale, view, onBack, onOpenPartn
         <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "partner.readOnly")}</Text>
       </View>
       {selectedThread && <Action label={mobileMessage(locale, "partner.refresh")}
-        colors={colors} onPress={onRefresh} disabled={view.detailStatus === "loading"} />}
+        colors={colors} onPress={refreshAction} disabled={view.detailStatus === "loading"} />}
     </View>
     {view.status === "offline" || view.detailStatus === "offline"
       ? <View style={styles.errorBody}>
         <Notice colors={colors} text={mobileMessage(locale, "partner.offline")} />
-        <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={onRefresh} />
+        <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={refreshAction} />
       </View>
       : view.status === "error" || view.detailStatus === "error"
         ? <View style={styles.errorBody}>
           <Notice colors={colors} error text={mobileMessage(locale, "partner.error")} />
-          <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={onRefresh} />
+          <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={refreshAction} />
         </View>
         : waitingForRoute
           ? <Centered colors={colors} text={mobileMessage(locale, "partner.loadingDetail")} loading />
@@ -419,7 +460,7 @@ export function MobilePartnersScreen({ colors, locale, view, onBack, onOpenPartn
             : <>
               {view.detailError && <View style={styles.errorBody}>
                 <Notice colors={colors} error text={mobileMessage(locale, "partner.readError")} />
-                <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={onRefresh} />
+                <Action label={mobileMessage(locale, "partner.retry")} colors={colors} onPress={refreshAction} />
               </View>}
               <View style={[styles.threadMeta, { borderColor: colors.border, backgroundColor: colors.surface }]}>
                 <Text style={[styles.label, { color: colors.ink }]}>{threadStatus(detail.thread, locale)}</Text>
@@ -448,13 +489,19 @@ export function MobilePartnersScreen({ colors, locale, view, onBack, onOpenPartn
                     : mobileMessage(locale, "partner.readUnknown")}
                 </Text>
               </View>
-              {detail.messages.length === 0
-                ? <Centered colors={colors} text={mobileMessage(locale, "partner.emptyMessages")} />
-                : <FlatList<MobilePrivateMessage> data={detail.messages} keyExtractor={(message) => message.messageId}
-                  renderItem={({ item }) => <MessageRow message={item} detail={detail} partners={view.partners}
+              <FlatList<MobilePrivateMessage> data={detail.messages} keyExtractor={(message) => message.messageId}
+                  renderItem={({ item }) => <MessageRow message={item} viewerPartnerId={view.selectedPartnerId!} partners={view.partners}
                     colors={colors} locale={locale} />}
                   contentContainerStyle={styles.messages} viewabilityConfig={viewabilityConfig}
-                  onViewableItemsChanged={onViewableItemsChanged} />}
+                  onViewableItemsChanged={onViewableItemsChanged}
+                  refreshControl={<RefreshControl refreshing={pulling} onRefresh={() => refresh(true)} tintColor={colors.muted} />}
+                  ListEmptyComponent={<Centered colors={colors} text={mobileMessage(locale, "partner.emptyMessages")} />}
+                  ListFooterComponent={detail.thread.closeReason === "messageLimit" ? <View style={styles.messageLimit}
+                    testID="partner.privateMessage.limit">
+                    <View style={[styles.messageLimitLine, { backgroundColor: colors.border }]} />
+                    <Text style={[styles.messageLimitText, { color: colors.muted }]}>{mobileMessage(locale, "partner.thread.closedLimit")}</Text>
+                    <View style={[styles.messageLimitLine, { backgroundColor: colors.border }]} />
+                  </View> : undefined} />
             </>}
   </View>;
 
@@ -492,7 +539,17 @@ const styles = StyleSheet.create({
   centeredText: { textAlign: "center" },
   errorBody: { gap: 10 },
   threadMeta: { borderWidth: 1, borderRadius: 13, padding: 12, gap: 4 },
-  messages: { gap: 10, paddingBottom: 24 },
-  message: { borderWidth: 1, borderRadius: 13, padding: 12, gap: 7 },
-  messageHeader: { flexDirection: "row", alignItems: "center", gap: 10 }
+  messages: { gap: 16, paddingTop: 16, paddingBottom: 24, flexGrow: 1 },
+  messageRow: { flexDirection: "row", alignItems: "flex-start", gap: 8 },
+  messageRowOwn: { justifyContent: "flex-end" },
+  messageRowPeer: { justifyContent: "flex-start" },
+  messageColumn: { maxWidth: "74%", minWidth: 0, gap: 4 },
+  messageColumnOwn: { alignItems: "flex-end" },
+  messageColumnPeer: { alignItems: "flex-start" },
+  messageMeta: { fontSize: 12, lineHeight: 18, paddingHorizontal: 4 },
+  messageBubble: { fontSize: 17, lineHeight: 26, fontWeight: "400", borderRadius: 12,
+    borderWidth: StyleSheet.hairlineWidth, paddingHorizontal: 12, paddingVertical: 8, overflow: "hidden" },
+  messageLimit: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 16 },
+  messageLimitLine: { flex: 1, height: StyleSheet.hairlineWidth },
+  messageLimitText: { flexShrink: 1, fontSize: 13, lineHeight: 18, textAlign: "center" }
 });

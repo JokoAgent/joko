@@ -6,6 +6,8 @@ import { createPartnerRoutineApi, newRoutineDefinition, ListPartnerRoutinesRespo
 import { createPartnerMemoryApi, ListPartnerMemoriesResponseSchema, PartnerMemoryKind, ReadPartnerMemoryResponseSchema, UpdatePartnerMemoryResponseSchema, DeletePartnerMemoryResponseSchema,
   GetPartnerMemoryPreferencesResponseSchema, UpdatePartnerMemoryPreferencesResponseSchema } from "@joko/contracts";
 import { Code } from "@connectrpc/connect";
+import { PartnerGroupSummarySchema, PartnerGroupMemberSchema, ListPartnerGroupsResponseSchema, GetPartnerGroupResponseSchema,
+  GetPartnerGroupCreationResponseSchema, RetirePartnerGroupCreationResponseSchema, PartnerGroupMemberStatus, type PartnerGroupApi } from "@joko/contracts";
 import { DevicePeerDescriptorSchema, RemoteDesktopControlStateSchema, type RemoteDesktopControlState } from "@joko/contracts";
 import { createPartnerConnectionsApi, GetPartnerConnectionsResponseSchema, UpdatePartnerConnectionsResponseSchema, PartnerConnectionMode } from "@joko/contracts";
 import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSkillResponseSchema, UpdatePartnerSkillResponseSchema, DeletePartnerSkillResponseSchema } from "@joko/contracts";
@@ -1820,6 +1822,231 @@ function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient
   return instance;
 }
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); vi.useRealTimers(); });
+
+describe("paired Partner group sources", () => {
+  function fixture() {
+    const network = fakeNetwork(), saved = memoryStorage([credential, otherCredential], credential.profileId);
+    const partners = [profilePartner, { ...profilePartner, partnerId: "partner-b", displayName: "Bea", lifecycle: "paused" as const, pauseCleanupPending: false }];
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 1_000 }, partners }));
+    network.readOwner = vi.fn(async value => value.profileId === otherCredential.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: create(SnapshotSchema, { ...snapshot, connections: [otherConnection], devices: [otherDevice] }) }
+      : { connection, device, snapshot });
+    const calls = new Map<string, PartnerGroupApi[]>();
+    const groups = new Map([credential.profileId, otherCredential.profileId].map(id => [id, create(PartnerGroupSummarySchema, {
+      id: "same-group", name: id === credential.profileId ? "First source group" : "Second source group", revision: { value: 2n },
+      members: partners.map(partner => ({ partnerId: partner.partnerId, name: partner.displayName,
+        status: partner.lifecycle === "paused" ? PartnerGroupMemberStatus.PAUSED : PartnerGroupMemberStatus.ACTIVE }))
+    })]));
+    network.partnerGroupApi = vi.fn((value, ownerKey, newRequestId, assertCurrent) => {
+      const original = (): NonNullable<ReturnType<typeof groups.get>> => groups.get(value.profileId)!;
+      const api: PartnerGroupApi = { ownerKey, newRequestId,
+        list: vi.fn(async signal => { assertCurrent(signal); return create(ListPartnerGroupsResponseSchema, { revision: { value: 3n }, groups: [original()], changeSequence: 1n }); }),
+        get: vi.fn(async (groupId, _before, signal) => { assertCurrent(signal); if (groupId !== original().id) throw new Error("Group not found.");
+          return create(GetPartnerGroupResponseSchema, { detail: { group: original() } }); }),
+        create: vi.fn(async () => original()), lookup: vi.fn(async () => create(GetPartnerGroupCreationResponseSchema, { group: original() })),
+        retire: vi.fn(async () => create(RetirePartnerGroupCreationResponseSchema, { retired: true })),
+        changes: vi.fn((_sequence, signal) => (async function* () { await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); })()),
+        update: vi.fn(async () => original()), members: vi.fn(async () => original()), remove: vi.fn(async () => undefined),
+        send: vi.fn(async () => { throw new Error("No group send was requested."); }), continue: vi.fn(async () => undefined), stop: vi.fn(async () => undefined),
+        markRead: vi.fn(async () => undefined), planAction: vi.fn(async () => undefined), planEdit: vi.fn(async () => undefined),
+        file: vi.fn(async () => { throw new Error("Mobile cannot read host handoff files."); }), respond: vi.fn(async () => undefined) };
+      calls.set(value.profileId, [...calls.get(value.profileId) ?? [], api]); return api;
+    });
+    return { network, saved, groups, calls, app: client(network, saved.storage) };
+  }
+  it("reads isolated same-ID group catalogs after public identity proof without changing the active node", async () => {
+    const { network, saved, app } = fixture(); await app.start();
+    vi.mocked(network.inspect).mockClear(); vi.mocked(saved.storage.loadCredential).mockClear();
+    const signal = new AbortController().signal;
+    const first = await app.partnerGroupRosterSourceTransport(credential.profileId, signal);
+    const second = await app.partnerGroupRosterSourceTransport(otherCredential.profileId, signal);
+    expect(first.sourceKey).not.toBe(second.sourceKey); expect(first.receiptScope).not.toBe(second.receiptScope);
+    expect((await first.list(signal)).groups[0]?.name).toBe("First source group");
+    expect((await second.list(signal)).groups[0]?.name).toBe("Second source group");
+    expect(app.state.activeProfileId).toBe(credential.profileId);
+    expect(vi.mocked(network.inspect).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(saved.storage.loadCredential).mock.invocationCallOrder[0]!);
+    expect((await second.list(signal)).groups[0]?.members[1]?.status).toBe(PartnerGroupMemberStatus.PAUSED);
+  });
+  it("adopts the exact original Group owner and creation receipt scope while refusing forged or other-source claims", async () => {
+    const { app, calls } = fixture(); await app.start(); const signal = new AbortController().signal;
+    const selected = await app.openPartnerGroupRosterSource(otherCredential.profileId, "same-group", signal);
+    expect(selected).toMatchObject({ profileId: otherCredential.profileId, groupId: "same-group", ownerKey: app.partnerGroupApi()!.ownerKey, receiptScope: app.partnerGroupReceiptScope() });
+    expect(app.state.activeProfileId).toBe(otherCredential.profileId); expect(app.partnerGroupSourceClaimCurrent(selected)).toBe(true);
+    expect(app.partnerGroupSourceClaimCurrent({ ...selected })).toBe(false);
+    const create = await app.openPartnerGroupRosterSource(otherCredential.profileId, undefined, signal);
+    expect(create.groupId).toBeUndefined(); expect(app.partnerGroupSourceClaimCurrent(create)).toBe(true);
+    expect([...calls.values()].flat().every(api => vi.mocked(api.create).mock.calls.length === 0)).toBe(true);
+    await app.openPartnerGroupRosterSource(credential.profileId, "same-group", signal);
+    expect(app.partnerGroupSourceClaimCurrent(selected)).toBe(false); expect(app.partnerGroupSourceClaimRetained(selected)).toBe(false);
+  });
+  it("retains completed same-source presentation offline but retires foreground late reads and never reads a mismatched source credential", async () => {
+    const { network, saved, app } = fixture(); await app.start(); const signal = new AbortController().signal;
+    const claim = await app.openPartnerGroupRosterSource(credential.profileId, "same-group", signal);
+    const source = await app.partnerGroupRosterSourceTransport(otherCredential.profileId, signal);
+    let finish!: (value: NodeIdentity) => void;
+    vi.mocked(network.inspect).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const late = source.list(signal); app.setForeground(false); finish(node);
+    await expect(late).rejects.toThrow(); expect(app.partnerGroupSourceClaimCurrent(claim)).toBe(false);
+    expect(app.partnerGroupSourceClaimRetained(claim)).toBe(true);
+    app.setForeground(true); await vi.waitFor(() => expect(app.state.status).toBe("connected"));
+    vi.mocked(network.inspect).mockClear(); vi.mocked(saved.storage.loadCredential).mockClear();
+    await expect(app.openPartnerGroupRosterSource(otherCredential.profileId, "same-group", signal, claim.sourceKey)).rejects.toThrow(/identity changed/u);
+    expect(network.inspect).not.toHaveBeenCalled(); expect(saved.storage.loadCredential).not.toHaveBeenCalled();
+  });
+  it("fails missing or newly invisible original membership instead of opening a same-ID group from another source", async () => {
+    const { network, app, groups } = fixture(); await app.start(); const signal = new AbortController().signal;
+    const existing = groups.get(otherCredential.profileId)!;
+    groups.set(otherCredential.profileId, create(PartnerGroupSummarySchema, { ...existing, members: [...existing.members,
+      create(PartnerGroupMemberSchema, { partnerId: "not-visible", name: "Missing", status: PartnerGroupMemberStatus.MISSING })] }));
+    await expect(app.openPartnerGroupRosterSource(otherCredential.profileId, "same-group", signal)).rejects.toThrow(/original source/u);
+    expect(app.state.activeProfileId).toBe(credential.profileId);
+    groups.set(otherCredential.profileId, existing);
+    const factory = network.partnerGroupApi!;
+    network.partnerGroupApi = vi.fn((value, ownerKey, newId, assertCurrent) => {
+      const api = factory(value, ownerKey, newId, assertCurrent);
+      if (value.profileId === otherCredential.profileId && !ownerKey.endsWith("partner-roster")) {
+        api.get = vi.fn(async () => create(GetPartnerGroupResponseSchema, { detail: { group: { ...existing,
+          members: [create(PartnerGroupMemberSchema, { partnerId: "not-visible", name: "Missing", status: PartnerGroupMemberStatus.MISSING })] } } }));
+      }
+      return api;
+    });
+    await expect(app.openPartnerGroupRosterSource(otherCredential.profileId, "same-group", signal)).rejects.toThrow(/membership changed/u);
+  });
+  it("keeps ordinary group read failure independent and removes only the revoked source credential", async () => {
+    const { network, saved, app } = fixture(); await app.start(); const signal = new AbortController().signal;
+    const factory = network.partnerGroupApi!; let revoked = false;
+    network.partnerGroupApi = vi.fn((value, ownerKey, newId, assertCurrent) => {
+      const api = factory(value, ownerKey, newId, assertCurrent);
+      if (value.profileId === otherCredential.profileId) api.list = vi.fn(async () => { throw Object.assign(new Error(revoked ? "Revoked" : "Group read failed"), revoked ? { code: Code.Unauthenticated } : {}); });
+      return api;
+    });
+    const failed = await app.partnerGroupRosterSourceTransport(otherCredential.profileId, signal);
+    await expect(failed.list(signal)).rejects.toThrow(/Group read failed/u);
+    expect(app.partnerRosterSources()).toHaveLength(2); expect(saved.key(otherCredential.profileId)).toBeDefined();
+    network.partnerGroupApi = vi.fn(() => { throw new Error("Group source initialization failed."); });
+    const partnerSource = await app.partnerRosterSourceTransport(otherCredential.profileId, signal);
+    expect((await partnerSource.list(signal)).partners).toHaveLength(2);
+    const groupSource = await app.partnerGroupRosterSourceTransport(otherCredential.profileId, signal);
+    await expect(groupSource.list(signal)).rejects.toThrow(/initialization failed/u);
+    network.partnerGroupApi = factory;
+    revoked = true; await expect(failed.list(signal)).rejects.toThrow();
+    expect(saved.key(otherCredential.profileId)).toBeUndefined(); expect(app.state.activeProfileId).toBe(credential.profileId);
+    expect((await (await app.partnerGroupRosterSourceTransport(credential.profileId, signal)).list(signal)).groups[0]?.name).toBe("First source group");
+  });
+});
+
+describe("paired Partner source roster", () => {
+  it("probes a saved source before reading its credential and removes public identity drift", async () => {
+    const network = fakeNetwork(), saved = memoryStorage([credential, otherCredential], credential.profileId);
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 1n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 1_000 }, partners: [profilePartner] }));
+    network.readOwner = vi.fn(async value => value.profileId === otherCredential.profileId
+      ? { connection: otherConnection, device: otherDevice, snapshot: create(SnapshotSchema, { ...snapshot, connections: [otherConnection], devices: [otherDevice] }) }
+      : { connection, device, snapshot });
+    const app = client(network, saved.storage); await app.start();
+    vi.mocked(network.inspect).mockClear(); vi.mocked(saved.storage.loadCredential).mockClear();
+    const transport = await app.partnerRosterSourceTransport(otherCredential.profileId, new AbortController().signal);
+    expect(vi.mocked(network.inspect).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(saved.storage.loadCredential).mock.invocationCallOrder[0]!);
+    expect((await transport.list(new AbortController().signal)).partners[0]).toEqual(profilePartner);
+    expect(app.state.activeProfileId).toBe(credential.profileId);
+    vi.mocked(saved.storage.loadCredential).mockClear();
+    vi.mocked(network.inspect).mockResolvedValue({ ...node, serverId: "replacement" });
+    await expect(app.partnerRosterSourceTransport(otherCredential.profileId, new AbortController().signal)).rejects.toThrow();
+    expect(saved.storage.loadCredential).not.toHaveBeenCalled();
+    expect(app.partnerRosterSources().map(source => source.profile.profileId)).toEqual([credential.profileId]);
+    expect(saved.key(otherCredential.profileId)).toBeDefined();
+  });
+  it("retires foreground late source proofs before a protected credential can be read", async () => {
+    const network = fakeNetwork(), saved = memoryStorage([credential, otherCredential], credential.profileId);
+    network.listPartnerCatalog = vi.fn(); const app = client(network, saved.storage); await app.start();
+    let finish!: (value: NodeIdentity) => void;
+    vi.mocked(network.inspect).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    vi.mocked(saved.storage.loadCredential).mockClear();
+    const pending = app.partnerRosterSourceTransport(otherCredential.profileId, new AbortController().signal);
+    app.setForeground(false); finish(node);
+    await expect(pending).rejects.toThrow(); expect(saved.storage.loadCredential).not.toHaveBeenCalled();
+  });
+  it("opens only a fresh original canonical relationship and fails destination identity drift instead of ordinary Task", async () => {
+    const network = fakeNetwork(), saved = memoryStorage(credential);
+    let partner = profilePartner;
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 1_000 }, partners: [partner] }));
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{ partnerId: partner.partnerId,
+      sessionId: "session", role: PartnerSessionRole.CANONICAL, profileVersion: 1n, available: true }] }));
+    const app = client(network, saved.storage); await app.start();
+    await expect(app.openPartnerRosterSource(credential.profileId, partner, new AbortController().signal)).resolves.toMatchObject({ sessionId: "session" });
+    partner = { ...partner, canonicalSessionId: "elsewhere" };
+    await expect(app.partnerConversationTransport()!.resolve(new AbortController().signal)).rejects.toThrow(/source relationship/u);
+    await expect(app.openPartnerRosterSource(credential.profileId, profilePartner, new AbortController().signal)).rejects.toThrow(/changed/u);
+  });
+  it("keeps a source profile save alive through its owned projection invalidation and rechecks fresh canonical detail", async () => {
+    const network = fakeNetwork(); let partner = profilePartner, revision = 4n, session = runtimeSession;
+    let push!: (event: Event) => void;
+    network.streamOwner = vi.fn((_credential, _after, signal) => (async function* () {
+      const next = await new Promise<Event | undefined>(resolve => { push = resolve; signal.addEventListener("abort", () => resolve(undefined), { once: true }); });
+      if (next && !signal.aborted) yield next;
+      await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true }); });
+    })());
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection(session) }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(session, true));
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 2_000 }, partners: [partner] }));
+    network.getPartnerProfileOptions = vi.fn(async () => ({ ...profileSnapshot.options, revision }));
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{ partnerId: partner.partnerId,
+      sessionId: "session", role: PartnerSessionRole.CANONICAL, profileVersion: 1n, available: true }] }));
+    network.updatePartnerProfile = vi.fn(async (_credential, _id, _revision, draft) => {
+      partner = { ...partner, ...draft, revision: partner.revision + 1n, profileVersion: partner.profileVersion + 1n }; revision++;
+      session = create(SessionSchema, { ...session, version: create(EntityVersionSchema, { ...session.version!,
+        revision: create(RevisionSchema, { value: session.version!.revision!.value + 1n }) }),
+        nativeBinding: create(NativeSessionBindingSchema, { ...session.nativeBinding!, runtimeGeneration: session.nativeBinding!.runtimeGeneration! + 1n }) });
+      push(create(EventSchema, { eventId: "profile-invalidation", cursor: { opaqueToken: "cursor-11", sequence: 11n, generation: 1n },
+        payload: { kind: { case: "projectionInvalidated", value: {} } } }));
+      await Promise.resolve(); await Promise.resolve();
+      return partner;
+    });
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const editor = app.partnerProfileTransport()!, initial = await editor.load(partner, new AbortController().signal);
+    const presentation = app.taskPresentationOwnerKey();
+    await expect(editor.save(initial, { ...mobilePartnerProfileDraft(partner), description: "Changed" }, new AbortController().signal))
+      .resolves.toMatchObject({ description: "Changed" });
+    expect(app.state.status).toBe("connected"); expect(app.taskPresentationOwnerKey()).not.toBe(presentation);
+    expect(app.partnerProfileTransport()?.ownerKey).toBe(editor.ownerKey);
+    expect((await editor.load(partner, new AbortController().signal)).partner.description).toBe("Changed");
+    expect(app.state.detail?.sessions[0]?.version?.revision?.value).toBe(session.version?.revision?.value);
+    const next = await editor.load(partner, new AbortController().signal);
+    await expect(editor.save(next, { ...mobilePartnerProfileDraft(partner), description: "Changed again" }, new AbortController().signal))
+      .resolves.toMatchObject({ description: "Changed again" });
+    await app.refresh();
+    await expect(editor.load(partner, new AbortController().signal)).rejects.toThrow(/owner changed/u);
+  });
+  it("allows a fresh paused source only through its existing settings and Resume owner", async () => {
+    const network = fakeNetwork(), partner = { ...profilePartner, lifecycle: "paused" as const, pauseCleanupPending: false };
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.readSession = vi.fn(async () => runtimeControlProjection(runtimeSession, true));
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 2_000 }, partners: [partner] }));
+    network.getPartnerProfileOptions = vi.fn(async () => profileSnapshot.options);
+    network.updatePartnerProfile = vi.fn(); network.resumePartner = vi.fn();
+    network.listPartnerSessions = vi.fn(async () => create(ListPartnerSessionsResponseSchema, { sessions: [{ partnerId: partner.partnerId,
+      sessionId: "session", role: PartnerSessionRole.CANONICAL, profileVersion: 1n, available: true }] }));
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const signal = new AbortController().signal;
+    await expect(app.openPartnerRosterSource(credential.profileId, partner, signal)).rejects.toThrow(/available canonical/u);
+    await expect(app.openPartnerRosterSource(credential.profileId, partner, signal, "settings")).resolves.toMatchObject({ sessionId: "session" });
+    expect((await app.partnerProfileTransport()!.load(partner, signal)).partner.lifecycle).toBe("paused");
+    expect(app.partnerResumeEditor(partner)).toBeDefined();
+  });
+  it("adopts a fresh unfinished source into the original initialization owner without selecting a generic task", async () => {
+    const network = fakeNetwork(), partner = { ...profilePartner, canonicalSessionId: undefined,
+      initializationState: "error" as const, invitationStage: "failed" as const, initializationErrorCode: "homeUnavailable" as const };
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 4n, activeCount: 1, archivedCount: 0, errorCount: 1, updatedAt: 2_000 }, partners: [partner] }));
+    network.retryPartnerInitialization = vi.fn();
+    const saved = memoryStorage(credential), app = client(network, saved.storage); await app.start();
+    const signal = new AbortController().signal;
+    expect(await app.openPartnerRosterInitializationSource(credential.profileId, partner, signal))
+      .toEqual({ partnerId: partner.partnerId, ownerKey: app.partnerInitializationTransport()!.ownerKey });
+    expect(network.listPartnerSessions).not.toHaveBeenCalled(); expect(network.retryPartnerInitialization).not.toHaveBeenCalled();
+    network.listPartnerCatalog = vi.fn(async () => ({ directory: { revision: 5n, activeCount: 1, archivedCount: 0, errorCount: 1, updatedAt: 2_000 },
+      partners: [{ ...partner, revision: partner.revision + 1n }] }));
+    await expect(app.openPartnerRosterInitializationSource(credential.profileId, partner, signal)).rejects.toThrow(/changed/u);
+  });
+});
 
 describe("Partner task output client", () => {
   async function fixture(platform: "android" | "ios" = "android") {

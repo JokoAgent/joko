@@ -117,6 +117,29 @@ interface JokoDesktopMainWindowCloseSettings {
   readonly revision: number;
 }
 
+interface JokoDesktopWallpaperSettings {
+  readonly version: 1;
+  readonly revision: number;
+  readonly mode: "none" | "custom";
+  readonly maskOpacity: number;
+  readonly customImage: {
+    readonly id: string;
+    readonly url: string;
+    readonly width: number;
+    readonly height: number;
+  } | null;
+}
+
+interface JokoDesktopWallpaperSettingsChange {
+  readonly expectedRevision: number;
+  readonly mode?: JokoDesktopWallpaperSettings["mode"];
+  readonly maskOpacity?: number;
+}
+
+type JokoDesktopWallpaperImportResult =
+  | { readonly cancelled: true }
+  | { readonly cancelled: false; readonly settings: JokoDesktopWallpaperSettings };
+
 type JokoDesktopCopyFileResult =
   | { readonly status: "copied" | "cancelled" | "unknown" | "unavailable" | "blocked" }
   | { readonly status: "failed"; readonly reason: "capacity" | "storage" | "helper" };
@@ -235,6 +258,7 @@ type JokoDesktopCapability =
   | "app.update"
   | "attention.badge"
   | "appearance.zoom"
+  | "appearance.wallpaper"
   | "application.menu"
   | "extension.libraryGestures"
   | "extension.libraryLocationPicker"
@@ -451,6 +475,14 @@ interface JokoDesktopApi {
   /** OS-preferred locale captured by the trusted Desktop preload for this app start. */
   readonly preferredSystemLocale: "en" | "zh-CN";
   readonly capabilities: readonly JokoDesktopCapability[];
+  readonly wallpaper?: {
+    get(): Promise<JokoDesktopWallpaperSettings>;
+    set(change: JokoDesktopWallpaperSettingsChange): Promise<JokoDesktopWallpaperSettings>;
+    import(expectedRevision: number): Promise<JokoDesktopWallpaperImportResult>;
+    remove(expectedRevision: number): Promise<JokoDesktopWallpaperSettings>;
+    reset(expectedRevision: number): Promise<JokoDesktopWallpaperSettings>;
+    onChanged(listener: (settings: JokoDesktopWallpaperSettings) => void): () => void;
+  };
   readonly appInfo: {
     get(): Promise<JokoDesktopAppInfo>;
   };

@@ -10,6 +10,14 @@ type MobilePartnerMessageRow = readonly [
 ];
 
 const rows = [
+  ["partnerGroups.search", "Search Partners and groups", "搜索伙伴和群聊", "搜尋夥伴和群聊", "パートナーとグループを検索", "파트너와 그룹 검색"],
+  ["partnerGroups.sourceChoice", "{name} · {origin}", "{name} · {origin}", "{name} · {origin}", "{name} · {origin}", "{name} · {origin}"],
+  ["partnerGroups.loading", "Loading groups…", "正在加载群聊…", "正在載入群聊…", "グループを読み込み中…", "그룹 불러오는 중…"],
+  ["partnerGroups.online", "Groups connected", "群聊已连接", "群聊已連線", "グループに接続済み", "그룹 연결됨"],
+  ["partnerGroups.empty", "No groups on this node yet", "此节点还没有群聊", "此節點尚無群聊", "このノードにグループはありません", "이 노드에는 아직 그룹이 없습니다"],
+  ["partnerGroups.failed", "Could not refresh groups. Retry this node.", "无法刷新群聊，请重试此节点。", "無法重新整理群聊，請重試此節點。", "グループを更新できません。このノードで再試行してください。", "그룹을 새로 고치지 못했습니다. 이 노드에서 다시 시도하세요."],
+  ["partnerGroups.offline", "Groups offline; saved previews remain", "群聊离线，保留已保存预览", "群聊離線，保留已儲存預覽", "グループはオフラインです。保存済みのプレビューを表示します", "그룹이 오프라인입니다. 저장된 미리보기를 표시합니다"],
+  ["partnerGroups.retry", "Retry groups", "重试群聊", "重試群聊", "グループを再試行", "그룹 다시 시도"],
   ["partnerOutputs.title", "Outputs", "成果", "成果", "成果物", "결과물"],
   ["partnerOutputs.loading", "Loading outputs…", "正在加载成果…", "正在載入成果…", "成果物を読み込み中…", "결과물 불러오는 중…"],
   ["partnerOutputs.empty", "No outputs yet. Ask your Partner to create something.", "还没有成果，可以让伙伴创作一些内容。", "尚無成果，可以請夥伴創作一些內容。", "成果物はまだありません。パートナーに作成を頼んでみましょう。", "아직 결과물이 없습니다. 파트너에게 만들어 달라고 요청하세요."],
@@ -206,6 +214,8 @@ const rows = [
   ["partnerProfile.error.modelUnavailable", "A model or option is unavailable. Choose an available route.", "某个模型或选项不可用。请选择可用路由。", "某個模型或選項無法使用。請選擇可用路由。", "モデルまたはオプションが利用できません。利用可能な経路を選択してください。", "모델 또는 옵션을 사용할 수 없습니다. 사용 가능한 경로를 선택하세요."],
   ["partner.menuDescription", "Read private conversations between Partners", "查看伙伴之间的私聊", "查看夥伴之間的私聊", "パートナー間の非公開会話を表示", "파트너 간 비공개 대화 보기"],
   ["partner.openThread", "Open Partner chat", "打开伙伴私聊", "開啟夥伴私聊", "パートナーのチャットを開く", "파트너 채팅 열기"],
+  ["partner.sentTo", "Sent to {name}", "发送给 {name}", "傳送給 {name}", "{name}に送信", "{name}에게 보냄"],
+  ["partner.receivedFrom", "Received from {name}", "收到 {name} 的消息", "收到 {name} 的訊息", "{name}から受信", "{name}에게서 받음"],
   ["partner.readOnly", "Read-only · Partners exchange these messages", "只读 · 消息由伙伴互发", "唯讀 · 訊息由夥伴互傳", "読み取り専用 · パートナー間のメッセージ", "읽기 전용 · 파트너끼리 주고받은 메시지"],
   ["partner.directory", "Partners", "伙伴", "夥伴", "パートナー", "파트너"],
   ["partner.threads", "Conversations", "会话", "對話", "会話", "대화"],

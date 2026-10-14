@@ -35,6 +35,12 @@ export const DESKTOP_CHANNELS = {
   mainWindowCloseSettingsGet: "joko:main-window-close-settings:get",
   mainWindowCloseSettingsSet: "joko:main-window-close-settings:set",
   mainWindowCloseSettingsChanged: "joko:main-window-close-settings:changed",
+  wallpaperGet: "joko:wallpaper:get",
+  wallpaperSet: "joko:wallpaper:set",
+  wallpaperImport: "joko:wallpaper:import",
+  wallpaperRemove: "joko:wallpaper:remove",
+  wallpaperReset: "joko:wallpaper:reset",
+  wallpaperChanged: "joko:wallpaper:changed",
   pageSearchStart: "joko:page-search:start",
   pageSearchStop: "joko:page-search:stop",
   pageSearchResult: "joko:page-search:result",
@@ -906,6 +912,53 @@ export interface DesktopMainWindowCloseSettings {
 export interface DesktopMainWindowCloseSettingsChange {
   readonly behavior: DesktopMainWindowCloseBehavior | null;
   readonly expectedRevision: number;
+}
+
+export interface DesktopWallpaperSettings {
+  readonly version: 1;
+  readonly revision: number;
+  readonly mode: "none" | "custom";
+  readonly maskOpacity: number;
+  readonly customImage: {
+    readonly id: string;
+    readonly url: string;
+    readonly width: number;
+    readonly height: number;
+  } | null;
+}
+
+export interface DesktopWallpaperSettingsChange {
+  readonly expectedRevision: number;
+  readonly mode?: DesktopWallpaperSettings["mode"];
+  readonly maskOpacity?: number;
+}
+
+export type DesktopWallpaperImportResult =
+  | { readonly cancelled: true }
+  | { readonly cancelled: false; readonly settings: DesktopWallpaperSettings };
+
+export function requireDesktopWallpaperRevision(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) throw new TypeError("Wallpaper revision is invalid.");
+  return value as number;
+}
+
+export function parseDesktopWallpaperSettingsChange(value: unknown): DesktopWallpaperSettingsChange {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Wallpaper change is invalid.");
+  const entry = value as Record<string, unknown>;
+  if (!Object.hasOwn(entry, "expectedRevision") || Object.keys(entry).some(key =>
+    key !== "expectedRevision" && key !== "mode" && key !== "maskOpacity")) throw new TypeError("Wallpaper change is invalid.");
+  const expectedRevision = requireDesktopWallpaperRevision(entry["expectedRevision"]);
+  if (Object.hasOwn(entry, "mode") && entry["mode"] !== "none" && entry["mode"] !== "custom") throw new TypeError("Wallpaper mode is invalid.");
+  const maskOpacity = entry["maskOpacity"];
+  if (Object.hasOwn(entry, "maskOpacity") && (typeof maskOpacity !== "number" || !Number.isFinite(maskOpacity)
+    || maskOpacity < 0 || maskOpacity > 0.6 || Math.abs(maskOpacity * 20 - Math.round(maskOpacity * 20)) > 1e-7)) {
+    throw new TypeError("Wallpaper mask opacity is invalid.");
+  }
+  return {
+    expectedRevision,
+    ...(Object.hasOwn(entry, "mode") ? { mode: entry["mode"] as DesktopWallpaperSettings["mode"] } : {}),
+    ...(Object.hasOwn(entry, "maskOpacity") ? { maskOpacity: maskOpacity as number } : {})
+  };
 }
 
 export type DesktopMicrophonePermissionStatus = "granted" | "denied" | "prompt" | "unknown";

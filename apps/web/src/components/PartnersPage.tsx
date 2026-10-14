@@ -36,6 +36,9 @@ import { partnerResumeMessages, routineMessages } from "@joko/contracts";
 import type { PartnerDeletionView } from "@joko/contracts";
 import { partnerAvatarInput, type PartnerAvatarDraft } from "../partner-avatar.js";
 import { PartnerAvatar } from "./PartnerAvatar.js";
+import { PartnerSources } from "./PartnerSources.js";
+import { partnerSourceKey, validatePartnerSourceOwner, validatePartnerSourceProfile, validatePartnerSourceSession } from "../partner-sources.js";
+import { registerPartnerNavigationLeave } from "../partner-navigation-leave.js";
 import { currentPartnerWorkingStatus } from "../partner-working-status.js";
 import { PartnerWorkingLabel } from "./PartnerWorkingStatus.js";
 import { usePartnerDocumentForeground } from "./use-partner-working-status.js";
@@ -85,18 +88,22 @@ interface PartnerEditorDraft {
   readonly taskModelOverride?: PartnerModelRouteView;
 }
 
-export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNavigation }: {
+export function PartnersPage({ controller, snapshot, focusPartnerId, preparation: preparationProp, t, onOpenNavigation }: {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
   readonly focusPartnerId?: string;
+  readonly preparation?: boolean;
   readonly t: Translator;
   readonly onOpenNavigation: () => void;
 }): JSX.Element {
   const latestControllerRef = useRef(controller);
   latestControllerRef.current = controller;
+  const rootRef = useRef<HTMLElement>(null);
+  const preparation = preparationProp === true || controller.state.route?.kind === "partners" && controller.state.route.preparation === true;
+  const requestedSourceProfile = controller.state.route?.kind === "partners" ? controller.state.route.profileId : undefined;
   const ownerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
     controller.state.activeProfile?.origin, controller.state.activeProfile?.deviceId, controller.state.connectionGeneration,
-    controller.state.connectionState, snapshot.generation.toString()]);
+    controller.state.connectionState, snapshot.generation.toString(), requestedSourceProfile, focusPartnerId, preparation]);
   const foreground = usePartnerDocumentForeground();
   const ownerRef = useRef(ownerKey);
   ownerRef.current = ownerKey;
@@ -124,10 +131,24 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
     const generation = ++loadGenerationRef.current;
     const expectedOwner = ownerRef.current;
     if (!quiet) { setLoading(true); setLoadError(undefined); }
-    return latestControllerRef.current.listPartners(undefined, signal).then((result) => {
+    return latestControllerRef.current.listPartners(undefined, signal).then(async (result) => {
       if (signal.aborted || generation !== loadGenerationRef.current || expectedOwner !== ownerRef.current) return false;
+      const sourceProfile = latestControllerRef.current.state.route?.kind === "partners" ? latestControllerRef.current.state.route.profileId : undefined;
+      let incoming = result;
+      if (focusPartnerId !== undefined && sourceProfile !== undefined) {
+        const active = latestControllerRef.current.state.activeProfile;
+        if (active?.id !== sourceProfile) throw new Error("The original Partner node has not been adopted.");
+        const [fresh, links] = await Promise.all([latestControllerRef.current.getPartner(focusPartnerId, signal),
+          preparation ? Promise.resolve(undefined) : latestControllerRef.current.listPartnerSessions(focusPartnerId, signal)]);
+        if (signal.aborted || generation !== loadGenerationRef.current || expectedOwner !== ownerRef.current) return false;
+        validatePartnerSourceOwner(active, latestControllerRef.current.state.snapshot);
+        if (preparation) validatePartnerSourceProfile(focusPartnerId, fresh);
+        else validatePartnerSourceSession(focusPartnerId, fresh, links!, latestControllerRef.current.state.snapshot);
+        incoming = { ...result, partners: upsertPartner(result.partners, fresh) };
+      }
+      const previousOwner = catalogOwnerRef.current;
       catalogOwnerRef.current = expectedOwner;
-      setCatalog((current) => retainCurrentCatalog(current, result));
+      setCatalog((current) => previousOwner === expectedOwner ? retainCurrentCatalog(current, incoming) : incoming);
       setLoadError(undefined);
       if (focusPartnerId !== undefined) {
         const focused = result.partners.find((partner) => partner.id === focusPartnerId);
@@ -203,6 +224,11 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
     if (partner.canonicalSessionId === undefined) return;
     const expectedOwner = ownerRef.current;
     setActionError(undefined);
+    if (controller.openSourcePartner && controller.state.activeProfile) {
+      try { await controller.openSourcePartner(partnerSourceKey(controller.state.activeProfile), partner.id, "session"); }
+      catch (error) { if (ownerRef.current === expectedOwner) setActionError(errorMessage(error, t("partners.actionFailed"))); }
+      return;
+    }
     if (partner.activity.unreadReplyCount > 0 && partner.activity.latestReplyCursor !== undefined) {
       try {
         const activity = await latestControllerRef.current.markPartnerRead(
@@ -224,12 +250,19 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
     latestControllerRef.current.navigate({ kind: "session", sessionId: partner.canonicalSessionId });
   };
 
-  const selected = catalog?.partners.find((partner) => partner.id === focusPartnerId);
-  const visible = catalog?.partners.filter((partner) => showArchived ? partner.lifecycle === "archived" : ["active", "paused"].includes(partner.lifecycle)) ?? [];
+  const catalogCurrent = catalogOwnerRef.current === ownerKey;
+  const selected = !preparation && catalogCurrent && (requestedSourceProfile === undefined || requestedSourceProfile === controller.state.activeProfile?.id)
+    ? catalog?.partners.find((partner) => partner.id === focusPartnerId) : undefined;
+  const visible = catalogCurrent ? catalog?.partners.filter((partner) => showArchived ? partner.lifecycle === "archived" : ["active", "paused"].includes(partner.lifecycle)) ?? [] : [];
   const usableModels = useMemo(() => partnerModels(snapshot), [snapshot.backends, snapshot.models]);
   const creationCatalogCurrent = catalog !== undefined && catalogOwnerRef.current === ownerKey;
+  useEffect(() => {
+    if (!preparation || !catalogCurrent) return;
+    const card = rootRef.current?.querySelector<HTMLElement>("[data-preparation-target='true']");
+    card?.scrollIntoView?.({ block: "nearest" }); card?.focus({ preventScroll: true });
+  }, [ownerKey, preparation, catalogCurrent]);
 
-  return <main className="route-page partners-page">
+  return <main ref={rootRef} className="route-page partners-page">
     <header className="route-header">
       {!controller.state.preferences.navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
       <div><p className="eyebrow">{t("partners.eyebrow")}</p><h1>{t("nav.partners")}</h1><p>{t("partners.subtitle")}</p></div>
@@ -252,13 +285,13 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
     {resumePartner && resumeOwnerRef.current === ownerKey && <PartnerResumeDialog key={`resume:${ownerKey}:${resumePartner.id}`}
       controller={controller} ownerKey={ownerKey} foreground={foreground} partner={resumePartner}
       onClose={() => setResumePartner(undefined)} onChanged={load} />}
-    {catalog !== undefined && <section className="partner-summary" aria-label={t("partners.summary")}>
+    {catalog !== undefined && catalogCurrent && <section className="partner-summary" aria-label={t("partners.summary")}>
       <div><strong>{catalog.directory.activeCount}</strong><span>{t("partners.active")}</span></div>
       <div><strong>{catalog.directory.archivedCount}</strong><span>{t("partners.archived")}</span></div>
       <div className={catalog.directory.errorCount > 0 ? "is-warning" : undefined}><strong>{catalog.directory.errorCount}</strong><span>{t("partners.needsAttention")}</span></div>
       <Button tone="ghost" onClick={() => load()} disabled={loading}><RefreshCcw aria-hidden="true" />{t("common.refresh")}</Button>
     </section>}
-    {catalog && !showArchived && <PartnerGroupsSection controller={controller} partners={catalog.partners} t={t} />}
+    {catalog && catalogCurrent && !showArchived && <PartnerGroupsSection controller={controller} partners={catalog.partners} t={t} />}
     <div className="partners-toolbar">
       <div className="segmented" role="radiogroup" aria-label={t("partners.filter")}>
         <button type="button" role="radio" aria-checked={!showArchived} className={cx("segmented__item", !showArchived && "is-active")} onClick={() => setShowArchived(false)}>{t("partners.active")}</button>
@@ -266,19 +299,25 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
       </div>
     </div>
     {actionError !== undefined && <p className="partner-page-error" role="alert">{actionError}</p>}
+    {controller.state.activeProfile && <header className="partner-source__header"><div><h2>{controller.state.activeProfile.name}</h2><Pill>{t("partners.source.current")}</Pill></div></header>}
     {loadError !== undefined && catalog !== undefined && <p className="partner-page-error" role="alert">{loadError}<Button onClick={() => load()}>{t("common.retry")}</Button></p>}
-    {loading && catalog === undefined ? <div className="partner-page-state"><Spinner /><p>{t("partners.loading")}</p></div>
+    {loading && (catalog === undefined || !catalogCurrent) ? <div className="partner-page-state"><Spinner /><p>{t("partners.loading")}</p></div>
       : loadError !== undefined && catalog === undefined ? <div className="partner-page-state"><CircleAlert aria-hidden="true" /><h2>{t("partners.unavailable")}</h2><p>{loadError}</p><Button onClick={() => load()}>{t("common.retry")}</Button></div>
         : <section className="partner-card-grid">{visible.map((partner) => <PartnerCard
           key={partner.id}
           partner={partner}
+          preparationTarget={preparation && partner.id === focusPartnerId}
           controller={controller}
           snapshot={snapshot}
           workingOwner={foreground && controller.state.ready && controller.state.connectionState === "connected"
             && catalogOwnerRef.current === ownerKey && loadError === undefined ? ownerKey : undefined}
           pending={pendingIds.has(partner.id)}
           t={t}
-          onEdit={() => controller.navigate({ kind: "partners", partnerId: partner.id })}
+          onEdit={() => { if (controller.openSourcePartner && controller.state.activeProfile && partner.initializationState === "ready" && partner.lifecycle !== "archived") {
+            void controller.openSourcePartner(partnerSourceKey(controller.state.activeProfile), partner.id, "settings").catch(error => {
+              if (ownerRef.current === ownerKey) setActionError(errorMessage(error, t("partners.actionFailed")));
+            });
+          } else controller.navigate({ kind: "partners", partnerId: partner.id }); }}
           onOpen={() => void openTask(partner)}
           onRetry={() => void retryInitialization(partner)}
           onArchive={() => void mutateLifecycle(partner, partner.lifecycle === "archived" ? "active" : "archived")}
@@ -286,6 +325,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
           onRestart={() => { restartOwnerRef.current = ownerKey; setRestartPartner(partner); }}
           onResume={() => { resumeOwnerRef.current = ownerKey; setResumePartner(partner); }}
         />)}{visible.length === 0 && <div className="partner-empty"><Bot aria-hidden="true" /><h2>{showArchived ? t("partners.noArchived") : t("partners.empty")}</h2><p>{t("partners.emptyBody")}</p>{!showArchived && <Button tone="primary" onClick={() => setCreating(true)}>{t("partners.invite")}</Button>}</div>}</section>}
+    <PartnerSources controller={controller} archived={showArchived} t={t} />
     {catalog !== undefined && creationCatalogCurrent && <PartnerInviteDialog
       key={ownerKey}
       open={creating}
@@ -301,7 +341,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
         controller.navigate({ kind: "partners", partnerId: result.partner.id });
       }}
     />}
-    {catalog !== undefined && <PartnerDefaultsDialog
+    {catalog !== undefined && catalogCurrent && <PartnerDefaultsDialog
       open={editingDefaults}
       directory={catalog.directory}
       snapshot={snapshot}
@@ -336,12 +376,13 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, t, onOpenNa
   </main>;
 }
 
-function PartnerCard({ partner, controller, snapshot, workingOwner, pending, t, onEdit, onOpen, onRetry, onArchive, onDelete, onRestart, onResume }: {
+function PartnerCard({ partner, controller, snapshot, workingOwner, pending, preparationTarget = false, t, onEdit, onOpen, onRetry, onArchive, onDelete, onRestart, onResume }: {
   readonly partner: PartnerProfileView;
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
   readonly workingOwner: string | undefined;
   readonly pending: boolean;
+  readonly preparationTarget?: boolean;
   readonly t: Translator;
   readonly onEdit: () => void;
   readonly onOpen: () => void;
@@ -354,7 +395,8 @@ function PartnerCard({ partner, controller, snapshot, workingOwner, pending, t, 
   const primary = partner.capabilities.modelChain[0]!;
   const statusTone = partner.initializationState === "ready" ? "success" : partner.initializationState === "error" ? "danger" : "warning";
   const working = workingOwner === undefined || !partner.activity.workingStatus ? undefined : currentPartnerWorkingStatus(partner, snapshot);
-  return <article className={cx("partner-card", partner.lifecycle === "archived" && "is-archived")} data-partner-id={partner.id}>
+  return <article className={cx("partner-card", partner.lifecycle === "archived" && "is-archived")} data-partner-id={partner.id}
+    data-preparation-target={preparationTarget ? "true" : undefined} tabIndex={preparationTarget ? -1 : undefined}>
     <header><PartnerAvatar preset={partner.avatar} partner={partner} /><div><h2>{partner.displayName}</h2><p>{primary.providerId} · {primary.modelId}</p></div><Pill tone={partner.lifecycle === "paused" ? "warning" : statusTone}>{partner.lifecycle === "paused" ? partnerResumeMessages(controller.state.effectiveLocale).paused : t(`partners.state.${partner.initializationState}`)}</Pill></header>
     {working && workingOwner ? <p className="partner-card__working" role="status" aria-live="polite">
       <PartnerWorkingLabel controller={controller} partner={partner} status={working} ownerKey={workingOwner} t={t} />
@@ -369,7 +411,7 @@ function PartnerCard({ partner, controller, snapshot, workingOwner, pending, t, 
     <footer>
       {partner.lifecycle === "active" && partner.initializationState === "ready" && <Button onClick={onOpen}><MessageSquare aria-hidden="true" />{t("partners.openTask")}</Button>}
       {partner.initializationState === "error" && <Button onClick={onRetry} disabled={pending}><RotateCcw aria-hidden="true" />{pending ? t("common.working") : t("common.retry")}</Button>}
-      <Button onClick={onEdit}><Pencil aria-hidden="true" />{t("common.edit")}</Button>
+      <Button onClick={onEdit} disabled={preparationTarget && partner.initializationState !== "ready"}><Pencil aria-hidden="true" />{t("common.edit")}</Button>
       {partner.lifecycle === "active" && partner.canonicalSessionId !== undefined && <Button onClick={onRestart} disabled={pending}><RefreshCcw aria-hidden="true" />{t("partners.restartAction")}</Button>}
       {partner.lifecycle === "paused" && <Button onClick={onResume} disabled={pending || !workingOwner}><RotateCcw aria-hidden="true" />{partnerResumeMessages(controller.state.effectiveLocale).action}</Button>}
       {partner.lifecycle !== "paused" && <Button onClick={onArchive} disabled={pending}><Archive aria-hidden="true" />{partner.lifecycle === "archived" ? t("partners.restore") : t("session.archive")}</Button>}
@@ -687,6 +729,43 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   const draftKey = editorDraftKey(draft);
   const baselineKey = editorDraftKey(editorDraft(baseline));
   const dirty = draftKey !== baselineKey;
+  const [pendingLeave, setPendingLeave] = useState(false);
+  const leaveRef = useRef<{ readonly finish: (accepted: boolean) => void } | undefined>(undefined);
+  const leaveStateRef = useRef({ dirty, blocked: false });
+  leaveStateRef.current = { dirty, blocked: saving || avatarPreparing || restartBusy || routinesVisible || resumeVisible || memoryVisible || connectionsVisible };
+  const finishLeave = (accepted: boolean): void => {
+    const request = leaveRef.current;
+    if (request === undefined) return;
+    leaveRef.current = undefined;
+    setPendingLeave(false);
+    if (accepted) {
+      const clean = editorDraft(baseline);
+      draftRef.current = clean; leaveStateRef.current = { dirty: false, blocked: false }; setDraft(clean);
+    }
+    request?.finish(accepted);
+  };
+  const askLeave = (signal: AbortSignal): Promise<boolean> | undefined => {
+    if (signal.aborted || leaveStateRef.current.blocked) return Promise.resolve(false);
+    if (!leaveStateRef.current.dirty) return undefined;
+    leaveRef.current?.finish(false);
+    return new Promise<boolean>(resolve => {
+      const cancel = (): void => { if (leaveRef.current === request) { leaveRef.current = undefined; setPendingLeave(false); } finish(false); };
+      const finish = (accepted: boolean): void => { signal.removeEventListener("abort", cancel); resolve(!signal.aborted && accepted); };
+      const request = { finish };
+      leaveRef.current = request;
+      signal.addEventListener("abort", cancel, { once: true }); setPendingLeave(true);
+    });
+  };
+  useEffect(() => {
+    const unregister = registerPartnerNavigationLeave(askLeave);
+    return () => { unregister(); leaveRef.current?.finish(false); leaveRef.current = undefined; };
+  }, [ownerKey]);
+  useEffect(() => { if (!restartForeground) finishLeave(false); }, [restartForeground]);
+  useEffect(() => {
+    const prevent = (event: BeforeUnloadEvent): void => { if (leaveStateRef.current.dirty || leaveStateRef.current.blocked) { event.preventDefault(); event.returnValue = ""; } };
+    window.addEventListener("beforeunload", prevent); return () => window.removeEventListener("beforeunload", prevent);
+  }, []);
+  const close = (): void => { const decision = askLeave(new AbortController().signal); if (decision === undefined) onClose(); else void decision.then(accepted => { if (accepted) onClose(); }); };
   const valid = !avatarPreparing && validEditorDraft(draft, directory);
   const effectiveCapabilities = draft.usesDirectoryDefaults ? directory.defaultCapabilities ?? draft.capabilities : draft.capabilities;
   const permissionCatalog = useMemo(() => partnerPermissionCatalogKey(snapshot), [snapshot.backends, snapshot.models, snapshot.generation]);
@@ -695,7 +774,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   const permissionConfirmation = usePartnerPermissionConfirmation(permissionScope, permissionAvailable && !saving && !restartBusy && !resumeBusy && !memoryVisible && !connectionsVisible && !conflict && saveError === undefined, t);
 
   useEffect(() => {
-    if (!dirty || !valid || !permissionAvailable || saving || restartBusy || resumeBusy || memoryVisible || connectionsVisible || conflict || saveError !== undefined) return;
+    if (!dirty || !valid || !permissionAvailable || saving || pendingLeave || restartBusy || resumeBusy || memoryVisible || connectionsVisible || conflict || saveError !== undefined) return;
     setSaved(false);
     const timer = window.setTimeout(() => {
       const token = aliveRef.current;
@@ -722,7 +801,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
       } else write();
     }, 650);
     return () => window.clearTimeout(timer);
-  }, [baseline.revision, conflict, draftKey, dirty, saveError, saving, restartBusy, resumeBusy, memoryVisible, connectionsVisible, valid, permissionAvailable, permissionScope]);
+  }, [baseline.revision, conflict, draftKey, dirty, saveError, saving, pendingLeave, restartBusy, resumeBusy, memoryVisible, connectionsVisible, valid, permissionAvailable, permissionScope]);
 
   const reconcile = async (preserveDraft: boolean): Promise<void> => {
     const token = aliveRef.current;
@@ -741,7 +820,10 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
     }
   };
   const status = conflict ? t("partners.conflict") : saveError !== undefined ? t("partners.notSaved") : saving ? t("partners.saving") : dirty ? t("partners.unsaved") : saved ? t("partners.saved") : t("partners.unsaved");
-  return <Modal open title={t(initialSection === "profile" ? "partners.settingsTitle" : "partners.workspaceTitle", { name: partner.displayName })} description={section === "profile" ? t("partners.settingsBody") : t("partners.workspaceBody")} size="large" onClose={restartBusy || routinesVisible || resumeVisible || memoryVisible || connectionsVisible ? () => undefined : onClose} showClose={showClose} closeLabel={t("common.close")}>
+  return <Modal open title={t(initialSection === "profile" ? "partners.settingsTitle" : "partners.workspaceTitle", { name: partner.displayName })} description={section === "profile" ? t("partners.settingsBody") : t("partners.workspaceBody")} size="large" onClose={close} showClose={showClose} closeLabel={t("common.close")}>
+    <Modal open={pendingLeave} dialogRole="alertdialog" title={t("partners.leave.title")} description={t("partners.leave.body")} onClose={() => finishLeave(false)}>
+      <div className="modal__actions"><Button onClick={() => finishLeave(false)}>{t("partners.leave.stay")}</Button><Button tone="danger" onClick={() => finishLeave(true)}>{t("partners.leave.discard")}</Button></div>
+    </Modal>
     {permissionConfirmation.dialog}
     {connectionsVisible && <PartnerConnectionsDialog key={`${ownerKey}:${partner.id}`} controller={controller} partner={baseline} ownerKey={ownerKey} onClose={() => setConnectionsVisible(false)} />}
     {memoryVisible && <PartnerMemoryDialog key={`${ownerKey}:${partner.id}`} controller={controller} partner={baseline} ownerKey={ownerKey} onClose={() => setMemoryVisible(false)} />}

@@ -5,6 +5,26 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 
+internal sealed class NativeClipboardProbe
+{
+    internal bool Current;
+    internal bool UnicodeAvailable;
+    internal bool TextAvailable;
+    internal bool UnicodeInspected;
+    internal bool UnicodeMatches;
+    internal int Error;
+
+    internal string Snapshot()
+    {
+        return "{\"current\":" + (Current ? "true" : "false")
+            + ",\"unicodeAvailable\":" + (UnicodeAvailable ? "true" : "false")
+            + ",\"textAvailable\":" + (TextAvailable ? "true" : "false")
+            + ",\"unicodeInspected\":" + (UnicodeInspected ? "true" : "false")
+            + ",\"unicodeMatches\":" + (UnicodeMatches ? "true" : "false")
+            + ",\"error\":" + Error + "}";
+    }
+}
+
 internal sealed class FrontmostTargetForm : Form
 {
     internal readonly FrontmostTargetTextBox Input = new FrontmostTargetTextBox();
@@ -44,6 +64,9 @@ internal sealed class FrontmostTargetForm : Form
             + ",\"pastes\":" + Input.Pastes + ",\"pasteMatches\":"
             + (Input.Text == FrontmostTargetContext.PasteSentinel ? "true" : "false")
             + ",\"focused\":" + (Input.Focused ? "true" : "false")
+            + ",\"enabled\":" + (Input.Enabled ? "true" : "false")
+            + ",\"readOnly\":" + (Input.ReadOnly ? "true" : "false")
+            + ",\"pasteClipboard\":" + Input.PasteClipboard.Snapshot()
             + ",\"textLength\":" + Input.TextLength + "}";
     }
 }
@@ -51,10 +74,16 @@ internal sealed class FrontmostTargetForm : Form
 internal sealed class FrontmostTargetTextBox : TextBox
 {
     internal int Pastes;
+    internal Func<NativeClipboardProbe> InspectClipboard;
+    internal NativeClipboardProbe PasteClipboard = new NativeClipboardProbe { Error = 1 };
 
     protected override void WndProc(ref Message message)
     {
-        if (message.Msg == 0x0302) Pastes++;
+        if (message.Msg == 0x0302)
+        {
+            Pastes++;
+            if (InspectClipboard != null) PasteClipboard = InspectClipboard();
+        }
         base.WndProc(ref message);
     }
 }
@@ -67,6 +96,9 @@ internal sealed class FrontmostTargetContext : ApplicationContext
     private readonly System.Windows.Forms.Timer expiry = new System.Windows.Forms.Timer();
     private IDataObject originalClipboard;
     private bool clipboardPrepared;
+    private uint clipboardSequence;
+    private IntPtr clipboardOwner;
+    private NativeClipboardProbe clipboardPreparation = new NativeClipboardProbe { Error = 1 };
     private bool exiting;
 
     [DllImport("user32.dll")]
@@ -81,9 +113,29 @@ internal sealed class FrontmostTargetContext : ApplicationContext
     private static extern bool AttachThreadInput(uint source, uint target, bool attach);
     [DllImport("kernel32.dll")]
     private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")]
+    private static extern uint GetClipboardSequenceNumber();
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetClipboardOwner();
+    [DllImport("user32.dll")]
+    private static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll")]
+    private static extern bool CloseClipboard();
+    [DllImport("user32.dll")]
+    private static extern bool IsClipboardFormatAvailable(uint format);
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetClipboardData(uint format);
+    [DllImport("kernel32.dll")]
+    private static extern UIntPtr GlobalSize(IntPtr memory);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GlobalLock(IntPtr memory);
+    [DllImport("kernel32.dll")]
+    private static extern bool GlobalUnlock(IntPtr memory);
 
     internal FrontmostTargetContext()
     {
+        first.Input.InspectClipboard = delegate { return InspectOwnClipboard(false); };
+        second.Input.InspectClipboard = delegate { return InspectOwnClipboard(false); };
         first.FormClosed += delegate { ExitThread(); };
         expiry.Interval = 40000;
         expiry.Tick += delegate { ExitThread(); };
@@ -182,6 +234,41 @@ internal sealed class FrontmostTargetContext : ApplicationContext
         originalClipboard = Clipboard.GetDataObject();
         Clipboard.SetText(PasteSentinel);
         clipboardPrepared = true;
+        clipboardSequence = GetClipboardSequenceNumber();
+        clipboardOwner = GetClipboardOwner();
+        clipboardPreparation = InspectOwnClipboard(true);
+    }
+
+    private NativeClipboardProbe InspectOwnClipboard(bool inspectUnicode)
+    {
+        NativeClipboardProbe result = new NativeClipboardProbe();
+        if (!clipboardPrepared || clipboardSequence == 0) { result.Error = 1; return result; }
+        if (!OpenClipboard(first.Input.Handle)) { result.Error = 2; return result; }
+        try
+        {
+            result.Current = GetClipboardSequenceNumber() == clipboardSequence && GetClipboardOwner() == clipboardOwner;
+            if (!result.Current) { result.Error = 3; return result; }
+            result.UnicodeAvailable = IsClipboardFormatAvailable(13);
+            result.TextAvailable = IsClipboardFormatAvailable(1);
+            if (!inspectUnicode) return result;
+            IntPtr memory = result.UnicodeAvailable ? GetClipboardData(13) : IntPtr.Zero;
+            if (memory == IntPtr.Zero) { result.Error = 4; return result; }
+            ulong size = GlobalSize(memory).ToUInt64();
+            int expectedSize = (PasteSentinel.Length + 1) * 2;
+            if (size < (ulong)expectedSize || size > (ulong)(expectedSize + 64)) { result.Error = 5; return result; }
+            IntPtr bytes = GlobalLock(memory);
+            if (bytes == IntPtr.Zero) { result.Error = 5; return result; }
+            try
+            {
+                result.UnicodeInspected = true;
+                result.UnicodeMatches = Marshal.ReadInt16(bytes, PasteSentinel.Length * 2) == 0;
+                for (int index = 0; result.UnicodeMatches && index < PasteSentinel.Length; index++)
+                    result.UnicodeMatches = Marshal.ReadInt16(bytes, index * 2) == PasteSentinel[index];
+            }
+            finally { GlobalUnlock(memory); }
+            return result;
+        }
+        finally { CloseClipboard(); }
     }
 
     private void RestoreClipboard()
@@ -207,6 +294,7 @@ internal sealed class FrontmostTargetContext : ApplicationContext
             + Process.GetCurrentProcess().Id + ",\"foreground\":\""
             + GetForegroundWindow().ToInt64().ToString(CultureInfo.InvariantCulture)
             + "\",\"clipboardPrepared\":" + (clipboardPrepared ? "true" : "false")
+            + ",\"clipboardPreparation\":" + clipboardPreparation.Snapshot()
             + ",\"first\":" + first.Snapshot() + ",\"second\":" + second.Snapshot() + "}");
         Console.Out.Flush();
     }

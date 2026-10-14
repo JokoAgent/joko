@@ -143,9 +143,12 @@ describe("isolated Orchestrator runtime staging", () => {
       runtimeRoot,
       managerEntry: realpathSync(resolve(runtimeRoot, "dist", "extension-library-manager.js")),
       workerEntry: realpathSync(resolve(runtimeRoot, "dist", "extension-library-sql-worker.js")),
+      surfaceEntry: realpathSync(resolve(runtimeRoot, "dist", "extension-main-view-manager.js")),
       version: "1",
       electronVersion: "43.6.0",
       sqlite: true,
+      surfaceRegistered: true,
+      surfaceClosed: true,
       changes: 1,
       selectedValue: "electron-worker"
     });

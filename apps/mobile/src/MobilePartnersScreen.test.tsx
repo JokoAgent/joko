@@ -10,6 +10,8 @@ import { MobilePartnersScreen, type MobilePartnersScreenProps } from "./MobilePa
 const native = vi.hoisted(() => ({
   width: 390,
   viewable: undefined as undefined | ((event: { viewableItems: readonly unknown[] }) => void),
+  pull: undefined as undefined | (() => void),
+  pulling: false,
   back: undefined as undefined | (() => boolean)
 }));
 
@@ -17,7 +19,7 @@ vi.mock("react-native", async () => {
   const React = await import("react");
   const element = (tag: string) => ({ accessibilityLabel, accessibilityRole, accessibilityState,
     onPress, disabled, numberOfLines: _numberOfLines, selectable: _selectable,
-    contentContainerStyle: _contentContainerStyle, ...props }: Record<string, unknown> & {
+    contentContainerStyle: _contentContainerStyle, testID, accessible: _accessible, ...props }: Record<string, unknown> & {
       children?: React.ReactNode;
       accessibilityLabel?: string;
       accessibilityRole?: string;
@@ -27,8 +29,10 @@ vi.mock("react-native", async () => {
       numberOfLines?: number;
       selectable?: boolean;
       contentContainerStyle?: unknown;
+      testID?: string;
     }) => React.createElement(tag, {
       ...props,
+      ...(testID ? { "data-testid": testID } : {}),
       ...(accessibilityLabel ? { "aria-label": accessibilityLabel } : {}),
       ...(accessibilityRole ? { role: accessibilityRole } : {}),
       ...(accessibilityState?.selected === undefined ? {} : { "aria-selected": accessibilityState.selected }),
@@ -43,18 +47,26 @@ vi.mock("react-native", async () => {
       native.back = handler;
       return { remove: () => { if (native.back === handler) native.back = undefined; } };
     } },
-    FlatList: ({ data, renderItem, onViewableItemsChanged }: {
+    FlatList: ({ data, renderItem, onViewableItemsChanged, refreshControl, ListEmptyComponent, ListFooterComponent }: {
       data: readonly unknown[];
       renderItem: (value: { item: unknown; index: number }) => React.ReactNode;
       onViewableItemsChanged: (event: { viewableItems: readonly unknown[] }) => void;
+      refreshControl?: React.ReactNode;
+      ListEmptyComponent?: React.ReactNode;
+      ListFooterComponent?: React.ReactNode;
     }) => {
       native.viewable = onViewableItemsChanged;
       return React.createElement("div", { "data-message-list": true },
-        data.map((item, index) => React.createElement(React.Fragment, { key: index }, renderItem({ item, index }))));
+        refreshControl, data.length ? data.map((item, index) => React.createElement(React.Fragment, { key: index }, renderItem({ item, index })))
+          : ListEmptyComponent, ListFooterComponent);
+    },
+    RefreshControl: ({ refreshing, onRefresh }: { refreshing: boolean; onRefresh: () => void }) => {
+      native.pull = onRefresh; native.pulling = refreshing;
+      return React.createElement("span", { "data-refreshing": refreshing });
     },
     Pressable: element("button"),
     ScrollView: element("div"),
-    StyleSheet: { create: <T,>(value: T) => value },
+    StyleSheet: { create: <T,>(value: T) => value, hairlineWidth: 1 },
     Text: element("span"),
     View: element("div"),
     useWindowDimensions: () => ({ width: native.width, height: 844, scale: 1, fontScale: 1 })
@@ -123,8 +135,10 @@ afterEach(() => {
   root = undefined as unknown as Root;
   native.width = 390;
   native.viewable = undefined;
+  native.pull = undefined; native.pulling = false;
   native.back = undefined;
   Object.values(callbacks).forEach((callback) => callback.mockReset());
+  vi.useRealTimers();
 });
 
 describe("MobilePartnersScreen", () => {
@@ -223,5 +237,61 @@ describe("MobilePartnersScreen", () => {
     expect(container.textContent).toContain("Bo");
     expect(container.textContent).toContain("Third private body");
     expect(container.querySelectorAll("[data-message-list]")).toHaveLength(1);
+  });
+
+  it("uses the viewing Partner for sender sides and keeps an empty limited thread refreshable", () => {
+    render(state({ selectedPartnerId: "beta", selectedThreadId: "thread-1", threads: [thread],
+      detailStatus: "ready", detail: { thread, messages } }));
+    const own = container.querySelectorAll('[data-testid="partner.privateMessage.own"]');
+    expect(own).toHaveLength(2);
+    expect(own[0]?.textContent).toContain("Bo");
+    expect(own[0]?.textContent).toContain("First private body");
+    expect(own[0]?.querySelector('[data-testid="partner.avatar.B"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="partner.privateMessage.peer"]')?.textContent)
+      .toContain("Second private body");
+    render(state({ selectedPartnerId: "beta", selectedThreadId: "thread-1", threads: [thread],
+      detailStatus: "ready", detail: { thread, messages: [] } }));
+    expect(container.textContent).toContain("No messages in this conversation.");
+    expect(container.querySelector('[data-testid="partner.privateMessage.limit"]')).toBeTruthy();
+    expect(native.pull).toBeTypeOf("function");
+  });
+
+  it("coalesces pull refresh and ends the spinner on settlement or a bounded fallback", async () => {
+    vi.useFakeTimers();
+    let resolve!: () => void;
+    callbacks.onRefresh.mockImplementation(() => new Promise<void>(done => { resolve = done; }));
+    render(state({ selectedPartnerId: "alpha", selectedThreadId: "thread-1", threads: [thread],
+      detailStatus: "ready", detail: { thread, messages } }));
+    act(() => { native.pull?.(); native.pull?.(); });
+    expect(callbacks.onRefresh).toHaveBeenCalledOnce();
+    expect(native.pulling).toBe(true);
+    await act(async () => { resolve(); await Promise.resolve(); });
+    expect(native.pulling).toBe(false);
+    callbacks.onRefresh.mockImplementation(() => new Promise<void>(() => undefined));
+    act(() => native.pull?.());
+    expect(native.pulling).toBe(true);
+    act(() => vi.advanceTimersByTime(8000));
+    expect(native.pulling).toBe(false);
+    act(() => native.pull?.());
+    expect(callbacks.onRefresh).toHaveBeenCalledTimes(2);
+  });
+
+  it("retires a pull when leaving and ignores its late completion after reentering", async () => {
+    const done: (() => void)[] = [];
+    callbacks.onRefresh.mockImplementation(() => new Promise<void>(resolve => { done.push(resolve); }));
+    render(state({ selectedPartnerId: "alpha", selectedThreadId: "thread-1", threads: [thread],
+      detailStatus: "ready", detail: { thread, messages } }));
+    const oldPull = native.pull;
+    act(() => native.pull?.());
+    press("Back to conversations");
+    act(() => oldPull?.());
+    expect(callbacks.onRefresh).toHaveBeenCalledOnce();
+    press("Read conversation between Ada and Bo");
+    act(() => native.pull?.());
+    expect(callbacks.onRefresh).toHaveBeenCalledTimes(2);
+    await act(async () => { done[0]?.(); await Promise.resolve(); });
+    expect(native.pulling).toBe(true);
+    await act(async () => { done[1]?.(); await Promise.resolve(); });
+    expect(native.pulling).toBe(false);
   });
 });

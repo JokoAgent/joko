@@ -3,6 +3,7 @@ import type { CSSProperties, JSX, KeyboardEvent as ReactKeyboardEvent, PointerEv
 import { AlertTriangle, Bell, CircleAlert, CirclePlus, Info, Menu, RefreshCcw, ServerCrash, Sparkles, X } from "lucide-react";
 import { appRouteHash, useAppController } from "./controller.js";
 import { useAppDefaultModelBridge } from "./app-default-model-bridge.js";
+import { useWallpaperSettings } from "./wallpaper-settings.js";
 import type { AppController } from "./controller.js";
 import { translate } from "./i18n.js";
 import type { ComposerDraft, ComposerFileSelectionQuoteDraft, InteractionView, SessionMessageSearchMatchView, SessionView, TargetView, TimelineHistoryCursorView, TimelineItemView } from "./model.js";
@@ -251,6 +252,8 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   readonly initialInspectorSubagentFocusRequest?: { readonly sessionId: string; readonly runId: string; readonly requestId: number };
 }): JSX.Element {
   const { state } = controller;
+  const wallpaper = useWallpaperSettings().state.settings;
+  const wallpaperActive = wallpaper?.mode === "custom" && wallpaper.customImage !== null;
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
   const extensionApplicationWindow = typeof window !== "undefined" && isExtensionApplicationWindow(window.location);
   const auxiliaryApplicationWindow = sessionApplicationWindow || extensionApplicationWindow;
@@ -2166,7 +2169,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       ? JSON.stringify([state.activeProfile.id, state.activeProfile.deviceId, state.activeProfile.serverId, state.activeProfile.origin, state.snapshot.generation.toString()]) : undefined}>
     <div
       className={cx("app", shellNavigationOpen && "has-navigation", settingsRoute ? "navigation-hidden" : `navigation-${navigationMode}`, formalFilesMode && "workspace-files-mode", navigationDrag !== undefined && !settingsRoute && "is-navigation-resizing", inspectorAttached && "has-inspector")}
+      data-wallpaper-active={wallpaperActive ? "true" : undefined}
       style={{
+        ...(wallpaperActive ? {
+          "--app-wallpaper-image": `url("${wallpaper.customImage!.url}")`,
+          "--app-wallpaper-mask-veil": `${wallpaper.maskOpacity * 40}%`
+        } : {}),
         "--sidebar-width": `${navigationWidth}px`,
         "--sidebar-expanded-width": `${state.preferences.navigationWidth}px`
       } as CSSProperties}
@@ -2428,7 +2436,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           {state.route.kind === "schedules" && <SchedulesPage controller={controller} schedules={state.snapshot.schedules} sessions={state.snapshot.sessions} targets={state.snapshot.targets} models={state.snapshot.models} backends={state.snapshot.backends} extraDirectories={state.snapshot.extraDirectories} focusScheduleId={state.route.scheduleId} locale={state.effectiveLocale} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "partners" && (state.route.groupId ? <PartnerGroupPage controller={controller} groupId={state.route.groupId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />
-            : <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />)}
+            : <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} preparation={state.route.preparation} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />)}
           {state.route.kind === "tools" && <ToolsPage
             controller={controller}
             snapshot={state.snapshot}

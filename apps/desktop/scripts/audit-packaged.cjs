@@ -78,7 +78,7 @@ module.exports = async function auditPackaged(context) {
   const { buildNativeGamepad } = await import(
     pathToFileURL(resolve(__dirname, "build-native-gamepad.mjs")).href
   );
-  const { buildNativeRemoteDesktop } = await import(
+  const { buildNativeRemoteDesktop, assertNativeRemoteDesktopBuildTarget } = await import(
     pathToFileURL(resolve(__dirname, "build-native-remote-desktop.mjs")).href
   );
   const targetArch = sqliteVecElectronBuilderArchitecture(context.arch);
@@ -97,11 +97,10 @@ module.exports = async function auditPackaged(context) {
     architecture: targetArch,
     output: resolve(resourcesRoot, "native-gamepad")
   });
-  buildNativeRemoteDesktop({
-    platform: context.electronPlatformName,
-    architecture: targetArch,
-    output: resolve(resourcesRoot, "native-remote-desktop")
-  });
+  await prepareNativeRemoteDesktopForPackage(
+    resolve(resourcesRoot, "native-remote-desktop"), context.electronPlatformName, targetArch,
+    { buildNativeRemoteDesktop, assertNativeRemoteDesktopBuildTarget }
+  );
   if (context.packager.config.electronVersion !== AUDITED_ELECTRON_VERSION) {
     throw new Error("The dedicated hardware SDK ABI audit is not pinned to the packaged Electron version.");
   }
@@ -134,11 +133,6 @@ module.exports = async function auditPackaged(context) {
     context.electronPlatformName, targetArch);
   await auditNativeHardware(resolve(resourcesRoot, "native-hardware"), context.electronPlatformName, targetArch);
   await auditNativeGamepad(resolve(resourcesRoot, "native-gamepad"), context.electronPlatformName, targetArch);
-  await auditNativeRemoteDesktop(
-    resolve(resourcesRoot, "native-remote-desktop"),
-    context.electronPlatformName,
-    targetArch
-  );
   await auditNativeSimulatorHelper(nativeSimulatorHidRoot, context.electronPlatformName,
     targetArch, "Simulator HID", "joko-simulator-hid");
   await auditNativeSimulatorHelper(nativeSimulatorH264Root, context.electronPlatformName,
@@ -951,6 +945,24 @@ async function auditNativeGamepad(root, platform, targetArch) {
   }
 }
 
+async function prepareNativeRemoteDesktopForPackage(root, platform, targetArch, nativeBuilder) {
+  nativeBuilder.assertNativeRemoteDesktopBuildTarget(platform, targetArch);
+  const manifestPath = resolve(root, "manifest.json");
+  await assertCanonicalRegularFile(manifestPath, "The packaged Remote Desktop manifest is unsafe.");
+  const info = await lstat(manifestPath);
+  if (info.size < 1 || info.size > 4_096) throw new Error("The packaged Remote Desktop manifest exceeds its bounds.");
+  const manifest = await readJsonManifest(manifestPath, "Remote Desktop helper");
+  if (manifest === null || typeof manifest !== "object" || Array.isArray(manifest)
+    || manifest.protocolVersion !== 1 || !["darwin", "win32", "linux"].includes(manifest.platform)
+    || !["x64", "arm64"].includes(manifest.architecture)) {
+    throw new Error("The packaged Remote Desktop helper identity is invalid.");
+  }
+  await auditNativeRemoteDesktop(root, manifest.platform, manifest.architecture);
+  if (manifest.platform === platform && manifest.architecture === targetArch) return;
+  await nativeBuilder.buildNativeRemoteDesktop({ platform, architecture: targetArch, output: root });
+  await auditNativeRemoteDesktop(root, platform, targetArch);
+}
+
 async function auditNativeRemoteDesktop(root, platform, targetArch) {
   const inputHelper = platform === "darwin"
     ? "joko-macos-remote-desktop-input"
@@ -1130,6 +1142,7 @@ async function auditNativeRemoteDesktop(root, platform, targetArch) {
 }
 
 module.exports.auditNativeRemoteDesktop = auditNativeRemoteDesktop;
+module.exports.prepareNativeRemoteDesktopForPackage = prepareNativeRemoteDesktopForPackage;
 
 async function auditNativeLinuxCredentials(root, identity) {
   const names = ["main.py", "channel.py", "host.py", "storage.py", "platform_linux.py", "requirements.txt"].sort();
