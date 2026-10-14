@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-snapshots.js";
 import { WorkspaceChangeSetService } from "./workspace-change-set.js";
-import { DurableWorkspaceRunCapture } from "./workspace-run-capture.js";
+import { DurableWorkspaceRunCapture, prepareRunProjectGit } from "./workspace-run-capture.js";
 
 const cleanupPaths: string[] = [];
 const cleanupStores = new Set<OperationalStore>();
@@ -21,6 +21,46 @@ afterEach(async () => {
 });
 
 describe("DurableWorkspaceRunCapture", () => {
+  it("keeps first-Run Git bootstrap inside the exact ordinary local project authority", async () => {
+    const f = await outputFixture();
+    const input = { sessionId: f.input.sessionId, runId: f.input.runId, workspaceRoot: f.workspace };
+    const ensure = vi.fn(async ({ assertCurrent }: { readonly assertCurrent: () => void }) => {
+      assertCurrent(); return { status: "skipped" as const, reason: "non_empty_project" as const };
+    });
+    await prepareRunProjectGit(f.store, { ensure }, input);
+    expect(ensure).not.toHaveBeenCalled();
+    const target = { ...f.input.target, managed: false };
+    f.store.upsertTarget(target);
+    await prepareRunProjectGit(f.store, { ensure }, input);
+    expect(ensure).toHaveBeenCalledOnce();
+    const remote = { kind: "ssh" as const, hostTargetId: "ssh-owner", hostId: "ssh-host", workspaceRoot: "/project" };
+    f.store.upsertTarget({ ...target, id: "ssh-owner" });
+    f.store.upsertTarget({ ...target, remoteWorkspace: remote });
+    await prepareRunProjectGit(f.store, { ensure }, input);
+    expect(ensure).toHaveBeenCalledOnce();
+    f.store.upsertTarget(target);
+    const session = f.store.getSession(f.input.sessionId).descriptor;
+    const isolated = f.store.createSession({ ...session, id: "isolated-session", binding: { opaqueRef: "fake://isolated", generation: 1 },
+      worktree: { leaseId: "isolation-lease", workspaceId: "isolated-workspace",
+      path: f.workspace, repositoryRoot: f.workspace, branch: "isolated-fixture", sourceRef: "HEAD", sourceCommit: "a".repeat(40),
+      sourceStrategy: "explicit", sourceRefreshed: false, state: "active", acquiredAt: 1, updatedAt: 1 } });
+    f.store.createRun({ id: "isolated-run", sessionId: isolated.descriptor.id, source: "user", state: "running", createdAt: 1 });
+    await prepareRunProjectGit(f.store, { ensure }, { ...input, sessionId: isolated.descriptor.id, runId: "isolated-run" });
+    expect(ensure).toHaveBeenCalledOnce();
+  });
+
+  it("fences a first-Run Git bootstrap when its Target revision changes", async () => {
+    const f = await outputFixture();
+    f.store.upsertTarget({ ...f.input.target, managed: false });
+    const ensure = vi.fn(async ({ assertCurrent }: { readonly assertCurrent: () => void }) => {
+      const target = f.store.getTarget(f.input.target.id);
+      f.store.upsertTarget({ ...target.descriptor, displayName: "Changed" });
+      assertCurrent(); return { status: "skipped" as const, reason: "non_empty_project" as const };
+    });
+    await expect(prepareRunProjectGit(f.store, { ensure }, { sessionId: f.input.sessionId, runId: f.input.runId,
+      workspaceRoot: f.workspace })).rejects.toThrow(/authority changed/iu);
+  });
+
   it("keeps terminal output pending until the exact accepted capture and event commit together", async () => {
     const f = await outputFixture();
     await f.capture.captureBeforeRun(f.input); f.accept();

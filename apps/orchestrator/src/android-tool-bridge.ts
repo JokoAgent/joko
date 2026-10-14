@@ -8,8 +8,12 @@ import type {
   BridgeToolCallContext,
   BridgeToolProvider,
   McpCallResult,
-  McpToolDescriptor
+  McpToolDescriptor,
+  BridgeToolCallResult,
+  McpResultArtifactStore
 } from "./mcp-router.js";
+import { operationBodyHash, type OperationalStore } from "@joko/store";
+import type { BlobRef } from "@joko/core";
 
 export const ANDROID_BRIDGE_PROVIDER_ID = "joko_android";
 
@@ -17,6 +21,14 @@ const CATEGORY = "android";
 const LIST_TOOLS_NAME = "list_tools";
 const CALL_TOOL_NAME = "call_tool";
 const WORKFLOW = "Start with status or list_devices. Use get_device_state before tap/swipe/input_text/press_key/launch_app. Re-read get_device_state after each action to verify results.";
+const XML_RECEIPT_KIND = "android_ui_xml_capture";
+const XML_PAGE_LIMIT = 16 * 1024;
+
+export interface AndroidXmlArtifactPort extends McpResultArtifactStore {
+  readBlob(blob: BlobRef): Promise<{ readonly data: Uint8Array; readonly mimeType: string }>;
+}
+interface XmlScope { readonly sessionId: string; readonly targetId: string; readonly generation: number; readonly providerGeneration: number }
+interface XmlReceipt { readonly format: 1; readonly scope: XmlScope; readonly blob: BlobRef }
 
 const BRIDGE_TOOLS: readonly McpToolDescriptor[] = Object.freeze([
   {
@@ -60,14 +72,31 @@ export class AndroidToolBridgeProvider implements BridgeToolProvider {
   readonly #provider: () => AndroidToolProvider;
   readonly #enabledForNewSessions: () => boolean;
   readonly #catalog: readonly AndroidToolDescriptor[];
+  readonly #store: OperationalStore | undefined;
+  readonly #artifacts: AndroidXmlArtifactPort | undefined;
+  readonly #redactXml: (value: string) => string;
 
   constructor(input: {
     readonly provider: () => AndroidToolProvider;
     readonly enabledForNewSessions: () => boolean;
+    readonly store?: OperationalStore;
+    readonly artifacts?: AndroidXmlArtifactPort;
+    readonly redactXml?: (value: string) => string;
   }) {
     this.#provider = input.provider;
     this.#enabledForNewSessions = input.enabledForNewSessions;
-    this.#catalog = Object.freeze([...input.provider().listTools()]);
+    this.#store = input.store;
+    this.#artifacts = input.artifacts;
+    this.#redactXml = input.redactXml ?? ((value) => value);
+    this.#catalog = Object.freeze(input.provider().listTools().map((tool) => tool.name !== "get_device_state" ? tool : {
+      ...tool, description: `${tool.description} To read a previously returned complete XML Artifact, pass only xml_artifact_id and optional xml_offset/xml_limit. This branch reads no device state. Offsets and limits are UTF-16 code units; pages never split a surrogate pair.`,
+      inputSchema: { ...tool.inputSchema, properties: {
+        ...(tool.inputSchema["properties"] as Record<string, unknown>),
+        xml_artifact_id: { type: "string", minLength: 1, maxLength: 512 },
+        xml_offset: { type: "integer", minimum: 0, maximum: 10 * 1024 * 1024 },
+        xml_limit: { type: "integer", minimum: 1, maximum: XML_PAGE_LIMIT }
+      } }
+    }));
     if (this.#catalog.length !== 8) throw new Error("Android automation must expose exactly eight actions.");
   }
 
@@ -126,7 +155,7 @@ export class AndroidToolBridgeProvider implements BridgeToolProvider {
     arguments_: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
     context: BridgeToolCallContext
-  ): Promise<McpCallResult> {
+  ): Promise<BridgeToolCallResult> {
     const outerSchema = BRIDGE_TOOLS[1]?.inputSchema;
     if (!hasOnlyKeys(arguments_, ["name", "args"])) {
       return invalidArgumentsResult(CALL_TOOL_NAME, [validationIssue([], "unrecognized_keys", "Unsupported call_tool argument.")], outerSchema);
@@ -144,14 +173,110 @@ export class AndroidToolBridgeProvider implements BridgeToolProvider {
     }
     const issues = validateSchema(selectedArguments, selected.inputSchema);
     if (issues.length > 0) return invalidArgumentsResult(selectedName, issues, selected.inputSchema);
+    if (selected.name === "get_device_state" && selectedArguments["xml_artifact_id"] !== undefined) {
+      if (!hasOnlyKeys(selectedArguments, ["xml_artifact_id", "xml_offset", "xml_limit"])) return textResult({ ok: false, errorCode: "INVALID_ARGS" }, true);
+      return this.#readXml(selectedArguments, context, signal);
+    }
+    if (selectedArguments["xml_offset"] !== undefined || selectedArguments["xml_limit"] !== undefined) return textResult({ ok: false, errorCode: "INVALID_ARGS" }, true);
 
-    return mapToolResult(await this.#provider().callTool(
+    const provider = this.#provider();
+    const result = await provider.callTool(
       context.sessionId,
       selected.name,
       selectedArguments,
       signal
-    ));
+    );
+    const mapped = mapToolResult(result);
+    if (result.rawUiXml === undefined || selected.name !== "get_device_state") return mapped;
+    const store = this.#store;
+    const artifacts = this.#artifacts;
+    if (store === undefined || artifacts === undefined) return textResult({ ok: false, errorCode: "ARTIFACT_UNAVAILABLE" }, true);
+    const guard = (): void => {
+      signal?.throwIfAborted();
+      const session = store.getSession(context.sessionId).descriptor;
+      if (this.#provider() !== provider || session.targetId !== context.targetId
+        || session.binding.generation !== context.generation || session.archived || session.deletedAt !== undefined
+        || store.findPendingSessionLifecycleCleanup(context.sessionId) !== undefined) throw new Error("Android XML task owner is no longer active.");
+    };
+    guard();
+    const safeXml = this.#redactXml(result.rawUiXml);
+    const bytes = Buffer.from(safeXml, "utf8");
+    if (bytes.byteLength < 1 || bytes.byteLength > Math.min(10 * 1024 * 1024, artifacts.maximumBlobBytes)) {
+      return textResult({ ok: false, errorCode: "UI_XML_TOO_LARGE" }, true);
+    }
+    const blob = await artifacts.ingestBytes(bytes, { fileName: "android-ui.xml", mimeType: "application/xml" });
+    guard();
+    const scope = this.#xmlScope(context);
+    const receipt: XmlReceipt = { format: 1, scope, blob: { id: blob.id, sha256: blob.sha256,
+      byteLength: blob.byteLength, mimeType: blob.mimeType } };
+    store.runOperation({ id: xmlReceiptId(scope, blob.id), kind: XML_RECEIPT_KIND, body: receipt }, () => { guard(); return receipt; });
+    guard();
+    const xml = { type: "text", text: `Complete Android UI XML:\n${safeXml}` } as const;
+    const inlined = Buffer.byteLength(JSON.stringify([...mapped.content, xml]), "utf8") <= 480 * 1024;
+    return { ...mapped,
+      content: [...mapped.content, ...(inlined ? [xml] : []), { type: "text", text: JSON.stringify({
+        raw_ui_dump_artifact: { id: blob.id, sha256: blob.sha256, byteLength: blob.byteLength, mimeType: blob.mimeType },
+        xml_complete: true, xml_model_readable: true, xml_inline_complete: inlined, xml_inline_truncated: !inlined,
+        xml_read_hint: { name: "get_device_state", args: { xml_artifact_id: blob.id, xml_offset: 0, xml_limit: XML_PAGE_LIMIT },
+          offset_kind: "utf16", page_limit: XML_PAGE_LIMIT }
+      }) }],
+      hostArtifacts: [{ blob, label: "Complete Android UI XML" }]
+    };
   }
+
+  #xmlScope(context: BridgeToolCallContext): XmlScope {
+    if (context.providerGeneration !== undefined && context.providerGeneration !== this.generation) throw new Error("Android XML Provider generation is stale.");
+    return { sessionId: context.sessionId, targetId: context.targetId, generation: context.generation, providerGeneration: this.generation };
+  }
+
+  async #readXml(args: Readonly<Record<string, unknown>>, context: BridgeToolCallContext, signal?: AbortSignal): Promise<McpCallResult> {
+    try {
+      const store = this.#store;
+      const artifacts = this.#artifacts;
+      if (store === undefined || artifacts === undefined) throw new Error("unavailable");
+      const scope = this.#xmlScope(context);
+      const guard = (): void => {
+        signal?.throwIfAborted();
+        const session = store.getSession(scope.sessionId).descriptor;
+        this.#xmlScope(context);
+        if (session.targetId !== scope.targetId || session.binding.generation !== scope.generation
+          || session.archived || session.deletedAt !== undefined || store.findPendingSessionLifecycleCleanup(scope.sessionId) !== undefined) throw new Error("retired");
+      };
+      guard();
+      const id = args["xml_artifact_id"] as string;
+      const operation = store.findOperation<XmlReceipt>(xmlReceiptId(scope, id));
+      const receipt = operation?.response;
+      if (operation?.status !== "completed" || operation.kind !== XML_RECEIPT_KIND || receipt?.format !== 1
+        || operationBodyHash(receipt.scope) !== operationBodyHash(scope) || receipt.blob.id !== id
+        || receipt.blob.mimeType !== "application/xml" || receipt.blob.byteLength < 1 || receipt.blob.byteLength > 10 * 1024 * 1024
+        || operation.bodyHash !== operationBodyHash(receipt)) throw new Error("unavailable");
+      const read = await artifacts.readBlob(receipt.blob);
+      guard();
+      if (read.mimeType !== receipt.blob.mimeType || read.data.byteLength !== receipt.blob.byteLength) throw new Error("unavailable");
+      const xml = new TextDecoder("utf-8", { fatal: true }).decode(read.data);
+      const offset = (args["xml_offset"] as number | undefined) ?? 0;
+      const limit = (args["xml_limit"] as number | undefined) ?? XML_PAGE_LIMIT;
+      if (offset > xml.length || splitsSurrogate(xml, offset)) return textResult({ ok: false, errorCode: "INVALID_XML_RANGE" }, true);
+      let end = Math.min(xml.length, offset + limit);
+      if (splitsSurrogate(xml, end)) end -= 1;
+      if (end === offset && offset < xml.length) return textResult({ ok: false, errorCode: "INVALID_XML_RANGE" }, true);
+      guard();
+      return textResult({ ok: true, data: { xml_artifact_id: id, xml_sha256: receipt.blob.sha256,
+        xml_byte_length: receipt.blob.byteLength, xml_offset: offset, xml_offset_kind: "utf16",
+        xml_text: xml.slice(offset, end), next_xml_offset: end, xml_eof: end === xml.length } });
+    } catch (error) {
+      if (signal?.aborted === true) throw error;
+      return textResult({ ok: false, errorCode: "UI_XML_UNAVAILABLE" }, true);
+    }
+  }
+}
+
+function xmlReceiptId(scope: XmlScope, artifactId: string): string {
+  return `android-ui-xml:${operationBodyHash({ ...scope, artifactId })}`;
+}
+function splitsSurrogate(value: string, offset: number): boolean {
+  return offset > 0 && offset < value.length && value.charCodeAt(offset - 1) >= 0xd800
+    && value.charCodeAt(offset - 1) <= 0xdbff && value.charCodeAt(offset) >= 0xdc00 && value.charCodeAt(offset) <= 0xdfff;
 }
 
 interface ValidationIssue {

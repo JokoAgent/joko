@@ -131,7 +131,8 @@ describe("AdbCliAdapter", () => {
     const xml = [
       "UI hierarchy dumped to: /dev/tty",
       "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\" ?>",
-      '<hierarchy><node text="typed-value" content-desc="password=typed-value" password="true" clickable="true" enabled="true" bounds="[20,100][220,200]"/></hierarchy>'
+      '<hierarchy><node text="typed-value" content-desc="password=typed-value" password="true" clickable="true" enabled="true" bounds="[20,100][220,200]"/>'
+        + '<node text="secret>suffix" content-desc="private-detail" password="true" bounds="[0,0][20,20]"/></hierarchy>'
     ].join("\n");
     const runner = queuedRunner([
       result("Physical size: 1440x3200\nOverride size: 1080x2400"),
@@ -153,6 +154,10 @@ describe("AdbCliAdapter", () => {
       capturedAt: 1234
     });
     expect(snapshot.screenshot.dataBase64).toBe(png.toString("base64"));
+    expect(snapshot.rawUiXml).toContain('<hierarchy><node text="[REDACTED]"');
+    expect(snapshot.rawUiXml).not.toContain("typed-value");
+    expect(snapshot.rawUiXml).not.toContain("secret>suffix");
+    expect(snapshot.rawUiXml).not.toContain("private-detail");
     expect(argumentsFor(runner)[3]).toEqual([
       "-s", "emulator-5554", "exec-out", "screencap", "-p"
     ]);

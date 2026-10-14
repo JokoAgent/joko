@@ -53,7 +53,7 @@ describe("RuntimeGovernanceSettings", () => {
           revision: 2n
         },
         gitSafety: {
-          autoSnapshotEnabled: false,
+          mode: "off" as const,
           pendingTurns: 0,
           trackedSessions: 2,
           trackedRepositories: 1,
@@ -94,9 +94,8 @@ describe("RuntimeGovernanceSettings", () => {
     await changeAndBlur(softLimit, "4");
     expect(updateCollaborationSettings).toHaveBeenCalledWith({ workerSoftLimit: 4 });
 
-    const savepointToggle = container.querySelector<HTMLButtonElement>('button[aria-label="Toggle hidden Git savepoints"]')!;
-    await act(async () => savepointToggle.click());
-    expect(updateGitSafetySettings).toHaveBeenCalledWith({ autoSnapshotEnabled: true });
+    await clickButton(container, "All projects");
+    expect(updateGitSafetySettings).toHaveBeenCalledWith({ mode: "all-projects" });
 
     await clickButton(container, "Clear savepoints");
     expect(cleanupGitSafetySavepoints).toHaveBeenCalledTimes(1);

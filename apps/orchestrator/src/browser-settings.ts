@@ -5,6 +5,7 @@ import {
   BrowserBackendHealthSchema,
   BrowserBackendStatus,
   BrowserSettingsSchema,
+  BrowserSettingsPatchSchema,
   BrowserTargetSettingsSchema,
   CapabilitySupport,
   type BrowserSettings,
@@ -39,6 +40,7 @@ export interface BrowserSettingsTransition {
   readonly targetId?: string;
   readonly previous: BrowserRuntimeSettings;
   readonly next: BrowserRuntimeSettings;
+  readonly assertCurrent?: () => void;
 }
 
 export interface BrowserSettingsHooks {
@@ -47,7 +49,7 @@ export interface BrowserSettingsHooks {
   /** Publish a disabled policy without stopping grants held by live Sessions. */
   stop(transition: BrowserSettingsTransition): void | Promise<void>;
   /** Reconfigure service-level Browser placement. */
-  refresh(transition: BrowserSettingsTransition): void | Promise<void>;
+  refresh(transition: BrowserSettingsTransition): void | (() => Promise<void>) | Promise<void | (() => Promise<void>)>;
 }
 
 export interface BrowserSettingsControllerOptions {
@@ -169,10 +171,15 @@ export class BrowserSettingsController {
     });
   }
 
-  apply(patch: BrowserSettingsPatch): Promise<BrowserSettings> {
-    const task = this.#tail.then(() => this.#apply(patch));
+  apply(patch: BrowserSettingsPatch, assertCurrent?: () => void): Promise<BrowserSettings> {
+    const task = this.#tail.then(() => this.#apply(patch, assertCurrent));
     this.#tail = task.then(() => undefined, () => undefined);
     return task;
+  }
+
+  async setAutomationTarget(target: BrowserRuntimeSettings["automationTarget"], assertCurrent?: () => void): Promise<BrowserRuntimeSettings["automationTarget"]> {
+    await this.apply(create(BrowserSettingsPatchSchema, { browserProviderId: this.#providerId, automationTarget: toProtoAutomationTarget(target) }), assertCurrent);
+    return this.automationTarget();
   }
 
   enabled(targetId: string): boolean {
@@ -195,7 +202,8 @@ export class BrowserSettingsController {
   uploadAllowed(): boolean { return this.#serviceSettings().allowUploads; }
   downloadAllowed(): boolean { return this.#serviceSettings().allowDownloads; }
 
-  async #apply(patch: BrowserSettingsPatch): Promise<BrowserSettings> {
+  async #apply(patch: BrowserSettingsPatch, assertCurrent?: () => void): Promise<BrowserSettings> {
+    assertCurrent?.();
     if (patch === null || typeof patch !== "object") throw new BrowserSettingsValidationError("patch", "Browser settings patch is required.");
     const providerId = validateProviderId(patch.browserProviderId, "patch.browser_provider_id");
     if (providerId !== this.#providerId) {
@@ -221,24 +229,37 @@ export class BrowserSettingsController {
 
     const previous = runtimeSettings(previousService, previousEnabled);
     const next = runtimeSettings(nextService, nextEnabled);
-    const transition: BrowserSettingsTransition = { ...(target === undefined ? {} : { targetId: target.descriptor.id }), previous, next };
+    const transition: BrowserSettingsTransition = { ...(target === undefined ? {} : { targetId: target.descriptor.id }), previous, next,
+      ...(assertCurrent === undefined ? {} : { assertCurrent }) };
     const effect = lifecycleEffect(previous, next, targetChanged);
+    let rollback: (() => Promise<void>) | undefined;
     if (effect !== undefined) {
-      try { await this.#hooks[effect](transition); }
-      catch (error) { throw new BrowserSettingsEffectError(effect, { cause: error }); }
+      try {
+        assertCurrent?.();
+        const result = await this.#hooks[effect](transition);
+        if (typeof result === "function") rollback = result;
+        assertCurrent?.();
+      }
+      catch (error) { await rollback?.(); throw new BrowserSettingsEffectError(effect, { cause: error }); }
     }
 
     const at = this.#now();
-    this.#store.transaction((store) => {
-      if (serviceChanged) store.setSetting(SERVICE_SCOPE_TYPE, this.#scopeId, this.#serviceSettingKey, encodeServiceSettings(nextService), at);
-      if (targetChanged && target !== undefined) {
-        store.setSetting<StoredBrowserTargetSettings>(TARGET_SCOPE_TYPE, target.descriptor.id, this.#targetSettingKey, {
-          format: 1,
-          browserProviderId: this.#providerId,
-          enabled: nextEnabled
-        }, at);
-      }
-    });
+    try {
+      assertCurrent?.();
+      this.#store.transaction((store) => {
+        if (serviceChanged) store.setSetting(SERVICE_SCOPE_TYPE, this.#scopeId, this.#serviceSettingKey, encodeServiceSettings(nextService), at);
+        if (targetChanged && target !== undefined) {
+          store.setSetting<StoredBrowserTargetSettings>(TARGET_SCOPE_TYPE, target.descriptor.id, this.#targetSettingKey, {
+            format: 1,
+            browserProviderId: this.#providerId,
+            enabled: nextEnabled
+          }, at);
+        }
+      });
+    } catch (error) {
+      await rollback?.();
+      throw error;
+    }
     return this.snapshot();
   }
 

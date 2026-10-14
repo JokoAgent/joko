@@ -184,6 +184,7 @@ export class AdbCliAdapter implements AndroidAdbAdapter {
     let nodes: readonly AndroidUiNode[] = [];
     let nodesTruncated = false;
     let uiDumpError: string | undefined;
+    let rawUiXml: string | undefined;
     try {
       const dumpResult = await this.#runDevice(
         safeSerial,
@@ -195,6 +196,8 @@ export class AdbCliAdapter implements AndroidAdbAdapter {
       const parsed = parseAndroidUiNodes(dumpResult.stdout.slice(xmlStart));
       nodes = parsed.nodes;
       nodesTruncated = parsed.truncated || dumpResult.stdoutTruncated;
+      if (!dumpResult.stdoutTruncated) rawUiXml = redactUiXml(dumpResult.stdout.slice(xmlStart));
+      else uiDumpError = "The complete UI XML exceeded the ADB capture limit.";
     } catch (error) {
       if (isAbortError(error)) throw error;
       uiDumpError = redactAndroidOutput(error instanceof Error ? error.message : String(error)).slice(0, 1_024);
@@ -212,7 +215,8 @@ export class AdbCliAdapter implements AndroidAdbAdapter {
       nodes,
       nodesTruncated,
       capturedAt: this.#now(),
-      ...(uiDumpError === undefined ? {} : { uiDumpError })
+      ...(uiDumpError === undefined ? {} : { uiDumpError }),
+      ...(rawUiXml === undefined ? {} : { rawUiXml })
     };
   }
 
@@ -573,6 +577,20 @@ function parseBounds(raw: string): AndroidUiBounds | undefined {
 function readXmlAttribute(attributes: string, name: string): string | undefined {
   const match = new RegExp(`(?:^|\\s)${name}="([^"]*)"`, "iu").exec(attributes);
   return match?.[1] === undefined ? undefined : decodeXml(match[1]);
+}
+
+function redactUiXml(xml: string): string {
+  return xml.replace(/<node\b(?:[^"'<>]|"[^"]*"|'[^']*')*>/gu, (node) => {
+    const password = readXmlAttribute(node, "password") === "true";
+    return node.replace(/([\w:-]+)="([^"]*)"/gu, (attribute, name: string, value: string) => {
+      const decoded = decodeXml(value);
+      const redacted = password && (name === "text" || name === "content-desc") ? "[REDACTED]" : redactAndroidOutput(decoded);
+      if (redacted === decoded) return attribute;
+      const encoded = redacted.replace(/&/gu, "&amp;").replace(/"/gu, "&quot;")
+        .replace(/</gu, "&lt;").replace(/>/gu, "&gt;").replace(/\n/gu, "&#10;").replace(/\r/gu, "&#13;");
+      return `${name}="${encoded}"`;
+    });
+  });
 }
 
 function decodeXml(value: string): string {

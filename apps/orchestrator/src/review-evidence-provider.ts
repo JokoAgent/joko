@@ -4,6 +4,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { BlobRef, MessageBlock } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
+import { extractPdfText, PDF_TEXT_MAX_BYTES, PdfTextExtractionError, type PdfTextWorkerResult } from "@joko/tool-document";
 import type { ArtifactStore } from "./artifact-store.js";
 import type { ReviewEvidenceProvider } from "./review-coordinator.js";
 import {
@@ -16,6 +17,7 @@ import {
   type ReviewSourceFileSnapshot
 } from "./review-evidence.js";
 import { MAX_REVIEW_ATTACHMENTS, type StartReviewRequest } from "./review-types.js";
+import { MAX_REVIEW_ARTIFACT_EXCERPT_CHARACTERS } from "./review-prompt.js";
 import type { WorkspaceChange, WorkspaceChangeSetRecord, WorkspaceChangeSetService } from "./workspace-change-set.js";
 import type { GitState, WorkspaceGitDiff, WorkspaceService } from "./workspace-service.js";
 import { listAllQueueItems, listAllVisibleSessionEvents } from "./operational-pagination.js";
@@ -26,6 +28,7 @@ const MAX_REVIEW_ARTIFACT_TOTAL_BYTES = 128 * 1024 * 1024;
 const MAX_SELECTED_FILE_BYTES = 32 * 1024 * 1024;
 const MAX_SELECTED_TOTAL_BYTES = 256 * 1024 * 1024;
 const MAX_SELECTED_PATHS = 20_000;
+const MAX_REVIEW_PDF_FILES = 4;
 const MAX_PATCH_CHARACTERS = 2_000_000;
 
 export type ReviewEvidenceCaptureCode = "source-busy" | "nothing-to-review" | "artifact-unavailable" | "source-changed";
@@ -43,6 +46,7 @@ export interface DurableReviewEvidenceProviderOptions {
   readonly workspaces: WorkspaceService;
   readonly workspaceChanges: WorkspaceChangeSetService;
   readonly artifacts: ArtifactStore;
+  readonly pdfText?: (data: Uint8Array, maxChars: number) => Promise<PdfTextWorkerResult>;
 }
 
 /** Captures transient Review evidence; only its domain-separated seal is durable. */
@@ -51,12 +55,14 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
   readonly #workspaces: WorkspaceService;
   readonly #workspaceChanges: WorkspaceChangeSetService;
   readonly #artifacts: ArtifactStore;
+  readonly #pdfText: (data: Uint8Array, maxChars: number) => Promise<PdfTextWorkerResult>;
 
   constructor(options: DurableReviewEvidenceProviderOptions) {
     this.#store = options.store;
     this.#workspaces = options.workspaces;
     this.#workspaceChanges = options.workspaceChanges;
     this.#artifacts = options.artifacts;
+    this.#pdfText = options.pdfText ?? extractPdfText;
   }
 
   async capture(
@@ -138,7 +144,29 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
 
     const attachments = collectAttachments(request, visible);
     assertArtifactBudget(attachments.values);
-    const artifacts = await Promise.all(attachments.values.map((attachment) => this.#artifactEvidence(attachment)));
+    const artifacts: ReviewSourceArtifact[] = [];
+    let pdfFiles = 0;
+    let remainingPdfCharacters = MAX_REVIEW_ARTIFACT_EXCERPT_CHARACTERS;
+    for (const attachment of attachments.values) {
+      const pdf = attachment.kind !== "image" && (attachment.blob.mimeType.toLowerCase() === "application/pdf" ||
+        attachment.displayName.toLowerCase().endsWith(".pdf"));
+      const artifact = await this.#artifactEvidence(attachment, {
+        pdf, enabled: !pdf || pdfFiles++ < MAX_REVIEW_PDF_FILES, maxChars: remainingPdfCharacters
+      });
+      artifacts.push(artifact);
+      if (pdf && artifact.excerpt !== undefined) remainingPdfCharacters -= artifact.excerpt.content.length;
+    }
+    assertSourceIdle(this.#store, request.sourceSessionId);
+    const currentSource = this.#store.getSession(request.sourceSessionId);
+    if (currentSource.descriptor.deletedAt !== source.descriptor.deletedAt ||
+        currentSource.descriptor.archived !== source.descriptor.archived ||
+        currentSource.descriptor.targetId !== source.descriptor.targetId ||
+        currentSource.descriptor.binding.generation !== source.descriptor.binding.generation ||
+        currentSource.descriptor.binding.opaqueRef !== source.descriptor.binding.opaqueRef ||
+        currentSource.descriptor.binding.nativeSessionId !== source.descriptor.binding.nativeSessionId ||
+        this.#store.getTarget(target.descriptor.id).revision !== target.revision) {
+      throw new ReviewEvidenceCaptureError("source-changed", "Review source authority changed during evidence capture.");
+    }
     const hasContext = messages.some((message) => message.text.trim() !== "");
     const hasFocus = (request.focus?.trim().length ?? 0) > 0;
     const hasChanges = workspaceDiffs.length > 0 || (branch?.fileCount ?? 0) > 0 || (changeSetEvidence?.diffs.length ?? 0) > 0;
@@ -197,7 +225,9 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
     };
   }
 
-  async #artifactEvidence(attachment: ReviewSourceArtifact): Promise<ReviewSourceArtifact> {
+  async #artifactEvidence(attachment: ReviewSourceArtifact, pdf: {
+    readonly pdf: boolean; readonly enabled: boolean; readonly maxChars: number;
+  }): Promise<ReviewSourceArtifact> {
     try {
       const stored = await this.#artifacts.get(attachment.blob.id);
       if (normalizeSha(stored.sha256) !== normalizeSha(attachment.blob.sha256)
@@ -208,6 +238,28 @@ export class DurableReviewEvidenceProvider implements ReviewEvidenceProvider {
       const read = await this.#artifacts.readBlob(attachment.blob);
       if (sha256(read.data) !== normalizeSha(attachment.blob.sha256)) throw new Error("content mismatch");
       if (attachment.kind === "image") return attachment;
+      if (pdf.pdf) {
+        const visualWarning = "PDF text does not prove page layout, images, forms, signatures or scanned-page coverage.";
+        if (!pdf.enabled || pdf.maxChars < 1) return { ...attachment,
+          warning: `The bounded PDF count or text limit was reached; this PDF's contents were not read. ${visualWarning}` };
+        if (read.data.byteLength > PDF_TEXT_MAX_BYTES) return { ...attachment,
+          warning: `PDF exceeds the 20 MiB text extraction limit; its contents were not read. ${visualWarning}` };
+        try {
+          const extracted = await this.#pdfText(read.data, pdf.maxChars);
+          if (extracted.sections.length === 0) return { ...attachment,
+            warning: `PDF has no extractable text; its contents were not reviewed. ${visualWarning}` };
+          const limited = extracted.clipped || extracted.pagesInspected < extracted.numPages;
+          return { ...attachment,
+            excerpt: { format: "pdf-text", content: extracted.sections.join("\n\n"),
+              coverage: limited ? `Bounded text from ${extracted.pagesInspected} of ${extracted.numPages} pages; later or clipped text is not covered.`
+                : `Extractable text from all ${extracted.numPages} pages.` },
+            warning: `${visualWarning}${limited ? " PDF text reached the page or character limit." : ""}` };
+        } catch (error) {
+          return { ...attachment, warning: `${error instanceof PdfTextExtractionError && error.code === "RETIREMENT_UNKNOWN"
+            ? "PDF worker exit could not be confirmed; no text was adopted."
+            : "PDF text extraction was unavailable; its contents were not read."} ${visualWarning}` };
+        }
+      }
       if (stored.byteLength > MAX_ARTIFACT_EXCERPT_BYTES) {
         return { ...attachment, warning: "File exceeds the bounded Review excerpt limit." };
       }

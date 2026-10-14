@@ -95,7 +95,9 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([
     "find_references",
     "find_references",
     "Find exact workspace references for the symbol at an exact source position.",
-    POSITION_SCHEMA
+    objectSchema({ ...POSITION_SCHEMA["properties"] as Record<string, Readonly<Record<string, unknown>>>,
+      includeDeclaration: { type: "boolean", description: "Include declaration locations; defaults to false." }
+    }, ["file", "line", "character"])
   ),
   directTool(
     "outline",
@@ -108,14 +110,14 @@ const TOOLS: readonly McpToolDescriptor[] = Object.freeze([
     "workspace_symbols",
     "Search symbols across the authenticated TypeScript or JavaScript workspace.",
     objectSchema({
+      anchorFile: FILE_PROPERTY,
       query: {
         type: "string",
-        minLength: 1,
         maxLength: MAXIMUM_QUERY_CHARACTERS,
-        description: "Non-empty symbol-name query."
+        description: "Symbol-name query. Omit or use an empty string to list symbols in the anchor's project."
       },
       max_results: MAXIMUM_RESULTS_PROPERTY
-    }, ["query"])
+    }, ["anchorFile"])
   ),
   directTool(
     "incoming_calls",
@@ -238,6 +240,8 @@ interface ParsedArguments {
   readonly column?: number;
   readonly query?: string;
   readonly maxResults?: number;
+  readonly anchorFile?: string;
+  readonly includeDeclaration?: boolean;
 }
 
 function parseArguments(
@@ -246,9 +250,11 @@ function parseArguments(
 ): ParsedArguments {
   if (!isRecord(value)) throw invalidArgument("arguments", "Tool arguments must be an object.");
   if (name === "workspace_symbol") {
-    requireOnlyKeys(value, ["query", "max_results"]);
+    requireOnlyKeys(value, ["anchorFile", "query", "max_results"]);
+    if (value["query"] !== undefined && (typeof value["query"] !== "string" || value["query"].length > MAXIMUM_QUERY_CHARACTERS || value["query"].includes("\0"))) throw invalidArgument("query", "Query must be a bounded string.");
     return {
-      query: requiredString(value["query"], "query"),
+      anchorFile: requiredString(value["anchorFile"], "anchorFile"),
+      ...(value["query"] === undefined ? {} : { query: value["query"] as string }),
       ...optionalMaximumResults(value["max_results"])
     };
   }
@@ -259,11 +265,13 @@ function parseArguments(
       ...optionalMaximumResults(value["max_results"])
     };
   }
-  requireOnlyKeys(value, ["file", "line", "character", "max_results"]);
+  requireOnlyKeys(value, ["file", "line", "character", "max_results", ...(name === "find_references" ? ["includeDeclaration"] : [])]);
+  if (value["includeDeclaration"] !== undefined && typeof value["includeDeclaration"] !== "boolean") throw invalidArgument("includeDeclaration", "Expected a boolean.");
   return {
     file: requiredString(value["file"], "file"),
     line: positiveInteger(value["line"], "line"),
     column: positiveInteger(value["character"], "character"),
+    ...(value["includeDeclaration"] === undefined ? {} : { includeDeclaration: value["includeDeclaration"] as boolean }),
     ...optionalMaximumResults(value["max_results"])
   };
 }
@@ -275,7 +283,7 @@ function requestFor(
 ): LspToolRequest {
   const limit = parsed.maxResults === undefined ? {} : { maxResults: parsed.maxResults };
   if (name === "workspace_symbol") {
-    return { action: "workspace_symbol", workspaceRoot, query: parsed.query ?? "", ...limit };
+    return { action: "workspace_symbol", workspaceRoot, anchorFile: parsed.anchorFile ?? "", query: parsed.query ?? "", ...limit };
   }
   if (name === "outline") {
     return { action: "outline", workspaceRoot, file: parsed.file ?? "", ...limit };
@@ -286,6 +294,7 @@ function requestFor(
     file: parsed.file ?? "",
     line: parsed.line ?? 0,
     column: parsed.column ?? 0,
+    ...(name !== "find_references" || parsed.includeDeclaration === undefined ? {} : { includeDeclaration: parsed.includeDeclaration }),
     ...limit
   };
 }

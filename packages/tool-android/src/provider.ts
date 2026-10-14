@@ -61,6 +61,7 @@ export interface AndroidToolCallResult {
   readonly content: readonly AndroidToolContent[];
   readonly isError?: boolean;
   readonly structuredContent?: Readonly<Record<string, unknown>>;
+  readonly rawUiXml?: string;
 }
 
 export class AndroidToolProvider {
@@ -471,7 +472,8 @@ async function stateResult(snapshot: AndroidDeviceSnapshot): Promise<AndroidTool
     content: [
       { type: "text", text: JSON.stringify(payload) },
       { type: "image", data: screenshot.data, mimeType: screenshot.mimeType }
-    ]
+    ],
+    ...(snapshot.rawUiXml === undefined ? {} : { rawUiXml: snapshot.rawUiXml })
   };
 }
 

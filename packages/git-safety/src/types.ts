@@ -1,11 +1,13 @@
 export const SAVEPOINT_REF_NAMESPACE = "refs/joko/savepoints/";
 
+export type GitSafetyMode = "off" | "existing-git" | "all-projects";
+
 export const DEFAULT_GIT_SAFETY_SETTINGS: GitSafetySettings = Object.freeze({
-  autoSnapshotEnabled: false
+  mode: "existing-git"
 });
 
 export interface GitSafetySettings {
-  readonly autoSnapshotEnabled: boolean;
+  readonly mode: GitSafetyMode;
 }
 
 export type GitSafetyGapKind =

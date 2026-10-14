@@ -71,7 +71,7 @@ const STATE_OBSERVATION_TOOLS = Object.freeze([
 ] as const);
 
 const BUILD_TOOLS = Object.freeze([
-  { name: "build_app", description: "Build a trusted Xcode project for the exact Simulator. Xcode executes project build scripts as the current macOS user; those scripts can read or modify files outside the project, and bounded build diagnostics are returned to the agent. Approve only trusted projects.", readOnly: false }
+  { name: "build_app", description: "Build a trusted Xcode project for instanceId, generation and leaseId. Optional projectDir selects an existing local directory relative to the task root or by absolute path; containerPath and scheme select within that project. Source selection keeps the task and device owner. Xcode executes project build scripts as the current macOS user; those scripts can read or modify files outside the project, and bounded build diagnostics are returned to the agent. Approve only trusted projects.", readOnly: false }
 ] as const);
 
 const INSTALL_TOOLS = Object.freeze([
@@ -877,11 +877,14 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
   async #callProjectBuild(args: Record<string, unknown>, signal: AbortSignal | undefined,
     context: BridgeToolCallContext): Promise<McpCallResult> {
     if (!this.#projectBuild) throw new SimulatorToolError("UNKNOWN_TOOL", "Simulator project build is unavailable.");
-    onlyKeys(args, ["instanceId", "generation", "leaseId", "containerPath", "scheme"]);
+    onlyKeys(args, ["instanceId", "generation", "leaseId", "projectDir", "containerPath", "scheme"]);
     const route = requiredRoute(args);
+    const projectDir = args["projectDir"];
     const containerPath = args["containerPath"];
     const scheme = args["scheme"];
-    if (containerPath !== undefined && (typeof containerPath !== "string" ||
+    if (projectDir !== undefined && (typeof projectDir !== "string" ||
+        !projectDir.trim() || projectDir.length > 4_096 || projectDir.includes("\0")) ||
+        containerPath !== undefined && (typeof containerPath !== "string" ||
         !containerPath.trim() || containerPath.length > 4_096) ||
         scheme !== undefined && (typeof scheme !== "string" || !scheme.trim() || scheme.length > 256)) {
       throw new SimulatorToolError("INVALID_ARGUMENT", "Simulator project selection is invalid.");
@@ -898,7 +901,8 @@ export class IosSimulatorToolBridgeProvider implements BridgeToolProvider {
     if (!environment.ready) return response({ ok: false, errorCode: environment.issue,
       message: environment.error, data: { environment } }, true);
     const result = await this.#projectBuild.execute(context, route,
-      { ...(containerPath === undefined ? {} : { containerPath: containerPath as string }),
+      { ...(projectDir === undefined ? {} : { projectDir: projectDir as string }),
+        ...(containerPath === undefined ? {} : { containerPath: containerPath as string }),
         ...(scheme === undefined ? {} : { scheme: scheme as string }) },
       { effectIdentity: authority.effectIdentity!, requestBodyHash: authority.requestBodyHash!,
         providerGeneration: authority.providerGeneration! }, signal);

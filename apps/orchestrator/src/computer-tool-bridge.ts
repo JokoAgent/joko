@@ -202,7 +202,7 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
     if (fence === undefined) return;
     this.#sessionFences.delete(sessionId);
     try {
-      await this.#provider.closeSession(fence);
+      await this.#provider.closeProductSession(sessionId);
     } catch (error) {
       if (!(error instanceof ComputerToolProviderError) || error.code !== "stale_session") throw error;
     }

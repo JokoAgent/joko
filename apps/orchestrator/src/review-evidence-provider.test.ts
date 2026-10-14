@@ -2,9 +2,12 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalStore, type PersistedEvent, type QueueItemRecord } from "@joko/store";
+import { extractPdfText, PdfTextExtractionError, PDF_TEXT_MAX_BYTES, PDF_TEXT_TIMEOUT_MS, type PdfTextWorkerResult } from "@joko/tool-document";
 
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import type { ArtifactStore } from "./artifact-store.js";
@@ -224,6 +227,92 @@ describe("DurableReviewEvidenceProvider", () => {
       }))
     })).rejects.toMatchObject({ code: "artifact-unavailable" });
   });
+
+  it("adopts bounded PDF text only after worker retirement and preserves exact Blob and Task authority", { timeout: 30_000 }, async () => {
+    const pdf = buildTextPdf(Array.from({ length: 41 }, (_, index) => `Evidence page ${index + 1}`));
+    const extracted = await extractPdfText(pdf, 48_000);
+    expect(extracted).toMatchObject({ numPages: 41, pagesInspected: 40, clipped: false });
+    expect(extracted.sections.join("\n\n")).toContain("Evidence page 40");
+    expect(extracted.sections.join("\n\n")).not.toContain("Evidence page 41");
+    const clipped = await extractPdfText(pdf, 60);
+    expect(clipped.clipped).toBe(true);
+    expect(clipped.sections.join("\n\n").length).toBeLessThanOrEqual(60);
+    expect(await extractPdfText(buildTextPdf([null]), 100)).toMatchObject({ sections: [], numPages: 1, pagesInspected: 1 });
+    await expect(extractPdfText(Buffer.from("not a PDF"), 100)).rejects.toMatchObject({ code: "FAILED" });
+
+    class UnknownWorker extends EventEmitter {
+      terminate(): Promise<number> { return Promise.reject(new Error("private worker detail")); }
+    }
+    const unknownWorker = new UnknownWorker();
+    const unknownResult = extractPdfText(pdf, 100, { workerFactory: () => unknownWorker });
+    unknownWorker.emit("message", { ok: true, result: { sections: ["unconfirmed text"], numPages: 1, pagesInspected: 1, clipped: false } });
+    await expect(unknownResult).rejects.toMatchObject({ code: "RETIREMENT_UNKNOWN" });
+    class HungWorker extends EventEmitter {
+      terminate(): Promise<number> { return new Promise(() => undefined); }
+    }
+    vi.useFakeTimers();
+    try {
+      const timedOut = extractPdfText(pdf, 100, { workerFactory: () => new HungWorker() });
+      const rejected = expect(timedOut).rejects.toMatchObject({ code: "RETIREMENT_UNKNOWN" });
+      await vi.advanceTimersByTimeAsync(PDF_TEXT_TIMEOUT_MS);
+      await rejected;
+    } finally { vi.useRealTimers(); }
+
+    const fixture = setup();
+    const bytes = new Map<string, Uint8Array>();
+    const attachment = (id: string, data = pdf) => {
+      bytes.set(id, data);
+      return { kind: "file" as const, displayName: `${id}.pdf`, blob: {
+        id, sha256: createHash("sha256").update(data).digest("hex"), byteLength: data.byteLength,
+        mimeType: "application/pdf", fileName: `${id}.pdf`
+      } };
+    };
+    const files = Array.from({ length: 5 }, (_, index) => attachment(`report-${index}`));
+    const artifacts = {
+      get: async (id: string) => {
+        const data = bytes.get(id)!;
+        return { id, sha256: createHash("sha256").update(data).digest("hex"), byteLength: data.byteLength, mimeType: "application/pdf" };
+      },
+      readBlob: async (blob: import("@joko/core").BlobRef) => ({ data: bytes.get(blob.id)!, mimeType: "application/pdf" })
+    } as unknown as ArtifactStore;
+    const workspaces = workspaceStub(fixture.root, cleanGit(), cleanDiff());
+    const capture = await providerFor(fixture.store, workspaces, [], artifacts).capture(request(files[0]));
+    const built = buildReviewEvidence(capture);
+    expect(built.promptInput.artifactExcerpts?.[0]).toMatchObject({ format: "pdf-text", coverage: "Bounded text from 40 of 41 pages; later or clipped text is not covered." });
+    expect(built.promptInput.artifactExcerpts?.[0]?.content).toContain("Evidence page 40");
+    expect(built.promptInput.artifactWarnings?.[0]?.message).toContain("does not prove page layout");
+    expect(JSON.stringify(built.freshness)).not.toContain("Evidence page");
+
+    const parser = vi.fn(async () => extracted);
+    const bounded = providerFor(fixture.store, workspaces, [], artifacts, parser);
+    const counted = await bounded.capture({ ...request(), attachments: files });
+    expect(parser).toHaveBeenCalledTimes(4);
+    expect(counted.artifacts[4]).toMatchObject({ blob: files[4]!.blob, warning: expect.stringContaining("contents were not read") });
+    expect(counted.artifacts[4]?.excerpt).toBeUndefined();
+    const large = attachment("large", Buffer.alloc(PDF_TEXT_MAX_BYTES + 1));
+    const oversized = await bounded.capture(request(large));
+    expect(parser).toHaveBeenCalledTimes(4);
+    expect(oversized.artifacts[0]).toMatchObject({ blob: large.blob, warning: expect.stringContaining("20 MiB") });
+    expect(oversized.artifacts[0]?.excerpt).toBeUndefined();
+
+    const unavailable = await providerFor(fixture.store, workspaces, [], artifacts, async () => {
+      throw new PdfTextExtractionError("RETIREMENT_UNKNOWN");
+    }).capture(request(files[0]));
+    expect(unavailable.artifacts[0]).toMatchObject({ blob: files[0]!.blob, warning: expect.stringContaining("no text was adopted") });
+    expect(unavailable.artifacts[0]?.excerpt).toBeUndefined();
+    bytes.set(files[0]!.blob.id, Buffer.from(pdf).fill(0, 0, 1));
+    await expect(bounded.capture(request(files[0]))).rejects.toMatchObject({ code: "artifact-unavailable" });
+    bytes.set(files[0]!.blob.id, pdf);
+    const changedPdf = buildTextPdf(["Changed evidence"]);
+    const changedAttachment = attachment("changed", changedPdf);
+    const changed = buildReviewEvidence(await bounded.capture(request(changedAttachment)));
+    expect(changed.freshness.artifactsSha256).not.toBe(built.freshness.artifactsSha256);
+    await expect(providerFor(fixture.store, workspaces, [], artifacts, async () => {
+      const session = fixture.store.getSession("source");
+      fixture.store.updateSession("source", { binding: { ...session.descriptor.binding, generation: 2 } }, session.revision, 3);
+      return extracted;
+    }).capture(request(files[0]))).rejects.toMatchObject({ code: "source-changed" });
+  });
 });
 
 function setup(targetId = "workspace") {
@@ -252,13 +341,15 @@ function providerFor(
   store: OperationalStore,
   workspaces: ReturnType<typeof workspaceStub>,
   changeSets: readonly unknown[],
-  artifacts: ArtifactStore = {} as ArtifactStore
+  artifacts: ArtifactStore = {} as ArtifactStore,
+  pdfText?: (data: Uint8Array, maxChars: number) => Promise<PdfTextWorkerResult>
 ) {
   return new DurableReviewEvidenceProvider({
     store,
     workspaces: workspaces as unknown as WorkspaceService,
     workspaceChanges: { listChangeSets: async () => changeSets } as unknown as WorkspaceChangeSetService,
-    artifacts
+    artifacts,
+    ...(pdfText === undefined ? {} : { pdfText })
   });
 }
 
@@ -303,4 +394,25 @@ function request(attachment?: { readonly kind: "file" | "image"; readonly displa
     focus: "review the deliverable",
     attachments: attachment === undefined ? [] : [attachment]
   };
+}
+
+function buildTextPdf(pages: readonly (string | null)[]): Buffer {
+  const objects = ["", "", "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"];
+  const add = (value: string): number => { objects.push(value); return objects.length; };
+  const pageIds = pages.map(text => {
+    if (text === null) return add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << >> >>");
+    const stream = `BT /F1 24 Tf 72 760 Td (${text}) Tj ET`;
+    const content = add(`<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`);
+    return add(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents ${content} 0 R >>`);
+  });
+  objects[0] = "<< /Type /Catalog /Pages 2 0 R >>";
+  objects[1] = `<< /Type /Pages /Kids [${pageIds.map(id => `${id} 0 R`).join(" ")}] /Count ${pageIds.length} >>`;
+  let output = "%PDF-1.4\n";
+  const offsets: number[] = [];
+  objects.forEach((body, index) => { offsets.push(output.length); output += `${index + 1} 0 obj\n${body}\nendobj\n`; });
+  const xref = output.length;
+  output += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (const offset of offsets) output += `${String(offset).padStart(10, "0")} 00000 n \n`;
+  output += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return Buffer.from(output, "latin1");
 }

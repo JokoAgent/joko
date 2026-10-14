@@ -13,6 +13,11 @@ import {
 } from "playwright-core";
 import { isWithin } from "@joko/core/policy";
 import { installHtmlSnapshot, validateHtmlSnapshot, type BrowserHtmlSnapshot } from "./html-preview.js";
+import { BrowserProxyRequestGate, type BrowserProxyRequestGateHandle } from "./proxy-request-gate.js";
+import {
+  browserProxyRouteKey, buildBrowserProxyLaunchArgs, parseBrowserProxyServer, publicBrowserProxyRoute,
+  type BrowserProxyRoute, type BrowserStartOptions
+} from "./proxy.js";
 import {
   BrowserLeaseConflictError,
   BrowserLeaseRegistry,
@@ -223,6 +228,8 @@ export interface BrowserProviderOptions {
   readonly now?: () => number;
   /** Runtime seam for embedders and deterministic lifecycle tests. */
   readonly launchPersistentContext?: BrowserContextLauncher;
+  /** Private seam for verifying request-gate and writer lifecycle together. */
+  readonly createProxyRequestGate?: (context: BrowserContext, route: BrowserProxyRoute, onFailure: () => void) => BrowserProxyRequestGateHandle;
 }
 
 export type BrowserContextLauncher = (
@@ -326,7 +333,7 @@ export interface BrowserResourceSnapshot {
 }
 
 export type BrowserAutomationAction =
-  | "doctor" | "status" | "start" | "stop" | "profiles" | "tabs" | "open" | "focus" | "close"
+  | "doctor" | "status" | "setBackend" | "start" | "stop" | "profiles" | "tabs" | "open" | "focus" | "close"
   | "snapshot" | "screenshot" | "navigate" | "console" | "pdf" | "upload" | "dialog" | "act"
   | "requests" | "responseBody" | "extract" | "recipe" | "siteguide" | "saveRecipe";
 
@@ -444,6 +451,14 @@ export class BrowserProvider {
   readonly #leases = new BrowserLeaseRegistry();
   readonly #takeovers: BrowserTakeoverRegistry;
   #context: BrowserContext | undefined;
+  #route: BrowserProxyRoute | undefined;
+  #desiredRoute: BrowserProxyRoute = { mode: "direct" };
+  #routeBlocked = false;
+  readonly #nativeContexts = new Map<BrowserContext, {
+    readonly route: BrowserProxyRoute;
+    readonly gate?: BrowserProxyRequestGateHandle;
+    retirement?: Promise<void>;
+  }>();
   readonly #htmlContexts = new Set<BrowserContext>();
   readonly #htmlPageOwners = new Map<Page, {
     readonly context: BrowserContext;
@@ -523,8 +538,33 @@ export class BrowserProvider {
     return this.#targetMode;
   }
 
-  start(): Promise<void> {
-    return this.queueLifecycle(() => this.startNow());
+  proxyState(): ReturnType<typeof publicBrowserProxyRoute> {
+    return publicBrowserProxyRoute(this.#routeBlocked ? undefined : this.#route);
+  }
+
+  captureStartOptions(): Omit<BrowserStartOptions, "signal" | "assertCurrent"> {
+    return this.#desiredRoute.mode === "direct" ? {} : { proxyServer: this.#desiredRoute.server,
+      ...(this.#desiredRoute.allowedHostnames === undefined ? {} : { proxyAllowedHostnames: [...this.#desiredRoute.allowedHostnames] }) };
+  }
+
+  start(options?: BrowserStartOptions): Promise<void> {
+    if (options === undefined && this.#routeBlocked) throw new Error("The Browser launch route is unknown; explicitly start or stop it before other actions.");
+    const requested = options === undefined ? this.#desiredRoute : parseBrowserProxyServer(options.proxyServer, options.proxyAllowedHostnames);
+    if (requested.mode === "proxied" && this.#targetMode !== "external") throw new BrowserTargetModeConflictError("Proxy startup requires the external managed Browser.");
+    this.assertStartAuthority(options);
+    return this.queueLifecycle(async () => {
+      this.assertStartAuthority(options);
+      if (this.#context !== undefined && !this.#routeBlocked && this.#route !== undefined
+        && browserProxyRouteKey(this.#route) === browserProxyRouteKey(requested)) return;
+      if (this.#context !== undefined) {
+        this.#lifecycleEpoch += 1;
+        const previous = this.detachContext();
+        if (previous !== undefined) await this.retireContext(previous);
+      }
+      if (requested.mode === "proxied" || this.hasUnretiredProxy()) await this.retireContexts();
+      this.assertStartAuthority(options);
+      await this.startNow(requested, options);
+    });
   }
 
   stop(): Promise<void> {
@@ -532,7 +572,9 @@ export class BrowserProvider {
     this.#lifecycleEpoch += 1;
     const context = this.detachContext();
     const task = (async () => {
-      if (context !== undefined) await context.close().catch(() => undefined);
+      if (context !== undefined) await this.retireContext(context);
+      await this.retireContexts();
+      this.#routeBlocked = false;
       await this.emit({ at: Date.now(), type: "stopped", detail: "Browser stopped." });
     })();
     let stopping!: Promise<void>;
@@ -553,14 +595,16 @@ export class BrowserProvider {
     // but its exit fence can no longer publish a result.
     this.#lifecycleEpoch += 1;
     const recoveryEpoch = this.#lifecycleEpoch;
+    const route = this.#desiredRoute;
     const previous = this.detachContext();
-    if (previous !== undefined) void previous.close().catch(() => undefined);
+    if (previous !== undefined && route.mode === "direct") void this.retireContext(previous).catch(() => undefined);
     const task = (async () => {
       await this.emit({ at: Date.now(), type: "stopped", detail: "Browser stopped for recovery." });
       if (recoveryEpoch !== this.#lifecycleEpoch) {
         throw new BrowserLeaseConflictError("Browser recovery was superseded by a newer generation.");
       }
-      await this.startNow();
+      if (route.mode === "proxied" || this.hasUnretiredProxy()) await this.retireContexts();
+      await this.startNow(route);
     })();
     let recovery!: Promise<void>;
     recovery = task.finally(() => {
@@ -589,7 +633,9 @@ export class BrowserProvider {
       if (this.#context !== undefined) {
         throw new BrowserTargetModeConflictError("Stop the Browser Provider before changing its target.");
       }
+      await this.retireContexts();
       this.#targetMode = next;
+      this.#desiredRoute = { mode: "direct" };
     });
   }
 
@@ -644,8 +690,40 @@ export class BrowserProvider {
     this.#downloadHandler = handler;
   }
 
-  private async startNow(): Promise<void> {
+  private assertStartAuthority(options?: BrowserStartOptions): void {
+    options?.signal?.throwIfAborted();
+    options?.assertCurrent?.();
+  }
+
+  private hasUnretiredProxy(): boolean {
+    return [...this.#nativeContexts.values()].some(record => record.route.mode === "proxied");
+  }
+
+  private retireContext(context: BrowserContext): Promise<void> {
+    const record = this.#nativeContexts.get(context);
+    if (record === undefined) return Promise.resolve();
+    if (record.retirement !== undefined) return record.retirement;
+    record.gate?.beginRetirement();
+    const retirement = (async () => {
+      try { await context.close(); }
+      catch { this.#routeBlocked = true; throw new Error("The owned Browser writer retirement is unconfirmed; stop it before retrying."); }
+      await record.gate?.dispose();
+      this.#nativeContexts.delete(context);
+    })();
+    record.retirement = retirement;
+    void retirement.catch(() => { if (record.retirement === retirement) delete record.retirement; });
+    return retirement;
+  }
+
+  private async retireContexts(): Promise<void> {
+    await Promise.all([...this.#nativeContexts.keys()].map(context => this.retireContext(context)));
+  }
+
+  private async startNow(route = this.#desiredRoute, options?: BrowserStartOptions): Promise<void> {
     if (this.#context !== undefined) return;
+    this.assertStartAuthority(options);
+    if (route.mode === "proxied" && this.#targetMode !== "external") throw new BrowserTargetModeConflictError("Proxy startup requires the external managed Browser.");
+    this.#desiredRoute = route;
     const lifecycleEpoch = this.#lifecycleEpoch;
     const profileDirectory = this.#profileDirectories[this.#targetMode];
     await Promise.all([
@@ -665,23 +743,50 @@ export class BrowserProvider {
       headless: this.#targetMode === "sidebar",
       acceptDownloads: true,
       downloadsPath: this.#options.downloadDirectory,
-      args: [...(this.#options.launchArgs ?? [])]
+      args: [...(this.#options.launchArgs ?? []), ...buildBrowserProxyLaunchArgs(route)]
     });
-    if (lifecycleEpoch !== this.#lifecycleEpoch) {
-      void context.close().catch(() => undefined);
-      throw new BrowserLeaseConflictError("Browser start was superseded by recovery.");
+    const gate = route.mode === "direct" ? undefined
+      : (this.#options.createProxyRequestGate?.(context, route, () => this.proxyGateFailed(context, lifecycleEpoch))
+        ?? new BrowserProxyRequestGate(context, route, () => this.proxyGateFailed(context, lifecycleEpoch)));
+    this.#nativeContexts.set(context, { route, ...(gate === undefined ? {} : { gate }) });
+    const onAbort = () => this.proxyGateFailed(context, lifecycleEpoch);
+    options?.signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      this.assertStartAuthority(options);
+      if (lifecycleEpoch !== this.#lifecycleEpoch) throw new BrowserLeaseConflictError("Browser start was superseded by recovery.");
+      await gate?.start();
+      this.assertStartAuthority(options);
+      if (lifecycleEpoch !== this.#lifecycleEpoch || (gate !== undefined && !gate.active)) throw new BrowserLeaseConflictError("Browser start was superseded or its request gate failed.");
+      this.#generation += 1;
+      this.#generationAbort = new AbortController();
+      this.#context = context;
+      this.#route = route;
+      this.#desiredRoute = route;
+      this.#routeBlocked = false;
+      context.on("page", (page) => this.bindPage(page));
+      for (const page of context.pages()) this.bindPage(page);
+      await this.emit({ at: Date.now(), type: "started", detail: `Browser generation ${this.#generation} started.` });
+    } catch (error) {
+      if (route.mode === "proxied") this.#routeBlocked = true;
+      if (this.#context === context) this.detachContext();
+      await this.retireContext(context);
+      throw error;
+    } finally {
+      options?.signal?.removeEventListener("abort", onAbort);
     }
-    this.#generation += 1;
-    this.#generationAbort = new AbortController();
-    this.#context = context;
-    context.on("page", (page) => this.bindPage(page));
-    for (const page of context.pages()) this.bindPage(page);
-    await this.emit({ at: Date.now(), type: "started", detail: `Browser generation ${this.#generation} started.` });
+  }
+
+  private proxyGateFailed(context: BrowserContext, lifecycleEpoch: number): void {
+    if (!this.#nativeContexts.has(context)) return;
+    if (this.#context === context) { this.#lifecycleEpoch += 1; this.detachContext(); this.#routeBlocked = true; }
+    else if (lifecycleEpoch === this.#lifecycleEpoch) { this.#lifecycleEpoch += 1; this.#routeBlocked = true; }
+    void this.retireContext(context).catch(() => undefined);
   }
 
   private detachContext(): BrowserContext | undefined {
     const context = this.#context;
     this.#context = undefined;
+    this.#route = undefined;
     for (const htmlContext of this.#htmlContexts) void htmlContext.close().catch(() => undefined);
     this.#htmlContexts.clear();
     this.#htmlPageOwners.clear();
@@ -1847,6 +1952,7 @@ export class BrowserProvider {
     return this.withAgentControl(fence, async () => {
       const page = this.requirePageNow(safePageId);
       assertBrowserPageContentReadable(page);
+      if (this.#route?.mode === "proxied") throw new Error("Resource saving is unavailable while the Browser uses a proxy.");
       const response = await page.context().request.get(safeUrl, { timeout: MAXIMUM_WAIT_MILLISECONDS });
       return resourceFromResponse(response, safeMaximum);
     });
@@ -2091,6 +2197,7 @@ export class BrowserProvider {
   }
 
   private requireContext(): BrowserContext {
+    if (this.#routeBlocked) throw new Error("The Browser launch route is unknown; start or stop it before other actions.");
     if (this.#context === undefined) throw new Error("Browser provider is not running.");
     return this.#context;
   }

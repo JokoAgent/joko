@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
   GetSnapshotResponseSchema,
+  GitSafetyMode,
   ListManagedModelRuntimesResponseSchema,
   ManagedProcessPriority,
   OperationState,
@@ -30,7 +31,7 @@ describe("runtime governance gateway", () => {
           version: { revision: { value: 8n } }
         },
         gitSafety: {
-          autoSnapshotEnabled: true,
+          mode: GitSafetyMode.ALL_PROJECTS,
           pendingTurns: 1,
           trackedSessions: 2,
           trackedRepositories: 1,
@@ -56,7 +57,7 @@ describe("runtime governance gateway", () => {
       revision: 8n
     });
     expect(snapshot.settings.gitSafety).toMatchObject({
-      autoSnapshotEnabled: true,
+      mode: "all-projects",
       pendingTurns: 1,
       trackedSessions: 2,
       trackedRepositories: 1,
@@ -86,7 +87,7 @@ describe("runtime governance gateway", () => {
       workerHardLimit: 9,
       workerIdleReleaseMinutes: 20
     });
-    await gateway.updateGitSafetySettings({ autoSnapshotEnabled: true });
+    await gateway.updateGitSafetySettings({ mode: "all-projects" });
     await gateway.cleanupGitSafetySavepoints();
 
     expect(payloads).toEqual([
@@ -114,7 +115,7 @@ describe("runtime governance gateway", () => {
       }),
       expect.objectContaining({
         case: "updateGitSafetySettings",
-        value: expect.objectContaining({ patch: expect.objectContaining({ autoSnapshotEnabled: true, resetAll: false }) })
+        value: expect.objectContaining({ patch: expect.objectContaining({ mode: GitSafetyMode.ALL_PROJECTS, resetAll: false }) })
       }),
       expect.objectContaining({ case: "cleanupGitSafetySavepoints" })
     ]);

@@ -116,6 +116,8 @@ export interface AndroidDeviceSnapshot {
   readonly nodesTruncated: boolean;
   readonly capturedAt: number;
   readonly uiDumpError?: string;
+  /** Complete, credential-redacted XML; private until the task bridge publishes it. */
+  readonly rawUiXml?: string;
 }
 
 export type AndroidKey =

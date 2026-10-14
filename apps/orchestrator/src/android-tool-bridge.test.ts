@@ -1,4 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import { OperationalStore } from "@joko/store";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ArtifactStore } from "./artifact-store.js";
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import type { BridgeToolCallContext } from "./mcp-router.js";
 
 import {
   ANDROID_TOOL_NAMES,
@@ -19,6 +26,88 @@ const context = {
 } as const;
 
 describe("AndroidToolBridgeProvider", () => {
+  it("publishes complete XML through inline text or a paged task Artifact", async () => {
+    for (const xml of ["<hierarchy><node text=\"Complete observation\"/></hierarchy>", `<hierarchy>${"<node/>".repeat(90_000)}</hierarchy>`]) {
+      const fake = providerFixture({ content: [{ type: "text", text: '{"ok":true}' }], rawUiXml: xml });
+      const ingestBytes = vi.fn(async (bytes: Uint8Array) => ({ id: "ui-xml", sha256: "a".repeat(64), byteLength: bytes.byteLength, mimeType: "application/xml" }));
+      const store = { getSession: () => ({ descriptor: { targetId: context.targetId, binding: { generation: context.generation } } }),
+        findPendingSessionLifecycleCleanup: () => undefined, runOperation: (_input: unknown, callback: () => unknown) => ({ value: callback() }) } as unknown as OperationalStore;
+      const bridge = new AndroidToolBridgeProvider({ provider: () => fake.provider, enabledForNewSessions: () => true,
+        store, artifacts: { maximumBlobBytes: 10 * 1024 * 1024, ingestBytes, readBlob: async () => { throw new Error("unused"); } } });
+      const result = await bridge.callTool("call_tool", { name: "get_device_state", args: {} }, undefined, context);
+      const readable = xml.length < 480 * 1024;
+      expect(result.content.some((part) => (part as { text?: string }).text?.includes(`Complete Android UI XML:\n${xml}`))).toBe(readable);
+      expect(JSON.parse((result.content.at(-1) as { text: string }).text)).toMatchObject({ xml_model_readable: true, xml_inline_complete: readable });
+      expect(Buffer.from(ingestBytes.mock.calls[0]![0]).toString("utf8")).toBe(xml);
+      expect(result).toMatchObject({ hostArtifacts: [{ blob: { id: "ui-xml" } }] });
+    }
+  });
+
+  it("reads complete task XML after restart with durable ownership, safe Unicode pages, and verified Artifact bytes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-android-xml-"));
+    const database = join(root, "state.db");
+    let store = new OperationalStore(database);
+    const xml = `<hierarchy>${"x".repeat(16_383 - "<hierarchy>".length)}🎵${"y".repeat(520_000)}</hierarchy>`;
+    const fake = providerFixture({ content: [{ type: "text", text: '{"ok":true}' }], rawUiXml: xml });
+    const artifactStore = () => new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] });
+    let artifacts = artifactStore();
+    try {
+      store.upsertBackend({ id: "pi", displayName: "Pi", version: "test", health: "healthy", adapterKind: "fixture",
+        instanceGeneration: 0, installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+      store.upsertTarget({ id: context.targetId, backendId: "pi", displayName: "Workspace", workspaceRoot: root, managed: false, trusted: true });
+      for (const id of [context.sessionId, "foreign-session"]) store.createSession({ id, backendId: "pi", targetId: context.targetId, title: id,
+        binding: { opaqueRef: `${id}.jsonl`, generation: context.generation }, pinned: false, archived: false,
+        permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+      await artifacts.initialize();
+      const first = new AndroidToolBridgeProvider({ provider: () => fake.provider, enabledForNewSessions: () => true, store, artifacts });
+      const captured = await first.callTool("call_tool", { name: "get_device_state", args: {} }, undefined, context);
+      const metadata = JSON.parse((captured.content.at(-1) as { text: string }).text) as { raw_ui_dump_artifact: { id: string }; xml_inline_complete: boolean; xml_model_readable: boolean };
+      expect(metadata.xml_model_readable).toBe(true);
+      expect(metadata.xml_inline_complete).toBe(false);
+      const id = metadata.raw_ui_dump_artifact.id;
+      store.close();
+      store = new OperationalStore(database);
+      artifacts = artifactStore();
+      await artifacts.initialize();
+      const readBlob = vi.spyOn(artifacts, "readBlob");
+      const resumed = new AndroidToolBridgeProvider({ provider: () => fake.provider, enabledForNewSessions: () => false, store, artifacts });
+      const read = (args: object, owner: BridgeToolCallContext = context) => resumed.callTool("call_tool", { name: "get_device_state", args }, undefined, owner);
+      expect(await read({ xml_artifact_id: id }, { ...context, sessionId: "foreign-session" })).toMatchObject({ isError: true });
+      expect(readBlob).not.toHaveBeenCalled();
+      expect(await read({ xml_artifact_id: id, xml_offset: 16_384 })).toMatchObject({ isError: true });
+      expect(await read({ xml_artifact_id: id, xml_offset: 16_383, xml_limit: 1 })).toMatchObject({ isError: true });
+      let offset = 0;
+      let complete = "";
+      for (let page = 0; page < 40; page += 1) {
+        const result = await read({ xml_artifact_id: id, xml_offset: offset });
+        const value = textPayload(result) as { data: { xml_text: string; next_xml_offset: number; xml_eof: boolean } };
+        expect(result.isError).toBe(false);
+        expect(value.data.xml_text.length).toBeLessThanOrEqual(16 * 1024);
+        complete += value.data.xml_text;
+        if (value.data.xml_eof) break;
+        expect(value.data.next_xml_offset).toBeGreaterThan(offset);
+        offset = value.data.next_xml_offset;
+      }
+      expect(complete).toBe(xml);
+      expect(fake.callTool).toHaveBeenCalledTimes(1);
+      expect(await read({ xml_artifact_id: id }, { ...context, generation: 5 })).toMatchObject({ isError: true });
+      const record = await artifacts.get(id);
+      await writeFile(record.storagePath, Buffer.alloc(record.byteLength, 0x78));
+      expect(await read({ xml_artifact_id: id })).toMatchObject({ isError: true });
+    } finally { store.close(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("does not publish a late XML Artifact after the task generation retires", async () => {
+    let generation: number = context.generation;
+    const fake = providerFixture({ content: [], rawUiXml: "<hierarchy/>" });
+    const bridge = new AndroidToolBridgeProvider({ provider: () => fake.provider, enabledForNewSessions: () => true,
+      store: { getSession: () => ({ descriptor: { targetId: context.targetId, binding: { generation } } }), findPendingSessionLifecycleCleanup: () => undefined } as unknown as OperationalStore,
+      artifacts: { maximumBlobBytes: 10 * 1024 * 1024, readBlob: async () => { throw new Error("unused"); }, ingestBytes: async (bytes) => {
+        generation += 1;
+        return { id: "retired", sha256: "a".repeat(64), byteLength: bytes.byteLength, mimeType: "application/xml" };
+      } } });
+    await expect(bridge.callTool("call_tool", { name: "get_device_state", args: {} }, undefined, context)).rejects.toThrow("owner is no longer active");
+  });
   it("exposes only the discovery and dispatch tools and gates future snapshots", () => {
     let enabled = false;
     const fake = providerFixture();

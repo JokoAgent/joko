@@ -20,6 +20,33 @@ afterEach(() => {
 });
 
 describe("RuntimeGovernanceSettingsRepository", () => {
+  it("uses existing-git by default and fences every explicit mode and reset by revision", () => {
+    const store = new OperationalStore(":memory:");
+    try {
+      const repository = new RuntimeGovernanceSettingsRepository({ store });
+      const initial = repository.gitSafetySnapshot();
+      expect(initial.value).toEqual({ mode: "existing-git" });
+      const changed = repository.updateGitSafety({ mode: "all-projects" }, initial.revision);
+      expect(repository.updateGitSafety({ mode: "all-projects" }, changed.revision).revision).toBe(changed.revision);
+      expect(() => repository.updateGitSafety({ mode: "off" }, initial.revision)).toThrow(RevisionConflictError);
+      expect(repository.resetGitSafety(changed.revision).value).toEqual({ mode: "existing-git" });
+    } finally { store.close(); }
+  });
+
+  it.each([
+    { format: 1, autoSnapshotEnabled: true },
+    { format: 1, mode: "existing-git", autoSnapshotEnabled: false },
+    { format: 1, mode: "unknown" },
+    { format: 1 },
+    { format: 1, mode: false }
+  ])("rejects a stored Git policy outside the exact current v1 mode shape", value => {
+    const store = new OperationalStore(":memory:");
+    try {
+      store.setSetting("service", "orchestrator", GIT_SAFETY_SETTING_KEY, value);
+      expect(() => new RuntimeGovernanceSettingsRepository({ store })).toThrow(/Git safety/iu);
+    } finally { store.close(); }
+  });
+
   it("persists every governance setting group on the current schema across restart", () => {
     const directory = mkdtempSync(join(tmpdir(), "joko-runtime-governance-"));
     directories.push(directory);
@@ -29,7 +56,7 @@ describe("RuntimeGovernanceSettingsRepository", () => {
     expect(store.health().schemaVersion).toBe(SCHEMA_VERSION);
     repository.updateAgentResource({ maxConcurrentCommands: 7, processPriority: "low", capToolchainThreads: true });
     repository.updateCollaboration({ workerSoftLimit: 3, workerHardLimit: 6, workerIdleReleaseMinutes: 15 });
-    repository.updateGitSafety({ autoSnapshotEnabled: true });
+    repository.updateGitSafety({ mode: "all-projects" });
     store.close();
 
     store = new OperationalStore(path);
@@ -37,7 +64,7 @@ describe("RuntimeGovernanceSettingsRepository", () => {
     expect(repository.snapshot()).toMatchObject({
       agentResource: { value: { maxConcurrentCommands: 7, processPriority: "low", capToolchainThreads: true } },
       collaboration: { value: { workerSoftLimit: 3, workerHardLimit: 6, workerIdleReleaseMinutes: 15 } },
-      gitSafety: { value: { autoSnapshotEnabled: true } }
+      gitSafety: { value: { mode: "all-projects" } }
     });
     expect(store.health().schemaVersion).toBe(SCHEMA_VERSION);
     store.close();

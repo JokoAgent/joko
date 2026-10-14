@@ -4708,7 +4708,7 @@ export interface CollaborationSettingsView {
 }
 
 export interface GitSafetySettingsView {
-  readonly autoSnapshotEnabled: boolean;
+  readonly mode: "off" | "existing-git" | "all-projects";
   readonly pendingTurns: number;
   readonly trackedSessions: number;
   readonly trackedRepositories: number;
@@ -6699,7 +6699,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
     "maxConcurrentCommands" | "processPriority" | "capToolchainThreads">> | { readonly resetAll: true }): Promise<void>;
   updateCollaborationSettings(patch: Partial<Pick<CollaborationSettingsView,
     "workerSoftLimit" | "workerHardLimit" | "workerIdleReleaseMinutes">> | { readonly resetAll: true }): Promise<void>;
-  updateGitSafetySettings(patch: { readonly autoSnapshotEnabled: boolean } | { readonly resetAll: true }): Promise<void>;
+  updateGitSafetySettings(patch: { readonly mode: GitSafetySettingsView["mode"] } | { readonly resetAll: true }): Promise<void>;
   cleanupGitSafetySavepoints(): Promise<void>;
   predictNextPrompt(sessionId: string, expectedLastActivityAt: number, expectedGeneration: bigint, signal: AbortSignal): Promise<string>;
   setSilentEncryptedRetryEnabled(enabled: boolean): Promise<void>;
@@ -6824,7 +6824,7 @@ export function emptySnapshot(): AppSnapshot {
         revision: 0n
       },
       gitSafety: {
-        autoSnapshotEnabled: false,
+        mode: "existing-git",
         pendingTurns: 0,
         trackedSessions: 0,
         trackedRepositories: 0,

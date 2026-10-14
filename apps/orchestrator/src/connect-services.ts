@@ -13467,14 +13467,13 @@ function settingsSnapshot(dependencies: ConnectServiceDependencies): contract.Se
       )
     }),
     gitSafety: create(contract.GitSafetySettingsSchema, {
-      autoSnapshotEnabled: gitSafetySetting?.value.autoSnapshotEnabled
-        ?? DEFAULT_GIT_SAFETY_SETTINGS.autoSnapshotEnabled,
+      mode: toProtoGitSafetyMode(gitSafetySetting?.value.mode ?? DEFAULT_GIT_SAFETY_SETTINGS.mode),
       pendingTurns: gitSafetyStatus.pendingTurns,
       trackedSessions: gitSafetyStatus.trackedSessions,
       trackedRepositories: gitSafetyStatus.trackedRepositories,
       cleanupAvailable: gitSafetyStatus.cleanupAvailable,
       customized: gitSafetySetting === undefined ? false :
-        gitSafetySetting.value.autoSnapshotEnabled !== DEFAULT_GIT_SAFETY_SETTINGS.autoSnapshotEnabled,
+        gitSafetySetting.value.mode !== DEFAULT_GIT_SAFETY_SETTINGS.mode,
       version: toProtoEntityVersion(
         gitSafetySetting?.revision ?? health.revision,
         0,
@@ -18542,10 +18541,11 @@ async function dispatchMutation(
       }
       const patch = payload.value.patch;
       if (patch === undefined) throw invalidArgument("update_git_safety_settings.patch is required");
-      const hasField = patch.autoSnapshotEnabled !== undefined;
+      const hasField = patch.mode !== undefined;
       if (patch.resetAll === hasField) {
-        throw invalidArgument("Specify reset_all or auto_snapshot_enabled, but not both");
+        throw invalidArgument("Specify reset_all or mode, but not both");
       }
+      const mode = patch.mode === undefined ? undefined : fromProtoGitSafetyMode(patch.mode);
       const execution = await host.mutate({
         operationId,
         connection,
@@ -18553,7 +18553,7 @@ async function dispatchMutation(
         body: mutation,
         commit: () => {
           if (patch.resetAll) repository.resetGitSafety();
-          else repository.updateGitSafety({ autoSnapshotEnabled: patch.autoSnapshotEnabled! });
+          else repository.updateGitSafety({ mode: mode! });
           return { accepted: true, resultCase: "settings" } satisfies OperationOutcome;
         }
       });
@@ -23890,5 +23890,23 @@ function languageForPath(path: string): string {
     case "dockerfile": return "dockerfile";
     case "makefile": case "mk": return "makefile";
     default: return "";
+  }
+}
+
+function toProtoGitSafetyMode(mode: import("@joko/git-safety").GitSafetyMode): contract.GitSafetyMode {
+  switch (mode) {
+    case "off": return contract.GitSafetyMode.OFF;
+    case "existing-git": return contract.GitSafetyMode.EXISTING_GIT;
+    case "all-projects": return contract.GitSafetyMode.ALL_PROJECTS;
+    default: throw invalidArgument("Git safety mode is invalid");
+  }
+}
+
+function fromProtoGitSafetyMode(mode: contract.GitSafetyMode): import("@joko/git-safety").GitSafetyMode {
+  switch (mode) {
+    case contract.GitSafetyMode.OFF: return "off";
+    case contract.GitSafetyMode.EXISTING_GIT: return "existing-git";
+    case contract.GitSafetyMode.ALL_PROJECTS: return "all-projects";
+    default: throw invalidArgument("Git safety mode is required and must be known");
   }
 }

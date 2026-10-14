@@ -228,6 +228,42 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it("bootstraps only admitted ordinary local projects before native creation and replays without a second effect", async () => {
+    const bootstrap = vi.fn(async ({ assertCurrent }: { readonly assertCurrent: () => void }) => {
+      assertCurrent();
+      expect(f.store.getOperation("bootstrap-create").status).toBe("started");
+      expect(nativeCreate).not.toHaveBeenCalled();
+    });
+    const f = await createFixture(new FakeBackendAdapter(PI_LIKE_PROFILE), { prepareProjectGit: bootstrap });
+    const nativeCreate = vi.spyOn(f.adapter, "createSession");
+    const registered = f.store.getTarget("target-one");
+    f.store.upsertTarget({ ...registered.descriptor, managed: false });
+    const input = { operationId: "bootstrap-create", connection: f.connection, targetId: "target-one", title: "Project",
+      permissionMode: "ask" as const, planMode: false, fastMode: false };
+    await f.host.createSession(input);
+    await f.host.createSession(input);
+    expect(bootstrap).toHaveBeenCalledOnce();
+    expect(nativeCreate).toHaveBeenCalledOnce();
+    f.store.upsertTarget({ ...f.store.getTarget("target-one").descriptor, managed: true });
+    await f.host.createSession({ ...input, operationId: "dialogue-no-init" });
+    expect(bootstrap).toHaveBeenCalledOnce();
+  });
+
+  it("rejects creation authority drift during bootstrap before any native Session is created", async () => {
+    const bootstrap = vi.fn(async ({ assertCurrent }: { readonly assertCurrent: () => void }) => {
+      const target = f.store.getTarget("target-one");
+      f.store.upsertTarget({ ...target.descriptor, displayName: "Changed target" });
+      assertCurrent();
+    });
+    const f = await createFixture(new FakeBackendAdapter(PI_LIKE_PROFILE), { prepareProjectGit: bootstrap });
+    f.store.upsertTarget({ ...f.store.getTarget("target-one").descriptor, managed: false });
+    const nativeCreate = vi.spyOn(f.adapter, "createSession");
+    await expect(f.host.createSession({ operationId: "bootstrap-drift", connection: f.connection, targetId: "target-one", title: "Drift",
+      permissionMode: "ask", planMode: false, fastMode: false })).rejects.toBeInstanceOf(OperationPreviouslyFailedError);
+    expect(JSON.stringify(f.store.getOperation("bootstrap-drift").error)).toMatch(/revision/iu);
+    expect(nativeCreate).not.toHaveBeenCalled();
+  });
+
   it("keeps trusted task sender provenance on canonical input and strips forged native senders", async () => {
     const adapter = new class extends FakeBackendAdapter {
       override async send(input: PromptInput, context: AdapterContext): Promise<void> {
@@ -15193,6 +15229,7 @@ async function createFixture(
   adapter: FakeBackendAdapter = new FakeBackendAdapter(PI_LIKE_PROFILE),
   hostOptions: {
     readonly workspaceCapture?: WorkspaceRunCapture;
+    readonly prepareProjectGit?: NonNullable<ConstructorParameters<typeof SessionHost>[3]>["prepareProjectGit"];
     readonly partnerLearning?: PartnerLearningHostPort;
     readonly registerPartnerLearningToolAuthority?: (authority: PartnerLearningToolAuthority) => string;
     readonly worktrees?: SessionWorktreeCoordinator;

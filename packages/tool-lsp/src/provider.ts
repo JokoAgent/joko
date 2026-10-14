@@ -21,6 +21,7 @@ import type {
   LspRange,
   LspReferenceItem,
   LspReferencesResult,
+  LspReferencesRequest,
   LspToolAction,
   LspToolRequest,
   LspToolResponse,
@@ -122,7 +123,7 @@ export class TypeScriptLspBridge {
       .then((result) => result as LspDefinitionResult);
   }
 
-  findReferences(request: LspPositionRequest, options?: LspCallOptions): Promise<LspReferencesResult> {
+  findReferences(request: LspReferencesRequest, options?: LspCallOptions): Promise<LspReferencesResult> {
     return this.execute({ ...request, action: "find_references" }, options)
       .then((result) => result as LspReferencesResult);
   }
@@ -201,6 +202,7 @@ export class TypeScriptLspBridge {
     request: LspToolRequest,
     control: LspOperationControl
   ): LspToolResponse {
+    if (request.action !== "workspace_symbol") workspace.resetProject();
     switch (request.action) {
     case "hover": return this.executeHover(workspace, request, control);
     case "goto_definition": return this.executeDefinition(workspace, request, control);
@@ -276,10 +278,13 @@ export class TypeScriptLspBridge {
   ): LspReferencesResult {
     const maximum = maximumResults(request.maxResults, DEFAULT_REFERENCE_RESULTS);
     const position = workspace.resolvePosition(request.file, request.line, request.column, control);
-    const references = workspace.run(
+    const groups = workspace.run(
       control,
-      (service) => service.getReferencesAtPosition(position.fileName, position.offset) ?? []
+      (service) => service.findReferences(position.fileName, position.offset) ?? []
     );
+    const declarations = new Set(groups.map(({ definition }) => `${definition.fileName}\0${definition.textSpan.start}\0${definition.textSpan.length}`));
+    const references = groups.flatMap(({ references }) => references).filter((reference) => request.includeDeclaration === true
+      || !declarations.has(`${reference.fileName}\0${reference.textSpan.start}\0${reference.textSpan.length}`));
     const projection = new WorkspaceProjection(workspace, control);
     const items: LspReferenceItem[] = [];
     for (const reference of references) {
@@ -342,10 +347,12 @@ export class TypeScriptLspBridge {
   ): LspWorkspaceSymbolResult {
     const maximum = maximumResults(request.maxResults, DEFAULT_WORKSPACE_SYMBOL_RESULTS);
     const query = validateQuery(request.query);
+    workspace.selectProject(request.anchorFile, control);
     const queryLimit = maximum === MAXIMUM_RESULTS ? maximum : maximum + 1;
     const symbols = workspace.run(
       control,
-      (service) => service.getNavigateToItems(query, queryLimit, undefined, false, true)
+      (service) => query === "" ? workspace.projectSymbols(service, control, queryLimit)
+        : service.getNavigateToItems(query, queryLimit, undefined, false, true)
     );
     const projection = new WorkspaceProjection(workspace, control);
     const items: LspWorkspaceSymbolItem[] = [];
@@ -545,12 +552,13 @@ function validateRequest(request: LspToolRequest): LspToolRequest {
   const action = candidate["action"];
   if (!isAction(action)) throw new LspToolError("INVALID_ARGUMENT", "The LSP action is unsupported.", { field: "action" });
   const allowed = new Set(["action", "workspaceRoot", "maxResults"]);
-  if (action === "workspace_symbol") allowed.add("query");
+  if (action === "workspace_symbol") { allowed.add("query"); allowed.add("anchorFile"); }
   else {
     allowed.add("file");
     if (action !== "outline") {
       allowed.add("line");
       allowed.add("column");
+      if (action === "find_references") allowed.add("includeDeclaration");
     }
   }
   if (Object.keys(candidate).some((key) => !allowed.has(key))) {
@@ -560,7 +568,10 @@ function validateRequest(request: LspToolRequest): LspToolRequest {
     throw new LspToolError("INVALID_ARGUMENT", "workspaceRoot must be a string.", { field: "workspaceRoot" });
   }
   if (candidate["maxResults"] !== undefined) maximumResults(candidate["maxResults"], 1);
-  if (action === "workspace_symbol") validateQuery(candidate["query"]);
+  if (action === "workspace_symbol") {
+    validateQuery(candidate["query"]);
+    if (typeof candidate["anchorFile"] !== "string") throw new LspToolError("INVALID_ARGUMENT", "anchorFile must be a string.");
+  }
   else {
     if (typeof candidate["file"] !== "string") {
       throw new LspToolError("INVALID_ARGUMENT", "file must be a string.", { field: "file" });
@@ -568,6 +579,7 @@ function validateRequest(request: LspToolRequest): LspToolRequest {
     if (action !== "outline") {
       validateCoordinate(candidate["line"], "line");
       validateCoordinate(candidate["column"], "column");
+      if (action === "find_references" && candidate["includeDeclaration"] !== undefined && typeof candidate["includeDeclaration"] !== "boolean") throw new LspToolError("INVALID_ARGUMENT", "includeDeclaration must be boolean.");
     }
   }
   return request;
@@ -585,8 +597,9 @@ function validateCoordinate(value: unknown, field: "column" | "line"): void {
 }
 
 function validateQuery(value: unknown): string {
-  if (typeof value !== "string" || value.trim() === "" || value.length > MAXIMUM_QUERY_CHARACTERS || value.includes("\0")) {
-    throw new LspToolError("INVALID_ARGUMENT", "query must be non-empty and no longer than 1024 characters.", {
+  if (value === undefined) return "";
+  if (typeof value !== "string" || value.length > MAXIMUM_QUERY_CHARACTERS || value.includes("\0")) {
+    throw new LspToolError("INVALID_ARGUMENT", "query must be no longer than 1024 characters.", {
       field: "query",
       maximum: MAXIMUM_QUERY_CHARACTERS
     });

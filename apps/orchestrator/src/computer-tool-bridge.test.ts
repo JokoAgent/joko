@@ -505,6 +505,11 @@ class FakeComputerProvider {
     this.closeSessionRequests.push(fence);
   }
 
+  async closeProductSession(sessionId: string): Promise<void> {
+    const fence = this.openRequests.findLast((entry) => entry.sessionId === sessionId);
+    if (fence !== undefined) await this.closeSession(fence);
+  }
+
   async closeAll(): Promise<void> {
     this.closeAllCount += 1;
   }

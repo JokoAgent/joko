@@ -8,9 +8,11 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 import {
   COMPUTER_PUBLIC_TOOLS,
+  COMPUTER_POSTCHECK_ACTIONS,
   ComputerToolArgumentError,
   isComputerPublicToolName,
   normalizeComputerToolArguments,
+  computerPublicTool,
   type ComputerPublicToolName
 } from "./catalog.js";
 import { safeComputerEnvironment } from "./process-runner.js";
@@ -98,7 +100,8 @@ export class ComputerToolProviderError extends Error {
       | "invalid_arguments"
       | "catalog_too_large"
       | "driver_incompatible"
-      | "stale_snapshot",
+      | "stale_snapshot"
+      | "action_outcome_unknown",
     readonly toolName?: string,
     readonly underlying?: unknown
   ) {
@@ -118,6 +121,8 @@ interface SessionEntry {
   cursorMotion: "pending" | "applied" | "unavailable";
   cursorStyle: "pending" | "applied" | "unavailable";
   runtimeHeld: boolean;
+  goalClaimed?: boolean;
+  goalName?: string;
   driverTools?: readonly ComputerToolDescriptor[];
 }
 
@@ -126,6 +131,7 @@ type ComputerRecoveryDecision<T> =
   | { readonly handled: false };
 
 interface ComputerReconnectOptions<T> {
+  readonly mutation?: boolean;
   readonly retryTimeout?: boolean;
   readonly beforeReconnect?: (error: unknown) => Promise<ComputerRecoveryDecision<T>>;
 }
@@ -158,6 +164,8 @@ export class ComputerToolProvider {
   readonly #closings = new Map<string, Promise<void>>();
   readonly #generations = new Map<string, number>();
   #closingAll: Promise<void> | undefined;
+  #namedRunSequence = 0;
+  readonly #sessionGoals = new Map<string, string | undefined>();
 
   constructor(options: ComputerToolProviderOptions = {}) {
     this.#runtime = options.runtime ?? new ComputerRuntime({
@@ -247,6 +255,17 @@ export class ComputerToolProvider {
         }
         throw error;
       }
+      if (!["status", "check_permissions", "replay_trajectory"].includes(name) && !this.#sessionGoals.has(fence.sessionId)) {
+        entry.goalClaimed = true;
+        const goal = typeof normalized["session_goal"] === "string"
+          ? Array.from(normalized["session_goal"].replace(/[\p{Cc}\p{Cf}]/gu, " ").replace(/\s+/gu, " ").trim()).slice(0, 40).join("")
+          : "";
+        if (goal) entry.goalName = `${goal}-${++this.#namedRunSequence}`;
+        this.#sessionGoals.set(fence.sessionId, entry.goalName);
+      }
+      const claimedGoal = this.#sessionGoals.get(fence.sessionId);
+      if (claimedGoal === undefined) delete entry.goalName;
+      else entry.goalName = claimedGoal;
       return enqueue(entry, async () => this.#callPublicTool(
         entry,
         name,
@@ -269,6 +288,7 @@ export class ComputerToolProvider {
 
   async closeSession(fence: ComputerSessionFence): Promise<void> {
     const entry = this.#requireSession(fence);
+    this.#sessionGoals.delete(fence.sessionId);
     this.#sessions.delete(fence.sessionId);
     entry.closed = true;
     entry.abort.abort();
@@ -286,6 +306,7 @@ export class ComputerToolProvider {
   }
 
   async closeAll(): Promise<void> {
+    this.#sessionGoals.clear();
     const existing = this.#closingAll;
     if (existing !== undefined) return existing;
     const closing = this.#closeAllNow();
@@ -295,6 +316,12 @@ export class ComputerToolProvider {
     } finally {
       if (this.#closingAll === closing) this.#closingAll = undefined;
     }
+  }
+
+  async closeProductSession(sessionId: string): Promise<void> {
+    this.#sessionGoals.delete(sessionId);
+    const entry = this.#sessions.get(sessionId);
+    if (entry !== undefined) await this.closeSession(entry.fence);
   }
 
   async #closeAllNow(): Promise<void> {
@@ -334,7 +361,8 @@ export class ComputerToolProvider {
       snapshots: new ComputerWindowSnapshotTracker(this.#idFactory),
       cursorMotion: "pending",
       cursorStyle: "pending",
-      runtimeHeld: true
+      runtimeHeld: true,
+      ...(this.#sessionGoals.get(fence.sessionId) === undefined ? {} : { goalName: this.#sessionGoals.get(fence.sessionId)! })
     };
   }
 
@@ -382,6 +410,10 @@ export class ComputerToolProvider {
       if (error instanceof ComputerToolProviderError) throw error;
       const stale = isStaleComputerTransportError(error);
       const timedOut = isComputerTimeoutError(error);
+      if (options.mutation === true) {
+        this.#retireSessionEntry(entry);
+        throw new ComputerToolProviderError("action_outcome_unknown");
+      }
       if (stale || timedOut) {
         const decision = await options.beforeReconnect?.(error);
         if (decision?.handled === true) {
@@ -441,7 +473,8 @@ export class ComputerToolProvider {
     name: ComputerPublicToolName,
     arguments_: Record<string, unknown>,
     signal: AbortSignal | undefined,
-    workspaceRoot?: string
+    workspaceRoot?: string,
+    automaticObservation = false
   ): Promise<ComputerToolCallResult> {
     if (name === "status" || name === "check_permissions") {
       const status = await this.#runtime.status({ signal });
@@ -461,6 +494,14 @@ export class ComputerToolProvider {
 
     const stale = staleSnapshotResult(entry, name, arguments_);
     if (stale !== undefined) return stale;
+    const expected = arguments_["postcondition"];
+    arguments_ = { ...arguments_ };
+    delete arguments_["postcondition"];
+    delete arguments_["session_goal"];
+    const element = typeof arguments_["element_token"] === "string" ? entry.snapshots.element(arguments_["element_token"]) : undefined;
+    const snapshot = arguments_["snapshot_id"] ?? element?.snapshotId;
+    if (typeof snapshot === "string") arguments_["window_id"] ??= entry.snapshots.reference(snapshot)?.windowId;
+    if (expected !== undefined && typeof arguments_["window_id"] !== "number") return errorToolResult("INVALID_ARGS", { message: "Postcondition requires an exact window." });
     if (name === "verify_state") invalidateWindowObservation(entry, name, arguments_);
 
     const chunks = name === "type_text" && typeof arguments_["text"] === "string"
@@ -481,7 +522,7 @@ export class ComputerToolProvider {
           if (stale !== undefined) throw new StaleTransportError(stale);
           if (chunks !== undefined && !driverResultFailed(response)) {
             const characterCount = readInsertedCharacters(response) ?? Array.from(chunks[0] ?? "").length;
-            return aggregateTypeTextResult(characterCount, 1);
+            return aggregateTypeTextResult(characterCount, 1, Array.from(arguments_["text"] as string).length);
           }
           return response;
         }
@@ -497,9 +538,13 @@ export class ComputerToolProvider {
           if (driverResultFailed(response)) return response;
           inserted += readInsertedCharacters(response) ?? Array.from(chunk).length;
           nextChunk += 1;
+          if ((readInsertedCharacters(response) ?? Array.from(chunk).length) < Array.from(chunk).length) {
+            return aggregateTypeTextResult(inserted, nextChunk, Array.from(arguments_["text"] as string).length);
+          }
         }
-        return aggregateTypeTextResult(inserted, chunks.length);
+        return aggregateTypeTextResult(inserted, chunks.length, Array.from(arguments_["text"] as string).length);
       }, {
+        mutation: computerPublicTool(name)?.annotations?.["readOnlyHint"] !== true,
         retryTimeout: LIGHTWEIGHT_TIMEOUT_RETRY_TOOLS.has(name),
         beforeReconnect: async (error) => {
           const fallback = await this.#fallbackAfterFailure(name, arguments_, error, signal);
@@ -510,6 +555,12 @@ export class ComputerToolProvider {
       });
     } catch (error) {
       invalidateWindowObservation(entry, name, arguments_);
+      if (error instanceof ComputerToolProviderError && error.code === "action_outcome_unknown") {
+        const unknown = jsonToolResult({ ok: false, errorCode: "ACTION_OUTCOME_UNKNOWN",
+          outcome: { status: "unknown", next_step: "fresh_state" },
+          ...(chunks !== undefined && inserted > 0 ? { inserted_chars: inserted, remaining_chars: Array.from(arguments_["text"] as string).length - inserted } : {}) });
+        return this.#postcheck(entry, name, arguments_, expected, { ...unknown, isError: true }, signal);
+      }
       const fallback = await this.#fallbackAfterFailure(name, arguments_, error, signal);
       if (fallback !== undefined) return fallback;
       throw error;
@@ -531,7 +582,14 @@ export class ComputerToolProvider {
       const enriched = await this.#runtime.enrichWindows(payload, arguments_, { signal });
       return filterListWindowsResult(replaceJsonResultPayload(result, enriched), arguments_);
     }
-    if (name !== "get_window_state") return result;
+    if (name !== "get_window_state") {
+      const payload = driverResultPayload(result);
+      const declaredUnknown = (typeof payload?.["effect"] === "string" && payload["effect"] !== "confirmed")
+        || (isRecord(payload?.["outcome"]) && payload["outcome"]["status"] === "unknown");
+      return COMPUTER_POSTCHECK_ACTIONS.has(name) && (expected !== undefined || declaredUnknown)
+        ? this.#postcheck(entry, name, arguments_, expected, result, signal)
+        : result;
+    }
     const processId = arguments_["pid"];
     const windowId = arguments_["window_id"];
     if (typeof processId !== "number" || typeof windowId !== "number") return result;
@@ -540,10 +598,49 @@ export class ComputerToolProvider {
       entry.snapshots.invalidate(processId, windowId);
       return { ...result, isError: true };
     }
+    if (automaticObservation) {
+      entry.snapshots.invalidate(processId, windowId);
+      return result;
+    }
     const driverSnapshotId = readDriverSnapshotId(result);
     const snapshotId = entry.snapshots.record(processId, windowId, driverSnapshotId);
     if (driverSnapshotId !== undefined) entry.snapshots.registerAlias(snapshotId, driverSnapshotId);
     return stampSnapshotId(result, snapshotId, entry.snapshots);
+  }
+
+  async #postcheck(entry: SessionEntry, name: ComputerPublicToolName, arguments_: Record<string, unknown>,
+    expected: unknown, result: ComputerToolCallResult, signal?: AbortSignal): Promise<ComputerToolCallResult> {
+    if (!COMPUTER_POSTCHECK_ACTIONS.has(name) || signal?.aborted === true) return result;
+    const pid = arguments_["pid"];
+    const window = arguments_["window_id"];
+    const tool = typeof pid !== "number" || typeof window !== "number" ? "list_windows"
+      : expected === undefined ? "get_window_state" : "verify_state";
+    const readArgs: Record<string, unknown> = tool === "list_windows" ? { ...(typeof pid === "number" ? { pid } : {}) }
+      : { pid, window_id: window, include_screenshot: false,
+        ...(expected === undefined ? {} : { expect: expected, timeout_ms: 1_500, stable_samples: 2 }) };
+    let checked: ComputerToolCallResult;
+    try {
+      signal?.throwIfAborted();
+      const reader = entry.closed ? this.#requireSession(await this.openSession(entry.fence.sessionId, signal)) : entry;
+      invalidateWindowObservation(reader, "get_window_state", readArgs);
+      checked = await controlledPromise(this.#callPublicTool(reader, tool, readArgs,
+        AbortSignal.any([reader.abort.signal, ...(signal === undefined ? [] : [signal]), AbortSignal.timeout(2_000)]),
+        undefined, true), 2_000, signal);
+      // Automatic evidence never becomes a reusable element observation.
+      invalidateWindowObservation(reader, "get_window_state", readArgs);
+    } catch (error) {
+      if (isAbortError(error) && signal !== undefined && Boolean(signal.aborted)) throw error;
+      checked = errorToolResult("POSTCHECK_UNAVAILABLE", {});
+    }
+    const payload = driverResultPayload(result) ?? {};
+    const data = driverResultPayload(checked) ?? {};
+    const checkOutcome = computerOutcome("verify_state", data);
+    const outcome = expected !== undefined && payload["errorCode"] !== "ACTION_OUTCOME_UNKNOWN"
+      && !(typeof payload["remaining_chars"] === "number" && payload["remaining_chars"] > 0)
+      ? checkOutcome : computerOutcome(name, payload);
+    const final = jsonToolResult({ ...payload, outcome,
+      postcheck: { ok: checked.isError !== true, tool, data, reusable_snapshot: false, next_step: "get_window_state" } });
+    return { ...final, isError: result.isError === true || (expected !== undefined && outcome.status !== "confirmed") };
   }
 
   async #fallbackAfterFailure(
@@ -1240,7 +1337,7 @@ const ELEMENT_ACTION_TOOLS = new Set<ComputerPublicToolName>([
 ]);
 
 function driverSessionId(entry: SessionEntry): string {
-  const session = entry.fence.sessionId.replace(/[^A-Za-z0-9_.:-]/gu, "-").slice(0, 200);
+  const session = (entry.goalName ?? entry.fence.sessionId).replace(/[^A-Za-z0-9_.:-]/gu, "-").slice(0, 200);
   const nonce = entry.fence.token.replace(/[^A-Za-z0-9_.:-]/gu, "-").slice(0, 80);
   return `${session}-computer-${nonce}-${entry.fence.generation}-${entry.transportEpoch}`;
 }
@@ -1431,13 +1528,15 @@ function readInsertedCharacters(result: ComputerToolCallResult): number | undefi
 
 function aggregateTypeTextResult(
   inserted: number,
-  chunks: number
+  chunks: number,
+  requestedCharacters: number
 ): ComputerToolCallResult {
   return jsonToolResult({
     ok: true,
     inserted,
     chars: inserted,
     chunks,
+    ...(inserted < requestedCharacters ? { remaining_chars: requestedCharacters - inserted } : {}),
     outcome: { status: "unknown", next_step: "verify_state" }
   });
 }
@@ -1446,6 +1545,16 @@ function driverResultFailed(result: ComputerToolCallResult): boolean {
   if (result.isError === true) return true;
   const payload = driverResultPayload(result);
   return payload?.["ok"] === false || payload?.["isError"] === true || payload?.["effect"] === "refused";
+}
+
+function computerOutcome(name: string, value?: Record<string, unknown>): { status: "confirmed" | "unknown" | "failed"; next_step: "verify_state" | "fresh_state" | "done" } {
+  if (value?.["errorCode"] === "ACTION_OUTCOME_UNKNOWN" || value?.["errorCode"] === "POSTCHECK_UNAVAILABLE") return { status: "unknown", next_step: "fresh_state" };
+  if (value?.["ok"] === false || value?.["isError"] === true || value?.["effect"] === "refused") return { status: "failed", next_step: "fresh_state" };
+  if (name === "verify_state") {
+    const confirmed = value?.["status"] === "satisfied" && value["stable"] !== false;
+    return { status: confirmed ? "confirmed" : value?.["status"] === "unsatisfied" ? "failed" : "unknown", next_step: confirmed ? "done" : "fresh_state" };
+  }
+  return { status: value?.["effect"] === "confirmed" ? "confirmed" : "unknown", next_step: "verify_state" };
 }
 
 function readDriverSnapshotId(result: ComputerToolCallResult): string | undefined {
@@ -1689,6 +1798,7 @@ function providerErrorMessage(code: ComputerToolProviderError["code"], toolName?
   if (code === "stale_session") return "Computer automation Session is closed or fenced.";
   if (code === "connect_failed") return "Computer automation transport could not connect.";
   if (code === "transport_failed") return "Computer automation transport failed.";
+  if (code === "action_outcome_unknown") return "Computer automation input outcome is unknown. The input was not replayed; observe before continuing.";
   if (code === "unknown_tool") return toolName === undefined
     ? "Computer automation tool name is invalid."
     : `Computer automation tool '${toolName}' is unavailable.`;

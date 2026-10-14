@@ -184,6 +184,79 @@ export class TypeScriptWorkspace {
     return this.#files;
   }
 
+  resetProject(): void {
+    this.#host.resetProject();
+  }
+
+  selectProject(anchorFile: string, control: LspOperationControl): void {
+    const anchor = this.resolveFile(anchorFile, control);
+    let directory = dirname(anchor.fileName);
+    let configPath: string | undefined;
+    while (isWithin(directory, this.root)) {
+      control.check();
+      for (const name of ["tsconfig.json", "jsconfig.json"]) {
+        const candidate = resolve(directory, name);
+        try {
+          const info = lstatSync(candidate);
+          if (!info.isFile() || info.isSymbolicLink()) throw new LspToolError("FILE_UNSAFE", "The project configuration must be an ordinary file.");
+          configPath = candidate;
+          break;
+        } catch (error) { if (!isMissing(error)) throw error; }
+      }
+      if (configPath !== undefined || samePath(directory, this.root)) break;
+      directory = dirname(directory);
+    }
+    if (configPath === undefined) {
+      this.#host.setProject([anchor.fileName]);
+      return;
+    }
+    const readConfig = (path: string): string | undefined => {
+      control.check();
+      if (!isWithin(path, this.root)) return undefined;
+      try { return readTrustedRegularFileSync(path, this.root, MAXIMUM_GITIGNORE_BYTES, control); }
+      catch (error) { if (isMissing(error)) return undefined; throw error; }
+    };
+    const text = readConfig(configPath);
+    if (text === undefined) throw new LspToolError("FILE_NOT_FOUND", "The project configuration disappeared.");
+    const parsedText = ts.parseConfigFileTextToJson(configPath, text);
+    if (parsedText.error !== undefined) throw new LspToolError("INVALID_ARGUMENT", "The project configuration is invalid.");
+    const parsed = ts.parseJsonConfigFileContent(parsedText.config, {
+      useCaseSensitiveFileNames: ts.sys.useCaseSensitiveFileNames,
+      readFile: readConfig,
+      fileExists: (path) => isWithin(path, this.root) && readConfig(path) !== undefined,
+      readDirectory: (root, extensions, exclude, include, depth) => {
+        control.check();
+        if (!isWithin(root, this.root)) return [];
+        return ts.sys.readDirectory(root, extensions, exclude, include, depth)
+          .filter((path) => this.#fileByKey.has(pathKey(path)));
+      }
+    }, dirname(configPath), { noEmit: true }, configPath);
+    if (parsed.errors.length > 0) throw new LspToolError("INVALID_ARGUMENT", "The anchor project configuration is invalid or outside the workspace.");
+    const files = parsed.fileNames.filter((path) => this.#fileByKey.has(pathKey(path)));
+    if (!files.some((path) => samePath(path, anchor.fileName))) this.#host.setProject([anchor.fileName]);
+    else this.#host.setProject(files, parsed.options);
+  }
+
+  projectSymbols(service: ts.LanguageService, control: LspOperationControl, maximum: number): ts.NavigateToItem[] {
+    const items: ts.NavigateToItem[] = [];
+    for (const file of service.getProgram()?.getSourceFiles() ?? []) {
+      control.check();
+      if (!this.#fileByKey.has(pathKey(file.fileName))) continue;
+      const tree = service.getNavigationTree(file.fileName);
+      const stack = [...(tree.childItems ?? [])].reverse().map((item) => ({ item, container: "" }));
+      while (stack.length > 0 && items.length < maximum) {
+        const current = stack.pop()!;
+        const span = current.item.nameSpan ?? current.item.spans[0];
+        if (span !== undefined) items.push({ name: current.item.text, kind: current.item.kind,
+          kindModifiers: current.item.kindModifiers, matchKind: "exact", isCaseSensitive: true,
+          fileName: file.fileName, textSpan: span, containerName: current.container, containerKind: ts.ScriptElementKind.unknown });
+        for (const item of [...(current.item.childItems ?? [])].reverse()) stack.push({ item, container: current.item.text });
+      }
+      if (items.length >= maximum) break;
+    }
+    return items;
+  }
+
   dispose(): void {
     if (this.#disposed) return;
     this.#disposed = true;
@@ -382,7 +455,9 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
   readonly #files: readonly string[];
   readonly #fileByKey: ReadonlyMap<string, string>;
   readonly #directoryByKey: ReadonlyMap<string, string>;
-  readonly #compilerOptions: ts.CompilerOptions;
+  #compilerOptions: ts.CompilerOptions;
+  readonly #defaultCompilerOptions: ts.CompilerOptions;
+  #projectFiles: readonly string[];
   readonly #libraryRoot: string;
   #activeControl: LspOperationControl | undefined;
   #projectVersion = 0;
@@ -406,6 +481,8 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
       target: ts.ScriptTarget.ES2023,
       types: []
     });
+    this.#defaultCompilerOptions = this.#compilerOptions;
+    this.#projectFiles = scan.files;
     this.#libraryRoot = dirname(ts.getDefaultLibFilePath(this.#compilerOptions));
   }
 
@@ -431,7 +508,17 @@ class GovernedLanguageServiceHost implements ts.LanguageServiceHost {
 
   getScriptFileNames(): string[] {
     this.check();
-    return [...this.#files];
+    return [...this.#projectFiles];
+  }
+
+  setProject(files: readonly string[], options = this.#defaultCompilerOptions): void {
+    this.#projectFiles = files;
+    this.#compilerOptions = { ...options, noEmit: true };
+    this.touch();
+  }
+
+  resetProject(): void {
+    this.setProject(this.#files);
   }
 
   getScriptVersion(fileName: string): string {

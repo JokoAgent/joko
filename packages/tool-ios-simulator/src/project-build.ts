@@ -17,6 +17,8 @@ export type SimulatorProjectBuildErrorCode = "UNSUPPORTED_PLATFORM" | "INVALID_A
   "APP_BUILD_FAILED" | "APP_ARTIFACT_INVALID" | "MUTATION_CANCELLED" | "BUILD_OUTCOME_UNKNOWN";
 
 export class SimulatorProjectBuildError extends Error {
+  /** Private source-I/O retirement evidence, independent of effect certainty. */
+  writerRetired: boolean | undefined;
   constructor(readonly code: SimulatorProjectBuildErrorCode, message: string,
     readonly buildLogTail = "", readonly resultBundlePath: string | null = null,
     readonly outputTruncated = false) { super(message); }
@@ -30,6 +32,7 @@ export interface SimulatorProjectDescriptor {
 }
 
 export interface SimulatorProjectBuildResult extends SimulatorProjectDescriptor {
+  readonly writerRetired?: boolean;
   readonly scheme: string;
   readonly appPath: string;
   readonly resultBundlePath: string | null;
@@ -38,6 +41,7 @@ export interface SimulatorProjectBuildResult extends SimulatorProjectDescriptor 
 }
 
 export interface SimulatorBuildCommandResult {
+  readonly writerRetired?: boolean;
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number | null;
@@ -63,13 +67,13 @@ export function createNodeSimulatorBuildCommandRunner(
         !Number.isSafeInteger(maxBufferBytes) || maxBufferBytes < 1 || maxBufferBytes > 4 * 1024 * 1024) {
       throw new RangeError("Simulator build process budget is invalid.");
     }
-    if (signal?.aborted) return Promise.resolve({ stdout: "", stderr: "", exitCode: null, aborted: true });
+    if (signal?.aborted) return Promise.resolve({ stdout: "", stderr: "", exitCode: null, aborted: true, writerRetired: true });
     return new Promise<SimulatorBuildCommandResult>(resolveResult => {
       let child: ChildProcess;
       try { child = spawn(command, [...args], { cwd: options.cwd, env: childEnvironment,
         shell: false, windowsHide: true,
         detached: hostPlatform() === "darwin", stdio: ["ignore", "pipe", "pipe"] }); }
-      catch { resolveResult({ stdout: "", stderr: "", exitCode: null, failed: true }); return; }
+      catch { resolveResult({ stdout: "", stderr: "", exitCode: null, failed: true, writerRetired: true }); return; }
       const chunks: Array<{ readonly stream: "stdout" | "stderr"; bytes: Buffer }> = [];
       let bytes = 0;
       let timedOut = false;
@@ -79,7 +83,7 @@ export function createNodeSimulatorBuildCommandRunner(
       let settled = false;
       let stopping = false;
       let forceTimer: ReturnType<typeof setTimeout> | undefined;
-      const finish = (exitCode: number | null): void => {
+      const finish = (exitCode: number | null, writerRetired = false): void => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
@@ -89,7 +93,7 @@ export function createNodeSimulatorBuildCommandRunner(
           .map(item => item.bytes)).toString("utf8"),
           stderr: Buffer.concat(chunks.filter(item => item.stream === "stderr")
             .map(item => item.bytes)).toString("utf8"), exitCode,
-          timedOut, aborted, outputTruncated, failed });
+          timedOut, aborted, outputTruncated, failed, writerRetired });
       };
       const stop = (): void => {
         if (stopping || settled) return;
@@ -108,7 +112,7 @@ export function createNodeSimulatorBuildCommandRunner(
           child.stdout?.destroy();
           child.stderr?.destroy();
           child.unref();
-          finish(null);
+          finish(null, hostPlatform() === "darwin" ? !groupAlive() : child.exitCode !== null || child.signalCode !== null);
         }, 1_000);
       };
       const groupAlive = (): boolean => {
@@ -138,8 +142,8 @@ export function createNodeSimulatorBuildCommandRunner(
       };
       child.stdout?.on("data", (chunk: Buffer) => append("stdout", chunk));
       child.stderr?.on("data", (chunk: Buffer) => append("stderr", chunk));
-      child.once("error", () => { failed = true; if (!stopping) finish(null); });
-      child.once("close", code => { if (stopping && groupAlive()) return; finish(code); });
+      child.once("error", () => { failed = true; if (!stopping) finish(null, child.pid === undefined); });
+      child.once("close", code => { if (stopping && groupAlive()) return; finish(code, !groupAlive()); });
       signal?.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted) onAbort();
     });
@@ -268,6 +272,8 @@ export class SimulatorProjectBuilder {
   async build(input: { readonly worktreeRoot: string; readonly derivedDataPath: string;
     readonly simulatorUdid: string; readonly containerPath?: string; readonly scheme?: string;
     readonly expectedArch?: "arm64" | "x86_64"; readonly signal?: AbortSignal }): Promise<SimulatorProjectBuildResult> {
+    const observed: SimulatorBuildCommandResult[] = [];
+    try {
     cancelled(input.signal);
     if (!UUID.test(input.simulatorUdid) || input.scheme !== undefined &&
         (!input.scheme.trim() || input.scheme.length > 256 || /[\0\r\n]/u.test(input.scheme))) {
@@ -284,6 +290,7 @@ export class SimulatorProjectBuilder {
         : args;
       const result = await this.#runner.run(XCODEBUILD, commandArgs,
         { cwd: project.projectRoot, timeoutMs, maxBufferBytes, signal: input.signal });
+      observed.push(result);
       resultProblem(result, input.signal);
       return result;
     };
@@ -368,8 +375,13 @@ export class SimulatorProjectBuilder {
         "The built app artifact escaped its managed build root.", logTail(buildAttempts), availableBundle);
     }
     return { ...project, scheme, appPath, resultBundlePath: availableBundle,
+      writerRetired: observed.every(result => result.writerRetired === true),
       buildLogTail: logTail(buildAttempts),
       outputTruncated: buildAttempts.some(result => Boolean(result.outputTruncated)) };
+    } catch (error) {
+      if (error instanceof SimulatorProjectBuildError) error.writerRetired = observed.every(result => result.writerRetired === true);
+      throw error;
+    }
   }
 
   async readXcresult(resultBundlePath: string, signal?: AbortSignal): Promise<string> {
