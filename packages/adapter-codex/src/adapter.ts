@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
 import { mkdtemp, readFile, readdir, realpath, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -20,6 +20,8 @@ import {
   MEMORY_NATIVE_LIVE_LOCAL_OPTION,
   MEMORY_NATIVE_RESET_LOCAL_OPTION,
   type AdapterContext,
+  type PartnerLearningTurnHandle,
+  type PartnerLearningToolAuthority,
   type BackendDescriptor,
   type Capability,
   type CreateNativeSessionInput,
@@ -177,6 +179,7 @@ export interface CodexMcpCallLease {
   readonly signal: AbortSignal;
   readonly assertCurrent: () => void;
   readonly release: () => void;
+  readonly partnerLearningAuthority?: PartnerLearningToolAuthority;
 }
 
 export interface CodexMcpRoute {
@@ -202,7 +205,7 @@ export interface CodexMcpOpenInput {
   /** Rechecks the Adapter/Session/Target authority without requiring an installed runtime. */
   readonly assertSessionCurrent: () => void;
   /** Acquires the active native root-or-descendant turn fence for one call. */
-  readonly beginToolCall: (threadId: string) => CodexMcpCallLease;
+  readonly beginToolCall: (threadId: string, request: { readonly requestId: string; readonly serverId: string; readonly toolName: string }) => CodexMcpCallLease;
 }
 
 export interface CodexRemoteRuntimePort {
@@ -283,6 +286,7 @@ interface SessionRuntime {
   readonly dispatchLifetime: AbortController;
   context: AdapterContext;
   activeTurnContext?: AdapterContext;
+  partnerLearningTurn?: PartnerLearningTurnHandle;
   hostGeneration: number;
   subscription?: HostSubscription;
   subscriptionFlight?: Promise<HostSubscription>;
@@ -310,6 +314,7 @@ interface SessionRuntime {
     readonly planMode: boolean;
     readonly context: AdapterContext;
     readonly yieldClaim?: YieldContinuationClaim;
+    readonly partnerLearningTurn?: PartnerLearningTurnHandle;
   };
   readonly planTurnIds: Set<string>;
   readonly planTextByTurn: Map<string, string>;
@@ -334,6 +339,7 @@ interface SessionRuntime {
 }
 
 interface YieldContinuationClaim {
+  readonly partnerLearningTurn?: PartnerLearningTurnHandle;
   readonly originTurnId: string;
   readonly context: AdapterContext;
   cells: YieldedExecCell[];
@@ -1879,6 +1885,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         context,
         ...(yieldDispatch === undefined ? {} : { yieldClaim: yieldDispatch.claim })
       };
+    if (pendingTurnStart !== undefined) {
+      const partnerLearningTurn = yieldDispatch === undefined
+        ? context.capturePartnerLearningTurn?.({ nativeOccurrence: `codex:${runtime.threadId}:${randomUUID()}` })
+        : runtime.partnerLearningTurn;
+      runtime.partnerLearningTurn = partnerLearningTurn;
+      if (partnerLearningTurn !== undefined) Object.assign(pendingTurnStart, { partnerLearningTurn });
+    }
     if (pendingTurnStart !== undefined) runtime.pendingTurnStart = pendingTurnStart;
     let acceptedResponseShapePending = false;
     try {
@@ -2026,7 +2039,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           if (!claimYieldProductTerminal(runtime, yieldClaim)) return;
           this.#cancelYieldContinuation(runtime, false);
           this.#releaseManagedOperation(runtime);
-          await yieldClaim.context.emit({ type: "done", outcome: "aborted" }, {
+          await (yieldClaim.partnerLearningTurn?.emit ?? yieldClaim.context.emit)({ type: "done", outcome: "aborted" }, {
             namespace: "codex.yield_continuation",
             fields: { reason: "stopped" }
           });
@@ -2062,7 +2075,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       );
       this.#cancelPendingMcpCalls(runtime, (pending) => pending.threadId === runtime.threadId);
       this.#releaseManagedOperation(runtime);
-      await yieldClaim.context.emit({ type: "done", outcome: "aborted" }, {
+      await (yieldClaim.partnerLearningTurn?.emit ?? yieldClaim.context.emit)({ type: "done", outcome: "aborted" }, {
         namespace: "codex.yield_continuation",
         fields: { reason: "stopped" }
       });
@@ -3557,9 +3570,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             this.#assertContextTarget(context, context.target);
             scope.assertCurrent();
           },
-          beginToolCall: (requestThreadId) => {
+          beginToolCall: (requestThreadId, request) => {
             if (mcp === undefined) throw mcpUnavailable(scope.remote);
-            return this.#beginMcpCall(context.sessionId, mcp, requestThreadId);
+            return this.#beginMcpCall(context.sessionId, mcp, requestThreadId, request);
           }
         });
       }
@@ -3575,9 +3588,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #beginMcpCall(
     sessionId: string,
     expectedLease: CodexMcpRuntimeLease,
-    threadId: string
+    threadId: string,
+    request: { readonly requestId: string; readonly serverId: string; readonly toolName: string }
   ): CodexMcpCallLease {
     const runtime = this.#sessions.get(sessionId);
+    const originalTurnId = threadId === runtime?.threadId ? runtime.state.activeTurnId : undefined;
+    const learningTurn = threadId === runtime?.threadId
+      ? runtime.pendingTurnStart?.partnerLearningTurn ?? runtime.partnerLearningTurn : undefined;
     const abort = new AbortController();
     let released = false;
     let pending: PendingMcpCall;
@@ -3591,6 +3608,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       expectedLease.assertCurrent();
       const rootActive = threadId === runtime.threadId
         && runtime.state.activeTurnId !== undefined
+        && runtime.state.activeTurnId === originalTurnId
         && !runtime.state.terminalTurnIds.has(runtime.state.activeTurnId);
       if (!rootActive && !runtime.nativeTasks.ownsActiveThread(threadId)) throw mcpCallStale(runtime.remote);
     };
@@ -3607,7 +3625,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     runtime.dispatchLifetime.signal.addEventListener("abort", cancel, { once: true });
     try {
       assertCurrent();
-      return { signal: abort.signal, assertCurrent, release };
+      const partnerLearningAuthority = originalTurnId === undefined ? undefined : learningTurn?.captureToolRequest(request);
+      return { signal: abort.signal, assertCurrent, release,
+        ...(partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority }) };
     } catch (error) {
       release();
       throw error;
@@ -4163,6 +4183,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           }
           if (this.#handleRetiredYieldNotification(runtime, method, params, input.hostGeneration)) return;
           if (!this.#acceptTurnNotification(runtime, method, params)) return;
+          const learningTurn = runtime.pendingTurnStart?.partnerLearningTurn ?? runtime.partnerLearningTurn;
           observeYieldedExecNotification(runtime, method, params);
           let logicalTerminal = false;
           try {
@@ -4187,12 +4208,15 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             logicalTerminal = yieldResolution?.logicalTerminal ?? false;
             for (const event of events) {
               if (!this.#isRuntimeCurrent(runtime, input.hostGeneration)) return;
-              await runtime.context.emit(event, {
+              await (learningTurn?.emit ?? runtime.context.emit)(event, {
                 namespace: "codex.app_server",
                 fields: { method }
               });
             }
             reconcileRuntimeSettings(runtime, method, params);
+            if (events.some((event) => event.type === "done") && runtime.partnerLearningTurn === learningTurn) {
+              runtime.partnerLearningTurn = undefined;
+            }
             if (nativeTaskEffects !== undefined) {
               await this.#emitNativeTaskPayloads(
                 runtime,
@@ -4355,7 +4379,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           runtime.disconnectTerminalEmitted = true;
           this.#cancelPendingServerRequests(runtime);
           runtime.state.activeTurnId = undefined;
-          const context = runtime.context;
+          const context = runtime.activeTurnContext ?? runtime.context;
+          const emit = runtime.partnerLearningTurn?.emit ?? context.emit;
           await this.#emitNativeTaskPayloads(
             runtime,
             runtime.nativeTasks.terminateActive("failed", {
@@ -4372,7 +4397,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             false
           );
           if (ownsRootTerminal && this.#matchesCallbackFence(runtime, input.hostGeneration)) {
-            await context.emit({
+            await emit({
               type: "error",
               error: {
                 code: "CODEX_APP_SERVER_DISCONNECTED",
@@ -4385,7 +4410,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               terminal: true
             }, { namespace: "codex.app_server", fields: { state: "disconnected" } });
             if (this.#matchesCallbackFence(runtime, input.hostGeneration)) {
-              await context.emit({ type: "done", outcome: "failed" }, {
+              await emit({ type: "done", outcome: "failed" }, {
                 namespace: "codex.app_server",
                 fields: { state: "disconnected" }
               });
@@ -4525,7 +4550,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const startFailed = reason === "start_failed";
     const context = claim.context;
     if (!this.#matchesCallbackFence(runtime, hostGeneration)) return;
-    await context.emit({
+    await (claim.partnerLearningTurn?.emit ?? context.emit)({
       type: "error",
       error: {
         code: startFailed ? "CODEX_YIELD_CONTINUATION_START_FAILED" : "CODEX_YIELD_CONTINUATION_INCOMPLETE",
@@ -4543,7 +4568,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       fields: { reason, attempts: claim.attemptsStarted }
     });
     if (!this.#matchesCallbackFence(runtime, hostGeneration)) return;
-    await context.emit({ type: "done", outcome: "failed" }, {
+    await (claim.partnerLearningTurn?.emit ?? context.emit)({ type: "done", outcome: "failed" }, {
       namespace: "codex.yield_continuation",
       fields: { reason, attempts: claim.attemptsStarted }
     });
@@ -4569,13 +4594,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (runtime.yieldContinuation === claim) this.#cancelYieldContinuation(runtime, false);
     try {
       if (ownsTerminal && this.#matchesCallbackFence(runtime, hostGeneration)) {
-        await claim.context.emit({ type: "error", error: failure.publicError, terminal: true }, {
+        await (claim.partnerLearningTurn?.emit ?? claim.context.emit)({ type: "error", error: failure.publicError, terminal: true }, {
           namespace: "codex.yield_continuation",
           fields: { reason: "stop_unknown" }
         });
       }
       if (ownsTerminal && this.#matchesCallbackFence(runtime, hostGeneration)) {
-        await claim.context.emit({ type: "done", outcome: "failed" }, {
+        await (claim.partnerLearningTurn?.emit ?? claim.context.emit)({ type: "done", outcome: "failed" }, {
           namespace: "codex.yield_continuation",
           fields: { reason: "stop_unknown" }
         });
@@ -5024,7 +5049,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const resolution = resolveYieldTurnCompletion(runtime, params, translatedEvents, completedPlan);
     for (const event of resolution.events) {
       if (!this.#matchesCallbackFence(runtime, hostGeneration)) return;
-      await claim.context.emit(event, {
+      await (claim.partnerLearningTurn?.emit ?? claim.context.emit)(event, {
         namespace: "codex.app_server",
         fields: { method: "turn/completed", reconciled: true }
       });
@@ -5313,7 +5338,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       false
     ).catch(() => undefined);
     if (ownsRootTerminal && terminalContext !== undefined && revokedTurnFailure !== undefined) {
-      await terminalContext.emit({
+      await (runtime.partnerLearningTurn?.emit ?? terminalContext.emit)({
         type: "error",
         error: revokedTurnFailure,
         terminal: true
@@ -5321,7 +5346,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         namespace: "codex.app_server",
         fields: { method: "runtime/auth_revoked" }
       }).catch(() => undefined);
-      await terminalContext.emit({ type: "done", outcome: "failed" }, {
+      await (runtime.partnerLearningTurn?.emit ?? terminalContext.emit)({ type: "done", outcome: "failed" }, {
         namespace: "codex.app_server",
         fields: { method: "runtime/auth_revoked" }
       }).catch(() => undefined);
@@ -7455,6 +7480,7 @@ function resolveYieldTurnCompletion(
   if (claim === undefined && yieldedCells.length > 0) {
     const next: YieldContinuationClaim = {
       originTurnId: turnId,
+      ...(runtime.partnerLearningTurn === undefined ? {} : { partnerLearningTurn: runtime.partnerLearningTurn }),
       context: runtime.activeTurnContext ?? runtime.context,
       cells: yieldedCells,
       settledCellIds: new Set(),

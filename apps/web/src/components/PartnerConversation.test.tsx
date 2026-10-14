@@ -6,6 +6,7 @@ import type { AppController } from "../controller.js";
 import { emptySnapshot, type PartnerActivityView, type PartnerPrivateThreadView, type PartnerProfileView, type SessionView, type TimelineItemView } from "../model.js";
 import { PartnerConversationProvider, usePartnerConversation } from "./PartnerConversation.js";
 import { Timeline } from "./Timeline.js";
+import type { PartnerMemoryApi, PartnerConnectionsApi, ConnectionsDetail, PartnerLearningFeedbackView } from "@joko/contracts";
 
 vi.mock("@tanstack/react-virtual", () => ({
   defaultRangeExtractor: () => [],
@@ -49,6 +50,50 @@ afterEach(async () => {
 });
 
 describe("mounted Partner conversation", () => {
+  it.each(["memory", "skills"] as const)("opens the original %s settings from a completed assistant learning receipt", async destination => {
+    const selected = { ...partner(), capabilities: { ...partner().capabilities,
+      modelChain: [{ backendId: "backend", providerId: "provider", modelId: "model", fastMode: false }] } }, owner = { partnerId: selected.id, homeTargetId: selected.homeTargetId,
+      canonicalSessionId: selected.canonicalSessionId!, revision: 1n, readOnly: false, memoryEnabled: true };
+    const memoryApi: PartnerMemoryApi = { ownerKey: "", list: vi.fn(async () => ({ owner, groups: [], truncated: false })),
+      read: vi.fn(async () => ({ owner })), save: vi.fn(), remove: vi.fn(),
+      preferences: vi.fn(async () => ({ owner, enabled: true, userContext: "" })), savePreferences: vi.fn() };
+    const detail: ConnectionsDetail = { owner, catalogRevision: "a".repeat(64), revision: 1n, entries: [{
+      kind: "skills", id: "personal", name: "Release", available: true, inherited: false, personal: true }],
+      skills: { mode: "allowlist", ids: ["personal"] }, mcp: { mode: "inherit", ids: [] }, toolsets: { mode: "inherit", ids: [] } };
+    const connectionsApi: PartnerConnectionsApi = { ownerKey: "", read: vi.fn(async () => detail), save: vi.fn() };
+    const memory = vi.fn((_id: string, ownerKey: string) => ({ ...memoryApi, ownerKey }));
+    const skills = vi.fn((_id: string, ownerKey: string) => ({ ...connectionsApi, ownerKey }));
+    const learning: PartnerLearningFeedbackView = { revision: 2n, receipts: [{
+      kind: destination === "memory" ? "memory" : "skill", entryId: "saved", title: "Release", action: "updated" }] };
+    const app = controller({ partnerMemoryApi: memory, partnerConnectionsApi: skills, getPartner: vi.fn(async () => selected),
+      listPartners: vi.fn(async () => ({ ...(await controller().listPartners()), partners: [selected] })) });
+    const view = await mount(app, true, false,
+      [message("answer", "assistant", { text: "Done.", learning, completionCursor: 91n })]);
+    const footer = view.host.querySelector<HTMLElement>("[data-partner-learning-footer]")!;
+    expect(footer).not.toBeNull();
+    await act(async () => { footer.querySelector<HTMLButtonElement>("button")!.click(); await settle(); });
+    const factory = destination === "memory" ? memory : skills;
+    expect(factory).toHaveBeenCalledExactlyOnceWith("partner", expect.any(String));
+    if (destination === "memory") expect(document.body.textContent).toContain("No saved memories.");
+    else {
+      expect(document.body.textContent).toContain("Release");
+      expect(document.activeElement?.getAttribute("aria-label")).toBe("Skill references");
+    }
+    expect(memoryApi.save).not.toHaveBeenCalled();
+    expect(connectionsApi.save).not.toHaveBeenCalled();
+  });
+
+  it("keeps saved learning feedback on a stopped original reply without exposing it on private or streaming content", async () => {
+    const learning: PartnerLearningFeedbackView = { revision: 1n, receipts: [{ kind: "memory", entryId: "memory", title: "Clear language", action: "created" }] };
+    const original = message("answer", "assistant", { text: "Partial useful reply.", learning });
+    const view = await mount(controller(), true, false, [original, message("stop", "status", { runTerminal: "aborted" })]);
+    expect(view.host.querySelector("[data-partner-learning-footer]")?.textContent).toContain("Clear language");
+    await view.render([{ ...original, partnerPrivateOrigin: { messageId: "private", threadId: "thread", senderPartnerId: "sender",
+      recipientPartnerId: "partner", senderDisplayName: "Sender" } }]);
+    expect(view.host.querySelector("[data-partner-learning-footer]")).toBeNull();
+    await view.render([{ ...original, streaming: true }]);
+    expect(view.host.querySelector("[data-partner-learning-footer]")).toBeNull();
+  });
   it("keeps an explicit Partner route failed when its canonical relationship disappears instead of adopting an ordinary task", async () => {
     const original = controller();
     const app = controller({ state: { ...original.state, route: { kind: "session", sessionId: "session", profileId: "profile", partnerId: "partner" } },

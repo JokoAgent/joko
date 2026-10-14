@@ -21,6 +21,32 @@ import type {
 } from "./types.js";
 import type { SubagentControlInput } from "./subagents.js";
 import type { PolicySnapshot } from "./policy.js";
+import type { PartnerLearningTurnSource } from "./partner-learning.js";
+
+/** A private, original-turn tool authority. It is never accepted from model
+ * arguments or a public Session/Tool request. */
+export interface PartnerLearningToolAuthority {
+  readonly source: PartnerLearningTurnSource;
+  readonly requestId: string;
+  readonly serverId: string;
+  readonly toolName: string;
+  readonly proof?: string;
+  assertCurrent(): void;
+}
+
+/** Host-minted owner for one native foreground occurrence, including all
+ * accepted steers. Its emitter captures actual durable assistant identities. */
+export interface PartnerLearningTurnHandle {
+  readonly source: PartnerLearningTurnSource;
+  readonly emit: (payload: EventPayload, metadata?: AdapterEventMetadata) => Promise<void>;
+  captureToolRequest(input: {
+    readonly requestId: string;
+    readonly serverId: string;
+    readonly toolName: string;
+  }): PartnerLearningToolAuthority | undefined;
+  /** An Adapter-observed persistence identity, never a guessed recent reply. */
+  observeNativeReply(nativeBoundaryId: string): void;
+}
 
 export interface AdapterContext {
   readonly sessionId: SessionId;
@@ -53,6 +79,10 @@ export interface AdapterContext {
     mention: Extract<PromptInput["mentions"][number], { readonly kind: "resource" }>
   ) => void;
   readonly signal: AbortSignal;
+  readonly capturePartnerLearningTurn?: (input: {
+    readonly nativeOccurrence: string;
+    readonly nativeTurnId?: string;
+  }) => PartnerLearningTurnHandle | undefined;
   readonly emit: (payload: EventPayload, metadata?: AdapterEventMetadata) => Promise<void>;
   readonly requestInteraction: (
     interaction: InteractionPayload,

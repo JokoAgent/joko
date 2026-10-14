@@ -63,6 +63,8 @@ export * from "./partner-task-model-messages.js";
 export * from "./partner-connections-messages.js";
 export * from "./partner-skills.js";
 export * from "./partner-skills-messages.js";
+export * from "./partner-learning-presentation.js";
+export * from "./partner-learning-messages.js";
 export * from "./partner-routines.js";
 export * from "./partner-routine-editor.js";
 export * from "./partner-routine-messages.js";

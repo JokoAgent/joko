@@ -93,6 +93,7 @@ message EventPayload {
     TaskTagCatalogChangedEvent task_tag_catalog_changed = 75;
     RuntimeHandoffEvent runtime_handoff = 76;
     AppDefaultModelRequestedEvent app_default_model_requested = 77;
+    PartnerLearningChangedEvent partner_learning_changed = 78;
   }
 }
 
@@ -227,6 +228,25 @@ message MessageStartedEvent {
   ObjectiveContinuation objective_continuation = 12;
   // Host-owned provenance; absent from public InputContent.
   PartnerPrivateMessageOrigin partner_private_origin = 13;
+  // Host-owned report provenance, absent from public input and native echoes.
+  CollaborationReportOrigin collaboration_report_origin = 14;
+  TaskMessageOrigin task_message_origin = 15;
+}
+
+message TaskMessageOrigin {
+  string sender_session_id = 1;
+  optional string sender_session_title = 2;
+  optional string sender_partner_id = 3;
+  optional string sender_partner_name = 4;
+}
+
+message CollaborationReportOrigin {
+  string goal_id = 1;
+  string worker_id = 2;
+  string lead_session_id = 3;
+  string worker_session_id = 4;
+  string worker_label = 5;
+  string body = 6;
 }
 
 message PartnerPrivateMessageOrigin {
@@ -352,6 +372,39 @@ message MessageCompletedEvent {
   // transient hints only; clients reconcile them against these ordered blocks.
   repeated MessageBlock blocks = 9;
   PartnerPrivateMessageOrigin partner_private_origin = 10;
+  // Service-authored projection joined to this exact completion Event.
+  PartnerLearningFeedback learning = 11;
+}
+
+enum PartnerLearningKind {
+  PARTNER_LEARNING_KIND_UNSPECIFIED = 0;
+  PARTNER_LEARNING_KIND_MEMORY = 1;
+  PARTNER_LEARNING_KIND_SKILL = 2;
+}
+
+enum PartnerLearningAction {
+  PARTNER_LEARNING_ACTION_UNSPECIFIED = 0;
+  PARTNER_LEARNING_ACTION_CREATED = 1;
+  PARTNER_LEARNING_ACTION_UPDATED = 2;
+}
+
+message PartnerLearningReceipt {
+  PartnerLearningKind kind = 1;
+  string entry_id = 2;
+  string title = 3;
+  PartnerLearningAction action = 4;
+}
+
+message PartnerLearningFeedback {
+  repeated PartnerLearningReceipt receipts = 1;
+  Revision revision = 2;
+}
+
+// Replaces only the original message's footer. It carries no saved content.
+message PartnerLearningChangedEvent {
+  string completion_event_id = 1;
+  string message_id = 2;
+  PartnerLearningFeedback feedback = 3;
 }
 
 message MessageBlock {

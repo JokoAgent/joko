@@ -18,6 +18,7 @@ import {
   validInputMentionRanges,
   type ApprovedDirectory,
   type AdapterContext,
+  type PartnerLearningTurnHandle,
   type AdapterEventMetadata,
   type BackendAdapter,
   type BackendDescriptor,
@@ -74,6 +75,7 @@ import {
 } from "@joko/runtime-governance";
 import { provisionManagedBridge } from "./bridge.js";
 import { handleCommandGateExtensionRequest } from "./command-gate-bridge.js";
+import { capturePartnerLearningExtensionRequest, consumePartnerLearningNativeReply } from "./partner-learning-bridge.js";
 import {
   handlePolicyDecisionExtensionRequest,
   type PolicyDecisionRequest,
@@ -565,6 +567,7 @@ interface PiRuntime {
   readonly artifactDirectory: string;
   readonly redactValues: readonly string[];
   readonly resources: readonly RuntimeResource[];
+  readonly mcpTools: readonly PiMcpToolDescriptor[];
   readonly nativeSkills?: NativeSkillSnapshot;
   readonly generationLease: PiManagedGenerationLease;
   translator: PiEventTranslator;
@@ -602,6 +605,7 @@ interface PiRuntime {
 
 interface PiNativeLifecycleParticipant {
   readonly context: AdapterContext;
+  readonly partnerLearningTurn?: PartnerLearningTurnHandle;
   readonly disposition: "prompt" | "steer" | "follow_up";
   readonly message: string;
   /** Present only when the live command catalog resolved one exact managed
@@ -615,6 +619,7 @@ interface PiNativeLifecycle {
   readonly pendingSteering: PiNativeLifecycleParticipant[];
   readonly pendingFollowUps: PiNativeLifecycleParticipant[];
   currentContext: AdapterContext;
+  currentPartnerLearningTurn?: PartnerLearningTurnHandle;
   initialUserMessageSeen: boolean;
   agentStarted: boolean;
   settlementReceived: boolean;
@@ -1439,8 +1444,11 @@ export class PiBackendAdapter implements
           composerCommand.skillResourceId,
           runtime.transport.generation
         );
+    const partnerLearningTurn = input.disposition === "steer" ? undefined
+      : context.capturePartnerLearningTurn?.({ nativeOccurrence: `pi:${runtime.binding.nativeSessionId ?? runtime.key}:${randomUUID()}` });
     const participant: PiNativeLifecycleParticipant = {
-      context,
+      context: partnerLearningTurn === undefined ? context : { ...context, emit: partnerLearningTurn.emit },
+      ...(partnerLearningTurn === undefined ? {} : { partnerLearningTurn }),
       disposition: input.disposition,
       message,
       ...(skillCommandResource === undefined ? {} : { skillCommandResource })
@@ -1475,13 +1483,14 @@ export class PiBackendAdapter implements
         participants: [participant],
         pendingSteering: [],
         pendingFollowUps: [],
-        currentContext: context,
+        currentContext: participant.context,
+        ...(partnerLearningTurn === undefined ? {} : { currentPartnerLearningTurn: partnerLearningTurn }),
         initialUserMessageSeen: false,
         agentStarted: false,
         settlementReceived: false
       };
       runtime.lifecycle = lifecycle;
-      runtime.translator.setContext(context);
+      runtime.translator.setContext(participant.context);
     } else {
       const activeLifecycle = runtime.lifecycle;
       if (runtime.abortRequested || activeLifecycle === undefined || activeLifecycle.settlementReceived) {
@@ -4973,6 +4982,7 @@ export class PiBackendAdapter implements
         redactValues,
         resources: [...managedResourceSnapshot.resources, ...projectResourceSnapshot.resources,
           ...(nativeSkills?.skills.filter(mount => !mount.discovery).map(mount => ({ ...mount.seed.resource, runtimePath: mount.path })) ?? [])],
+        mcpTools: mcpBridge?.tools ?? [],
         ...(nativeSkills ? { nativeSkills } : {}),
         generationLease,
         translator: undefined as unknown as PiEventTranslator,
@@ -5116,7 +5126,16 @@ export class PiBackendAdapter implements
       const lifecycle = runtime.lifecycle;
       const runningExtensionCommand = runtime.runningExtensionCommand;
       const userShell = event.type === "bash_execution_update" ? runtime.userShell : undefined;
-      let failureContext = userShell?.context ?? runningExtensionCommand?.context ?? lifecycle?.currentContext ?? runtime.context;
+      const capturedEventContext = userShell?.context ?? (
+        runningExtensionCommand !== undefined && isExtensionUiRequest(event) ? runningExtensionCommand.context
+          : lifecycle === undefined ? runtime.context : routeLifecycleEvent(lifecycle, event)
+      );
+      const capturedLearningTurn = lifecycle?.currentPartnerLearningTurn;
+      const learningRequest = isExtensionUiRequest(event) && isCurrent()
+        ? capturePartnerLearningExtensionRequest(rawEvent, capturedLearningTurn, runtime.mcpTools) : undefined;
+      const learningReply = isExtensionUiRequest(event) && isCurrent()
+        ? consumePartnerLearningNativeReply(rawEvent, capturedLearningTurn) : false;
+      let failureContext = capturedEventContext;
       if (event.type === "agent_start" && lifecycle !== undefined) lifecycle.agentStarted = true;
       if (event.type === "agent_settled" && lifecycle !== undefined) {
         lifecycle.settlementReceived = true;
@@ -5126,13 +5145,7 @@ export class PiBackendAdapter implements
         .then(async () => {
           if (!isCurrent()) return;
           if (event.type === "agent_settled" && lifecycle === undefined) return;
-          const eventContext = userShell?.context ?? (
-            runningExtensionCommand !== undefined && isExtensionUiRequest(event)
-              ? runningExtensionCommand.context
-              : lifecycle === undefined
-                ? runtime.context
-                : routeLifecycleEvent(lifecycle, event)
-          );
+          const eventContext = capturedEventContext;
           failureContext = eventContext;
           if (userShell !== undefined) {
             const record = event as unknown as Record<string, unknown>;
@@ -5151,6 +5164,13 @@ export class PiBackendAdapter implements
               })
             );
           } else if (isExtensionUiRequest(event)) {
+            if (learningReply) return;
+            if (learningRequest !== undefined) {
+              if (learningRequest.id !== "" && !runtime.transport.closed) {
+                await runtime.transport.notify({ type: "extension_ui_response", ...learningRequest });
+              }
+              return;
+            }
             if (await handleCommandGateExtensionRequest(
               event as unknown as Record<string, unknown>,
               {
@@ -8415,6 +8435,7 @@ function routeLifecycleEvent(lifecycle: PiNativeLifecycle, event: PiRpcEvent): A
   if (!lifecycle.initialUserMessageSeen) {
     lifecycle.initialUserMessageSeen = true;
     lifecycle.currentContext = lifecycle.owner.context;
+    lifecycle.currentPartnerLearningTurn = lifecycle.owner.partnerLearningTurn;
     return lifecycle.currentContext;
   }
   const steering = takeLifecycleParticipant(lifecycle.pendingSteering);
@@ -8425,7 +8446,10 @@ function routeLifecycleEvent(lifecycle: PiNativeLifecycle, event: PiRpcEvent): A
     return lifecycle.currentContext;
   }
   const followUp = takeLifecycleParticipant(lifecycle.pendingFollowUps);
-  if (followUp !== undefined) lifecycle.currentContext = followUp.context;
+  if (followUp !== undefined) {
+    lifecycle.currentContext = followUp.context;
+    lifecycle.currentPartnerLearningTurn = followUp.partnerLearningTurn;
+  }
   return lifecycle.currentContext;
 }
 

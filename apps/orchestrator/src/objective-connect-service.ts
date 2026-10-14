@@ -88,7 +88,7 @@ export function createObjectiveConnectService(
         text: request.text,
         ...(limits?.tokenBudget === undefined ? {} : { tokenBudget: safeNumber(limits.tokenBudget, "limits.token_budget") }),
         ...(limits?.maximumTurns === undefined ? {} : { maximumTurns: limits.maximumTurns }),
-        ...(limits?.noProgressTurnLimit === undefined ? {} : { noProgressTurnLimit: limits.noProgressTurnLimit }),
+        ...(limits === undefined ? {} : { noProgressTurnLimit: limits.noProgressTurnLimit ?? null }),
         ...(request.expectedSessionGeneration === undefined
           ? {}
           : { expectedSessionGeneration: safeNumber(request.expectedSessionGeneration, "expected_session_generation") })

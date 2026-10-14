@@ -77,6 +77,7 @@ import { AUTOMATION_USER_MESSAGE_VISUAL_LINE_THRESHOLD, mayExceedUserMessageLine
 import { MessageNavRail } from "./MessageNavRail.js";
 import { PrevMessageJumpChip } from "./PrevMessageJumpChip.js";
 import { MessageUsageMeta } from "./MessageUsageMeta.js";
+import { PartnerLearningFooter } from "./PartnerLearningFooter.js";
 import { SubagentInlineCard } from "./SubagentInlineCard.js";
 import {
   PartnerDelegationInlineCard,
@@ -1487,6 +1488,10 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
   const assistantContent = <>
     <div className="markdown message-assistant__body"><StreamingMarkdown text={displayText} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
     {attachments}
+    {partnerConversation?.confirmed && partner !== undefined && !item.streaming && displayText.trim()
+      && item.partnerPrivateOrigin === undefined && <PartnerLearningFooter feedback={item.learning} locale={locale}
+        disabled={!partnerConversation.editable || selectionActive}
+        onOpen={destination => partnerConversation.openLearningSettings(destination)} />}
     {!selectionActive && !item.streaming && (showActions || partner !== undefined) && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={displayText} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer === undefined ? undefined : () => onAddMessageToComposer({ ...item, text: displayText })} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
   </>;
   return (

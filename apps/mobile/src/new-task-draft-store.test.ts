@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PermissionMode } from "@joko/contracts";
 import type { MobilePlainStorageDriver } from "./connection-storage";
 import {
   MobileNewTaskDraftStore,
@@ -42,6 +43,18 @@ function memoryDriver() {
 function input(text: string) {
   return plainTextMobileComposerDraft(text);
 }
+
+it("retains the confirmed collaboration source and marks one preparation attempt across restart", async () => {
+  const { driver } = memoryDriver(), store = new MobileNewTaskDraftStore(driver);
+  const collaboration = { role: "reviewer", targetId: "worker-project", permissionMode: PermissionMode.ASK, initialTask: "", sourceScope: "exact-source" };
+  const draft = { targetId: "project", name: "Task", input: input("Lead input"), collaboration };
+  await store.beginSubmission(first, draft, { ...authority, collaboration });
+  await store.advanceToSending(first, authority.createOperationId, "session", 7n);
+  await store.markCollaborationHandled(first, authority.createOperationId);
+  const restored = await new MobileNewTaskDraftStore(driver).read(first);
+  expect(restored?.collaboration).toEqual(collaboration);
+  expect(restored?.submission).toMatchObject({ collaboration, collaborationHandled: true, phase: "sending" });
+});
 
 function structuredInput() {
   const session = insertMobileSessionMention(
@@ -89,6 +102,18 @@ function attachedInput(state: "local" | "uploaded" = "local"): MobileComposerDra
 }
 
 describe("mobile new-task retained draft store", () => {
+  it("persists an objective-only creation and its original request through restart without a first-message owner", async () => {
+    const memory = memoryDriver(), store = new MobileNewTaskDraftStore(memory.driver);
+    const objective = { text: "Reach the result", limits: { maximumTurns: 20, tokenBudget: 500_000, noProgressTurnLimit: null } };
+    await store.beginSubmission(first, { targetId: "target-one", name: "Goal task", input: input("") }, { ...authority, objective });
+    const restored = new MobileNewTaskDraftStore(memory.driver);
+    expect((await restored.read(first))?.submission).toMatchObject({ phase: "creating", objective });
+    await restored.advanceToSending(first, authority.createOperationId, "created-task", 7n);
+    await restored.setObjectiveRequest(first, authority.createOperationId, "goal-request");
+    expect((await new MobileNewTaskDraftStore(memory.driver).read(first))?.submission)
+      .toMatchObject({ phase: "sending", objective, sessionId: "created-task", runtimeGeneration: "7", objectiveRequestId: "goal-request" });
+    await expect(restored.setObjectiveRequest(first, authority.createOperationId, "replacement-request")).rejects.toThrow("owner changed");
+  });
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 

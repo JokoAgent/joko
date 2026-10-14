@@ -8,6 +8,16 @@ import { createObjectiveConnectService } from "./objective-connect-service.js";
 import type { ObjectiveManager } from "./objective-manager.js";
 
 describe("ObjectiveService", () => {
+  it("keeps untouched defaults distinct from explicit unlimited no-progress turns", async () => {
+    const set = vi.fn(async () => objective());
+    const service = createObjectiveConnectService({ set } as unknown as ObjectiveManager, () => ({ connectionId: "connection-one" }));
+    for (const limits of [undefined, {}, { noProgressTurnLimit: 5 }]) {
+      await service.setObjective(create(contract.SetObjectiveRequestSchema, {
+        requestId: "set-limits", sessionId: "session-one", text: "Finish the task", ...(limits === undefined ? {} : { limits })
+      }), context());
+    }
+    expect(set.mock.calls.map(call => (call as unknown as [{ noProgressTurnLimit?: number | null }])[0].noProgressTurnLimit)).toEqual([undefined, null, 5]);
+  });
   it("emits an initial cleared projection even when after_revision was supplied", async () => {
     const listeners = new Set<(objective: ObjectiveRecord | undefined) => void>();
     const manager = {

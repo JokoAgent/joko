@@ -7151,6 +7151,9 @@ function eventContext(
       })
     : undefined;
   return {
+    ...(item.payload.type !== "message_complete" || item.payload.role !== "assistant" ? {} : {
+      learning: store.getPartnerLearningFeedback(item.id)
+    }),
     ...(session === undefined ? {} : { session }),
     ...(target === undefined ? {} : { target }),
     ...(run === undefined ? {} : { run, attempts: store.listAttempts(run.descriptor.id) }),

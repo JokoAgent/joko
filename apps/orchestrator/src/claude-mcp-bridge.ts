@@ -71,7 +71,8 @@ export function createClaudeMcpBridge(options: {
             serverId: call.serverId,
             toolName: call.toolName,
             arguments: call.arguments,
-            signal
+            signal,
+            ...(call.partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority: call.partnerLearningAuthority })
           });
           signal.throwIfAborted();
           assertCurrent();

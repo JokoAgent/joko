@@ -21,6 +21,9 @@ import type {
   Capability,
   DeviceContentProjection,
   EventPayload,
+  PartnerLearningFeedback,
+  PartnerLearningReceipt,
+  PartnerLearningTurnSource,
   InteractionDecision,
   PromptInput,
   PublicError,
@@ -74,6 +77,7 @@ import {
 } from "./interaction-shape.js";
 import { parseCurrentResourceUsageEventPayload } from "./resource-usage-shape.js";
 import { parseCurrentTaskTagEventPayload } from "./task-tag-shape.js";
+import { learningIdentity, learningReceipt, learningReceipts, learningSource, mergeLearningReceipts, type PartnerLearningTurnRecord } from "./partner-learning-shape.js";
 import { configureDatabase, initializeDatabase, SCHEMA_VERSION } from "./schema.js";
 import {
   projectResourceUsageStream,
@@ -4542,7 +4546,7 @@ export class OperationalStore {
         input.createOperationId,
         collaborationShortText(input.label, "worker label", 64),
         collaborationShortText(input.role, "worker role", 128),
-        collaborationText(input.assignment, "worker assignment"),
+        collaborationText(input.assignment, "worker assignment", true),
         boolInt(activeRuntimeCount + 1 >= softLimit),
         at,
         at,
@@ -4735,7 +4739,7 @@ export class OperationalStore {
         input.role === undefined ? current.role : collaborationShortText(input.role, "worker role", 128),
         input.assignment === undefined
           ? current.assignment
-          : collaborationText(input.assignment, "worker assignment"),
+          : collaborationText(input.assignment, "worker assignment", true),
         at,
         asSqlInteger(this.requireActiveRevision()),
         current.id,
@@ -10124,7 +10128,167 @@ export class OperationalStore {
     });
   }
 
+  /** Private provenance and receipts share the memory/Resource write transaction. */
+  registerPartnerLearningTurn(input: PartnerLearningTurnSource, partnerId: string): PartnerLearningTurnRecord {
+    return this.write(() => {
+      const source = learningSource(input), partner = learningIdentity(partnerId, "Partner");
+      this.assertLearningSourceCurrent(source);
+      const existing = this.getPartnerLearningTurn(source.occurrenceId);
+      if (existing) {
+        if (existing.partnerId !== partner || serializeJson(existing.source) !== serializeJson(source)) {
+          throw new StoreError("Learning occurrence already belongs to another source.");
+        }
+        return existing;
+      }
+      this.database.prepare(`INSERT INTO partner_learning_turns
+        (occurrence_id, partner_id, session_id, source_run_id, source_attempt_id, source_queue_item_id, source_json, receipts_json, revision)
+        VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?)`).run(source.occurrenceId, partner, source.sessionId, source.sourceRunId,
+          source.sourceAttemptId, source.sourceQueueItemId, serializeJson(source), asSqlInteger(this.requireActiveRevision()));
+      return this.getPartnerLearningTurn(source.occurrenceId)!;
+    });
+  }
+
+  getPartnerLearningTurn(occurrenceId: string): PartnerLearningTurnRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare("SELECT * FROM partner_learning_turns WHERE occurrence_id = ?")
+      .get(learningIdentity(occurrenceId, "occurrence")) as Row | undefined;
+    return row === undefined ? undefined : this.learningTurnFromRow(row);
+  }
+
+  findPartnerLearningTurnByCompletion(completionEventId: string): PartnerLearningTurnRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare("SELECT * FROM partner_learning_turns WHERE completion_event_id = ? ORDER BY occurrence_id LIMIT 1")
+      .get(learningIdentity(completionEventId, "completion")) as Row | undefined;
+    return row === undefined ? undefined : this.learningTurnFromRow(row);
+  }
+
+  acceptPartnerLearningTurn(occurrenceId: string): boolean {
+    return this.write(() => {
+      const turn = this.getPartnerLearningTurn(occurrenceId);
+      if (!turn) return false;
+      const queue = this.assertLearningSourceCurrent(turn.source, true);
+      if (queue.backendAcceptedAt === undefined) return false;
+      if (!turn.accepted) this.database.prepare(`UPDATE partner_learning_turns SET accepted_at = ?, revision = ? WHERE occurrence_id = ?`)
+        .run(queue.backendAcceptedAt, asSqlInteger(this.requireActiveRevision()), occurrenceId);
+      return true;
+    });
+  }
+
+  sealPartnerLearningTurn(occurrenceId: string, completionEventId: string): boolean {
+    return this.write(() => {
+      const turn = this.getPartnerLearningTurn(occurrenceId);
+      if (!turn || !turn.accepted) return false;
+      this.assertLearningSourceCurrent(turn.source, true);
+      const origin = this.findVisibleSessionMessageOrigin({ sessionId: turn.source.sessionId, eventId: completionEventId });
+      const event = origin && this.findEvent(origin.eventId);
+      if (!event || event.payload.type !== "message_complete" || event.payload.role !== "assistant"
+        || event.payload.partnerPrivateOrigin !== undefined || event.payload.automaticContinuation !== undefined
+        || event.payload.objectiveContinuation !== undefined || event.backendId !== turn.source.backendId
+        || event.targetId !== turn.source.targetId || event.generation !== turn.source.bindingGeneration) return false;
+      if (turn.completionEventId !== undefined) {
+        if (turn.completionEventId !== event.id || turn.messageId !== origin!.messageId) {
+          throw new StoreError("Learning turn cannot move to another completion.");
+        }
+        return true;
+      }
+      this.database.prepare(`UPDATE partner_learning_turns SET completion_event_id = ?, message_id = ?, revision = ? WHERE occurrence_id = ?`)
+        .run(event.id, origin!.messageId, asSqlInteger(this.requireActiveRevision()), occurrenceId);
+      this.publishPartnerLearningFeedback(event.id);
+      return true;
+    });
+  }
+
+  addPartnerLearningReceipt(occurrenceId: string, input: PartnerLearningReceipt): void {
+    this.write(() => {
+      const turn = this.getPartnerLearningTurn(occurrenceId);
+      if (!turn) throw new StoreError("Learning turn was not captured.");
+      this.assertLearningSourceCurrent(turn.source);
+      const receipts = mergeLearningReceipts(turn.receipts, [learningReceipt(input)]);
+      if (serializeJson(receipts) === serializeJson(turn.receipts)) return;
+      this.database.prepare(`UPDATE partner_learning_turns SET receipts_json = ?, revision = ? WHERE occurrence_id = ?`)
+        .run(serializeJson(receipts), asSqlInteger(this.requireActiveRevision()), occurrenceId);
+      if (turn.completionEventId !== undefined) this.publishPartnerLearningFeedback(turn.completionEventId);
+    });
+  }
+
+  /** Claim before invoking an auxiliary model; a restart never retries this claim. */
+  claimPartnerLearningReview(completionEventId: string): PartnerLearningTurnRecord | undefined {
+    return this.write(() => {
+      if (this.database.prepare("SELECT 1 FROM partner_learning_turns WHERE completion_event_id = ? AND review_claimed_at IS NOT NULL")
+        .get(completionEventId) !== undefined) return undefined;
+      const turn = this.findPartnerLearningTurnByCompletion(completionEventId);
+      if (!turn || !turn.accepted || this.getRun(turn.source.sourceRunId).descriptor.state !== "completed"
+        || this.findVisibleSessionMessageOrigin({ sessionId: turn.source.sessionId, eventId: completionEventId }) === undefined) return undefined;
+      this.assertLearningSourceCurrent(turn.source);
+      this.database.prepare(`UPDATE partner_learning_turns SET review_claimed_at = ?, revision = ? WHERE occurrence_id = ?`)
+        .run(this.now(), asSqlInteger(this.requireActiveRevision()), turn.source.occurrenceId);
+      return this.getPartnerLearningTurn(turn.source.occurrenceId);
+    });
+  }
+
+  getPartnerLearningFeedback(completionEventId: string): PartnerLearningFeedback | undefined {
+    this.assertOpen();
+    const rows = this.database.prepare("SELECT * FROM partner_learning_turns WHERE completion_event_id = ? AND accepted_at IS NOT NULL ORDER BY occurrence_id")
+      .all(learningIdentity(completionEventId, "completion")) as Row[];
+    const turns = rows.map(row => this.learningTurnFromRow(row));
+    const first = turns[0];
+    if (!first || this.findVisibleSessionMessageOrigin({ sessionId: first.source.sessionId, eventId: completionEventId }) === undefined) return undefined;
+    const session = this.getSession(first.source.sessionId).descriptor;
+    let receipts: PartnerLearningReceipt[] = [], revision = 0n;
+    for (const turn of turns) {
+      if (turn.source.sessionId !== session.id || turn.source.targetId !== session.targetId || turn.source.backendId !== session.backendId
+        || turn.source.bindingFingerprint !== nativeBindingFingerprint(session.binding.opaqueRef)) continue;
+      receipts = mergeLearningReceipts(receipts, turn.receipts);
+      if (turn.revision > revision) revision = turn.revision;
+    }
+    return receipts.length === 0 ? undefined : { receipts, revision: revision.toString() };
+  }
+
+  private learningTurnFromRow(row: Row): PartnerLearningTurnRecord {
+    const source = learningSource(parseJson(String(row["source_json"])));
+    if (source.occurrenceId !== row["occurrence_id"] || source.sessionId !== row["session_id"]
+      || source.sourceRunId !== row["source_run_id"] || source.sourceAttemptId !== row["source_attempt_id"]
+      || source.sourceQueueItemId !== row["source_queue_item_id"]) throw new StoreError("Learning source routing is inconsistent.");
+    return { source, partnerId: learningIdentity(row["partner_id"], "Partner"), accepted: row["accepted_at"] !== null,
+      ...(row["completion_event_id"] === null ? {} : { completionEventId: learningIdentity(row["completion_event_id"], "completion") }),
+      ...(row["message_id"] === null ? {} : { messageId: learningIdentity(row["message_id"], "message") }),
+      reviewClaimed: row["review_claimed_at"] !== null, receipts: learningReceipts(parseJson(String(row["receipts_json"]))),
+      revision: toBigInt(row["revision"]) };
+  }
+
+  private assertLearningSourceCurrent(source: PartnerLearningTurnSource, allowArchived = false): QueueItemRecord {
+    const session = this.getSession(source.sessionId).descriptor, target = this.getTarget(source.targetId).descriptor;
+    const run = this.getRun(source.sourceRunId).descriptor, attempt = this.getAttempt(source.sourceAttemptId).descriptor;
+    const queue = this.getQueueItem(source.sourceQueueItemId);
+    if (session.deletedAt !== undefined || session.archived && !allowArchived || session.targetId !== source.targetId || session.backendId !== source.backendId
+      || !target.trusted || session.remoteWorkspace?.kind === "ssh" || target.remoteWorkspace?.kind === "ssh"
+      || session.binding.generation !== source.bindingGeneration || nativeBindingFingerprint(session.binding.opaqueRef) !== source.bindingFingerprint
+      || this.getBackend(source.backendId).descriptor.instanceGeneration !== source.backendInstanceGeneration
+      || run.sessionId !== source.sessionId || run.parentRunId !== undefined || attempt.runId !== source.sourceRunId
+      || attempt.generation !== source.bindingGeneration || queue.sessionId !== source.sessionId || queue.runId !== source.sourceRunId
+      || queue.attemptId !== source.sourceAttemptId || queue.backendInstanceGeneration !== source.backendInstanceGeneration
+      || source.operationId !== undefined && queue.operationId !== source.operationId) throw new StoreError("Learning source changed.");
+    return queue;
+  }
+
+  private publishPartnerLearningFeedback(completionEventId: string): void {
+    const feedback = this.getPartnerLearningFeedback(completionEventId), original = this.findEvent(completionEventId);
+    if (!feedback || !original) return;
+    const turn = this.findPartnerLearningTurnByCompletion(completionEventId)!;
+    const session = this.getSession(original.sessionId).descriptor;
+    this.appendSessionEvent({ backendId: session.backendId, targetId: session.targetId, sessionId: session.id,
+      generation: session.binding.generation, traceId: "partner-learning-feedback", payload: {
+        type: "partner_learning_changed", completionEventId, messageId: turn.messageId!, feedback } });
+  }
+
   appendEvent(input: AppendEventInput): PersistedEvent {
+    if (input.payload.type === "partner_learning_changed") {
+      throw new StoreError("Learning feedback is owned by the Store, not Session adapters.");
+    }
+    return this.appendSessionEvent(input);
+  }
+
+  private appendSessionEvent(input: AppendEventInput): PersistedEvent {
     return this.write(() => {
       if (input.payload.type === "device_changed") {
         throw new StoreError("Device content observations are owned by the Store, not Session adapters.");
@@ -22554,11 +22718,11 @@ function collaborationPermissionMode(
   return value;
 }
 
-function collaborationText(value: string, label: string): string {
+function collaborationText(value: string, label: string, allowEmpty = false): string {
   if (typeof value !== "string") throw new StoreError(`Collaboration ${label} must be text.`);
   const normalized = value.normalize("NFC").replace(/\r\n?/gu, "\n").trim();
-  if (normalized.length === 0 || [...normalized].length > 32_000 || normalized.includes("\0")) {
-    throw new StoreError(`Collaboration ${label} must contain between 1 and 32000 safe characters.`);
+  if (!allowEmpty && normalized.length === 0 || [...normalized].length > 32_000 || normalized.includes("\0")) {
+    throw new StoreError(`Collaboration ${label} must contain between ${allowEmpty ? 0 : 1} and 32000 safe characters.`);
   }
   return normalized;
 }
@@ -22615,7 +22779,7 @@ function assertSameCollaborationWorkerReservation(
     worker.planMode !== input.planMode ||
     worker.label !== collaborationShortText(input.label, "worker label", 64) ||
     worker.role !== collaborationShortText(input.role, "worker role", 128) ||
-    worker.assignment !== collaborationText(input.assignment, "worker assignment")
+    worker.assignment !== collaborationText(input.assignment, "worker assignment", true)
   ) {
     throw new OperationConflictError(
       input.createOperationId,

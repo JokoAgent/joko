@@ -32,6 +32,11 @@ import type {
   MessageBlock,
   MessageInputDelivery,
   PartnerPrivateMessageOrigin,
+  CollaborationReportOrigin,
+  TaskMessageOrigin,
+  PartnerLearningTurnSource,
+  PartnerLearningTurnHandle,
+  PartnerLearningToolAuthority,
   PermissionMode,
   PromptInput,
   ProviderModel,
@@ -284,6 +289,22 @@ interface RunSilenceWatchdog {
 
 interface PendingDispatchAcceptance {
   settlement?: "completed" | "aborted" | "failed";
+  learningSettlement?: PartnerLearningTurnRecord;
+}
+
+export interface PartnerLearningHostPort {
+  captureSource(source: PartnerLearningTurnSource): boolean;
+  accepted(occurrenceId: string): void;
+  sealed(occurrenceId: string, completionEventId: string): void;
+  settled(occurrenceId: string, completionEventId: string, outcome: "completed" | "aborted" | "failed"): Promise<void> | void;
+}
+
+interface PartnerLearningTurnRecord {
+  readonly source: PartnerLearningTurnSource;
+  readonly handle: PartnerLearningTurnHandle;
+  assistantEventId?: string;
+  nativeBoundaryId?: string;
+  settled: boolean;
 }
 
 interface NativeDispatchRecoveryBaseline {
@@ -688,6 +709,8 @@ export interface EnqueueServiceInput {
   readonly originSessionId?: string;
   /** Trusted Partner service authority, persisted on the admitting Operation. */
   readonly partnerPrivateOrigin?: PartnerPrivateMessageOrigin;
+  readonly collaborationReportOrigin?: CollaborationReportOrigin;
+  readonly taskMessageOrigin?: TaskMessageOrigin;
   readonly overrides?: TurnExecutionOverrides;
   /** Runs inside the same Store transaction after Queue admission and before
    * dispatch can start. Trusted service owners use this to bind their durable
@@ -834,6 +857,10 @@ export class SessionHost {
   readonly #drainSettlements = new Map<string, Promise<void>>();
   readonly #pendingInteractions = new Map<string, PendingInteraction>();
   readonly #pendingDispatchAcceptances = new Map<string, PendingDispatchAcceptance>();
+  readonly #partnerLearningTurns = new Map<string, PartnerLearningTurnRecord>();
+  readonly #partnerLearningEmissions = new WeakMap<object, PartnerLearningTurnRecord>();
+  readonly #partnerLearning: PartnerLearningHostPort | undefined;
+  readonly #registerPartnerLearningToolAuthority: ((authority: PartnerLearningToolAuthority) => string) | undefined;
   readonly #dispatchPreparations = new Map<string, DispatchPreparation>();
   readonly #creationLocks = new Map<string, {
     readonly bodyHash: string;
@@ -966,6 +993,8 @@ export class SessionHost {
     adapters: readonly BackendAdapter[],
     options: {
       readonly workspaceCapture?: WorkspaceRunCapture;
+      readonly partnerLearning?: PartnerLearningHostPort;
+      readonly registerPartnerLearningToolAuthority?: (authority: PartnerLearningToolAuthority) => string;
       readonly freezeToolPolicies?: (sessionId: string, targetId: string) => void;
       readonly onSessionRuntimeClosed?: (sessionId: string) => void;
       /** Confirm user-owned interactive processes before releasing a Session workspace. */
@@ -1055,6 +1084,8 @@ export class SessionHost {
     } = {}
   ) {
     this.#store = store;
+    this.#partnerLearning = options.partnerLearning;
+    this.#registerPartnerLearningToolAuthority = options.registerPartnerLearningToolAuthority;
     this.#runtimeHandoffs = new SessionRuntimeHandoffStore(store);
     this.#artifactStore = artifactStore;
     this.#workspaceCapture = options.workspaceCapture;
@@ -2625,6 +2656,23 @@ export class SessionHost {
       }
       readPartnerPrivateOrigin(input.partnerPrivateOrigin);
     }
+    if (input.taskMessageOrigin !== undefined) {
+      const origin = readTaskMessageOrigin(input.taskMessageOrigin)!;
+      if (input.source !== "system" || origin.senderSessionId !== input.originSessionId
+        || input.collaborationReportOrigin !== undefined || input.partnerPrivateOrigin !== undefined) {
+        throw new StoreError("Task message provenance requires its original system handoff.");
+      }
+    }
+    if (input.collaborationReportOrigin !== undefined) {
+      const report = readCollaborationReportOrigin(input.collaborationReportOrigin)!;
+      if (input.source !== "system" || input.partnerPrivateOrigin !== undefined
+        || report.workerSessionId !== input.originSessionId || report.leadSessionId !== input.sessionId) {
+        throw new StoreError("A collaboration report requires its original worker and lead tasks.");
+      }
+      const worker = this.#store.getCollaborationWorker(report.workerId), goal = this.#store.getCollaborationGoal(report.goalId);
+      if (worker.goalId !== goal.id || worker.sessionId !== report.workerSessionId || goal.leadSessionId !== report.leadSessionId
+        || worker.label !== report.workerLabel || goal.status !== "active") throw new StoreError("The collaboration report membership changed.");
+    }
     this.assertSessionNotPendingScheduleDeletion(input.sessionId);
     this.assertMessageDeletionAdmission(input.sessionId);
     this.validateTurnOverrides(input.sessionId, input.overrides);
@@ -2643,6 +2691,8 @@ export class SessionHost {
           ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
           ...(input.originSessionId === undefined ? {} : { originSessionId: input.originSessionId }),
           ...(input.partnerPrivateOrigin === undefined ? {} : { partnerPrivateOrigin: input.partnerPrivateOrigin }),
+          ...(input.collaborationReportOrigin === undefined ? {} : { collaborationReportOrigin: input.collaborationReportOrigin }),
+          ...(input.taskMessageOrigin === undefined ? {} : { taskMessageOrigin: input.taskMessageOrigin }),
           ...(input.overrides === undefined ? {} : { overrides: input.overrides })
         }
       },
@@ -9542,6 +9592,7 @@ export class SessionHost {
   async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    this.#partnerLearningTurns.clear();
     for (const calls of this.#nativeDerivationCleanupCalls.values()) {
       for (const controller of calls) controller.abort(new StoreError("Native derivation lifecycle work was interrupted by shutdown."));
     }
@@ -12733,6 +12784,9 @@ export class SessionHost {
               });
             }
           });
+          for (const turn of this.#partnerLearningTurns.values()) {
+            if (turn.source.sourceRunId === run.descriptor.id) this.#partnerLearning?.accepted(turn.source.occurrenceId);
+          }
           this.refreshRunSilenceWatchdog(sessionId);
           if (reviewReadOnly) {
             this.persistReviewerPromptEvent({
@@ -12756,7 +12810,7 @@ export class SessionHost {
                 this.reviewRuntimeOutcome(sessionId, pendingAcceptance.settlement)
               );
             } else {
-              await this.finishSettledSession(sessionId, pendingAcceptance.settlement, run.descriptor.id);
+              await this.finishSettledSession(sessionId, pendingAcceptance.settlement, run.descriptor.id, pendingAcceptance.learningSettlement);
             }
           }
         } catch (error) {
@@ -12991,7 +13045,7 @@ export class SessionHost {
       && (runId !== undefined && turnBudget.runIds.has(runId)
         || this.#sessionRuntimeMutationMustDefer(sessionId))
       ? turnBudget.budgets : this.captureModelWorkingContexts(target.backendId);
-    return {
+    const context: AdapterContext = {
       sessionId,
       generation,
       backendInstanceGeneration,
@@ -13012,7 +13066,14 @@ export class SessionHost {
       ...(binding === undefined ? {} : { binding }),
       ...(operationId === undefined ? {} : { operationId }),
       signal,
+      ...(this.#partnerLearning === undefined || runtimePolicy === "review_read_only" || runId === undefined || attemptId === undefined
+        ? {} : { capturePartnerLearningTurn: (input: { readonly nativeOccurrence: string; readonly nativeTurnId?: string }) =>
+          this.capturePartnerLearningTurn(context, runId, attemptId, input) }),
       emit: (payload, metadata) => {
+        if (payload.type === "partner_learning_changed" || payload.type === "message_complete" && Object.hasOwn(payload, "learning")) {
+          return Promise.reject(new StoreError("Partner learning feedback is owned by the service, not Session adapters."));
+        }
+        const learningTurn = this.#partnerLearningEmissions.get(payload);
         if (this.#disposed || !this.backendInstanceGenerationOwnsContext(
           sessionId,
           backendInstanceGeneration,
@@ -13070,7 +13131,7 @@ export class SessionHost {
             if (session === undefined) return;
             const emittedAt = Date.now();
             const append = (store: OperationalStore): void => {
-              store.appendEvent({
+              const event = store.appendEvent({
               backendId: target.backendId,
               targetId: target.id,
               sessionId,
@@ -13086,6 +13147,11 @@ export class SessionHost {
                 ...(durableMetadata.pi === undefined ? {} : { pi: durableMetadata.pi })
               })
               });
+              if (learningTurn !== undefined && durablePayload.type === "message_complete" && durablePayload.role === "assistant") {
+                learningTurn.assistantEventId = event.id;
+                const nativeBoundaryId = nativeHistoryEventContext(durablePayload)?.identity?.entryId;
+                if (nativeBoundaryId !== undefined) learningTurn.nativeBoundaryId = nativeBoundaryId;
+              }
             };
             const appendAndArmRecovery = (store: OperationalStore): void => {
               append(store);
@@ -13196,8 +13262,11 @@ export class SessionHost {
           if (payload.type === "done") {
             this.clearRunSilenceWatchdog(sessionId);
             const pendingAcceptance = runId === undefined ? undefined : this.#pendingDispatchAcceptances.get(runId);
-            if (pendingAcceptance === undefined) await this.finishSettledSession(sessionId, payload.outcome, runId);
-            else pendingAcceptance.settlement ??= payload.outcome;
+            if (pendingAcceptance === undefined) await this.finishSettledSession(sessionId, payload.outcome, runId, learningTurn);
+            else {
+              pendingAcceptance.settlement ??= payload.outcome;
+              pendingAcceptance.learningSettlement ??= learningTurn;
+            }
           }
           else if (payload.type === "retry" && !isTerminalRetryState(payload.state) && runId !== undefined) {
             const current = this.#store.getRun(runId);
@@ -13318,6 +13387,77 @@ export class SessionHost {
         }
       }
     };
+    return context;
+  }
+
+  private capturePartnerLearningTurn(
+    context: AdapterContext,
+    runId: string,
+    attemptId: string,
+    input: { readonly nativeOccurrence: string; readonly nativeTurnId?: string }
+  ): PartnerLearningTurnHandle | undefined {
+    if (this.#partnerLearning === undefined || context.binding === undefined || context.target.remoteWorkspace !== undefined
+      || input.nativeOccurrence.trim() === "" || input.nativeOccurrence.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(input.nativeOccurrence)) return undefined;
+    const assertCurrent = (): void => {
+      if (this.#disposed || !this.backendInstanceGenerationOwnsContext(context.sessionId, context.backendInstanceGeneration!, runId, attemptId)) {
+        throw staleBackendInstanceContextError();
+      }
+      const current = this.#store.getSession(context.sessionId).descriptor;
+      if (current.targetId !== context.target.id || current.backendId !== context.target.backendId
+        || current.binding.generation !== context.generation || current.binding.opaqueRef !== context.binding!.opaqueRef
+        || current.binding.nativeSessionId !== context.binding!.nativeSessionId || current.archived || current.deletedAt !== undefined
+        || this.#store.findPendingSessionLifecycleCleanup(current.id) !== undefined) throw staleBackendInstanceContextError();
+    };
+    assertCurrent();
+    const queue = this.#store.findQueueItemByRunId(context.sessionId, runId);
+    if (queue === undefined || queue.attemptId !== attemptId || !["dispatching", "backend_accepted"].includes(queue.state)) return undefined;
+    const source: PartnerLearningTurnSource = Object.freeze({
+      occurrenceId: randomUUID(), sessionId: context.sessionId, targetId: context.target.id, backendId: context.target.backendId,
+      backendInstanceGeneration: context.backendInstanceGeneration!, bindingGeneration: context.generation,
+      bindingFingerprint: nativeBindingFingerprint(context.binding.opaqueRef), sourceRunId: runId, sourceAttemptId: attemptId,
+      sourceQueueItemId: queue.id, ...(context.operationId === undefined ? {} : { operationId: context.operationId }),
+      nativeOccurrence: input.nativeOccurrence, ...(input.nativeTurnId === undefined ? {} : { nativeTurnId: input.nativeTurnId })
+    });
+    if (!this.#partnerLearning.captureSource(source)) return undefined;
+    let record: PartnerLearningTurnRecord;
+    const handle: PartnerLearningTurnHandle = {
+      source,
+      emit: (payload, metadata) => {
+        if (record.settled) return Promise.resolve();
+        const ownedPayload = { ...payload };
+        this.#partnerLearningEmissions.set(ownedPayload, record);
+        return context.emit(ownedPayload, metadata);
+      },
+      captureToolRequest: (request) => {
+        if (record.settled || request.requestId.trim() === "" || request.requestId.length > 1_024
+          || request.serverId.trim() === "" || request.toolName.trim() === "") return undefined;
+        assertCurrent();
+        const authority: PartnerLearningToolAuthority = { source, ...request, assertCurrent };
+        const proof = this.#registerPartnerLearningToolAuthority?.(authority);
+        return Object.freeze(proof === undefined ? authority : { ...authority, proof });
+      },
+      observeNativeReply: (nativeBoundaryId) => {
+        if (record.settled || nativeBoundaryId.trim() === "" || nativeBoundaryId.length > 4_096 || /[\u0000-\u001f\u007f]/u.test(nativeBoundaryId)) return;
+        assertCurrent();
+        record.nativeBoundaryId = nativeBoundaryId;
+      }
+    };
+    record = { source, handle, settled: false };
+    this.#partnerLearningTurns.set(source.occurrenceId, record);
+    if (queue.state === "backend_accepted") this.#partnerLearning.accepted(source.occurrenceId);
+    return handle;
+  }
+
+  private async settlePartnerLearningTurn(turn: PartnerLearningTurnRecord | undefined, outcome: "completed" | "aborted" | "failed"): Promise<void> {
+    if (turn === undefined || turn.settled || this.#partnerLearning === undefined) return;
+    turn.settled = true;
+    this.#partnerLearningTurns.delete(turn.source.occurrenceId);
+    const origin = turn.nativeBoundaryId === undefined
+      ? turn.assistantEventId === undefined ? undefined : this.#store.findVisibleSessionMessageOrigin({ sessionId: turn.source.sessionId, eventId: turn.assistantEventId })
+      : this.#store.findVisibleSessionMessageOrigin({ sessionId: turn.source.sessionId, nativeBoundaryId: turn.nativeBoundaryId });
+    if (origin === undefined) return;
+    this.#partnerLearning.sealed(turn.source.occurrenceId, origin.eventId);
+    await this.#partnerLearning.settled(turn.source.occurrenceId, origin.eventId, outcome);
   }
 
   /** Collect the terminal conclusion while the normal durable Event path keeps
@@ -13573,7 +13713,8 @@ export class SessionHost {
   private async finishSettledSession(
     sessionId: string,
     outcome: "completed" | "aborted" | "failed",
-    settledRunId?: string
+    settledRunId?: string,
+    learningTurn?: PartnerLearningTurnRecord
   ): Promise<void> {
     this.clearRunSilenceWatchdog(sessionId);
     if (this.isReviewReadOnlySession(sessionId)) {
@@ -13645,6 +13786,7 @@ export class SessionHost {
       }
       await this.notifyServiceRunSettled(sessionId, run.descriptor.id, outcome);
     }
+    await this.settlePartnerLearningTurn(learningTurn, outcome);
     if (outcome === "failed") this.ensureContextOverflowReplay(sessionId);
     this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
     await this.#applyPendingSessionRuntimeControl(sessionId);
@@ -14268,6 +14410,8 @@ export class SessionHost {
       readonly inputDelivery: Extract<EventPayload, { readonly type: "message_complete" }>["inputDelivery"];
       readonly automaticContinuation: Extract<EventPayload, { readonly type: "message_complete" }>["automaticContinuation"];
       readonly objectiveContinuation: Extract<EventPayload, { readonly type: "message_complete" }>["objectiveContinuation"];
+      readonly collaborationReportOrigin: CollaborationReportOrigin | undefined;
+      readonly taskMessageOrigin: TaskMessageOrigin | undefined;
     };
     const acceptedUserMetadata = new Map<string, AcceptedUserMetadata>();
     const privateMessageMetadata = new Map<string, PartnerPrivateMessageOrigin>();
@@ -14302,6 +14446,8 @@ export class SessionHost {
           || event.payload.automationOrigin !== undefined
           || event.payload.inputDelivery !== undefined
           || event.payload.automaticContinuation !== undefined
+          || event.payload.collaborationReportOrigin !== undefined
+          || event.payload.taskMessageOrigin !== undefined
           || event.payload.objectiveContinuation !== undefined)
       ) {
         const metadata: AcceptedUserMetadata = {
@@ -14309,7 +14455,9 @@ export class SessionHost {
           automationOrigin: event.payload.automationOrigin,
           inputDelivery: event.payload.inputDelivery,
           automaticContinuation: event.payload.automaticContinuation,
-          objectiveContinuation: event.payload.objectiveContinuation
+          objectiveContinuation: event.payload.objectiveContinuation,
+          collaborationReportOrigin: event.payload.collaborationReportOrigin,
+          taskMessageOrigin: event.payload.taskMessageOrigin
         };
         const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
         const eventBindingFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
@@ -14365,7 +14513,9 @@ export class SessionHost {
               : { automaticContinuation: acceptedMetadata.automaticContinuation }),
             ...(acceptedMetadata.objectiveContinuation === undefined
               ? {}
-              : { objectiveContinuation: acceptedMetadata.objectiveContinuation })
+              : { objectiveContinuation: acceptedMetadata.objectiveContinuation }),
+            ...(acceptedMetadata.collaborationReportOrigin === undefined ? {} : { collaborationReportOrigin: acceptedMetadata.collaborationReportOrigin }),
+            ...(acceptedMetadata.taskMessageOrigin === undefined ? {} : { taskMessageOrigin: acceptedMetadata.taskMessageOrigin })
           });
       const privateOrigin = projectionEntryId === undefined ? undefined : privateMessageMetadata.get(projectionEntryId);
       const payload = projectedPayload.type === "message_complete" && privateOrigin !== undefined
@@ -14448,7 +14598,8 @@ export class SessionHost {
     runId?: string
   ): EventPayload {
     if (payload.type !== "message_complete") return payload;
-    const { partnerPrivateOrigin: _untrustedPrivateOrigin, ...messagePayload } = payload;
+    const { partnerPrivateOrigin: _untrustedPrivateOrigin, collaborationReportOrigin: _untrustedReportOrigin,
+      taskMessageOrigin: _untrustedTaskOrigin, ...messagePayload } = payload;
     if (runId === undefined) return messagePayload;
     const queued = this.#store.findQueueItemByRunId(sessionId, runId);
     if (queued === undefined) return messagePayload;
@@ -14456,6 +14607,8 @@ export class SessionHost {
     const privateOrigin = this.privateServiceInputOrigin(sessionId, queued.operationId).partnerPrivateOrigin;
     const ownedPayload = { ...messagePayload, ...(privateOrigin === undefined ? {} : { partnerPrivateOrigin: privateOrigin }) };
     if (payload.role !== "user") return ownedPayload;
+    const reportOrigin = this.collaborationServiceInputOrigin(sessionId, queued.operationId);
+    const taskOrigin = this.taskServiceInputOrigin(sessionId, queued.operationId);
     const operationBody = operation?.kind === "schedule_dispatch" && isRecord(operation.body)
       ? operation.body
       : undefined;
@@ -14482,6 +14635,8 @@ export class SessionHost {
       ...nativePayload,
       blocks: promptInputMessageBlocks(queued.body),
       acceptedInput: queued.body,
+      ...(reportOrigin === undefined ? {} : { collaborationReportOrigin: reportOrigin }),
+      ...(taskOrigin === undefined ? {} : { taskMessageOrigin: taskOrigin }),
       ...(automationOrigin === undefined ? {} : { automationOrigin }),
       ...(queued.body.automaticContinuation === undefined
         ? {}
@@ -14515,6 +14670,26 @@ export class SessionHost {
     const originSessionId = operation.body["originSessionId"];
     if (typeof originSessionId !== "string" || originSessionId.trim() === "" || originSessionId === sessionId) throw new StoreError("Private message origin task is invalid.");
     return { partnerPrivateOrigin, originSessionId };
+  }
+
+  private collaborationServiceInputOrigin(sessionId: string, operationId: string): CollaborationReportOrigin | undefined {
+    const operation = this.#store.findOperation(operationId);
+    if (operation?.kind !== "service_send_input" || !isRecord(operation.body)
+      || operation.body["source"] !== "system" || operation.body["sessionId"] !== sessionId) return undefined;
+    const report = readCollaborationReportOrigin(operation.body["collaborationReportOrigin"]);
+    if (report && (report.leadSessionId !== sessionId || report.workerSessionId !== operation.body["originSessionId"])) {
+      throw new StoreError("The collaboration report belongs to another task.");
+    }
+    return report;
+  }
+
+  private taskServiceInputOrigin(sessionId: string, operationId: string): TaskMessageOrigin | undefined {
+    const operation = this.#store.findOperation(operationId);
+    if (operation?.kind !== "service_send_input" || !isRecord(operation.body)
+      || operation.body["source"] !== "system" || operation.body["sessionId"] !== sessionId) return undefined;
+    const origin = readTaskMessageOrigin(operation.body["taskMessageOrigin"]);
+    if (origin && origin.senderSessionId !== operation.body["originSessionId"]) throw new StoreError("The task message source changed.");
+    return origin;
   }
 
   private requireAdapterGeneration(backendId: string, adapter: BackendAdapter): number {
@@ -15070,6 +15245,33 @@ function readPartnerPrivateOrigin(value: unknown): PartnerPrivateMessageOrigin |
     senderPartnerId: value["senderPartnerId"] as string, recipientPartnerId: value["recipientPartnerId"] as string,
     senderDisplayName: value["senderDisplayName"] as string
   };
+}
+
+function readCollaborationReportOrigin(value: unknown): CollaborationReportOrigin | undefined {
+  if (value === undefined) return undefined;
+  const ids = ["goalId", "workerId", "leadSessionId", "workerSessionId"] as const;
+  const fields = [...ids, "workerLabel", "body"];
+  if (!isRecord(value) || Object.keys(value).some(key => !fields.includes(key))
+    || ids.some(key => typeof value[key] !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value[key]))
+    || typeof value["workerLabel"] !== "string" || !value["workerLabel"].trim() || value["workerLabel"].length > 64
+    || typeof value["body"] !== "string" || !value["body"].trim() || value["body"].length > 32_000 || value["body"].includes("\0")
+    || value["leadSessionId"] === value["workerSessionId"]) throw new StoreError("Collaboration report provenance is invalid.");
+  return { goalId: value["goalId"] as string, workerId: value["workerId"] as string, leadSessionId: value["leadSessionId"] as string,
+    workerSessionId: value["workerSessionId"] as string, workerLabel: value["workerLabel"] as string, body: value["body"] as string };
+}
+
+function readTaskMessageOrigin(value: unknown): TaskMessageOrigin | undefined {
+  if (value === undefined) return undefined;
+  const fields = ["senderSessionId", "senderSessionTitle", "senderPartnerId", "senderPartnerName"];
+  if (!isRecord(value) || Object.keys(value).some(key => !fields.includes(key))
+    || typeof value["senderSessionId"] !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value["senderSessionId"])
+    || value["senderPartnerId"] !== undefined && (typeof value["senderPartnerId"] !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(value["senderPartnerId"]))
+    || (value["senderPartnerId"] === undefined) !== (value["senderPartnerName"] === undefined)
+    || ["senderSessionTitle", "senderPartnerName"].some(key => value[key] !== undefined && (typeof value[key] !== "string"
+      || value[key].length > 256 || /[\u0000-\u001f\u007f]/u.test(value[key])))) throw new StoreError("Task message provenance is invalid.");
+  return { senderSessionId: value["senderSessionId"] as string,
+    ...(value["senderSessionTitle"] === undefined ? {} : { senderSessionTitle: value["senderSessionTitle"] as string }),
+    ...(value["senderPartnerId"] === undefined ? {} : { senderPartnerId: value["senderPartnerId"] as string, senderPartnerName: value["senderPartnerName"] as string }) };
 }
 
 function promptInputMessageBlocks(input: PromptInput): readonly MessageBlock[] {

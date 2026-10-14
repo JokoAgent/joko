@@ -10,6 +10,14 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["task.messageSource", "From another task", "来自其他任务", "來自其他任務", "別のタスクから", "다른 작업에서 보냄"],
+  ["task.messageSourceNamed", "From task {name}", "来自任务{name}", "來自任務{name}", "タスク {name} から", "작업 {name}에서 보냄"],
+  ["task.messageSourcePartner", "From Partner {name}", "来自 Partner {name}", "來自 Partner {name}", "Partner {name} から", "Partner {name}에서 보냄"],
+  ["task.headerPending", "{count} queued", "{count} 项待执行", "{count} 項待執行", "{count} 件が待機中", "{count}개 대기 중"],
+  ["task.headerLead", "Collaboration lead", "协作主任务", "協作主務", "共同作業のリード", "협업 리드"],
+  ["task.headerWorker", "Collaboration worker", "协作成员任务", "協作成員任務", "共同作業のワーカー", "협업 작업자"],
+  ["task.headerQueuePaused", "Queue paused", "队列已暂停", "佇列已暫停", "キューは一時停止中", "대기열 일시 중지됨"],
+  ["task.headerRoleUnavailable", "Task controls are unavailable. Retry to refresh this task.", "任务操作暂不可用，请重试刷新此任务。", "任務操作暫不可用，請重試重新整理此任務。", "タスクの操作を利用できません。再試行して更新してください。", "작업 제어를 사용할 수 없습니다. 다시 시도하여 이 작업을 새로 고치세요."],
   ["image.previewLoading", "Loading image…", "正在加载图片…", "正在載入圖片…", "画像を読み込み中…", "이미지를 불러오는 중…"],
   ["image.previewFailed", "Image preview failed. Open the image or try again.", "图片预览失败，可打开图片或重试。", "圖片預覽失敗，可開啟圖片或重試。", "画像を表示できません。画像を開くか再試行してください。", "이미지를 표시할 수 없습니다. 이미지를 열거나 다시 시도하세요."],
   ["image.previewRetry", "Retry image preview: {name}", "重试图片预览：{name}", "重試圖片預覽：{name}", "画像の表示を再試行: {name}", "이미지 미리 보기 다시 시도: {name}"],

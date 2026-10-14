@@ -302,9 +302,9 @@ export class CodexMcpBridgeManager {
     server.setRequestHandler(CallToolRequestSchema, async (request, extra): Promise<CallToolResult> => {
       assertCurrent();
       const threadId = codexThreadId(request.params._meta);
-      const call = input.beginToolCall(threadId);
-      const signal = AbortSignal.any([extra.signal, call.signal, routeAbort]);
       const requestId = bridgeRequestId(extra.sessionId, extra.requestId, threadId);
+      const call = input.beginToolCall(threadId, { requestId, serverId: route.serverId, toolName: request.params.name });
+      const signal = AbortSignal.any([extra.signal, call.signal, routeAbort]);
       try {
         signal.throwIfAborted();
         call.assertCurrent();
@@ -317,7 +317,8 @@ export class CodexMcpBridgeManager {
           serverId: route.serverId,
           toolName: request.params.name,
           arguments: request.params.arguments,
-          signal
+          signal,
+          ...(call.partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority: call.partnerLearningAuthority })
         });
         signal.throwIfAborted();
         call.assertCurrent();

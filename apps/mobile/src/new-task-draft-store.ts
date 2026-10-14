@@ -1,4 +1,6 @@
 import type { MobilePlainStorageDriver } from "./connection-storage";
+import { normalizeMobileObjectiveInput, type MobileObjectiveInput } from "./mobile-objective";
+import { normalizeMobileWorkerForm, type MobileWorkerForm } from "./mobile-collaboration";
 import {
   cloneMobileComposerDraft,
   mobileComposerDraftsEqual,
@@ -11,6 +13,7 @@ export interface MobileNewTaskDraftIdentity {
 }
 
 export interface MobileNewTaskEditableDraft {
+  readonly collaboration?: MobileWorkerForm;
   readonly targetId: string;
   readonly name: string;
   readonly input: MobileComposerDraft;
@@ -24,6 +27,8 @@ export interface MobileNewTaskModelSelection {
 }
 
 interface MobileNewTaskSubmissionBase {
+  readonly collaboration?: MobileWorkerForm;
+  readonly objective?: MobileObjectiveInput;
   readonly connectionId: string;
   readonly serverId: string;
   readonly backendId: string;
@@ -41,10 +46,12 @@ export interface MobileNewTaskCreateSubmission extends MobileNewTaskSubmissionBa
 }
 
 export interface MobileNewTaskSendSubmission extends MobileNewTaskSubmissionBase {
+  readonly collaborationHandled?: boolean;
   readonly phase: "sending";
   readonly sessionId: string;
   readonly runtimeGeneration: string;
   readonly sendOperationId?: string;
+  readonly objectiveRequestId?: string;
 }
 
 export type MobileNewTaskSubmission = MobileNewTaskCreateSubmission | MobileNewTaskSendSubmission;
@@ -188,7 +195,7 @@ export class MobileNewTaskDraftStore {
     }
     const editable = normalizeEditableDraft(draft);
     const displayName = editable.name.trim() || "New task";
-    if (!editable.targetId || !hasComposerInput(editable.input)) {
+    if (!editable.targetId || !hasComposerInput(editable.input) && authority.objective === undefined) {
       throw new Error("Choose a project and enter a first message or attachment.");
     }
     const submission = normalizeSubmission({
@@ -244,6 +251,25 @@ export class MobileNewTaskDraftStore {
     const next = normalizeSubmission({ ...submission, sendOperationId }) as MobileNewTaskSendSubmission;
     await this.#replace(exact, { ...current, submission: next });
     return cloneSubmission(next) as MobileNewTaskSendSubmission;
+  }
+
+  async setObjectiveRequest(identity: MobileNewTaskDraftIdentity, createOperationId: string, requestId: string): Promise<MobileNewTaskSendSubmission> {
+    const exact = normalizeIdentity(identity), current = this.#required(exact), submission = current.submission;
+    if (submission?.phase !== "sending" || submission.createOperationId !== createOperationId || !submission.objective
+      || submission.objectiveRequestId !== undefined && submission.objectiveRequestId !== requestId || submission.sendOperationId !== undefined) {
+      throw new Error("The retained new-task objective owner changed.");
+    }
+    assertIdentity(requestId, "objective request");
+    const next = normalizeSubmission({ ...submission, objectiveRequestId: requestId }) as MobileNewTaskSendSubmission;
+    await this.#replace(exact, { ...current, submission: next });
+    return cloneSubmission(next) as MobileNewTaskSendSubmission;
+  }
+
+  async markCollaborationHandled(identity: MobileNewTaskDraftIdentity, createOperationId: string): Promise<MobileNewTaskSendSubmission> {
+    const exact = normalizeIdentity(identity), current = this.#required(exact), submission = current.submission;
+    if (submission?.phase !== "sending" || submission.createOperationId !== createOperationId || !submission.collaboration) throw new Error("The retained collaboration draft owner changed.");
+    const next = normalizeSubmission({ ...submission, collaborationHandled: true }) as MobileNewTaskSendSubmission;
+    await this.#replace(exact, { ...current, submission: next }); return cloneSubmission(next) as MobileNewTaskSendSubmission;
   }
 
   async replaceSubmissionInput(
@@ -426,7 +452,8 @@ function normalizeEditableDraft(value: MobileNewTaskEditableDraft): MobileNewTas
   if (value.targetId !== "") assertIdentity(value.targetId, "project");
   if (value.name.length > 256) throw new Error("The local Joko task name is too long.");
   const input = normalizeNewTaskInput(value.input);
-  return { targetId: value.targetId, name: value.name, input };
+  return { targetId: value.targetId, name: value.name, input,
+    ...(value.collaboration === undefined ? {} : { collaboration: normalizeMobileWorkerForm(value.collaboration) }) };
 }
 
 function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmission {
@@ -446,10 +473,12 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
   assertIdentity(value.createOperationId, "creation operation");
   if (!value.displayName.trim() || value.displayName.length > 256) throw new Error("The retained Joko task name is invalid.");
   const input = normalizeNewTaskInput(value.input);
-  if (!hasComposerInput(input)) {
+  if (!hasComposerInput(input) && value.objective === undefined) {
     throw new Error("The retained Joko first message is invalid.");
   }
   const base: MobileNewTaskSubmissionBase = {
+    ...(value.collaboration === undefined ? {} : { collaboration: normalizeMobileWorkerForm(value.collaboration) }),
+    ...(value.objective === undefined ? {} : { objective: normalizeMobileObjectiveInput(value.objective) }),
     connectionId: value.connectionId,
     serverId: value.serverId,
     backendId: value.backendId,
@@ -465,12 +494,19 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
   assertIdentity(value.sessionId, "task");
   positiveDecimal(value.runtimeGeneration, "task runtime generation");
   if (value.sendOperationId !== undefined) assertIdentity(value.sendOperationId, "first-message operation");
+  if (value.objectiveRequestId !== undefined) assertIdentity(value.objectiveRequestId, "objective request");
+  if (value.collaborationHandled !== undefined && (value.collaborationHandled !== true || value.collaboration === undefined)) throw new Error("The retained collaboration preparation is invalid.");
+  if (value.objective !== undefined ? value.sendOperationId !== undefined : value.objectiveRequestId !== undefined) {
+    throw new Error("The retained task submission has conflicting input owners.");
+  }
   return {
     phase: "sending",
     ...base,
     sessionId: value.sessionId,
     runtimeGeneration: value.runtimeGeneration,
-    ...(value.sendOperationId === undefined ? {} : { sendOperationId: value.sendOperationId })
+    ...(value.collaborationHandled === undefined ? {} : { collaborationHandled: true }),
+    ...(value.sendOperationId === undefined ? {} : { sendOperationId: value.sendOperationId }),
+    ...(value.objectiveRequestId === undefined ? {} : { objectiveRequestId: value.objectiveRequestId })
   };
 }
 
@@ -504,7 +540,8 @@ function readRecord(serialized: string, identity: MobileNewTaskDraftIdentity): M
   const editable = normalizeEditableDraft({
     targetId: draft["targetId"],
     name: draft["name"],
-    input: draft["input"] as unknown as MobileComposerDraft
+    input: draft["input"] as unknown as MobileComposerDraft,
+    ...(draft["collaboration"] === undefined ? {} : { collaboration: draft["collaboration"] as unknown as MobileWorkerForm })
   });
   if (draft["submission"] === undefined) return editable;
   if (!isRecord(draft["submission"]) || "input" in draft["submission"]) {
@@ -524,6 +561,8 @@ function cloneDraft(draft: MobileNewTaskDraft): MobileNewTaskDraft {
 function cloneSubmission(submission: MobileNewTaskSubmission): MobileNewTaskSubmission {
   return {
     ...submission,
+    ...(submission.objective === undefined ? {} : { objective: normalizeMobileObjectiveInput(submission.objective) }),
+    ...(submission.collaboration === undefined ? {} : { collaboration: normalizeMobileWorkerForm(submission.collaboration) }),
     model: submission.model === null ? null : { ...submission.model },
     input: cloneMobileComposerDraft(submission.input)
   };
@@ -536,6 +575,7 @@ function persistedSubmission(submission: MobileNewTaskSubmission): Omit<MobileNe
 
 function sameDraft(left: MobileNewTaskDraft, right: MobileNewTaskDraft): boolean {
   return left.targetId === right.targetId && left.name === right.name
+    && JSON.stringify(left.collaboration) === JSON.stringify(right.collaboration)
     && mobileComposerDraftsEqual(left.input, right.input)
     && (left.submission === undefined && right.submission === undefined
       || left.submission !== undefined && right.submission !== undefined
@@ -543,7 +583,8 @@ function sameDraft(left: MobileNewTaskDraft, right: MobileNewTaskDraft): boolean
 }
 
 function cloneEditableDraft(draft: MobileNewTaskEditableDraft): MobileNewTaskEditableDraft {
-  return { targetId: draft.targetId, name: draft.name, input: cloneMobileComposerDraft(draft.input) };
+  return { targetId: draft.targetId, name: draft.name, input: cloneMobileComposerDraft(draft.input),
+    ...(draft.collaboration === undefined ? {} : { collaboration: normalizeMobileWorkerForm(draft.collaboration) }) };
 }
 
 function normalizeNewTaskInput(value: MobileComposerDraft): MobileComposerDraft {
@@ -564,10 +605,11 @@ function sameSubmission(left: MobileNewTaskSubmission, right: MobileNewTaskSubmi
     || left.createOperationId !== right.createOperationId || left.displayName !== right.displayName
     || !sameNewTaskModelSelection(left.model, right.model)
     || !mobileComposerDraftsEqual(left.input, right.input)) return false;
+  if (JSON.stringify(left.objective) !== JSON.stringify(right.objective) || JSON.stringify(left.collaboration) !== JSON.stringify(right.collaboration)) return false;
   return left.phase === "creating" && right.phase === "creating"
     || left.phase === "sending" && right.phase === "sending"
       && left.sessionId === right.sessionId && left.runtimeGeneration === right.runtimeGeneration
-      && left.sendOperationId === right.sendOperationId;
+      && left.sendOperationId === right.sendOperationId && left.objectiveRequestId === right.objectiveRequestId && left.collaborationHandled === right.collaborationHandled;
 }
 
 function normalizeNewTaskModelSelection(

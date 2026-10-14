@@ -1,3 +1,5 @@
+import type { PartnerLearningToolAuthority } from "@joko/core";
+
 /** Product-authorized MCP catalog and executor for one committed native Query. */
 export interface ClaudeMcpTool {
   readonly serverId: string;
@@ -23,6 +25,7 @@ export interface ClaudeMcpRuntimeLease {
     readonly requestId: string;
     readonly arguments: Readonly<Record<string, unknown>>;
     readonly signal: AbortSignal;
+    readonly partnerLearningAuthority?: PartnerLearningToolAuthority;
   }): Promise<ClaudeMcpCallResult>;
   release(): void;
 }

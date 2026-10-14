@@ -1,7 +1,7 @@
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { resolve as resolvePath } from "node:path";
 
-import { TASK_TAG_COLORS, type PromptInput, type SessionDescriptor, type TaskTagColor } from "@joko/core";
+import { TASK_TAG_COLORS, type PromptInput, type SessionDescriptor, type TaskTagColor, type TaskMessageOrigin } from "@joko/core";
 import {
   InvalidStateTransitionError,
   NotFoundError,
@@ -416,6 +416,7 @@ export interface SessionHelperToolProviderOptions {
   readonly host: () => HelperHost | undefined;
   readonly messageSearch?: () => Pick<MessageSearchEmbeddingCoordinator, "embedQuery"> | undefined;
   readonly now?: () => number;
+  readonly taskSenderPartner?: (sessionId: string) => Pick<TaskMessageOrigin, "senderPartnerId" | "senderPartnerName"> | undefined;
 }
 
 interface HistoryMessage {
@@ -470,6 +471,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
   readonly #host: () => HelperHost | undefined;
   readonly #messageSearch: () => Pick<MessageSearchEmbeddingCoordinator, "embedQuery"> | undefined;
   readonly #now: () => number;
+  readonly #taskSenderPartner: NonNullable<SessionHelperToolProviderOptions["taskSenderPartner"]>;
   readonly #confirmationSecret = randomBytes(32);
 
   constructor(options: SessionHelperToolProviderOptions) {
@@ -477,6 +479,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     this.#host = options.host;
     this.#messageSearch = options.messageSearch ?? (() => undefined);
     this.#now = options.now ?? Date.now;
+    this.#taskSenderPartner = options.taskSenderPartner ?? (() => undefined);
     if (SESSION_HELPER_NESTED_TOOLS.length !== 27) {
       throw new Error("The task helper catalog must expose exactly twenty-seven applicable nested tools.");
     }
@@ -1723,6 +1726,12 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     };
   }
 
+  #taskMessageOrigin(sessionId: string): TaskMessageOrigin {
+    const sender = this.#store.getSession(sessionId).descriptor;
+    return { senderSessionId: sender.id, ...(sender.title.trim() ? { senderSessionTitle: sender.title } : {}),
+      ...this.#taskSenderPartner(sessionId) };
+  }
+
   async #sendToSession(
     input: Readonly<Record<string, unknown>>,
     caller: SessionDescriptor,
@@ -1754,6 +1763,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
         sessionId: targetSessionId,
         source: "system",
         originSessionId: caller.id,
+        taskMessageOrigin: this.#taskMessageOrigin(caller.id),
         prompt: prompt(message, "prompt")
       });
       // The durable queue admission is authoritative. Only after it commits may
@@ -1805,6 +1815,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
       sessionId: session.id,
       source: "system",
       originSessionId: caller.id,
+      taskMessageOrigin: this.#taskMessageOrigin(caller.id),
       prompt: prompt(message, "prompt")
     });
     return {

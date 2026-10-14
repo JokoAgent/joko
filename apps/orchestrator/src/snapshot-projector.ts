@@ -700,6 +700,8 @@ export class SnapshotProjector {
       return toProtoToolLease(lease, session.descriptor.backendId);
     });
     const mappedTimeline = input.timeline.map((event) => toProtoEvent(event, {
+      learning: event.payload.type === "message_complete" && event.payload.role === "assistant"
+        ? this.store.getPartnerLearningFeedback(event.id) : undefined,
       queueItem: eventQueueItem(event, queueById, input.queueItems),
       queueControl: event.payload.type === "queue_control"
         ? this.store.getQueueControl(event.sessionId)

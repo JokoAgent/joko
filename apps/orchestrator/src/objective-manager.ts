@@ -44,11 +44,12 @@ export interface ObjectiveManagerOptions {
   readonly now?: () => number;
 }
 
-export interface SetObjectiveInput extends ObjectiveLimits {
+export interface SetObjectiveInput extends Omit<ObjectiveLimits, "noProgressTurnLimit"> {
   readonly operationId: string;
   readonly sessionId: string;
   readonly text: string;
   readonly expectedSessionGeneration?: number;
+  readonly noProgressTurnLimit?: number | null;
 }
 
 export interface UpdateObjectiveMutationInput {
@@ -154,7 +155,7 @@ export class ObjectiveManager {
             text: input.text,
             tokenBudget: input.tokenBudget ?? null,
             maximumTurns: input.maximumTurns ?? null,
-            noProgressTurnLimit: input.noProgressTurnLimit ?? DEFAULT_NO_PROGRESS_TURN_LIMIT,
+            noProgressTurnLimit: input.noProgressTurnLimit === undefined ? DEFAULT_NO_PROGRESS_TURN_LIMIT : input.noProgressTurnLimit,
             expectedSessionGeneration: input.expectedSessionGeneration ?? null
           }
         },
@@ -169,7 +170,9 @@ export class ObjectiveManager {
             text: input.text,
             ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
             ...(input.maximumTurns === undefined ? {} : { maximumTurns: input.maximumTurns }),
-            noProgressTurnLimit: input.noProgressTurnLimit ?? DEFAULT_NO_PROGRESS_TURN_LIMIT,
+            ...(input.noProgressTurnLimit === null ? {} : {
+              noProgressTurnLimit: input.noProgressTurnLimit ?? DEFAULT_NO_PROGRESS_TURN_LIMIT
+            }),
             ...(input.expectedSessionGeneration === undefined
               ? {}
               : { expectedSessionGeneration: input.expectedSessionGeneration }),

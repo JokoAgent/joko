@@ -199,7 +199,7 @@ function fixture(granted = true) {
     addPartnerWorkbenchProject: vi.fn(async (_owner: PartnerWorkbenchView["owner"], _revision: bigint, _path: string, _signal?: AbortSignal) => { view = { ...view, revision: view.revision + 1n, projects: [{ path: "D:/project", name: "project", addedAt: 1_000, exists: true }] }; return { ...view, acceptedProject: "D:/project" }; }),
     send: vi.fn(async (_sessionId: string, _draft: unknown, _options: unknown) => undefined), navigate: vi.fn(), releaseArtifactUrl: vi.fn() };
   const conversation: PartnerConversationView = { sessionId: session.id, ownerKey: "profile/server/canonical/1", kind: "partner", partner, confirmed: true, editable: true, failed: false, connected: true, readFailed: false, readRetry: 0,
-    acknowledge: vi.fn(), retryRead: vi.fn(), refresh: vi.fn(), openSettings: vi.fn(), openPrivateThread: vi.fn(), workbenchAvailable: true, workbenchOpenFailed: false, openWorkbench: vi.fn() };
+    acknowledge: vi.fn(), retryRead: vi.fn(), refresh: vi.fn(), openSettings: vi.fn(), openLearningSettings: vi.fn(), openPrivateThread: vi.fn(), workbenchAvailable: true, workbenchOpenFailed: false, openWorkbench: vi.fn() };
   const drafts: PartnerWorkbenchDrafts = { messages: new Map() };
   return { app, session, conversation, drafts, routineApi, get view() { return view; } };
 }

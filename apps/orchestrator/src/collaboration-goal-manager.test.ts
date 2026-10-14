@@ -12,6 +12,7 @@ import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 import { SessionHost } from "./session-host.js";
+import type { AdapterContext, PromptInput } from "@joko/core";
 import { mkdtempSync } from "./test-paths.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
@@ -21,6 +22,62 @@ afterEach(async () => {
 });
 
 describe("CollaborationGoalManager", () => {
+  it("persists a worker report's exact service origin before publishing canonical lead input", async () => {
+    const adapter = new class extends FakeBackendAdapter {
+      override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+        await context.emit({ type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }],
+          collaborationReportOrigin: { goalId: "forged", workerId: "forged", leadSessionId: "forged", workerSessionId: "other", workerLabel: "Spoofed", body: "Spoofed" } });
+        await super.send(input, context);
+      }
+    }(PI_LIKE_PROFILE);
+    const fixture = await createFixture(DEFAULT_COLLABORATION_SETTINGS, adapter);
+    const goal = fixture.manager.createGoal({ operationId: "report-goal", leadSessionId: fixture.leadSessionId,
+      expectedSessionGeneration: fixture.leadGeneration, title: "Team", objective: "Coordinate work." }).goal;
+    const { worker } = await fixture.manager.createWorker(workerInput(goal.id, goal.revision, fixture.leadSessionId, {
+      operationId: "report-worker", label: "Developer", role: "developer", assignment: ""
+    }));
+    const input = { operationId: "worker-report", workerId: worker.id, callerWorkerSessionId: worker.sessionId!,
+      expectedWorkerRevision: worker.revision, expectedWorkerSessionGeneration: worker.sessionGeneration!, message: "Completed the assigned work.\nConcrete evidence." };
+    const report = fixture.manager.sendWorkerReport(input);
+    const origin = { goalId: goal.id, workerId: worker.id, leadSessionId: fixture.leadSessionId,
+      workerSessionId: worker.sessionId!, workerLabel: "Developer", body: input.message };
+    expect(fixture.store.getOperation(input.operationId).body).toMatchObject({ collaborationReportOrigin: origin });
+    expect(fixture.store.getQueueItem(report.queueItemId).body.text).toBe(`[From Developer]\n${input.message}`);
+    await vi.waitFor(() => expect(fixture.store.listEvents({ sessionId: fixture.leadSessionId, order: "asc", limit: 1_000 })
+      .some(event => event.payload.type === "message_complete" && event.payload.role === "user" && event.payload.collaborationReportOrigin?.workerId === worker.id)).toBe(true));
+    const events = fixture.store.listEvents({ sessionId: fixture.leadSessionId, order: "asc", limit: 1_000 });
+    expect(events.filter(event => event.payload.type === "message_complete" && event.payload.role === "user")).toMatchObject([{ payload: { collaborationReportOrigin: origin } }]);
+    expect(events.filter(event => event.payload.type === "message_complete" && event.payload.role === "assistant")
+      .every(event => event.payload.type === "message_complete" && event.payload.collaborationReportOrigin === undefined)).toBe(true);
+    expect(() => fixture.manager.sendWorkerReport({ ...input, operationId: "report-impostor", callerWorkerSessionId: fixture.leadSessionId })).toThrow("selected worker");
+    expect(() => fixture.host.enqueueServiceInput({ operationId: "report-forged-target", sessionId: worker.sessionId!, source: "system",
+      originSessionId: fixture.leadSessionId, collaborationReportOrigin: origin,
+      prompt: { text: input.message, images: [], files: [], mentions: [], disposition: "prompt" } })).toThrow("original worker and lead");
+  });
+  it("creates a ready worker with no initial input and never dispatches edited metadata during recovery", async () => {
+    const fixture = await createFixture();
+    const goal = fixture.manager.createGoal({ operationId: "ready-goal", leadSessionId: fixture.leadSessionId,
+      expectedSessionGeneration: fixture.leadGeneration, title: "Task team", objective: "Collaborate on the lead task." }).goal;
+    const created = await fixture.manager.createWorker(workerInput(goal.id, goal.revision, fixture.leadSessionId, {
+      operationId: "ready-worker", label: "Developer", role: "developer", assignment: ""
+    }));
+    expect(created.worker).toMatchObject({ status: "idle", assignment: "", runtimeReleased: false });
+    expect(fixture.store.listCollaborationDispatches({ workerId: created.worker.id })).toEqual([]);
+    expect(fixture.store.listQueueItems({ sessionId: created.worker.sessionId! })).toEqual([]);
+    fixture.manager.updateWorker({ operationId: "ready-worker-note", workerId: created.worker.id,
+      callerLeadSessionId: fixture.leadSessionId, expectedRevision: created.worker.revision, assignment: "Updated role notes." });
+    await fixture.manager.close();
+    const recovered = new CollaborationGoalManager({ store: fixture.store, sessionHost: fixture.host,
+      readSettings: () => DEFAULT_COLLABORATION_SETTINGS });
+    fixture.managers.push(recovered); await recovered.initialize();
+    const worker = recovered.getTree(goal.id).workers[0]!;
+    expect(worker.assignment).toBe("Updated role notes.");
+    expect(fixture.store.listCollaborationDispatches({ workerId: worker.id })).toEqual([]);
+    await recovered.sendMessage({ operationId: "ready-worker-explicit-message", goalId: goal.id, workerId: worker.id,
+      callerLeadSessionId: fixture.leadSessionId, expectedWorkerRevision: worker.revision,
+      expectedSessionGeneration: worker.sessionGeneration!, message: "Run the requested verification." });
+    expect(fixture.store.listCollaborationDispatches({ workerId: worker.id })).toMatchObject([{ message: "Run the requested verification." }]);
+  });
   it("creates a durable Goal and worker, then admits the initial assignment through the exact worker Queue", async () => {
     const fixture = await createFixture();
     const goal = fixture.manager.createGoal({
@@ -62,6 +119,9 @@ describe("CollaborationGoalManager", () => {
       body: { text: created.worker.assignment }
     });
     expect(fixture.store.getOperation(dispatches[0]!.operationId).status).toBe("completed");
+    expect(fixture.store.getOperation(dispatches[0]!.operationId).body).toMatchObject({ taskMessageOrigin: {
+      senderSessionId: fixture.leadSessionId, senderSessionTitle: "Lead"
+    } });
 
     await vi.waitFor(() => {
       expect(["idle", "completed"]).toContain(fixture.manager.getTree(goal.id).workers[0]!.status);
@@ -759,7 +819,7 @@ describe("CollaborationGoalManager", () => {
   });
 });
 
-async function createFixture(settings = DEFAULT_COLLABORATION_SETTINGS) {
+async function createFixture(settings = DEFAULT_COLLABORATION_SETTINGS, adapter = new FakeBackendAdapter(PI_LIKE_PROFILE)) {
   const directory = mkdtempSync(join(tmpdir(), "joko-collaboration-goal-"));
   const store = new OperationalStore(join(directory, "operational.db"));
   const artifacts = new ArtifactStore({
@@ -768,7 +828,7 @@ async function createFixture(settings = DEFAULT_COLLABORATION_SETTINGS) {
     ingestRoots: [directory]
   });
   await artifacts.initialize();
-  const host = new SessionHost(store, artifacts, [new FakeBackendAdapter(PI_LIKE_PROFILE)]);
+  const host = new SessionHost(store, artifacts, [adapter]);
   await host.initialize();
   await host.registerTarget({
     id: "target-one",

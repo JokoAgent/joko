@@ -74,6 +74,29 @@ async function render(active?: MobilePartnerProfileTransport, resumeFactory?: (p
   await act(async () => root.render(createElement(MobilePartnerProfileSheet, { visible: true, partner,
     transport: active, resumeFactory, routineFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale: "en", onClose: close, onSaved: saved })));
 }
+
+it.each(["memory", "skills"] as const)("opens the original %s destination after the learning request obtains a fresh profile", async destination => {
+  const owner = { partnerId: profilePartner.partnerId, homeTargetId: profilePartner.homeTargetId,
+    canonicalSessionId: profilePartner.canonicalSessionId!, revision: 1n, readOnly: false, memoryEnabled: true };
+  const load = deferred<MobilePartnerProfileSnapshot>();
+  const active = { ...transport(), load: vi.fn(() => load.promise) };
+  const memoryApi: PartnerMemoryApi = { ownerKey: active.ownerKey, list: vi.fn(async () => ({ owner, groups: [], truncated: false })),
+    read: vi.fn(async () => ({ owner })), save: vi.fn(), remove: vi.fn(),
+    preferences: vi.fn(async () => ({ owner, enabled: true, userContext: "" })), savePreferences: vi.fn() };
+  const skillApi: PartnerSkillsApi = { ownerKey: active.ownerKey,
+    list: vi.fn(async () => ({ owner, skills: [], total: 0 })), read: vi.fn(), save: vi.fn(), remove: vi.fn() };
+  const memoryFactory = vi.fn((_partner: typeof profilePartner, _ownerKey: string) => new PartnerMemoryEditor(memoryApi, owner));
+  const skillsFactory = vi.fn((_partner: typeof profilePartner, _ownerKey: string) => new PartnerSkillsEditor(skillApi, owner));
+  container = document.createElement("div"); document.body.append(container); root = createRoot(container);
+  await act(async () => root.render(createElement(MobilePartnerProfileSheet, { visible: true, partner: profilePartner,
+    transport: active, memoryFactory, skillsFactory, initialLearningDestination: destination, colors, locale: "en", onClose: close, onSaved: saved })));
+  expect(memoryFactory).not.toHaveBeenCalled(); expect(skillsFactory).not.toHaveBeenCalled();
+  await act(async () => load.resolve({ ...profileSnapshot, ownerKey: active.ownerKey }));
+  const factory = destination === "memory" ? memoryFactory : skillsFactory;
+  expect(factory).toHaveBeenCalledExactlyOnceWith(profilePartner, active.ownerKey);
+  expect(container.textContent).toContain(destination === "memory" ? "No saved memories." : "No matching skills.");
+  expect(memoryApi.save).not.toHaveBeenCalled(); expect(skillApi.save).not.toHaveBeenCalled();
+});
 async function press(label: string) {
   const button = container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
   expect(button, label).toBeTruthy(); await act(async () => button!.click());

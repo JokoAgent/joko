@@ -1,5 +1,6 @@
 import { createHash, createHmac, generateKeyPairSync, randomBytes, randomUUID, sign } from "node:crypto";
 import type { KeyObject } from "node:crypto";
+import type { PartnerLearningTurnSource } from "@joko/core";
 import { mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "./test-paths.js";
 import { tmpdir } from "node:os";
@@ -104,7 +105,7 @@ class FakeMcpFactory implements McpClientFactory {
   }
 }
 
-interface FixtureOptions extends Partial<Pick<McpRouterOptions, "now" | "bridgeGrantTtlMs" | "nativeAuthLeaseTtlMs" | "nativeAuth" | "nativeAuthRecovery" | "trustedManagedRunnerScriptSha256" | "toolDiscoveryPolicy" | "targetReferences">> {
+interface FixtureOptions extends Partial<Pick<McpRouterOptions, "now" | "bridgeGrantTtlMs" | "nativeAuthLeaseTtlMs" | "nativeAuth" | "nativeAuthRecovery" | "trustedManagedRunnerScriptSha256" | "toolDiscoveryPolicy" | "targetReferences" | "capturePartnerLearningSave">> {
   readonly maximumBlobBytes?: number;
   readonly audioResultDownloader?: McpAudioResultDownloader;
 }
@@ -231,13 +232,50 @@ async function fixture(options: FixtureOptions = {}) {
     ...(options.trustedManagedRunnerScriptSha256 === undefined
       ? {} : { trustedManagedRunnerScriptSha256: options.trustedManagedRunnerScriptSha256 }),
     ...(options.toolDiscoveryPolicy === undefined ? {} : { toolDiscoveryPolicy: options.toolDiscoveryPolicy }),
-    ...(options.targetReferences === undefined ? {} : { targetReferences: options.targetReferences })
+    ...(options.targetReferences === undefined ? {} : { targetReferences: options.targetReferences }),
+    ...(options.capturePartnerLearningSave === undefined ? {} : { capturePartnerLearningSave: options.capturePartnerLearningSave })
   });
   await router.initialize();
   return { root, store, credentials, factory, artifacts, router };
 }
 
 describe("McpRouter", () => {
+  it("binds private original-turn proof to authenticated request scope and never grants learning from tool arguments", async () => {
+    const recorded = vi.fn(), capture = vi.fn(() => ({ recordSaved: recorded }));
+    const { router, store } = await fixture({ capturePartnerLearningSave: capture });
+    const calls: import("./mcp-router.js").BridgeToolCallContext[] = [];
+    router.registerBridgeToolProvider({ id: "learning-tools", generation: 1, available: true,
+      tools: [{ serverId: "learning-tools", name: "save", description: "Save", inputSchema: { type: "object" }, requiresPermission: false }],
+      callTool: async (_name, _arguments, _signal, context) => {
+        calls.push(context);
+        context.partnerLearningSave?.recordSaved(store, { kind: "memory", entryId: "memory-one", title: "Preference", action: "created" });
+        return { content: [{ type: "text", text: "saved" }], isError: false };
+      } });
+    const source: PartnerLearningTurnSource = { occurrenceId: "private-occurrence", sessionId: "session-1", targetId: "target-1",
+      backendId: "pi", backendInstanceGeneration: 0, bindingGeneration: 1, bindingFingerprint: "original-binding",
+      sourceRunId: "original-run", sourceAttemptId: "original-attempt", sourceQueueItemId: "original-queue", nativeOccurrence: "native-original" };
+    const authority = { source, requestId: "private-save", serverId: "learning-tools", toolName: "save", assertCurrent: vi.fn() };
+    const proof = router.registerPartnerLearningToolAuthority(authority);
+    const bridge = router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", expectedPiGeneration: 1,
+      sessionId: source.sessionId, targetId: source.targetId });
+    const request = { authorization: `Bearer ${bridge.mcpBridge.token}`, requestId: authority.requestId, generation: 1,
+      sessionId: source.sessionId, targetId: source.targetId, serverId: authority.serverId, toolName: authority.toolName,
+      arguments: { value: "original" }, partnerLearningProof: proof };
+    expect(await router.executeBridgeCall(request)).toMatchObject({ isError: false });
+    expect(capture).toHaveBeenCalledWith(source);
+    expect(recorded).toHaveBeenCalledOnce();
+    expect(await router.executeBridgeCall(request)).toMatchObject({ isError: true });
+    expect(await router.executeBridgeCall({ ...request, arguments: { value: "changed" } })).toMatchObject({ isError: true });
+    expect(await router.executeBridgeCall({ ...request, requestId: "next-turn" })).toMatchObject({ isError: true });
+    expect(await router.executeBridgeCall({ ...request, partnerLearningProof: undefined,
+      partnerLearningAuthority: { ...authority, source: { ...source }, proof } })).toMatchObject({ isError: true });
+    expect(calls).toHaveLength(1);
+    expect(await router.executeBridgeCall({ ...request, requestId: "ordinary-save", partnerLearningProof: undefined,
+      arguments: { source, partnerLearningProof: proof } })).toMatchObject({ isError: false });
+    expect(calls[1]!.partnerLearningSave).toBeUndefined();
+    expect(recorded).toHaveBeenCalledOnce();
+    bridge.revoke(); await router.dispose(); store.close();
+  });
   it("freezes Partner connection selections, preserves essential tools and leaves ordinary scopes unchanged", async () => {
     let selected = { mcpIds: new Set(["selected"]), toolsetIds: new Set(["optional-policy"]) };
     const { root, store, router } = await fixture({ targetReferences: targetId => targetId === "target-1" ? selected : undefined });

@@ -669,6 +669,7 @@ export class CollaborationGoalManager {
         prompt: servicePrompt(input.message),
         source: "system",
         originSessionId: input.callerLeadSessionId,
+        taskMessageOrigin: { senderSessionId: input.callerLeadSessionId, senderSessionTitle: this.#store.getSession(input.callerLeadSessionId).descriptor.title },
         onAdmitted: (store, result) => {
           const dispatch = store.createCollaborationDispatch({
             goalId: input.goalId,
@@ -759,6 +760,7 @@ export class CollaborationGoalManager {
         prompt: servicePrompt(input.message),
         source: "system",
         originSessionId: input.callerLeadSessionId,
+        taskMessageOrigin: { senderSessionId: input.callerLeadSessionId, senderSessionTitle: this.#store.getSession(input.callerLeadSessionId).descriptor.title },
         onAdmitted: (store, result) => {
           const replacement = store.createCollaborationDispatch({
             goalId: input.goalId,
@@ -839,6 +841,8 @@ export class CollaborationGoalManager {
       prompt: servicePrompt(`[From ${worker.label}]\n${input.message}`),
       source: "system",
       originSessionId: worker.sessionId,
+      collaborationReportOrigin: { goalId: goal.id, workerId: worker.id, leadSessionId: goal.leadSessionId,
+        workerSessionId: worker.sessionId, workerLabel: worker.label, body: input.message },
       onAdmitted: (store) => {
         const current = store.getCollaborationWorker(worker.id);
         const currentGoal = store.getCollaborationGoal(current.goalId);
@@ -1094,6 +1098,14 @@ export class CollaborationGoalManager {
     if (worker.sessionId === undefined || worker.sessionGeneration === undefined || worker.runtimeReleased || [
       "provisioning", "failed", "stopping", "stopped", "dispatch_unknown", "archived"
     ].includes(worker.status)) return worker;
+    const creation = this.#store.getOperation(worker.createOperationId);
+    if (!isRecord(creation.body) || typeof creation.body["assignment"] !== "string") {
+      throw new StoreError("The worker's original assignment snapshot is unavailable.");
+    }
+    const assignment = creation.body["assignment"].normalize("NFC").replace(/\r\n?/gu, "\n").trim();
+    // An empty initial task creates a ready worker. Later metadata edits are
+    // never authority to synthesize a first input during recovery.
+    if (assignment === "") return worker;
     const operationId = serviceOperationId(worker.createOperationId, "initial-assignment");
     if (this.#store.findCollaborationDispatchByOperation(operationId) !== undefined) {
       return this.#reconcileWorker(worker.id);
@@ -1106,7 +1118,7 @@ export class CollaborationGoalManager {
       callerLeadSessionId: goal.leadSessionId,
       expectedWorkerRevision: worker.revision,
       expectedSessionGeneration: worker.sessionGeneration,
-      message: worker.assignment
+      message: assignment
     });
     worker = this.#reconcileWorker(worker.id);
     return worker;

@@ -1,4 +1,5 @@
 import { WorkspaceKind, type Session, type Snapshot } from "@joko/contracts";
+import { safeWindowRect, windowDivision, type MobileWindowGeometry } from "./mobile-window-geometry";
 
 export type MobileHomeStatusFilter = "active" | "archived" | "all";
 
@@ -101,8 +102,6 @@ export const WIDE_SESSION_NAV_MIN_WIDTH = 600;
 
 export interface WideSessionNavLayoutInput {
   readonly windowWidth?: number;
-  readonly platform?: string;
-  readonly iosPad?: boolean;
 }
 
 export interface WideSessionNavLayout {
@@ -111,10 +110,48 @@ export interface WideSessionNavLayout {
 }
 
 export function buildWideSessionNavLayout(input: WideSessionNavLayoutInput): WideSessionNavLayout {
-  const width = Number.isFinite(input.windowWidth) && (input.windowWidth ?? 0) > 0 ? input.windowWidth! : 0;
-  const platformAllowed = input.platform !== "ios" || input.iosPad === true;
-  if (!platformAllowed || width < WIDE_SESSION_NAV_MIN_WIDTH) return { enabled: false, drawerWidth: 0 };
-  return { enabled: true, drawerWidth: Math.min(360, Math.max(300, Math.round(width * 0.4))) };
+  const width = positiveDimension(input.windowWidth);
+  if (width < WIDE_SESSION_NAV_MIN_WIDTH) return { enabled: false, drawerWidth: 0 };
+  return { enabled: true, drawerWidth: Math.min(width - 24, Math.min(360, Math.max(300, Math.round(width * 0.4)))) };
+}
+
+export interface MobileHomeNavigationLayoutInput {
+  readonly windowWidth?: number;
+  readonly windowHeight?: number;
+  readonly safeInsets?: { readonly top?: number; readonly bottom?: number; readonly left?: number; readonly right?: number };
+  readonly windowGeometry?: MobileWindowGeometry;
+}
+
+export interface MobileHomeNavigationLayout {
+  readonly mode: "narrow" | "drawer" | "persistent";
+  readonly drawerWidth: number;
+  readonly sidebarWidth: number;
+  readonly sidebarGap: number;
+  readonly detailWidth: number;
+}
+
+export function buildMobileHomeNavigationLayout(input: MobileHomeNavigationLayoutInput): MobileHomeNavigationLayout {
+  const width = positiveDimension(input.windowWidth);
+  const height = positiveDimension(input.windowHeight);
+  const geometry = input.windowGeometry;
+  const safe = geometry ? safeWindowRect(geometry) : {
+    x: positiveDimension(input.safeInsets?.left), y: positiveDimension(input.safeInsets?.top),
+    width: Math.max(0, width - positiveDimension(input.safeInsets?.left) - positiveDimension(input.safeInsets?.right)),
+    height: Math.max(0, height - positiveDimension(input.safeInsets?.top) - positiveDimension(input.safeInsets?.bottom))
+  };
+  const division = geometry ? windowDivision(geometry) : null;
+  const splitAtDivision = division?.axis === "vertical" && division.first.width >= 240 && division.second.width >= 320;
+  if (splitAtDivision || (!division && geometry?.regularWidth !== false && safe.width >= 760 && safe.height >= 480)) {
+    const sidebarWidth = splitAtDivision ? division.first.width : Math.min(320, Math.round(safe.width * 0.34));
+    const sidebarGap = splitAtDivision ? division.second.x - safe.x - sidebarWidth : 0;
+    return { mode: "persistent", drawerWidth: 0, sidebarWidth, sidebarGap, detailWidth: safe.width - sidebarWidth - sidebarGap };
+  }
+  const quick = buildWideSessionNavLayout({ windowWidth: width });
+  return { mode: quick.enabled ? "drawer" : "narrow", drawerWidth: quick.drawerWidth, sidebarWidth: 0, sidebarGap: 0, detailWidth: safe.width };
+}
+
+function positiveDimension(value: number | undefined): number {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 export interface SwipeRowRegistry {

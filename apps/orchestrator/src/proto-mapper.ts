@@ -337,6 +337,7 @@ export class ProtoMappingError extends Error {
 }
 
 export interface EventMappingContext {
+  readonly learning?: import("@joko/core").PartnerLearningFeedback;
   readonly queueItem?: QueueItemRecord;
   readonly queueControl?: QueueControlRecord;
   readonly interaction?: InteractionRecord;
@@ -2937,6 +2938,10 @@ export function fromProtoEvent(event: ProtoEvent): AppendEventInput {
 function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext): ProtoEventPayload {
   const payload = event.payload;
   switch (payload.type) {
+    case "partner_learning_changed":
+      return protoPayload("partnerLearningChanged", message<contract.PartnerLearningChangedEvent>("joko.v1.PartnerLearningChangedEvent", {
+        completionEventId: payload.completionEventId, messageId: payload.messageId, feedback: toProtoLearningFeedback(payload.feedback)
+      }));
     case "device_changed":
       return protoPayload("deviceChanged", message<contract.DeviceChangedEvent>("joko.v1.DeviceChangedEvent", {
         device: toProtoDeviceContent(payload.device)
@@ -2978,6 +2983,13 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         hidden: false
       }));
     case "message_complete":
+      if (payload.taskMessageOrigin !== undefined && (payload.role !== "user" || payload.acceptedInput === undefined)) {
+        throw new ProtoMappingError("invalid_argument", "event.payload.task_message_origin", "A sender requires canonical accepted user input.");
+      }
+      if (payload.collaborationReportOrigin !== undefined && (payload.role !== "user" || payload.acceptedInput === undefined
+        || payload.collaborationReportOrigin.leadSessionId !== event.sessionId)) {
+        throw new ProtoMappingError("invalid_argument", "event.payload.collaboration_report_origin", "A report requires its canonical accepted lead input.");
+      }
       if (payload.acceptedInput !== undefined && payload.role !== "user") {
         throw new ProtoMappingError("invalid_argument", "event.payload.accepted_input", "Only user messages may carry accepted input.");
       }
@@ -3008,6 +3020,10 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
           runtimeRecoveryId: payload.automaticContinuation?.recoveryId ?? "",
           partnerPrivateOrigin: payload.partnerPrivateOrigin === undefined ? undefined
             : message<contract.PartnerPrivateMessageOrigin>("joko.v1.PartnerPrivateMessageOrigin", payload.partnerPrivateOrigin),
+          collaborationReportOrigin: payload.collaborationReportOrigin === undefined ? undefined
+            : message<contract.CollaborationReportOrigin>("joko.v1.CollaborationReportOrigin", fromProtoCollaborationReportOrigin(payload.collaborationReportOrigin)),
+          taskMessageOrigin: payload.taskMessageOrigin === undefined ? undefined
+            : message<contract.TaskMessageOrigin>("joko.v1.TaskMessageOrigin", fromProtoTaskMessageOrigin(payload.taskMessageOrigin)),
           objectiveContinuation: payload.objectiveContinuation === undefined
             ? undefined
             : message<contract.ObjectiveContinuation>("joko.v1.ObjectiveContinuation", {
@@ -3026,6 +3042,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         nativeIdentity: toProtoNativeMessageIdentity(payload.nativeHistory?.identity),
         partnerPrivateOrigin: payload.partnerPrivateOrigin === undefined ? undefined
           : message<contract.PartnerPrivateMessageOrigin>("joko.v1.PartnerPrivateMessageOrigin", payload.partnerPrivateOrigin),
+        learning: context.learning === undefined ? undefined : toProtoLearningFeedback(context.learning),
         ...toProtoMessageGenerationTiming(payload)
       }));
     case "runtime_recovery":
@@ -3400,6 +3417,8 @@ function fromProtoEventPayload(
   occurredAt?: number
 ): EventPayload {
   switch (payload.kind.case) {
+    case "partnerLearningChanged":
+      throw new ProtoMappingError("invalid_argument", "event.payload.partner_learning_changed", "Learning feedback is owned by the Store and cannot be imported as a Session event.");
     case "deviceChanged":
       throw new ProtoMappingError("invalid_argument", "event.payload.device_changed", "Device content is owned by the Store and cannot be imported as a Session event.");
     case "sessionChanged":
@@ -3457,7 +3476,23 @@ function fromProtoEventPayload(
         ...(payload.kind.value.partnerPrivateOrigin === undefined ? {} : {
           partnerPrivateOrigin: fromProtoPartnerPrivateOrigin(payload.kind.value.partnerPrivateOrigin)
         }),
+        ...(payload.kind.value.collaborationReportOrigin === undefined ? {} : {
+          collaborationReportOrigin: (() => {
+            if (payload.kind.value.role !== MessageRole.USER || !payload.kind.value.userInputAccepted) {
+              throw new ProtoMappingError("invalid_argument", "event.payload.collaboration_report_origin", "Only accepted user input can carry a worker report.");
+            }
+            return fromProtoCollaborationReportOrigin(payload.kind.value.collaborationReportOrigin);
+          })()
+        }),
         ...(inputDelivery === undefined ? {} : { inputDelivery }),
+        ...(payload.kind.value.taskMessageOrigin === undefined ? {} : {
+          taskMessageOrigin: (() => {
+            if (payload.kind.value.role !== MessageRole.USER || !payload.kind.value.userInputAccepted) {
+              throw new ProtoMappingError("invalid_argument", "event.payload.task_message_origin", "Only accepted user input can carry a sender.");
+            }
+            return fromProtoTaskMessageOrigin(payload.kind.value.taskMessageOrigin);
+          })()
+        }),
         ...(payload.kind.value.automaticContinuation && payload.kind.value.runtimeRecoveryId.trim().length > 0 ? {
           automaticContinuation: {
             recoveryId: payload.kind.value.runtimeRecoveryId
@@ -4447,6 +4482,30 @@ function safeNumber(value: bigint, fieldPath: string): number {
     throw new ProtoMappingError("out_of_range", fieldPath, `${fieldPath} is outside the supported integer range.`);
   }
   return Number(value);
+}
+
+function fromProtoTaskMessageOrigin(value: { readonly senderSessionId: string; readonly senderSessionTitle?: string; readonly senderPartnerId?: string;
+  readonly senderPartnerName?: string }): NonNullable<Extract<EventPayload, { type: "message_complete" }>["taskMessageOrigin"]> {
+  const { senderSessionId, senderSessionTitle, senderPartnerId, senderPartnerName } = value;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(senderSessionId)
+    || senderPartnerId !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(senderPartnerId)
+    || (senderPartnerId === undefined) !== (senderPartnerName === undefined)
+    || [senderSessionTitle, senderPartnerName].some(text => text !== undefined && (text.length > 256 || /[\u0000-\u001f\u007f]/u.test(text)))) {
+    throw new ProtoMappingError("invalid_argument", "event.payload.task_message_origin", "The sender snapshot is invalid.");
+  }
+  return { senderSessionId, ...(senderSessionTitle === undefined ? {} : { senderSessionTitle }),
+    ...(senderPartnerId === undefined ? {} : { senderPartnerId, senderPartnerName }) };
+}
+
+function fromProtoCollaborationReportOrigin(value: { readonly goalId: string; readonly workerId: string; readonly leadSessionId: string;
+  readonly workerSessionId: string; readonly workerLabel: string; readonly body: string }): NonNullable<Extract<EventPayload, { type: "message_complete" }>["collaborationReportOrigin"]> {
+  const { goalId, workerId, leadSessionId, workerSessionId, workerLabel, body } = value;
+  if ([goalId, workerId, leadSessionId, workerSessionId].some(id => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(id))
+    || leadSessionId === workerSessionId || !workerLabel.trim() || workerLabel.length > 64
+    || !body.trim() || body.length > 32_000 || body.includes("\0")) {
+    throw new ProtoMappingError("invalid_argument", "event.payload.collaboration_report_origin", "The report provenance is invalid.");
+  }
+  return { goalId, workerId, leadSessionId, workerSessionId, workerLabel, body };
 }
 
 function fromProtoPartnerPrivateOrigin(value: contract.PartnerPrivateMessageOrigin): NonNullable<Extract<EventPayload, { type: "message_complete" }>["partnerPrivateOrigin"]> {
@@ -6698,6 +6757,28 @@ export function toProtoUsage(value: UsageSnapshot): Usage {
     totalTokens: unsignedBigInt(value.totalTokens, "usage.total_tokens"),
     costMicros: costMicros(value.cost),
     currencyCode: "USD"
+  });
+}
+
+function toProtoLearningFeedback(value: import("@joko/core").PartnerLearningFeedback): contract.PartnerLearningFeedback {
+  if (!/^[1-9][0-9]*$/u.test(value.revision)) {
+    throw new ProtoMappingError("invalid_argument", "learning.revision", "Learning feedback requires its committed revision.");
+  }
+  return message<contract.PartnerLearningFeedback>("joko.v1.PartnerLearningFeedback", {
+    revision: toProtoRevision(BigInt(value.revision)),
+    receipts: value.receipts.map(item => {
+      if (item.kind !== "memory" && item.kind !== "skill" || item.action !== "created" && item.action !== "updated"
+        || !item.entryId || item.entryId.length > 256 || item.entryId !== item.entryId.trim()
+        || !item.title || Array.from(item.title).length > 100 || item.title !== item.title.trim()
+        || /[\u0000-\u001f\u007f]/u.test(item.entryId + item.title) || redactSecrets(item.title) !== item.title) {
+        throw new ProtoMappingError("invalid_argument", "learning.receipt", "Learning feedback contains an invalid receipt.");
+      }
+      return message<contract.PartnerLearningReceipt>("joko.v1.PartnerLearningReceipt", {
+        kind: item.kind === "memory" ? contract.PartnerLearningKind.MEMORY : contract.PartnerLearningKind.SKILL,
+        entryId: item.entryId, title: item.title,
+        action: item.action === "created" ? contract.PartnerLearningAction.CREATED : contract.PartnerLearningAction.UPDATED
+      });
+    })
   });
 }
 

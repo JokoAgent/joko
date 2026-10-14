@@ -1,5 +1,8 @@
 import type { ConnectRouter } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
+import { create } from "@bufbuild/protobuf";
+import type { PartnerLearningFeedback } from "@joko/core";
+import type { PersistedEvent } from "@joko/store";
 import { describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
@@ -24,6 +27,35 @@ function stubApplication(overrides: Record<string, unknown> = {}): OrchestratorA
 }
 
 describe("Connect service composition", () => {
+  it("joins original learning feedback consistently in event stream, history and around-message responses", async () => {
+    const feedback: PartnerLearningFeedback = { revision: "5", receipts: [{ kind: "memory", entryId: "memory-1", title: "Preference", action: "created" }] };
+    const original: PersistedEvent = { id: "original-completion", sequence: 1n, globalCursor: 1n, revision: 1n, emittedAt: 1_000,
+      backendId: "backend", targetId: "target", sessionId: "session", generation: 1, traceId: "learning:original",
+      payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original reply" }] } };
+    const getFeedback = vi.fn((id: string) => id === original.id ? feedback : undefined);
+    const connections = { authenticate: () => ({ id: "owner" }), fence: vi.fn(), onRevoked: () => () => undefined };
+    const store = { health: () => ({ globalCursor: 1n, revision: 5n }), listEvents: () => [original], listEventsAround: () => [original],
+      getPartnerLearningFeedback: getFeedback, subscribe: () => () => undefined,
+      getSession: () => { throw new Error("Historical session omitted"); }, getTarget: () => { throw new Error("Historical target omitted"); } };
+    const services = createConnectServices(stubApplication({ store, connections }));
+    const signal = new AbortController();
+    const handler = { requestHeader: new Headers(), signal: signal.signal };
+    const timeline = services.session.listSessionTimeline as (request: contract.ListSessionTimelineRequest, context: unknown) => contract.ListSessionTimelineResponse;
+    const older = await timeline(create(contract.ListSessionTimelineRequestSchema, { sessionId: "session", limit: 10 }), handler);
+    const around = await timeline(create(contract.ListSessionTimelineRequestSchema, { sessionId: "session", aroundEventId: original.id, limit: 10 }), handler);
+    const stream = services.event.streamEvents as (request: contract.StreamEventsRequest, context: unknown) => AsyncIterable<contract.StreamEventsResponse>;
+    const iterator = stream(create(contract.StreamEventsRequestSchema, {}), handler)[Symbol.asyncIterator]();
+    const live = await iterator.next();
+    for (const projected of [older.events[0], around.events[0], live.value?.event]) {
+      expect(projected?.eventId).toBe(original.id);
+      expect(projected?.payload?.kind).toMatchObject({ case: "messageCompleted", value: { messageId: original.id,
+        blocks: [{ content: { case: "text", value: "Original reply" } }], learning: { revision: { value: 5n },
+          receipts: [{ kind: contract.PartnerLearningKind.MEMORY, entryId: "memory-1", title: "Preference", action: contract.PartnerLearningAction.CREATED }] } } });
+    }
+    expect(getFeedback).toHaveBeenCalledTimes(3);
+    expect(connections.fence).toHaveBeenCalledOnce();
+    signal.abort(); await iterator.return?.();
+  });
   it("registers every public service and RPC handler", () => {
     const registrations: Array<{ descriptor: { method: Record<string, unknown> }; implementation: Record<string, unknown> }> = [];
     const router = {

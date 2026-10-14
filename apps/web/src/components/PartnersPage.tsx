@@ -30,6 +30,7 @@ import { PartnerConnectionsDialog } from "./PartnerConnectionsDialog.js";
 import { partnerTaskModelMessages } from "@joko/contracts";
 import { partnerSessionTaskMessages, partnerSessionTaskActive, type PartnerSessionTaskView } from "@joko/contracts";
 import { partnerConnectionsMessages } from "@joko/contracts";
+import type { PartnerLearningSettingsDestination } from "@joko/contracts";
 import { partnerMemoryMessages } from "@joko/contracts";
 import { partnerImportMessages } from "@joko/contracts";
 import { partnerResumeMessages, routineMessages } from "@joko/contracts";
@@ -687,7 +688,7 @@ function PartnerDefaultsDialog({ open, directory, snapshot, controller, ownerKey
   return <Modal open={open} title={t("partners.defaultsTitle")} description={t("partners.defaultsBody")} size="large" onClose={saving ? () => undefined : onClose}>{permissionConfirmation.dialog}<div ref={(node) => { permissionConfirmation.rootRef.current = node; }} className="partner-editor"><CapabilitiesEditor value={value} snapshot={snapshot} disabled={saving} t={t} onChange={setValue} />{error !== undefined && <p className="partner-editor__error" role="alert">{error}</p>}<div className="modal__actions"><Button onClick={onClose} disabled={saving}>{t("common.cancel")}</Button><Button tone="primary" disabled={saving || !validPartnerCapabilities(value) || !partnerCapabilitiesAvailable(value, snapshot)} onClick={save}>{saving ? t("common.working") : t("common.save")}</Button></div></div></Modal>;
 }
 
-export function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, initialSection = "activity", initialPrivateThreadId, showClose = false, onClose, onUpdated, onActivityUpdated }: {
+export function PartnerSettingsDialog({ partner, partners, directory, snapshot, controller, ownerKey, t, initialSection = "activity", initialPrivateThreadId, initialLearningDestination, showClose = false, onClose, onUpdated, onActivityUpdated }: {
   readonly partner: PartnerProfileView;
   readonly partners: readonly PartnerProfileView[];
   readonly directory: PartnerDirectoryView;
@@ -697,6 +698,7 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   readonly t: Translator;
   readonly initialSection?: "profile" | "activity";
   readonly initialPrivateThreadId?: string;
+  readonly initialLearningDestination?: PartnerLearningSettingsDestination;
   readonly showClose?: boolean;
   readonly onClose: () => void;
   readonly onUpdated: (result: PartnerMutationView) => void;
@@ -729,6 +731,18 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   const draftKey = editorDraftKey(draft);
   const baselineKey = editorDraftKey(editorDraft(baseline));
   const dirty = draftKey !== baselineKey;
+  const learningEntryRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!initialLearningDestination || baseline.initializationState !== "ready" || !baseline.canonicalSessionId
+      || dirty || saving || avatarPreparing || restartBusy || resumeBusy || conflict || !restartForeground
+      || controller.state.connectionState !== "connected") return;
+    const key = `${ownerKey}\u0000${baseline.id}\u0000${initialLearningDestination}`;
+    if (learningEntryRef.current === key) return;
+    learningEntryRef.current = key;
+    setSection("profile");
+    if (initialLearningDestination === "memory") setMemoryVisible(true); else setConnectionsVisible(true);
+  }, [initialLearningDestination, ownerKey, baseline.id, baseline.initializationState, baseline.canonicalSessionId,
+    dirty, saving, avatarPreparing, restartBusy, resumeBusy, conflict, restartForeground, controller.state.connectionState]);
   const [pendingLeave, setPendingLeave] = useState(false);
   const leaveRef = useRef<{ readonly finish: (accepted: boolean) => void } | undefined>(undefined);
   const leaveStateRef = useRef({ dirty, blocked: false });
@@ -825,7 +839,8 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
       <div className="modal__actions"><Button onClick={() => finishLeave(false)}>{t("partners.leave.stay")}</Button><Button tone="danger" onClick={() => finishLeave(true)}>{t("partners.leave.discard")}</Button></div>
     </Modal>
     {permissionConfirmation.dialog}
-    {connectionsVisible && <PartnerConnectionsDialog key={`${ownerKey}:${partner.id}`} controller={controller} partner={baseline} ownerKey={ownerKey} onClose={() => setConnectionsVisible(false)} />}
+    {connectionsVisible && <PartnerConnectionsDialog key={`${ownerKey}:${partner.id}`} controller={controller} partner={baseline}
+      ownerKey={ownerKey} focusSkills={initialLearningDestination === "skills"} onClose={() => setConnectionsVisible(false)} />}
     {memoryVisible && <PartnerMemoryDialog key={`${ownerKey}:${partner.id}`} controller={controller} partner={baseline} ownerKey={ownerKey} onClose={() => setMemoryVisible(false)} />}
     {resumeVisible && <PartnerResumeDialog controller={controller} ownerKey={ownerKey} foreground={restartForeground} partner={baseline}
       onBusyChange={setResumeBusy} onClose={() => setResumeVisible(false)} onChanged={(profile) => { setBaseline(profile); setDraft(editorDraft(profile)); onActivityUpdated(profile); }} />}

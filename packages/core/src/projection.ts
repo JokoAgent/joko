@@ -13,6 +13,7 @@ export interface TimelineItem {
   readonly inputDelivery?: MessageInputDelivery;
   readonly usage?: UsageSnapshot;
   readonly payload?: EventPayload;
+  readonly learning?: import("./partner-learning.js").PartnerLearningFeedback;
 }
 
 export interface SessionProjection {
@@ -72,6 +73,10 @@ export function reduceEvent(state: SessionProjection, event: EventEnvelope): Ses
       }
     ];
     streamingBlocks.clear();
+  } else if (payload.type === "partner_learning_changed") {
+    timeline = timeline.map(item => item.id === payload.completionEventId && item.role === "assistant"
+      && (item.learning === undefined || BigInt(item.learning.revision) < BigInt(payload.feedback.revision))
+      ? { ...item, learning: payload.feedback } : item);
   } else if (payload.type === "interaction_opened") {
     interactions.set(payload.interaction.id, payload.interaction);
     timeline = appendPayload(timeline, event);

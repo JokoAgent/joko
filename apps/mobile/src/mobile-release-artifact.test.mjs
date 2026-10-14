@@ -232,6 +232,6 @@ describe("mobile release artifact configuration", () => {
     const pkg = JSON.parse(readFileSync(resolve(mobileDirectory, "package.json"), "utf8"));
     expect(pkg.expo.autolinking.android.buildFromSource).toEqual(["expo-image"]);
     expect(pkg.expo.autolinking.ios.buildFromSource).toEqual(["expo-image-manipulator"]);
-    expect(pkg.expo.autolinking.android.exclude).toEqual(["expo-notifications"]);
+    expect(pkg.expo.autolinking.android.exclude).toEqual(["expo-notifications", "react-native-screens"]);
   });
 });
