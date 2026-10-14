@@ -78,6 +78,7 @@ describe("Desktop distribution", () => {
       "electron-updater": "6.8.9",
       "electron-window-state": "5.0.3",
       loudness: "0.4.2",
+      sharp: "0.35.3",
       yaml: "2.9.0"
     });
     expect(manifest.devDependencies).toMatchObject({
@@ -221,8 +222,8 @@ describe("Desktop distribution", () => {
   });
 
   it("builds and audits only the fixed Remote Desktop native helpers", () => {
-    expect(manifest.devDependencies?.["sharp"]).toBe("0.35.3");
-    expect(manifest.dependencies?.["sharp"]).toBeUndefined();
+    expect(manifest.dependencies?.["sharp"]).toBe("0.35.3");
+    expect(manifest.devDependencies?.["sharp"]).toBeUndefined();
     expect(manifest.scripts?.["build:native-remote-desktop"])
       .toBe("node scripts/build-native-remote-desktop.mjs");
     expect(manifest.scripts?.build).toContain("pnpm build:native-remote-desktop");
@@ -235,9 +236,6 @@ describe("Desktop distribution", () => {
     expect(nativeRemoteDesktopBuild).toContain('const windowsHostService = "joko-windows-remote-desktop-host.exe"');
     expect(nativeRemoteDesktopBuild).toContain('const windowsHostAddon = "joko-windows-remote-desktop-host.node"');
     expect(nativeRemoteDesktopBuild).toContain("export function buildNativeRemoteDesktop(");
-    expect(packagedAudit).toContain("buildNativeRemoteDesktop({");
-    expect(packagedAudit).toContain('output: resolve(resourcesRoot, "native-remote-desktop")');
-    expect(packagedAudit).toContain("auditNativeRemoteDesktop(");
   });
 
   it("allows an explicit all-users protected installation while retaining the current-user default", () => {

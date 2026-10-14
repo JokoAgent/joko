@@ -28,6 +28,9 @@ import type {
   DesktopKeepAwakeSettings,
   DesktopMainWindowCloseSettings,
   DesktopMainWindowCloseSettingsChange,
+  DesktopWallpaperSettings,
+  DesktopWallpaperSettingsChange,
+  DesktopWallpaperImportResult,
   DesktopLocale,
   DesktopSystemLocale,
   DesktopManagedOrchestratorConnection,
@@ -128,6 +131,12 @@ const DESKTOP_CHANNELS = {
   mainWindowCloseSettingsGet: "joko:main-window-close-settings:get",
   mainWindowCloseSettingsSet: "joko:main-window-close-settings:set",
   mainWindowCloseSettingsChanged: "joko:main-window-close-settings:changed",
+  wallpaperGet: "joko:wallpaper:get",
+  wallpaperSet: "joko:wallpaper:set",
+  wallpaperImport: "joko:wallpaper:import",
+  wallpaperRemove: "joko:wallpaper:remove",
+  wallpaperReset: "joko:wallpaper:reset",
+  wallpaperChanged: "joko:wallpaper:changed",
   pageSearchStart: "joko:page-search:start",
   pageSearchStop: "joko:page-search:stop",
   pageSearchResult: "joko:page-search:result",
@@ -294,6 +303,7 @@ const desktopCapabilities = Object.freeze([
   "navigation.deepLinks",
   "app.update",
   "appearance.zoom",
+  "appearance.wallpaper",
   "application.menu",
   "inspector.detach",
   ...((process.platform === "win32" || process.platform === "darwin") ? ["files.copy" as const] : []),
@@ -449,6 +459,27 @@ const desktopApi = Object.freeze({
       const wrapped = (): void => listener();
       ipcRenderer.on(DESKTOP_CHANNELS.layoutResetBroadcast, wrapped);
       return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.layoutResetBroadcast, wrapped);
+    }
+  }),
+  wallpaper: Object.freeze({
+    get: (): Promise<DesktopWallpaperSettings> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.wallpaperGet).then(parseDesktopWallpaperSettings),
+    set: (change: DesktopWallpaperSettingsChange): Promise<DesktopWallpaperSettings> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.wallpaperSet, parseDesktopWallpaperSettingsChange(change)).then(parseDesktopWallpaperSettings),
+    import: (expectedRevision: number): Promise<DesktopWallpaperImportResult> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.wallpaperImport, requireDesktopWallpaperRevision(expectedRevision)).then(parseDesktopWallpaperImportResult),
+    remove: (expectedRevision: number): Promise<DesktopWallpaperSettings> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.wallpaperRemove, requireDesktopWallpaperRevision(expectedRevision)).then(parseDesktopWallpaperSettings),
+    reset: (expectedRevision: number): Promise<DesktopWallpaperSettings> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.wallpaperReset, requireDesktopWallpaperRevision(expectedRevision)).then(parseDesktopWallpaperSettings),
+    onChanged: (listener: (settings: DesktopWallpaperSettings) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("Wallpaper listener must be a function.");
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => {
+        try { listener(parseDesktopWallpaperSettings(value)); }
+        catch { /* Only a valid confirmed projection may update this Document. */ }
+      };
+      ipcRenderer.on(DESKTOP_CHANNELS.wallpaperChanged, wrapped);
+      return () => ipcRenderer.removeListener(DESKTOP_CHANNELS.wallpaperChanged, wrapped);
     }
   }),
   mainWindowClose: Object.freeze({
@@ -1868,6 +1899,66 @@ function parseDesktopKeepAwakeSettings(value: unknown): DesktopKeepAwakeSettings
     throw new TypeError("Desktop keep-awake settings are invalid.");
   }
   return Object.freeze({ enabled: (value as { readonly enabled: boolean }).enabled });
+}
+
+function requireDesktopWallpaperRevision(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) throw new TypeError("Wallpaper revision is invalid.");
+  return value as number;
+}
+
+function parseDesktopWallpaperSettingsChange(value: unknown): DesktopWallpaperSettingsChange {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Wallpaper change is invalid.");
+  const entry = value as Record<string, unknown>;
+  if (!Object.hasOwn(entry, "expectedRevision") || Object.keys(entry).some(key =>
+    key !== "expectedRevision" && key !== "mode" && key !== "maskOpacity")) throw new TypeError("Wallpaper change is invalid.");
+  const expectedRevision = requireDesktopWallpaperRevision(entry["expectedRevision"]);
+  if (Object.hasOwn(entry, "mode") && entry["mode"] !== "none" && entry["mode"] !== "custom") throw new TypeError("Wallpaper mode is invalid.");
+  const maskOpacity = entry["maskOpacity"];
+  if (Object.hasOwn(entry, "maskOpacity") && (typeof maskOpacity !== "number" || !Number.isFinite(maskOpacity)
+    || maskOpacity < 0 || maskOpacity > 0.6 || Math.abs(maskOpacity * 20 - Math.round(maskOpacity * 20)) > 1e-7)) {
+    throw new TypeError("Wallpaper mask opacity is invalid.");
+  }
+  return Object.freeze({
+    expectedRevision,
+    ...(Object.hasOwn(entry, "mode") ? { mode: entry["mode"] as DesktopWallpaperSettings["mode"] } : {}),
+    ...(Object.hasOwn(entry, "maskOpacity") ? { maskOpacity: maskOpacity as number } : {})
+  });
+}
+
+function parseDesktopWallpaperSettings(value: unknown): DesktopWallpaperSettings {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Wallpaper settings are invalid.");
+  const entry = value as Record<string, unknown>;
+  if (Object.keys(entry).sort().join(",") !== "customImage,maskOpacity,mode,revision,version" || entry["version"] !== 1
+    || entry["mode"] !== "none" && entry["mode"] !== "custom") throw new TypeError("Wallpaper settings are invalid.");
+  const revision = requireDesktopWallpaperRevision(entry["revision"]);
+  const maskOpacity = entry["maskOpacity"];
+  if (typeof maskOpacity !== "number" || !Number.isFinite(maskOpacity) || maskOpacity < 0 || maskOpacity > 0.6
+    || Math.abs(maskOpacity * 20 - Math.round(maskOpacity * 20)) > 1e-7) throw new TypeError("Wallpaper settings are invalid.");
+  let customImage: DesktopWallpaperSettings["customImage"] = null;
+  const image = entry["customImage"];
+  if (image !== null) {
+    if (typeof image !== "object" || Array.isArray(image)) throw new TypeError("Wallpaper image is invalid.");
+    const fields = image as Record<string, unknown>;
+    if (Object.keys(fields).sort().join(",") !== "height,id,url,width" || typeof fields["id"] !== "string"
+      || !/^[a-f0-9]{64}$/u.test(fields["id"]) || fields["url"] !== `joko-wallpaper://image/${fields["id"]}.webp`
+      || !Number.isSafeInteger(fields["width"]) || (fields["width"] as number) < 1 || (fields["width"] as number) > 3840
+      || !Number.isSafeInteger(fields["height"]) || (fields["height"] as number) < 1 || (fields["height"] as number) > 3840) {
+      throw new TypeError("Wallpaper image is invalid.");
+    }
+    customImage = Object.freeze({ id: fields["id"], url: fields["url"] as string, width: fields["width"] as number, height: fields["height"] as number });
+  }
+  if (entry["mode"] === "custom" && customImage === null) throw new TypeError("Wallpaper image is unavailable.");
+  return Object.freeze({ version: 1, revision, mode: entry["mode"], maskOpacity, customImage });
+}
+
+function parseDesktopWallpaperImportResult(value: unknown): DesktopWallpaperImportResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError("Wallpaper import result is invalid.");
+  const entry = value as Record<string, unknown>;
+  if (entry["cancelled"] === true && Object.keys(entry).join(",") === "cancelled") return Object.freeze({ cancelled: true });
+  if (entry["cancelled"] === false && Object.keys(entry).sort().join(",") === "cancelled,settings") {
+    return Object.freeze({ cancelled: false, settings: parseDesktopWallpaperSettings(entry["settings"]) });
+  }
+  throw new TypeError("Wallpaper import result is invalid.");
 }
 
 function parseDesktopMainWindowCloseSettings(value: unknown): DesktopMainWindowCloseSettings {

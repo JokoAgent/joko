@@ -3,20 +3,23 @@ import type { AppController } from "../controller.js";
 import type { PartnerProfileView } from "../model.js";
 import type { PartnerAvatarDraft } from "../partner-avatar.js";
 
-const AvatarOwner = createContext<{ readonly ownerKey?: string; readonly read: (partner: PartnerProfileView) => Promise<string> } | undefined>(undefined);
+type AvatarPartner = Pick<PartnerProfileView, "id" | "revision" | "avatar">;
+const AvatarOwner = createContext<{ readonly ownerKey?: string; readonly read: (partner: AvatarPartner) => Promise<string> } | undefined>(undefined);
 
-export function PartnerAvatarProvider({ controller, ownerKey, children }: { readonly controller: AppController; readonly ownerKey?: string; readonly children: ReactNode }): JSX.Element {
+export function PartnerAvatarProvider({ controller, ownerKey, sourceKey, children }: { readonly controller: AppController; readonly ownerKey?: string; readonly sourceKey?: string; readonly children: ReactNode }): JSX.Element {
   const requests = useRef(new Map<string, { readonly abort: AbortController; readonly promise: Promise<string>; readonly bytes: number }>());
   const active = useRef(new Set<AbortController>());
   const owner = useRef(ownerKey); owner.current = ownerKey;
   useEffect(() => () => { for (const abort of active.current) abort.abort(); active.current.clear(); requests.current.clear(); }, [ownerKey]);
-  const read = (partner: PartnerProfileView): Promise<string> => {
+  const read = (partner: AvatarPartner): Promise<string> => {
     if (!ownerKey || owner.current !== ownerKey || typeof partner.avatar === "string") return Promise.reject(new Error("No current Partner image owner."));
     const key = `${ownerKey}:${partner.id}:${partner.revision}:${partner.avatar.sha256}`;
     const existing = requests.current.get(key); if (existing) return existing.promise;
     const abort = new AbortController();
     active.current.add(abort);
-    const promise = controller.readPartnerAvatar(partner.id, partner.revision, partner.avatar, abort.signal).then((uri) => {
+    const request = sourceKey === undefined ? controller.readPartnerAvatar(partner.id, partner.revision, partner.avatar, abort.signal)
+      : controller.readSourcePartnerAvatar?.(sourceKey, partner.id, partner.revision, partner.avatar, abort.signal) ?? Promise.reject(new Error("No current Partner source image reader."));
+    const promise = request.then((uri) => {
       abort.signal.throwIfAborted();
       if (owner.current !== ownerKey) throw new Error("The Partner image owner changed.");
       return uri;
@@ -35,7 +38,7 @@ export function PartnerAvatarProvider({ controller, ownerKey, children }: { read
   return <AvatarOwner.Provider value={{ ownerKey, read }}>{children}</AvatarOwner.Provider>;
 }
 
-export function PartnerAvatar({ preset, partner }: { readonly preset: PartnerAvatarDraft; readonly partner?: PartnerProfileView }): JSX.Element {
+export function PartnerAvatar({ preset, partner }: { readonly preset: PartnerAvatarDraft; readonly partner?: AvatarPartner }): JSX.Element {
   const owner = useContext(AvatarOwner);
   const read = owner?.ownerKey ? owner.read : undefined;
   const readRef = useRef(read); readRef.current = read;

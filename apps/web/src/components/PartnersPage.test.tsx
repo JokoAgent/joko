@@ -25,6 +25,7 @@ import { PartnersPage, PartnerSettingsDialog } from "./PartnersPage.js";
 import { translate } from "../i18n.js";
 import { ListPartnerGroupsResponseSchema, type PartnerGroupApi } from "@joko/contracts";
 import type { ConnectionsDetail, PartnerConnectionsApi } from "@joko/contracts";
+import { requestPartnerNavigationLeave } from "../partner-navigation-leave.js";
 
 const roots: Root[] = [];
 
@@ -39,6 +40,55 @@ afterEach(async () => {
 });
 
 describe("PartnersPage", () => {
+  it("shows the original failed initialization card without a Profile dialog and dispatches its existing explicit retry", async () => {
+    const base = controller(), owner = base.state.activeProfile!;
+    const failed = partner({ initializationState: "error", invitationStage: "failed", canonicalSessionId: undefined });
+    const retryPartnerInitialization = vi.fn(async () => ({ partner: partner({ revision: 9n }), directory: directory() }));
+    const listPartnerSessions = vi.fn(async () => []);
+    const current = { ...snapshot(), remoteConnections: [{ id: owner.id, deviceId: owner.deviceId, name: owner.name, state: "connected" as const }],
+      devices: [{ id: owner.deviceId, name: "Device", defaultDisplayName: "Device", revision: 1n, kind: "web" as const, platform: "web", appVersion: "1", revoked: false, remoteControlEnabled: false, presence: "online" as const }] };
+    const view = await mount({ partners: [failed], focusPartnerId: failed.id, pageSnapshot: current, getPartner: vi.fn(async () => failed),
+      controllerOverrides: { retryPartnerInitialization, listPartnerSessions,
+        state: { ...base.state, snapshot: current, route: { kind: "partners", profileId: owner.id, partnerId: failed.id, preparation: true } } } });
+    expect(document.body.querySelector("[role='dialog']")).toBeNull(); expect(listPartnerSessions).not.toHaveBeenCalled();
+    const card = required(view.host.querySelector<HTMLElement>("[data-preparation-target='true']"));
+    expect(card.textContent).toContain("partners.preparationFailed"); expect(button(card, "common.edit").disabled).toBe(true);
+    await act(async () => { button(card, "common.retry").click(); await settle(); });
+    expect(retryPartnerInitialization).toHaveBeenCalledExactlyOnceWith(failed.id, failed.revision);
+    expect(card.textContent).toContain("partners.state.ready"); expect(document.body.querySelector("[role='dialog']")).toBeNull();
+  });
+  it("withholds a same-ID settings editor while its route requests another source that has not been adopted", async () => {
+    const view = await mount({ partners: [partner()], focusPartnerId: "partner-one" });
+    expect(document.body.querySelector("[role='dialog']")).not.toBeNull();
+    const otherSource = { ...view.app, state: { ...view.app.state, route: { kind: "partners" as const, partnerId: "partner-one", profileId: "other-source" } } };
+    await act(async () => { view.root.render(page(otherSource, snapshot(), "partner-one")); await settle(); });
+    expect(document.body.querySelector("[role='dialog']")).toBeNull();
+    expect(view.host.textContent).toContain("original Partner node has not been adopted");
+  });
+  it("retains a dirty original-node profile when leaving is cancelled, then requires explicit discard", async () => {
+    vi.useFakeTimers(); const view = await mountPermissionProfile();
+    const name = required(view.host.querySelector<HTMLInputElement>("input[required]"));
+    await act(async () => { setNativeValue(name, "Unsaved source draft"); name.dispatchEvent(new Event("input", { bubbles: true })); });
+    let first!: Promise<boolean>;
+    await act(async () => { first = requestPartnerNavigationLeave(new AbortController().signal)!; await settle(); });
+    expect(first).toBeDefined();
+    await act(async () => { button(required(document.body.querySelector("[role='alertdialog']")), "Keep editing").click(); await settle(); });
+    await expect(first).resolves.toBe(false); expect(name.value).toBe("Unsaved source draft");
+    let second!: Promise<boolean>;
+    await act(async () => { second = requestPartnerNavigationLeave(new AbortController().signal)!; await settle(); });
+    await act(async () => { button(required(document.body.querySelector("[role='alertdialog']")), "Discard and leave").click(); await settle(); });
+    await expect(second).resolves.toBe(true); expect(name.value).toBe("Aster");
+    await act(async () => { await vi.advanceTimersByTimeAsync(700); }); expect(view.updatePartner).not.toHaveBeenCalled();
+  });
+  it("retires an aborted node handoff's discard prompt without clearing the original profile draft", async () => {
+    vi.useFakeTimers(); const view = await mountPermissionProfile(); const name = required(view.host.querySelector<HTMLInputElement>("input[required]"));
+    await act(async () => { setNativeValue(name, "Draft retained"); name.dispatchEvent(new Event("input", { bubbles: true })); });
+    const abort = new AbortController(); let result!: Promise<boolean>;
+    await act(async () => { result = requestPartnerNavigationLeave(abort.signal)!; await settle(); });
+    const stale = button(required(document.body.querySelector("[role='alertdialog']")), "Discard and leave");
+    await act(async () => { abort.abort(); stale.click(); await settle(); });
+    await expect(result).resolves.toBe(false); expect(name.value).toBe("Draft retained"); expect(document.body.querySelector("[role='alertdialog']")).toBeNull();
+  });
   it("autosaves all three Partner permission values and requires the exact Full access risk confirmation before escalation", async () => {
     vi.useFakeTimers();
     const view = await mountPermissionProfile();

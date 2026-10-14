@@ -2,7 +2,7 @@
 import { act, createElement, forwardRef, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
+import { EventSchema, MessageRole, RuntimeCommandInputMode, RuntimeCommandSource, ResourceKind, SessionSchema, SessionState, SnapshotSchema } from "@joko/contracts";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MobileComposerDraftStore } from "./composer-draft-store";
 import { mobileComposerInput, plainTextMobileComposerDraft, replaceMobileComposerRange, type MobileComposerDraft } from "./mobile-composer-document";
@@ -10,6 +10,7 @@ import type { MobileComposerRichInput } from "./MobileComposerRichInput";
 import type { MobileRuntimeCommandPalette } from "./MobileRuntimeCommandPalette";
 import type { MobileState } from "./mobile-client";
 import { mobileMessage } from "./mobile-messages";
+import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 
 let input: ComponentProps<typeof MobileComposerRichInput>;
 let palette: ComponentProps<typeof MobileRuntimeCommandPalette>;
@@ -35,6 +36,18 @@ const appControls = { ...runtime, surfaceOwnerKey: "app-owner", session: create(
 const resolveResource = vi.fn(async () => resource);
 const send = vi.fn(async () => true);
 const empty = Object.freeze([]);
+let activePartner: MobilePartnerDirectoryProfile | undefined;
+const peer: MobilePartnerDirectoryProfile = {
+  partnerId: "bea", revision: 3n, profileVersion: 1n, displayName: "Current Bea", description: "", avatar: "leaf",
+  identitySource: "Help", templateId: "general", lifecycle: "active", initializationState: "ready", invitationStage: "ready",
+  homeTargetId: "target", canonicalSessionId: "peer-session", usesDirectoryDefaults: true,
+  capabilities: { modelChain: [{ backendId: "backend", providerId: "provider", modelId: "model", fastMode: false }], permissionMode: "ask", planMode: false },
+  createdAt: 1000, updatedAt: 2000, activity: { partnerId: "bea", unreadReplyCount: 0, artifactCount: 0,
+    activeDelegationCount: 0, readThroughCursor: 0n, readUpdatedAt: 0 }
+};
+const privateDirectory = vi.fn(async () => ({ directory: { revision: 1n, activeCount: 2, archivedCount: 0,
+  errorCount: 0, updatedAt: 2000 }, partners: [activePartner!, peer] }));
+const openPrivateThread = vi.fn();
 const client = new Proxy({
   taskAppCommandControls: () => current ? appControls : undefined,
   taskRuntimeCommandControls: () => current ? runtime : undefined,
@@ -43,12 +56,15 @@ const client = new Proxy({
   taskQueueItems: () => empty, taskQueueCapabilities: () => ({}), taskInteractions: () => empty, subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
   taskNativeTreeControls: () => undefined, send, taskContextControls: () => undefined,
-  taskCatalogMentionControls: () => undefined, taskTimelineRows: () => empty
+  taskCatalogMentionControls: () => undefined, taskTimelineRows: () => empty,
+  partnerConversationTransport: () => activePartner ? { ownerKey: "private-task", sessionId: "session" } : undefined,
+  partnerDirectoryTransport: () => activePartner ? { ownerKey: "private-node", list: privateDirectory } : undefined
 }, { get: (object, key) => key in object ? object[key as keyof typeof object] : () => undefined });
 const session = create(SessionSchema, { sessionId: "session", backendId: "backend", targetId: "target", state: SessionState.IDLE });
 const snapshot = create(SnapshotSchema, { sessions: [session] });
 const state = { status: "connected", activeProfileId: "profile", selectedId: "session", owner: snapshot, detail: snapshot,
   saved: [], pending: [], older: [], live: [], busy: false, historyBusy: false, historyEnd: true, readReceipts: {} } as unknown as MobileState;
+let renderedState = state;
 const colors = { background: "#fff", surface: "#fff", ink: "#111", muted: "#666", border: "#ccc", accent: "#f80", negative: "#c00", brandBackground: "#ffe", dark: false };
 const surface = ({ children }: { children?: ReactNode }) => createElement("div", null, children);
 
@@ -57,9 +73,11 @@ beforeAll(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
     View: surface, Text: surface, ScrollView: surface, SectionList: surface, Image: surface, ActivityIndicator: surface,
-    FlatList: forwardRef(() => null), TextInput: forwardRef(() => null),
+    FlatList: forwardRef(({ data, renderItem }: { data?: readonly unknown[];
+      renderItem?: (value: { item: unknown; index: number }) => ReactNode }) => createElement("div", null,
+      data?.map((item, index) => createElement("div", { key: index }, renderItem?.({ item, index }))))), TextInput: forwardRef(() => null),
     Modal: ({ visible, children }: { visible?: boolean; children?: ReactNode }) => visible ? createElement("div", null, children) : null,
-    Pressable: ({ children, onPress, disabled, accessibilityLabel }: { children?: ReactNode; onPress?: () => void; disabled?: boolean; accessibilityLabel?: string }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel }, children),
+    Pressable: ({ children, onPress, disabled, accessibilityLabel }: { children?: ReactNode | ((value: { pressed: boolean }) => ReactNode); onPress?: () => void; disabled?: boolean; accessibilityLabel?: string }) => createElement("button", { onClick: onPress, disabled, "aria-label": accessibilityLabel }, typeof children === "function" ? children({ pressed: false }) : children),
     StyleSheet: { create: (value: unknown) => value, hairlineWidth: 1 }, Platform: { OS: "android", select: (value: Record<string, unknown>) => value.android ?? value.default },
     AppState: { currentState: "active", addEventListener: () => ({ remove() {} }) }, BackHandler: { addEventListener: () => ({ remove() {} }) },
     Keyboard: { dismiss() {}, addListener: () => ({ remove() {} }) }, PanResponder: { create: () => ({ panHandlers: {} }) },
@@ -101,9 +119,11 @@ beforeAll(async () => {
   }));
   vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
   vi.doMock("./MobilePartnerAvatar", () => ({ MobilePartnerAvatar: () => null, MobilePartnerAvatarProvider: surface }));
+  vi.doMock("./MobilePartnerConversationRow", () => ({ MobilePartnerConversationRow: surface }));
   vi.doMock("./MobileKeyboardAvoidingView", () => ({ MobileKeyboardAvoidingView: surface, useMobileKeyboardState: () => ({ shown: false, height: 0 }) }));
   vi.doMock("./use-mobile-voice-input", () => ({ useMobileVoiceInput: () => ({ busy: false, recording: false, preparing: false, error: undefined }) }));
-  vi.doMock("./use-mobile-partner-read", () => ({ useMobilePartnerIdentity: () => ({ ready: true }), useMobilePartnerRead: () => ({ ready: true }) }));
+  vi.doMock("./use-mobile-partner-read", () => ({ useMobilePartnerIdentity: () => ({ ready: true, partner: activePartner, retrySequence: 0 }),
+    useMobilePartnerRead: () => ({ ready: true, partner: activePartner }) }));
   vi.doMock("./use-mobile-audio-artwork", () => ({ useMobileAudioArtwork: () => new Map() }));
   vi.doMock("./mobile-delegated-reader", () => ({ useMobileDelegatedTasks: () => ({ entries: empty, loading: false }) }));
   vi.doMock("./use-mobile-hidden-history", () => ({ useMobileHiddenHistory: () => false }));
@@ -113,12 +133,13 @@ beforeAll(async () => {
 });
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockClear();
+  activePartner = undefined; renderedState = state; privateDirectory.mockClear(); openPrivateThread.mockClear();
   drafts.save(identity, plainTextMobileComposerDraft("/an arguments")); await drafts.flush(identity);
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
 });
 afterEach(async () => { await act(async () => root?.unmount()); host?.remove(); });
 async function render(assertPalette = true): Promise<void> {
-  await act(async () => root.render(createElement(TaskScreen, { colors, state, locale: "en", onBack() {}, onHome() {}, onNew() {}, onFiles() {}, onOpenPartnerThread() {}, onRemoteDesktop() {}, focusComposer: false, onComposerFocused() {}, onOpenDerivationOrigin: async () => false })));
+  await act(async () => root.render(createElement(TaskScreen, { colors, state: renderedState, locale: "en", onBack() {}, onHome() {}, onNew() {}, onFiles() {}, onOpenPartnerThread: openPrivateThread, onRemoteDesktop() {}, focusComposer: false, onComposerFocused() {}, onOpenDerivationOrigin: async () => false })));
   await act(async () => {});
   await act(async () => input.onFocus?.());
   await act(async () => input.onSelectionChange({ start: 3, end: 3 }, input.draft));
@@ -169,4 +190,28 @@ describe("actual App slash Skill selection", () => {
     expect(input.draft.text).toBe(retirement === "edit" ? "/an arguments changed" : "/an arguments");
     expect(input.draft.mentions).toEqual([]); expect(send).not.toHaveBeenCalled();
   });
+});
+
+it("opens the actual Task private source pill with a fresh current peer and keeps incoming private bodies hidden", async () => {
+  activePartner = { ...peer, partnerId: "ada", displayName: "Ada", canonicalSessionId: "session" };
+  const origin = { messageId: "private-message", threadId: "private-thread", senderPartnerId: "bea",
+    recipientPartnerId: "ada", senderDisplayName: "Historical Bea" };
+  renderedState = { ...state, live: [create(EventSchema, { eventId: "private-input",
+    identity: { sessionId: "session" }, cursor: { generation: 1n, sequence: 1n, opaqueToken: "cursor" },
+    payload: { kind: { case: "messageStarted", value: { messageId: "private-message", role: MessageRole.USER,
+      userInputAccepted: true, partnerPrivateOrigin: origin,
+      userInput: { parts: [{ content: { case: "text", value: "Original private prompt must stay hidden" } }] } } } } })] };
+  await render(false);
+  const button = host.querySelector<HTMLButtonElement>('[aria-label="Received from Current Bea"]');
+  expect(button).not.toBeNull(); expect(privateDirectory).toHaveBeenCalledOnce();
+  expect(host.textContent).not.toContain("Original private prompt must stay hidden");
+  await act(async () => button!.click());
+  expect(openPrivateThread).toHaveBeenCalledExactlyOnceWith({ threadId: "private-thread", targetPartnerId: "bea",
+    targetName: "Historical Bea" });
+  renderedState = { ...renderedState, status: "offline" };
+  await render(false);
+  const offline = host.querySelector<HTMLButtonElement>('[aria-label="Received from Historical Bea"]');
+  expect(offline?.disabled).toBe(true);
+  await act(async () => offline!.click());
+  expect(openPrivateThread).toHaveBeenCalledOnce(); expect(privateDirectory).toHaveBeenCalledOnce();
 });

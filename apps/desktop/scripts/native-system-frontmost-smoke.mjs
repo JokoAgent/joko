@@ -92,18 +92,27 @@ async function runNativeFrontmostSmoke(configuration) {
     try { value = JSON.parse(line); } catch { throw new Error("Native foreground target returned invalid JSON."); }
     const identity = (candidate) => typeof candidate === "string" && /^[1-9][0-9]{0,18}$/u.test(candidate);
     const counter = (candidate) => Number.isSafeInteger(candidate) && candidate >= 0 && candidate <= 1000;
-    assert.equal(Object.keys(value).sort().join(","), "clipboardPrepared,event,first,foreground,pid,second");
+    const clipboardProbe = (probe) => {
+      assert.equal(Object.keys(probe).sort().join(","), "current,error,textAvailable,unicodeAvailable,unicodeInspected,unicodeMatches");
+      for (const key of ["current", "textAvailable", "unicodeAvailable", "unicodeInspected", "unicodeMatches"]) assert.equal(typeof probe[key], "boolean");
+      assert.ok(Number.isInteger(probe.error) && probe.error >= 0 && probe.error <= 5);
+    };
+    assert.equal(Object.keys(value).sort().join(","), "clipboardPreparation,clipboardPrepared,event,first,foreground,pid,second");
     assert.ok(["ready", "state", "closed"].includes(value.event));
     assert.equal(value.pid, child.pid);
     assert.ok(identity(value.foreground) || value.foreground === "0");
     assert.equal(typeof value.clipboardPrepared, "boolean");
+    clipboardProbe(value.clipboardPreparation);
     for (const target of [value.first, value.second]) {
-      assert.equal(Object.keys(target).sort().join(","), "focused,nativeId,pasteMatches,pastes,returnDown,returnUp,textLength,wheelDelta,wheels");
+      assert.equal(Object.keys(target).sort().join(","), "enabled,focused,nativeId,pasteClipboard,pasteMatches,pastes,readOnly,returnDown,returnUp,textLength,wheelDelta,wheels");
       assert.ok(identity(target.nativeId));
       for (const key of ["pastes", "returnDown", "returnUp", "wheels"]) assert.ok(counter(target[key]));
       assert.ok(Number.isSafeInteger(target.wheelDelta) && Math.abs(target.wheelDelta) <= 24_000);
       assert.equal(typeof target.pasteMatches, "boolean");
       assert.equal(typeof target.focused, "boolean");
+      assert.equal(typeof target.enabled, "boolean");
+      assert.equal(typeof target.readOnly, "boolean");
+      clipboardProbe(target.pasteClipboard);
       assert.ok(counter(target.textLength));
     }
     return value;
@@ -216,6 +225,7 @@ async function runNativeFrontmostSmoke(configuration) {
     }
     throw new Error(`The controlled native target did not receive its input effect: ${JSON.stringify({
       phase, foreground: latest?.foreground ?? "0", processId: latest?.pid ?? null,
+      clipboardPreparation: latest?.clipboardPreparation ?? null,
       first: latest?.first ?? null, second: latest?.second ?? null
     })}`);
   };
@@ -271,6 +281,11 @@ async function runNativeFrontmostSmoke(configuration) {
       const beforeClipboard = sampleIdentity();
       const prepared = await command("clipboard");
       assert.equal(prepared.clipboardPrepared, true);
+      assert.equal(prepared.clipboardPreparation.current, true);
+      assert.equal(prepared.clipboardPreparation.error, 0);
+      assert.equal(prepared.clipboardPreparation.unicodeAvailable, true);
+      assert.equal(prepared.clipboardPreparation.unicodeInspected, true);
+      assert.equal(prepared.clipboardPreparation.unicodeMatches, true);
       const afterClipboard = sampleIdentity();
       await focus("focus-first", ready.first.nativeId);
       await postEffect(input.runner, "postPaste", target, undefined, { beforeClipboard, afterClipboard });
@@ -302,7 +317,9 @@ async function runNativeFrontmostSmoke(configuration) {
       assert.deepEqual(final.second, rejectionBaseline.second);
       return {
         sampler: true, exactTarget: true, fixedTargetAfterFocusMove: true,
-        return: true, wheel: true, paste: true, currentProcessRejected: true, wrongProcessRejected: true
+        return: true, wheel: true, paste: true, currentProcessRejected: true, wrongProcessRejected: true,
+        clipboardPreparation: prepared.clipboardPreparation,
+        pasteClipboard: pasted.first.pasteClipboard
       };
     })(), interrupted]);
   } finally {

@@ -60,6 +60,9 @@ importers:
       loudness:
         specifier: 0.4.2
         version: 0.4.2
+      sharp:
+        specifier: 0.35.3
+        version: 0.35.3(@types/node@24.12.4)
       yaml:
         specifier: 2.9.0
         version: 2.9.0
@@ -79,9 +82,6 @@ importers:
       electron-builder:
         specifier: 26.15.3
         version: 26.15.3(electron-builder-squirrel-windows@26.15.3)(supports-color@8.1.1)
-      sharp:
-        specifier: 0.35.3
-        version: 0.35.3(@types/node@24.12.4)
       tsx:
         specifier: 4.22.1
         version: 4.22.1

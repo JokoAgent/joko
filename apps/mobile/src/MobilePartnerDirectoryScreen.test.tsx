@@ -25,6 +25,9 @@ import type { MobileGroupAttachmentTransport } from "./mobile-partner-groups";
 import type { MobileLocalComposerAttachment } from "./mobile-attachments";
 import { MobilePhotoLibrary } from "./mobile-photo-library";
 import { MobileAttachmentFiles } from "./mobile-attachment-files";
+import { MobilePartnerRoster, mobilePartnerRosterSourceKey, type MobilePartnerRosterSourceTransport } from "./mobile-partner-roster";
+import { MobilePartnerGroupRoster, type MobilePartnerGroupSelection } from "./mobile-partner-group-roster";
+import { mobileMessage } from "./mobile-messages";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -198,7 +201,7 @@ async function render(active?: MobilePartnerDirectoryTransport, initializationTr
   creationTransport?: MobilePartnerCreationTransport, observation?: MobilePartnerDirectoryObservation,
   workingTransport?: MobilePartnerWorkingTransport, deletionTransport?: MobilePartnerDeletionTransport,
   resumeFactory?: MobilePartnerDirectoryScreenProps["resumeFactory"], importFactory?: MobilePartnerDirectoryScreenProps["importFactory"],
-  groups?: Pick<MobilePartnerDirectoryScreenProps, "groupApi" | "groupReceiptScope" | "groupCreationStorage" | "groupAttachments">) {
+  groups?: Partial<MobilePartnerDirectoryScreenProps>) {
   if (!root) {
     container = document.createElement("div");
     document.body.append(container);
@@ -247,6 +250,97 @@ function groupFixture(empty = false) {
   return { api, group, plan, message, props: { groupApi: api, groupReceiptScope: "node-profile-device", groupCreationStorage: {
     getItem: async (key: string) => receipts.get(key) ?? null, setItem: async (key: string, value: string) => { receipts.set(key, value); }, removeItem: async (key: string) => { receipts.delete(key); } } }, receipts };
 }
+function pairedGroupsFixture() {
+  const profiles = ["first", "second"].map(id => ({ profileId: id, origin: `https://${id}.test`, serverId: `server-${id}`,
+    connectionId: `connection-${id}`, deviceId: `device-${id}`, displayName: "Same node name" }));
+  let sources = profiles.map((profile, index) => ({ key: mobilePartnerRosterSourceKey(profile), profile, current: index === 0 }));
+  const first = groupFixture(), second = groupFixture(); first.group.name = "First group"; second.group.name = "Second group";
+  first.group.lastMessage = create(groupWire.PartnerGroupPreviewSchema, { content: "First preview", createdAt: { seconds: 10n } });
+  second.group.lastMessage = create(groupWire.PartnerGroupPreviewSchema, { content: "Second preview", createdAt: { seconds: 20n } });
+  first.message.kind = second.message.kind = groupWire.PartnerGroupMessageKind.MESSAGE;
+  first.message.content = "First conversation body"; second.message.content = "Second conversation body";
+  const apis = [first.api, { ...second.api, ownerKey: "group-owner-second" }];
+  const storage = { getItem: async () => null, setItem: async () => undefined, removeItem: async () => undefined };
+  const roster = new MobilePartnerRoster(storage, async (id, signal) => {
+    const source = sources.find(item => item.profile.profileId === id)!;
+    return { sourceKey: source.key, ownerKey: id, profile: source.profile, isCurrent: () => !signal.aborted, list: async () => catalog,
+      observation: () => undefined, canonical: async partner => ({ partner, sessionId: partner.canonicalSessionId! }) };
+  });
+  let secondOffline = false;
+  const groupRoster = new MobilePartnerGroupRoster(storage, async (id, signal) => {
+    const index = id === "first" ? 0 : 1, source = sources[index]!;
+    return { sourceKey: source.key, ownerKey: `readonly-${id}`, receiptScope: `receipt-${id}`, isCurrent: () => !signal.aborted,
+      list: async caller => { if (id === "second" && secondOffline) throw new Error("Network offline"); return apis[index]!.list(caller); } };
+  });
+  roster.setSources(sources); groupRoster.setSources(sources);
+  let active = 0;
+  const claims = new Set<MobilePartnerGroupSelection>();
+  const props = (): Partial<MobilePartnerDirectoryScreenProps> => ({ ...first.props, groupApi: apis[active], groupReceiptScope: `receipt-${profiles[active]!.profileId}`,
+    groupSourceKey: sources[active]!.key, roster, groupRoster, groupSourceClaimCurrent: selection => claims.has(selection) && selection.sourceKey === sources[active]!.key,
+    groupSourceClaimRetained: selection => claims.has(selection) && selection.sourceKey === sources[active]!.key,
+    onOpenGroupSource: open });
+  const adopt = async (index: number) => {
+    active = index; sources = sources.map((item, row) => ({ ...item, current: row === index })); roster.setSources(sources); groupRoster.setSources(sources);
+    await render(transport(`directory-${active}`), undefined, undefined, undefined, undefined, undefined, undefined, undefined, props());
+  };
+  const open = vi.fn(async (source: (typeof sources)[number], groupId: string | undefined, _signal: AbortSignal) => {
+    const index = source.profile.profileId === "first" ? 0 : 1;
+    const selection: MobilePartnerGroupSelection = { sourceKey: source.key, receiptScope: `receipt-${source.profile.profileId}`,
+      ownerKey: apis[index]!.ownerKey, profileId: source.profile.profileId, ...(groupId ? { groupId } : {}) };
+    claims.add(selection); await adopt(index); return selection;
+  });
+  return { sources: () => sources, props, adopt, open, roster, groupRoster, first, second, apis,
+    failSecond: () => { secondOffline = true; groupRoster.refresh(sources[1]!.key); } };
+}
+it("opens a same-ID group from its original source and hides its body synchronously on source change", async () => {
+  const f = pairedGroupsFixture();
+  await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined, f.props());
+  await act(async () => { await vi.waitFor(() => expect(f.groupRoster.snapshot.every(item => item.status === "online")).toBe(true)); });
+  expect(container.querySelector('[data-testid="partnerGroups.sourceItem.first.shared-group"]')).not.toBeNull();
+  expect(container.querySelector('[data-testid="partnerGroups.sourceItem.second.shared-group"]')).not.toBeNull();
+  const search = container.querySelector<HTMLInputElement>('[data-testid="partnerDirectory.search"]')!;
+  await act(async () => { search.value = "Second preview"; search.dispatchEvent(new Event("input", { bubbles: true })); });
+  expect(container.querySelector('[data-testid="partnerGroups.sourceItem.first.shared-group"]')).toBeNull();
+  await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="partnerGroups.sourceItem.second.shared-group"]')!.click());
+  expect(f.open).toHaveBeenCalledWith(expect.objectContaining({ key: f.sources()[1]!.key }), "shared-group", expect.any(AbortSignal));
+  expect(f.apis[1]!.get).toHaveBeenCalledWith("shared-group", undefined, expect.any(AbortSignal)); expect(f.apis[0]!.get).not.toHaveBeenCalled();
+  expect(container.textContent).toContain("Second conversation body");
+  await act(async () => f.adopt(0));
+  expect(container.textContent).not.toContain("Second conversation body");
+  expect(container.querySelector('[data-testid="partnerGroups.composer"]')).toBeNull();
+});
+it("keeps failed source previews disabled and offers creation only on a live group source", async () => {
+  const f = pairedGroupsFixture(), m = groupWire.partnerGroupMessages("en");
+  await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined, f.props());
+  await act(async () => { await vi.waitFor(() => expect(f.groupRoster.snapshot.every(item => item.status === "online")).toBe(true)); f.failSecond();
+    await vi.waitFor(() => expect(f.groupRoster.snapshot[1]?.status).toBe("offline")); });
+  const cached = container.querySelector<HTMLButtonElement>('[data-testid="partnerGroups.sourceItem.second.shared-group"]')!;
+  expect(cached.disabled).toBe(true); expect(cached.textContent).toContain("Offline · Second preview");
+  expect(container.querySelector('[data-testid="partnerGroups.sourceRetry.second"]')).not.toBeNull();
+  await press(m.create);
+  const firstChoice = mobileMessage("en", "partnerGroups.sourceChoice", { name: "Same node name", origin: "https://first.test" });
+  const secondChoice = mobileMessage("en", "partnerGroups.sourceChoice", { name: "Same node name", origin: "https://second.test" });
+  expect(container.querySelector(`button[aria-label="${secondChoice}"]`)).toBeNull(); await press(firstChoice);
+  expect(f.open).toHaveBeenCalledWith(expect.objectContaining({ key: f.sources()[0]!.key }), undefined, expect.any(AbortSignal));
+  expect(container.querySelector(`input[aria-label="${m.name}"]`)).not.toBeNull();
+  expect(f.apis[0]!.create).not.toHaveBeenCalled(); expect(f.apis[1]!.create).not.toHaveBeenCalled();
+});
+it("retires an unfinished source opening in background and allows a fresh foreground selection", async () => {
+  const f = pairedGroupsFixture(); let settle!: (selection: MobilePartnerGroupSelection) => void;
+  const opening = vi.fn((_source: Parameters<NonNullable<MobilePartnerDirectoryScreenProps["onOpenGroupSource"]>>[0], _groupId: string | undefined, _signal: AbortSignal) => new Promise<MobilePartnerGroupSelection>(resolve => { settle = resolve; }));
+  const props = { ...f.props(), onOpenGroupSource: opening };
+  await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined, props);
+  await act(async () => { await vi.waitFor(() => expect(f.groupRoster.snapshot.every(item => item.status === "online")).toBe(true)); });
+  await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="partnerGroups.sourceItem.second.shared-group"]')!.click());
+  expect(opening).toHaveBeenCalledOnce();
+  await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined, { ...props, rosterActive: false });
+  expect(opening.mock.calls[0]![2].aborted).toBe(true);
+  await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined, props);
+  await act(async () => { await vi.waitFor(() => expect(f.groupRoster.snapshot.every(item => item.status === "online")).toBe(true)); });
+  expect(container.querySelector<HTMLButtonElement>('[data-testid="partnerGroups.sourceItem.second.shared-group"]')!.disabled).toBe(false);
+  await act(async () => settle({ sourceKey: f.sources()[1]!.key, receiptScope: "receipt-second", ownerKey: f.apis[1]!.ownerKey, profileId: "second", groupId: "shared-group" }));
+  expect(container.querySelector('[data-testid="partnerGroups.composer"]')).toBeNull(); expect(container.textContent).not.toContain("Second conversation body");
+});
 it("creates a group from the actual mixed directory and recovers its durable unknown receipt", async () => {
   const f = groupFixture(true), m = groupWire.partnerGroupMessages("en");
   await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined, f.props); await press(m.create);
@@ -442,6 +536,63 @@ describe("MobilePartnerDirectoryScreen", () => {
     expect(container.textContent).toContain("Reconnect to view Partners");
     expect(native.back?.()).toBe(true);
     expect(onBack).toHaveBeenCalledOnce();
+  });
+
+  it("renders same-ID Partners under independent saved node sources, routes original-source settings and blocks cached navigation", async () => {
+    const profiles = ["first", "second"].map(id => ({ profileId: id, origin: `https://${id}.test`, serverId: `server-${id}`,
+      connectionId: `connection-${id}`, deviceId: `device-${id}`, displayName: `Node ${id}` }));
+    const sources = profiles.map((profile, index) => ({ key: mobilePartnerRosterSourceKey(profile), profile, current: index === 0 }));
+    let offline = false;
+    const roster = new MobilePartnerRoster({ getItem: async () => null, setItem: async () => undefined, removeItem: async () => undefined },
+      async (profileId, signal): Promise<MobilePartnerRosterSourceTransport> => {
+        if (offline && profileId === "second") throw new Error("Network offline");
+        const source = sources.find(item => item.profile.profileId === profileId)!;
+        return { sourceKey: source.key, ownerKey: profileId, profile: source.profile, isCurrent: () => !signal.aborted,
+          list: async () => ({ ...catalog, partners: [{ ...ada, displayName: profileId === "second" ? "Remote Ada" : "Ada",
+            ...(profileId === "second" ? { lifecycle: "paused" as const, pauseCleanupPending: false } : {}) }] }),
+          observation: () => undefined, canonical: async partner => ({ partner, sessionId: partner.canonicalSessionId! }) };
+      });
+    roster.setSources(sources);
+    const openSource = vi.fn(async () => undefined);
+    await render(transport(), undefined, undefined, undefined, undefined, undefined, undefined, undefined, { roster, onOpenSource: openSource });
+    await act(async () => { await vi.waitFor(() => expect(roster.snapshot.every(item => item.status === "online")).toBe(true)); });
+    expect(container.querySelector('[data-testid="partnerDirectory.item.ada"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="partnerDirectory.sourceItem.second.ada"]')).not.toBeNull();
+    expect(container.querySelector<HTMLButtonElement>('[data-testid="partnerDirectory.sourceItem.second.ada"] [data-testid="partnerDirectory.item.ada"]')!.disabled).toBe(true);
+    expect(container.textContent).toContain("Node first"); expect(container.textContent).toContain("Node second");
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="partnerDirectory.sourceSettings.second.ada"]')!.click());
+    expect(openSource).toHaveBeenCalledWith(sources[1], expect.objectContaining({ partnerId: "ada", displayName: "Remote Ada" }), "settings", expect.any(AbortSignal));
+    offline = true; await act(async () => { roster.refresh(sources[1]!.key); await vi.waitFor(() => expect(roster.snapshot[1]?.status).toBe("offline")); });
+    expect(container.querySelector('[data-testid="partnerDirectory.cached.second.ada"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="partnerDirectory.sourceSettings.second.ada"]')).toBeNull();
+    await act(async () => { roster.setSources([sources[0]!]); });
+    expect(container.textContent).not.toContain("Remote Ada");
+  });
+
+  it("hands an unfinished remote Partner to the actual original initialization screen and its explicit retry", async () => {
+    const remote = { profileId: "remote", origin: "https://remote.test", serverId: "remote-node", connectionId: "remote-connection", deviceId: "phone", displayName: "Remote node" };
+    const source = { key: mobilePartnerRosterSourceKey(remote), profile: remote, current: false };
+    const failed = profile({ partnerId: "failed-remote", displayName: "Preparing Partner", canonicalSessionId: undefined,
+      initializationState: "error", invitationStage: "failed", initializationErrorCode: "homeUnavailable" });
+    const roster = new MobilePartnerRoster({ getItem: async () => null, setItem: async () => undefined, removeItem: async () => undefined },
+      async (_id, signal) => ({ sourceKey: source.key, ownerKey: "remote-roster", profile: remote, isCurrent: () => !signal.aborted,
+        list: async () => ({ ...catalog, partners: [failed] }), observation: () => undefined,
+        canonical: async () => { throw new Error("Unfinished Partner cannot open a generic Task."); } }));
+    roster.setSources([source]);
+    const initialization: MobilePartnerInitializationTransport = { ownerKey: "remote-initialization",
+      load: vi.fn(async () => failed), retry: vi.fn(async () => ({ ...ada, partnerId: failed.partnerId, displayName: failed.displayName })),
+      open: vi.fn(async () => ({ sessionId: "remote-canonical" })) };
+    const adopt = vi.fn(async () => ({ ownerKey: initialization.ownerKey, partnerId: failed.partnerId }));
+    await render(transport(), initialization, undefined, undefined, undefined, undefined, undefined, undefined,
+      { roster, onOpenSourceInitialization: adopt });
+    await act(async () => { await vi.waitFor(() => expect(roster.snapshot[0]?.status).toBe("online")); });
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="partnerDirectory.item.failed-remote"]')!.click());
+    expect(adopt).toHaveBeenCalledWith(source, failed, expect.any(AbortSignal));
+    expect(container.querySelector('[data-testid="partnerInitialization.screen"]')).not.toBeNull();
+    expect(initialization.retry).not.toHaveBeenCalled();
+    await press(mobileMessage("en", "partnerInitialization.retry"));
+    expect(initialization.retry).toHaveBeenCalledWith(failed, expect.any(AbortSignal));
+    expect(onOpenTask).toHaveBeenCalledWith("remote-canonical");
   });
 
   it("shows canonical working and waiting state, preserves the same owner's reply offline and retires it on owner loss", async () => {

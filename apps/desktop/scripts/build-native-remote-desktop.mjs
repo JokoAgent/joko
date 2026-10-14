@@ -46,17 +46,21 @@ export function nativeRemoteDesktopMacTarget(architecture) {
   return Object.freeze(target);
 }
 
-export function buildNativeRemoteDesktop({
-  platform = process.platform,
-  architecture = process.arch,
-  output = defaultOutput
-} = {}) {
+export function assertNativeRemoteDesktopBuildTarget(platform, architecture) {
   if (["darwin", "win32", "linux"].includes(platform) && platform !== process.platform) {
     throw new Error("The Remote Desktop native helper must be compiled on its target operating system.");
   }
   if (platform === "linux" && (!["x64", "arm64"].includes(architecture) || architecture !== process.arch)) {
     throw new Error("The Remote Desktop Linux helpers must be compiled on their target architecture.");
   }
+}
+
+export function buildNativeRemoteDesktop({
+  platform = process.platform,
+  architecture = process.arch,
+  output = defaultOutput
+} = {}) {
+  assertNativeRemoteDesktopBuildTarget(platform, architecture);
   const artifactOutput = resolve(output);
   mkdirSync(artifactOutput, { recursive: true });
   for (const name of [

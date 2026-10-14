@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   ActivityIndicator,
   BackHandler,
@@ -20,7 +20,8 @@ import {
   type MobilePartnerDirectoryTransport
 } from "./mobile-partner-directory";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
-import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
+import { MobilePartnerAvatar, MobilePartnerAvatarProvider } from "./MobilePartnerAvatar";
+import type { MobilePartnerRoster, MobilePartnerRosterShard, MobilePartnerRosterDisplay, MobilePartnerRosterSource } from "./mobile-partner-roster";
 import { MobilePartnerInitializationScreen } from "./MobilePartnerInitializationScreen";
 import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
 import type { MobilePartnerCreationTransport } from "./mobile-partner-creation";
@@ -46,6 +47,8 @@ import { partnerMemoryMessages, type PartnerMemoryEditor } from "@joko/contracts
 import { partnerGroupMessages, type PartnerGroupApi, type PartnerGroupSummary, type RoutineReceiptStorage } from "@joko/contracts";
 import { MobileGroupAction, MobilePartnerGroupChat, MobilePartnerGroupCreateSheet, MobilePartnerGroupRow, useMobilePartnerGroups } from "./MobilePartnerGroups";
 import type { MobileGroupAttachmentTransport } from "./mobile-partner-groups";
+import { MobileActionSheet } from "./MobileActionSheet";
+import type { MobilePartnerGroupRoster, MobilePartnerGroupRosterShard, MobilePartnerGroupDisplay, MobilePartnerGroupSelection } from "./mobile-partner-group-roster";
 
 export interface MobilePartnerDirectoryScreenProps {
   readonly colors: MobilePartnersColors;
@@ -65,11 +68,25 @@ export interface MobilePartnerDirectoryScreenProps {
   readonly groupAttachments?: MobileGroupAttachmentTransport;
   readonly groupCreationStorage?: RoutineReceiptStorage;
   readonly groupReceiptScope?: string;
-  readonly initialGroupId?: string;
+  readonly groupSourceKey?: string;
+  readonly initialGroupSelection?: MobilePartnerGroupSelection;
+  readonly groupRoster?: MobilePartnerGroupRoster;
+  readonly groupSourceClaimCurrent?: (selection: MobilePartnerGroupSelection) => boolean;
+  readonly groupSourceClaimRetained?: (selection: MobilePartnerGroupSelection) => boolean;
+  readonly onOpenGroupSource?: (source: MobilePartnerRosterSource, groupId: string | undefined, signal: AbortSignal) => Promise<MobilePartnerGroupSelection>;
   readonly onGroupOpened?: () => void;
   readonly onBack: () => void;
   readonly onOpenTask: (sessionId: string) => void;
+  readonly roster?: MobilePartnerRoster;
+  readonly rosterActive?: boolean;
+  readonly onOpenSource?: (source: MobilePartnerRosterSource, partner: MobilePartnerDirectoryProfile,
+    mode: "conversation" | "settings", signal: AbortSignal) => Promise<void>;
+  readonly onOpenSourceInitialization?: (source: MobilePartnerRosterSource, partner: MobilePartnerDirectoryProfile,
+    signal: AbortSignal) => Promise<{ readonly ownerKey: string; readonly partnerId: string }>;
 }
+const NO_SHARDS: readonly MobilePartnerRosterShard[] = [];
+const NO_GROUP_SHARDS: readonly MobilePartnerGroupRosterShard[] = [];
+const noSubscription = (): (() => void) => () => undefined;
 
 interface DirectoryState {
   readonly ownerKey?: string;
@@ -177,8 +194,16 @@ function PartnerRow({ partner, colors, locale, opening, recoverable, online, obs
 }
 
 export function MobilePartnerDirectoryScreen({ colors, locale, transport, observation, workingTransport, initializationTransport, creationTransport, importFactory, deletionTransport, restartTransport, routineFactory, resumeFactory, memoryFactory,
-  groupApi, groupAttachments, groupCreationStorage, groupReceiptScope, initialGroupId, onGroupOpened, onBack, onOpenTask }:
+  groupApi, groupAttachments, groupCreationStorage, groupReceiptScope, groupSourceKey, initialGroupSelection, groupRoster, groupSourceClaimCurrent, groupSourceClaimRetained, onOpenGroupSource, onGroupOpened, onBack, onOpenTask,
+  roster, rosterActive = true, onOpenSource, onOpenSourceInitialization }:
   MobilePartnerDirectoryScreenProps) {
+  const shards = useSyncExternalStore(roster?.subscribe ?? noSubscription, () => roster?.snapshot ?? NO_SHARDS);
+  const groupShards = useSyncExternalStore(groupRoster?.subscribe ?? noSubscription, () => groupRoster?.snapshot ?? NO_GROUP_SHARDS);
+  useEffect(() => { roster?.setActive(rosterActive); return () => roster?.setActive(false); }, [roster, rosterActive]);
+  useEffect(() => { groupRoster?.setActive(rosterActive); return () => groupRoster?.setActive(false); }, [groupRoster, rosterActive]);
+  const sourceOpenRef = useRef<AbortController | undefined>(undefined);
+  const [sourceOpening, setSourceOpening] = useState<string>();
+  useEffect(() => { if (!rosterActive) { sourceOpenRef.current?.abort(); setSourceOpening(undefined); } return () => sourceOpenRef.current?.abort(); }, [rosterActive]);
   const [state, setState] = useState<DirectoryState>(() => transport
     ? { ownerKey: transport.ownerKey, status: "loading", refreshing: false }
     : { status: "offline", refreshing: false });
@@ -195,9 +220,18 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
   const [routine, setRoutine] = useState<PartnerRoutineEditor>();
   const [resume, setResume] = useState<PartnerResumeEditor>();
   const [memory, setMemory] = useState<PartnerMemoryEditor>();
-  const [selectedGroupId, setSelectedGroupId] = useState<string>(), groups = useMobilePartnerGroups(groupApi, groupReceiptScope, selectedGroupId), [groupCreation, setGroupCreation] = useState(false), groupCopy = partnerGroupMessages(locale);
-  useEffect(() => { setGroupCreation(false); setSelectedGroupId(undefined); }, [groupReceiptScope]);
-  useEffect(() => { if (initialGroupId && groupApi) { setSelectedGroupId(initialGroupId); onGroupOpened?.(); } }, [initialGroupId, groupApi?.ownerKey]);
+  const [groupEntry, setGroupEntry] = useState<{ readonly selection: MobilePartnerGroupSelection; readonly groupId?: string }>();
+  const groupIdentity = groupSourceKey ?? "current";
+  const groupMatches = (selection: MobilePartnerGroupSelection, retained = false): boolean => selection.sourceKey === groupIdentity
+    && selection.receiptScope === groupReceiptScope && (retained ? !groupSourceClaimRetained || groupSourceClaimRetained(selection)
+      : (!groupApi || selection.ownerKey === groupApi.ownerKey) && (!rosterActive || !groupApi || !groupSourceClaimCurrent || groupSourceClaimCurrent(selection)));
+  const selectedGroupId = groupEntry && groupMatches(groupEntry.selection, true) ? groupEntry.groupId : undefined;
+  const groupCreation = !!groupEntry && groupMatches(groupEntry.selection) && groupEntry.groupId === undefined;
+  const [groupChoosing, setGroupChoosing] = useState(false);
+  const groups = useMobilePartnerGroups(groupApi, groupReceiptScope, selectedGroupId), groupCopy = partnerGroupMessages(locale);
+  useEffect(() => { if (initialGroupSelection && groupMatches(initialGroupSelection)) {
+    setGroupEntry({ selection: initialGroupSelection, groupId: initialGroupSelection.groupId }); onGroupOpened?.();
+  } }, [initialGroupSelection, groupApi?.ownerKey, groupReceiptScope, groupSourceKey]);
   useEffect(() => () => memory?.dispose(), [memory]);
   useEffect(() => () => routine?.dispose(), [routine]);
   useEffect(() => () => resume?.dispose(), [resume]);
@@ -266,7 +300,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
   const leaveInitialization = (): void => { setInitialization(undefined); load(); };
   useEffect(() => {
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      if (selectedGroupId) setSelectedGroupId(undefined); else if (initialization) leaveInitialization(); else onBack();
+      if (selectedGroupId) setGroupEntry(undefined); else if (initialization) leaveInitialization(); else onBack();
       return true;
     });
     return () => subscription.remove();
@@ -277,14 +311,82 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
   const status = currentOwner ? state.status : transport ? "loading" : "offline";
   const visible = useMemo(() => filterMobilePartnerDirectory(catalog?.partners ?? [], lifecycle, query, locale),
     [catalog?.partners, lifecycle, query, locale]);
-  type Entry = { kind: "partner"; partner: MobilePartnerDirectoryProfile } | { kind: "group"; group: PartnerGroupSummary };
-  const entries = useMemo<Entry[]>(() => [
+  type Entry = { kind: "partner"; partner: MobilePartnerDirectoryProfile } | { kind: "group"; group: PartnerGroupSummary }
+    | { kind: "source"; shard: MobilePartnerRosterShard }
+    | { kind: "remote"; shard: MobilePartnerRosterShard; partner: MobilePartnerDirectoryProfile }
+    | { kind: "cached"; shard: MobilePartnerRosterShard; row: MobilePartnerRosterDisplay }
+    | { kind: "source-group"; shard: MobilePartnerGroupRosterShard; row: MobilePartnerGroupDisplay };
+  const localEntries = useMemo<Extract<Entry, { kind: "partner" | "group" }>[]>(() => [
     ...visible.map(partner => ({ kind: "partner" as const, partner })),
-    ...(lifecycle === "active" ? groups.state.catalog?.groups.filter(group => !query.trim() || [group.name, ...group.members.map(member => member.name)].join(" ").toLocaleLowerCase(locale).includes(query.trim().toLocaleLowerCase(locale))).map(group => ({ kind: "group" as const, group })) ?? [] : [])
+    ...(!groupRoster && lifecycle === "active" ? groups.state.catalog?.groups.filter(group => !query.trim() || [group.name, ...group.members.map(member => member.name)].join(" ").toLocaleLowerCase(locale).includes(query.trim().toLocaleLowerCase(locale))).map(group => ({ kind: "group" as const, group })) ?? [] : [])
   ].sort((left, right) => {
-    const time = (entry: Entry) => entry.kind === "partner" ? entry.partner.activity.latestReplyAt ?? entry.partner.updatedAt : Number((entry.group.lastMessage?.createdAt ?? entry.group.updatedAt)?.seconds ?? 0n) * 1000;
+    const time = (entry: Extract<Entry, { kind: "partner" | "group" }>) => entry.kind === "partner" ? entry.partner.activity.latestReplyAt ?? entry.partner.updatedAt : Number((entry.group.lastMessage?.createdAt ?? entry.group.updatedAt)?.seconds ?? 0n) * 1000;
     return time(right) - time(left);
-  }), [visible, groups.state.catalog, lifecycle, query, locale]);
+  }), [visible, groups.state.catalog, groupRoster, lifecycle, query, locale]);
+  const entries = useMemo<Entry[]>(() => {
+    if (!roster) return localEntries;
+    const result: Entry[] = [], current = shards.find(shard => shard.source.current);
+    const groupEntries = (key: string): Extract<Entry, { kind: "source-group" }>[] => {
+      const shard = groupShards.find(item => item.source.key === key);
+      const normalized = query.trim().normalize("NFKC").toLocaleLowerCase(locale);
+      return lifecycle !== "active" || !shard ? [] : shard.display.filter(row => !normalized
+        || [row.name, ...row.members.map(member => member.name), row.preview].join(" ").normalize("NFKC").toLocaleLowerCase(locale).includes(normalized))
+        .map(row => ({ kind: "source-group", shard, row }));
+    };
+    const time = (entry: Exclude<Entry, { kind: "source" }>): number => entry.kind === "source-group" ? entry.row.updatedAt
+      : entry.kind === "cached" ? entry.row.updatedAt : entry.kind === "group" ? Number((entry.group.lastMessage?.createdAt ?? entry.group.updatedAt)?.seconds ?? 0n) * 1000
+        : entry.partner.activity.latestReplyAt ?? entry.partner.updatedAt;
+    if (current && catalog) result.push({ kind: "source", shard: current }, ...[...localEntries, ...groupEntries(current.source.key)].sort((a, b) => time(b) - time(a)));
+    else if (localEntries.length) result.push(...localEntries);
+    for (const shard of shards) {
+      if (shard.source.current && catalog) continue;
+      result.push({ kind: "source", shard });
+      const sourceEntries: Exclude<Entry, { kind: "source" }>[] = [...groupEntries(shard.source.key)];
+      if (shard.catalog && roster.transport(shard.source.key)) {
+        sourceEntries.push(...filterMobilePartnerDirectory(shard.catalog.partners.filter(partner => shard.source.current || partner.lifecycle !== "archived"), lifecycle, query, locale)
+          .map(partner => ({ kind: "remote" as const, shard, partner })));
+      } else {
+        const normalized = query.trim().normalize("NFKC").toLocaleLowerCase(locale);
+        sourceEntries.push(...shard.display.filter(row => (shard.source.current || row.lifecycle !== "archived")
+          && (row.lifecycle === lifecycle || lifecycle === "active" && row.lifecycle === "paused")
+          && (!normalized || [row.displayName, row.preview].join(" ").normalize("NFKC").toLocaleLowerCase(locale).includes(normalized)))
+          .map(row => ({ kind: "cached" as const, shard, row })));
+      }
+      result.push(...sourceEntries.sort((a, b) => time(b) - time(a)));
+    }
+    return result;
+  }, [roster, shards, catalog, localEntries, groupShards, lifecycle, query, locale]);
+  const groupCreateTargets = groupShards.filter(shard => groupRoster?.transport(shard.source.key) !== undefined);
+  const localGroupSelection = (groupId?: string): MobilePartnerGroupSelection | undefined => groupApi && groupReceiptScope
+    ? { sourceKey: groupIdentity, receiptScope: groupReceiptScope, ownerKey: groupApi.ownerKey, profileId: "current", groupId } : undefined;
+  const openGroupSource = (source: MobilePartnerRosterSource, groupId?: string): void => {
+    if (!onOpenGroupSource || sourceOpening || !rosterActive || !groupRoster?.transport(source.key)) return;
+    const abort = new AbortController(); sourceOpenRef.current = abort;
+    setSourceOpening(JSON.stringify([source.key, groupId ?? "create"])); setActionError(undefined);
+    void onOpenGroupSource(source, groupId, abort.signal).then(selection => {
+      if (abort.signal.aborted || selection.sourceKey !== source.key || selection.groupId !== groupId) return;
+      setGroupEntry({ selection, groupId });
+    }).catch((error: unknown) => { if (!abort.signal.aborted) setActionError(error instanceof Error ? error.message : String(error)); })
+      .finally(() => { if (!abort.signal.aborted) setSourceOpening(undefined); });
+  };
+  const openSource = (source: MobilePartnerRosterSource, partner: MobilePartnerDirectoryProfile, mode: "conversation" | "settings"): void => {
+    if (!onOpenSource || sourceOpening || !rosterActive || !roster?.transport(source.key)) return;
+    const abort = new AbortController(); sourceOpenRef.current = abort;
+    setSourceOpening(`${source.key}:${partner.partnerId}`); setActionError(undefined);
+    void onOpenSource(source, partner, mode, abort.signal).catch((error: unknown) => {
+      if (!abort.signal.aborted) setActionError(error instanceof Error ? error.message : String(error));
+    }).finally(() => { if (!abort.signal.aborted) setSourceOpening(undefined); });
+  };
+  const openSourceInitialization = (source: MobilePartnerRosterSource, partner: MobilePartnerDirectoryProfile): void => {
+    if (!onOpenSourceInitialization || sourceOpening || !rosterActive || !roster?.transport(source.key)) return;
+    const abort = new AbortController(); sourceOpenRef.current = abort;
+    setSourceOpening(`${source.key}:${partner.partnerId}`); setActionError(undefined);
+    void onOpenSourceInitialization(source, partner, abort.signal).then(owner => {
+      if (!abort.signal.aborted) setInitialization(owner);
+    }).catch((error: unknown) => {
+      if (!abort.signal.aborted) setActionError(error instanceof Error ? error.message : String(error));
+    }).finally(() => { if (!abort.signal.aborted) setSourceOpening(undefined); });
+  };
   const open = (partner: MobilePartnerDirectoryProfile): void => {
     const current = transportRef.current;
     if (!current || openingId !== undefined || current.ownerKey !== state.ownerKey) return;
@@ -308,7 +410,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
   const emptyKey = query.trim() !== "" ? "partnerDirectory.noResults"
     : lifecycle === "active" ? "partnerDirectory.emptyActive" : "partnerDirectory.emptyArchived";
   if (selectedGroupId && groups.view) return <MobilePartnerGroupChat key={`${groupReceiptScope}:${selectedGroupId}`} view={groups.view} partners={catalog?.partners ?? []} colors={colors} locale={locale}
-    attachments={groupAttachments?.ownerKey === groups.view.api.ownerKey ? groupAttachments : undefined} onBack={() => setSelectedGroupId(undefined)} />;
+    attachments={groupAttachments?.ownerKey === groups.view.api.ownerKey ? groupAttachments : undefined} onBack={() => setGroupEntry(undefined)} />;
   if (initialization) return <MobilePartnerInitializationScreen partnerId={initialization.partnerId}
     transport={initializationTransport?.ownerKey === initialization.ownerKey ? initializationTransport : undefined}
     colors={colors} locale={locale} onBack={leaveInitialization} onOpenTask={onOpenTask} />;
@@ -320,15 +422,24 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
         <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "partnerDirectory.subtitle")}</Text>
       </View>
       <Action label={mobileMessage(locale, "common.refresh")} colors={colors}
-        disabled={!transport || status === "loading" || state.refreshing} onPress={() => { load(); void groups.view?.refresh(); }}
+        disabled={roster ? !rosterActive : !transport || status === "loading" || state.refreshing}
+        onPress={() => { load(); roster?.refresh(); groupRoster?.refresh(); void groups.view?.refresh(); }}
         testID="partnerDirectory.refresh" />
       <Action label={mobileMessage(locale, "partnerCreation.create")} colors={colors} onPress={() => setCreation(true)}
         disabled={!creationTransport || creationTransport.ownerKey !== transport?.ownerKey} testID="partnerDirectory.create" />
     </View>
-    {groups.view && <View style={styles.controls}><MobileGroupAction label={groupCopy.create} colors={colors} disabled={groups.state.status !== "ready" || !catalog} onPress={() => setGroupCreation(true)} testID="partnerGroups.create" /></View>}
+    {(groupRoster || groups.view) && <View style={styles.controls}><MobileGroupAction label={groupCopy.create} colors={colors}
+      disabled={groupRoster ? !rosterActive || sourceOpening !== undefined || groupCreateTargets.length === 0 : groups.state.status !== "ready" || !catalog}
+      onPress={() => { if (groupRoster) setGroupChoosing(true); else { const selection = localGroupSelection(); if (selection) setGroupEntry({ selection }); } }} testID="partnerGroups.create" /></View>}
+    <MobileActionSheet visible={groupChoosing} colors={colors} locale={locale} onClose={() => setGroupChoosing(false)}
+      items={groupCreateTargets.map(shard => ({ id: shard.source.key, label: mobileMessage(locale, "partnerGroups.sourceChoice", {
+        name: shard.source.profile.displayName, origin: shard.source.profile.origin }), disabled: sourceOpening !== undefined || !rosterActive }))}
+      onAction={key => { const shard = groupCreateTargets.find(item => item.source.key === key); if (shard) openGroupSource(shard.source); }} />
     {groups.state.error && <View style={styles.notice}><Text accessibilityRole="alert" style={{ color: colors.negative }}>{groups.state.error}</Text><MobileGroupAction label={groupCopy.refresh} colors={colors} onPress={() => groups.view?.setActive(true)} /></View>}
     {groupCreation && groups.view && <MobilePartnerGroupCreateSheet key={groups.view.api.ownerKey} view={groups.view} partners={catalog?.partners ?? []} colors={colors} locale={locale} storage={groupCreationStorage} receiptScope={groupReceiptScope}
-      onClose={() => setGroupCreation(false)} onCreated={id => { setGroupCreation(false); setSelectedGroupId(id); }} />}
+      onClose={() => setGroupEntry(undefined)} onCreated={id => { if (groupEntry && groupMatches(groupEntry.selection)) {
+        setGroupEntry({ selection: groupEntry.selection, groupId: id }); groupRoster?.refresh(groupEntry.selection.sourceKey);
+      } }} />}
     {importFactory && <View style={styles.controls}><Action label={partnerImportMessages(locale).title} colors={colors}
       onPress={() => { const editor = importFactory(); if (editor?.api.ownerKey === transportRef.current?.ownerKey) setImportEditor(editor); else editor?.dispose(); }}
       disabled={!transport || status !== "ready"} testID="partnerDirectory.import" /></View>}
@@ -347,7 +458,7 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
         {mobileMessage(locale, "partnerDirectory.errorCount", { count: catalog.directory.errorCount })}
       </Text>
     </View>}
-    {catalog && <View style={styles.controls}>
+    {(catalog || roster) && <View style={styles.controls}>
       <View accessibilityRole="radiogroup" style={[styles.segmented, { borderColor: colors.border }]}>
         {(["active", "archived"] as const).map((value) => <Pressable key={value} accessibilityRole="radio"
           accessibilityState={{ checked: lifecycle === value }} onPress={() => setLifecycle(value)}
@@ -358,9 +469,9 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
         </Pressable>)}
       </View>
       <View style={[styles.searchField, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-      <TextInput accessibilityLabel={mobileMessage(locale, "partnerDirectory.search")} value={query}
+      <TextInput accessibilityLabel={mobileMessage(locale, groupRoster ? "partnerGroups.search" : "partnerDirectory.search")} value={query}
         onChangeText={setQuery} autoCorrect={false} clearButtonMode="while-editing"
-        placeholder={mobileMessage(locale, "partnerDirectory.search")}
+        placeholder={mobileMessage(locale, groupRoster ? "partnerGroups.search" : "partnerDirectory.search")}
         placeholderTextColor={colors.muted} testID="partnerDirectory.search"
         style={[styles.search, { color: colors.ink }]} />
       {query.length > 0 && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "common.clear")}
@@ -369,32 +480,119 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
       </Pressable>}
       </View>
     </View>}
-    {currentOwner && (state.error || actionError) && <View accessibilityRole="alert" style={[styles.notice, {
+    {(currentOwner && state.error || actionError) && <View accessibilityRole="alert" style={[styles.notice, {
       borderColor: colors.negative, backgroundColor: colors.surface
     }]}>
       <Text style={[styles.body, { color: colors.negative }]}>{actionError ?? mobileMessage(locale,
         catalog ? "partnerDirectory.stale" : "partnerDirectory.error")}</Text>
     </View>}
-    {status === "offline" && !catalog ? <View style={styles.center}>
+    {!roster && status === "offline" && !catalog ? <View style={styles.center}>
       <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "partnerDirectory.offline")}</Text>
-    </View> : status === "loading" ? <View style={styles.center}>
+    </View> : !roster && status === "loading" ? <View style={styles.center}>
       <ActivityIndicator color={colors.accent} />
       <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "partnerDirectory.loading")}</Text>
-    </View> : status === "error" ? <View style={styles.center}>
+    </View> : !roster && status === "error" ? <View style={styles.center}>
       <Text style={[styles.body, { color: colors.negative }]}>{mobileMessage(locale, "partnerDirectory.error")}</Text>
       <Action label={mobileMessage(locale, "common.retry")} colors={colors} onPress={load} />
-    </View> : <FlatList data={entries} keyExtractor={entry => entry.kind === "partner" ? `partner:${entry.partner.partnerId}` : `group:${entry.group.id}`}
+    </View> : <FlatList data={entries} keyExtractor={entry => entry.kind === "partner" ? `partner:${entry.partner.partnerId}`
+      : entry.kind === "group" ? `group:${entry.group.id}` : entry.kind === "source" ? `source:${entry.shard.source.key}`
+        : `${entry.shard.source.key}:${entry.kind === "remote" ? entry.partner.partnerId : entry.kind === "source-group" ? `group:${entry.row.groupId}` : entry.row.partnerId}`}
       contentContainerStyle={[styles.list, entries.length === 0 && styles.emptyList]}
       keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag"
-      refreshControl={<RefreshControl refreshing={state.refreshing || groups.state.refreshing} onRefresh={() => { load(); void groups.view?.refresh(); }} tintColor={colors.accent} />}
+      refreshControl={<RefreshControl refreshing={state.refreshing || groups.state.refreshing || shards.some(shard => shard.refreshing) || groupShards.some(shard => shard.refreshing)}
+        onRefresh={() => { load(); roster?.refresh(); groupRoster?.refresh(); void groups.view?.refresh(); }} tintColor={colors.accent} />}
       ListEmptyComponent={<View style={styles.center}><Text style={[styles.body, styles.emptyText, { color: colors.muted }]}>
         {mobileMessage(locale, emptyKey)}
       </Text>{!query.trim() && lifecycle === "active" && <Action label={mobileMessage(locale, "partnerCreation.create")}
         colors={colors} onPress={() => setCreation(true)} disabled={!creationTransport || creationTransport.ownerKey !== transport?.ownerKey}
         testID="partnerDirectory.emptyCreate" />}</View>}
       renderItem={({ item: entry, index }) => {
+        if (entry.kind === "source") {
+          const shard = entry.shard, live = roster?.transport(shard.source.key) !== undefined;
+          const groupShard = groupShards.find(item => item.source.key === shard.source.key), groupLive = !!groupRoster?.transport(shard.source.key);
+          const label = shard.status === "loading" ? mobileMessage(locale, "partnerDirectory.loading")
+            : live ? mobileMessage(locale, "connections.state.connected")
+              : shard.status === "error" ? mobileMessage(locale, shard.display.length ? "partnerDirectory.stale" : "partnerDirectory.error")
+                : mobileMessage(locale, "common.offline");
+          return <View style={styles.sourceHeader} testID={`partnerDirectory.source.${shard.source.profile.profileId}`}>
+            <View style={styles.grow}><Text style={[styles.body, { color: colors.ink }]}>{shard.source.profile.displayName}</Text>
+              <Text style={[styles.caption, { color: colors.muted }]}>{shard.source.profile.origin}</Text>
+              <Text accessibilityRole={shard.error ? "alert" : undefined} style={[styles.caption, { color: shard.error ? colors.negative : colors.muted }]}>{label}</Text>
+              {!live && shard.savedAt !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>
+                {mobileMessage(locale, "offline.saved")} · {formatTime(shard.savedAt, locale)}
+              </Text>}
+              {!live && shard.displayTotal > shard.display.length && <Text style={[styles.caption, { color: colors.muted }]}>
+                {mobileMessage(locale, "partnerDirectory.cachedLimited", { shown: shard.display.length, total: shard.displayTotal })}
+              </Text>}
+              {!shard.refreshing && shard.display.length === 0 && <Text style={[styles.caption, { color: colors.muted }]}>
+                {mobileMessage(locale, emptyKey)}
+              </Text>}
+              {groupShard && <Text accessibilityRole={groupShard.error ? "alert" : undefined} style={[styles.caption, { color: groupShard.error ? colors.negative : colors.muted }]}
+                testID={`partnerGroups.sourceState.${shard.source.profile.profileId}`}>
+                {mobileMessage(locale, groupShard.refreshing && !groupShard.display.length ? "partnerGroups.loading"
+                  : groupLive ? groupShard.display.length ? "partnerGroups.online" : "partnerGroups.empty"
+                    : groupShard.status === "error" ? "partnerGroups.failed" : "partnerGroups.offline")}
+                {!groupLive && groupShard.savedAt !== undefined ? ` · ${formatTime(groupShard.savedAt, locale)}` : ""}
+              </Text>}
+              {groupShard && !groupLive && groupShard.displayTotal > groupShard.display.length && <Text style={[styles.caption, { color: colors.muted }]}>
+                {mobileMessage(locale, "partnerDirectory.cachedLimited", { shown: groupShard.display.length, total: groupShard.displayTotal })}
+              </Text>}
+            </View>{shard.refreshing && <ActivityIndicator color={colors.muted} />}
+            <View style={styles.sourceActions}><Action label={mobileMessage(locale, "common.retry")} colors={colors} disabled={!rosterActive || shard.refreshing}
+              testID={`partnerDirectory.sourceRetry.${shard.source.profile.profileId}`} onPress={() => roster?.refresh(shard.source.key)} />
+              {groupShard && <Action label={mobileMessage(locale, "partnerGroups.retry")} colors={colors} disabled={!rosterActive || groupShard.refreshing}
+                testID={`partnerGroups.sourceRetry.${shard.source.profile.profileId}`} onPress={() => groupRoster?.refresh(shard.source.key)} />}
+            </View>
+          </View>;
+        }
+        if (entry.kind === "source-group") {
+          const { shard, row } = entry, source = shard.source, live = !!groupRoster?.transport(source.key);
+          const group = live ? shard.catalog?.groups.find(item => item.id === row.groupId) : undefined;
+          const partners = source.current && catalog ? catalog.partners : shards.find(item => item.source.key === source.key)?.catalog?.partners ?? [];
+          const cachedPartners = shards.find(item => item.source.key === source.key)?.display ?? [];
+          const working = !!group?.speakers.length;
+          const preview = live ? working ? groupCopy.replying : group?.openPlan ? groupCopy.plan : row.preview || row.members.map(member => member.name).join(" · ")
+            : `${mobileMessage(locale, "common.offline")} · ${row.preview || row.members.map(member => member.name).join(" · ")}`;
+          const disabled = !live || !rosterActive || sourceOpening !== undefined || !onOpenGroupSource || !group || group.deleting;
+          return <MobilePartnerAvatarProvider transport={roster?.transport(source.key)?.avatar}>
+            <Pressable accessibilityRole="button" accessibilityLabel={`${row.name} · ${groupCopy.groups}${row.unread ? ` · ${groupCopy.unread}` : ""}${!live ? ` · ${mobileMessage(locale, "common.offline")}` : ""}`}
+              accessibilityState={{ disabled }} disabled={disabled} onPress={() => openGroupSource(source, row.groupId)}
+              testID={`partnerGroups.sourceItem.${source.profile.profileId}.${row.groupId}`} style={[styles.row, !live && styles.unavailable]}>
+              <View style={styles.groupAvatars}>{row.members.slice(0, 4).map(member => {
+                const partner = partners.find(item => item.partnerId === member.partnerId), cached = cachedPartners.find(item => item.partnerId === member.partnerId);
+                return <View key={member.partnerId} style={styles.groupAvatar}><MobilePartnerAvatar preset={partner?.avatar ?? cached?.avatar ?? "orbit"} partner={partner} colors={colors} size={26} /></View>;
+              })}</View>
+              <View style={[styles.rowBody, { borderBottomWidth: index === entries.length - 1 ? 0 : StyleSheet.hairlineWidth, borderColor: colors.border }]}>
+                <View style={styles.titleRow}><Text style={[styles.name, styles.grow, { color: colors.ink }]} numberOfLines={1}>{row.name}</Text>
+                  {sourceOpening === JSON.stringify([source.key, row.groupId]) ? <ActivityIndicator color={colors.muted} />
+                    : <Text style={[styles.time, { color: colors.muted }]}>{working ? groupCopy.replying : formatTime(row.updatedAt, locale)}</Text>}</View>
+                <View style={styles.previewRow}><Text style={[styles.preview, { color: colors.muted }]} numberOfLines={1}>{preview}</Text>
+                  {row.unread && <View accessibilityLabel={groupCopy.unread} style={[styles.unread, { backgroundColor: colors.accent }]} />}</View>
+              </View>
+            </Pressable>
+          </MobilePartnerAvatarProvider>;
+        }
+        if (entry.kind === "cached") return <View style={[styles.row, styles.unavailable]} testID={`partnerDirectory.cached.${entry.shard.source.profile.profileId}.${entry.row.partnerId}`}>
+          <MobilePartnerAvatarProvider><MobilePartnerAvatar preset={entry.row.avatar} colors={colors} /></MobilePartnerAvatarProvider>
+          <View style={styles.grow}><Text style={[styles.name, { color: colors.ink }]}>{entry.row.displayName}</Text>
+            <Text style={[styles.preview, { color: colors.muted }]} numberOfLines={1}>{mobileMessage(locale, "common.offline")} · {entry.row.preview || mobileMessage(locale, "partnerDirectory.startChat")}</Text></View>
+        </View>;
+        if (entry.kind === "remote") {
+          const source = entry.shard.source, remote = roster?.transport(source.key), item = entry.partner;
+          const preparing = remote !== undefined && item.lifecycle === "active" && item.initializationState !== "ready"
+            && onOpenSourceInitialization !== undefined;
+          return <MobilePartnerAvatarProvider transport={remote?.avatar}><View style={styles.managedRow} testID={`partnerDirectory.sourceItem.${source.profile.profileId}.${item.partnerId}`}>
+            <View style={styles.grow}><PartnerRow partner={item} colors={colors} locale={locale} recoverable={preparing}
+              online={remote !== undefined} observation={remote?.observation()} last={index === entries.length - 1}
+              opening={sourceOpening === `${source.key}:${item.partnerId}`} onOpen={() => preparing
+                ? openSourceInitialization(source, item) : openSource(source, item, "conversation")} /></View>
+            <Action label={mobileMessage(locale, "settings.title")} colors={colors}
+              disabled={!remote || sourceOpening !== undefined || item.lifecycle === "archived" || item.initializationState !== "ready"}
+              testID={`partnerDirectory.sourceSettings.${source.profile.profileId}.${item.partnerId}`} onPress={() => openSource(source, item, "settings")} />
+          </View></MobilePartnerAvatarProvider>;
+        }
         if (entry.kind === "group") return <MobilePartnerGroupRow group={entry.group} partners={catalog?.partners ?? []} colors={colors} locale={locale}
-          disabled={!groups.view || groups.state.status !== "ready" || entry.group.deleting} onOpen={() => setSelectedGroupId(entry.group.id)} />;
+          disabled={!groups.view || groups.state.status !== "ready" || entry.group.deleting} onOpen={() => { const selection = localGroupSelection(entry.group.id); if (selection) setGroupEntry({ selection, groupId: entry.group.id }); }} />;
         const item = entry.partner;
         const recoverable = item.lifecycle === "active" && item.initializationState !== "ready"
           && initializationTransport !== undefined && initializationTransport.ownerKey === transport?.ownerKey;
@@ -404,7 +602,10 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
           last={index === entries.length - 1} opening={openingId === item.partnerId} onOpen={() => {
             if (recoverable && transport) setInitialization({ ownerKey: transport.ownerKey, partnerId: item.partnerId });
             else open(item);
-          }} /></View>{deletionTransport && deletionTransport.ownerKey === transport?.ownerKey && deletionTransport.ownerKey === ownerKey
+          }} /></View>{onOpenSource && shards.find(shard => shard.source.current) && <Action label={mobileMessage(locale, "settings.title")} colors={colors}
+            disabled={!transport || sourceOpening !== undefined || item.lifecycle === "archived" || item.initializationState !== "ready"}
+            testID={`partnerDirectory.settings.${item.partnerId}`} onPress={() => openSource(shards.find(shard => shard.source.current)!.source, item, "settings")} />}
+          {deletionTransport && deletionTransport.ownerKey === transport?.ownerKey && deletionTransport.ownerKey === ownerKey
             && <View style={styles.deleteAction}><Action label={mobileMessage(locale, "partnerDeletion.delete")} colors={colors}
               testID={`partnerDirectory.delete.${item.partnerId}`} disabled={openingId !== undefined}
               onPress={() => setDeletion({ ownerKey: deletionTransport.ownerKey, partner: item })} /></View>}
@@ -446,6 +647,10 @@ export function MobilePartnerDirectoryScreen({ colors, locale, transport, observ
 
 const styles = StyleSheet.create({
   screen: { flex: 1, paddingTop: 12 },
+  sourceHeader: { minHeight: 70, padding: 14, flexDirection: "row", alignItems: "center", gap: 10 },
+  sourceActions: { gap: 8 },
+  groupAvatars: { width: 54, height: 54, flexDirection: "row", flexWrap: "wrap" },
+  groupAvatar: { width: 27, height: 27 },
   header: { minHeight: 54, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14 },
   grow: { flex: 1, minWidth: 0 },
   title: { fontSize: 23, lineHeight: 29, fontWeight: "700" },

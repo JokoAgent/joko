@@ -4,20 +4,85 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { verifyPackagedDesktopRemoteDesktopBinary, verifyPackagedDesktopRemoteDesktopLinuxCredentials,
   verifyPackagedDesktopRemoteDesktopPrivacy, verifyPackagedDesktopRemoteDesktopWindowsHost } from
   "../src/remote-desktop-native-manifest.js";
 
 const roots: string[] = [];
-const { auditNativeRemoteDesktop } = createRequire(import.meta.url)("../scripts/audit-packaged.cjs") as {
-  auditNativeRemoteDesktop(root: string, platform: string, architecture: string): Promise<void>;
+type NativeRemoteDesktopBuilder = {
+  assertNativeRemoteDesktopBuildTarget(platform: string, architecture: string): void;
+  buildNativeRemoteDesktop(options: { platform: string; architecture: string; output: string }): void | Promise<void>;
 };
+const { auditNativeRemoteDesktop, prepareNativeRemoteDesktopForPackage } = createRequire(import.meta.url)("../scripts/audit-packaged.cjs") as {
+  auditNativeRemoteDesktop(root: string, platform: string, architecture: string): Promise<void>;
+  prepareNativeRemoteDesktopForPackage(root: string, platform: string, architecture: string, builder: NativeRemoteDesktopBuilder): Promise<void>;
+};
+const { assertNativeRemoteDesktopBuildTarget } = await import(new URL("../scripts/build-native-remote-desktop.mjs", import.meta.url).href) as Pick<NativeRemoteDesktopBuilder, "assertNativeRemoteDesktopBuildTarget">;
 
 describe("packaged Remote Desktop native manifest", () => {
   afterEach(async () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  describe("afterPack native target preparation", () => {
+    beforeEach(() => {
+      vi.stubGlobal("process", new Proxy(process, { get(target, property) {
+        if (property === "platform") return "win32";
+        if (property === "arch") return "x64";
+        return Reflect.get(target, property);
+      } }));
+    });
+    afterEach(() => vi.unstubAllGlobals());
+
+    it("preserves all four copied Windows byte identities without rebuilding a matched afterPack target", async () => {
+      const root = await directory(); await windowsPair(root, "x64");
+      const names = ["manifest.json", "joko-windows-remote-desktop-input.exe", "joko-windows-remote-desktop-host.exe", "joko-windows-remote-desktop-host.node"];
+      const before = await Promise.all(names.map(name => readFile(join(root, name))));
+      const buildNativeRemoteDesktop = vi.fn(() => { throw new Error("A matched artifact must not be rebuilt."); });
+      await prepareNativeRemoteDesktopForPackage(root, "win32", "x64", { assertNativeRemoteDesktopBuildTarget, buildNativeRemoteDesktop });
+      expect(buildNativeRemoteDesktop).not.toHaveBeenCalled();
+      expect(await Promise.all(names.map(name => readFile(join(root, name))))).toEqual(before);
+    });
+
+    it("builds only a different afterPack architecture and audits its exact target closure", async () => {
+      const root = await directory(); await windowsPair(root, "x64");
+      const buildNativeRemoteDesktop = vi.fn(async () => { await windowsPair(root, "arm64"); });
+      await prepareNativeRemoteDesktopForPackage(root, "win32", "arm64", { assertNativeRemoteDesktopBuildTarget, buildNativeRemoteDesktop });
+      expect(buildNativeRemoteDesktop).toHaveBeenCalledExactlyOnceWith({ platform: "win32", architecture: "arm64", output: root });
+      await expect(auditNativeRemoteDesktop(root, "win32", "arm64")).resolves.toBeUndefined();
+    });
+
+    it.each(["binary digest", "manifest shape", "manifest target"])("rejects an afterPack copy with a changed %s without healing its bytes", async defect => {
+      const root = await directory(); await windowsPair(root, "x64");
+      const path = join(root, defect === "binary digest" ? "joko-windows-remote-desktop-host.node" : "manifest.json");
+      if (defect === "binary digest") { const bytes = pe("x64", true); bytes[112] = 1; await writeFile(path, bytes); }
+      else { const manifest = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+        if (defect === "manifest target") manifest["platform"] = "unsupported"; else delete manifest["windowsHostAddonSha256"];
+        await writeFile(path, JSON.stringify(manifest)); }
+      const before = await readFile(path), buildNativeRemoteDesktop = vi.fn();
+      await expect(prepareNativeRemoteDesktopForPackage(root, "win32", "x64", { assertNativeRemoteDesktopBuildTarget, buildNativeRemoteDesktop })).rejects.toThrow();
+      expect(buildNativeRemoteDesktop).not.toHaveBeenCalled(); expect(await readFile(path)).toEqual(before);
+    });
+
+    it("rejects a rebuilt afterPack closure that still belongs to the previous architecture", async () => {
+      const root = await directory(); await windowsPair(root, "x64");
+      const buildNativeRemoteDesktop = vi.fn();
+      await expect(prepareNativeRemoteDesktopForPackage(root, "win32", "arm64", { assertNativeRemoteDesktopBuildTarget, buildNativeRemoteDesktop })).rejects.toThrow("artifact target");
+      expect(buildNativeRemoteDesktop).toHaveBeenCalledOnce();
+    });
+
+    it.each(["foreign host", "Linux cross-architecture"])("keeps the afterPack %s build policy before reading or changing copied resources", async defect => {
+      if (defect === "Linux cross-architecture") vi.stubGlobal("process", new Proxy(process, { get(target, property) {
+        if (property === "platform") return "linux"; if (property === "arch") return "x64"; return Reflect.get(target, property);
+      } }));
+      const root = await directory(), path = join(root, "manifest.json"); await writeFile(path, "unchanged");
+      const buildNativeRemoteDesktop = vi.fn();
+      await expect(prepareNativeRemoteDesktopForPackage(root, "linux", "arm64", { assertNativeRemoteDesktopBuildTarget, buildNativeRemoteDesktop }))
+        .rejects.toThrow(defect === "foreign host" ? "target operating system" : "target architecture");
+      expect(buildNativeRemoteDesktop).not.toHaveBeenCalled(); expect(await readFile(path, "utf8")).toBe("unchanged");
+    });
   });
 
   it.each(["x64", "arm64"])("accepts the exact Linux %s helper set through runtime and package audit", async (architecture) => {

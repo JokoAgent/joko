@@ -106,6 +106,8 @@ import {
   selectedMachineProfileIds,
   type MachineSelection
 } from "./machine-federation.js";
+import { PartnerSourceDirectory, partnerSourceKey, resolvePartnerSourceProfile, resolvePartnerSourceSession, validatePartnerSourceOwner, type PartnerSourceView } from "./partner-sources.js";
+import { requestPartnerNavigationLeave } from "./partner-navigation-leave.js";
 
 const LIGHT_APP_ICON_URL = lightAppIconUrl;
 const DARK_APP_ICON_URL = darkAppIconUrl;
@@ -116,17 +118,18 @@ export type ToolsTab = "browser" | "extensions" | "skills" | "resources" | "mcp"
 const TOOLS_TABS: readonly ToolsTab[] = ["browser", "extensions", "skills", "resources", "mcp", "activity"];
 
 export type AppRoute =
-  | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly messageId?: string; readonly messageEventId?: string }
+  | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly partnerId?: string; readonly messageId?: string; readonly messageEventId?: string }
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string }
   | { readonly kind: "projects"; readonly projectId?: string }
-  | { readonly kind: "partners"; readonly partnerId?: string; readonly groupId?: string }
+  | { readonly kind: "partners"; readonly partnerId?: string; readonly profileId?: string; readonly preparation?: boolean; readonly groupId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
   | { readonly kind: "tools"; readonly tab?: ToolsTab; readonly extensionId?: string; readonly recommendationNonce?: string }
   | { readonly kind: "extensionMainView"; readonly extensionId: string }
   | { readonly kind: "settings" };
 
 interface MachineSessionMessageTarget {
+  readonly partnerId?: string;
   readonly messageId?: string;
   readonly messageEventId?: string;
 }
@@ -160,6 +163,7 @@ export interface ControllerState {
   readonly profiles: readonly ConnectionProfile[];
   readonly machineCaches: readonly MachineCacheView[];
   readonly machinePresenceByProfile: Readonly<Record<string, MachinePresenceView>>;
+  readonly partnerSources?: readonly PartnerSourceView[];
   readonly activeProfile?: ConnectionProfile;
   readonly discoveredNodes: readonly DiscoveredOrchestratorView[];
   readonly discoveryState: "idle" | "discovering" | "ready";
@@ -212,6 +216,9 @@ export interface AppController extends OperationApi {
   setMachineSelection(selection: MachineSelection): Promise<void>;
   switchMachine(profileId: string): Promise<void>;
   openMachineSession(profileId: string, sessionId: string, messageTarget?: MachineSessionMessageTarget): Promise<void>;
+  refreshPartnerSource?(sourceKey: string): Promise<void>;
+  openSourcePartner?(sourceKey: string, partnerId: string, destination: "session" | "settings" | "preparation"): Promise<void>;
+  readSourcePartnerAvatar?(sourceKey: string, partnerId: string, revision: bigint, image: import("./partner-avatar.js").PartnerAvatarImageView, signal: AbortSignal): Promise<string>;
   searchRemoteSessionMessages(query: string, options?: SessionMessageSearchCollectionOptions): Promise<readonly FederatedSessionMessageSearchMatchView[]>;
   retryManagedOrchestrator(): Promise<void>;
   /** Consume only the not-yet-started automatic attempt for this app open. */
@@ -368,6 +375,18 @@ export function useAppController(): AppController {
   const machineFailureBackoffRef = useRef(new Map<string, { readonly failures: number; readonly retryAt: number }>());
   const machineSwitchIntentRef = useRef(0);
   const remoteMachineGatewayEpochRef = useRef(0);
+  const partnerDirectoryRef = useRef<PartnerSourceDirectory | undefined>(undefined);
+  if (partnerDirectoryRef.current === undefined) {
+    let storage: Storage | undefined;
+    try { storage = window.localStorage; } catch { /* The display cache is optional. */ }
+    partnerDirectoryRef.current = new PartnerSourceDirectory({
+      probe: probeOrchestratorOrigin,
+      readAuthKey: profile => requireLocal(localRef.current).readAuthKey(profile),
+      createGateway: createOrchestratorGateway,
+      ...(storage === undefined ? {} : { storage }),
+      publish: partnerSources => setState(current => ({ ...current, partnerSources }))
+    });
+  }
   const remoteMachineGatewaysRef = useRef(new Map<string, {
     readonly epoch: number;
     readonly profileKey: string;
@@ -584,7 +603,7 @@ export function useAppController(): AppController {
           effectiveManagedStatus = managedRecoveryStatus("identityConflict");
         }
       }
-      const routedProfileId = routeRef.current.kind === "session" ? routeRef.current.profileId : undefined;
+      const routedProfileId = routeRef.current.kind === "session" || routeRef.current.kind === "partners" ? routeRef.current.profileId : undefined;
       const routedProfile = routedProfileId === undefined ? undefined : profiles.find((profile) => profile.id === routedProfileId);
       const automaticProfile = routedProfile ?? (automaticConnectionAvailable
         ? automaticConnectionProfile(effectivePreferences.automaticConnectionTarget, profiles, effectiveManagedStatus)
@@ -692,11 +711,9 @@ export function useAppController(): AppController {
       navigationHashHandoffRef.current = undefined;
       const requestId = ++navigationRequestRef.current;
       const leave = workspaceRouteLeaveRequest(routeRef.current, next);
-      if (leave === undefined) {
-        commitRoute(next);
-        return;
-      }
       const requestAbort = new AbortController();
+      const leavePartner = requestPartnerNavigationLeave(requestAbort.signal);
+      if (leave === undefined && leavePartner === undefined) { commitRoute(next); return; }
       navigationAbortRef.current = requestAbort;
       let currentHash = appRouteHash(routeRef.current);
       if (event.oldURL !== "") {
@@ -707,7 +724,12 @@ export function useAppController(): AppController {
         }
       }
       window.history.replaceState(window.history.state, "", currentHash);
-      void requestWorkspaceDocumentLeave({ ...leave, signal: requestAbort.signal }).then((accepted) => {
+      const acceptedLeave = async (): Promise<boolean> => {
+        if (leavePartner !== undefined && !await leavePartner) return false;
+        if (requestAbort.signal.aborted) return false;
+        return leave === undefined || await requestWorkspaceDocumentLeave({ ...leave, signal: requestAbort.signal });
+      };
+      void acceptedLeave().then((accepted) => {
         if (!accepted || navigationRequestRef.current !== requestId || requestAbort.signal.aborted) {
           if (navigationRequestRef.current === requestId) navigationAbortRef.current = undefined;
           return;
@@ -994,6 +1016,7 @@ export function useAppController(): AppController {
       },
       onAuthenticationInvalidated: async (error) => {
         if (gatewayGenerationRef.current !== generation) return;
+        partnerDirectoryRef.current?.invalidate(profile.id);
         const managedLocal = profile.managedLocal === true;
         // Desktop owns managed-local bearer diagnosis and retirement. Keep it
         // available so the main process can prove an explicit server logout;
@@ -1400,6 +1423,7 @@ export function useAppController(): AppController {
   }, []);
 
   const removeProfile = useCallback(async (profileId: string): Promise<void> => {
+    partnerDirectoryRef.current?.invalidate(profileId);
     if (state.activeProfile?.id === profileId) await disconnect();
     if (automaticConnectionTargetMatchesProfile(preferencesRef.current.automaticConnectionTarget, profileId, state.profiles)) {
       automaticPreferenceIntentRef.current += 1;
@@ -1534,15 +1558,93 @@ export function useAppController(): AppController {
       }
     };
     const leave = workspaceRouteLeaveRequest(routeRef.current, effectiveRoute);
-    if (leave === undefined) {
-      commit();
-      return;
-    }
-    void requestWorkspaceDocumentLeave({ ...leave, signal }).then((accepted) => {
-      if (accepted && ownerIsCurrent()) commit();
-      else finish();
-    });
+    const leavePartner = appRouteHash(routeRef.current) === hash ? undefined : requestPartnerNavigationLeave(signal);
+    const afterPartner = (): void => {
+      if (!ownerIsCurrent()) { finish(); return; }
+      if (leave === undefined) { commit(); return; }
+      void requestWorkspaceDocumentLeave({ ...leave, signal }).then(accepted => {
+        if (accepted && ownerIsCurrent()) commit(); else finish();
+      });
+    };
+    if (leavePartner === undefined) afterPartner();
+    else void leavePartner.then(accepted => { if (accepted) afterPartner(); else finish(); });
   }, [updatePreferences]);
+
+  useEffect(() => {
+    if (!state.ready) return;
+    const directory = partnerDirectoryRef.current!;
+    directory.sync(state.profiles);
+    void directory.refreshAll();
+  }, [state.ready, state.profiles]);
+
+  useEffect(() => {
+    if (!state.ready) return;
+    const directory = partnerDirectoryRef.current!;
+    let shown = true;
+    const foreground = (): void => {
+      const active = shown && document.visibilityState !== "hidden";
+      directory.setForeground(active);
+      if (active) void directory.refreshAll();
+    };
+    const hide = (): void => { shown = false; foreground(); };
+    const show = (): void => { shown = true; foreground(); };
+    document.addEventListener("visibilitychange", foreground);
+    window.addEventListener("pagehide", hide); window.addEventListener("pageshow", show);
+    foreground();
+    const timer = window.setInterval(() => void directory.refreshAll(), 30_000);
+    return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", foreground);
+      window.removeEventListener("pagehide", hide); window.removeEventListener("pageshow", show); directory.dispose(); };
+  }, [state.ready]);
+
+  const openSourcePartner = useCallback(async (sourceKey: string, partnerId: string, destination: "session" | "settings" | "preparation"): Promise<void> => {
+    const intent = ++machineSwitchIntentRef.current;
+    const routeHash = appRouteHash(routeRef.current), locationHash = window.location.hash, navigationRevision = navigationRevisionRef.current;
+    const abort = new AbortController();
+    const retire = (): void => abort.abort();
+    const current = (): boolean => !abort.signal.aborted && document.visibilityState !== "hidden"
+      && machineSwitchIntentRef.current === intent && appRouteHash(routeRef.current) === routeHash
+      && window.location.hash === locationHash && navigationRevisionRef.current === navigationRevision;
+    window.addEventListener("pagehide", retire);
+    try {
+      const leave = requestPartnerNavigationLeave(abort.signal);
+      if (leave !== undefined && !await leave) return;
+      if (!current()) return;
+      const directory = partnerDirectoryRef.current!;
+      const profile = directory.getProfile(sourceKey);
+      if (profile === undefined || !profilesRef.current.some(candidate => partnerSourceKey(candidate) === sourceKey)) throw new Error("The Partner source is no longer saved on this client.");
+      const preparing = destination === "preparation";
+      const resolved = preparing ? undefined : await directory.resolve(sourceKey, partnerId, abort.signal);
+      const originalPartner = preparing ? await directory.resolvePreparationProfile(sourceKey, partnerId, abort.signal) : resolved!.partner;
+      if (!current()) return;
+      if (activeProfileRef.current === undefined || partnerSourceKey(activeProfileRef.current) !== sourceKey || connectionStateRef.current !== "connected") await connect(profile);
+      if (!current()) return;
+      const active = activeProfileRef.current, gateway = gatewayRef.current, generation = gatewayGenerationRef.current;
+      if (active === undefined || partnerSourceKey(active) !== sourceKey || gateway === undefined || connectionStateRef.current !== "connected") throw new Error("The original Partner node could not be adopted.");
+      const verified = preparing ? undefined : await resolvePartnerSourceSession(gateway, partnerId, () => snapshotRef.current, abort.signal);
+      const verifiedPartner = preparing ? await resolvePartnerSourceProfile(gateway, partnerId, abort.signal) : verified!.partner;
+      if (!current() || gatewayGenerationRef.current !== generation || gatewayRef.current !== gateway) return;
+      validatePartnerSourceOwner(active, snapshotRef.current);
+      if (originalPartner.id !== verifiedPartner.id || originalPartner.homeTargetId !== verifiedPartner.homeTargetId
+        || (preparing && verifiedPartner.profileVersion < originalPartner.profileVersion)
+        || (!preparing && resolved!.link.sessionId !== verified!.link.sessionId)) throw new Error("The Partner relationship changed while connecting. Refresh before opening it.");
+      navigate(preparing ? { kind: "partners", partnerId, profileId: profile.id, preparation: true }
+        : destination === "settings" ? { kind: "partners", partnerId, profileId: profile.id } : { kind: "session", profileId: profile.id, partnerId, sessionId: verified!.session.id }, {
+        signal: abort.signal,
+        isCurrent: () => !abort.signal.aborted && document.visibilityState !== "hidden" && machineSwitchIntentRef.current === intent
+          && gatewayGenerationRef.current === generation && gatewayRef.current === gateway && activeProfileRef.current !== undefined
+          && partnerSourceKey(activeProfileRef.current) === sourceKey && profilesRef.current.some(candidate => partnerSourceKey(candidate) === sourceKey)
+      });
+    } finally { window.removeEventListener("pagehide", retire); }
+  }, [connect, navigate]);
+
+  useEffect(() => {
+    const route = state.route;
+    if (!state.ready || route.kind !== "partners" || !route.profileId || !route.partnerId || explicitDisconnectRef.current) return;
+    if (state.activeProfile?.id === route.profileId && ["connected", "connecting"].includes(state.connectionState)) return;
+    const profile = profilesRef.current.find(candidate => candidate.id === route.profileId);
+    if (profile === undefined) return;
+    void openSourcePartner(partnerSourceKey(profile), route.partnerId, route.preparation ? "preparation" : "settings").catch(error => setState(current => ({ ...current, error: messageOf(error) })));
+  }, [state.ready, state.route, state.activeProfile?.id, state.connectionState, openSourcePartner]);
 
   const loadMachineSnapshot = useCallback(async (profile: ConnectionProfile): Promise<AppSnapshot> => {
     if (profile.id === activeProfileRef.current?.id && connectionStateRef.current === "connected") return snapshotRef.current;
@@ -1712,6 +1814,7 @@ export function useAppController(): AppController {
       kind: "session",
       profileId,
       sessionId,
+      ...(messageTarget?.partnerId === undefined ? {} : { partnerId: messageTarget.partnerId }),
       ...(messageTarget?.messageId === undefined ? {} : { messageId: messageTarget.messageId }),
       ...(messageTarget?.messageEventId === undefined ? {} : { messageEventId: messageTarget.messageEventId })
     });
@@ -2499,6 +2602,9 @@ export function useAppController(): AppController {
     setMachineSelection,
     switchMachine,
     openMachineSession,
+    openSourcePartner,
+    refreshPartnerSource: (sourceKey) => partnerDirectoryRef.current!.refresh(sourceKey),
+    readSourcePartnerAvatar: (sourceKey, partnerId, revision, image, signal) => partnerDirectoryRef.current!.readAvatar(sourceKey, partnerId, revision, image, signal),
     retryManagedOrchestrator,
     cancelAutomaticConnectionAttempt,
     setAutomaticConnectionEnabled,
@@ -3887,7 +3993,8 @@ export function routeFromHash(hash: string): AppRoute {
   }
   if (parts[0] === "projects") return { kind: "projects", ...(parts[1] === undefined ? {} : { projectId: parts[1] }) };
   if (parts[0] === "partners" && parts[1] === "groups" && parts[2]) return { kind: "partners", groupId: parts[2] };
-  if (parts[0] === "partners") return { kind: "partners", ...(parts[1] === undefined ? {} : { partnerId: parts[1] }) };
+  if (parts[0] === "partners") return { kind: "partners", ...(parts[1] === undefined ? {} : { partnerId: parts[1] }),
+    ...(query.get("profile") ? { profileId: query.get("profile")! } : {}), ...(query.get("prepare") === "1" ? { preparation: true } : {}) };
   if (parts[0] === "tools") {
     const extensionId = query.get("extension")?.trim();
     const recommendationNonce = routeRecommendationNonce(query);
@@ -3920,6 +4027,7 @@ export function routeFromHash(hash: string): AppRoute {
   const messageId = query.get("message")?.trim();
   const messageEventId = query.get("event")?.trim();
   const profileId = query.get("profile")?.trim();
+  const partnerId = query.get("partner")?.trim();
   if (parts[1] === undefined) {
     return {
       kind: "session",
@@ -3929,6 +4037,7 @@ export function routeFromHash(hash: string): AppRoute {
   return {
     kind: "session",
     sessionId: parts[1],
+    ...(partnerId === undefined || partnerId === "" ? {} : { partnerId }),
     ...(profileId === undefined || profileId === "" ? {} : { profileId }),
     ...(messageId === undefined || messageId === "" ? {} : { messageId }),
     ...(messageEventId === undefined || messageEventId === "" ? {} : { messageEventId })
@@ -3940,6 +4049,7 @@ export function sessionRouteHash(route: Extract<AppRoute, { readonly kind: "sess
   if (route.messageEventId !== undefined) query.set("event", route.messageEventId);
   if (route.messageId !== undefined) query.set("message", route.messageId);
   if (route.profileId !== undefined) query.set("profile", route.profileId);
+  if (route.partnerId !== undefined) query.set("partner", route.partnerId);
   const suffix = query.size === 0 ? "" : `?${query.toString()}`;
   if (route.sessionId === undefined) return `#/tasks/${suffix}`;
   return `#/tasks/${encodeURIComponent(route.sessionId)}${suffix}`;
@@ -3962,7 +4072,13 @@ export function appRouteHash(route: AppRoute): string {
     return `#/tasks/new${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
   if (route.kind === "projects") return route.projectId === undefined ? "#/projects" : `#/projects/${encodeURIComponent(route.projectId)}`;
-  if (route.kind === "partners") return route.groupId ? `#/partners/groups/${encodeURIComponent(route.groupId)}` : route.partnerId === undefined ? "#/partners" : `#/partners/${encodeURIComponent(route.partnerId)}`;
+  if (route.kind === "partners") {
+    if (route.groupId) return `#/partners/groups/${encodeURIComponent(route.groupId)}`;
+    const query = new URLSearchParams();
+    if (route.profileId !== undefined) query.set("profile", route.profileId);
+    if (route.preparation) query.set("prepare", "1");
+    return `${route.partnerId === undefined ? "#/partners" : `#/partners/${encodeURIComponent(route.partnerId)}`}${query.size === 0 ? "" : `?${query.toString()}`}`;
+  }
   if (route.kind === "schedules") {
     const query = new URLSearchParams();
     if (route.scheduleId !== undefined) query.set("focus", route.scheduleId);

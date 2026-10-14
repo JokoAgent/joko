@@ -370,7 +370,9 @@ describe("MobilePartnerProfileSheet", () => {
       remove: vi.fn(async () => { entry = undefined; }), preferences: vi.fn(async () => ({ owner, enabled: owner.memoryEnabled, userContext: "", revision: 5n })),
       savePreferences: vi.fn(async (base, patch) => { owner.memoryEnabled = patch.enabled ?? base.enabled; return { ...base, ...patch, owner, revision: 6n }; }) };
     const factory = vi.fn(() => editor = new PartnerMemoryEditor(api, owner));
-    await render(active, undefined, undefined, profilePartner, factory); await press("Saved memories");
+    await render(active, undefined, undefined, profilePartner, factory);
+    const parentListenerCount = native.listeners.size;
+    await press("Saved memories");
     expect(factory).toHaveBeenCalledWith(profilePartner, active.ownerKey);
     expect(Array.from(container.querySelectorAll<HTMLButtonElement>('button[aria-label="Close"]')).at(-1)!.disabled).toBe(true);
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="Save Partner"]')!.disabled).toBe(true);
@@ -387,7 +389,8 @@ describe("MobilePartnerProfileSheet", () => {
     await act(async () => container.querySelector<HTMLInputElement>('input[aria-label="Remember things about me"]')!.click());
     await press("Done"); expect(api.savePreferences).toHaveBeenCalledWith(expect.any(Object), { enabled: false, userContext: "Complete personal context." }, expect.any(AbortSignal));
     await render(transport("next-task"), undefined, undefined, profilePartner, factory);
-    await editor.refresh(); expect(native.listeners.size).toBe(0); expect(container.querySelector('input[aria-label="Search memories"]')).toBeNull();
+    await editor.refresh(); expect(native.listeners.size).toBe(parentListenerCount); expect(container.querySelector('input[aria-label="Search memories"]')).toBeNull();
+    act(() => root.unmount()); root = undefined as unknown as Root; expect(native.listeners.size).toBe(0);
   });
   it.each(["task", "partner"] as const)("opens the actual routine sheet under the Task owner, protects the parent and retires it on %s change", async (change) => {
     const active = transport("node\u001ftask-session"); let editor!: PartnerRoutineEditor; let api!: PartnerRoutineApi;
@@ -398,7 +401,9 @@ describe("MobilePartnerProfileSheet", () => {
         retire: vi.fn(async () => create(RetirePartnerRoutineCreationResponseSchema)) };
       return editor = new PartnerRoutineEditor(api, new RoutineCreationReceipts({ getItem: () => null, setItem: () => undefined, removeItem: () => undefined }, "node"), partnerId);
     });
-    await render(active, undefined, factory); await press("Routines");
+    await render(active, undefined, factory);
+    const parentListenerCount = native.listeners.size;
+    await press("Routines");
     expect(factory).toHaveBeenCalledWith(profilePartner.partnerId, active.ownerKey); expect(api.list).toHaveBeenCalledOnce();
     expect(container.querySelector('button[aria-label="New routine"]')).toBeTruthy();
     const parentClose = Array.from(container.querySelectorAll<HTMLButtonElement>('button[aria-label="Close"]')).at(-1)!;
@@ -409,7 +414,8 @@ describe("MobilePartnerProfileSheet", () => {
     const next = transport(change === "task" ? "node\u001ftask-next" : active.ownerKey);
     vi.mocked(next.load).mockResolvedValue({ ...profileSnapshot, ownerKey: next.ownerKey, partner: nextPartner });
     await render(next, undefined, factory, nextPartner); expect(container.querySelector('button[aria-label="New routine"]')).toBeNull();
-    await editor.refresh(); expect(api.list).toHaveBeenCalledOnce(); expect(native.listeners.size).toBe(0);
+    await editor.refresh(); expect(api.list).toHaveBeenCalledOnce(); expect(native.listeners.size).toBe(parentListenerCount);
+    act(() => root.unmount()); root = undefined as unknown as Root; expect(native.listeners.size).toBe(0);
   });
   it("offers resume from paused settings and blocks its confirmation while a profile draft is dirty", async () => {
     const active = transport(); const paused = { ...profilePartner, lifecycle: "paused" as const, pauseCleanupPending: false };

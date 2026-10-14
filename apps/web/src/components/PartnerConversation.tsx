@@ -3,6 +3,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import type { AppController } from "../controller.js";
 import type { PartnerListView, PartnerMutationView, PartnerProfileView, SessionView } from "../model.js";
 import { isLoopbackHostname } from "../connection-origin.js";
+import { validatePartnerSourceSession } from "../partner-sources.js";
 import { PartnerSettingsDialog } from "./PartnersPage.js";
 import type { Translator } from "./types.js";
 
@@ -57,7 +58,8 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   readonly children: ReactNode;
 }): JSX.Element {
   const profile = controller.state.activeProfile;
-  const ownerKey = JSON.stringify([profile?.id, profile?.serverId, profile?.origin,
+  const expectedPartnerId = controller.state.route?.kind === "session" ? controller.state.route.partnerId : undefined;
+  const ownerKey = JSON.stringify([profile?.id, profile?.serverId, profile?.origin, expectedPartnerId,
     String(controller.state.snapshot.generation), session.id, session.targetId, String(session.generation)]);
   const connected = controller.state.ready && controller.state.connectionState === "connected";
   const [refresh, setRefresh] = useState(0);
@@ -117,17 +119,20 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
       if (!current()) return;
       const candidates = catalog.partners.filter((partner) => partner.canonicalSessionId === session.id);
       if (candidates.length === 0) {
+        if (expectedPartnerId !== undefined) throw new Error("The requested Partner no longer owns this task.");
         setProjection({ key: ownerKey, owner: requestOwner, phase: "ready", identity: { kind: "task" } });
         return;
       }
       const partner = candidates[0];
       if (candidates.length !== 1 || partner === undefined || !ownsConversation(partner, session)) throw new Error("Partner conversation ownership is unavailable.");
+      if (expectedPartnerId !== undefined && partner.id !== expectedPartnerId) throw new Error("The task now belongs to another Partner.");
       const links = await controllerRef.current.listPartnerSessions(partner.id, abort.signal);
       if (!current()) return;
       const canonical = links.filter((link) => link.role === "canonical");
       const link = canonical[0];
       if (canonical.length !== 1 || link === undefined || link.partnerId !== partner.id || link.sessionId !== session.id
         || !link.available || link.deleted || link.profileVersion > partner.profileVersion) throw new Error("Partner canonical session is unavailable.");
+      if (expectedPartnerId !== undefined) validatePartnerSourceSession(expectedPartnerId, partner, links, controllerRef.current.state.snapshot);
       setProjection((previous) => ({ key: ownerKey, owner: requestOwner, phase: "ready",
         identity: retainNewerIdentity(previous?.key === ownerKey ? previous.identity : undefined, { kind: "partner", catalog, partner }) }));
     })().catch(() => {

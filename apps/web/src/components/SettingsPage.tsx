@@ -48,6 +48,7 @@ import type { AppController } from "../controller.js";
 import { DEFAULT_UI_PREFERENCES, LINK_OPEN_DEFAULTS, type LinkOpenKind, type LinkOpenPreference } from "../local-state.js";
 import { translate } from "../i18n.js";
 import { clampCodeSize, clampUiSize } from "../appearance-settings.js";
+import { WallpaperSection } from "./WallpaperSection.js";
 import { currentAppShortcutPlatform } from "../app-shortcuts.js";
 import { composerVoiceShortcutsConflict } from "../composer-voice-shortcut-conflict.js";
 import { isConversationModel } from "../model-capabilities.js";
@@ -701,6 +702,7 @@ export function AppearanceSettings({ controller, locale, theme, onSuccess, onOpe
           t={t}
         />
       </section>
+      <WallpaperSection t={t} />
       <section className="settings-card" aria-label={t("settings.layoutResetTitle")}>
         <div className="setting-row">
           <div><strong>{t("settings.layoutResetTitle")}</strong><span>{t("settings.layoutResetBody")}</span></div>

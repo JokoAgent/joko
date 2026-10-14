@@ -1,5 +1,5 @@
 import { mkdirSync, realpathSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 
 export interface DesktopUserDataDirectoryOptions {
   readonly packaged: boolean;
@@ -34,4 +34,20 @@ export function prepareDesktopUserDataDirectory(directory: string): string {
   }
   mkdirSync(normalized, { recursive: true });
   return realpathSync.native(normalized);
+}
+
+export function prepareDesktopManagedWorkspaceDirectory(options: {
+  readonly packagedSmoke: boolean;
+  readonly userDataDirectory: string;
+  readonly documentsDirectory: string;
+}): string {
+  if (!options.packagedSmoke) return options.documentsDirectory;
+  const profile = prepareDesktopUserDataDirectory(options.userDataDirectory);
+  const workspace = prepareDesktopUserDataDirectory(resolve(profile, "smoke-workspace"));
+  const parent = dirname(workspace);
+  const contained = process.platform === "win32"
+    ? parent.toLowerCase() === profile.toLowerCase()
+    : parent === profile;
+  if (!contained) throw new Error("The Desktop smoke workspace must remain inside its isolated profile.");
+  return workspace;
 }

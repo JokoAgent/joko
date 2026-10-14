@@ -55,6 +55,7 @@ import {
   type DesktopRemoteDesktopPermissions,
   type DesktopRemoteDesktopSnapshot,
   type DesktopMainWindowCloseSettings,
+  type DesktopWallpaperSettings,
   type DesktopLocale,
   type DesktopSystemLocale,
   type DesktopNativeTaskStatusAction,
@@ -161,6 +162,7 @@ import {
   installWindowsApplicationIdentity
 } from "./desktop-identity.js";
 import {
+  prepareDesktopManagedWorkspaceDirectory,
   prepareDesktopUserDataDirectory,
   resolveDesktopUserDataDirectory
 } from "./desktop-user-data.js";
@@ -249,6 +251,9 @@ import {
   parseMainWindowCloseSettingsChange,
   type DesktopMainWindowCloseSettingsStore
 } from "./window-close-settings.js";
+import { DesktopWallpaperStore } from "./wallpaper-store.js";
+import { DESKTOP_WALLPAPER_SCHEME, createDesktopWallpaperProtocolHandler } from "./wallpaper-protocol.js";
+import { registerDesktopWallpaperIpc } from "./wallpaper-ipc.js";
 import {
   createDesktopNativeTaskStatusSettingsStore,
   type DesktopNativeTaskStatusSettingsStore
@@ -777,6 +782,7 @@ let desktopKeepAwakeController: DesktopKeepAwakeController | undefined;
 let desktopKeepAwakeCoordinator: DesktopKeepAwakeSettingsCoordinator | undefined;
 let desktopWindowInteractionSettings: DesktopWindowInteractionSettingsStore | undefined;
 let desktopMainWindowCloseSettings: DesktopMainWindowCloseSettingsStore | undefined;
+let desktopWallpaperStore: DesktopWallpaperStore | undefined;
 let mainWindowCloseController: DesktopMainWindowCloseController | undefined;
 let desktopNativeTaskStatusSettings: DesktopNativeTaskStatusSettingsStore | undefined;
 let desktopNativeTaskStatusLayoutSettings: DesktopNativeTaskStatusLayoutSettingsStore | undefined;
@@ -852,6 +858,9 @@ protocol.registerSchemesAsPrivileged([{
     corsEnabled: true,
     codeCache: true
   }
+}, {
+  scheme: DESKTOP_WALLPAPER_SCHEME,
+  privileges: { standard: true, secure: true }
 }]);
 
 const desktopUserDataDirectory = resolveDesktopUserDataDirectory({
@@ -1018,6 +1027,10 @@ if (!app.requestSingleInstanceLock()) {
       join(app.getPath("userData"), "main-window-close-settings.json"), process.platform
     );
     await desktopMainWindowCloseSettings.initialize();
+    desktopWallpaperStore = new DesktopWallpaperStore({ directory: join(app.getPath("userData"), "wallpaper") });
+    await desktopWallpaperStore.initialize();
+    desktopWallpaperStore.onChanged(broadcastDesktopWallpaperSettings);
+    protocol.handle(DESKTOP_WALLPAPER_SCHEME, createDesktopWallpaperProtocolHandler(desktopWallpaperStore));
     await initializeDesktopNativeTaskStatus();
     if (shouldRunDesktopUpdateStartup()) desktopUpdateStartupPhase = { kind: "checking" };
     await initializeDesktopKeepAwake();
@@ -1302,6 +1315,13 @@ function createWindow(): void {
   electronSession.webRequest.onBeforeRequest((details, callback) => {
     let protocol: string | undefined;
     try { protocol = new URL(details.url).protocol; } catch { protocol = undefined; }
+    if (protocol === `${DESKTOP_WALLPAPER_SCHEME}:`) {
+      const contents = details.webContents ?? BrowserWindow.getAllWindows()
+        .find(candidate => !candidate.isDestroyed() && candidate.webContents.id === details.webContentsId)?.webContents;
+      callback({ cancel: details.resourceType !== "image" || contents === undefined || contents.isDestroyed()
+        || details.frame !== contents.mainFrame || !isTrustedApplicationContents(contents) });
+      return;
+    }
     if (
       (protocol === "file:" || protocol === `${DESKTOP_APP_SCHEME}:`) &&
       !isAllowedPackagedBundleResource(details.url, navigationPolicy)
@@ -6578,6 +6598,23 @@ function broadcastDesktopMainWindowCloseSettings(settings: DesktopMainWindowClos
   }
 }
 
+function broadcastDesktopWallpaperSettings(settings: DesktopWallpaperSettings): void {
+  for (const window of applicationWindows()) {
+    if (window.isDestroyed() || window.webContents.isDestroyed() || !isTrustedApplicationContents(window.webContents)) continue;
+    try { window.webContents.send(DESKTOP_CHANNELS.wallpaperChanged, settings); }
+    catch { /* Confirmed settings remain authoritative when an observer retires. */ }
+  }
+}
+
+function captureDesktopWallpaperOwner(event: IpcMainInvokeEvent): () => void {
+  assertTrustedIpcSender(event);
+  const scope = nativeFileActionScope(event);
+  return (): void => {
+    if (!scope.isCurrent() || !canApplyMainWindowClose()) throw new Error("The wallpaper Document is no longer current.");
+    assertTrustedIpcSender(event);
+  };
+}
+
 function broadcastDesktopNativeTaskStatusSettings(settings: DesktopNativeTaskStatusSettings): void {
   for (const window of applicationWindows()) {
     if (!window.webContents.isDestroyed()) {
@@ -7691,6 +7728,19 @@ function registerIpc(): void {
     broadcastDesktopMainWindowCloseSettings(settings);
     return settings;
   });
+  registerDesktopWallpaperIpc({
+    ipc: ipcMain,
+    store: requireDesktopWallpaperStore,
+    captureOwner: captureDesktopWallpaperOwner,
+    pickFile: async event => {
+      const owner = trustedApplicationWindowForContents(event.sender);
+      if (owner === undefined) throw new Error("Wallpaper import requires its current application window.");
+      const selected = await dialog.showOpenDialog(owner, {
+        properties: ["openFile"], filters: [{ name: "PNG / JPEG / WebP", extensions: ["png", "jpg", "jpeg", "webp"] }]
+      });
+      return selected.canceled || selected.filePaths.length !== 1 ? undefined : selected.filePaths[0];
+    }
+  });
   ipcMain.handle(DESKTOP_CHANNELS.windowInteractionSet, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (parameters.length !== 1 || typeof parameters[0] !== "boolean") {
@@ -8632,6 +8682,11 @@ function requireDesktopMainWindowCloseSettings(): DesktopMainWindowCloseSettings
   return desktopMainWindowCloseSettings;
 }
 
+function requireDesktopWallpaperStore(): DesktopWallpaperStore {
+  if (desktopWallpaperStore === undefined) throw new Error("Wallpaper settings are not initialized.");
+  return desktopWallpaperStore;
+}
+
 async function runDiscoveryScan(): Promise<readonly DesktopDiscoveredNode[]> {
   if (activeDiscoveryScan !== undefined) return activeDiscoveryScan;
   const controller = new AbortController();
@@ -8947,7 +9002,11 @@ async function launchManagedOrchestratorBootstrap(
         ? process.resourcesPath
         : resolve(sourceDirectory, "..", "resources"),
       dataDirectory: join(app.getPath("userData"), "orchestrator"),
-      workspaceRoot: app.getPath("documents"),
+      workspaceRoot: prepareDesktopManagedWorkspaceDirectory({
+        packagedSmoke: packagedSmokeRequested,
+        userDataDirectory: app.getPath("userData"),
+        documentsDirectory: app.getPath("documents")
+      }),
       deviceId,
       defaultDeviceName: hostname().trim() || "Unknown Device",
       appVersion: app.getVersion(),

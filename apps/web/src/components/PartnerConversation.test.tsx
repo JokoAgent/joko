@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { emptySnapshot, type PartnerActivityView, type PartnerPrivateThreadView, type PartnerProfileView, type SessionView, type TimelineItemView } from "../model.js";
-import { PartnerConversationProvider } from "./PartnerConversation.js";
+import { PartnerConversationProvider, usePartnerConversation } from "./PartnerConversation.js";
 import { Timeline } from "./Timeline.js";
 
 vi.mock("@tanstack/react-virtual", () => ({
@@ -49,6 +49,16 @@ afterEach(async () => {
 });
 
 describe("mounted Partner conversation", () => {
+  it("keeps an explicit Partner route failed when its canonical relationship disappears instead of adopting an ordinary task", async () => {
+    const original = controller();
+    const app = controller({ state: { ...original.state, route: { kind: "session", sessionId: "session", profileId: "profile", partnerId: "partner" } },
+      listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 1, templates: [], avatarPresets: ["orbit"] } })) });
+    const host = document.body.appendChild(document.createElement("div")), root = createRoot(host); roots.push(root);
+    function Probe() { const view = usePartnerConversation(); return <output>{JSON.stringify({ kind: view?.kind, failed: view?.failed, confirmed: view?.confirmed })}</output>; }
+    const session: SessionView = { id: "session", targetId: "home", backendId: "backend", name: "Task", state: "idle", generation: 1n, pinned: false, archived: false, fastMode: false, planMode: false, permissionMode: "ask", updatedAt: 1 };
+    await act(async () => { root.render(<PartnerConversationProvider controller={app} session={session} active t={key => key}><Probe /></PartnerConversationProvider>); await settle(); });
+    expect(JSON.parse(host.textContent!)).toEqual({ failed: true, confirmed: false });
+  });
   it("renders the canonical avatar, frozen unread boundary and Reply while retaining ordinary message actions", async () => {
     const view = await mount();
     expect(view.host.querySelector(".partner-message-avatar .partner-avatar--orbit")).not.toBeNull();
@@ -184,7 +194,8 @@ function controller(overrides: Partial<AppController> = {}): AppController {
   return { state: { ready: true, connectionState: "connected", activeProfile: { id: "profile", serverId: "node", origin: "https://node.invalid" }, snapshot: emptySnapshot() },
     listPartners: vi.fn(async () => ({ partners: [partner()], directory: { revision: 1n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 1, templates: [], avatarPresets: ["orbit"] } })),
     listPartnerSessions: vi.fn(async () => [{ partnerId: "partner", sessionId: "session", role: "canonical", available: true, deleted: false, profileVersion: 1n }]),
-    getPartner: vi.fn(async () => partner()), markPartnerRead: vi.fn(async () => ({ ...partner().activity, readThroughCursor: 91n })), ...overrides
+    getPartner: vi.fn(async () => partner()), markPartnerRead: vi.fn(async () => ({ ...partner().activity, readThroughCursor: 91n })),
+    listPartnerSessionTasks: vi.fn(async () => []), ...overrides
   } as unknown as AppController;
 }
 function partner(): PartnerProfileView {

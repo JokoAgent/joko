@@ -97,7 +97,7 @@ export interface MobilePartnerDirectoryOpenResult {
 export interface MobilePartnerDirectoryTransport {
   readonly ownerKey: string;
   list(signal: AbortSignal): Promise<MobilePartnerCatalog>;
-  open(partner: MobilePartnerDirectoryProfile, signal: AbortSignal): Promise<MobilePartnerDirectoryOpenResult>;
+  open(partner: MobilePartnerDirectoryProfile, signal: AbortSignal, allowPaused?: boolean): Promise<MobilePartnerDirectoryOpenResult>;
 }
 
 export function mobilePartnerDirectoryIdentity(profile: MobilePartnerDirectoryProfile): string {
@@ -166,7 +166,10 @@ export function assertMobilePartnerDirectorySession(
     throw new Error("The selected Partner does not have an available canonical task.");
   }
   const matches = response.sessions.filter((session) => session.sessionId === sessionId);
+  const availableCanonical = response.sessions.filter(session => session.role === PartnerSessionRole.CANONICAL
+    && session.available && !session.readOnly && !session.deleted && !session.archived);
   if (matches.length !== 1 || matches[0]?.partnerId !== partner.partnerId
+    || availableCanonical.length !== 1 || availableCanonical[0]?.sessionId !== sessionId
     || matches[0].role !== PartnerSessionRole.CANONICAL || !matches[0].available
     || matches[0].profileVersion < 1n || matches[0].profileVersion > partner.profileVersion || matches[0].readOnly
     || matches[0].deleted || matches[0].archived) {

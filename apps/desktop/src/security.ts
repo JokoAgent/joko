@@ -17,7 +17,7 @@ export const DESKTOP_CONTENT_SECURITY_POLICY = [
   // internal graph codec. Inline and remote scripts remain forbidden.
   "script-src 'self' 'unsafe-eval'",
   "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data: blob: https: http:",
+  "img-src 'self' data: blob: https: http: joko-wallpaper:",
   "media-src 'self' data: blob:",
   "font-src 'self' data:",
   // CSP cannot express RFC1918/ULA ranges. The main-process webRequest policy
