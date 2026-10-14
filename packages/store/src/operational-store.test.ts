@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -6,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import {
   JokoError,
   type BackendDescriptor,
+  type PartnerLearningTurnSource,
   type SubagentRunDetail,
   type SubagentTranscriptEntry
 } from "@joko/core";
@@ -35,6 +37,135 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("commits learning receipts with the actual save and updates only the original reply after a late write", () => {
+    const f = prepareLearningFixture(), store = f.store;
+    const reply = f.reply("original-reply"), rawReply = store.findEvent(reply.id);
+    expect(store.sealPartnerLearningTurn(f.source.occurrenceId, reply.id)).toBe(false);
+    f.accept();
+    const publications: PersistedEvent[] = [];
+    store.subscribe(event => {
+      if (event.payload.type !== "partner_learning_changed") return;
+      expect(store.getMakerMemoryEntry(event.payload.feedback.receipts[0]!.entryId).body).toBe("Private saved preference.");
+      expect(store.findEvent(event.id)).toEqual(event);
+      publications.push(event);
+    });
+    let entryId = "";
+    store.transaction(owner => {
+      const entry = owner.putMakerMemoryEntry({ targetId: "target-1", kind: "user", slug: "preference", title: "Preference",
+        description: "A preference", body: "Private saved preference.", mode: "create" });
+      entryId = entry.id;
+      owner.addPartnerLearningReceipt(f.source.occurrenceId, { kind: "memory", entryId, title: entry.title, action: "created" });
+      expect(publications).toEqual([]);
+    });
+    expect(publications).toEqual([]);
+    expect(store.sealPartnerLearningTurn(f.source.occurrenceId, reply.id)).toBe(true);
+    expect(publications).toHaveLength(1);
+    const firstFeedback = store.getPartnerLearningFeedback(reply.id)!;
+    f.reply("later-reply");
+    store.addPartnerLearningReceipt(f.source.occurrenceId, { kind: "memory", entryId, title: "Updated preference", action: "updated" });
+    expect(store.getPartnerLearningFeedback(reply.id)?.receipts).toEqual([{ kind: "memory", entryId, title: "Updated preference", action: "updated" }]);
+    expect(store.getPartnerLearningFeedback("later-reply")).toBeUndefined();
+    expect(store.findEvent(reply.id)).toEqual(rawReply);
+    expect(store.getPartnerLearningFeedback(reply.id)!.revision).not.toBe(firstFeedback.revision);
+    expect(publications).toHaveLength(2);
+    expect(store.listEvents({ sessionId: "session-1" }).filter(event => event.payload.type === "message_complete")).toHaveLength(2);
+    const cursor = store.health().globalCursor;
+    expect(() => store.transaction(owner => {
+      owner.putMakerMemoryEntry({ targetId: "target-1", kind: "user", slug: "rollback", title: "Rollback", description: "Rollback",
+        body: "Unsaved content", mode: "create" });
+      owner.addPartnerLearningReceipt(f.source.occurrenceId, { kind: "memory", entryId: "rollback", title: "Rollback", action: "created" });
+      throw new Error("Save rolled back");
+    })).toThrow("Save rolled back");
+    expect(store.listMakerMemoryEntries({ targetId: "target-1" }).some(entry => entry.slug === "rollback")).toBe(false);
+    expect(store.health().globalCursor).toBe(cursor);
+    expect(store.getPartnerLearningFeedback(reply.id)?.receipts).toHaveLength(1);
+  });
+
+  it("claims learning review once per completion across duplicate turn seals and database reopen", () => {
+    const f = prepareLearningFixture(); f.accept();
+    const reply = f.reply("review-reply");
+    f.store.sealPartnerLearningTurn(f.source.occurrenceId, reply.id);
+    const duplicate = { ...f.source, occurrenceId: "second-captured-occurrence", nativeOccurrence: "second-occurrence" };
+    f.store.registerPartnerLearningTurn(duplicate, "partner-1");
+    f.store.acceptPartnerLearningTurn(duplicate.occurrenceId);
+    f.store.sealPartnerLearningTurn(duplicate.occurrenceId, reply.id);
+    expect(f.store.claimPartnerLearningReview(reply.id)).toBeUndefined();
+    f.store.updateQueueState({ queueItemId: f.source.sourceQueueItemId, attemptId: f.source.sourceAttemptId,
+      state: "completed", traceId: "learning:queue-completed" });
+    f.store.updateRunState({ runId: f.source.sourceRunId, activeAttemptId: f.source.sourceAttemptId,
+      state: "completed", traceId: "learning:completed" });
+    expect(f.store.claimPartnerLearningReview(reply.id)).toMatchObject({ reviewClaimed: true, completionEventId: reply.id });
+    expect(f.store.claimPartnerLearningReview(reply.id)).toBeUndefined();
+    const file = f.store.filePath; f.store.close(); f.replaceStore(new OperationalStore(file));
+    expect(f.store.claimPartnerLearningReview(reply.id)).toBeUndefined();
+    expect(f.store.findPartnerLearningTurnByCompletion(reply.id)?.reviewClaimed).toBe(true);
+  });
+
+  it("retires learning projection when its exact original message is durably deleted", () => {
+    const f = prepareLearningFixture(); f.accept();
+    const reply = f.reply("deleted-learning-reply");
+    f.store.addPartnerLearningReceipt(f.source.occurrenceId, { kind: "memory", entryId: "memory", title: "Preference", action: "created" });
+    f.store.sealPartnerLearningTurn(f.source.occurrenceId, reply.id);
+    f.store.runOperation({ id: "delete-learning-operation", kind: "delete_message", body: { eventId: reply.id } }, owner => {
+      owner.commitMessageDeletion({ sessionId: "session-1", requestedEventId: reply.id, deletedEventIds: [reply.id],
+        operationId: "delete-learning-operation", traceId: "learning:delete" }); return {};
+    });
+    expect(f.store.getPartnerLearningFeedback(reply.id)).toBeUndefined();
+    const cursor = f.store.health().globalCursor;
+    f.store.addPartnerLearningReceipt(f.source.occurrenceId, { kind: "skill", entryId: "late-skill", title: "Late saved skill", action: "created" });
+    expect(f.store.health().globalCursor).toBe(cursor);
+    expect(f.store.getPartnerLearningFeedback(reply.id)).toBeUndefined();
+    expect(f.store.claimPartnerLearningReview(reply.id)).toBeUndefined();
+  });
+
+  it("seals a real nontext assistant completion without fabricating a learning receipt", () => {
+    const f = prepareLearningFixture(); f.accept();
+    const reply = f.store.appendEvent({ id: "nontext-completion", backendId: "pi", targetId: "target-1", sessionId: "session-1",
+      runId: "run-1", attemptId: "learning-attempt", generation: 0, traceId: "learning:nontext", payload: {
+        type: "message_complete", role: "assistant", blocks: [{ kind: "thinking", text: "Private generation", redacted: true }] } });
+    expect(f.store.sealPartnerLearningTurn(f.source.occurrenceId, reply.id)).toBe(true);
+    expect(f.store.getPartnerLearningFeedback(reply.id)).toBeUndefined();
+    expect(f.store.listEvents().some(event => event.payload.type === "partner_learning_changed")).toBe(false);
+    f.store.updateQueueState({ queueItemId: f.source.sourceQueueItemId, attemptId: f.source.sourceAttemptId,
+      state: "completed", traceId: "learning:queue-done" });
+    f.store.updateRunState({ runId: f.source.sourceRunId, activeAttemptId: f.source.sourceAttemptId, state: "completed", traceId: "learning:done" });
+    expect(f.store.claimPartnerLearningReview(reply.id)).toMatchObject({ completionEventId: reply.id, reviewClaimed: true });
+  });
+
+  it("retains a successful learning receipt after archive without admitting further writes or automatic review", () => {
+    const f = prepareLearningFixture(); f.accept();
+    const reply = f.reply("archived-learning-reply");
+    f.store.addPartnerLearningReceipt(f.source.occurrenceId, { kind: "memory", entryId: "memory", title: "Preference", action: "created" });
+    const session = f.store.getSession("session-1");
+    f.store.updateSession("session-1", { archived: true }, session.revision);
+    expect(f.store.acceptPartnerLearningTurn(f.source.occurrenceId)).toBe(true);
+    expect(f.store.sealPartnerLearningTurn(f.source.occurrenceId, reply.id)).toBe(true);
+    expect(f.store.getPartnerLearningFeedback(reply.id)?.receipts[0]?.entryId).toBe("memory");
+    expect(() => f.store.addPartnerLearningReceipt(f.source.occurrenceId, { kind: "skill", entryId: "new-skill", title: "Later", action: "created" }))
+      .toThrow(/source changed/u);
+    expect(f.store.claimPartnerLearningReview(reply.id)).toBeUndefined();
+  });
+
+  it("keeps successful learning saves on an aborted reply while rejecting forged feedback and retired source writes", () => {
+    const f = prepareLearningFixture(); f.accept();
+    const reply = f.reply("aborted-reply");
+    f.store.addPartnerLearningReceipt(f.source.occurrenceId, { kind: "skill", entryId: "skill-1", title: "Review habit", action: "created" });
+    f.store.updateQueueState({ queueItemId: f.source.sourceQueueItemId, attemptId: f.source.sourceAttemptId, state: "cancelled", traceId: "learning:cancelled" });
+    f.store.updateRunState({ runId: f.source.sourceRunId, activeAttemptId: f.source.sourceAttemptId, state: "aborted", traceId: "learning:aborted" });
+    expect(f.store.sealPartnerLearningTurn(f.source.occurrenceId, reply.id)).toBe(true);
+    expect(f.store.getPartnerLearningFeedback(reply.id)?.receipts[0]?.kind).toBe("skill");
+    expect(f.store.claimPartnerLearningReview(reply.id)).toBeUndefined();
+    const delta = f.store.listEvents().find(event => event.payload.type === "partner_learning_changed")!;
+    expect(() => f.store.appendEvent({ backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: 0,
+      traceId: "forged-learning", payload: delta.payload })).toThrow(/owned by the Store/u);
+    expect(() => f.store.registerPartnerLearningTurn(f.source, "other-partner")).toThrow(/another source/u);
+    const session = f.store.getSession("session-1");
+    f.store.updateSession("session-1", { binding: { opaqueRef: "native/replacement.jsonl", generation: 1 } }, session.revision);
+    expect(() => f.store.addPartnerLearningReceipt(f.source.occurrenceId, { kind: "memory", entryId: "late", title: "Late", action: "created" }))
+      .toThrow(/source changed/u);
+    expect(f.store.getPartnerLearningFeedback(reply.id)).toBeUndefined();
+  });
+
   it("adopts a runtime binding and all accepted attempts atomically while retaining parked ownership across reopen", () => {
     const f = createFixture(), store = f.store, handoffs = new SessionRuntimeHandoffStore(store);
     store.upsertBackend({ ...store.getBackend("pi").descriptor, id: "second-runtime" });
@@ -5669,6 +5800,28 @@ function backendAuthorityDescriptor(
     tools: [],
     diagnostics: []
   };
+}
+
+function prepareLearningFixture() {
+  const fixture = createFixture(), store = fixture.store;
+  store.createAttempt({ id: "learning-attempt", runId: "run-1", ordinal: 1, generation: 0, startedAt: 3 });
+  store.runOperation({ id: "learning-operation", kind: "prompt", body: fixture.prompt }, owner => {
+    owner.enqueueQueueItem({ id: "learning-queue", sessionId: "session-1", runId: "run-1", attemptId: "learning-attempt",
+      operationId: "learning-operation", disposition: "prompt", body: fixture.prompt }); return {};
+  });
+  store.claimNextQueueItem({ sessionId: "session-1", backendInstanceGeneration: 0, traceId: "learning:dispatch" });
+  store.updateRunState({ runId: "run-1", state: "running", activeAttemptId: "learning-attempt", traceId: "learning:running" });
+  const source: PartnerLearningTurnSource = { occurrenceId: "learning-occurrence", sessionId: "session-1", targetId: "target-1", backendId: "pi",
+    backendInstanceGeneration: 0, bindingGeneration: 0, bindingFingerprint: `sha256:${createHash("sha256").update("native/session.jsonl").digest("hex")}`,
+    sourceRunId: "run-1", sourceAttemptId: "learning-attempt", sourceQueueItemId: "learning-queue", operationId: "learning-operation",
+    nativeOccurrence: "native-turn-occurrence" };
+  store.registerPartnerLearningTurn(source, "partner-1");
+  return { get store() { return fixture.store; }, source, replaceStore: fixture.replaceStore,
+    accept: () => { fixture.store.updateQueueState({ queueItemId: source.sourceQueueItemId, state: "backend_accepted",
+      attemptId: source.sourceAttemptId, traceId: "learning:accepted" }); fixture.store.acceptPartnerLearningTurn(source.occurrenceId); },
+    reply: (id: string) => fixture.store.appendEvent({ id, backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: 0,
+      runId: "run-1", attemptId: "learning-attempt", traceId: "learning:reply", payload: { type: "message_complete", role: "assistant",
+        blocks: [{ kind: "text", text: "Original assistant reply." }] } }) };
 }
 
 function createFixture(): {

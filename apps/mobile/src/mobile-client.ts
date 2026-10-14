@@ -1,5 +1,11 @@
 import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
 import { projectPartnerSessionTask } from "@joko/contracts";
+import { normalizeMobileObjectiveInput, type MobileObjectiveInput, type MobileObjectiveApi } from "./mobile-objective";
+import { MobileObjectiveRecovery, type MobileObjectiveRecoveryIdentity } from "./mobile-objective-recovery";
+import { mobileWorkerTargets, mobileWorkerLabel, mobileWorkerInitialTask, normalizeMobileWorkerForm,
+  type MobileCollaborationApi, type MobileCollaborationView, type MobileWorkerForm } from "./mobile-collaboration";
+import { MobileWorkerStorage, type MobileWorkerFormIdentity } from "./mobile-worker-storage";
+import { CollaborationSessionRole, CollaborationGoalStatus, CollaborationWorkerStatus, type CollaborationGoalTree, type CollaborationSettings } from "@joko/contracts";
 import { MobileAttachmentCamera } from "./mobile-attachment-camera";
 import { MobilePhotoLibrary } from "./mobile-photo-library";
 import { waitForMobileAttachmentAuthority } from "./mobile-attachment-authority";
@@ -8350,12 +8356,20 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
-  async create(targetId: string, name: string, firstInput: MobileComposerDraft): Promise<MobileNewTaskResult> {
+  newTaskObjectiveOwnerKey(targetId: string): string | undefined {
+    const key = this.#newTaskAuthorityKey(targetId);
+    return key && this.network.objectiveRpc ? `${key}\u001fobjective-create\u001f${this.#epoch}` : undefined;
+  }
+
+  async create(targetId: string, name: string, firstInput: MobileComposerDraft, objective?: MobileObjectiveInput, collaboration?: MobileWorkerForm): Promise<MobileNewTaskResult> {
     const input = normalizeMobileComposerDraft(firstInput);
-    if (!input.text.trim() && input.attachments.length === 0) {
+    const objectiveInput = objective === undefined ? undefined : normalizeMobileObjectiveInput(objective);
+    const workerForm = collaboration === undefined ? undefined : normalizeMobileWorkerForm(collaboration);
+    if (workerForm && (!this.newTaskCollaborationOwnerKey(targetId) || workerForm.sourceScope !== this.newTaskCollaborationScope(targetId, workerForm.targetId))) throw new Error("The collaboration projects or saved node changed. Confirm the retained configuration again.");
+    if (!input.text.trim() && input.attachments.length === 0 && objectiveInput === undefined) {
       throw new Error("Enter a first message or attach a file for this task.");
     }
-    if (input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
+    if (objectiveInput === undefined && input.mentions.some((mention) => mention.kind === "resource" || mention.kind === "artifact")) {
       throw new Error("A new task cannot reference runtime Resources or Artifacts before its Session exists.");
     }
     if (name.length > 256) throw new Error("Use a task name no longer than 256 characters.");
@@ -8382,30 +8396,35 @@ export class MobileClient {
     if (!authorityKey) throw new Error("The selected project authority is unavailable.");
     const receivingModel = resolveMobileNewTaskDefaultModelAuthority(owner, backend.backendId);
     const attachmentControls = this.newTaskAttachmentControls(targetId);
-    if (input.attachments.length > 0) {
+    if (objectiveInput === undefined && input.attachments.length > 0) {
       if (!attachmentControls) throw new Error("This Backend does not accept attachments for a new task.");
       assertMobileAttachmentPolicy(input.attachments, attachmentControls.policy);
     }
-    assertMobileSessionMentionDraft(this.newTaskSessionMentionControls(targetId), input);
-    assertMobileWorkspaceMentionDraft(this.newTaskWorkspaceMentionControls(targetId), input);
-    assertMobileWorkspacePathPasteDraft(this.newTaskWorkspacePathPasteControls(targetId), input);
+    if (objectiveInput === undefined) {
+      assertMobileSessionMentionDraft(this.newTaskSessionMentionControls(targetId), input);
+      assertMobileWorkspaceMentionDraft(this.newTaskWorkspaceMentionControls(targetId), input);
+      assertMobileWorkspacePathPasteDraft(this.newTaskWorkspacePathPasteControls(targetId), input);
+    }
     const identity = { profileId: credential.profileId } satisfies MobileNewTaskDraftIdentity;
     const createOperationId = this.newId();
     const action = this.#claimMutation();
     this.#newTaskSubmissionActive = true;
     try {
-      const submission = await this.newTaskDrafts.beginSubmission(identity, { targetId, name, input }, {
+      const submission = await this.newTaskDrafts.beginSubmission(identity, { targetId, name, input, ...(workerForm ? { collaboration: workerForm } : {}) }, {
         connectionId: credential.connectionId,
         serverId: credential.serverId,
         backendId: target.backendId,
         targetRevision: targetRevision.value.toString(10),
         ...(targetRevision.etag === "" ? {} : { targetRevisionEtag: targetRevision.etag }),
         model: receivingModel?.selection ?? null,
+        ...(objectiveInput === undefined ? {} : { objective: objectiveInput }),
+        ...(workerForm === undefined ? {} : { collaboration: workerForm }),
         createOperationId
       });
       try {
         await this.network.prepareTarget(credential, target, this.#abort?.signal);
-        await this.#validateNewTaskSubmissionInput(submission, authorityKey);
+        if (objectiveInput === undefined) await this.#validateNewTaskSubmissionInput(submission, authorityKey);
+        else this.#assertNewTaskCreateAuthority(submission);
       } catch (error) {
         await this.newTaskDrafts.clearSubmission(identity, createOperationId).catch(() => undefined);
         throw error;
@@ -8499,7 +8518,86 @@ export class MobileClient {
       generation
     );
     await this.#selectCreatedNewTask(sending);
-    return this.#sendNewTaskFirstInput(identity, sending);
+    return this.#finishNewTaskPreparation(identity, sending);
+  }
+
+  async #finishNewTaskPreparation(identity: MobileNewTaskDraftIdentity, initial: MobileNewTaskSendSubmission): Promise<MobileNewTaskResult> {
+    let submission = initial;
+    let collaborationError: string | undefined;
+    if (submission.collaboration && !submission.collaborationHandled) {
+      const epoch = this.#epoch, signal = this.#abort!.signal, credential = this.#ready();
+      const recoveryIdentity: MobileWorkerFormIdentity = { profileId: identity.profileId, connectionId: submission.connectionId,
+        serverId: submission.serverId, sessionId: submission.sessionId, generation: submission.runtimeGeneration };
+      // Mark this one preparation attempt before any service side effect. Restart only observes receipts.
+      submission = await this.newTaskDrafts!.markCollaborationHandled(identity, submission.createOperationId);
+      try {
+        if (credential.profileId !== identity.profileId || credential.connectionId !== submission.connectionId || credential.serverId !== submission.serverId) throw new Error("The retained collaboration belongs to another saved node.");
+        const form = normalizeMobileWorkerForm({ ...submission.collaboration!, initialTask: mobileWorkerInitialTask(submission.collaboration!.initialTask, submission.input.text) });
+        await this.workerStorage()?.save(recoveryIdentity, form);
+        if (!this.#current(epoch) || signal.aborted) return { created: true, sent: false, definitive: false, sessionId: submission.sessionId };
+        const api = this.#collaborationApi(true);
+        if (form.sourceScope !== this.newTaskCollaborationScope(submission.targetId, form.targetId)) throw new Error("The configured collaboration projects changed before creation. Review the retained worker form.");
+        if (!api || api.sessionId !== submission.sessionId || api.generation.toString() !== submission.runtimeGeneration) throw new Error("The original created task must reconnect before enabling its team.");
+        await api.enable(form, signal);
+      } catch (error) {
+        if (!this.#current(epoch) || signal.aborted) return { created: true, sent: false, definitive: false, sessionId: submission.sessionId };
+        collaborationError = `The task was created. Collaboration was not confirmed; its form is retained. ${message(error)}`;
+      }
+    }
+    const result = submission.objective !== undefined ? await this.#finishNewTaskObjective(identity, submission) : await this.#sendNewTaskFirstInput(identity, submission);
+    if (collaborationError && this.#state.selectedId === submission.sessionId && this.#credential?.connectionId === submission.connectionId) this.#set({ error: collaborationError });
+    return result;
+  }
+
+  async #finishNewTaskObjective(identity: MobileNewTaskDraftIdentity, initial: MobileNewTaskSendSubmission): Promise<MobileNewTaskResult> {
+    const input = initial.objective!;
+    const credential = this.#ready(), epoch = this.#epoch, request = this.#abort!.signal;
+    if (credential.profileId !== identity.profileId || credential.connectionId !== initial.connectionId || credential.serverId !== initial.serverId) {
+      throw new Error("The retained objective belongs to another saved node.");
+    }
+    const current = (): boolean => !request.aborted && this.#current(epoch) && this.#credential === credential;
+    const result = (definitive: boolean, sent = false): MobileNewTaskResult => ({ sessionId: initial.sessionId, created: true, sent, definitive });
+    const recoveryIdentity: MobileObjectiveRecoveryIdentity = { profileId: identity.profileId, connectionId: initial.connectionId,
+      serverId: initial.serverId, sessionId: initial.sessionId, generation: initial.runtimeGeneration };
+    const recovery = new MobileObjectiveRecovery(this.newTaskDrafts!.driver);
+    await recovery.save(recoveryIdentity, input);
+    if (!current()) return result(false);
+    const retainInput = async (): Promise<void> => {
+      if (initial.input.text || initial.input.attachments.length) await this.#recoverNewTaskComposerDraft(identity, initial.sessionId, initial.input);
+    };
+    if (initial.objectiveRequestId !== undefined) {
+      // Resume observes the original request only; it never sets the goal again.
+      const operation = await this.network.getServiceOperation?.(credential, initial.objectiveRequestId, request);
+      if (!current()) return result(false);
+      if (operation?.operationId !== initial.objectiveRequestId || !isTerminal(operation.state)) return result(false);
+      if (operation.state !== OperationState.SUCCEEDED) {
+        await retainInput(); await this.newTaskDrafts!.clear(identity); return result(true);
+      }
+      await recovery.clear(recoveryIdentity); await this.newTaskDrafts!.clear(identity); return result(true, true);
+    }
+    const authority = this.#newTaskSendAuthority(initial);
+    if (authority.status !== "ready") { await retainInput(); this.#set({ error: authority.message }); return result(false); }
+    const api = this.taskObjectiveApi();
+    if (!api || api.sessionId !== initial.sessionId || api.generation.toString() !== initial.runtimeGeneration) {
+      await retainInput(); this.#set({ error: "The task was created. Its objective form is retained until the original task reconnects." }); return result(false);
+    }
+    const requestId = this.newId();
+    await this.newTaskDrafts!.setObjectiveRequest(identity, initial.createOperationId, requestId);
+    try {
+      await this.#assertObjectiveWritable(api.ownerKey, this.#abort!.signal);
+      const rpc = this.network.objectiveRpc!(this.#ready(), api.sessionId, api.generation, signal => this.#assertObjectiveOwner(api.ownerKey, signal));
+      if (await rpc.get(this.#abort!.signal)) throw new Error("The created task already has an objective. Review its current state.");
+      await this.#recordObjectiveEffect("objective-set", api.sessionId, requestId, api.ownerKey, this.#abort!.signal,
+        signal => rpc.set(input, requestId, signal));
+      await recovery.clear(recoveryIdentity); await this.newTaskDrafts!.clear(identity);
+      for (const attachment of initial.input.attachments) await this.attachmentFiles?.remove(identity.profileId, attachment).catch(() => undefined);
+      return result(true, true);
+    } catch (error) {
+      await retainInput(); if (current()) this.#set({ error: message(error) });
+      // The form's limits survive app restart even when the creation sheet retires.
+      await this.newTaskDrafts!.clear(identity);
+      return result(!this.#state.pending.some(value => value.operationId === requestId));
+    }
   }
 
   #createdNewTaskSession(operation: Operation, submission: MobileNewTaskCreateSubmission): Session | undefined {
@@ -10587,6 +10685,257 @@ export class MobileClient {
     }, this.#state.owner, this.#state.detail, this.#state.selectedId);
   }
 
+  newTaskCollaborationOwnerKey(targetId: string): string | undefined {
+    const key = this.#newTaskAuthorityKey(targetId);
+    return key && this.network.collaborationRpc ? `${key}\u001fcollaboration-create\u001f${this.#epoch}` : undefined;
+  }
+  newTaskCollaborationScope(targetId: string, workerTargetId: string): string | undefined {
+    const lead = this.#newTaskAuthorityKey(targetId), worker = this.#newTaskAuthorityKey(workerTargetId);
+    return lead && worker ? JSON.stringify([lead, worker]) : undefined;
+  }
+  workerTargets() { return mobileWorkerTargets(this.#state.owner); }
+  workerStorage(): MobileWorkerStorage | undefined { return this.newTaskDrafts ? new MobileWorkerStorage(this.newTaskDrafts.driver) : undefined; }
+
+  taskCollaborationApi(): MobileCollaborationApi | undefined { return this.#collaborationApi(false); }
+  #collaborationApi(ownedClaim: boolean): MobileCollaborationApi | undefined {
+    const key = this.#collaborationOwnerKey(), factory = this.network.collaborationRpc;
+    const session = this.#selectedSession(), credential = this.#credential;
+    if (!key || !factory || !session || !credential) return undefined;
+    const generation = session.nativeBinding!.runtimeGeneration, ownerSignal = this.#abort!.signal;
+    const identity: MobileWorkerFormIdentity = { profileId: credential.profileId, connectionId: credential.connectionId,
+      serverId: credential.serverId, sessionId: session.sessionId, generation: generation.toString() };
+    const storage = this.workerStorage(), targets = this.workerTargets();
+    const assert = (signal: AbortSignal): void => this.#assertCollaborationOwner(key, signal);
+    const rpc = factory.call(this.network, credential, session.sessionId, generation, assert);
+    const requestSignal = (signal: AbortSignal) => AbortSignal.any([signal, ownerSignal]);
+    const load = async (signal: AbortSignal): Promise<MobileCollaborationView> => {
+      assert(signal); const access = await rpc.list(signal);
+      const selected = access.find(value => value.role === CollaborationSessionRole.WORKER)
+        ?? access.filter(value => value.goal!.status === CollaborationGoalStatus.ACTIVE).sort((a, b) =>
+          Number(b.goal!.createdAt!.seconds - a.goal!.createdAt!.seconds))[0];
+      const tree = selected ? await rpc.get(selected.goal!.goalId, signal) : undefined;
+      const settings = await this.network.getCollaborationSettings?.(credential, signal); assert(signal);
+      const self = selected?.role === CollaborationSessionRole.WORKER ? tree?.workers.find(value => value.workerId === selected.workerId && value.sessionId === session.sessionId) : undefined;
+      if (selected?.role === CollaborationSessionRole.WORKER && !self) throw new Error("The worker membership could not be confirmed.");
+      return { role: self ? "worker" : tree ? "lead" : "ordinary", ...(tree ? { tree } : {}), ...(self ? { self } : {}), ...(settings ? { settings } : {}) };
+    };
+    const validateForm = (input: MobileWorkerForm): MobileWorkerForm => {
+      const form = normalizeMobileWorkerForm(input), target = this.workerTargets().find(value => value.id === form.targetId);
+      if (!target || !target.permissionModes.includes(form.permissionMode)
+        || form.model && !resolveMobileExplicitNewTaskModelAuthority(this.#state.owner, target.backendId, form.model)) {
+        throw new Error("The worker project, model or permissions changed. Review the retained form.");
+      }
+      return form;
+    };
+    const write = async <T>(signal: AbortSignal, effect: (fresh: MobileCollaborationView, request: AbortSignal) => Promise<T>): Promise<T> => {
+      const request = requestSignal(signal); assert(request);
+      if (session.archived || session.state === SessionState.CLOSING || this.#state.pending.some(value => value.sessionId === session.sessionId && value.kind.startsWith("collaboration-"))) {
+        throw new Error("Check the current collaboration operation before changing this task.");
+      }
+      if (await this.partnerConversationTransport()?.resolve(request)) throw new Error("Partner tasks have their own collaboration controls.");
+      assert(request); const action = ownedClaim ? undefined : this.#claimMutation();
+      try { const fresh = await load(request); assert(request); return await effect(fresh, request); }
+      finally { if (action !== undefined) this.#releaseMutation(action); }
+    };
+    const sameGoal = (shown: MobileCollaborationView, fresh: MobileCollaborationView): void => {
+      if (!shown.tree?.goal || !fresh.tree?.goal || shown.tree.goal.goalId !== fresh.tree.goal.goalId
+        || shown.tree.goal.revision?.value !== fresh.tree.goal.revision?.value || shown.role !== fresh.role) throw new Error("The team changed. Refresh its current state.");
+    };
+    const lead = (view: MobileCollaborationView): void => {
+      if (view.role !== "lead" || view.tree?.goal?.leadSessionId !== session.sessionId || view.tree.goal.status !== CollaborationGoalStatus.ACTIVE
+        || [SessionState.CLOSED, SessionState.ARCHIVED].includes(session.state)) throw new Error("Only the active lead task can control this team.");
+    };
+    const saveForm = async (form: MobileWorkerForm, signal: AbortSignal): Promise<void> => {
+      await storage?.save(identity, form); assert(signal);
+      const target = targets.find(value => value.id === form.targetId)!;
+      await storage?.remember(credential.profileId, target, form); assert(signal);
+    };
+    const createWorker = async (tree: CollaborationGoalTree, form: MobileWorkerForm, signal: AbortSignal, settings?: CollaborationSettings): Promise<MobileCollaborationView> => {
+      const label = mobileWorkerLabel(form.role, tree.workers), backendId = targets.find(value => value.id === form.targetId)!.backendId;
+      const result = await this.#recordCollaborationEffect("collaboration-create", key, signal,
+        async (id, request) => {
+          const value = await rpc.createWorker(tree.goal!, form, label, id, request), worker = value.workers.find(candidate => candidate.label === label);
+          if (!worker || worker.route?.backendId !== backendId || worker.route.targetId !== form.targetId) throw new Error("The created worker belongs to another backend or project.");
+          if (worker.status === CollaborationWorkerStatus.FAILED) throw new Error(worker.error?.message || "The worker could not start. Review its current state before retrying.");
+          return value;
+        });
+      await storage?.clear(identity); assert(signal);
+      return { role: "lead", tree: result, ...(settings ? { settings } : {}) };
+    };
+    return { ownerKey: key, sessionId: session.sessionId, generation, profileId: credential.profileId, targets,
+      initialTargetId: session.targetId, writable: !session.archived && session.state !== SessionState.CLOSING,
+      restore: async signal => { const request = requestSignal(signal); assert(request); const value = await storage?.read(identity); assert(request); return value; },
+      load: signal => load(requestSignal(signal)),
+      enable: (input, signal) => write(signal, async (fresh, request) => {
+        if (fresh.role !== "ordinary") throw new Error("This task already belongs to a team. Refresh its current state.");
+        if ([SessionState.CLOSED, SessionState.ARCHIVED].includes(session.state)) throw new Error("Reopen this task before enabling collaboration.");
+        const form = validateForm(input); await saveForm(form, request);
+        const tree = await this.#recordCollaborationEffect("collaboration-enable", key, request, (id, current) => rpc.createGoal(id,
+          session.displayName || "Task collaboration", "Coordinate the lead task and its workers.", current));
+        return createWorker(tree, form, request, fresh.settings);
+      }),
+      create: (shown, input, signal) => write(signal, async (fresh, request) => {
+        sameGoal(shown, fresh); lead(fresh); const form = validateForm(input); await saveForm(form, request);
+        return createWorker(fresh.tree!, form, request, fresh.settings);
+      }),
+      archive: (shown, worker, signal) => write(signal, async (fresh, request) => {
+        sameGoal(shown, fresh); const exact = fresh.tree!.workers.find(value => value.workerId === worker.workerId);
+        if (!exact || exact.revision?.value !== worker.revision?.value || exact.status === CollaborationWorkerStatus.ARCHIVED
+          || fresh.role === "worker" && (fresh.self?.workerId !== exact.workerId || exact.sessionId !== session.sessionId)) throw new Error("Only the selected current worker can be archived.");
+        if (fresh.role !== "worker") lead(fresh);
+        const tree = await this.#recordCollaborationEffect("collaboration-archive", key, request, (id, current) => rpc.archive(fresh.tree!.goal!, exact, id, current));
+        return { ...fresh, tree, ...(fresh.self ? { self: tree.workers.find(value => value.workerId === fresh.self!.workerId)! } : {}) };
+      }),
+      end: (shown, signal) => write(signal, async (fresh, request) => {
+        sameGoal(shown, fresh); lead(fresh);
+        const tree = await this.#recordCollaborationEffect("collaboration-end", key, request, (id, current) => rpc.end(fresh.tree!.goal!, id, current));
+        return { role: "ordinary", tree };
+      }),
+      openWorker: (shown, worker, signal) => write(signal, async (fresh, request) => {
+        sameGoal(shown, fresh); lead(fresh);
+        let exact = fresh.tree!.workers.find(value => value.workerId === worker.workerId);
+        if (!exact?.sessionId || exact.status === CollaborationWorkerStatus.ARCHIVED || exact.revision?.value !== worker.revision?.value) throw new Error("The selected worker changed. Refresh this team.");
+        if (exact.status === CollaborationWorkerStatus.COMPLETED && !exact.runtimeReleased) {
+          const tree = await this.#recordCollaborationEffect("collaboration-release", key, request, (id, current) => rpc.release(fresh.tree!.goal!, exact!, id, current));
+          exact = tree.workers.find(value => value.workerId === worker.workerId)!;
+        }
+        assert(request); await this.select(exact.sessionId);
+      }),
+      openLead: async (shown, signal) => {
+        const request = requestSignal(signal), fresh = await load(request); sameGoal(shown, fresh);
+        if (fresh.role !== "worker" || !fresh.self || fresh.self.sessionId !== session.sessionId) throw new Error("The original lead could not be confirmed.");
+        assert(request); await this.select(fresh.tree!.goal!.leadSessionId);
+      },
+      resolveReport: async (origin, signal) => {
+        const request = requestSignal(signal); assert(request);
+        if (origin.leadSessionId !== session.sessionId || origin.workerSessionId === session.sessionId) throw new Error("The report belongs to another lead task.");
+        const tree = await rpc.get(origin.goalId, request); assert(request);
+        const worker = tree.workers.find(value => value.workerId === origin.workerId);
+        if (tree.goal?.leadSessionId !== session.sessionId || worker?.sessionId !== origin.workerSessionId) {
+          throw new Error("The original reporting worker could not be confirmed.");
+        }
+        return worker.sessionId;
+      } };
+  }
+  #collaborationOwnerKey(): string | undefined {
+    const key = this.#objectiveOwnerKey(); return key ? `${key}\u001fcollaboration` : undefined;
+  }
+  #assertCollaborationOwner(key: string, signal: AbortSignal): void {
+    signal.throwIfAborted();
+    if (this.#collaborationOwnerKey() !== key) throw new Error("The collaboration task or connection changed.");
+  }
+  async #recordCollaborationEffect<T>(kind: Extract<PendingOperation["kind"], `collaboration-${string}`>, key: string,
+    signal: AbortSignal, effect: (id: string, signal: AbortSignal) => Promise<T>): Promise<T> {
+    this.#assertCollaborationOwner(key, signal);
+    const epoch = this.#epoch, credential = this.#ready(), requestId = this.newId(), before = this.#state.pending;
+    const pending: PendingOperation = { kind, sessionId: this.#state.selectedId!, sourceGeneration: this.#selectedSession()!.nativeBinding!.runtimeGeneration.toString(),
+      operationId: requestId, connectionId: credential.connectionId, state: "unknown" };
+    const next = [...before, pending]; this.#set({ pending: next });
+    try { if (!await this.#persistPending(next, epoch)) throw new Error("The collaboration connection changed while its receipt was saved."); }
+    catch (error) { if (this.#current(epoch)) this.#set({ pending: before }); throw error; }
+    let dispatched = false;
+    try {
+      this.#assertCollaborationOwner(key, signal); dispatched = true;
+      const result = await effect(requestId, signal); this.#assertCollaborationOwner(key, signal);
+      const rest = this.#state.pending.filter(value => value.operationId !== requestId);
+      if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest }); return result;
+    } catch (error) {
+      if (!dispatched && this.#current(epoch)) {
+        const rest = this.#state.pending.filter(value => value.operationId !== requestId);
+        if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest });
+      }
+      throw error;
+    }
+  }
+
+  taskObjectiveApi(): MobileObjectiveApi | undefined {
+    const key = this.#objectiveOwnerKey(), factory = this.network.objectiveRpc;
+    const session = this.#selectedSession(), credential = this.#credential;
+    if (!key || !factory || !session || !credential) return undefined;
+    const generation = session.nativeBinding!.runtimeGeneration;
+    const ownerSignal = this.#abort!.signal;
+    const identity: MobileObjectiveRecoveryIdentity = { profileId: credential.profileId, serverId: credential.serverId,
+      connectionId: credential.connectionId, sessionId: session.sessionId, generation: generation.toString() };
+    const recovery = this.newTaskDrafts ? new MobileObjectiveRecovery(this.newTaskDrafts.driver) : undefined;
+    const rpc = factory.call(this.network, credential, session.sessionId, generation, signal => this.#assertObjectiveOwner(key, signal));
+    const write = async <T>(kind: Extract<PendingOperation["kind"], `objective-${string}`>, signal: AbortSignal,
+      effect: (id: string, request: AbortSignal) => Promise<T>, prepare?: (request: AbortSignal) => Promise<void>): Promise<T> => {
+      const request = AbortSignal.any([signal, ownerSignal]);
+      await this.#assertObjectiveWritable(key, request);
+      const action = this.#claimMutation(), requestId = this.newId();
+      try {
+        await prepare?.(request); this.#assertObjectiveOwner(key, request);
+        return await this.#recordObjectiveEffect(kind, session.sessionId, requestId, key, request, current => effect(requestId, current));
+      }
+      finally { this.#releaseMutation(action); }
+    };
+    return { ownerKey: key, sessionId: session.sessionId, generation,
+      writable: !session.archived && ![SessionState.CLOSED, SessionState.ARCHIVED, SessionState.CLOSING].includes(session.state),
+      get: signal => rpc.get(AbortSignal.any([signal, ownerSignal])),
+      watch: signal => rpc.watch(AbortSignal.any([signal, ownerSignal])),
+      restore: async signal => {
+        this.#assertObjectiveOwner(key, signal); const input = await recovery?.read(identity);
+        this.#assertObjectiveOwner(key, signal); return input;
+      },
+      set: async (input, signal) => {
+        const exact = normalizeMobileObjectiveInput(input);
+        const value = await write("objective-set", signal, (id, request) => rpc.set(exact, id, request), async request => {
+          if (await rpc.get(request)) throw new Error("This task already has an objective. Refresh its current state.");
+          await recovery?.save(identity, exact); this.#assertObjectiveOwner(key, request);
+        });
+        await recovery?.clear(identity); return value;
+      },
+      pause: (value, signal) => write("objective-pause", signal, (id, request) => rpc.pause(value, id, request)),
+      resume: (value, signal) => write("objective-resume", signal, (id, request) => rpc.resume(value, id, request)),
+      clear: (value, signal) => write("objective-clear", signal, (id, request) => rpc.clear(value, id, request)) };
+  }
+
+  #objectiveOwnerKey(): string | undefined {
+    const key = this.taskPresentationOwnerKey(), session = this.#selectedSession(), backend = this.#selectedBackend(session);
+    if (!key || !session || !backend || !supportsText(backend)
+      || this.#state.detail?.reviewRuns.some(value => value.reviewerSessionId === session.sessionId)) return undefined;
+    return `${key}\u001fobjective\u001f${backendAuthorityKey(backend)}\u001f${this.#epoch}`;
+  }
+  #assertObjectiveOwner(key: string, signal: AbortSignal): void {
+    signal.throwIfAborted();
+    if (this.#objectiveOwnerKey() !== key) throw new Error("The objective task or connection changed.");
+  }
+  async #assertObjectiveWritable(key: string, signal: AbortSignal): Promise<void> {
+    this.#assertObjectiveOwner(key, signal);
+    const session = this.#selectedSession()!;
+    if (session.archived || [SessionState.CLOSED, SessionState.ARCHIVED, SessionState.CLOSING].includes(session.state)
+      || this.#state.pending.some(value => value.sessionId === session.sessionId && value.kind.startsWith("objective-"))) {
+      throw new Error("Check the current objective operation before changing this task.");
+    }
+    if (await this.readTaskHeaderRole(this.taskHeaderSourceKey()!, signal) === "worker") throw new Error("Worker tasks cannot own an autonomous objective.");
+    if (await this.partnerConversationTransport()?.resolve(signal)) throw new Error("Partner tasks use their own objective controls.");
+    this.#assertObjectiveOwner(key, signal);
+  }
+  async #recordObjectiveEffect<T>(kind: Extract<PendingOperation["kind"], `objective-${string}`>, sessionId: string,
+    requestId: string, ownerKey: string, signal: AbortSignal, effect: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    this.#assertObjectiveOwner(ownerKey, signal);
+    const epoch = this.#epoch, credential = this.#ready(), before = this.#state.pending;
+    const pending: PendingOperation = { kind, sessionId, sourceGeneration: this.#selectedSession()!.nativeBinding!.runtimeGeneration.toString(),
+      operationId: requestId, connectionId: credential.connectionId, state: "unknown" };
+    const next = [...before, pending]; this.#set({ pending: next });
+    try { if (!await this.#persistPending(next, epoch)) throw new Error("The objective connection changed while its receipt was saved."); }
+    catch (error) { if (this.#current(epoch)) this.#set({ pending: before }); throw error; }
+    let dispatched = false;
+    try {
+      this.#assertObjectiveOwner(ownerKey, signal); dispatched = true;
+      const result = await effect(signal); this.#assertObjectiveOwner(ownerKey, signal);
+      const rest = this.#state.pending.filter(value => value.operationId !== requestId);
+      if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest });
+      return result;
+    } catch (error) {
+      if (!dispatched && this.#current(epoch)) {
+        const rest = this.#state.pending.filter(value => value.operationId !== requestId);
+        if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest });
+      }
+      throw error;
+    }
+  }
+
   async compactTaskContext(authorityKey: string): Promise<MobileCompactOutcome | undefined> {
     const controls = this.#contextControlContext(authorityKey);
     const session = assertMobileContextCompact(controls);
@@ -11062,6 +11411,25 @@ export class MobileClient {
     }
     this.#set({ owner: owner.snapshot });
     return current();
+  }
+
+  taskHeaderSourceKey(): string | undefined {
+    if (!this.#taskAuthorityKey()) return undefined;
+    const credential = this.#credential!, owner = this.#state.owner!;
+    const session = this.#state.detail!.sessions.find(candidate => candidate.sessionId === this.#state.selectedId)!;
+    return [credential.profileId, credential.serverId, credential.connectionId, credential.deviceId, owner.generation.toString(),
+      session.sessionId, session.backendId, session.targetId, session.nativeBinding!.runtimeGeneration.toString(), this.#epoch.toString()].join("\u001f");
+  }
+
+  async readTaskHeaderRole(sourceKey: string, signal: AbortSignal): Promise<import("./mobile-task-header-role").MobileTaskHeaderRole> {
+    if (!sourceKey || this.taskHeaderSourceKey() !== sourceKey) throw new Error("The task header source is no longer current.");
+    const credential = this.#ready(), epoch = this.#epoch, sessionId = this.#state.selectedId!;
+    const combined = AbortSignal.any([this.#abort!.signal, signal]); combined.throwIfAborted();
+    const role = await this.network.readTaskHeaderRole(credential, sessionId, combined);
+    if (combined.aborted || !this.#current(epoch) || this.#credential !== credential || this.taskHeaderSourceKey() !== sourceKey) {
+      throw new Error("The task header source changed while reading.");
+    }
+    return role;
   }
 
   taskDelegatedControls(): import("./mobile-delegated-reader").MobileDelegatedControls | undefined {
@@ -13956,7 +14324,29 @@ export class MobileClient {
     for (const pending of this.#state.pending) {
       if (pending.connectionId !== credential.connectionId) continue;
       try {
-        const operation = await this.network.getOperation(credential, pending.operationId, this.#abort?.signal);
+        const operation = pending.kind.startsWith("objective-") || pending.kind.startsWith("collaboration-")
+          ? await this.network.getServiceOperation?.(credential, pending.operationId, this.#abort?.signal)
+          : await this.network.getOperation(credential, pending.operationId, this.#abort?.signal);
+        if (pending.kind.startsWith("objective-") || pending.kind.startsWith("collaboration-")) {
+          // These service ledgers have no client connection field.
+          // Observe its original ID through the exact authenticated saved node.
+          if (operation?.operationId === pending.operationId && isTerminal(operation.state) && this.#current(epoch)) {
+            if (operation.state === OperationState.SUCCEEDED && pending.kind === "objective-set" && this.newTaskDrafts) {
+              await new MobileObjectiveRecovery(this.newTaskDrafts.driver).clear({ profileId: credential.profileId, connectionId: credential.connectionId,
+                serverId: credential.serverId, sessionId: pending.sessionId!, generation: pending.sourceGeneration! });
+              if (!this.#current(epoch)) return;
+            }
+            if (operation.state === OperationState.SUCCEEDED && pending.kind === "collaboration-create" && this.newTaskDrafts) {
+              await this.workerStorage()!.clear({ profileId: credential.profileId, connectionId: credential.connectionId, serverId: credential.serverId,
+                sessionId: pending.sessionId!, generation: pending.sourceGeneration! });
+              if (!this.#current(epoch)) return;
+            }
+            const rest = this.#state.pending.filter(value => value.operationId !== pending.operationId);
+            if (await this.#persistPending(rest, epoch)) this.#set({ pending: rest,
+              ...(operation.state === OperationState.SUCCEEDED ? {} : { error: operation.error?.message || "The service operation was rejected." }) });
+          }
+          continue;
+        }
         if (!this.#current(epoch)) return;
         if (operation) {
           if (pending.kind === "session-fork" && operation.state === OperationState.SUCCEEDED
@@ -14055,7 +14445,8 @@ export class MobileClient {
         return;
       }
       if (submission.sendOperationId === undefined) {
-        await this.#sendNewTaskFirstInput(identity, submission);
+        await this.#selectCreatedNewTask(submission);
+        await this.#finishNewTaskPreparation(identity, submission);
         return;
       }
       await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
@@ -14138,6 +14529,11 @@ export class MobileClient {
     const credential = this.#ready();
     const pending = this.#state.pending.find((item) => item.operationId === operationId && item.connectionId === credential.connectionId);
     if (!pending || pending.state !== "unknown") throw new Error("Only an unconfirmed operation can be cleared.");
+    if (pending.kind.startsWith("objective-") || pending.kind.startsWith("collaboration-")) {
+      await this.reconcile();
+      if (this.#state.pending.some(value => value.operationId === operationId)) throw new Error("The service operation is still unconfirmed. Refresh its original receipt before retrying.");
+      return;
+    }
     const epoch = this.#epoch;
     const operation = await this.network.getOperation(credential, operationId, this.#abort?.signal);
     if (!this.#current(epoch)) return;

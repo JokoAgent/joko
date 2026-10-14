@@ -11,9 +11,21 @@ import type { MobileRuntimeCommandPalette } from "./MobileRuntimeCommandPalette"
 import type { MobileState } from "./mobile-client";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
+import type { MobileObjectiveApi } from "./mobile-objective";
+import type { MobileCollaborationApi } from "./mobile-collaboration";
+import { PermissionMode } from "@joko/contracts";
+import type { MobileObjectiveSheetProps } from "./MobileObjectiveSheet";
+import type { MobileTaskHeader } from "./MobileTaskHeader";
+import type { MobileContextSheet } from "./MobileContextSheet";
 
 let input: ComponentProps<typeof MobileComposerRichInput>;
 let palette: ComponentProps<typeof MobileRuntimeCommandPalette>;
+let header: ComponentProps<typeof MobileTaskHeader>;
+let contextSheet: ComponentProps<typeof MobileContextSheet>;
+let objectiveSheet: MobileObjectiveSheetProps;
+let activeObjectiveApi: MobileObjectiveApi | undefined;
+let activeCollaborationApi: MobileCollaborationApi | undefined;
+let taskRole: "ordinary" | "lead" | "worker" = "ordinary";
 let root: Root;
 let host: HTMLDivElement;
 let TaskScreen: typeof import("./App").TaskScreen;
@@ -56,6 +68,8 @@ const client = new Proxy({
   taskQueueItems: () => empty, taskQueueCapabilities: () => ({}), taskInteractions: () => empty, subscribe: () => () => {},
   taskPendingImagePasteCount: () => 0, taskForeground: () => true,
   taskNativeTreeControls: () => undefined, send, taskContextControls: () => undefined,
+  taskObjectiveApi: () => current ? activeObjectiveApi : undefined,
+  taskCollaborationApi: () => current ? activeCollaborationApi : undefined,
   taskCatalogMentionControls: () => undefined, taskTimelineRows: () => empty,
   partnerConversationTransport: () => activePartner ? { ownerKey: "private-task", sessionId: "session" } : undefined,
   partnerDirectoryTransport: () => activePartner ? { ownerKey: "private-node", list: privateDirectory } : undefined
@@ -111,13 +125,17 @@ beforeAll(async () => {
     }), MobileComposerAtomChips: () => null, MobileAttachmentTray: () => null
   }));
   vi.doMock("./MobileRuntimeCommandPalette", () => ({ MobileRuntimeCommandPalette: (_props: ComponentProps<typeof MobileRuntimeCommandPalette>) => { palette = _props; return null; } }));
-  const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileActionSheet", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileTaskHeader", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet", "MobileRuntimeControlsSheet", "MobileContextSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "SwipeableSessionRow", "MobileMarkdownMessage", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerConversationRow", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobileConversationSearchSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
+  const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileActionSheet", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet", "MobileRuntimeControlsSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobileConversationSearchSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
   for (const name of screens) vi.doMock(`./${name}`, () => new Proxy({}, {
     get: (_object, key) => key === "then" ? undefined : () => null,
     has: () => true,
     getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: () => null })
   }));
   vi.doMock("./MobileTaskTags", () => ({ MobileTaskTagDots: () => null, MobileTaskTagsSheet: () => null, mobileTaskTagName: () => "" }));
+  vi.doMock("./use-mobile-task-header-role", () => ({ useMobileTaskHeaderRole: () => ({ role: taskRole, failed: false, retry() {} }) }));
+  vi.doMock("./MobileTaskHeader", () => ({ MobileTaskHeader: (props: ComponentProps<typeof MobileTaskHeader>) => { header = props; return null; } }));
+  vi.doMock("./MobileContextSheet", () => ({ MobileContextSheet: (props: ComponentProps<typeof MobileContextSheet>) => { contextSheet = props; return null; } }));
+  vi.doMock("./MobileObjectiveSheet", () => ({ MobileObjectiveSheet: (props: MobileObjectiveSheetProps) => { objectiveSheet = props; return null; } }));
   vi.doMock("./MobilePartnerAvatar", () => ({ MobilePartnerAvatar: () => null, MobilePartnerAvatarProvider: surface }));
   vi.doMock("./MobilePartnerConversationRow", () => ({ MobilePartnerConversationRow: surface }));
   vi.doMock("./MobileKeyboardAvoidingView", () => ({ MobileKeyboardAvoidingView: surface, useMobileKeyboardState: () => ({ shown: false, height: 0 }) }));
@@ -134,6 +152,8 @@ beforeAll(async () => {
 beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockClear();
   activePartner = undefined; renderedState = state; privateDirectory.mockClear(); openPrivateThread.mockClear();
+  activeObjectiveApi = undefined;
+  activeCollaborationApi = undefined; taskRole = "ordinary";
   drafts.save(identity, plainTextMobileComposerDraft("/an arguments")); await drafts.flush(identity);
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
 });
@@ -190,6 +210,43 @@ describe("actual App slash Skill selection", () => {
     expect(input.draft.text).toBe(retirement === "edit" ? "/an arguments changed" : "/an arguments");
     expect(input.draft.mentions).toEqual([]); expect(send).not.toHaveBeenCalled();
   });
+});
+
+it("opens the actual Context collaboration form, creates a waiting worker, and keeps the lead composer", async () => {
+  activeCollaborationApi = { ownerKey: "team-source", sessionId: "session", generation: 7n, profileId: "profile", writable: true, initialTargetId: "target",
+    targets: [{ id: "target", name: "Project", backendId: "backend", backendName: "Backend", models: [], permissionModes: [PermissionMode.ASK], canSetEffort: false, canSetFastMode: false }],
+    load: vi.fn(async () => ({ role: "ordinary" })), restore: vi.fn(async () => undefined), enable: vi.fn(async () => ({ role: "lead" })) } as unknown as MobileCollaborationApi;
+  await render(false); await act(async () => header.actions.find(action => action.id === "context")!.onPress());
+  expect(contextSheet.visible).toBe(true); await act(async () => contextSheet.onCollaboration!());
+  const button = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find(value => value.getAttribute("aria-label") === "Enable collaboration");
+  expect(button).toBeDefined(); await act(async () => button!.click());
+  expect(activeCollaborationApi.enable).toHaveBeenCalledWith({ role: "developer", targetId: "target", initialTask: "", permissionMode: PermissionMode.ASK }, expect.any(AbortSignal));
+  expect(drafts.readSync(identity)?.text).toBe("/an arguments"); expect(send).not.toHaveBeenCalled();
+});
+
+it("renders the actual worker conversation read-only with a return to its original lead", async () => {
+  taskRole = "worker"; activeCollaborationApi = { ownerKey: "worker-source", sessionId: "session", restore: vi.fn(async () => undefined),
+    load: vi.fn(async () => ({ role: "worker" })), openLead: vi.fn() } as unknown as MobileCollaborationApi;
+  await act(async () => root.render(createElement(TaskScreen, { colors, state, locale: "en", onBack() {}, onHome() {}, onNew() {}, onFiles() {}, onOpenPartnerThread: openPrivateThread, onRemoteDesktop() {}, focusComposer: false, onComposerFocused() {}, onOpenDerivationOrigin: async () => false })));
+  expect(host.textContent).toContain("Worker conversations are read-only"); expect(host.textContent).not.toContain("Send input");
+  const back = Array.from(host.querySelectorAll<HTMLButtonElement>("button")).find(value => value.getAttribute("aria-label") === "Return to lead");
+  expect(back).toBeDefined(); await act(async () => back!.click()); expect(activeCollaborationApi.openLead).toHaveBeenCalledOnce();
+  expect(header.detailsOnly).toBe(true); expect(send).not.toHaveBeenCalled();
+});
+
+it.each([false, true])("opens the actual Context objective and consumes its exact source draft only before retirement=%s", async retired => {
+  activeObjectiveApi = { ownerKey: "objective-source", sessionId: "session", generation: 7n, writable: true,
+    restore: vi.fn(async () => undefined) } as unknown as MobileObjectiveApi;
+  await render(false);
+  await act(async () => header.actions.find(action => action.id === "context")!.onPress());
+  expect(contextSheet.visible).toBe(true); expect(contextSheet.objectiveApi).toBe(activeObjectiveApi);
+  await act(async () => contextSheet.onObjective!());
+  expect(objectiveSheet.visible).toBe(true); expect(objectiveSheet.initialText).toBe("/an arguments");
+  const accept = objectiveSheet.onSaved!;
+  if (retired) activeObjectiveApi = { ...activeObjectiveApi, ownerKey: "replacement-generation" };
+  await act(async () => accept({ text: "Reach the result" }));
+  expect(drafts.readSync(identity)?.text ?? "").toBe(retired ? "/an arguments" : "");
+  expect(input.draft.text).toBe(retired ? "/an arguments" : ""); expect(send).not.toHaveBeenCalled();
 });
 
 it("opens the actual Task private source pill with a fresh current peer and keeps incoming private bodies hidden", async () => {

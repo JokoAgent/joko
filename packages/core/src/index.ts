@@ -14,4 +14,5 @@ export * from "./partner-workbench.js";
 export * from "./native-session-preview.js";
 export * from "./partner-routines.js";
 export * from "./partner-groups.js";
+export * from "./partner-learning.js";
 export * from "./runtime-skills.js";

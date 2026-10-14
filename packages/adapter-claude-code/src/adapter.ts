@@ -19,6 +19,7 @@ import {
   MEMORY_NATIVE_RESET_LOCAL_OPTION,
   SESSION_REWIND_SERVICE_NODE_ONLY_OPTION,
   type AdapterContext,
+  type PartnerLearningTurnHandle,
   type AdapterEventMetadata,
   type ApprovedDirectory,
   type BackendAuthenticationState,
@@ -389,6 +390,7 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
 interface ActiveTurn {
   readonly providerLease?: ManagedProviderOperationLease;
   readonly context: AdapterContext;
+  readonly partnerLearningTurn?: PartnerLearningTurnHandle;
   readonly sessionGeneration: number;
   readonly backendInstanceGeneration: number;
   readonly queryGeneration: number;
@@ -1775,6 +1777,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const turn: ActiveTurn = {
       ...(providerLease === undefined ? {} : { providerLease }),
       context,
+      ...(context.capturePartnerLearningTurn === undefined ? {} : {
+        partnerLearningTurn: context.capturePartnerLearningTurn({
+          nativeOccurrence: `claude:${runtime.nativeSessionId}:${runtime.queryGeneration}:${operationUuid(operationId)}`,
+          nativeTurnId: operationUuid(operationId)
+        })
+      }),
       sessionGeneration: context.generation,
       backendInstanceGeneration: this.#instanceGeneration,
       queryGeneration: runtime.queryGeneration,
@@ -3015,6 +3023,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   ): Promise<ClaudeMcpCallResult> {
     const turn = runtime.activeTurn;
     const lease = runtime.mcpLease;
+    const learningTurn = turn?.partnerLearningTurn;
+    const capturedArguments = structuredClone(arguments_);
+    const requestId = turn === undefined ? "" : createHash("sha256")
+      .update(runtime.nativeSessionId).update("\0")
+      .update(String(turn.queryGeneration)).update("\0")
+      .update(turn.operationId).update("\0")
+      .update(options.toolUseId).digest("hex");
     const name = `mcp__${claudeMcpServerName(tool.serverId)}__${tool.name}`;
     if (turn !== undefined && lease !== undefined && this.#isTurnCurrent(runtime, turn)
       && !turn.seenToolStarts.has(options.toolUseId)) {
@@ -3046,17 +3061,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     assertCurrent();
     const signal = AbortSignal.any([options.signal, runtime.abortController.signal, turn!.mcpCallCancellation.signal]);
     signal.throwIfAborted();
-    const requestId = createHash("sha256")
-      .update(runtime.nativeSessionId).update("\0")
-      .update(String(runtime.queryGeneration)).update("\0")
-      .update(turn!.operationId).update("\0")
-      .update(options.toolUseId).digest("hex");
+    const partnerLearningAuthority = learningTurn?.captureToolRequest({ requestId, serverId: tool.serverId, toolName: tool.name });
     const result = await lease!.call({
       serverId: tool.serverId,
       toolName: tool.name,
       requestId,
-      arguments: arguments_,
-      signal
+      arguments: capturedArguments,
+      signal,
+      ...(partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority })
     });
     signal.throwIfAborted();
     assertCurrent();
@@ -4011,6 +4023,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const uuid = stringValue(envelope["uuid"]);
     if (uuid !== undefined && turn.seenFrameUuids.has(uuid)) return;
     if (uuid !== undefined) addBoundedIdentity(turn.seenFrameUuids, uuid);
+    if (uuid !== undefined) turn.partnerLearningTurn?.observeNativeReply(uuid);
     const error = stringValue(envelope["error"]);
     if (error !== undefined) turn.assistantError = error;
     const nativeMessage = record(envelope["message"]);
@@ -5494,7 +5507,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (runtime.backendInstanceGeneration !== undefined) {
       fields["backendInstanceGeneration"] = runtime.backendInstanceGeneration;
     }
-    await context.emit(payload, { namespace: "claude-code", fields });
+    await (context === turn.context ? turn.partnerLearningTurn?.emit ?? context.emit : context.emit)(payload, { namespace: "claude-code", fields });
     return this.#isTurnCurrent(runtime, turn);
   }
 

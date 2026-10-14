@@ -5,7 +5,7 @@ import { access, mkdir, open, readFile, readdir, rm, stat, writeFile } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, PolicySnapshot, ProviderModel, TargetDescriptor } from "@joko/core";
+import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, PartnerLearningTurnSource, PolicySnapshot, ProviderModel, TargetDescriptor } from "@joko/core";
 import { describe, expect, it, vi } from "vitest";
 import { appendVisionBridgeDescriptions, createPiAdapter, escapePiComposerSlashCommand, isRuntimeResourceProvenLoaded, mergeManagedResourceSnapshots, projectPiTreeNodes, resolvePiComposerSlashCommand } from "./adapter.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
@@ -16,6 +16,7 @@ import {
 } from "./runtime-tool-catalog.js";
 import type { PiProcessHandle, PiProcessSpec } from "./transport.js";
 import { encodePolicyDecisionRequest } from "./policy-decision-bridge.js";
+import { PARTNER_LEARNING_REQUEST_PREFIX, PARTNER_LEARNING_REPLY_STATUS_KEY } from "./partner-learning-bridge.js";
 import { mkdtemp } from "./test-paths.js";
 
 interface ScriptedPiProcessOptions {
@@ -3584,6 +3585,59 @@ describe("PiBackendAdapter", () => {
 
     expect(roots).toMatchObject([{ entryId: "resource-user", role: "user", label: undefined }]);
     expect(JSON.stringify(roots)).not.toContain(privateBody);
+  });
+
+  it("captures private tool requests synchronously from the original Pi occurrence before follow-up routing", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-tool-turn-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-tool-turn-workspace-"));
+    let scripted!: ScriptedPiProcess;
+    const adapter = createPiAdapter({ agentHome, sessionRoot: agentHome, versionProbe: async () => "pi 99.99.99-tool-turn-test",
+      providers: [{ id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true,
+        models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096 }] }],
+      mcpBridge: { endpoint: "http://127.0.0.1:4318/internal/mcp", token: "fixture-private-token",
+        tools: [{ serverId: "memory", name: "save", description: "Save", inputSchema: { type: "object" }, requiresPermission: true }] },
+      processFactory: (spec) => {
+        scripted = new ScriptedPiProcess(spec, { holdAgentLifecycle: true, echoQueuedUserMessages: true });
+        return scripted as unknown as PiProcessHandle;
+      } });
+    const target: TargetDescriptor = { id: "tool-turn-target", backendId: "pi", displayName: "Tool turn", workspaceRoot: workspace, managed: true, trusted: true };
+    const originalEvents: EventPayload[] = [], followUpEvents: EventPayload[] = [];
+    const original = makeContext(target, originalEvents);
+    const captures: string[] = [], replies: string[] = [];
+    const withLearning = (context: AdapterContext, marker: string): AdapterContext => ({ ...context,
+      capturePartnerLearningTurn: () => {
+        const source: PartnerLearningTurnSource = { occurrenceId: marker, sessionId: context.sessionId, targetId: target.id, backendId: target.backendId,
+          backendInstanceGeneration: 0, bindingGeneration: 1, bindingFingerprint: "original-binding", sourceRunId: marker,
+          sourceAttemptId: `${marker}-attempt`, sourceQueueItemId: `${marker}-queue`, nativeOccurrence: marker };
+        return { source, emit: context.emit, observeNativeReply: (id) => { replies.push(`${marker}:${id}`); },
+          captureToolRequest: (request) => { captures.push(`${marker}:${request.requestId}`);
+            return { source, ...request, proof: (marker === "root" ? "a" : "b").repeat(43), assertCurrent: () => undefined }; } };
+      } });
+    const request = (id: string) => ({ type: "extension_ui_request", id: `ack-${id}`, method: "input",
+      title: PARTNER_LEARNING_REQUEST_PREFIX + Buffer.from(JSON.stringify({ requestId: id, serverId: "memory", toolName: "save" })).toString("base64url") });
+    const emit = (event: unknown) => scripted.stdout.write(`${JSON.stringify(event)}\n`);
+    try {
+      const binding = await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" }, original);
+      await adapter.send({ text: "root", images: [], files: [], mentions: [], disposition: "prompt" }, withLearning({ ...original, binding }, "root"));
+      await adapter.send({ text: "steer", images: [], files: [], mentions: [], disposition: "steer" }, {
+        ...original, binding, capturePartnerLearningTurn: () => { throw new Error("Steer cannot replace root occurrence."); } });
+      emit(request("first-save"));
+      await adapter.send({ text: "follow-up", images: [], files: [], mentions: [], disposition: "follow_up" },
+        withLearning({ ...makeContext(target, followUpEvents), binding }, "follow-up"));
+      emit(request("second-save"));
+      emit({ type: "extension_ui_request", id: "reply-status", method: "setStatus", statusKey: PARTNER_LEARNING_REPLY_STATUS_KEY, statusText: JSON.stringify({ entryId: "exact-follow-up-reply" }) });
+      scripted.emitAssistant("follow-up reply"); scripted.settle();
+      await vi.waitFor(() => expect(scripted.commands.filter((command) => command.type === "extension_ui_response")).toHaveLength(2));
+      expect(captures).toEqual(["root:first-save", "follow-up:second-save"]);
+      expect(replies).toEqual(["follow-up:exact-follow-up-reply"]);
+      expect(scripted.commands.filter((command) => command.type === "extension_ui_response")).toMatchObject([
+        { id: "ack-first-save", value: "a".repeat(43) }, { id: "ack-second-save", value: "b".repeat(43) }
+      ]);
+      await vi.waitFor(() => expect(followUpEvents.some((event) => event.type === "done")).toBe(true));
+      expect(originalEvents.some((event) => event.type === "message_complete" && event.role === "assistant")).toBe(false);
+      expect(JSON.stringify([...originalEvents, ...followUpEvents])).not.toContain("exact-follow-up-reply");
+      expect(JSON.stringify([...originalEvents, ...followUpEvents])).not.toContain("ack-first-save");
+    } finally { await adapter.dispose(); await rm(agentHome, { recursive: true, force: true }); await rm(workspace, { recursive: true, force: true }); }
   });
 
   it("routes expanded and duplicate queued inputs by accepted queue order instead of message text", async () => {

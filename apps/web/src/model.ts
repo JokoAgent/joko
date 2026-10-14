@@ -1,6 +1,7 @@
 import type { JSONContent } from "@tiptap/core";
 import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar.js";
 import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine } from "@joko/contracts";
+import type { PartnerLearningFeedbackView } from "@joko/contracts";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
 export type SystemLocale = Exclude<Locale, "en-XA">;
@@ -1515,6 +1516,7 @@ export interface ContextView {
 }
 
 export interface TimelineItemView {
+  readonly learning?: PartnerLearningFeedbackView;
   readonly id: string;
   /** Owning completed/streaming message when one message projects multiple blocks. */
   readonly messageId?: string;

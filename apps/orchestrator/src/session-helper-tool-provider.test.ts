@@ -3,7 +3,7 @@ import { mkdtempSync } from "./test-paths.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { Capability, PromptInput, SessionDescriptor } from "@joko/core";
+import type { Capability, PromptInput, SessionDescriptor, TaskMessageOrigin } from "@joko/core";
 import { OperationalStore, type OperationExecution } from "@joko/store";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -13,7 +13,7 @@ import {
   SESSION_HELPER_NESTED_TOOLS,
   SessionHelperToolBridgeProvider
 } from "./session-helper-tool-provider.js";
-import type { SessionHost } from "./session-host.js";
+import type { EnqueueServiceInput, SessionHost } from "./session-host.js";
 
 const NOW = Date.UTC(2026, 7, 25, 8, 0, 0);
 const openStores: OperationalStore[] = [];
@@ -347,6 +347,16 @@ describe("SessionHelperToolBridgeProvider", () => {
     expect(search.vector_skip_reason).toEqual(expect.any(String));
   });
 
+  it("freezes the task and Partner sender snapshot on an explicitly delivered message", async () => {
+    const { store, provider } = fixture(id => id === "session-a" ? { senderPartnerId: "partner", senderPartnerName: "Original Partner" } : undefined);
+    const title = store.getSession("session-a").descriptor.title;
+    const sent = resultData(await callNested(provider, "send_to_session", { target_session_id: "session-b", message: "Visible message" })) as Record<string, unknown>;
+    const queued = store.getQueueItem(String(sent["queued_message_id"]));
+    expect(store.getOperation(queued.operationId).body).toMatchObject({ taskMessageOrigin: {
+      senderSessionId: "session-a", senderSessionTitle: title, senderPartnerId: "partner", senderPartnerName: "Original Partner"
+    } });
+    expect(queued.body.text).toBe("Visible message");
+  });
   it("persists handoff messages before return and enforces per-caller queue edit and cancel ownership", async () => {
     const { store, provider, hostState } = fixture();
     const sent = resultData(await callNested(provider, "send_to_session", {
@@ -366,7 +376,7 @@ describe("SessionHelperToolBridgeProvider", () => {
       body: expect.objectContaining({ text: "handoff body" })
     });
     expect(store.findOperation(store.getQueueItem(queueItemId).operationId)?.body)
-      .toMatchObject({ originSessionId: "session-a" });
+      .toMatchObject({ originSessionId: "session-a", taskMessageOrigin: { senderSessionId: "session-a", senderSessionTitle: store.getSession("session-a").descriptor.title } });
 
     const listed = resultData(await callNested(provider, "list_session_queue", { session_id: "session-b" })) as {
       queue: readonly Record<string, unknown>[];
@@ -498,6 +508,8 @@ describe("SessionHelperToolBridgeProvider", () => {
       agent_kind: "backend-a"
     })) as Record<string, unknown>;
     const createdId = String(created["target_session_id"]);
+    const createdQueue = store.getQueueItem(String(created["queued_message_id"]));
+    expect(store.getOperation(createdQueue.operationId).body).toMatchObject({ taskMessageOrigin: { senderSessionId: "session-a" } });
     expect(created).toMatchObject({
       wake_kind: "created",
       target_title: "Issue 42",
@@ -582,7 +594,7 @@ describe("SessionHelperToolBridgeProvider", () => {
   });
 });
 
-function fixture() {
+function fixture(taskSenderPartner?: (sessionId: string) => Pick<TaskMessageOrigin, "senderPartnerId" | "senderPartnerName"> | undefined) {
   const store = new OperationalStore(":memory:");
   openStores.push(store);
   const base = mkdtempSync(join(tmpdir(), "joko-session-helper-"));
@@ -699,13 +711,7 @@ function fixture() {
 
   const activeSessions = new Set<string>(["session-a"]);
   let serviceSequence = 0;
-  const enqueueServiceInput = vi.fn((input: {
-    operationId: string;
-    sessionId: string;
-    prompt: PromptInput;
-    source: "schedule" | "system";
-    originSessionId?: string;
-  }) => enqueueService(store, input));
+  const enqueueServiceInput = vi.fn((input: EnqueueServiceInput) => enqueueService(store, input));
   const createServiceSession = vi.fn(async (input: {
     operationId: string;
     targetId: string;
@@ -805,7 +811,8 @@ function fixture() {
       "abort" | "createServiceSession" | "enqueueServiceInput" | "getSessionRuntimeControl" |
       "isSessionActive" | "resume" | "sessionRuntimeFallbackEnabled" | "setSessionRuntimeControl"
     >,
-    now: () => NOW + 10_000
+    now: () => NOW + 10_000,
+    taskSenderPartner
   });
   return { store, provider, hostState, roots };
 }
@@ -831,6 +838,7 @@ function enqueueService(
     prompt: PromptInput;
     source: "schedule" | "system";
     originSessionId?: string;
+    taskMessageOrigin?: TaskMessageOrigin;
   }
 ): OperationExecution<{ sessionId: string; runId: string; attemptId: string; queueItemId: string }> {
   const suffix = input.operationId.replace(/[^A-Za-z0-9]/gu, "").slice(-24);
@@ -845,7 +853,8 @@ function enqueueService(
         sessionId: input.sessionId,
         prompt: input.prompt,
         source: input.source,
-        ...(input.originSessionId === undefined ? {} : { originSessionId: input.originSessionId })
+        ...(input.originSessionId === undefined ? {} : { originSessionId: input.originSessionId }),
+        ...(input.taskMessageOrigin === undefined ? {} : { taskMessageOrigin: input.taskMessageOrigin })
       }
     },
     (transactionStore) => {

@@ -19,6 +19,16 @@ afterEach(() => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
 });
 
+it("persists an empty optional worker assignment without weakening required Goal and message text", () => {
+  const fixture = createFixture(), bound = seedBoundWorker(fixture.store);
+  const goal = fixture.store.getCollaborationGoal(bound.goalId), worker = fixture.store.getCollaborationWorker(bound.workerId);
+  fixture.store.updateCollaborationWorkerAssignment({ workerId: worker.id, callerLeadSessionId: goal.leadSessionId,
+    expectedRevision: worker.revision, assignment: "", updatedAt: worker.updatedAt + 1 });
+  fixture.reopen(); expect(fixture.store.getCollaborationWorker(worker.id).assignment).toBe("");
+  expect(() => fixture.store.createCollaborationGoal({ id: "empty-goal", leadId: "empty-lead", leadSessionId: "lead-session",
+    title: "Empty", objective: "", createdAt: 100 })).toThrow();
+});
+
 describe("OperationalStore collaboration", () => {
   it("finds the latest Run in one Session generation when timestamps tie", () => {
     const fixture = createFixture();

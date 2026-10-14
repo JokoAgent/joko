@@ -6,6 +6,12 @@ import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
 import { create } from "@bufbuild/protobuf";
 import { OperationMutationSchema } from "@joko/contracts";
 import { RemoteDesktopSystemActionKind, type RemoteDesktopSystemAction } from "@joko/contracts";
+import { CollaborationService } from "@joko/contracts";
+import { ObjectiveService } from "@joko/contracts";
+import { createMobileObjectiveRpc, type MobileObjectiveRpc } from "./mobile-objective";
+import { createMobileCollaborationRpc, type MobileCollaborationRpc } from "./mobile-collaboration";
+import type { CollaborationSettings } from "@joko/contracts";
+import { mobileTaskHeaderRole, type MobileTaskHeaderRole } from "./mobile-task-header-role";
 import { protoMobilePartnerAvatar, type MobilePartnerAvatarIdentity } from "./mobile-partner-avatar";
 import { MobilePartnerCreationRejected, projectMobilePartnerCreationOptions, projectMobilePartnerCreationResult,
   type MobilePartnerCreationOptions, type MobilePartnerCreationDraft, type MobilePartnerCreationResult } from "./mobile-partner-creation";
@@ -179,6 +185,12 @@ export interface MobilePushCapabilityResult {
 }
 
 export interface MobileNetwork {
+  objectiveRpc?(credential: PairedCredential, sessionId: string, generation: bigint,
+    assertCurrent: (signal: AbortSignal) => void): MobileObjectiveRpc;
+  getServiceOperation?(credential: PairedCredential, operationId: string, signal?: AbortSignal): Promise<Operation | undefined>;
+  collaborationRpc?(credential: PairedCredential, sessionId: string, generation: bigint,
+    assertCurrent: (signal: AbortSignal) => void): MobileCollaborationRpc;
+  getCollaborationSettings?(credential: PairedCredential, signal?: AbortSignal): Promise<CollaborationSettings>;
   inspect(origin: string, signal?: AbortSignal): Promise<NodeIdentity>;
   discover(origin: string, signal?: AbortSignal): Promise<readonly DiscoveredNodeRecord[]>;
   requestPairing(origin: string, deviceName: string, platform: string, deviceNameSource: DeviceNameSource, signal?: AbortSignal): Promise<{ identity: NodeIdentity; challengeId: string }>;
@@ -419,6 +431,7 @@ export interface MobileNetwork {
   readSession(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<Snapshot>;
   readNativeSessionTree(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<NativeSessionTree>;
   previewTaskTagDeletion(credential: PairedCredential, taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreview>;
+  readTaskHeaderRole(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<MobileTaskHeaderRole>;
   listBackgroundTasks(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ tasks: readonly BackgroundTask[]; nextPageToken: string }>;
   listSubagentRuns(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ runs: readonly SubagentRun[]; nextPageToken: string }>;
   getSubagentRun(credential: PairedCredential, sessionId: string, runId: string, signal?: AbortSignal): Promise<SubagentRunDetail>;
@@ -1753,6 +1766,41 @@ export const mobileNetwork: MobileNetwork = {
     return createPartnerMemoryApi({ rpc: createClient(PartnerService, transport(credential.origin, credential.authKey)),
       partnerId, ownerKey, assertCurrent });
   },
+  objectiveRpc(credential, sessionId, generation, assertCurrent) {
+    return createMobileObjectiveRpc(createClient(ObjectiveService, transport(credential.origin, credential.authKey)),
+      sessionId, generation, assertCurrent);
+  },
+  collaborationRpc(credential, sessionId, generation, assertCurrent) {
+    return createMobileCollaborationRpc(createClient(CollaborationService, transport(credential.origin, credential.authKey)),
+      sessionId, generation, assertCurrent);
+  },
+  async getCollaborationSettings(credential, signal) {
+    const value = (await createClient(SettingsService, transport(credential.origin, credential.authKey)).getSettings({}, options(signal))).settings?.collaboration;
+    signal?.throwIfAborted();
+    if (!value || !value.version?.revision || value.version.revision.value < 1n || !Number.isInteger(value.workerSoftLimit)
+      || !Number.isInteger(value.workerHardLimit) || value.workerSoftLimit < 1 || value.workerHardLimit < value.workerSoftLimit
+      || value.workerHardLimit > 128 || !Number.isInteger(value.workerIdleReleaseMinutes) || value.workerIdleReleaseMinutes < 1) {
+      throw new Error("The collaboration capacity settings are unavailable.");
+    }
+    return value;
+  },
+  async getServiceOperation(credential, operationId, signal) {
+    signal?.throwIfAborted();
+    let response;
+    try {
+      response = await createClient(OperationService, transport(credential.origin, credential.authKey)).getOperation({ operationId }, options(signal));
+    } catch (error) {
+      if (error instanceof ConnectError && error.code === Code.NotFound) return undefined;
+      throw error;
+    }
+    signal?.throwIfAborted();
+    const operation = response.operation;
+    // Service managers record requests on the authenticated node without a client connection field.
+    if (operation && (operation.operationId !== operationId || operation.connectionId !== "" && operation.connectionId !== credential.connectionId)) {
+      throw new Error("The service operation belongs to another owner.");
+    }
+    return operation;
+  },
   partnerConnectionsApi(credential, partnerId, ownerKey, assertCurrent) {
     return createPartnerConnectionsApi({ rpc: createClient(PartnerService, transport(credential.origin, credential.authKey)),
       partnerId, ownerKey, assertCurrent });
@@ -2424,6 +2472,14 @@ export const mobileNetwork: MobileNetwork = {
       throw new Error("The Joko node returned a mismatched task-tag delete preview.");
     }
     return response.preview;
+  },
+  async readTaskHeaderRole(credential, sessionId, signal) {
+    signal?.throwIfAborted();
+    if (!sessionId) throw new Error("A current task is required for its header.");
+    const response = await createClient(CollaborationService, transport(credential.origin, credential.authKey))
+      .listCollaborationGoals({ sessionId, includeArchived: true }, options(signal));
+    signal?.throwIfAborted();
+    return mobileTaskHeaderRole(sessionId, response.access);
   },
   async listBackgroundTasks(credential, sessionId, pageToken = "", signal) {
     signal?.throwIfAborted();

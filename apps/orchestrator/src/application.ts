@@ -210,6 +210,7 @@ import { SkillMarketManager } from "./skill-market-manager.js";
 import { SkillMarketSyncManager } from "./skill-market-sync-manager.js";
 import { SkillMutationCoordinator } from "./skill-mutation-coordinator.js";
 import { PartnerSkillsManager, PartnerSkillsToolProvider } from "./partner-skills.js";
+import { PartnerLearningManager } from "./partner-learning.js";
 import { PartnerCapabilityTools } from "./partner-capability-tools.js";
 import { PartnerProfileTools } from "./partner-profile-tools.js";
 import { AppDefaultModelCoordinator } from "./app-default-model.js";
@@ -921,11 +922,13 @@ export async function createOrchestratorApplication(
   const partnerConnectionPreferences = new PartnerConnectionPreferences(store);
   let partnerConnections: PartnerConnectionsManager | undefined;
   let partnerSkills: PartnerSkillsManager | undefined;
+  let partnerLearning: PartnerLearningManager | undefined;
   const mcpRouter = new McpRouter({
     store,
     credentials,
     targetReferences: (targetId, sessionId) => partnerConnections?.targetReferences(sessionId === undefined ? targetId : partnerGroupRuntime?.homeTarget(sessionId, targetId) ?? targetId),
     isGroupSession: sessionId => partnerStore.getSessionLink(sessionId)?.role === "group",
+    capturePartnerLearningSave: source => partnerLearning?.captureSave(source),
     resultArtifacts: artifacts,
     nativeAuth: {
       describe: (providerId) => providers.describeNativeAuthLease(providerId),
@@ -989,7 +992,13 @@ export async function createOrchestratorApplication(
     new SessionHelperToolBridgeProvider({
       store,
       host: () => sessionHostForHelperTools,
-      messageSearch: () => messageSearchForHelperTools
+      messageSearch: () => messageSearchForHelperTools,
+      taskSenderPartner: sessionId => {
+        const link = partnerStore.getSessionLink(sessionId);
+        if (link?.role !== "canonical") return undefined;
+        const partner = partnerStore.getPartner(link.partnerId);
+        return { senderPartnerId: partner.id, senderPartnerName: partner.displayName };
+      }
     })
   );
   const unregisterContactTools = mcpRouter.registerBridgeToolProvider(
@@ -1647,6 +1656,13 @@ export async function createOrchestratorApplication(
   let managedModelRuntimeForSession: ManagedModelRuntimeSystem | undefined;
   let modelWorkingContext: ModelWorkingContextCoordinator | undefined;
   const sessionHost = startupSessionHost = new SessionHost(store, artifacts, initialAdapters, {
+    partnerLearning: {
+      captureSource: source => partnerLearning?.captureSource(source) ?? false,
+      accepted: occurrenceId => partnerLearning?.accepted(occurrenceId),
+      sealed: (occurrenceId, completionEventId) => partnerLearning?.sealed(occurrenceId, completionEventId),
+      settled: (occurrenceId, completionEventId, outcome) => partnerLearning?.settled(occurrenceId, completionEventId, outcome)
+    },
+    registerPartnerLearningToolAuthority: authority => mcpRouter.registerPartnerLearningToolAuthority(authority),
     resolveModelWorkingContext: target => modelWorkingContext?.resolve(target),
     prepareManagedProviderRuntime: async context => { await managedModelRuntimeForSession?.prepareProviderRuntime(context); },
     backendDescriptors: backendInstances.descriptors(),
@@ -2120,6 +2136,8 @@ export async function createOrchestratorApplication(
     (sessionId, targetId) => partnerGroupRuntime?.homeTarget(sessionId, targetId));
   partnerSkills = new PartnerSkillsManager(partners, partnerStore, store, piResources, skillMutations,
     sessionId => sessionHost.requestServiceRuntimeRefresh(sessionId), (sessionId, targetId) => partnerGroupRuntime?.homeTarget(sessionId, targetId));
+  partnerLearning = new PartnerLearningManager({ store, profiles: partnerStore, partners, memory: makerMemory,
+    skills: partnerSkills, auxiliary: auxiliaryText });
   const unregisterPartnerSkillTools = mcpRouter.registerBridgeToolProvider(new PartnerSkillsToolProvider(partnerSkills));
   const unregisterPartnerCapabilityTools = mcpRouter.registerBridgeToolProvider(new PartnerCapabilityTools(partnerConnections,
     sessionId => sessionHost.requestServiceRuntimeRefresh(sessionId)));
@@ -2762,6 +2780,8 @@ export async function createOrchestratorApplication(
     await attempt(() => unregisterSchedulerBridgeTools());
     await attempt(() => unregisterVisionBridgeTools());
     await attempt(() => unregisterMakerMemoryBridge());
+    partnerLearning.dispose();
+    await attempt(() => partnerLearning?.drain());
     makerMemory.dispose();
     await attempt(() => { if (maintenanceTimer !== undefined) clearInterval(maintenanceTimer); });
     await attempt(() => maintenanceTail);
@@ -2958,6 +2978,8 @@ export async function createOrchestratorApplication(
         await attempt(() => partnerWorkingStatus.dispose());
         await attempt(() => partnerGroups?.close());
         await attempt(() => partnerGroupWorkspaces?.dispose());
+        partnerLearning?.dispose();
+        await attempt(() => partnerLearning?.drain());
         await attempt(() => auxiliaryText.dispose());
         await attempt(() => providerAuth.beginShutdown());
         await attempt(() => providerAccountUsage.invalidate());
@@ -3041,6 +3063,8 @@ export async function createOrchestratorApplication(
     await attempt(() => partnerGroups?.close());
     await attempt(() => partnerGroupWorkspaces?.dispose());
     await attempt(() => startupPartnerImportRuntime?.close());
+    partnerLearning?.dispose();
+    await attempt(() => partnerLearning?.drain());
     await attempt(() => deferredBackendRestarts?.dispose());
     await attempt(() => commandConcurrencyGate.close());
     await attempt(() => stopExtensionLibraryAuthorityNotifications());

@@ -2,6 +2,11 @@ import type { Locale } from "./model.js";
 import { presentJokoServiceTerminology } from "./i18n/service-terminology.js";
 
 const en = {
+  "settings.search.label": "Search settings",
+  "settings.search.placeholder": "Search settings…",
+  "settings.search.clear": "Clear settings search",
+  "settings.search.results": "Matching settings",
+  "settings.search.empty": "No matching settings.",
   "partners.source.title": "Partners on {name}",
   "partners.source.current": "Current node",
   "partners.source.loading": "Connecting",
@@ -5962,6 +5967,11 @@ export type MessageKey = keyof typeof en;
 export const messageKeys: readonly MessageKey[] = Object.freeze(Object.keys(en) as MessageKey[]);
 
 const zhBase: Record<MessageKey, string> = {
+  "settings.search.label": "搜索设置",
+  "settings.search.placeholder": "搜索设置…",
+  "settings.search.clear": "清除设置搜索",
+  "settings.search.results": "匹配的设置",
+  "settings.search.empty": "没有匹配的设置。",
   "partners.source.title": "{name} 的伙伴",
   "partners.source.current": "当前节点",
   "partners.source.loading": "正在连接",

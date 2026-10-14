@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import {
   ObjectiveStatus,
+  OperationState,
   QueueDispatchState,
   QueueItemState,
   RunState,
@@ -49,8 +50,9 @@ describe("Objective HTTP/SQLite product chain", () => {
       )
     );
     const generation = fixture.application.store.getSession(sessionId).descriptor.binding.generation;
+    const objectiveRequestId = randomUUID();
     const set = await paired.clients.objective.setObjective({
-      requestId: randomUUID(),
+      requestId: objectiveRequestId,
       sessionId,
       text: "Finish the durable two-turn objective.",
       limits: { maximumTurns: 4, noProgressTurnLimit: 3 },
@@ -72,6 +74,8 @@ describe("Objective HTTP/SQLite product chain", () => {
       createAdapter: (profile) => new HeldObjectiveAdapter(profile)
     });
     const restarted = fixture.clients(paired.authKey);
+    const receipt = await restarted.operation.getOperation({ operationId: objectiveRequestId });
+    expect(receipt.operation).toMatchObject({ operationId: objectiveRequestId, state: OperationState.SUCCEEDED });
     const recovered = await restarted.objective.getObjective({ sessionId });
     expect(recovered.objective).toMatchObject({
       status: ObjectiveStatus.ACTIVE,

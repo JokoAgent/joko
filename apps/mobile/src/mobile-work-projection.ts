@@ -24,6 +24,7 @@ export interface MobileWorkCandidate {
   /** Completed prose is delivered after its work; canonical message cursor stays unchanged. */
   readonly answerSequence?: bigint;
   readonly planSequence?: bigint;
+  readonly collaboration?: { readonly variant: "dispatch" | "report" };
 }
 
 export interface MobileWorkGroup<T extends MobileWorkCandidate> extends MobileWorkCandidate {
@@ -63,7 +64,7 @@ export function mobileWorkItems<T extends MobileWorkCandidate>(rows: readonly T[
   }
   if (current.length) segments.push(current);
   return segments.flatMap((segment, index) => groupMobileWorkRuns<MobileWorkItem<T>, T>(segment, sessionStreaming && index === segments.length - 1, {
-    isUserBoundary: (row) => row.kind === "user",
+    isUserBoundary: (row) => row.kind === "user" && row.collaboration?.variant !== "report",
     isAnswer: (row) => row.kind === "assistant" && !row.workActivity && row.text.trim() !== "" && row.text !== "…",
     isSealedAnswer: (row) => row.kind !== "work" && row.turnFinal === true,
     isCompactBoundary: (row) => row.kind !== "work" && row.compactBoundary === true,

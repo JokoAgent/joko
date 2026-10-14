@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { EventCursorSchema, EventIdentitySchema, EventSchema, MessageRole, QueueItemState, RunState, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
+import { EventCursorSchema, EventIdentitySchema, EventSchema, InputContentSchema, MessageRole, ObjectiveLifecycleAction, ObjectiveStatus, QueueItemState, RunState, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { timelineRows } from "./timeline";
 import { isWorkGroup, mobileWorkItems } from "./mobile-work-projection";
@@ -18,7 +18,70 @@ function completed(blocks: any[], role = MessageRole.ASSISTANT) {
   });
 }
 
+it("shows typed objective completion while keeping the internal verdict out of visible and quoted assistant text", () => {
+  const completion = completed([{ content: { case: "text", value: 'Done.\n```json\n{"goal_status":"complete"}\n```' } }]);
+  const lifecycle = create(EventSchema, { eventId: "objective-complete", identity: { sessionId: "session" }, cursor: { generation: 1n, sequence: 2n },
+    payload: { kind: { case: "objectiveLifecycle", value: { action: ObjectiveLifecycleAction.COMPLETED, status: ObjectiveStatus.COMPLETE,
+      ownerGeneration: 2n, turnsUsed: 4, tokensUsed: 123_000n } } } });
+  const rows = timelineRows([completion, lifecycle]);
+  expect(rows[0]).toMatchObject({ text: "Done.", quoteSource: { text: "Done." } });
+  expect(rows[1]).toMatchObject({ objectiveLifecycle: { status: "complete", turns: 4, tokens: 123_000 } });
+  expect(completion.payload?.kind.case === "messageCompleted" && completion.payload.kind.value.blocks[0]?.content.value).toContain("goal_status");
+  const payload = lifecycle.payload!.kind;
+  if (payload.case === "objectiveLifecycle") payload.value.status = ObjectiveStatus.ACTIVE;
+  expect(timelineRows([lifecycle])).toEqual([]);
+});
+
 describe("mobile Timeline metadata events", () => {
+  it("retains typed task senders without changing literal user text or inferring provenance from JSON", () => {
+    const taskMessageOrigin = { senderSessionId: "source", senderSessionTitle: "Source title", senderPartnerId: "partner", senderPartnerName: "Partner name" };
+    const event = create(EventSchema, { eventId: "handoff", identity: { sessionId: "recipient" }, cursor: { generation: 1n, sequence: 5n },
+      payload: { kind: { case: "messageStarted", value: { messageId: "input", role: MessageRole.USER, userInputAccepted: true, taskMessageOrigin,
+        userInput: { parts: [{ content: { case: "text", value: JSON.stringify(taskMessageOrigin) } }] } } } } });
+    expect(timelineRows([event])).toMatchObject([{ text: JSON.stringify(taskMessageOrigin), sequence: 5n, eventId: "handoff", taskMessageOrigin }]);
+    if (event.payload?.kind.case === "messageStarted") {
+      event.payload.kind.value.userInputAccepted = false; expect(timelineRows([event])[0]?.taskMessageOrigin).toBeUndefined();
+      event.payload.kind.value.userInputAccepted = true; event.payload.kind.value.taskMessageOrigin = undefined;
+      expect(timelineRows([event])[0]?.taskMessageOrigin).toBeUndefined();
+    }
+  });
+  it("keeps progressive collaboration dispatches visible with their original cursor and failure state", () => {
+    const event = (sequence: bigint, done = false) => create(EventSchema, { eventId: `dispatch-${sequence}`, identity: { sessionId: "lead", runId: "run", generation: 1n },
+      cursor: { generation: 1n, sequence }, payload: { kind: { case: done ? "toolCallCompleted" : "toolCallStarted", value: { toolCall: {
+        toolCallId: "dispatch", toolId: "mcp__joko_collaboration__call_tool", sessionId: "lead", runId: "run", state: done ? ToolCallState.FAILED : ToolCallState.RUNNING,
+        arguments: done ? [] : [{ fieldPath: "$", value: { case: "text", value: JSON.stringify({ name: "create_workers", args: { workers: [
+          { label: "Developer", assignment: "Implement the feature" }, { label: "Reviewer", assignment: "Verify the evidence" }
+        ] } }) } }], result: done ? { parts: [{ content: { case: "text", value: "Worker capacity reached" } }] } : undefined
+      } } } } });
+    const rows = timelineRows([event(1n), event(3n, true)]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ sequence: 1n, eventId: "dispatch-3", persistentTask: true,
+      collaboration: { variant: "dispatch", action: "batch", count: 2, state: "failed", body: "Developer: Implement the feature\nReviewer: Verify the evidence", error: "Worker capacity reached" } });
+    expect(isWorkGroup(mobileWorkItems(rows, false)[0]!)).toBe(false);
+    const redacted = event(1n); if (redacted.payload?.kind.case === "toolCallStarted") redacted.payload.kind.value.toolCall!.arguments[0]!.redacted = true;
+    expect(timelineRows([redacted])[0]?.collaboration).toBeUndefined();
+    const unrelated = event(1n); if (unrelated.payload?.kind.case === "toolCallStarted") unrelated.payload.kind.value.toolCall!.toolId = "mcp__other__call_tool";
+    expect(timelineRows([unrelated])[0]?.collaboration).toBeUndefined();
+    for (const name of ["mcp__joko_032ff7b36750c3f6aec4706f__call_tool", "joko_joko_collaboration_0123456789ab/call_tool"]) {
+      const routed = event(1n); if (routed.payload?.kind.case === "toolCallStarted") routed.payload.kind.value.toolCall!.toolId = name;
+      expect(timelineRows([routed])[0]?.collaboration).toMatchObject({ action: "batch", count: 2 });
+    }
+  });
+  it("presents only typed accepted worker reports and leaves user JSON and foreign provenance as ordinary input", () => {
+    const origin = { goalId: "goal", workerId: "worker", leadSessionId: "lead", workerSessionId: "worker-task", workerLabel: "Reviewer", body: "Done\nEvidence" };
+    const event = create(EventSchema, { eventId: "report", identity: { sessionId: "lead" }, cursor: { generation: 1n, sequence: 4n },
+      payload: { kind: { case: "messageStarted", value: { messageId: "report-message", role: MessageRole.USER, userInputAccepted: true,
+        userInput: { parts: [{ content: { case: "text", value: "[From Reviewer]\nDone\nEvidence" } }] }, collaborationReportOrigin: origin } } } });
+    expect(timelineRows([event])).toMatchObject([{ text: origin.body, kind: "user", sequence: 4n, eventId: "report", collaboration: { variant: "report", origin } }]);
+    if (event.payload?.kind.case === "messageStarted") {
+      event.payload.kind.value.userInputAccepted = false; expect(timelineRows([event])[0]?.collaboration).toBeUndefined();
+      event.payload.kind.value.userInputAccepted = true; event.payload.kind.value.collaborationReportOrigin!.leadSessionId = "other";
+      expect(timelineRows([event])[0]?.collaboration).toBeUndefined();
+      event.payload.kind.value.collaborationReportOrigin = undefined;
+      event.payload.kind.value.userInput = create(InputContentSchema, { parts: [{ content: { case: "text", value: JSON.stringify(origin) } }] });
+      expect(timelineRows([event])[0]?.collaboration).toBeUndefined();
+    }
+  });
   function metadataEvents() {
     return [
       create(EventSchema, { eventId: "session-metadata", identity: { sessionId: "session-one" },

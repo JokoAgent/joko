@@ -9,7 +9,7 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import type { Transport, FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { PiMcpBridgeOptions, PiMcpToolDescriptor } from "@joko/adapter-pi";
 import { validateMcpEndpoint } from "@joko/adapter-pi";
-import { redactSecrets, type BlobRef, type PolicySubjectKind } from "@joko/core";
+import { redactSecrets, type BlobRef, type PolicySubjectKind, type PartnerLearningReceipt, type PartnerLearningTurnSource, type PartnerLearningToolAuthority } from "@joko/core";
 import { operationBodyHash, type OperationalStore } from "@joko/store";
 
 import type { CredentialManager } from "./credential-manager.js";
@@ -254,6 +254,11 @@ export interface BridgeToolCallContext {
   /** Digest binding the request identity to its canonical authenticated body. */
   readonly effectIdentity?: string;
   readonly requestBodyHash?: string;
+  readonly partnerLearningSave?: PartnerLearningSaveCapture;
+}
+
+export interface PartnerLearningSaveCapture {
+  recordSaved(store: OperationalStore, receipt: PartnerLearningReceipt): void;
 }
 
 interface StoredMcpServer {
@@ -397,6 +402,7 @@ export interface McpRouterOptions {
     readonly toolsetIds?: ReadonlySet<string>;
   } | undefined;
   readonly isGroupSession?: (sessionId: string) => boolean;
+  readonly capturePartnerLearningSave?: (source: PartnerLearningTurnSource) => PartnerLearningSaveCapture | undefined;
 }
 
 /**
@@ -532,6 +538,13 @@ export class McpRouter {
   readonly #bridgeToolProviders = new Map<string, BridgeToolProvider>();
   readonly #targetReferences: McpRouterOptions["targetReferences"];
   readonly #isGroupSession: McpRouterOptions["isGroupSession"];
+  readonly #capturePartnerLearningSave: McpRouterOptions["capturePartnerLearningSave"];
+  readonly #partnerLearningAuthorities = new Map<string, {
+    readonly authority: PartnerLearningToolAuthority;
+    readonly expiresAt: number;
+    bodyHash?: string;
+    claimed?: boolean;
+  }>();
   #lastGeneration = 0;
   #initialized = false;
   #tail: Promise<void> = Promise.resolve();
@@ -539,6 +552,7 @@ export class McpRouter {
   constructor(options: McpRouterOptions) {
     this.#targetReferences = options.targetReferences;
     this.#isGroupSession = options.isGroupSession;
+    this.#capturePartnerLearningSave = options.capturePartnerLearningSave;
     this.#store = options.store;
     this.#credentials = options.credentials;
     this.#resultArtifacts = options.resultArtifacts;
@@ -987,6 +1001,19 @@ export class McpRouter {
   }
 
   /** Adapter-facing authenticated bridge executor; suitable for a loopback POST handler. */
+  /** In-process registration only. The native bridge receives this opaque
+   * proof, never the Host's Run/Attempt source object. */
+  registerPartnerLearningToolAuthority(authority: PartnerLearningToolAuthority): string {
+    authority.assertCurrent();
+    for (const [proof, saved] of this.#partnerLearningAuthorities) {
+      if (saved.claimed === true || saved.expiresAt <= this.#now()) this.#partnerLearningAuthorities.delete(proof);
+    }
+    if (this.#partnerLearningAuthorities.size >= 4_096) throw new Error("Too many pending original-turn tool authorities.");
+    const proof = randomBytes(32).toString("base64url");
+    this.#partnerLearningAuthorities.set(proof, { authority, expiresAt: this.#now() + 30 * 60_000 });
+    return proof;
+  }
+
   async executeBridgeCall(input: {
     readonly authorization: string | undefined;
     readonly requestId: string;
@@ -997,6 +1024,8 @@ export class McpRouter {
     readonly toolName: string;
     readonly arguments?: Readonly<Record<string, unknown>>;
     readonly signal?: AbortSignal;
+    readonly partnerLearningAuthority?: PartnerLearningToolAuthority;
+    readonly partnerLearningProof?: string;
   }): Promise<McpBridgeCallResult> {
     this.#assertInitialized();
     const token = bearerToken(input.authorization);
@@ -1040,6 +1069,25 @@ export class McpRouter {
       });
       const requestIdentity = bridgeRequestIdentity(grant.authorityDigest, input.requestId);
       const effectIdentity = bridgeEffectIdentity(requestIdentity, requestBodyHash);
+      const learningProof = input.partnerLearningAuthority?.proof ?? input.partnerLearningProof;
+      let partnerLearningSave: PartnerLearningSaveCapture | undefined;
+      if (learningProof !== undefined) {
+        const captured = this.#partnerLearningAuthorities.get(learningProof);
+        if (captured === undefined || captured.expiresAt <= this.#now()) throw new Error("The original native tool authority is retired.");
+        const authority = captured.authority;
+        if (authority.source.sessionId !== input.sessionId || authority.source.targetId !== input.targetId
+          || authority.source.bindingGeneration !== input.generation || authority.requestId !== input.requestId
+          || authority.serverId !== input.serverId || authority.toolName !== input.toolName
+          || input.partnerLearningAuthority !== undefined && input.partnerLearningAuthority.source !== authority.source
+          || captured.bodyHash !== undefined && captured.bodyHash !== requestBodyHash) {
+          throw new Error("The original native tool authority does not own this request.");
+        }
+        if (captured.claimed === true) throw new Error("The original native tool request has already been claimed.");
+        authority.assertCurrent();
+        captured.bodyHash ??= requestBodyHash;
+        captured.claimed = true;
+        partnerLearningSave = this.#capturePartnerLearningSave?.(authority.source);
+      }
       let result: McpCallResult;
       let hostImages: readonly BridgeToolImageOutput[] = [];
       let hostArtifacts: readonly BridgeToolArtifactOutput[] = [];
@@ -1115,7 +1163,8 @@ export class McpRouter {
               providerGeneration: serverGeneration,
               requestIdentity,
               effectIdentity,
-              requestBodyHash
+              requestBodyHash,
+              ...(partnerLearningSave === undefined ? {} : { partnerLearningSave })
             }
           );
         guard();
@@ -1161,6 +1210,7 @@ export class McpRouter {
   }
 
   async dispose(): Promise<void> {
+    this.#partnerLearningAuthorities.clear();
     this.#grants.clear();
     this.#detachedNativeAuthLeases.clear();
     this.#recoveryNativeAuthLeases.clear();

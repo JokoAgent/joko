@@ -12,7 +12,22 @@ import { fromProtoRevision, toProtoRevision } from "./proto-mapper.js";
 import { type PiResourceDescriptor, type PiResourceManager, type PreparedPiResourceMutation } from "./resource-manager.js";
 import { readSkillFile, renderSkillFile, type SkillFileMetadata } from "./skill-file.js";
 import { SkillMutationCoordinator, skillInstallSlotMutationKey, skillResourceMutationKey } from "./skill-mutation-coordinator.js";
-import type { BridgeToolCallContext, BridgeToolProvider, McpToolDescriptor } from "./mcp-router.js";
+import type { BridgeToolCallContext, BridgeToolProvider, McpToolDescriptor, PartnerLearningSaveCapture } from "./mcp-router.js";
+
+export interface PartnerLearningSkillRecord {
+  readonly id: string;
+  readonly slug: string;
+  readonly title: string;
+  readonly description: string;
+  readonly enabled: boolean;
+  readonly revision: bigint;
+  readonly contentRevision: string;
+}
+export interface PartnerLearningSkillBody extends PartnerLearningSkillRecord { readonly body: string; }
+export interface PartnerLearningSkillSnapshot {
+  readonly catalog: readonly PartnerLearningSkillRecord[];
+  readonly bodies: readonly PartnerLearningSkillBody[];
+}
 
 type PersonalSkill = ReturnType<PiResourceManager["listPartnerSkills"]>[number];
 const fail = (message: string, code = Code.FailedPrecondition): never => { throw new ConnectError(message, code); };
@@ -140,14 +155,45 @@ export class PartnerSkillsManager {
     const file = await this.#file(item, signal); scope.assertCurrent();
     return { owner: scope.owner, skill: detail(item, file, scope.owner.readOnly) };
   }
+  async readLearningSnapshot(partnerId: string, signal: AbortSignal, assertCaller: () => void): Promise<PartnerLearningSkillSnapshot | undefined> {
+    const scope = this.#capture(partnerId, undefined, false, signal, assertCaller);
+    const catalog: PartnerLearningSkillRecord[] = [], bodies: PartnerLearningSkillBody[] = [];
+    let indexChars = 2, bodyChars = 24_000, enabledCount = 0;
+    for (const item of this.resources.listPartnerSkills(partnerId, scope.owner.homeTargetId)) {
+      const file = await this.#file(item, signal); scope.assertCurrent();
+      const index = { slug: item.slug, title: file.name, description: file.description, enabled: item.resource.enabled };
+      indexChars += JSON.stringify(index).length + 1;
+      if (indexChars > 24_000) return undefined;
+      const record: PartnerLearningSkillRecord = { ...index, id: item.resource.id, revision: item.resource.versionNumber,
+        contentRevision: item.resource.discoveredRevision };
+      catalog.push(record);
+      if (!record.enabled || ++enabledCount > 40 || file.body.length > 12_000) continue;
+      const size = JSON.stringify({ ...index, body: file.body }).length;
+      if (size > bodyChars) continue;
+      bodies.push({ ...record, body: file.body }); bodyChars -= size;
+    }
+    scope.assertCurrent(); return { catalog, bodies };
+  }
+  async saveLearningProposal(partnerId: string, input: { readonly slug: string; readonly title: string;
+    readonly description: string; readonly body: string; readonly expectedPartnerRevision: bigint;
+    readonly prior?: PartnerLearningSkillRecord }, signal: AbortSignal, assertCaller: () => void, learningSave: PartnerLearningSaveCapture) {
+    if (slugOf(input.title, input.slug) !== input.slug) return fail("Skill identity is invalid.", Code.InvalidArgument);
+    return this.#write(partnerId, { slug: input.slug, name: input.title, description: input.description, body: input.body,
+      expectedPartnerRevision: input.expectedPartnerRevision, expectAbsent: input.prior === undefined, requireEnabled: true,
+      deferRefresh: true,
+      ...(input.prior === undefined ? {} : { id: input.prior.id, expectedRevision: input.prior.revision,
+        expectedContentRevision: input.prior.contentRevision }) }, signal, assertCaller, learningSave);
+  }
   async #write(partnerId: string, input: { readonly id?: string; readonly slug: string; readonly name: string; readonly description: string;
-    readonly body: string; readonly expectedPartnerRevision?: bigint; readonly expectedRevision?: bigint; readonly expectedContentRevision?: string },
-    signal?: AbortSignal, assertCaller?: () => void) {
+    readonly body: string; readonly expectedPartnerRevision?: bigint; readonly expectedRevision?: bigint; readonly expectedContentRevision?: string;
+    readonly expectAbsent?: boolean; readonly requireEnabled?: boolean; readonly deferRefresh?: boolean },
+    signal?: AbortSignal, assertCaller?: () => void, learningSave?: PartnerLearningSaveCapture) {
     const scope = this.#capture(partnerId, input.expectedPartnerRevision, true, signal, assertCaller);
     const name = field(input.name, 64), description = field(input.description, 280), body = field(input.body, 65_536);
     if (Buffer.byteLength(body) > 65_536) return fail("Skill body exceeds 64 KiB.", Code.InvalidArgument);
     const item = input.id ? this.#item(scope.owner, input.id)
       : this.resources.listPartnerSkills(partnerId, scope.owner.homeTargetId).find(entry => entry.slug === input.slug);
+    if (item && input.expectAbsent || item && input.requireEnabled && !item.resource.enabled) return fail("Skill changed. Refresh before saving.", Code.Aborted);
     if (item && (input.expectedRevision !== undefined && item.resource.versionNumber !== input.expectedRevision
       || input.expectedContentRevision !== undefined && item.resource.discoveredRevision !== input.expectedContentRevision)) return fail("Skill changed. Refresh before saving.", Code.Aborted);
     const backendId = this.store.getTarget(scope.owner.homeTargetId).descriptor.backendId;
@@ -175,11 +221,16 @@ export class PartnerSkillsManager {
         : await this.resources.preparePartnerSkill({ partnerId, backendId, targetId: scope.owner.homeTargetId,
           slug: input.slug, candidateRoot: draft, changedByConnectionId });
       scope.assertCurrent(); mutationLease.assertActive();
-      await this.resources.completePreparedMutation(prepared, finalize => this.store.transaction(store => { scope.assertCurrent(); finalize(store); }));
+      await this.resources.completePreparedMutation(prepared, finalize => this.store.transaction(store => {
+        scope.assertCurrent(); finalize(store);
+        const saved = this.resources.listPartnerSkills(partnerId, scope.owner.homeTargetId).find(entry => entry.slug === entryName)!;
+        learningSave?.recordSaved(store, { kind: "skill", entryId: saved.resource.id, title: name,
+          action: item === undefined ? "created" : "updated" });
+      }));
       prepared = undefined; scope.assertCurrent();
       const saved = this.resources.listPartnerSkills(partnerId, scope.owner.homeTargetId).find(entry => entry.slug === entryName)!;
       return { owner: scope.owner, skill: detail(saved, readSkillFile(renderSkillFile({ slug: entryName, name, description, updatedAt, body }), entryName), scope.owner.readOnly),
-        created: item === undefined, effective: this.requestRefresh?.(scope.owner.canonicalSessionId) ? "next-turn" as const : "next-session" as const };
+        created: item === undefined, effective: !input.deferRefresh && this.requestRefresh?.(scope.owner.canonicalSessionId) ? "next-turn" as const : "next-session" as const };
     } finally {
       try { if (prepared) await this.resources.discardPreparedMutation(prepared); }
       finally { await rm(draft, { recursive: true, force: true }); mutationLease.release(); }
@@ -234,9 +285,10 @@ export class PartnerSkillsManager {
     assertCurrent(); return { partnerId: profile.id, assertCurrent };
   }
   async saveForCaller(context: BridgeToolCallContext, input: Readonly<Record<string, unknown>>, signal?: AbortSignal) {
+    const learningSave = context.partnerLearningSave;
     const caller = this.caller(context, signal), name = field(input["name"], 64);
     return this.#write(caller.partnerId, { slug: slugOf(name, input["slug"]), name,
-      description: field(input["description"], 280), body: field(input["body"], 65_536) }, signal, caller.assertCurrent);
+      description: field(input["description"], 280), body: field(input["body"], 65_536) }, signal, caller.assertCurrent, learningSave);
   }
   runtimeIdentity(session: SessionDescriptor): string | undefined {
     const link = this.profiles.getSessionLink(session.id); if (!link) return undefined;

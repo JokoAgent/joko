@@ -263,16 +263,21 @@ export class MakerMemoryController {
     readonly description: string;
     readonly body: string;
     readonly mode?: "create" | "update" | "append";
-  }): MakerMemoryEntry {
+  }, onSaved?: (store: OperationalStore, entry: MakerMemoryEntry, created: boolean) => void): MakerMemoryEntry {
     if (!this.settings().makerEnabled) throw new Error("Maker Memory is disabled.");
-    return this.#store.putMakerMemoryEntry({
-      targetId,
-      kind: input.kind,
-      slug: input.name,
-      title: input.title,
-      description: input.description,
-      body: input.body,
-      ...(input.mode === undefined ? {} : { mode: input.mode })
+    return this.#store.transaction(store => {
+      const prior = store.findMakerMemoryEntry(targetId, input.kind, input.name);
+      const entry = store.putMakerMemoryEntry({
+        targetId,
+        kind: input.kind,
+        slug: input.name,
+        title: input.title,
+        description: input.description,
+        body: input.body,
+        ...(input.mode === undefined ? {} : { mode: input.mode })
+      });
+      onSaved?.(store, entry, prior === undefined);
+      return entry;
     });
   }
 
@@ -336,6 +341,7 @@ export class MakerMemoryBridgeProvider implements BridgeToolProvider {
         return privateResult({ hits: this.#memory.search(targetId, requiredString(input, "query", 256), kind) });
       }
       case "memory_write": {
+        const learningSave = context.partnerLearningSave;
         const kind = memoryKind(input["type"], false);
         const entry = this.#memory.write(targetId, {
           kind,
@@ -344,7 +350,8 @@ export class MakerMemoryBridgeProvider implements BridgeToolProvider {
           description: requiredString(input, "description", 200),
           body: requiredString(input, "body", 8_192),
           ...(input["mode"] === undefined ? {} : { mode: writeMode(input["mode"]) })
-        });
+        }, learningSave === undefined ? undefined : (store, saved, created) => learningSave.recordSaved(store,
+          { kind: "memory", entryId: saved.id, title: saved.title, action: created ? "created" : "updated" }));
         return privateResult({ entry: publicEntry(entry) });
       }
       case "memory_delete":

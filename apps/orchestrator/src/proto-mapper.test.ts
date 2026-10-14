@@ -41,6 +41,36 @@ import {
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it("round-trips typed task senders while rejecting unaccepted or incomplete provenance", () => {
+    const taskMessageOrigin = { senderSessionId: "source", senderSessionTitle: "Original title", senderPartnerId: "partner", senderPartnerName: "Partner name" };
+    const event: PersistedEvent = { id: "handoff", sequence: 1n, globalCursor: 9n, revision: 1n, emittedAt: 1_000,
+      backendId: "backend", targetId: "target", sessionId: "recipient", generation: 1, traceId: "handoff", runId: "run",
+      payload: { type: "message_complete", role: "user", blocks: [], acceptedInput: { text: "Literal user body", images: [], files: [], mentions: [], disposition: "prompt" }, taskMessageOrigin } };
+    const proto = toProtoEvent(event);
+    expect(fromProtoEvent(fromBinary(EventSchema, toBinary(EventSchema, proto))).payload).toMatchObject({ taskMessageOrigin, acceptedInput: { text: "Literal user body" } });
+    if (proto.payload?.kind.case === "messageStarted") {
+      proto.payload.kind.value.userInputAccepted = false; expect(() => fromProtoEvent(proto)).toThrow(ProtoMappingError);
+      proto.payload.kind.value.userInputAccepted = true; proto.payload.kind.value.taskMessageOrigin!.senderPartnerName = undefined;
+      expect(() => fromProtoEvent(proto)).toThrow(ProtoMappingError);
+    }
+  });
+  it("round-trips canonical worker reports and rejects native echoes claiming report provenance", () => {
+    const collaborationReportOrigin = { goalId: "goal", workerId: "worker", leadSessionId: "lead", workerSessionId: "worker-task", workerLabel: "Developer", body: "Done\nEvidence" };
+    const event: PersistedEvent = { id: "report", sequence: 3n, globalCursor: 91n, revision: 3n, emittedAt: 1_000,
+      backendId: "backend", targetId: "target", sessionId: "lead", generation: 1, traceId: "report-test", runId: "run",
+      payload: { type: "message_complete", role: "user", blocks: [], acceptedInput: { text: "[From Developer]\nDone\nEvidence", images: [], files: [], mentions: [], disposition: "prompt" }, collaborationReportOrigin } };
+    const proto = toProtoEvent(event);
+    expect(fromProtoEvent(fromBinary(EventSchema, toBinary(EventSchema, proto))).payload).toMatchObject({ collaborationReportOrigin });
+    expect(() => toProtoEvent({ ...event, sessionId: "other" })).toThrow(ProtoMappingError);
+    expect(() => toProtoEvent({ ...event, payload: { ...event.payload as Extract<EventPayload, { type: "message_complete" }>, acceptedInput: undefined } })).toThrow(ProtoMappingError);
+    if (proto.payload?.kind.case === "messageStarted") {
+      proto.payload.kind.value.userInputAccepted = false;
+      expect(() => fromProtoEvent(proto)).toThrow(ProtoMappingError);
+      proto.payload.kind.value.userInputAccepted = true;
+      proto.payload.kind.value.collaborationReportOrigin!.workerSessionId = "lead";
+      expect(() => fromProtoEvent(proto)).toThrow(ProtoMappingError);
+    }
+  });
   it("preserves declared model metadata presence, exact effort defaults and estimated capacities", () => {
     const model: ProviderModel = { providerId: "provider", modelId: "model", displayName: "Model", api: "openai-responses", contextWindow: 128000,
       maxOutputTokens: 16000, contextWindowSource: "estimated", maxOutputTokensSource: "estimated", supportsImages: true, supportsFastMode: true,

@@ -106,8 +106,12 @@ describe("Collaboration Goal production chain", () => {
         permissionMode: PermissionMode.AUTO
       }
     });
-    const second = await createWorker(paired, tree, "worker-two", "Verifier", "Verify the second durable result.");
+    const second = await createWorker(paired, tree, "worker-two", "Verifier", "");
     tree = required(second.tree, "second worker tree");
+    expect(second.worker).toMatchObject({ assignment: "", status: CollaborationWorkerStatus.IDLE });
+    expect(tree.queue.filter(entry => entry.dispatch?.workerId === second.worker!.workerId)).toEqual([]);
+    const explicitWork = await sendWorkerMessage(paired, tree, second.worker!.workerId, "Verify the second durable result.", "collaboration-e2e-explicit-first-work");
+    expect(explicitWork.dispatch?.workerId).toBe(second.worker!.workerId);
     const sessionCountBeforeHardLimit = fixture.application.store.listSessions({ includeArchived: true }).length;
     await expect(createWorker(paired, tree, "worker-three", "Blocked", "This worker must never reach an external effect."))
       .rejects.toMatchObject({ code: Code.ResourceExhausted });

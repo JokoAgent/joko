@@ -5,6 +5,7 @@ import type { PartnerListView, PartnerMutationView, PartnerProfileView, SessionV
 import { isLoopbackHostname } from "../connection-origin.js";
 import { validatePartnerSourceSession } from "../partner-sources.js";
 import { PartnerSettingsDialog } from "./PartnersPage.js";
+import type { PartnerLearningSettingsDestination } from "@joko/contracts";
 import type { Translator } from "./types.js";
 
 type ConversationIdentity =
@@ -34,6 +35,7 @@ export interface PartnerConversationView {
   readonly retryRead: () => void;
   readonly refresh: () => void;
   readonly openSettings: (section?: "profile" | "activity") => void;
+  readonly openLearningSettings: (destination: PartnerLearningSettingsDestination) => void;
   readonly openPrivateThread: (threadId: string) => void;
   readonly workbenchAvailable: boolean;
   readonly workbenchRequest?: number;
@@ -73,7 +75,8 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   const [projection, setProjection] = useState<IdentityProjection>();
-  const [settings, setSettings] = useState<{ readonly owner: object; readonly section: "profile" | "activity"; readonly threadId?: string }>();
+  const [settings, setSettings] = useState<{ readonly owner: object; readonly section: "profile" | "activity";
+    readonly threadId?: string; readonly learningDestination?: PartnerLearningSettingsDestination }>();
   const entryReadRef = useRef<{ readonly owner: object; readonly partnerId: string; readonly cursor: bigint } | undefined>(undefined);
   const [readRetry, setReadRetry] = useState(0);
   const [readFailure, setReadFailure] = useState<object>();
@@ -209,6 +212,9 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
     if (flight?.owner === conversationOwner) { flight.failed = false; flight.pending = flight.committed; setReadFailure(undefined); setReadRetry((value) => value + 1); }
   };
   const openSettings = (section: "profile" | "activity" = "profile"): void => { if (editable) setSettings({ owner: conversationOwner, section }); };
+  const openLearningSettings = (destination: PartnerLearningSettingsDestination): void => {
+    if (editable && conversationOwnerRef.current === conversationOwner) setSettings({ owner: conversationOwner, section: "profile", learningDestination: destination });
+  };
   const openPrivateThread = (threadId: string): void => { if (editable) setSettings({ owner: conversationOwner, section: "activity", threadId }); };
   const target = controller.state.snapshot.targets.find((item) => item.id === session.targetId);
   const workbenchAvailable = partnerIdentity !== undefined && target?.trusted === true && target.remoteWorkspace === undefined && isLocalOrigin(profile?.origin);
@@ -224,7 +230,7 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
     sessionId: session.id, ownerKey, kind: identity?.kind, partner: partnerIdentity?.partner, confirmed, editable, failed, connected,
     entryReadCursor: entryReadRef.current?.owner === conversationOwner ? entryReadRef.current.cursor : undefined,
     readFailed: readFailure === conversationOwner, readRetry, acknowledge, retryRead,
-    refresh: () => setRefresh((value) => value + 1), openSettings, openPrivateThread,
+    refresh: () => setRefresh((value) => value + 1), openSettings, openLearningSettings, openPrivateThread,
     workbenchAvailable, workbenchRequest: workbenchRequest?.owner === ownerKey ? workbenchRequest.sequence : undefined,
     workbenchOpenFailed: workbenchOpenFailure === conversationOwner, openWorkbench
   };
@@ -234,7 +240,8 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
       key={`${ownerKey}\u0000${partnerIdentity.partner.id}`}
       partner={partnerIdentity.partner} partners={partnerIdentity.catalog.partners} directory={partnerIdentity.catalog.directory}
       snapshot={controller.state.snapshot} controller={controller} ownerKey={ownerKey} t={t}
-      initialSection={settings.section} initialPrivateThreadId={settings.threadId} showClose onClose={() => setSettings(undefined)} onUpdated={acceptMutation}
+      initialSection={settings.section} initialPrivateThreadId={settings.threadId} initialLearningDestination={settings.learningDestination}
+      showClose onClose={() => setSettings(undefined)} onUpdated={acceptMutation}
       onActivityUpdated={(partner) => acceptMutation({ partner, directory: partnerIdentity.catalog.directory })}
     />}
   </PartnerConversationContext.Provider>;

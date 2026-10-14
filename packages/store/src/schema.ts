@@ -15,7 +15,8 @@ const DURABLE_JSON_SHAPE_BASELINE = [
   "device-content-event:owner-routing-null+exact-default/manual/effective-projection-v1",
   "native-derivation-remote-worktree-plan:exact-v1",
   "native-derivation-worktree:optional-remote-owner-exact-v1",
-  "task-tag-catalog-event:exact-v1"
+  "task-tag-catalog-event:exact-v1",
+  "partner-learning-turn-and-receipts:exact-v1"
 ].join("\n");
 
 const SCHEMA_MARKER_SCHEMA = `
@@ -1189,6 +1190,29 @@ CREATE TABLE runs (
         revision INTEGER NOT NULL CHECK (revision >= 1)
       ) STRICT;
 
+CREATE TABLE partner_learning_turns (
+        occurrence_id TEXT PRIMARY KEY CHECK (length(occurrence_id) BETWEEN 1 AND 1024),
+        partner_id TEXT NOT NULL CHECK (length(partner_id) BETWEEN 1 AND 1024),
+        session_id TEXT NOT NULL REFERENCES product_sessions(id) ON DELETE CASCADE,
+        source_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        source_attempt_id TEXT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+        source_queue_item_id TEXT NOT NULL REFERENCES queue_items(id) ON DELETE CASCADE,
+        source_json TEXT NOT NULL,
+        accepted_at INTEGER CHECK (accepted_at IS NULL OR accepted_at >= 0),
+        completion_event_id TEXT REFERENCES events(id) ON DELETE CASCADE,
+        message_id TEXT,
+        review_claimed_at INTEGER CHECK (review_claimed_at IS NULL OR review_claimed_at >= 0),
+        receipts_json TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK (revision >= 1),
+        CHECK ((completion_event_id IS NULL AND message_id IS NULL) OR
+          (completion_event_id IS NOT NULL AND message_id IS NOT NULL AND accepted_at IS NOT NULL)),
+        CHECK (review_claimed_at IS NULL OR completion_event_id IS NOT NULL)
+      ) STRICT;
+
+CREATE INDEX partner_learning_completion ON partner_learning_turns(completion_event_id);
+CREATE UNIQUE INDEX partner_learning_review_claim ON partner_learning_turns(completion_event_id)
+        WHERE review_claimed_at IS NOT NULL;
+
 CREATE TABLE schedule_run_history (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
@@ -1456,7 +1480,7 @@ CREATE TABLE collaboration_workers (
           length(trim(role)) BETWEEN 1 AND 128 AND instr(role, char(0)) = 0
         ),
         assignment TEXT NOT NULL CHECK (
-          length(trim(assignment)) BETWEEN 1 AND 32000 AND instr(assignment, char(0)) = 0
+          length(trim(assignment)) BETWEEN 0 AND 32000 AND instr(assignment, char(0)) = 0
         ),
         status TEXT NOT NULL CHECK (status IN (
           'provisioning', 'idle', 'queued', 'running', 'completed', 'failed',

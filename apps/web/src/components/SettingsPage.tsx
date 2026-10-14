@@ -105,6 +105,9 @@ import { MorphPopover } from "./MorphPopover.js";
 import { timelineCodeHighlight } from "./timeline-code-highlighting.js";
 import { resetWindowLayout } from "../layout-reset-orchestration.js";
 import { readVoiceInputPreferences } from "../voice-input-preferences.js";
+import { SettingsSearchBox } from "./SettingsSearchBox.js";
+import { buildSettingsSearchDocuments, settingsSearchEntryFromHash, settingsSearchHash, type SettingsSearchEntry } from "./settings-search.js";
+import { useSettingsSearchTarget } from "./use-settings-search-target.js";
 
 export const SETTINGS_NAV_SECTION_IDS = [
   "general",
@@ -121,8 +124,8 @@ export const SETTINGS_NAV_SECTION_IDS = [
   "automation",
   "about"
 ] as const;
-type SettingsSection = typeof SETTINGS_NAV_SECTION_IDS[number];
-type SettingsSubsection = "appearance" | "policy" | "pi" | "backends" | "credentials" | "remoteDesktop" | "remoteHosts" | "mcp" | "diagnostics" | "runtime";
+export type SettingsSection = typeof SETTINGS_NAV_SECTION_IDS[number];
+export type SettingsSubsection = "appearance" | "policy" | "pi" | "backends" | "credentials" | "remoteDesktop" | "remoteHosts" | "mcp" | "diagnostics" | "runtime";
 interface SettingsLocation {
   readonly section: SettingsSection;
   readonly subsection?: SettingsSubsection;
@@ -185,6 +188,8 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
     nativeTaskStatusVisible
   ));
   const { section, subsection } = location;
+  const [navigationHash, setNavigationHash] = useState(() => typeof window === "undefined" ? "" : window.location.hash);
+  const [searchActivation, setSearchActivation] = useState(0);
   const [compactSettings, setCompactSettings] = useState(() => settingsViewportIsCompact());
   const [mobileIndexOpen, setMobileIndexOpen] = useState(() => settingsViewportIsCompact() && settingsHashIsRoot(
     typeof window === "undefined" ? "" : window.location.hash
@@ -194,6 +199,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
   useEffect(() => {
     const syncSectionFromLocation = (): void => {
       setLocation(availableSettingsLocationFromHash(window.location.hash, nativeTaskStatusVisible));
+      setNavigationHash(window.location.hash);
       if (compactSettings) setMobileIndexOpen(settingsHashIsRoot(window.location.hash));
     };
     window.addEventListener("hashchange", syncSectionFromLocation);
@@ -213,17 +219,20 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
     setLocation({ section: next });
     if (compactSettings) setMobileIndexOpen(false);
     const hash = `#/settings/${next}`;
+    setNavigationHash(hash);
     if (window.location.hash !== hash) window.history.replaceState(window.history.state, "", hash);
   };
   const selectSubsection = (next: SettingsSubsection): void => {
     const parent = SETTINGS_SUBSECTION_PARENTS[next];
     setLocation({ section: parent, subsection: next });
     const hash = `#/settings/${parent}/${next}`;
+    setNavigationHash(hash);
     if (window.location.hash !== hash) window.history.replaceState(null, "", hash);
   };
   const closeNestedSettings = (): void => {
     setLocation({ section: "general" });
     const hash = "#/settings/general";
+    setNavigationHash(hash);
     if (window.location.hash !== hash) window.history.replaceState(null, "", hash);
   };
   const showSuccess = useCallback((text: string): void => {
@@ -256,19 +265,36 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
     { id: "automation", label: t("settings.automation"), icon: <MonitorCog /> },
     { id: "about", label: t("settings.about"), icon: <Info /> }
   ];
+  const desktopCapabilityKey = (typeof window === "undefined" ? [] : window.jokoDesktop?.capabilities ?? []).join("\n");
+  const searchDocuments = useMemo(() => buildSettingsSearchDocuments(t, {
+    visibleSections: SETTINGS_NAV_SECTION_IDS.filter((id) => id !== "taskStatus" || nativeTaskStatusVisible),
+    desktopCapabilities: desktopCapabilityKey.split("\n")
+  }), [t, nativeTaskStatusVisible, desktopCapabilityKey]);
+  const searchEntry = settingsSearchEntryFromHash(navigationHash, section, subsection, searchDocuments);
   const contentRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const content = contentRef.current;
-    if (content === null) return;
+    if (content === null || searchEntry !== undefined) return;
     if (subsection === undefined || subsection === "pi") {
       content.scrollTo?.({ top: 0 });
       return;
     }
     content.querySelector<HTMLElement>(`#settings-subsection-${subsection}`)?.scrollIntoView?.({ block: "start" });
-  }, [section, subsection]);
+  }, [section, subsection, searchEntry]);
+  useSettingsSearchTarget(searchEntry, contentRef, `${navigationHash}:${searchActivation}`, t);
+  const selectSearchResult = (entry: SettingsSearchEntry): void => {
+    if (!searchDocuments.some((document) => document.entry === entry)) return;
+    const hash = settingsSearchHash(entry);
+    setLocation({ section: entry.section, ...(entry.subsection === undefined ? {} : { subsection: entry.subsection }) });
+    setNavigationHash(hash);
+    setSearchActivation((current) => current + 1);
+    if (compactSettings) setMobileIndexOpen(false);
+    window.history.replaceState(window.history.state, "", hash);
+  };
   const leaveSettings = (): void => {
     if (compactSettings && !mobileIndexOpen) {
       setMobileIndexOpen(true);
+      setNavigationHash("#/settings");
       window.history.replaceState(null, "", "#/settings");
       return;
     }
@@ -289,27 +315,28 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
             <IconButton className="settings-back" label={compactSettings && !mobileIndexOpen ? t("settings.mobileBackToList") : t("settings.back")} onClick={leaveSettings}><ArrowLeft aria-hidden="true" /></IconButton>
             <h1>{t("settings.title")}</h1>
           </header>
+          <SettingsSearchBox key={`${controller.state.activeProfile?.id ?? "offline"}:${locale}`} documents={searchDocuments} onSelect={selectSearchResult} t={t} />
           <nav className="settings-nav" aria-label={t("settings.title")} role="tablist" aria-orientation="vertical">{sections.map((item) => <button type="button" role="tab" id={`settings-tab-${item.id}`} aria-controls={`settings-panel-${item.id}`} aria-selected={section === item.id} tabIndex={section === item.id ? 0 : -1} className={section === item.id ? "is-active" : ""} key={item.id} onClick={() => selectSection(item.id)} onKeyDown={(event) => moveTablistSelection(event, "vertical")}>{item.icon}<span>{item.label}</span></button>)}</nav>
         </aside>
         <div className={cx("settings-content-scroll", (section === "providers" || section === "import") && "settings-content-scroll--workbench")} ref={contentRef} key={section}>
           <div className={cx("settings-content", (section === "providers" || section === "import") && "settings-content--workbench")} id={`settings-panel-${section}`} role="tabpanel" aria-labelledby={`settings-tab-${section}`} tabIndex={0}>
             {section === "general" && (subsection === "pi"
-              ? <><SettingsNestedBack label={t("settings.general")} onClick={closeNestedSettings} /><PiSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></>
+              ? <SettingsPageSection id="pi"><SettingsNestedBack label={t("settings.general")} onClick={closeNestedSettings} /><PiSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection>
               : <>
                 <SettingsHeading title={t("settings.general")} body={t("settings.generalBody")} />
                 <SettingsPageSection id="appearance"><SettingsSectionHeading title={t("settings.appearance")} body={t("settings.appearanceBody")} /><AppearanceSettings controller={controller} locale={locale} theme={controller.state.preferences.theme} onSuccess={showSuccess} onOpenPi={() => selectSubsection("pi")} showHeading={false} t={t} /></SettingsPageSection>
                 <SettingsPageSection id="general"><SettingsSectionHeading title={t("settings.applicationBehavior")} body={t("settings.applicationBehaviorBody")} /><GeneralSettings controller={controller} snapshot={snapshot} runAction={runAction} onSuccess={showSuccess} showHeading={false} t={t} /></SettingsPageSection>
                 <SettingsPageSection id="policy"><SettingsSectionHeading title={t("settings.policy")} body={t("settings.policyBody")} /><PolicySettings controller={controller} snapshot={snapshot} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection>
               </>)}
-            {section === "personalization" && <PersonalizationSettings controller={controller} snapshot={snapshot} runAction={personalizationRunAction} onSuccess={showSuccess} t={t} />}
-            {section === "shortcuts" && <><AppShortcutsSettings controller={controller} overrides={controller.state.preferences.appShortcutOverrides} t={t} /><DedicatedHardwareSettings t={t} bridge={dedicatedHardwareBridge} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /><GamepadSettings t={t} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /></>}
-            {section === "voice" && <VoiceInputSettings controller={controller} t={t} />}
-            {section === "taskStatus" && <><SettingsHeading title={t("settings.nativeTaskStatus.title")} body={t("settings.nativeTaskStatus.body")} /><NativeTaskStatusSettings t={t} showHeading={false} /></>}
+            {section === "personalization" && <SettingsPageSection id="personalization"><PersonalizationSettings controller={controller} snapshot={snapshot} runAction={personalizationRunAction} onSuccess={showSuccess} t={t} /></SettingsPageSection>}
+            {section === "shortcuts" && <SettingsPageSection id="shortcuts"><AppShortcutsSettings controller={controller} overrides={controller.state.preferences.appShortcutOverrides} t={t} /><DedicatedHardwareSettings t={t} bridge={dedicatedHardwareBridge} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /><GamepadSettings t={t} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /></SettingsPageSection>}
+            {section === "voice" && <SettingsPageSection id="voice"><VoiceInputSettings controller={controller} t={t} /></SettingsPageSection>}
+            {section === "taskStatus" && <SettingsPageSection id="taskStatus"><SettingsHeading title={t("settings.nativeTaskStatus.title")} body={t("settings.nativeTaskStatus.body")} /><NativeTaskStatusSettings t={t} showHeading={false} /></SettingsPageSection>}
             {section === "connections" && <><SettingsHeading title={t("settings.connections")} body={t("settings.connectionsBody")} /><SettingsPageSection id="remoteDesktop"><SettingsSectionHeading title={t("settings.remoteDesktop.title")} body={t("settings.remoteDesktop.body")} /><DesktopRemoteDesktopSettings t={t} /></SettingsPageSection><SettingsPageSection id="connections"><ConnectionSettings controller={controller} snapshot={snapshot} locale={locale} t={t} runAction={runAction} showHeading={false} /></SettingsPageSection><SettingsPageSection id="remoteHosts"><RemoteHostsSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} t={t} /></SettingsPageSection><SshKeySettings controller={controller} t={t} /></>}
-            {section === "providers" && <SettingsPageSection id="providers"><ProviderSettings controller={controller} snapshot={snapshot} runAction={runAction} onSuccess={showSuccess} initialView={subsection === "credentials" ? "credentials" : undefined} t={t} /></SettingsPageSection>}
+            {section === "providers" && <SettingsPageSection id="providers"><ProviderSettings key={searchEntry === undefined ? subsection : `${searchEntry.id}:${searchActivation}`} controller={controller} snapshot={snapshot} runAction={runAction} onSuccess={showSuccess} initialView={searchEntry?.providerView ?? (subsection === "credentials" ? "credentials" : undefined)} t={t} /></SettingsPageSection>}
             {section === "tools" && <><SettingsHeading title={t("settings.toolPolicies.nav")} body={t("settings.toolsBody")} /><SettingsPageSection id="tools"><SettingsSectionHeading title={t("settings.toolPolicies.title")} body={t("settings.toolPolicies.body")} /><ToolPolicySettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="mcp"><McpSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
-            {section === "automation" && <AutomationSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} onSuccess={showSuccess} t={t} />}
-            {section === "import" && <TaskImportSettings controller={controller} snapshot={snapshot} onImportPortable={onImportPortableSession} runAction={runAction} onSuccess={showSuccess} t={t} />}
+            {section === "automation" && <SettingsPageSection id="automation"><AutomationSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} onSuccess={showSuccess} t={t} /></SettingsPageSection>}
+            {section === "import" && <SettingsPageSection id="import"><TaskImportSettings controller={controller} snapshot={snapshot} onImportPortable={onImportPortableSession} runAction={runAction} onSuccess={showSuccess} t={t} /></SettingsPageSection>}
             {section === "contacts" && <SettingsPageSection id="contacts"><ContactsSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} locale={locale} t={t} /></SettingsPageSection>}
             {section === "messaging" && <SettingsPageSection id="messaging"><MessagingSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection>}
             {section === "about" && <><SettingsPageSection id="about"><AboutSettings controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection><SettingsPageSection id="backends"><SettingsSectionHeading title={t("settings.backends")} body={t("settings.backendsBody")} /><BackendSettings controller={controller} snapshot={snapshot} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="diagnostics"><DiagnosticSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection><SettingsPageSection id="runtime"><RuntimeProcessMonitor controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
@@ -3380,7 +3407,7 @@ function permissionModeLabel(mode: PermissionMode, t: Translator): string {
   return t("permission.full");
 }
 
-export function ProviderSettings({ controller, snapshot, runAction, onSuccess, initialView, t }: { readonly controller: AppController; readonly snapshot: AppSnapshot; readonly runAction: RunAction; readonly onSuccess?: (text: string) => void; readonly initialView?: "credentials"; readonly t: Translator }): JSX.Element {
+export function ProviderSettings({ controller, snapshot, runAction, onSuccess, initialView, t }: { readonly controller: AppController; readonly snapshot: AppSnapshot; readonly runAction: RunAction; readonly onSuccess?: (text: string) => void; readonly initialView?: "credentials" | "usage"; readonly t: Translator }): JSX.Element {
   const [editor, setEditor] = useState<ProviderConfigurationView | "new">();
   const [addWizardOpen, setAddWizardOpen] = useState(false);
   const [runtimeOnboardingId, setRuntimeOnboardingId] = useState<string>();
@@ -3404,11 +3431,11 @@ export function ProviderSettings({ controller, snapshot, runAction, onSuccess, i
   const [selectedItem, setSelectedItem] = useState(() => {
     const catalog = providerSettingsEntries(snapshot);
     const first = catalog.configured[0];
-    if (initialView === "credentials") return "credentials";
+    if (initialView !== undefined) return initialView;
     return first === undefined ? "" : `provider:${first.id}`;
   });
   const [compactProviderView, setCompactProviderView] = useState(() => settingsViewportIsCompact());
-  const [mobileDetailOpen, setMobileDetailOpen] = useState(() => settingsViewportIsCompact() && initialView === "credentials");
+  const [mobileDetailOpen, setMobileDetailOpen] = useState(() => settingsViewportIsCompact() && initialView !== undefined);
   const [refreshingProviderKey, setRefreshingProviderKey] = useState<string>();
   const [modelRefreshFeedback, setModelRefreshFeedback] = useState<{
     readonly providerKey: string;

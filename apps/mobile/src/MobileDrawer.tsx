@@ -39,23 +39,36 @@ export function MobileDrawer({
   const reducedMotion = useReducedMotion();
   const [mounted, setMounted] = useState(false);
   const mountedRef = useRef(false);
+  const visibleRef = useRef(visible);
+  const animationGeneration = useRef(0);
+  const closedPending = useRef(false);
   const translateX = useRef(new Animated.Value(-width)).current;
   const onClosedRef = useRef(onClosed);
   const onMountedChangeRef = useRef(onMountedChange);
   onClosedRef.current = onClosed;
   onMountedChangeRef.current = onMountedChange;
   mountedRef.current = mounted;
+  visibleRef.current = visible;
 
   useEffect(() => {
-    if (!visible || mounted) return;
+    if (!visible) return;
+    closedPending.current = false;
+    if (mounted) return;
     translateX.setValue(-width);
     setMounted(true);
     onMountedChangeRef.current?.(true);
   }, [mounted, translateX, visible, width]);
 
   useEffect(() => {
+    if (mounted || !closedPending.current) return;
+    closedPending.current = false;
+    if (!visibleRef.current) onClosedRef.current?.();
+  }, [mounted, visible]);
+
+  useEffect(() => {
     if (!mounted) return;
     translateX.stopAnimation();
+    const generation = ++animationGeneration.current;
     if (visible) {
       Keyboard.dismiss();
       Animated.timing(translateX, {
@@ -64,11 +77,11 @@ export function MobileDrawer({
         toValue: 0,
         useNativeDriver: true
       }).start(({ finished }) => {
-        if (!finished || !visible) return;
+        if (!finished || !visibleRef.current || generation !== animationGeneration.current) return;
         const node = initialFocusRef?.current ? findNodeHandle(initialFocusRef.current) : null;
         if (node !== null) AccessibilityInfo.setAccessibilityFocus(node);
       });
-      return;
+      return () => { animationGeneration.current += 1; translateX.stopAnimation(); };
     }
     Animated.timing(translateX, {
       duration: reducedMotion ? 0 : 160,
@@ -76,14 +89,16 @@ export function MobileDrawer({
       toValue: -width,
       useNativeDriver: true
     }).start(({ finished }) => {
-      if (!finished || visible) return;
+      if (!finished || visibleRef.current || generation !== animationGeneration.current) return;
+      closedPending.current = true;
       setMounted(false);
       onMountedChangeRef.current?.(false);
-      onClosedRef.current?.();
     });
+    return () => { animationGeneration.current += 1; translateX.stopAnimation(); };
   }, [initialFocusRef, mounted, reducedMotion, translateX, visible, width]);
 
   useEffect(() => () => {
+    closedPending.current = false;
     translateX.stopAnimation();
     if (mountedRef.current) onMountedChangeRef.current?.(false);
   }, [translateX]);

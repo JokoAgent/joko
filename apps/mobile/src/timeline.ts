@@ -1,4 +1,5 @@
-import { MessageInputDelivery, MessageRole, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type ToolCall } from "@joko/contracts";
+import { MessageInputDelivery, MessageRole, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
+import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
 import { mobileInputSummary } from "./mobile-composer-document";
 import { mobileTimelineContent, mobileTimelineContentSourceKey, mobileTimelineToolMediaEvents } from "./mobile-timeline-content";
 import { projectMobileToolCall, mobileToolCallScopeKey, mobileToolCallCompleted, type MobileToolCallView } from "./mobile-tool-call";
@@ -14,6 +15,8 @@ import {
 import { mobileEventTimestamp, mobileMessageEventScope, mobileMessageScope, mobileThinkingViews,
   type MobileThinkingView } from "./mobile-thinking-projection";
 import type { MobileInlinePlan } from "./mobile-plan-projection";
+import { mobileObjectiveDisplayText, projectMobileObjectiveLifecycle, type MobileObjectiveLifecycle } from "./mobile-objective";
+import { mobileCollaborationDispatch, mobileCollaborationReport, type MobileCollaborationMessage } from "./mobile-collaboration-timeline";
 
 export type MobileTimelineMessagePart =
   | { readonly kind: "text"; readonly contentIndex: number; readonly text: string }
@@ -30,6 +33,8 @@ export interface MobilePartnerPrivatePreviewCandidate {
 }
 
 export interface TimelineRow {
+  readonly learning?: PartnerLearningFeedbackView;
+  readonly assistantBodyPresent?: boolean;
   readonly runtimeHandoff?: { readonly fromBackendId: string; readonly toBackendId: string; readonly modelId: string; readonly resumed: boolean };
   readonly id: string;
   readonly label: string;
@@ -74,6 +79,9 @@ export interface TimelineRow {
   /** The exact latest plan edge places its structural card without changing this row's raw cursor. */
   readonly planSequence?: bigint;
   readonly plan?: MobileInlinePlan;
+  readonly objectiveLifecycle?: MobileObjectiveLifecycle;
+  readonly collaboration?: MobileCollaborationMessage;
+  readonly taskMessageOrigin?: TaskMessageOrigin;
 }
 
 const PARTNER_PRIVATE_TOOL_NAMES = new Set([
@@ -105,16 +113,20 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
         break;
       case "messageStarted": {
         const message = kind.value;
+        const collaboration = mobileCollaborationReport(event);
+        const origin = taskMessageOrigin(event);
         if (message.role === MessageRole.USER && message.userInputAccepted) acceptedUserInputs.add(message.messageId);
         const images = mobileTimelineGalleryPages(event).map(mobileImageGalleryPageSummary);
         byId.set(message.messageId, { id: message.messageId, label: roleLabel(message.role),
-          text: mobileInputSummary(message.userInput, message.userInputAccepted) || "…", sequence, eventId: event.eventId,
+          text: collaboration?.body || mobileInputSummary(message.userInput, message.userInputAccepted) || "…", sequence, eventId: event.eventId,
           kind: roleKind(message.role), completed: message.role === MessageRole.USER && message.userInputAccepted,
           ...(message.role !== MessageRole.USER ? {} : {
             internalInput: message.automaticContinuation || message.objectiveContinuation !== undefined
               || message.automationOrigin !== undefined || message.inputDelivery === MessageInputDelivery.SCHEDULER
           }),
           ...(message.partnerPrivateOrigin === undefined ? {} : { partnerPrivateOrigin: message.partnerPrivateOrigin }),
+          ...(collaboration === undefined ? {} : { collaboration }),
+          ...(origin === undefined ? {} : { taskMessageOrigin: origin }),
           ...(message.role === MessageRole.USER && message.userInputAccepted && event.identity?.operationId
             ? { operationId: event.identity.operationId }
             : {}),
@@ -137,7 +149,7 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
           && previous?.images && previous.images.length > 0
           ? previous.images
           : completedImages;
-        const blocks = message.blocks.flatMap((block) => block.content.case === "text" ? [block.content.value]
+        const blocks = message.blocks.flatMap((block) => block.content.case === "text" ? [message.role === MessageRole.ASSISTANT ? mobileObjectiveDisplayText(block.content.value) : block.content.value]
           : block.content.case === "image" ? ["[Image]"] : block.content.case === "artifact" ? ["[Artifact]"]
             : block.content.case === "toolCall" ? ["[Tool call]"] : []);
         const acceptedInput = message.role === MessageRole.USER && acceptedUserInputs.has(message.messageId)
@@ -145,13 +157,17 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
           : undefined;
         const quoteText = message.role === MessageRole.ASSISTANT && message.blocks.length > 0
           && message.blocks.every((block) => block.content.case === "text")
-          ? message.blocks.map((block) => block.content.case === "text" ? block.content.value : "").join("\n")
+          ? mobileObjectiveDisplayText(message.blocks.map((block) => block.content.case === "text" ? block.content.value : "").join("\n"))
           : undefined;
         byId.set(message.messageId, { id: message.messageId, label: previous?.label || roleLabel(message.role),
           text: acceptedInput || blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
           eventId: event.eventId, kind: roleKind(message.role), completed: true,
           completionCursor: sequence,
+          ...(message.role !== MessageRole.ASSISTANT ? {} : { assistantBodyPresent: message.blocks.some(block => block.content.case === "text" && !!block.content.value.trim()) }),
+          ...(message.role !== MessageRole.ASSISTANT || message.learning === undefined ? {} : { learning: projectPartnerLearningFeedback(message.learning) }),
           ...(previous?.internalInput === undefined ? {} : { internalInput: previous.internalInput }),
+          ...(previous?.collaboration === undefined ? {} : { collaboration: previous.collaboration }),
+          ...(previous?.taskMessageOrigin === undefined ? {} : { taskMessageOrigin: previous.taskMessageOrigin }),
           ...((message.partnerPrivateOrigin ?? previous?.partnerPrivateOrigin) === undefined ? {}
             : { partnerPrivateOrigin: message.partnerPrivateOrigin ?? previous?.partnerPrivateOrigin }),
           ...(previous?.operationId === undefined ? {} : { operationId: previous.operationId }),
@@ -164,6 +180,18 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
           ...(artifacts.length === 0 ? {} : { artifacts }) });
         break;
       }
+      case "partnerLearningChanged": {
+        const changed = kind.value;
+        const previous = byId.get(changed.messageId);
+        if (!previous || previous.kind !== "assistant" || !previous.completed || previous.eventId !== changed.completionEventId) break;
+        const completion = unique.get(changed.completionEventId);
+        if (!completion || completion.identity?.sessionId !== event.identity?.sessionId
+          || completion.cursor?.generation !== event.cursor?.generation) break;
+        const learning = projectPartnerLearningFeedback(changed.feedback);
+        if (learning && (previous.learning?.revision ?? 0n) >= learning.revision) break;
+        byId.set(previous.id, { ...previous, learning });
+        break;
+      }
       case "runtimeHandoff":
         if (kind.value.fromBackendId && kind.value.toBackendId && kind.value.modelId) byId.set(event.eventId, {
           id: event.eventId, label: "Execution changed", text: `${kind.value.fromBackendId} → ${kind.value.toBackendId} · ${kind.value.modelId}`,
@@ -172,6 +200,12 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
       case "statusStream":
         byId.set(event.eventId, { id: event.eventId, label: "Status", text: kind.value.label + (kind.value.detail ? ` · ${kind.value.detail}` : ""), sequence, eventId: event.eventId, kind: "status", completed: false });
         break;
+      case "objectiveLifecycle": {
+        const lifecycle = projectMobileObjectiveLifecycle(kind.value);
+        if (lifecycle) byId.set(event.eventId, { id: event.eventId, label: "Objective", text: [lifecycle.text, lifecycle.reason].filter(Boolean).join("\n"),
+          sequence, eventId: event.eventId, kind: "system", completed: true, objectiveLifecycle: lifecycle });
+        break;
+      }
       case "recoverableError":
       case "terminalError":
         byId.set(event.eventId, { id: event.eventId, label: "Error", text: kind.value.error?.message || "The task reported an error.", sequence, eventId: event.eventId, kind: "error", completed: false });
@@ -191,9 +225,11 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
         const tool = projectMobileToolCall(event, previous?.tool)!;
         if (previous?.tool === tool) break;
         const candidate = kind.case === "toolCallCompleted" ? partnerPrivatePreview(event, toolStarts.get(callId) ?? []) : undefined;
+        const collaboration = mobileCollaborationDispatch(tool);
         byId.set(tool.scopeKey, { id: tool.scopeKey, label: "Tool", text: tool.name,
           sequence: previous?.sequence ?? sequence, eventId: event.eventId, kind: "tool", completed: mobileToolCallCompleted(tool), tool,
           ...(candidate === undefined ? {} : { partnerPrivatePreview: candidate }) });
+        if (collaboration) byId.set(tool.scopeKey, { ...byId.get(tool.scopeKey)!, collaboration, persistentTask: true });
         break;
       }
       case "runDone":
@@ -296,7 +332,8 @@ function attachThinkingParts(rows: Map<string, TimelineRow>, ordered: readonly E
           if (block.content.case === "thinking") {
             const view = thinking.find((item) => item.contentIndex === contentIndex);
             if (view) parts.push({ kind: "thinking", contentIndex, thinking: view });
-          } else if (block.content.case === "text") parts.push({ kind: "text", contentIndex, text: block.content.value });
+          } else if (block.content.case === "text") parts.push({ kind: "text", contentIndex,
+            text: mobileObjectiveDisplayText(block.content.value) });
           else if (block.content.case === "image" || block.content.case === "artifact") {
             const page = pages.find((item) => item.source.kind === "timeline" && item.source.contentIndex === contentIndex);
             const artifact = row.artifacts?.find((item) => item.source.kind === "timeline" && item.source.contentIndex === contentIndex);
@@ -323,6 +360,16 @@ function attachThinkingParts(rows: Map<string, TimelineRow>, ordered: readonly E
       ...(parts.length ? { messageParts: parts, workActivity: thoughtOnly, workStreaming: thinking.some((view) => view.streaming) } : {})
     });
   }
+}
+
+function taskMessageOrigin(event: Event): TaskMessageOrigin | undefined {
+  const payload = event.payload?.kind;
+  if (payload?.case !== "messageStarted" || payload.value.role !== MessageRole.USER || !payload.value.userInputAccepted) return undefined;
+  const origin = payload.value.taskMessageOrigin;
+  if (!origin || !PARTNER_ID.test(origin.senderSessionId) || origin.senderPartnerId !== undefined && !PARTNER_ID.test(origin.senderPartnerId)
+    || (origin.senderPartnerId === undefined) !== (origin.senderPartnerName === undefined)
+    || [origin.senderSessionTitle, origin.senderPartnerName].some(text => text !== undefined && (text.length > 256 || FORBIDDEN_INLINE.test(text)))) return undefined;
+  return origin;
 }
 
 function timelineMedia(events: readonly Event[]): Pick<TimelineRow, "images" | "artifacts"> {

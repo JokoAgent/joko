@@ -18,6 +18,14 @@ import { createOrchestratorGateway } from "./gateway.js";
 describe("Collaboration gateway", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("reads a ready worker's empty initial assignment without treating it as a missing Goal", async () => {
+    const value = activeTree({ workers: [worker({ assignment: "", status: CollaborationWorkerStatus.IDLE, idleSince: timestamp(3n) })], queue: [] });
+    const gateway = connectedGateway(collaborationTransport(method => method === "getCollaborationGoal" ? { tree: value } : collaborationResponse(method)));
+    await gateway.connect();
+    await expect(gateway.getCollaborationGoal("goal-one", "lead-session")).resolves.toMatchObject({ workers: [{ assignment: "", status: "idle" }] });
+    gateway.disconnect();
+  });
+
   it("uses every generated RPC and preserves authority, generation, route, and Queue CAS axes", async () => {
     const requests: Array<{ readonly method: string; readonly input: any; readonly signal?: AbortSignal }> = [];
     const gateway = connectedGateway(collaborationTransport(collaborationResponse, requests));

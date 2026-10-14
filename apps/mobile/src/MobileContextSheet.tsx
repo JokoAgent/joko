@@ -11,6 +11,9 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
+import { useMobileObjective } from "./use-mobile-objective";
+import type { MobileObjectiveApi } from "./mobile-objective";
+import { mobileCollaborationCopy } from "./mobile-collaboration-messages";
 import {
   formatMobileContextTokens,
   type MobileCompactOutcome,
@@ -32,7 +35,10 @@ export function MobileContextSheet({
   locale,
   onClose,
   onCompact,
-  onError
+  onError,
+  objectiveApi,
+  onObjective,
+  onCollaboration
 }: {
   readonly visible: boolean;
   readonly controls?: MobileContextControls;
@@ -42,7 +48,11 @@ export function MobileContextSheet({
   readonly onClose: () => void;
   readonly onCompact: (authorityKey: string) => Promise<MobileCompactOutcome | undefined>;
   readonly onError: (message: string) => void;
+  readonly objectiveApi?: MobileObjectiveApi;
+  readonly onObjective?: () => void;
+  readonly onCollaboration?: () => void;
 }) {
+  const objective = useMobileObjective(objectiveApi, visible);
   const [confirmation, setConfirmation] = useState<CompactConfirmation>();
   const [settling, setSettling] = useState(false);
   const [feedback, setFeedback] = useState<string>();
@@ -62,7 +72,7 @@ export function MobileContextSheet({
     setFeedback(undefined);
   }, [controls?.surfaceOwnerKey, visible]);
 
-  if (!controls) return null;
+  if (!controls && !onObjective && !onCollaboration) return null;
 
   const back = (): void => {
     if (disabled) return;
@@ -71,7 +81,7 @@ export function MobileContextSheet({
   };
 
   const requestCompact = (): void => {
-    if (disabled || !controls.canCompact || !controls.usage) return;
+    if (disabled || !controls?.canCompact || !controls.usage) return;
     setFeedback(undefined);
     setConfirmation({
       authorityKey: controls.authorityKey,
@@ -100,7 +110,7 @@ export function MobileContextSheet({
 
   const title = mobileMessage(locale, confirmation ? "context.confirmTitle" : "context.title");
   const subtitle = confirmation ? mobileMessage(locale, "context.confirmSubtitle")
-    : controls.backend.displayName || controls.backend.backendId;
+    : controls ? controls.backend.displayName || controls.backend.backendId : "";
 
   return <Modal visible={visible} transparent animationType="slide" statusBarTranslucent onRequestClose={back}>
     <View style={styles.modalRoot}>
@@ -118,10 +128,20 @@ export function MobileContextSheet({
           <IconButton label={mobileMessage(locale, "context.close")} text="×" disabled={disabled} colors={colors} onPress={onClose} />
         </View>
         <ScrollView contentContainerStyle={styles.content}>
+          {!confirmation && onCollaboration && <Pressable accessibilityRole="button" accessibilityLabel={mobileCollaborationCopy(locale).title}
+            disabled={disabled} onPress={onCollaboration} style={[styles.settingRow, { borderColor: colors.border }]}>
+            <Text style={[styles.rowLabel, styles.flex, { color: colors.ink }]}>{mobileCollaborationCopy(locale).title}</Text>
+            <Text style={[styles.caption, { color: colors.muted }]}>›</Text>
+          </Pressable>}
+          {!confirmation && onObjective && <Pressable accessibilityRole="button" accessibilityLabel={mobileMessage(locale, "objective.title")}
+            disabled={disabled} onPress={onObjective} style={[styles.settingRow, { borderColor: colors.border }]}>
+            <Text style={[styles.rowLabel, styles.flex, { color: colors.ink }]}>{mobileMessage(locale, "objective.title")}</Text>
+            <Text style={[styles.caption, { color: colors.muted }]}>{objective.objective ? mobileMessage(locale, `objective.${objective.objective.status}`) : "›"}</Text>
+          </Pressable>}
           {confirmation
             ? <CompactConfirmationView confirmation={confirmation} disabled={disabled} colors={colors} locale={locale}
                 onCancel={() => setConfirmation(undefined)} onConfirm={() => void confirmCompact()} />
-            : <ContextDetails controls={controls} disabled={disabled} feedback={feedback} locale={locale}
+            : controls && <ContextDetails controls={controls} disabled={disabled} feedback={feedback} locale={locale}
                 colors={colors} onCompact={requestCompact} />}
         </ScrollView>
       </SafeAreaView>

@@ -1,4 +1,6 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
+import type { MobileCollaborationRpc } from "./mobile-collaboration";
 import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
 import { createPartnerRoutineApi, newRoutineDefinition, ListPartnerRoutinesResponseSchema, PartnerRoutineSchema,
   SavePartnerRoutineResponseSchema, RunPartnerRoutineResponseSchema, DeletePartnerRoutineResponseSchema,
@@ -45,6 +47,7 @@ import { MobilePartnerRestartReceipts } from "./mobile-partner-restart";
 import { mobilePartnerCreationDraft, MobilePartnerCreationRejected, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import { creationSnapshot } from "./test/mobile-partner-creation";
 import { MobileCredentialStorageError, profileFromCredential } from "./connection-storage";
+import type { MobileObjective, MobileObjectiveRpc } from "./mobile-objective";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import { animatedPngBytes, gifBytes, svgBytes, bmpBytes, tiffBytes, isoImageBytes, iconBytes, iconDibBytes } from "./test/image-formats";
 import type { MobileDiscovery } from "./connection-discovery";
@@ -1013,6 +1016,7 @@ function fakeNetwork(): MobileNetwork {
     })),
     unregisterMobilePush: vi.fn(async () => undefined),
     readSession: vi.fn(async () => snapshot),
+    readTaskHeaderRole: vi.fn(async () => "ordinary" as const),
     listBackgroundTasks: vi.fn(async () => ({ tasks: [], nextPageToken: "" })),
     listSubagentRuns: vi.fn(async () => ({ runs: [], nextPageToken: "" })),
     getSubagentRun: vi.fn(async () => { throw new Error("No delegated run fixture was configured."); }),
@@ -1730,6 +1734,35 @@ describe("mobile current task delegated reads", () => {
     network.readSession = vi.fn(async () => detail);
     return { network, owner, detail };
   }
+
+  it("reads header role only for the exact current task source without granting backend controls", async () => {
+    const { network } = delegatedNetwork(); network.readTaskHeaderRole = vi.fn(async () => "worker" as const);
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const source = app.taskHeaderSourceKey()!; expect(source).toBeTruthy();
+    const signal = new AbortController().signal;
+    expect(await app.readTaskHeaderRole(source, signal)).toBe("worker");
+    expect(network.readTaskHeaderRole).toHaveBeenCalledExactlyOnceWith(credential, "session", expect.any(AbortSignal));
+    await expect(app.readTaskHeaderRole("another-source", signal)).rejects.toThrow("no longer current");
+    expect(network.readTaskHeaderRole).toHaveBeenCalledOnce();
+  });
+
+  it("retires late header role after runtime replacement, cancellation and background", async () => {
+    const { network, owner, detail } = delegatedNetwork();
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    let finish!: (value: "worker") => void, active!: AbortSignal;
+    network.readTaskHeaderRole = vi.fn((_credential, _id, signal) => {
+      active = signal!; return new Promise<"worker">(resolve => { finish = resolve; });
+    });
+    const source = app.taskHeaderSourceKey()!;
+    const pending = app.readTaskHeaderRole(source, new AbortController().signal);
+    owner.sessions[0]!.nativeBinding!.runtimeGeneration = 2n; detail.sessions[0]!.nativeBinding!.runtimeGeneration = 2n;
+    finish("worker"); await expect(pending).rejects.toThrow("source changed");
+    const caller = new AbortController(); const cancelled = app.readTaskHeaderRole(app.taskHeaderSourceKey()!, caller.signal);
+    caller.abort(); expect(active.aborted).toBe(true); finish("worker"); await expect(cancelled).rejects.toThrow("source changed");
+    const background = app.readTaskHeaderRole(app.taskHeaderSourceKey()!, new AbortController().signal);
+    app.setForeground(false); expect(active.aborted).toBe(true); expect(app.taskHeaderSourceKey()).toBeUndefined();
+    finish("worker"); await expect(background).rejects.toThrow("source changed");
+  });
 
   it("reads typed Session scoped background/run/detail/child pages only through the current authenticated owner", async () => {
     const { network } = delegatedNetwork();
@@ -5898,6 +5931,137 @@ describe("native mobile connection and operation ownership", () => {
     });
     expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
     expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+  });
+
+  it.each([false, true])("creates an objective task without sending the composer and retains the complete form on failure=%s", async fails => {
+    const network = fakeNetwork(), drafts = memoryDraftStores();
+    let operation = 0;
+    const value: MobileObjective = { sessionId: "session", text: "Reach the result", status: "active", maximumTurns: 20,
+      tokenBudget: 500_000, noProgressTurnLimit: null, turnsUsed: 0, tokensUsed: 0, lastReason: "", revision: 10n, ownerGeneration: 1n, sessionGeneration: 8n };
+    const set = vi.fn(async () => { if (fails) throw new Error("The response was lost"); return value; });
+    network.objectiveRpc = vi.fn(() => ({ get: vi.fn(async () => undefined), set } as unknown as MobileObjectiveRpc));
+    network.getServiceOperation = vi.fn(async (_credential, id) => create(OperationSchema, { operationId: id, state: OperationState.SUCCEEDED }));
+    vi.mocked(network.submit).mockImplementation(async (_credential, id, mutation) => {
+      expect(mutation.payload.case).toBe("createSession");
+      return create(OperationSchema, { operationId: id, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+        result: { payload: { case: "session", value: snapshot.sessions[0]! } } });
+    });
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => `objective-operation-${++operation}`, undefined, drafts);
+    await app.start();
+    const input = { text: "Reach the result", limits: { maximumTurns: 20, tokenBudget: 500_000, noProgressTurnLimit: null } };
+    const source = plainTextMobileComposerDraft("Retain the original composer");
+    const result = await app.create("target", "Goal task", source, input);
+    expect(result).toMatchObject({ created: true, sessionId: "session", sent: !fails });
+    expect(set).toHaveBeenCalledTimes(1); expect(network.submit).toHaveBeenCalledTimes(1);
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+    if (fails) {
+      expect(await app.taskObjectiveApi()!.restore(new AbortController().signal)).toEqual(input);
+      expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toEqual(source);
+      expect(app.state.pending).toMatchObject([{ kind: "objective-set", sessionId: "session", sourceGeneration: "8", state: "unknown" }]);
+      expect(JSON.stringify(app.state.pending)).not.toContain(input.text);
+      await app.reconcile(); expect(app.state.pending).toEqual([]);
+      expect(set).toHaveBeenCalledTimes(1); expect(network.submit).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it.each([false, true])("enables new-task collaboration before the first input and keeps unknown worker creation without repeating it: %s", async fails => {
+    const owner = clone(SnapshotSchema, snapshot); owner.settings = create(SettingsSnapshotSchema, {});
+    owner.scope = create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema, {}) } });
+    const network = projectedNetwork(owner), drafts = memoryDraftStores(); let request = 0;
+    const tree = create(CollaborationGoalTreeSchema, { goal: { goalId: "goal", leadId: "lead", leadSessionId: "session", status: CollaborationGoalStatus.ACTIVE, revision: { value: 1n } } });
+    let enabled = false;
+    const createGoal = vi.fn(async () => { enabled = true; return tree; });
+    const createWorker = vi.fn(async () => { if (fails) throw new Error("Worker response lost"); tree.workers.push(create(CollaborationGoalTreeSchema, { workers: [{ workerId: "worker", label: "reviewer", role: "reviewer", assignment: "", route: { targetId: "target", backendId: "backend", permissionMode: PermissionMode.ASK } }] }).workers[0]!); return tree; });
+    network.collaborationRpc = vi.fn((_credential, _id, _generation, assert) => ({
+      list: async (signal: AbortSignal) => { assert(signal); return enabled ? [{ $typeName: "joko.v1.CollaborationGoalAccess", goal: tree.goal, role: CollaborationSessionRole.LEAD }] : []; },
+      get: async () => tree, createGoal, createWorker
+    } as unknown as MobileCollaborationRpc));
+    network.getServiceOperation = vi.fn(async () => undefined);
+    vi.mocked(network.submit).mockImplementation(async (_credential, id, mutation) => create(OperationSchema, {
+      operationId: id, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: mutation.payload.case === "createSession" ? { case: "session", value: snapshot.sessions[0]! }
+        : { case: "queueItem", value: create(QueueItemSchema, { queueItemId: "first", sessionId: "session", targetId: "target", backendId: "backend" }) } }
+    }));
+    const storage = memoryStorage(credential).storage;
+    const app = client(network, storage, undefined, undefined, () => `collaboration-request-${++request}`, undefined, drafts); await app.start();
+    const form = { role: "reviewer", targetId: "target", permissionMode: PermissionMode.ASK, initialTask: "", sourceScope: app.newTaskCollaborationScope("target", "target")! };
+    await expect(app.create("target", "Task", plainTextMobileComposerDraft("Lead input"), undefined, form)).resolves.toMatchObject({ created: true, sent: true });
+    if (!createGoal.mock.calls.length) throw new Error(app.state.error || "The collaboration creation was skipped.");
+    expect(createGoal).toHaveBeenCalledOnce(); expect(createWorker).toHaveBeenCalledWith(expect.anything(), form, "reviewer", expect.any(String), expect.any(AbortSignal));
+    expect(createWorker.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(network.submit).mock.invocationCallOrder[1]!);
+    if (fails) {
+      expect(app.state.error).toContain("Collaboration was not confirmed"); expect(app.state.pending).toMatchObject([{ kind: "collaboration-create", sourceGeneration: "8" }]);
+      expect(JSON.stringify(app.state.pending)).not.toContain("Lead input");
+      expect(await app.taskCollaborationApi()!.restore(new AbortController().signal)).toEqual(form);
+      app.dispose();
+      const restartedDrafts = { values: drafts.values, newTask: new MobileNewTaskDraftStore(drafts.newTask.driver), composer: new MobileComposerDraftStore(drafts.composer.driver) };
+      const restarted = client(network, storage, undefined, undefined, () => `collaboration-request-${++request}`, undefined, restartedDrafts);
+      await restarted.start();
+      expect(await restarted.taskCollaborationApi()!.restore(new AbortController().signal)).toEqual(form);
+      expect(createGoal).toHaveBeenCalledOnce(); expect(createWorker).toHaveBeenCalledOnce();
+      vi.mocked(network.getServiceOperation!).mockImplementation(async (_credential, id) => create(OperationSchema, { operationId: id, state: OperationState.SUCCEEDED }));
+      await restarted.reconcile(); expect(restarted.state.pending).toEqual([]); expect(createWorker).toHaveBeenCalledOnce();
+      expect(await restarted.taskCollaborationApi()!.restore(new AbortController().signal)).toBeUndefined();
+    }
+    expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+    await expect(app.create("target", "Task", plainTextMobileComposerDraft("input"), undefined, { ...form, sourceScope: "retired" })).rejects.toThrow("Confirm");
+  });
+
+  it("denies worker escalation, archives only self with original lead authority, and retires collaboration reads", async () => {
+    const network = fakeNetwork(), tree = create(CollaborationGoalTreeSchema, { goal: { goalId: "goal", leadSessionId: "lead-session", revision: { value: 1n } },
+      workers: [{ workerId: "self", goalId: "goal", sessionId: "session", revision: { value: 1n }, status: CollaborationWorkerStatus.IDLE },
+        { workerId: "sibling", goalId: "goal", sessionId: "sibling-session", revision: { value: 1n }, status: CollaborationWorkerStatus.IDLE }] });
+    const archive = vi.fn(async () => tree), createWorker = vi.fn();
+    network.collaborationRpc = vi.fn((_credential, _id, _generation, assert) => ({ list: async (signal: AbortSignal) => {
+      assert(signal); return [{ $typeName: "joko.v1.CollaborationGoalAccess", goal: tree.goal, workerId: "self", role: CollaborationSessionRole.WORKER }];
+    }, get: async () => tree, archive, createWorker } as unknown as MobileCollaborationRpc));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const api = app.taskCollaborationApi()!, signal = new AbortController().signal, view = await api.load(signal);
+    await expect(api.create(view, { role: "reviewer", targetId: "target", initialTask: "", permissionMode: PermissionMode.ASK }, signal)).rejects.toThrow("Only");
+    await expect(api.archive(view, tree.workers[1]!, signal)).rejects.toThrow("selected current worker");
+    expect(app.state.pending).toEqual([]); expect(createWorker).not.toHaveBeenCalled();
+    await api.archive(view, tree.workers[0]!, signal); expect(archive).toHaveBeenCalledWith(tree.goal, tree.workers[0], expect.any(String), expect.any(AbortSignal));
+    app.setForeground(false); await expect(api.load(signal)).rejects.toThrow(); expect(archive).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an unavailable task source before retiring the receiving task or its selected identity", async () => {
+    const app = client(fakeNetwork(), memoryStorage(credential).storage); await app.start(); await app.select("session");
+    await expect(app.select("unavailable-source")).rejects.toThrow("current Joko node");
+    expect(app.state.selectedId).toBe("session"); expect(app.state.pending).toEqual([]);
+  });
+
+  it("resolves reporting worker navigation through exact membership without releasing, waking or mutating work", async () => {
+    const network = fakeNetwork(), tree = create(CollaborationGoalTreeSchema, { goal: { goalId: "goal", leadSessionId: "session" },
+      workers: [{ workerId: "worker", goalId: "goal", sessionId: "worker-task", label: "Renamed worker" }] });
+    const origin = { $typeName: "joko.v1.CollaborationReportOrigin" as const, goalId: "goal", workerId: "worker", leadSessionId: "session",
+      workerSessionId: "worker-task", workerLabel: "Original label", body: "Completed the work." };
+    const get = vi.fn(async (_id: string, signal: AbortSignal) => { signal.throwIfAborted(); return tree; }), release = vi.fn();
+    network.collaborationRpc = vi.fn(() => ({ get, release } as unknown as MobileCollaborationRpc));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const api = app.taskCollaborationApi()!, signal = new AbortController().signal;
+    expect(await api.resolveReport(origin, signal)).toBe("worker-task");
+    expect(get).toHaveBeenCalledWith("goal", expect.any(AbortSignal)); expect(release).not.toHaveBeenCalled(); expect(app.state.pending).toEqual([]);
+    tree.workers[0]!.sessionId = "replacement";
+    await expect(api.resolveReport(origin, signal)).rejects.toThrow("original reporting worker");
+    await expect(api.resolveReport({ ...origin, leadSessionId: "other" }, signal)).rejects.toThrow("another lead");
+    tree.workers[0]!.sessionId = "worker-task";
+    const cancelled = new AbortController(); cancelled.abort(); await expect(api.resolveReport(origin, cancelled.signal)).rejects.toThrow();
+    app.setForeground(false); await expect(api.resolveReport(origin, signal)).rejects.toThrow(); expect(release).not.toHaveBeenCalled();
+  });
+
+  it("retires objective facades and denies worker writes before an RPC or receipt", async () => {
+    const network = fakeNetwork(), set = vi.fn();
+    network.objectiveRpc = vi.fn((_credential, _session, _generation, assertCurrent) => ({
+      get: async (signal: AbortSignal) => { assertCurrent(signal); return undefined; }, set
+    } as unknown as MobileObjectiveRpc));
+    const app = client(network, memoryStorage(credential).storage); await app.start(); await app.select("session");
+    const api = app.taskObjectiveApi()!; expect(api).toBeDefined();
+    vi.mocked(network.readTaskHeaderRole).mockResolvedValueOnce("worker");
+    await expect(api.set({ text: "Do the task" }, new AbortController().signal)).rejects.toThrow("Worker");
+    expect(set).not.toHaveBeenCalled(); expect(app.state.pending).toEqual([]);
+    app.setForeground(false);
+    await expect(api.get(new AbortController().signal)).rejects.toThrow();
+    expect(set).not.toHaveBeenCalled();
   });
 
   it("uploads a retained attachment-only first input after creation and sends canonical image/file parts", async () => {

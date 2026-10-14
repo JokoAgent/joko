@@ -23,6 +23,8 @@ export interface PendingOperation {
     | "session-model" | "session-permission" | "session-plan" | "session-compact" | "session-branch"
     | "session-shell" | "session-reset" | "session-review" | "session-clone" | "session-fork" | "session-rewind" | "workspace-rewind"
     | "task-tag"
+    | "objective-set" | "objective-pause" | "objective-resume" | "objective-clear"
+    | "collaboration-enable" | "collaboration-create" | "collaboration-release" | "collaboration-archive" | "collaboration-end"
     | "schedule-run" | "schedule-enable" | "schedule-run-restart" | "schedule-run-read"
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
@@ -402,6 +404,8 @@ function isPending(value: unknown): value is PendingOperation {
     || !["create", "send", "logout", "revoke", "device-rename", "rename", "pin", "archive", "delete", "message-delete",
       "queue-cancel", "queue-edit-lock", "queue-edit", "queue-interaction-lock", "queue-reorder",
       "interaction-resolve", "interaction-dismiss", "session-model", "session-permission", "session-plan", "session-compact",
+      "objective-set", "objective-pause", "objective-resume", "objective-clear",
+      "collaboration-enable", "collaboration-create", "collaboration-release", "collaboration-archive", "collaboration-end",
       "session-branch", "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "schedule-run", "schedule-enable",
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
@@ -449,9 +453,13 @@ function isPending(value: unknown): value is PendingOperation {
     && (typeof record.sessionId !== "string" || typeof record.interactionId !== "string"
       || typeof record.interactionGeneration !== "string" || typeof record.interactionRevision !== "string")) return false;
   if (["session-model", "session-permission", "session-plan", "session-compact", "session-branch",
-    "session-shell", "session-reset", "session-review", "session-clone", "session-fork"].includes(String(record.kind))
+    "session-shell", "session-reset", "session-review", "session-clone", "session-fork",
+    "objective-set", "objective-pause", "objective-resume", "objective-clear"].includes(String(record.kind))
     && typeof record.sessionId !== "string") return false;
   if (record.kind === "session-fork" && !validReceiptIdentity(record.eventId)) return false;
+  if (String(record.kind).startsWith("objective-") && (!validReceiptIdentity(record.sessionId) || record.sourceGeneration === undefined)) return false;
+  if (String(record.kind).startsWith("collaboration-") && (!validReceiptIdentity(record.sessionId) || record.sourceGeneration === undefined
+    || record.backendId !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
   if (["session-rewind", "workspace-rewind"].includes(String(record.kind)) && (!validReceiptIdentity(record.sessionId)
     || !validReceiptIdentity(record.eventId) || !validReceiptIdentity(record.targetId) || !validReceiptIdentity(record.backendId)
     || record.sourceGeneration === undefined)) return false;
@@ -489,8 +497,10 @@ function isPending(value: unknown): value is PendingOperation {
     && record.triggerId !== undefined) return false;
   if (!["schedule-create", "schedule-update", "schedule-project-reconcile", "session-rewind", "workspace-rewind"].includes(String(record.kind))
     && record.targetId !== undefined) return false;
-  if (!["session-rewind", "workspace-rewind"].includes(String(record.kind))
+  if (!["session-rewind", "workspace-rewind", "objective-set", "objective-pause", "objective-resume", "objective-clear",
+    "collaboration-enable", "collaboration-create", "collaboration-release", "collaboration-archive", "collaboration-end"].includes(String(record.kind))
     && (record.backendId !== undefined || record.sourceGeneration !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
+  if (String(record.kind).startsWith("objective-") && (record.backendId !== undefined || record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
   if (record.kind === "session-rewind" && (record.workspaceId !== undefined || record.changeSetId !== undefined)) return false;
   if (!["interaction-resolve", "interaction-dismiss"].includes(String(record.kind))
     && (record.interactionId !== undefined || record.interactionGeneration !== undefined

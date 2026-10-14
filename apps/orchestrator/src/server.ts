@@ -311,6 +311,7 @@ export async function createInternalServer(application: OrchestratorApplication)
       const serverId = body["serverId"];
       const toolName = body["toolName"];
       const argumentsValue = body["arguments"];
+      const partnerLearningProof = body["partnerLearningProof"];
       const headerGeneration = request.headers["x-joko-pi-generation"];
       if (
         typeof requestId !== "string" || requestId.length < 1 || requestId.length > 1_024 ||
@@ -321,6 +322,7 @@ export async function createInternalServer(application: OrchestratorApplication)
         typeof serverId !== "string" || serverId === "" ||
         typeof toolName !== "string" || toolName === "" ||
         (argumentsValue !== undefined && !isRecord(argumentsValue)) ||
+        (partnerLearningProof !== undefined && (typeof partnerLearningProof !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(partnerLearningProof))) ||
         typeof headerGeneration !== "string" || Number(headerGeneration) !== generation
       ) return reply.code(400).send({ error: "MCP bridge request failed its generation or schema fence." });
       const cancellation = new AbortController();
@@ -339,6 +341,7 @@ export async function createInternalServer(application: OrchestratorApplication)
           serverId,
           toolName,
           signal: cancellation.signal,
+          ...(partnerLearningProof === undefined ? {} : { partnerLearningProof: partnerLearningProof as string }),
           ...(argumentsValue === undefined ? {} : { arguments: argumentsValue })
         });
         return result;

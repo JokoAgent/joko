@@ -22,6 +22,28 @@ afterEach(() => {
 });
 
 describe("SnapshotProjector", () => {
+  it("joins committed learning metadata to the original assistant snapshot without changing message content", () => {
+    const { store } = createFixture();
+    store.claimNextQueueItem({ sessionId: "session-1", backendInstanceGeneration: 0, traceId: "learning:dispatch" });
+    store.updateQueueState({ queueItemId: "queue-1", attemptId: "attempt-1", state: "backend_accepted", traceId: "learning:accepted" });
+    const source = { occurrenceId: "learning-source", sessionId: "session-1", targetId: "target-1", backendId: "pi",
+      backendInstanceGeneration: 0, bindingGeneration: 7, bindingFingerprint: nativeBindingFingerprint("opaque:pi:session-1"),
+      sourceRunId: "run-1", sourceAttemptId: "attempt-1", sourceQueueItemId: "queue-1", operationId: "operation-1", nativeOccurrence: "native-turn" };
+    store.registerPartnerLearningTurn(source, "partner-1"); store.acceptPartnerLearningTurn(source.occurrenceId);
+    const reply = store.appendEvent({ id: "learning-original-reply", backendId: "pi", targetId: "target-1", sessionId: "session-1",
+      runId: "run-1", attemptId: "attempt-1", generation: 7, traceId: "learning:reply", payload: {
+        type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original reply." }] } });
+    store.addPartnerLearningReceipt(source.occurrenceId, { kind: "memory", entryId: "memory-entry", title: "Preference", action: "created" });
+    store.sealPartnerLearningTurn(source.occurrenceId, reply.id);
+    const snapshot = createProjector(store).projectSessionSnapshot({ sessionId: "session-1", recentTimelineItems: 100 });
+    const projected = snapshot.timeline.find(event => event.eventId === reply.id)!;
+    expect(projected.payload?.kind).toMatchObject({ case: "messageCompleted", value: {
+      messageId: reply.id, blocks: [{ content: { case: "text", value: "Original reply." } }], learning: {
+        receipts: [{ entryId: "memory-entry", title: "Preference" }], revision: { value: expect.any(BigInt) } } } });
+    expect(snapshot.timeline.filter(event => event.payload?.kind.case === "messageCompleted"
+      && event.payload.kind.value.messageId === reply.id)).toHaveLength(1);
+    expect(store.findEvent(reply.id)).toEqual(reply);
+  });
   it("projects Provider access and upstream pricing capability without Backend-ID branching", () => {
     const provider = toProtoProviderDescriptor(
       "backend-one",

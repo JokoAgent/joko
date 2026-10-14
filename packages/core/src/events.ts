@@ -117,7 +117,28 @@ export interface PartnerPrivateMessageOrigin {
   readonly senderDisplayName: string;
 }
 
+/** Trusted collaboration service provenance for a worker's canonical report. */
+export interface CollaborationReportOrigin {
+  readonly goalId: string;
+  readonly workerId: string;
+  readonly leadSessionId: string;
+  readonly workerSessionId: string;
+  readonly workerLabel: string;
+  readonly body: string;
+}
+
+/** Public sender snapshot for an explicitly delivered task message. */
+export interface TaskMessageOrigin {
+  readonly senderSessionId: string;
+  readonly senderSessionTitle?: string;
+  readonly senderPartnerId?: string;
+  readonly senderPartnerName?: string;
+}
+
 export type EventPayload =
+  /** Store-owned metadata for one existing assistant completion, never a new message. */
+  | { readonly type: "partner_learning_changed"; readonly completionEventId: string; readonly messageId: string;
+      readonly feedback: import("./partner-learning.js").PartnerLearningFeedback }
   | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError }
   /** Store-owned observation; never emitted by a Session adapter. */
   | { readonly type: "device_changed"; readonly device: DeviceContentProjection }
@@ -134,6 +155,8 @@ export type EventPayload =
       /** Host-owned accepted Queue input for canonical user presentation, independent of the native echo. */
       readonly acceptedInput?: PromptInput;
       readonly partnerPrivateOrigin?: PartnerPrivateMessageOrigin;
+      readonly collaborationReportOrigin?: CollaborationReportOrigin;
+      readonly taskMessageOrigin?: TaskMessageOrigin;
       /** Per-message provider accounting when authoritatively reported. */
       readonly usage?: UsageSnapshot;
       /** Generation-only time for this assistant message, never turn wall-clock time. */

@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   AdapterContext,
+  PartnerLearningTurnSource,
+  PartnerLearningToolAuthority,
   ApprovedSkillSeed,
   CreateNativeSessionInput,
   EventPayload,
@@ -2369,6 +2371,39 @@ describe("CodexBackendAdapter", () => {
     });
   });
 
+  it("keeps original Partner tool and reply authority across a native steer", async () => {
+    const opened: CodexMcpOpenInput[] = [], events: EventPayload[] = [];
+    const setup = await createSetup(7, { localMcpBridge: async (input) => {
+      opened.push(input);
+      return { routes: [{ serverId: "tools", name: "joko_tools", url: "http://127.0.0.1:4100/private" }],
+        assertCurrent: input.assertSessionCurrent, release: async () => undefined };
+    } });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, [], { backendInstanceGeneration: 7 }));
+    const original = context(setup.target, events, { binding, operationId: "original-root", backendInstanceGeneration: 7 });
+    const source: PartnerLearningTurnSource = { occurrenceId: "root-occurrence", sessionId: original.sessionId, targetId: setup.target.id,
+      backendId: setup.adapter.id, backendInstanceGeneration: 7, bindingGeneration: 1, bindingFingerprint: "root-binding",
+      sourceRunId: "original-root", sourceAttemptId: "original-attempt", sourceQueueItemId: "original-queue", nativeOccurrence: "native-root" };
+    const capture = vi.fn((request: { readonly requestId: string; readonly serverId: string; readonly toolName: string }): PartnerLearningToolAuthority =>
+      ({ source, ...request, assertCurrent: () => undefined }));
+    const captureTurn = vi.fn(() => ({ source, emit: original.emit, captureToolRequest: capture, observeNativeReply: () => undefined }));
+    await setup.adapter.send(prompt("original"), { ...original, capturePartnerLearningTurn: captureTurn });
+    const steerEvents: EventPayload[] = [];
+    await setup.adapter.send({ ...prompt("steer"), disposition: "steer" }, { ...context(setup.target, steerEvents, {
+      binding, operationId: "different-steer", backendInstanceGeneration: 7
+    }), capturePartnerLearningTurn: () => { throw new Error("A steer cannot replace the root learning source."); } });
+    const request = { requestId: "original-save", serverId: "tools", toolName: "save" };
+    const call = opened[0]!.beginToolCall(binding.nativeSessionId!, request);
+    expect(call.partnerLearningAuthority?.source).toBe(source);
+    expect(capture).toHaveBeenCalledWith(request);
+    expect(captureTurn).toHaveBeenCalledOnce();
+    await setup.fake.completeTurn(binding.nativeSessionId!);
+    expect(events.some((event) => event.type === "message_complete" && event.role === "assistant")).toBe(true);
+    expect(events.some((event) => event.type === "done")).toBe(true);
+    expect(steerEvents.some((event) => event.type === "message_complete" && event.role === "assistant")).toBe(false);
+    expect(() => call.assertCurrent()).toThrow();
+    call.release();
+  });
+
   it("isolates local MCP config and binds the frozen route to active native turns", async () => {
     const opened: CodexMcpOpenInput[] = [];
     const released = vi.fn(async () => undefined);
@@ -2427,9 +2462,9 @@ describe("CodexBackendAdapter", () => {
       backendInstanceGeneration: 7,
       operationId: "local-mcp-turn"
     }));
-    const call = opened[0]!.beginToolCall(threadId);
+    const call = opened[0]!.beginToolCall(threadId, { requestId: "local-tool", serverId: "tools", toolName: "read" });
     expect(() => call.assertCurrent()).not.toThrow();
-    expect(() => opened[0]!.beginToolCall("foreign-thread")).toThrow();
+    expect(() => opened[0]!.beginToolCall("foreign-thread", { requestId: "foreign-tool", serverId: "tools", toolName: "read" })).toThrow();
     await setup.fake.completeTurn(threadId);
     expect(call.signal.aborted).toBe(true);
     call.release();
@@ -2695,8 +2730,8 @@ describe("CodexBackendAdapter", () => {
         "mcp_servers.joko_local_2.url": "http://127.0.0.1:4100/2"
       } });
     await setup.adapter.send(prompt("second"), { ...bound, operationId: "local-after-model-switch" });
-    expect(() => opened[0]!.beginToolCall(binding.nativeSessionId!)).toThrow();
-    const call = opened[1]!.beginToolCall(binding.nativeSessionId!);
+    expect(() => opened[0]!.beginToolCall(binding.nativeSessionId!, { requestId: "old-tool", serverId: "tools", toolName: "read" })).toThrow();
+    const call = opened[1]!.beginToolCall(binding.nativeSessionId!, { requestId: "new-tool", serverId: "tools", toolName: "read" });
     expect(() => call.assertCurrent()).not.toThrow();
     call.release();
   });
@@ -2770,9 +2805,9 @@ describe("CodexBackendAdapter", () => {
       backendInstanceGeneration: 7,
       operationId: "remote-mcp-turn"
     }));
-    const call = opened[0]!.beginToolCall(threadId);
+    const call = opened[0]!.beginToolCall(threadId, { requestId: "remote-tool", serverId: "tools", toolName: "read" });
     expect(() => call.assertCurrent()).not.toThrow();
-    expect(() => opened[0]!.beginToolCall("unowned-native-thread")).toThrow();
+    expect(() => opened[0]!.beginToolCall("unowned-native-thread", { requestId: "unowned-tool", serverId: "tools", toolName: "read" })).toThrow();
 
     bridgeGeneration = 2;
     const resumeCountWhileBusy = setup.remoteFake.transport!.requests.filter((request) => request.method === "thread/resume").length;
@@ -2817,7 +2852,7 @@ describe("CodexBackendAdapter", () => {
         agentsStates: { [childThreadId]: { status: "running", message: null } }
       }
     });
-    const childCall = opened[1]!.beginToolCall(childThreadId);
+    const childCall = opened[1]!.beginToolCall(childThreadId, { requestId: "child-tool", serverId: "tools", toolName: "read" });
     expect(() => childCall.assertCurrent()).not.toThrow();
     await setup.remoteFake.transport!.emitNotification("turn/completed", {
       threadId: childThreadId,

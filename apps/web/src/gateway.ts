@@ -6,6 +6,7 @@ import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResu
 import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
 import { createPartnerMemoryApi } from "@joko/contracts";
+import { projectPartnerLearningFeedback } from "@joko/contracts";
 import { createPartnerConnectionsApi } from "@joko/contracts";
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import { mapPartnerAvatar, protoPartnerAvatar, type PartnerAvatarImageView } from "./partner-avatar.js";
@@ -10745,6 +10746,7 @@ export function projectSnapshotEvent(
     case "thinkingDelta":
     case "statusStream":
     case "messageCompleted":
+    case "partnerLearningChanged":
     case "toolCallStarted":
     case "toolCallUpdated":
     case "toolCallCompleted":
@@ -10883,6 +10885,7 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
     || kind === "thinkingDelta"
     || kind === "statusStream"
     || kind === "messageCompleted"
+    || kind === "partnerLearningChanged"
     || kind === "toolCallStarted"
     || kind === "toolCallUpdated"
     || kind === "toolCallCompleted"
@@ -11092,6 +11095,20 @@ function projectTimelineEvent(
         }
       }
       changed = found;
+      break;
+    }
+    case "partnerLearningChanged": {
+      const update = kind.value;
+      const learning = projectPartnerLearningFeedback(update.feedback);
+      changed = false;
+      for (let index = 0; index < items.length; index += 1) {
+        const item = items[index];
+        if (!item || item.kind !== "assistant" || item.streaming === true || item.sourceEventId !== update.completionEventId
+          || (item.messageId ?? item.id) !== update.messageId) continue;
+        if (learning && (item.learning?.revision ?? 0n) >= learning.revision) continue;
+        items[index] = { ...item, learning };
+        changed = true;
+      }
       break;
     }
     case "toolCallStarted":
@@ -11445,6 +11462,7 @@ function reconcileCompletedAssistantMessage(
   usage: TimelineItemView["usage"] | undefined
 ): boolean {
   const messageId = completed.messageId;
+  const learning = projectPartnerLearningFeedback(completed.learning);
   const existingContent = items.filter((item) =>
     (item.kind === "assistant" || item.kind === "thinking")
     && isProjectedMessageItem(item, messageId)
@@ -11488,6 +11506,7 @@ function reconcileCompletedAssistantMessage(
           ...(event.cursor !== undefined && event.cursor.sequence > 0n ? { completionCursor: event.cursor.sequence } : {}),
           ...timelinePrivateMessageOrigin(completed.partnerPrivateOrigin),
           streaming: false,
+          ...(learning === undefined ? {} : { learning }),
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(usage === undefined ? {} : { usage })
         }
@@ -20137,7 +20156,7 @@ function mapCollaborationWorker(value: ProtoCollaborationWorker | undefined): Co
   if (value === undefined || route === undefined || !validCollaborationOwnedIdentity(value.workerId)
     || !validCollaborationOwnedIdentity(value.goalId)
     || !validCollaborationShortText(value.label, 64) || !validCollaborationShortText(value.role, 128)
-    || !validCollaborationText(value.assignment)
+    || value.assignment !== "" && !validCollaborationText(value.assignment)
     || !validCollaborationRouteIdentity(route.backendId) || !validCollaborationRouteIdentity(route.targetId)
     || (value.parentWorkerId !== undefined && !validCollaborationOwnedIdentity(value.parentWorkerId))
     || (value.sessionId !== undefined && value.sessionId.trim() === "")

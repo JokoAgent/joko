@@ -40,6 +40,9 @@ import {
   type PolicySnapshot,
   type PortableNativeSession,
   type PromptInput,
+  type PartnerLearningTurnHandle,
+  type PartnerLearningTurnSource,
+  type PartnerLearningToolAuthority,
   type ProviderModel,
   type RuntimeCommand,
   type RuntimeToolCatalog,
@@ -84,7 +87,7 @@ import {
   encodePortableSessionProjection
 } from "./portable-session-projection.js";
 import { ScheduleCoordinator } from "./schedule-coordinator.js";
-import { SessionHost, type InteractionDecisionSubmission, type WorkspaceRunCapture } from "./session-host.js";
+import { SessionHost, type InteractionDecisionSubmission, type WorkspaceRunCapture, type PartnerLearningHostPort } from "./session-host.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 import { activeNativeTimeline } from "./snapshot-projector.js";
 import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD } from "./native-history.js";
@@ -225,6 +228,28 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it("keeps trusted task sender provenance on canonical input and strips forged native senders", async () => {
+    const adapter = new class extends FakeBackendAdapter {
+      override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+        await context.emit({ type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }], taskMessageOrigin: { senderSessionId: "forged", senderSessionTitle: "Spoofed" } });
+        await super.send(input, context);
+      }
+    }(PI_LIKE_PROFILE);
+    const f = await createFixture(adapter);
+    const createTask = (operationId: string) => f.host.createSession({ operationId, connection: f.connection, targetId: "target-one", title: operationId,
+      permissionMode: "ask", planMode: false, fastMode: false });
+    const sender = (await createTask("source-task")).value.sessionId, recipient = (await createTask("recipient-task")).value.sessionId;
+    const taskMessageOrigin = { senderSessionId: sender, senderSessionTitle: "Source title at delivery" };
+    const prompt = { text: "Original literal message", images: [], files: [], mentions: [], disposition: "prompt" as const };
+    f.host.enqueueServiceInput({ operationId: "trusted-task-message", sessionId: recipient, source: "system", originSessionId: sender, taskMessageOrigin, prompt });
+    await eventually(() => f.store.listEvents({ sessionId: recipient, order: "asc", limit: 1_000 })
+      .some(event => event.payload.type === "message_complete" && event.payload.role === "user"), 5_000);
+    const user = f.store.listEvents({ sessionId: recipient, order: "asc", limit: 1_000 }).find(event => event.payload.type === "message_complete" && event.payload.role === "user");
+    expect(user?.payload).toMatchObject({ acceptedInput: { text: prompt.text }, taskMessageOrigin });
+    expect(f.store.getOperation("trusted-task-message").body).toMatchObject({ taskMessageOrigin });
+    expect(() => f.host.enqueueServiceInput({ operationId: "forged-task-message", sessionId: recipient, source: "system", originSessionId: sender,
+      taskMessageOrigin: { senderSessionId: recipient }, prompt })).toThrow("original system handoff");
+  });
   it("hands off at the next send and resumes parked bindings with delta history in the same task", async () => {
     const profile = { ...PI_LIKE_PROFILE, capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
       ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability) };
@@ -13364,7 +13389,9 @@ describe("SessionHost", () => {
     });
     expect(remoteFake.transport!.requests.find((candidate) => candidate.method === "turn/start")?.params)
       .toMatchObject({ threadId: nativeSessionId, cwd: "/srv/joko-project", clientUserMessageId: "dispatch-remote-codex-text" });
-    const remoteMcpCall = remoteMcpInput!.beginToolCall(nativeSessionId);
+    const remoteMcpCall = remoteMcpInput!.beginToolCall(nativeSessionId, {
+      requestId: "remote-tool-lease", serverId: "product-tools", toolName: "fixture"
+    });
     expect(() => remoteMcpCall.assertCurrent()).not.toThrow();
     expect(remoteMcpCall.signal.aborted).toBe(false);
     expect(releaseRemoteMcp).not.toHaveBeenCalled();
@@ -15065,10 +15092,83 @@ function advanceBackendInstanceGeneration(store: OperationalStore, backendId: st
   return reservation.generation;
 }
 
+describe("original Partner learning turn authority", () => {
+  it("captures dispatching authority and seals its actual reply only after native acceptance", async () => {
+    class CaptureAdapter extends FakeBackendAdapter {
+      turn?: PartnerLearningTurnHandle;
+      original?: AdapterContext;
+      override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+        this.original = context;
+        this.turn = context.capturePartnerLearningTurn!({ nativeOccurrence: "native-original" });
+        await this.turn!.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Saved reply" }] });
+        await this.turn!.emit({ type: "done", outcome: "completed" });
+      }
+    }
+    const sources: PartnerLearningTurnSource[] = [], phases: string[] = [];
+    const sealed = vi.fn((_occurrence: string, _eventId: string) => { phases.push("sealed"); });
+    const settled = vi.fn((_occurrence: string, _eventId: string, _outcome: string) => { phases.push("settled"); });
+    const adapter = new CaptureAdapter(PI_LIKE_PROFILE);
+    const fixture = await createFixture(adapter, { partnerLearning: {
+      captureSource: (source) => { sources.push(source); phases.push("captured"); return true; },
+      accepted: () => { phases.push("accepted"); }, sealed, settled
+    } });
+    const created = await fixture.host.createSession({ operationId: "learning-create", connection: fixture.connection,
+      targetId: "target-one", title: "Partner", fastMode: false, permissionMode: "ask", planMode: false });
+    const sessionId = created.value.sessionId;
+    const queued = fixture.host.enqueueInput({ operationId: "learning-input", connection: fixture.connection, sessionId,
+      prompt: { text: "Save", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await vi.waitFor(() => expect(settled).toHaveBeenCalledOnce());
+    const item = fixture.store.getQueueItem(queued.value.queueItemId);
+    expect(sources[0]).toMatchObject({ sessionId, sourceRunId: item.runId, sourceAttemptId: item.attemptId,
+      sourceQueueItemId: item.id, operationId: "learning-input", nativeOccurrence: "native-original" });
+    expect(phases).toEqual(["captured", "accepted", "sealed", "settled"]);
+    const event = fixture.store.findEvent(sealed.mock.calls[0]![1])!;
+    expect(event).toMatchObject({ runId: item.runId, attemptId: item.attemptId, payload: { type: "message_complete", role: "assistant" } });
+    expect(adapter.turn!.captureToolRequest({ requestId: "after-terminal", serverId: "tools", toolName: "save" })).toBeUndefined();
+    const priorCount = fixture.store.listEvents({ sessionId }).length;
+    await adapter.turn!.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Late assistant cannot replace the original seal" }] });
+    expect(fixture.store.listEvents({ sessionId })).toHaveLength(priorCount);
+    await expect(adapter.original!.emit({ type: "partner_learning_changed", completionEventId: event.id, messageId: "forged",
+      feedback: { receipts: [], revision: "1" } })).rejects.toThrow("owned by the service");
+  });
+
+  it("seals an exact native persistence identity when reconciliation replaces the transient reply", async () => {
+    class NativeCaptureAdapter extends FakeBackendAdapter {
+      override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+        const turn = context.capturePartnerLearningTurn!({ nativeOccurrence: "native-reconciled" })!;
+        await turn.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Native saved reply" }] },
+          { namespace: "fixture", fields: { nativeHistoryReplacesTransient: true } });
+        turn.observeNativeReply("reply-native-original");
+        await turn.emit({ type: "done", outcome: "aborted" });
+      }
+      async getNativeHistoryProjection(): Promise<NativeHistoryProjection> {
+        return { activeEntryId: "reply-native-original", activeLineage: [{ entryId: "reply-native-original" }], events: [{
+          nativeEntryId: "reply-native-original", projectionKind: "message_assistant", contentIndex: 0,
+          payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Native saved reply" }] }
+        }] };
+      }
+    }
+    const sealed = vi.fn(), settled = vi.fn();
+    const fixture = await createFixture(new NativeCaptureAdapter(PI_LIKE_PROFILE), { partnerLearning: {
+      captureSource: () => true, accepted: () => undefined, sealed, settled
+    } });
+    const { sessionId } = (await fixture.host.createSession({ operationId: "native-learning-create", connection: fixture.connection,
+      targetId: "target-one", title: "Native Partner", fastMode: false, permissionMode: "ask", planMode: false })).value;
+    fixture.host.enqueueInput({ operationId: "native-learning-input", connection: fixture.connection, sessionId,
+      prompt: { text: "Save", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await vi.waitFor(() => expect(sealed).toHaveBeenCalledOnce());
+    const event = fixture.store.findEvent(sealed.mock.calls[0]![1] as string)!;
+    expect(event.payload).toMatchObject({ type: "message_complete", nativeHistory: { identity: { entryId: "reply-native-original" } } });
+    expect(settled).toHaveBeenCalledWith(expect.any(String), event.id, "aborted");
+  });
+});
+
 async function createFixture(
   adapter: FakeBackendAdapter = new FakeBackendAdapter(PI_LIKE_PROFILE),
   hostOptions: {
     readonly workspaceCapture?: WorkspaceRunCapture;
+    readonly partnerLearning?: PartnerLearningHostPort;
+    readonly registerPartnerLearningToolAuthority?: (authority: PartnerLearningToolAuthority) => string;
     readonly worktrees?: SessionWorktreeCoordinator;
     readonly closeSessionTerminals?: (sessionId: string) => Promise<void>;
     readonly onSessionRuntimeClosed?: (sessionId: string) => void;

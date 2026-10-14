@@ -19,6 +19,15 @@ afterEach(async () => {
 });
 
 describe("ObjectiveManager", () => {
+  it("starts with default no-progress protection or explicitly unlimited turns without a second mutation", async () => {
+    const fixture = createFixture();
+    const defaults = await fixture.manager.set(setInput("default-limits", fixture));
+    expect(defaults.noProgressTurnLimit).toBe(3);
+    const unlimited = await fixture.manager.set({ ...setInput("unlimited-limits", fixture), noProgressTurnLimit: null });
+    expect(unlimited.noProgressTurnLimit).toBeUndefined();
+    expect(fixture.store.getOperation("unlimited-limits").body).toMatchObject({ noProgressTurnLimit: null });
+    expect(unlimited.ownerGeneration).toBeGreaterThan(defaults.ownerGeneration);
+  });
   it("cancels and clears an accepted Objective Queue owner when paused", async () => {
     const fixture = createFixture();
     const started = await fixture.manager.set(setInput("set-accepted", fixture));

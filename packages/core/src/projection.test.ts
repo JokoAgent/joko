@@ -18,6 +18,18 @@ function event(sequence: bigint, payload: EventEnvelope["payload"]): EventEnvelo
 }
 
 describe("session projection", () => {
+  it("replaces only an original assistant learning footer without adding a timeline row", () => {
+    const completed = event(1n, { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Original" }] });
+    let state = reduceEvent(emptyProjection(), completed);
+    const feedback = { receipts: [{ kind: "memory", entryId: "memory", title: "Preference", action: "created" }], revision: "3" } as const;
+    state = reduceEvent(state, event(2n, { type: "partner_learning_changed", completionEventId: completed.id, messageId: completed.id, feedback }));
+    state = reduceEvent(state, event(3n, { type: "partner_learning_changed", completionEventId: "another-message", messageId: "another-message", feedback }));
+    state = reduceEvent(state, event(4n, { type: "partner_learning_changed", completionEventId: completed.id, messageId: completed.id,
+      feedback: { ...feedback, receipts: [], revision: "2" } }));
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({ id: completed.id, blocks: [{ kind: "text", text: "Original" }], sequence: 1n, learning: feedback });
+    expect(state.attention).toBeUndefined();
+  });
   it("assembles streaming blocks and replaces them with authoritative messages", () => {
     let state = emptyProjection();
     state = reduceEvent(state, event(1n, { type: "text_delta", blockId: "b", delta: "Hel" }));

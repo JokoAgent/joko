@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import {
   JokoError,
   type AdapterContext,
+  type PartnerLearningTurnSource,
   type CreateNativeSessionInput,
   type EventPayload,
   type InteractionDecision,
@@ -218,7 +219,7 @@ describe("ClaudeCodeAdapter", () => {
     const sdk = new FakeSdkRuntime();
     let committed = false;
     let released = false;
-    const calls: Array<{ readonly requestId: string; readonly arguments: Readonly<Record<string, unknown>> }> = [];
+    const calls: Array<Parameters<ClaudeMcpRuntimeLease["call"]>[0]> = [];
     const tool = {
       serverId: "approved-tools", name: "echo", description: "Echo an approved value",
       inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
@@ -228,7 +229,7 @@ describe("ClaudeCodeAdapter", () => {
       tools: [tool],
       assertCurrent: () => { if (released || !committed) throw new Error("Stale product Session"); },
       call: async (input) => {
-        calls.push({ requestId: input.requestId, arguments: input.arguments });
+        calls.push(input);
         return { content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" }, isError: false };
       },
       release: () => { released = true; }
@@ -241,23 +242,38 @@ describe("ClaudeCodeAdapter", () => {
     expect(sdk.queries[0]!.params.options.mcpTools).toBeUndefined();
     committed = true;
     const source = contextFor(binding, { operationId: "approved-mcp-turn" });
-    await adapter.send(textPrompt("Use the approved tool"), source.context);
+    const learningSource: PartnerLearningTurnSource = { occurrenceId: "root-occurrence", sessionId: source.context.sessionId, targetId: target.id,
+      backendId: target.backendId, backendInstanceGeneration: INSTANCE_GENERATION, bindingGeneration: 1, bindingFingerprint: "root-binding",
+      sourceRunId: "original-root", sourceAttemptId: "original-attempt", sourceQueueItemId: "original-queue", nativeOccurrence: "native-root" };
+    const nativeReply = vi.fn();
+    await adapter.send(textPrompt("Use the approved tool"), { ...source.context, capturePartnerLearningTurn: () => ({
+      source: learningSource, emit: source.context.emit, observeNativeReply: nativeReply,
+      captureToolRequest: (request) => ({ source: learningSource, ...request, assertCurrent: () => undefined })
+    }) });
     expect(sdk.queries).toHaveLength(2);
     expect(sdk.retiredQueries).toEqual([sdk.queries[0]]);
     expect(sdk.queries[1]!.params.options.resume).toBe(binding.nativeSessionId);
     expect(sdk.queries[1]!.params.options.mcpTools).toMatchObject([tool]);
     const call = sdk.queries[1]!.params.options.mcpTools![0]!;
     const toolUseId = "native-approved-call";
-    const invoke = () => call.call({ value: "hello" }, { toolUseId, signal: new AbortController().signal });
+    const nativeArguments = { value: "hello" };
+    const invoke = () => call.call(nativeArguments, { toolUseId, signal: new AbortController().signal });
     const earlyCall = invoke();
-    sdk.queries[1]!.push(assistantMessage(binding.nativeSessionId!, randomUUID(), [{
+    nativeArguments.value = "changed while awaiting root owner";
+    const assistantUuid = randomUUID();
+    sdk.queries[1]!.push(assistantMessage(binding.nativeSessionId!, assistantUuid, [{
       type: "tool_use", id: toolUseId, name: `mcp__joko_${createHash("sha256").update(tool.serverId).digest("hex").slice(0, 24)}__echo`, input: { value: "hello" }
     }]));
     await eventually(() => source.events.some((event) => event.type === "tool_start"));
     await expect(earlyCall).resolves.toMatchObject({ content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" } });
     expect(calls).toHaveLength(1);
+    expect(calls[0]!.arguments).toEqual({ value: "hello" });
+    expect(calls[0]!.partnerLearningAuthority).toMatchObject({ source: learningSource, requestId: calls[0]!.requestId, serverId: tool.serverId, toolName: tool.name });
+    expect(nativeReply).toHaveBeenCalledWith(assistantUuid);
+    sdk.queries[1]!.push(assistantMessage(binding.nativeSessionId!, assistantUuid, [{ type: "text", text: "Repeated native frame" }]));
     sdk.queries[1]!.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));
     await eventually(() => source.events.some((event) => event.type === "done"));
+    expect(nativeReply).toHaveBeenCalledOnce();
     await expect(invoke()).rejects.toThrow("active root tool owner");
     await adapter.dispose();
     expect(released).toBe(true);

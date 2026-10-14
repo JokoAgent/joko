@@ -19,6 +19,7 @@ import { MobilePartnerRoutineSheet } from "./MobilePartnerRoutineSheet";
 import { MobilePartnerResumeSheet } from "./MobilePartnerResumeSheet";
 import { MobilePartnerMemorySheet } from "./MobilePartnerMemorySheet";
 import { partnerMemoryMessages, type PartnerMemoryEditor } from "@joko/contracts";
+import type { PartnerLearningSettingsDestination } from "@joko/contracts";
 import { partnerConnectionsMessages, type PartnerConnectionsEditor } from "@joko/contracts";
 import { MobilePartnerConnectionsSheet } from "./MobilePartnerConnectionsSheet";
 import { partnerSkillsMessages, type PartnerSkillsEditor } from "@joko/contracts";
@@ -33,7 +34,7 @@ interface OutputHandoff {
   readonly row: MobilePartnerTaskOutput;
 }
 
-export function MobilePartnerProfileSheet({ visible, partner, transport, deletionTransport, restartTransport, routineFactory, resumeFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale, onClose, onSaved, onSearch, online = true, onOutputsPageChange, onOpenOutputError }: {
+export function MobilePartnerProfileSheet({ visible, partner, transport, deletionTransport, restartTransport, routineFactory, resumeFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale, onClose, onSaved, onSearch, online = true, onOutputsPageChange, onOpenOutputError, initialLearningDestination }: {
   readonly visible: boolean;
   readonly partner?: MobilePartnerDirectoryProfile;
   readonly transport?: MobilePartnerProfileTransport;
@@ -52,6 +53,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   readonly online?: boolean;
   readonly onOutputsPageChange?: (open: boolean) => void;
   readonly onOpenOutputError?: (message: string) => void;
+  readonly initialLearningDestination?: PartnerLearningSettingsDestination;
 }) {
   const binding = visible && partner && transport ? `${transport.ownerKey}\u001f${partner.partnerId}` : undefined;
   const [routine, setRoutine] = useState<PartnerRoutineEditor>();
@@ -148,6 +150,24 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   const draft = snapshot ? state.draft : undefined;
   const dirty = !!snapshot && !!draft && JSON.stringify(mobilePartnerProfileDraft(snapshot.partner)) !== JSON.stringify(draft);
   const editable = !!snapshot && !!draft && !busy && !taskBusy && !restartBusy && !routine && !resume && !memory && !connections && !skills && snapshot.partner.pauseCleanupPending !== true && !state.requiresRefresh;
+  const learningEntryRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!binding || !initialLearningDestination) { learningEntryRef.current = undefined; return; }
+    const key = `${binding}\u001f${initialLearningDestination}`;
+    if (learningEntryRef.current === key || !visible || !online || !foreground || AppState.currentState !== "active"
+      || !snapshot || !transport || !editable || dirty || snapshot.partner.initializationState !== "ready"
+      || !snapshot.partner.canonicalSessionId) return;
+    if (initialLearningDestination === "memory") {
+      const editor = memoryFactory?.(snapshot.partner, transport.ownerKey);
+      if (!editor) return;
+      learningEntryRef.current = key; setMemory(editor);
+    } else {
+      const editor = skillsFactory?.(snapshot.partner, transport.ownerKey);
+      if (!editor) return;
+      learningEntryRef.current = key; setSkills(editor);
+    }
+  }, [binding, initialLearningDestination, visible, online, foreground, snapshot, transport?.ownerKey, editable, dirty,
+    memoryFactory, skillsFactory]);
 
   const load = (): void => {
     permissionConfirmation.current = undefined;

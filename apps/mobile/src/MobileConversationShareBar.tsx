@@ -2,11 +2,12 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 import { mobileMessage } from "./mobile-messages";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 
-export function MobileConversationShareBar({ count, allSelected, busy, locale, colors, onCancel, onToggleAll, onShare, screenshotTriggered }: {
+export function MobileConversationShareBar({ count, allSelected, busy, locale, colors, onCancel, onToggleAll, onShare, screenshotTriggered, selectionInHeader = false }: {
   readonly count: number; readonly allSelected: boolean; readonly busy: boolean; readonly locale: MobileSupportedLocale;
   readonly colors: { readonly surface: string; readonly ink: string; readonly muted: string; readonly border: string; readonly accent: string };
   readonly onCancel: () => void; readonly onToggleAll: () => void; readonly onShare: () => void;
   readonly screenshotTriggered?: boolean;
+  readonly selectionInHeader?: boolean;
 }) {
   return <View style={[styles.bar, { backgroundColor: colors.surface, borderColor: colors.border }]}>
     {screenshotTriggered && <Text accessibilityLiveRegion="polite" style={{ color: colors.muted }}>{mobileMessage(locale, "share.screenshotHint")}</Text>}
@@ -17,10 +18,10 @@ export function MobileConversationShareBar({ count, allSelected, busy, locale, c
       </Pressable>
     </View>
     <View style={styles.top}>
-      <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: allSelected, disabled: busy }} disabled={busy}
+      {!selectionInHeader && <Pressable accessibilityRole="checkbox" accessibilityState={{ checked: allSelected, disabled: busy }} disabled={busy}
         onPress={onToggleAll} style={styles.button}>
         <Text style={{ color: busy ? colors.muted : colors.accent }}>{mobileMessage(locale, allSelected ? "share.restoreSelection" : "share.selectAll")}</Text>
-      </Pressable>
+      </Pressable>}
       <Pressable accessibilityRole="button" accessibilityState={{ disabled: busy || count === 0, busy }} disabled={busy || count === 0}
         onPress={onShare} style={styles.button}>
         <Text style={{ color: busy || count === 0 ? colors.muted : colors.accent }}>{mobileMessage(locale, busy ? "share.preparing" : "share.shareImage")}</Text>

@@ -72,6 +72,8 @@ const RUNTIME_TOOL_CATALOG_STATUS_KEY = "joko-runtime-tool-catalog/v1";
 const MAX_RUNTIME_TOOL_CATALOG_BYTES = ${MAXIMUM_PI_RUNTIME_TOOL_CATALOG_BYTES};
 const RUNTIME_TOOL_CATALOG_CHUNK_BYTES = ${PI_RUNTIME_TOOL_CATALOG_CHUNK_BYTES};
 const COMMAND_GATE_REQUEST_PREFIX = "joko:command-gate/v1/";
+const PARTNER_LEARNING_REQUEST_PREFIX = "joko:tool-turn/v1/";
+const PARTNER_LEARNING_REPLY_STATUS_KEY = "joko-reply-identity/v1";
 const POLICY_DECISION_REQUEST_PREFIX = "joko:policy-decision/v1/";
 const MAX_POLICY_DECISION_ENVELOPE_CHARACTERS = ${MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS};
 
@@ -971,10 +973,17 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
         label: descriptor.name,
         description: descriptor.description,
         parameters: descriptor.inputSchema as any,
-        async execute(_id, params, signal) {
+        async execute(_id, params, signal, _onUpdate, ctx) {
           if (typeof _id !== "string" || _id.length < 1 || _id.length > 1024 || _id.includes("\0") || /[\r\n]/u.test(_id)) {
             throw new Error("MCP bridge tool-call identity is invalid");
           }
+          if (!ctx.hasUI) throw new Error("The original tool turn bridge is unavailable");
+          const captureRequest = Buffer.from(JSON.stringify({ requestId: _id, serverId: descriptor.serverId, toolName: descriptor.name }), "utf8").toString("base64url");
+          const partnerLearningProof = await ctx.ui.input(PARTNER_LEARNING_REQUEST_PREFIX + captureRequest, "");
+          if (partnerLearningProof !== "untracked" && (typeof partnerLearningProof !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(partnerLearningProof))) {
+            throw new Error("The original tool turn was not acknowledged");
+          }
+          signal?.throwIfAborted();
           const response = await fetch(mcp.endpoint, {
             method: "POST",
             redirect: "error",
@@ -991,6 +1000,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
               generation: runtimeGeneration,
               sessionId: mcp.sessionId,
               targetId: mcp.targetId,
+              ...(partnerLearningProof === "untracked" ? {} : { partnerLearningProof }),
             }),
             signal,
           });
@@ -1012,6 +1022,15 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
       });
     }
   }
+
+  pi.on("turn_end", (event, ctx) => {
+    if (ctx.mode !== "rpc" || event.message.role !== "assistant") return;
+    // The published runtime has appended this exact message object before
+    // turn_end. Object identity selects its persisted entry without searching
+    // for the latest reply or comparing a user's/model's message body.
+    const entries = ctx.sessionManager.getBranch().filter(entry => entry.type === "message" && entry.message === event.message);
+    if (entries.length === 1) ctx.ui.setStatus(PARTNER_LEARNING_REPLY_STATUS_KEY, JSON.stringify({ entryId: entries[0]!.id }));
+  });
 
   // Pi exposes the authoritative tool registry to extensions but not through
   // its RPC command union. Publish bounded records through an RPC-supported

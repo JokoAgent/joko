@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, ScalarType, toBinary } from "@bufbuild/protobuf";
 
 import * as contract from "../dist/index.js";
 
@@ -346,7 +346,8 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "list_remote_desktop_display_modes", "set_remote_desktop_display_mode", "set_remote_desktop_host_mute",
     "set_remote_desktop_clipboard_sync", "get_remote_desktop_clipboard_version", "set_remote_desktop_privacy_screen",
     "get_remote_desktop_lock_state", "request_remote_desktop_credentials", "close_remote_desktop_credentials",
-    "set_remote_desktop_viewer_display", "restore_remote_desktop_viewer_display"
+    "set_remote_desktop_viewer_display", "restore_remote_desktop_viewer_display",
+    "perform_remote_desktop_system_action"
   ]);
   assert.deepEqual(oneofMembers(contract.DevicePeerAgentResultSchema, "payload"), [
     "acknowledgement", "recent_directories", "directories", "directory_inspection", "directory_created",
@@ -362,7 +363,8 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "remote_desktop_clipboard_content", "remote_desktop_presentation_proof",
     "remote_desktop_display_modes", "remote_desktop_host_mute", "remote_desktop_clipboard_sync",
     "remote_desktop_clipboard_version", "remote_desktop_privacy_screen", "remote_desktop_lock_state",
-    "remote_desktop_credentials", "remote_desktop_display_mode", "remote_desktop_viewer_display", "failure"
+    "remote_desktop_credentials", "remote_desktop_display_mode", "remote_desktop_viewer_display",
+    "remote_desktop_system_action", "failure"
   ]);
   assert.deepEqual([...fieldNames(contract.OpenDevicePeerAgentRouteRequestSchema)], [
     "target_device_id", "route_generation", "request_id", "hello", "result", "heartbeat"
@@ -1519,10 +1521,17 @@ test("public enum wire numbers remain stable", () => {
 });
 
 test("public messages use typed fields instead of maps, Struct, or Any", () => {
+  const descriptions = field(contract.ManagedModelRuntimeCatalogModelSchema, "descriptions");
+  assert.equal(descriptions.fieldKind, "map");
+  assert.equal(descriptions.mapKey, ScalarType.STRING);
+  assert.equal(descriptions.mapKind, "scalar");
+  assert.equal(descriptions.scalar, ScalarType.STRING);
   for (const [exportName, descriptor] of Object.entries(contract)) {
     if (!exportName.endsWith("Schema") || descriptor?.kind !== "message") continue;
     for (const candidate of descriptor.fields) {
-      assert.notEqual(candidate.fieldKind, "map", `${descriptor.typeName}.${candidate.name} uses a map`);
+      if (descriptor.typeName !== "joko.v1.ManagedModelRuntimeCatalogModel" || candidate.name !== "descriptions") {
+        assert.notEqual(candidate.fieldKind, "map", `${descriptor.typeName}.${candidate.name} uses a map`);
+      }
       if (candidate.message !== undefined) {
         assert.notEqual(candidate.message.typeName, "google.protobuf.Struct");
         assert.notEqual(candidate.message.typeName, "google.protobuf.Any");
