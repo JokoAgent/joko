@@ -1486,6 +1486,9 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     );
   }
   const assistantContent = <>
+    {item.modelSubstitution && <p className="muted" role="note">{t("timeline.modelSubstitution", {
+      selected: item.modelSubstitution.selectedModelId, actual: item.modelSubstitution.actualModelId
+    })}</p>}
     <div className="markdown message-assistant__body"><StreamingMarkdown text={displayText} streaming={item.streaming === true} streamFadeKey={`${sessionId}:${item.id}`} t={t} />{item.streaming && <span className={cx("streaming-cursor", reducedMotion && "streaming-cursor--reduced-motion")} aria-label={t("timeline.streaming")} />}</div>
     {attachments}
     {partnerConversation?.confirmed && partner !== undefined && !item.streaming && displayText.trim()
@@ -1653,7 +1656,7 @@ export function MessageActions({ ownerKey, sessionId, sessionName, item, text, a
     }
   };
   const time = <time key="time" dateTime={new Date(item.createdAt).toISOString()}>{formatDateTime(item.createdAt, locale)}</time>;
-  const usage = align === "left" && !partnerPresentation ? <MessageUsageMeta key="usage" usage={item.usage} t={t} /> : null;
+  const usage = align === "left" && !partnerPresentation ? <MessageUsageMeta key="usage" usage={item.turnUsage} t={t} /> : null;
   const copied = shareFeedback?.kind === "success" && shareFeedback.copy === "text";
   const copy = <IconButton key="copy" className="copy-button" disabled={copying !== undefined} aria-busy={copying === "text"} label={copied ? t("timeline.blockCopied") : t("timeline.copy")} onClick={(event) => { void copyMessage("text", event.currentTarget); }}>{copying === "text" ? <Spinner label={t("common.loading")} /> : copied ? <Check aria-hidden="true" /> : <Clipboard aria-hidden="true" />}</IconButton>;
   const share = shareable

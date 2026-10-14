@@ -10326,6 +10326,11 @@ export function projectSnapshotEvent(
     case "runChanged": {
       const run = kind.value.run;
       if (run !== undefined) {
+        if (run.usage !== undefined) timelineRunUsage(run.usage);
+        const previous = raw.runs.find((candidate) => candidate.runId === run.runId);
+        const revision = run.version?.revision?.value;
+        const previousRevision = previous?.version?.revision?.value;
+        if (revision !== undefined && previousRevision !== undefined && revision < previousRevision) break;
         raw = { ...raw, runs: upsertBy(raw.runs, run, (value) => value.runId) };
         projected = remapSessionProjection(raw, projected, run.sessionId);
         diagnosticsChanged = true;
@@ -10707,7 +10712,7 @@ export function projectSnapshotEvent(
       break;
     }
     case "runDone": {
-      ({ raw, projected } = projectTerminalRun(raw, projected, kind.value.runId, RunState.SUCCEEDED, kind.value.usage));
+      ({ raw, projected } = projectTerminalRun(raw, projected, kind.value.runId, RunState.SUCCEEDED));
       diagnosticsChanged = true;
       break;
     }
@@ -10718,7 +10723,7 @@ export function projectSnapshotEvent(
     }
     case "terminalError": {
       const runId = event.identity?.runId ?? "";
-      if (runId.length > 0) ({ raw, projected } = projectTerminalRun(raw, projected, runId, RunState.FAILED, undefined, kind.value.error));
+      if (runId.length > 0) ({ raw, projected } = projectTerminalRun(raw, projected, runId, RunState.FAILED, kind.value.error));
       diagnosticsChanged = true;
       break;
     }
@@ -10766,6 +10771,9 @@ export function projectSnapshotEvent(
       break;
   }
 
+  if (kind.case === "runChanged" || kind.case === "messageCompleted" || kind.case === "runDone") {
+    projected = { ...projected, timelineBySession: projectRunUsage(projected.timelineBySession, raw.runs) };
+  }
   if (diagnosticsChanged) projected = { ...projected, diagnostics: collectDiagnostics(raw) };
   return { rawSnapshot: raw, snapshot: projected, refresh };
 }
@@ -10792,7 +10800,6 @@ function projectTerminalRun(
   snapshot: AppSnapshot,
   runId: string,
   state: RunState,
-  usage?: Snapshot["runs"][number]["usage"],
   error?: ErrorInfo
 ): { readonly raw: Snapshot; readonly projected: AppSnapshot } {
   const run = raw.runs.find((candidate) => candidate.runId === runId);
@@ -10800,7 +10807,6 @@ function projectTerminalRun(
   const updated = {
     ...run,
     state,
-    ...(usage === undefined ? {} : { usage }),
     ...(error === undefined ? {} : { error })
   };
   const nextRaw = { ...raw, runs: upsertBy(raw.runs, updated, (value) => value.runId) };
@@ -11068,11 +11074,11 @@ function projectTimelineEvent(
     case "messageCompleted": {
       const usage = kind.value.usage === undefined
         ? undefined
-        : timelineMessageUsage(
+        : { ...timelineMessageUsage(
           kind.value.usage,
           kind.value.generationDurationMs,
           kind.value.generationReliable
-        );
+        ), ...(kind.value.usageIsEstimate === undefined ? {} : { isEstimate: kind.value.usageIsEstimate }) };
       if (kind.value.role !== 1) {
         changed = reconcileCompletedAssistantMessage(items, event, kind.value, sequence, createdAt, usage);
         break;
@@ -11462,6 +11468,16 @@ function reconcileCompletedAssistantMessage(
   usage: TimelineItemView["usage"] | undefined
 ): boolean {
   const messageId = completed.messageId;
+  const turnUsage = completed.turnUsage === undefined ? undefined : timelineRunUsage(completed.turnUsage);
+  if (completed.turnUsage !== undefined && (completed.turnUsage.completionEventId !== event.eventId
+    || completed.turnUsage.messageId !== messageId || !event.identity?.runId || !event.identity.sessionId)) {
+    throw new GatewayError("Orchestrator returned Run usage for a different message completion.");
+  }
+  const modelSubstitution = completed.modelSubstitution;
+  if (modelSubstitution && [modelSubstitution.selectedModelId, modelSubstitution.actualModelId].some(value => !value || value.length > 256
+    || /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(value))) {
+    throw new GatewayError("Orchestrator returned invalid model substitution metadata.");
+  }
   const learning = projectPartnerLearningFeedback(completed.learning);
   const existingContent = items.filter((item) =>
     (item.kind === "assistant" || item.kind === "thinking")
@@ -11508,7 +11524,11 @@ function reconcileCompletedAssistantMessage(
           streaming: false,
           ...(learning === undefined ? {} : { learning }),
           ...(attachments.length > 0 ? { attachments } : {}),
-          ...(usage === undefined ? {} : { usage })
+          ...(usage === undefined ? {} : { usage }),
+          ...(turnUsage === undefined ? {} : { turnUsage }),
+          ...(modelSubstitution === undefined ? {} : { modelSubstitution: {
+            selectedModelId: modelSubstitution.selectedModelId, actualModelId: modelSubstitution.actualModelId
+          } })
         }
       });
       continue;
@@ -11616,7 +11636,11 @@ function reconcileCompletedAssistantMessage(
         attachments,
         ...(event.cursor !== undefined && event.cursor.sequence > 0n ? { completionCursor: event.cursor.sequence } : {}),
         ...timelinePrivateMessageOrigin(completed.partnerPrivateOrigin),
-        ...(usage === undefined ? {} : { usage })
+        ...(usage === undefined ? {} : { usage }),
+        ...(turnUsage === undefined ? {} : { turnUsage }),
+        ...(modelSubstitution === undefined ? {} : { modelSubstitution: {
+          selectedModelId: modelSubstitution.selectedModelId, actualModelId: modelSubstitution.actualModelId
+        } })
       }
     });
   }
@@ -11991,7 +12015,7 @@ export function mapSnapshot(
   }
   const reviewRuns = snapshot.reviewRuns.map(mapReviewRun);
   const timelineBySession = withMissingRunningReviewCards(
-    buildTimeline(snapshot.timeline, isLocalUserInput),
+    projectRunUsage(buildTimeline(snapshot.timeline, isLocalUserInput), snapshot.runs),
     reviewRuns,
     snapshot.resumeCursor?.sequence ?? 0n
   );
@@ -19639,8 +19663,69 @@ function messageInputPastedTextRanges(
   return mapped;
 }
 
+function projectRunUsage(
+  timeline: ReadonlyMap<string, readonly TimelineItemView[]>,
+  runs: Snapshot["runs"]
+): ReadonlyMap<string, readonly TimelineItemView[]> {
+  let projected: Map<string, readonly TimelineItemView[]> | undefined;
+  for (const run of runs) {
+    const summary = run.usage;
+    const turnUsage = summary === undefined ? undefined : timelineRunUsage(summary);
+    if (summary !== undefined && (!run.sessionId || !run.runId)) {
+      throw new GatewayError("Orchestrator returned Run usage without its owner.");
+    }
+    const items = (projected ?? timeline).get(run.sessionId);
+    if (items === undefined) continue;
+    let changed = false;
+    const updated = items.map((item) => {
+      if (item.kind !== "assistant" || item.runId !== run.runId) return item;
+      if (turnUsage !== undefined && summary?.completionEventId && item.streaming !== true
+        && item.sourceEventId === summary.completionEventId && item.messageId === summary.messageId) {
+        changed = true;
+        return { ...item, turnUsage };
+      }
+      if (item.turnUsage === undefined) return item;
+      const { turnUsage: _previous, ...withoutTurnUsage } = item;
+      changed = true;
+      return withoutTurnUsage;
+    });
+    if (changed) (projected ??= new Map(timeline)).set(run.sessionId, updated);
+  }
+  return projected ?? timeline;
+}
+
+function timelineRunUsage(summary: NonNullable<Snapshot["runs"][number]["usage"]>): TimelineMessageUsageView {
+  if (summary.usage === undefined || typeof summary.estimated !== "boolean" || typeof summary.costComplete !== "boolean" || typeof summary.tokensComplete !== "boolean"
+    || !validRunUsageIdentity(summary.completionEventId) || !validRunUsageIdentity(summary.messageId)
+    || Boolean(summary.completionEventId) !== Boolean(summary.messageId)) {
+    throw new GatewayError("Orchestrator returned invalid Run usage metadata.");
+  }
+  const usage = mapUsageTokens(summary.usage);
+  if (usage.currencyCode !== "" && !/^[A-Z]{3}$/u.test(usage.currencyCode)
+    || usage.currencyCode === "" && (usage.costMicros !== 0 || summary.costComplete)) {
+    throw new GatewayError("Orchestrator returned invalid Run usage currency metadata.");
+  }
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheReadTokens: usage.cacheReadTokens,
+    cacheWriteTokens: usage.cacheWriteTokens,
+    totalTokens: usage.totalTokens,
+    cost: usage.costMicros / 1_000_000,
+    currency: usage.currencyCode,
+    isEstimate: summary.estimated,
+    costComplete: summary.costComplete,
+    tokensComplete: summary.tokensComplete
+  };
+}
+
+function validRunUsageIdentity(value: string): boolean {
+  return value.length <= 512 && !/[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(value)
+    && (value === "" || value.trim() === value);
+}
+
 function timelineMessageUsage(
-  value: any,
+  value: ProtoUsage,
   generationDurationMs: bigint | undefined,
   generationReliable: boolean | undefined
 ): NonNullable<TimelineItemView["usage"]> {

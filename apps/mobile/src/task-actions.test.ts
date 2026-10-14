@@ -29,6 +29,7 @@ describe("mobile message action sheet", () => {
 
   it("offers only actions backed by the current durable message and capability", () => {
     expect(buildMobileMessageActions(row, { canDelete: true, locale: "en" })).toEqual([
+      { id: "copy-text", label: "Copy message" },
       { id: "add-to-composer", label: "Add to composer" },
       { id: "copy-link", label: "Copy message link" },
       { id: "share-image", label: "Share as image" },
@@ -42,6 +43,7 @@ describe("mobile message action sheet", () => {
       label: "Assistant",
       quoteSource: { sourceMessageId: row.id, sourceEventId: row.eventId, text: row.text }
     }, { canDelete: true, locale: "en", copyDisabled: true })).toEqual([
+      { id: "copy-text", label: "Copying message…", disabled: true },
       { id: "add-to-composer", label: "Add to composer" },
       { id: "quote-selection", label: "Quote selection" },
       { id: "copy-link", label: "Copying link…", disabled: true },

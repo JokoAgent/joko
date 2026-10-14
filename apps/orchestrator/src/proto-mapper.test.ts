@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { CapabilitySupport, PermissionMode, ProviderApiCompatibility, ProviderConfigurationField, WorkspaceLocationSchema, capabilityNames } from "@joko/contracts";
 import { AuthenticationState, BackgroundTaskState, CompactionState, ContextRebuildReason, EventSchema, InlineTextRangeSchema, InputContentSchema, InputMentionRangeSchema, InstallationState, InteractionState, MessageInputDelivery, ModelPriceSource, QueueSourceKind, ResourceUsageActivity, ReviewFreshnessState, RetryState, RunState, ScheduleExecutionMode, ScheduleFireSource, ScheduleRunPhase, ScheduleSessionMode, ToolCallOutputMode } from "@joko/contracts";
-import type { EventPayload, PiEventMetadata, PromptInput, ProviderModel, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
+import type { EventPayload, PiEventMetadata, PromptInput, ProviderModel, RunUsageSummary, SubagentRunDetail, SubagentTranscriptEntry } from "@joko/core";
 import { OperationConflictError, type ArtifactRecord, type InteractionRecord, type PersistedEvent, type QueueItemRecord, type ScheduleRecord, type ScheduleRunRecord, type StoredAttempt, type StoredBackend, type StoredRun, type StoredSession } from "@joko/store";
 
 import {
@@ -15,6 +15,7 @@ import {
   fromProtoInteraction,
   fromProtoInteractionDecision,
   fromProtoQueueItem,
+  fromProtoRun,
   fromProtoSchedule,
   fromProtoSession,
   fromProtoSubagentRunDetail,
@@ -31,6 +32,7 @@ import {
   toProtoInteraction,
   toProtoModelDescriptor,
   toProtoQueueItem,
+  toProtoRun,
   toProtoSchedule,
   toProtoSchedulerRuntime,
   toProtoSession,
@@ -41,6 +43,52 @@ import {
 } from "./proto-mapper.js";
 
 describe("proto mapper", () => {
+  it("preserves unknown Run money and exact completion ownership through current-v1 wire data", () => {
+    const summary: RunUsageSummary = { tokensComplete: true, inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0,
+      totalTokens: 15, costMicros: 0, estimated: true, costComplete: false, completionEventId: "reply", messageId: "native-reply" };
+    const run: StoredRun = { descriptor: { id: "run", sessionId: "task", source: "user", state: "completed", createdAt: 1, usage: summary }, revision: 3n };
+    const mapped = toProtoRun(run, { backendId: "backend", targetId: "target", attempts: [] });
+    expect(mapped.usage?.usage?.currencyCode).toBe("");
+    expect(fromProtoRun(mapped).usage).toEqual(summary);
+    const event: PersistedEvent = { id: "reply", sequence: 2n, globalCursor: 2n, revision: 2n, emittedAt: 1_000,
+      backendId: "backend", targetId: "target", sessionId: "task", generation: 1, traceId: "reply", runId: "run",
+      payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Done" }], nativeHistory: { identity: { entryId: "native-reply" } } } };
+    const wire = fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent(event, { run })));
+    expect(fromProtoEvent(wire).payload).toMatchObject({ turnUsage: summary });
+    expect(toProtoEvent({ ...event, id: "other-reply" }, { run }).payload?.kind).toMatchObject({ case: "messageCompleted", value: { turnUsage: undefined } });
+    if (wire.payload?.kind.case !== "messageCompleted") throw new Error("Expected assistant completion");
+    wire.payload.kind.value.turnUsage!.messageId = "other-message";
+    expect(() => fromProtoEvent(wire)).toThrow(ProtoMappingError);
+    for (const invalid of [{ ...summary, costMicros: 1 }, { ...summary, costComplete: true }, { ...summary, outputTokens: -1 }, { ...summary, messageId: undefined }]) {
+      expect(() => toProtoRun({ ...run, descriptor: { ...run.descriptor, usage: invalid } }, { backendId: "backend", targetId: "target", attempts: [] })).toThrow(ProtoMappingError);
+    }
+  });
+  it("replays Run accounting from its immutable event instead of a later materialized summary", () => {
+    const summary: RunUsageSummary = { tokensComplete: true, inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 15,
+      costMicros: 5, currencyCode: "CNY", estimated: true, costComplete: true };
+    const run: StoredRun = { descriptor: { id: "run", sessionId: "task", source: "user", state: "completed", createdAt: 1,
+      usage: { ...summary, totalTokens: 100 } }, revision: 30n };
+    const event: PersistedEvent = { id: "usage-update", sequence: 3n, globalCursor: 3n, revision: 3n, emittedAt: 1_000,
+      backendId: "backend", targetId: "target", sessionId: "task", generation: 1, traceId: "usage-update", runId: "run",
+      payload: { type: "run_state", state: "running", usage: summary } };
+    const target = { descriptor: { id: "target", backendId: "backend", displayName: "Target", workspaceRoot: "D:/workspace", managed: true, trusted: true }, metadata: {}, createdAt: 1, updatedAt: 1, revision: 1n };
+    const wire = toProtoEvent(event, { run, target });
+    expect(wire.payload?.kind).toMatchObject({ case: "runChanged", value: { run: { state: RunState.RUNNING, version: { revision: { value: 3n } } } } });
+    expect(fromProtoEvent(wire).payload).toEqual(event.payload);
+    expect(fromProtoEvent(toProtoEvent({ ...event, payload: { type: "run_state", state: "running" } }, { run, target })).payload).toEqual({ type: "run_state", state: "running" });
+  });
+  it("round-trips native assistant model substitution and service money semantics on one completed message", () => {
+    const payload: EventPayload = { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Done" }],
+      usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, cacheReadTokens: 0, cacheWriteTokens: 0, cost: 0.02 },
+      usageIsEstimate: true, modelSubstitution: { selectedModelId: "selected", actualModelId: "actual" } };
+    const event: PersistedEvent = { id: "reply", sequence: 2n, globalCursor: 2n, revision: 2n, emittedAt: 1_000,
+      backendId: "backend", targetId: "target", sessionId: "task", generation: 1, traceId: "reply", runId: "run", payload };
+    const proto = fromBinary(EventSchema, toBinary(EventSchema, toProtoEvent(event)));
+    expect(fromProtoEvent(proto).payload).toMatchObject(payload);
+    if (proto.payload?.kind.case !== "messageCompleted") throw new Error("Expected assistant completion");
+    proto.payload.kind.value.modelSubstitution!.actualModelId = "";
+    expect(() => fromProtoEvent(proto)).toThrow(ProtoMappingError);
+  });
   it("round-trips typed task senders while rejecting unaccepted or incomplete provenance", () => {
     const taskMessageOrigin = { senderSessionId: "source", senderSessionTitle: "Original title", senderPartnerId: "partner", senderPartnerName: "Partner name" };
     const event: PersistedEvent = { id: "handoff", sequence: 1n, globalCursor: 9n, revision: 1n, emittedAt: 1_000,

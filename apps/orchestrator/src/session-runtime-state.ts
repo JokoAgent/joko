@@ -57,12 +57,17 @@ function usageSnapshot(value: unknown): UsageSnapshot | undefined {
   const contextWindow = optionalNonnegative(value["contextWindow"]);
   const pricing = isRecord(value["pricingContext"]) ? value["pricingContext"] : undefined;
   const requestInputTokens = nonnegativeInteger(pricing?.["inputTokens"]);
+  const native = value["nativeAccounting"];
+  if (native !== undefined && (!isRecord(native) || Object.keys(native).length !== 4
+    || typeof native["sourceId"] !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(native["sourceId"])
+    || [native["tokensComplete"], native["costComplete"], native["costEstimated"]].some(flag => typeof flag !== "boolean"))) return undefined;
   return {
     inputTokens,
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
     totalTokens,
+    ...(native === undefined ? {} : { nativeAccounting: native as unknown as NonNullable<UsageSnapshot["nativeAccounting"]> }),
     ...(contextTokens === undefined ? {} : { contextTokens }),
     ...(contextWindow === undefined ? {} : { contextWindow }),
     ...(requestInputTokens === undefined ? {} : { pricingContext: {

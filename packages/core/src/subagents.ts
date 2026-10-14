@@ -30,6 +30,11 @@ export interface SubagentCapabilities {
 }
 
 export interface SubagentUsage {
+  readonly tokensComplete?: boolean;
+  readonly costComplete?: boolean;
+  readonly costEstimated?: boolean;
+  /** True when these native task counters are already part of its owning Query's usage. */
+  readonly accountingIncludedInParent?: boolean;
   readonly inputTokens?: number;
   readonly outputTokens?: number;
   readonly cacheReadTokens?: number;

@@ -37,6 +37,194 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("atomically attributes parent and child usage once and keeps immutable Run update snapshots through recovery", () => {
+    const f = createFixture(), published: PersistedEvent[] = [];
+    const observe = (sourceId: string, tokens: number, measuredAt: number, runId = "run-1") => f.store.recordUsageObservation({
+      ownerId: "owner-1", sessionId: "session-1", sourceId, generation: 0, backendId: "pi", providerId: "provider-1", modelId: "model-1",
+      measuredAt, inputTokens: tokens, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: tokens,
+      reportedCostMicros: tokens * 10, currencyCode: "USD", runUsage: { runId, currencyCode: "USD" } });
+    f.store.subscribe(event => {
+      if (event.payload.type !== "run_state" || event.payload.usage === undefined) return;
+      expect(f.store.findEvent(event.id)).toEqual(event);
+      expect(f.store.getRun(event.runId!).descriptor.usage).toEqual(event.payload.usage);
+      published.push(event);
+    });
+    observe("session-runtime", 100, 1000);
+    const first = published[0]!;
+    expect(first.payload).toMatchObject({ type: "run_state", usage: { totalTokens: 100, tokensComplete: true, costMicros: 1000, currencyCode: "USD" } });
+    expect(first.payload).not.toHaveProperty("usage.completionEventId");
+    const completion = f.store.appendEvent({ id: "run-completion", backendId: "pi", targetId: "target-1", sessionId: "session-1", runId: "run-1",
+      generation: 0, traceId: "run:reply", payload: { type: "message_complete", role: "assistant",
+        blocks: [{ kind: "text", text: "Completed reply." }], nativeHistory: { identity: { entryId: "native-completion" } } } });
+    const anchoredRevision = f.store.getRun("run-1").revision;
+    expect(f.store.getRun("run-1").descriptor.usage).toMatchObject({ completionEventId: completion.id, messageId: "native-completion", totalTokens: 100 });
+    expect(f.store.findEvent(first.id)?.payload).not.toHaveProperty("usage.completionEventId");
+    observe("delegated-run:worker", 40, 1100);
+    const combined = f.store.getRun("run-1");
+    expect(combined.revision).toBeGreaterThan(anchoredRevision);
+    expect(combined.descriptor.usage).toMatchObject({ inputTokens: 140, totalTokens: 140, costMicros: 1400,
+      completionEventId: completion.id, messageId: "native-completion", tokensComplete: true, estimated: false, costComplete: true });
+    const eventCount = published.length, beforeReplay = combined.revision;
+    expect(observe("delegated-run:worker", 40, 1100).changed).toBe(false);
+    expect(observe("session-runtime", 100, 1200).changed).toBe(false);
+    expect(f.store.getRun("run-1").revision).toBe(beforeReplay);
+    expect(published).toHaveLength(eventCount);
+    f.store.createRun({ id: "run-2", sessionId: "session-1", source: "user", state: "queued", createdAt: 1300 });
+    observe("session-runtime", 130, 1400, "run-2");
+    expect(f.store.getRun("run-2").descriptor.usage).toMatchObject({ totalTokens: 30, costMicros: 300 });
+    expect(f.store.getRun("run-2").descriptor.usage).not.toHaveProperty("completionEventId");
+    expect(f.store.getRun("run-1").descriptor.usage).toEqual(combined.descriptor.usage);
+    const file = f.store.filePath; f.store.close(); f.replaceStore(new OperationalStore(file));
+    expect(f.store.getRun("run-1").descriptor.usage).toEqual(combined.descriptor.usage);
+    expect(observe("delegated-run:worker", 40, 1100).changed).toBe(false);
+    expect(f.store.findEvent(first.id)?.payload).toEqual(first.payload);
+    expect(f.store.listRuns({ sessionId: "session-1" }).find(run => run.descriptor.id === "run-1")?.descriptor.usage).toEqual(combined.descriptor.usage);
+    expect(f.store.summarizeUsageLedger({ ownerId: "owner-1" })).toMatchObject({ totalTokens: 170, costMicros: 1700 });
+  });
+
+  it("keeps missing and mixed currency explicit and anchors only a public rendered completion", () => {
+    const f = createFixture();
+    const observe = (sourceId: string, tokens: number, currencyCode?: string, runId = "run-1") => f.store.recordUsageObservation({
+      ownerId: "owner-1", sessionId: "session-1", sourceId, generation: 0, backendId: "pi", providerId: "provider-1", modelId: "model-1",
+      measuredAt: 1000, inputTokens: tokens, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: tokens,
+      ...(currencyCode === undefined ? {} : { reportedCostMicros: tokens, currencyCode }), runUsage: { runId, ...(currencyCode === undefined ? {} : { currencyCode }) } });
+    observe("session-runtime", 100);
+    expect(f.store.getRun("run-1").descriptor.usage).toMatchObject({ totalTokens: 100, costMicros: 0, estimated: true, costComplete: false });
+    expect(f.store.getRun("run-1").descriptor.usage).not.toHaveProperty("currencyCode");
+    const append = (id: string, blocks: Extract<PersistedEvent["payload"], { type: "message_complete" }>["blocks"]) =>
+      f.store.appendEvent({ id, backendId: "pi", targetId: "target-1", sessionId: "session-1", runId: "run-1", generation: 0, traceId: id,
+        payload: { type: "message_complete", role: "assistant", blocks } });
+    append("empty-reply", [{ kind: "text", text: "  " }]);
+    append("tool-reply", [{ kind: "tool_call", callId: "call", name: "tool", input: "{}" }]);
+    expect(f.store.getRun("run-1").descriptor.usage).not.toHaveProperty("completionEventId");
+    append("public-reply", [{ kind: "text", text: "Public reply" }]);
+    append("later-tool-reply", [{ kind: "tool_result", callId: "call", output: "Done", isError: false }]);
+    expect(f.store.getRun("run-1").descriptor.usage).toMatchObject({ completionEventId: "public-reply", messageId: "public-reply" });
+    observe("delegated-run:usd", 30, "USD");
+    observe("delegated-run:cny", 20, "CNY");
+    const summary = f.store.getRun("run-1").descriptor.usage;
+    expect(summary).toMatchObject({ totalTokens: 150, costMicros: 0, estimated: true, costComplete: false,
+      completionEventId: "public-reply", messageId: "public-reply" });
+    expect(summary).not.toHaveProperty("currencyCode");
+    f.store.createRun({ id: "run-mixed", sessionId: "session-1", source: "user", state: "queued", createdAt: 1100 });
+    observe("mixed:usd", 10, "USD", "run-mixed");
+    expect(f.store.getRun("run-mixed").descriptor.usage).toMatchObject({ costMicros: 10, currencyCode: "USD", costComplete: true });
+    observe("mixed:cny", 20, "CNY", "run-mixed");
+    observe("mixed:later-usd", 30, "USD", "run-mixed");
+    expect(f.store.getRun("run-mixed").descriptor.usage).toMatchObject({ totalTokens: 60, costMicros: 0, estimated: false, costComplete: false });
+    expect(f.store.getRun("run-mixed").descriptor.usage).not.toHaveProperty("currencyCode");
+    f.store.updateRunState({ runId: "run-1", state: "running", traceId: "run:running" });
+    f.store.updateRunState({ runId: "run-1", state: "completed", traceId: "run:completed" });
+    expect(f.store.listEvents({ sessionId: "session-1" }).filter(event => event.payload.type === "run_state").at(-1)?.payload).toMatchObject({
+      state: "completed", usage: summary });
+  });
+
+  it("rejects malformed current Run summaries and rolls back invalid Run attribution before consuming a source", () => {
+    const f = createFixture();
+    const input = { ownerId: "owner-1", sessionId: "session-1", sourceId: "session-runtime", generation: 0, backendId: "pi",
+      providerId: "provider-1", modelId: "model-1", measuredAt: 1000, inputTokens: 1, outputTokens: 0, cacheReadTokens: 0,
+      cacheWriteTokens: 0, totalTokens: 1, runUsage: { runId: "missing-run" } };
+    expect(() => f.store.recordUsageObservation(input)).toThrow("Run not found: missing-run");
+    expect(f.store.listUsageLedger({ ownerId: "owner-1" })).toEqual([]);
+    expect(f.store.recordUsageObservation({ ...input, runUsage: { runId: "run-1" } }).changed).toBe(true);
+    const saved = f.store.findSetting("session", "session-1", "run.usage:run-1")!.value as Record<string, unknown>;
+    for (const invalid of [{ ...saved, version: 0 }, { ...saved, legacy: true }, { ...saved, costMicros: 1 },
+      { ...saved, totalTokens: Number.MAX_SAFE_INTEGER + 1 }, { ...saved, completionEventId: "completion" },
+      { ...saved, completionEventId: " ", messageId: "message" }, { ...saved, currencyCode: "usd" }, { ...saved, estimated: undefined },
+      { ...saved, tokensComplete: undefined }, { ...saved, tokensComplete: "complete" }]) {
+      f.store.setSetting("session", "session-1", "run.usage:run-1", invalid);
+      expect(() => f.store.getRun("run-1")).toThrow("current Run usage summary");
+    }
+    f.store.setSetting("session", "session-1", "run.usage:run-1", { ...saved, completionEventId: "missing-completion", messageId: "missing-message" });
+    expect(() => f.store.getRun("run-1")).toThrow("exact owned message");
+    f.store.setSetting("session", "session-1", "run.usage:run-1", saved);
+    const summary = f.store.getRun("run-1").descriptor.usage!;
+    expect(() => f.store.appendEvent({ backendId: "pi", targetId: "target-1", sessionId: "session-1", runId: "run-1", generation: 0,
+      traceId: "forged-run-usage", payload: { type: "run_state", state: "queued", usage: { ...summary, totalTokens: 100 } } })).toThrow("durable service-owned summary");
+    f.store.recordUsageObservation({ ...input, runUsage: { runId: "run-1" }, measuredAt: 2000,
+      inputTokens: Number.MAX_SAFE_INTEGER, totalTokens: Number.MAX_SAFE_INTEGER });
+    const beforeOverflow = f.store.getRun("run-1");
+    const overflow = { ...input, sourceId: "delegated-run:overflow", runUsage: { runId: "run-1" }, measuredAt: 2100 };
+    expect(() => f.store.recordUsageObservation(overflow)).toThrow("Run usage inputTokens");
+    expect(f.store.getRun("run-1")).toEqual(beforeOverflow);
+    expect(f.store.summarizeUsageLedger({ ownerId: "owner-1" }).totalTokens).toBe(Number.MAX_SAFE_INTEGER);
+    expect(f.store.recordUsageObservation({ ...overflow, inputTokens: 0, totalTokens: 0 }).changed).toBe(false);
+  });
+
+  it("preserves native token and cost incompleteness without counting unchanged observations twice", () => {
+    const f = createFixture();
+    const input = { ownerId: "owner-1", sessionId: "session-1", sourceId: "query:parent", generation: 0, backendId: "pi",
+      providerId: "provider-1", modelId: "model-1", measuredAt: 1000, inputTokens: 10, outputTokens: 0, cacheReadTokens: 0,
+      cacheWriteTokens: 0, totalTokens: 10, reportedCostMicros: 100, currencyCode: "USD", runUsage: { runId: "run-1", currencyCode: "USD" } };
+    f.store.recordUsageObservation(input);
+    const completeRun = f.store.getRun("run-1");
+    const completeEvent = f.store.listEvents({ sessionId: "session-1" }).filter(event => event.payload.type === "run_state").at(-1)!;
+    expect(completeRun.descriptor.usage).toMatchObject({ totalTokens: 10, tokensComplete: true, costMicros: 100, costComplete: true });
+    const partial = { ...input, measuredAt: 1001, observedCostComplete: false, runUsage: { ...input.runUsage, tokensComplete: false } };
+    expect(f.store.recordUsageObservation(partial)).toMatchObject({ changed: false, totalTokens: 0, costMicros: 0, costComplete: false });
+    const partialRun = f.store.getRun("run-1");
+    expect(partialRun.revision).toBeGreaterThan(completeRun.revision);
+    expect(partialRun.descriptor.usage).toMatchObject({ totalTokens: 10, tokensComplete: false, costMicros: 100, currencyCode: "USD", costComplete: false });
+    expect(f.store.findEvent(completeEvent.id)?.payload).toMatchObject({ usage: { tokensComplete: true, costComplete: true } });
+    expect(f.store.recordUsageObservation(partial).changed).toBe(false);
+    expect(f.store.getRun("run-1")).toEqual(partialRun);
+    expect(() => f.store.recordUsageObservation({ ...partial, totalTokens: 11 })).toThrow("Conflicting usage observations");
+    f.store.recordUsageObservation({ ...input, measuredAt: 1002, inputTokens: 20, totalTokens: 20, reportedCostMicros: 200 });
+    expect(f.store.getRun("run-1").descriptor.usage).toMatchObject({ totalTokens: 20, tokensComplete: false, costMicros: 200, costComplete: false });
+    const rated = f.store.recordUsageObservation({ ...input, sourceId: "query:child", measuredAt: 1100, inputTokens: 5, totalTokens: 5,
+      reportedCostMicros: undefined, costRates: { inputMicrosPerMillion: 1_000_000, outputMicrosPerMillion: 1_000_000 }, observedCostComplete: false });
+    expect(rated).toMatchObject({ changed: true, costMicros: 5, costComplete: false, estimated: true });
+    const file = f.store.filePath; f.store.close(); f.replaceStore(new OperationalStore(file));
+    expect(f.store.getRun("run-1").descriptor.usage).toMatchObject({ totalTokens: 25, tokensComplete: false, costMicros: 205, costComplete: false, estimated: true });
+    expect(f.store.summarizeUsageLedger({ ownerId: "owner-1" })).toMatchObject({ totalTokens: 25, costMicros: 205, costComplete: false });
+    f.store.createRun({ id: "run-zero-baseline", sessionId: "session-1", source: "user", state: "queued", createdAt: 1150 });
+    const zeroBaseline = { ...input, sourceId: "query:zero-baseline", measuredAt: 1150, inputTokens: 0, totalTokens: 0,
+      reportedCostMicros: 0, observedCostComplete: false, runUsage: { runId: "run-zero-baseline", currencyCode: "USD", tokensComplete: false } };
+    expect(f.store.recordUsageObservation(zeroBaseline)).toMatchObject({ changed: false, costMicros: 0, costComplete: false });
+    expect(f.store.getRun("run-zero-baseline").descriptor.usage).toMatchObject({ totalTokens: 0, tokensComplete: false, costMicros: 0, costComplete: false });
+    expect(f.store.recordUsageObservation({ ...zeroBaseline, measuredAt: 1151, inputTokens: 10, totalTokens: 10, reportedCostMicros: 100 }))
+      .toMatchObject({ changed: true, costMicros: 100, costComplete: false });
+    expect(f.store.getRun("run-zero-baseline").descriptor.usage).toMatchObject({ totalTokens: 10, tokensComplete: false, costMicros: 100, costComplete: false });
+    for (const field of ["accountingIncludedInParent", "tokensComplete", "costComplete", "costEstimated"] as const) {
+      const run = delegatedRun(`bad-${field}`, "running", 1200);
+      expect(() => appendDelegatedRun(f.store, { ...run, usage: { ...run.usage, [field]: "invalid" } } as unknown as SubagentRunDetail)).toThrow(`${field} must be explicitly boolean`);
+    }
+  });
+
+  it("reads only the latest exact Run model substitution without borrowing another Run", () => {
+    const f = createFixture();
+    const append = (id: string, runId: string, modelSubstitution?: { selectedModelId: string; actualModelId: string }) => f.store.appendEvent({
+      id, backendId: "pi", targetId: "target-1", sessionId: "session-1", runId, generation: 0, traceId: id,
+      payload: { type: "message_complete", role: "assistant", blocks: [], ...(modelSubstitution === undefined ? {} : { modelSubstitution }) } });
+    expect(f.store.findRunModelSubstitution("run-1")).toBeUndefined();
+    expect(() => f.store.findRunModelSubstitution("missing-run")).toThrow("Run not found: missing-run");
+    append("substitution:first", "run-1", { selectedModelId: "selected", actualModelId: "actual-first" });
+    append("substitution:last", "run-1", { selectedModelId: "selected", actualModelId: "actual-last" });
+    append("completion:no-substitution", "run-1");
+    f.store.createRun({ id: "run-2", sessionId: "session-1", source: "user", state: "queued", createdAt: 1100 });
+    append("substitution:other-run", "run-2", { selectedModelId: "other-selected", actualModelId: "other-actual" });
+    expect(f.store.findRunModelSubstitution("run-1")).toEqual({ selectedModelId: "selected", actualModelId: "actual-last" });
+    expect(f.store.findRunModelSubstitution("run-2")).toEqual({ selectedModelId: "other-selected", actualModelId: "other-actual" });
+  });
+
+  it("persists assistant model substitution before publication and rejects malformed or user-owned facts", () => {
+    const f = prepareLearningFixture();
+    const modelSubstitution = { selectedModelId: "selected", actualModelId: "actual" };
+    const input = { id: "model-facts", backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: 0, traceId: "model-facts",
+      payload: { type: "message_complete" as const, role: "assistant" as const, blocks: [{ kind: "text" as const, text: "Done" }],
+        modelSubstitution, usageIsEstimate: true } };
+    const published: PersistedEvent[] = [];
+    f.store.subscribe(event => { if (event.id === input.id) { expect(f.store.findEvent(event.id)).toEqual(event); published.push(event); } });
+    f.store.appendEvent(input);
+    expect(published).toHaveLength(1);
+    const file = f.store.filePath; f.store.close(); f.replaceStore(new OperationalStore(file));
+    expect(f.store.findEvent(input.id)?.payload).toMatchObject({ modelSubstitution, usageIsEstimate: true });
+    for (const payload of [{ ...input.payload, role: "user" as const },
+      { ...input.payload, modelSubstitution: { ...modelSubstitution, actualModelId: "" } },
+      { ...input.payload, modelSubstitution: { ...modelSubstitution, actualModelId: "selected" } }]) {
+      expect(() => f.store.appendEvent({ ...input, id: undefined, payload })).toThrow(StoreError);
+    }
+  });
   it("commits learning receipts with the actual save and updates only the original reply after a late write", () => {
     const f = prepareLearningFixture(), store = f.store;
     const reply = f.reply("original-reply"), rawReply = store.findEvent(reply.id);

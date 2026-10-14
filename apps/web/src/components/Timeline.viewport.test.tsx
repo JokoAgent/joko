@@ -116,6 +116,18 @@ afterEach(async () => {
 });
 
 describe("Timeline viewport journeys", () => {
+  it("shows whole-Run accounting only on its current completion while keeping segment usage private to running status", async () => {
+    const segmentUsage = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0,
+      totalTokens: 15, cost: 0.004, currency: "USD", generationDurationMs: 1_000, generationReliable: true };
+    const answer = { ...item("answer", 1, "assistant"), runId: "run", usage: segmentUsage };
+    await render({ items: [answer], sessionActive: false });
+    expect(host.querySelector(".message-usage-meta")).toBeNull();
+    await render({ items: [{ ...answer, turnUsage: { ...segmentUsage, totalTokens: 120, cost: 0.02, costComplete: true } }] });
+    expect(host.querySelector(".message-usage-meta")?.textContent).toBe("$0.02");
+    await render({ items: [answer] });
+    expect(host.querySelector(".message-usage-meta")).toBeNull();
+  });
+
   it("counts durable tail messages while detached and clears unread on downward intent at the edge", async () => {
     await render();
     const viewport = timeline();

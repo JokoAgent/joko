@@ -1815,7 +1815,7 @@ describe("SessionHost", () => {
       baseline: { providerId: "provider-a", modelId: "reasoner" },
       effective: { providerId: "provider-b", modelId: "reasoner" },
       fallbackHop: 1,
-      visitedRoutes: ["provider-a\0reasoner", "provider-b\0reasoner"]
+      visitedRoutes: [`${adapter.id}\0provider-a\0reasoner`, `${adapter.id}\0provider-b\0reasoner`]
     });
     const events = fixture.store.listEvents({ sessionId, order: "asc", limit: 1_000 });
     const recoveries = events.filter((event) => event.payload.type === "runtime_recovery");
@@ -4415,6 +4415,10 @@ describe("SessionHost", () => {
       operationId: "create-tiered-usage", connection: fixture.connection, targetId: "target-one", title: "Tiered usage",
       providerId: "test", modelId: "text", fastMode: true, permissionMode: "ask", planMode: false
     })).value.sessionId;
+    if (testCase.name === "standard at the threshold") {
+      const receiptClock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+      cleanups.push(async () => { receiptClock.mockRestore(); });
+    }
     const queued = fixture.host.enqueueInput({
       operationId: "send-tiered-usage", connection: fixture.connection, sessionId,
       prompt: { text: "measure", images: [], files: [], mentions: [], disposition: "prompt" }
@@ -4480,13 +4484,23 @@ describe("SessionHost", () => {
       costMicros: 0,
       currencyCode: "USD",
       costComplete: false
+    },
+    {
+      name: "does not price a substituted model using the selected model",
+      modelCost: { input: 1, output: 2, cacheRead: 0.02, cacheWrite: 0 },
+      pricing: { source: "providerReference", currencyCode: "CNY", cacheReadAvailable: true, cacheWriteAvailable: false },
+      substitutedModelId: "actual-model",
+      costMicros: 0,
+      currencyCode: "CNY",
+      costComplete: false
     }
   ] as const)("$name", async (testCase) => {
     const fixture = await createFixture(new TieredUsageFakeAdapter({
       requestInput: 200_000,
       fastMode: false,
       modelCost: testCase.modelCost,
-      pricing: testCase.pricing
+      pricing: testCase.pricing,
+      ...("substitutedModelId" in testCase ? { substitutedModelId: testCase.substitutedModelId } : {})
     }), { usageMoneyKind: () => "reference-value" });
     const sessionId = (await fixture.host.createSession({
       operationId: "create-currency-usage", connection: fixture.connection, targetId: "target-one", title: "Currency usage",
@@ -4505,6 +4519,11 @@ describe("SessionHost", () => {
         estimated: true
       })
     ]);
+    expect(fixture.store.getRun(queued.value.runId).descriptor.usage).toMatchObject({
+      totalTokens: 402_000, costMicros: testCase.costMicros, costComplete: testCase.costComplete, estimated: true
+    });
+    expect(fixture.store.getRun(queued.value.runId).descriptor.usage?.currencyCode)
+      .toBe(testCase.costComplete ? testCase.currencyCode : undefined);
   });
 
   it("applies a model price override only to the matching Backend identity", async () => {
@@ -4608,6 +4627,13 @@ describe("SessionHost", () => {
       .toMatchObject({ inputTokens: 20, outputTokens: 10, totalTokens: 30, costMicros: 5_000 });
     expect(fixture.store.summarizeUsageLedger({ ownerId: "orchestrator" }))
       .toMatchObject({ inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000 });
+    const completion = fixture.store.listEvents({ sessionId }).find(event => event.runId === queued.value.runId
+      && event.payload.type === "message_complete" && event.payload.role === "assistant");
+    expect(completion).toBeDefined();
+    expect(fixture.store.getRun(queued.value.runId).descriptor.usage).toMatchObject({
+      inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000, currencyCode: "USD",
+      completionEventId: completion!.id, messageId: completion!.id
+    });
   });
 
   it("records a terminal Provider limit for the effective turn model and clears it after live usage succeeds", async () => {
@@ -15833,6 +15859,7 @@ function hostServiceZeroUsage(): Record<string, unknown> {
 }
 
 class DelegatedUsageFakeAdapter extends FakeBackendAdapter {
+  #observedUsage = false;
   constructor() {
     super({
       ...PI_LIKE_PROFILE,
@@ -15845,7 +15872,18 @@ class DelegatedUsageFakeAdapter extends FakeBackendAdapter {
     });
   }
 
+  override async inspectSession(binding: NativeSessionBinding, context: AdapterContext): Promise<NativeSessionState> {
+    const full = await super.inspectSession(binding, context);
+    if (this.#observedUsage) return full;
+    const { usage: _initialUsage, ...state } = full;
+    return state;
+  }
+
   override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    this.#observedUsage = true;
+    await context.emit({ type: "usage", usage: { inputTokens: 12, outputTokens: 8, cacheReadTokens: 0, cacheWriteTokens: 0,
+      totalTokens: 20, contextTokens: 20, contextWindow: 32_000, cost: 0.001 } });
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Parent result" }] });
     const base = {
       ...portableWorkerRun(context.sessionId, 0),
       id: "delegated-usage-worker",
@@ -15919,6 +15957,7 @@ class TieredUsageFakeAdapter extends FakeBackendAdapter {
     readonly fastMode: boolean | undefined;
     readonly omitPricingContext?: boolean;
     readonly reportedCost?: boolean;
+    readonly substitutedModelId?: string;
     readonly modelCost?: ProviderModel["cost"];
     readonly pricing?: ProviderModel["pricing"] | null;
   }) {
@@ -15948,6 +15987,8 @@ class TieredUsageFakeAdapter extends FakeBackendAdapter {
   }
 
   override async send(_input: PromptInput, context: AdapterContext): Promise<void> {
+    if (this.observation.substitutedModelId) await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Replaced model result" }],
+      modelSubstitution: { selectedModelId: "text", actualModelId: this.observation.substitutedModelId } });
     for (const count of [1, 2]) {
       const usage: UsageSnapshot = {
         inputTokens: (this.observation.requestInput - 102_000) * count,
@@ -15961,7 +16002,6 @@ class TieredUsageFakeAdapter extends FakeBackendAdapter {
       };
       await context.emit({ type: "usage", usage });
       await context.emit({ type: "usage", usage });
-      await new Promise((resolve) => setTimeout(resolve, 2));
     }
     await context.emit({ type: "done", outcome: "completed" });
   }

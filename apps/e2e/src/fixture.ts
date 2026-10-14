@@ -20,6 +20,7 @@ import {
   OperationalWorkspaceSnapshotRepository,
   OperationalArtifactRepository,
   ObjectiveManager,
+  PartnerManager,
   DurableReviewEvidenceProvider,
   ReviewCoordinator,
   RemoteExecutionRouter,
@@ -39,7 +40,7 @@ import {
   type BackendInstanceFactory,
   type OrchestratorConfig
 } from "@joko/orchestrator";
-import { ContactStore, OperationalStore, VoiceDictionaryPeerStore } from "@joko/store";
+import { ContactStore, OperationalStore, PartnerStore, VoiceDictionaryPeerStore } from "@joko/store";
 import {
   FakeBackendAdapter,
   PI_LIKE_PROFILE,
@@ -425,6 +426,14 @@ export class OrchestratorE2eFixture {
     });
     await voiceDictionaryPeers?.initialize();
     const modelFavorites = new ModelFavoriteSettings(store);
+    const partnerStore = new PartnerStore(join(dataDirectory, "partners.db"));
+    const partners = new PartnerManager({
+      store: partnerStore,
+      operationalStore: store,
+      sessionHost,
+      workspaceService: workspaces,
+      homesRoot: join(dataDirectory, "partner-homes")
+    });
     const application: OrchestratorApplication = {
       config,
       store,
@@ -456,6 +465,7 @@ export class OrchestratorE2eFixture {
       modelFavorites,
       browserActivity: [],
       contacts,
+      partners,
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
       voiceDictionary,
@@ -490,6 +500,7 @@ export class OrchestratorE2eFixture {
         await attempt(() => voiceDictionary.close());
         await attempt(() => dictionaryPeerStore?.close());
         await attempt(() => contactStore.close());
+        await attempt(() => partnerStore.close());
         await attempt(() => sessionWorktrees.dispose());
         await attempt(() => devicePeers.shutdown());
         await attempt(() => store.close());

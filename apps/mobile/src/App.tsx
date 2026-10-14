@@ -28,6 +28,8 @@ import { useMobileFileTextActions } from "./use-mobile-file-text-actions";
 import { MobileFilesPreviewPager } from "./MobileFilesPreviewPager";
 import { mobileFilesPreviewCanSwipe, type MobileFilesPreviewPager as FilesPreviewPager } from "./mobile-files-preview-pager";
 import { MobileTimelineImage } from "./MobileTimelineImage";
+import { MobileUserMessageContent } from "./MobileUserMessageContent";
+import { MobileMessageRunFacts } from "./MobileMessageRunFacts";
 import { MobileImageGalleryPresenter } from "./mobile-image-gallery-presentation";
 import { MobileNativeIntentNotice } from "./MobileNativeIntentNotice";
 import {
@@ -3610,11 +3612,12 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     nativeGeneration: session?.nativeBinding?.runtimeGeneration ?? 0n
   }, actualSessionStreaming && state.window === undefined),
   [actualSessionStreaming, session?.nativeBinding?.runtimeGeneration, state.detail?.generation, state.selectedId, state.window, taskTimelineEvents]);
-  const latestObservedRows = useMemo(() => timelineRows(taskTimelineEvents, actualSessionStreaming),
-    [actualSessionStreaming, taskTimelineEvents]);
+  const latestObservedRows = useMemo(() => timelineRows(taskTimelineEvents, actualSessionStreaming, state.detail?.runs),
+    [actualSessionStreaming, state.detail?.runs, taskTimelineEvents]);
   const observedRows = useMemo(() => state.window === undefined
     ? latestObservedRows
-    : timelineRows(state.window), [latestObservedRows, state.window]);
+    : timelineRows([...state.window, ...taskTimelineEvents.filter(event => event.payload?.kind.case === "runChanged")], false, state.detail?.runs),
+  [latestObservedRows, state.detail?.runs, state.window, taskTimelineEvents]);
   const optimisticOwnerKey = state.status === "connected" ? client.taskPresentationOwnerKey() : undefined;
   const ownerOptimisticRows = useMemo(() => state.status === "connecting"
     ? optimisticUserRows
@@ -4361,7 +4364,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       canRewind: !workerReadOnly && !state.busy && !attachmentBusy && !voice.busy && queueEdit === undefined
         && client.taskMessageRewindControls(messageAction.row.eventId)?.canRewind === true,
       shareDisabled: conversationShareDisabled
-    }).filter((item) => state.status === "connected" || item.id === "copy-link")
+    }).filter((item) => state.status === "connected" || item.id === "copy-link" || item.id === "copy-text")
     : [];
   useMobileScreenshotSelection({ owner: client.conversationShareOwnerKey(), selectionActive: conversationShare.active,
     blocked: conversationShareDisabled || drawerOpen || messageActionsVisible || taskActionsVisible || interactionVisible || contextVisible
@@ -5454,6 +5457,40 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       if (taskMountedRef.current) setCopyBusy(false);
     }
   };
+  const copyPublicMessageText = async (message: TimelineRow): Promise<void> => {
+    if (copyInFlightRef.current || mobileCopyLinks.busy) return;
+    const initial = projectMobileNativeIntentSnapshot(client.state);
+    if (!initial.selectedSessionId) return;
+    const authority = claimMobileCopyLinkAuthority(initial, { sessionId: initial.selectedSessionId,
+      requiresSelectedSession: true, messageId: message.id, messageEventId: message.eventId });
+    if (!authority || !mobileMessageShareable(message)) return;
+    const text = message.sourceText ?? message.text;
+    const owner = client.state.owner?.generation;
+    const generation = client.state.detail?.generation;
+    const request = ++copyGenerationRef.current;
+    const current = (): boolean => taskMountedRef.current && copyGenerationRef.current === request
+      && AppState.currentState === "active" && client.state.owner?.generation === owner
+      && client.state.detail?.generation === generation
+      && mobileCopyLinkAuthorityMatches(authority, projectMobileNativeIntentSnapshot(client.state));
+    copyInFlightRef.current = true; setCopyBusy(true); setComposerNotice(""); setLocalError("");
+    try {
+      const result = await filesClipboard.copy({ text, kind: "source", assertCurrent: (signal) => {
+        signal?.throwIfAborted();
+        const latest = timelineRows(client.state.window
+          ?? [...client.state.older, ...(client.state.detail?.timeline ?? []), ...client.state.live])
+          .find(row => row.id === message.id && row.eventId === message.eventId);
+        if (!current() || !latest || !mobileMessageShareable(latest) || (latest.sourceText ?? latest.text) !== text) {
+          throw new Error("The public message changed before copying.");
+        }
+      } });
+      if (!current() || result === "retired") return;
+      if (result === "copied") setComposerNotice(mobileMessage(locale, "actions.messageCopied"));
+      else setLocalError(mobileMessage(locale, result === "unknown" ? "actions.copyMessageUnknown" : "actions.copyMessageFailed"));
+    } finally {
+      copyInFlightRef.current = false;
+      if (taskMountedRef.current) setCopyBusy(false);
+    }
+  };
   const runMessageAction = (action: MobileMessageActionId): void => {
     const selected = messageAction;
     setMessageAction(undefined);
@@ -5463,7 +5500,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       ?? [...client.state.older, ...(client.state.detail?.timeline ?? []), ...client.state.live])
       .find((row) => row.id === selected.row.id && row.eventId === selected.row.eventId && row.completed
         && (row.kind === "user" || row.kind === "assistant"));
-    if (!latest) return;
+    if (!latest || !mobileMessageShareable(latest)) return;
+    if (action === "copy-text") {
+      void copyPublicMessageText(latest);
+      return;
+    }
     if (action === "copy-link") {
       void copyPublicTaskLink(latest);
       return;
@@ -5906,6 +5947,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           </Pressable>}
         </View>}
         <View pointerEvents={conversationShare.active ? "none" : "auto"}>
+        {item.automationOrigin && <Text numberOfLines={1} style={[styles.caption, { color: colors.muted }]}
+          testID="message.automationOrigin">{item.automationOrigin.scheduleName
+            ? mobileMessage(locale, "task.automationSourceNamed", { name: item.automationOrigin.scheduleName })
+            : mobileMessage(locale, "task.automationSource")}</Text>}
         {taskSource && !item.collaboration && <Pressable accessibilityRole="button" accessibilityLabel={sourceLabel || ""}
           disabled={state.status !== "connected" || state.busy || attachmentBusy || voice.busy || navigationBusy
             || taskSource.senderSessionId === state.selectedId}
@@ -5942,6 +5987,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
+          : item.kind === "user" ? <MobileUserMessageContent ownerKey={`${blockOwnerKey}/${item.id}`} text={item.text}
+            automation={item.automationOrigin !== undefined} selectable={!item.optimistic} colors={colors} locale={locale} />
           : item.objectiveLifecycle ? <View style={styles.field}>
             {item.text !== "" && <Text selectable style={[styles.body, { color: colors.ink }]}>{item.text}</Text>}
             <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "objective.progress", {
@@ -5949,6 +5996,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             })}</Text>
           </View> : <Text selectable={!item.optimistic} style={[styles.body, { color: colors.ink }]}>{partnerIdentity.partner && item.runStopped
             ? mobileMessage(locale, "partnerConversation.stopped") : item.text}</Text>}
+        {!conversationShare.active && <MobileMessageRunFacts row={item} locale={locale} colors={colors} />}
         {delegatedCards.map(renderDelegatedCard)}
         {partnerRead.ready && partnerIdentity.partner && item.kind === "assistant" && item.completed && item.assistantBodyPresent === true
           && !item.partnerPrivateOrigin && <MobilePartnerLearningFooter feedback={item.learning} locale={locale} color={colors.muted}

@@ -532,6 +532,15 @@ enum RunState {
   RUN_STATE_CANCELLED = 11;
 }
 
+message RunUsageSummary {
+  Usage usage = 1;
+  bool estimated = 2;
+  bool cost_complete = 3;
+  string completion_event_id = 4;
+  string message_id = 5;
+  bool tokens_complete = 6;
+}
+
 message Run {
   string run_id = 1;
   string session_id = 2;
@@ -542,7 +551,7 @@ message Run {
   RunState state = 7;
   repeated Attempt attempts = 8;
   string active_attempt_id = 9;
-  Usage usage = 10;
+  RunUsageSummary usage = 10;
   google.protobuf.Timestamp accepted_at = 11;
   google.protobuf.Timestamp started_at = 12;
   google.protobuf.Timestamp ended_at = 13;

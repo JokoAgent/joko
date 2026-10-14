@@ -27,7 +27,8 @@ export interface MobileConversationShareSnapshot {
 }
 
 export function mobileMessageShareable(row: TimelineRow): boolean {
-  return row.completed && !row.optimistic && (row.kind === "user" || row.kind === "assistant");
+  return row.completed && !row.optimistic && !row.internalInput
+    && (row.kind === "assistant" || row.kind === "user" && row.partnerPrivateOrigin === undefined);
 }
 
 export function projectMobileConversationShareMessage(
@@ -47,7 +48,7 @@ export function projectMobileConversationShareMessage(
       else if (block.content.case === "image") bodyParts.push({ kind: "text", text: "[Image]" });
     });
   } else {
-    bodyParts.push({ kind: "text", text: redactShareMessageText(row.text) });
+    bodyParts.push({ kind: "text", text: redactShareMessageText(row.sourceText ?? row.text) });
     for (const page of pages) attachments.push({ kind: "image", name: redactShareMessageText(page.title), uri: page.pageId });
     for (const artifact of row.artifacts ?? []) attachments.push({ kind: "file", name: redactShareMessageText(artifact.title) });
     const input = (acceptedInput ?? event).payload?.kind;
@@ -58,7 +59,7 @@ export function projectMobileConversationShareMessage(
       }
     }
   }
-  return { clientId: row.id, kind: row.kind as "user" | "assistant", body: redactShareMessageText(row.text), bodyParts, attachments };
+  return { clientId: row.id, kind: row.kind as "user" | "assistant", body: redactShareMessageText(row.sourceText ?? row.text), bodyParts, attachments };
 }
 
 export class MobileConversationShareSelection {

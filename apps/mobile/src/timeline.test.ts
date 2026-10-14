@@ -1,9 +1,11 @@
 import { create } from "@bufbuild/protobuf";
-import { EventCursorSchema, EventIdentitySchema, EventSchema, InputContentSchema, MessageRole, ObjectiveLifecycleAction, ObjectiveStatus, QueueItemState, RunState, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
+import { EventCursorSchema, EventIdentitySchema, EventSchema, InputContentSchema, MessageInputDelivery, MessageRole, ObjectiveLifecycleAction, ObjectiveStatus, QueueItemState, RunSchema, RunState, RunUsageSummarySchema, ToolCallOutputMode, ToolCallState, ToolFileAction, ToolResultSchema } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 import { timelineRows } from "./timeline";
 import { isWorkGroup, mobileWorkItems } from "./mobile-work-projection";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
+import { mobilePartnerConversationRows, mobilePublicConversationInputs } from "./mobile-partner-presentation";
+import { mobileMessageShareable, projectMobileConversationShareMessage } from "./mobile-conversation-share";
 
 function completed(blocks: any[], role = MessageRole.ASSISTANT) {
   return create(EventSchema, {
@@ -33,6 +35,49 @@ it("shows typed objective completion while keeping the internal verdict out of v
 });
 
 describe("mobile Timeline metadata events", () => {
+  it("replays public scheduler input and its exact source without exposing objective or recovery prompts", () => {
+    const text = "Read the report\n".repeat(18);
+    const start = create(EventSchema, { eventId: "scheduled-input", identity: { sessionId: "session" }, cursor: { generation: 1n, sequence: 1n },
+      payload: { kind: { case: "messageStarted", value: { messageId: "message", role: MessageRole.USER,
+        userInputAccepted: true, inputDelivery: MessageInputDelivery.SCHEDULER,
+        automationOrigin: { scheduleId: "schedule", scheduleName: "Daily report", runId: "run" },
+        userInput: { parts: [{ content: { case: "text", value: text } }] } } } } });
+    const end = completed([{ content: { case: "text", value: "native echo" } }], MessageRole.USER);
+    end.cursor!.sequence = 2n;
+    const replay = timelineRows([end, start]);
+    expect(mobilePublicConversationInputs(replay)).toMatchObject([{ text, sourceText: text, internalInput: false,
+      automationOrigin: { scheduleId: "schedule", scheduleName: "Daily report", runId: "run" } }]);
+    expect(mobilePartnerConversationRows(replay, false, "partner")).toEqual(replay);
+    expect(projectMobileConversationShareMessage(replay[0]!, end, [], start)).toMatchObject({ body: text,
+      bodyParts: [{ kind: "text", text }] });
+    if (start.payload?.kind.case !== "messageStarted") throw new Error("Expected accepted input");
+    start.payload.kind.value.automaticContinuation = true;
+    expect(mobilePublicConversationInputs(timelineRows([start, end]))).toEqual([]);
+    expect(mobileMessageShareable(timelineRows([start, end])[0]!)).toBe(false);
+    start.payload.kind.value.automaticContinuation = false;
+    start.payload.kind.value.objectiveContinuation = { $typeName: "joko.v1.ObjectiveContinuation", ownerGeneration: 1n, turn: 1 };
+    expect(mobilePublicConversationInputs(timelineRows([start, end]))).toEqual([]);
+    expect(timelineRows([start, end])[0]?.sourceText).toBeUndefined();
+  });
+
+  it("keeps pasted input source available for copying and sharing while rejecting unaccepted source labels", () => {
+    const text = "First line\nSecond line";
+    const start = create(EventSchema, { eventId: "input", cursor: { generation: 1n, sequence: 1n },
+      payload: { kind: { case: "messageStarted", value: { messageId: "message", role: MessageRole.USER, userInputAccepted: true,
+        automationOrigin: { scheduleId: "schedule", scheduleName: "Daily" },
+        userInput: { parts: [{ content: { case: "text", value: text } }], pastedTextRanges: [{ start: 0, end: text.length, display: "Pasted text (2 lines)" }] } } } } });
+    const row = timelineRows([start])[0]!;
+    expect(row.text).toBe("Pasted text (2 lines)");
+    expect(row.sourceText).toBe(text);
+    expect(projectMobileConversationShareMessage(row, start)).toMatchObject({ body: text });
+    if (start.payload?.kind.case !== "messageStarted") throw new Error("Expected input");
+    start.payload.kind.value.userInputAccepted = false;
+    expect(timelineRows([start])[0]?.automationOrigin).toBeUndefined();
+    expect(timelineRows([start])[0]?.sourceText).toBeUndefined();
+    start.payload.kind.value.userInputAccepted = true;
+    start.payload.kind.value.automationOrigin!.scheduleId = "";
+    expect(timelineRows([start])[0]?.automationOrigin).toBeUndefined();
+  });
   it("retains typed task senders without changing literal user text or inferring provenance from JSON", () => {
     const taskMessageOrigin = { senderSessionId: "source", senderSessionTitle: "Source title", senderPartnerId: "partner", senderPartnerName: "Partner name" };
     const event = create(EventSchema, { eventId: "handoff", identity: { sessionId: "recipient" }, cursor: { generation: 1n, sequence: 5n },
@@ -161,6 +206,120 @@ describe("mobile Timeline metadata events", () => {
     expect(events).toEqual(original);
     expect(events.at(-1)?.cursor?.sequence).toBe(13n);
     expect(timelineRows(events).at(-1)?.sequence).toBe(12n);
+  });
+});
+
+describe("mobile Timeline turn usage", () => {
+  const answer = () => create(EventSchema, { eventId: "answer-completed", cursor: { generation: 3n, sequence: 5n },
+    identity: { sessionId: "task", runId: "run", attemptId: "attempt", generation: 2n },
+    payload: { kind: { case: "messageCompleted", value: { messageId: "answer", role: MessageRole.ASSISTANT,
+      blocks: [{ content: { case: "text", value: "Done" } }], usage: { totalTokens: 10n } } } } });
+  const summary = () => create(RunUsageSummarySchema, { usage: { totalTokens: 30n, costMicros: 120_000n, currencyCode: "USD" },
+    estimated: true, costComplete: true, tokensComplete: true, completionEventId: "answer-completed", messageId: "answer" });
+  const run = () => create(RunSchema, { runId: "run", sessionId: "task", state: RunState.SUCCEEDED,
+    version: { revision: { value: 2n } }, usage: summary() });
+  const changed = () => create(EventSchema, { eventId: "run-projection", cursor: { generation: 3n, sequence: 6n },
+    identity: { sessionId: "task", runId: "run", generation: 2n }, payload: { kind: { case: "runChanged", value: { run: run() } } } });
+
+  it("uses the durable total only on the exact final completion and restores a history window from the Snapshot Run", () => {
+    const completion = answer();
+    const intermediate = answer(); intermediate.eventId = "segment-completed";
+    if (intermediate.payload?.kind.case === "messageCompleted") intermediate.payload.kind.value.messageId = "segment";
+    intermediate.cursor!.sequence = 4n;
+    expect(timelineRows([intermediate, completion]).map(row => row.usage)).toEqual([undefined, undefined]);
+    const events = [intermediate, completion, changed()]; const original = structuredClone(events);
+    const live = timelineRows([...events, events[2]!]);
+    expect(live).toMatchObject([{ id: "segment" }, { id: "answer", usage: { totalTokens: 30n }, usageIsEstimate: true, usageCostComplete: true, usageTokensComplete: true }]);
+    expect(live[0]?.usage).toBeUndefined();
+    expect(timelineRows([completion], false, [run()])).toEqual([live[1]]);
+    expect(timelineRows([...events].reverse())).toEqual(live);
+    expect(events).toEqual(original);
+    if (completion.payload?.kind.case === "messageCompleted") completion.payload.kind.value.turnUsage = summary();
+    expect(timelineRows([completion])).toEqual([live[1]]);
+  });
+
+  it("adopts later priced totals without adding repeated observations or letting a stale Snapshot replace them", () => {
+    const updated = changed(); updated.eventId = "priced-projection"; updated.cursor!.sequence = 8n;
+    if (updated.payload?.kind.case !== "runChanged") throw new Error("Expected Run projection");
+    updated.payload.kind.value.run!.version!.revision!.value = 3n;
+    updated.payload.kind.value.run!.usage!.usage!.totalTokens = 45n;
+    updated.payload.kind.value.run!.usage!.usage!.costMicros = 240_000n;
+    updated.payload.kind.value.run!.usage!.estimated = false;
+    expect(timelineRows([updated, changed(), answer(), changed(), updated], false, [run()]))
+      .toMatchObject([{ usage: { totalTokens: 45n, costMicros: 240_000n }, usageIsEstimate: false, usageCostComplete: true }]);
+  });
+
+  it("retires a previously joined segment when the Run completion moves, including a final outside the visible history page", () => {
+    const segment = answer(); segment.eventId = "segment-completed"; segment.cursor!.sequence = 3n;
+    if (segment.payload?.kind.case !== "messageCompleted") throw new Error("Expected completion");
+    segment.payload.kind.value.messageId = "segment";
+    segment.payload.kind.value.turnUsage = summary();
+    segment.payload.kind.value.turnUsage.messageId = "segment";
+    segment.payload.kind.value.turnUsage.completionEventId = "segment-completed";
+    expect(timelineRows([segment])[0]?.usage?.totalTokens).toBe(30n);
+    const latest = changed();
+    expect(timelineRows([segment, answer(), latest])[0]?.usage).toBeUndefined();
+    expect(timelineRows([segment, latest])).toMatchObject([{ id: "segment", usage: undefined }]);
+    expect(timelineRows([segment], false, [run()])).toMatchObject([{ id: "segment", usage: undefined }]);
+    const checkpoint = run(); checkpoint.usage!.usage!.totalTokens = 200n;
+    const historyProjection = changed();
+    if (historyProjection.payload?.kind.case !== "runChanged") throw new Error("Expected Run projection");
+    historyProjection.payload.kind.value.run!.usage = structuredClone(segment.payload.kind.value.turnUsage);
+    historyProjection.payload.kind.value.run!.usage!.usage!.totalTokens = 120n;
+    expect(timelineRows([segment, historyProjection], false, [checkpoint]))
+      .toMatchObject([{ id: "segment", usage: undefined }]);
+    for (const field of ["generation", "nativeGeneration", "sessionId", "runId"] as const) {
+      const foreign = changed();
+      if (field === "generation") foreign.cursor!.generation = 1n;
+      else if (field === "nativeGeneration") foreign.identity!.generation = 1n;
+      else foreign.identity![field] = "foreign";
+      expect(timelineRows([segment, foreign])[0]?.usage?.totalTokens).toBe(30n);
+    }
+  });
+
+  it("rejects foreign Run and completion identities and retired event generations instead of guessing message ownership", () => {
+    const completion = answer();
+    for (const field of ["sessionId", "runId"] as const) {
+      const foreign = run(); foreign[field] = "foreign";
+      expect(timelineRows([completion], false, [foreign])[0]?.usage).toBeUndefined();
+    }
+    for (const field of ["completionEventId", "messageId"] as const) {
+      const foreign = run(); foreign.usage![field] = "foreign";
+      expect(timelineRows([completion], false, [foreign])[0]?.usage).toBeUndefined();
+      if (completion.payload?.kind.case !== "messageCompleted") throw new Error("Expected completion");
+      completion.payload.kind.value.turnUsage = foreign.usage;
+      expect(timelineRows([completion])[0]?.usage).toBeUndefined();
+    }
+    if (completion.payload?.kind.case === "messageCompleted") completion.payload.kind.value.turnUsage = undefined;
+    for (const field of ["generation", "nativeGeneration", "runId", "sessionId"] as const) {
+      const retired = changed();
+      if (field === "generation") retired.cursor!.generation = 1n;
+      else if (field === "nativeGeneration") retired.identity!.generation = 1n;
+      else retired.identity![field] = "foreign";
+      expect(timelineRows([completion, retired])[0]?.usage).toBeUndefined();
+      expect(timelineRows([completion, retired], false, [run()])[0]?.usage?.totalTokens).toBe(30n);
+    }
+    const child = run(); child.runId = "child-run"; child.sessionId = "child-task";
+    expect(timelineRows([completion], false, [child, run()])[0]?.usage?.totalTokens).toBe(30n);
+  });
+
+  it("keeps missing and mixed prices token-only and rejects malformed current-v1 totals", () => {
+    const completion = answer(); const unknown = run();
+    unknown.usage!.usage!.currencyCode = ""; unknown.usage!.usage!.costMicros = 0n; unknown.usage!.costComplete = false;
+    unknown.usage!.tokensComplete = false;
+    expect(timelineRows([completion], false, [unknown])[0]).toMatchObject({ usage: { totalTokens: 30n, currencyCode: "", costMicros: 0n },
+      usageIsEstimate: true, usageCostComplete: false, usageTokensComplete: false });
+    for (const mutate of [
+      (value: ReturnType<typeof run>) => { value.usage!.usage!.inputTokens = -1n; },
+      (value: ReturnType<typeof run>) => { value.usage!.usage!.totalTokens = 2n ** 64n; },
+      (value: ReturnType<typeof run>) => { value.usage!.usage!.costMicros = -1n; },
+      (value: ReturnType<typeof run>) => { value.usage!.usage!.currencyCode = "usd"; },
+      (value: ReturnType<typeof run>) => { value.usage!.usage!.currencyCode = ""; },
+      (value: ReturnType<typeof run>) => { value.usage!.messageId = ""; }
+    ]) {
+      const malformed = run(); mutate(malformed);
+      expect(timelineRows([completion], false, [malformed])[0]?.usage).toBeUndefined();
+    }
   });
 });
 

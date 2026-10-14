@@ -13,6 +13,8 @@ import path, { type PlatformPath } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { SessionRuntimeHandoffStore, type RuntimeHandoffSource } from "./session-runtime-handoff-store.js";
+import { validModelSubstitution } from "@joko/core";
+import { parseCurrentRunUsageEventPayload, parseRunUsageSummary, runUsageSettingKey } from "./run-usage-shape.js";
 
 import type {
   AttemptDescriptor,
@@ -31,6 +33,7 @@ import type {
   RemoteWorkspaceBinding,
   RunDescriptor,
   RunState,
+  RunUsageSummary,
   NativeSessionBinding,
   SessionAttentionKind,
   SessionDescriptor,
@@ -8967,6 +8970,7 @@ export class OperationalStore {
     options: { readonly traceId?: string; readonly operationId?: string } = {}
   ): StoredRun {
     return this.write(() => {
+      if (descriptor.usage !== undefined) throw new StoreError("A new Run cannot provide a service-owned usage summary.");
       const session = this.getSession(descriptor.sessionId);
       this.assertSessionNotPendingScheduleDeletion(descriptor.sessionId);
       if (descriptor.parentRunId !== undefined) {
@@ -9050,10 +9054,26 @@ export class OperationalStore {
     return run;
   }
 
+  findRunModelSubstitution(runId: string): { readonly selectedModelId: string; readonly actualModelId: string } | undefined {
+    this.assertOpen();
+    const run = this.database.prepare("SELECT session_id FROM runs WHERE id = ?").get(runId) as Row | undefined;
+    if (run === undefined) throw new NotFoundError("Run", runId);
+    const row = this.database.prepare(`SELECT json_extract(payload_json, '$.payload.modelSubstitution') AS model_substitution
+      FROM events WHERE run_id = ? AND session_id = ?
+        AND json_extract(payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(payload_json, '$.payload.role') = 'assistant'
+        AND json_extract(payload_json, '$.payload.modelSubstitution') IS NOT NULL
+      ORDER BY session_sequence DESC LIMIT 1`).get(runId, stringValue(run["session_id"])) as Row | undefined;
+    if (row === undefined) return undefined;
+    const value = parseJson<unknown>(stringValue(row["model_substitution"]));
+    if (!validModelSubstitution(value)) throw new StoreError("The current Run model substitution is invalid.");
+    return value;
+  }
+
   findRun(id: string): StoredRun | undefined {
     this.assertOpen();
     const row = this.database.prepare("SELECT * FROM runs WHERE id = ?").get(id) as Row | undefined;
-    return row === undefined ? undefined : runFromRow(row);
+    return row === undefined ? undefined : this.runWithUsage(row);
   }
 
   findRunByParentId(parentRunId: string): StoredRun | undefined {
@@ -9061,7 +9081,7 @@ export class OperationalStore {
     const row = this.database.prepare(`
       SELECT * FROM runs WHERE parent_run_id = ? LIMIT 1
     `).get(nonBlank(parentRunId, "Parent Run ID")) as Row | undefined;
-    return row === undefined ? undefined : runFromRow(row);
+    return row === undefined ? undefined : this.runWithUsage(row);
   }
 
   listRuns(options: RunListOptions = {}): StoredRun[] {
@@ -9071,7 +9091,7 @@ export class OperationalStore {
       `SELECT run.* FROM runs AS run ${filter.where}
        ORDER BY run.created_at DESC, run.id LIMIT ? OFFSET ?`
     ).all(...filter.params, normalizeLimit(options.limit, 500), normalizeOffset(options.offset)) as Row[])
-      .map(runFromRow);
+      .map(row => this.runWithUsage(row));
   }
 
   findLatestRunForSessionGeneration(sessionId: string, generation: number): StoredRun | undefined {
@@ -9086,7 +9106,89 @@ export class OperationalStore {
       ${filter.where} AND attempt.generation = ?
       ORDER BY run.rowid DESC LIMIT 1
     `).get(...filter.params, generation) as Row | undefined;
-    return row === undefined ? undefined : runFromRow(row);
+    return row === undefined ? undefined : this.runWithUsage(row);
+  }
+
+  private runWithUsage(row: Row): StoredRun {
+    const run = runFromRow(row);
+    const setting = this.findSetting("session", run.descriptor.sessionId, runUsageSettingKey(run.descriptor.id));
+    if (setting === undefined) return run;
+    const usage = parseRunUsageSummary(setting.value);
+    if (usage.completionEventId !== undefined) {
+      const completion = this.findEvent(usage.completionEventId, { includeTombstoned: true });
+      if (completion === undefined || completion.runId !== run.descriptor.id || completion.sessionId !== run.descriptor.sessionId
+        || !isRunUsageCompletion(completion) || completion.payload.type !== "message_complete"
+        || usage.messageId !== (completion.payload.nativeHistory?.identity?.entryId ?? completion.id)) {
+        throw new StoreError("The current Run usage completion does not match its exact owned message.");
+      }
+    }
+    return { ...run, descriptor: { ...run.descriptor, usage } };
+  }
+
+  private recordRunUsage(runId: string, delta: UsageObservationResult, currencyCode: string | undefined, generation: number, tokensComplete = true): StoredRun {
+    return this.write(() => {
+      const run = this.getRun(runId);
+      const session = this.getSession(run.descriptor.sessionId);
+      if (session.descriptor.binding.generation !== generation) throw new StaleGenerationError(session.descriptor.binding.generation, generation);
+      const prior = run.descriptor.usage;
+      const completeTokens = (prior?.tokensComplete ?? true) && tokensComplete;
+      const completeCost = (prior?.costComplete ?? true) && delta.costComplete;
+      const estimated = (prior?.estimated ?? false) || delta.estimated;
+      if (!delta.changed && prior !== undefined && prior.tokensComplete === completeTokens
+        && prior.costComplete === completeCost && prior.estimated === estimated) return run;
+      const currency = currencyCode === undefined ? undefined : usageCurrency(currencyCode);
+      const mixed = delta.changed || prior === undefined
+        ? currency === undefined || prior !== undefined && prior.currencyCode !== currency
+        : prior.currencyCode === undefined;
+      const summaryCurrency = delta.changed || prior === undefined ? currency : prior.currencyCode;
+      const total = (key: "inputTokens" | "outputTokens" | "cacheReadTokens" | "cacheWriteTokens" | "totalTokens" | "costMicros"): number =>
+        safeUsageInteger((prior?.[key] ?? 0) + safeUsageInteger(delta[key], `Run usage ${key}`), `Run usage ${key}`);
+      const completion = this.latestRunUsageCompletion(runId);
+      const messageId = completion?.payload.type === "message_complete"
+        ? completion.payload.nativeHistory?.identity?.entryId ?? completion.id : undefined;
+      const summary = parseRunUsageSummary({ version: 1, inputTokens: total("inputTokens"), outputTokens: total("outputTokens"),
+        cacheReadTokens: total("cacheReadTokens"), cacheWriteTokens: total("cacheWriteTokens"), totalTokens: total("totalTokens"),
+        costMicros: mixed ? 0 : total("costMicros"), ...(mixed ? {} : { currencyCode: summaryCurrency }),
+        estimated, tokensComplete: completeTokens, costComplete: !mixed && completeCost,
+        ...(completion === undefined || messageId === undefined ? {} : { completionEventId: completion.id, messageId }) });
+      this.persistRunUsage(run, summary, generation);
+      return this.getRun(runId);
+    });
+  }
+
+  private latestRunUsageCompletion(runId: string): PersistedEvent | undefined {
+    const rows = this.database.prepare(`SELECT event.* FROM events AS event
+      LEFT JOIN message_event_tombstones AS tombstone ON tombstone.event_id = event.id
+      WHERE event.run_id = ? AND tombstone.event_id IS NULL
+        AND json_extract(event.payload_json, '$.payload.type') = 'message_complete'
+        AND json_extract(event.payload_json, '$.payload.role') = 'assistant'
+      ORDER BY event.session_sequence DESC`).iterate(runId);
+    for (const row of rows) {
+      const event = eventFromRow(row as Row);
+      if (isRunUsageCompletion(event)) return event;
+    }
+    return undefined;
+  }
+
+  private persistRunUsage(run: StoredRun, summary: RunUsageSummary, generation: number): void {
+    this.setSetting("session", run.descriptor.sessionId, runUsageSettingKey(run.descriptor.id), { version: 1, ...summary });
+    this.database.prepare("UPDATE runs SET revision = ? WHERE id = ?")
+      .run(asSqlInteger(this.requireActiveRevision()), run.descriptor.id);
+    const session = this.getSession(run.descriptor.sessionId).descriptor;
+    this.appendEvent({ backendId: session.backendId, targetId: session.targetId,
+      sessionId: session.id, runId: run.descriptor.id, generation, traceId: `run-usage:${run.descriptor.id}`,
+      payload: { type: "run_state", state: run.descriptor.state,
+        ...(run.descriptor.error === undefined ? {} : { error: run.descriptor.error }), usage: summary } });
+  }
+
+  private bindRunUsageCompletion(event: PersistedEvent): void {
+    if (event.runId === undefined || !isRunUsageCompletion(event) || event.payload.type !== "message_complete") return;
+    const run = this.getRun(event.runId), prior = run.descriptor.usage;
+    if (prior === undefined) return;
+    const messageId = event.payload.nativeHistory?.identity?.entryId ?? event.id;
+    if (prior.completionEventId === event.id && prior.messageId === messageId) return;
+    const summary = parseRunUsageSummary({ version: 1, ...prior, completionEventId: event.id, messageId });
+    this.persistRunUsage(run, summary, event.generation);
   }
 
   countRuns(options: Omit<RunListOptions, "limit" | "offset"> = {}): number {
@@ -10319,9 +10421,21 @@ export class OperationalStore {
         }
       }
       if (input.operationId !== undefined) this.getOperation(input.operationId);
-      const payload = parseCurrentTaskTagEventPayload(parseCurrentResourceUsageEventPayload(
+      let payload = parseCurrentRunUsageEventPayload(parseCurrentTaskTagEventPayload(parseCurrentResourceUsageEventPayload(
         parseCurrentInteractionEventPayload(redactSubagentEventPayload(input.payload))
-      ));
+      )));
+      if (payload.type === "run_state") {
+        if (payload.usage !== undefined && input.runId === undefined) throw new StoreError("A Run usage event requires exact Run routing.");
+        const run = input.runId === undefined ? undefined : this.getRun(input.runId);
+        if (payload.usage !== undefined && serializeJson(payload.usage) !== serializeJson(run?.descriptor.usage)) {
+          throw new StoreError("A Run usage event must match the durable service-owned summary.");
+        }
+        if (run?.descriptor.usage !== undefined) payload = { ...payload, usage: run.descriptor.usage };
+      }
+      if (payload.type === "message_complete" && payload.modelSubstitution !== undefined
+        && (payload.role !== "assistant" || !validModelSubstitution(payload.modelSubstitution))) {
+        throw new StoreError("A model substitution requires an exact assistant completion and bounded model identities.");
+      }
       if (payload.type === "device_changed") throw new StoreError("Device content cannot use Session routing.");
       if (payload.type === "resource_usage" && (
         input.runId === undefined || payload.runtimeGeneration !== input.generation
@@ -10340,6 +10454,13 @@ export class OperationalStore {
       const revision = this.requireActiveRevision();
       const emittedAt = input.emittedAt ?? this.now();
       const id = input.id ?? this.idFactory();
+      if (payload.type === "message_complete" && payload.turnUsage !== undefined && (
+        input.runId === undefined || payload.turnUsage.completionEventId !== id
+        || payload.turnUsage.messageId !== (payload.nativeHistory?.identity?.entryId ?? id)
+        || serializeJson(payload.turnUsage) !== serializeJson(this.getRun(input.runId).descriptor.usage)
+      )) {
+        throw new StoreError("A message Run usage summary must match its durable service-owned completion.");
+      }
       const traceId = nonBlank(redactSecrets(input.traceId), "Event trace ID");
       const namespace = input.metadata === undefined
         ? undefined
@@ -10408,6 +10529,7 @@ export class OperationalStore {
         );
       }
       this.currentFrame().events.push(event);
+      this.bindRunUsageCompletion(event);
       if (event.payload.type === "error" && event.payload.terminal) {
         this.recordSessionAttention({
           sessionId: event.sessionId,
@@ -17383,6 +17505,13 @@ export class OperationalStore {
    * same cumulative prefix twice. Counter rollback starts a new cumulative
    * epoch.
    */
+  findUsageObservationMeasuredAt(ownerId: string, sessionId: string, sourceId: string): number | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`SELECT measured_at FROM usage_session_cursors
+      WHERE owner_id = ? AND session_id = ? AND source_id = ?`).get(ownerId, sessionId, sourceId) as Row | undefined;
+    return row === undefined ? undefined : numberValue(row["measured_at"]);
+  }
+
   recordUsageObservation(input: RecordUsageObservationInput): UsageObservationResult {
     this.assertOpen();
     const ownerId = usageIdentity(input.ownerId, "usage owner ID", 256, false);
@@ -17393,6 +17522,9 @@ export class OperationalStore {
     const modelId = usageIdentity(input.modelId, "usage model ID", 512, true);
     const generation = safeUsageInteger(input.generation, "usage generation");
     const measuredAt = safeUsageInteger(input.measuredAt, "usage measurement time");
+    if (input.observedCostComplete !== undefined && typeof input.observedCostComplete !== "boolean") {
+      throw new StoreError("Observed usage cost completeness must be explicitly boolean.");
+    }
     const current = {
       inputTokens: safeUsageInteger(input.inputTokens, "usage input tokens"),
       outputTokens: safeUsageInteger(input.outputTokens, "usage output tokens"),
@@ -17424,6 +17556,14 @@ export class OperationalStore {
       if (session.descriptor.binding.generation !== generation) {
         throw new StaleGenerationError(session.descriptor.binding.generation, generation);
       }
+      if (input.runUsage !== undefined) {
+        const run = this.getRun(nonBlank(input.runUsage.runId, "Run usage Run ID"));
+        if (run.descriptor.sessionId !== sessionId) throw new StoreError("Run usage attribution belongs to another Session.");
+        if (input.runUsage.currencyCode !== undefined) usageCurrency(input.runUsage.currencyCode);
+        if (input.runUsage.tokensComplete !== undefined && typeof input.runUsage.tokensComplete !== "boolean") {
+          throw new StoreError("Run usage token completeness must be explicitly boolean.");
+        }
+      }
       const prior = this.database.prepare(`
         SELECT * FROM usage_session_cursors WHERE owner_id = ? AND session_id = ? AND source_id = ?
       `).get(ownerId, sessionId, sourceId) as Row | undefined;
@@ -17437,7 +17577,7 @@ export class OperationalStore {
           cacheWriteTokens: 0,
           totalTokens: 0,
           costMicros: 0,
-          costComplete: true,
+          costComplete: input.observedCostComplete !== false,
           estimated: false,
           day: usageDay(priorMeasuredAt)
         } satisfies UsageObservationResult;
@@ -17494,6 +17634,7 @@ export class OperationalStore {
         costComplete = false;
         estimated = true;
       }
+      costComplete = costComplete && input.observedCostComplete !== false;
       const changed = delta.inputTokens !== 0
         || delta.outputTokens !== 0
         || delta.cacheReadTokens !== 0
@@ -17557,7 +17698,11 @@ export class OperationalStore {
           asSqlInteger(revision)
         );
       }
-      return { changed, ...delta, costMicros, costComplete, estimated, day };
+      const result = { changed, ...delta, costMicros, costComplete, estimated, day };
+      if (input.runUsage !== undefined && (changed || input.runUsage.tokensComplete === false || input.observedCostComplete === false)) {
+        this.recordRunUsage(input.runUsage.runId, result, input.runUsage.currencyCode, generation, input.runUsage.tokensComplete !== false);
+      }
+      return result;
     });
   }
 
@@ -19716,6 +19861,13 @@ function withSessionAttention(
   };
 }
 
+function isRunUsageCompletion(event: PersistedEvent): boolean {
+  return event.payload.type === "message_complete" && event.payload.role === "assistant"
+    && event.payload.partnerPrivateOrigin === undefined && event.payload.automaticContinuation === undefined
+    && event.payload.objectiveContinuation === undefined && event.payload.blocks.some(block =>
+      block.kind === "image" || block.kind === "artifact" || block.kind === "text" && block.text.trim().length > 0);
+}
+
 function runFromRow(row: Row): StoredRun {
   return {
     descriptor: {
@@ -20575,6 +20727,11 @@ function validateSubagentRoute(route: SubagentRunDetail["route"]): void {
 
 function validateSubagentUsage(usage: SubagentRunDetail["usage"]): void {
   if (usage === undefined) return;
+  for (const field of ["accountingIncludedInParent", "tokensComplete", "costComplete", "costEstimated"] as const) {
+    if (usage[field] !== undefined && typeof usage[field] !== "boolean") {
+      throw new StoreError(`Subagent ${field} must be explicitly boolean.`);
+    }
+  }
   for (const [value, label] of [
     [usage.inputTokens, "input tokens"],
     [usage.outputTokens, "output tokens"],
@@ -20736,7 +20893,16 @@ function eventFromRow(row: Row): PersistedEvent {
     readonly payload: unknown;
     readonly pi?: NonNullable<AppendEventInput["pi"]> | null;
   }>(stringValue(row["payload_json"]));
-  const payload = parseCurrentTaskTagEventPayload(parseCurrentInteractionEventPayload(stored.payload));
+  const payload = parseCurrentRunUsageEventPayload(parseCurrentTaskTagEventPayload(parseCurrentInteractionEventPayload(stored.payload)));
+  if (payload.type === "run_state" && payload.usage !== undefined && (row["run_id"] === null || row["run_id"] === undefined)) {
+    throw new StoreError("Stored Run usage requires exact Run routing.");
+  }
+  if (payload.type === "message_complete" && payload.turnUsage !== undefined && (
+    row["run_id"] === null || row["run_id"] === undefined || payload.turnUsage.completionEventId !== row["id"]
+    || payload.turnUsage.messageId !== (payload.nativeHistory?.identity?.entryId ?? row["id"])
+  )) {
+    throw new StoreError("Stored message Run usage does not match its exact completion identity.");
+  }
   if (payload.type === "device_changed") {
     if (row["backend_id"] !== null || row["target_id"] !== null || row["session_id"] !== null
       || row["run_id"] !== null || row["attempt_id"] !== null || row["operation_id"] !== null

@@ -4,8 +4,11 @@ import {
   ConnectionState,
   DeviceKind,
   DeviceSchema,
+  EventSchema,
+  MessageRole,
   OperationSchema,
   OwnerSnapshotScopeSchema,
+  RunSchema,
   SessionAutomationOriginSchema,
   SessionSchema,
   SessionSnapshotScopeSchema,
@@ -21,6 +24,7 @@ import {
   type MobileOfflineCacheStorage
 } from "./mobile-offline-cache";
 import type { NodeIdentity } from "./network";
+import { timelineRows } from "./timeline";
 
 const profile: MobileConnectionProfile = {
   profileId: "profile-one",
@@ -150,7 +154,16 @@ function cacheFixture() {
 describe("current-v1 mobile offline content cache", () => {
   it("round-trips a task by its native generation independently of the service event generation", async () => {
     const fixture = cacheFixture();
-    await fixture.cache.save(profile, node, owner(), detail());
+    const currentDetail = detail();
+    currentDetail.timeline = [create(EventSchema, { eventId: "answer-complete", identity: { sessionId: "session-one", runId: "run-one", generation: 7n },
+      cursor: { generation: 42n, sequence: 10n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "answer", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Done" } }],
+        modelSubstitution: { selectedModelId: "selected", actualModelId: "actual" }
+      } } } })];
+    currentDetail.runs = [create(RunSchema, { runId: "run-one", sessionId: "session-one", version: { revision: { value: 2n } },
+      usage: { usage: { totalTokens: 1234n }, estimated: true, costComplete: false, tokensComplete: false, completionEventId: "answer-complete", messageId: "answer" }
+    })];
+    await fixture.cache.save(profile, node, owner(), currentDetail);
     await fixture.cache.save(profile, node, owner());
 
     const restored = await fixture.cache.load(profile, "session-one");
@@ -161,6 +174,10 @@ describe("current-v1 mobile offline content cache", () => {
     expect(restored?.detail?.sessions[0]?.nativeBinding?.runtimeGeneration).toBe(7n);
     expect(restored?.owner.operations).toEqual([]);
     expect(restored?.detail?.operations).toEqual([]);
+    expect(timelineRows(restored!.detail!.timeline, false, restored!.detail!.runs)).toMatchObject([{
+      id: "answer", usage: { totalTokens: 1234n, costMicros: 0n, currencyCode: "" }, usageIsEstimate: true, usageCostComplete: false, usageTokensComplete: false,
+      modelSubstitution: { selectedModelId: "selected", actualModelId: "actual" }
+    }]);
     const durable = [...fixture.memory.values.values()].join("\n");
     expect(durable).not.toContain("authKey");
     expect(durable).not.toContain("credential-secret");

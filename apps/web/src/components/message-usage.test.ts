@@ -58,7 +58,33 @@ describe("message usage presentation", () => {
     expect(messageUsagePresentation({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 0, cost: 0, currency: "USD" }, t)).toBeUndefined();
   });
 
-  it("retains a lower bound for sub-cent cost", () => {
+  it("keeps exact tokens and price estimate metadata separate without inventing a currency", () => {
+    const view = messageUsagePresentation({ inputTokens: 100, outputTokens: 20, totalTokens: 120,
+      cacheReadTokens: 0, cacheWriteTokens: 0, cost: 0, currency: "", isEstimate: true, costComplete: false, tokensComplete: false }, t);
+    expect(view?.label).toBe("timeline.usageTokens|tokens=120");
+    expect(view?.tooltipLines).toEqual([
+      "timeline.usageEstimated", "timeline.usageCostIncomplete", "timeline.usageTokensIncomplete", "timeline.usageTokenLine|total=120,input=100,output=20",
+      "timeline.usageCacheLine|read=0,write=0,rate=0%", "timeline.usageNoBilledCost"
+    ]);
+    expect(formatMessageTurnCost(1, "")).toBeUndefined();
+    expect(formatMessageTurnCost(1, "usd")).toBeUndefined();
+    expect(formatMessageTurnCost(Number.POSITIVE_INFINITY, "USD")).toBeUndefined();
+  });
+
+  it("shows observed zero cost and marks only partially priced totals as incomplete", () => {
+    const base = { inputTokens: 10, outputTokens: 5, totalTokens: 15, cacheReadTokens: 0, cacheWriteTokens: 0, currency: "USD" };
+    expect(messageUsagePresentation({ ...base, cost: 0, costComplete: true }, t)?.label).toBe("$0.00");
+    const partial = messageUsagePresentation({ ...base, cost: 0.01, costComplete: false, isEstimate: false }, t);
+    expect(partial?.label).toBe("$0.01+");
+    expect(partial?.tooltipLines).toContain("timeline.usageCostIncomplete");
+    expect(partial?.tooltipLines).not.toContain("timeline.usageEstimated");
+    expect(messageUsagePresentation({ ...base, cost: 0.004, costComplete: false }, t)?.label).toBe("<$0.01+");
+    expect(messageUsagePresentation({ ...base, cost: 0.016, costComplete: false }, t)?.label).toBe("$0.02+");
+  });
+
+  it("retains observed sub-cent values without rounding them to zero", () => {
+    expect(messageUsagePresentation({ inputTokens: 10, outputTokens: 5, totalTokens: 15, cacheReadTokens: 0, cacheWriteTokens: 0,
+      cost: 0.004, currency: "USD", isEstimate: true }, t)?.label).toBe("≈<$0.01");
     expect(formatMessageTurnCost(0.004, "USD")).toBe("<$0.01");
     expect(formatMessageTurnCost(1.5, "CNY")).toBe("¥1.50");
   });
