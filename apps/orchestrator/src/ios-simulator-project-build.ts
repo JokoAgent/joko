@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { cp, lstat, mkdir, readdir, realpath, rm } from "node:fs/promises";
+import { cp, lstat, mkdir, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { arch } from "node:os";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { acquireWorktreeSourceUse, type WorktreeSourceUse } from "@joko/worktree";
 import { JokoError, redactSecrets } from "@joko/core";
 import { inspectSimulatorAppArtifact, SimulatorAppArtifactError,
   SimulatorProjectBuildError, SimulatorProjectBuilder,
@@ -187,6 +188,9 @@ export class SimulatorProjectBuildCoordinator {
         if (!entry.isDirectory() || !UUID.test(entry.name) ||
             family === "artifacts" && retained.has(entry.name)) continue;
         const directory = join(parent, entry.name);
+        // Presence is only a deletion fence; it never proves a live writer.
+        if (family === "builds" && await lstat(join(directory, "writer.json")).then(() => true,
+          error => (error as NodeJS.ErrnoException).code !== "ENOENT")) continue;
         const metadata = await lstat(directory).catch(() => null);
         if (metadata && this.#now() - metadata.mtimeMs > ORPHAN_STORAGE_TTL_MS) {
           await discardManagedChild(parent, directory);
@@ -227,11 +231,13 @@ export class SimulatorProjectBuildCoordinator {
   }
 
   async execute(scope: SimulatorTaskScope, route: SimulatorInstanceRoute,
-    input: { readonly containerPath?: string; readonly scheme?: string },
+    input: { readonly projectDir?: string; readonly containerPath?: string; readonly scheme?: string },
     authority: SimulatorLifecycleEffectAuthority, signal?: AbortSignal):
     Promise<{ readonly receipt: SimulatorBuildReceipt; readonly replayed: boolean }> {
     if (!DIGEST.test(authority.effectIdentity) || !BODY_HASH.test(authority.requestBodyHash) ||
         !Number.isSafeInteger(authority.providerGeneration) || authority.providerGeneration < 1 ||
+        input.projectDir !== undefined && (typeof input.projectDir !== "string" ||
+          !input.projectDir.trim() || input.projectDir.length > 4_096 || input.projectDir.includes("\0")) ||
         input.containerPath !== undefined && (typeof input.containerPath !== "string" ||
           !input.containerPath.trim() || input.containerPath.length > 4_096) ||
         input.scheme !== undefined && (typeof input.scheme !== "string" ||
@@ -299,28 +305,38 @@ export class SimulatorProjectBuildCoordinator {
     let copiedPath: string | undefined;
     let completed = false;
     let attempted = false;
+    let writerRetired = true;
+    let projectUse: WorktreeSourceUse | undefined;
     let evicted: SimulatorBuildArtifact[] = [];
     try {
-      const project = await this.#builder.inspect(worktreeRoot, input.containerPath);
+      const taskRoot = await realpath(worktreeRoot);
+      const projectRoot = await realpath(resolve(taskRoot, input.projectDir ?? "."));
+      projectUse = await acquireWorktreeSourceUse(projectRoot, operationId, controller);
+      const project = await this.#builder.inspect(projectUse.projectRoot, input.containerPath);
+      await projectUse.verify();
       if (controller.signal.aborted) throw new SimulatorAppBuildError("MUTATION_CANCELLED", "Simulator build was cancelled before dispatch.");
       this.#ownership.heartbeatRoute(scope, route);
       const currentRoot = this.#currentWorktree(scope);
-      if (await realpath(currentRoot) !== project.worktreeRoot) throw new SimulatorOwnershipError(
+      if (await realpath(currentRoot) !== taskRoot || project.worktreeRoot !== projectUse.projectRoot) throw new SimulatorOwnershipError(
         "STALE_SCOPE", "Simulator task worktree changed before build.");
       const projectId = randomUUID();
       const managed = join(this.#artifactRoot, "builds", projectId);
       derivedPath = join(managed, "derived");
       await mkdir(derivedPath, { recursive: true, mode: 0o700 });
+      await writeFile(join(managed, "writer.json"), JSON.stringify({ format: 1, operationId }), { flag: "wx", mode: 0o600 });
       if (controller.signal.aborted) throw new SimulatorAppBuildError("MUTATION_CANCELLED", "Simulator build was cancelled before dispatch.");
       this.#ownership.heartbeatRoute(scope, route);
       attempted = true;
+      writerRetired = false;
       let built: SimulatorProjectBuildResult;
       try {
         built = await this.#builder.build({ worktreeRoot: project.worktreeRoot,
           derivedDataPath: derivedPath, simulatorUdid: instance.simulatorUdid,
           containerPath: project.containerPath, scheme: input.scheme,
           expectedArch: this.#architecture, signal: controller.signal });
+        writerRetired = built.writerRetired === true;
       } catch (error) {
+        if (error instanceof SimulatorProjectBuildError) writerRetired = error.writerRetired === true;
         if (error instanceof SimulatorProjectBuildError &&
             (error.code === "APP_BUILD_FAILED" || error.code === "BUILD_OUTCOME_UNKNOWN")) {
           const diagnostics = await this.#rememberDiagnostics(scope, instance.instanceId,
@@ -338,7 +354,8 @@ export class SimulatorProjectBuildCoordinator {
       if (controller.signal.aborted || heartbeatError) throw new SimulatorAppBuildError("BUILD_OUTCOME_UNKNOWN",
         "Simulator build ownership changed while Xcode was running.");
       this.#ownership.heartbeatRoute(scope, route);
-      if (await realpath(this.#currentWorktree(scope)) !== project.worktreeRoot) throw new SimulatorOwnershipError(
+      await projectUse.verify();
+      if (await realpath(this.#currentWorktree(scope)) !== taskRoot) throw new SimulatorOwnershipError(
         "STALE_SCOPE", "Simulator task worktree changed while Xcode was running.");
       const diagnostics = await this.#rememberDiagnostics(scope, instance.instanceId,
         built.buildLogTail, built.resultBundlePath, built.outputTruncated,
@@ -361,12 +378,13 @@ export class SimulatorProjectBuildCoordinator {
       if (controller.signal.aborted || heartbeatError) throw new SimulatorAppBuildError("BUILD_OUTCOME_UNKNOWN",
         "Simulator build ownership changed before artifact registration.");
       this.#ownership.heartbeatRoute(scope, route);
-      if (await realpath(this.#currentWorktree(scope)) !== project.worktreeRoot) throw new SimulatorOwnershipError(
+      await projectUse.verify();
+      if (await realpath(this.#currentWorktree(scope)) !== taskRoot) throw new SimulatorOwnershipError(
         "STALE_SCOPE", "Simulator task worktree changed before artifact registration.");
       const artifact: SimulatorBuildArtifact = { artifactId, sessionId: scope.sessionId,
         targetId: scope.targetId, bindingGeneration: scope.generation,
         instanceId: instance.instanceId, simulatorUdid: instance.simulatorUdid,
-        worktreeRootHash: hashRoot(project.worktreeRoot), appPath: identity.appPath,
+        worktreeRootHash: hashRoot(taskRoot), appPath: identity.appPath,
         bundleId: identity.bundleId, scheme: built.scheme, projectKind: built.kind,
         createdAt: new Date(this.#now()).toISOString() };
       const receipt: SimulatorBuildReceipt = { artifact: { artifactId, bundleId: artifact.bundleId,
@@ -398,9 +416,10 @@ export class SimulatorProjectBuildCoordinator {
     } finally {
       clearInterval(heartbeat);
       signal?.removeEventListener("abort", onAbort);
+      await projectUse?.release({ writerRetired }).catch(() => undefined);
       if (!completed && copiedPath) await discardManagedChild(
         join(this.#artifactRoot, "artifacts"), dirname(copiedPath));
-      if (derivedPath) await discardManagedChild(join(this.#artifactRoot, "builds"), dirname(derivedPath));
+      if (derivedPath && writerRetired) await discardManagedChild(join(this.#artifactRoot, "builds"), dirname(derivedPath));
     }
   }
 

@@ -42,6 +42,10 @@ describe("BrowserAutomationNodeExecutor", () => {
     })).resolves.toEqual({ ok: true, data: { running: true } });
     expect(callTool).toHaveBeenCalledWith("browser", { action: "status" }, undefined);
     await expect(executor.execute({
+      nodeId: "node-local", expectedGeneration: 7, action: "setBackend", arguments: { action: "setBackend", backend: "sidebar" }
+    })).rejects.toThrow("local Settings");
+    expect(callTool).toHaveBeenCalledOnce();
+    await expect(executor.execute({
       nodeId: "node-local",
       expectedGeneration: 6,
       action: "status",

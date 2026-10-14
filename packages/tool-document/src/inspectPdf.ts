@@ -70,7 +70,7 @@ async function inspectInWorker(data: Buffer, pages: readonly number[], maxPages:
   const execArgv = sourceMode ? ["--import", import.meta.resolve("tsx")] : [];
   return await new Promise<PdfWorkerResult>((resolveResult, reject) => {
     const worker = new Worker(workerFile, {
-      workerData: { data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), pages, maxPages },
+      workerData: { kind: "inspect", data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), pages, maxPages },
       transferList: [data.buffer as ArrayBuffer],
       resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 16 },
       execArgv

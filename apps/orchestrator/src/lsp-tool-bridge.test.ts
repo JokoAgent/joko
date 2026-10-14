@@ -104,7 +104,7 @@ describe("LspToolBridgeProvider", () => {
       ["goto_definition", { file: "src/main.ts", line: 3, character: 7 }],
       ["find_references", { file: "src/main.ts", line: 3, character: 7 }],
       ["outline", { file: "src/main.ts", max_results: 8 }],
-      ["workspace_symbol", { query: "Main", max_results: 9 }],
+      ["workspace_symbol", { anchorFile: "src/main.ts", query: "Main", max_results: 9 }],
       ["incoming_calls", { file: "src/main.ts", line: 3, character: 7 }]
     ] as const;
 
@@ -139,7 +139,7 @@ describe("LspToolBridgeProvider", () => {
         column: 7
       },
       { action: "outline", workspaceRoot: value.workspaceRoot, file: "src/main.ts", maxResults: 8 },
-      { action: "workspace_symbol", workspaceRoot: value.workspaceRoot, query: "Main", maxResults: 9 },
+      { action: "workspace_symbol", workspaceRoot: value.workspaceRoot, anchorFile: "src/main.ts", query: "Main", maxResults: 9 },
       {
         action: "incoming_calls",
         workspaceRoot: value.workspaceRoot,

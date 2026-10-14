@@ -816,10 +816,17 @@ message CollaborationSettings {
   EntityVersion version = 5;
 }
 
-// Automatic workspace savepoints are opt-in. Counts are bounded operational
-// status only; repository paths, filenames, and commit contents stay private.
+enum GitSafetyMode {
+  GIT_SAFETY_MODE_UNSPECIFIED = 0;
+  GIT_SAFETY_MODE_OFF = 1;
+  GIT_SAFETY_MODE_EXISTING_GIT = 2;
+  GIT_SAFETY_MODE_ALL_PROJECTS = 3;
+}
+
+// Local project policy. Counts are bounded operational status only;
+// repository paths, filenames, and commit contents stay private.
 message GitSafetySettings {
-  bool auto_snapshot_enabled = 1;
+  GitSafetyMode mode = 1;
   uint32 pending_turns = 2;
   uint32 tracked_sessions = 3;
   uint32 tracked_repositories = 4;
@@ -1079,7 +1086,7 @@ message CollaborationSettingsPatch {
 }
 
 message GitSafetySettingsPatch {
-  optional bool auto_snapshot_enabled = 1;
+  optional GitSafetyMode mode = 1;
   bool reset_all = 2;
 }
 

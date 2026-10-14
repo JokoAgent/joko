@@ -54,7 +54,7 @@ import {
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
 import { ContactStore, OperationalStore, PartnerStore, PartnerWorkbenchStore, VoiceDictionaryPeerStore } from "@joko/store";
-import { GitSafetyCoordinator, NodeGitCommandRunner } from "@joko/git-safety";
+import { GitSafetyCoordinator, NodeGitCommandRunner, ProjectGitBootstrap } from "@joko/git-safety";
 import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
 import { TerminalProvider } from "@joko/tool-terminal";
@@ -285,7 +285,7 @@ import { VoiceDictionaryPeerManager } from "./voice-dictionary-peer-manager.js";
 import { VoiceInputSettingsController } from "./voice-input-settings.js";
 import { WorkspaceChangeSetService } from "./workspace-change-set.js";
 import { OperationalWorkspaceChangeJournal } from "./workspace-change-stream.js";
-import { DurableWorkspaceRunCapture } from "./workspace-run-capture.js";
+import { DurableWorkspaceRunCapture, prepareRunProjectGit } from "./workspace-run-capture.js";
 import { PartnerTaskOutputProjection } from "./partner-task-outputs.js";
 import { WorkspaceService } from "./workspace-service.js";
 import { OperationalCodeHostSessionAuthorization } from "./session-code-host-context.js";
@@ -666,9 +666,12 @@ export async function createOrchestratorApplication(
   );
   const runtimeActivity = createRuntimeActivityTracker(store);
   const runtimeGovernance = new RuntimeGovernanceSettingsRepository({ store });
+  const gitCommandRunner = new NodeGitCommandRunner();
+  const projectGitBootstrap = new ProjectGitBootstrap(gitCommandRunner);
   const gitSafety = new GitSafetyCoordinator({
-    runner: new NodeGitCommandRunner(),
-    readAutoSnapshotEnabled: () => runtimeGovernance.gitSafety().autoSnapshotEnabled,
+    runner: gitCommandRunner,
+    readMode: () => runtimeGovernance.gitSafety().mode,
+    initializeProjectGit: input => prepareRunProjectGit(store, projectGitBootstrap, input),
     onGap: (gap) => {
       store.appendDiagnostic({
         severity: "warning",
@@ -1701,6 +1704,10 @@ export async function createOrchestratorApplication(
     backendDescriptors: backendInstances.descriptors(),
     backendDescriptorsAlreadyPublished: true,
     workspaceCapture,
+    prepareProjectGit: async (input) => {
+      if (runtimeGovernance.gitSafety().mode !== "all-projects") return;
+      await projectGitBootstrap.ensure(input);
+    },
     freezeToolPolicies: (sessionId, targetId) => { toolPolicies.freezeSession(sessionId, targetId); },
     scheduleRunNotifications,
     worktrees: sessionWorktrees,
@@ -2588,6 +2595,9 @@ export async function createOrchestratorApplication(
     });
     androidBridge = new AndroidToolBridgeProvider({
       provider: () => androidRuntime.provider(),
+      store,
+      artifacts,
+      redactXml: (value) => credentials.redactText(value),
       enabledForNewSessions: () => androidAutomation?.availableForNewSessions() ?? false
     });
     unregisterAndroidBridge = mcpRouter.registerBridgeToolProvider(androidBridge);
@@ -2653,22 +2663,36 @@ export async function createOrchestratorApplication(
           // Profile labels and transfer policy are read live. Placement owns a
           // separate persistent profile and therefore requires a fenced
           // Browser generation transition.
-          refresh: async ({ previous, next }) => {
+          refresh: async ({ previous, next, assertCurrent }) => {
             if (previous.automationTarget === next.automationTarget) return;
+            assertCurrent?.();
             browserSettings?.setBackendHealth({ active: false, status: "recovering", canRecover: false });
             const wasRunning = configuredBrowser.running;
-            configuredTransfers.fenceBeforeGeneration(configuredBrowser.generation + 1);
-            await configuredBrowser.stop();
-            await configuredBrowser.setTargetMode(next.automationTarget);
-            if (!wasRunning) return;
+            const previousLaunch = configuredBrowser.captureStartOptions();
+            const rollback = async () => {
+              configuredTransfers.fenceBeforeGeneration(configuredBrowser.generation + 1);
+              await configuredBrowser.stop();
+              await configuredBrowser.setTargetMode(previous.automationTarget);
+              if (wasRunning) await configuredBrowser.start(previousLaunch);
+              browserSettings?.setBackendHealth({ active: configuredBrowser.running,
+                status: configuredBrowser.running ? "ready" : "disconnected", canRecover: true });
+            };
             try {
-              await configuredBrowser.start();
-              await refreshPiGeneration();
-              browserSettings?.setBackendHealth({ active: true, status: "ready", canRecover: true });
+              configuredTransfers.fenceBeforeGeneration(configuredBrowser.generation + 1);
+              await configuredBrowser.stop();
+              assertCurrent?.();
+              await configuredBrowser.setTargetMode(next.automationTarget);
+              assertCurrent?.();
+              if (wasRunning) {
+                await configuredBrowser.start({ ...(assertCurrent === undefined ? {} : { assertCurrent }) });
+                await refreshPiGeneration();
+              }
+              assertCurrent?.();
+              browserSettings?.setBackendHealth({ active: configuredBrowser.running,
+                status: configuredBrowser.running ? "ready" : "disconnected", canRecover: true });
+              return rollback;
             } catch (error) {
-              await configuredBrowser.stop().catch(() => undefined);
-              await configuredBrowser.setTargetMode(previous.automationTarget).catch(() => undefined);
-              await configuredBrowser.start().catch(() => undefined);
+              await rollback().catch(() => undefined);
               browserSettings?.setBackendHealth({
                 active: configuredBrowser.running,
                 status: "error",
@@ -2706,7 +2730,13 @@ export async function createOrchestratorApplication(
         state: browserState,
         enabledForNewSessions: (targetId) => configuredSettings.enabled(targetId),
         remoteNodes: browserNodeRouter,
-        userKnowledge
+        userKnowledge,
+        setBackend: async (mode, assertCurrent) => {
+          const selected = await configuredSettings.setAutomationTarget(mode, assertCurrent);
+          assertCurrent();
+          if (configuredBrowser.targetMode !== selected) throw new Error("The persisted Browser mode could not be confirmed by its runtime owner.");
+          return selected;
+        }
       });
       browserAutomationNode = new BrowserAutomationNodeExecutor({
         nodeId: serverId,

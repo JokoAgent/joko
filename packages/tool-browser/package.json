@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@joko/core": "workspace:*",
+    "ipaddr.js": "2.4.0",
     "playwright-core": "1.60.0",
     "ws": "8.21.3"
   },

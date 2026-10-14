@@ -922,6 +922,7 @@ export class SessionHost {
   readonly #reviewRuntimeFlights = new Map<string, ReviewRuntimeFlight>();
   readonly #scheduledWorktreeCreations = new Set<string>();
   readonly #workspaceCapture: WorkspaceRunCapture | undefined;
+  readonly #prepareProjectGit: ((input: { readonly workspaceRoot: string; readonly assertCurrent: () => void }) => Promise<void>) | undefined;
   readonly #freezeToolPolicies: ((sessionId: string, targetId: string) => void) | undefined;
   readonly #onSessionRuntimeClosed: ((sessionId: string) => void) | undefined;
   readonly #closeSessionTerminals: ((sessionId: string) => Promise<void>) | undefined;
@@ -993,6 +994,8 @@ export class SessionHost {
     adapters: readonly BackendAdapter[],
     options: {
       readonly workspaceCapture?: WorkspaceRunCapture;
+      /** Private best-effort bootstrap, after exact ordinary local project admission. */
+      readonly prepareProjectGit?: (input: { readonly workspaceRoot: string; readonly assertCurrent: () => void }) => Promise<void>;
       readonly partnerLearning?: PartnerLearningHostPort;
       readonly registerPartnerLearningToolAuthority?: (authority: PartnerLearningToolAuthority) => string;
       readonly freezeToolPolicies?: (sessionId: string, targetId: string) => void;
@@ -1089,6 +1092,7 @@ export class SessionHost {
     this.#runtimeHandoffs = new SessionRuntimeHandoffStore(store);
     this.#artifactStore = artifactStore;
     this.#workspaceCapture = options.workspaceCapture;
+    this.#prepareProjectGit = options.prepareProjectGit;
     this.#freezeToolPolicies = options.freezeToolPolicies;
     this.#onSessionRuntimeClosed = options.onSessionRuntimeClosed;
     this.#closeSessionTerminals = options.closeSessionTerminals;
@@ -10470,6 +10474,31 @@ export class SessionHost {
       const runtimeTarget = sessionWorktree === undefined
         ? target.descriptor
         : { ...target.descriptor, workspaceRoot: sessionWorktree.path };
+      if (nativeStart.kind === "new" && input.worktree === undefined && !target.descriptor.managed &&
+          target.descriptor.remoteWorkspace === undefined && this.#prepareProjectGit !== undefined) {
+        const assertCurrent = (): void => {
+          this.#assertOpen();
+          if ("assertServiceScope" in input) input.assertServiceScope?.();
+          this.assertCurrentAdapterGeneration(target.descriptor.backendId, adapter, backendInstanceGeneration);
+          const operation = this.#store.getOperation(claim.operation.id);
+          if (operation.status !== "started" || operation.bodyHash !== claim.operation.bodyHash) {
+            throw new StoreError("Project creation Operation is no longer current.");
+          }
+          const current = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
+          if (current.revision !== registeredTarget.revision || current.descriptor.workspaceRoot !== target.descriptor.workspaceRoot) {
+            throw new RevisionConflictError("Target", input.targetId, registeredTarget.revision, current.revision);
+          }
+          if (authorized) {
+            const connection = this.#store.getConnection(input.connection.id);
+            if (connection.state !== "active" || connection.authKeyDigest !== input.connection.authKeyDigest) {
+              throw new AuthorizationError("Project creation authorization is no longer active.");
+            }
+          }
+        };
+        assertCurrent();
+        await this.#prepareProjectGit({ workspaceRoot: target.descriptor.workspaceRoot, assertCurrent });
+        assertCurrent();
+      }
       if ("preparePrivateSession" in input && input.preparePrivateSession !== undefined) {
         if (input.serviceKind !== "partner" || input.assertServiceScope === undefined || nativeStart.kind !== "new") {
           throw new StoreError("Private group creation requires a fenced new Partner Session.");

@@ -3,9 +3,24 @@ import "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
 
 interface WorkerRequest {
+  readonly kind: "inspect";
   readonly data: Uint8Array;
   readonly pages: readonly number[];
   readonly maxPages: number;
+}
+
+interface TextWorkerRequest {
+  readonly kind: "extract_text";
+  readonly data: Uint8Array;
+  readonly maxPages: number;
+  readonly maxChars: number;
+}
+
+export interface PdfTextWorkerResult {
+  readonly sections: readonly string[];
+  readonly numPages: number;
+  readonly pagesInspected: number;
+  readonly clipped: boolean;
 }
 
 export interface PdfPageInspection {
@@ -105,9 +120,55 @@ async function inspect(request: WorkerRequest): Promise<PdfWorkerResult> {
   }
 }
 
+async function extractText(request: TextWorkerRequest): Promise<PdfTextWorkerResult> {
+  const loading = pdfjs.getDocument({ data: request.data,
+    useWorkerFetch: false, useWasm: false, stopAtErrors: true, maxImageSize: 1,
+    isOffscreenCanvasSupported: false, isImageDecoderSupported: false, disableFontFace: true,
+    enableXfa: false, disableRange: true, disableStream: true, disableAutoFetch: true, verbosity: 0 });
+  let document: Awaited<typeof loading.promise> | undefined;
+  try {
+    document = await loading.promise;
+    if (!Number.isSafeInteger(document.numPages) || document.numPages < 0) throw new Error("Invalid PDF page count.");
+    const sections: string[] = [];
+    let totalChars = 0, pagesInspected = 0, clipped = false;
+    for (let pageNumber = 1; pageNumber <= Math.min(document.numPages, request.maxPages); pageNumber += 1) {
+      const page = await document.getPage(pageNumber);
+      try {
+        const content = await page.getTextContent();
+        pagesInspected = pageNumber;
+        const parts: string[] = [];
+        for (const item of content.items) {
+          if (item && "str" in item && typeof item.str === "string") parts.push(item.str, item.hasEOL ? "\n" : " ");
+        }
+        const text = parts.join("").replace(/[ \t]+\n/gu, "\n").replace(/[ \t]{2,}/gu, " ").trim();
+        if (text === "") continue;
+        const section = `--- Page ${pageNumber} ---\n${text}`;
+        const separators = sections.length > 0 ? 2 : 0;
+        const remaining = request.maxChars - totalChars - separators;
+        if (section.length > remaining) {
+          if (remaining > 0) {
+            let end = remaining;
+            if (end < section.length && /[\uD800-\uDBFF]/u.test(section[end - 1]!)) end -= 1;
+            sections.push(section.slice(0, end));
+          }
+          clipped = true; break;
+        }
+        sections.push(section); totalChars += separators + section.length;
+      } finally { page.cleanup(); }
+    }
+    return { sections, numPages: document.numPages, pagesInspected, clipped };
+  } finally {
+    if (document) await document.destroy().catch(() => undefined);
+    else await loading.destroy().catch(() => undefined);
+  }
+}
+
 const port = parentPort;
 if (port) {
-  void inspect(workerData as WorkerRequest).then(
+  const request = workerData as WorkerRequest | TextWorkerRequest;
+  const job = request.kind === "inspect" ? inspect(request)
+    : request.kind === "extract_text" ? extractText(request) : Promise.reject(new Error("Unknown PDF worker request."));
+  void job.then(
     result => port.postMessage({ ok: true, result }),
     () => port.postMessage({ ok: false })
   );

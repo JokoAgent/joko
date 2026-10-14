@@ -18,6 +18,7 @@ function fixture(
     readonly generation?: number;
     readonly enabledForNewSessions?: (targetId: string) => boolean;
     readonly state?: OperationalBrowserState;
+    readonly setBackend?: (mode: "external" | "sidebar", assertCurrent: () => void) => Promise<"external" | "sidebar">;
   } = {}
 ) {
   const lease: BrowserLease = {
@@ -55,6 +56,8 @@ function fixture(
     generation: options.generation ?? 6,
     running: options.running ?? true,
     targetMode: "external",
+    proxyState: vi.fn(() => ({ mode: "direct" })),
+    captureStartOptions: vi.fn(() => ({})),
     start,
     stop: vi.fn(async () => undefined),
     acquireAgentLease,
@@ -127,13 +130,15 @@ function fixture(
   }));
   const transfers = {
     upload,
-    list: vi.fn(() => [])
+    list: vi.fn(() => []),
+    fenceBeforeGeneration: vi.fn()
   } as unknown as BrowserTransferCoordinator;
   const bridge = new BrowserToolBridgeProvider({
     browser,
     transfers,
     artifacts: { get, ingestBytes } as unknown as ArtifactStore,
     ...(options.state === undefined ? {} : { state: options.state }),
+    ...(options.setBackend === undefined ? {} : { setBackend: options.setBackend }),
     ...(options.enabledForNewSessions === undefined
       ? {}
       : { enabledForNewSessions: options.enabledForNewSessions }),
@@ -158,6 +163,28 @@ function fixture(
 }
 
 describe("BrowserToolBridgeProvider", () => {
+  it("awaits the persistent global mode owner and rejects misplaced or remote startup options before effects", async () => {
+    const setBackend = vi.fn(async (mode: "external" | "sidebar", assertCurrent: () => void) => { assertCurrent(); return mode; });
+    const { bridge, start } = fixture(undefined, undefined, { setBackend });
+    const switched = await bridge.callTool("call_tool", { name: "browser", args: { action: "setBackend", backend: "sidebar" } });
+    expect(switched.isError).toBe(false);
+    expect(JSON.parse((switched.content[0] as { text: string }).text)).toMatchObject({ action: "setBackend", data: { backend: "sidebar", scope: "global", persisted: true } });
+    for (const args of [
+      { action: "status", backend: "external" },
+      { action: "tabs", proxyServer: "http://proxy.example:8080" },
+      { action: "start", proxyAllowedHostnames: ["example.com"] },
+      { action: "setBackend", backend: "external", target: "node", node: "remote-node" }
+    ]) expect((await bridge.callTool("call_tool", { name: "browser", args })).isError).toBe(true);
+    expect(setBackend).toHaveBeenCalledOnce();
+    expect(start).not.toHaveBeenCalled();
+    const signal = new AbortController();
+    signal.abort();
+    await expect(bridge.callTool("browser", { action: "setBackend", backend: "external" }, signal.signal)).rejects.toThrow();
+    expect(setBackend).toHaveBeenCalledOnce();
+    await bridge.callTool("browser", { action: "start", proxyServer: "http://proxy.example:8080", proxyAllowedHostnames: ["example.com"] });
+    expect(start).toHaveBeenCalledWith(expect.objectContaining({ proxyServer: "http://proxy.example:8080", proxyAllowedHostnames: ["example.com"], assertCurrent: expect.any(Function) }));
+  });
+
   it("publishes lifecycle tools while cold without launching the Browser", async () => {
     const { bridge, browser } = fixture(undefined, undefined, {
       running: false,
@@ -350,14 +377,14 @@ describe("BrowserToolBridgeProvider", () => {
       }>> } };
     }).data.schema;
     expect(Object.keys(schema.properties)).toEqual([
-      "action", "profile", "target", "node", "url", "targetId", "label", "limit", "maxChars",
+      "action", "backend", "proxyServer", "proxyAllowedHostnames", "profile", "target", "node", "url", "targetId", "label", "limit", "maxChars",
       "mode", "snapshotFormat", "refs", "interactive", "compact", "depth", "selector", "frame", "labels", "urls",
       "fullPage", "ref", "type", "level", "paths", "inputRef", "query", "timeoutMs", "dialogId",
       "accept", "promptText", "filter", "clear", "extract", "recipeId", "inputs", "site", "recipeDraft",
       "siteGuideDraft", "request"
     ]);
     expect(schema.properties["action"]?.enum).toEqual([
-      "doctor", "status", "start", "stop", "profiles", "tabs", "open", "focus", "close",
+      "doctor", "status", "setBackend", "start", "stop", "profiles", "tabs", "open", "focus", "close",
       "snapshot", "screenshot", "navigate", "console", "pdf", "upload", "dialog", "act",
       "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe"
     ]);

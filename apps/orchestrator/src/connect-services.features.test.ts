@@ -5488,10 +5488,10 @@ describe("Connect typed feature boundaries", () => {
     await submit("operation-git-safety", {
       case: "updateGitSafetySettings",
       value: create(contract.UpdateGitSafetySettingsMutationSchema, {
-        patch: create(contract.GitSafetySettingsPatchSchema, { autoSnapshotEnabled: true })
+        patch: create(contract.GitSafetySettingsPatchSchema, { mode: contract.GitSafetyMode.ALL_PROJECTS })
       })
     });
-    expect(updateGitSafety).toHaveBeenCalledWith({ autoSnapshotEnabled: true });
+    expect(updateGitSafety).toHaveBeenCalledWith({ mode: "all-projects" });
     await submit("operation-git-safety-reset", {
       case: "updateGitSafetySettings",
       value: create(contract.UpdateGitSafetySettingsMutationSchema, {

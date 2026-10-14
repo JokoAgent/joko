@@ -100,7 +100,7 @@ it("retains a bounded output tail without aborting a successful chatty build pro
   const result = await createNodeSimulatorBuildCommandRunner().run(process.execPath,
     ["-e", "process.stdout.write('x'.repeat(100000))"],
     { timeoutMs: 5_000, maxBufferBytes: 1_024 });
-  expect(result).toMatchObject({ exitCode: 0, outputTruncated: true });
+  expect(result).toMatchObject({ exitCode: 0, outputTruncated: true, writerRetired: true });
   expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(1_024);
 });
 

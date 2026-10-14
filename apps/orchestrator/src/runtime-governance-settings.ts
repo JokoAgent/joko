@@ -132,7 +132,7 @@ export class RuntimeGovernanceSettingsRepository {
     patch: Partial<GitSafetySettings>,
     expectedRevision?: bigint
   ): GovernanceSettingSnapshot<GitSafetySettings> {
-    assertPatch(patch, ["autoSnapshotEnabled"]);
+    assertPatch(patch, ["mode"]);
     const current = this.gitSafetySnapshot();
     assertRevision(GIT_SAFETY_SETTING_KEY, current.revision, expectedRevision);
     const next = validateGitSafetySettings({ ...current.value, ...patch });
@@ -230,8 +230,10 @@ function decodeCollaboration(value: unknown): CollaborationSettings {
 }
 
 function decodeGitSafety(value: unknown): GitSafetySettings {
-  if (!isRecord(value) || value["format"] !== 1) throw new Error("Stored Git safety settings are invalid.");
-  return validateGitSafetySettings({ autoSnapshotEnabled: value["autoSnapshotEnabled"] });
+  if (!isRecord(value) || value["format"] !== 1 || Object.keys(value).some(key => key !== "format" && key !== "mode")) {
+    throw new Error("Stored Git safety settings are invalid.");
+  }
+  return validateGitSafetySettings({ mode: value["mode"] });
 }
 
 function sameAgentResource(left: AgentResourceSettings, right: AgentResourceSettings): boolean {
@@ -247,14 +249,15 @@ function sameCollaboration(left: CollaborationSettings, right: CollaborationSett
 }
 
 function sameGitSafety(left: GitSafetySettings, right: GitSafetySettings): boolean {
-  return left.autoSnapshotEnabled === right.autoSnapshotEnabled;
+  return left.mode === right.mode;
 }
 
 function validateGitSafetySettings(value: unknown): GitSafetySettings {
-  if (!isRecord(value) || typeof value["autoSnapshotEnabled"] !== "boolean") {
-    throw new Error("Git safety auto-snapshot setting must be a boolean.");
+  if (!isRecord(value) || typeof value["mode"] !== "string" || !["off", "existing-git", "all-projects"].includes(value["mode"]) ||
+      Object.keys(value).some(key => key !== "mode")) {
+    throw new Error("Git safety mode is invalid.");
   }
-  return { autoSnapshotEnabled: value["autoSnapshotEnabled"] };
+  return { mode: value["mode"] as GitSafetySettings["mode"] };
 }
 
 function snapshotOf<T>(record: SettingRecord<unknown>, value: T): GovernanceSettingSnapshot<T> {

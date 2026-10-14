@@ -5718,8 +5718,11 @@ const en = {
   ,"settings.agentResource.capThreadsHint": "Set conservative thread environment variables for new test and build processes without overriding values you set."
   ,"settings.gitSafety.title": "Git Safety"
   ,"settings.gitSafety.autoSnapshotTitle": "Hidden Git savepoints"
-  ,"settings.gitSafety.description": "Record hidden savepoints around local agent edits without adding commits to your branch. This is off by default."
-  ,"settings.gitSafety.toggleAria": "Toggle hidden Git savepoints"
+  ,"settings.gitSafety.description": "Record hidden savepoints around local agent edits. Existing repositories are protected by default; All projects also initializes empty local projects."
+  ,"settings.gitSafety.modeAria": "Git safety mode"
+  ,"settings.gitSafety.modes.off": "Off"
+  ,"settings.gitSafety.modes.existingGit": "Existing Git"
+  ,"settings.gitSafety.modes.allProjects": "All projects"
   ,"settings.gitSafety.statusTitle": "Savepoint status"
   ,"settings.gitSafety.statusBody": "{sessions} tasks across {repositories} repositories · {pending} turns in progress"
   ,"settings.gitSafety.cleanup": "Clear savepoints"
@@ -9262,8 +9265,11 @@ const zhBase: Record<MessageKey, string> = {
   "settings.agentResource.capThreadsHint": "为新启动的测试和构建进程设置保守的线程环境变量，不覆盖你自行配置的值。",
   "settings.gitSafety.title": "Git 安全",
   "settings.gitSafety.autoSnapshotTitle": "隐藏 Git 保存点",
-  "settings.gitSafety.description": "在本机 Agent 修改前后记录隐藏保存点，不会向当前分支添加 commit；默认关闭。",
-  "settings.gitSafety.toggleAria": "切换隐藏 Git 保存点",
+  "settings.gitSafety.description": "在本机 Agent 修改前后记录隐藏保存点。默认保护已有 Git 仓库；所有项目也会初始化空的本地项目。",
+  "settings.gitSafety.modeAria": "Git 安全模式",
+  "settings.gitSafety.modes.off": "关闭",
+  "settings.gitSafety.modes.existingGit": "已有 Git",
+  "settings.gitSafety.modes.allProjects": "所有项目",
   "settings.gitSafety.statusTitle": "保存点状态",
   "settings.gitSafety.statusBody": "{sessions} 个任务、{repositories} 个仓库 · {pending} 轮正在进行",
   "settings.gitSafety.cleanup": "清理保存点",

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { BrowserAutomationTarget, BrowserSettingsPatchSchema } from "@joko/contracts";
 import { OperationalStore } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   BrowserSettingsController,
@@ -32,6 +32,22 @@ const cleanups: Array<() => void> = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
 
 describe("BrowserSettingsController Target policy", () => {
+  it("uses the same durable placement row for Agent mode changes and compensates authority loss before commit", async () => {
+    const fixture = createFixture();
+    expect(await fixture.controller.setAutomationTarget("sidebar")).toBe("sidebar");
+    expect(fixture.store.getSetting("service", "orchestrator", "settings.browser.browser").value).toMatchObject({ automationTarget: "sidebar" });
+    let current = true;
+    const rollback = vi.fn(async () => undefined);
+    const guarded = new BrowserSettingsController({ store: fixture.store, defaults: DEFAULTS, hooks: {
+      start: async () => undefined, stop: async () => undefined,
+      refresh: async () => { current = false; return rollback; }
+    } });
+    await expect(guarded.setAutomationTarget("external", () => { if (!current) throw new Error("invocation retired"); })).rejects.toBeInstanceOf(BrowserSettingsEffectError);
+    expect(rollback).toHaveBeenCalledOnce();
+    expect(guarded.automationTarget()).toBe("sidebar");
+    expect(fixture.store.getSetting("service", "orchestrator", "settings.browser.browser").value).toMatchObject({ automationTarget: "sidebar" });
+  });
+
   it("stores service configuration separately and isolates Target activation", async () => {
     const fixture = createFixture();
     expect(fixture.controller.snapshot()).toMatchObject({

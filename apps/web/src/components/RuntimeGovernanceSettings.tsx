@@ -4,7 +4,7 @@ import type { JSX } from "react";
 import type { AppController } from "../controller.js";
 import type { AgentResourceSettingsView, AppSnapshot, CollaborationSettingsView, GitSafetySettingsView } from "../model.js";
 import type { RunAction, Translator } from "./types.js";
-import { Button, Pill, cx, CheckboxControl, SwitchControl } from "./ui.js";
+import { Button, Pill, cx, CheckboxControl, SwitchControl, SegmentedControl } from "./ui.js";
 
 type AgentPreset = "full" | "balanced" | "background";
 
@@ -185,12 +185,16 @@ function GitSafetySettings({ controller, settings, runAction, t }: {
     <div className="settings-card runtime-governance-card">
       <div className="setting-row">
         <SettingCopy title={t("settings.gitSafety.autoSnapshotTitle")} body={t("settings.gitSafety.description")} />
-        <SwitchControl
-            checked={settings.autoSnapshotEnabled}
-            aria-label={t("settings.gitSafety.toggleAria")}
-            onChange={(event) => runAction("git-safety-auto-snapshot", () =>
-              controller.updateGitSafetySettings({ autoSnapshotEnabled: event.target.checked }))}
-          />
+        <SegmentedControl<GitSafetySettingsView["mode"]>
+          value={settings.mode}
+          label={t("settings.gitSafety.modeAria")}
+          options={[
+            { value: "off", label: t("settings.gitSafety.modes.off") },
+            { value: "existing-git", label: t("settings.gitSafety.modes.existingGit") },
+            { value: "all-projects", label: t("settings.gitSafety.modes.allProjects") }
+          ]}
+          onChange={(mode) => runAction("git-safety-mode", () => controller.updateGitSafetySettings({ mode }))}
+        />
       </div>
       <div className="setting-row runtime-governance-status-row">
         <SettingCopy title={t("settings.gitSafety.statusTitle")} body={t("settings.gitSafety.statusBody", {

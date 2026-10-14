@@ -52,13 +52,18 @@ export interface LspPositionRequest extends LspFileRequest {
 }
 
 export interface LspWorkspaceSymbolRequest extends LspWorkspaceRequest {
-  readonly query: string;
+  readonly anchorFile: string;
+  readonly query?: string;
+}
+
+export interface LspReferencesRequest extends LspPositionRequest {
+  readonly includeDeclaration?: boolean;
 }
 
 export type LspToolRequest =
   | ({ readonly action: "hover" } & LspPositionRequest)
   | ({ readonly action: "goto_definition" } & LspPositionRequest)
-  | ({ readonly action: "find_references" } & LspPositionRequest)
+  | ({ readonly action: "find_references" } & LspReferencesRequest)
   | ({ readonly action: "outline" } & LspFileRequest)
   | ({ readonly action: "workspace_symbol" } & LspWorkspaceSymbolRequest)
   | ({ readonly action: "incoming_calls" } & LspPositionRequest);

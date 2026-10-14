@@ -8,13 +8,32 @@ import type { GitSafetyGap, SkippedPathFingerprint } from "./types.js";
 const UNUSED_RUNNER = {} as GitCommandRunner;
 
 describe("GitSafetyCoordinator", () => {
-  it("is default-off and samples the explicit setting at turn start", async () => {
+  it("bootstraps only the sampled all-projects Run before its first baseline", async () => {
+    const port = fakePort();
+    let initialized = false;
+    const initializeProjectGit = vi.fn(async () => { initialized = true; });
+    let mode: "off" | "existing-git" | "all-projects" = "existing-git";
+    const coordinator = new GitSafetyCoordinator({ runner: UNUSED_RUNNER, savepoints: port,
+      readMode: () => mode, initializeProjectGit,
+      resolveRepository: async () => initialized ? "D:\\repo" : null });
+    await expect(coordinator.onTurnStart(turn("session_a", "existing"))).resolves.toMatchObject({ status: "not_repository" });
+    await coordinator.onTurnSettled(turn("session_a", "existing"));
+    expect(initializeProjectGit).not.toHaveBeenCalled();
+    mode = "all-projects";
+    await expect(coordinator.onTurnStart(turn("session_a", "all"))).resolves.toMatchObject({ status: "captured" });
+    mode = "off";
+    await expect(coordinator.onTurnSettled(turn("session_a", "all"))).resolves.toMatchObject({ status: "captured" });
+    expect(initializeProjectGit).toHaveBeenCalledOnce();
+    expect(port.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("samples the selected mode at turn start for the whole Run", async () => {
     let enabled = false;
     const port = fakePort();
     const coordinator = new GitSafetyCoordinator({
       runner: UNUSED_RUNNER,
       savepoints: port,
-      readAutoSnapshotEnabled: () => enabled,
+      readMode: () => enabled ? "existing-git" : "off",
       resolveRepository: async () => "D:\\repo"
     });
 
@@ -39,7 +58,7 @@ describe("GitSafetyCoordinator", () => {
     const coordinator = new GitSafetyCoordinator({
       runner: UNUSED_RUNNER,
       savepoints: port,
-      readAutoSnapshotEnabled: () => true,
+      readMode: () => "existing-git",
       resolveRepository: async () => "D:\\same-repo",
       onGap: (gap) => { gaps.push(gap); }
     });
@@ -65,7 +84,7 @@ describe("GitSafetyCoordinator", () => {
     const coordinator = new GitSafetyCoordinator({
       runner: UNUSED_RUNNER,
       savepoints: port,
-      readAutoSnapshotEnabled: () => true,
+      readMode: () => "existing-git",
       resolveRepository: async () => "D:\\repo"
     });
 
@@ -93,7 +112,7 @@ describe("GitSafetyCoordinator", () => {
     const coordinator = new GitSafetyCoordinator({
       runner: UNUSED_RUNNER,
       savepoints: port,
-      readAutoSnapshotEnabled: () => true,
+      readMode: () => "existing-git",
       resolveRepository: async () => "D:\\repo",
       onGap: () => { throw new Error("sink unavailable"); }
     });
@@ -113,7 +132,7 @@ describe("GitSafetyCoordinator", () => {
     const coordinator = new GitSafetyCoordinator({
       runner: UNUSED_RUNNER,
       savepoints: port,
-      readAutoSnapshotEnabled: () => true,
+      readMode: () => "existing-git",
       resolveRepository: async () => "D:\\repo"
     });
 
@@ -132,7 +151,7 @@ describe("GitSafetyCoordinator", () => {
     const coordinator = new GitSafetyCoordinator({
       runner: UNUSED_RUNNER,
       savepoints: port,
-      readAutoSnapshotEnabled: () => true,
+      readMode: () => "existing-git",
       resolveRepository: async (workspaceRoot) => workspaceRoot.endsWith("one") ? "D:\\repo-one" : "D:\\repo-two"
     });
 

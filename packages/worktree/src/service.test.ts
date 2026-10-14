@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   lstat,
@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import { afterEach, describe, expect, test } from "vitest";
 
 import { EphemeralWorktreeService } from "./service.js";
+import { acquireWorktreeSourceUse } from "./source-use.js";
 import type { WorktreeErrorCode } from "./errors.js";
 import type { WorktreeResult } from "./types.js";
 
@@ -30,6 +31,76 @@ afterEach(async () => {
 });
 
 describe("EphemeralWorktreeService", () => {
+  test("cancels a project source borrower before recycling and releases only after its writer retires", { timeout: 30_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    unwrap(await service.initialize());
+    const checkout = unwrap(await service.acquire({ sessionId: "build-source", cwd: fixture.repositoryRoot }));
+    const controller = new AbortController();
+    const source = await acquireWorktreeSourceUse(join(checkout.lease.path, "src"), "simulator-build", controller);
+    await source.verify();
+    expect(unwrap(await service.release("build-source"))).toMatchObject({ status: "preserved", pathRemoved: false });
+    expect(controller.signal.aborted).toBe(true);
+    await expect(source.verify()).rejects.toBeTruthy();
+    expect(await readFile(join(checkout.lease.path, "tracked.txt"), "utf8")).toContain("initial");
+    await source.release({ writerRetired: true });
+    expect(unwrap(await service.release("build-source"))).toMatchObject({ status: "destroyed", pathRemoved: true });
+    service.dispose();
+  });
+
+  test("keeps an unconfirmed project writer through worktree owner restart", { timeout: 30_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    unwrap(await service.initialize());
+    const checkout = unwrap(await service.acquire({ sessionId: "unknown-build-source", cwd: fixture.repositoryRoot }));
+    const source = await acquireWorktreeSourceUse(checkout.lease.path, "unknown-simulator-build", new AbortController());
+    await source.release({ writerRetired: false });
+    service.dispose();
+    const restarted = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    expect(unwrap(await restarted.initialize())).toMatchObject({ removed: 0, preserved: 1 });
+    expect(unwrap(await restarted.release("unknown-build-source"))).toMatchObject({ status: "preserved", pathRemoved: false });
+    expect(await readFile(join(checkout.lease.path, "tracked.txt"), "utf8")).toContain("initial");
+    await source.release({ writerRetired: true });
+    expect(unwrap(await restarted.release("unknown-build-source"))).toMatchObject({ status: "destroyed", pathRemoved: true });
+    restarted.dispose();
+  });
+
+  test("notifies a project source borrower in another process before retrying reclamation", { timeout: 30_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    unwrap(await service.initialize());
+    const checkout = unwrap(await service.acquire({ sessionId: "process-build-source", cwd: fixture.repositoryRoot }));
+    const script = `import { acquireWorktreeSourceUse } from ${JSON.stringify(new URL("../dist/index.js", import.meta.url).href)};
+      const controller = new AbortController();
+      const source = await acquireWorktreeSourceUse(process.argv[1], "process-simulator-build", controller);
+      const keepAlive = setInterval(() => {}, 50);
+      process.stdout.write("ready\\n");
+      await new Promise(resolve => controller.signal.addEventListener("abort", resolve, {once:true}));
+      await source.release({writerRetired:true});
+      clearInterval(keepAlive);`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", script, checkout.lease.path],
+      { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const closed = new Promise<number | null>((resolveExit, rejectExit) => {
+      child.once("error", rejectExit); child.once("close", resolveExit);
+    });
+    const ready = new Promise<void>((resolveReady, rejectReady) => {
+      let text = "";
+      child.stdout.on("data", chunk => { text += String(chunk); if (text.includes("ready\n")) resolveReady(); });
+      child.once("error", rejectReady);
+      child.once("close", () => rejectReady(new Error("Source borrower exited before readiness.")));
+    });
+    try {
+      await ready;
+      expect(unwrap(await service.release("process-build-source"))).toMatchObject({ status: "preserved", pathRemoved: false });
+      expect(await closed).toBe(0);
+      expect(unwrap(await service.release("process-build-source"))).toMatchObject({ status: "destroyed", pathRemoved: true });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+      await closed;
+      service.dispose();
+    }
+  });
+
   test("detects a primary checkout, resolves its source, and gives a session an idempotent lease", { timeout: 15_000 }, async () => {
     const fixture = await createRepositoryFixture();
     const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });

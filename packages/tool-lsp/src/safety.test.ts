@@ -25,13 +25,13 @@ describe("TypeScript LSP safety boundaries", () => {
     await writeFile(join(root, "node_modules", "dependency.ts"), "export function dependencySymbol() {}\n", "utf8");
     const bridge = new TypeScriptLspBridge();
     try {
-      await expect(bridge.workspaceSymbol({ workspaceRoot: root, query: "visibleSymbol" }))
+      await expect(bridge.workspaceSymbol({ workspaceRoot: root, anchorFile: "visible.ts", query: "visibleSymbol" }))
         .resolves.toMatchObject({ items: [expect.objectContaining({ name: "visibleSymbol" })] });
-      await expect(bridge.workspaceSymbol({ workspaceRoot: root, query: "hiddenSymbol" }))
+      await expect(bridge.workspaceSymbol({ workspaceRoot: root, anchorFile: "visible.ts", query: "hiddenSymbol" }))
         .resolves.toMatchObject({ items: [] });
-      await expect(bridge.workspaceSymbol({ workspaceRoot: root, query: "ignoredNestedSymbol" }))
+      await expect(bridge.workspaceSymbol({ workspaceRoot: root, anchorFile: "visible.ts", query: "ignoredNestedSymbol" }))
         .resolves.toMatchObject({ items: [] });
-      await expect(bridge.workspaceSymbol({ workspaceRoot: root, query: "dependencySymbol" }))
+      await expect(bridge.workspaceSymbol({ workspaceRoot: root, anchorFile: "visible.ts", query: "dependencySymbol" }))
         .resolves.toMatchObject({ items: [] });
       await expect(bridge.hover({ workspaceRoot: root, file: "ignored.ts", line: 1, column: 17 }))
         .rejects.toMatchObject({ code: "FILE_IGNORED" });
@@ -105,7 +105,7 @@ describe("TypeScript LSP safety boundaries", () => {
     }
     const fileBound = new TypeScriptLspBridge({ maximumWorkspaceFiles: 2 });
     try {
-      await expect(fileBound.workspaceSymbol({ workspaceRoot: root, query: "item" }))
+      await expect(fileBound.workspaceSymbol({ workspaceRoot: root, anchorFile: "file-0.ts", query: "item" }))
         .rejects.toMatchObject({ code: "FILE_LIMIT_EXCEEDED" });
     } finally {
       fileBound.dispose();
@@ -113,7 +113,8 @@ describe("TypeScript LSP safety boundaries", () => {
 
     const outputBound = new TypeScriptLspBridge({ maximumOutputCharacters: 500 });
     try {
-      const result = await outputBound.workspaceSymbol({ workspaceRoot: root, query: "item", maxResults: 100_000 });
+      await writeFile(join(root, "tsconfig.json"), JSON.stringify({ include: ["*.ts"] }), "utf8");
+      const result = await outputBound.workspaceSymbol({ workspaceRoot: root, anchorFile: "file-0.ts", query: "item", maxResults: 100_000 });
       expect(result.truncated).toBe(true);
       expect(JSON.stringify(result).length).toBeLessThanOrEqual(500);
     } finally {

@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { isWorktreeServiceError, WorktreeServiceError } from "./errors.js";
 import { runGit } from "./git.js";
+import { cancelWorktreeSourceUses, withWorktreeSourceLock } from "./source-use.js";
 import {
   DEFAULT_WORKTREE_OPERATION_TIMEOUT_MS,
   WorktreeOperationControl,
@@ -630,9 +631,21 @@ export class EphemeralWorktreeService {
     retainForRestore: boolean,
     control: WorktreeOperationControl
   ): Promise<WorktreeRelease> {
+    return withWorktreeSourceLock(entry.path, () => this.#releaseLockedEntry(entry, retainForRestore, control), control.signal);
+  }
+
+  async #releaseLockedEntry(
+    entry: ManagedWorktreeEntry,
+    retainForRestore: boolean,
+    control: WorktreeOperationControl
+  ): Promise<WorktreeRelease> {
     const store = this.#requireStore();
     let current = store.get(entry.id) ?? entry;
     await this.#validateManagedRecord(current);
+    if (await cancelWorktreeSourceUses(current.path)) {
+      await store.set(preservedEntry(current, this.#now()), control);
+      return Object.freeze({ status: "preserved", reason: "keep", pathRemoved: false, branchPreserved: true });
+    }
     let snapshotSha = retainForRestore
       ? await this.#prepareSnapshotForRestore(current, control)
       : await this.#snapshotForDeletion(current, control);
@@ -782,9 +795,17 @@ export class EphemeralWorktreeService {
     entry: ManagedWorktreeEntry,
     control: WorktreeOperationControl
   ): Promise<ManagedWorktreeEntry> {
+    return withWorktreeSourceLock(entry.path, () => this.#restoreLockedEntry(entry, control), control.signal);
+  }
+
+  async #restoreLockedEntry(
+    entry: ManagedWorktreeEntry,
+    control: WorktreeOperationControl
+  ): Promise<ManagedWorktreeEntry> {
     const store = this.#requireStore();
     let current = store.get(entry.id) ?? entry;
     await this.#validateManagedRecord(current);
+    if (await cancelWorktreeSourceUses(current.path)) throw new WorktreeServiceError("SESSION_CONFLICT", "The project worktree is still in use.");
     await validateOrdinaryDirectory(
       current.repositoryRoot,
       "REPOSITORY_UNSAFE",
@@ -1566,9 +1587,19 @@ export class EphemeralWorktreeService {
     retainForRestore = false,
     safeRemoval = false
   ): Promise<DestructionResult> {
+    return withWorktreeSourceLock(entry.path, () => this.#destroyLockedEntry(entry, control, retainForRestore, safeRemoval), control.signal);
+  }
+
+  async #destroyLockedEntry(
+    entry: ManagedWorktreeEntry,
+    control: WorktreeOperationControl,
+    retainForRestore = false,
+    safeRemoval = false
+  ): Promise<DestructionResult> {
     const store = this.#requireStore();
     const current = store.get(entry.id) ?? entry;
     await this.#validateManagedRecord(current);
+    if (await cancelWorktreeSourceUses(current.path)) throw new WorktreeServiceError("SESSION_CONFLICT", "The project worktree is still in use.");
     const destroying: ManagedWorktreeEntry = {
       ...current,
       status: "destroying",

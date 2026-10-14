@@ -7,6 +7,7 @@ import {
   validatePublicBrowserResourceUrl,
   validateTakeoverNavigationUrl,
   validateWebUrl,
+  parseBrowserProxyServer,
   type BrowserAutomationAction,
   type BrowserAutomationActKind,
   type BrowserElementQuery,
@@ -19,7 +20,8 @@ import {
   type BrowserProvider,
   type BrowserRemoteAutomationResult,
   type BrowserRemoteNodeRoute,
-  type BrowserRemoteNodeRouter
+  type BrowserRemoteNodeRouter,
+  type BrowserTargetMode
 } from "@joko/tool-browser";
 
 import type { ArtifactStore } from "./artifact-store.js";
@@ -77,7 +79,7 @@ const MAXIMUM_INLINE_BINARY_BYTES = 10 * 1024 * 1024;
 const MAXIMUM_UNIFIED_RESULT_BYTES = 200_000;
 
 const unifiedActions = [
-  "doctor", "status", "start", "stop", "profiles", "tabs", "open", "focus", "close",
+  "doctor", "status", "setBackend", "start", "stop", "profiles", "tabs", "open", "focus", "close",
   "snapshot", "screenshot", "navigate", "console", "pdf", "upload", "dialog", "act",
   "requests", "responseBody", "extract", "recipe", "siteguide", "saveRecipe"
 ] as const;
@@ -149,6 +151,9 @@ const actRequestSchema = objectSchema({
 
 const unifiedSchema = objectSchema({
   action: { type: "string", enum: unifiedActions },
+  backend: { type: "string", enum: ["external", "sidebar"], description: "Only setBackend: save the global Browser presentation mode; modes keep separate profiles and tabs." },
+  proxyServer: { type: "string", minLength: 1, maxLength: 2048, description: "Only start in external mode: a proxy URL without credentials." },
+  proxyAllowedHostnames: { type: "array", items: { type: "string", minLength: 1, maxLength: 255 }, minItems: 1, maxItems: 32, description: "Only proxied start: public DNS names or *.example.com; omission denies navigation." },
   profile: { type: "string", minLength: 1, maxLength: 256 },
   target: { type: "string", enum: ["sandbox", "host", "node"] },
   node: { type: "string", minLength: 1, maxLength: 512 },
@@ -379,6 +384,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   readonly #enabledForNewSessions: (targetId: string) => boolean;
   readonly #remoteNodes: BrowserRemoteNodeRouter | undefined;
   readonly #userKnowledge: BrowserUserKnowledgeLayer | undefined;
+  readonly #setBackend: ((mode: BrowserTargetMode, assertCurrent: () => void) => Promise<BrowserTargetMode>) | undefined;
   readonly #recipes = new Map<string, BrowserRecipe>();
   readonly #siteGuides = new Map<string, BrowserSiteGuide>();
   readonly #builtinRecipeIds = new Set<string>();
@@ -397,6 +403,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     readonly enabledForNewSessions?: (targetId: string) => boolean;
     readonly remoteNodes?: BrowserRemoteNodeRouter;
     readonly userKnowledge?: BrowserUserKnowledgeLayer;
+    readonly setBackend?: (mode: BrowserTargetMode, assertCurrent: () => void) => Promise<BrowserTargetMode>;
   }) {
     this.#browser = input.browser;
     this.#transfers = input.transfers;
@@ -405,6 +412,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
     this.#enabledForNewSessions = input.enabledForNewSessions ?? (() => true);
     this.#remoteNodes = input.remoteNodes;
     this.#userKnowledge = input.userKnowledge;
+    this.#setBackend = input.setBackend;
     for (const raw of BUILTIN_BROWSER_RECIPES) {
       if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("Built-in Browser recipe is invalid.");
       const recipe = validateRecipe(raw as Readonly<Record<string, unknown>>);
@@ -752,6 +760,12 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
   ): Promise<McpCallResult> {
     signal?.throwIfAborted();
     const action = requiredEnum(input, "action", unifiedActions);
+    if (input["backend"] !== undefined && action !== "setBackend") throw new Error("backend is only accepted by action=setBackend.");
+    const hasProxy = input["proxyServer"] !== undefined || input["proxyAllowedHostnames"] !== undefined;
+    if (hasProxy && action !== "start") throw new Error("Proxy options are only accepted by action=start.");
+    if (hasProxy) parseBrowserProxyServer(input["proxyServer"], input["proxyAllowedHostnames"]);
+    if (input["target"] === "node" && (action === "setBackend" || hasProxy)) throw new Error("This remote Browser route does not advertise mode switching or proxy startup.");
+    const assertCurrent = () => { signal?.throwIfAborted(); this.#assertSessionContext(); };
     if (input["target"] === "node") return this.#executeRemote(action, input, signal);
     assertUnifiedRoute(input, this.#browser.targetMode);
     switch (action) {
@@ -762,6 +776,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           running: this.#browser.running,
           generation: this.#browser.generation,
           target: this.#browser.targetMode,
+          proxy: this.#browser.proxyState(),
           pageCount: pages.length,
           ...(this.#browser.running ? {} : { fix: "Call action=start, then open an HTTP(S) page." })
         });
@@ -771,11 +786,32 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           running: this.#browser.running,
           generation: this.#browser.generation,
           target: this.#browser.targetMode,
+          proxy: this.#browser.proxyState(),
           pages: this.#browser.running ? (await this.#listVisiblePages()).map(publicPage) : []
         });
-      case "start":
-        await this.#browser.start();
-        return browserResult(action, { running: true, generation: this.#browser.generation, target: this.#browser.targetMode });
+      case "setBackend": {
+        const requested = requiredEnum(input, "backend", ["external", "sidebar"] as const);
+        if (this.#setBackend === undefined) throw new Error("The Browser mode owner is unavailable.");
+        const backend = await this.#setBackend(requested, assertCurrent);
+        assertCurrent();
+        return backend === requested
+          ? browserResult(action, { backend, scope: "global", persisted: true })
+          : browserError(action, { backend, scope: "global", errorCode: "BROWSER_MODE_CHANGED", message: "The Browser mode changed; query status again." });
+      }
+      case "start": {
+        if (hasProxy && this.#browser.targetMode !== "external") throw new Error("Proxy startup requires the external managed Browser.");
+        const next = parseBrowserProxyServer(input["proxyServer"], input["proxyAllowedHostnames"]);
+        // A route transition fences outstanding transfers before native teardown.
+        if (this.#browser.running && JSON.stringify(this.#browser.captureStartOptions()) !== JSON.stringify(next.mode === "direct" ? {} : {
+          proxyServer: next.server, ...(next.allowedHostnames === undefined ? {} : { proxyAllowedHostnames: next.allowedHostnames })
+        })) {
+          this.#transfers.fenceBeforeGeneration(this.#browser.generation + 1);
+        }
+        await this.#browser.start({ ...(next.mode === "direct" ? {} : { proxyServer: next.server,
+          ...(next.allowedHostnames === undefined ? {} : { proxyAllowedHostnames: next.allowedHostnames }) }),
+          ...(signal === undefined ? {} : { signal }), assertCurrent });
+        return browserResult(action, { running: true, generation: this.#browser.generation, target: this.#browser.targetMode, proxy: this.#browser.proxyState() });
+      }
       case "stop":
         await this.#assertNoForeignLivePages();
         await this.#browser.stop();
@@ -1950,6 +1986,7 @@ function scopedRemotePageId(
   input: Readonly<Record<string, unknown>>
 ): string | undefined {
   switch (action) {
+    case "setBackend": throw new Error("Remote Browser mode switching is not advertised.");
     case "doctor":
     case "status":
     case "start":

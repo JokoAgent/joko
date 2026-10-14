@@ -1,4 +1,4 @@
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,6 +13,32 @@ afterEach(async () => {
 });
 
 describe("TypeScript LSP bridge capabilities", () => {
+  it("filters declaration locations and selects the anchor's configured project for empty and named queries", async () => {
+    const fixture = await workspaceFixture();
+    for (const name of ["first", "second"]) {
+      await mkdir(join(fixture.root, name));
+      await writeFile(join(fixture.root, name, "tsconfig.json"), JSON.stringify({ files: ["main.ts", "extra.ts"] }));
+      await writeFile(join(fixture.root, name, "main.ts"), `export const ${name}Main = 1;`);
+      await writeFile(join(fixture.root, name, "extra.ts"), `export const ${name}Extra = 2;`);
+    }
+    const bridge = new TypeScriptLspBridge();
+    try {
+      const position = oneBased(fixture.librarySource, "greet");
+      const request = { workspaceRoot: fixture.root, file: "lib.ts", ...position };
+      const without = await bridge.findReferences(request);
+      const withDeclaration = await bridge.findReferences({ ...request, includeDeclaration: true });
+      expect(without.items.some((item) => item.location.path === "lib.ts" && item.location.range.start.line === position.line)).toBe(false);
+      expect(withDeclaration.items.some((item) => item.location.path === "lib.ts" && item.location.range.start.line === position.line)).toBe(true);
+      const first = await bridge.workspaceSymbol({ workspaceRoot: fixture.root, anchorFile: "first/main.ts" });
+      expect(first.items.map((item) => item.name)).toEqual(expect.arrayContaining(["firstMain", "firstExtra"]));
+      expect(first.items.every((item) => item.location.path.startsWith("first/"))).toBe(true);
+      const second = await bridge.workspaceSymbol({ workspaceRoot: fixture.root, anchorFile: "second/main.ts", query: "" });
+      expect(second.items.map((item) => item.name)).toEqual(expect.arrayContaining(["secondMain", "secondExtra"]));
+      expect(second.items.every((item) => item.location.path.startsWith("second/"))).toBe(true);
+      expect((await bridge.workspaceSymbol({ workspaceRoot: fixture.root, anchorFile: "second/main.ts", query: "first" })).items).toEqual([]);
+      await expect(bridge.workspaceSymbol({ workspaceRoot: fixture.root, anchorFile: "../outside.ts" })).rejects.toMatchObject({ code: "PATH_OUTSIDE_WORKSPACE" });
+    } finally { bridge.dispose(); }
+  });
   it("advertises the six stable bridge actions", () => {
     expect(LSP_TOOL_ACTIONS).toEqual([
       "hover",
@@ -60,7 +86,7 @@ describe("TypeScript LSP bridge capabilities", () => {
       expect(outline.items.map((item) => item.name)).toEqual(expect.arrayContaining(["User", "greet", "format"]));
       expect(outline.items.every((item) => item.location.path === "lib.ts")).toBe(true);
 
-      const symbols = await bridge.workspaceSymbol({ workspaceRoot: fixture.root, query: "greet" });
+      const symbols = await bridge.workspaceSymbol({ workspaceRoot: fixture.root, anchorFile: "main.ts", query: "greet" });
       expect(symbols.items).toEqual(expect.arrayContaining([
         expect.objectContaining({ name: "greet", location: expect.objectContaining({ path: "lib.ts" }) })
       ]));

@@ -439,6 +439,58 @@ describe("isStaleComputerTransportError", () => {
 });
 
 describe("public computer automation surface", () => {
+  it("claims one goal and verifies a delivered input without publishing reusable automatic observations", async () => {
+    const connection = new FakeConnection({ callTool: async (name) => ({ structuredContent: name === "verify_state"
+      ? { status: "satisfied", stable: true }
+      : name === "get_window_state" ? { ok: true, snapshot_id: "native-observation", elements: [{ element_index: 0, element_token: "native-element" }] }
+        : { ok: true, effect: "unknown" } }) });
+    const provider = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([connection]).factory, idFactory: () => "fence" });
+    const fence = await provider.openSession("session");
+    const observed = await provider.callTool(fence, "get_window_state", { pid: 1, window_id: 2, include_screenshot: false, session_goal: "Configure notifications" });
+    const snapshot = observed.structuredContent?.["snapshot_id"];
+    const result = await provider.callTool(fence, "click", { pid: 1, window_id: 2, element_index: 0, snapshot_id: snapshot,
+      session_goal: "Ignored later name", postcondition: [{ window: { exists: true } }] });
+    expect(result).toMatchObject({ isError: false, structuredContent: { outcome: { status: "confirmed" }, postcheck: { tool: "verify_state", reusable_snapshot: false } } });
+    const action = connection.callRequests.find((call) => call.name === "click")!;
+    expect(action.arguments["session"]).toContain("Configure-notifications-1-computer-");
+    expect(action.arguments).not.toHaveProperty("session_goal");
+    expect(action.arguments).not.toHaveProperty("postcondition");
+    const before = connection.callRequests.length;
+    expect(await provider.callTool(fence, "click", { pid: 1, window_id: 2, element_index: 0, snapshot_id: snapshot })).toMatchObject({ isError: true });
+    expect(connection.callRequests).toHaveLength(before);
+    await provider.closeAll();
+  });
+
+  it("keeps failed postconditions distinct from delivery and never replays an input after transport loss", async () => {
+    const first = new FakeConnection({ callTool: async () => { throw new Error("not connected: private transport detail"); } });
+    const second = new FakeConnection({ callTool: async () => ({ structuredContent: { ok: true, elements: [] } }) });
+    const provider = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([first, second]).factory, idFactory: () => "fence" });
+    const fence = await provider.openSession("session");
+    const result = await provider.callTool(fence, "type_text", { pid: 1, window_id: 2, text: "x".repeat(450), session_goal: "Enter form" });
+    expect(result).toMatchObject({ isError: true, structuredContent: { errorCode: "ACTION_OUTCOME_UNKNOWN", outcome: { status: "unknown" }, postcheck: { reusable_snapshot: false } } });
+    expect(first.callRequests.filter((call) => call.name === "type_text")).toHaveLength(1);
+    expect(second.callRequests.map((call) => call.name)).toEqual(["get_window_state"]);
+    expect(JSON.stringify(result)).not.toContain("private transport detail");
+    await provider.closeProductSession("session");
+    expect(provider.activeSessionCount).toBe(0);
+
+    const refused = new FakeConnection({ callTool: async (name) => ({ structuredContent: name === "verify_state" ? { status: "unsatisfied", stable: true } : { ok: true, effect: "confirmed" } }) });
+    const checking = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([refused]).factory, idFactory: () => "fence" });
+    const scope = await checking.openSession("another");
+    expect(await checking.callTool(scope, "click", { pid: 1, window_id: 2, x: 1, y: 2, postcondition: [{ window: { exists: false } }] }))
+      .toMatchObject({ isError: true, structuredContent: { outcome: { status: "failed" } } });
+    expect(refused.callRequests.filter((call) => call.name === "click")).toHaveLength(1);
+    await checking.closeAll();
+
+    const partial = new FakeConnection({ callTool: async (name) => ({ structuredContent: name === "verify_state"
+      ? { status: "satisfied", stable: true } : { ok: true, inserted: 2 } }) });
+    const typing = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([partial]).factory, idFactory: () => "fence" });
+    const typingScope = await typing.openSession("partial");
+    expect(await typing.callTool(typingScope, "type_text", { pid: 1, window_id: 2, text: "abcde", postcondition: [{ window: { exists: true } }] }))
+      .toMatchObject({ isError: true, structuredContent: { remaining_chars: 3, outcome: { status: "unknown" } } });
+    expect(partial.callRequests.filter((call) => call.name === "type_text")).toHaveLength(1);
+    await typing.closeAll();
+  });
   it("publishes the stable catalog independently of private driver tools", async () => {
     const connection = new FakeConnection({
       listTools: async () => ({ tools: [{ name: "private_driver_tool", inputSchema: {} }] })
@@ -790,7 +842,7 @@ describe("public computer automation surface", () => {
     expect(connection.callRequests[2]?.arguments["screenshot_out_file"]).toBe("D:\\workspace\\explicit.png");
   });
 
-  it("continues chunked Unicode text from the first unconfirmed chunk after one transport recovery", async () => {
+  it("preserves known Unicode input progress without replaying an unconfirmed chunk after transport loss", async () => {
     let firstCalls = 0;
     const first = new FakeConnection({
       callTool: async () => {
@@ -817,9 +869,10 @@ describe("public computer automation surface", () => {
 
     expect(Array.from(first.callRequests[0]?.arguments["text"] as string)).toHaveLength(400);
     expect(Array.from(first.callRequests[1]?.arguments["text"] as string)).toHaveLength(50);
-    expect(Array.from(second.callRequests[0]?.arguments["text"] as string)).toHaveLength(50);
-    expect(result.structuredContent).toMatchObject({ ok: true, inserted: 450, chars: 450, chunks: 2 });
+    expect(second.callRequests.filter((call) => call.name === "type_text")).toHaveLength(0);
+    expect(result.structuredContent).toMatchObject({ ok: false, errorCode: "ACTION_OUTCOME_UNKNOWN", inserted_chars: 400, remaining_chars: 50 });
     expect(JSON.stringify(result)).not.toContain(COMPUTER_TEXT_CORPUS.multibyteCharacter);
+    await provider.closeAll();
   });
 
   it("rejects unknown fields before driver dispatch", async () => {

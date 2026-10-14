@@ -14,6 +14,7 @@ import type {
   GitSafetyGap,
   GitSafetyGapReason,
   GitSafetyLogger,
+  GitSafetyMode,
   GitSafetyTurnBoundaryInput,
   SkippedPathFingerprint
 } from "./types.js";
@@ -21,6 +22,7 @@ import type {
 interface TurnRecord {
   readonly input: GitSafetyTurnBoundaryInput;
   readonly enabled: boolean;
+  readonly mode: GitSafetyMode;
   startPromise: Promise<GitSafetyBoundaryOutcome>;
   repositoryRoot?: string;
   baselineCommit?: string;
@@ -33,7 +35,8 @@ interface TurnRecord {
 export interface GitSafetyCoordinatorOptions {
   readonly runner: GitCommandRunner;
   readonly savepoints?: GitSafetySavepointPort;
-  readonly readAutoSnapshotEnabled: () => boolean;
+  readonly readMode: () => GitSafetyMode;
+  readonly initializeProjectGit?: (input: GitSafetyTurnBoundaryInput) => Promise<void>;
   readonly resolveRepository?: (workspaceRoot: string) => Promise<string | null>;
   readonly onGap?: (gap: GitSafetyGap) => Promise<void> | void;
   readonly logger?: GitSafetyLogger;
@@ -61,7 +64,8 @@ const SILENT_LOGGER: GitSafetyLogger = Object.freeze({
 
 export class GitSafetyCoordinator {
   readonly #savepoints: GitSafetySavepointPort;
-  readonly #readAutoSnapshotEnabled: () => boolean;
+  readonly #readMode: () => GitSafetyMode;
+  readonly #initializeProjectGit: ((input: GitSafetyTurnBoundaryInput) => Promise<void>) | undefined;
   readonly #resolveRepository: (workspaceRoot: string) => Promise<string | null>;
   readonly #onGap: ((gap: GitSafetyGap) => Promise<void> | void) | undefined;
   readonly #logger: GitSafetyLogger;
@@ -72,7 +76,8 @@ export class GitSafetyCoordinator {
 
   constructor(options: GitSafetyCoordinatorOptions) {
     this.#savepoints = options.savepoints ?? new ShadowSavepointService(options.runner);
-    this.#readAutoSnapshotEnabled = options.readAutoSnapshotEnabled;
+    this.#readMode = options.readMode;
+    this.#initializeProjectGit = options.initializeProjectGit;
     this.#resolveRepository = options.resolveRepository ?? ((workspaceRoot) => detectRepositoryRoot(workspaceRoot, options.runner));
     this.#onGap = options.onGap;
     this.#logger = options.logger ?? SILENT_LOGGER;
@@ -85,10 +90,12 @@ export class GitSafetyCoordinator {
     const key = turnKey(input);
     const existing = this.#records.get(key);
     if (existing !== undefined) return existing.startPromise;
-    const enabled = this.#readAutoSnapshotEnabled();
+    const mode = this.#readMode();
+    const enabled = mode !== "off";
     const record: TurnRecord = {
       input,
       enabled,
+      mode,
       startPromise: Promise.resolve({ status: "disabled", gaps: [] })
     };
     record.startPromise = this.#captureTurnStart(record);
@@ -101,11 +108,13 @@ export class GitSafetyCoordinator {
     const key = turnKey(input);
     let record = this.#records.get(key);
     if (record === undefined) {
-      const enabled = this.#readAutoSnapshotEnabled();
+      const mode = this.#readMode();
+      const enabled = mode !== "off";
       if (!enabled) return { status: "disabled", gaps: [] };
       record = {
         input,
         enabled,
+        mode,
         startPromise: Promise.resolve({ status: "gap", gaps: [] })
       };
       const repositoryRoot = await this.#resolveRepository(input.workspaceRoot).catch(() => null);
@@ -244,7 +253,11 @@ export class GitSafetyCoordinator {
   async #captureTurnStart(record: TurnRecord): Promise<GitSafetyBoundaryOutcome> {
     if (!record.enabled) return { status: "disabled", gaps: [] };
     try {
-      const repositoryRoot = await this.#resolveRepository(record.input.workspaceRoot);
+      let repositoryRoot = await this.#resolveRepository(record.input.workspaceRoot);
+      if (repositoryRoot === null && record.mode === "all-projects" && this.#initializeProjectGit !== undefined) {
+        await this.#initializeProjectGit(record.input);
+        repositoryRoot = await this.#resolveRepository(record.input.workspaceRoot);
+      }
       if (repositoryRoot === null) return { status: "not_repository", gaps: [] };
       record.repositoryRoot = repositoryRoot;
       this.#rememberRepository(record.input.sessionId, repositoryRoot);

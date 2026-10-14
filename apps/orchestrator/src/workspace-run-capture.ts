@@ -11,7 +11,7 @@ import type {
   WorkspaceGitProjection
 } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
-import type { GitSafetyCoordinator } from "@joko/git-safety";
+import type { GitSafetyCoordinator, GitSafetyTurnBoundaryInput, ProjectGitBootstrap } from "@joko/git-safety";
 
 import type { WorkspaceRunCapture } from "./session-host.js";
 import type { SnapshotFile, WorkspaceChangeSetRecord, WorkspaceChangeSetService } from "./workspace-change-set.js";
@@ -36,6 +36,38 @@ interface RunOutputSeal {
 export interface WorkspaceRunOutput {
   readonly readiness: WorkspaceRunOutputReadiness;
   readonly changes: readonly { readonly path: string; readonly status: "added" | "modified" | "deleted" | "renamed" }[];
+}
+
+/** The Run owns initialization only for its unchanged, ordinary local project. */
+export async function prepareRunProjectGit(
+  store: OperationalStore,
+  bootstrap: Pick<ProjectGitBootstrap, "ensure">,
+  input: GitSafetyTurnBoundaryInput
+): Promise<void> {
+  const session = store.getSession(input.sessionId);
+  const target = store.getTarget(session.descriptor.targetId);
+  const run = store.getRun(input.runId);
+  if (session.descriptor.deletedAt !== undefined || session.descriptor.archived ||
+      session.descriptor.worktree !== undefined || session.descriptor.remoteWorkspace !== undefined ||
+      target.descriptor.managed || target.descriptor.remoteWorkspace !== undefined ||
+      target.descriptor.workspaceRoot !== input.workspaceRoot || run.descriptor.sessionId !== input.sessionId ||
+      (run.descriptor.state !== "running" && run.descriptor.state !== "queued")) return;
+  const assertCurrent = (): void => {
+    const current = store.getSession(input.sessionId);
+    const currentTarget = store.getTarget(target.descriptor.id);
+    const currentRun = store.getRun(input.runId);
+    if (current.descriptor.targetId !== target.descriptor.id ||
+        current.descriptor.binding.generation !== session.descriptor.binding.generation ||
+        current.descriptor.deletedAt !== undefined || current.descriptor.archived ||
+        current.descriptor.worktree !== undefined || current.descriptor.remoteWorkspace !== undefined ||
+        currentTarget.revision !== target.revision || currentRun.descriptor.sessionId !== input.sessionId ||
+        currentRun.descriptor.state !== run.descriptor.state) {
+      throw new Error("Project Git initialization authority changed.");
+    }
+  };
+  assertCurrent();
+  await bootstrap.ensure({ workspaceRoot: input.workspaceRoot, assertCurrent });
+  assertCurrent();
 }
 
 export class DurableWorkspaceRunCapture implements WorkspaceRunCapture {

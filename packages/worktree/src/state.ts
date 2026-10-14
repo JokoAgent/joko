@@ -108,7 +108,7 @@ export class WorktreeStateStore {
       if (Buffer.byteLength(text, "utf8") > MAXIMUM_STATE_BYTES) {
         throw new WorktreeServiceError("STATE_CORRUPT", "The worktree state file exceeds its safe limit.");
       }
-      state = validateState(JSON.parse(text) as unknown);
+      state = validateWorktreeState(JSON.parse(text) as unknown);
     } catch (error) {
       if (isMissing(error)) state = { format: 1, entries: [] };
       else if (error instanceof WorktreeServiceError) throw error;
@@ -253,7 +253,7 @@ async function prepareStorageRoot(storageRoot: string, control: WorktreeOperatio
   return validateOrdinaryDirectory(root, "STORAGE_UNSAFE", "The worktree storage root is unsafe.");
 }
 
-function validateState(value: unknown): PersistedWorktreeState {
+export function validateWorktreeState(value: unknown): PersistedWorktreeState {
   if (!isRecord(value) || value["format"] !== 1 || !Array.isArray(value["entries"])) {
     throw new WorktreeServiceError("STATE_CORRUPT", "The worktree state has an unsupported format.");
   }

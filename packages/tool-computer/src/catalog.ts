@@ -74,6 +74,18 @@ const snapshotId = stringValue(
 );
 const elementToken = stringValue("Exact element_token from the latest window observation. Re-observe after verification or a failed observation.");
 const deliveryMode = choice("background", "foreground");
+const postcondition = { type: "array", minItems: 1, maxItems: 8, items: objectSchema({
+  element: objectSchema({
+    selector: objectSchema({ role: { type: "string", minLength: 1 }, label_contains: { type: "string", minLength: 1 } }),
+    exists: { type: "boolean", const: true }, enabled: booleanValue(), selected: booleanValue(), value_equals: stringValue()
+  }, ["selector"]),
+  window: objectSchema({ exists: booleanValue(), bounds: objectSchema({
+    x: numberValue(), y: numberValue(), width: numberValue(), height: numberValue(), tolerance_px: numberValue({ minimum: 0, maximum: 100 })
+  }, ["x", "y", "width", "height"]) })
+}) };
+export const COMPUTER_POSTCHECK_ACTIONS: ReadonlySet<ComputerPublicToolName> = new Set([
+  "click", "double_click", "right_click", "drag", "type_text", "set_value", "press_key", "hotkey", "scroll"
+]);
 
 function tool(
   name: ComputerPublicToolName,
@@ -81,10 +93,20 @@ function tool(
   inputSchema: JsonSchema,
   readOnly = false
 ): ComputerToolDescriptor {
+  const properties = inputSchema["properties"] as Record<string, JsonSchema>;
+  const scopedSchema = ["status", "check_permissions", "replay_trajectory"].includes(name) ? inputSchema : {
+    ...inputSchema,
+    properties: {
+      ...properties,
+      session_goal: { type: "string", minLength: 1, maxLength: 80,
+        description: "On the first call, name the overall objective in short English. The host claims this name once; omit it on later calls. Never include credentials or internal IDs." },
+      ...(COMPUTER_POSTCHECK_ACTIONS.has(name) ? { postcondition } : {})
+    }
+  };
   return Object.freeze({
     name,
     description,
-    inputSchema,
+    inputSchema: scopedSchema,
     annotations: Object.freeze({
       readOnlyHint: readOnly,
       destructiveHint: !readOnly,
@@ -372,11 +394,15 @@ export function normalizeComputerToolArguments(
 ): Record<string, unknown> {
   const normalized = { ...input };
   validateAgainstSchema(normalized, computerPublicTool(name)!.inputSchema);
+  if (typeof normalized["session_goal"] === "string") {
+    normalized["session_goal"] = normalized["session_goal"].trim();
+    if (normalized["session_goal"] === "") throw new ComputerToolArgumentError("session_goal");
+  }
   if (name === "set_value" && normalized["element_index"] === undefined && normalized["element_token"] === undefined) {
     throw new ComputerToolArgumentError("element_token");
   }
-  if (name === "verify_state") {
-    for (const predicate of normalized["expect"] as Record<string, unknown>[]) {
+  if (name === "verify_state" || normalized["postcondition"] !== undefined) {
+    for (const predicate of (normalized[name === "verify_state" ? "expect" : "postcondition"]) as Record<string, unknown>[]) {
       if ((predicate["element"] === undefined) === (predicate["window"] === undefined)) throw new ComputerToolArgumentError("expect");
     }
   }
@@ -415,6 +441,7 @@ function validateAgainstSchema(value: unknown, schema: JsonSchema, field = "argu
   if (type === "string") {
     if (typeof value !== "string" || value.includes("\0")) throw new ComputerToolArgumentError(field);
     if (typeof schema["minLength"] === "number" && value.length < schema["minLength"]) throw new ComputerToolArgumentError(field);
+    if (typeof schema["maxLength"] === "number" && value.length > schema["maxLength"]) throw new ComputerToolArgumentError(field);
   } else if (type === "number" || type === "integer") {
     if (typeof value !== "number" || !Number.isFinite(value) || (type === "integer" && !Number.isInteger(value))) {
       throw new ComputerToolArgumentError(field);

@@ -54,7 +54,7 @@ async function fixture() {
     return { kind: "xcode-project", worktreeRoot: workspace, projectRoot: workspace,
       containerPath: join(workspace, "Example.xcodeproj"), scheme: "Example",
       appPath: sourceApp, resultBundlePath: null, buildLogTail: "BUILD SUCCEEDED",
-      outputTruncated: false };
+      outputTruncated: false, writerRetired: true };
   };
   const builder: Pick<SimulatorProjectBuilder, "inspect" | "build" | "readXcresult"> = {
     inspect: async () => ({ kind: "xcode-project", worktreeRoot: workspace,
@@ -101,6 +101,32 @@ it("claims a build before dispatch and replays its task-owned immutable artifact
         .toMatchObject({ replayed: true, receipt: first.receipt });
       expect(h.calls).toEqual(["build"]);
     } finally { resumedStore.close(); }
+  } finally { await h.close(); }
+});
+
+it("builds from an explicit local project without transferring the task or app artifact owner", async () => {
+  const h = await fixture();
+  const selectedRoot = join(h.root, "selected-project");
+  try {
+    await mkdir(join(selectedRoot, "Selected.xcodeproj"), { recursive: true });
+    h.options.builder.inspect = async root => {
+      expect(root).toBe(selectedRoot);
+      return { kind: "xcode-project", worktreeRoot: root, projectRoot: root,
+        containerPath: join(root, "Selected.xcodeproj") };
+    };
+    h.setBuild(async input => {
+      expect(input.worktreeRoot).toBe(selectedRoot);
+      expect(input.simulatorUdid).toBe(UDID);
+      return { kind: "xcode-project", worktreeRoot: selectedRoot, projectRoot: selectedRoot,
+        containerPath: join(selectedRoot, "Selected.xcodeproj"), scheme: "Selected",
+        appPath: join(h.root, "workspace", "Build", "Example.app"), resultBundlePath: null,
+        buildLogTail: "BUILD SUCCEEDED", outputTruncated: false, writerRetired: true };
+    });
+    const result = await h.coordinator.execute(SCOPE, route(h.instance),
+      { projectDir: "../selected-project" }, authority("9"));
+    const app = await h.coordinator.getArtifact(SCOPE, route(h.instance), result.receipt.artifact.artifactId);
+    expect(app).toMatchObject({ sessionId: SCOPE.sessionId, targetId: SCOPE.targetId, scheme: "Selected" });
+    await expect(h.coordinator.getArtifact({ ...SCOPE, sessionId: "foreign-task" }, route(h.instance), app.artifactId)).rejects.toBeTruthy();
   } finally { await h.close(); }
 });
 
@@ -224,17 +250,22 @@ it("reclaims only aged unpublished private build storage after a host restart", 
     const copiesRoot = join(h.root, "managed", "artifacts");
     const staleBuild = randomUUID();
     const freshBuild = randomUUID();
+    const unknownWriterBuild = randomUUID();
     const unpublishedCopy = randomUUID();
     await mkdir(join(buildsRoot, staleBuild));
     await mkdir(join(buildsRoot, freshBuild));
+    await mkdir(join(buildsRoot, unknownWriterBuild));
+    await writeFile(join(buildsRoot, unknownWriterBuild, "writer.json"), JSON.stringify({ format: 1, operationId: "unconfirmed-build" }));
     await mkdir(join(copiesRoot, unpublishedCopy));
     const old = new Date(Date.now() - 2 * 24 * 60 * 60_000);
     await utimes(join(buildsRoot, staleBuild), old, old);
+    await utimes(join(buildsRoot, unknownWriterBuild), old, old);
     await utimes(join(copiesRoot, unpublishedCopy), old, old);
     await utimes(join(copiesRoot, built.receipt.artifact.artifactId), old, old);
     await h.coordinator.reconcileBuildStorage();
     expect(await readdir(buildsRoot)).toContain(freshBuild);
     expect(await readdir(buildsRoot)).not.toContain(staleBuild);
+    expect(await readdir(buildsRoot)).toContain(unknownWriterBuild);
     expect(await readdir(copiesRoot)).toContain(built.receipt.artifact.artifactId);
     expect(await readdir(copiesRoot)).not.toContain(unpublishedCopy);
   } finally { await h.close(); }

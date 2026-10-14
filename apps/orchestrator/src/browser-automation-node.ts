@@ -520,6 +520,7 @@ export function assertActionCapabilities(
   arguments_: Readonly<Record<string, unknown>>,
   capabilities: ReadonlySet<BrowserRemoteNodeCapability>
 ): BrowserAutomationActKind | undefined {
+  if (action === "setBackend") throw new Error("Browser mode switching is owned by local Settings and cannot be dispatched to a Browser node.");
   if (!BROWSER_AUTOMATION_ACTIONS.includes(action)) throw new Error("Browser automation action is invalid.");
   if (!capabilities.has(`action:${action}`)) throw new Error(`Browser automation node does not advertise action:${action}.`);
   let kind: BrowserAutomationActKind | undefined;

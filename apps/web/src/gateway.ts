@@ -125,6 +125,7 @@ import {
   DiagnosticLevel,
   EntityKind,
   ErrorSeverity,
+  GitSafetyMode,
   EventCursorSchema,
   ExtensionWidgetPlacement,
   ExtensionCatalogSource as ProtoExtensionCatalogSource,
@@ -9583,8 +9584,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       case: "updateGitSafetySettings",
       value: {
         patch: {
-          ...(!resetAll && "autoSnapshotEnabled" in patch
-            ? { autoSnapshotEnabled: patch.autoSnapshotEnabled }
+          ...(!resetAll && "mode" in patch
+            ? { mode: toProtoGitSafetyMode(patch.mode) }
             : {}),
           resetAll
         }
@@ -17936,7 +17937,7 @@ function mapSettings(settings: SettingsSnapshot | undefined): SettingsView {
       revision: settings.collaboration.version?.revision?.value ?? 0n
     },
     gitSafety: {
-      autoSnapshotEnabled: settings.gitSafety.autoSnapshotEnabled,
+      mode: fromProtoGitSafetyMode(settings.gitSafety.mode),
       pendingTurns: settings.gitSafety.pendingTurns,
       trackedSessions: settings.gitSafety.trackedSessions,
       trackedRepositories: settings.gitSafety.trackedRepositories,
@@ -23333,4 +23334,22 @@ function positiveTimelineInteger(value: number, label: string): number {
 
 function errorSeverity(value: ErrorSeverity): ErrorView["severity"] {
   return value === ErrorSeverity.WAITING ? "waiting" : value === ErrorSeverity.RETRYABLE ? "retryable" : value === ErrorSeverity.BLOCKED ? "blocked" : "fatal";
+}
+
+function toProtoGitSafetyMode(mode: import("./model.js").GitSafetySettingsView["mode"]): GitSafetyMode {
+  switch (mode) {
+    case "off": return GitSafetyMode.OFF;
+    case "existing-git": return GitSafetyMode.EXISTING_GIT;
+    case "all-projects": return GitSafetyMode.ALL_PROJECTS;
+    default: throw new GatewayError("Git safety mode is invalid.");
+  }
+}
+
+function fromProtoGitSafetyMode(mode: GitSafetyMode): import("./model.js").GitSafetySettingsView["mode"] {
+  switch (mode) {
+    case GitSafetyMode.OFF: return "off";
+    case GitSafetyMode.EXISTING_GIT: return "existing-git";
+    case GitSafetyMode.ALL_PROJECTS: return "all-projects";
+    default: throw new GatewayError("Orchestrator returned an unknown Git safety mode.");
+  }
 }
