@@ -10,6 +10,7 @@ import type {
   QueueItemId,
   RunId,
   RunState,
+  RunUsageSummary,
   SessionAttentionKind,
   SessionId,
   TargetId,
@@ -139,7 +140,7 @@ export type EventPayload =
   /** Store-owned metadata for one existing assistant completion, never a new message. */
   | { readonly type: "partner_learning_changed"; readonly completionEventId: string; readonly messageId: string;
       readonly feedback: import("./partner-learning.js").PartnerLearningFeedback }
-  | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError }
+  | { readonly type: "run_state"; readonly state: RunState; readonly error?: PublicError; readonly usage?: RunUsageSummary }
   /** Store-owned observation; never emitted by a Session adapter. */
   | { readonly type: "device_changed"; readonly device: DeviceContentProjection }
   /** Content-free signal that the durable Session projection changed. */
@@ -159,6 +160,11 @@ export type EventPayload =
       readonly taskMessageOrigin?: TaskMessageOrigin;
       /** Per-message provider accounting when authoritatively reported. */
       readonly usage?: UsageSnapshot;
+      /** Native-observed replacement of the selected model, scoped to this assistant completion. */
+      readonly modelSubstitution?: { readonly selectedModelId: string; readonly actualModelId: string };
+      /** Service-owned money semantics; a subscription/reference value is not a billed charge. */
+      readonly usageIsEstimate?: boolean;
+      readonly turnUsage?: RunUsageSummary;
       /** Generation-only time for this assistant message, never turn wall-clock time. */
       readonly generationDurationMs?: number;
       /** True only when generationDurationMs came from an authoritative native duration. */
@@ -610,6 +616,13 @@ export interface NativeHistoryEventContext {
 }
 
 export const NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD = "nativeHistoryReplacesTransient";
+export function validModelSubstitution(value: unknown): value is { readonly selectedModelId: string; readonly actualModelId: string } {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const fields = value as Record<string, unknown>;
+  if (Object.keys(fields).length !== 2 || fields["selectedModelId"] === fields["actualModelId"]) return false;
+  return [fields["selectedModelId"], fields["actualModelId"]].every(value => typeof value === "string"
+    && value.trim().length > 0 && value.length <= 256 && !/[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u.test(value));
+}
 export const NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD = "nativeBindingFingerprint";
 
 export function nativeHistoryEventContext(payload: EventPayload): NativeHistoryEventContext | undefined {

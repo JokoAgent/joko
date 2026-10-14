@@ -2282,9 +2282,13 @@ export interface RecordUsageObservationInput extends UsageTokenTotals {
   readonly reportedCostMicros?: number;
   /** True when the reported amount is a subscription/catalog value projection, not billed spend. */
   readonly reportedCostEstimated?: boolean;
+  /** False when the native observation explicitly omits part of its accounted cost. */
+  readonly observedCostComplete?: boolean;
   /** Catalog pricing used only for the newly observed token delta. */
   readonly costRates?: UsageCostRates;
   readonly currencyCode?: string;
+  /** Service-owned Run attribution, committed atomically with the source cursor. */
+  readonly runUsage?: { readonly runId: RunId; readonly currencyCode?: string; readonly tokensComplete?: boolean };
 }
 
 export interface UsageObservationResult extends UsageTokenTotals {

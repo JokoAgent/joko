@@ -1,6 +1,6 @@
-import { MessageInputDelivery, MessageRole, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
+import { MessageRole, ToolCallState, type Event, type PartnerPrivateMessageOrigin, type Run, type RunUsageSummary, type TaskMessageOrigin, type ToolCall } from "@joko/contracts";
 import { projectPartnerLearningFeedback, type PartnerLearningFeedbackView } from "@joko/contracts";
-import { mobileInputSummary } from "./mobile-composer-document";
+import { mobileInputSummary, mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
 import { mobileTimelineContent, mobileTimelineContentSourceKey, mobileTimelineToolMediaEvents } from "./mobile-timeline-content";
 import { projectMobileToolCall, mobileToolCallScopeKey, mobileToolCallCompleted, type MobileToolCallView } from "./mobile-tool-call";
 import {
@@ -70,6 +70,9 @@ export interface TimelineRow {
   readonly answerSequence?: bigint;
   readonly completionCursor?: bigint;
   readonly internalInput?: boolean;
+  /** Original public input for copy/share; visual folding and pasted-text previews do not rewrite it. */
+  readonly sourceText?: string;
+  readonly automationOrigin?: { readonly scheduleId: string; readonly scheduleName?: string; readonly runId?: string };
   readonly partnerPrivateOrigin?: PartnerPrivateMessageOrigin;
   /** A durable Run outcome, distinct from a completed message segment. */
   readonly runOutcome?: "completed" | "failed" | "stopped";
@@ -82,6 +85,11 @@ export interface TimelineRow {
   readonly objectiveLifecycle?: MobileObjectiveLifecycle;
   readonly collaboration?: MobileCollaborationMessage;
   readonly taskMessageOrigin?: TaskMessageOrigin;
+  readonly modelSubstitution?: { readonly selectedModelId: string; readonly actualModelId: string };
+  readonly usage?: import("@joko/contracts").Usage;
+  readonly usageIsEstimate?: boolean;
+  readonly usageCostComplete?: boolean;
+  readonly usageTokensComplete?: boolean;
 }
 
 const PARTNER_PRIVATE_TOOL_NAMES = new Set([
@@ -93,7 +101,7 @@ const PARTNER_AVATAR = /^[a-z][a-z0-9-]{0,31}$/u;
 const FORBIDDEN_INLINE = /[\u0000-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 const FORBIDDEN_MULTILINE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 
-export function timelineRows(events: readonly Event[], sessionStreaming = false): TimelineRow[] {
+export function timelineRows(events: readonly Event[], sessionStreaming = false, runs: readonly Run[] = []): TimelineRow[] {
   const byId = new Map<string, TimelineRow>();
   const toolStarts = new Map<string, Event[]>();
   const acceptedUserInputs = new Set<string>();
@@ -115,6 +123,11 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
         const message = kind.value;
         const collaboration = mobileCollaborationReport(event);
         const origin = taskMessageOrigin(event);
+        const automation = automationOrigin(event);
+        const inputText = message.role === MessageRole.USER && message.userInputAccepted
+          && !message.automaticContinuation && message.objectiveContinuation === undefined && message.partnerPrivateOrigin === undefined
+          ? message.userInput?.parts.flatMap(part => part.content.case === "text" ? [part.content.value] : []).join("")
+          : undefined;
         if (message.role === MessageRole.USER && message.userInputAccepted) acceptedUserInputs.add(message.messageId);
         const images = mobileTimelineGalleryPages(event).map(mobileImageGalleryPageSummary);
         byId.set(message.messageId, { id: message.messageId, label: roleLabel(message.role),
@@ -122,8 +135,10 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
           kind: roleKind(message.role), completed: message.role === MessageRole.USER && message.userInputAccepted,
           ...(message.role !== MessageRole.USER ? {} : {
             internalInput: message.automaticContinuation || message.objectiveContinuation !== undefined
-              || message.automationOrigin !== undefined || message.inputDelivery === MessageInputDelivery.SCHEDULER
           }),
+          ...(inputText === undefined ? {} : { sourceText: message.userInput?.quotesEncoded
+            ? mobileVisibleSelectionQuoteText(inputText, []) ?? inputText : inputText }),
+          ...(automation === undefined ? {} : { automationOrigin: automation }),
           ...(message.partnerPrivateOrigin === undefined ? {} : { partnerPrivateOrigin: message.partnerPrivateOrigin }),
           ...(collaboration === undefined ? {} : { collaboration }),
           ...(origin === undefined ? {} : { taskMessageOrigin: origin }),
@@ -164,8 +179,15 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
           eventId: event.eventId, kind: roleKind(message.role), completed: true,
           completionCursor: sequence,
           ...(message.role !== MessageRole.ASSISTANT ? {} : { assistantBodyPresent: message.blocks.some(block => block.content.case === "text" && !!block.content.value.trim()) }),
+          ...messageTurnUsage(event, message.turnUsage),
+          ...(message.role !== MessageRole.ASSISTANT || message.modelSubstitution === undefined
+            || message.modelSubstitution.selectedModelId === message.modelSubstitution.actualModelId
+            || [message.modelSubstitution.selectedModelId, message.modelSubstitution.actualModelId].some(value => !value || value.length > 256 || FORBIDDEN_INLINE.test(value))
+            ? {} : { modelSubstitution: message.modelSubstitution }),
           ...(message.role !== MessageRole.ASSISTANT || message.learning === undefined ? {} : { learning: projectPartnerLearningFeedback(message.learning) }),
           ...(previous?.internalInput === undefined ? {} : { internalInput: previous.internalInput }),
+          ...(previous?.sourceText === undefined ? {} : { sourceText: previous.sourceText }),
+          ...(previous?.automationOrigin === undefined ? {} : { automationOrigin: previous.automationOrigin }),
           ...(previous?.collaboration === undefined ? {} : { collaboration: previous.collaboration }),
           ...(previous?.taskMessageOrigin === undefined ? {} : { taskMessageOrigin: previous.taskMessageOrigin }),
           ...((message.partnerPrivateOrigin ?? previous?.partnerPrivateOrigin) === undefined ? {}
@@ -270,8 +292,64 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false)
       byId.delete(event.eventId);
     }
   }
+  const usageRuns = new Map<string, { run: Run; event?: Event }>();
+  for (const run of runs) if (run.runId && run.sessionId && (run.version?.revision?.value ?? 0n) > 0n) {
+    const key = JSON.stringify([run.sessionId, run.runId]);
+    if ((usageRuns.get(key)?.run.version?.revision?.value ?? 0n) <= run.version!.revision!.value) usageRuns.set(key, { run });
+  }
+  for (const event of ordered) {
+    if (event.payload?.kind.case !== "runChanged") continue;
+    const run = event.payload.kind.value.run;
+    if (!run?.runId || !run.sessionId || run.runId !== event.identity?.runId || run.sessionId !== event.identity.sessionId
+      || (run.version?.revision?.value ?? 0n) <= 0n) continue;
+    const source = unique.get(run.usage?.completionEventId ?? "") ?? ordered.find(candidate =>
+      candidate.payload?.kind.case === "messageCompleted" && candidate.identity?.runId === run.runId && candidate.identity.sessionId === run.sessionId
+      && candidate.cursor?.generation === event.cursor?.generation && candidate.identity.generation === event.identity?.generation);
+    if (!source || source.identity?.runId !== run.runId || source.identity.sessionId !== run.sessionId
+      || source.payload?.kind.case !== "messageCompleted"
+      || source.eventId === run.usage?.completionEventId && source.payload.kind.value.messageId !== run.usage.messageId
+      || event.cursor?.generation !== source.cursor?.generation || event.identity.generation !== source.identity.generation) continue;
+    const key = JSON.stringify([run.sessionId, run.runId]);
+    const previous = usageRuns.get(key);
+    const priorRevision = previous?.run.version?.revision?.value ?? 0n;
+    if (priorRevision > run.version!.revision!.value || previous !== undefined && previous.event === undefined
+      && priorRevision === run.version!.revision!.value) continue;
+    usageRuns.set(key, { run, event });
+  }
+  for (const { run, event } of usageRuns.values()) {
+    const summary = run.usage;
+    if (!summary?.messageId || !summary.completionEventId) continue;
+    for (const row of byId.values()) {
+      const source = unique.get(row.eventId);
+      if (row.kind !== "assistant" || !row.completed || source?.identity?.runId !== run.runId || source.identity.sessionId !== run.sessionId
+        || event && (event.cursor?.generation !== source.cursor?.generation || event.identity?.generation !== source.identity.generation)) continue;
+      if (row.eventId !== summary.completionEventId || row.id !== summary.messageId) byId.set(row.id,
+        { ...row, usage: undefined, usageIsEstimate: undefined, usageCostComplete: undefined, usageTokensComplete: undefined });
+    }
+    const row = byId.get(summary.messageId);
+    const source = row && unique.get(row.eventId);
+    if (row?.kind !== "assistant" || !row.completed || row.eventId !== summary.completionEventId
+      || source?.identity?.runId !== run.runId || source?.identity?.sessionId !== run.sessionId
+      || event && (event.cursor?.generation !== source.cursor?.generation || event.identity?.generation !== source.identity.generation)) continue;
+    byId.set(row.id, { ...row, ...messageTurnUsage(source, summary) });
+  }
   attachThinkingParts(byId, ordered, sessionStreaming);
   return [...byId.values()].sort((a, b) => a.sequence < b.sequence ? -1 : a.sequence > b.sequence ? 1 : a.id.localeCompare(b.id));
+}
+
+function messageTurnUsage(event: Event, summary: RunUsageSummary | undefined): Pick<TimelineRow, "usage" | "usageIsEstimate" | "usageCostComplete" | "usageTokensComplete"> {
+  const message = event.payload?.kind;
+  const usage = summary?.usage;
+  if (message?.case !== "messageCompleted" || message.value.role !== MessageRole.ASSISTANT
+    || !event.identity?.sessionId || !event.identity.runId || !event.eventId || !message.value.messageId
+    || !summary || summary.messageId !== message.value.messageId || summary.completionEventId !== event.eventId
+    || typeof summary.estimated !== "boolean" || typeof summary.costComplete !== "boolean" || typeof summary.tokensComplete !== "boolean" || !usage
+    || [usage.inputTokens, usage.outputTokens, usage.cacheReadTokens, usage.cacheWriteTokens, usage.totalTokens]
+      .some(value => typeof value !== "bigint" || value < 0n || value > 0xffffffffffffffffn)
+    || typeof usage.costMicros !== "bigint" || usage.costMicros < 0n || usage.costMicros > 0x7fffffffffffffffn
+    || typeof usage.currencyCode !== "string" || usage.currencyCode !== "" && !/^[A-Z]{3}$/u.test(usage.currencyCode)
+    || usage.currencyCode === "" && (usage.costMicros !== 0n || summary.costComplete)) return {};
+  return { usage, usageIsEstimate: summary.estimated, usageCostComplete: summary.costComplete, usageTokensComplete: summary.tokensComplete };
 }
 
 function attachThinkingParts(rows: Map<string, TimelineRow>, ordered: readonly Event[], sessionStreaming: boolean): void {
@@ -360,6 +438,16 @@ function attachThinkingParts(rows: Map<string, TimelineRow>, ordered: readonly E
       ...(parts.length ? { messageParts: parts, workActivity: thoughtOnly, workStreaming: thinking.some((view) => view.streaming) } : {})
     });
   }
+}
+
+function automationOrigin(event: Event): TimelineRow["automationOrigin"] {
+  const payload = event.payload?.kind;
+  if (payload?.case !== "messageStarted" || payload.value.role !== MessageRole.USER || !payload.value.userInputAccepted) return undefined;
+  const origin = payload.value.automationOrigin;
+  if (!origin || !PARTNER_ID.test(origin.scheduleId) || origin.runId !== "" && !PARTNER_ID.test(origin.runId)
+    || origin.scheduleName.length > 256 || FORBIDDEN_INLINE.test(origin.scheduleName)) return undefined;
+  return { scheduleId: origin.scheduleId, ...(origin.scheduleName ? { scheduleName: origin.scheduleName } : {}),
+    ...(origin.runId ? { runId: origin.runId } : {}) };
 }
 
 function taskMessageOrigin(event: Event): TaskMessageOrigin | undefined {

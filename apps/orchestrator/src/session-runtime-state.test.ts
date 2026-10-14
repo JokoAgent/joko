@@ -15,6 +15,7 @@ describe("materialized session runtime state", () => {
       totalTokens: 18,
       contextTokens: 12,
       contextWindow: 32_000,
+      nativeAccounting: { sourceId: "query-one", tokensComplete: false, costComplete: false, costEstimated: true },
       cost: 0.02
     };
     const withLeaf = mergeMaterializedSessionRuntimeState(undefined, {

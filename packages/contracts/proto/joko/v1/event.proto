@@ -374,6 +374,17 @@ message MessageCompletedEvent {
   PartnerPrivateMessageOrigin partner_private_origin = 10;
   // Service-authored projection joined to this exact completion Event.
   PartnerLearningFeedback learning = 11;
+  // Native-observed substitution, never inferred from a requested model or message body.
+  ModelSubstitution model_substitution = 12;
+  // Service-owned semantics of the message money; absent means no classification was observed.
+  optional bool usage_is_estimate = 13;
+  // Joined from the exact durable Run summary; per-message generation usage stays separate.
+  RunUsageSummary turn_usage = 14;
+}
+
+message ModelSubstitution {
+  string selected_model_id = 1;
+  string actual_model_id = 2;
 }
 
 enum PartnerLearningKind {

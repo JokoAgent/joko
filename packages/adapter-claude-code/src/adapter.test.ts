@@ -60,6 +60,80 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("accounts fresh root and native child frames once and excludes saved usage after Query resume and reopen", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    const adapter = adapterFor(runtime);
+    const observedUsage = (input_tokens: number, output_tokens: number) => ({ input_tokens, output_tokens,
+      cache_read_input_tokens: 0, cache_creation_input_tokens: 0 });
+    const cumulative = (inputTokens: number, outputTokens: number, costUSD: number) => ({ inputTokens, outputTokens,
+      cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context);
+      const first = contextFor(binding, { operationId: "first-accounting-turn" });
+      await adapter.send(textPrompt("first"), first.context);
+      const root = assistantMessage(binding.nativeSessionId!, "root-usage", [{ type: "text", text: "Root" }]);
+      const child = childAssistantMessage(binding.nativeSessionId!, "child-usage", "native-child-tool", [{ type: "text", text: "Child" }], "model-b");
+      const rootFrame = { ...root, message: { ...root.message, usage: observedUsage(10, 5) } };
+      const childFrame = { ...child, message: { ...child.message, usage: observedUsage(2, 1) } };
+      runtime.queries[0]!.push(rootFrame); runtime.queries[0]!.push(rootFrame);
+      runtime.queries[0]!.push(childFrame); runtime.queries[0]!.push(childFrame);
+      runtime.queries[0]!.push({ ...resultMessage(binding.nativeSessionId!, { result: "Done", totalCostUsd: 0.03 }),
+        modelUsage: { "model-a": cumulative(10, 5, 0.02), "model-b": cumulative(2, 1, 0.01) } });
+      await eventually(() => first.events.some(event => event.type === "done"));
+      const firstUsage = first.events.find((event): event is Extract<EventPayload, { type: "usage" }> => event.type === "usage")!.usage;
+      expect(firstUsage).toMatchObject({ totalTokens: 18, cost: 0.03,
+        nativeAccounting: { tokensComplete: true, costComplete: true, costEstimated: true } });
+      await adapter.closeSession(binding, contextFor(binding).context);
+
+      const sources = [firstUsage.nativeAccounting!.sourceId];
+      for (const [index, total] of [20, 30].entries()) {
+        const restored = await adapter.resumeSession(binding, contextFor(binding).context);
+        expect(restored.usage).toBeUndefined();
+        const active = contextFor(binding, { operationId: `resumed-accounting-${index}` });
+        await adapter.send(textPrompt("new input"), active.context);
+        const query = runtime.queries.at(-1)!;
+        expect(query.params.options.resume).toBe(binding.nativeSessionId);
+        const reply = assistantMessage(binding.nativeSessionId!, `current-reply-${index}`, [{ type: "text", text: "Current" }]);
+        const frame = { ...reply, message: { ...reply.message, usage: observedUsage(10, 5) } };
+        query.push(frame); query.push(frame);
+        query.push({ ...resultMessage(binding.nativeSessionId!, { result: "Current", totalCostUsd: 0.05 + index * 0.02 }),
+          modelUsage: { "model-a": cumulative(total, total / 2, 0.04 + index * 0.02), "model-b": cumulative(2, 1, 0.01) } });
+        await eventually(() => active.events.some(event => event.type === "done"));
+        const usage = active.events.find((event): event is Extract<EventPayload, { type: "usage" }> => event.type === "usage")!.usage;
+        expect(usage).toMatchObject({ totalTokens: 15, cost: 0,
+          nativeAccounting: { tokensComplete: false, costComplete: false, costEstimated: true } });
+        expect(sources).not.toContain(usage.nativeAccounting!.sourceId);
+        sources.push(usage.nativeAccounting!.sourceId);
+        expect((await adapter.inspectSession(binding, contextFor(binding).context)).usage).toEqual(usage);
+        await adapter.closeSession(binding, contextFor(binding).context);
+      }
+    } finally { await adapter.dispose(); }
+  });
+
+  test("emits native model substitution only on the owning assistant result and preserves the selected model", async () => {
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
+    runtime.probeInitialization = runtime.queryInitialization = { ...initialization(), models: [
+      { ...initialization().models[0]!, value: "claude-fable-5" },
+      { ...initialization().models[1]!, value: "claude-opus-4-8" }
+    ] };
+    const adapter = adapterFor(runtime);
+    try {
+      const binding = await adapter.createSession(createInput({ modelId: "claude-fable-5" }), contextFor().context);
+      const active = contextFor(binding, { operationId: "substitution-turn" });
+      await adapter.send(textPrompt("first"), active.context);
+      const query = runtime.queries[0]!;
+      const reply = assistantMessage(binding.nativeSessionId!, "replacement-reply", [{ type: "text", text: "Done" }]);
+      query.push({ ...reply, message: { ...reply.message, model: "claude-opus-4-8", usage: { input_tokens: 10, output_tokens: 5 } } });
+      query.push({ ...resultMessage(binding.nativeSessionId!, { result: "Done", totalCostUsd: 0.02 }),
+        modelUsage: { "claude-opus-4-8": { inputTokens: 10, outputTokens: 5, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } } });
+      await eventually(() => active.events.some(event => event.type === "done"));
+      expect(active.events.filter(event => event.type === "message_complete")).toMatchObject([{ modelSubstitution: {
+        selectedModelId: "claude-fable-5", actualModelId: "claude-opus-4-8"
+      } }]);
+      expect(query.params.options.model).toBe("claude-fable-5");
+      expect(query.modelCalls).toEqual([]);
+    } finally { await adapter.dispose(); }
+  });
   test("preserves native model metadata presence independently of known capacity estimates", async () => {
     const runtime = new FakeSdkRuntime(), adapter = adapterFor(runtime);
     runtime.probeInitialization = { ...initialization(), models: [{ value: "claude-opus-5-5", displayName: "Native model", description: "Native description", supportsEffort: true, supportedEffortLevels: ["high"], supportsFastMode: false }, { value: "future-model", displayName: "Future", description: "Future description" }] };
@@ -713,7 +787,8 @@ describe("ClaudeCodeAdapter", () => {
       expect(parent.settingCalls).toEqual([]);
       expect(active.events).toContainEqual(expect.objectContaining({
         type: "subagent_run",
-        run: expect.objectContaining({ state: "completed", route: { providerId: "claude-code", modelId: "compatible-model" } })
+        run: expect.objectContaining({ state: "completed", route: { providerId: "claude-code", modelId: "compatible-model" },
+          usage: expect.objectContaining({ accountingIncludedInParent: false, inputTokens: expect.any(Number), outputTokens: expect.any(Number) }) })
       }));
       parent.push(resultMessage(binding.nativeSessionId!, { result: "Parent completed.", totalCostUsd: 0 }));
       await eventually(() => active.events.some((event) => event.type === "done"));
@@ -3768,7 +3843,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(terminalRun).toMatchObject({
       state: "completed",
       route: { providerId: "claude-code", modelId: "child-model" },
-      usage: { totalTokens: 40, toolUses: 2, durationMs: 500 },
+      usage: { totalTokens: 40, toolUses: 2, durationMs: 500, accountingIncludedInParent: true },
       returnedResult: "child answer [REDACTED]",
       capabilities: { stop: false, viewFullTranscript: true, parentContext: "live" }
     });

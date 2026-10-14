@@ -26,9 +26,10 @@ export function formatCompactUsageTokens(value: number): string {
   return `${(normalized / largest.divisor).toFixed(1)}${largest.suffix}`;
 }
 
-export function formatMessageTurnCost(cost: number, currency: string): string {
-  const normalized = Number.isFinite(cost) ? Math.max(0, cost) : 0;
-  const code = currency.trim().toUpperCase() || "USD";
+export function formatMessageTurnCost(cost: number, currency: string): string | undefined {
+  if (!Number.isFinite(cost) || cost < 0 || !/^[A-Z]{3}$/u.test(currency)) return undefined;
+  const normalized = cost;
+  const code = currency;
   const prefix = code === "USD" ? "$" : code === "CNY" ? "¥" : `${code} `;
   if (normalized > 0 && normalized < 0.01) return `<${prefix}0.01`;
   return `${prefix}${normalized.toFixed(2)}`;
@@ -45,11 +46,18 @@ export function messageUsagePresentation(
   const cacheWrite = usageToken(usage.cacheWriteTokens);
   const total = usageToken(usage.totalTokens);
   const cost = Number.isFinite(usage.cost) ? Math.max(0, usage.cost) : 0;
-  if (total === 0 && cost === 0) return undefined;
+  const hasKnownCost = Number.isFinite(usage.cost) && usage.cost >= 0
+    && /^[A-Z]{3}$/u.test(usage.currency) && (cost > 0 || usage.costComplete === true);
+  if (total === 0 && !hasKnownCost) return undefined;
 
-  const formattedCost = cost > 0 ? formatMessageTurnCost(cost, usage.currency) : undefined;
+  const amount = hasKnownCost ? formatMessageTurnCost(cost, usage.currency) : undefined;
+  const formattedCost = amount === undefined ? undefined
+    : `${usage.isEstimate ? "≈" : ""}${amount}${usage.costComplete === false ? "+" : ""}`;
   const tooltipLines: string[] = [];
   if (formattedCost !== undefined) tooltipLines.push(t("timeline.usageCostLine", { cost: formattedCost }));
+  if (usage.isEstimate === true) tooltipLines.push(t("timeline.usageEstimated"));
+  if (usage.costComplete === false) tooltipLines.push(t("timeline.usageCostIncomplete"));
+  if (usage.tokensComplete === false) tooltipLines.push(t("timeline.usageTokensIncomplete"));
   tooltipLines.push(t("timeline.usageTokenLine", {
     total: formatCompactUsageTokens(total),
     input: formatCompactUsageTokens(input),

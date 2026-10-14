@@ -57,6 +57,11 @@ message SubagentUsage {
   optional uint64 tool_uses = 6;
   google.protobuf.Duration duration = 7;
   optional double cost_usd = 8;
+  // Native accounting provenance; included task counters are not charged a second time.
+  optional bool accounting_included_in_parent = 9;
+  optional bool tokens_complete = 10;
+  optional bool cost_complete = 11;
+  optional bool cost_estimated = 12;
 }
 
 message SubagentRoute {

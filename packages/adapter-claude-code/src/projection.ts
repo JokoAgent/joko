@@ -49,9 +49,8 @@ export interface ProjectedUserContent {
 export interface ResultProjection {
   readonly outcome: "completed" | "aborted" | "failed";
   readonly error?: PublicError;
-  readonly usage: UsageSnapshot;
+  readonly usage?: UsageSnapshot;
   readonly messageUsage: UsageSnapshot;
-  readonly totalCostUsd: number;
   readonly durationMs?: number;
   readonly fallbackText?: string;
 }
@@ -151,17 +150,14 @@ export class SafeProjection {
     return { toolResults };
   }
 
-  result(message: unknown, previousTotalCostUsd: number, assistantError?: string): ResultProjection {
+  result(message: unknown, nativeUsage: UsageSnapshot | undefined, assistantError?: string): ResultProjection {
     const value = record(message) ?? {};
     const subtype = stringValue(value["subtype"]);
     const terminalReason = stringValue(value["terminal_reason"]);
     const isError = value["is_error"] === true;
-    const totalCostUsd = nonNegative(value["total_cost_usd"]);
-    const costDelta = totalCostUsd >= previousTotalCostUsd
-      ? totalCostUsd - previousTotalCostUsd
-      : totalCostUsd;
-    const messageUsage = usageFromNative(value["usage"], costDelta);
-    const usage = cumulativeUsage(value["modelUsage"], totalCostUsd, messageUsage);
+    // Main-loop generation counters remain distinct from inclusive Query accounting.
+    const messageUsage = usageFromNative(value["usage"], 0);
+    const usage = nativeUsage === undefined ? undefined : withNativeContextWindow(value["modelUsage"], nativeUsage);
     const duration = finite(value["duration_api_ms"]) ?? finite(value["duration_ms"]);
     const durationMs = duration === undefined ? undefined : Math.max(0, duration);
     const aborted = terminalReason === "aborted_streaming"
@@ -169,14 +165,13 @@ export class SafeProjection {
       || terminalReason === "hook_stopped";
     const failed = assistantError !== undefined || isError || subtype !== "success";
     const fallbackText = !failed && subtype === "success" ? this.text(value["result"]) : undefined;
-    if (aborted) return { outcome: "aborted", usage, messageUsage, totalCostUsd, durationMs };
-    if (!failed) return { outcome: "completed", usage, messageUsage, totalCostUsd, durationMs, fallbackText };
+    if (aborted) return { outcome: "aborted", usage, messageUsage, durationMs };
+    if (!failed) return { outcome: "completed", usage, messageUsage, durationMs, fallbackText };
     return {
       outcome: "failed",
       error: classifyFailure(subtype, terminalReason, assistantError),
       usage,
       messageUsage,
-      totalCostUsd,
       durationMs
     };
   }
@@ -336,34 +331,21 @@ export function integer(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) ? value : undefined;
 }
 
-function cumulativeUsage(value: unknown, cost: number, fallback: UsageSnapshot): UsageSnapshot {
+function withNativeContextWindow(value: unknown, observed: UsageSnapshot): UsageSnapshot {
   const models = record(value);
-  if (models === undefined) return { ...fallback, cost };
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheReadTokens = 0;
-  let cacheWriteTokens = 0;
+  if (models === undefined) return observed;
   let contextWindow: number | undefined;
   for (const rawUsage of Object.values(models)) {
     const usage = record(rawUsage);
     if (usage === undefined) continue;
-    inputTokens += nonNegative(usage["inputTokens"]);
-    outputTokens += nonNegative(usage["outputTokens"]);
-    cacheReadTokens += nonNegative(usage["cacheReadInputTokens"]);
-    cacheWriteTokens += nonNegative(usage["cacheCreationInputTokens"]);
     const nativeWindow = finite(usage["contextWindow"]);
     if (nativeWindow !== undefined && nativeWindow >= 0) {
       contextWindow = Math.max(contextWindow ?? 0, nativeWindow);
     }
   }
   return {
-    inputTokens,
-    outputTokens,
-    cacheReadTokens,
-    cacheWriteTokens,
-    totalTokens: inputTokens + outputTokens,
-    ...(contextWindow === undefined ? {} : { contextWindow }),
-    cost
+    ...observed,
+    ...(contextWindow === undefined ? {} : { contextWindow })
   };
 }
 

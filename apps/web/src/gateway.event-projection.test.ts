@@ -44,6 +44,7 @@ import {
   ReviewRunState,
   ReviewTargetKind,
   RunState,
+  RunUsageSummarySchema,
   RuntimeRecoveryState,
   RuntimeCommandSource,
   RuntimeCommandInputMode,
@@ -303,6 +304,143 @@ describe("browser takeover projection", () => {
 });
 
 describe("incremental event projection", () => {
+  it("joins whole-Run usage to the exact completion in either live order and after rebuilding", () => {
+    const completion = create(EventSchema, { eventId: "completed", identity: { sessionId: "task", sequence: 1n, runId: "run" },
+      cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "answer", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Done" } }],
+        usage: { totalTokens: 15n, outputTokens: 5n, currencyCode: "USD" }, generationDurationMs: 1_000n, generationReliable: true
+      } } } });
+    const summary = { usage: { inputTokens: 100n, outputTokens: 20n, totalTokens: 120n, currencyCode: "USD", costMicros: 20_000n },
+      completionEventId: "completed", messageId: "answer", estimated: false, costComplete: true };
+    const changed = create(EventSchema, { eventId: "run-summary", cursor: { generation: 1n, sequence: 2n },
+      payload: { kind: { case: "runChanged", value: { run: { runId: "run", sessionId: "task", state: RunState.SUCCEEDED,
+        version: { revision: { value: 3n } }, usage: summary } } } } });
+    for (const events of [[completion, changed], [changed, completion]]) {
+      let raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
+      let snapshot = mapSnapshot(raw);
+      for (const event of events) ({ rawSnapshot: raw, snapshot } = projectSnapshotEvent(raw, snapshot, event));
+      const item = snapshot.timelineBySession.get("task")?.[0];
+      expect(item).toMatchObject({ usage: { totalTokens: 15, outputTokens: 5, generationDurationMs: 1_000 },
+        turnUsage: { totalTokens: 120, outputTokens: 20, cost: 0.02, currency: "USD", isEstimate: false, costComplete: true } });
+      expect(item?.turnUsage).not.toHaveProperty("generationDurationMs");
+      expect(mapSnapshot(raw).timelineBySession.get("task")).toEqual(snapshot.timelineBySession.get("task"));
+      const stale = create(EventSchema, { payload: { kind: { case: "runChanged", value: { run: {
+        runId: "run", sessionId: "task", state: RunState.RUNNING, version: { revision: { value: 2n } },
+        usage: { ...summary, usage: { totalTokens: 1n, currencyCode: "USD" } }
+      } } } } });
+      ({ rawSnapshot: raw, snapshot } = projectSnapshotEvent(raw, snapshot, stale));
+      expect(raw.runs[0]?.state).toBe(RunState.SUCCEEDED);
+      expect(snapshot.timelineBySession.get("task")?.[0]?.turnUsage?.totalTokens).toBe(120);
+      ({ rawSnapshot: raw, snapshot } = projectSnapshotEvent(raw, snapshot, completion));
+      expect(snapshot.timelineBySession.get("task")).toHaveLength(1);
+      expect(snapshot.timelineBySession.get("task")?.[0]?.turnUsage?.totalTokens).toBe(120);
+    }
+    for (const owner of [{ runId: "other" }, { sessionId: "other" }, { completionEventId: "other" }, { messageId: "other" }]) {
+      const raw = create(SnapshotSchema, { timeline: [completion], runs: [{ runId: owner.runId ?? "run", sessionId: owner.sessionId ?? "task",
+        usage: { ...summary, completionEventId: owner.completionEventId ?? "completed", messageId: owner.messageId ?? "answer" } }] });
+      expect(mapSnapshot(raw).timelineBySession.get("task")?.[0]?.turnUsage).toBeUndefined();
+    }
+  });
+
+  it("retains exact tokens and price estimate metadata with unavailable or mixed currency while rejecting invalid Run summaries", () => {
+    const completion = create(EventSchema, { eventId: "completed", identity: { sessionId: "task", runId: "run" },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "answer", role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: "Done" } }], turnUsage: {
+          usage: { totalTokens: 120n }, completionEventId: "completed", messageId: "answer", estimated: true, costComplete: false
+        } } } } });
+    const raw = create(SnapshotSchema, { timeline: [completion] });
+    expect(mapSnapshot(raw).timelineBySession.get("task")?.[0]?.turnUsage).toMatchObject({
+      totalTokens: 120, cost: 0, currency: "", isEstimate: true, costComplete: false
+    });
+    if (completion.payload!.kind.case !== "messageCompleted") throw new Error("Wrong completion fixture");
+    const summary = completion.payload!.kind.value.turnUsage!;
+    for (const invalid of [
+      { completionEventId: "other" }, { messageId: "other" }, { messageId: "" },
+      { usage: { totalTokens: -1n } }, { usage: { totalTokens: BigInt(Number.MAX_SAFE_INTEGER) + 1n } },
+      { usage: { totalTokens: 120n, currencyCode: "US" } }, { usage: { totalTokens: 120n, costMicros: 1n } },
+      { usage: { totalTokens: 120n, currencyCode: "USD", costMicros: -1n } }, { costComplete: true }
+    ]) {
+      const badSummary = create(RunUsageSummarySchema, { usage: summary.usage,
+        completionEventId: summary.completionEventId, messageId: summary.messageId,
+        estimated: summary.estimated, costComplete: summary.costComplete, ...invalid });
+      const bad = create(EventSchema, { eventId: completion.eventId, identity: completion.identity, payload: { kind: { case: "messageCompleted", value: {
+        ...completion.payload!.kind.value, turnUsage: badSummary
+      } } } });
+      expect(() => mapSnapshot(create(SnapshotSchema, { timeline: [bad] }))).toThrow();
+    }
+  });
+
+  it("joins long native message identities through snapshots and live events within the current contract limit", () => {
+    const nativeMessageId = "native-".padEnd(300, "n");
+    const completionEventId = "completion-".padEnd(512, "e");
+    const completion = create(EventSchema, { eventId: completionEventId, identity: { sessionId: "task", runId: "run" },
+      payload: { kind: { case: "messageCompleted", value: { messageId: nativeMessageId, role: MessageRole.ASSISTANT,
+        nativeIdentity: { entryId: nativeMessageId }, blocks: [{ content: { case: "text", value: "Done" } }] } } } });
+    const run = { runId: "run", sessionId: "task", version: { revision: { value: 1n } }, usage: {
+      usage: { totalTokens: 120n }, completionEventId, messageId: nativeMessageId, estimated: false, costComplete: false
+    } };
+    const hydrated = create(SnapshotSchema, { timeline: [completion], runs: [run] });
+    expect(mapSnapshot(hydrated).timelineBySession.get("task")?.[0]).toMatchObject({
+      nativeEntryId: nativeMessageId, sourceEventId: completionEventId, turnUsage: { totalTokens: 120 }
+    });
+    const changed = create(EventSchema, { payload: { kind: { case: "runChanged", value: { run } } } });
+    for (const events of [[completion, changed], [changed, completion]]) {
+      let raw = create(SnapshotSchema);
+      let snapshot = mapSnapshot(raw);
+      for (const event of events) ({ rawSnapshot: raw, snapshot } = projectSnapshotEvent(raw, snapshot, event));
+      expect(snapshot.timelineBySession.get("task")).toEqual(mapSnapshot(hydrated).timelineBySession.get("task"));
+    }
+    for (const usage of [{ ...run.usage, messageId: "n".repeat(513) }, { ...run.usage, completionEventId: "e".repeat(513) }]) {
+      expect(() => mapSnapshot(create(SnapshotSchema, { timeline: [completion], runs: [{ ...run, usage }] }))).toThrow();
+      const invalid = create(EventSchema, { payload: { kind: { case: "runChanged", value: { run: { ...run, usage } } } } });
+      const raw = create(SnapshotSchema, { timeline: [completion] });
+      expect(() => projectSnapshotEvent(raw, mapSnapshot(raw), invalid)).toThrow();
+    }
+  });
+
+  it("adopts the later completion anchor within one transaction revision and retires prior turn accounting", () => {
+    const completion = (eventId: string, messageId: string): Event => create(EventSchema, {
+      eventId, identity: { sessionId: "task", runId: "run" }, payload: { kind: { case: "messageCompleted", value: {
+        messageId, role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: messageId } }]
+      } } }
+    });
+    const summary = { usage: { totalTokens: 120n }, estimated: false, costComplete: false,
+      completionEventId: "first-completion", messageId: "first-answer" };
+    let raw = create(SnapshotSchema, { timeline: [completion("first-completion", "first-answer")],
+      runs: [{ runId: "run", sessionId: "task", version: { revision: { value: 4n } }, usage: summary }] });
+    let snapshot = mapSnapshot(raw);
+    expect(snapshot.timelineBySession.get("task")?.[0]?.turnUsage?.totalTokens).toBe(120);
+    const changed = create(EventSchema, { eventId: "later-anchor", payload: { kind: { case: "runChanged", value: { run: {
+      runId: "run", sessionId: "task", version: { revision: { value: 4n } },
+      usage: { ...summary, completionEventId: "second-completion", messageId: "second-answer" }
+    } } } } });
+    ({ rawSnapshot: raw, snapshot } = projectSnapshotEvent(raw, snapshot, changed));
+    expect(snapshot.timelineBySession.get("task")?.[0]?.turnUsage).toBeUndefined();
+    ({ rawSnapshot: raw, snapshot } = projectSnapshotEvent(raw, snapshot, completion("second-completion", "second-answer")));
+    expect(snapshot.timelineBySession.get("task")?.map((item) => item.turnUsage?.totalTokens)).toEqual([undefined, 120]);
+    expect(mapSnapshot(raw).timelineBySession.get("task")).toEqual(snapshot.timelineBySession.get("task"));
+    const unanchored = create(EventSchema, { eventId: "unanchored", payload: { kind: { case: "runChanged", value: { run: {
+      runId: "run", sessionId: "task", version: { revision: { value: 5n } }, usage: {
+        usage: { totalTokens: 120n }, estimated: false, costComplete: false
+      }
+    } } } } });
+    ({ rawSnapshot: raw, snapshot } = projectSnapshotEvent(raw, snapshot, unanchored));
+    expect(snapshot.timelineBySession.get("task")?.map((item) => item.turnUsage)).toEqual([undefined, undefined]);
+  });
+
+  it("retains native model substitution and estimate semantics through completion and snapshot rebuilding", () => {
+    const event = create(EventSchema, { eventId: "facts", identity: { sessionId: "task", sequence: 1n, runId: "run" }, cursor: { generation: 1n, sequence: 1n },
+      payload: { kind: { case: "messageCompleted", value: { messageId: "answer", role: MessageRole.ASSISTANT,
+        blocks: [{ content: { case: "text", value: "Done" } }], usage: { totalTokens: 15n, costMicros: 20_000n, currencyCode: "USD" },
+        usageIsEstimate: true, modelSubstitution: { selectedModelId: "selected", actualModelId: "actual" } } } } });
+    const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
+    const projected = projectSnapshotEvent(raw, mapSnapshot(raw), event);
+    const expected = { text: "Done", modelSubstitution: { selectedModelId: "selected", actualModelId: "actual" }, usage: { cost: 0.02, isEstimate: true, totalTokens: 15 } };
+    expect(projected.snapshot.timelineBySession.get("task")?.[0]).toMatchObject(expected);
+    expect(mapSnapshot(projected.rawSnapshot).timelineBySession.get("task")?.[0]).toMatchObject(expected);
+    event.payload!.kind.case === "messageCompleted" && (event.payload!.kind.value.modelSubstitution = undefined);
+    expect(projectSnapshotEvent(raw, mapSnapshot(raw), event).snapshot.timelineBySession.get("task")?.[0]?.modelSubstitution).toBeUndefined();
+  });
   it("keeps the message's start position while preserving its completion global cursor and private origin", () => {
     const raw = create(SnapshotSchema, { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } });
     const start = create(EventSchema, { eventId: "start", cursor: { generation: 1n, sequence: 12n }, identity: { sessionId: "session", sequence: 2n, runId: "run" },

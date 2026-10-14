@@ -545,6 +545,13 @@ export interface BackendToolDescriptor {
 }
 
 export interface UsageSnapshot {
+  /** Native accounting-stream provenance for the Adapter/Host port, never a service Run total. */
+  readonly nativeAccounting?: {
+    readonly sourceId: string;
+    readonly tokensComplete: boolean;
+    readonly costComplete: boolean;
+    readonly costEstimated: boolean;
+  };
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly cacheReadTokens: number;
@@ -558,6 +565,23 @@ export interface UsageSnapshot {
     readonly fastMode?: boolean;
   };
   readonly cost: number;
+}
+
+/** Exact deltas from the durable usage ledger, attached only to one owned Run completion. */
+export interface RunUsageSummary {
+  readonly tokensComplete: boolean;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
+  readonly totalTokens: number;
+  readonly costMicros: number;
+  /** Absent when the Run contains incomparable currencies; money stays in the original ledger. */
+  readonly currencyCode?: string;
+  readonly estimated: boolean;
+  readonly costComplete: boolean;
+  readonly completionEventId?: string;
+  readonly messageId?: string;
 }
 
 export type BackendInstallationState =
@@ -880,6 +904,7 @@ export interface SessionAttention {
 }
 
 export interface RunDescriptor {
+  readonly usage?: RunUsageSummary;
   readonly id: RunId;
   readonly sessionId: SessionId;
   readonly source: "user" | "schedule" | "system";

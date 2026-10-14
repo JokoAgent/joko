@@ -219,6 +219,13 @@ export class ClaudeNativeTaskProjection {
     return notifications;
   }
 
+  observeIndependentUsage(rawTaskId: string, usage: SubagentUsage): readonly NativeTaskEmission[] {
+    const task = this.#tasks.get(rawTaskId);
+    if (task === undefined) return [];
+    task.usage = { ...usage, accountingIncludedInParent: false };
+    return this.#snapshot(task, []);
+  }
+
   confirmStopped(rawTaskId: string): readonly NativeTaskEmission[] {
     const task = this.#tasks.get(rawTaskId);
     if (task === undefined || !activeState(task.state)) return [];
@@ -847,6 +854,7 @@ function taskUsage(value: unknown): SubagentUsage | undefined {
   const durationMs = nonNegativeNumber(usage["duration_ms"]);
   if (totalTokens === undefined && toolUses === undefined && durationMs === undefined) return undefined;
   return {
+    accountingIncludedInParent: true,
     ...(totalTokens === undefined ? {} : { totalTokens }),
     ...(toolUses === undefined ? {} : { toolUses }),
     ...(durationMs === undefined ? {} : { durationMs })

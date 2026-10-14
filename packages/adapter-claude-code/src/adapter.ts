@@ -64,6 +64,8 @@ import {
   type UsageSnapshot
 } from "@joko/core";
 import { AsyncInputGate, deferred, type Deferred } from "./async-input-gate.js";
+import { NativeModelUsageObserver } from "./model-substitution.js";
+import { NativeQueryUsage } from "./native-query-usage.js";
 import { claudeCodeError } from "./errors.js";
 import type { ClaudeMcpBridgePort, ClaudeMcpCallResult, ClaudeMcpRuntimeLease, ClaudeMcpTool } from "./mcp-bridge.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
@@ -388,6 +390,7 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
 }
 
 interface ActiveTurn {
+  readonly selectedModelId?: string;
   readonly providerLease?: ManagedProviderOperationLease;
   readonly context: AdapterContext;
   readonly partnerLearningTurn?: PartnerLearningTurnHandle;
@@ -472,6 +475,7 @@ interface ManagedContinuationNotification {
 }
 
 interface ManagedChildTask {
+  readonly nativeUsage: NativeQueryUsage;
   readonly rawTaskId: string;
   readonly toolUseId: string;
   readonly parentRawTaskId?: string;
@@ -525,6 +529,8 @@ interface PendingPermission {
 }
 
 interface NativeRuntime {
+  readonly nativeUsage: NativeQueryUsage;
+  readonly modelUsageObserver: NativeModelUsageObserver;
   readonly mcpLease?: ClaudeMcpRuntimeLease;
   readonly managedRoute?: ManagedProviderRouteBinding;
   readonly managedEffortSnapshot?: ManagedQueryEffortSnapshot;
@@ -584,7 +590,6 @@ interface NativeRuntime {
   planMode: boolean;
   additionalDirectories: readonly ApprovedDirectory[];
   lastUsage?: UsageSnapshot;
-  lastTotalCostUsd: number;
 }
 
 type NativeEffort = typeof EFFORT_LEVELS[number];
@@ -1775,6 +1780,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     try { this.#requireIdleRuntime(context); prepared.assertCurrent(); }
     catch (error) { providerLease?.release(); preparation.abort(); throw error; }
     const turn: ActiveTurn = {
+      selectedModelId: context.modelSelection?.modelId ?? runtime.modelId,
       ...(providerLease === undefined ? {} : { providerLease }),
       context,
       ...(context.capturePartnerLearningTurn === undefined ? {} : {
@@ -3479,7 +3485,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         permissionMode: launch.permissionMode,
         planMode: false,
         additionalDirectories: launch.additionalDirectories,
-        lastTotalCostUsd: 0
+        nativeUsage: new NativeQueryUsage(!launch.resume),
+        modelUsageObserver: new NativeModelUsageObserver()
       };
       this.#sessions.set(context.sessionId, runtime);
     } finally {
@@ -3932,6 +3939,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (isChildFrame) {
       if (turn !== undefined && !turn.nativeIdentityConfirmed) throw continuityGap();
       if (turn !== undefined) turn.childOutputObserved = true;
+      if (type === "assistant" && turn !== undefined && this.#isTurnCurrent(runtime, turn)) runtime.nativeUsage.observeAssistant(envelope);
       if (!runtime.nativeTaskProjectionEnabled) return;
       const emissions = type === "assistant"
         ? runtime.nativeTasks.observeChildAssistant(envelope)
@@ -4023,6 +4031,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const uuid = stringValue(envelope["uuid"]);
     if (uuid !== undefined && turn.seenFrameUuids.has(uuid)) return;
     if (uuid !== undefined) addBoundedIdentity(turn.seenFrameUuids, uuid);
+    runtime.nativeUsage.observeAssistant(envelope);
+    runtime.modelUsageObserver.observeAssistant(envelope["message"]);
     if (uuid !== undefined) turn.partnerLearningTurn?.observeNativeReply(uuid);
     const error = stringValue(envelope["error"]);
     if (error !== undefined) turn.assistantError = error;
@@ -4128,7 +4138,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     await this.#projectPermissionDenials(runtime, turn, envelope["permission_denials"]);
     if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
-    const result = this.#projection.result(envelope, runtime.lastTotalCostUsd, turn.assistantError);
+    const result = this.#projection.result(envelope, runtime.nativeUsage.observeResult(envelope), turn.assistantError);
     const consumedIds = resultInputIdentities(envelope, turn);
     const interrupted = turn.interruptConfirmation?.settled() === true && result.outcome === "aborted";
     for (const [inputId, steer] of turn.steers) {
@@ -4144,22 +4154,27 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const appliedContextWindow = runtime.managedRoute === undefined
       ? undefined
       : managedModelLimit(runtime.managedRoute.model.contextWindow, "context window");
-    const usage = appliedContextWindow === undefined
+    const usage = appliedContextWindow === undefined || result.usage === undefined
       ? result.usage
       : { ...result.usage, contextWindow: appliedContextWindow };
-    runtime.lastTotalCostUsd = result.totalCostUsd;
     runtime.lastUsage = usage;
     const hasText = turn.blocks.some((block) => block.kind === "text");
     if (!hasText && result.fallbackText !== undefined && result.fallbackText.length > 0) {
       appendTurnBlocks(turn, [{ kind: "text", text: result.fallbackText }]);
     }
     const generation = this.#generationProjection(turn, result.messageUsage, result.durationMs);
+    const observedSubstitution = runtime.modelUsageObserver.observe(envelope["modelUsage"], turn.selectedModelId);
+    const modelSubstitution = observedSubstitution === undefined ? undefined : {
+      selectedModelId: this.#projection.text(observedSubstitution.selectedModelId),
+      actualModelId: this.#projection.text(observedSubstitution.actualModelId)
+    };
     if (turn.blocks.length > 0) {
       await this.#emit(runtime, turn, {
         type: "message_complete",
         role: "assistant",
         blocks: [...turn.blocks],
         usage: generation.usage,
+        ...(modelSubstitution === undefined ? {} : { modelSubstitution }),
         ...(generation.durationMs === undefined ? {} : {
           generationDurationMs: generation.durationMs,
           generationReliable: generation.reliable
@@ -4167,7 +4182,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       });
       if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     }
-    await this.#emit(runtime, turn, { type: "usage", usage });
+    if (usage !== undefined) await this.#emit(runtime, turn, { type: "usage", usage });
     if (!this.#isTurnCurrent(runtime, turn) || turn.terminalClaimed) return;
     if (result.error !== undefined) {
       if (result.error.code === "CLAUDE_CODE_AUTHENTICATION_FAILED") {
@@ -4607,6 +4622,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     let child!: ManagedChildTask;
     const result = Promise.resolve().then(() => this.#executeManagedChild(runtime, child, cwd));
     child = {
+      nativeUsage: new NativeQueryUsage(true),
       rawTaskId,
       toolUseId,
       ...(parentRawTaskId === undefined ? {} : { parentRawTaskId }),
@@ -4955,6 +4971,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         throw new Error("The delegated Query emitted work before initialization identity.");
       }
       if (type === "assistant") {
+        child.nativeUsage.observeAssistant(envelope);
         const forwarded = managedChildFrame(child, envelope);
         const projected = this.#projection.assistant(forwarded);
         for (const block of projected.blocks) {
@@ -4993,7 +5010,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       if (queuedCount !== undefined && (!Number.isSafeInteger(queuedCount) || queuedCount !== 0)) {
         throw new Error("The delegated Result retained unowned queued input.");
       }
-      const projected = this.#projection.result(envelope, 0, assistantError);
+      const projected = this.#projection.result(envelope, child.nativeUsage.observeResult(envelope), assistantError);
       const fallback = projected.fallbackText?.trim();
       const summary = fallback !== undefined && fallback.length > 0
         ? fallback
@@ -5037,6 +5054,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         uuid: randomUUID(),
         session_id: runtime.nativeSessionId
       }, child.turn.context));
+      if (usage !== undefined) await this.#publishNativeTaskEmissions(runtime, runtime.nativeTasks.observeIndependentUsage(child.rawTaskId, {
+        inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens,
+        cacheWriteTokens: usage.cacheWriteTokens, totalTokens: usage.totalTokens, costUsd: usage.cost,
+        ...(usage.nativeAccounting === undefined ? {} : {
+          tokensComplete: usage.nativeAccounting.tokensComplete, costComplete: usage.nativeAccounting.costComplete,
+          costEstimated: usage.nativeAccounting.costEstimated
+        }),
+        ...(durationMs === undefined ? {} : { durationMs })
+      }));
       if (child.background && child.identityConfirmed && status !== "stopped") {
         this.#queueManagedNotification(runtime, child.turn, child.rawTaskId, status, safeSummary);
       }

@@ -1583,6 +1583,9 @@ export interface TimelineItemView {
   readonly mentionRanges?: readonly TimelineInputMentionRangeView[];
   /** Authoritative accounting for this completed assistant segment. */
   readonly usage?: TimelineMessageUsageView;
+  /** Service-owned accounting for the whole Run, joined to its exact completion. */
+  readonly turnUsage?: TimelineMessageUsageView;
+  readonly modelSubstitution?: { readonly selectedModelId: string; readonly actualModelId: string };
   /** Durable host-authored identity for a scheduler-injected user prompt. */
   readonly automationOrigin?: TimelineAutomationOriginView;
   readonly partnerPrivateOrigin?: {
@@ -1645,6 +1648,9 @@ export interface TimelineInputMentionRangeView {
 }
 
 export interface TimelineMessageUsageView {
+  readonly tokensComplete?: boolean;
+  readonly isEstimate?: boolean;
+  readonly costComplete?: boolean;
   readonly inputTokens: number;
   readonly outputTokens: number;
   readonly cacheReadTokens: number;

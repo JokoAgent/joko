@@ -265,7 +265,7 @@ import type {
   ToolResultContentPart as CoreToolResultContentPart,
   UsageSnapshot
 } from "@joko/core";
-import { validInlineTextRanges, validInputMentionRanges } from "@joko/core";
+import { validInlineTextRanges, validInputMentionRanges, validModelSubstitution } from "@joko/core";
 import type { ExtraDirectoryRecord } from "./extra-directory-manager.js";
 import { TIMED_EXTENSION_INTERACTION_EXPIRED_REASON } from "./interaction-expiry.js";
 import {
@@ -1035,7 +1035,7 @@ export function toProtoRun(record: StoredRun, context: RunMappingContext): Proto
     state: toProtoRunState(run.state),
     attempts: attempts.map((attempt) => toProtoAttempt(attempt, record)),
     activeAttemptId: run.activeAttemptId ?? "",
-    usage: undefined,
+    usage: run.usage === undefined ? undefined : toProtoRunUsageSummary(run.usage),
     acceptedAt: toProtoTimestamp(run.createdAt),
     startedAt: optionalTimestamp(run.startedAt),
     endedAt: optionalTimestamp(run.endedAt),
@@ -1054,6 +1054,7 @@ export function fromProtoRun(run: ProtoRun): RunDescriptor {
     sessionId: requireText(run.sessionId, "run.session_id"),
     source: run.sourceQueueItemId === "" ? "system" : "user",
     state: fromProtoRunState(run.state),
+    ...(run.usage === undefined ? {} : { usage: fromProtoRunUsageSummary(run.usage) }),
     ...(run.retryOfRunId === "" ? {} : { parentRunId: run.retryOfRunId }),
     ...(run.activeAttemptId === "" ? {} : { activeAttemptId: run.activeAttemptId }),
     createdAt,
@@ -2930,7 +2931,7 @@ export function fromProtoEvent(event: ProtoEvent): AppendEventInput {
     ...(identity.operationId === "" ? {} : { operationId: identity.operationId }),
     generation: safeNumber(identity.generation, "event.identity.generation"),
     traceId: requireText(identity.trace?.traceId ?? "", "event.identity.trace.trace_id"),
-    payload: fromProtoEventPayload(event.payload, identity.sessionId, occurredAt),
+    payload: fromProtoEventPayload(event.payload, identity.sessionId, occurredAt, event.eventId, identity.runId),
     ...(event.pi === undefined ? {} : { pi: fromProtoPiMetadata(event.pi) })
   };
 }
@@ -2950,7 +2951,8 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
       if (context.run === undefined) throw missingPayload("event.context.run");
       if (context.target === undefined) throw missingPayload("event.context.target");
       return protoPayload("runChanged", message("joko.v1.RunChangedEvent", {
-        run: toProtoRun(context.run, {
+        run: toProtoRun({ ...context.run, revision: event.revision,
+          descriptor: { ...context.run.descriptor, state: payload.state, error: payload.error, usage: payload.usage } }, {
           backendId: event.backendId,
           targetId: event.targetId,
           attempts: context.attempts ?? []
@@ -2983,6 +2985,10 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         hidden: false
       }));
     case "message_complete":
+      if (payload.modelSubstitution !== undefined && (payload.role !== "assistant" || !validModelSubstitution(payload.modelSubstitution))
+        || payload.role !== "assistant" && (payload.usageIsEstimate !== undefined || payload.turnUsage !== undefined)) {
+        throw new ProtoMappingError("invalid_argument", "event.payload.message_completed", "Only assistant completions may carry valid model and accounting facts.");
+      }
       if (payload.taskMessageOrigin !== undefined && (payload.role !== "user" || payload.acceptedInput === undefined)) {
         throw new ProtoMappingError("invalid_argument", "event.payload.task_message_origin", "A sender requires canonical accepted user input.");
       }
@@ -3038,6 +3044,14 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         role: MessageRole.ASSISTANT,
         blocks: payload.blocks.map(toProtoMessageBlock),
         usage: payload.usage === undefined ? undefined : toProtoUsage(payload.usage),
+        modelSubstitution: payload.modelSubstitution === undefined ? undefined
+          : message<contract.ModelSubstitution>("joko.v1.ModelSubstitution", payload.modelSubstitution),
+        usageIsEstimate: payload.usageIsEstimate,
+        turnUsage: context.run !== undefined && context.run.descriptor.id === event.runId && context.run.descriptor.sessionId === event.sessionId
+          && context.run.descriptor.usage?.completionEventId === event.id
+          && context.run.descriptor.usage.messageId === (payload.nativeHistory?.identity?.entryId ?? event.id)
+          ? toProtoRunUsageSummary(context.run.descriptor.usage)
+          : payload.turnUsage === undefined ? undefined : toProtoMessageTurnUsage(payload.turnUsage, event),
         stopReason: "",
         nativeIdentity: toProtoNativeMessageIdentity(payload.nativeHistory?.identity),
         partnerPrivateOrigin: payload.partnerPrivateOrigin === undefined ? undefined
@@ -3414,7 +3428,9 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
 function fromProtoEventPayload(
   payload: ProtoEventPayload,
   sessionId: string,
-  occurredAt?: number
+  occurredAt: number | undefined,
+  eventId: string,
+  runId: string
 ): EventPayload {
   switch (payload.kind.case) {
     case "partnerLearningChanged":
@@ -3434,6 +3450,7 @@ function fromProtoEventPayload(
       return {
         type: "run_state",
         state: coreRunStateName(fromProtoRunState(run.state)),
+        ...(run.usage === undefined ? {} : { usage: fromProtoRunUsageSummary(run.usage) }),
         ...(run.error === undefined ? {} : { error: fromProtoErrorInfo(run.error) })
       };
     }
@@ -3567,6 +3584,20 @@ function fromProtoEventPayload(
     }
     case "messageCompleted": {
       const generationTiming = fromProtoMessageGenerationTiming(payload.kind.value);
+      const substitution = payload.kind.value.modelSubstitution;
+      if (substitution !== undefined && (payload.kind.value.role !== MessageRole.ASSISTANT
+        || !validModelSubstitution({ selectedModelId: substitution.selectedModelId, actualModelId: substitution.actualModelId }))) {
+        throw new ProtoMappingError("invalid_argument", "event.payload.message_completed.model_substitution", "Invalid assistant model substitution.");
+      }
+      if ((payload.kind.value.usageIsEstimate !== undefined || payload.kind.value.turnUsage !== undefined)
+        && payload.kind.value.role !== MessageRole.ASSISTANT) {
+        throw new ProtoMappingError("invalid_argument", "event.payload.message_completed", "Only assistant completions carry Run accounting facts.");
+      }
+      const turnUsage = payload.kind.value.turnUsage === undefined ? undefined : fromProtoRunUsageSummary(payload.kind.value.turnUsage);
+      if (turnUsage !== undefined && (turnUsage.completionEventId !== eventId
+        || turnUsage.messageId !== payload.kind.value.messageId || runId === "")) {
+        throw new ProtoMappingError("invalid_argument", "event.payload.message_completed.turn_usage", "Run usage must belong to this exact completion.");
+      }
       if (payload.kind.value.role === MessageRole.USER && Object.keys(generationTiming).length > 0) {
         throw new ProtoMappingError(
           "invalid_argument",
@@ -3578,6 +3609,11 @@ function fromProtoEventPayload(
         type: "message_complete",
         role: payload.kind.value.role === MessageRole.USER ? "user" : "assistant",
         blocks: payload.kind.value.blocks.map(fromProtoMessageBlock),
+        ...(substitution === undefined ? {} : { modelSubstitution: {
+          selectedModelId: substitution.selectedModelId, actualModelId: substitution.actualModelId
+        } }),
+        ...(payload.kind.value.usageIsEstimate === undefined ? {} : { usageIsEstimate: payload.kind.value.usageIsEstimate }),
+        ...(turnUsage === undefined ? {} : { turnUsage }),
         ...(payload.kind.value.partnerPrivateOrigin === undefined ? {} : {
           partnerPrivateOrigin: fromProtoPartnerPrivateOrigin(payload.kind.value.partnerPrivateOrigin)
         }),
@@ -6605,12 +6641,18 @@ function toProtoSubagentUsage(value: SubagentUsage): contract.SubagentUsage {
     totalTokens: value.totalTokens === undefined ? undefined : BigInt(value.totalTokens),
     toolUses: value.toolUses === undefined ? undefined : BigInt(value.toolUses),
     duration: value.durationMs === undefined ? undefined : toProtoDuration(value.durationMs),
+    accountingIncludedInParent: value.accountingIncludedInParent,
+    tokensComplete: value.tokensComplete, costComplete: value.costComplete, costEstimated: value.costEstimated,
     costUsd: value.costUsd
   });
 }
 
 function fromProtoSubagentUsage(value: contract.SubagentUsage): SubagentUsage {
   return {
+    ...(value.accountingIncludedInParent === undefined ? {} : { accountingIncludedInParent: value.accountingIncludedInParent }),
+    ...(value.tokensComplete === undefined ? {} : { tokensComplete: value.tokensComplete }),
+    ...(value.costComplete === undefined ? {} : { costComplete: value.costComplete }),
+    ...(value.costEstimated === undefined ? {} : { costEstimated: value.costEstimated }),
     ...(value.inputTokens === undefined ? {} : { inputTokens: safeNumber(value.inputTokens, "subagent_usage.input_tokens") }),
     ...(value.outputTokens === undefined ? {} : { outputTokens: safeNumber(value.outputTokens, "subagent_usage.output_tokens") }),
     ...(value.cacheReadTokens === undefined ? {} : { cacheReadTokens: safeNumber(value.cacheReadTokens, "subagent_usage.cache_read_tokens") }),
@@ -6746,6 +6788,44 @@ function finiteNonNegative(value: number, fieldPath: string): number {
     throw new ProtoMappingError("out_of_range", fieldPath, "Value must be finite and non-negative.");
   }
   return value;
+}
+
+function toProtoRunUsageSummary(value: NonNullable<RunDescriptor["usage"]>): contract.RunUsageSummary {
+  if ([value.tokensComplete, value.costComplete, value.estimated].some(flag => typeof flag !== "boolean")) {
+    throw new ProtoMappingError("invalid_argument", "run.usage", "Run usage requires explicit accounting completeness and estimate facts.");
+  }
+  const mapped = message<contract.RunUsageSummary>("joko.v1.RunUsageSummary", {
+    usage: message<Usage>("joko.v1.Usage", { inputTokens: unsignedBigInt(value.inputTokens, "run.usage.input_tokens"), outputTokens: unsignedBigInt(value.outputTokens, "run.usage.output_tokens"),
+      cacheReadTokens: unsignedBigInt(value.cacheReadTokens, "run.usage.cache_read_tokens"), cacheWriteTokens: unsignedBigInt(value.cacheWriteTokens, "run.usage.cache_write_tokens"), totalTokens: unsignedBigInt(value.totalTokens, "run.usage.total_tokens"),
+      costMicros: unsignedBigInt(value.costMicros, "run.usage.cost_micros"), currencyCode: value.currencyCode ?? "" }),
+    estimated: value.estimated, costComplete: value.costComplete, tokensComplete: value.tokensComplete,
+    completionEventId: value.completionEventId ?? "", messageId: value.messageId ?? ""
+  });
+  fromProtoRunUsageSummary(mapped);
+  return mapped;
+}
+
+function fromProtoRunUsageSummary(value: contract.RunUsageSummary): NonNullable<RunDescriptor["usage"]> {
+  if (!value.usage || typeof value.tokensComplete !== "boolean" || value.usage.currencyCode !== "" && !/^[A-Z]{3}$/u.test(value.usage.currencyCode)
+    || value.usage.currencyCode === "" && (value.usage.costMicros !== 0n || value.costComplete)
+    || (value.completionEventId === "") !== (value.messageId === "")
+    || value.completionEventId.length > 512 || value.messageId.length > 512) {
+    throw new ProtoMappingError("invalid_argument", "run.usage", "Invalid Run usage summary.");
+  }
+  const usage = value.usage;
+  return { inputTokens: safeNumber(usage.inputTokens, "run.usage.input_tokens"), outputTokens: safeNumber(usage.outputTokens, "run.usage.output_tokens"),
+    cacheReadTokens: safeNumber(usage.cacheReadTokens, "run.usage.cache_read_tokens"), cacheWriteTokens: safeNumber(usage.cacheWriteTokens, "run.usage.cache_write_tokens"),
+    totalTokens: safeNumber(usage.totalTokens, "run.usage.total_tokens"), costMicros: safeNumber(usage.costMicros, "run.usage.cost_micros"),
+    ...(usage.currencyCode === "" ? {} : { currencyCode: usage.currencyCode }), estimated: value.estimated, costComplete: value.costComplete, tokensComplete: value.tokensComplete,
+    ...(value.completionEventId ? { completionEventId: value.completionEventId, messageId: value.messageId } : {}) };
+}
+
+function toProtoMessageTurnUsage(value: NonNullable<RunDescriptor["usage"]>, event: PersistedEvent): contract.RunUsageSummary {
+  const messageId = event.payload.type === "message_complete" ? event.payload.nativeHistory?.identity?.entryId ?? event.id : undefined;
+  if (!event.runId || value.completionEventId !== event.id || value.messageId !== messageId) {
+    throw new ProtoMappingError("invalid_argument", "event.payload.message_completed.turn_usage", "Run usage must belong to this exact completion.");
+  }
+  return toProtoRunUsageSummary(value);
 }
 
 export function toProtoUsage(value: UsageSnapshot): Usage {

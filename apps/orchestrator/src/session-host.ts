@@ -13070,8 +13070,9 @@ export class SessionHost {
         ? {} : { capturePartnerLearningTurn: (input: { readonly nativeOccurrence: string; readonly nativeTurnId?: string }) =>
           this.capturePartnerLearningTurn(context, runId, attemptId, input) }),
       emit: (payload, metadata) => {
-        if (payload.type === "partner_learning_changed" || payload.type === "message_complete" && Object.hasOwn(payload, "learning")) {
-          return Promise.reject(new StoreError("Partner learning feedback is owned by the service, not Session adapters."));
+        if (payload.type === "partner_learning_changed" || payload.type === "run_state" && Object.hasOwn(payload, "usage") || payload.type === "message_complete"
+          && (Object.hasOwn(payload, "learning") || Object.hasOwn(payload, "usageIsEstimate") || Object.hasOwn(payload, "turnUsage"))) {
+          return Promise.reject(new StoreError("Message accounting and learning feedback are owned by the service, not Session adapters."));
         }
         const learningTurn = this.#partnerLearningEmissions.get(payload);
         if (this.#disposed || !this.backendInstanceGenerationOwnsContext(
@@ -13131,6 +13132,12 @@ export class SessionHost {
             if (session === undefined) return;
             const emittedAt = Date.now();
             const append = (store: OperationalStore): void => {
+              const usageItem = durablePayload.type === "message_complete" && durablePayload.usage !== undefined && runId !== undefined
+                ? listAllQueueItems(store, { sessionId }).find(candidate => candidate.runId === runId) : undefined;
+              const publishedPayload: EventPayload = durablePayload.type === "message_complete" && durablePayload.role === "assistant" && durablePayload.usage !== undefined
+                ? { ...durablePayload, usageIsEstimate: this.#usageMoneyKind(target.backendId,
+                  usageItem?.executionOverrides?.providerId ?? session.descriptor.providerId ?? "") !== "actual-cost" }
+                : durablePayload;
               const event = store.appendEvent({
               backendId: target.backendId,
               targetId: target.id,
@@ -13141,7 +13148,7 @@ export class SessionHost {
               generation,
               emittedAt,
               traceId: `adapter:${sessionId}:${randomUUID()}`,
-              payload: durablePayload,
+              payload: publishedPayload,
               ...(durableMetadata === undefined ? {} : {
                 metadata: { namespace: durableMetadata.namespace, fields: durableMetadata.fields },
                 ...(durableMetadata.pi === undefined ? {} : { pi: durableMetadata.pi })
@@ -13207,11 +13214,12 @@ export class SessionHost {
                   usageItem?.executionOverrides?.providerId,
                   usageItem?.executionOverrides?.modelId,
                   true,
-                  scheduleRunUsageTarget(store, [runId], "exact")
+                  scheduleRunUsageTarget(store, [runId], "exact"), runId
                 );
                 appendAndArmRecovery(store);
               });
-            } else if (durablePayload.type === "subagent_run" && durablePayload.run.usage !== undefined) {
+            } else if (durablePayload.type === "subagent_run" && durablePayload.run.usage !== undefined
+              && durablePayload.run.usage.accountingIncludedInParent !== true) {
               const childUsage = durablePayload.run.usage;
               this.#store.transaction((store) => {
                 this.recordUsageObservation(
@@ -13224,7 +13232,12 @@ export class SessionHost {
                   durablePayload.run.route?.providerId,
                   durablePayload.run.route?.modelId,
                   false,
-                  scheduleRunUsageTarget(store, [durablePayload.run.parentRunId, runId], "direct")
+                  scheduleRunUsageTarget(store, [durablePayload.run.parentRunId, runId], "direct"), durablePayload.run.parentRunId ?? runId,
+                  childUsage.inputTokens !== undefined && childUsage.outputTokens !== undefined
+                    && childUsage.cacheReadTokens !== undefined && childUsage.cacheWriteTokens !== undefined,
+                  { tokensComplete: childUsage.tokensComplete ?? (childUsage.inputTokens !== undefined && childUsage.outputTokens !== undefined
+                    && childUsage.cacheReadTokens !== undefined && childUsage.cacheWriteTokens !== undefined),
+                    costComplete: childUsage.costComplete, costEstimated: childUsage.costEstimated }
                 );
                 appendAndArmRecovery(store);
               });
@@ -13886,7 +13899,7 @@ export class SessionHost {
         observedProviderId,
         observedModelId,
         false,
-        scheduleRunUsageTarget(store, [scheduleRunId], "direct")
+        scheduleRunUsageTarget(store, [scheduleRunId], "direct"), scheduleRunId
       );
       if (sameUsageSnapshot(previous?.usage, usage)) return;
       store.setSetting(
@@ -13924,10 +13937,22 @@ export class SessionHost {
     observedProviderId?: string,
     observedModelId?: string,
     provesProviderAvailable = false,
-    scheduleUsage?: { readonly runId: string; readonly attribution: "exact" | "direct" }
+    scheduleUsage?: { readonly runId: string; readonly attribution: "exact" | "direct" },
+    runUsageId?: string,
+    referencePricingKnown = true,
+    childAccounting?: { readonly tokensComplete: boolean; readonly costComplete?: boolean; readonly costEstimated?: boolean }
   ): ReturnType<OperationalStore["recordUsageObservation"]> {
     const providerId = observedProviderId ?? session.descriptor.providerId ?? "";
     const modelId = observedModelId ?? session.descriptor.modelId ?? "";
+    const native = usage.nativeAccounting;
+    if (native !== undefined && (!/^[A-Za-z0-9._:-]{1,128}$/u.test(native.sourceId)
+      || [native.tokensComplete, native.costComplete, native.costEstimated].some(value => typeof value !== "boolean"))) {
+      throw new StoreError("The native usage accounting provenance is invalid.");
+    }
+    const accountingSourceId = native === undefined ? sourceId : `native-accounting:${native.sourceId}`;
+    const substitution = runUsageId === undefined ? undefined : store.findRunModelSubstitution(runUsageId);
+    const canPriceReference = referencePricingKnown && native?.costComplete !== false
+      && childAccounting?.costComplete !== false && !(substitution?.selectedModelId === modelId);
     const usageMoneyKind = this.#usageMoneyKind(session.descriptor.backendId, providerId);
     if (provesProviderAvailable) {
       clearProviderRateLimit(store, session.descriptor.backendId, providerId);
@@ -13939,10 +13964,10 @@ export class SessionHost {
     const priceOverride = providerId === "" || modelId === ""
       ? undefined
       : store.findModelPriceOverride(this.#usageOwnerId, session.descriptor.backendId, providerId, modelId);
-    const reportedCostMicros = usage.cost > 0
+    const reportedCostMicros = usage.cost > 0 || native !== undefined || childAccounting?.costComplete !== undefined
       ? Math.round(usage.cost * 1_000_000)
       : undefined;
-    const costRates = priceOverride === undefined
+    const costRates = !canPriceReference ? undefined : priceOverride === undefined
       ? model === undefined ? undefined : modelUsageCostRates(model, usage)
       : {
           inputMicrosPerMillion: priceOverride.inputCostMicrosPerMillion,
@@ -13957,25 +13982,35 @@ export class SessionHost {
     const currencyCode = reportedCostMicros === undefined
       ? priceOverride?.currencyCode ?? model?.pricing?.currencyCode ?? "USD"
       : "USD";
+    const runCurrencyCode = reportedCostMicros !== undefined ? "USD"
+      : costRates === undefined ? undefined : priceOverride?.currencyCode ?? model?.pricing?.currencyCode ?? "USD";
+    // Local callbacks are already serialized by this owner. Distinct observations can
+    // arrive in one clock tick; retain their order without weakening ledger conflicts.
+    const previousMeasuredAt = store.findUsageObservationMeasuredAt(this.#usageOwnerId, session.descriptor.id, accountingSourceId);
+    const orderedMeasuredAt = previousMeasuredAt === undefined ? measuredAt : Math.max(measuredAt, previousMeasuredAt + 1);
     const result = store.recordUsageObservation({
       ownerId: this.#usageOwnerId,
       sessionId: session.descriptor.id,
-      sourceId,
+      sourceId: accountingSourceId,
       generation,
       backendId: session.descriptor.backendId,
       providerId,
       modelId,
-      measuredAt,
+      measuredAt: orderedMeasuredAt,
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
       cacheReadTokens: usage.cacheReadTokens,
       cacheWriteTokens: usage.cacheWriteTokens,
       totalTokens: usage.totalTokens,
       ...(reportedCostMicros === undefined ? {} : { reportedCostMicros }),
-      ...(reportedCostMicros === undefined || usageMoneyKind === "actual-cost"
+      ...(reportedCostMicros === undefined || usageMoneyKind === "actual-cost" && native?.costEstimated !== true && childAccounting?.costEstimated !== true
         ? {}
         : { reportedCostEstimated: true }),
       ...(costRates === undefined ? {} : { costRates }),
+      ...(native === undefined && childAccounting?.costComplete === undefined ? {} : { observedCostComplete: native?.costComplete ?? childAccounting?.costComplete }),
+      ...(runUsageId === undefined ? {} : { runUsage: { runId: runUsageId,
+        tokensComplete: native?.tokensComplete ?? childAccounting?.tokensComplete ?? true,
+        ...(runCurrencyCode === undefined ? {} : { currencyCode: runCurrencyCode }) } }),
       currencyCode
     });
     if (scheduleUsage !== undefined && result.changed) {
@@ -16887,7 +16922,11 @@ function sameUsageSnapshot(left: UsageSnapshot | undefined, right: UsageSnapshot
     left.contextWindow === right.contextWindow &&
     left.pricingContext?.inputTokens === right.pricingContext?.inputTokens &&
     left.pricingContext?.fastMode === right.pricingContext?.fastMode &&
-    left.cost === right.cost;
+    left.cost === right.cost &&
+    left.nativeAccounting?.sourceId === right.nativeAccounting?.sourceId &&
+    left.nativeAccounting?.tokensComplete === right.nativeAccounting?.tokensComplete &&
+    left.nativeAccounting?.costComplete === right.nativeAccounting?.costComplete &&
+    left.nativeAccounting?.costEstimated === right.nativeAccounting?.costEstimated;
 }
 
 function scheduleRunUsageTarget(

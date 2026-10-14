@@ -18,8 +18,8 @@ import {
   SubmitOperationRequestSchema,
   nativeSessionTreeRoots
 } from "@joko/contracts";
-import { PI_LIKE_PROFILE } from "@joko/testkit";
-import type { AdapterContext, NativeHistoryEventContext, PromptInput } from "@joko/core";
+import { PI_LIKE_PROFILE, type FakeAdapterProfile } from "@joko/testkit";
+import type { AdapterContext, NativeHistoryEventContext, NativeSessionBinding, PromptInput, SubagentRunDetail, UsageSnapshot } from "@joko/core";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -195,6 +195,109 @@ describe("session host, durable events, and reconnect semantics", () => {
     });
     const malformedIterator = paired.clients.event.streamEvents({ scope: sessionScope, afterCursor: malformed })[Symbol.asyncIterator]();
     await expect(malformedIterator.next()).rejects.toBeInstanceOf(ConnectError);
+  });
+
+  it("keeps service-owned turn totals and the exact final model fact through child replay, history, and restart", async () => {
+    const profile: FakeAdapterProfile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.capabilities,
+      { key: "subagents.list", supported: true }, { key: "subagents.detail", supported: true }] };
+    const createAdapter = (value: FakeAdapterProfile) => new ControlledTurnUsageAdapter(value);
+    fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter });
+    const paired = await fixture.pair("Turn facts client");
+    const adapter = fixture.adapter() as ControlledTurnUsageAdapter;
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      createSessionMutation({ backendId: adapter.id, targetId: fixture.targetId(), providerId: "test", modelId: "text" })));
+    const scope = create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId, recentTimelineItems: 200 } } });
+    const before = (await paired.clients.event.getSnapshot({ scope })).snapshot!;
+    const operationId = randomUUID();
+    const input = sendInputMutation(sessionId, BigInt(fixture.application.store.getSession(sessionId).descriptor.binding.generation), "Observe turn facts");
+    const runId = queueRunIdFrom(await submit(paired.clients.operation, paired.connectionId, input, operationId));
+    const context = await waitFor(async () => adapter.contexts.get(sessionId), value => value !== undefined, "the controlled turn to dispatch");
+    if (!context) throw new Error("The controlled turn has no owned Adapter context.");
+    const parentUsage: UsageSnapshot = { inputTokens: 12, outputTokens: 8, cacheReadTokens: 0, cacheWriteTokens: 0,
+      totalTokens: 20, cost: 0.001 };
+    await adapter.observeUsage(parentUsage, context);
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Intermediate answer" }],
+      nativeHistory: { identity: { entryId: "turn-intermediate" } } });
+    const intermediate = (await paired.clients.run.getRun({ runId })).run!.usage!;
+    expect(intermediate).toMatchObject({ usage: { totalTokens: 20n, costMicros: 1000n }, messageId: "turn-intermediate" });
+
+    const startedAt = Date.now();
+    const child: SubagentRunDetail = { id: "independent-turn-child", sessionId, parentRunId: runId, logicalAgentId: "reader",
+      identityAliases: [], providerRunIds: ["native-child"], state: "running", startedAt, updatedAt: startedAt,
+      route: { providerId: "vision", modelId: "multimodal" },
+      capabilities: { viewActivity: true, viewReturnedResult: true, viewFullTranscript: false,
+        stop: false, steer: false, followUp: false, resume: false, parentContext: "snapshot" }, activity: [] };
+    for (const [index, usage] of [{ inputTokens: 10, outputTokens: 5, totalTokens: 15, costUsd: 0.002 },
+      { inputTokens: 10, outputTokens: 5, totalTokens: 15, costUsd: 0.002 },
+      { inputTokens: 20, outputTokens: 10, totalTokens: 30, costUsd: 0.005 }].entries()) {
+      await context.emit({ type: "subagent_run", run: { ...child, updatedAt: startedAt + index,
+        usage: { ...usage, cacheReadTokens: 0, cacheWriteTokens: 0, tokensComplete: true },
+        ...(index === 2 ? { state: "completed", endedAt: startedAt + index } : {}) } });
+    }
+    await context.emit({ type: "subagent_run", run: { ...child, id: "included-native-task", logicalAgentId: "native-reader",
+      providerRunIds: ["native-included-child"], state: "completed", endedAt: startedAt + 3, updatedAt: startedAt + 3,
+      usage: { accountingIncludedInParent: true, inputTokens: 50, outputTokens: 10, totalTokens: 60, costUsd: 0.004 } } });
+    await adapter.observeUsage(parentUsage, context);
+    const modelSubstitution = { selectedModelId: "text", actualModelId: "native-actual" };
+    await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Final answer" }],
+      nativeHistory: { identity: { entryId: "turn-final" } }, modelSubstitution,
+      usage: { inputTokens: 3, outputTokens: 2, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 5, cost: 0.0001 } });
+    await context.emit({ type: "done", outcome: "completed" });
+    const completed = await waitFor(() => paired.clients.run.getRun({ runId }), value => value.run?.state === RunState.SUCCEEDED,
+      "the controlled turn to complete");
+    const summary = completed.run!.usage!;
+    expect(summary).toMatchObject({ usage: { inputTokens: 32n, outputTokens: 18n, totalTokens: 50n,
+      costMicros: 6000n, currencyCode: "USD" }, estimated: false, costComplete: true, tokensComplete: true, messageId: "turn-final" });
+    expect(summary.completionEventId).not.toBe(intermediate.completionEventId);
+    expect(fixture.application.store.getRun(runId).descriptor.usage).toMatchObject({ totalTokens: 50, costMicros: 6000,
+      completionEventId: summary.completionEventId, messageId: "turn-final" });
+    expect(fixture.application.store.summarizeUsageLedger({ ownerId: "orchestrator" }))
+      .toMatchObject({ totalTokens: 50, costMicros: 6000 });
+
+    const streamAbort = new AbortController();
+    try {
+      let observedFinal = false;
+      for await (const response of paired.clients.event.streamEvents({ scope, afterCursor: before.resumeCursor }, { signal: streamAbort.signal })) {
+        const event = response.event;
+        if (!event) continue;
+        if (event.payload?.kind.case !== "runChanged" || event.payload.kind.value.run?.usage?.messageId !== "turn-final") continue;
+        expect(event.payload.kind.value.run.usage).toEqual(summary);
+        expect(fixture.application.store.findEvent(event.eventId)?.payload).toMatchObject({ type: "run_state",
+          usage: { completionEventId: summary.completionEventId, totalTokens: 50 } });
+        observedFinal = true;
+        break;
+      }
+      expect(observedFinal).toBe(true);
+    } finally { streamAbort.abort(); }
+    const history = await paired.clients.session.listSessionTimeline({ sessionId, limit: 200 });
+    const final = history.events.find(event => event.eventId === summary.completionEventId);
+    expect(final?.payload?.kind).toMatchObject({ case: "messageCompleted", value: { messageId: "turn-final",
+      usage: { totalTokens: 5n }, turnUsage: summary, modelSubstitution } });
+    const oldCompletion = history.events.find(event => event.eventId === intermediate.completionEventId)?.payload?.kind;
+    expect(oldCompletion?.case === "messageCompleted" ? oldCompletion.value.turnUsage : "missing").toBeUndefined();
+    const snapshot = (await paired.clients.event.getSnapshot({ scope })).snapshot!;
+    expect(snapshot.runs.find(run => run.runId === runId)?.usage).toEqual(summary);
+    expect(snapshot.timeline.find(event => event.eventId === summary.completionEventId)?.payload?.kind)
+      .toMatchObject({ value: { turnUsage: summary, modelSubstitution } });
+    expect(snapshot.sessions.find(session => session.sessionId === sessionId)?.model?.model?.modelId).toBe("text");
+    expect(queueRunIdFrom(await submit(paired.clients.operation, paired.connectionId, input, operationId))).toBe(runId);
+    expect(adapter.sendCalls).toHaveLength(1);
+
+    const rootDirectory = fixture.rootDirectory;
+    await fixture.close({ removeRoot: false });
+    fixture = await OrchestratorE2eFixture.start({ rootDirectory, profiles: [profile], createAdapter });
+    const reconnected = fixture.clients(paired.authKey);
+    expect((await reconnected.run.getRun({ runId })).run?.usage).toEqual(summary);
+    const restored = (await reconnected.event.getSnapshot({ scope })).snapshot!;
+    expect(restored.runs.find(run => run.runId === runId)?.usage).toEqual(summary);
+    expect(restored.timeline.find(event => event.eventId === summary.completionEventId)?.payload?.kind)
+      .toMatchObject({ value: { turnUsage: summary, modelSubstitution } });
+    expect((await reconnected.session.listSessionTimeline({ sessionId, limit: 200 })).events
+      .find(event => event.eventId === summary.completionEventId)?.payload?.kind).toMatchObject({ value: { turnUsage: summary, modelSubstitution } });
+    expect(queueRunIdFrom(await submit(reconnected.operation, paired.connectionId, input, operationId))).toBe(runId);
+    expect(fixture.application.store.listRuns({ sessionId })).toHaveLength(1);
+    expect(fixture.application.store.listQueueItems({ sessionId })).toHaveLength(1);
+    expect(fixture.adapter().sendCalls).toHaveLength(0);
   });
 
   it("replays an adopted native clone after restart and keeps both task bindings independently usable", async () => {
@@ -555,7 +658,7 @@ describe("session host, durable events, and reconnect semantics", () => {
     browser = await chromium.launch({
       executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true, ignoreDefaultArgs: ["--hide-scrollbars"]
     });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
     const pageErrors: string[] = [];
     page.on("pageerror", (error) => pageErrors.push(error.name));
     let failedEventStreams = 0;
@@ -653,7 +756,23 @@ describe("session host, durable events, and reconnect semantics", () => {
       await route.fulfill({ response });
     });
     const composer = page.locator(".composer-rich-editor__content[contenteditable=true]");
-    await composer.fill(MOUNTED_TIMELINE_LOCAL);
+    await composer.click();
+    await composer.pressSequentially(MOUNTED_TIMELINE_LOCAL);
+    expect(await composer.getAttribute("data-empty")).toBe("false");
+    await waitFor(() => page.getByRole("button", { name: "Send", exact: true }).isEnabled(), value => value,
+      "the mounted Composer to accept its keyboard input", 2_000).catch(async () => {
+      const diagnostics = await page.locator(".composer").evaluate(node => ({
+        busy: node.getAttribute("aria-busy"),
+        editors: [...node.querySelectorAll<HTMLElement>(".composer-rich-editor__content")].map(editor => ({
+          editable: editor.getAttribute("contenteditable"), empty: editor.dataset.empty, textLength: editor.textContent?.length,
+          disabled: editor.parentElement?.dataset.disabled
+        })),
+        controls: [...node.querySelectorAll<HTMLButtonElement>("button")].map(button => ({
+          label: button.getAttribute("aria-label"), title: button.title, disabled: button.disabled, text: button.textContent?.slice(0, 100)
+        }))
+      }));
+      throw new Error(`The mounted Composer cannot send: ${JSON.stringify({ heldBrowserRequest, diagnostics })}`);
+    });
     await page.getByRole("button", { name: "Send", exact: true }).click();
     await requestEntered.promise;
     await timeline.hover({ position: { x: 150, y: 200 } });
@@ -737,6 +856,27 @@ class MountedTimelineAdapter extends InstrumentedFakeAdapter {
       return;
     }
     await super.send(input, context);
+  }
+}
+
+class ControlledTurnUsageAdapter extends InstrumentedFakeAdapter {
+  readonly contexts = new Map<string, AdapterContext>();
+  readonly observedUsage = new Map<string, UsageSnapshot>();
+
+  override async inspectSession(binding: NativeSessionBinding, context: AdapterContext) {
+    const { usage: _initialUsage, ...state } = await super.inspectSession(binding, context);
+    const usage = this.observedUsage.get(context.sessionId);
+    return usage === undefined ? state : { ...state, usage };
+  }
+
+  override async send(input: PromptInput, context: AdapterContext): Promise<void> {
+    this.sendCalls.push(input);
+    this.contexts.set(context.sessionId, context);
+  }
+
+  async observeUsage(usage: UsageSnapshot, context: AdapterContext): Promise<void> {
+    this.observedUsage.set(context.sessionId, usage);
+    await context.emit({ type: "usage", usage });
   }
 }
 
