@@ -86,6 +86,7 @@ export * from "./scheduler.js";
 export * from "./schedule-coordinator.js";
 export * from "./server.js";
 export * from "./session-host.js";
+export * from "./task-sharing-home.js";
 export { PartnerManager } from "./partner-manager.js";
 export * from "./session-worktree-coordinator.js";
 export * from "./snapshot-projector.js";

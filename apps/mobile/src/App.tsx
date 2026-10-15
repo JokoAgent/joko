@@ -190,7 +190,7 @@ import { MobileActionSheet } from "./MobileActionSheet";
 import { MobileTaskDerivationSheet } from "./MobileTaskDerivationSheet";
 import { MobileMessageRewindSheet } from "./MobileMessageRewindSheet";
 import { MobileSessionDerivationMarker } from "./MobileSessionDerivationMarker";
-import { MobileTaskHeader } from "./MobileTaskHeader";
+import { MobileTaskHeader, type MobileTaskHeaderAction } from "./MobileTaskHeader";
 import { MobileTaskTagDots, MobileTaskTagsSheet, mobileTaskTagName } from "./MobileTaskTags";
 import { MobileComposerAtomSheet } from "./MobileComposerAtomSheet";
 import {
@@ -334,6 +334,9 @@ import { mobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
 import { MobileFilesClipboard, type MobileFilesClipboardLease, type MobileFilesClipboardResult } from "./mobile-files-clipboard";
 import type { MobileFilesPreferences } from "./mobile-files-presentation";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
+import { MobileTaskSharingScreen, mobileTaskSharingCopy, MobileSharedTaskEntries } from "./MobileTaskSharingScreen";
+import { parseTaskShareInvitation } from "@joko/contracts";
+import { QueueDeliveryMode } from "@joko/contracts";
 import { MobileRemoteDesktopScreen, type MobileRemoteDesktopLifecycleHandler } from "./MobileRemoteDesktopScreen";
 import { mobileRemoteDesktopCopy, mobileRemoteDesktopSessionDeviceId } from "./remote-desktop-presentation";
 import { MobileVoiceDictionaryReadOnlyController } from "./mobile-voice-dictionary-readonly-controller";
@@ -414,7 +417,7 @@ const mobileUpdateActions: MobileUpdateActions = {
   onOpenUpdate: (target) => mobileUpdates.openUpdate(target),
   onRecheckForced: () => mobileUpdates.recheckForced()
 };
-type Page = "home" | "connection" | "new" | "task" | "files" | "automations" | "extensions" | "partner-directory" | "partner-resources" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
+type Page = "home" | "connection" | "new" | "task" | "task-sharing" | "files" | "automations" | "extensions" | "partner-directory" | "partner-resources" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
 
 interface MobileRemoteDesktopEntry {
   readonly ownerKey: string;
@@ -586,6 +589,10 @@ export function App() {
     () => mobilePush.snapshot
   );
   const [page, setPage] = useState<Page>("home");
+  const [taskInvitation, setTaskInvitation] = useState<string>();
+  const [sharingSessionId, setSharingSessionId] = useState<string>();
+  const [sharingLeaveJoinId, setSharingLeaveJoinId] = useState<string>();
+  useEffect(() => { if (taskInvitation && state.status === "connected") setPage("task-sharing"); }, [taskInvitation, state.status]);
   const [filesInitialSource, setFilesInitialSource] = useState<MobileFilesComposerSource>();
   const [partnerReturnPage, setPartnerReturnPage] = useState<"home" | "task">("home");
   const [menuOpen, setMenuOpen] = useState(false);
@@ -640,6 +647,13 @@ export function App() {
   if (nativeIntentDeliveryRef.current === null) nativeIntentDeliveryRef.current = new MobileNativeIntentDelivery();
   if (externalIntentFenceRef.current === null) externalIntentFenceRef.current = new MobileExternalIntentFence();
   const offerNativeUrl = useCallback((url: string): boolean => {
+    try {
+      parseTaskShareInvitation(url);
+      externalNavigationRevisionRef.current++;
+      nativeIntentDeliveryRef.current!.invalidate();
+      if (nativeIntentConnectingRef.current) client.cancel();
+      setTaskInvitation(url); setPage("task-sharing"); return true;
+    } catch { /* Other native intents have their own parser. */ }
     if (isMobileIncomingShareUrl(url)) {
       externalNavigationRevisionRef.current++;
       externalIntentFenceRef.current!.offerShare();
@@ -960,6 +974,11 @@ export function App() {
                   setPage("task");
                 }} /> :
                 page === "task" ? <TaskScreen {...common}
+                  onTaskSharing={() => {
+                    setSharingSessionId(state.taskSource?.kind === "joined" ? undefined : state.selectedId);
+                    setSharingLeaveJoinId(state.taskSource?.kind === "joined" ? state.taskSource.joined.joinId : undefined);
+                    setPage("task-sharing");
+                  }}
                   homeNavigation={{ viewState: homeViewState, onViewStateChange: setHomeViewState, incomingShare,
                     menuButtonRef: homeMenuButtonRef, searchFocusRequest: homeSearchFocusRequest,
                     onSearchFocus: () => setHomeSearchFocusRequest((value) => value + 1),
@@ -1046,7 +1065,12 @@ export function App() {
                     if (!foreground || updates.prompt || updates.forced || page !== "partners") return;
                     void client.markPartnerPrivateVisible(partnerId, threadId, throughSequence);
                   }} /> :
+                page === "task-sharing" ? <MobileTaskSharingScreen {...common} client={client} foreground={foreground} storage={mobilePlainStorage}
+                  invitation={taskInvitation} onInvitationConsumed={() => setTaskInvitation(undefined)} initialSessionId={sharingSessionId}
+                  leaveJoinId={sharingLeaveJoinId} onLeavePromptConsumed={() => setSharingLeaveJoinId(undefined)}
+                  onBack={() => { setSharingSessionId(undefined); void client.select().then(() => setPage("settings")); }} onOpenTask={() => setPage("task")} /> :
                 page === "settings" ? <MobileSettingsScreen colors={colors} state={state} foreground={foreground}
+                  onTaskSharing={() => { setSharingSessionId(undefined); setPage("task-sharing"); }}
                   theme={theme} locale={locale} diagnostics={diagnostics} voiceDictionary={voiceDictionary}
                   readOnlyDictionary={readOnlyDictionary}
                   updates={updates} updateActions={mobileUpdateActions} push={push} client={client}
@@ -1414,6 +1438,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       </View>
       {!newTaskInSystemBar && <Action label={mobileMessage(locale, "common.new")} onPress={() => navigate({ kind: "new-task" })} colors={colors} compact disabled={state.status !== "connected"} />}
     </View>
+    <MobileSharedTaskEntries client={client} colors={colors} locale={locale} foreground={foreground} onOpen={onSelect} />
     {(incomingShare.batch || incomingShare.error) && <View style={[styles.card,
       { marginHorizontal: 16, marginBottom: 8, backgroundColor: colors.surface, borderColor: colors.border }]}>
       <Text accessibilityRole="alert" style={[styles.caption, { color: incomingShare.error ? colors.negative : colors.ink }]}>
@@ -3338,11 +3363,12 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
   </ScrollView>;
 }
 
-export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused,
+export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFiles, onOpenPartnerThread, onRemoteDesktop, focusComposer, onComposerFocused, onTaskSharing,
   messageFocus, onOpenDerivationOrigin, partnerSettingsEntry, onPartnerSettingsEntryConsumed, homeNavigation }: ScreenProps & {
   onBack: () => void; onHome: () => void; onNew: () => void; onFiles: (source?: MobileFilesComposerSource) => void;
   onOpenPartnerThread: (preview: NonNullable<TimelineRow["partnerPrivatePreview"]>) => void;
   onRemoteDesktop: (targetDeviceId: string) => void;
+  onTaskSharing?: () => void;
   focusComposer: boolean; onComposerFocused: () => void;
   messageFocus?: MobileNativeIntentMessageFocus;
   onOpenDerivationOrigin: (authorityKey: string, signal: AbortSignal) => Promise<boolean>;
@@ -3350,8 +3376,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   onPartnerSettingsEntryConsumed?: () => void;
   homeNavigation?: TaskHomeNavigationProps;
 }) {
-  const initialDraftIdentity = state.activeProfileId && state.selectedId
-    ? { profileId: state.activeProfileId, sessionId: state.selectedId }
+  const taskDraftProfileId = client.taskDraftProfileId();
+  const initialDraftIdentity = taskDraftProfileId && state.selectedId
+    ? { profileId: taskDraftProfileId!, sessionId: state.selectedId }
     : undefined;
   const initialComposerDraft = initialDraftIdentity ? mobileComposerDrafts.readSync(initialDraftIdentity) : null;
   const [draft, setDraft] = useState<MobileComposerDraft>(() => initialComposerDraft ?? emptyMobileComposerDraft());
@@ -3410,6 +3437,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [selectedInteractionId, setSelectedInteractionId] = useState<string | undefined>(initialInteractions[0]?.interactionId);
   const [interactionVisible, setInteractionVisible] = useState(initialInteractions.length > 0);
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
+  const [sharedBackendChoices, setSharedBackendChoices] = useState(false);
   const [partnerSettingsOwner, setPartnerSettingsOwner] = useState<string>();
   const [partnerLearningEntry, setPartnerLearningEntry] = useState<{ readonly owner: string;
     readonly destination: PartnerLearningSettingsDestination; readonly messageId: string; readonly completionEventId: string }>();
@@ -3452,7 +3480,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
   const interactionSurfaceOwnerRef = useRef<string | undefined>(
-    state.activeProfileId && state.selectedId ? `${state.activeProfileId}\u001f${state.selectedId}` : undefined
+    state.activeProfileId && state.selectedId ? `${taskDraftProfileId}\u001f${state.selectedId}` : undefined
   );
   const interactionDraftsRef = useRef<{ readonly ownerKey?: string; readonly values: ReadonlyMap<string, MobileInteractionDraftIdentity> }>({
     values: new Map()
@@ -3506,8 +3534,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const safeArea = useSafeAreaInsets();
   const { width, height } = useWindowDimensions();
   const adaptiveWindow = useMobileAdaptiveWindow();
-  const draftIdentity = state.activeProfileId && state.selectedId
-    ? { profileId: state.activeProfileId, sessionId: state.selectedId }
+  const draftIdentity = taskDraftProfileId && state.selectedId
+    ? { profileId: taskDraftProfileId!, sessionId: state.selectedId }
     : undefined;
   const draftIdentityKey = draftIdentity ? mobileComposerDraftIdentityKey(draftIdentity) : undefined;
   draftIdentityRef.current = draftIdentity;
@@ -3587,7 +3615,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   if (homeLayout.drawerWidth) drawerWidthRef.current = homeLayout.drawerWidth;
   const drawerMenuRef = useRef<View>(null);
   const session = state.detail?.sessions.find((item) => item.sessionId === state.selectedId)
-    || state.owner?.sessions.find((item) => item.sessionId === state.selectedId);
+    || (state.taskSource?.kind === "joined" ? undefined : state.owner?.sessions.find((item) => item.sessionId === state.selectedId));
   const headerSourceKey = client.taskHeaderSourceKey();
   const headerRole = useMobileTaskHeaderRole(client, headerSourceKey);
   const workerReadOnly = headerRole.role === "worker";
@@ -3596,7 +3624,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const remoteDesktopDeviceId = mobileRemoteDesktopSessionDeviceId(session,
     state.detail?.targets.length ? state.detail.targets : state.owner?.targets ?? [], remoteDesktopControllerDeviceId);
   const actualSessionStreaming = state.status === "connected" && session?.state === SessionState.RUNNING;
-  const blockOwnerKey = JSON.stringify([state.activeProfileId ?? "", state.selectedId ?? "", session?.backendId ?? "",
+  const blockOwnerKey = JSON.stringify([taskDraftProfileId ?? "", state.selectedId ?? "", session?.backendId ?? "",
     session?.targetId ?? "", session?.nativeBinding?.runtimeGeneration.toString() ?? ""]);
   const delegatedControls = state.status === "connected" ? client.taskDelegatedControls() : undefined;
   const taskTimelineEvents = useMemo(() => [
@@ -3861,7 +3889,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     setAttachmentBusy(false);
   }, []);
   const interactionOwnerKey = state.activeProfileId && state.selectedId
-    ? `${state.activeProfileId}\u001f${state.selectedId}`
+    ? `${taskDraftProfileId}\u001f${state.selectedId}`
     : undefined;
   const interactionIdsKey = JSON.stringify(interactions.map((interaction) => [
     interaction.interactionId,
@@ -4090,7 +4118,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     const next = new Map<string, MobileInteractionDraftIdentity>();
     if (state.activeProfileId) {
       for (const interaction of interactions) {
-        const identity = mobileInteractionDraftIdentity(state.activeProfileId, interaction);
+        const identity = mobileInteractionDraftIdentity(taskDraftProfileId!, interaction);
         if (identity) next.set(mobileInteractionDraftIdentityKey(identity), identity);
       }
     }
@@ -5126,7 +5154,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         || composerSelectionRef.current.start !== selection.start
         || composerSelectionRef.current.end !== selection.end
         || !composerPasteEditableRef.current || queueEditRef.current
-        || client.state.activeProfileId !== identity.profileId || client.state.selectedId !== identity.sessionId
+        || client.taskDraftProfileId() !== identity.profileId || client.state.selectedId !== identity.sessionId
         || client.state.owner !== ownerSnapshot
         || client.state.status === "unpaired" || client.state.status === "revoked"
         || AppState.currentState !== "active") {
@@ -5153,7 +5181,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           || composerSelectionRef.current.start !== selection.start
           || composerSelectionRef.current.end !== selection.end
           || !composerPasteEditableRef.current || queueEditRef.current
-          || client.state.activeProfileId !== identity.profileId || client.state.selectedId !== identity.sessionId
+          || client.taskDraftProfileId() !== identity.profileId || client.state.selectedId !== identity.sessionId
           || client.state.owner !== ownerSnapshot
           || client.taskWorkspacePathPasteControls()?.surfaceOwnerKey
             !== workspacePathControls.surfaceOwnerKey
@@ -5194,7 +5222,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             || composerSelectionRef.current.start !== result.selection.start
             || composerSelectionRef.current.end !== result.selection.end
             || !composerPasteEditableRef.current || queueEditRef.current
-            || client.state.activeProfileId !== identity.profileId
+            || client.taskDraftProfileId() !== identity.profileId
             || client.state.selectedId !== identity.sessionId
             || client.state.owner !== ownerSnapshot
             || client.state.status !== "connected" || AppState.currentState !== "active") return;
@@ -5220,7 +5248,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       || request.draft !== current || request.count > controls.policy.maximumItems - current.attachments.length
       || attachmentOwnerRef.current !== controls.surfaceOwnerKey || !composerPasteEditableRef.current
       || imagePasteLeaseRef.current !== undefined || attachmentNativeActivityRef.current || queueEditRef.current
-      || client.state.activeProfileId !== identity.profileId || client.state.selectedId !== identity.sessionId
+      || client.taskDraftProfileId() !== identity.profileId || client.state.selectedId !== identity.sessionId
       || client.state.status !== "connected" || client.state.busy || AppState.currentState !== "active") return false;
     const generation = ++attachmentGenerationRef.current;
     const controller = new AbortController();
@@ -5296,7 +5324,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             || attachmentAbortRef.current !== lease.controller || lease.controller.signal.aborted
             || !currentIdentity || mobileComposerDraftIdentityKey(currentIdentity) !== identityKey
             || composerDraftRef.current !== lease.draft || queueEditRef.current
-            || client.state.activeProfileId !== lease.identity.profileId
+            || client.taskDraftProfileId() !== lease.identity.profileId
             || client.state.selectedId !== lease.identity.sessionId || client.state.status !== "connected"
             || client.state.busy || AppState.currentState !== "active"
             || attachmentOwnerRef.current !== lease.controls.surfaceOwnerKey
@@ -5632,7 +5660,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       if (taskMountedRef.current) setLocalError(errorText(error));
     });
   }, [interactionIdsKey, state.activeProfileId, state.selectedId]);
-  const submitComposer = async (): Promise<void> => {
+  const submitComposer = async (deliveryMode = QueueDeliveryMode.PROMPT): Promise<void> => {
     if (voice.busy) return;
     setLocalError("");
     const active = queueEditRef.current;
@@ -5653,7 +5681,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const identity = draftIdentityRef.current;
         const sourceDraft = composerDraftRef.current;
         const intent = mobileAppCommandIntent(sourceDraft);
-        if (intent !== undefined) {
+        if (intent !== undefined && state.taskSource?.kind !== "joined") {
           const controls = client.taskAppCommandControls();
           const invocation = parseMobileAppCommand(sourceDraft, controls);
           if (!identity || !controls || !invocation) {
@@ -5700,10 +5728,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const operationId = randomUUID();
         const accepted = await client.send(sourceDraft, {
           operationId,
+          deliveryMode,
           onDispatch: (dispatchDraft) => {
             const current = client.state;
             if (!taskMountedRef.current || !identity || current.status !== "connected"
-              || current.activeProfileId !== identity.profileId || current.selectedId !== identity.sessionId
+              || client.taskDraftProfileId() !== identity.profileId || current.selectedId !== identity.sessionId
               || current.window !== undefined
               || current.pending.some((item) => item.kind === "send" && item.sessionId === identity.sessionId)) return;
             const currentSession = current.detail?.sessions.find((item) => item.sessionId === identity.sessionId)
@@ -5760,7 +5789,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         }
         return;
       }
-      if (!await client.saveQueueEdit(active.lease, draft.text)) return;
+      if (!await client.saveQueueEdit(active.lease, draft.text, deliveryMode === QueueDeliveryMode.STEER ? deliveryMode : undefined)) return;
       if (queueEditRef.current !== active) return;
       queueEditRef.current = undefined;
       setQueueEdit(undefined);
@@ -5791,7 +5820,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       if (!taskMountedRef.current || AppState.currentState !== "active") return undefined;
       const current = client.state;
       const selected = current.detail?.sessions.find((item) => item.sessionId === current.selectedId)
-        ?? current.owner?.sessions.find((item) => item.sessionId === current.selectedId);
+        ?? (current.taskSource?.kind === "joined" ? undefined : current.owner?.sessions.find((item) => item.sessionId === current.selectedId));
       return { sourceKey: mobileHomeSourceKey(current), sessionId: current.selectedId,
         runtimeKey: JSON.stringify([current.owner?.generation?.toString(), current.node?.apiVersion,
           selected?.backendId, selected?.targetId, selected?.nativeBinding?.runtimeGeneration?.toString(),
@@ -5820,6 +5849,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     execute: async (intent, sourceCurrent) => {
       if (!sourceCurrent()) return;
       setLocalError("");
+      if (client.state.taskSource?.kind === "joined" && ["new-task", "incoming-share", "home", "page"].includes(intent.kind)) {
+        await client.select();
+        if (!taskMountedRef.current || AppState.currentState !== "active") return;
+      }
       if (intent.kind === "session") {
         await client.select(intent.sessionId);
         if (!sourceCurrent() || client.state.selectedId !== intent.sessionId) return;
@@ -5851,7 +5884,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     onMenu={homeNavigation?.onMenu ?? onHome} menuButtonRef={homeNavigation?.menuButtonRef ?? fallbackHomeMenuRef}
     searchFocusRequest={homeNavigation?.searchFocusRequest ?? fallbackHomeSearchFocus}
     viewState={homeNavigation?.viewState ?? localHomeView} onViewStateChange={homeNavigation?.onViewStateChange ?? setLocalHomeView}
-    currentSessionId={state.selectedId} host={host} foreground={AppState.currentState === "active" && (host !== "drawer" || drawerOpen)}
+    currentSessionId={state.taskSource?.kind === "joined" ? undefined : state.selectedId} host={host} foreground={AppState.currentState === "active" && (host !== "drawer" || drawerOpen)}
     newTaskInSystemBar={newTaskInSystemBar}
     runNavigation={(intent) => { requestTaskHomeNavigation(intent, host === "drawer"); }} />;
   const renderTimelineImage = (item: TimelineRow, image: NonNullable<TimelineRow["images"]>[number], index: number): ReactNode => <MobileTimelineImage key={image.pageId} client={client} page={image}
@@ -5926,7 +5959,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const delegatedOnly = delegatedCards.length > 0 && item.tool === undefined;
         const linked = item.optimistic !== true && messageFocusHighlight === messageFocusKey && messageFocus !== undefined
           && mobileNativeIntentMessageMatches(messageFocus, item);
-        const markdownOwnerKey = `${state.activeProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
+        const markdownOwnerKey = `${taskDraftProfileId}/${state.selectedId}/${session?.nativeBinding?.runtimeGeneration}/${item.id}`;
         return <View accessibilityLiveRegion={linked ? "polite" : undefined}
           collapsable={false} ref={(view) => {
             if (view && mobileMessageShareable(item)) screenshotMessageViewsRef.current.set(item.id, view);
@@ -6087,7 +6120,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       menuHeader={usageProvider && <MobileAccountUsageSummary snapshot={taskAccountUsage.snapshots[mobileUsageProviderKey(usageProvider)]}
         modelId={session?.model?.model?.modelId} providerName={usageProvider.displayName} loading={taskAccountUsage.loading}
         failed={taskAccountUsage.failed} now={taskAccountUsage.now} colors={colors} locale={locale} />}
-      actions={[
+      actions={([
+        ...(onTaskSharing ? [{ id: "task-sharing" as const, label: state.taskSource?.kind === "joined" ? mobileTaskSharingCopy(locale).leave : mobileTaskSharingCopy(locale).title,
+          disabled: state.busy || attachmentBusy || voice.busy, onPress: onTaskSharing }] : []),
         { id: "search", label: mobileMessage(locale, "conversationSearch.title"), onPress: openConversationSearch,
           disabled: !partnerIdentity.ready || state.detail === undefined || state.busy || attachmentBusy || voice.busy },
         ...(state.owner?.taskTagCatalog?.taskTags ?? []).slice(0, 7).map((tag) => ({
@@ -6128,7 +6163,27 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         ...(client.canOpenFiles() ? [{ id: "files" as const, label: mobileMessage(locale, "task.files"),
           onPress: () => onFiles(), disabled: state.status !== "connected" || attachmentBusy }] : []),
         { id: "refresh", label: mobileMessage(locale, "common.refresh"), onPress: () => { headerRole.retry(); void client.refresh(); }, disabled: attachmentBusy }
-      ]} />
+      ] satisfies readonly MobileTaskHeaderAction[]).filter(action => state.taskSource?.kind !== "joined"
+        || ["task-sharing", "search", "context", "controls", "refresh"].includes(action.id))} />
+    {state.taskSource?.kind === "joined" && <View style={[styles.queue, { gap: 8 }]}>
+      <View style={styles.actionRow}>
+        <Action colors={colors} compact label={mobileTaskSharingCopy(locale).stop} disabled={state.busy || state.status !== "connected"}
+          onPress={() => void client.controlSharedTask("stop").catch(failure => setLocalError(errorText(failure)))} />
+        <Action colors={colors} compact label={mobileTaskSharingCopy(locale).resume} disabled={state.busy || state.status !== "connected"}
+          onPress={() => void client.controlSharedTask("resume").catch(failure => setLocalError(errorText(failure)))} />
+        <Action colors={colors} compact label={`${mobileTaskSharingCopy(locale).backend}: ${state.detail?.backends.find(item => item.backendId === session?.backendId)?.displayName ?? ""}`}
+          disabled={state.busy || state.status !== "connected"} onPress={() => setSharedBackendChoices(value => !value)} />
+        {runtimeControls?.canSetEffort && <Action colors={colors} compact
+          label={`${mobileTaskSharingCopy(locale).thinking}: ${session?.model?.effortId && session.model.effortId !== "off" ? mobileTaskSharingCopy(locale).enabled : mobileTaskSharingCopy(locale).disabled}`}
+          disabled={state.busy || state.status !== "connected"} onPress={() => void client.setSharedTaskRuntime({ effort: session?.model?.effortId && session.model.effortId !== "off" ? "off" : "xhigh" }).catch(failure => setLocalError(errorText(failure)))} />}
+      </View>
+      {sharedBackendChoices && <ScrollView style={{ maxHeight: 180 }}>
+        {(state.detail?.backends ?? []).map(backend => <Action key={backend.backendId} colors={colors} label={backend.displayName || backend.backendId}
+          disabled={state.busy || state.status !== "connected"} onPress={() => {
+            setSharedBackendChoices(false); void client.setSharedTaskRuntime({ backendId: backend.backendId }).catch(failure => setLocalError(errorText(failure)));
+          }} />)}
+      </ScrollView>}
+    </View>}
     <Text accessibilityLiveRegion="polite" style={[styles.caption, styles.queue, { color: colors.muted }]}>
       {mobileMessage(locale, state.liveStatus === "streaming" ? "task.live"
         : state.liveStatus === "verifying" ? "task.checkingLive"
@@ -6224,12 +6279,13 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         const editableText = queueItemText(item.input);
         return <View key={item.queueItemId} style={[styles.queueCard, { backgroundColor: colors.surface, borderColor: editing ? colors.accent : colors.border }]}>
           <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "task.queued")} {index + 1} · {queueState(item.state, locale)}{item.editLocked && !editing ? mobileMessage(locale, "task.editingElsewhere") : ""}</Text>
+          {item.sharedTaskAuthor?.displayName && <Text style={[styles.caption, { color: colors.muted }]}>{item.sharedTaskAuthor.displayName}</Text>}
           <Text selectable style={[styles.body, { color: colors.ink }]}>{queueItemSummary(item, locale)}</Text>
           <View style={styles.queueActions}>
-            {queueCapabilities.edit && <Action label={editing ? mobileMessage(locale, "composer.editing") : mobileMessage(locale, "common.edit")} colors={colors} compact
+            {queueCapabilities.edit && client.taskQueueItemOwned(item) && <Action label={editing ? mobileMessage(locale, "composer.editing") : mobileMessage(locale, "common.edit")} colors={colors} compact
               disabled={disabled || editing || item.editLocked || editableText === undefined}
               onPress={() => void beginQueueEdit(item)} />}
-            {queueCapabilities.cancel && <Action label={mobileMessage(locale, "common.remove")} colors={colors} compact
+            {queueCapabilities.cancel && client.taskQueueItemOwned(item) && <Action label={mobileMessage(locale, "common.remove")} colors={colors} compact
               disabled={disabled || editing}
               onPress={() => mutateQueue(() => client.cancelQueueItem(item.queueItemId))} />}
             {queueCapabilities.reorder && <Action label={mobileMessage(locale, "task.moveUp")} colors={colors} compact
@@ -6497,6 +6553,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             || (!queueEdit && unknown) || attachmentBusy || voice.busy || state.busy || composerOperationPending
             || state.status !== "connected"}
           onPress={() => void submitComposer()} />
+        {state.taskSource?.kind === "joined" && <Action label={mobileTaskSharingCopy(locale).steer} colors={colors} compact
+          disabled={!composerOwnerReady || !draft.text.trim() || unknown || attachmentBusy || state.busy || state.status !== "connected"}
+          onPress={() => void submitComposer(QueueDeliveryMode.STEER)} />}
       </View>
     </View>}
     </View>
@@ -6620,7 +6679,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       colors={colors} locale={locale} busy={state.busy || voice.busy || attachmentBusy || !composerOwnerReady || queueEdit !== undefined}
       onClose={() => setComposerAtomId(undefined)} onSavePaste={savePastedTextAtom} onRemove={removeComposerAtom} />
     <MobileInteractionSheet visible={!workerReadOnly && interactionVisible && interactions.length > 0} locale={locale}
-      profileId={state.activeProfileId} interactions={interactions} selectedId={activeInteractionId}
+      profileId={taskDraftProfileId} interactions={interactions} selectedId={activeInteractionId}
       busy={state.busy || interactionMutationPending} colors={colors}
       onSelect={setSelectedInteractionId} onMinimize={() => setInteractionVisible(false)}
       onResolve={async (interaction, submission) => {

@@ -17,6 +17,7 @@ export interface MobileConnectionIndex {
 export interface PendingOperation {
   readonly operationId: string;
   readonly connectionId: string;
+  readonly taskJoinId?: string;
   readonly kind: "create" | "send" | "logout" | "revoke" | "device-rename" | "rename" | "pin" | "archive" | "delete"
     | "message-delete" | "queue-cancel" | "queue-edit-lock" | "queue-edit"
     | "queue-interaction-lock" | "queue-reorder" | "interaction-resolve" | "interaction-dismiss"
@@ -415,6 +416,7 @@ function isPending(value: unknown): value is PendingOperation {
       "extension-setup-revoke"].includes(String(record.kind))
     || (record.state !== "unknown" && record.state !== "accepted")) return false;
   if (record.sessionId !== undefined && typeof record.sessionId !== "string") return false;
+  if (record.taskJoinId !== undefined && !validReceiptIdentity(record.taskJoinId)) return false;
   if (record.eventId !== undefined && typeof record.eventId !== "string") return false;
   if (record.backendId !== undefined && !validReceiptIdentity(record.backendId)) return false;
   if (record.sourceGeneration !== undefined && (typeof record.sourceGeneration !== "string" || record.sourceGeneration.length > 20

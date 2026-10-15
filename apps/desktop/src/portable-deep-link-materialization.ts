@@ -8,7 +8,7 @@ const MAXIMUM_PORTABLE_SESSION_FILE_BYTES = 256 * 1024 * 1024;
 export type DesktopFileSnapshotReader = (path: string, maximumBytes: number) => Promise<Uint8Array>;
 
 export async function materializeDesktopDeepLinkNavigation(
-  intent: Exclude<DesktopInboundOpenIntent, { readonly kind: "focus" }>,
+  intent: Exclude<DesktopInboundOpenIntent, { readonly kind: "focus" | "taskShareInvitation" }>,
   readFileSnapshot: DesktopFileSnapshotReader
 ): Promise<DesktopDeepLinkNavigation> {
   if (intent.kind === "session" || intent.kind === "settings") return intent;

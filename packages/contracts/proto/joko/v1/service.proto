@@ -126,6 +126,7 @@ service SessionService {
   rpc ListRuntimeCommands(ListRuntimeCommandsRequest) returns (ListRuntimeCommandsResponse);
   rpc ListSessionResources(ListSessionResourcesRequest) returns (ListSessionResourcesResponse);
   rpc ListBackgroundTasks(ListBackgroundTasksRequest) returns (ListBackgroundTasksResponse);
+  rpc GetBackgroundTaskOutput(GetBackgroundTaskOutputRequest) returns (GetBackgroundTaskOutputResponse);
   rpc ListSessionTimeline(ListSessionTimelineRequest) returns (ListSessionTimelineResponse);
   rpc SearchSessionMessages(SearchSessionMessagesRequest) returns (SearchSessionMessagesResponse);
   // Ephemeral one-shot prediction. It never appends to Backend/native history.

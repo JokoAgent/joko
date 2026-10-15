@@ -113,6 +113,7 @@ import {
   ProviderCatalogManager
 } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
+import { TaskSharingHome } from "./task-sharing-home.js";
 import { ApnsMobilePushProvider } from "./apns-mobile-push-provider.js";
 import {
   MobilePushCoordinator,
@@ -389,6 +390,7 @@ export function composeCodeHostProviders(
 }
 
 export interface OrchestratorApplication {
+  readonly taskSharingHome?: TaskSharingHome;
   readonly config: OrchestratorConfig;
   readonly store: OperationalStore;
   readonly connections: ConnectionManager;
@@ -760,6 +762,8 @@ export async function createOrchestratorApplication(
   const baseSettings = await loadJsonFile<PiManagedSettings>(config.piSettingsFile, {});
   const settings = effectivePiSettings(baseSettings, store.findSetting<unknown>("service", "orchestrator", "settings.pi.pi")?.value);
   const credentialVault = await CredentialVault.open(join(config.dataDirectory, "credentials", "master.key"));
+  const taskSharingHome = new TaskSharingHome({ directory: join(config.dataDirectory, "task-sharing-home"),
+    vault: credentialVault, serverId });
   let lastContactSyncDiagnosticAt = 0;
   const contactSync = new ContactSyncManager({
     store: contactStore,
@@ -2616,6 +2620,7 @@ export async function createOrchestratorApplication(
     });
     await partnerWorkbenches.initialize();
     await sessionHost.initialize();
+    await taskSharingHome.initialize();
     await personalDevelopmentCoordinator.initialize();
     personalDevelopmentDoctor.initialize();
     personalDevelopmentCoordinator.setDoctorReports(personalDevelopmentDoctor);
@@ -2878,6 +2883,7 @@ export async function createOrchestratorApplication(
     };
     closed = true;
     await attempt(closePersonalDevelopment);
+    await attempt(() => taskSharingHome.dispose());
     await attempt(() => partnerImports?.close());
     await attempt(() => partnerImportRuntime.close());
     await attempt(() => deferredBackendRestarts?.dispose());
@@ -2986,6 +2992,7 @@ export async function createOrchestratorApplication(
 
   return {
     config,
+    taskSharingHome,
     store,
     connections,
     serverId,
@@ -3121,6 +3128,7 @@ export async function createOrchestratorApplication(
         deferredBackendRestarts?.dispose();
         for (const cleanup of cleanups) await attempt(cleanup);
         await attempt(closePersonalDevelopment);
+        await attempt(() => taskSharingHome.dispose());
         await attempt(() => unregisterPersonalDevelopmentTools());
         await attempt(() => partnerImports?.close());
         await attempt(() => partnerSessionTasks?.close());

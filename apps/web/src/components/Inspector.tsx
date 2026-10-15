@@ -1130,6 +1130,8 @@ export function Inspector({ controller, snapshot, session, workspace, timeline, 
             onRefresh={() => setBackgroundHistoryRefresh((value) => value + 1)}
             canCancel={canCancelBackgroundTasks}
             onCancel={(backgroundTaskId) => controller.cancelBackgroundTask(session.id, backgroundTaskId)}
+            onReadOutput={(backgroundTaskId, signal) => controller.getBackgroundTaskOutput(session.id, backgroundTaskId, signal)}
+            outputOwner={JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, controller.state.connectionGeneration, session.id, String(session.generation)])}
             locale={controller.state.effectiveLocale}
             t={t}
           />}

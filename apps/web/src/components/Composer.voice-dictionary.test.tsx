@@ -68,6 +68,13 @@ afterEach(async () => {
 });
 
 describe("composer voice dictionary observation", () => {
+  it("keeps the microphone and recognized-text send available in an explicit guest task source", async () => {
+    const view = await mount("", vi.fn(async () => ({ actions: [] })), true);
+    expect(view.controller.getVoiceInputCapabilities).toHaveBeenCalled();
+    expect(view.host.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("voice kit");
+    await act(async () => { view.host.querySelector<HTMLButtonElement>(".send-button")!.click(); await Promise.all(view.actions); });
+    expect(view.controller.send).toHaveBeenCalledExactlyOnceWith(session.id, expect.objectContaining({ text: "voice kit" }), { expectedGeneration: session.generation });
+  });
   it("announces a local input mutation before its delayed save, without treating a render as an edit", async () => {
     const view = await mount("", vi.fn(async () => ({ actions: [] })));
     const before = view.mutations.mock.calls.length;
@@ -142,7 +149,7 @@ describe("composer voice dictionary observation", () => {
   });
 });
 
-async function mount(initialText: string, advice: AppController["adviseVoiceInputDictionaryEdit"]): Promise<{
+async function mount(initialText: string, advice: AppController["adviseVoiceInputDictionaryEdit"], guest = false): Promise<{
   host: HTMLElement;
   edit(text: string): Promise<void>;
   controller: AppController;
@@ -154,7 +161,8 @@ async function mount(initialText: string, advice: AppController["adviseVoiceInpu
   const controller = {
     state: { connectionState: "connected", snapshot: { ...snapshot, settings: { ...snapshot.settings, voiceInput: {
       ...snapshot.settings.voiceInput, refinementEnabled: true
-    } } }, preferences: DEFAULT_UI_PREFERENCES },
+    } } }, preferences: DEFAULT_UI_PREFERENCES, ...(guest ? { sessionAccess: { role: "guest", memberId: "member", editableQueueItemIds: new Set() },
+      taskSource: { kind: "joined", homeProfileId: "home", homeServerId: "home-server", homeOrigin: "https://home.example", joinId: "join", remoteServerId: "host", shareId: "share", memberId: "member", sessionId: session.id, generation: 1n, memberGeneration: 1n } } : {}) },
     readDraft: vi.fn(async () => ({ text: initialText })),
     readDraftSnapshot: vi.fn(async () => ({ revision: 1, draft: { text: initialText, attachments: [], mentions: [], deliveryMode: "prompt" as const } })),
     saveDraft: vi.fn(async () => undefined),

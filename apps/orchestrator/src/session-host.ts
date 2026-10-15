@@ -9,6 +9,7 @@ import type {
   ArtifactReferenceSnapshot,
   BackendAdapter,
   BackendDescriptor,
+  BackgroundTaskOutputResult,
   BlobRef,
   ContextRebuildInput,
   DurableNativeDispatchPreparation,
@@ -1847,6 +1848,7 @@ export class SessionHost {
     readonly expectedGeneration: number;
     readonly patch: SessionRuntimePatch;
     readonly source?: SessionRuntimeMutationSource;
+    readonly assertAuthority?: () => void;
   }): Promise<SessionRuntimeMutationResult> {
     this.#assertOpen();
     if (!Number.isSafeInteger(input.expectedGeneration) || input.expectedGeneration < 0) {
@@ -1859,6 +1861,7 @@ export class SessionHost {
       throw new SessionRuntimeControlError("INVALID_ARGS", "At least one runtime selection axis is required.");
     }
     return this.#withSessionRuntimeControlLock(input.sessionId, async () => {
+      input.assertAuthority?.();
       const stored = this.#store.getSession(input.sessionId);
       if (stored.descriptor.deletedAt !== undefined || stored.descriptor.archived) {
         throw new SessionRuntimeControlError("ROUTE_UNAVAILABLE", "Archived or deleted tasks cannot change runtime selection.");
@@ -1878,6 +1881,7 @@ export class SessionHost {
       }
       if (input.patch.backendId !== undefined && (input.patch.backendId !== stored.descriptor.backendId || handoff !== undefined)
         || handoff !== undefined) {
+        input.assertAuthority?.();
         return this.#stageSessionRuntimeHandoff(input, stored, snapshot);
       }
       if (handoff !== undefined) this.#runtimeHandoffs.cancel(input.sessionId, snapshot.generation + 1);
@@ -1933,6 +1937,7 @@ export class SessionHost {
       }
       const source = input.source ?? "agent";
       if (this.#sessionRuntimeMutationMustDefer(input.sessionId)) {
+        input.assertAuthority?.();
         if (routeExplicit) {
           this.#sessionRuntimeControl.acceptDeferred(input.sessionId, source, profile, snapshot.effective);
         } else {
@@ -1956,10 +1961,12 @@ export class SessionHost {
       this.#sessionRuntimeControlEffects.add(input.sessionId);
       try {
         const active = await this.activate(input.sessionId);
+        input.assertAuthority?.();
         if (!this.#sessionRuntimeControl.generationMatches(input.sessionId, input.expectedGeneration)) {
           throw new SessionRuntimeControlError("CONFLICT", "The task runtime selection changed while it was being applied.");
         }
-        await this.#applySessionRuntimeProfile(input.sessionId, active, profile);
+        await this.#applySessionRuntimeProfile(input.sessionId, active, profile, input.assertAuthority);
+        input.assertAuthority?.();
         if (routeExplicit) {
           this.#sessionRuntimeControl.acceptApplied(input.sessionId, source, profile, snapshot.effective);
         } else {
@@ -1989,6 +1996,63 @@ export class SessionHost {
     this.#clearSessionRuntimeRecovery(sessionId);
     this.#publishSessionRuntimeControlChanged(stored);
     return generation;
+  }
+
+  /** A service authority may select a model without claiming a node Connection.
+   * The original runtime lock owns native changes and the final durable commit;
+   * retirement closes the partial native route before the old baseline resumes. */
+  async applyAuthorizedSessionModel<T>(input: {
+    readonly sessionId: string;
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly effort?: string;
+    readonly fastMode: boolean;
+    readonly assertCurrent: () => void;
+    readonly commit: (store: OperationalStore) => T;
+  }): Promise<T> {
+    return this.#withSessionRuntimeControlLock(input.sessionId, async () => {
+      input.assertCurrent();
+      const stored = this.#store.getSession(input.sessionId);
+      if (stored.descriptor.deletedAt !== undefined || stored.descriptor.archived
+        || this.isReviewReadOnlySession(input.sessionId)) throw new StoreError("The task cannot change its runtime model.");
+      const baseline = sessionRuntimeBaseline(stored.descriptor);
+      if (!baseline) throw new StoreError("The task has no complete model baseline.");
+      const runtime = this.#sessionRuntimeControl.snapshot(input.sessionId, baseline);
+      const current = runtime.effective ?? baseline;
+      const backend = this.#store.getBackend(stored.descriptor.backendId).descriptor;
+      const axisOnly = stored.descriptor.providerId === input.providerId && stored.descriptor.modelId === input.modelId;
+      const axes: SessionRuntimeAxisPatch = {
+        ...(input.effort === undefined ? {} : { effort: input.effort }), fastMode: input.fastMode };
+      const profile = resolveSessionRuntimeProfile({ baseline, current,
+        patch: { ...(axisOnly ? {} : { providerId: input.providerId, modelId: input.modelId }),
+          ...(input.effort === undefined ? {} : { effort: input.effort }), fastMode: input.fastMode },
+        models: backend.models, fastModeSupported: backend.capabilities.get("model.fast_mode")?.supported === true });
+      if (!profile) throw new StoreError("The requested model selection is unavailable.");
+      const active = await this.activate(input.sessionId);
+      try {
+        input.assertCurrent();
+        if (axisOnly) await this.#applySessionRuntimeAxes(input.sessionId, active, current, profile, axes, input.assertCurrent);
+        else await this.#applySessionRuntimeProfile(input.sessionId, active, profile, input.assertCurrent);
+        const result = this.#store.transaction(store => {
+          input.assertCurrent();
+          store.updateSession(input.sessionId, { ...(axisOnly ? {} : { providerId: profile.providerId, modelId: profile.modelId }),
+            effort: profile.effort ?? null, fastMode: profile.fastMode });
+          return input.commit(store);
+        });
+        if (axisOnly) {
+          this.#sessionRuntimeControl.recordUserAxisSelection(input.sessionId, axes, runtime.pending === undefined ? undefined
+            : resolveCompatibleSessionRuntimeAxisPatch({ profile: runtime.pending.profile, patch: axes,
+                models: backend.models, fastModeSupported: backend.capabilities.get("model.fast_mode")?.supported === true }));
+          this.#clearSessionRuntimeRecovery(input.sessionId);
+          this.#publishSessionRuntimeControlChanged(this.#store.getSession(input.sessionId));
+        } else this.recordUserSessionRuntimeSelection(input.sessionId);
+        return result;
+      } catch (error) {
+        await active.adapter.closeSession(stored.descriptor.binding, this.contextFor(stored)).catch(() => undefined);
+        this.deleteActiveSession(input.sessionId, active);
+        throw error;
+      }
+    });
   }
 
   /** Apply owner-selected axes to the live temporary route and retain any accepted pending route. */
@@ -2599,6 +2663,13 @@ export class SessionHost {
     }
     this.scheduleBackendProviderAuthenticationRuntimeInvalidations(backendId, normalizedProviderId);
     this.wakeBackendQueues(backendId);
+  }
+
+  /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
+  canShareSession(sessionId: string): boolean {
+    this.#assertOpen();
+    const session = this.#store.getSession(sessionId).descriptor;
+    return !session.archived && session.deletedAt === undefined && !this.isReviewReadOnlySession(sessionId);
   }
 
   /** Called inside the caller's authorized Store transaction; no adapter effects run here. */
@@ -5249,7 +5320,8 @@ export class SessionHost {
   async #applySessionRuntimeProfile(
     sessionId: string,
     active: ActiveSession,
-    profile: SessionRuntimeProfile
+    profile: SessionRuntimeProfile,
+    assertAuthority: () => void = () => undefined
   ): Promise<void> {
     const durable = this.#store.getSession(sessionId);
     if (durable.descriptor.backendId !== profile.backendId) {
@@ -5271,27 +5343,33 @@ export class SessionHost {
     const stored = lease.stored;
     const context = lease.context;
     try {
+      assertAuthority();
       if (changes.fastMode && !profile.fastMode) {
         await active.adapter.setFastMode(false, context);
+        assertAuthority();
         this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.model) {
         await active.adapter.setModel(profile.providerId, profile.modelId, context);
+        assertAuthority();
         this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.effort && profile.effort !== undefined) {
         await active.adapter.setEffort(profile.effort, context);
+        assertAuthority();
         this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.fastMode && profile.fastMode) {
         await active.adapter.setFastMode(true, context);
+        assertAuthority();
         this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
         this.assertActiveBackendSideEffectLease(lease);
       }
       const observed = await this.refreshNativeStateObservation(sessionId, active);
+      assertAuthority();
       this.assertProviderAuthenticationAvailable(backend.id, profile.providerId);
       this.assertActiveBackendSideEffectLease(lease);
       if (
@@ -5327,7 +5405,8 @@ export class SessionHost {
     active: ActiveSession,
     current: SessionRuntimeProfile,
     profile: SessionRuntimeProfile,
-    patch: SessionRuntimeAxisPatch
+    patch: SessionRuntimeAxisPatch,
+    assertAuthority: () => void = () => undefined
   ): Promise<NativeSessionState> {
     const durable = this.#store.getSession(sessionId);
     // Activation is an async boundary. A Provider logout can install its fence
@@ -5343,22 +5422,27 @@ export class SessionHost {
     const stored = lease.stored;
     const context = lease.context;
     try {
+      assertAuthority();
       if (changes.fastMode && !profile.fastMode) {
         await active.adapter.setFastMode(false, context);
+        assertAuthority();
         this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.effort && patch.effort !== undefined && profile.effort !== undefined) {
         await active.adapter.setEffort(profile.effort, context);
+        assertAuthority();
         this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
         this.assertActiveBackendSideEffectLease(lease);
       }
       if (changes.fastMode && profile.fastMode) {
         await active.adapter.setFastMode(true, context);
+        assertAuthority();
         this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
         this.assertActiveBackendSideEffectLease(lease);
       }
       const observed = await this.refreshNativeStateObservation(sessionId, active);
+      assertAuthority();
       this.assertSessionProviderAuthenticationAvailable(this.#store.getSession(sessionId));
       this.assertActiveBackendSideEffectLease(lease);
       if (
@@ -8862,6 +8946,25 @@ export class SessionHost {
       sideEffectLease?.release();
       releaseBackendAdmission?.();
     }
+  }
+
+  async getBackgroundTaskOutput(sessionId: string, taskId: string, maximumBytes = 16_384): Promise<BackgroundTaskOutputResult> {
+    this.#assertOpen();
+    const absent = (status: "unavailable" | "failed" = "unavailable"): BackgroundTaskOutputResult => ({ status, text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now() });
+    if (!taskId || !Number.isSafeInteger(maximumBytes) || maximumBytes < 1 || maximumBytes > 256 * 1024) return absent();
+    const stored = this.#store.getSession(sessionId), active = this.#active.get(sessionId);
+    if (!active || !active.adapter.getBackgroundTaskOutput || stored.descriptor.archived || stored.descriptor.deletedAt !== undefined) return absent();
+    const observed = this.#store.listActiveSessionBackgroundTaskEvents(sessionId).find(event => event.payload.type === "background_task" && event.payload.taskId === taskId);
+    if (!observed || observed.generation !== stored.descriptor.binding.generation) return absent();
+    const lease = this.beginActiveBackendSideEffect(sessionId, active);
+    try {
+      let output: BackgroundTaskOutputResult;
+      try { output = await active.adapter.getBackgroundTaskOutput(lease.context, taskId, maximumBytes); }
+      catch { output = absent("failed"); }
+      this.assertActiveBackendSideEffectLease(lease);
+      return this.#store.listActiveSessionBackgroundTaskEvents(sessionId).some(event => event.payload.type === "background_task"
+        && event.payload.taskId === taskId && event.generation === lease.productGeneration) ? output : absent();
+    } finally { lease.release(); }
   }
 
   private trackBackgroundTask(
@@ -14458,15 +14561,20 @@ export class SessionHost {
         const recovered = baseline === undefined
           ? undefined
           : nativeDispatchRecoveryIsCompleted(store, current.descriptor, baseline, history);
+        const acceptedOwners = journal?.entries.flatMap((entry) => {
+          const ownership = nativeDispatchHistoryOwnership(store, current.descriptor, entry, history, "accepted");
+          return ownership === undefined ? [] : [ownership];
+        }) ?? [];
+        const historyOwner = recovered ?? (acceptedOwners.length === 1 ? acceptedOwners[0] : undefined);
         this.appendNativeHistory(
           store,
           current.descriptor,
           active.adapter,
           history,
-          recovered?.baseline.operationId,
-          recovered === undefined ? undefined : {
-            runId: recovered.baseline.runId,
-            nativeEntryIds: recovered.nativeEntryIds
+          historyOwner?.baseline.operationId,
+          historyOwner === undefined ? undefined : {
+            runId: historyOwner.baseline.runId,
+            nativeEntryIds: historyOwner.nativeEntryIds
           }
         );
         if (recovered === undefined) return undefined;
@@ -14621,6 +14729,22 @@ export class SessionHost {
         const eventBindingFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
         if (entryId !== undefined && eventBindingFingerprint === bindingFingerprint) {
           acceptedUserMetadata.set(entryId, metadata);
+          if (event.payload.acceptedInput !== undefined && event.runId !== undefined
+            && event.operationId !== undefined && event.attemptId !== undefined) {
+            const queue = store.findQueueItemByRunId(session.id, event.runId);
+            const attempt = store.getAttempt(event.attemptId).descriptor;
+            if (queue !== undefined && queue.operationId === event.operationId && queue.attemptId === event.attemptId
+              && attempt.runId === event.runId && attempt.generation === event.generation
+              && queue.backendInstanceGeneration !== undefined
+              && attempt.backendInstanceGeneration === queue.backendInstanceGeneration
+              && operationBodyHash(queue.body) === operationBodyHash(event.payload.acceptedInput)) {
+              const previous = acceptedQueueInputs.get(entryId);
+              if (previous !== undefined && previous.id !== queue.id) {
+                throw new StoreError("Native input identity belongs to multiple durable Queue items.");
+              }
+              acceptedQueueInputs.set(entryId, queue);
+            }
+          }
         }
       }
     });
@@ -16387,9 +16511,21 @@ function nativeDispatchRecoveryIsCompleted(
   baseline: NativeDispatchRecoveryBaseline,
   history: NativeHistoryProjection
 ): NativeDispatchRecoveryCompletion | undefined {
+  return nativeDispatchHistoryOwnership(store, session, baseline, history, "recovery");
+}
+
+function nativeDispatchHistoryOwnership(
+  store: OperationalStore,
+  session: SessionDescriptor,
+  baseline: NativeDispatchRecoveryBaseline,
+  history: NativeHistoryProjection,
+  mode: "recovery" | "accepted"
+): NativeDispatchRecoveryCompletion | undefined {
   const lineage = history.activeLineage;
   if (
-    session.binding.generation <= baseline.generation ||
+    (mode === "recovery" ? session.binding.generation <= baseline.generation
+      : session.binding.generation !== baseline.generation || baseline.phase !== "accepted"
+        || store.getBackend(session.backendId).descriptor.instanceGeneration !== baseline.backendInstanceGeneration) ||
     nativeBindingFingerprint(session.binding.opaqueRef) !== baseline.bindingFingerprint ||
     lineage === undefined || lineage.length <= baseline.lineageCount ||
     nativeLineageDigest(lineage.slice(0, baseline.lineageCount)) !== baseline.lineageDigest ||
@@ -16399,12 +16535,14 @@ function nativeDispatchRecoveryIsCompleted(
   const prefixLastEntryId = baseline.lineageCount === 0 ? undefined : lineage[baseline.lineageCount - 1]?.entryId;
   if (prefixLastEntryId !== baseline.activeEntryId || history.activeEntryId !== lineage.at(-1)?.entryId) return undefined;
 
-  const unknownQueueItems = listAllQueueItems(store, { sessionId: session.id, states: ["dispatch_unknown"] });
-  const unknownRuns = listAllRuns(store, { sessionId: session.id, activeOnly: true })
-    .filter((candidate) => candidate.descriptor.state === "dispatch_unknown");
-  if (unknownQueueItems.length !== 1 || unknownRuns.length !== 1) return undefined;
-  const item = unknownQueueItems[0]!;
-  const run = unknownRuns[0]!;
+  const queueItems = listAllQueueItems(store, { sessionId: session.id,
+    states: [mode === "recovery" ? "dispatch_unknown" : "backend_accepted"] });
+  const runs = listAllRuns(store, { sessionId: session.id, activeOnly: true })
+    .filter((candidate) => mode === "recovery" ? candidate.descriptor.state === "dispatch_unknown"
+      : candidate.descriptor.state !== "queued" && candidate.descriptor.state !== "dispatch_unknown");
+  if (queueItems.length !== 1 || runs.length !== 1) return undefined;
+  const item = queueItems[0]!;
+  const run = runs[0]!;
   if (
     item.id !== baseline.queueItemId || item.runId !== baseline.runId ||
     item.operationId !== baseline.operationId || item.attemptId !== baseline.attemptId ||
@@ -16414,7 +16552,9 @@ function nativeDispatchRecoveryIsCompleted(
   ) return undefined;
   const attempt = store.listAttempts(run.descriptor.id)
     .find((candidate) => candidate.descriptor.id === baseline.attemptId);
-  if (attempt?.descriptor.generation !== baseline.generation || attempt.descriptor.endedAt === undefined) return undefined;
+  if (attempt?.descriptor.generation !== baseline.generation
+    || attempt.descriptor.backendInstanceGeneration !== baseline.backendInstanceGeneration
+    || (mode === "recovery" ? attempt.descriptor.endedAt === undefined : attempt.descriptor.endedAt !== undefined)) return undefined;
 
   const suffixLineage = lineage.slice(baseline.lineageCount);
   if (suffixLineage.length < 2) return undefined;

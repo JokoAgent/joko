@@ -337,6 +337,7 @@ export class ProtoMappingError extends Error {
 }
 
 export interface EventMappingContext {
+  readonly sharedTaskAuthor?: import("@joko/store").SharedTaskAuthor;
   readonly learning?: import("@joko/core").PartnerLearningFeedback;
   readonly queueItem?: QueueItemRecord;
   readonly queueControl?: QueueControlRecord;
@@ -1068,6 +1069,12 @@ export function fromProtoRun(run: ProtoRun): RunDescriptor {
   };
 }
 
+export function toProtoSharedTaskAuthor(author: import("@joko/store").SharedTaskAuthor): contract.SharedTaskAuthor {
+  return message<contract.SharedTaskAuthor>("joko.v1.SharedTaskAuthor", { shareId: author.shareId,
+    sessionId: author.sessionId, shareGeneration: BigInt(author.shareGeneration), memberId: author.memberId,
+    memberGeneration: BigInt(author.memberGeneration), displayName: author.displayName });
+}
+
 export function toProtoQueueItem(
   item: QueueItemRecord,
   routing: {
@@ -1076,6 +1083,7 @@ export function toProtoQueueItem(
     readonly source: RunDescriptor["source"];
     readonly parentRunId?: string;
     readonly generation: number;
+    readonly sharedTaskAuthor?: import("@joko/store").SharedTaskAuthor;
   },
   ordinal = 0n
 ): ProtoQueueItem {
@@ -1102,7 +1110,8 @@ export function toProtoQueueItem(
     backendInstanceGeneration: item.backendInstanceGeneration === undefined
       ? undefined
       : unsignedBigInt(item.backendInstanceGeneration, "queue_item.backend_instance_generation"),
-    editLocked: item.editLocked
+    editLocked: item.editLocked,
+    sharedTaskAuthor: routing.sharedTaskAuthor === undefined ? undefined : toProtoSharedTaskAuthor(routing.sharedTaskAuthor)
   });
 }
 
@@ -3013,6 +3022,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
           role: MessageRole.USER,
           userInput: toProtoInputContent(payload.acceptedInput ?? promptInputFromMessageBlocks(payload.blocks)),
           userInputAccepted: payload.acceptedInput !== undefined,
+          sharedTaskAuthor: context.sharedTaskAuthor === undefined ? undefined : toProtoSharedTaskAuthor(context.sharedTaskAuthor),
           inputDelivery: toProtoMessageInputDelivery(payload.inputDelivery ?? payload.acceptedInput?.disposition),
           automationOrigin: payload.automationOrigin === undefined
             ? undefined

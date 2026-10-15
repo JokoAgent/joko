@@ -30,6 +30,9 @@ import { CodeHostPullRequestSummary } from "./CodeHostPullRequestSummary.js";
 import { TaskTagDot, taskTagDisplayName } from "./TaskTags.js";
 
 export interface SessionHeaderActionsMenuProps {
+  readonly guestOnly?: boolean;
+  readonly onSharing?: () => void;
+  readonly onLeaveSharing?: () => void;
   readonly session: SessionView;
   readonly projectTargets: readonly TargetView[];
   readonly movingProject?: boolean;
@@ -56,6 +59,9 @@ export interface SessionHeaderActionsMenuProps {
 }
 
 export function SessionHeaderActionsMenu({
+  guestOnly = false,
+  onSharing,
+  onLeaveSharing,
   session,
   projectTargets,
   movingProject = false,
@@ -193,7 +199,7 @@ export function SessionHeaderActionsMenu({
       aria-label={projectMenuOpen ? t("session.moveToProject") : t("a11y.sessionActions", { name: session.name })}
       onKeyDown={onMenuKeyDown}
     >
-      {projectMenuOpen ? <>
+      {guestOnly ? <button data-task-sharing-leave type="button" role="menuitem" className="danger-text" disabled={onLeaveSharing === undefined} onClick={() => { if (onLeaveSharing) run(onLeaveSharing); }}>{t("taskSharing.leave")}</button> : projectMenuOpen ? <>
         <button type="button" role="menuitem" className="session-header-menu__back" onClick={() => setProjectMenuOpen(false)}>
           <ChevronLeft aria-hidden="true" />
           <span>{t("session.moveToProject")}</span>
@@ -227,6 +233,7 @@ export function SessionHeaderActionsMenu({
           {session.projectId === undefined && <Check aria-hidden="true" />}
         </button>
       </> : <>
+        {onSharing !== undefined && <button data-task-sharing-manage type="button" role="menuitem" onClick={() => run(onSharing)}><ExternalLink aria-hidden="true" />{t("taskSharing.manage")}</button>}
         {!session.archived && <button type="button" role="menuitem" onClick={() => run(onPin)}>
           <Pin aria-hidden="true" />
           {session.pinned ? t("session.unpin") : t("session.pin")}

@@ -15,6 +15,7 @@ import "joko/v1/settings.proto";
 import "joko/v1/skill.proto";
 import "joko/v1/subagent.proto";
 import "joko/v1/tool.proto";
+import "joko/v1/task_sharing_types.proto";
 import "joko/v1/workspace.proto";
 
 enum OperationState {
@@ -42,6 +43,7 @@ message Operation {
   google.protobuf.Timestamp started_at = 11;
   google.protobuf.Timestamp completed_at = 12;
   EntityVersion version = 13;
+  SharedTaskAuthor shared_task_author = 14;
 }
 
 message OperationPrecondition {
@@ -76,6 +78,7 @@ message OperationMutation {
     CompactSessionMutation compact_session = 31;
     ExportSessionMutation export_session = 32;
     SetSessionModelMutation set_session_model = 33;
+    SetSessionRuntimeMutation set_session_runtime = 224;
     SetSessionPermissionMutation set_session_permission = 34;
     SetSessionPlanModeMutation set_session_plan_mode = 35;
     MoveSessionProjectMutation move_session_project = 36;
@@ -767,6 +770,16 @@ message MoveSessionProjectMutation {
   // projectless dialogue group without changing its immutable Target/runtime.
   optional string project_id = 2;
   NativeCatalogImportPresentation catalog_import = 3;
+}
+
+message SetSessionRuntimeMutation {
+  string session_id = 1;
+  uint64 expected_runtime_generation = 2;
+  optional string backend_id = 3;
+  optional string provider_id = 4;
+  optional string model_id = 5;
+  optional string effort = 6;
+  optional bool fast_mode = 7;
 }
 
 message SendInputMutation {

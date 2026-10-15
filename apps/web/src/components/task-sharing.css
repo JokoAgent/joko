@@ -1,0 +1,10 @@
+.task-sharing-settings { display: grid; gap: 16px; min-width: 0; }
+.task-sharing-settings form { display: grid; gap: 12px; }
+.task-sharing-settings label { display: grid; gap: 6px; }
+.task-sharing-settings textarea { min-height: 90px; resize: vertical; width: 100%; }
+.task-sharing-settings [role="tablist"], .task-sharing-settings .settings-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.task-sharing-session { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
+.task-sharing-session > .session-pane { flex: 1; min-height: 0; }
+.task-sharing-session > .settings-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 16px; }
+.task-sharing-runtime { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 0 16px 8px; padding: 8px 12px; }
+.task-sharing-runtime label { display: flex; align-items: center; gap: 8px; }

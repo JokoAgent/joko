@@ -6,6 +6,7 @@ import { isWorkGroup, mobileWorkItems } from "./mobile-work-projection";
 import { producedArtifactEvent, producedImageEvent, toolMediaEvent } from "./test/timeline-media";
 import { mobilePartnerConversationRows, mobilePublicConversationInputs } from "./mobile-partner-presentation";
 import { mobileMessageShareable, projectMobileConversationShareMessage } from "./mobile-conversation-share";
+import { SharedTaskAuthorSchema } from "@joko/contracts";
 
 function completed(blocks: any[], role = MessageRole.ASSISTANT) {
   return create(EventSchema, {
@@ -35,6 +36,19 @@ it("shows typed objective completion while keeping the internal verdict out of v
 });
 
 describe("mobile Timeline metadata events", () => {
+  it("preserves the Host participant author through accepted input and completed-message replay", () => {
+    const author = { shareId: "share", sessionId: "session", shareGeneration: 2n, memberId: "member", memberGeneration: 3n, displayName: "Participant" };
+    const start = create(EventSchema, { eventId: "accepted", identity: { sessionId: "session" }, cursor: { generation: 1n, sequence: 1n },
+      payload: { kind: { case: "messageStarted", value: { messageId: "message", role: MessageRole.USER, userInputAccepted: true,
+        sharedTaskAuthor: author, userInput: { parts: [{ content: { case: "text", value: "A shared input" } }] } } } } });
+    const end = completed([{ content: { case: "text", value: "A shared input" } }], MessageRole.USER);
+    if (end.payload?.kind.case !== "messageCompleted") throw new Error("Expected completed input.");
+    end.payload.kind.value.sharedTaskAuthor = create(SharedTaskAuthorSchema, author); end.cursor!.sequence = 2n;
+    expect(timelineRows([end, start])[0]).toMatchObject({ label: "Participant", text: "A shared input", completed: true });
+    expect(timelineRows([end])[0]?.label).toBe("Participant");
+    end.payload.kind.value.sharedTaskAuthor.sessionId = "another-session";
+    expect(timelineRows([end])[0]?.label).not.toBe("Participant");
+  });
   it("replays public scheduler input and its exact source without exposing objective or recovery prompts", () => {
     const text = "Read the report\n".repeat(18);
     const start = create(EventSchema, { eventId: "scheduled-input", identity: { sessionId: "session" }, cursor: { generation: 1n, sequence: 1n },

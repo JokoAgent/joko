@@ -28,6 +28,7 @@ import {
   type ContextRebuildInput,
   type CreateNativeSessionInput,
   type DurableNativeDispatchPreparation,
+  type EventPayload,
   type NativeSessionBinding,
   type NativeSessionCandidate,
   type NativeSessionCatalogEntry,
@@ -608,9 +609,18 @@ interface PiNativeLifecycleParticipant {
   readonly partnerLearningTurn?: PartnerLearningTurnHandle;
   readonly disposition: "prompt" | "steer" | "follow_up";
   readonly message: string;
+  nativePrefix?: NonNullable<NativeHistoryProjection["activeLineage"]>;
   /** Present only when the live command catalog resolved one exact managed
    * Skill command to one immutable runtime Resource. */
   readonly skillCommandResource?: RuntimeResource;
+}
+
+interface PiNativeUserOccurrence {
+  readonly participant: PiNativeLifecycleParticipant;
+  message?: Readonly<Record<string, unknown>>;
+  identity?: import("@joko/core").NativeMessageIdentity;
+  emitted?: { readonly payload: Extract<EventPayload, { readonly type: "message_complete" }>;
+    readonly metadata: import("@joko/core").AdapterEventMetadata | undefined };
 }
 
 interface PiNativeLifecycle {
@@ -620,6 +630,9 @@ interface PiNativeLifecycle {
   readonly pendingFollowUps: PiNativeLifecycleParticipant[];
   currentContext: AdapterContext;
   currentPartnerLearningTurn?: PartnerLearningTurnHandle;
+  readonly userOccurrences: PiNativeUserOccurrence[];
+  currentUserOccurrence?: PiNativeUserOccurrence;
+  nativePrefix?: NonNullable<NativeHistoryProjection["activeLineage"]>;
   initialUserMessageSeen: boolean;
   agentStarted: boolean;
   settlementReceived: boolean;
@@ -1264,10 +1277,6 @@ export class PiBackendAdapter implements
     context: AdapterContext,
     persistFence: (preparation: DurableNativeDispatchPreparation) => Promise<void>
   ): Promise<void> {
-    if (context.target.remoteWorkspace === undefined) {
-      await this.send(input, context);
-      return;
-    }
     let visionStarted = false;
     try {
       await this.#sendInput(input, context, () => { visionStarted = true; }, persistFence);
@@ -1424,7 +1433,7 @@ export class PiBackendAdapter implements
       return;
     }
     let durableNativeDispatchFingerprint: string | undefined;
-    if (persistFence !== undefined && input.disposition === "prompt") {
+    if (persistFence !== undefined) {
       const redactedMessage = redactPiNativeValue({
         role: "user",
         content: [
@@ -1484,6 +1493,7 @@ export class PiBackendAdapter implements
         pendingSteering: [],
         pendingFollowUps: [],
         currentContext: participant.context,
+        userOccurrences: [],
         ...(partnerLearningTurn === undefined ? {} : { currentPartnerLearningTurn: partnerLearningTurn }),
         initialUserMessageSeen: false,
         agentStarted: false,
@@ -1506,9 +1516,6 @@ export class PiBackendAdapter implements
         throw inactiveContinuationError(input.disposition);
       }
       lifecycle = activeLifecycle;
-      lifecycle.participants.push(participant);
-      if (input.disposition === "steer") lifecycle.pendingSteering.push(participant);
-      else lifecycle.pendingFollowUps.push(participant);
     }
     const command: PiRpcCommand =
       input.disposition === "steer"
@@ -1516,19 +1523,34 @@ export class PiBackendAdapter implements
         : input.disposition === "follow_up"
           ? { type: "follow_up", message, images }
           : { type: "prompt", message, images };
+    let commandSent = false;
     try {
       await this.#runExclusiveSessionMutation(runtime, context, async () => {
         runtime.nativeSkills?.assertCurrent();
         if (
-          command.type === "prompt" &&
           persistFence !== undefined &&
           durableNativeDispatchFingerprint !== undefined
         ) {
+          const nativeHistory = await this.getNativeHistoryProjection(context);
+          if (nativeHistory.activeLineage === undefined) {
+            throw piError("PI_NATIVE_DISPATCH_LINEAGE_MISSING", "Pi native input lineage could not be established", "dispatch");
+          }
+          participant.nativePrefix = nativeHistory.activeLineage;
+          if (command.type === "prompt") lifecycle.nativePrefix = nativeHistory.activeLineage;
           await persistFence({
             inputFingerprint: durableNativeDispatchFingerprint,
-            nativeHistory: await this.getNativeHistoryProjection(context)
+            nativeHistory
           });
         }
+        if (command.type !== "prompt") {
+          if (runtime.abortRequested || runtime.lifecycle !== lifecycle || lifecycle.settlementReceived) {
+            throw inactiveContinuationError(input.disposition as "steer" | "follow_up");
+          }
+          lifecycle.participants.push(participant);
+          if (command.type === "steer") lifecycle.pendingSteering.push(participant);
+          else lifecycle.pendingFollowUps.push(participant);
+        }
+        commandSent = true;
         return command.type === "prompt"
           ? requestPiPromptAcceptance(runtime, command, context.signal)
           : runtime.transport.request(command, {
@@ -1541,6 +1563,11 @@ export class PiBackendAdapter implements
       if (input.disposition === "prompt" && runtime.lifecycle === lifecycle && !lifecycle.agentStarted) {
         runtime.lifecycle = undefined;
         runtime.translator.setContext(runtime.context);
+      } else if (!commandSent) {
+        for (const participants of [lifecycle.participants, lifecycle.pendingSteering, lifecycle.pendingFollowUps]) {
+          const index = participants.indexOf(participant);
+          if (index !== -1) participants.splice(index, 1);
+        }
       }
       throw error;
     }
@@ -4199,6 +4226,44 @@ export class PiBackendAdapter implements
     });
   }
 
+  async #confirmNativeUserOccurrence(
+    runtime: PiRuntime,
+    lifecycle: PiNativeLifecycle,
+    occurrence: PiNativeUserOccurrence
+  ): Promise<void> {
+    if (occurrence.identity !== undefined || occurrence.message === undefined || lifecycle.nativePrefix === undefined
+      || occurrence.participant.nativePrefix === undefined) return;
+    const history = await this.getNativeHistoryProjection(occurrence.participant.context);
+    const lineage = history.activeLineage;
+    const preservesPrefix = (prefix: NonNullable<NativeHistoryProjection["activeLineage"]>) => lineage !== undefined
+      && prefix.length <= lineage.length && prefix.every((entry, index) => entry.entryId === lineage[index]?.entryId
+        && entry.parentEntryId === lineage[index]?.parentEntryId);
+    if (!preservesPrefix(lifecycle.nativePrefix) || !preservesPrefix(occurrence.participant.nativePrefix)) return;
+    const suffixIds = new Set(lineage!.slice(lifecycle.nativePrefix.length).map(entry => entry.entryId));
+    const users = history.events.filter(entry => suffixIds.has(entry.nativeEntryId)
+      && entry.payload.type === "message_complete" && entry.payload.role === "user");
+    const index = lifecycle.userOccurrences.indexOf(occurrence);
+    if (index < 0 || users[index] === undefined || new Set(users.map(entry => entry.nativeEntryId)).size !== users.length) return;
+    // RPC message events precede appendMessage. Read the persisted parent chain,
+    // then verify its actual consumed occurrence order; never search by text or
+    // use the current leaf as the identity of an earlier queued input.
+    for (let ordinal = 0; ordinal <= index; ordinal += 1) {
+      const observed = lifecycle.userOccurrences[ordinal];
+      const native = users[ordinal];
+      const prefix = observed?.participant.nativePrefix;
+      if (observed?.message === undefined || native === undefined || prefix === undefined || !preservesPrefix(prefix)
+        || lineage!.findIndex(entry => entry.entryId === native.nativeEntryId) < prefix.length) return;
+      const materialized = await runtime.translator.materializeNativeHistoryEntry({ id: native.nativeEntryId,
+        type: "message", data: { message: observed.message } });
+      const message = materialized.data["message"];
+      if (!isRecord(message) || native.metadata?.fields["nativeDispatchFingerprint"] !== nativeDispatchFingerprintForUserMessage(message)) return;
+    }
+    const native = users[index]!;
+    occurrence.identity = { entryId: native.nativeEntryId,
+      ...(native.nativeParentEntryId === undefined ? {} : { parentEntryId: native.nativeParentEntryId }),
+      ...(native.nativeRewindBefore === undefined ? {} : { rewindBefore: native.nativeRewindBefore }) };
+  }
+
   async getForkMessages(context: AdapterContext): Promise<readonly { readonly entryId: string; readonly text: string }[]> {
     this.#assertReviewOperationAllowed(context, "read fork history");
     const runtime = this.#runtime(context);
@@ -5130,6 +5195,12 @@ export class PiBackendAdapter implements
         runningExtensionCommand !== undefined && isExtensionUiRequest(event) ? runningExtensionCommand.context
           : lifecycle === undefined ? runtime.context : routeLifecycleEvent(lifecycle, event)
       );
+      const capturedUserOccurrence = event.type === "message_end" && isRecord(rawEvent.message) && rawEvent.message.role === "user"
+        ? lifecycle?.currentUserOccurrence : undefined;
+      if (capturedUserOccurrence !== undefined) {
+        capturedUserOccurrence.message = rawEvent.message as Readonly<Record<string, unknown>>;
+        delete lifecycle!.currentUserOccurrence;
+      }
       const capturedLearningTurn = lifecycle?.currentPartnerLearningTurn;
       const learningRequest = isExtensionUiRequest(event) && isCurrent()
         ? capturePartnerLearningExtensionRequest(rawEvent, capturedLearningTurn, runtime.mcpTools) : undefined;
@@ -5145,7 +5216,30 @@ export class PiBackendAdapter implements
         .then(async () => {
           if (!isCurrent()) return;
           if (event.type === "agent_settled" && lifecycle === undefined) return;
-          const eventContext = capturedEventContext;
+          if (event.type === "agent_settled" && lifecycle !== undefined) {
+            for (const occurrence of lifecycle.userOccurrences) {
+              if (occurrence.identity !== undefined || occurrence.emitted === undefined) continue;
+              await this.#confirmNativeUserOccurrence(runtime, lifecycle, occurrence).catch(() => undefined);
+              if (occurrence.identity !== undefined) await occurrence.participant.context.emit({
+                ...occurrence.emitted.payload, nativeHistory: { identity: occurrence.identity }
+              }, occurrence.emitted.metadata);
+            }
+          }
+          if (capturedUserOccurrence !== undefined && lifecycle !== undefined) {
+            await this.#confirmNativeUserOccurrence(runtime, lifecycle, capturedUserOccurrence).catch(() => undefined);
+          }
+          const eventContext: AdapterContext = capturedUserOccurrence === undefined ? capturedEventContext : {
+            ...capturedEventContext,
+            emit: async (payload, metadata) => {
+              if (payload.type === "message_complete" && payload.role === "user") {
+                capturedUserOccurrence.emitted = { payload, metadata };
+                return capturedEventContext.emit(capturedUserOccurrence.identity === undefined ? payload : {
+                  ...payload, nativeHistory: { identity: capturedUserOccurrence.identity }
+                }, metadata);
+              }
+              return capturedEventContext.emit(payload, metadata);
+            }
+          };
           failureContext = eventContext;
           if (userShell !== undefined) {
             const record = event as unknown as Record<string, unknown>;
@@ -8429,6 +8523,12 @@ function inactiveContinuationError(disposition: "steer" | "follow_up") {
 }
 
 function routeLifecycleEvent(lifecycle: PiNativeLifecycle, event: PiRpcEvent): AdapterContext {
+  if (event.type === "message_end") {
+    const record = event as unknown as Record<string, unknown>;
+    if (isRecord(record.message) && record.message.role === "user") {
+      return lifecycle.currentUserOccurrence?.participant.context ?? lifecycle.currentContext;
+    }
+  }
   if (event.type !== "message_start") return lifecycle.currentContext;
   const record = event as unknown as Record<string, unknown>;
   if (!isRecord(record.message) || record.message.role !== "user") return lifecycle.currentContext;
@@ -8436,19 +8536,28 @@ function routeLifecycleEvent(lifecycle: PiNativeLifecycle, event: PiRpcEvent): A
     lifecycle.initialUserMessageSeen = true;
     lifecycle.currentContext = lifecycle.owner.context;
     lifecycle.currentPartnerLearningTurn = lifecycle.owner.partnerLearningTurn;
+    const occurrence = { participant: lifecycle.owner };
+    lifecycle.userOccurrences.push(occurrence);
+    lifecycle.currentUserOccurrence = occurrence;
     return lifecycle.currentContext;
   }
   const steering = takeLifecycleParticipant(lifecycle.pendingSteering);
   if (steering !== undefined) {
     // Steering mutates the currently executing native Run; it is not a new
-    // output lifecycle. Its own durable product Run receives only terminal
-    // acknowledgement when the shared native lifecycle settles.
-    return lifecycle.currentContext;
+    // output lifecycle. Its user occurrence still belongs to the exact input
+    // participant; following assistant/tool events retain the output owner.
+    const occurrence = { participant: steering };
+    lifecycle.userOccurrences.push(occurrence);
+    lifecycle.currentUserOccurrence = occurrence;
+    return steering.context;
   }
   const followUp = takeLifecycleParticipant(lifecycle.pendingFollowUps);
   if (followUp !== undefined) {
     lifecycle.currentContext = followUp.context;
     lifecycle.currentPartnerLearningTurn = followUp.partnerLearningTurn;
+    const occurrence = { participant: followUp };
+    lifecycle.userOccurrences.push(occurrence);
+    lifecycle.currentUserOccurrence = occurrence;
   }
   return lifecycle.currentContext;
 }

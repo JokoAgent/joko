@@ -89,6 +89,7 @@ export interface MobileSettingsScreenProps {
   readonly onBack: () => void;
   readonly onConnections: () => void;
   readonly onDevices: () => void;
+  readonly onTaskSharing?: () => void;
   readonly appVersion?: string;
 }
 
@@ -360,6 +361,9 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   }
 
   return <ScrollView contentContainerStyle={[styles.screen, { backgroundColor: colors.background }]}>
+    {props.onTaskSharing && <Pressable accessibilityRole="button" onPress={props.onTaskSharing} style={{ paddingVertical: 16 }}>
+      <Text style={{ color: colors.accent }}>{locale.effectiveLocale.startsWith("zh") ? "共享任务" : locale.effectiveLocale === "ja" ? "共有タスク" : locale.effectiveLocale === "ko" ? "공유 작업" : "Shared tasks"}</Text>
+    </Pressable>}
     <BackButton label="Joko" language={locale.effectiveLocale} onPress={onBack} colors={colors} />
     <Text style={[styles.title, { color: colors.ink }]}>{t("settings.title")}</Text>
 

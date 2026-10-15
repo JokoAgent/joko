@@ -23,6 +23,7 @@ import {
   RunService,
   RunState,
   TargetService,
+  TaskSharingService,
   TargetState,
   type BackendDescriptor,
   type Operation,
@@ -39,6 +40,7 @@ const MANAGED_RUNTIME_CAPABILITY = "provider.managed_catalog";
 const SESSION_RUNTIME_CAPABILITY = "session.resume";
 
 export const PACKAGED_SMOKE_TIMELINE_PROMPT = "Return the exact packaged Timeline clipboard fixture.";
+export const PACKAGED_SMOKE_SHARED_TASK_PROMPT = "Confirm the packaged shared task input.";
 
 export interface PackagedSmokeTask {
   readonly sessionId: string;
@@ -58,6 +60,23 @@ export interface PackagedSmokeTaskOptions {
   readonly timeoutMs?: number;
   readonly operationId?: () => string;
   readonly transportFactory?: (origin: string, authKey: string | undefined, timeoutMs: number) => Transport;
+}
+
+/** Creates an invitation on the second real service used by the packaged UI
+ * journey. The value remains in Main memory and the private invitation bridge. */
+export async function createPackagedSmokeTaskInvitation(
+  options: PackagedSmokeTaskOptions,
+  task: PackagedSmokeTask
+): Promise<string> {
+  return withPackagedSmokeAuthority(options, async (transport, signal) => {
+    const client = createClient(TaskSharingService, transport);
+    const { share } = await client.createTaskShare({ operationId: randomUUID(), sessionId: task.sessionId }, { signal });
+    if (!share || share.sessionId !== task.sessionId || share.hostServerId !== options.connection.serverId) {
+      throw new Error("The packaged shared task belongs to a different service.");
+    }
+    const result = await client.createTaskShareInvitation({ operationId: randomUUID(), shareId: share.shareId }, { signal });
+    return result.invitation;
+  });
 }
 
 /**

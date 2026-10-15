@@ -29,6 +29,7 @@ export interface SettingsSearchContext {
 }
 
 const CATEGORY_KEYS: Readonly<Record<SettingsSection, MessageKey>> = {
+  sharing: "taskSharing.title",
   general: "settings.general", personalization: "settings.personalization", providers: "settings.providers",
   voice: "settings.voiceInput", shortcuts: "settings.shortcuts", taskStatus: "settings.nativeTaskStatus.title",
   import: "portable.importTitle", contacts: "contacts.title", messaging: "settings.messaging",

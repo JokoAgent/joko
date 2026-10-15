@@ -651,6 +651,9 @@ interface JokoDesktopApi {
     acknowledge(acknowledgement: JokoDesktopDeepLinkAcknowledgement): Promise<boolean>;
     onNavigate(listener: (delivery: JokoDesktopDeepLinkDelivery) => void): () => void;
   };
+  readonly taskSharingInvitations?: {
+    subscribe(listener: (invitation: string) => void): () => void;
+  };
   saveFile(file: JokoDesktopFile): Promise<boolean>;
   copyFile(request: { readonly requestId: string; readonly file: JokoDesktopFile }): Promise<JokoDesktopCopyFileResult>;
   cancelFileCopy(requestId: string): Promise<void>;

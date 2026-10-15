@@ -94,6 +94,7 @@ import {
   type ObjectiveDialogRequest
 } from "./ObjectiveIndicator.js";
 import { objectiveSessionAccess } from "../objective-access.js";
+import { TaskSharingSettings } from "./TaskSharingSettings.js";
 
 // First-stage contracts do not expose a durable dismissal mutation. Keep this bounded and
 // client-local so route switches/remounts are stable without pretending to persist remotely.
@@ -206,6 +207,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   readonly onSplitSession?: (side: "right" | "bottom") => void;
   readonly onOpenSessionWindow?: () => void;
 }): JSX.Element {
+  const guest = controller.state.sessionAccess?.role === "guest";
   const exportDownload = useArtifactDownload(session.id, controller.exportSession);
   const partnerConversation = usePartnerConversation();
   const partnerRuntimeLocked = partnerConversation?.kind !== "task";
@@ -244,6 +246,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [backgroundStopping, setBackgroundStopping] = useState(false);
   const [backgroundStopError, setBackgroundStopError] = useState<string>();
   const [collaborationOpen, setCollaborationOpen] = useState(false);
+  const [sharingOpen, setSharingOpen] = useState(false);
   const [objectiveDialogRequest, setObjectiveDialogRequest] = useState<(ObjectiveDialogRequest & { readonly handoffId?: string })>();
   const objectiveDialogRequestIdRef = useRef(0);
   const collaborationButtonRef = useRef<HTMLButtonElement>(null);
@@ -481,7 +484,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const allowedPermissions = advertisedPermissionModes(backend);
   const canSetPermission = !reviewReadOnly && !partnerRuntimeLocked && permissionChangeSupported(backend);
   const canListRuntimeCommands = !reviewReadOnly && backend?.capabilities.get("runtime.commands")?.supported === true;
-  const objectiveAccess = objectiveSessionAccess(session, backend, {
+  const objectiveAccess = guest ? "hidden" : objectiveSessionAccess(session, backend, {
     connected: controller.state.connectionState === "connected",
     reviewReadOnly,
     embeddedInFiles: presentation === "filesRail"
@@ -555,7 +558,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     [errorTailProjection, recoveryPresentationTimeline]
   );
   const derivationOrigin = session.derivationOrigin;
-  const personalReportsEnabled = !reviewReadOnly && session.remoteWorkspace === undefined && controller.state.activeProfile?.managedLocal === true
+  const personalReportsEnabled = !guest && !reviewReadOnly && session.remoteWorkspace === undefined && controller.state.activeProfile?.managedLocal === true
     && window.jokoDesktop?.capabilities.includes("development.personal") === true;
   const personalReports = usePersonalDevelopmentReports(controller, session.id, personalReportsEnabled);
   const timelineWithPersonalReports = useMemo(() => mergePersonalDevelopmentReports(visibleTimeline, personalReports), [visibleTimeline, personalReports]);
@@ -994,6 +997,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     setStopRevision((current) => current + 1);
     runAction(`stop:${runId}`, async () => {
       try {
+        if (guest) { await controller.abort(runId); return; }
         const hasPendingQueueItems = hasPendingComposerQueueItems(queue, sourceSessionId);
         if (session.state === "retrying") {
           await pauseQueueThenAbortRetry(controller, sourceSessionId, runId, hasPendingQueueItems, queueControl?.state === "paused");
@@ -1751,7 +1755,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         models={canSwitchModel ? backendModels : session.model === undefined ? [] : [session.model]}
         ownerId={modelPreferenceOwnerId(controller.state.activeProfile?.serverId)}
         favoriteSettings={controller.state.snapshot.settings.modelFavorites}
-        onMutateFavorite={controller.updateModelFavorites}
+        onMutateFavorite={guest ? undefined : controller.updateModelFavorites}
         value={session.model === undefined ? undefined : {
           backendId: session.backendId,
           providerId: session.model.providerId,
@@ -1765,7 +1769,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         onSelectionFocus={() => setComposerFocusRequest((current) => current + 1)}
         t={t}
         onOpen={() => controller.refreshProviderModels(session.backendId, undefined, true).catch(() => undefined)}
-        onConnectSource={() => { window.location.hash = "#/settings/providers"; }}
+        onConnectSource={guest ? undefined : () => { window.location.hash = "#/settings/providers"; }}
         onSelect={(selection) => {
           if (selection === undefined) return;
           const model = backendModels.find((candidate) =>
@@ -1833,20 +1837,23 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         <div className="session-header__leading">
           {!navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
           <div className="session-heading">
-            <div className="breadcrumbs"><span>{navigationProjectName}</span><span aria-hidden="true">/</span><button type="button" onClick={onRename}>{session.name}</button><TaskTagDots tags={session.taskTags} t={t} /></div>
+            <div className="breadcrumbs"><span>{navigationProjectName}</span><span aria-hidden="true">/</span><button type="button" disabled={guest} onClick={onRename}>{session.name}</button><TaskTagDots tags={session.taskTags} t={t} /></div>
             <div className="session-heading__status"><StatusDot state={session.state === "retrying" ? "running" : session.state} label={session.state === "retrying" ? "running" : session.state} /><span>{sessionStateLabel(session.state, t)}</span>{displayBranch !== undefined && <Pill className="session-heading__branch" title={t("codeHost.branchBadge", { branch: displayBranch })} aria-label={t("codeHost.branchBadge", { branch: displayBranch })}><GitBranch aria-hidden="true" />{displayBranch}</Pill>}{session.nativeLeafId !== undefined && <Pill><GitBranch aria-hidden="true" />{shortId(session.nativeLeafId)}</Pill>}</div>
           </div>
         </div>
         <div className="session-header__actions">
           {canStop && running && session.activeRunId !== undefined && <Button className="session-header__abort" tone="danger" disabled={stopInFlight} onClick={stopRun}><CircleStop aria-hidden="true" />{t("controls.abort")}</Button>}
           {!reviewReadOnly && session.state === "error" && session.retryRunId !== undefined && <Button onClick={() => runAction("retry", () => controller.retry(session.retryRunId as string))}><RotateCcw aria-hidden="true" />{t("common.retry")}</Button>}
-          {controller.state.connectionState === "connected" && <IconButton
+          {!guest && controller.state.connectionState === "connected" && <IconButton
             buttonRef={collaborationButtonRef}
             label={t("collaboration.open")}
             aria-expanded={collaborationOpen}
             onClick={() => setCollaborationOpen((current) => !current)}
           ><UsersRound aria-hidden="true" /></IconButton>}
           <SessionHeaderActionsMenu
+            guestOnly={guest}
+            onLeaveSharing={guest ? onArchive : undefined}
+            onSharing={!guest && controller.taskSharing !== undefined ? () => setSharingOpen(true) : undefined}
             session={session}
             projectTargets={sessionProjectTargets}
             movingProject={movingSessionProject}
@@ -1904,7 +1911,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       </header></PartnerConversationHeader>}
 
       {session.worktree?.state === "preserved" && <div className="session-worktree-warning" role="alert"><GitBranch aria-hidden="true" /><span><strong>{t("worktree.preservedTitle")}</strong><small>{t("worktree.preservedDescription", { branch: session.worktree.branch })}</small></span></div>}
-      {!reviewReadOnly && <PortableReplacementCleanupNotice controller={controller} sessionId={session.id} t={t} />}
+      {!guest && !reviewReadOnly && <PortableReplacementCleanupNotice controller={controller} sessionId={session.id} t={t} />}
 
       <CollaborationGoalPanel
         controller={controller}
@@ -2095,10 +2102,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         hasInteraction={interaction !== undefined}
         placeholder={presentation === "filesRail" ? <div className="interaction-files-rail-placeholder" role="status">{t("interaction.waitForReply")}</div> : undefined}
       >
-        <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />
+        {guest && interaction !== undefined && !["permission", "question", "plan"].includes(interaction.kind)
+          ? <div role="status" className="settings-card">{t("taskSharing.waitingHost")}</div>
+          : <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />}
       </InteractionPromptHost>
       {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionId={session.id} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.effectiveLocale} t={t} getTimelineRoot={getTimelineRoot} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}
-{interaction === undefined && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}>
+{(interaction === undefined || guest) && <div className="session-composer-layer" hidden={currentShareSelection !== undefined}>
         {objectiveReadable && <ObjectiveIndicator
           controller={controller}
           session={session}
@@ -2128,6 +2137,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       <ExtensionWidgets widgets={extensionWidgets.filter((widget) => widget.placement === "belowEditor")} label={t("a11y.extensionWidgets")} />
       </div>
 
+      <Modal open={!guest && sharingOpen} title={t("taskSharing.manage")} onClose={() => setSharingOpen(false)}>
+        <TaskSharingSettings key={`${controller.state.activeProfile?.id}:${session.id}:${controller.state.connectionGeneration}`} controller={controller} t={t} sessionId={session.id} />
+      </Modal>
       <Modal open={canSetPermission && permissionToConfirm !== undefined} title={t("permission.full")} description={t("permission.fullHelp")} size="small" onClose={() => setPermissionToConfirm(undefined)}>
         <div className="risk-confirmation">
           <div className="risk-confirmation__icon"><Shield aria-hidden="true" /></div>

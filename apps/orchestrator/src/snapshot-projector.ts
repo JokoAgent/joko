@@ -674,6 +674,7 @@ export class SnapshotProjector {
         backendId: session.descriptor.backendId,
         targetId: session.descriptor.targetId,
         source: run.descriptor.source,
+        sharedTaskAuthor: new TaskShareStore(this.store).getAuthorForOperation(item.operationId),
         ...(run.descriptor.parentRunId === undefined ? {} : { parentRunId: run.descriptor.parentRunId }),
         generation: session.descriptor.binding.generation
       }, BigInt(index));
@@ -700,6 +701,7 @@ export class SnapshotProjector {
       return toProtoToolLease(lease, session.descriptor.backendId);
     });
     const mappedTimeline = input.timeline.map((event) => toProtoEvent(event, {
+      sharedTaskAuthor: taskShareEventAuthor(this.store, event),
       learning: event.payload.type === "message_complete" && event.payload.role === "assistant"
         ? this.store.getPartnerLearningFeedback(event.id) : undefined,
       queueItem: eventQueueItem(event, queueById, input.queueItems),
@@ -834,25 +836,42 @@ export function activeNativeTimeline(
   events: readonly PersistedEvent[],
   currentBinding?: { readonly opaqueRef: string; readonly generation: number }
 ): PersistedEvent[] {
+  const nativeEntryKey = (event: PersistedEvent): string | undefined => {
+    const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
+    const fingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
+    return event.sessionId === undefined || entryId === undefined || typeof fingerprint !== "string"
+      ? undefined : JSON.stringify([event.sessionId, fingerprint, entryId]);
+  };
+  const deduplicateNativeLive = (visible: readonly PersistedEvent[]): PersistedEvent[] => {
+    const canonical = new Set(visible.flatMap((event) => {
+      const key = event.metadata?.fields["nativeHydration"] === true ? nativeEntryKey(event) : undefined;
+      return key === undefined ? [] : [key];
+    }));
+    return visible.filter((event) => event.metadata?.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD] !== true
+      || event.metadata.fields["nativeHydration"] === true
+      || !canonical.has(nativeEntryKey(event) ?? ""));
+  };
   const marker = [...events].reverse().find((event) => event.payload.type === "native_session_changed");
   if (marker?.payload.type !== "native_session_changed") {
-    if (currentBinding === undefined) return [...events];
+    if (currentBinding === undefined) return deduplicateNativeLive(events);
     const currentFingerprint = nativeBindingFingerprint(currentBinding.opaqueRef);
-    return events.filter((event) => {
+    return deduplicateNativeLive(events.filter((event) => {
       const identity = nativeHistoryEventContext(event.payload)?.identity;
       if (identity !== undefined || event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] !== undefined) {
         return event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === currentFingerprint;
       }
       return event.generation === currentBinding.generation;
-    });
+    }));
   }
   if (currentBinding !== undefined && marker.payload.opaqueRef !== currentBinding.opaqueRef) {
-    return events.filter((event) =>
-      nativeHistoryEventContext(event.payload)?.identity === undefined &&
+    return deduplicateNativeLive(events.filter((event) =>
+      (nativeHistoryEventContext(event.payload)?.identity === undefined
+        || (event.metadata?.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD] === true
+          && event.globalCursor > marker.globalCursor)) &&
       (event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === undefined
         ? event.generation === currentBinding.generation
         : event.metadata.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === nativeBindingFingerprint(currentBinding.opaqueRef))
-    );
+    ));
   }
   const nativeReference = marker.payload.opaqueRef;
   const bindingFingerprint = nativeBindingFingerprint(nativeReference);
@@ -872,12 +891,14 @@ export function activeNativeTimeline(
     active.add(cursor);
     cursor = parents.get(cursor);
   }
-  return events.filter((event) => {
+  return deduplicateNativeLive(events.filter((event) => {
     const entryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
     if (entryId !== undefined) {
       const eventBindingFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
       if (eventBindingFingerprint !== bindingFingerprint) return false;
-      return leafId === undefined || active.has(entryId);
+      return leafId === undefined || active.has(entryId)
+        || (event.metadata?.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD] === true
+          && event.globalCursor > marker.globalCursor);
     }
     const productFingerprint = event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD];
     if (productFingerprint !== undefined) {
@@ -890,7 +911,7 @@ export function activeNativeTimeline(
       event.metadata?.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD] === true
     ) return false;
     return true;
-  });
+  }));
 }
 
 export function projectSnapshot(
@@ -1143,3 +1164,5 @@ function projectionReferenceError(field: string, entityId: string, missingId: st
     `Cannot project entity ${entityId}: referenced ${field} ${missingId} is missing.`
   );
 }
+import { TaskShareStore } from "@joko/store";
+import { taskShareEventAuthor } from "./task-sharing-author.js";

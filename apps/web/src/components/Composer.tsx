@@ -17,6 +17,7 @@ import {
   Zap
 } from "lucide-react";
 import type { AppController } from "../controller.js";
+import { taskSourceKey } from "../task-sharing.js";
 import { partnerResumeMessages } from "@joko/contracts";
 import type { ComposerSendShortcutPreference } from "../local-state.js";
 import { modelSourceAccess } from "../model-source-access.js";
@@ -134,6 +135,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
 }): JSX.Element {
   const [text, setText] = useState("");
   const partnerConversation = usePartnerConversation();
+  const guest = controller.state.sessionAccess?.role === "guest";
   const readOnly = taskReadOnly || partnerConversation?.partner?.lifecycle === "paused";
   const partnerPresentation = partnerConversation !== undefined && partnerConversation.kind !== "task";
   const [gamepadSkillError, setGamepadSkillError] = useState<string>();
@@ -302,7 +304,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     && target.backendId === session.backendId
     && !target.archived
     && target.error === undefined);
-  const learnSupported = !readOnly
+  const learnSupported = !guest && !readOnly
     && controller.state.connectionState === "connected"
     && !session.archived
     && session.state !== "closed"
@@ -321,13 +323,13 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const commandOptions = {
     resourceMentionSupported: mentionPolicy.resources && !readOnly && !session.archived
       && session.state !== "closed" && controller.state.connectionState === "connected",
-    helpSupported: true,
-    personalDevelopmentSupported: !readOnly && !session.archived && session.remoteWorkspace === undefined
+    helpSupported: !guest,
+    personalDevelopmentSupported: !guest && !readOnly && !session.archived && session.remoteWorkspace === undefined
       && controller.state.activeProfile?.managedLocal === true
       && typeof window !== "undefined" && window.jokoDesktop?.capabilities.includes("development.personal") === true,
     learnSupported,
     goalSupported,
-    jumpSessionSupported: true,
+    jumpSessionSupported: !guest,
     userShellSupported: bashCapable,
     sessionResetSupported,
     reviewSupported
@@ -431,7 +433,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     }
   }, [canMention, palette]);
 
-  const voiceDictionaryOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id, session.id, String(session.generation)]);
+  const voiceDictionaryOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
+    taskSourceKey(controller.state.taskSource ?? { kind: "own" }), session.id, String(session.generation)]);
   const currentDraftOwnerRef = useRef({ key: voiceDictionaryOwnerKey, serverId: controller.state.activeProfile?.serverId, sessionId: session.id });
   currentDraftOwnerRef.current = { key: voiceDictionaryOwnerKey, serverId: controller.state.activeProfile?.serverId, sessionId: session.id };
   const queuePendingDraftSave = (pending: PendingComposerDraftSave): void => {

@@ -4,6 +4,7 @@ import type { AppController } from "../controller.js";
 import type { PartnerListView, PartnerMutationView, PartnerProfileView, SessionView } from "../model.js";
 import { isLoopbackHostname } from "../connection-origin.js";
 import { validatePartnerSourceSession } from "../partner-sources.js";
+import { taskSourceKey } from "../task-sharing.js";
 import { PartnerSettingsDialog } from "./PartnersPage.js";
 import type { PartnerLearningSettingsDestination } from "@joko/contracts";
 import type { Translator } from "./types.js";
@@ -60,8 +61,14 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
   readonly children: ReactNode;
 }): JSX.Element {
   const profile = controller.state.activeProfile;
+  const source = controller.state.taskSource, access = controller.state.sessionAccess;
+  const sharedSource = source?.kind === "joined" || access?.role === "guest";
+  const sharedTask = source?.kind === "joined" && profile !== undefined && access?.role === "guest" && access.memberId === source.memberId
+    && source.sessionId === session.id && source.homeProfileId === profile?.id
+    && source.homeServerId === profile.serverId && source.homeOrigin === profile.origin;
   const expectedPartnerId = controller.state.route?.kind === "session" ? controller.state.route.partnerId : undefined;
   const ownerKey = JSON.stringify([profile?.id, profile?.serverId, profile?.origin, expectedPartnerId,
+    taskSourceKey(source ?? { kind: "own" }), access?.role, access?.memberId,
     String(controller.state.snapshot.generation), session.id, session.targetId, String(session.generation)]);
   const connected = controller.state.ready && controller.state.connectionState === "connected";
   const [refresh, setRefresh] = useState(0);
@@ -115,6 +122,13 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
     const abort = new AbortController();
     let alive = true;
     const current = (): boolean => alive && !abort.signal.aborted && requestOwnerRef.current === requestOwner;
+    if (sharedSource) {
+      // The authenticated task projection already supplies this identity. A
+      // guest cannot inspect the Home node's unrelated Partner directory.
+      setProjection({ key: ownerKey, owner: requestOwner, phase: sharedTask ? "ready" : "failed",
+        ...(sharedTask ? { identity: { kind: "task" as const } } : {}) });
+      return () => { alive = false; abort.abort(); };
+    }
     setProjection((previous) => ({ key: ownerKey, owner: requestOwner, phase: "loading",
       ...(previous?.key === ownerKey && previous.identity?.kind === "partner" ? { identity: previous.identity } : {}) }));
     void (async () => {
@@ -143,7 +157,7 @@ export function PartnerConversationProvider({ controller, session, active, t, ch
         ...(previous?.key === ownerKey && previous.identity?.kind === "partner" ? { identity: previous.identity } : {}) }));
     });
     return () => { alive = false; abort.abort(); };
-  }, [connected, documentActive, requestOwner, ownerKey, session.id, session.targetId]);
+  }, [connected, documentActive, requestOwner, ownerKey, session.id, session.targetId, sharedSource, sharedTask]);
 
   const confirmed = projection?.key === ownerKey && projection.owner === requestOwner && projection.phase === "ready";
   const identity = projection?.key === ownerKey ? projection.identity : undefined;

@@ -4008,6 +4008,26 @@ describe("ClaudeCodeAdapter", () => {
     await adapter.closeSession(binding, contextFor(binding).context);
   });
 
+  test("reads only an active local SDK-registered background output tail without publishing its path", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-native-task-output-")), outputFile = join(directory, "native.output");
+    const runtime = new FakeSdkRuntime({ autoAdmitTurns: true }), adapter = adapterFor(runtime);
+    try {
+      await writeFile(outputFile, "older line\ncurrent line\n");
+      const binding = await adapter.createSession(createInput(), contextFor().context), active = contextFor(binding, { operationId: "native-output" });
+      await adapter.send(textPrompt("run background command"), active.context);
+      const query = runtime.queries[0]!;
+      query.push({ ...taskStarted(binding.nativeSessionId!, "output-task", "output-tool", { taskType: "local_bash", description: "Background command" }), output_file: outputFile });
+      await eventually(() => active.events.some(event => event.type === "background_task"));
+      const taskId = active.events.find((event): event is Extract<EventPayload, { type: "background_task" }> => event.type === "background_task")!.taskId;
+      await expect(adapter.getBackgroundTaskOutput(active.context, taskId, 13)).resolves.toMatchObject({ status: "available", text: "current line\n", truncated: true });
+      await expect(adapter.getBackgroundTaskOutput(active.context, "other-task", 13)).resolves.toMatchObject({ status: "unavailable" });
+      expect(JSON.stringify(active.events)).not.toContain(outputFile);
+      query.push(taskNotification(binding.nativeSessionId!, "output-task", "output-tool", { status: "completed", summary: "Done", outputFile, totalTokens: 0, toolUses: 0, durationMs: 1 }));
+      await eventually(() => active.events.some(event => event.type === "background_task" && event.state === "completed"));
+      await expect(adapter.getBackgroundTaskOutput(active.context, taskId, 13)).resolves.toMatchObject({ status: "unavailable" });
+    } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
   test("projects native task lifecycle and child work without mixing child text into the parent turn", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const adapter = adapterFor(runtime, { redactValues: ["task-secret"] });

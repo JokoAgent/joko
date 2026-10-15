@@ -112,6 +112,7 @@ import { WorktreeRecycleSettings } from "./WorktreeRecycleSettings.js";
 import { PersonalDevelopmentSettings } from "./PersonalDevelopmentSettings.js";
 import { buildSettingsSearchDocuments, settingsSearchEntryFromHash, settingsSearchHash, type SettingsSearchEntry } from "./settings-search.js";
 import { useSettingsSearchTarget } from "./use-settings-search-target.js";
+import { TaskSharingSettings } from "./TaskSharingSettings.js";
 
 export const SETTINGS_NAV_SECTION_IDS = [
   "general",
@@ -124,6 +125,7 @@ export const SETTINGS_NAV_SECTION_IDS = [
   "contacts",
   "messaging",
   "connections",
+  "sharing",
   "tools",
   "automation",
   "about"
@@ -267,6 +269,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
     { id: "contacts", label: t("contacts.title"), icon: <UsersRound /> },
     { id: "messaging", label: t("settings.messaging"), icon: <MessageCircleMore /> },
     { id: "connections", label: t("settings.connections"), icon: <Network /> },
+    { id: "sharing", label: t("taskSharing.title"), icon: <UsersRound /> },
     { id: "tools", label: t("settings.toolPolicies.nav"), icon: <Wrench /> },
     { id: "automation", label: t("settings.automation"), icon: <MonitorCog /> },
     { id: "about", label: t("settings.about"), icon: <Info /> }
@@ -345,6 +348,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
             {section === "automation" && <SettingsPageSection id="automation"><AutomationSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} onSuccess={showSuccess} t={t} /></SettingsPageSection>}
             {section === "import" && <SettingsPageSection id="import"><TaskImportSettings controller={controller} snapshot={snapshot} onImportPortable={onImportPortableSession} runAction={runAction} onSuccess={showSuccess} t={t} /></SettingsPageSection>}
             {section === "contacts" && <SettingsPageSection id="contacts"><ContactsSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} locale={locale} t={t} /></SettingsPageSection>}
+            {section === "sharing" && <SettingsPageSection id="sharing"><TaskSharingSettings key={`${controller.state.activeProfile?.id}:${controller.state.connectionGeneration}`} controller={controller} t={t} /></SettingsPageSection>}
             {section === "messaging" && <SettingsPageSection id="messaging"><MessagingSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection>}
             {section === "about" && <><SettingsPageSection id="about"><AboutSettings controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection><SettingsPageSection id="backends"><SettingsSectionHeading title={t("settings.backends")} body={t("settings.backendsBody")} /><BackendSettings controller={controller} snapshot={snapshot} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="worktreeRecycle"><WorktreeRecycleSettings controller={controller} t={t} /></SettingsPageSection>{desktopCapabilityKey.split("\n").includes("development.personal") && <SettingsPageSection id="personalDevelopment"><PersonalDevelopmentSettings controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection>}<SettingsPageSection id="diagnostics"><DiagnosticSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection><SettingsPageSection id="runtime"><RuntimeProcessMonitor controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
           </div>

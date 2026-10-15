@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+package joko.v1;
+
+// Public attribution only. Authentication never comes from these fields.
+message SharedTaskAuthor {
+  string share_id = 1;
+  string session_id = 2;
+  uint64 share_generation = 3;
+  string member_id = 4;
+  uint64 member_generation = 5;
+  string display_name = 6;
+}
+
+message TaskShareScope {
+  string host_server_id = 1;
+  string share_id = 2;
+  uint64 share_generation = 3;
+  string session_id = 4;
+  string member_id = 5;
+  uint64 member_generation = 6;
+}
+
+message TaskShareMember {
+  string member_id = 1;
+  uint64 member_generation = 2;
+  string display_name = 3;
+  string status = 4;
+  int64 joined_at_ms = 5;
+}
+
+message TaskShare {
+  string share_id = 1;
+  string session_id = 2;
+  uint64 share_generation = 3;
+  uint64 revision = 4;
+  string title = 5;
+  string host_server_id = 6;
+  string host_origin = 7;
+  string status = 8;
+  repeated TaskShareMember members = 9;
+  int64 created_at_ms = 10;
+}
+
+message JoinedTaskShare {
+  string join_id = 1;
+  TaskShare share = 2;
+  TaskShareMember member = 3;
+  string status = 4;
+  int64 joined_at_ms = 5;
+  string error_code = 6;
+}
+
+// Closed mapping to existing generated request/response descriptors.
+enum TaskShareMethod {
+  TASK_SHARE_METHOD_UNSPECIFIED = 0;
+  TASK_SHARE_METHOD_GET_SESSION = 1;
+  TASK_SHARE_METHOD_LIST_SESSION_TIMELINE = 2;
+  TASK_SHARE_METHOD_SEARCH_SESSION_MESSAGES = 3;
+  TASK_SHARE_METHOD_LIST_RUNS = 4;
+  TASK_SHARE_METHOD_GET_RUN = 5;
+  TASK_SHARE_METHOD_LIST_QUEUE_ITEMS = 6;
+  TASK_SHARE_METHOD_GET_QUEUE_CONTROL = 7;
+  TASK_SHARE_METHOD_LIST_INTERACTIONS = 8;
+  TASK_SHARE_METHOD_GET_INTERACTION = 9;
+  TASK_SHARE_METHOD_GET_SESSION_STATISTICS = 10;
+  TASK_SHARE_METHOD_LIST_BACKGROUND_TASKS = 11;
+  TASK_SHARE_METHOD_LIST_SUBAGENT_RUNS = 12;
+  TASK_SHARE_METHOD_GET_SUBAGENT_RUN = 13;
+  TASK_SHARE_METHOD_LIST_SUBAGENT_TRANSCRIPT = 14;
+  TASK_SHARE_METHOD_LIST_MODELS = 15;
+  TASK_SHARE_METHOD_LIST_PROVIDERS = 16;
+  TASK_SHARE_METHOD_GET_BACKEND = 17;
+  TASK_SHARE_METHOD_SUBMIT_OPERATION = 18;
+  TASK_SHARE_METHOD_GET_OPERATION = 19;
+  TASK_SHARE_METHOD_LIST_ARTIFACTS = 20;
+  TASK_SHARE_METHOD_GET_ARTIFACT = 21;
+  TASK_SHARE_METHOD_GET_RUNTIME_CONTROL = 22;
+  TASK_SHARE_METHOD_LIST_BACKENDS = 23;
+  TASK_SHARE_METHOD_GET_BACKGROUND_TASK_OUTPUT = 24;
+}

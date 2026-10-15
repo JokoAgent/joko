@@ -19,6 +19,7 @@ export interface MobileDelegatedControls {
 export interface MobileDelegatedReadClient {
   taskDelegatedControls(): MobileDelegatedControls | undefined;
   loadTaskBackgroundTasks(authorityKey: string, pageToken?: string, signal?: AbortSignal): Promise<{ tasks: readonly BackgroundTask[]; nextPageToken: string }>;
+  loadTaskBackgroundOutput?(authorityKey: string, taskId: string, signal?: AbortSignal): Promise<import("@joko/contracts").BackgroundTaskOutput>;
   loadTaskDelegatedRuns(authorityKey: string, pageToken?: string, signal?: AbortSignal): Promise<{ runs: readonly SubagentRun[]; nextPageToken: string }>;
   loadTaskDelegatedDetail(authorityKey: string, runId: string, signal?: AbortSignal): Promise<SubagentRunDetail>;
   loadTaskDelegatedTranscript(authorityKey: string, runId: string, childId?: string, pageToken?: string, signal?: AbortSignal): Promise<{

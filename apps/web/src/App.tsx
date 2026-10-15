@@ -39,6 +39,9 @@ import { RuntimeProcessMonitorBroker } from "./components/RuntimeProcessMonitorB
 import { RuntimeProcessMonitorWindow } from "./components/RuntimeProcessMonitorWindow.js";
 import { VisionBridgeToasts } from "./components/VisionBridgeToasts.js";
 import { Sidebar } from "./components/Sidebar.js";
+import { TaskSharingInvitationDialog, TaskSharingNavigation } from "./components/TaskSharingSettings.js";
+import { TaskSharingSession } from "./components/TaskSharingSession.js";
+import { offerTaskSharingInvitation, clearTaskSharingInvitation } from "./task-sharing-invitation.js";
 import { PortableSessionDialogHost, type PortableSessionImportRequest } from "./components/PortableSessionDialogHost.js";
 import { PortableSessionDropTarget } from "./components/PortableSessionDropTarget.js";
 import { SessionSplitView } from "./components/SessionSplitView.js";
@@ -258,6 +261,17 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const sessionApplicationWindow = typeof window !== "undefined" && isSessionApplicationWindow(window.location);
   const extensionApplicationWindow = typeof window !== "undefined" && isExtensionApplicationWindow(window.location);
   const auxiliaryApplicationWindow = sessionApplicationWindow || extensionApplicationWindow;
+  const taskSharingInvitationOwner = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const key = state.activeProfile === undefined ? undefined : `${state.activeProfile.id}:${state.connectionGeneration}`;
+    if (taskSharingInvitationOwner.current !== undefined && taskSharingInvitationOwner.current !== key) clearTaskSharingInvitation();
+    taskSharingInvitationOwner.current = key;
+  }, [state.activeProfile?.id, state.connectionGeneration]);
+  useEffect(() => {
+    if (auxiliaryApplicationWindow) return;
+    const unsubscribe = window.jokoDesktop?.taskSharingInvitations?.subscribe(offerTaskSharingInvitation);
+    return () => { unsubscribe?.(); clearTaskSharingInvitation(); };
+  }, [auxiliaryApplicationWindow]);
   useAppDefaultModelBridge(controller, !auxiliaryApplicationWindow);
   const dedicatedHardwareBridge = typeof window !== "undefined"
     && window.jokoDesktop?.capabilities.includes("hardware.dedicatedInput") === true
@@ -2199,7 +2213,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       <DesktopPageSearchBar overrides={shortcutOverrides} t={t} />
       {applicationMenuFeedback}
       {!formalFilesMode && !settingsRoute && <Sidebar
-        groupNavigation={<PartnerGroupsNavigation controller={controller} t={t} onClose={closeNavigation} />}
+        groupNavigation={<><TaskSharingNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerGroupsNavigation controller={controller} t={t} onClose={closeNavigation} /></>}
         snapshot={sidebarSnapshot}
         activeSessionId={creatingNewSession ? undefined : activeSession?.id}
         route={state.route}
@@ -2447,6 +2461,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           {state.route.kind === "projects" && <ProjectsPage controller={controller} snapshot={state.snapshot} focusProjectId={state.route.projectId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} prepareSessionRemoval={prepareWorktreeRemoval} />}
           {state.route.kind === "partners" && (state.route.groupId ? <PartnerGroupPage controller={controller} groupId={state.route.groupId} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />
             : <PartnersPage controller={controller} snapshot={state.snapshot} focusPartnerId={state.route.partnerId} preparation={state.route.preparation} t={t} onOpenNavigation={() => setWindowNavigationOpen(true)} />)}
+          {state.route.kind === "sharedTask" && <TaskSharingSession controller={controller} joinId={state.route.joinId} profileId={state.route.profileId} t={t} runAction={runAction} onOpenNavigation={() => setWindowNavigationOpen(true)} />}
           {state.route.kind === "tools" && <ToolsPage
             controller={controller}
             snapshot={state.snapshot}
@@ -2593,6 +2608,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           controller.navigate({ kind: "session", sessionId });
         }}
       />
+      {!auxiliaryApplicationWindow && <TaskSharingInvitationDialog controller={controller} t={t} />}
       {portableImportTargets.length > 0 && <PortableSessionDropTarget
         label={t("portable.importEntryBody")}
         onFile={openPortableSessionImportFile}

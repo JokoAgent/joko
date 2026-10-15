@@ -10,6 +10,7 @@ import type { RunAction, Translator } from "./types.js";
 import { Button, IconButton, Pill, cx } from "./ui.js";
 import { QueueLockLease } from "./queue-lock-lease.js";
 import { QueueInputPreview } from "./QueueInputPreview.js";
+import { canEditSharedQueueItem } from "../task-sharing.js";
 
 interface QueueEditLock {
   readonly queueItemId: string;
@@ -60,6 +61,7 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
   const queueWindow = composerQueueWindow(ordered, expanded);
   const unknown = ordered.some((item) => item.state === "dispatchUnknown");
   const paused = control?.state === "paused";
+  const guest = controller.state.sessionAccess?.role === "guest";
   const interactionLocked = control?.interactionLocked === true && dragLockRef.current === undefined;
   useLayoutEffect(() => {
     const target = restoreEditorFocusRef.current;
@@ -320,7 +322,7 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
   const deliveryUnavailable = supportedDispositions.length === 0;
   return (
     <div ref={queueRootRef} className={cx("queue-strip", unknown && "queue-strip--warning", paused && "queue-strip--paused")} aria-label={t("context.queue")}>
-      <div className="queue-strip__title">{unknown ? <AlertTriangle aria-hidden="true" /> : paused ? <Pause aria-hidden="true" /> : <Clock3 aria-hidden="true" />}<strong>{t("composer.queueCount", { count: ordered.length })}</strong>{paused && <Pill tone="warning">{t("queue.paused")}</Pill>}{interactionLocked && <Pill tone="warning">{t("queue.interactionLocked")}</Pill>}<IconButton label={paused ? t("queue.resume") : t("queue.pause")} disabled={queueControlPending} onClick={() => {
+      <div className="queue-strip__title">{unknown ? <AlertTriangle aria-hidden="true" /> : paused ? <Pause aria-hidden="true" /> : <Clock3 aria-hidden="true" />}<strong>{t("composer.queueCount", { count: ordered.length })}</strong>{paused && <Pill tone="warning">{t("queue.paused")}</Pill>}{interactionLocked && <Pill tone="warning">{t("queue.interactionLocked")}</Pill>}{!guest && <IconButton label={paused ? t("queue.resume") : t("queue.pause")} disabled={queueControlPending} onClick={() => {
         if (queueControlPendingRef.current) return;
         queueControlPendingRef.current = true;
         setQueueControlPending(true);
@@ -335,10 +337,10 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
             }
           }
         });
-      }}>{paused ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}</IconButton></div>
+      }}>{paused ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}</IconButton>}</div>
       <div id={queueItemsId} className={cx("queue-strip__items", expanded && "is-expanded")}>{queueWindow.items.map((item) => {
         const index = ordered.findIndex((candidate) => candidate.id === item.id);
-        const mutable = item.state === "accepted";
+        const mutable = item.state === "accepted" && canEditSharedQueueItem(controller.state.sessionAccess, item);
         const userEditable = mutable && item.source === "user";
         const pending = pendingItemIds.has(item.id);
         const editLocked = item.editLocked && editLockRef.current?.queueItemId !== item.id;
@@ -398,7 +400,7 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
             }}
           >
             <div className="queue-strip__row">
-              {mutable && <IconButton
+              {mutable && !guest && <IconButton
                 className="queue-strip__drag-handle"
                 style={{ touchAction: "none" }}
                 draggable={editingId !== item.id && !blocked}

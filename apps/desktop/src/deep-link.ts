@@ -1,4 +1,5 @@
 import { posix, win32 } from "node:path";
+import { parseTaskShareInvitation } from "@joko/contracts";
 
 import {
   isDesktopDeepLinkSettingsSection,
@@ -17,13 +18,14 @@ const MAXIMUM_PORTABLE_PATH_CHARACTERS = 32_768;
 export type ParsedDesktopDeepLink =
   | Exclude<DesktopDeepLinkNavigation, { readonly kind: "portable"; readonly file?: unknown }>
   | { readonly kind: "portable" }
+  | { readonly kind: "taskShareInvitation"; readonly invitation: string }
   | { readonly kind: "focus"; readonly source?: string };
 
 export type DesktopInboundOpenIntent =
   | ParsedDesktopDeepLink
   | { readonly kind: "portableFile"; readonly path: string };
 
-type DesktopNavigatingOpenIntent = Exclude<DesktopInboundOpenIntent, { readonly kind: "focus" }>;
+type DesktopNavigatingOpenIntent = Exclude<DesktopInboundOpenIntent, { readonly kind: "focus" | "taskShareInvitation" }>;
 
 export interface DesktopInboundNavigationClaim {
   readonly intent: DesktopNavigatingOpenIntent;
@@ -52,6 +54,10 @@ export function isDesktopMainDocumentReplacementNavigation(
 
 /** Parse only the public OS handoff surface. The privileged `joko://app` origin is intentionally rejected. */
 export function parseDesktopDeepLink(value: unknown): ParsedDesktopDeepLink | undefined {
+  if (typeof value === "string" && value.startsWith("joko://shared-task/")) {
+    try { parseTaskShareInvitation(value); return Object.freeze({ kind: "taskShareInvitation", invitation: value }); }
+    catch { return undefined; }
+  }
   if (typeof value !== "string" || value.length < 1 || value.length > MAXIMUM_DEEP_LINK_CHARACTERS
     || value.trim() !== value || /[\u0000-\u001f\u007f]/u.test(value)) return undefined;
   let url: URL;
@@ -241,7 +247,10 @@ export class DesktopInboundOpenIntentFence {
   private currentToken: object | undefined;
 
   begin(intent: DesktopInboundOpenIntent): DesktopInboundNavigationClaim | undefined {
-    if (intent.kind === "focus") return undefined;
+    if (intent.kind === "focus" || intent.kind === "taskShareInvitation") {
+      if (intent.kind === "taskShareInvitation") this.currentToken = undefined;
+      return undefined;
+    }
     const token = Object.freeze({});
     this.currentToken = token;
     return Object.freeze({ intent, token });

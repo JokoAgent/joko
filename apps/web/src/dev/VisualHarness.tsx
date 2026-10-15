@@ -439,6 +439,7 @@ export function VisualHarness(): JSX.Element {
   const controller = useMemo(() => {
     const implemented = {
       state,
+      taskSharing: undefined,
       partnerGroupApi: () => partnerGroups,
       listPartners: async (_lifecycle: Parameters<AppController["listPartners"]>[0], signal?: AbortSignal): ReturnType<AppController["listPartners"]> => {
         signal?.throwIfAborted();

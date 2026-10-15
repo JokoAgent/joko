@@ -1,5 +1,12 @@
 import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
 import { projectPartnerSessionTask } from "@joko/contracts";
+import { TaskShareMethod, SetSessionRuntimeMutationSchema, type JoinedTaskShare, type TaskSharingApi } from "@joko/contracts";
+import { mobileTaskSharingApi, mobileJoinedTaskNetwork, assertMobileSharedTaskSnapshot,
+  assertMobileSharedTaskOperation, mobileSharedTaskAuthorMatches, mobileTaskSharingDelay,
+  mobileSharedTaskDraftProfileId,
+  type MobileJoinedTaskSource, type MobileTaskSource } from "./mobile-task-sharing";
+import { resolveMobileSharedRuntimeControls } from "./mobile-runtime-controls";
+import { resolveMobileSharedContextControls } from "./mobile-context-controls";
 import { normalizeMobileObjectiveInput, type MobileObjectiveInput, type MobileObjectiveApi } from "./mobile-objective";
 import { MobileObjectiveRecovery, type MobileObjectiveRecoveryIdentity } from "./mobile-objective-recovery";
 import { mobileWorkerTargets, mobileWorkerLabel, mobileWorkerInitialTask, normalizeMobileWorkerForm,
@@ -492,6 +499,7 @@ export interface MobileState {
   readonly challenge?: { readonly id: string; readonly origin: string; readonly deviceName: string };
   readonly owner?: Snapshot;
   readonly selectedId?: string;
+  readonly taskSource?: MobileTaskSource;
   readonly detail?: Snapshot;
   readonly older: readonly Event[];
   readonly window?: readonly Event[];
@@ -518,6 +526,7 @@ export interface MobileState {
 export interface MobileTaskSendObserver {
   /** Caller-owned durable Operation identity, allocated before dispatch. */
   readonly operationId?: string;
+  readonly deliveryMode?: QueueDeliveryMode;
   /** Presentation-only notification after validation/upload and immediately before durable submit. */
   readonly onDispatch?: (draft: MobileComposerDraft) => void;
 }
@@ -804,6 +813,9 @@ export class MobileClient {
     homeSearchStatus: "idle", homeSearchSessionIds: [], files: emptyMobileFilesState(),
     automations: emptyMobileAutomationsState(), partnerPrivate: emptyMobilePartnerPrivateState() };
   #credential?: PairedCredential;
+  #joinedTask?: { readonly source: MobileJoinedTaskSource; readonly credential: PairedCredential;
+    readonly api: TaskSharingApi; readonly network: MobileNetwork; readonly lifetime: AbortController };
+  private get network(): MobileNetwork { return this.#joinedTask?.network ?? this.ownerNetwork; }
   #profiles: MobileConnectionProfile[] = [];
   #automaticProfileId?: string;
   #activeProfileId?: string;
@@ -907,7 +919,7 @@ export class MobileClient {
   };
 
   constructor(
-    private readonly network: MobileNetwork,
+    private readonly ownerNetwork: MobileNetwork,
     private readonly storage: MobileStorage,
     private readonly discovery: MobileDiscovery,
     private readonly newId: () => string,
@@ -1481,6 +1493,7 @@ export class MobileClient {
   }
 
   partnerConversationTransport(): MobilePartnerConversationTransport | undefined {
+    if (this.#joinedTask) return undefined;
     const directory = this.partnerDirectoryTransport();
     const presentationKey = this.taskPresentationOwnerKey();
     const credential = this.#credential;
@@ -1725,7 +1738,7 @@ export class MobileClient {
         const detail = await this.network.readSession(context.credential, conversation.sessionId, signal); requireSaveOwner();
         const owned = observed.snapshot.sessions.filter(session => session.sessionId === conversation.sessionId);
         const detailed = detail.sessions.filter(session => session.sessionId === conversation.sessionId);
-        if (observed.snapshot.generation !== this.#state.owner?.generation || detail.generation !== observed.snapshot.generation
+        if (observed.snapshot.generation !== this.#taskGeneration() || detail.generation !== observed.snapshot.generation
           || detail.server?.serverId !== node.serverId || detail.server.apiVersion !== node.apiVersion
           || owned.length !== 1 || detailed.length !== 1 || owned[0]!.targetId !== saveSession.targetId
           || detailed[0]!.targetId !== saveSession.targetId || owned[0]!.backendId !== saveSession.backendId
@@ -3804,7 +3817,7 @@ export class MobileClient {
       selectedId: selected,
       activeProfileId: profile.profileId,
       automaticProfileId: this.#automaticProfileId,
-      pending: this.#allPending.filter((item) => item.connectionId === profile.connectionId),
+      pending: this.#allPending.filter((item) => item.connectionId === profile.connectionId && item.taskJoinId === undefined),
       older: [],
       window: undefined,
       before: undefined,
@@ -4184,6 +4197,7 @@ export class MobileClient {
     if (this.#queueEditLease) this.#releaseQueueEditLeaseDetached(this.#queueEditLease);
     if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
     this.#connectionAttemptAbort = undefined;
+    this.#joinedTask?.lifetime.abort(); this.#joinedTask = undefined; this.#set({ taskSource: { kind: "own" } });
     const epoch = this.#retire();
     if (!this.#current(epoch)) return;
     const priorProfileId = this.#activeProfileId;
@@ -4191,7 +4205,7 @@ export class MobileClient {
     this.#activeProfileId = credential.profileId;
     this.#lastAuthenticatedAt = this.now();
     if (priorProfileId !== credential.profileId) this.#durableSnapshotAt = undefined;
-    const ownedPending = this.#allPending.filter((item) => item.connectionId === credential.connectionId);
+    const ownedPending = this.#allPending.filter((item) => item.connectionId === credential.connectionId && item.taskJoinId === undefined);
     this.#set({
       status: "connected",
       busy: false,
@@ -4627,7 +4641,112 @@ export class MobileClient {
     void this.refresh();
   }
 
+  taskSharingApi(): TaskSharingApi | undefined {
+    const credential = this.#credential;
+    if (!credential || !this.#foreground || this.#state.owner?.server?.serverId !== credential.serverId) return undefined;
+    return mobileTaskSharingApi(credential, () => !this.#disposed && this.#foreground && this.#credential === credential
+      && this.#state.activeProfileId === credential.profileId && this.#state.owner?.server?.serverId === credential.serverId);
+  }
+
+  taskSharingOwnerKey(): string | undefined {
+    const credential = this.#credential;
+    return this.taskSharingApi() && credential ? JSON.stringify([credential.profileId, credential.serverId,
+      credential.origin, credential.connectionId, credential.deviceId]) : undefined;
+  }
+  newTaskSharingActionId(): string { return this.newId(); }
+
+  async setSharedTaskRuntime(change: { readonly backendId?: string; readonly effort?: string; readonly fastMode?: boolean }): Promise<boolean> {
+    const joined = this.#joinedTask;
+    if (!joined || !this.#taskAuthorityKey()) throw new Error("The shared task controls are unavailable.");
+    const signal = this.#abort!.signal, source = this.#taskAuthorityKey();
+    const response = await joined.api.invoke(joined.source.joined.joinId, TaskShareMethod.GET_RUNTIME_CONTROL,
+      { sessionId: joined.source.joined.share!.sessionId }, signal);
+    if (!response.control || this.#joinedTask !== joined || source !== this.#taskAuthorityKey()) throw new Error("The shared task runtime owner changed.");
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, { payload: { case: "setSessionRuntime", value: create(SetSessionRuntimeMutationSchema, {
+        sessionId: joined.source.joined.share!.sessionId, expectedRuntimeGeneration: response.control.generation, ...change
+      }) } }), { kind: "session-model", sessionId: joined.source.joined.share!.sessionId });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  async controlSharedTask(command: "stop" | "resume"): Promise<boolean> {
+    if (!this.#joinedTask || !this.#taskAuthorityKey()) throw new Error("The shared task is unavailable.");
+    const sessionId = this.#joinedTask.source.joined.share!.sessionId;
+    const run = this.#state.detail?.runs.find(item => item.sessionId === sessionId
+      && [RunState.ACCEPTED, RunState.DISPATCHING, RunState.RUNNING, RunState.WAITING, RunState.RETRYING].includes(item.state));
+    if (command === "stop" && !run) return true;
+    const action = this.#claimMutation();
+    try {
+      const result = await this.#submitTerminal(create(OperationMutationSchema, { payload: command === "stop"
+        ? { case: "abortRun", value: { runId: run!.runId } }
+        : { case: "resumeSession", value: { sessionId } } }), { kind: "session-model", sessionId });
+      return result.accepted && result.definitive;
+    } finally { this.#releaseMutation(action); }
+  }
+
+  taskDraftProfileId(): string | undefined {
+    const joined = this.#joinedTask;
+    return joined ? mobileSharedTaskDraftProfileId(joined.source.homeProfileId, joined.source.homeServerId,
+      joined.source.homeOrigin, joined.source.joined.joinId) : this.#state.activeProfileId;
+  }
+
+  async openJoinedTask(joined: JoinedTaskShare): Promise<void> {
+    const credential = this.#ready(), api = this.taskSharingApi();
+    if (!api || !joined.share || !joined.member || !["active", "disconnected"].includes(joined.status)) throw new Error("Reconnect to the Home node before opening this shared task.");
+    this.leaveTask();
+    this.#joinedTask?.lifetime.abort();
+    const lifetime = new AbortController();
+    const source: MobileJoinedTaskSource = { kind: "joined", homeProfileId: credential.profileId,
+      homeServerId: credential.serverId, homeOrigin: credential.origin, joined };
+    this.#joinedTask = { source, credential, api, lifetime,
+      network: mobileJoinedTaskNetwork(api, source, lifetime.signal, this.newId) };
+    this.#retire();
+    this.#set({ taskSource: source, selectedId: joined.share.sessionId, detail: undefined,
+      older: [], live: [], window: undefined, before: undefined, historyEnd: false, historyBusy: false,
+      pending: this.#allPending.filter(item => item.connectionId === credential.connectionId && item.taskJoinId === joined.joinId) });
+    await this.refresh();
+  }
+
+  async #refreshJoinedTask(): Promise<void> {
+    const joined = this.#joinedTask;
+    if (!joined || !this.#foreground) return;
+    const epoch = this.#retire(), signal = this.#abort!.signal;
+    this.#set({ status: "connecting", liveStatus: "polling", error: undefined });
+    const current = () => this.#current(epoch) && this.#joinedTask === joined && this.#credential === joined.credential;
+    const read = async (initial: boolean) => {
+      try {
+        const cursor = this.#state.detail?.resumeCursor;
+        const batch = !initial && cursor ? await joined.api.events({ joinId: joined.source.joined.joinId, after: cursor, limit: 128 }, signal) : undefined;
+        if (!current()) return;
+        const detail = await joined.network.readSession(joined.credential, joined.source.joined.share!.sessionId, signal);
+        if (!current()) return;
+        assertMobileSharedTaskSnapshot(joined.source, detail);
+        const reset = batch?.resyncRequired || (this.#state.detail && this.#state.detail.generation !== detail.generation);
+        this.#set({ detail, status: "connected", liveStatus: "polling", error: undefined,
+          ...(reset ? { older: [], window: undefined, before: undefined, historyEnd: false } : {}),
+          live: (batch?.events ?? []).filter(event => event.identity?.sessionId === detail.sessions[0]!.sessionId
+            && event.cursor && event.cursor.sequence > (detail.resumeCursor?.sequence ?? 0n)) });
+        if (initial) await this.reconcile(epoch);
+      } catch (error) {
+        if (!current() || signal.aborted) return;
+        const revoked = isRevoked(error) || (error as { code?: number })?.code === Code.NotFound;
+        this.#set({ status: "offline", liveStatus: "paused", error: revoked
+          ? "Access to this shared task ended. Return to Shared tasks to reconnect or leave."
+          : message(error), ...(revoked ? { detail: undefined, live: [], older: [], window: undefined } : {}) });
+        if (revoked) { joined.lifetime.abort(); return; }
+      }
+      if (current() && !joined.lifetime.signal.aborted) this.#timer = setTimeout(() => { void read(false); }, 1_000);
+    };
+    await read(true);
+  }
+
   async refresh(): Promise<void> {
+    if (this.#joinedTask && this.#joinedTask.credential !== this.#credential) {
+      this.#joinedTask?.lifetime.abort(); this.#joinedTask = undefined; this.#set({ taskSource: { kind: "own" } });
+    }
+    if (this.#joinedTask) { await this.#refreshJoinedTask(); return; }
     const credential = this.#credential;
     if (!this.#foreground) return;
     if (!credential) {
@@ -4655,7 +4774,7 @@ export class MobileClient {
       if (!this.#current(epoch)) return;
       if (selected !== selectedId) await this.storage.saveSelection(credential.profileId, selected);
       if (!this.#current(epoch)) return;
-      const sameWindow = selected === selectedId && this.#state.owner?.generation === owner.snapshot.generation;
+      const sameWindow = selected === selectedId && this.#taskGeneration() === owner.snapshot.generation;
       this.#lastAuthenticatedAt = this.now();
       this.#set({ node, origin: credential.origin, owner: owner.snapshot, detail, selectedId: selected,
         older: sameWindow ? this.#state.older : [], window: sameWindow ? this.#state.window : undefined,
@@ -4884,7 +5003,7 @@ export class MobileClient {
   async #syncProjection(epoch: number, credential: PairedCredential, snapshotPoll = false): Promise<void> {
     this.#projectionReading = true;
     const selectedId = this.#state.selectedId;
-    const generation = snapshotPoll ? this.#state.owner?.generation : this.#streamGeneration;
+    const generation = snapshotPoll ? this.#taskGeneration() : this.#streamGeneration;
     const edge = snapshotPoll ? this.#state.owner?.resumeCursor?.sequence ?? 0n : this.#streamSequence ?? 0n;
     try {
       let node = this.#state.node!;
@@ -4955,7 +5074,8 @@ export class MobileClient {
     const write = this.#pendingWrite.then(async () => {
       if (!this.#current(epoch) || this.#credential?.connectionId !== connectionId) return false;
       const merged = [
-        ...this.#allPending.filter((item) => item.connectionId !== connectionId),
+        ...this.#allPending.filter((item) => item.connectionId !== connectionId
+          || item.taskJoinId !== this.#joinedTask?.source.joined.joinId),
         ...items
       ];
       await this.storage.savePending(merged);
@@ -4988,6 +5108,9 @@ export class MobileClient {
     }
     if (this.#queueInteractionLease) this.#releaseQueueInteractionLeaseDetached(this.#queueInteractionLease);
     await this.#releaseQueueEditBeforeTransition();
+    this.#joinedTask?.lifetime.abort(); this.#joinedTask = undefined;
+    this.#set({ taskSource: { kind: "own" }, pending: this.#allPending.filter(item =>
+      item.connectionId === this.#credential?.connectionId && item.taskJoinId === undefined) });
     const profileId = this.#activeProfileId;
     if (!profileId) throw new Error("Reconnect to a saved Joko node before selecting a task.");
     const offline = this.#state.status === "offline" && this.#hasOfflineProjection(profileId);
@@ -5891,7 +6014,7 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
-  canOpenFiles(): boolean { return this.filesAuthorityKey() !== undefined; }
+  canOpenFiles(): boolean { return !this.#joinedTask && this.filesAuthorityKey() !== undefined; }
 
   filesAuthorityKey(): string | undefined { return this.#filesAuthorityKey(this.#state); }
 
@@ -6579,7 +6702,7 @@ export class MobileClient {
       throw new Error("This Timeline file does not have an in-app preview.");
     }
     const source = resolveMobileTimelinePreviewArtifact(events, selected);
-    const generation = this.#state.owner?.generation;
+    const generation = this.#taskGeneration();
     if (!taskAuthorityKey || !sessionId || !generation || !source
       || source.event.identity?.sessionId !== sessionId
       || source.event.cursor?.generation !== generation) {
@@ -6849,7 +6972,7 @@ export class MobileClient {
     const sessionId = this.#state.selectedId;
     const events = this.#timelineEvents();
     const source = resolveMobileTimelineArtifact(events, selected);
-    const generation = this.#state.owner?.generation;
+    const generation = this.#taskGeneration();
     if (!taskAuthorityKey || !sessionId || !generation || !source
       || source.event.identity?.sessionId !== sessionId
       || source.event.cursor?.generation !== generation) {
@@ -6942,7 +7065,7 @@ export class MobileClient {
         const around = await this.network.readAround(credential, timeline.sessionId, timeline.artifact.eventId, signal);
         assertCurrent(signal);
         const current = resolveMobileTimelinePreviewArtifact(around, timeline.artifact);
-        if (!current || current.event.identity?.sessionId !== timeline.sessionId || current.event.cursor?.generation !== this.#state.owner?.generation
+        if (!current || current.event.identity?.sessionId !== timeline.sessionId || current.event.cursor?.generation !== this.#taskGeneration()
           || !sameMobileTimelinePreviewArtifact(current.artifact, timeline.artifact)) throw new Error("The canonical Timeline text file changed.");
       } else if (entry) {
         const context = this.#filesContext();
@@ -7406,7 +7529,7 @@ export class MobileClient {
     if (!ownerKey || !sessionId) throw new Error("The inline image has no current task owner.");
     const currentPage = (events: readonly Event[]): MobileImageGalleryPage | undefined => {
       const sources = events.filter((event) => event.eventId === eventId && event.identity?.sessionId === sessionId
-        && event.cursor?.generation === this.#state.owner?.generation);
+        && event.cursor?.generation === this.#taskGeneration());
       return sources.length === 1 ? timelineGalleryPagesForSelection(events, eventId, pageId).find((page) => page.pageId === pageId) : undefined;
     };
     const page = currentPage(this.#timelineEvents());
@@ -7446,7 +7569,7 @@ export class MobileClient {
     const events = source.length === 1 ? this.#timelineEvents().filter((event) => event.eventId === source[0]!.eventId) : [];
     const event = events.length === 1 ? events[0] : undefined;
     if (!ownerKey || !event || event.identity?.sessionId !== files.authority.sessionId
-      || event.cursor?.generation !== this.#state.owner?.generation || event.payload?.kind.case !== "messageCompleted"
+      || event.cursor?.generation !== this.#taskGeneration() || event.payload?.kind.case !== "messageCompleted"
       || event.payload.kind.value.role !== MessageRole.ASSISTANT) throw new Error("The completed message has no current Workspace authority.");
     const digest = mobileConversationShareEventDigest(event);
     const assertCurrent = (signal?: AbortSignal): void => {
@@ -7469,7 +7592,7 @@ export class MobileClient {
         const around = await this.network.readAround(credential, files.authority.sessionId, event.eventId, signal);
         assertCurrent(signal);
         const matches = around.filter((item) => item.eventId === event.eventId && item.identity?.sessionId === files.authority.sessionId
-          && item.cursor?.generation === this.#state.owner?.generation);
+          && item.cursor?.generation === this.#taskGeneration());
         if (matches.length !== 1 || mobileConversationShareEventDigest(matches[0]!) !== digest) {
           throw new Error("The message was changed or removed before its resource opened.");
         }
@@ -7536,7 +7659,7 @@ export class MobileClient {
     this.#markdownResources.retain(leaseId);
     let adopted = false;
     try {
-      const identity = { profileId: credential.profileId, sessionId };
+      const identity = { profileId: this.taskDraftProfileId()!, sessionId };
       const snapshot = await this.composerDrafts.readSnapshot(identity);
       const draft = normalizeMobileComposerDraft(snapshot.draft ?? emptyMobileComposerDraft());
       signal.throwIfAborted(); this.#markdownResources.assertCurrent(leaseId);
@@ -7578,7 +7701,7 @@ export class MobileClient {
     const eventFor = (eventId: string): Event => {
       const matches = events.filter((event) => event.eventId === eventId);
       const event = matches.length === 1 ? matches[0]! : undefined;
-      if (!event || event.identity?.sessionId !== sessionId || event.cursor?.generation !== this.#state.owner?.generation) {
+      if (!event || event.identity?.sessionId !== sessionId || event.cursor?.generation !== this.#taskGeneration()) {
         throw new Error("A selected message source is unavailable.");
       }
       sources.set(eventId, mobileConversationShareEventDigest(event));
@@ -7705,7 +7828,7 @@ export class MobileClient {
       const around = await this.network.readAround(lease.credential, lease.sessionId, eventId, signal);
       this.#assertConversationShareCurrent(lease, signal);
       const matches = around.filter((event) => event.eventId === eventId && event.identity?.sessionId === lease.sessionId
-        && event.cursor?.generation === this.#state.owner?.generation);
+        && event.cursor?.generation === this.#taskGeneration());
       if (matches.length !== 1 || mobileConversationShareEventDigest(matches[0]!) !== digest) {
         throw new Error("A selected message was changed or removed before system sharing began.");
       }
@@ -7742,7 +7865,7 @@ export class MobileClient {
     if (initialIndex < 0 || pages.length === 0) {
       throw new Error("The selected image is not in its current durable Timeline source.");
     }
-    const identity = { profileId: credential.profileId, sessionId };
+    const identity = { profileId: this.taskDraftProfileId()!, sessionId };
     const snapshot = await this.composerDrafts.readSnapshot(identity);
     const draft = normalizeMobileComposerDraft(snapshot.draft ?? {
       text: "", mentions: [], atoms: [], slashCommands: [], attachments: []
@@ -8118,8 +8241,8 @@ export class MobileClient {
       const before = this.#state.before;
       const page = await this.network.readHistory(credential, sessionId, before, this.#abort?.signal);
       if (!this.#current(epoch) || sessionId !== this.#state.selectedId || this.#historyOwner !== owner) return;
-      validateHistory(page.events, sessionId, this.#state.owner?.generation, before);
-      if (page.before && (page.events.length === 0 || !page.before.opaqueToken || page.before.generation !== this.#state.owner?.generation
+      validateHistory(page.events, sessionId, this.#taskGeneration(), before);
+      if (page.before && (page.events.length === 0 || !page.before.opaqueToken || page.before.generation !== this.#taskGeneration()
         || (before && page.before.sequence >= before.sequence) || page.before.sequence > page.events[0]!.cursor!.sequence)) {
         throw new Error("The task history returned a cyclic or mismatched page cursor.");
       }
@@ -8146,7 +8269,7 @@ export class MobileClient {
     try {
       const events = await this.network.readAround(credential, sessionId, eventId, this.#abort?.signal);
       if (!this.#current(epoch) || sessionId !== this.#state.selectedId || this.#historyOwner !== owner) return;
-      validateHistory(events, sessionId, this.#state.owner?.generation);
+      validateHistory(events, sessionId, this.#taskGeneration());
       if (!events.some((event) => event.eventId === eventId)) throw new Error("The selected event is no longer in task history.");
       this.#set({ window: events, older: [], before: events[0]!.cursor, historyEnd: false });
     } catch (error) {
@@ -8864,7 +8987,7 @@ export class MobileClient {
     const exactDraft = normalizeMobileComposerDraft(draft);
     const sessionId = this.#state.selectedId;
     const session = this.#state.detail?.sessions.find((item) => item.sessionId === sessionId);
-    const backend = this.#state.owner?.backends.find((item) => item.backendId === session?.backendId);
+    const backend = this.#selectedBackend(session);
     const generation = session?.nativeBinding?.runtimeGeneration;
     if ((!exactDraft.text.trim() && exactDraft.attachments.length === 0)
       || !sessionId || !session || !backend || !supportsText(backend) || !generation || generation < 1n) {
@@ -8900,7 +9023,7 @@ export class MobileClient {
       assertMobileAttachmentPolicy(sendDraft.attachments, attachmentControls.policy);
     }
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
-    const draftIdentity = { profileId: credential.profileId, sessionId };
+    const draftIdentity = { profileId: this.taskDraftProfileId()!, sessionId };
     this.composerDrafts.save(draftIdentity, sendDraft);
     await this.composerDrafts.flush(draftIdentity);
     const currentSession = this.#selectedSession();
@@ -8981,7 +9104,7 @@ export class MobileClient {
         payload: { case: "sendInput", value: create(SendInputMutationSchema, {
           sessionId,
           input: mobileComposerInput(sendDraft),
-          deliveryMode: QueueDeliveryMode.PROMPT
+          deliveryMode: observer.deliveryMode ?? QueueDeliveryMode.PROMPT
         }) }
       }), { kind: "send", sessionId }, observer.operationId);
       if (accepted) {
@@ -9077,7 +9200,7 @@ export class MobileClient {
     if (this.#taskAuthorityKey() !== authorityKey || session?.sessionId !== sessionId
       || session.nativeBinding?.runtimeGeneration !== generation || !controls
       || controls.surfaceOwnerKey !== attachmentOwnerKey
-      || controls.profileId !== credential.profileId
+      || controls.profileId !== this.taskDraftProfileId()
       || this.#credential?.profileId !== credential.profileId
       || this.#credential.connectionId !== credential.connectionId) {
       throw new Error("The task changed while its attachments were uploading.");
@@ -9148,6 +9271,7 @@ export class MobileClient {
   }
 
   canDeleteMessage(eventId: string): boolean {
+    if (this.#joinedTask) return false;
     const session = this.#selectedSession();
     const backend = this.#selectedBackend(session);
     return this.#state.status === "connected" && this.#foreground
@@ -9190,6 +9314,7 @@ export class MobileClient {
 
   /** Stable page-local owner occurrence; excludes normal entity revision advancement. */
   taskPresentationOwnerKey(): string | undefined {
+    if (this.#joinedTask) return this.#taskAuthorityKey();
     const saving = this.#partnerProfileSave;
     if (saving) {
       if (!saving || this.#mutationOwner !== saving.action || !this.#current(saving.epoch)
@@ -9199,7 +9324,7 @@ export class MobileClient {
         const sessions = snapshot?.sessions.filter(session => session.sessionId === saving.sessionId) ?? [];
         const targets = snapshot?.targets.filter(target => target.targetId === saving.targetId) ?? [];
         const backends = snapshot?.backends.filter(backend => backend.backendId === saving.backendId) ?? [];
-        if (snapshot?.generation !== this.#state.owner?.generation || sessions.length !== 1 || targets.length !== 1 || backends.length !== 1
+        if (snapshot?.generation !== this.#taskGeneration() || sessions.length !== 1 || targets.length !== 1 || backends.length !== 1
           || sessions[0]!.targetId !== saving.targetId || sessions[0]!.backendId !== saving.backendId
           || !sessions[0]!.nativeBinding?.runtimeGeneration || sessions[0]!.nativeBinding!.runtimeGeneration! < 1n || sessions[0]!.archived
           || [SessionState.CLOSED, SessionState.ARCHIVED].includes(sessions[0]!.state)
@@ -9228,10 +9353,16 @@ export class MobileClient {
   }
 
   taskQueueCapabilities() {
-    return mobileQueueCapabilities(this.#selectedBackend(this.#selectedSession()));
+    const capabilities = mobileQueueCapabilities(this.#selectedBackend(this.#selectedSession()));
+    return this.#joinedTask ? { ...capabilities, reorder: false } : capabilities;
+  }
+
+  taskQueueItemOwned(item: QueueItem): boolean {
+    return !this.#joinedTask || mobileSharedTaskAuthorMatches(this.#joinedTask.source, item.sharedTaskAuthor);
   }
 
   taskRuntimeControls(): MobileRuntimeControls | undefined {
+    if (this.#joinedTask) return resolveMobileSharedRuntimeControls(this.#state.detail, this.#taskAuthorityKey());
     const credential = this.#credential;
     if (!credential || !this.#taskAuthorityKey()) return undefined;
     return resolveMobileRuntimeControls({
@@ -9243,6 +9374,7 @@ export class MobileClient {
   }
 
   taskProviderUsageTransport(): MobileProviderUsageTransport | undefined {
+    if (this.#joinedTask) return undefined;
     const credential = this.#credential;
     const ownerKey = this.#taskProviderUsageOwnerKey();
     const session = this.#selectedSession();
@@ -9501,6 +9633,7 @@ export class MobileClient {
   }
 
   taskSessionMentionControls(): MobileSessionMentionControls | undefined {
+    if (this.#joinedTask) return undefined;
     const authorityKey = this.#taskAuthorityKey();
     const session = this.#selectedSession();
     const backend = this.#selectedBackend(session);
@@ -9508,6 +9641,7 @@ export class MobileClient {
   }
 
   taskWorkspaceMentionControls(): MobileWorkspaceMentionControls | undefined {
+    if (this.#joinedTask) return undefined;
     return createMobileWorkspaceMentionControls(
       this.#taskAuthorityKey(),
       this.#state.owner,
@@ -9517,6 +9651,7 @@ export class MobileClient {
   }
 
   taskWorkspacePathPasteControls(): MobileWorkspacePathPasteControls | undefined {
+    if (this.#joinedTask) return undefined;
     return createMobileWorkspacePathPasteControls(
       this.#taskAuthorityKey(),
       this.#state.owner,
@@ -9552,6 +9687,7 @@ export class MobileClient {
   }
 
   taskCatalogMentionControls(): MobileCatalogMentionControls | undefined {
+    if (this.#joinedTask) return undefined;
     return createMobileCatalogMentionControls(
       this.#taskAuthorityKey(),
       this.#state.owner,
@@ -9561,6 +9697,7 @@ export class MobileClient {
   }
 
   taskRuntimeCommandControls(): MobileRuntimeCommandControls | undefined {
+    if (this.#joinedTask) return undefined;
     return createMobileRuntimeCommandControls(
       this.#taskAuthorityKey(),
       this.#state.owner,
@@ -9570,6 +9707,7 @@ export class MobileClient {
   }
 
   taskAppCommandControls(): MobileAppCommandControls | undefined {
+    if (this.#joinedTask) return undefined;
     return createMobileAppCommandControls(
       this.#taskAuthorityKey(),
       this.#state.owner,
@@ -9582,11 +9720,11 @@ export class MobileClient {
     const authorityKey = this.#taskAuthorityKey();
     const credential = this.#credential;
     const session = this.#selectedSession();
-    const model = resolveMobileSessionModelAuthority(this.#state.owner, session);
+    const model = resolveMobileSessionModelAuthority(this.#joinedTask ? this.#state.detail : this.#state.owner, session);
     const policy = resolveMobileAttachmentPolicy(this.#selectedBackend(session), model?.supportsImages === true);
     if (!authorityKey || !credential || !policy) return undefined;
     return {
-      profileId: credential.profileId,
+      profileId: this.taskDraftProfileId()!,
       surfaceOwnerKey: `${authorityKey}\u001fattachments\u001f${model?.authorityKey ?? "native-default"}`,
       policy
     };
@@ -9599,7 +9737,7 @@ export class MobileClient {
     const credential = this.#credential;
     if (!authorityKey || !credential) return undefined;
     return {
-      profileId: credential.profileId,
+      profileId: this.taskDraftProfileId()!,
       surfaceOwnerKey: `${authorityKey}\u001fincoming-share-text`,
       policy: textOnlyIncomingSharePolicy
     };
@@ -9623,10 +9761,10 @@ export class MobileClient {
       const sessionId = this.#state.selectedId;
       const authorityKey = this.#taskAuthorityKey();
       controls = this.taskAttachmentControls();
-      if (!sessionId || !authorityKey || !controls || controls.profileId !== credential.profileId) {
+      if (!sessionId || !authorityKey || !controls || controls.profileId !== this.taskDraftProfileId()) {
         throw new Error("The current task image attachment authority is unavailable.");
       }
-      const identity = { profileId: credential.profileId, sessionId };
+      const identity = { profileId: this.taskDraftProfileId()!, sessionId };
       const snapshot = await this.composerDrafts.readSnapshot(identity);
       const draft = normalizeMobileComposerDraft(snapshot.draft ?? {
         text: "", mentions: [], atoms: [], slashCommands: [], attachments: []
@@ -9634,7 +9772,7 @@ export class MobileClient {
       owner = { kind: "task", authorityKey, identity, snapshot, draft };
     } else {
       controls = this.newTaskAttachmentControls(request.targetId);
-      if (!controls || controls.profileId !== credential.profileId) {
+      if (!controls || controls.profileId !== this.taskDraftProfileId()) {
         throw new Error("The new-task image attachment authority is unavailable.");
       }
       const identity = { profileId: credential.profileId };
@@ -10716,6 +10854,7 @@ export class MobileClient {
   }
 
   taskContextControls(): MobileContextControls | undefined {
+    if (this.#joinedTask) return resolveMobileSharedContextControls(this.#state.detail, this.#taskAuthorityKey());
     const credential = this.#credential;
     if (!credential || !this.#taskAuthorityKey()) return undefined;
     return resolveMobileContextControls({
@@ -11175,6 +11314,7 @@ export class MobileClient {
   }
 
   taskDerivationOriginControls(): MobileSessionOriginControls | undefined {
+    if (this.#joinedTask) return undefined;
     const session = this.#selectedSession();
     if (!session) return undefined;
     const projected = projectMobileSessionOrigin(session, this.#state.owner?.sessions ?? []);
@@ -11455,6 +11595,7 @@ export class MobileClient {
   }
 
   taskHeaderSourceKey(): string | undefined {
+    if (this.#joinedTask) return this.#taskAuthorityKey();
     if (!this.#taskAuthorityKey()) return undefined;
     const credential = this.#credential!, owner = this.#state.owner!;
     const session = this.#state.detail!.sessions.find(candidate => candidate.sessionId === this.#state.selectedId)!;
@@ -11477,8 +11618,8 @@ export class MobileClient {
     const authorityKey = this.#taskAuthorityKey();
     const sessionId = this.#state.selectedId;
     const detail = this.#state.detail;
-    const owner = this.#state.owner;
-    if (!authorityKey || !sessionId || owner?.scope?.kind.case !== "owner"
+    const owner = this.#joinedTask ? this.#state.detail : this.#state.owner;
+    if (!authorityKey || !sessionId || (!this.#joinedTask && owner?.scope?.kind.case !== "owner") || !owner
       || detail?.scope?.kind.case !== "session" || detail.scope.kind.value.sessionId !== sessionId) return undefined;
     const session = detail.sessions.find((candidate) => candidate.sessionId === sessionId)!;
     const backend = detail.backends.find((candidate) => candidate.backendId === session.backendId)!;
@@ -11513,6 +11654,12 @@ export class MobileClient {
       this.network.listBackgroundTasks(credential, sessionId, pageToken, activeSignal));
   }
 
+  async loadTaskBackgroundOutput(authorityKey: string, taskId: string, signal?: AbortSignal) {
+    if (!this.taskDelegatedControls()?.canListBackground || !this.network.readBackgroundTaskOutput) throw new Error("Background output is unavailable for this task.");
+    return this.#readDelegated(authorityKey, signal, (credential, sessionId, owned) =>
+      this.network.readBackgroundTaskOutput!(credential, sessionId, taskId, owned));
+  }
+
   async loadTaskDelegatedRuns(authorityKey: string, pageToken = "", signal?: AbortSignal) {
     if (!this.taskDelegatedControls()?.canListRuns) throw new Error("Delegated activity is unavailable for this task.");
     return this.#readDelegated(authorityKey, signal, (credential, sessionId, activeSignal) =>
@@ -11532,6 +11679,7 @@ export class MobileClient {
   }
 
   taskNativeTreeControls(): MobileNativeTreeControls | undefined {
+    if (this.#joinedTask) return undefined;
     const credential = this.#credential;
     if (!credential || !this.#taskAuthorityKey()) return undefined;
     return resolveMobileNativeTreeControls({
@@ -11590,7 +11738,8 @@ export class MobileClient {
   }
 
   taskInteractions(): readonly Interaction[] {
-    return pendingMobileInteractions(this.#state.detail, this.#state.selectedId);
+    const all = pendingMobileInteractions(this.#state.detail, this.#state.selectedId);
+    return this.#joinedTask ? all.filter(item => ["permission", "question", "planReview"].includes(item.request.case ?? "")) : all;
   }
 
   async resolveInteraction(interactionId: string, submission: MobileInteractionSubmission): Promise<boolean> {
@@ -11711,11 +11860,11 @@ export class MobileClient {
     } finally { this.#releaseMutation(action); }
   }
 
-  async saveQueueEdit(lease: MobileQueueEditLease, text: string): Promise<boolean> {
+  async saveQueueEdit(lease: MobileQueueEditLease, text: string, deliveryMode?: QueueDeliveryMode): Promise<boolean> {
     this.#assertQueueEditLease(lease);
     const { item, capabilities } = this.#queueItemContext(lease.queueItemId);
     if (!capabilities.edit) throw new Error("This Backend no longer supports editing queued input.");
-    if (queueItemText(item.input) === text) {
+    if (queueItemText(item.input) === text && (deliveryMode === undefined || deliveryMode === item.deliveryMode)) {
       await this.cancelQueueEdit(lease);
       return true;
     }
@@ -11729,7 +11878,7 @@ export class MobileClient {
         payload: { case: "editQueueItem", value: create(EditQueueItemMutationSchema, {
           queueItemId: item.queueItemId,
           input: edit.input,
-          deliveryMode: item.deliveryMode,
+          deliveryMode: deliveryMode ?? item.deliveryMode,
           lockToken: lease.lockToken,
           textSplices: [...edit.textSplices]
         }) }
@@ -11988,12 +12137,14 @@ export class MobileClient {
     const sessionId = this.#state.selectedId;
     if (!sessionId) return undefined;
     return this.#state.detail?.sessions.find((item) => item.sessionId === sessionId)
-      ?? this.#state.owner?.sessions.find((item) => item.sessionId === sessionId);
+      ?? (this.#joinedTask ? undefined : this.#state.owner?.sessions.find((item) => item.sessionId === sessionId));
   }
 
   #selectedBackend(session: Session | undefined) {
-    return this.#state.owner?.backends.find((item) => item.backendId === session?.backendId);
+    return (this.#joinedTask ? this.#state.detail : this.#state.owner)?.backends.find((item) => item.backendId === session?.backendId);
   }
+
+  #taskGeneration(): bigint | undefined { return (this.#joinedTask ? this.#state.detail : this.#state.owner)?.generation; }
 
   #runtimeControlContext(expectedAuthorityKey: string): MobileRuntimeControls {
     this.#ready();
@@ -12351,6 +12502,7 @@ export class MobileClient {
     surfaceOwnerKey: string,
     readCurrentOwnerKey: () => string | undefined
   ): MobileVoiceTransport {
+    const voiceNetwork = this.ownerNetwork;
     const isCurrent = (): boolean => readCurrentOwnerKey() === surfaceOwnerKey
       && this.#credential?.profileId === credential.profileId
       && this.#credential.connectionId === credential.connectionId
@@ -12399,18 +12551,25 @@ export class MobileClient {
       surfaceOwnerKey,
       isCurrent,
       waitUntilCurrent,
-      getCapabilities: (signal) => owned(() => this.network.getVoiceInputCapabilities(credential, signal)),
-      getVoiceInputDictionary: (signal) => owned(() => this.network.getVoiceInputDictionary(credential, signal)),
+      getCapabilities: (signal) => owned(() => voiceNetwork.getVoiceInputCapabilities(credential, signal)),
+      getVoiceInputDictionary: (signal) => owned(() => voiceNetwork.getVoiceInputDictionary(credential, signal)),
       applyVoiceInputDictionaryLearning: (revision, actions, signal) => owned(() =>
-        this.network.applyVoiceInputDictionaryLearning(credential, revision, actions, signal)),
+        voiceNetwork.applyVoiceInputDictionaryLearning(credential, revision, actions, signal)),
       adviseVoiceInputDictionaryEdit: (draft, signal) => owned(() =>
-        this.network.adviseVoiceInputDictionaryEdit(credential, draft, signal)),
-      start: (requestId, mimeType, locale, refinement, signal, recognitionContext) => owned(() =>
-        recognitionContext === undefined
-          ? this.network.startVoiceInput(credential, requestId, mimeType, locale, refinement, signal)
-          : this.network.startVoiceInput(credential, requestId, mimeType, locale, refinement, signal, recognitionContext)),
+        voiceNetwork.adviseVoiceInputDictionaryEdit(credential, draft, signal)),
+      start: async (requestId, mimeType, locale, refinement, signal, recognitionContext) => {
+        assertCurrent();
+        const session = await (recognitionContext === undefined
+          ? voiceNetwork.startVoiceInput(credential, requestId, mimeType, locale, refinement, signal)
+          : voiceNetwork.startVoiceInput(credential, requestId, mimeType, locale, refinement, signal, recognitionContext));
+        if (!isCurrent() || signal?.aborted) {
+          await voiceNetwork.cancelVoiceInput(credential, session.id).catch(() => undefined);
+          throw new Error("The voice input owner changed while starting.");
+        }
+        return session;
+      },
       append: (voiceInputId, chunkSequence, audio, durationMs, voiced, signal) => owned(() =>
-        this.network.appendVoiceAudio(
+        voiceNetwork.appendVoiceAudio(
           credential,
           voiceInputId,
           chunkSequence,
@@ -12420,11 +12579,11 @@ export class MobileClient {
           signal
         )),
       stop: (voiceInputId, expectedNextChunkSequence, signal) => owned(() =>
-        this.network.stopVoiceInput(credential, voiceInputId, expectedNextChunkSequence, signal)),
+        voiceNetwork.stopVoiceInput(credential, voiceInputId, expectedNextChunkSequence, signal)),
       // Cleanup must retain the initiating credential even after UI authority
       // retires; it can only address this exact connection-owned voice id.
-      cancel: (voiceInputId, signal) => this.network.cancelVoiceInput(credential, voiceInputId, signal),
-      get: (voiceInputId, signal) => owned(() => this.network.getVoiceInputSession(credential, voiceInputId, signal))
+      cancel: (voiceInputId, signal) => voiceNetwork.cancelVoiceInput(credential, voiceInputId, signal),
+      get: (voiceInputId, signal) => owned(() => voiceNetwork.getVoiceInputSession(credential, voiceInputId, signal))
     };
   }
 
@@ -12464,6 +12623,18 @@ export class MobileClient {
   }
 
   #taskAuthorityKey(): string | undefined {
+    if (this.#joinedTask) {
+      const { source, credential, lifetime } = this.#joinedTask, detail = this.#state.detail;
+      const session = detail?.sessions[0], share = source.joined.share!, member = source.joined.member!;
+      if (lifetime.signal.aborted || credential !== this.#credential || this.#state.taskSource !== source
+        || !this.#foreground || this.#state.status !== "connected" || !detail || !session?.nativeBinding?.runtimeGeneration
+        || this.#state.owner?.server?.serverId !== credential.serverId || this.#state.activeProfileId !== credential.profileId) return undefined;
+      assertMobileSharedTaskSnapshot(source, detail);
+      return JSON.stringify(["joined", credential.profileId, credential.connectionId, credential.deviceId, credential.serverId,
+        source.joined.joinId, share.hostServerId, share.shareId, share.shareGeneration.toString(), member.memberId,
+        member.memberGeneration.toString(), detail.generation.toString(), session.sessionId, session.backendId,
+        session.targetId, session.nativeBinding.runtimeGeneration.toString()]);
+    }
     const credential = this.#credential;
     const owner = this.#state.owner;
     const detail = this.#state.detail;
@@ -12524,7 +12695,7 @@ export class MobileClient {
 
   #completedMessageEvent(eventId: string): Event | undefined {
     const sessionId = this.#state.selectedId;
-    const generation = this.#state.owner?.generation;
+    const generation = this.#taskGeneration();
     if (!sessionId || !eventId || !generation) return undefined;
     const events = this.#state.window
       ?? [...this.#state.older, ...(this.#state.detail?.timeline ?? []), ...this.#state.live];
@@ -12563,6 +12734,7 @@ export class MobileClient {
     const backend = this.#selectedBackend(session);
     const item = this.#queueItem(queueItemId);
     const revision = item?.version?.revision;
+    if (item && !this.taskQueueItemOwned(item)) throw new Error("Only your own pending input can be changed.");
     if (!authorityKey || !session || !backend || !item || item.state !== QueueItemState.ACCEPTED
       || item.backendId !== session.backendId || item.targetId !== session.targetId
       || !revision || revision.value < 1n || item.version!.generation < 1n) {
@@ -12687,6 +12859,7 @@ export class MobileClient {
     const pending: PendingOperation = {
       operationId: this.newId(),
       connectionId: lease.connectionId,
+      ...(this.#joinedTask ? { taskJoinId: this.#joinedTask.source.joined.joinId } : {}),
       kind: "queue-edit-lock",
       sessionId: lease.sessionId,
       queueItemId: lease.queueItemId,
@@ -12705,7 +12878,8 @@ export class MobileClient {
   async #runDetachedMutation(
     credential: PairedCredential,
     pending: PendingOperation,
-    mutation: OperationMutation
+    mutation: OperationMutation,
+    network = this.network
   ): Promise<void> {
     try {
       await this.#writeDetachedPending((items) => items.some((item) => item.operationId === pending.operationId)
@@ -12716,7 +12890,7 @@ export class MobileClient {
     }
     let operation: Operation;
     try {
-      operation = await this.network.submit(credential, pending.operationId, mutation);
+      operation = await network.submit(credential, pending.operationId, mutation);
     } catch {
       return;
     }
@@ -12725,7 +12899,7 @@ export class MobileClient {
         await this.#writeDetachedPending((items) => items.map((item) => item.operationId === pending.operationId
           ? { ...item, state: "accepted" as const }
           : item));
-        operation = await this.network.waitOperation(credential, pending.operationId);
+        operation = await network.waitOperation(credential, pending.operationId);
       } catch {
         return;
       }
@@ -12736,7 +12910,8 @@ export class MobileClient {
     } catch {
       return;
     }
-    if (this.#foreground && this.#credential?.connectionId === credential.connectionId) void this.refresh();
+    if (this.#foreground && this.#credential?.connectionId === credential.connectionId
+      && this.#joinedTask?.source.joined.joinId === pending.taskJoinId) void this.refresh();
   }
 
   async #writeDetachedPending(
@@ -12749,7 +12924,7 @@ export class MobileClient {
       const connectionId = this.#credential?.connectionId;
       if (connectionId) {
         this.#set({
-          pending: next.filter((item) => item.connectionId === connectionId),
+          pending: next.filter((item) => item.connectionId === connectionId && item.taskJoinId === this.#joinedTask?.source.joined.joinId),
           saved: this.#savedViews()
         });
       }
@@ -12910,7 +13085,7 @@ export class MobileClient {
       if (!("eventId" in source)) throw new Error("The Timeline image returned an invalid source identity.");
       const around = await this.network.readAround(credential, lease.identity.sessionId, source.eventId, signal);
       const matches = around.filter((event) => event.eventId === source.eventId && event.identity?.sessionId === lease.identity.sessionId
-        && event.cursor?.generation === this.#state.owner?.generation);
+        && event.cursor?.generation === this.#taskGeneration());
       const current = matches.length === 1 ? timelineGalleryPagesForSelection(around, source.eventId, page.pageId).find((item) => item.pageId === page.pageId) : undefined;
       if (!current || !sameMobileImageGalleryPage(current, page)) throw new Error("The Timeline image changed before system sharing began.");
     }
@@ -13101,7 +13276,7 @@ export class MobileClient {
     const source = resolveMobileTimelineArtifact(events, lease.artifact);
     return source !== undefined
       && source.event.identity?.sessionId === lease.sessionId
-      && source.event.cursor?.generation === this.#state.owner?.generation
+      && source.event.cursor?.generation === this.#taskGeneration()
       && sameMobileTimelineArtifact(source.artifact, lease.artifact);
   }
 
@@ -13224,7 +13399,7 @@ export class MobileClient {
     this.#assertFileShareLeaseCurrent(lease, signal);
     const source = resolveMobileTimelineArtifact(around, lease.artifact);
     if (!source || source.event.identity?.sessionId !== lease.sessionId
-      || source.event.cursor?.generation !== this.#state.owner?.generation
+      || source.event.cursor?.generation !== this.#taskGeneration()
       || !sameMobileTimelineArtifact(source.artifact, lease.artifact)
       || !sameFilesComposerBlob(source.blob, expectedBlob)) {
       throw new Error("The selected Timeline file changed before system sharing began.");
@@ -14246,7 +14421,8 @@ export class MobileClient {
     if (!requestCurrent()) return { accepted: false, definitive: false };
     const credential = this.#ready();
     const epoch = this.#epoch;
-    const pending: PendingOperation = { ...identity, connectionId: credential.connectionId, operationId, state: "unknown" };
+    const pending: PendingOperation = { ...identity, connectionId: credential.connectionId, operationId, state: "unknown",
+      ...(this.#joinedTask ? { taskJoinId: this.#joinedTask.source.joined.joinId } : {}) };
     const before = this.#state.pending;
     const next = [...before, pending];
     this.#set({ pending: next, ...(markBusy ? { busy: true } : {}), error: undefined });
@@ -14267,7 +14443,7 @@ export class MobileClient {
       return { accepted: false, definitive: false };
     }
     if (!this.#current(epoch) || !requestCurrent()) return { accepted: false, definitive: false };
-    if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
+    if (!this.#operationReceiptMatches(operation, pending)) {
       this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId} returned with the wrong durable identity. Its receipt was retained and no input was resent.` });
       return { accepted: false, definitive: false };
     }
@@ -14285,7 +14461,7 @@ export class MobileClient {
         return { accepted: false, definitive: false };
       }
       if (!this.#current(epoch) || !requestCurrent()) return { accepted: false, definitive: false };
-      if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
+      if (!this.#operationReceiptMatches(operation, pending)) {
         this.#set({ ...(markBusy ? { busy: false } : {}), error: `Operation ${pending.operationId} completed with the wrong durable identity. Its receipt was retained and no input was resent.` });
         return { accepted: false, definitive: false };
       }
@@ -14309,7 +14485,7 @@ export class MobileClient {
 
   async #receipt(operation: Operation, pending: PendingOperation, epoch: number): Promise<void> {
     if (!this.#current(epoch) || this.#credential?.connectionId !== pending.connectionId) return;
-    if (operation.operationId !== pending.operationId || operation.connectionId !== pending.connectionId) {
+    if (!this.#operationReceiptMatches(operation, pending)) {
       this.#set({
         error: `Operation ${pending.operationId} returned with the wrong durable identity and was ignored. Its local receipt was retained.`
       });
@@ -14335,7 +14511,7 @@ export class MobileClient {
       && this.#activeProfileId !== undefined && this.clearInteractionDraft !== undefined) {
       try {
         await this.clearInteractionDraft({
-          profileId: this.#activeProfileId,
+          profileId: this.taskDraftProfileId()!,
           sessionId: pending.sessionId,
           interactionId: pending.interactionId,
           kind: pending.interactionDraftKind,
@@ -14357,6 +14533,15 @@ export class MobileClient {
         "The device was revoked on the Joko node."
       );
     }
+  }
+
+  #operationReceiptMatches(operation: Operation, pending: PendingOperation): boolean {
+    if (pending.taskJoinId !== undefined) {
+      if (this.#joinedTask?.source.joined.joinId !== pending.taskJoinId) return false;
+      try { assertMobileSharedTaskOperation(this.#joinedTask.source, pending.operationId, operation); return true; }
+      catch { return false; }
+    }
+    return !this.#joinedTask && operation.operationId === pending.operationId && operation.connectionId === pending.connectionId;
   }
 
   async reconcile(epoch = this.#epoch): Promise<void> {
@@ -14408,7 +14593,9 @@ export class MobileClient {
           await this.#receipt(operation, pending, epoch);
           if (pending.kind === "session-rewind" && exactOperation && isTerminal(operation.state) && this.#current(epoch)
             && !this.#state.pending.some((value) => value.operationId === pending.operationId)) {
-            await this.composerDrafts?.clearOperationInput({ profileId: credential.profileId, sessionId: pending.sessionId! }, pending.operationId);
+            await this.composerDrafts?.clearOperationInput({ profileId: pending.taskJoinId
+              ? mobileSharedTaskDraftProfileId(credential.profileId, credential.serverId, credential.origin, pending.taskJoinId)
+              : credential.profileId, sessionId: pending.sessionId! }, pending.operationId);
             if (!this.#current(epoch)) return;
           }
           const scheduleMutation = ["schedule-run", "schedule-enable", "schedule-run-restart",

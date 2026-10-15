@@ -16,6 +16,9 @@ import { mapPartnerWorkingStatus } from "./partner-working-status.js";
 import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
 import { createClient, ConnectError, Code, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
+import { createWebTaskSharingApi } from "./task-sharing-api.js";
+import type { TaskSharingApi } from "@joko/contracts";
+import { TaskShareRuntimeService, BackgroundTaskOutputState, type BackgroundTaskOutput, type TaskShareRuntimeControl } from "@joko/contracts";
 import { streamSharedOwnerEvents } from "./shared-owner-events.js";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
@@ -997,6 +1000,11 @@ export interface PairingOutcome {
 }
 
 export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage">, AppDefaultModelUiPort {
+  taskSharingApi(): TaskSharingApi;
+  getSharedTaskRuntimeControl(sessionId: string): Promise<TaskShareRuntimeControl>;
+  getSharedTaskBackends(): Promise<readonly BackendView[]>;
+  recoverSharedTaskOperations(): Promise<void>;
+  setSharedTaskRuntime(sessionId: string, patch: { readonly backendId?: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode?: boolean }): Promise<void>;
   connect(options?: { readonly snapshotOnly?: boolean }): Promise<void>;
   disconnect(): void;
   pair(origin: string, humanCode: string, deviceName: string): Promise<PairingOutcome>;
@@ -1017,6 +1025,26 @@ type MutationPayload = NonNullable<MessageInitShape<typeof OperationMutationSche
 type MutationPrecondition = NonNullable<MessageInitShape<typeof OperationMutationSchema>["preconditions"]>[number];
 
 export type GatewayTransportFactory = (origin: string, authKey?: string) => Transport;
+
+/** The only transport available to a joined task. It cannot reach ordinary Home RPCs. */
+export interface TaskSharingGatewayPort {
+  readonly scopeKey: string;
+  readonly operations: {
+    pending(): Promise<readonly string[]>;
+    begin(operationId: string): Promise<void>;
+    finish(operationId: string): Promise<void>;
+  };
+  readonly transport: Transport;
+  snapshot(signal?: AbortSignal): Promise<Snapshot>;
+  events(after: Event["cursor"], signal: AbortSignal): Promise<{
+    readonly events: readonly Event[];
+    readonly resumeCursor?: Event["cursor"];
+    readonly generation: bigint;
+    readonly resyncRequired: boolean;
+  }>;
+  upload(file: File, signal: AbortSignal): Promise<Record<string, unknown>>;
+  download(blobId: string, signal?: AbortSignal): Promise<Blob>;
+}
 
 const APP_VERSION = "0.1.0";
 const OPERATION_TERMINAL_WAIT_TIMEOUT_MS = 600_000;
@@ -1047,6 +1075,7 @@ interface GatewayActionScope {
 }
 
 interface LocalUserInputOperation {
+  readonly taskSharingScope?: string;
   readonly profileId: string;
   readonly serverId: string;
   readonly origin: string;
@@ -1069,6 +1098,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   readonly #authKey: string | undefined;
   readonly #callbacks: GatewayCallbacks;
   readonly #transportFactory: GatewayTransportFactory;
+  readonly #taskSharing: TaskSharingGatewayPort | undefined;
+  #sharingApi: TaskSharingApi | undefined;
+  readonly #sharedTaskUnknownOperations = new Set<string>();
+  readonly #sharedTaskSubmitting = new Set<string>();
+  #sharedTaskReady = false;
+  #sharedTaskRecovery: Promise<void> | undefined;
   #transport: Transport | undefined;
   #abort: AbortController | undefined;
   #snapshot: AppSnapshot | undefined;
@@ -1083,12 +1118,14 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     profile: ConnectionProfile | undefined,
     authKey: string | undefined,
     callbacks: GatewayCallbacks,
-    transportFactory: GatewayTransportFactory
+    transportFactory: GatewayTransportFactory,
+    taskSharing?: TaskSharingGatewayPort
   ) {
     this.#profile = profile;
     this.#authKey = authKey;
     this.#callbacks = callbacks;
     this.#transportFactory = transportFactory;
+    this.#taskSharing = taskSharing;
   }
 
   async pair(origin: string, humanCode: string, deviceName: string): Promise<PairingOutcome> {
@@ -1168,6 +1205,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     try {
       await this.refresh();
       if (abort.signal.aborted || this.#abort !== abort || this.#transport !== transport) return;
+      if (this.#taskSharing !== undefined) {
+        for (const operationId of await this.#taskSharing.operations.pending()) this.#sharedTaskUnknownOperations.add(operationId);
+        try { await this.recoverSharedTaskOperations(); }
+        catch (error) { if (!abort.signal.aborted) this.#callbacks.onError?.(normalizeError(error)); }
+      }
+      if (abort.signal.aborted || this.#abort !== abort || this.#transport !== transport) return;
+      this.#sharedTaskReady = true;
       this.#callbacks.onState?.("connected");
       if (options?.snapshotOnly !== true) this.#streamTask = this.consumeEvents(abort.signal);
     } catch (error) {
@@ -1177,6 +1221,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       else this.#callbacks.onError?.(gatewayError);
       throw gatewayError;
     }
+  }
+
+  taskSharingApi(): TaskSharingApi {
+    if (this.#taskSharing !== undefined) throw new GatewayError("Shared task guests cannot manage sharing.");
+    const transport = this.requireTransport(), lifetime = this.#abort;
+    if (!lifetime) throw new GatewayError("The Home connection is unavailable.");
+    return this.#sharingApi ??= createWebTaskSharingApi(transport, lifetime.signal, () => this.#transport === transport && this.#abort === lifetime);
   }
 
   async *watchAppDefaultModel(uiOwnerId: string, signal: AbortSignal) {
@@ -1198,6 +1249,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   disconnect(): void {
+    this.#sharedTaskReady = false;
+    this.#sharingApi = undefined;
     this.#abort?.abort();
     this.#abort = undefined;
     if (this.#eventRefreshTimer !== undefined) {
@@ -1826,10 +1879,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   private async loadSnapshot(): Promise<void> {
     const transport = this.requireTransport();
     const signal = this.#abort?.signal;
-    const currentDeviceNameSource = await this.currentDeviceNameSource(transport, signal);
+    const currentDeviceNameSource = this.#taskSharing === undefined ? await this.currentDeviceNameSource(transport, signal) : undefined;
     signal?.throwIfAborted();
     const eventClient = createClient(EventService, transport);
-    const [response, managedModelRuntimes] = await Promise.all([
+    const [response, managedModelRuntimes] = this.#taskSharing !== undefined
+      ? [{ snapshot: await this.#taskSharing.snapshot(signal) }, []] as const
+      : await Promise.all([
       eventClient.getSnapshot({ scope: OWNER_SCOPE,
         ...(currentDeviceNameSource === undefined ? {} : { currentDeviceNameSource })
       }, signal === undefined ? undefined : { signal }),
@@ -1837,7 +1892,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     ]);
     if (response.snapshot === undefined) throw new GatewayError("Orchestrator returned an empty snapshot.");
     let raw = response.snapshot;
-    const entryMap = await loadWorkspaceEntries(transport, raw.workspaces, signal);
+    const entryMap = this.#taskSharing === undefined ? await loadWorkspaceEntries(transport, raw.workspaces, signal) : new Map<string, readonly WorkspaceEntry[]>();
     if (signal?.aborted === true || this.#transport !== transport) return;
     const currentCursor = this.#rawSnapshot?.resumeCursor;
     const fetchedCursor = raw.resumeCursor;
@@ -2632,10 +2687,46 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean): Promise<void> {
+    if (this.#taskSharing !== undefined) return this.setSharedTaskRuntime(sessionId, { providerId, modelId, effort, fastMode });
     await this.submit({
       case: "setSessionModel",
       value: { sessionId, model: { model: { providerId, modelId }, effortId: effort ?? "", fastMode } }
     });
+  }
+
+  async getSharedTaskRuntimeControl(sessionId: string): Promise<TaskShareRuntimeControl> {
+    if (this.#taskSharing === undefined || this.#rawSnapshot?.sessions.length !== 1 || this.#rawSnapshot.sessions[0]?.sessionId !== sessionId) throw new GatewayError("This task runtime is unavailable.");
+    const result = await createClient(TaskShareRuntimeService, this.requireTransport()).getRuntimeControl({ sessionId }, { signal: this.#abort?.signal });
+    if (!result.control) throw new GatewayError("The shared task runtime control is missing.");
+    return result.control;
+  }
+
+  async getSharedTaskBackends(): Promise<readonly BackendView[]> {
+    if (this.#taskSharing === undefined) throw new GatewayError("This task runtime is unavailable.");
+    const result = await createClient(BackendService, this.requireTransport()).listBackends({}, { signal: this.#abort?.signal });
+    return result.backends.map(mapBackend);
+  }
+
+  async recoverSharedTaskOperations(): Promise<void> {
+    if (this.#taskSharing === undefined) throw new GatewayError("This task recovery is unavailable.");
+    if (this.#sharedTaskRecovery) return this.#sharedTaskRecovery;
+    const port = this.#taskSharing, signal = this.#abort?.signal, client = createClient(OperationService, this.requireTransport());
+    const recover = async (): Promise<void> => {
+      for (const operationId of this.#sharedTaskUnknownOperations) {
+        if (this.#sharedTaskSubmitting.has(operationId)) continue;
+        try { await client.getOperation({ operationId }, { signal }); }
+        catch (error) { if (ConnectError.from(error).code !== Code.NotFound) throw error; }
+        signal?.throwIfAborted(); await port.operations.finish(operationId);
+        signal?.throwIfAborted(); this.#sharedTaskUnknownOperations.delete(operationId);
+      }
+    };
+    const flight = recover(); this.#sharedTaskRecovery = flight;
+    try { await flight; } finally { if (this.#sharedTaskRecovery === flight) this.#sharedTaskRecovery = undefined; }
+  }
+
+  async setSharedTaskRuntime(sessionId: string, patch: { readonly backendId?: string; readonly providerId?: string; readonly modelId?: string; readonly effort?: string; readonly fastMode?: boolean }): Promise<void> {
+    const control = await this.getSharedTaskRuntimeControl(sessionId);
+    await this.submit({ case: "setSessionRuntime", value: { sessionId, expectedRuntimeGeneration: control.generation, ...patch } });
   }
 
   async setPermission(sessionId: string, mode: PermissionMode): Promise<void> {
@@ -3139,7 +3230,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         interactionId: interaction.id,
         interactionGeneration: interaction.generation,
         resolution: {
-          connectionId: this.#profile?.id ?? "",
+          connectionId: this.#taskSharing === undefined ? this.#profile?.id ?? "" : "",
           decision
         }
       }
@@ -5743,8 +5834,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "revokeExtensionSetup", value: { extensionId, expectedRevision: { value: expectedRevision } } }, true);
   }
 
-  async listBackgroundTasks(sessionId: string): Promise<readonly BackgroundTaskHistoryView[]> {
-    const client = createClient(SessionService, this.requireTransport());
+  async listBackgroundTasks(sessionId: string, signal?: AbortSignal): Promise<readonly BackgroundTaskHistoryView[]> {
+    const scope = this.captureActionScope(signal), client = createClient(SessionService, scope.transport);
     const values: BackgroundTaskHistoryView[] = [];
     const consumedTokens = new Set<string>();
     let pageToken = "";
@@ -5752,7 +5843,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       const response = await client.listBackgroundTasks({
         sessionId,
         page: { pageSize: 500, pageToken }
-      }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
+      }, { signal: scope.signal });
+      scope.signal.throwIfAborted();
       values.push(...response.backgroundTasks.map(mapBackgroundTaskHistory));
       const nextPageToken = response.page?.nextPageToken ?? "";
       if (nextPageToken === "") return values;
@@ -5763,6 +5855,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       pageToken = nextPageToken;
     }
     throw new GatewayError("Background-task history exceeded the safe pagination limit.");
+  }
+
+  async getBackgroundTaskOutput(sessionId: string, backgroundTaskId: string, signal?: AbortSignal): Promise<BackgroundTaskOutput> {
+    const scope = this.captureActionScope(signal);
+    const result = await createClient(SessionService, scope.transport).getBackgroundTaskOutput({ sessionId, backgroundTaskId, maximumBytes: 16_384 }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    const output = result.output;
+    if (!output || output.sessionId !== sessionId || output.backgroundTaskId !== backgroundTaskId
+      || ![BackgroundTaskOutputState.AVAILABLE, BackgroundTaskOutputState.UNAVAILABLE, BackgroundTaskOutputState.FAILED].includes(output.state)
+      || new TextEncoder().encode(output.text).byteLength > 262_144) throw new GatewayError("The background output response changed owner or exceeded its limit.");
+    return output;
   }
 
   async cancelBackgroundTask(sessionId: string, backgroundTaskId: string): Promise<void> {
@@ -9855,7 +9958,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         let lastSequence = this.#snapshot?.cursor;
         this.#callbacks.onState?.("connected");
         const profile = this.#profile;
-        const stream = this.#transportFactory === transportFor && profile !== undefined && this.#authKey !== undefined
+        const stream = this.#taskSharing !== undefined ? this.finiteTaskEvents(signal)
+          : this.#transportFactory === transportFor && profile !== undefined && this.#authKey !== undefined
           && cursor !== undefined && typeof SharedWorker === "function"
           ? streamSharedOwnerEvents({ profileId: profile.id, serverId: profile.serverId, deviceId: profile.deviceId, origin: profile.origin },
             this.#authKey, cursor, signal, () => { if (this.#abort?.signal === signal) this.disconnect(); })
@@ -9939,6 +10043,31 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
   }
 
+  private async *finiteTaskEvents(signal: AbortSignal): AsyncGenerator<{ readonly event: Event }> {
+    const port = this.#taskSharing;
+    if (port === undefined) return;
+    let after = this.#rawSnapshot?.resumeCursor;
+    while (!signal.aborted) {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+        await abortableDelay(500, signal);
+        continue;
+      }
+      const batch = await port.events(after, signal);
+      signal.throwIfAborted();
+      if (batch.resyncRequired || batch.generation !== this.#rawSnapshot?.generation) {
+        await this.refresh();
+        after = this.#rawSnapshot?.resumeCursor;
+      } else {
+        for (const event of batch.events) {
+          signal.throwIfAborted();
+          yield { event };
+        }
+        after = batch.resumeCursor ?? this.#rawSnapshot?.resumeCursor;
+      }
+      await abortableDelay(batch.events.length >= 128 ? 0 : 1_000, signal);
+    }
+  }
+
   private async terminateAuthentication(error: GatewayError): Promise<void> {
     this.disconnect();
     this.#callbacks.onError?.(error);
@@ -9988,12 +10117,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     observeReceipt?: (operationId: string, operation?: Operation) => void
   ): Promise<Operation> {
     callerSignal?.throwIfAborted();
+    if (this.#taskSharing !== undefined && (!this.#sharedTaskReady || this.#sharedTaskUnknownOperations.size > 0)) throw new GatewayError("Check the previous shared task operation before starting another action.", { code: "RESULT_UNKNOWN" });
     const transport = this.requireTransport();
     const client = createClient(OperationService, transport);
     const operationId = randomUuid();
     const request = {
       operationId,
-      connectionId: this.#profile?.id ?? "",
+      connectionId: this.#taskSharing === undefined ? this.#profile?.id ?? "" : "",
       mutation: create(OperationMutationSchema, { payload, preconditions: [...preconditions] })
     };
     const signal = combinedAbortSignal(callerSignal, this.#abort?.signal);
@@ -10008,6 +10138,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         )?.expectedGeneration;
         if (generation !== undefined && generation > 0n) {
           localUserInputOperations.set(operationId, {
+            ...(this.#taskSharing === undefined ? {} : { taskSharingScope: this.#taskSharing.scopeKey }),
             profileId: this.#profile.id,
             serverId: this.#profile.serverId,
             origin: this.#profile.origin,
@@ -10020,21 +10151,39 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
     let response;
     try {
+      if (this.#taskSharing !== undefined) {
+        this.#sharedTaskUnknownOperations.add(operationId);
+        this.#sharedTaskSubmitting.add(operationId);
+        try { await this.#taskSharing.operations.begin(operationId); }
+        catch (error) { this.#sharedTaskUnknownOperations.delete(operationId); throw error; }
+        signal?.throwIfAborted();
+      }
       response = await submitOnce();
     } catch (error) {
-      // A dropped unary response does not say whether Orchestrator durably claimed
-      // the effect. Re-submit the exact request under the same idempotency key;
-      // never mint a second operation ID inside one user attempt.
+      // A dropped response leaves admission uncertain. Guests only read the exact
+      // receipt; the ordinary connection retains its existing idempotent retry.
       if (signal?.aborted === true || !isUncertainOperationSubmissionError(error)) throw error;
-      response = await submitOnce();
-    }
+      response = this.#taskSharing === undefined ? await submitOnce() : await client.getOperation({ operationId }, options);
+    } finally { this.#sharedTaskSubmitting.delete(operationId); }
     callerSignal?.throwIfAborted();
     if (response.operation === undefined) throw new GatewayError("Orchestrator accepted no operation.");
     let operation = response.operation;
+    if (this.#taskSharing !== undefined) {
+      await this.#taskSharing.operations.finish(operationId);
+      this.#sharedTaskUnknownOperations.delete(operationId);
+    }
     observeReceipt?.(operationId, operation);
     if (waitForTerminal && !TERMINAL_OPERATION_STATES.has(operation.state)) {
       const timeout = AbortSignal.timeout(OPERATION_TERMINAL_WAIT_TIMEOUT_MS);
-      for await (const update of client.watchOperation({
+      if (this.#taskSharing !== undefined) {
+        const owned = combinedAbortSignal(signal, timeout)!;
+        while (!TERMINAL_OPERATION_STATES.has(operation.state)) {
+          await abortableDelay(350, owned);
+          const update = await client.getOperation({ operationId }, { signal: owned });
+          if (!update.operation) throw new GatewayError("The shared task operation receipt is missing.");
+          operation = update.operation;
+        }
+      } else for await (const update of client.watchOperation({
         operationId,
         afterRevision: operation.version?.revision
       }, { signal: combinedAbortSignal(callerSignal, timeout) })) {
@@ -10070,6 +10219,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (identity === undefined || profile === undefined || identity.operationId === "") return false;
     const local = localUserInputOperations.get(identity.operationId);
     return local !== undefined
+      && local.taskSharingScope === this.#taskSharing?.scopeKey
       && local.profileId === profile.id
       && local.serverId === profile.serverId
       && local.origin === profile.origin
@@ -10083,6 +10233,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   private async uploadBlob(file: File, disposition: BlobDisposition, scope: GatewayActionScope): Promise<Record<string, unknown>> {
     scope.signal.throwIfAborted();
+    if (this.#taskSharing !== undefined) {
+      if (disposition !== BlobDisposition.ATTACHMENT) throw new GatewayError("This transfer is unavailable for a shared task.");
+      return this.#taskSharing.upload(file, scope.signal);
+    }
     const client = createClient(ArtifactService, scope.transport);
     const bytes = await file.arrayBuffer();
     scope.signal.throwIfAborted();
@@ -10120,6 +10274,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     const transport = this.requireTransport();
     const signal = combinedAbortSignal(callerSignal, this.#abort?.signal);
     signal?.throwIfAborted();
+    if (this.#taskSharing !== undefined) return this.#taskSharing.download(blobId, signal);
     const authKey = this.#authKey;
     const client = createClient(ArtifactService, transport);
     const response = await client.getBlobDownloadTicket({ blobId }, { signal });
@@ -11067,6 +11222,7 @@ function projectTimelineEvent(
         text: kind.value.role === 1 ? userText : existing?.text ?? "",
         ...(kind.value.role === 1 ? { attachments: inputAttachments(userInput) } : {}),
         ...(userInputAccepted ? { userInputAccepted: true } : {}),
+        ...(kind.value.sharedTaskAuthor === undefined ? {} : { sharedTaskAuthor: kind.value.sharedTaskAuthor }),
         ...(inputOperationId ? { inputOperationId } : {}),
         ...(kind.value.role === 1 && isLocalUserInput?.(event) === true ? { localUserInput: true } : {}),
         ...(userInputAccepted && inputMentions.length > 0 ? { inputMentions } : {}),
@@ -11835,6 +11991,15 @@ export function createOrchestratorGateway(
   transportFactory: GatewayTransportFactory = transportFor
 ): OrchestratorGateway {
   return new ConnectOrchestratorGateway(profile, authKey, callbacks, transportFactory);
+}
+
+export function createTaskSharingGateway(
+  homeProfile: ConnectionProfile,
+  callbacks: GatewayCallbacks,
+  port: TaskSharingGatewayPort
+): OrchestratorGateway {
+  // No foreign secret enters the renderer. All calls use the closed Home proxy port.
+  return new ConnectOrchestratorGateway(homeProfile, "", callbacks, () => port.transport, port);
 }
 
 const VISION_BRIDGE_STATUS_KINDS = new Map<string, VisionBridgeUiEffect["kind"]>([
@@ -13867,6 +14032,7 @@ function mapQueueItem(item: QueueItem): QueueItemView {
   const attachments = messageInputAttachments(item.input);
   return {
     id: item.queueItemId,
+    ...(item.sharedTaskAuthor === undefined ? {} : { sharedTaskAuthor: item.sharedTaskAuthor }),
     sessionId: item.sessionId,
     revision: version.revision,
     generation: version.generation,

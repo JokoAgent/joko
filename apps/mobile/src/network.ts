@@ -435,6 +435,7 @@ export interface MobileNetwork {
   previewTaskTagDeletion(credential: PairedCredential, taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreview>;
   readTaskHeaderRole(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<MobileTaskHeaderRole>;
   listBackgroundTasks(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ tasks: readonly BackgroundTask[]; nextPageToken: string }>;
+  readBackgroundTaskOutput?(credential: PairedCredential, sessionId: string, backgroundTaskId: string, signal?: AbortSignal): Promise<import("@joko/contracts").BackgroundTaskOutput>;
   listSubagentRuns(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ runs: readonly SubagentRun[]; nextPageToken: string }>;
   getSubagentRun(credential: PairedCredential, sessionId: string, runId: string, signal?: AbortSignal): Promise<SubagentRunDetail>;
   listSubagentTranscript(credential: PairedCredential, sessionId: string, runId: string, childId?: string, pageToken?: string, signal?: AbortSignal): Promise<{ entries: readonly SubagentTranscriptEntry[]; nextPageToken: string; tailPageToken: string }>;
@@ -2502,6 +2503,12 @@ export const mobileNetwork: MobileNetwork = {
       throw new Error("The background activity response belongs to another task.");
     }
     return { tasks: response.backgroundTasks, nextPageToken: response.page?.nextPageToken ?? "" };
+  },
+  async readBackgroundTaskOutput(credential, sessionId, backgroundTaskId, signal) {
+    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+      .getBackgroundTaskOutput({ sessionId, backgroundTaskId, maximumBytes: 16_384 }, options(signal));
+    if (!response.output || response.output.sessionId !== sessionId || response.output.backgroundTaskId !== backgroundTaskId) throw new Error("The background output belongs to another task.");
+    return response.output;
   },
   async listSubagentRuns(credential, sessionId, pageToken = "", signal) {
     signal?.throwIfAborted();
