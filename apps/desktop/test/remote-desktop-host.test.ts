@@ -1,6 +1,7 @@
 import {
   RemoteDesktopClipboardContentSchema,
   RemoteDesktopFailureReason,
+  RemoteDesktopIceServerSchema,
   RemoteDesktopLockState,
   RemoteDesktopStartMode,
   RemoteDesktopSystemActionKind,
@@ -644,12 +645,16 @@ describe("Desktop Remote Desktop host", () => {
       displayId: "display-1",
       mode: RemoteDesktopStartMode.NEW
     });
+    const iceExpiry = Math.floor(Date.now() / 1_000) * 1_000 + 300_000;
+    const iceServers = [create(RemoteDesktopIceServerSchema, { urls: ["turn:relay.example.test:3478"],
+      username: "ephemeral-user", credential: "ephemeral-secret", expiresAt: { seconds: BigInt(iceExpiry / 1_000) } })];
     await value.host.createOffer({
       ...REQUEST,
       leaseId: lease.leaseId,
       attemptId: "attempt-settings",
       offerSdp: "offer",
       cursorOverlay: false,
+      iceServers,
       settings: create(RemoteDesktopVideoSettingsSchema, {
         fps: 60,
         quality: RemoteDesktopVideoQuality.SAVER,
@@ -659,6 +664,7 @@ describe("Desktop Remote Desktop host", () => {
     expect(value.media.offer).toHaveBeenLastCalledWith(expect.objectContaining({
       leaseId: lease.leaseId,
       attemptId: "attempt-settings",
+      iceServers: [{ urls: ["turn:relay.example.test:3478"], username: "ephemeral-user", credential: "ephemeral-secret", expiresAt: iceExpiry }],
       settings: { fps: 60, quality: "saver", audio: true }
     }));
 
@@ -1405,6 +1411,37 @@ describe("Desktop Remote Desktop host", () => {
     await expect(value.host.getFrame({ ...REQUEST, leaseId: lease.leaseId, cursorOverlay: false }))
       .rejects.toMatchObject({ reason: RemoteDesktopFailureReason.LEASE_EXPIRED });
     expect(value.host.state).toBeUndefined(); expect(value.media.frame).not.toHaveBeenCalled();
+  });
+
+  it("Linux view-only viewing starts without control and a fresh lock retires late pixels and the old lease", async () => {
+    const value = fixture({ enabled: true, platform: "linux", linuxCapabilities: { canControl: false, cursorOverlay: false } });
+    hosts.push(value.host);
+    expect(await value.host.getCapabilities(REQUEST)).toMatchObject({ canControl: false, cursorOverlay: false,
+      clipboardText: false, clipboardContent: false, systemAudio: false, hostMute: false, lockOnExit: false,
+      privacyScreen: false, nativeCredentials: false });
+    const lease = await value.host.start({ ...REQUEST, displayId: "display-1", mode: RemoteDesktopStartMode.NEW });
+    expect(lease.controlling).toBe(false);
+    await expect(value.host.setControl({ ...REQUEST, leaseId: lease.leaseId, enabled: true }))
+      .rejects.toMatchObject({ reason: RemoteDesktopFailureReason.VIEW_ONLY });
+    expect(value.input.start).not.toHaveBeenCalled();
+    await expect(value.host.createOffer({ ...REQUEST, leaseId: lease.leaseId, attemptId: "view-only",
+      offerSdp: "offer", cursorOverlay: false })).resolves.toMatchObject({ answerSdp: "answer" });
+    let deliver!: () => void;
+    vi.mocked(value.media.frame).mockImplementationOnce(async () => {
+      await new Promise<void>(resolve => { deliver = resolve; });
+      return { jpeg: "AQ==", width: 1, height: 1 };
+    });
+    const pending = value.host.getFrame({ ...REQUEST, leaseId: lease.leaseId, cursorOverlay: false });
+    const rejected = expect(pending).rejects.toBeDefined();
+    await vi.waitFor(() => expect(value.media.frame).toHaveBeenCalledOnce());
+    // A lock discovered by the post-capture proof retires X11 without a power event.
+    value.setSessionProbe(false); deliver(); await rejected;
+    expect(value.host.state).toBeUndefined();
+    expect(value.media.stop).toHaveBeenCalled();
+    value.setSessionProbe(true);
+    await expect(value.host.heartbeat({ ...REQUEST, leaseId: lease.leaseId })).rejects.toBeDefined();
+    const replacement = await value.host.start({ ...REQUEST, displayId: "display-1", mode: RemoteDesktopStartMode.NEW });
+    expect(replacement.leaseId).not.toBe(lease.leaseId);
   });
 
   it("Linux portal capture pending preserves lease and typed retryability", async () => {

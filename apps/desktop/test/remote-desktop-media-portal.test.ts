@@ -46,7 +46,7 @@ beforeEach(() => {
   h.displayRequest = undefined; h.getSources.mockReset().mockResolvedValue([{ id: "screen:portal:0", display_id: "" }]);
   h.displayIds = [];
 });
-afterEach(async () => { for (const media of cleanup.splice(0)) await media.retire(); Object.defineProperty(process, "platform", platform); });
+afterEach(async () => { for (const media of cleanup.splice(0)) await media.retire(); Object.defineProperty(process, "platform", platform); vi.useRealTimers(); });
 
 function fixture() {
   const stopped = vi.fn(); const media = new DesktopRemoteDesktopMedia("/preload", undefined, stopped); cleanup.push(media);
@@ -61,6 +61,28 @@ function request(owner = h.windows.at(-1)!) {
 }
 
 describe("trusted Main portal capture owner", () => {
+  it("forwards fresh credentials per attempt, falls back to public STUN, and rejects credentials aged during capture setup", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime(new Date("2026-10-15T00:00:00Z"));
+    const f = fixture(); h.displayIds = ["1"];
+    const source = { id: "screen:1:0", display_id: "1" };
+    h.getSources.mockResolvedValue([source]);
+    const request = { ...f.frame(), displayId: "1", attemptId: "configured", offerSdp: "offer" };
+    const iceServers = [{ urls: ["turn:relay.example.test:3478?transport=udp", "turns:relay.example.test:5349?transport=tcp"],
+      username: "ephemeral-user", credential: "ephemeral-secret", expiresAt: Date.now() + 300_000 }];
+    await expect(f.media.offer({ ...request, iceServers })).resolves.toBe("answer");
+    expect(h.commands.findLast(value => value.op === "offer")).toMatchObject({ iceServers: [{
+      urls: iceServers[0]!.urls, username: "ephemeral-user", credential: "ephemeral-secret"
+    }], iceExpiresAt: iceServers[0]!.expiresAt });
+    await f.media.offer({ ...request, attemptId: "unconfigured" });
+    const fallback = h.commands.findLast(value => value.op === "offer");
+    expect(fallback).toMatchObject({ iceServers: [{ urls: ["stun:stun.cloudflare.com:3478"] }, { urls: ["stun:stun.l.google.com:19302"] }] });
+    expect(fallback).not.toHaveProperty("iceExpiresAt");
+    h.getSources.mockImplementationOnce(async () => { vi.setSystemTime(Date.now() + 180_001); return [source]; });
+    await expect(f.media.offer({ ...request, attemptId: "expired", iceServers })).rejects.toThrow("INVALID_REMOTE_DESKTOP_ICE_CONFIG");
+    expect(h.commands.filter(value => value.op === "offer")).toHaveLength(2);
+    expect(h.windows.at(-1)?.isDestroyed()).toBe(true);
+  });
+
   it("Windows retains its exact physical-source JPEG path and rejects late pixels through the required frame owner", async () => {
     Object.defineProperty(process, "platform", { ...platform, value: "win32" });
     const f = fixture(); h.displayIds = ["1"];

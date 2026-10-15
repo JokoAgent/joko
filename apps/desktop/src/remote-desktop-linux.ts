@@ -51,7 +51,7 @@ export async function readDesktopRemoteDesktopLinuxSessionState(
   return readLinuxSessionState(signal, runtime, false);
 }
 
-/** Terminal lock receipt only; this never admits locked portal pixels or input. */
+/** Terminal Wayland lock receipt only; this never admits locked portal or X11 pixels. */
 export async function readDesktopRemoteDesktopLinuxLockSessionState(
   signal: AbortSignal,
   runtime: DesktopRemoteDesktopLinuxRuntime = linuxRuntime()
@@ -64,7 +64,9 @@ async function readLinuxSessionState(signal: AbortSignal, runtime: DesktopRemote
   try {
     aborted(signal);
     const uid = runtime.uid(); const session = runtime.environment["XDG_SESSION_ID"];
-    if (!isDesktopRemoteDesktopWayland(runtime) || uid === undefined || uid <= 0
+    const sessionType = isDesktopRemoteDesktopWayland(runtime) ? "wayland"
+      : runtime.platform === "linux" && runtime.environment["XDG_SESSION_TYPE"] === "x11" ? "x11" : undefined;
+    if (sessionType === undefined || uid === undefined || uid <= 0
       || uid !== runtime.effectiveUid() || !/^[a-zA-Z0-9_-]{1,64}$/u.test(session ?? "")
       || !await runtime.trustedExecutable(LOGINCTL)) return "unsupported";
     const raw = await runtime.execute(LOGINCTL, ["show-session", session!, "-p", "User", "-p", "Active",
@@ -78,8 +80,12 @@ async function readLinuxSessionState(signal: AbortSignal, runtime: DesktopRemote
     }
     if (properties.size !== 5 || properties.get("User") !== String(uid)
       || properties.get("Active") !== "yes" || properties.get("Remote") !== "no"
-      || properties.get("Type") !== "wayland" || !["yes", "no"].includes(properties.get("LockedHint") ?? "")) {
+      || properties.get("Type") !== sessionType || !["yes", "no"].includes(properties.get("LockedHint") ?? "")) {
       return "unsupported";
+    }
+    if (sessionType === "x11") {
+      // Chromium captures only an ordinary owned desktop; X11 never grants locked viewing or native effects.
+      return properties.get("LockedHint") === "no" ? "unlocked" : "unsupported";
     }
     if (!runtime.environment["HYPRLAND_INSTANCE_SIGNATURE"]) {
       // Portal pixels still require the exact local consent stream; this never authorizes input.

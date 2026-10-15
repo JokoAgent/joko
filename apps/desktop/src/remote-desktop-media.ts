@@ -21,15 +21,18 @@ import {
   REMOTE_DESKTOP_OFFER_BUDGET,
   REMOTE_DESKTOP_STUN_SERVERS,
   parseRemoteDesktopIceCandidates,
+  parseRemoteDesktopHostIceServers,
   parseRemoteDesktopIceReply,
   parseRemoteDesktopRequest,
   isBoundedRemoteDesktopJpegFrame,
   type RemoteDesktopIceCandidate,
+  type RemoteDesktopHostIceServer,
   type RemoteDesktopInput,
   type RemoteDesktopJpegFrame
 } from "@joko/device-peer";
 
 import {
+  REMOTE_DESKTOP_AUDIO_RETRY_MS,
   REMOTE_DESKTOP_CAPTURE_CHANNELS,
   type DesktopRemoteDesktopCaptureCommand,
   type DesktopRemoteDesktopCaptureReply
@@ -110,6 +113,9 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     readonly requestId: string;
     readonly audio: boolean;
     readonly current: () => boolean;
+    readonly signal: AbortSignal;
+    remaining: number;
+    used: boolean;
   } | undefined;
   #pending: PendingCaptureRequest | undefined;
   #attempt: {
@@ -320,11 +326,13 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     readonly offerSdp: string;
     readonly cursorOverlay: boolean;
     readonly settings?: DesktopRemoteDesktopVideoSettings;
+    readonly iceServers?: readonly RemoteDesktopHostIceServer[];
     readonly current: () => boolean;
     readonly signal: AbortSignal;
   }): Promise<string> {
     this.#assertAvailable();
     if (this.#pending !== undefined) throw new Error("REMOTE_DESKTOP_VIDEO_BUSY");
+    const configuredIceServers = parseRemoteDesktopHostIceServers(request.iceServers ?? []);
     const settings = parseDesktopRemoteDesktopVideoSettings(request.settings);
     const profile = desktopRemoteDesktopVideoProfile(settings);
     assertCapturePermission();
@@ -370,7 +378,10 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       attemptId: request.attemptId,
       requestId,
       audio: settings?.audio === true,
-      current: request.current
+      current: request.current,
+      signal: request.signal,
+      remaining: settings?.audio === true ? 1 + REMOTE_DESKTOP_AUDIO_RETRY_MS.length : 1,
+      used: false
     };
     this.#attempt = {
       leaseId: request.leaseId,
@@ -383,6 +394,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     };
     const audio = nativeAudio ? this.#startAudio(this.#attempt) : undefined;
     try {
+      const freshIceServers = parseRemoteDesktopHostIceServers(configuredIceServers);
       const reply = await this.#command({
         op: "offer",
         id: requestId,
@@ -391,7 +403,11 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         offerSdp: settings === undefined
           ? request.offerSdp
           : withDesktopRemoteDesktopBitrateHints(request.offerSdp, profile),
-        iceServers: REMOTE_DESKTOP_STUN_SERVERS.map((server) => ({ urls: server.urls })),
+        iceServers: freshIceServers.length === 0
+          ? REMOTE_DESKTOP_STUN_SERVERS.map((server) => ({ urls: [server.urls] }))
+          : freshIceServers.map(({ urls, username, credential }) => ({ urls,
+              ...(username === undefined ? {} : { username }), ...(credential === undefined ? {} : { credential }) })),
+        ...(freshIceServers.length === 0 ? {} : { iceExpiresAt: Math.min(...freshIceServers.map(server => server.expiresAt)) }),
         nativeCapture: nativeAvailable,
         nativeVideo,
         chromiumCapture: this.#grant !== undefined,
@@ -708,7 +724,6 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         return;
       }
       const grant = this.#grant;
-      this.#grant = undefined;
       const owner = this.#window?.webContents;
       const pending = this.#pending;
       let grantCurrent = false;
@@ -720,11 +735,14 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
         || request.audioRequested !== grant.audio
         || this.#attempt?.leaseId !== grant.leaseId
         || this.#attempt.attemptId !== grant.attemptId
-        || !grantCurrent
-        || pending?.op !== "offer" || pending.id !== grant.requestId) {
+        || !grantCurrent || grant.signal.aborted || !capturePermissionGranted()
+        || ((grant.used || pending?.op !== "offer" || pending.id !== grant.requestId)
+          && (!grant.audio || !request.audioRequested || !grant.used))) {
         callback({});
         return;
       }
+      grant.used = true;
+      if (--grant.remaining === 0) this.#grant = undefined;
       callback({
         video: grant.source,
         ...(grant.audio ? { audio: "loopback" as const } : {})

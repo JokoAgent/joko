@@ -34,11 +34,13 @@ import {
   RemoteDesktopVideoQuality,
   type RemoteDesktopClipboardContent,
   type RemoteDesktopInputEvent,
+  type RemoteDesktopIceServer as ContractRemoteDesktopIceServer,
   type RemoteDesktopVideoSettings as ContractRemoteDesktopVideoSettings
 } from "@joko/contracts";
 import {
   DevicePeerRemoteDesktopHostError,
   RemoteDesktopController,
+  remoteDesktopHostIceServersFromContract,
   type DevicePeerRemoteDesktopHostPort,
   type DevicePeerRemoteDesktopHostRequest,
   type DevicePeerRemoteDesktopLeaseRequest,
@@ -47,6 +49,7 @@ import {
   type RemoteDesktopDisplayMode,
   type RemoteDesktopHostCapabilities,
   type RemoteDesktopIceCandidate,
+  type RemoteDesktopHostIceServer,
   type RemoteDesktopInput,
   type RemoteDesktopJpegFrame,
   type RemoteDesktopPermissions,
@@ -77,6 +80,7 @@ export interface DesktopRemoteDesktopMediaPort {
     readonly offerSdp: string;
     readonly cursorOverlay: boolean;
     readonly settings?: DesktopRemoteDesktopVideoSettings;
+    readonly iceServers?: readonly RemoteDesktopHostIceServer[];
     readonly current: () => boolean;
     readonly signal: AbortSignal;
   }): Promise<string>;
@@ -386,7 +390,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         },
         stopWorkspaceActions: () => dependencies.stopWorkspaceActions!()
       }),
-      offer: (lease, sdp, attemptId, settings, cursorOverlay, authority) =>
+      offer: (lease, sdp, attemptId, settings, cursorOverlay, authority, iceServers) =>
         this.#whileSessionViewable((sessionGeneration) => dependencies.media.offer({
           displayId: lease.display.id,
           leaseId: lease.lease,
@@ -394,6 +398,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
           offerSdp: sdp,
           cursorOverlay,
           ...(settings === undefined ? {} : { settings }),
+          ...(iceServers === undefined ? {} : { iceServers }),
           current: () => (sessionGeneration === this.#sessionGeneration
             || dependencies.platform === "linux" && dependencies.systemAudio && settings?.audio === true)
             && isViewableSession(this.#sessionState)
@@ -869,6 +874,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     readonly offerSdp: string;
     readonly settings?: ContractRemoteDesktopVideoSettings;
     readonly cursorOverlay: boolean;
+    readonly iceServers?: readonly ContractRemoteDesktopIceServer[];
   }) {
     const value = await this.#request(request, {
       op: "offer",
@@ -876,6 +882,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       attemptId: request.attemptId,
       sdp: request.offerSdp,
       cursorOverlay: request.cursorOverlay,
+      iceServers: remoteDesktopHostIceServersFromContract(request.iceServers ?? []),
       ...(request.settings === undefined ? {} : {
         settings: Object.freeze({
           fps: request.settings.fps,

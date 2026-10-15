@@ -1365,7 +1365,7 @@ describe("RemoteDesktopCoordinator", () => {
     expect(fake.actions()).toContain("stopRemoteDesktop");
   });
 
-  it("does not return ICE configuration after the lease is revoked in flight", async () => {
+  it.each(["viewer", "host"])("does not release %s ICE configuration after the lease is revoked in flight", async recipient => {
     const fake = new FakeDevicePeerOwner();
     const revocations = new RevocationHarness();
     let finishConfiguration: ((servers: readonly contract.RemoteDesktopIceServer[]) => void) | undefined;
@@ -1377,7 +1377,10 @@ describe("RemoteDesktopCoordinator", () => {
     }).coordinator;
     await start(coordinator);
 
-    const configuration = coordinator.getIceConfiguration(connection, identity, "lease-1", signal);
+    const configuration = recipient === "viewer"
+      ? coordinator.getIceConfiguration(connection, identity, "lease-1", signal)
+      : coordinator.createOffer(connection, identity,
+        { leaseId: "lease-1", attemptId: "attempt", offerSdp: "v=0\r\n", cursorOverlay: false }, signal);
     expect(finishConfiguration).toBeTypeOf("function");
     revocations.revoke(connection.id);
     finishConfiguration?.([]);
@@ -1386,6 +1389,28 @@ describe("RemoteDesktopCoordinator", () => {
       detail: { reason: contract.RemoteDesktopFailureReason.STOPPED }
     });
     expect(fake.actions()).toContain("stopRemoteDesktop");
+    expect(fake.actions()).not.toContain("createRemoteDesktopOffer");
+  });
+
+  it("loads separate fresh scoped ICE material for viewer and host before dispatching the host offer", async () => {
+    const fake = new FakeDevicePeerOwner();
+    const getConfiguration = vi.fn(async () => [create(contract.RemoteDesktopIceServerSchema, {
+      urls: ["turns:relay.example.test:5349?transport=tcp"], username: "temporary", credential: "secret",
+      expiresAt: { seconds: BigInt(Math.floor(Date.now() / 1000) + 600) }
+    })]);
+    const coordinator = fakeCoordinator(fake, { iceConfiguration: { getConfiguration } }).coordinator;
+    await start(coordinator);
+    fake.dispatchHandler = async (_authority, request) => request.action === "createRemoteDesktopOffer"
+      ? completed(result("remoteDesktopOffer", create(contract.RemoteDesktopOfferResultSchema,
+        { attemptId: "attempt", answerSdp: "v=0\r\n" }))) : defaultResponse(request);
+    await coordinator.getIceConfiguration(connection, identity, "lease-1", signal);
+    await coordinator.createOffer(connection, identity,
+      { leaseId: "lease-1", attemptId: "attempt", offerSdp: "v=0\r\n", cursorOverlay: false }, signal);
+    expect(getConfiguration).toHaveBeenCalledTimes(2);
+    expect(getConfiguration).toHaveBeenLastCalledWith({ controllerDeviceId: connection.deviceId,
+      targetDeviceId: identity.targetDeviceId, leaseId: "lease-1", signal });
+    const command = fake.calls.find(call => call.input.action === "createRemoteDesktopOffer")?.input.payload as contract.DevicePeerCommand;
+    expect(command.action.value).toMatchObject({ iceServers: [{ username: "temporary", credential: "secret" }] });
   });
 
   it("fences the lease to the exact controller Connection and peer identity", async () => {

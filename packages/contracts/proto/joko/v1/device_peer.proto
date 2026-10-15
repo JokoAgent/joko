@@ -410,6 +410,7 @@ message DevicePeerCreateRemoteDesktopOfferAction {
   string offer_sdp = 3;
   RemoteDesktopVideoSettings settings = 4;
   bool cursor_overlay = 5;
+  repeated RemoteDesktopIceServer ice_servers = 6;
 }
 
 message DevicePeerExchangeRemoteDesktopIceAction {

@@ -1,4 +1,5 @@
 import { REMOTE_DESKTOP_STUN_SERVERS } from "./remote-desktop-ice.js";
+import type { RemoteDesktopIceServer as ContractRemoteDesktopIceServer } from "@joko/contracts";
 
 export const REMOTE_DESKTOP_ICE_CONFIG_TIMEOUT_MS = 3_000;
 
@@ -6,6 +7,60 @@ export interface RemoteDesktopIceServer {
   readonly urls: readonly string[];
   readonly username?: string;
   readonly credential?: string;
+}
+
+/** Ephemeral host configuration, retained only until this offer is dispatched. */
+export interface RemoteDesktopHostIceServer extends RemoteDesktopIceServer {
+  readonly expiresAt: number;
+}
+
+export function remoteDesktopHostIceServersFromContract(
+  servers: readonly ContractRemoteDesktopIceServer[],
+  now = Date.now()
+): readonly RemoteDesktopHostIceServer[] {
+  return parseRemoteDesktopHostIceServers(servers.map((server) => ({
+    urls: server.urls,
+    ...(server.username === undefined ? {} : { username: server.username }),
+    ...(server.credential === undefined ? {} : { credential: server.credential }),
+    expiresAt: server.expiresAt !== undefined
+      && Number.isInteger(server.expiresAt.nanos)
+      && server.expiresAt.nanos >= 0 && server.expiresAt.nanos < 1_000_000_000
+      ? Number(server.expiresAt.seconds) * 1_000 + Math.floor(server.expiresAt.nanos / 1_000_000)
+      : Number.NaN
+  })), now);
+}
+
+/** Recheck freshness at the host and after any asynchronous capture setup. */
+export function parseRemoteDesktopHostIceServers(
+  value: unknown,
+  now = Date.now()
+): readonly RemoteDesktopHostIceServer[] {
+  const fail = (): never => { throw new Error("INVALID_REMOTE_DESKTOP_ICE_CONFIG"); };
+  if (!Array.isArray(value) || value.length > 4) return fail();
+  return Object.freeze(value.map((server: unknown) => {
+    if (typeof server !== "object" || server === null || Array.isArray(server)) return fail();
+    const candidate = server as {
+      readonly urls?: unknown;
+      readonly username?: unknown;
+      readonly credential?: unknown;
+      readonly expiresAt?: unknown;
+    };
+    if (!Number.isSafeInteger(candidate.expiresAt)
+      || (candidate.expiresAt as number) <= now + 120_000
+      || (candidate.expiresAt as number) > now + 86_400_000
+      || !Array.isArray(candidate.urls) || candidate.urls.length < 1 || candidate.urls.length > 4) return fail();
+    const urls = Object.freeze(candidate.urls.map((url) => parseIceUrl(url, fail)));
+    const turn = urls.some((url) => /^turns?:/u.test(url));
+    if (turn) {
+      if (typeof candidate.username !== "string" || candidate.username.length < 1 || candidate.username.length > 256
+        || typeof candidate.credential !== "string" || candidate.credential.length < 1 || candidate.credential.length > 256) return fail();
+    } else if (candidate.username !== undefined || candidate.credential !== undefined) return fail();
+    return Object.freeze({
+      urls,
+      ...(turn ? { username: candidate.username as string, credential: candidate.credential as string } : {}),
+      expiresAt: candidate.expiresAt as number
+    });
+  }));
 }
 
 const ICE_URL = /^(stun|turn|turns):(?:[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?|\[[0-9a-fA-F:]+\]):([0-9]{1,5})(\?transport=(udp|tcp))?$/u;

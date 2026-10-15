@@ -26,15 +26,26 @@ export function DesktopRemoteDesktopViewerWindow(): JSX.Element {
     const owner = new DesktopRemoteDesktopViewerController(api, root.current, setState);
     controller.current = owner;
     const offState = api.onState((scope) => {
+      if (scope.generation < generation.current) return;
       if (scope.generation !== generation.current || !scope.active) { setPanel(undefined); setConfirmClose(false); }
       generation.current = scope.generation;
     });
     const close = (): void => { owner.releaseInput(); setPanel(undefined);
       if (stateRef.current?.ready) setConfirmClose(true); else void owner.close(); };
     const offClose = api.onCloseRequested((value) => { if (generation.current === value) close(); });
-    const blur = (): void => owner.focusLost();
+    const inputFocus = (focused: boolean): void => {
+      if (generation.current > 0) void api.inputFocus(generation.current, focused).catch(() => undefined);
+    };
+    const focus = (event: FocusEvent): void => inputFocus((event.target as HTMLElement | null)?.id === "keyboard-input");
+    const focusOut = (event: FocusEvent): void => {
+      if ((event.target as HTMLElement | null)?.id === "keyboard-input") inputFocus(false);
+    };
+    const blur = (): void => { owner.focusLost(); inputFocus(false); };
+    document.addEventListener("focusin", focus);
+    document.addEventListener("focusout", focusOut);
     window.addEventListener("blur", blur);
-    return () => { offClose(); offState(); window.removeEventListener("blur", blur); owner.dispose();
+    return () => { offClose(); offState(); document.removeEventListener("focusin", focus); document.removeEventListener("focusout", focusOut);
+      window.removeEventListener("blur", blur); inputFocus(false); owner.dispose();
       if (controller.current === owner) controller.current = undefined; };
   }, [api]);
   const t = desktopViewerMessages(state?.locale ?? "en");

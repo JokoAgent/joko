@@ -82,7 +82,7 @@ vi.mock("../src/remote-desktop-windows-host.js", () => ({ desktopRemoteDesktopWi
 vi.mock("electron", () => ({
   app: { get isPackaged() { return h.packaged; } },
   BrowserWindow: class {}, dialog: {}, shell: {}, systemPreferences: {}, powerSaveBlocker: {},
-  screen: Object.assign(new EventEmitter(), { getAllDisplays: vi.fn(() => [{ id: 1 }]) }),
+  screen: Object.assign(new EventEmitter(), { getAllDisplays: vi.fn(() => [{ id: 1, label: "Desktop", size: { width: 1920, height: 1080 } }]) }),
   powerMonitor: Object.assign(new EventEmitter(), { getSystemIdleState: () => h.idle })
 }));
 vi.mock("../src/remote-desktop-host.js", () => ({ DesktopRemoteDesktopHost: class {
@@ -361,8 +361,8 @@ it("mirror Main does not exempt another output from the exact owned transition",
   await h.host!.displays(signal); expect(h.releaseControl).toHaveBeenCalledOnce();
 });
 
-it("display Main carries actual geometry and exact metrics, including workArea, rotation and removal", () => {
-  compose("darwin"); const listener = vi.fn(); const unsubscribe = h.host!.onDisplayChange!(listener);
+it.each(["darwin", "linux"] as const)("display Main %s carries actual geometry and exact metrics, including workArea, rotation and removal", target => {
+  h.linuxWayland = false; compose(target); const listener = vi.fn(); const unsubscribe = h.host!.onDisplayChange!(listener);
   const actual = { id: 1, size: { width: 1024, height: 768 } };
   for (const metric of ["bounds", "workArea", "scaleFactor", "rotation"]) {
     screen.emit("display-metrics-changed", {}, actual, [metric]);
@@ -383,7 +383,26 @@ it("Linux Main admits one portal source and reads actual locked state without us
   expect(await h.host!.sessionState(signal)).toBe("unsupported");
   h.linuxSession = "locked-logged-in";
   expect(await h.host!.sessionState(signal)).toBe("unsupported");
-  h.linuxWayland = false; await expect(h.host!.displays(signal)).rejects.toThrow("REMOTE_DESKTOP_UNSUPPORTED");
+});
+
+it("Linux X11 Main exposes only fresh physical desktop viewing even with unrelated native tools installed", async () => {
+  h.linuxWayland = false; h.linuxMute = true; h.linuxLock = true; h.linuxPrivacy = true;
+  h.linuxAudio = true; h.linuxClipboard = true; h.linuxInput = true; h.linuxCursor = true; h.linuxModes = true;
+  h.linuxViewer = true; h.linuxWorkspace = true; h.linuxSystemMenu = true;
+  compose("linux", { serverId: "server", deviceId: "host", profileId: "profile" });
+  const signal = new AbortController().signal;
+  expect(await h.host!.sessionState(signal)).toBe("unlocked");
+  expect(await h.host!.displays(signal)).toEqual([{ id: "1", name: "Desktop", width: 1920, height: 1080 }]);
+  expect(await h.host!.linuxCapabilities!(signal)).toEqual({ canControl: false, cursorOverlay: false,
+    displayModes: false, viewerDisplay: false, lockOnExit: false, privacyScreen: false, workspaceNavigation: false, systemMenu: false });
+  expect(h.host).toMatchObject({ systemAudio: false });
+  for (const capability of ["clipboard", "hostMute", "privacyScreen", "credentials", "lockScreen", "createViewerDisplay"] as const) {
+    expect(h.host![capability]).toBeUndefined();
+  }
+  vi.mocked(screen.getAllDisplays).mockImplementationOnce(() => { h.linuxSession = "unsupported"; return []; });
+  await expect(h.host!.displays(signal)).rejects.toThrow("LOCKED_SESSION_UNSUPPORTED");
+  expect(await h.host!.sessionState(signal)).toBe("unsupported");
+  await expect(h.host!.displays(signal)).rejects.toThrow("LOCKED_SESSION_UNSUPPORTED");
 });
 
 it("Linux Main adopts actual native output catalog and independent probes, then revokes control before layout reset", async () => {

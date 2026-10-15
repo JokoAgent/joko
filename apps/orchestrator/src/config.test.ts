@@ -33,6 +33,22 @@ const base = {
 } satisfies NodeJS.ProcessEnv;
 
 describe("Orchestrator network configuration", () => {
+  it("keeps remote desktop ICE deployment authentication outside public settings and workspace files", () => {
+    const configured = { ...base, JOKO_REMOTE_DESKTOP_ICE_URL: "https://relay.example.test/ice-servers",
+      JOKO_REMOTE_DESKTOP_ICE_TOKEN_FILE: join(dataDirectory, "ice-token") };
+    expect(loadConfig(configured).remoteDesktopIce).toEqual({ url: configured.JOKO_REMOTE_DESKTOP_ICE_URL,
+      tokenPath: configured.JOKO_REMOTE_DESKTOP_ICE_TOKEN_FILE });
+    expect(loadConfig(base).remoteDesktopIce).toBeUndefined();
+    for (const url of ["http://relay.example.test/ice", "https://token@relay.example.test/ice",
+      "https://relay.example.test/ice?token=secret", "https://relay.example.test/ice#secret"]) {
+      expect(() => loadConfig({ ...configured, JOKO_REMOTE_DESKTOP_ICE_URL: url })).toThrow(/Remote Desktop ICE/u);
+    }
+    expect(() => loadConfig({ ...configured, JOKO_REMOTE_DESKTOP_ICE_TOKEN_FILE: join(workspaceRoot, "secret") }))
+      .toThrow(/Remote Desktop ICE/u);
+    expect(() => loadConfig({ ...base, JOKO_REMOTE_DESKTOP_ICE_URL: configured.JOKO_REMOTE_DESKTOP_ICE_URL }))
+      .toThrow(/Remote Desktop ICE/u);
+  });
+
   it("keeps insecure loopback behind its existing explicit flag", () => {
     expect(() => loadConfig({ ...base, JOKO_ALLOW_INSECURE_LOOPBACK: "0" })).toThrow(/TLS is required/u);
     expect(loadConfig(base)).toMatchObject({

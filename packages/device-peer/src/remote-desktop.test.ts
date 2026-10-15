@@ -440,7 +440,7 @@ describe("remote desktop finite authority controller", () => {
       sdp: "offer", attemptId: "muted-attempt", cursorOverlay: false,
       settings: { fps: 30, quality: "auto", audio: false } })).resolves.toEqual({ sdp: "answer" });
     expect(fixture.dependencies.offer).toHaveBeenLastCalledWith(expect.objectContaining({ lease: lease.lease }),
-      "offer", "muted-attempt", { fps: 30, quality: "auto", audio: false }, false, AUTHORITY);
+      "offer", "muted-attempt", { fps: 30, quality: "auto", audio: false }, false, AUTHORITY, undefined);
     fixture.controller.stop();
   });
 

@@ -178,6 +178,7 @@ final class RemoteDesktopReceiver: NSObject, RTCPeerConnectionDelegate, RTCDataC
           RemoteDesktopBridgeNumber.integer(message["exchangeId"]) == batch.id, let peer else { return }
     iceTimer?.invalidate()
     guard let failed = RemoteDesktopBridgeNumber.boolean(message["error"]) else { fail("candidates"); return }
+    if failed { pending = nil; scheduleIce(1); return }
     guard let complete = RemoteDesktopBridgeNumber.boolean(message["complete"]),
           let values = message["candidates"] as? [[String: Any]], values.count <= 16,
           let next = RemoteDesktopBridgeNumber.integer(message["next"]), next == remoteAfter + values.count, next <= 128 else {

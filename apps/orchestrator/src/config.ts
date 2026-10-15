@@ -49,6 +49,8 @@ export interface OrchestratorConfig {
       readonly topic: string;
     };
   };
+  /** Deployment-owned HTTPS endpoint and private bearer file, never public settings. */
+  readonly remoteDesktopIce?: { readonly url: string; readonly tokenPath: string };
   /** Optional standalone Service-device outbound agent authority. */
   readonly devicePeerAgent?: {
     readonly controllerOrigin: string;
@@ -123,6 +125,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
     throw new Error("JOKO_DESKTOP_RESOURCES_PATH must be an existing absolute directory.");
   }
   const mobilePush = readMobilePushConfig(environment);
+  const remoteDesktopIce = readRemoteDesktopIceConfig(environment, workspaceRoot);
   const devicePeerAgent = readDevicePeerAgentConfig(environment, dataDirectory, allowInsecureLan);
   return {
     host,
@@ -174,6 +177,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
       nativeH264Path: join(simulatorResources, "native-simulator-h264", "joko-simulator-h264")
     } }),
     ...(mobilePush === undefined ? {} : { mobilePush }),
+    ...(remoteDesktopIce === undefined ? {} : { remoteDesktopIce }),
     ...(devicePeerAgent === undefined ? {} : { devicePeerAgent }),
     corsOrigins
   };
@@ -227,6 +231,20 @@ function readDevicePeerAgentConfig(
     credentialPath,
     stateDirectory: resolve(dataDirectory, "device-peer-agent")
   };
+}
+
+function readRemoteDesktopIceConfig(environment: NodeJS.ProcessEnv, workspaceRoot: string): OrchestratorConfig["remoteDesktopIce"] {
+  const endpoint = environment.JOKO_REMOTE_DESKTOP_ICE_URL?.trim();
+  const tokenSetting = environment.JOKO_REMOTE_DESKTOP_ICE_TOKEN_FILE?.trim();
+  if (!endpoint && !tokenSetting) return undefined;
+  const fail = (): never => { throw new Error("Remote Desktop ICE requires an HTTPS URL and a private token file outside workspace/source roots."); };
+  if (!endpoint || !tokenSetting || !isAbsolute(tokenSetting)) return fail();
+  let url: URL;
+  try { url = new URL(endpoint); } catch { return fail(); }
+  if (url.protocol !== "https:" || !url.hostname || url.username || url.password || url.search || url.hash) return fail();
+  const tokenPath = canonicalizePotentialPath(tokenSetting);
+  if ([workspaceRoot, ...jokoSourceRoots()].some(root => isWithin(canonicalizePotentialPath(root), tokenPath))) return fail();
+  return { url: url.toString(), tokenPath };
 }
 
 function readMobilePushConfig(environment: NodeJS.ProcessEnv): OrchestratorConfig["mobilePush"] {

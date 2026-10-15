@@ -7,6 +7,7 @@ const api: DesktopRemoteDesktopViewerApi = Object.freeze({
   platform: process.platform,
   state: () => invoke("state"),
   ready: (generation: number) => invoke("ready", generation),
+  inputFocus: (generation: number, focused: boolean) => invoke("input-focus", generation, focused),
   request: (generation: number, method: string, bytes: Uint8Array) => invoke("request", generation, method, bytes),
   clipboard: (generation: number, action: "copy" | "paste") => invoke("clipboard", generation, action),
   retryClipboardSync: (generation: number) => invoke("retry-clipboard-sync", generation),

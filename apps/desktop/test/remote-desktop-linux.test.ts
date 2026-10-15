@@ -63,6 +63,28 @@ describe("Linux owned session and physical layout", () => {
     vi.mocked(native.execute).mockResolvedValue("User=1000\nActive=yes\nRemote=no\nType=wayland\nLockedHint=yes\n");
     await expect(readDesktopRemoteDesktopLinuxSessionState(signal, native)).resolves.toBe("unsupported");
   });
+  it("admits a fresh owned X11 desktop without compositor or native capture authority", async () => {
+    const native = { ...runtime(), environment: { XDG_SESSION_TYPE: "x11", XDG_SESSION_ID: "4",
+      DISPLAY: ":0", HYPRLAND_INSTANCE_SIGNATURE: "stale" } };
+    vi.mocked(native.execute).mockResolvedValue("User=1000\nActive=yes\nRemote=no\nType=x11\nLockedHint=no\n");
+    expect(supportsDesktopRemoteDesktopLinuxCapture(native)).toBe(false);
+    await expect(readDesktopRemoteDesktopLinuxSessionState(signal, native)).resolves.toBe("unlocked");
+    expect(native.execute).toHaveBeenCalledOnce();
+    expect(native.execute).toHaveBeenCalledWith("/usr/bin/loginctl", ["show-session", "4", "-p", "User", "-p", "Active",
+      "-p", "Remote", "-p", "Type", "-p", "LockedHint"], signal, 4096, 2000);
+    vi.mocked(native.execute).mockResolvedValue("User=1000\nActive=yes\nRemote=no\nType=x11\nLockedHint=yes\n");
+    await expect(readDesktopRemoteDesktopLinuxSessionState(signal, native)).resolves.toBe("unsupported");
+    await expect(readDesktopRemoteDesktopLinuxLockSessionState(signal, native)).resolves.toBe("unsupported");
+  });
+  it.each(["User=2000", "Active=no", "Remote=yes", "Type=wayland", "LockedHint=unknown"])(
+    "rejects X11 session %s without reading compositor state", async invalid => {
+      const native = { ...runtime(), environment: { XDG_SESSION_TYPE: "x11", XDG_SESSION_ID: "4", DISPLAY: ":0" } };
+      const key = invalid.split("=")[0]!;
+      vi.mocked(native.execute).mockResolvedValue("User=1000\nActive=yes\nRemote=no\nType=x11\nLockedHint=no\n"
+        .replace(new RegExp(`${key}=[^\n]+`, "u"), invalid));
+      await expect(readDesktopRemoteDesktopLinuxSessionState(signal, native)).resolves.toBe("unsupported");
+      expect(native.execute).toHaveBeenCalledOnce();
+    });
   it("uses logind's locked receipt only for an owned portal terminal lock", async () => {
     const native = { ...runtime(), environment: { XDG_SESSION_TYPE: "wayland", XDG_SESSION_ID: "4" } };
     vi.mocked(native.execute).mockResolvedValue("User=1000\nActive=yes\nRemote=no\nType=wayland\nLockedHint=yes\n");

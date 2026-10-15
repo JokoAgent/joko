@@ -10,7 +10,10 @@ const args = process.argv.slice(2);
 const scope = args.length === 0 ? "full" : args.length === 2 && args[0] === "--scope" && args[1] === "viewer-lifecycle" ? "viewer-lifecycle" : undefined;
 if (!scope) throw new Error("Expected no arguments or --scope viewer-lifecycle.");
 const command = `node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs${scope === "full" ? "" : " --scope viewer-lifecycle"}`;
-const output = resolve(root, "../../.runtime/validation/c102/viewer-smoke", scope === "full" ? "." : "lifecycle");
+const evidenceRoot = process.env.JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR
+  ? resolve(process.env.JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR)
+  : resolve(root, "../../.runtime/validation/c102/viewer-smoke");
+const output = resolve(evidenceRoot, scope === "full" ? "." : "lifecycle");
 mkdirSync(output, { recursive: true });
 if (!process.versions.electron) {
   const electron = createRequire(import.meta.url)("electron");
