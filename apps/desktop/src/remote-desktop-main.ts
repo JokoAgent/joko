@@ -97,14 +97,14 @@ export function createDesktopRemoteDesktopMainHost(
   const input = process.platform === "win32"
     ? new DesktopRemoteDesktopWindowsInput(() => host?.releaseControl())
     : new DesktopRemoteDesktopInput(() => host?.releaseControl());
-  const linuxMute = process.platform === "linux" && supportsDesktopRemoteDesktopLinuxMute()
+  const linuxMute = process.platform === "linux" && isDesktopRemoteDesktopWayland() && supportsDesktopRemoteDesktopLinuxMute()
     ? new DesktopRemoteDesktopLinuxMute() : undefined;
   const linuxWorkspace = process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture()
     ? new DesktopRemoteDesktopLinuxWorkspace() : undefined;
   const supportsPrivacy = (process.platform === "darwin" && typeof process.getSystemVersion === "function"
     && Number(process.getSystemVersion().split(".")[0]) >= 14)
     || (process.platform === "win32" && Number(osRelease().split(".")[2]) >= 19041);
-  const privacy = process.platform === "linux" ? new DesktopRemoteDesktopLinuxPrivacyScreen({
+  const privacy = process.platform === "linux" && isDesktopRemoteDesktopWayland() ? new DesktopRemoteDesktopLinuxPrivacyScreen({
     stopped: async (owner) => { await host!.stopPrivacyByUser(owner); },
     suspendInput: (current, signal) => input.pauseForPrivacy(current, signal)
   }) : supportsPrivacy ? new DesktopRemoteDesktopPrivacyScreen({
@@ -128,7 +128,16 @@ export function createDesktopRemoteDesktopMainHost(
     geometry?: { readonly width: number; readonly height: number; readonly metrics: readonly string[] }) => void>();
   const readLinuxDisplays = async (signal: AbortSignal): Promise<readonly RemoteDesktopDisplay[]> => {
     if (!supportsDesktopRemoteDesktopLinuxCapture()) {
-      if (!isDesktopRemoteDesktopWayland()) throw new Error("REMOTE_DESKTOP_UNSUPPORTED");
+      if (!isDesktopRemoteDesktopWayland()) {
+        if (await readDesktopRemoteDesktopLinuxSessionState(signal) !== "unlocked") {
+          throw new Error("REMOTE_DESKTOP_LOCKED_SESSION_UNSUPPORTED");
+        }
+        const displays = desktopDisplays();
+        if (await readDesktopRemoteDesktopLinuxSessionState(signal) !== "unlocked") {
+          throw new Error("REMOTE_DESKTOP_LOCKED_SESSION_UNSUPPORTED");
+        }
+        return displays;
+      }
       return Object.freeze([{ id: WAYLAND_REMOTE_DESKTOP_DISPLAY_ID, name: "Shared screen",
         width: 1280, height: 720 }]);
     }
@@ -185,7 +194,7 @@ export function createDesktopRemoteDesktopMainHost(
     display: (listener: (displayId: string, geometryChanged: boolean, geometry?: {
       readonly width: number; readonly height: number; readonly metrics: readonly string[];
     }) => void): (() => void) => {
-      if (process.platform === "linux") {
+      if (process.platform === "linux" && isDesktopRemoteDesktopWayland()) {
         linuxDisplayListeners.add(listener);
         return () => { linuxDisplayListeners.delete(listener); };
       }
@@ -262,7 +271,7 @@ export function createDesktopRemoteDesktopMainHost(
     ...(process.platform === "linux" ? { linuxCapabilities: async (signal: AbortSignal) => ({
       ...(linuxWorkspace === undefined ? { workspaceNavigation: false, systemMenu: false }
         : await readDesktopRemoteDesktopLinuxWorkspaceSupport(signal)),
-      lockOnExit: await supportsDesktopRemoteDesktopLinuxLock(signal),
+      lockOnExit: isDesktopRemoteDesktopWayland() && await supportsDesktopRemoteDesktopLinuxLock(signal),
       canControl: supportsDesktopRemoteDesktopLinuxCapture() && await readDesktopRemoteDesktopLinuxInputSupport(signal),
       cursorOverlay: supportsDesktopRemoteDesktopLinuxCapture() && await readDesktopRemoteDesktopLinuxCursorSupport(signal),
       displayModes: supportsDesktopRemoteDesktopLinuxCapture() && await supportsDesktopRemoteDesktopLinuxDisplayModes(signal),
@@ -280,7 +289,7 @@ export function createDesktopRemoteDesktopMainHost(
     showPermissionGuide: (signal) => showDesktopRemoteDesktopPermissionGuide(options.getMainWindow(), signal),
     media,
     input,
-    ...(options.credentialsOwner !== undefined && (process.platform === "linux" || process.platform === "darwin"
+    ...(options.credentialsOwner !== undefined && (process.platform === "linux" && isDesktopRemoteDesktopWayland() || process.platform === "darwin"
       && typeof process.getSystemVersion === "function" && Number(process.getSystemVersion().split(".")[0]) >= 12)
       ? { credentials: { native: new DesktopRemoteCredentialsNative(), owner: options.credentialsOwner,
         ...(process.platform === "linux" ? { lockState: readDesktopRemoteDesktopLinuxCredentialLockState } : {}) } } : {}),
@@ -323,7 +332,7 @@ export function createDesktopRemoteDesktopMainHost(
       viewerDisplaySupported: supportsDesktopRemoteDesktopMacViewerDisplay,
       createViewerDisplay: createDesktopRemoteDesktopMacViewerDisplay
     } : {}),
-    ...(process.platform === "linux" ? {
+    ...(process.platform === "linux" && isDesktopRemoteDesktopWayland() ? {
       lockScreen: lockDesktopRemoteDesktopLinuxScreen,
       lockSessionState: readDesktopRemoteDesktopLinuxLockSessionState
     } : {}),

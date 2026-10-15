@@ -94,6 +94,7 @@ import {
   RemoteDesktopIceCandidateSchema,
   type RemoteDesktopIceExchangeResult,
   RemoteDesktopIceExchangeResultSchema,
+  RemoteDesktopIceServerSchema,
   type RemoteDesktopInputEvent,
   RemoteDesktopInputEventSchema,
   type RemoteDesktopLease,
@@ -114,6 +115,7 @@ import {
   RemoteDesktopVideoSettingsSchema
 } from "@joko/contracts";
 import { isRemoteDesktopCredentialHandle, isRemoteDesktopCredentialRequest, isRemoteDesktopCredentialResult } from "./remote-desktop-credentials.js";
+import { remoteDesktopHostIceServersFromContract } from "./remote-desktop-ice-config.js";
 import {
   DevicePeerRemoteDesktopHostError,
   type DevicePeerRemoteDesktopHostPort,
@@ -717,6 +719,7 @@ export class NodeDevicePeerAgentExecutor {
             ? {}
             : { settings: clone(RemoteDesktopVideoSettingsSchema, command.action.value.settings) }),
           cursorOverlay: command.action.value.cursorOverlay,
+          iceServers: command.action.value.iceServers.map(server => clone(RemoteDesktopIceServerSchema, server)),
           signal
         });
         validateRemoteDesktopOffer(value, command.action.value.attemptId);
@@ -2050,6 +2053,11 @@ function validateCommandInput(command: DevicePeerCommand): void {
       remoteDesktopLeaseId(command.action.value.leaseId);
       remoteDesktopAttemptId(command.action.value.attemptId);
       remoteDesktopSdp(command.action.value.offerSdp);
+      try {
+        remoteDesktopHostIceServersFromContract(command.action.value.iceServers);
+      } catch {
+        throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+      }
       if (typeof command.action.value.cursorOverlay !== "boolean") {
         throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
       }

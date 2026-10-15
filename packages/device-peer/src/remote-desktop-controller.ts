@@ -1,4 +1,5 @@
 import { isRemoteDesktopClipboardVersion } from "@joko/contracts";
+import type { RemoteDesktopHostIceServer } from "./remote-desktop-ice-config.js";
 import {
   REMOTE_DESKTOP_FRAME_INTERVAL_MS,
   REMOTE_DESKTOP_LEASE_MS,
@@ -98,7 +99,8 @@ export interface RemoteDesktopControllerDependencies {
     attemptId: string,
     settings: RemoteDesktopVideoSettings | undefined,
     cursorOverlay: boolean,
-    authority: RemoteDesktopAuthority
+    authority: RemoteDesktopAuthority,
+    iceServers?: readonly RemoteDesktopHostIceServer[]
   ): Promise<string>;
   ice?(
     request: RemoteDesktopIceRequest,
@@ -663,7 +665,8 @@ export class RemoteDesktopController {
             request.attemptId,
             request.settings,
             request.cursorOverlay,
-            authority
+            authority,
+            request.iceServers
           )
         );
         if (typeof answer !== "string" || answer.length < 1 || answer.length > 64_000) {

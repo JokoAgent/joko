@@ -10,6 +10,8 @@ import type { RemoteDesktopIceCandidate } from "@joko/device-peer";
 import type { IpcRendererEvent } from "electron";
 
 const { ipcRenderer } = require("electron") as typeof import("electron");
+const AUDIO_RETRY_MS: typeof import("./remote-desktop-capture-protocol.js").REMOTE_DESKTOP_AUDIO_RETRY_MS
+  = [3_000, 10_000, 30_000];
 
 const CHANNELS = Object.freeze({
   ready: "joko:remote-desktop-capture:ready",
@@ -45,6 +47,7 @@ let audio: Awaited<ReturnType<typeof nativeAudioStream>> | undefined;
 let audioAbort: AbortController | undefined;
 let audioDesired: { readonly revision: number; readonly enabled: boolean } | undefined;
 let resetAudio: (() => void) | undefined;
+let audioRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
 /** Output-monitor PCM enters the existing RTC stream and never the host speakers. */
 async function nativeAudioStream(
@@ -219,9 +222,11 @@ function stop(): void {
   nativeGeneration += 1;
   exchanging = false;
   clearTimeout(disconnectedTimer);
+  clearTimeout(audioRetryTimer);
   clearInterval(presentationTimer);
   clearInterval(cursorTimer);
   disconnectedTimer = undefined;
+  audioRetryTimer = undefined;
   presentationTimer = undefined;
   cursorTimer = undefined;
   presentationLease = undefined;
@@ -323,6 +328,7 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
     if (command.nativeAudio === true) audioDesired = { revision: command.audioRevision!, enabled: true };
     const profile = videoProfile(command.profile, settings.quality);
     const fps = Math.min(settings.fps, profile.maxFramerate) as 30 | 60;
+    let captureSettled: Promise<void> = Promise.resolve();
     let moving = true;
     let videoSender: RTCRtpSender | undefined;
     let preference = Promise.resolve();
@@ -350,14 +356,18 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       let abandoned = false;
       let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
+        const pending = capture().then((value) => {
+          if (abandoned || current !== generation) {
+            value.getTracks().forEach((track) => track.stop());
+            throw new Error("stopped");
+          }
+          return value;
+        });
+        // A timeout cannot dismiss an OS permission prompt. Wait for its actual
+        // settlement before asking again, and discard a late abandoned stream.
+        captureSettled = pending.then(() => undefined, () => undefined);
         return await Promise.race([
-          capture().then((value) => {
-            if (abandoned || current !== generation) {
-              value.getTracks().forEach((track) => track.stop());
-              throw new Error("stopped");
-            }
-            return value;
-          }),
+          pending,
           new Promise<never>((_resolve, reject) => {
             timeout = setTimeout(() => {
               abandoned = true;
@@ -435,10 +445,6 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       captured.getTracks().forEach((track) => track.stop());
       throw new Error("unavailable");
     }
-    if (settings.audio && command.nativeAudio !== true && captured.getAudioTracks().length === 0) {
-      captured.getTracks().forEach((track) => track.stop());
-      throw new Error("audio-unavailable");
-    }
     if (!settings.audio) {
       captured.getAudioTracks().forEach((track) => {
         captured.removeTrack(track);
@@ -446,7 +452,13 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       });
     }
     stream = captured;
-    const rtc = new RTCPeerConnection({ iceServers: [...command.iceServers] });
+    if (command.iceExpiresAt !== undefined && (!Number.isSafeInteger(command.iceExpiresAt)
+      || command.iceExpiresAt <= Date.now() + 120_000 || command.iceExpiresAt > Date.now() + 86_400_000)) {
+      throw new Error("unavailable");
+    }
+    const rtc = new RTCPeerConnection({ iceServers: command.iceServers.map(server => ({ urls: [...server.urls],
+      ...(server.username === undefined ? {} : { username: server.username }),
+      ...(server.credential === undefined ? {} : { credential: server.credential }) })) });
     peer = rtc;
     rtc.onicecandidate = ({ candidate }) => {
       if (current !== generation || candidate?.candidate === undefined || candidate.candidate.length === 0) return;
@@ -633,13 +645,15 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
       rtc.addTrack(track, captured);
     });
     await rtc.setRemoteDescription({ type: "offer", sdp: command.offerSdp });
+    const audioTransceiver = settings.audio && captured.getAudioTracks().length === 0
+      ? rtc.getTransceivers().find(value => value.receiver.track.kind === "audio") : undefined;
+    const audioSender = audioTransceiver?.sender ?? rtc.getSenders().find(value => value.track?.kind === "audio");
+    if (audioTransceiver !== undefined && audioSender !== undefined) {
+      audioTransceiver.direction = "sendonly";
+      audioSender.setStreams(captured);
+    }
     if (command.nativeAudio === true) {
-      const transceiver = rtc.getTransceivers().find(value => value.receiver.track.kind === "audio");
-      const sender = transceiver?.sender ?? rtc.getSenders().find(value => value.track?.kind === "audio");
-      if (transceiver !== undefined && sender !== undefined) {
-        transceiver.direction = "sendonly";
-        sender.setStreams(captured);
-      }
+      const sender = audioSender;
       if (sender !== undefined) {
         let revision = 0;
         resetAudio = () => {
@@ -692,6 +706,32 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
     const answerSdp = rtc.localDescription?.sdp;
     if (typeof answerSdp !== "string" || answerSdp.length === 0) throw new Error("unavailable");
     await reply(command.id, { kind: "offer", answerSdp });
+    const retryAudio = async (retry: number): Promise<void> => {
+      await captureSettled;
+      if (audioSender === undefined || current !== generation || peer !== rtc || retry >= AUDIO_RETRY_MS.length) return;
+      audioRetryTimer = setTimeout(() => {
+        audioRetryTimer = undefined;
+        void (async () => {
+          let replacement: MediaStream | undefined;
+          let retained: MediaStreamTrack | undefined;
+          try {
+            if (current !== generation || peer !== rtc) return;
+            replacement = await boundedCapture();
+            const track = replacement.getAudioTracks()[0];
+            if (track === undefined || current !== generation || peer !== rtc) return;
+            await audioSender.replaceTrack(track);
+            if (current !== generation || peer !== rtc) return;
+            captured.addTrack(track);
+            retained = track;
+          } catch { /* Optional audio preserves the established video and data channel. */ }
+          finally {
+            replacement?.getTracks().forEach(track => { if (track !== retained) track.stop(); });
+            if (retained === undefined) void retryAudio(retry + 1);
+          }
+        })();
+      }, AUDIO_RETRY_MS[retry]);
+    };
+    if (audioTransceiver !== undefined && command.nativeAudio !== true) void retryAudio(0);
   } catch (error) {
     if (current !== generation) return;
     const code = error instanceof Error && error.message === "audio-unavailable"

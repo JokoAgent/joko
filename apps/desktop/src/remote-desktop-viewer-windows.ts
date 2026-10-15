@@ -18,7 +18,7 @@ export const REMOTE_DESKTOP_VIEWER_CHANNELS = Object.freeze({ bind: PREFIX + "bi
   open: PREFIX + "open", state: PREFIX + "state", ready: PREFIX + "ready", request: PREFIX + "request",
   clipboard: PREFIX + "clipboard", close: PREFIX + "close", closeRequested: PREFIX + "close-requested",
   minimize: PREFIX + "minimize", fullscreen: PREFIX + "fullscreen", preferences: PREFIX + "preferences", resize: PREFIX + "resize",
-  retryClipboardSync: PREFIX + "retry-clipboard-sync", credential: PREFIX + "credential" });
+  retryClipboardSync: PREFIX + "retry-clipboard-sync", credential: PREFIX + "credential", inputFocus: PREFIX + "input-focus" });
 
 interface ViewerBinding {
   readonly source: WebContents;
@@ -110,6 +110,14 @@ export class DesktopRemoteDesktopViewerWindows {
       if (!Number.isSafeInteger(generation) || (generation as number) < 0) throw new TypeError("Invalid viewer generation.");
       const entry = this.localSender(event, generation);
       entry.ready = true; entry.presentation.ready(entry.window); this.publish(entry);
+    });
+    ipcMain.handle(c.inputFocus, (event, generation: unknown, focused: unknown) => {
+      if (!Number.isSafeInteger(generation) || (generation as number) < 1 || typeof focused !== "boolean") {
+        throw new TypeError("Invalid viewer input focus.");
+      }
+      const entry = this.sender(event, generation);
+      if (focused && !this.active(entry)) throw new Error("Viewer is inactive.");
+      entry.window.webContents.setIgnoreMenuShortcuts(focused && entry.window.isFocused());
     });
     ipcMain.handle(c.request, (event, generation: unknown, name: unknown, bytes: unknown) => {
       const entry = this.sender(event, generation);
@@ -250,6 +258,7 @@ export class DesktopRemoteDesktopViewerWindows {
           throw new Error("Viewer close authority retired.");
         }
       };
+      entry.window.webContents.setIgnoreMenuShortcuts(false);
       entry.binding.closing = true;
       entry.binding.clipboardSync?.refresh();
       try { await connection.stop(lockScreen, check); check(); entry.presentation.close(); }
@@ -388,6 +397,7 @@ export class DesktopRemoteDesktopViewerWindows {
     window.webContents.on("render-process-gone", () => { if (current()) entry.presentation.failed(window); });
     window.on("blur", () => {
       if (!current() || entry.binding === undefined) return;
+      window.webContents.setIgnoreMenuShortcuts(false);
       entry.binding.inputRevision++;
       entry.binding.clipboardAbort?.abort();
       entry.binding.clipboardSync?.refresh();
@@ -398,9 +408,20 @@ export class DesktopRemoteDesktopViewerWindows {
     window.on("close", (event) => {
       if (!current() || entry.binding?.closing || this.options.quitting()) return;
       event.preventDefault();
-      if (entry.binding === undefined || !entry.ready) { this.destroy(entry); return; }
-      window.webContents.send(REMOTE_DESKTOP_VIEWER_CHANNELS.closeRequested, entry.generation);
+      this.requestClose(entry);
     });
+    window.webContents.on("before-input-event", (event, input) => {
+      if (!current() || !this.current(entry) || entry.binding === undefined || entry.binding.closing || this.options.quitting()) return;
+      if (input.type === "keyDown" && input.code === "KeyW" && (input.meta || input.control)) {
+        event.preventDefault();
+        this.requestClose(entry);
+      }
+    });
+  }
+
+  private requestClose(entry: ViewerWindow): void {
+    if (entry.binding === undefined || !entry.ready) { this.destroy(entry); return; }
+    entry.window.webContents.send(REMOTE_DESKTOP_VIEWER_CHANNELS.closeRequested, entry.generation);
   }
 
   private async loadWindow(entry: ViewerWindow, window: BrowserWindow): Promise<void> {
@@ -426,6 +447,7 @@ export class DesktopRemoteDesktopViewerWindows {
     if (!entry.disposed && !entry.binding?.closing && !entry.window.isDestroyed()) entry.window.webContents.send(REMOTE_DESKTOP_VIEWER_CHANNELS.state, this.state(entry));
   }
   private deactivate(entry: ViewerWindow): void {
+    if (!entry.window.isDestroyed()) entry.window.webContents.setIgnoreMenuShortcuts(false);
     const binding = entry.binding;
     if (binding === undefined) { this.destroy(entry); return; }
     binding.clipboardAbort?.abort();
@@ -449,6 +471,7 @@ export class DesktopRemoteDesktopViewerWindows {
   private destroy(entry: ViewerWindow): void {
     if (entry.disposed) return;
     entry.disposed = true;
+    if (!entry.window.isDestroyed()) entry.window.webContents.setIgnoreMenuShortcuts(false);
     if (this.#spare === entry) this.#spare = undefined;
     const binding = entry.binding;
     if (binding !== undefined) {

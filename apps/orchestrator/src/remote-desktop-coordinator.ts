@@ -13,7 +13,7 @@ import {
   type DevicePeerOwner,
   type DevicePeerSelectionIdentity
 } from "./device-peer-owner.js";
-import { toProtoTimestamp } from "./proto-mapper.js";
+import { publicRemoteDesktopIceConfiguration } from "./remote-desktop-ice-configuration.js";
 
 const REMOTE_DESKTOP_LEASE_MS = 12_000;
 const REMOTE_DESKTOP_PRESENTATION_PROBE_MS = 3_000;
@@ -658,10 +658,13 @@ export class RemoteDesktopCoordinator {
       throw invalidArgument("Remote Desktop cursor overlay selection is invalid.");
     }
     const authority = this.#capture(connection, identity);
+    const iceServers = await this.getIceConfiguration(connection, identity, input.leaseId, signal);
+    this.#revalidateLeaseCompletion(state, connection, identity, authority);
+    signal.throwIfAborted();
     const value = await this.#runLeaseBound(state, connection, identity, authority, () =>
       this.#dispatch<contract.RemoteDesktopOfferResult>(authority, remoteDesktopCommand(
         "createRemoteDesktopOffer",
-        create(contract.DevicePeerCreateRemoteDesktopOfferActionSchema, input),
+        create(contract.DevicePeerCreateRemoteDesktopOfferActionSchema, { ...input, iceServers: [...iceServers] }),
         "side_effect"
       ), signal, "remoteDesktopOffer", "joko.v1.RemoteDesktopOfferResult"));
     if (value.attemptId !== input.attemptId) throw invalidTargetResponse();
@@ -1563,12 +1566,7 @@ class PublicStunRemoteDesktopIceConfiguration implements RemoteDesktopIceConfigu
   constructor(private readonly now: () => number) {}
 
   getConfiguration(): Promise<readonly contract.RemoteDesktopIceServer[]> {
-    return Promise.resolve(Object.freeze([
-      create(contract.RemoteDesktopIceServerSchema, {
-        urls: ["stun:stun.cloudflare.com:3478", "stun:stun.l.google.com:19302"],
-        expiresAt: toProtoTimestamp(this.now() + 5 * 60_000)
-      })
-    ]));
+    return Promise.resolve(publicRemoteDesktopIceConfiguration(this.now()));
   }
 }
 
@@ -2061,7 +2059,7 @@ function validateIceServers(values: readonly contract.RemoteDesktopIceServer[], 
     }
     if (value.expiresAt === undefined) throw invalidTargetResponse();
     const expiresAt = Number(value.expiresAt.seconds) * 1_000 + Math.floor(value.expiresAt.nanos / 1_000_000);
-    if (!Number.isSafeInteger(expiresAt) || expiresAt <= now || expiresAt > now + 24 * 60 * 60_000) {
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= now + 120_000 || expiresAt > now + 24 * 60 * 60_000) {
       throw invalidTargetResponse();
     }
   }

@@ -26,6 +26,7 @@ async function flush(): Promise<void> { for (let i = 0; i < 20; i++) await Promi
 function fixture(generation: number, blockedStart: boolean, target: DesktopRemoteDesktopViewerState["target"] = quiet.target) {
   let scope = { ...quiet, generation, target };
   const listeners = new Set<(value: DesktopRemoteDesktopViewerState) => void>();
+  const closeListeners = new Set<(generation: number) => void>();
   let allowCapabilities!: () => void, allowStart!: () => void;
   const capabilitiesGate = new Promise<void>(resolve => { allowCapabilities = resolve; });
   const startGate = blockedStart ? new Promise<void>(resolve => { allowStart = resolve; }) : Promise.resolve();
@@ -39,7 +40,8 @@ function fixture(generation: number, blockedStart: boolean, target: DesktopRemot
       for (const listener of listeners) listener({ ...scope, generation: current, active: scope.target !== null });
     }),
     onState: listener => { listeners.add(listener); return () => { listeners.delete(listener); }; },
-    onCloseRequested: () => () => undefined,
+    onCloseRequested: listener => { closeListeners.add(listener); return () => { closeListeners.delete(listener); }; },
+    inputFocus: vi.fn(async () => undefined),
     request: vi.fn(async (current, name, bytes) => {
       const method = RemoteDesktopService.methods.find(value => value.localName === name)!;
       const input = fromBinary(method.input, bytes) as unknown as Record<string, unknown>;
@@ -61,7 +63,7 @@ function fixture(generation: number, blockedStart: boolean, target: DesktopRemot
       biometricAvailable: false, biometricVerification: false } })),
     preferences: vi.fn(async () => ({ audio: true, hostMute: false, lockOnExit: false, clipboardSync: false, privacyScreen: false }))
   };
-  return { api, requests, readyViews, listeners, allowCapabilities, allowStart,
+  return { api, requests, readyViews, listeners, closeListeners, allowCapabilities, allowStart,
     bind(current: number, target: NonNullable<DesktopRemoteDesktopViewerState["target"]>) {
       scope = { ...quiet, generation: current, target }; for (const listener of listeners) listener(scope);
     } };
@@ -84,6 +86,57 @@ afterEach(async () => {
 });
 
 describe("actual standalone Desktop viewer quiet shell", () => {
+  it("reports remote keyboard focus and restores native menus on local focus, blur, and retirement", async () => {
+    const value = fixture(1, false), shell = await render(value.api);
+    const input = shell.container.querySelector<HTMLTextAreaElement>("#keyboard-input")!;
+    const localButton = shell.container.querySelector<HTMLButtonElement>('[aria-label="Display settings"]')
+      ?? shell.container.querySelector<HTMLButtonElement>(".remote-viewer-tool")!;
+    await act(async () => { input.focus(); await flush(); });
+    expect(value.api.inputFocus).toHaveBeenLastCalledWith(1, true);
+    await act(async () => { localButton.focus(); await flush(); });
+    expect(value.api.inputFocus).toHaveBeenLastCalledWith(1, false);
+    await act(async () => { input.focus(); input.blur(); await flush(); });
+    expect(value.api.inputFocus).toHaveBeenLastCalledWith(1, false);
+    await act(async () => { input.focus(); window.dispatchEvent(new Event("blur")); await flush(); });
+    expect(value.api.inputFocus).toHaveBeenLastCalledWith(1, false);
+    await act(async () => { value.bind(2, { deviceId: "peer", name: "New occurrence" }); await flush(); });
+    await act(async () => {
+      for (const listener of value.listeners) listener({ ...quiet, generation: 1, active: false });
+      input.blur(); input.focus(); await flush();
+    });
+    expect(value.api.inputFocus).toHaveBeenLastCalledWith(2, true);
+    await act(async () => shell.root.unmount()); roots.splice(roots.indexOf(shell.root), 1);
+    expect(value.api.inputFocus).toHaveBeenLastCalledWith(2, false);
+    const calls = vi.mocked(value.api.inputFocus).mock.calls.length;
+    document.dispatchEvent(new FocusEvent("focusin", { bubbles: true })); window.dispatchEvent(new Event("blur"));
+    expect(value.api.inputFocus).toHaveBeenCalledTimes(calls);
+  });
+
+  it("confirms an exact native close request before dispatching the safe exit", async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, "showModal");
+    Object.defineProperty(HTMLDialogElement.prototype, "showModal", { configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute("open", ""); } });
+    try {
+      const value = fixture(1, false), shell = await render(value.api);
+      await act(async () => { value.allowCapabilities(); await flush(); });
+      const owner = runtime.owners[0]!, init = owner.receive.mock.calls.map(([message]) => message).find(message => message.type === "init")!;
+      await act(async () => { owner.post({ type: "framePresented", epoch: init.epoch }); await flush(); });
+      await act(async () => { for (const close of value.closeListeners) close(0); await flush(); });
+      expect(shell.container.querySelector("dialog")).toBeNull();
+      await act(async () => { for (const close of value.closeListeners) close(1); await flush(); });
+      expect(shell.container.querySelector("dialog[open]")).not.toBeNull();
+      expect(value.api.close).not.toHaveBeenCalled();
+      await act(async () => { shell.container.querySelector<HTMLButtonElement>("dialog button")!.click(); await flush(); });
+      expect(shell.container.querySelector("dialog")).toBeNull(); expect(value.api.close).not.toHaveBeenCalled();
+      await act(async () => { for (const close of value.closeListeners) close(1); await flush(); });
+      await act(async () => { shell.container.querySelector<HTMLButtonElement>("dialog button:last-child")!.click(); await flush(); });
+      expect(value.api.close).toHaveBeenCalledExactlyOnceWith(1);
+    } finally {
+      if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, "showModal", descriptor);
+      else Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
+    }
+  });
+
   it("keeps mounted null-target content local until a fresh binding adopts the same renderer", async () => {
     const value = fixture(0, false, null), shell = await render(value.api), owner = runtime.owners[0]!;
     expect(value.api.ready).toHaveBeenCalledExactlyOnceWith(0);

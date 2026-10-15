@@ -5,6 +5,7 @@ import {
   type RemoteDesktopIceRequest
 } from "./remote-desktop-ice.js";
 import type { RemoteDesktopClipboardContent, RemoteDesktopSystemAction } from "@joko/contracts";
+import { parseRemoteDesktopHostIceServers, type RemoteDesktopHostIceServer } from "./remote-desktop-ice-config.js";
 
 export const REMOTE_DESKTOP_PROTOCOL_VERSION = 1 as const;
 export const REMOTE_DESKTOP_LEASE_MS = 12_000;
@@ -196,6 +197,7 @@ export type RemoteDesktopRequest =
       readonly sdp: string;
       readonly attemptId: string;
       readonly settings?: RemoteDesktopVideoSettings;
+      readonly iceServers?: readonly RemoteDesktopHostIceServer[];
       readonly cursorOverlay: boolean;
     }
   | { readonly op: "displayModes"; readonly lease: string }
@@ -480,7 +482,7 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
       });
     }
     case "offer":
-      requireExactKeys(value, ["op", "lease", "sdp", "attemptId", "cursorOverlay"], ["settings"]);
+      requireExactKeys(value, ["op", "lease", "sdp", "attemptId", "cursorOverlay"], ["settings", "iceServers"]);
       if (typeof value.sdp !== "string"
         || value.sdp.length < 1
         || value.sdp.length > 64_000
@@ -494,6 +496,7 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
         sdp: value.sdp,
         attemptId: value.attemptId,
         cursorOverlay: value.cursorOverlay,
+        ...(value.iceServers === undefined ? {} : { iceServers: parseRemoteDesktopHostIceServers(value.iceServers) }),
         ...(value.settings === undefined
           ? {}
           : { settings: parseRemoteDesktopVideoSettings(value.settings) })

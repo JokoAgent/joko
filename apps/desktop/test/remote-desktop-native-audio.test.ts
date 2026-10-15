@@ -178,9 +178,10 @@ describe("native optional audio in the actual capture preload", () => {
     expect(h.replies.filter(reply => reply.value.kind === "offer")).toHaveLength(1);
   });
 
-  it("retains the Mac/Windows required-loopback rejection without treating it as native optional audio", async () => {
+  it("reserves silent loopback audio without reading the native PCM channel", async () => {
     const h = await harness(); h.offer("required", false);
-    await vi.waitFor(() => expect(h.replies).toContainEqual({ id: "required", value: { kind: "error", code: "audio-unavailable" } }));
-    expect(h.pcm).not.toHaveBeenCalled(); expect(h.peers).toHaveLength(0);
+    await vi.waitFor(() => expect(h.replies).toContainEqual({ id: "required", value: { kind: "offer", answerSdp: "answer" } }));
+    expect(h.pcm).not.toHaveBeenCalled(); expect(h.peers[0]!.closed).toBe(false);
+    expect(h.peers[0]!.transceiver.direction).toBe("sendonly");
   });
 });

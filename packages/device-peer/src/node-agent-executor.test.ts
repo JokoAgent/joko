@@ -76,6 +76,7 @@ import {
   RemoteDesktopPrivacyScreenResultSchema,
   RemoteDesktopIceCandidateSchema,
   RemoteDesktopIceExchangeResultSchema,
+  RemoteDesktopIceServerSchema,
   RemoteDesktopInputEventSchema,
   RemoteDesktopLeaseSchema,
   RemoteDesktopOfferResultSchema,
@@ -513,6 +514,35 @@ describe("Node Device peer Remote Desktop host ownership", () => {
     await executor.retire();
     await executor.retire();
     expect(fixture.state.retireCalls).toBe(1);
+  });
+
+  it("passes fresh private ICE credentials only to the host and rejects expired or malformed configuration", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-15T00:00:00Z"));
+    const root = await testRoot(); const fixture = remoteDesktopHost();
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "ice-host.json"), remoteDesktop: fixture.port });
+    const expiresAt = { seconds: BigInt((Date.now() + 300_000) / 1_000), nanos: 0 };
+    const turn = create(RemoteDesktopIceServerSchema, { urls: ["turn:relay.example.test:3478?transport=udp",
+      "turn:relay.example.test:3478?transport=tcp", "turns:relay.example.test:5349?transport=tcp"],
+      username: "ephemeral-user", credential: "ephemeral-secret", expiresAt });
+    const offer = (iceServers: typeof turn[]) => remoteDesktopCommand({ case: "createRemoteDesktopOffer",
+      value: create(DevicePeerCreateRemoteDesktopOfferActionSchema, { leaseId: "lease-1", attemptId: "attempt-ice",
+        offerSdp: "v=0\r\n", iceServers }) }, DevicePeerEffectKind.SIDE_EFFECT);
+    const valid = [create(RemoteDesktopIceServerSchema, { urls: ["stun:stun.example.test:3478"], expiresAt }), turn];
+    const result = await execute(executor, offer(valid));
+    expect(fixture.state.calls).toHaveLength(1);
+    expect(fixture.state.calls[0]?.request).toMatchObject({ iceServers: valid });
+    expect(JSON.stringify(result, (_key, value: unknown) => typeof value === "bigint" ? String(value) : value))
+      .not.toContain("ephemeral-secret");
+    for (const invalid of [
+      { ...turn, expiresAt: undefined },
+      { ...turn, expiresAt: { ...turn.expiresAt!, seconds: expiresAt.seconds - 180n } },
+      { ...turn, urls: ["https://relay.example.test/secret"] },
+      { ...turn, urls: ["stun:stun.example.test:3478"] },
+      { ...turn, credential: undefined }
+    ]) await expect(execute(executor, offer([create(RemoteDesktopIceServerSchema, invalid)]))).rejects.toBeDefined();
+    expect(fixture.state.calls).toHaveLength(1);
+    await executor.retire();
   });
 
   it("rejects over-bound commands before host dispatch and fails closed on over-bound host results", async () => {

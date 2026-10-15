@@ -4,6 +4,13 @@ enum RemoteClipboardSize {
   // Rich transfer is JSON chunked by UTF-16 code units. The narrower 16 Ki
   // bound belongs to the separate legacy text RPC, outside this native item.
   static let transferLimit = 32 * 1024 * 1024
+  static let imageBytes = 8 * 1024 * 1024
+  static let imagePixels = 4_000_000.0
+
+  static func acceptsImage(width: Double, height: Double) -> Bool {
+    width.isFinite && height.isFinite && width > 0 && height > 0
+      && width <= imagePixels / height
+  }
 
   static func acceptsTransfer(_ string: String) -> Bool {
     string.utf16.count <= transferLimit

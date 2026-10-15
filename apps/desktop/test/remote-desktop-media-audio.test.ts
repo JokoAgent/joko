@@ -1,11 +1,16 @@
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { REMOTE_DESKTOP_CAPTURE_CHANNELS, type DesktopRemoteDesktopCaptureCommand } from "../src/remote-desktop-capture-protocol.js";
+import { REMOTE_DESKTOP_AUDIO_RETRY_MS, REMOTE_DESKTOP_CAPTURE_CHANNELS,
+  type DesktopRemoteDesktopCaptureCommand } from "../src/remote-desktop-capture-protocol.js";
 
 const h = vi.hoisted(() => ({ handlers: new Map<string, (...args: unknown[]) => unknown>(),
   commands: [] as DesktopRemoteDesktopCaptureCommand[],
   windows: [] as { readonly mainFrame: { readonly url: string; readonly parent: null }; isDestroyed(): boolean }[],
-  supported: true, native: true, sources: vi.fn(async () => [{ id: "screen:1:0", display_id: "1" }]) }));
+  displayRequest: undefined as undefined | ((request: { readonly frame: unknown; readonly videoRequested: boolean;
+    readonly audioRequested: boolean; readonly securityOrigin: string }, callback: (value: unknown) => void) => void),
+  onOffer: undefined as undefined | (() => void),
+  supported: true, native: true, sources: vi.fn(async () => [{ id: "screen:1:0", display_id: "1",
+    thumbnail: { isEmpty: () => false, getSize: () => ({ width: 640, height: 360 }), toJPEG: () => Buffer.from([1, 2, 3]) } }]) }));
 vi.mock("../src/remote-desktop-linux-audio.js", () => ({ supportsDesktopRemoteDesktopLinuxAudio: () => h.supported,
   DesktopRemoteDesktopLinuxAudio: class {} }));
 vi.mock(import("../src/remote-desktop-linux.js"), async original => ({ ...await original(),
@@ -17,8 +22,11 @@ vi.mock("electron", () => {
       isDestroyed: () => this.destroyed, setWindowOpenHandler: vi.fn(),
       send: (_channel: string, command: DesktopRemoteDesktopCaptureCommand) => {
         h.commands.push(command);
-        if (command.op === "offer") queueMicrotask(() => h.handlers.get(REMOTE_DESKTOP_CAPTURE_CHANNELS.reply)!(
-          { sender: this.webContents, senderFrame: this.webContents.mainFrame }, command.id, { kind: "offer", answerSdp: "answer" }));
+        if (command.op === "offer") {
+          h.onOffer?.();
+          queueMicrotask(() => h.handlers.get(REMOTE_DESKTOP_CAPTURE_CHANNELS.reply)!(
+            { sender: this.webContents, senderFrame: this.webContents.mainFrame }, command.id, { kind: "offer", answerSdp: "answer" }));
+        }
       } });
     constructor() { h.windows.push(this.webContents); }
     isDestroyed() { return this.destroyed; }
@@ -27,19 +35,26 @@ vi.mock("electron", () => {
   }
   return { app: {}, BrowserWindow: Window, desktopCapturer: { getSources: h.sources }, screen: { getAllDisplays: () => [{ id: 1 }] },
     ipcMain: { handle: (channel: string, fn: (...args: unknown[]) => unknown) => h.handlers.set(channel, fn), removeHandler: (channel: string) => h.handlers.delete(channel) },
-    nativeImage: {}, systemPreferences: {}, session: { fromPartition: () => Object.assign(new EventEmitter(), {
+    nativeImage: {}, systemPreferences: { getMediaAccessStatus: () => "granted" }, session: { fromPartition: () => Object.assign(new EventEmitter(), {
       protocol: { handle: vi.fn(), unhandle: vi.fn() }, setPermissionCheckHandler: vi.fn(),
-      setPermissionRequestHandler: vi.fn(), setDisplayMediaRequestHandler: vi.fn() }) } };
+      setPermissionRequestHandler: vi.fn(), setDisplayMediaRequestHandler: (handler: typeof h.displayRequest) => { h.displayRequest = handler; } }) } };
 });
 import { DesktopRemoteDesktopMedia, type DesktopRemoteDesktopNativeAudioPort } from "../src/remote-desktop-media.js";
 import { readDesktopSystemAudioSupport } from "../src/remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopSessionState } from "../src/remote-desktop-input.js";
 
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+const systemVersion = Object.getOwnPropertyDescriptor(process, "getSystemVersion");
 const cleanup: DesktopRemoteDesktopMedia[] = [];
 beforeEach(() => { Object.defineProperty(process, "platform", { ...platform, value: "linux" });
-  h.handlers.clear(); h.commands.length = 0; h.windows.length = 0; h.supported = true; h.native = true; h.sources.mockClear(); });
-afterEach(async () => { for (const media of cleanup.splice(0)) await media.retire(); Object.defineProperty(process, "platform", platform); });
+  h.handlers.clear(); h.commands.length = 0; h.windows.length = 0; h.supported = true; h.native = true;
+  h.sources.mockClear(); h.displayRequest = undefined; h.onOffer = undefined; });
+afterEach(async () => {
+  for (const media of cleanup.splice(0)) await media.retire();
+  Object.defineProperty(process, "platform", platform);
+  if (systemVersion === undefined) Reflect.deleteProperty(process, "getSystemVersion");
+  else Object.defineProperty(process, "getSystemVersion", systemVersion);
+});
 
 function fixture() {
   const lower = { supports: vi.fn(() => true), start: vi.fn<DesktopRemoteDesktopNativeAudioPort["start"]>(async () => undefined),
@@ -62,6 +77,19 @@ function fixture() {
 }
 
 describe("Linux native output audio capture owner", () => {
+  it("keeps X11 Chromium JPEG and renderer viewing available without native capture or audio", async () => {
+    h.native = false;
+    const f = fixture();
+    expect(readDesktopSystemAudioSupport()).toBe(false);
+    await expect(f.offer()).rejects.toThrow("AUDIO_UNAVAILABLE");
+    await expect(f.offer("view-only", false)).resolves.toBe("answer");
+    expect(h.commands.find(value => value.op === "offer")).toMatchObject({ nativeCapture: false,
+      nativeVideo: false, chromiumCapture: true, portalCapture: false, settings: { audio: false } });
+    expect(f.lower.start).not.toHaveBeenCalled();
+    await expect(f.media.frame({ displayId: "1", leaseId: "lease", cursorOverlay: false,
+      current: () => true, signal: new AbortController().signal })).resolves.toEqual({ jpeg: "AQID", width: 640, height: 360 });
+    expect(h.sources).toHaveBeenLastCalledWith({ types: ["screen"], thumbnailSize: { width: 1280, height: 1280 }, fetchWindowIcons: false });
+  });
   it("adopts only native Linux audio without Chromium source grants and keeps an initial audio failure optional", async () => {
     const f = fixture(); f.lower.start.mockRejectedValueOnce(new Error("DESKTOP_AUDIO_UNAVAILABLE"));
     await expect(f.offer()).resolves.toBe("answer");
@@ -124,5 +152,48 @@ describe("Linux native output audio capture owner", () => {
     expect(readDesktopSystemAudioSupport()).toBe(true); h.supported = false;
     expect(readDesktopSystemAudioSupport()).toBe(false); const f = fixture();
     await expect(f.offer()).rejects.toThrow("AUDIO_UNAVAILABLE"); expect(f.lower.start).not.toHaveBeenCalled();
+  });
+});
+
+describe("scoped Chromium loopback audio recovery grant", () => {
+  function mac() {
+    Object.defineProperty(process, "platform", { ...platform, value: "darwin" });
+    Object.defineProperty(process, "getSystemVersion", { configurable: true, value: () => "15.0" });
+    const f = fixture();
+    const request = (owner = h.windows.at(-1)!) => ({ frame: owner.mainFrame, videoRequested: true,
+      audioRequested: true, securityOrigin: "https://remote-desktop.joko.invalid" });
+    const capture = (value = request()) => { const callback = vi.fn(); h.displayRequest!(value, callback); return callback; };
+    return { ...f, request, capture };
+  }
+
+  it("limits the exact lease and attempt to the first capture plus three audio retries after the offer settles", async () => {
+    const f = mac();
+    h.onOffer = () => {
+      expect(f.capture({ ...f.request(), frame: { ...f.request().frame } })).toHaveBeenCalledWith({});
+      expect(f.capture({ ...f.request(), audioRequested: false })).toHaveBeenCalledWith({});
+      expect(f.capture()).toHaveBeenCalledWith({ video: expect.objectContaining({ display_id: "1" }), audio: "loopback" });
+    };
+    await f.offer();
+    for (const _delay of REMOTE_DESKTOP_AUDIO_RETRY_MS) expect(f.capture()).toHaveBeenCalledWith(expect.objectContaining({ audio: "loopback" }));
+    expect(f.capture()).toHaveBeenCalledWith({});
+    expect(h.windows[0]!.isDestroyed()).toBe(false);
+  });
+
+  it("does not let a revoked occurrence or a retired document consume a replacement grant", async () => {
+    const f = mac(); h.onOffer = () => { f.capture(); }; await f.offer();
+    const old = h.windows[0]!;
+    await f.offer("replacement");
+    expect(f.capture(f.request(old))).toHaveBeenCalledWith({});
+    expect(f.capture()).toHaveBeenCalledWith(expect.objectContaining({ audio: "loopback" }));
+    f.revoke(); expect(f.capture()).toHaveBeenCalledWith({});
+    expect(h.windows.at(-1)!.isDestroyed()).toBe(false);
+  });
+
+  it("denies a grant after its captured host lifetime signal is cancelled", async () => {
+    const f = mac(); const abort = new AbortController(); h.onOffer = () => { f.capture(); };
+    await f.media.offer({ displayId: "1", leaseId: "lease", attemptId: "attempt", offerSdp: "offer",
+      cursorOverlay: false, current: () => true, signal: abort.signal,
+      settings: { fps: 30, quality: "auto", audio: true } });
+    abort.abort(); expect(f.capture()).toHaveBeenCalledWith({});
   });
 });

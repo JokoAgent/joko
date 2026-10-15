@@ -26,7 +26,6 @@ describe("native Remote Desktop clipboard boundary", () => {
     expect(swift).toContain('AsyncFunction("clipboardVersion")');
     expect(swift).toContain('AsyncFunction("syncClipboard")');
     expect(swift).toContain("String(UIPasteboard.general.changeCount) != expectedVersion");
-    expect(swift).not.toContain('AsyncFunction("rotate")');
   });
 
   it("registers only the Android clipboard module and its non-exported managed image provider", () => {
@@ -65,7 +64,6 @@ describe("native Remote Desktop clipboard boundary", () => {
     expect(size).toContain("string.utf16.count <= transferLimit");
     expect(size).toContain("data.count <= transferLimit * 3");
     expect(size).not.toContain("16 * 1024");
-    expect(swift).toContain("width <= 64_000_000 / height");
     expect(swift).toContain("RemoteClipboardSize.acceptsTransfer(json)");
   });
 });

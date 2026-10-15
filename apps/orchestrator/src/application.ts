@@ -247,6 +247,7 @@ import {
   RemoteDesktopCoordinator,
   type RemoteDesktopIceConfigurationProvider
 } from "./remote-desktop-coordinator.js";
+import { ConfiguredRemoteDesktopIceConfiguration, REMOTE_DESKTOP_ICE_RESPONSE_BYTES } from "./remote-desktop-ice-configuration.js";
 import { RemoteHostRegistry } from "./remote-host-registry.js";
 import { RemoteExecutionRouter } from "./remote-execution-router.js";
 import {
@@ -791,9 +792,10 @@ export async function createOrchestratorApplication(
   const remoteDesktop = new RemoteDesktopCoordinator({
     owner: devicePeers,
     onRevoked: (connectionId, listener) => connections.onRevoked(connectionId, listener),
-    ...(dependencies.remoteDesktopIceConfiguration === undefined
-      ? {}
-      : { iceConfiguration: dependencies.remoteDesktopIceConfiguration })
+    iceConfiguration: dependencies.remoteDesktopIceConfiguration ?? new ConfiguredRemoteDesktopIceConfiguration({
+      configuration: config.remoteDesktopIce,
+      fetch: createOutboundFetch(dependencies.resolveOutboundProxy, REMOTE_DESKTOP_ICE_RESPONSE_BYTES)
+    })
   });
   const remoteExecution = new RemoteExecutionRouter({ hosts: remoteHosts, peers: devicePeers });
   const remotePiProcesses = new RemotePiProcessFactory({

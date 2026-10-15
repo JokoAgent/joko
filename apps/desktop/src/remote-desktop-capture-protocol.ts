@@ -1,4 +1,4 @@
-import type { RemoteDesktopIceCandidate, RemoteDesktopInput, RemoteDesktopJpegFrame } from "@joko/device-peer";
+import type { RemoteDesktopIceCandidate, RemoteDesktopIceServer, RemoteDesktopInput, RemoteDesktopJpegFrame } from "@joko/device-peer";
 import type { DesktopRemoteDesktopVideoSettings } from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopNativeFrame } from "./remote-desktop-native-capture.js";
 import type { DesktopRemoteDesktopVideoProfile } from "./remote-desktop-quality.js";
@@ -14,6 +14,8 @@ export const REMOTE_DESKTOP_CAPTURE_CHANNELS = Object.freeze({
   stopped: "joko:remote-desktop-capture:stopped"
 });
 
+export const REMOTE_DESKTOP_AUDIO_RETRY_MS = [3_000, 10_000, 30_000] as const;
+
 export type DesktopRemoteDesktopCaptureCommand =
   | {
       readonly op: "offer";
@@ -21,7 +23,8 @@ export type DesktopRemoteDesktopCaptureCommand =
       readonly leaseId: string;
       readonly attemptId: string;
       readonly offerSdp: string;
-      readonly iceServers: readonly { readonly urls: string }[];
+      readonly iceServers: readonly RemoteDesktopIceServer[];
+      readonly iceExpiresAt?: number;
       readonly nativeCapture: boolean;
       readonly nativeVideo: boolean;
       readonly chromiumCapture: boolean;

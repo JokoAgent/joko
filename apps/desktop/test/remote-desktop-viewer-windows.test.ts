@@ -13,6 +13,7 @@ const state = vi.hoisted(() => ({ handlers: new Map<string, (...args: any[]) => 
 vi.mock("electron", async () => {
   const { EventEmitter } = await import("node:events");
   class Contents extends EventEmitter { mainFrame = { url: "" }; sent: unknown[][] = [];
+    setIgnoreMenuShortcuts = vi.fn();
     isDestroyed() { return false; } send(...args: unknown[]) { this.sent.push(args); } setWindowOpenHandler() {} }
   class Window extends EventEmitter {
     webContents = new Contents(); visible = false; minimized = false; focused = false; destroyed = false;
@@ -104,6 +105,56 @@ function fixture(syncClipboard?: DesktopViewerSyncClipboard, credentialNative?: 
 function targetWindows(): any[] { return state.windows.filter(window => window.title !== "Remote Desktop"); }
 
 describe("Desktop viewer native windows", () => {
+  it("fences native menu bypass to the current trusted viewer focus and retires it with its owner", async () => {
+    const f = fixture(); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+    const window = targetWindows()[0], event = f.viewerEvent(window), generation = f.invoke(C.state, event).generation;
+    expect(() => f.invoke(C.inputFocus, event, generation, true)).toThrow("inactive");
+    f.invoke(C.ready, event, generation);
+    const menus = window.webContents.setIgnoreMenuShortcuts;
+    f.invoke(C.inputFocus, event, generation, true); expect(menus).toHaveBeenLastCalledWith(true);
+    f.invoke(C.inputFocus, event, generation, false); expect(menus).toHaveBeenLastCalledWith(false);
+    for (const value of [undefined, "true", 1]) expect(() => f.invoke(C.inputFocus, event, generation, value)).toThrow("focus");
+    expect(() => f.invoke(C.inputFocus, { ...event, senderFrame: {} }, generation, true)).toThrow("retired");
+    f.manager.prewarm();
+    const spare = state.windows.find(value => value !== window);
+    expect(() => f.invoke(C.inputFocus, f.viewerEvent(spare), 0, true)).toThrow("focus");
+    window.focused = false;
+    f.invoke(C.inputFocus, event, generation, true); expect(menus).toHaveBeenLastCalledWith(false);
+    window.focused = true; f.invoke(C.inputFocus, event, generation, true);
+    window.hide(); expect(menus).toHaveBeenLastCalledWith(false);
+    const next = f.invoke(C.state, event).generation;
+    await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+    f.invoke(C.inputFocus, event, next, true); expect(menus).toHaveBeenLastCalledWith(true);
+    expect(() => f.invoke(C.inputFocus, event, generation, false)).toThrow("retired");
+    expect(menus).toHaveBeenLastCalledWith(true);
+    window.focused = false; window.emit("blur"); expect(menus).toHaveBeenLastCalledWith(false);
+    window.focused = true; f.invoke(C.inputFocus, event, next, true);
+    f.manager.retireSource(f.source); expect(menus).toHaveBeenLastCalledWith(false);
+    expect(() => f.invoke(C.inputFocus, event, next, true)).toThrow("retired");
+  });
+
+  it.each(["darwin", "win32", "linux"] as const)("routes native close shortcuts through the current confirmation and safe stop on %s", async platform => {
+    const f = fixture(undefined, undefined, platform); f.invoke(C.bind, f.event, "document", OWNER);
+    await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+    const window = targetWindows()[0], event = f.viewerEvent(window), generation = f.invoke(C.state, event).generation;
+    f.invoke(C.ready, event, generation); f.invoke(C.inputFocus, event, generation, true);
+    const preventDefault = vi.fn(), connection = state.connections[0];
+    window.webContents.emit("before-input-event", { preventDefault }, { type: "keyDown", code: "KeyW", meta: platform === "darwin", control: platform !== "darwin" });
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(window.webContents.sent.at(-1)).toEqual([C.closeRequested, generation]);
+    expect(window.visible).toBe(true); expect(connection.stop).not.toHaveBeenCalled();
+    for (const input of [{ type: "keyUp", code: "KeyW", meta: true }, { type: "keyDown", code: "KeyW" }, { type: "keyDown", code: "KeyC", control: true }]) {
+      window.webContents.emit("before-input-event", { preventDefault }, input);
+    }
+    expect(preventDefault).toHaveBeenCalledOnce();
+    await f.invoke(C.close, event, generation);
+    expect(connection.stop).toHaveBeenCalledOnce(); expect(window.visible).toBe(false);
+    expect(window.webContents.setIgnoreMenuShortcuts).toHaveBeenLastCalledWith(false);
+    f.manager.retireSource(f.source);
+    window.webContents.emit("before-input-event", { preventDefault }, { type: "keyDown", code: "KeyW", control: true });
+    expect(preventDefault).toHaveBeenCalledOnce();
+  });
+
   it.each(["win32", "darwin", "linux"] as const)("prewarms exactly one hidden local shell without service or native effects on %s", async platform => {
     vi.useFakeTimers();
     const native = { request: vi.fn(), close: vi.fn(async () => undefined) } as DesktopViewerCredentialNative;

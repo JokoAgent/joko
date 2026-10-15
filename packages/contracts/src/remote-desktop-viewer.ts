@@ -57,6 +57,7 @@ export interface DesktopRemoteDesktopViewerApi {
   readonly platform: string;
   state(): Promise<DesktopRemoteDesktopViewerState>;
   ready(generation: number): Promise<void>;
+  inputFocus(generation: number, focused: boolean): Promise<void>;
   request(generation: number, method: string, bytes: Uint8Array): Promise<DesktopRemoteDesktopViewerReply>;
   clipboard(generation: number, action: "copy" | "paste"): Promise<void>;
   retryClipboardSync(generation: number): Promise<void>;

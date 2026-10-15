@@ -558,6 +558,9 @@ test("Remote Desktop keeps public controller identity implicit and target comman
     "joko.v1.RemoteDesktopVideoSettings");
   assert.equal(field(contract.DevicePeerCreateRemoteDesktopOfferActionSchema, "settings").message.typeName,
     "joko.v1.RemoteDesktopVideoSettings");
+  assert.equal(field(contract.DevicePeerCreateRemoteDesktopOfferActionSchema, "ice_servers").message.typeName,
+    "joko.v1.RemoteDesktopIceServer");
+  assert.equal(fieldNames(contract.CreateRemoteDesktopOfferRequestSchema).has("ice_servers"), false);
   assert.equal(contract.RemoteDesktopFailureReason.AUDIO_UNAVAILABLE, 23);
   assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_MODES_UNAVAILABLE, 24);
   assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_MODE_MISSING, 25);

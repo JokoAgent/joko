@@ -30,6 +30,7 @@ function fixture(platform = "win32", temporary = false, portal = false, systemAu
   const api: DesktopRemoteDesktopViewerApi = {
     platform, state: vi.fn(() => initialState),
     ready: vi.fn(async () => { onState({ ...SCOPE, active: true }); }),
+    inputFocus: vi.fn(async () => undefined),
     request: vi.fn(async (_generation, name, bytes) => {
       const method = RemoteDesktopService.methods.find((item) => item.localName === name)!;
       const input = fromBinary(method.input, bytes) as unknown as Record<string, unknown>;

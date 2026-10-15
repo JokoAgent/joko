@@ -10,6 +10,7 @@ import {
   type RemoteDesktopHostMuteResult,
   type RemoteDesktopIceCandidate,
   type RemoteDesktopIceExchangeResult,
+  type RemoteDesktopIceServer,
   type RemoteDesktopInputEvent,
   type RemoteDesktopLease,
   type RemoteDesktopOfferResult,
@@ -191,6 +192,7 @@ export interface DevicePeerRemoteDesktopHostPort {
     readonly offerSdp: string;
     readonly settings?: RemoteDesktopVideoSettings;
     readonly cursorOverlay: boolean;
+    readonly iceServers?: readonly RemoteDesktopIceServer[];
   }): Promise<RemoteDesktopOfferResult>;
   exchangeIce(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly attemptId: string;
