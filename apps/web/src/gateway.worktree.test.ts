@@ -11,11 +11,47 @@ import {
   SubmitOperationResponseSchema,
   WorktreeEligibility
 } from "@joko/contracts";
+import { AskHelpResponseSchema, CreateHelpFeedbackDraftResponseSchema, ListWorktreeRecycleStatusResponseSchema, ControlWorktreeRecycleResponseSchema, WorktreeRecycleState, WorktreeRecycleReason, WorktreeRecycleAction } from "@joko/contracts";
 import { describe, expect, it, vi } from "vitest";
 
 import { createOrchestratorGateway } from "./gateway.js";
 
 describe("isolated-workspace gateway", () => {
+  it("maps private Help replies and replayable drafts while discarding arbitrary navigation actions", async () => {
+    let section = "providers";
+    const drafts: unknown[] = [];
+    const transport = transportWithSnapshot(async (method, input) => {
+      if (method.localName === "askHelp") return response(method, create(AskHelpResponseSchema, { result: { case: "answer", value: { text: "An answer", settingsSection: section } } }));
+      if (method.localName === "createHelpFeedbackDraft") { drafts.push(input); return response(method, create(CreateHelpFeedbackDraftResponseSchema, { draftId: "draft-1" })); }
+      throw new Error(`Unexpected method ${method.localName}`);
+    });
+    const gateway = createOrchestratorGateway(profile("help"), "secret", {}, () => transport); await gateway.connect();
+    await expect(gateway.askHelp([{ role: "user", content: "Question" }], "en")).resolves.toEqual({ kind: "answer", text: "An answer", settingsSection: "providers" });
+    section = "https://example.com";
+    await expect(gateway.askHelp([{ role: "user", content: "Question" }], "en")).resolves.toEqual({ kind: "answer", text: "An answer" });
+    const draft = { requestId: "request-1", question: "Question", answer: "", title: "Feedback", body: "Missing answer", locale: "en" };
+    await expect(gateway.createHelpFeedbackDraft(draft)).resolves.toBe("draft-1");
+    expect(drafts).toEqual([draft]); gateway.disconnect();
+  });
+
+  it("pages recovery status and sends exact generation controls without accepting another record's receipt", async () => {
+    const requests: unknown[] = [];
+    const record = { id: "lease", generation: "gen-1", sessionId: "task", displayName: "Task", pathDisplay: "D:/tree", state: WorktreeRecycleState.PAUSED, reason: WorktreeRecycleReason.FAILED, failures: 3, nextAttemptAtMs: 0n };
+    let returnedId = "lease";
+    const transport = transportWithSnapshot(async (method, input) => {
+      if (method.localName === "listWorktreeRecycleStatus") return response(method, create(ListWorktreeRecycleStatusResponseSchema, { records: [record], page: { totalSize: 1n } }));
+      if (method.localName === "controlWorktreeRecycle") { requests.push(input); return response(method, create(ControlWorktreeRecycleResponseSchema, { record: { ...record, id: returnedId, generation: "gen-2", state: WorktreeRecycleState.KEPT, reason: WorktreeRecycleReason.KEPT } })); }
+      throw new Error(`Unexpected method ${method.localName}`);
+    });
+    const gateway = createOrchestratorGateway(profile("recycle"), "secret", {}, () => transport); await gateway.connect();
+    const [row] = await gateway.listWorktreeRecycleStatus();
+    expect(row).toEqual({ id: "lease", generation: "gen-1", sessionId: "task", displayName: "Task", pathDisplay: "D:/tree", state: "paused", reason: "failed", failures: 3, nextAttemptAt: 0 });
+    await expect(gateway.controlWorktreeRecycle({ id: row!.id, generation: row!.generation }, "keep")).resolves.toMatchObject({ generation: "gen-2", state: "kept" });
+    expect(requests).toEqual([{ id: "lease", generation: "gen-1", action: WorktreeRecycleAction.KEEP }]);
+    returnedId = "another-lease";
+    await expect(gateway.controlWorktreeRecycle(row!, "retry")).rejects.toThrow("another record"); gateway.disconnect();
+  });
+
   it("prepares only the requested Target workspace revision", async () => {
     const requests: unknown[] = [];
     let returnedTargetId = "target-1";

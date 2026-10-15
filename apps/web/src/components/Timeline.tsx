@@ -125,6 +125,7 @@ import { normalizeTimelineMathDelimiters } from "./timeline-markdown-math.js";
 import { TimelineMarkdownDocument } from "./TimelineMarkdownDocument.js";
 import { stripObjectiveVerdict } from "../objective-verdict.js";
 import { TimelineFadeElement } from "./TimelineFadeElement.js";
+import { PersonalDevelopmentReport } from "./PersonalDevelopmentReport.js";
 import {
   commitTimelineWordFadeCandidate,
   createTimelineWordFadeCandidate,
@@ -1259,7 +1260,7 @@ function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, ret
       : <NoticeBlock item={item} icon={<ListChecks />} title={item.interaction?.state === "pending" ? t("timeline.inputRequired") : t("timeline.inputClosed")} locale={locale} accent />;
     case "background": return <BackgroundBlock item={item} locale={locale} t={t} />;
     case "review": return <ReviewCard item={item} t={t} onReobserveReview={onReobserveReview} />;
-    case "status": return <StatusBlock item={item} locale={locale} />;
+    case "status": return item.personalDevelopmentReport === undefined ? <StatusBlock item={item} locale={locale} /> : <PersonalDevelopmentReport report={item.personalDevelopmentReport} task={item.personalDevelopmentTask} t={t} />;
   }
 }
 

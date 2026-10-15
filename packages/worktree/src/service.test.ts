@@ -31,6 +31,74 @@ afterEach(async () => {
 });
 
 describe("EphemeralWorktreeService", () => {
+  test("persists exact recycle controls without charging native and source writer waits", { timeout: 40_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });
+    unwrap(await service.initialize());
+    const checkout = unwrap(await service.acquire({ sessionId: "recycle-source", cwd: fixture.repositoryRoot }));
+    const source = await acquireWorktreeSourceUse(checkout.lease.path, "recycle-build", new AbortController());
+    expect(unwrap(await service.release("recycle-source", { retainForRestore: true })))
+      .toMatchObject({ status: "preserved", reason: "in_use", pathRemoved: false });
+    const pending = service.listRecycleStatus()[0]!;
+    expect(pending).toMatchObject({ id: checkout.lease.id, state: "waiting", reason: "in_use", failures: 0 });
+    unwrap(await service.controlRecycle({ id: pending.id, generation: pending.generation, action: "keep" }));
+    await source.release({ writerRetired: true });
+    service.dispose();
+
+    const restarted = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });
+    unwrap(await restarted.initialize({ deferRecycle: true, preserveSessionIds: ["recycle-source"] }));
+    expect(restarted.listRecycleStatus()[0]).toMatchObject({ generation: pending.generation, state: "kept", reason: "kept", failures: 0 });
+    let checks = 0;
+    expect(unwrap(await restarted.retryRecycle(pending, async () => { checks += 1; return true; })))
+      .toMatchObject({ status: "preserved", reason: "keep" });
+    expect(checks).toBe(0);
+    expectFailure(await restarted.controlRecycle({ ...pending, generation: "00000000-0000-0000-0000-000000000000", action: "retry" }), "INVALID_ARGUMENT");
+    expectFailure(await restarted.controlRecycle({ id: pending.id, generation: "00000000-0000-0000-0000-000000000000", action: "retry" }), "SESSION_CONFLICT");
+    unwrap(await restarted.controlRecycle({ id: pending.id, generation: pending.generation, action: "retry" }));
+    expect(unwrap(await restarted.retryRecycle(pending, async () => false))).toMatchObject({ reason: "in_use" });
+    expect(restarted.listRecycleStatus()[0]).toMatchObject({ state: "waiting", failures: 0 });
+    await writeFile(join(checkout.lease.path, "tracked.txt"), "staged recovery\n");
+    await git(checkout.lease.path, ["add", "tracked.txt"]);
+    await writeFile(join(checkout.lease.path, "untracked.txt"), "untracked recovery\n");
+    expect(unwrap(await restarted.retryRecycle(pending, async () => true))).toMatchObject({ reason: "restorable", pathRemoved: true });
+    expect(restarted.listRecycleStatus()).toEqual([]);
+    const restored = unwrap(await restarted.acquire({ sessionId: "recycle-source", cwd: fixture.repositoryRoot }));
+    expect((await readFile(join(restored.lease.path, "tracked.txt"), "utf8")).replaceAll("\r\n", "\n")).toBe("staged recovery\n");
+    expect(await git(restored.lease.path, ["diff", "--cached", "--name-only"])).toContain("tracked.txt");
+    expect((await readFile(join(restored.lease.path, "untracked.txt"), "utf8")).replaceAll("\r\n", "\n")).toBe("untracked recovery\n");
+    const nextUse = await acquireWorktreeSourceUse(restored.lease.path, "next-recycle-build", new AbortController());
+    unwrap(await restarted.release("recycle-source", { retainForRestore: true }));
+    expect(restarted.listRecycleStatus()[0]?.generation).not.toBe(pending.generation);
+    expectFailure(await restarted.controlRecycle({ id: pending.id, generation: pending.generation, action: "keep" }), "SESSION_CONFLICT");
+    await nextUse.release({ writerRetired: true });
+    restarted.dispose();
+  });
+
+  test("pauses real removal failures across restart until an exact explicit retry", { timeout: 40_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });
+    unwrap(await service.initialize());
+    const checkout = unwrap(await service.acquire({ sessionId: "locked-recycle", cwd: fixture.repositoryRoot }));
+    await git(fixture.repositoryRoot, ["worktree", "lock", "--reason", "fixture writer lock", checkout.lease.path]);
+    expectFailure(await service.release("locked-recycle", { retainForRestore: true }), "SESSION_CONFLICT");
+    const pending = service.listRecycleStatus()[0]!;
+    expect(pending).toMatchObject({ state: "retrying", reason: "failed", failures: 1 });
+    expectFailure(await service.retryRecycle(pending, async () => true), "SESSION_CONFLICT");
+    expectFailure(await service.retryRecycle(pending, async () => true), "SESSION_CONFLICT");
+    expect(service.listRecycleStatus()[0]).toMatchObject({ state: "paused", failures: 3, nextAttemptAt: 0 });
+    service.dispose();
+    const restarted = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });
+    unwrap(await restarted.initialize({ preserveSessionIds: ["locked-recycle"] }));
+    expect(restarted.listRecycleStatus()[0]).toMatchObject({ generation: pending.generation, state: "paused", failures: 3 });
+    expect(unwrap(await restarted.retryRecycle(pending, async () => { throw new Error("Paused records must not reach native owners."); })))
+      .toMatchObject({ reason: "paused", pathRemoved: false });
+    await git(fixture.repositoryRoot, ["worktree", "unlock", checkout.lease.path]);
+    unwrap(await restarted.controlRecycle({ id: pending.id, generation: pending.generation, action: "retry" }));
+    expect(unwrap(await restarted.retryRecycle(pending, async () => true))).toMatchObject({ pathRemoved: true, reason: "restorable" });
+    expect(restarted.listRecycleStatus()).toEqual([]);
+    restarted.dispose();
+  });
+
   test("cancels a project source borrower before recycling and releases only after its writer retires", { timeout: 30_000 }, async () => {
     const fixture = await createRepositoryFixture();
     const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });

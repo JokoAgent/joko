@@ -8,6 +8,49 @@ import { describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 import type { AppSnapshot } from "./model.js";
 
+describe("Gateway snapshot-only connection", () => {
+  it("loads and refreshes owner snapshots without reserving an Event stream", async () => {
+    const harness = ownerHarness();
+    await harness.gateway.connect({ snapshotOnly: true });
+    await harness.gateway.refresh();
+    expect(harness.reads()).toBe(2);
+    expect(harness.states.at(-1)).toBe("connected");
+    expect(harness.transport.stream).not.toHaveBeenCalled();
+    harness.gateway.disconnect();
+  });
+
+  it("keeps the normal connection's Event stream and retires it on disconnect", async () => {
+    const harness = ownerHarness();
+    await harness.gateway.connect();
+    await vi.waitFor(() => expect(harness.transport.stream).toHaveBeenCalledTimes(1));
+    const signal = vi.mocked(harness.transport.stream).mock.calls[0]![1]!;
+    expect(signal.aborted).toBe(false);
+    harness.gateway.disconnect();
+    expect(signal.aborted).toBe(true);
+  });
+
+  it("does not connect or open an Event stream after a failed initial snapshot", async () => {
+    const harness = ownerHarness(async () => { throw new Error("snapshot unavailable"); });
+    await expect(harness.gateway.connect({ snapshotOnly: true })).rejects.toThrow("snapshot unavailable");
+    expect(harness.states).not.toContain("connected");
+    expect(harness.transport.stream).not.toHaveBeenCalled();
+    harness.gateway.disconnect();
+  });
+
+  it.each([false, true])("does not revive a retired connection after a late snapshot (snapshotOnly=%s)", async snapshotOnly => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const harness = ownerHarness(() => pending);
+    const connecting = harness.gateway.connect({ snapshotOnly });
+    await vi.waitFor(() => expect(harness.reads()).toBe(1));
+    harness.gateway.disconnect(); release(); await connecting;
+    expect(harness.states.at(-1)).toBe("disconnected");
+    expect(harness.states).not.toContain("connected");
+    expect(harness.latest()).toBeUndefined();
+    expect(harness.transport.stream).not.toHaveBeenCalled();
+  });
+});
+
 describe("owner snapshot Timeline retention", () => {
   it("keeps a durable live answer across a workspace refresh and retires replaced Session and service generations", async () => {
     const harness = ownerHarness();
@@ -78,12 +121,13 @@ function answer(messageId: string, text: string): EventKind {
     blocks: [{ content: { case: "text", value: text } }] } };
 }
 
-function ownerHarness() {
+function ownerHarness(beforeSnapshot?: () => Promise<void>) {
   let generation = 7n;
   let sequence = 0n;
   let sessionGeneration: bigint | undefined = 3n;
   let snapshotReads = 0;
   const snapshots: AppSnapshot[] = [];
+  const states: string[] = [];
   const requests: any[] = [];
   const events: Event[] = [];
   let wake: (() => void) | undefined;
@@ -97,6 +141,7 @@ function ownerHarness() {
     unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
       if (method.localName !== "getSnapshot") throw new Error(`Unexpected method: ${method.localName}`);
       requests.push(input); snapshotReads += 1;
+      await beforeSnapshot?.();
       return response(method, create(GetSnapshotResponseSchema, { snapshot: rawSnapshot() }));
     }),
     stream: vi.fn(async (method: any, signal: AbortSignal) => response(method, stream(signal), true))
@@ -114,9 +159,9 @@ function ownerHarness() {
   }
   const gateway = createOrchestratorGateway({ id: "connection-one", deviceId: "device-one", serverId: "server-one",
     name: "Browser", origin: "https://orchestrator.example" }, "test-credential", {
-      onSnapshot: (snapshot) => snapshots.push(snapshot)
+      onSnapshot: (snapshot) => snapshots.push(snapshot), onState: state => states.push(state)
     }, () => transport);
-  return { gateway, requests, reads: () => snapshotReads, latest: () => snapshots.at(-1)!,
+  return { gateway, transport, states, requests, reads: () => snapshotReads, latest: () => snapshots.at(-1)!,
     replaceSession: (next: bigint | undefined) => { sessionGeneration = next; },
     replaceService: (next: bigint) => { generation = next; sequence = 0n; },
     emit: async (kind: EventKind, runtimeGeneration = sessionGeneration ?? 3n, sequenceStep = 1n): Promise<void> => {

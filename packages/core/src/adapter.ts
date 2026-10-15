@@ -472,9 +472,22 @@ export interface UserShellResult {
   readonly artifact?: BlobRef;
 }
 
+/** Ephemeral, tool-free inference owned by one exact local Backend instance. */
+export interface NativeTextInferenceInput {
+  readonly system: string;
+  readonly user: string;
+  readonly timeoutMs: number;
+  readonly signal: AbortSignal;
+  readonly backendInstanceGeneration: number;
+  readonly assertCurrent: () => void;
+  readonly assertModelAllowed: (providerId: string, modelId: string) => void;
+}
+
 export interface BackendAdapter {
   readonly id: string;
   describe(): Promise<BackendDescriptor>;
+  /** Optional native-account inference; never borrows a product Session or its tools. */
+  inferNativeText?(input: NativeTextInferenceInput): Promise<string>;
   validateTarget(target: TargetDescriptor): Promise<void>;
   /** Resolve and validate an opaque native reference without starting a runtime. */
   resolveNativeSessionReference?(

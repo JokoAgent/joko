@@ -25,6 +25,7 @@ describe("independent Partner source directory", () => {
     expect(view.directory.getSources().map(source => [source.key, source.status, source.rows[0]?.displayName])).toEqual([
       [partnerSourceKey(first), "online", "Partner on Node A"], [partnerSourceKey(second), "online", "Partner on Node B"]
     ]);
+    expect(view.connections).toEqual([{ profileId: first.id, options: { snapshotOnly: true } }, { profileId: second.id, options: { snapshotOnly: true } }]);
     const resolved = await view.directory.resolve(partnerSourceKey(second), "same-partner", new AbortController().signal);
     expect(resolved.session.id).toBe("session-node-b");
     view.directory.dispose();
@@ -72,8 +73,30 @@ describe("independent Partner source directory", () => {
     const view = fixture(); view.images.add(second.id); view.directory.sync([first, second]); await view.directory.refreshAll();
     const image = { sha256: "a".repeat(64), mimeType: "image/png" as const, byteLength: 8 };
     await expect(view.directory.readAvatar(partnerSourceKey(second), "same-partner", 1n, image, new AbortController().signal)).resolves.toBe("data:node-b");
+    expect(view.ownerReads).toEqual([second.id]);
     await expect(view.directory.readAvatar(partnerSourceKey(first), "same-partner", 1n, image, new AbortController().signal)).rejects.toThrow("unavailable");
     view.directory.dispose();
+  });
+  it.each(["avatar", "canonical", "preparation"] as const)("refreshes and rejects a revoked owner before the formal %s read", async operation => {
+    const view = fixture(); view.images.add(first.id); view.directory.sync([first]); await view.directory.refreshAll();
+    view.revokedOwners.add(first.id);
+    const key = partnerSourceKey(first), signal = new AbortController().signal;
+    const read = operation === "avatar" ? view.directory.readAvatar(key, "same-partner", 1n, { sha256: "a".repeat(64), mimeType: "image/png", byteLength: 8 }, signal)
+      : operation === "canonical" ? view.directory.resolve(key, "same-partner", signal) : view.directory.resolvePreparationProfile(key, "same-partner", signal);
+    await expect(read).rejects.toThrow("no longer authorized");
+    expect(view.partnerReads).not.toHaveBeenCalled(); expect(view.avatarReads).not.toHaveBeenCalled();
+    expect(view.directory.getSources()[0]).toMatchObject({ status: "accessDenied", rows: [] });
+    expect(localStorage.getItem("joko.partner-source.v1." + key)).toBeNull(); view.directory.dispose();
+  });
+  it("does not dispatch an avatar read when its fresh snapshot fails or its source retires while reading", async () => {
+    const view = fixture(); view.images.add(first.id); view.directory.sync([first]); await view.directory.refreshAll();
+    const read = () => view.directory.readAvatar(partnerSourceKey(first), "same-partner", 1n, { sha256: "a".repeat(64), mimeType: "image/png", byteLength: 8 }, new AbortController().signal);
+    view.failedSnapshots.add(first.id); await expect(read()).rejects.toThrow("snapshot failed");
+    view.failedSnapshots.delete(first.id);
+    const late = deferred(); view.pendingSnapshots.set(first.id, late.promise);
+    const pending = read(), rejected = expect(pending).rejects.toThrow();
+    await settle(); view.directory.setForeground(false); late.resolve(); await rejected;
+    expect(view.avatarReads).not.toHaveBeenCalled(); expect(view.directory.getSources()[0]?.status).toBe("offline"); view.directory.dispose();
   });
 });
 
@@ -96,6 +119,8 @@ describe("fresh Partner canonical navigation", () => {
 
 function fixture() {
   const order: string[] = [], names = new Map<string, string>(), failedReads = new Set<string>(), revoked = new Set<string>(), identityMismatch = new Set<string>(), large = new Set<string>(), images = new Set<string>(), pendingReads = new Map<string, Promise<void>>();
+  const revokedOwners = new Set<string>(), failedSnapshots = new Set<string>(), pendingSnapshots = new Map<string, Promise<void>>(), ownerReads: string[] = [];
+  const connections: { profileId: string; options: unknown }[] = [], partnerReads = vi.fn(), avatarReads = vi.fn();
   const readAuthKey = vi.fn(async (profile: ConnectionProfile) => { order.push("secret:" + profile.serverId); return "private-auth-key"; });
   const directory = new PartnerSourceDirectory({ storage: localStorage, publish: vi.fn(), readAuthKey,
     probe: async origin => { const owner = origin === first.origin ? first : second; order.push("probe:" + owner.serverId); return { serverId: identityMismatch.has(owner.id) ? "changed" : owner.serverId }; },
@@ -103,14 +128,15 @@ function fixture() {
       const snapshot = ownerSnapshot(owner);
       const partner = () => ({ ...profile(owner), displayName: names.get(owner.id) ?? "Partner on " + owner.name,
         ...(images.has(owner.id) ? { avatar: { sha256: "a".repeat(64), mimeType: "image/png" as const, byteLength: 8 } } : {}) });
-      return { connect: async () => { if (revoked.has(owner.id)) { await callbacks.onAuthenticationInvalidated?.(new Error("revoked") as never); throw new Error("revoked"); } callbacks.onSnapshot?.(snapshot); },
-        disconnect: vi.fn(), refresh: async () => callbacks.onSnapshot?.(snapshot), getPartner: async () => partner(), listPartnerSessions: async () => [link(owner)],
-        readPartnerAvatar: async () => "data:" + owner.serverId,
+      return { connect: async (options: unknown) => { connections.push({ profileId: owner.id, options }); if (revoked.has(owner.id)) { await callbacks.onAuthenticationInvalidated?.(new Error("revoked") as never); throw new Error("revoked"); } callbacks.onSnapshot?.(snapshot); },
+        disconnect: vi.fn(), refresh: async () => { ownerReads.push(owner.id); await pendingSnapshots.get(owner.id); if (failedSnapshots.has(owner.id)) throw new Error("snapshot failed"); callbacks.onSnapshot?.({ ...snapshot, devices: snapshot.devices.map(device => ({ ...device, revoked: revokedOwners.has(owner.id) })) }); },
+        getPartner: async () => { partnerReads(owner.id); return partner(); }, listPartnerSessions: async () => [link(owner)],
+        readPartnerAvatar: async () => { avatarReads(owner.id); return "data:" + owner.serverId; },
         listPartners: async () => { await pendingReads.get(owner.id); if (failedReads.has(owner.id)) throw new Error("read failed");
           return { partners: large.has(owner.id) ? Array.from({ length: 201 }, (_, index) => ({ ...partner(), id: "partner-" + index })) : [partner()], directory: {} }; }
       } as unknown as OrchestratorGateway;
     } });
-  return { directory, order, readAuthKey, names, failedReads, revoked, identityMismatch, large, images, pendingReads };
+  return { directory, order, readAuthKey, names, failedReads, revoked, identityMismatch, large, images, pendingReads, connections, ownerReads, revokedOwners, failedSnapshots, pendingSnapshots, partnerReads, avatarReads };
 }
 function profile(owner: ConnectionProfile): PartnerProfileView { return { id: "same-partner", revision: 1n, profileVersion: 1n, displayName: "Partner", description: "", avatar: "orbit", identitySource: "private identity", templateId: "general", lifecycle: "active", initializationState: "ready", invitationStage: "ready", homeTargetId: "home-" + owner.serverId, canonicalSessionId: "session-" + owner.serverId,
   capabilities: { permissionMode: "ask", planMode: false, modelChain: [] }, usesDirectoryDefaults: true, createdAt: 1, updatedAt: 1,

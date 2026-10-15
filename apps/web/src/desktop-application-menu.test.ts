@@ -29,6 +29,7 @@ describe("Desktop application-menu bridge", () => {
     const queue = createDesktopApplicationMenuCommandQueue({
       getPreferences,
       openAbout: vi.fn(),
+      openHelp: vi.fn(),
       openNewSession: vi.fn(),
       openSettings: vi.fn(),
       openTaskStatusSettings: vi.fn(),
@@ -43,11 +44,13 @@ describe("Desktop application-menu bridge", () => {
     expect(changeWindowZoom).toHaveBeenCalledWith("increase");
   });
 
-  it("routes the native About item through the guarded renderer action", async () => {
+  it("routes the native About and Help items through guarded renderer actions", async () => {
     const openAbout = vi.fn();
+    const openHelp = vi.fn();
     const queue = createDesktopApplicationMenuCommandQueue({
       getPreferences: () => ({ navigationOpen: true, windowZoom: 1 }),
       openAbout,
+      openHelp,
       openNewSession: vi.fn(),
       openSettings: vi.fn(),
       openTaskStatusSettings: vi.fn(),
@@ -56,8 +59,10 @@ describe("Desktop application-menu bridge", () => {
       changeWindowZoom: vi.fn(async () => 1)
     });
     queue.handle("open-about");
+    queue.handle("open-help");
     await queue.whenIdle();
     expect(openAbout).toHaveBeenCalledOnce();
+    expect(openHelp).toHaveBeenCalledOnce();
   });
 
   it("routes the native task-status gear directly to its settings action", async () => {
@@ -65,6 +70,7 @@ describe("Desktop application-menu bridge", () => {
     const queue = createDesktopApplicationMenuCommandQueue({
       getPreferences: () => ({ navigationOpen: true, windowZoom: 1 }),
       openAbout: vi.fn(),
+      openHelp: vi.fn(),
       openNewSession: vi.fn(),
       openSettings: vi.fn(),
       openTaskStatusSettings,
@@ -84,6 +90,7 @@ describe("Desktop application-menu bridge", () => {
     const queue = createDesktopApplicationMenuCommandQueue({
       getPreferences: () => ({ navigationOpen: true, windowZoom: 1 }),
       openAbout: vi.fn(),
+      openHelp: vi.fn(),
       openNewSession: vi.fn(),
       openSettings: vi.fn(),
       openTaskStatusSettings: vi.fn(),
@@ -114,6 +121,7 @@ describe("Desktop application-menu bridge", () => {
     const queue = createDesktopApplicationMenuCommandQueue({
       getPreferences: () => ({ navigationOpen: true, windowZoom: 1 }),
       openAbout: vi.fn(),
+      openHelp: vi.fn(),
       openNewSession: () => Promise.reject(new Error("blocked")),
       openSettings,
       openTaskStatusSettings: vi.fn(),
@@ -139,6 +147,7 @@ describe("Desktop application-menu bridge", () => {
     const queue = createDesktopApplicationMenuCommandQueue({
       getPreferences,
       openAbout: vi.fn(),
+      openHelp: vi.fn(),
       openNewSession: vi.fn(),
       openSettings: vi.fn(),
       openTaskStatusSettings: vi.fn(),
@@ -167,6 +176,7 @@ describe("Desktop application-menu bridge", () => {
     const queue = createDesktopApplicationMenuCommandQueue({
       getPreferences: () => ({ navigationOpen: true, windowZoom: 1 }),
       openAbout: vi.fn(),
+      openHelp: vi.fn(),
       openNewSession,
       openSettings,
       openTaskStatusSettings: vi.fn(),

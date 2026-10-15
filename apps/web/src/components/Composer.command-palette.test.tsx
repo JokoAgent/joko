@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
 import type { JSONContent } from "@tiptap/core";
+import { create } from "@bufbuild/protobuf";
+import { PersonalDevelopmentDoctorRunSchema, PersonalDevelopmentStateSchema } from "@joko/contracts";
 import { act, forwardRef, useImperativeHandle, useRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -8,7 +10,7 @@ import { remapComposerInlineMentionReplacement } from "../composer-mention-range
 import { appendQuoteToComposerDocument, composerDocumentPlainText, composerDocumentQuotes, plainTextToComposerDocument } from "../composer-quote-document.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { GAMEPAD_SKILL_EVENT } from "../gamepad-client.js";
-import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type ObjectiveView, type RuntimeCommandView, type SessionView } from "../model.js";
+import { emptySnapshot, type BackendView, type ComposerDraft, type ComposerInlineMentionRange, type ModelView, type ObjectiveView, type RuntimeCommandView, type SessionView } from "../model.js";
 import { replaceComposerDocumentTextRange } from "./composer-inline-mention.js";
 import { Composer } from "./Composer.js";
 import type { ObjectiveDialogHandoffRequest } from "./ObjectiveIndicator.js";
@@ -204,6 +206,58 @@ it("starts application-owned learning from the current task or free text without
   expect(fromText.api.send).not.toHaveBeenCalled();
 });
 
+it("runs the personal development doctor without enqueueing a user input or creating a coding task", async () => {
+  const view = await mountPersonalDevelopment(draft("/joko-make-doctor"));
+  await act(async () => view.send().click()); await settleActions(view.actions);
+  expect(view.api.startPersonalDevelopmentDoctor).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    mode: "check", sessionId: baseSession.id, targetId: baseSession.targetId, request: ""
+  }), expect.any(String), expect.any(AbortSignal));
+  expect(view.api.send).not.toHaveBeenCalled(); expect(view.api.startPersonalDevelopmentTask).not.toHaveBeenCalled();
+  expect(view.editor().value).toBe(""); expect(view.api.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "doctor-session" });
+});
+
+it("opens personal development preflight and submits prepare doctor only after explicit model confirmation", async () => {
+  const view = await mountPersonalDevelopment(draft("/joko-make Add a keyboard shortcut"));
+  await act(async () => view.send().click()); await settleActions(view.actions);
+  const form = document.querySelector<HTMLFormElement>(".personal-development-task-form");
+  expect(form).not.toBeNull(); expect(form?.querySelector("textarea")?.value).toBe("Add a keyboard shortcut");
+  expect(view.api.startPersonalDevelopmentDoctor).not.toHaveBeenCalled();
+  const submit = form!.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+  await vi.waitFor(() => expect(submit.disabled).toBe(false));
+  await act(async () => { submit.click(); await Promise.resolve(); }); await settleActions(view.actions);
+  expect(view.api.startPersonalDevelopmentDoctor).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ mode: "prepare", sessionId: baseSession.id,
+    targetId: baseSession.targetId, providerId: "personal-provider", modelId: "personal-model", request: "Add a keyboard shortcut" }), expect.any(String), expect.any(AbortSignal));
+  expect(view.api.send).not.toHaveBeenCalled(); expect(view.api.startPersonalDevelopmentTask).not.toHaveBeenCalled();
+});
+
+it.each(["joko-make", "joko-make-doctor"])("keeps an exact loaded /%s Skill in the runtime command lane", async name => {
+  const text = `/${name}${name === "joko-make" ? " Add a shortcut" : ""}`;
+  const view = await mountPersonalDevelopment(draft(text));
+  vi.mocked(view.api.listCommands).mockResolvedValueOnce([{ id: `skill-${name}`, name, description: "Loaded command", source: "skill", inputMode: "text", loaded: true }]);
+  await act(async () => view.send().click()); await settleActions(view.actions);
+  expect(view.api.send).toHaveBeenCalledExactlyOnceWith(baseSession.id, expect.objectContaining({ text }), { expectedGeneration: baseSession.generation });
+  expect(view.api.startPersonalDevelopmentDoctor).not.toHaveBeenCalled(); expect(document.querySelector(".personal-development-task-form")).toBeNull();
+});
+
+it("rejects personal command attachments and ignores a doctor reply after the source composer changes task", async () => {
+  const attachment = { id: "personal-evidence", kind: "file" as const, file: new File(["evidence"], "evidence.txt", { type: "text/plain" }) };
+  const blocked = await mountPersonalDevelopment({ ...draft("/joko-make-doctor"), attachments: [attachment] });
+  await act(async () => blocked.send().click()); await settleActions(blocked.actions);
+  expect(document.querySelector("[role='alert']")?.textContent).toContain("personalDevelopment.noAttachments");
+  expect(blocked.api.startPersonalDevelopmentDoctor).not.toHaveBeenCalled(); expect(blocked.api.send).not.toHaveBeenCalled();
+  expect(blocked.drafts.get(baseSession.id)?.attachments).toEqual([attachment]);
+
+  const late = await mountPersonalDevelopment(draft("/joko-make-doctor"));
+  let finish!: () => void;
+  vi.mocked(late.api.startPersonalDevelopmentDoctor).mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve(create(PersonalDevelopmentDoctorRunSchema, { runId: "late-doctor", sessionId: "stale-session", mode: "check" })); }));
+  await act(async () => late.send().click()); await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+  await late.render({ ...baseSession, id: "task-two", generation: 2n });
+  await act(async () => finish()); await settleActions(late.actions);
+  expect(late.api.navigate).not.toHaveBeenCalled(); expect(late.api.send).not.toHaveBeenCalled();
+  await vi.waitFor(() => expect(late.editor().value).toBe("second task"));
+  expect(late.drafts.get(baseSession.id)?.text).toBe("/joko-make-doctor");
+});
+
 it("refreshes command ownership at dispatch and sends a loaded runtime /learn exactly once", async () => {
   const view = await mount(draft("/learn runtime evidence"));
   const runtimeLearn: RuntimeCommandView = {
@@ -319,6 +373,7 @@ it("opens a fenced Home /goal handoff after hydration and consumes only its unch
     id: "home-goal-request",
     serverId: "server-one",
     profileId: "profile-one",
+    origin: "https://localhost",
     connectionGeneration: 1,
     sessionId: baseSession.id,
     sessionGeneration: baseSession.generation,
@@ -353,6 +408,7 @@ it("waits for the matching rejected first-input recovery before opening a Home /
     id: "restored-home-goal-request",
     serverId: "server-one",
     profileId: "profile-one",
+    origin: "https://localhost",
     connectionGeneration: 1,
     sessionId: baseSession.id,
     sessionGeneration: baseSession.generation,
@@ -943,7 +999,7 @@ async function mount(
     ["task-two", draft("second task")]
   ]);
   const api = {
-    state: { connectionState: "connected", connectionGeneration: 1, activeProfile: { serverId: "server-one", id: "profile-one" }, snapshot: { ...emptySnapshot(), targets: [baseTarget] }, preferences: DEFAULT_UI_PREFERENCES, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) },
+    state: { connectionState: "connected", connectionGeneration: 1, activeProfile: { serverId: "server-one", id: "profile-one", origin: "https://localhost" }, snapshot: { ...emptySnapshot(), targets: [baseTarget] }, preferences: DEFAULT_UI_PREFERENCES, ...(rejectedFirstInputRecovery === undefined ? {} : { rejectedFirstInputRecovery }) },
     readDraft: vi.fn(async (sessionId: string) => drafts.get(sessionId)),
     readDraftSnapshot: vi.fn(async (sessionId: string) => ({ revision: 1, draft: drafts.get(sessionId) })),
     saveDraft: vi.fn(async (sessionId: string, draftValue: ComposerDraft) => { drafts.set(sessionId, draftValue); }),
@@ -1054,6 +1110,28 @@ async function mount(
     shell: () => host.querySelector<HTMLButtonElement>('button[aria-label="composer.shellEnter"]')!
   };
 }
+
+async function mountPersonalDevelopment(initialDraft: ComposerDraft) {
+  vi.stubGlobal("jokoDesktop", { capabilities: ["development.personal"] });
+  const view = await mount(initialDraft);
+  Object.assign(view.api.state.activeProfile!, { managedLocal: true, deviceId: "personal-device", origin: "https://local.invalid" });
+  Object.assign(view.api.state, { ready: true, snapshot: { ...view.api.state.snapshot, models: [personalDevelopmentModel] } });
+  Object.assign(view.api, {
+    getPersonalDevelopment: vi.fn(async () => ({ available: true, unavailableReason: "", state: create(PersonalDevelopmentStateSchema, {
+      generation: 1n, environment: { status: "ready" }, source: { status: "ready" }, versions: { selected: "original" }
+    }) })),
+    watchPersonalDevelopment: vi.fn(async () => undefined),
+    startPersonalDevelopmentDoctor: vi.fn(async (input: { readonly mode?: string }) => create(PersonalDevelopmentDoctorRunSchema, { runId: "doctor-run", sessionId: "doctor-session", mode: input.mode ?? "check" })),
+    startPersonalDevelopmentTask: vi.fn(async () => ({ taskId: "coding-task", sessionId: "coding-session" }))
+  });
+  await view.render(baseSession); return view;
+}
+
+const personalDevelopmentModel: ModelView = {
+  backendId: baseSession.backendId, providerId: "personal-provider", providerName: "Provider", modelId: "personal-model", name: "Model",
+  available: true, supportsImages: false, supportsFast: false, inputModalities: ["text"], outputModalities: ["text"], efforts: [],
+  contextWindow: 8192, maximumOutputTokens: 2048, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, currencyCode: "USD"
+};
 
 function draft(text: string): ComposerDraft {
   return { text, editorDocument: plainTextToComposerDocument(text), attachments: [], mentions: [], inlineMentionRanges: [], deliveryMode: "prompt" };

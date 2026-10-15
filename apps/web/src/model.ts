@@ -1,7 +1,8 @@
 import type { JSONContent } from "@tiptap/core";
 import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar.js";
 import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine } from "@joko/contracts";
-import type { PartnerLearningFeedbackView } from "@joko/contracts";
+import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask } from "@joko/contracts";
+import type { PersonalDevelopmentApi } from "./personal-development-api.js";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
 export type SystemLocale = Exclude<Locale, "en-XA">;
@@ -1532,6 +1533,8 @@ export interface ContextView {
 }
 
 export interface TimelineItemView {
+  readonly personalDevelopmentReport?: PersonalDevelopmentDoctorRun;
+  readonly personalDevelopmentTask?: PersonalDevelopmentTask;
   readonly learning?: PartnerLearningFeedbackView;
   readonly id: string;
   /** Owning completed/streaming message when one message projects multiple blocks. */
@@ -5753,6 +5756,35 @@ export interface PortableSessionActivationResultView {
   readonly activationError?: ErrorView;
 }
 
+export interface HelpMessageView {
+  readonly role: "user" | "assistant";
+  readonly content: string;
+}
+
+export type HelpAnswerView = { readonly kind: "answer"; readonly text: string; readonly settingsSection?: string }
+  | { readonly kind: "noAnswer" };
+
+export interface HelpFeedbackDraftView {
+  readonly requestId: string;
+  readonly question: string;
+  readonly answer: string;
+  readonly title: string;
+  readonly body: string;
+  readonly locale: string;
+}
+
+export interface WorktreeRecycleRecordView {
+  readonly id: string;
+  readonly generation: string;
+  readonly sessionId: string;
+  readonly displayName: string;
+  readonly pathDisplay: string;
+  readonly state: "retrying" | "waiting" | "paused" | "kept";
+  readonly reason: "pending" | "inUse" | "changed" | "kept" | "integrity" | "storage" | "identity" | "failed";
+  readonly failures: number;
+  readonly nextAttemptAt: number;
+}
+
 export interface PortableReplacementCleanupView {
   readonly importedSessionId: string;
   readonly nativeState: "pending" | "dispatched" | "unknown" | "completed";
@@ -5966,7 +5998,7 @@ export interface SimulatorViewerVideoPreferenceView {
   readonly clientFallbackReason?: "decode_failed";
 }
 
-export interface OperationApi extends VoiceDictionaryPeerApi {
+export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmentApi {
   getSimulatorViewerState(sessionId: string, signal?: AbortSignal): Promise<SimulatorViewerStateView>;
   controlSimulatorInstance(sessionId: string, requestId: string, input: SimulatorViewerControlView, signal?: AbortSignal): Promise<SimulatorViewerControlResultView>;
   controlSimulatorViewerInput(sessionId: string, requestId: string, route: SimulatorViewerRouteView,
@@ -6061,6 +6093,10 @@ export interface OperationApi extends VoiceDictionaryPeerApi {
   acknowledgeSessionError(sessionId: string, throughCursor: TimelineHistoryCursorView): Promise<void>;
   deleteSession(sessionId: string, deleteNative: boolean): Promise<void>;
   createSession(draft: NewSessionDraft): Promise<{ readonly sessionId: string; readonly generation: bigint }>;
+  askHelp(messages: readonly HelpMessageView[], locale: string, signal?: AbortSignal): Promise<HelpAnswerView>;
+  createHelpFeedbackDraft(draft: HelpFeedbackDraftView, signal?: AbortSignal): Promise<string>;
+  listWorktreeRecycleStatus(signal?: AbortSignal): Promise<readonly WorktreeRecycleRecordView[]>;
+  controlWorktreeRecycle(record: Pick<WorktreeRecycleRecordView, "id" | "generation">, action: "retry" | "keep", signal?: AbortSignal): Promise<WorktreeRecycleRecordView | undefined>;
   probeTargetWorktree(targetId: string, signal?: AbortSignal): Promise<TargetWorktreeProbeView>;
   listTargetWorktreeSources(targetId: string, signal?: AbortSignal): Promise<readonly WorktreeSourceView[]>;
   discoverNativeSessions(targetId: string, signal?: AbortSignal): Promise<readonly NativeSessionCandidateView[]>;

@@ -35,7 +35,8 @@
     { "path": "../../packages/tool-lsp" },
     { "path": "../../packages/tool-terminal" },
     { "path": "../../packages/voice-input" },
-    { "path": "../../packages/worktree" }
+    { "path": "../../packages/worktree" },
+    { "path": "../../packages/personal-development" }
   ],
   "include": ["src/**/*.ts", "src/**/*.mts"]
 }

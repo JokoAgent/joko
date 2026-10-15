@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/personal_development.proto";
+
+// This service requires the private, committed Desktop host authorization in
+// addition to the ordinary Connection bearer. It is never a renderer capability.
+service DesktopPersonalDevelopmentHostService {
+  rpc RegisterDesktopDevelopmentHost(RegisterDesktopDevelopmentHostRequest) returns (RegisterDesktopDevelopmentHostResponse);
+  rpc PollDesktopDevelopmentCommand(PollDesktopDevelopmentCommandRequest) returns (PollDesktopDevelopmentCommandResponse);
+  rpc CompleteDesktopDevelopmentCommand(CompleteDesktopDevelopmentCommandRequest) returns (CompleteDesktopDevelopmentCommandResponse);
+}
+
+message DesktopDevelopmentRuntime {
+  string id = 1;
+  string generation = 2;
+  string runtime_directory = 3;
+  string executable = 4;
+  string runtime_digest = 5;
+  string compatibility_identity = 6;
+  string version = 7;
+  bool development = 8;
+}
+
+message RegisterDesktopDevelopmentHostRequest {
+  string host_instance_id = 1;
+  string profile_identity = 2;
+  DesktopDevelopmentRuntime original = 3;
+  DesktopDevelopmentRuntime current = 4;
+  bool busy = 5;
+  // Supplied only by the native startup path after verifying its private launch record.
+  string launch_ticket_id = 6;
+}
+
+message RegisterDesktopDevelopmentHostResponse {
+  uint64 host_generation = 1;
+}
+
+message PollDesktopDevelopmentCommandRequest {
+  string host_instance_id = 1;
+  uint64 host_generation = 2;
+}
+
+enum DesktopDevelopmentCommandKind {
+  DESKTOP_DEVELOPMENT_COMMAND_KIND_UNSPECIFIED = 0;
+  DESKTOP_DEVELOPMENT_COMMAND_KIND_REVEAL = 1;
+  DESKTOP_DEVELOPMENT_COMMAND_KIND_HANDOFF = 2;
+  DESKTOP_DEVELOPMENT_COMMAND_KIND_TEST_START = 3;
+  DESKTOP_DEVELOPMENT_COMMAND_KIND_TEST_STOP = 4;
+  DESKTOP_DEVELOPMENT_COMMAND_KIND_TEST_FIND = 5;
+  DESKTOP_DEVELOPMENT_COMMAND_KIND_OPEN_DIRECTORY = 6;
+}
+
+message DesktopDevelopmentCommand {
+  string command_id = 1;
+  DesktopDevelopmentCommandKind kind = 2;
+  DesktopDevelopmentRuntime target = 3;
+  string path = 4;
+  string ticket_id = 5;
+  string task_id = 6;
+  string session_id = 7;
+  string completion_id = 8;
+  string receipt = 9;
+  PersonalDevelopmentDirectoryKind directory = 10;
+}
+
+message PollDesktopDevelopmentCommandResponse {
+  DesktopDevelopmentCommand command = 1;
+}
+
+message CompleteDesktopDevelopmentCommandRequest {
+  string host_instance_id = 1;
+  uint64 host_generation = 2;
+  string command_id = 3;
+  // Closed result vocabulary validated against the exact command kind.
+  string status = 4;
+  string receipt = 5;
+  DesktopDevelopmentRuntime observed_current = 6;
+}
+
+message CompleteDesktopDevelopmentCommandResponse {
+  bool accepted = 1;
+  // Only a prepared, armed, exact handoff may execute after this response arrives.
+  bool execute_handoff = 2;
+}

@@ -23,6 +23,7 @@ const runtimePackageRoots = [
   "packages/local-model-runtime",
   "packages/messaging",
   "packages/outbound-network",
+  "packages/personal-development",
   "packages/remote-ssh",
   "packages/runtime-governance",
   "packages/store",

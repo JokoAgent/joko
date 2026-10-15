@@ -14,6 +14,7 @@ import type {
   SessionDescriptor
 } from "@joko/core";
 import { OperationalStore } from "@joko/store";
+import { acquireWorktreeSourceUse } from "@joko/worktree";
 import type { RemoteGitCheckoutLease, RemoteGitCheckoutPlan } from "@joko/remote-ssh";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -32,6 +33,66 @@ afterEach(async () => {
 });
 
 describe("SessionWorktreeCoordinator lifecycle", () => {
+  test.each(["archive", "delete"] as const)("retries only the exact %s lifecycle after native and source writers retire", { timeout: 40_000 }, async disposition => {
+    const root = await mkdtemp(join(tmpdir(), "joko-worktree-recycle-"));
+    const repositoryRoot = await createRepository(join(root, "project"));
+    const store = new OperationalStore(join(root, "store.db"));
+    store.upsertBackend({ id: "local-backend", adapterKind: "fixture", displayName: "Local", version: "1",
+      instanceGeneration: 0, health: "healthy", installationState: "installed", authenticationState: "not_required",
+      capabilities: new Map(), models: [], tools: [], diagnostics: [] });
+    const target = store.upsertTarget({ id: "local-target", backendId: "local-backend", displayName: "Project",
+      workspaceRoot: repositoryRoot, managed: false, trusted: true }).descriptor;
+    const workspaces = new WorkspaceService();
+    const storageRoot = join(root, "worktrees");
+    const worktrees = new SessionWorktreeCoordinator({ store, workspaces, storageRoot });
+    cleanups.push(async () => {
+      worktrees.dispose(); await workspaces.close(); store.close();
+      await rm(root, { recursive: true, force: true, maxRetries: 3 });
+    });
+    await worktrees.initialize();
+    const binding = await worktrees.acquire({ sessionId: "recycle-task", target });
+    store.createSession({ id: "recycle-task", backendId: target.backendId, targetId: target.id, title: "Retained task",
+      binding: { opaqueRef: "native/recycle-task", generation: 0 }, worktree: binding,
+      pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+    store.prepareSessionLifecycleCleanup({ operationId: "recycle-lifecycle", sessionId: "recycle-task", disposition, releaseWorktree: true });
+    const source = await acquireWorktreeSourceUse(binding.path, "build-owner", new AbortController());
+    if (disposition === "archive") await expect(worktrees.archive("recycle-task")).rejects.toMatchObject({ code: "SESSION_CONFLICT" });
+    else await worktrees.release("recycle-task");
+    const pending = worktrees.listRecycleStatus()[0]!;
+    expect(pending).toMatchObject({ sessionId: "recycle-task", displayName: "Retained task", state: "waiting", reason: "in_use", failures: 0 });
+    const canRecycle = vi.fn(async () => false);
+    await worktrees.startRecycleMaintenance(canRecycle);
+    expect(canRecycle).not.toHaveBeenCalled();
+    store.advanceSessionLifecycleCleanup({ operationId: "recycle-lifecycle", phase: "close" });
+    await worktrees.startRecycleMaintenance(canRecycle);
+    expect(canRecycle).toHaveBeenCalled();
+    expect(worktrees.listRecycleStatus()[0]).toMatchObject({ state: "waiting", failures: 0 });
+    const borrowerTarget = store.upsertTarget({ ...target, id: "borrower-target", workspaceRoot: binding.path }).descriptor;
+    store.createSession({ id: "borrower-task", backendId: target.backendId, targetId: borrowerTarget.id, title: "Live borrower",
+      binding: { opaqueRef: "native/borrower-task", generation: 0 }, pinned: false, archived: false,
+      permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+    canRecycle.mockResolvedValue(true);
+    const checksBeforeReference = canRecycle.mock.calls.length;
+    await worktrees.startRecycleMaintenance(canRecycle);
+    expect(canRecycle).toHaveBeenCalledTimes(checksBeforeReference);
+    expect(worktrees.listRecycleStatus()[0]).toMatchObject({ state: "waiting", failures: 0 });
+    store.updateSession("borrower-task", { archived: true });
+    await worktrees.controlRecycle({ id: pending.id, generation: pending.generation, action: "keep" });
+    await source.release({ writerRetired: true });
+    canRecycle.mockResolvedValue(true);
+    await worktrees.startRecycleMaintenance(canRecycle);
+    expect(worktrees.listRecycleStatus()[0]).toMatchObject({ state: "kept", failures: 0 });
+    await expect(lstat(binding.path)).resolves.toBeDefined();
+    await worktrees.controlRecycle({ id: pending.id, generation: pending.generation, action: "retry" });
+    expect(worktrees.listRecycleStatus()).toEqual([]);
+    await expect(lstat(binding.path)).rejects.toMatchObject({ code: "ENOENT" });
+    if (disposition === "archive") expect(store.getSession("recycle-task").descriptor.worktree?.state).toBe("preserved");
+    else await expect(worktrees.release("recycle-task")).resolves.toBeUndefined();
+    expect(store.getSessionLifecycleCleanup("recycle-lifecycle").worktreeCompleted).toBe(false);
+    await expect(worktrees.controlRecycle({ id: pending.id, generation: pending.generation, action: "keep" }))
+      .rejects.toMatchObject({ code: "SOURCE_NOT_FOUND" });
+  });
+
   test("retains a deleted portable source until native cleanup and replays its exact worktree release", { timeout: 30_000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-portable-worktree-cleanup-"));
     const repositoryRoot = await createRepository(join(root, "project"));

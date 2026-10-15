@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { SessionWorktreeBinding, TargetDescriptor } from "@joko/core";
 import { operationBodyHash, type OperationalStore, type StoredSession, type StoredTarget } from "@joko/store";
@@ -7,6 +8,9 @@ import {
   EphemeralWorktreeService,
   type WorktreeCallOptions,
   type WorktreeErrorCode,
+  type WorktreeLease,
+  type WorktreeRecycleControl,
+  type WorktreeRecycleRecord,
   type WorktreeSourceOption
 } from "@joko/worktree";
 
@@ -57,6 +61,14 @@ export interface SessionWorktreeRemovalPreview {
   readonly dirty: boolean;
 }
 
+export interface SessionWorktreeRecycleRecord extends Omit<WorktreeRecycleRecord, "lease" | "retainForRestore"> {
+  readonly sessionId: string;
+  readonly displayName: string;
+  readonly pathDisplay: string;
+}
+
+export type SessionWorktreeRecycleSafetyCheck = (sessionId: string, binding: SessionWorktreeBinding) => Promise<boolean>;
+
 type RemoteWorktreeOwnerPort = Pick<RemoteClaudeWorktreeOwner,
   "plan" | "derive" | "inspectExact" | "cleanupPending" | "assertExact" | "releaseExact">;
 
@@ -78,6 +90,12 @@ export class SessionWorktreeCoordinator {
   readonly #remoteOwner: RemoteWorktreeOwnerPort | undefined;
   readonly #activeBindings = new Map<string, SessionWorktreeBinding>();
   #initialized = false;
+  #recycleSafetyCheck: SessionWorktreeRecycleSafetyCheck | undefined;
+  #recycleTimer: ReturnType<typeof setTimeout> | undefined;
+  #recycleFlight: Promise<void> | undefined;
+  #recycleStopped = false;
+  readonly #recycleAbort = new AbortController();
+  readonly #recycleWake = new Set<string>();
 
   constructor(options: {
     readonly store: OperationalStore;
@@ -88,7 +106,7 @@ export class SessionWorktreeCoordinator {
   }) {
     this.#store = options.store;
     this.#workspaces = options.workspaces;
-    this.#service = options.service ?? new EphemeralWorktreeService({ storageRoot: options.storageRoot });
+    this.#service = options.service ?? new EphemeralWorktreeService({ storageRoot: options.storageRoot, recycle: true });
     this.#remoteOwner = options.remoteOwner;
   }
 
@@ -122,6 +140,8 @@ export class SessionWorktreeCoordinator {
       .map((session) => session.descriptor.id);
     const archivedSessionIdSet = new Set(archivedSessionIds);
     const initialized = await this.#service.initialize({
+      preserveUnclaimed: true,
+      deferRecycle: true,
       retainSessionIds: [...new Set([
         ...liveSessionIds,
         ...scheduledOwnerSessionIds.filter((sessionId) => !archivedSessionIdSet.has(sessionId)),
@@ -138,6 +158,11 @@ export class SessionWorktreeCoordinator {
     }
     for (const session of localSessions) {
       const binding = session.descriptor.worktree!;
+      if (this.#store.findPendingSessionLifecycleCleanup(session.descriptor.id) !== undefined) {
+        this.#activeBindings.delete(session.descriptor.id);
+        this.#workspaces.unregister(binding.workspaceId);
+        continue;
+      }
       if (session.descriptor.archived) {
         this.#workspaces.unregister(binding.workspaceId);
         if (binding.state !== "preserved") {
@@ -495,7 +520,170 @@ export class SessionWorktreeCoordinator {
     return Object.freeze({ hasWorktree: true, dirty: result.value.dirty });
   }
 
-  async release(sessionId: string, expectedBinding?: SessionWorktreeBinding): Promise<void> {
+  listRecycleStatus(): readonly SessionWorktreeRecycleRecord[] {
+    this.#requireInitialized();
+    return this.#service.listRecycleStatus().flatMap(record => {
+      const session = this.#recycleSession(record);
+      if (session === undefined) return [];
+      return [{
+        id: record.id, generation: record.generation, sessionId: session.descriptor.id,
+        displayName: session.descriptor.title, pathDisplay: record.lease.path,
+        state: record.state, reason: record.reason, failures: record.failures,
+        nextAttemptAt: record.nextAttemptAt
+      }];
+    });
+  }
+
+  async controlRecycle(input: WorktreeRecycleControl, options?: WorktreeCallOptions): Promise<SessionWorktreeRecycleRecord | undefined> {
+    this.#requireInitialized();
+    const record = this.#service.listRecycleStatus().find(candidate => candidate.id === input.id);
+    if (record === undefined || this.#recycleSession(record) === undefined) {
+      throw new SessionWorktreeCoordinatorError("SOURCE_NOT_FOUND");
+    }
+    const controlled = await this.#service.controlRecycle(input, options);
+    if (!controlled.ok) throw new SessionWorktreeCoordinatorError(controlled.error.code);
+    if (input.action === "retry") {
+      this.#recycleWake.add(record.lease.sessionId);
+      await this.#runRecycleMaintenance();
+    }
+    this.#scheduleRecycleMaintenance();
+    return this.listRecycleStatus().find(candidate => candidate.id === input.id);
+  }
+
+  /** Starts only after native owners and terminal cleanup are available. */
+  startRecycleMaintenance(canRecycle: SessionWorktreeRecycleSafetyCheck): Promise<void> {
+    this.#requireInitialized();
+    this.#recycleSafetyCheck = canRecycle;
+    for (const record of this.#service.listRecycleStatus()) this.#recycleWake.add(record.lease.sessionId);
+    return this.#runRecycleMaintenance();
+  }
+
+  notifyRecycleOpportunity(sessionId?: string): void {
+    if (this.#recycleStopped) return;
+    if (sessionId === undefined) {
+      for (const record of this.#service.listRecycleStatus()) this.#recycleWake.add(record.lease.sessionId);
+    } else this.#recycleWake.add(sessionId);
+    this.#scheduleRecycleMaintenance(100);
+  }
+
+  #recycleSession(record: WorktreeRecycleRecord): StoredSession | undefined {
+    const session = this.#store.listSessions({ includeArchived: true, includeDeleted: true })
+      .find(candidate => candidate.descriptor.id === record.lease.sessionId);
+    const binding = session?.descriptor.worktree;
+    if (session === undefined || binding === undefined || binding.remote !== undefined
+      || !sameLease(record.lease, { ...binding, state: "active" })) return undefined;
+    if (this.#store.findSetting("service", session.descriptor.id, SCHEDULED_WORKTREE_OWNER_SETTING_KEY) !== undefined) return undefined;
+    const cleanup = this.#store.findPendingSessionLifecycleCleanup(session.descriptor.id);
+    const ownsLifecycle = cleanup !== undefined && cleanup.releaseWorktree
+      && !cleanup.worktreeCompleted && (cleanup.disposition === "archive") === record.retainForRestore;
+    if (!session.descriptor.archived && session.descriptor.deletedAt === undefined && !ownsLifecycle) return undefined;
+    return session;
+  }
+
+  async #canRecycle(lease: WorktreeLease, retainForRestore: boolean): Promise<boolean> {
+    if (this.#recycleStopped) return false;
+    const record = this.#service.listRecycleStatus().find(candidate => candidate.id === lease.id);
+    if (record === undefined || record.retainForRestore !== retainForRestore) return false;
+    const session = this.#recycleSession(record);
+    if (session === undefined || this.#recycleSafetyCheck === undefined) return false;
+    const safeReferences = (): boolean => {
+      const current = this.#recycleSession(record);
+      if (current === undefined) return false;
+      const cleanup = this.#store.findPendingSessionLifecycleCleanup(lease.sessionId);
+      if (cleanup !== undefined && (!cleanup.closeCompleted || !cleanup.nativeCompleted)) return false;
+      if (this.#store.listRuns({ sessionId: lease.sessionId, activeOnly: true, limit: 1 }).length > 0) return false;
+      if (this.#store.listSettings("service").some(setting => setting.key === SCHEDULED_WORKTREE_OWNER_SETTING_KEY
+        && setting.scopeId === lease.sessionId)) return false;
+      if (this.#store.listUnadoptedNativeSessionDerivations().some(derivation =>
+        derivation.sessionId === lease.sessionId || derivation.sourceSessionId === lease.sessionId)) return false;
+      if (this.#store.listPendingPortableReplacementCleanups().some(replacement =>
+        replacement.replacedSessionId === lease.sessionId && replacement.nativeState !== "completed")) return false;
+      return !this.#store.listSessions({ includeArchived: true, includeDeleted: true }).some(other => {
+        if (other.descriptor.id === lease.sessionId || other.descriptor.deletedAt !== undefined || other.descriptor.archived) return false;
+        const otherBinding = other.descriptor.worktree;
+        if (otherBinding?.remote !== undefined) return false;
+        const target = this.#store.getTarget(other.descriptor.targetId).descriptor;
+        if (target.remoteWorkspace !== undefined) return false;
+        return localPathWithin(lease.path, otherBinding?.path ?? target.workspaceRoot);
+      });
+    };
+    if (!safeReferences() || await this.#hasPhysicalLiveReference(lease)) return false;
+    let retired = false;
+    try { retired = await this.#recycleSafetyCheck(lease.sessionId, session.descriptor.worktree!); }
+    catch { return false; }
+    return retired && !this.#recycleStopped && safeReferences() && !await this.#hasPhysicalLiveReference(lease);
+  }
+
+  async #hasPhysicalLiveReference(lease: WorktreeLease): Promise<boolean> {
+    try {
+      const root = await physicalPath(lease.path);
+      for (const other of this.#store.listSessions({ includeArchived: false, includeDeleted: false })) {
+        if (other.descriptor.id === lease.sessionId || other.descriptor.worktree?.remote !== undefined) continue;
+        const target = this.#store.getTarget(other.descriptor.targetId).descriptor;
+        if (target.remoteWorkspace !== undefined) continue;
+        if (localPathWithin(root, await physicalPath(other.descriptor.worktree?.path ?? target.workspaceRoot))) return true;
+      }
+      return false;
+    } catch { return true; }
+  }
+
+  #runRecycleMaintenance(): Promise<void> {
+    if (this.#recycleFlight !== undefined) return this.#recycleFlight;
+    if (this.#recycleStopped || this.#recycleSafetyCheck === undefined) return Promise.resolve();
+    if (this.#recycleTimer !== undefined) clearTimeout(this.#recycleTimer);
+    this.#recycleTimer = undefined;
+    const wake = new Set(this.#recycleWake);
+    this.#recycleWake.clear();
+    const task = (async () => {
+      for (const record of this.#service.listRecycleStatus()) {
+        if (this.#recycleStopped || record.state === "kept" || record.state === "paused"
+          || record.state === "waiting" && !wake.has(record.lease.sessionId)
+          || record.nextAttemptAt > Date.now() && !wake.has(record.lease.sessionId)
+          || this.#recycleSession(record) === undefined) continue;
+        const result = await this.#service.retryRecycle(record, (lease, retain) => this.#canRecycle(lease, retain), { signal: this.#recycleAbort.signal });
+        if (!this.#recycleStopped && result.ok && result.value.pathRemoved === true && record.retainForRestore) {
+          const session = this.#recycleSession(record);
+          if (session !== undefined) {
+            const binding = session.descriptor.worktree!;
+            this.#activeBindings.delete(session.descriptor.id);
+            this.#workspaces.unregister(binding.workspaceId);
+            if (binding.state !== "preserved") this.#store.updateSessionWorktreeState(session.descriptor.id, "preserved");
+          }
+        }
+      }
+    })().finally(() => {
+      this.#recycleFlight = undefined;
+      this.#scheduleRecycleMaintenance();
+    });
+    this.#recycleFlight = task;
+    return task;
+  }
+
+  #scheduleRecycleMaintenance(delayMs?: number): void {
+    if (this.#recycleStopped || this.#recycleSafetyCheck === undefined) return;
+    if (this.#recycleTimer !== undefined) {
+      if (delayMs === undefined) return;
+      clearTimeout(this.#recycleTimer);
+      this.#recycleTimer = undefined;
+    }
+    const eligible = this.#service.listRecycleStatus().filter(record => record.state !== "kept" && record.state !== "paused"
+      && this.#recycleSession(record) !== undefined);
+    if (eligible.length === 0) return;
+    // A bounded metadata opportunity observes writer releases in other processes.
+    // Reference waits never consume the removal failure budget.
+    const delay = delayMs ?? Math.max(100, Math.min(...eligible.map(record =>
+      record.state === "waiting" ? 30_000 : Math.max(0, record.nextAttemptAt - Date.now()))));
+    this.#recycleTimer = setTimeout(() => {
+      this.#recycleTimer = undefined;
+      for (const record of this.#service.listRecycleStatus()) {
+        if (record.state === "waiting") this.#recycleWake.add(record.lease.sessionId);
+      }
+      void this.#runRecycleMaintenance().catch(() => undefined);
+    }, delay);
+    this.#recycleTimer.unref();
+  }
+
+  async release(sessionId: string, expectedBinding?: SessionWorktreeBinding, options?: { readonly retiredCleanupOperationId: string }): Promise<void> {
     this.#requireInitialized();
     const session = this.#store.listSessions({ includeArchived: true, includeDeleted: true })
       .find((candidate) => candidate.descriptor.id === sessionId);
@@ -521,8 +709,24 @@ export class SessionWorktreeCoordinator {
       if (persistedBinding !== undefined && !samePersistedBinding(persistedBinding, binding)) {
         throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
       }
-      if (expectedBinding !== undefined) {
-        if (binding.state !== "active"
+      const pendingCleanup = this.#store.findPendingSessionLifecycleCleanup(sessionId);
+      if (expectedBinding === undefined && pendingCleanup?.disposition === "delete"
+        && pendingCleanup.closeCompleted && pendingCleanup.nativeCompleted
+        && pendingCleanup.releaseWorktree && !pendingCleanup.worktreeCompleted) {
+        result = await this.#service.releaseExact({
+          sessionId, leaseId: binding.leaseId, path: binding.path, repositoryRoot: binding.repositoryRoot,
+          branch: binding.branch,
+          source: {
+            ref: binding.sourceRef, commit: binding.sourceCommit, strategy: binding.sourceStrategy,
+            refreshed: binding.sourceRefreshed,
+            ...(binding.sourceRemote === undefined ? {} : { remote: binding.sourceRemote })
+          }, acquiredAt: binding.acquiredAt
+        });
+      } else if (expectedBinding !== undefined) {
+        const retiredCleanup = options === undefined ? undefined : this.#store.findSessionLifecycleCleanup(options.retiredCleanupOperationId);
+        const canReconcileReleased = retiredCleanup?.sessionId === sessionId && retiredCleanup.state === "pending"
+          && retiredCleanup.closeCompleted && retiredCleanup.nativeCompleted && retiredCleanup.releaseWorktree && !retiredCleanup.worktreeCompleted;
+        if (binding.state !== "active" && !canReconcileReleased
           || (authoritativeBinding !== undefined && !samePersistedBinding(authoritativeBinding, binding))) {
           throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
         }
@@ -565,6 +769,7 @@ export class SessionWorktreeCoordinator {
     } else {
       result = await this.#service.release(sessionId);
     }
+    this.notifyRecycleOpportunity(sessionId);
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     if (expectedBinding !== undefined && result.value.status === "preserved") {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
@@ -625,6 +830,7 @@ export class SessionWorktreeCoordinator {
       throw new SessionWorktreeCoordinatorError("SESSION_CONFLICT");
     }
     const result = await this.#service.release(sessionId, { retainForRestore: true });
+    this.notifyRecycleOpportunity(sessionId);
     if (!result.ok) throw new SessionWorktreeCoordinatorError(result.error.code);
     if (result.value.status !== "preserved" || result.value.reason !== "restorable"
       || result.value.pathRemoved !== true) {
@@ -664,6 +870,9 @@ export class SessionWorktreeCoordinator {
   }
 
   dispose(): void {
+    this.#recycleStopped = true;
+    this.#recycleAbort.abort();
+    if (this.#recycleTimer !== undefined) clearTimeout(this.#recycleTimer);
     this.#service.dispose();
     this.#activeBindings.clear();
   }
@@ -704,6 +913,23 @@ export class SessionWorktreeCoordinator {
 
   #requireInitialized(): void {
     if (!this.#initialized) throw new SessionWorktreeCoordinatorError("NOT_INITIALIZED");
+  }
+}
+
+function localPathWithin(root: string, candidate: string): boolean {
+  const path = relative(resolve(root), resolve(candidate));
+  return path === "" || path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path);
+}
+
+async function physicalPath(value: string): Promise<string> {
+  let cursor = resolve(value);
+  const suffix: string[] = [];
+  for (;;) {
+    try { return join(await realpath(cursor), ...suffix); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || dirname(cursor) === cursor) throw error;
+      suffix.unshift(basename(cursor)); cursor = dirname(cursor);
+    }
   }
 }
 

@@ -2795,6 +2795,7 @@ button.attachment-chip__content:focus-visible { outline: 2px solid var(--accent-
 .settings-section-heading--actions { min-height: 36px; align-items: center; flex-direction: row; justify-content: space-between; gap: 12px; margin-top: 26px; }
 .settings-section-heading--actions > .button { flex: 0 0 auto; }
 .settings-card + .settings-section-heading { margin-top: 26px; }
+.worktree-recycle-list { padding: 0; margin: 0; list-style: none; }.worktree-recycle-list > li { border-top: 1px solid var(--line); }.worktree-recycle-path { overflow-wrap: anywhere; }.worktree-recycle-actions { display: flex; gap: 8px; }
 .settings-page-section { scroll-margin-top: 12px; }
 .settings-page-section + .settings-page-section { margin-top: 26px; }
 .settings-card-stack { display: grid; gap: 12px; }

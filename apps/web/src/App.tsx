@@ -208,6 +208,7 @@ interface PendingObjectiveDialogHandoff extends ObjectiveDialogHandoffRequest {
 interface DesktopApplicationMenuActionTarget {
   readonly preferences: DesktopApplicationMenuPreferenceView;
   readonly openAbout: () => Promise<void>;
+  readonly openHelp: () => Promise<void>;
   readonly openNewSession: () => Promise<void>;
   readonly openSettings: () => Promise<void>;
   readonly openTaskStatusSettings: () => Promise<void>;
@@ -644,6 +645,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     return createDesktopApplicationMenuCommandQueue({
       getPreferences: () => target().preferences,
       openAbout: () => target().openAbout(),
+      openHelp: () => target().openHelp(),
       openNewSession: () => target().openNewSession(),
       openSettings: () => target().openSettings(),
       openTaskStatusSettings: () => target().openTaskStatusSettings(),
@@ -810,6 +812,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       id: acceptance.requestId,
       serverId: owner.serverId,
       profileId: owner.profileId,
+      origin: profile.origin,
       connectionGeneration: owner.connectionGeneration,
       sessionId: acceptance.sessionId,
       sessionGeneration: acceptance.sessionGeneration,
@@ -839,7 +842,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       if (request === undefined) return undefined;
       const profile = state.activeProfile;
       if (state.connectionState !== "connected" || profile === undefined
-        || request.serverId !== profile.serverId || request.profileId !== profile.id
+        || request.serverId !== profile.serverId || request.profileId !== profile.id || request.origin !== profile.origin
         || request.connectionGeneration !== state.connectionGeneration) return undefined;
       if (state.route.kind === "session" || state.route.kind === "files") {
         if (state.route.sessionId !== undefined && state.route.sessionId !== request.sessionId) return undefined;
@@ -1029,6 +1032,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     && state.connectionState === "connected"
     && objectiveDialogHandoff.serverId === state.activeProfile?.serverId
     && objectiveDialogHandoff.profileId === state.activeProfile?.id
+    && objectiveDialogHandoff.origin === state.activeProfile?.origin
     && objectiveDialogHandoff.connectionGeneration === state.connectionGeneration
     && objectiveDialogHandoff.sessionId === activeSession.id
     && objectiveDialogHandoff.sessionGeneration === activeSession.generation
@@ -1369,6 +1373,12 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     preferences: applicationMenuPreferences,
     openAbout: async () => {
       if (await navigateFromApplicationMenu({ kind: "settings" })) window.location.hash = "#/settings/about";
+    },
+    openHelp: async () => {
+      if (await navigateFromApplicationMenu({ kind: "settings" })) {
+        window.location.hash = "#/settings/general?help=1";
+        window.dispatchEvent(new Event("joko:open-help"));
+      }
     },
     openNewSession: async () => { await navigateFromApplicationMenu({ kind: "newSession" }); },
     openSettings: async () => { await navigateFromApplicationMenu({ kind: "settings" }); },

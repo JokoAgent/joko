@@ -22,6 +22,7 @@ import type { ComposerSendShortcutPreference } from "../local-state.js";
 import { modelSourceAccess } from "../model-source-access.js";
 import { remapComposerInlineMentionReplacement } from "../composer-mention-ranges.js";
 import { ModelSourceNotice } from "./ModelSourceNotice.js";
+import { PersonalDevelopmentSettings, rememberPersonalDevelopmentDoctor, type PersonalDevelopmentLaunch } from "./PersonalDevelopmentSettings.js";
 import { usePartnerConversation } from "./PartnerConversation.js";
 import type { ArtifactReferenceCatalogItemView, AttachmentDraft, BackendView, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ComposerMessageMentionDraft, ComposerSelectionQuoteDraft, DeliveryMode, ExtraDirectoryView, QueueControlView, QueueItemView, RuntimeCommandView, SessionResourceView, SessionView, UsageTokensView, WorkspaceView } from "../model.js";
 import { browserCommentPreviewTag, removeBrowserCommentAndRepairChains } from "../browser-comment-draft.js";
@@ -165,6 +166,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
 
   const [pastedTextTarget, setPastedTextTarget] = useState<ComposerPastedTextDialogTarget>();
   const [commandHelpOpen, setCommandHelpOpen] = useState(false);
+  const [personalDevelopmentLaunch, setPersonalDevelopmentLaunch] = useState<(PersonalDevelopmentLaunch & { readonly sessionId: string; readonly owner: object })>();
   const richEditorRef = useRef<ComposerRichTextEditorHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerStackRef = useRef<HTMLDivElement>(null);
@@ -320,6 +322,9 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     resourceMentionSupported: mentionPolicy.resources && !readOnly && !session.archived
       && session.state !== "closed" && controller.state.connectionState === "connected",
     helpSupported: true,
+    personalDevelopmentSupported: !readOnly && !session.archived && session.remoteWorkspace === undefined
+      && controller.state.activeProfile?.managedLocal === true
+      && typeof window !== "undefined" && window.jokoDesktop?.capabilities.includes("development.personal") === true,
     learnSupported,
     goalSupported,
     jumpSessionSupported: true,
@@ -1279,7 +1284,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const sendDraft = (
     modeOverride?: DeliveryMode,
     completedDocument?: JSONContent,
-    runtimeApplicationCommand?: "learn" | "goal",
+    runtimeApplicationCommand?: "learn" | "goal" | "joko-make" | "joko-make-doctor",
     pinnedController?: AppController
   ): void => {
     if (readOnly) return;
@@ -1342,14 +1347,78 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       return;
     }
     const parsedBuiltInCommand = composerBuiltInCommand(draftText, commandOptions);
-    const parsedApplicationCommand = parsedBuiltInCommand?.kind === "learn" || parsedBuiltInCommand?.kind === "objective";
+    const parsedApplicationCommand = parsedBuiltInCommand?.kind === "learn" || parsedBuiltInCommand?.kind === "objective" || parsedBuiltInCommand?.kind === "personalDevelopment";
     const applicationCommandName = parsedBuiltInCommand?.kind === "learn" ? "learn"
-      : parsedBuiltInCommand?.kind === "objective" ? "goal" : undefined;
+      : parsedBuiltInCommand?.kind === "objective" ? "goal" : parsedBuiltInCommand?.kind === "personalDevelopment"
+        ? parsedBuiltInCommand.mode === "check" ? "joko-make-doctor" : "joko-make" : undefined;
     const builtInCommand = applicationCommandName !== undefined && runtimeApplicationCommand === applicationCommandName
       ? undefined
       : browserComments.length === 0 || parsedApplicationCommand
         ? parsedBuiltInCommand
         : undefined;
+    if (builtInCommand?.kind === "personalDevelopment") {
+      if (builtInCommand.mode === "check" ? builtInCommand.request.length > 0 : !builtInCommand.request.trim() || builtInCommand.request.length > 4000) {
+        setAttachmentError(t(builtInCommand.mode === "check" ? "personalDevelopment.doctorUsage" : "personalDevelopment.usage")); return;
+      }
+      if (attachments.length > 0 || mentions.length > 0 || browserComments.length > 0 || composerDocumentQuotes(draftDocument).length > 0
+        || (extraDirectoryIds?.length ?? 0) > 0 || !composerDocumentIsPlainTextInvocation(draftDocument)) {
+        setAttachmentError(t("personalDevelopment.noAttachments")); return;
+      }
+      const sourceSessionId = session.id, owner = sourceGuard.capture(sourceSessionId), sourceSendOwner = sendOwner;
+      if (!sourceGuard.beginSubmission(sourceSessionId, "send")) return;
+      setSubmissionKind("send"); closePalette();
+      const sourceDeliveryMode = deliveryMode;
+      const close = (): void => { setPersonalDevelopmentLaunch(undefined); finishSubmission(sourceSessionId, "send", sourceGuard); };
+      const accepted = (createdSessionId?: string): void => runAction(`personal-development-create:${sourceSessionId}`, async () => {
+          try {
+            if (operationGuardRef.current !== sourceGuard || !sourceGuard.ownsActivation(owner)) return;
+            if (sourceDraftStillClearable(sourceSessionId, owner) && sourceGuard.consumeUnchangedDraft(owner)) {
+              resetHistoryNavigation(); textRef.current = ""; setText(""); setEditorDocument(emptyComposerDocument());
+              setMentions([]); replaceInlineMentionRanges([]);
+              await enqueueDraftSave(draftSaveChainRef, sourceControllerRef, sourceSessionId,
+                { text: "", editorDocument: emptyComposerDocument(), deliveryMode: sourceDeliveryMode, mentions: [], attachments: [] });
+            }
+            if (operationGuardRef.current !== sourceGuard || !sourceGuard.ownsActivation(owner)) return;
+            if (createdSessionId !== undefined) controller.navigate({ kind: "session", sessionId: createdSessionId });
+            else { controller.navigate({ kind: "settings" }); window.location.hash = "#/settings/about/personalDevelopment"; }
+          } finally { close(); }
+        });
+      const open = (): void => setPersonalDevelopmentLaunch({ sessionId: sourceSessionId, owner: sourceSendOwner, request: builtInCommand.request,
+        originSessionId: sourceSessionId, targetId: session.targetId, providerId: session.model?.providerId ?? "", modelId: session.model?.modelId ?? "",
+        onClose: close, onCreated: accepted
+      });
+      const request = new AbortController(), sourceEpoch = sendEpochRef.current;
+      const flight = { owner: sourceSendOwner, controller: request }; applicationCommandFlightRef.current = flight;
+      runAction(`personal-development-command:${sourceSessionId}`, async () => {
+        let opened = false;
+        const current = (): boolean => !request.signal.aborted && operationGuardRef.current === sourceGuard
+          && sourceGuard.ownsActivation(owner) && sourceGuard.draftUnchanged(owner) && sendEpochRef.current === sourceEpoch
+          && sendStateRef.current.owner === sourceSendOwner && sendStateRef.current.connected;
+        try {
+          if (!current()) return;
+          const currentCommands = await sourceController.listCommands(sourceSessionId, request.signal);
+          if (!current()) return;
+          const name = builtInCommand.mode === "check" ? "joko-make-doctor" : "joko-make";
+          if (runtimeCommandOwnsApplicationCommand(currentCommands, name)) {
+            finishSubmission(sourceSessionId, "send", sourceGuard);
+            sendDraft(sourceDeliveryMode, draftDocument, name, sourceController); return;
+          }
+          if (builtInCommand.mode === "prepare") { open(); opened = true; }
+          else {
+            const id = randomUuid(), draft = { mode: "check", request: "", title: t("personalDevelopment.doctorTitle"), sessionId: sourceSessionId,
+              targetId: session.targetId, providerId: session.model?.providerId ?? "", modelId: session.model?.modelId ?? "",
+              permissionMode: session.permissionMode, planMode: session.planMode, fastMode: false };
+            const forget = rememberPersonalDevelopmentDoctor(sourceController, draft, id);
+            const report = await sourceController.startPersonalDevelopmentDoctor(draft, id, request.signal);
+            forget(); if (current()) accepted(report.sessionId || sourceSessionId);
+          }
+        } finally {
+          if (applicationCommandFlightRef.current === flight) applicationCommandFlightRef.current = undefined;
+          request.abort(); if (!opened) finishSubmission(sourceSessionId, "send", sourceGuard);
+        }
+      });
+      return;
+    }
     if (builtInCommand?.kind === "objective") {
       const sourceSessionId = session.id;
       const owner = sourceGuard.capture(sourceSessionId);
@@ -2451,7 +2520,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     session.updatedAt
   ), [promptRecommendationRevision, session.generation, session.id, session.updatedAt]);
   const recommendationVisible = recommendationEligible ? promptRecommendation : undefined;
-  const draftCanSend = !modelRouteUnavailable && (recommendationVisible !== undefined
+  const personalDraft = composerBuiltInCommand(text, commandOptions)?.kind === "personalDevelopment";
+  const draftCanSend = personalDraft || !modelRouteUnavailable && (recommendationVisible !== undefined
     || browserComments.length > 0
     || canSend(text, attachments, mentions, selectionQuotes, supportedModes, deliveryMode))
     && attachmentsAllowed(draftMedia, attachmentPolicy)
@@ -2901,6 +2971,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
         requestComposerFrame(() => richEditorRef.current?.focus());
       }}
     />
+    {personalDevelopmentLaunch !== undefined && personalDevelopmentLaunch.sessionId === session.id && personalDevelopmentLaunch.owner === sendOwner && commandOptions.personalDevelopmentSupported && <PersonalDevelopmentSettings controller={controller} snapshot={controller.state.snapshot} t={t} launch={personalDevelopmentLaunch} />}
     <Modal
       open={commandHelpOpen}
       title={t("composer.commands")}

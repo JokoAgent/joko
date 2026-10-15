@@ -55,6 +55,7 @@
     "@joko/tool-terminal": "workspace:*",
     "@joko/voice-input": "workspace:*",
     "@joko/worktree": "workspace:*",
+    "@joko/personal-development": "workspace:*",
     "@modelcontextprotocol/sdk": "1.29.0",
     "croner": "9.1.0",
     "extract-zip": "2.0.1",

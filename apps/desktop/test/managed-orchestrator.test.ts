@@ -66,6 +66,7 @@ describe("managed local Orchestrator", () => {
     const directory = temporaryDirectory();
     const entryPath = resolve(fileURLToPath(import.meta.url));
     const resourcesDirectory = resolve(directory, "resources");
+    const personalCommandHost = resolve(resourcesDirectory, "joko-command-host.exe");
     let spawnArgs: readonly string[] | undefined;
     let spawnOptions: SpawnOptions | undefined;
     let requestCapability: string | undefined;
@@ -93,6 +94,7 @@ describe("managed local Orchestrator", () => {
         PATH: process.env.PATH,
         OPENAI_API_KEY: "must-not-cross",
         NODE_OPTIONS: "--inspect",
+        JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST: personalCommandHost,
         JOKO_LOG_LEVEL: "warn"
       },
       now: () => 1_000,
@@ -124,6 +126,7 @@ describe("managed local Orchestrator", () => {
       JOKO_ALLOW_INSECURE_LOOPBACK: "1",
       JOKO_LAN_DISCOVERY: "0",
       JOKO_DESKTOP_RESOURCES_PATH: resourcesDirectory,
+      JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST: personalCommandHost,
       JOKO_LOG_LEVEL: "warn"
     });
 
@@ -350,6 +353,7 @@ describe("managed local Orchestrator", () => {
     });
     const codexHome = resolve("C:/Profiles/Codex");
     const claudeConfigDirectory = resolve("C:/Profiles/Claude");
+    const personalCommandHost = resolve("C:/Joko/resources/joko-command-host.exe");
     expect(managedOrchestratorEnvironment({
       PATH: "system-path",
       HOME: "home",
@@ -378,6 +382,7 @@ describe("managed local Orchestrator", () => {
       CODEX_HOME: codexHome,
       CODEX_PROFILE: "work-profile",
       CLAUDE_CONFIG_DIR: claudeConfigDirectory,
+      JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST: personalCommandHost,
       CODEX_API_KEY: "secret",
       CLAUDE_CODE_OAUTH_TOKEN: "secret",
       [MANAGED_OUTBOUND_PROXY_SNAPSHOT_ENV]: snapshot,
@@ -397,6 +402,7 @@ describe("managed local Orchestrator", () => {
       CODEX_HOME: codexHome,
       CODEX_PROFILE: "work-profile",
       CLAUDE_CONFIG_DIR: claudeConfigDirectory,
+      JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST: personalCommandHost,
       HTTPS_PROXY: "http://person:secret@proxy.example:8080/",
       https_proxy: "socks5://person:socks-secret@proxy.example:1080",
       NO_PROXY: "localhost,.example.test",
@@ -415,6 +421,10 @@ describe("managed local Orchestrator", () => {
       CODEX_PROFILE: "invalid\nprofile",
       CLAUDE_CONFIG_DIR: ""
     })).toEqual({});
+  });
+
+  it.each(["", "relative/joko-command-host.exe"])("omits a personal command helper path that is not an absolute private input: %j", value => {
+    expect(managedOrchestratorEnvironment({ JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST: value })).toEqual({});
   });
 
   it("takes one fixed system proxy snapshot for managed outbound routes", async () => {

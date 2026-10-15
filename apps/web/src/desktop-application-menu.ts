@@ -8,6 +8,7 @@ import {
 
 export type DesktopApplicationMenuCommand =
   | "open-about"
+  | "open-help"
   | "new-session"
   | "open-settings"
   | "open-task-status-settings"
@@ -25,6 +26,7 @@ export interface DesktopApplicationMenuPreferenceView {
 export interface DesktopApplicationMenuCommandActions {
   readonly getPreferences: () => DesktopApplicationMenuPreferenceView;
   readonly openAbout: () => void | Promise<void>;
+  readonly openHelp: () => void | Promise<void>;
   readonly openNewSession: () => void | Promise<void>;
   readonly openSettings: () => void | Promise<void>;
   readonly openTaskStatusSettings: () => void | Promise<void>;
@@ -97,6 +99,10 @@ export function createDesktopApplicationMenuCommandQueue(
   const run = async (command: DesktopApplicationMenuCommand): Promise<void> => {
     if (command === "open-about") {
       await actions.openAbout();
+      return;
+    }
+    if (command === "open-help") {
+      await actions.openHelp();
       return;
     }
     if (command === "new-session") {

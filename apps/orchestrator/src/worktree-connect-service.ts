@@ -6,13 +6,14 @@ import { NotFoundError, StoreClosedError, type OperationalStore } from "@joko/st
 import {
   SessionWorktreeCoordinator,
   SessionWorktreeCoordinatorError,
+  type SessionWorktreeRecycleRecord,
   type TargetWorktreeEligibility
 } from "./session-worktree-coordinator.js";
 
 const DEFAULT_PAGE_SIZE = 100;
 const MAXIMUM_PAGE_SIZE = 500;
 
-/** Read-only capability boundary used before a client snapshots first-Send intent. */
+/** Authenticated capability and exact-record recycle controls. */
 export function createWorktreeConnectService(
   coordinator: SessionWorktreeCoordinator | undefined,
   store: OperationalStore,
@@ -63,8 +64,55 @@ export function createWorktreeConnectService(
         hasWorktree: preview.hasWorktree,
         dirty: preview.dirty
       });
+    }),
+
+    listWorktreeRecycleStatus: async (request, context) => worktreeRpc(async () => {
+      authenticate(context);
+      const records = requireCoordinator(coordinator).listRecycleStatus();
+      const page = paginate(records, request.page);
+      return create(contract.ListWorktreeRecycleStatusResponseSchema, {
+        records: page.values.map(toProtoRecycleRecord), page: page.info
+      });
+    }),
+
+    controlWorktreeRecycle: async (request, context) => worktreeRpc(async () => {
+      authenticate(context);
+      if (request.action !== contract.WorktreeRecycleAction.RETRY && request.action !== contract.WorktreeRecycleAction.KEEP) {
+        throw new ConnectError("Worktree recycle action is invalid.", Code.InvalidArgument);
+      }
+      if (!/^[a-f0-9]{24}$/u.test(request.id)
+        || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u.test(request.generation)) {
+        throw new ConnectError("Worktree recycle identity is invalid.", Code.InvalidArgument);
+      }
+      const record = await requireCoordinator(coordinator).controlRecycle({
+        id: request.id, generation: request.generation,
+        action: request.action === contract.WorktreeRecycleAction.KEEP ? "keep" : "retry"
+      }, { signal: context.signal });
+      authenticate(context);
+      return create(contract.ControlWorktreeRecycleResponseSchema, {
+        ...(record === undefined ? {} : { record: toProtoRecycleRecord(record) })
+      });
     })
   } satisfies ServiceImpl<typeof contract.WorktreeService>;
+}
+
+function toProtoRecycleRecord(record: SessionWorktreeRecycleRecord): contract.WorktreeRecycleRecord {
+  const states = {
+    retrying: contract.WorktreeRecycleState.RETRYING, waiting: contract.WorktreeRecycleState.WAITING,
+    paused: contract.WorktreeRecycleState.PAUSED, kept: contract.WorktreeRecycleState.KEPT
+  };
+  const reasons = {
+    pending: contract.WorktreeRecycleReason.PENDING, in_use: contract.WorktreeRecycleReason.IN_USE,
+    changed: contract.WorktreeRecycleReason.CHANGED, kept: contract.WorktreeRecycleReason.KEPT,
+    integrity: contract.WorktreeRecycleReason.INTEGRITY, storage: contract.WorktreeRecycleReason.STORAGE,
+    identity: contract.WorktreeRecycleReason.IDENTITY, failed: contract.WorktreeRecycleReason.FAILED
+  };
+  return create(contract.WorktreeRecycleRecordSchema, {
+    id: record.id, generation: record.generation, sessionId: record.sessionId,
+    displayName: record.displayName, pathDisplay: record.pathDisplay,
+    state: states[record.state], reason: reasons[record.reason], failures: record.failures,
+    nextAttemptAtMs: BigInt(record.nextAttemptAt)
+  });
 }
 
 function requireCoordinator(value: SessionWorktreeCoordinator | undefined): SessionWorktreeCoordinator {

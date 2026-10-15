@@ -11,6 +11,7 @@ import "joko/v1/contact.proto";
 import "joko/v1/event.proto";
 import "joko/v1/extension.proto";
 import "joko/v1/interaction.proto";
+import "joko/v1/help.proto";
 import "joko/v1/managed_model_runtime.proto";
 import "joko/v1/messaging.proto";
 import "joko/v1/mobile_push.proto";
@@ -54,6 +55,11 @@ service AppDefaultModelService {
   rpc WatchAppDefaultModel(WatchAppDefaultModelRequest) returns (stream WatchAppDefaultModelResponse);
   rpc SyncAppDefaultModel(SyncAppDefaultModelRequest) returns (SyncAppDefaultModelResponse);
   rpc ClaimAppDefaultModel(ClaimAppDefaultModelRequest) returns (ClaimAppDefaultModelResponse);
+}
+
+service HelpService {
+  rpc AskHelp(AskHelpRequest) returns (AskHelpResponse);
+  rpc CreateHelpFeedbackDraft(CreateHelpFeedbackDraftRequest) returns (CreateHelpFeedbackDraftResponse);
 }
 
 service EventService {
@@ -427,6 +433,8 @@ service WorktreeService {
   rpc ProbeTargetWorktree(ProbeTargetWorktreeRequest) returns (ProbeTargetWorktreeResponse);
   rpc ListTargetWorktreeSources(ListTargetWorktreeSourcesRequest) returns (ListTargetWorktreeSourcesResponse);
   rpc GetSessionWorktreeRemovalPreview(GetSessionWorktreeRemovalPreviewRequest) returns (GetSessionWorktreeRemovalPreviewResponse);
+  rpc ListWorktreeRecycleStatus(ListWorktreeRecycleStatusRequest) returns (ListWorktreeRecycleStatusResponse);
+  rpc ControlWorktreeRecycle(ControlWorktreeRecycleRequest) returns (ControlWorktreeRecycleResponse);
 }
 
 service ExtensionService {
@@ -1637,6 +1645,63 @@ message GetSessionWorktreeRemovalPreviewResponse {
   string session_id = 1;
   bool has_worktree = 2;
   bool dirty = 3;
+}
+
+enum WorktreeRecycleState {
+  WORKTREE_RECYCLE_STATE_UNSPECIFIED = 0;
+  WORKTREE_RECYCLE_STATE_RETRYING = 1;
+  WORKTREE_RECYCLE_STATE_WAITING = 2;
+  WORKTREE_RECYCLE_STATE_PAUSED = 3;
+  WORKTREE_RECYCLE_STATE_KEPT = 4;
+}
+
+enum WorktreeRecycleReason {
+  WORKTREE_RECYCLE_REASON_UNSPECIFIED = 0;
+  WORKTREE_RECYCLE_REASON_PENDING = 1;
+  WORKTREE_RECYCLE_REASON_IN_USE = 2;
+  WORKTREE_RECYCLE_REASON_CHANGED = 3;
+  WORKTREE_RECYCLE_REASON_KEPT = 4;
+  WORKTREE_RECYCLE_REASON_INTEGRITY = 5;
+  WORKTREE_RECYCLE_REASON_STORAGE = 6;
+  WORKTREE_RECYCLE_REASON_IDENTITY = 7;
+  WORKTREE_RECYCLE_REASON_FAILED = 8;
+}
+
+enum WorktreeRecycleAction {
+  WORKTREE_RECYCLE_ACTION_UNSPECIFIED = 0;
+  WORKTREE_RECYCLE_ACTION_RETRY = 1;
+  WORKTREE_RECYCLE_ACTION_KEEP = 2;
+}
+
+message WorktreeRecycleRecord {
+  string id = 1;
+  string generation = 2;
+  string session_id = 3;
+  string display_name = 4;
+  string path_display = 5;
+  WorktreeRecycleState state = 6;
+  WorktreeRecycleReason reason = 7;
+  uint32 failures = 8;
+  int64 next_attempt_at_ms = 9;
+}
+
+message ListWorktreeRecycleStatusRequest {
+  PageRequest page = 1;
+}
+
+message ListWorktreeRecycleStatusResponse {
+  repeated WorktreeRecycleRecord records = 1;
+  PageInfo page = 2;
+}
+
+message ControlWorktreeRecycleRequest {
+  string id = 1;
+  string generation = 2;
+  WorktreeRecycleAction action = 3;
+}
+
+message ControlWorktreeRecycleResponse {
+  WorktreeRecycleRecord record = 1;
 }
 
 message ListWorkspacesRequest {

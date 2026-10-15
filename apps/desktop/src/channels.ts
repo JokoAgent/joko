@@ -237,6 +237,7 @@ export function isDesktopSystemLocale(value: unknown): value is DesktopSystemLoc
 
 export type DesktopApplicationMenuCommand =
   | "open-about"
+  | "open-help"
   | "new-session"
   | "open-settings"
   | "open-task-status-settings"
@@ -486,6 +487,7 @@ function plainRecordWithKeys(value: unknown, keys: readonly string[]): value is 
 
 export function isDesktopApplicationMenuCommand(value: unknown): value is DesktopApplicationMenuCommand {
   return value === "open-about"
+    || value === "open-help"
     || value === "new-session"
     || value === "open-settings"
     || value === "open-task-status-settings"

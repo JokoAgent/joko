@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
 import type { JSONContent } from "@tiptap/core";
+import { create } from "@bufbuild/protobuf";
+import { PersonalDevelopmentDoctorRunSchema, PersonalDevelopmentStateSchema } from "@joko/contracts";
 import { act, forwardRef, useImperativeHandle, useRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -94,6 +96,57 @@ afterEach(async () => {
 });
 
 describe("NewSessionPage typed slash commands", () => {
+  it("runs the personal doctor from Home without submitting an Agent first input", async () => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    const view = await renderPage(onSubmit, { personalDevelopment: true });
+    await edit("/joko-make-doctor", 17, false); await key("Escape"); await key("Enter");
+    await vi.waitFor(() => expect(view.controller.startPersonalDevelopmentDoctor).toHaveBeenCalledOnce());
+    expect(view.controller.startPersonalDevelopmentDoctor).toHaveBeenCalledWith(expect.objectContaining({ mode: "check", targetId: "target-1", request: "" }), expect.any(String), expect.any(AbortSignal));
+    expect(onSubmit).not.toHaveBeenCalled(); expect(view.controller.startPersonalDevelopmentTask).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(view.controller.navigate).toHaveBeenCalledWith({ kind: "session", sessionId: "doctor-session" }));
+  });
+
+  it("preflights a Home personal request then starts prepare doctor with the selected route", async () => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    const view = await renderPage(onSubmit, { personalDevelopment: true, attachmentActions: true });
+    const text = "/joko-make Add a keyboard shortcut";
+    await edit(text, text.length, false); await key("Escape"); await key("Enter");
+    const form = document.querySelector<HTMLFormElement>(".personal-development-task-form"); expect(form).not.toBeNull();
+    expect(form?.querySelector("textarea")?.value).toBe("Add a keyboard shortcut");
+    expect(view.controller.startPersonalDevelopmentDoctor).not.toHaveBeenCalled();
+    const button = form!.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+    await vi.waitFor(() => expect(button.disabled).toBe(false));
+    await act(async () => { button.click(); await flush(); });
+    await vi.waitFor(() => expect(view.controller.startPersonalDevelopmentDoctor).toHaveBeenCalledOnce());
+    expect(view.controller.startPersonalDevelopmentDoctor).toHaveBeenCalledWith(expect.objectContaining({ mode: "prepare", request: "Add a keyboard shortcut", targetId: "target-1", providerId: visionModel.providerId, modelId: visionModel.modelId }), expect.any(String), expect.any(AbortSignal));
+    expect(onSubmit).not.toHaveBeenCalled(); expect(view.controller.startPersonalDevelopmentTask).not.toHaveBeenCalled();
+  });
+
+  it.each(["joko-make", "joko-make-doctor"])("submits a loaded Home /%s Skill through ordinary first-input reconciliation", async name => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    const view = await renderPage(onSubmit, { personalDevelopment: true, commands: [{ id: `skill-${name}`, name, description: "Loaded command", source: "skill", inputMode: "text", loaded: true }] });
+    const text = `/${name}${name === "joko-make" ? " Add a shortcut" : ""}`;
+    await edit(text, text.length, false); await key("Escape"); await key("Enter");
+    expect(onSubmit).toHaveBeenCalledOnce(); expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({ text });
+    expect(view.controller.startPersonalDevelopmentDoctor).not.toHaveBeenCalled();
+  });
+
+  it("rejects Home personal command attachments and ignores a doctor reply after profile retirement", async () => {
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
+    const blocked = await renderPage(onSubmit, { personalDevelopment: true, attachmentActions: true });
+    await attachFile("evidence.txt"); await edit("/joko-make-doctor", 17, false); await key("Escape"); await key("Enter");
+    expect(blocked.controller.startPersonalDevelopmentDoctor).not.toHaveBeenCalled(); expect(onSubmit).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("personalDevelopment.noAttachments"); expect(document.body.textContent).toContain("evidence.txt");
+    const late = await renderPage(onSubmit, { personalDevelopment: true }); let finish!: () => void;
+    vi.mocked(late.controller.startPersonalDevelopmentDoctor).mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve(create(PersonalDevelopmentDoctorRunSchema, { runId: "late-doctor", sessionId: "stale-session", mode: "check" })); }));
+    await edit("/joko-make-doctor", 17, false); await key("Escape"); await key("Enter");
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    Object.assign(late.controller.state, { activeProfile: { ...late.controller.state.activeProfile!, id: "replacement-profile" } });
+    await act(async () => late.render(late.snapshot)); await edit("A new profile draft", 19, false);
+    await act(async () => { finish(); await flush(); });
+    expect(late.controller.navigate).not.toHaveBeenCalled(); expect(editorElement?.textContent).toBe("A new profile draft");
+  });
+
   it("advertises /learn only for a Skill-capable selected Target", async () => {
     const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, _owner: NewSessionSubmissionOwner) => undefined);
     await renderPage(onSubmit);
@@ -525,14 +578,17 @@ async function renderPage(
     readonly skillCapable?: boolean;
     readonly commands?: AppSnapshot["commands"];
     readonly dialogue?: boolean;
+    readonly personalDevelopment?: boolean;
   } = {}
 ): Promise<RenderedNewSessionPage> {
   const snapshotValue = snapshot(options.attachmentActions === true, options.skillCapable === true, options.commands);
+  if (options.personalDevelopment === true) vi.stubGlobal("jokoDesktop", { capabilities: ["development.personal"] });
   const controllerValue = {
     state: {
       connectionState: "connected",
       connectionGeneration: 1,
-      activeProfile: { id: "profile-one", serverId: "server-one", deviceId: "device-one", name: "Local", origin: "https://localhost" },
+      ready: options.personalDevelopment === true,
+      activeProfile: { id: "profile-one", serverId: "server-one", deviceId: "device-one", name: "Local", origin: "https://localhost", managedLocal: options.personalDevelopment === true },
       route: { kind: "newSession" as const },
       snapshot: snapshotValue,
       preferences: { locale: "en", composerSendShortcut: "enter", newSessionWorktreeEnabled: false }
@@ -545,7 +601,12 @@ async function renderPage(
     prepareTargetWorkspace: vi.fn(async () => undefined),
     probeTargetWorktree: vi.fn(async (targetId: string) => ({ targetId, eligibility: "unavailable", canRefreshRemote: false })),
     listTargetWorktreeSources: vi.fn(async () => []),
-    setNewSessionWorktreeEnabled: vi.fn(async () => undefined)
+    setNewSessionWorktreeEnabled: vi.fn(async () => undefined),
+    getPersonalDevelopment: vi.fn(async () => ({ available: true, unavailableReason: "", state: create(PersonalDevelopmentStateSchema, { generation: 1n, environment: { status: "ready" }, source: { status: "ready" }, versions: { selected: "original" } }) })),
+    watchPersonalDevelopment: vi.fn(async () => undefined),
+    startPersonalDevelopmentDoctor: vi.fn(async (input: { readonly mode?: string }) => create(PersonalDevelopmentDoctorRunSchema, { runId: "doctor-run", sessionId: "doctor-session", mode: input.mode ?? "check" })),
+    startPersonalDevelopmentTask: vi.fn(async () => ({ taskId: "coding-task", sessionId: "coding-session" })),
+    navigate: vi.fn()
   };
   const controller = controllerValue as unknown as AppController;
   const container = document.body.appendChild(document.createElement("div"));

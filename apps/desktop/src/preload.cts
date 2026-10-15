@@ -300,6 +300,7 @@ const attentionBadgeSupported = process.platform === "darwin" || process.platfor
   || process.platform === "linux";
 const desktopCapabilities = Object.freeze([
   "app.info",
+  ...((process.platform === "win32" && process.arch === "x64" || (process.platform === "darwin" || process.platform === "linux") && (process.arch === "x64" || process.arch === "arm64")) ? ["development.personal" as const] : []),
   "navigation.deepLinks",
   "app.update",
   "appearance.zoom",
@@ -1203,6 +1204,7 @@ function readPreferredSystemLocale(): DesktopSystemLocale {
 
 function isDesktopApplicationMenuCommand(value: unknown): value is DesktopApplicationMenuCommand {
   return value === "open-about"
+    || value === "open-help"
     || value === "new-session"
     || value === "open-settings"
     || value === "open-task-status-settings"

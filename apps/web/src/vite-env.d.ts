@@ -255,6 +255,7 @@ type JokoDesktopCapability =
   | "hardware.dedicatedInput"
   | "hardware.nativeGamepad"
   | "app.info"
+  | "development.personal"
   | "app.update"
   | "attention.badge"
   | "appearance.zoom"
@@ -575,7 +576,7 @@ interface JokoDesktopApi {
       readonly openSettingsAccelerator?: string | null;
       readonly toggleSidebarAccelerator?: string | null;
     }): Promise<void>;
-    onCommand(listener: (command: "open-about" | "new-session" | "open-settings" | "open-task-status-settings" | "check-for-updates" | "toggle-sidebar" | "zoom-reset" | "zoom-in" | "zoom-out") => void): () => void;
+    onCommand(listener: (command: "open-about" | "open-help" | "new-session" | "open-settings" | "open-task-status-settings" | "check-for-updates" | "toggle-sidebar" | "zoom-reset" | "zoom-in" | "zoom-out") => void): () => void;
   };
   readonly inspectorWindow: {
     activate(): Promise<boolean>;

@@ -85,6 +85,7 @@ import type {
   StoredSession
 } from "@joko/store";
 import type { PendingRuntimeHandoff, RuntimeHandoffSource } from "@joko/store";
+import { assertPersonalDevelopmentInput, readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import { buildSessionHandoffText, sessionHandoffMessages } from "./session-handoff-text.js";
 import { operationBodyHash } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
@@ -532,7 +533,7 @@ export interface CreateScheduledSessionInput {
  * its first queued message settles. */
 export interface CreateServiceSessionInput {
   readonly operationId: string;
-  readonly serviceKind: "session_handoff" | "partner" | "collaboration" | "messaging" | "learning";
+  readonly serviceKind: "session_handoff" | "partner" | "collaboration" | "messaging" | "learning" | "personal_development";
   readonly targetId: string;
   /** Private Partner primary route; the home Target keeps its workspace identity. */
   readonly runtimeBackendId?: string;
@@ -555,6 +556,14 @@ export interface CreateServiceSessionInput {
   /** Prime private group ownership before a native context freezes tools, Skills or identity. */
   readonly preparePrivateSession?: (sessionId: string, target: TargetDescriptor) => Promise<void>;
   readonly worktree?: { readonly sourceRef?: string; readonly refreshRemote: boolean };
+  /** Private personal-task intent, committed before checkout/native effects. */
+  readonly onPreparing?: (store: OperationalStore, input: {
+    readonly sessionId: string; readonly target: StoredTarget; readonly backendGeneration: number;
+  }) => void;
+  /** Personal merge candidates already have an exact package-owned checkout. */
+  readonly beforeNativeCreation?: (sessionId: string, target: TargetDescriptor) => Promise<void>;
+  /** Synchronous purpose adoption in the same transaction as the visible Session. */
+  readonly onAdmitted?: (store: OperationalStore, session: StoredSession) => void;
 }
 
 type SessionCreationInput = CreateSessionInput | CreateScheduledSessionInput | CreateServiceSessionInput;
@@ -1781,6 +1790,11 @@ export class SessionHost {
     if (input.serviceKind === "session_handoff" && input.appendSystemPrompt !== undefined) {
       throw new StoreError("A handed-off task cannot supply a private system prompt.");
     }
+    if ((input.onPreparing !== undefined || input.onAdmitted !== undefined || input.beforeNativeCreation !== undefined)
+      && (input.serviceKind !== "personal_development" || input.assertServiceScope === undefined
+        || input.worktree === undefined && input.beforeNativeCreation === undefined || input.nativeStart?.kind === "attach")) {
+      throw new StoreError("Personal task adoption requires its exact new isolated service scope.");
+    }
     const target = this.#store.getTarget(input.targetId);
     this.validateFastSelection(
       target.descriptor.backendId,
@@ -1795,7 +1809,7 @@ export class SessionHost {
   /** Only this native effect owner can confirm an unstored private creation ended. */
   isPrivateSessionCreationClosed(operationId: string, sessionId: string): boolean {
     const operation = this.#store.findOperation(operationId), value = this.#store.findSetting("service", sessionId, PRIVATE_CREATION_RECEIPT_KEY)?.value;
-    if (operation?.kind !== "create_partner_session" || operation.status !== "failed" || !isRecord(value)
+    if (operation?.kind !== "create_partner_session" && operation?.kind !== "create_personal_development_session" || operation.status !== "failed" || !isRecord(value)
       || Object.keys(value).some(key => !["version", "operationId", "phase"].includes(key)) || value["version"] !== 1 || value["operationId"] !== operationId
       || !["prepared", "closed"].includes(String(value["phase"])) || this.#store.listSessions({ includeArchived: true, includeDeleted: true }).some(session => session.descriptor.id === sessionId)) return false;
     return true;
@@ -3804,6 +3818,62 @@ export class SessionHost {
 
   isPartnerSessionRetiring(sessionId: string): boolean {
     return this.#partnerSessionRetiring(sessionId);
+  }
+
+  isPersonalDevelopmentSessionEnding(sessionId: string): boolean {
+    const purpose = readPersonalDevelopmentPurpose(this.#store, sessionId);
+    const cleanup = this.#store.findPendingSessionLifecycleCleanup(sessionId);
+    return purpose?.phase === "adopted" && purpose.editing === "ending"
+      && cleanup !== undefined && cleanup.operationId === purpose.endingOperationId && cleanup.disposition === "archive";
+  }
+
+  /** Uses the normal shell/effect/native/drain retirement order while the
+   * personal owner preserves history and owns the exact cleanup manifest. */
+  async preparePersonalDevelopmentClose(sessionId: string): Promise<void> {
+    const assertCurrent = () => {
+      this.#assertOpen();
+      const purpose = readPersonalDevelopmentPurpose(this.#store, sessionId);
+      const session = this.#store.getSession(sessionId).descriptor;
+      const merge = purpose?.merge !== undefined && purpose.phase === "adopted" && purpose.editing === "ending"
+        && purpose.binding?.opaqueRef === session.binding.opaqueRef && purpose.binding.nativeSessionId === session.binding.nativeSessionId
+        && purpose.targetId === session.targetId && purpose.targetRevision === this.#store.getTarget(session.targetId).revision.toString()
+        && purpose.backendGeneration === this.#store.getBackend(session.backendId).descriptor.instanceGeneration
+        && session.remoteWorkspace === undefined && !session.archived && session.deletedAt === undefined;
+      if (!merge && !this.isPersonalDevelopmentSessionEnding(sessionId)) throw new StoreError("Personal task cleanup requires its durable owner.");
+    };
+    assertCurrent();
+    await this.quiesceSessionForExplicitClose(sessionId, "The personal development task is ending.", assertCurrent);
+    assertCurrent();
+  }
+
+  async preparePersonalDevelopmentCompletion(sessionId: string, completionId: string): Promise<void> {
+    const assertCurrent = () => {
+      this.#assertOpen();
+      const purpose = readPersonalDevelopmentPurpose(this.#store, sessionId);
+      if (purpose?.editing !== "completing" || purpose.completion?.id !== completionId
+        || purpose.completion.state !== "requested"
+        || this.#store.getSession(sessionId).descriptor.binding.generation !== purpose.completion.generation) {
+        throw new StoreError("Personal task completion no longer owns this native generation.");
+      }
+    };
+    assertCurrent();
+    await (this.#drainSettlements.get(sessionId) ?? Promise.resolve());
+    assertCurrent(); this.assertSessionLifecycleIdle(sessionId);
+    await this.closeIfActive(sessionId); assertCurrent();
+  }
+
+  async preparePersonalDevelopmentMergeCompletion(sessionId: string, runId: string, generation: number): Promise<void> {
+    const assertCurrent = () => {
+      this.#assertOpen(); const purpose = readPersonalDevelopmentPurpose(this.#store, sessionId);
+      const session = this.#store.getSession(sessionId).descriptor;
+      if (purpose?.merge === undefined || purpose.phase !== "adopted" || purpose.editing !== "ending"
+        || session.binding.generation !== generation || this.#store.getRun(runId).descriptor.state !== "completed"
+        || purpose.binding?.opaqueRef !== session.binding.opaqueRef || purpose.targetRevision !== this.#store.getTarget(session.targetId).revision.toString()) {
+        throw new StoreError("The merge completion no longer owns this native generation.");
+      }
+    };
+    assertCurrent(); await (this.#drainSettlements.get(sessionId) ?? Promise.resolve());
+    assertCurrent(); this.assertSessionLifecycleIdle(sessionId); await this.closeIfActive(sessionId); assertCurrent();
   }
 
   async quiescePartnerTargetCreations(targetId: string): Promise<void> {
@@ -6131,6 +6201,7 @@ export class SessionHost {
   }
 
   assertInputCapabilities(sessionId: string, prompt: PromptInput): void {
+    assertPersonalDevelopmentInput(this.#store, sessionId);
     this.assertPartnerPolicyReady(sessionId);
     const stored = this.#store.getSession(sessionId);
     const capabilities = this.#store.getBackend(stored.descriptor.backendId).descriptor.capabilities;
@@ -10309,6 +10380,8 @@ export class SessionHost {
               ? "create_messaging_session"
               : input.serviceKind === "learning"
                 ? "create_learning_session"
+              : input.serviceKind === "personal_development"
+                ? "create_personal_development_session"
               : "create_session_handoff"
         : "create_scheduled_session";
     const claim = authorized
@@ -10328,6 +10401,8 @@ export class SessionHost {
 
     let createdBinding: NativeSessionBinding | undefined;
     let adapterForCleanup: BackendAdapter | undefined;
+    let personalNativeCreationDispatched = false;
+    let personalNativeCreationClosed = false;
     let contextForCleanup: AdapterContext | undefined;
     let acquiredWorktreeSessionId: string | undefined;
     let scheduledWorktreeSessionId: string | undefined;
@@ -10362,6 +10437,11 @@ export class SessionHost {
         this.#scheduledWorktreeCreations.add(sessionId);
       }
       const now = Date.now();
+      if ("onPreparing" in input && input.onPreparing !== undefined) {
+        input.assertServiceScope?.();
+        this.#store.transaction(store => input.onPreparing!(store, { sessionId, target: registeredTarget, backendGeneration: backendInstanceGeneration }));
+        input.assertServiceScope?.();
+      }
       let nativeStart = input.nativeStart ?? { kind: "new" as const };
       let catalogEntry: NativeSessionCatalogEntry | undefined;
       let catalogProjectRevision: bigint | undefined;
@@ -10507,6 +10587,15 @@ export class SessionHost {
         this.#store.setSetting("service", sessionId, PRIVATE_CREATION_RECEIPT_KEY, { version: 1, operationId: claim.operation.id, phase: "prepared" } satisfies PrivateCreationReceipt);
         input.assertServiceScope(); await input.preparePrivateSession(sessionId, runtimeTarget); input.assertServiceScope();
       }
+      if ("beforeNativeCreation" in input && input.beforeNativeCreation !== undefined) {
+        if (input.serviceKind !== "personal_development" || input.assertServiceScope === undefined || nativeStart.kind !== "new"
+          || input.worktree !== undefined || input.onPreparing === undefined || input.onAdmitted === undefined) {
+          throw new StoreError("Personal merge creation requires its exact managed candidate owner.");
+        }
+        privateCreationSessionId = sessionId;
+        this.#store.setSetting("service", sessionId, PRIVATE_CREATION_RECEIPT_KEY, { version: 1, operationId: claim.operation.id, phase: "prepared" } satisfies PrivateCreationReceipt);
+        input.assertServiceScope(); await input.beforeNativeCreation(sessionId, runtimeTarget); input.assertServiceScope();
+      }
       const context = { ...this.provisionalContext(
         sessionId,
         runtimeTarget,
@@ -10585,6 +10674,7 @@ export class SessionHost {
         } else {
           if (privateCreationSessionId !== undefined) this.#store.setSetting("service", privateCreationSessionId, PRIVATE_CREATION_RECEIPT_KEY,
             { version: 1, operationId: claim.operation.id, phase: "creating" } satisfies PrivateCreationReceipt);
+          if ("serviceKind" in input && input.serviceKind === "personal_development") personalNativeCreationDispatched = true;
           binding = await adapter.createSession({
             target: runtimeTarget,
             name: input.title,
@@ -10715,6 +10805,7 @@ export class SessionHost {
               nativeSessionBlank: nativeStart.kind === "new"
                 && nativeStart.parentNativeReference === undefined
             });
+            if ("onAdmitted" in input && input.onAdmitted !== undefined) input.onAdmitted(store, created);
             if (nativeHistory !== undefined) {
               this.appendNativeHistory(store, descriptor, adapter, nativeHistory, input.operationId);
             }
@@ -10824,12 +10915,15 @@ export class SessionHost {
       if (createdBinding !== undefined && adapterForCleanup !== undefined && contextForCleanup !== undefined) {
         try {
           await adapterForCleanup.closeSession(createdBinding, contextForCleanup);
+          personalNativeCreationClosed = true;
           if (privateCreationSessionId !== undefined) this.#store.setSetting("service", privateCreationSessionId, PRIVATE_CREATION_RECEIPT_KEY,
             { version: 1, operationId: claim.operation.id, phase: "closed" } satisfies PrivateCreationReceipt);
         } catch { /* A failed native cleanup keeps the original creation unknown. */ }
       }
       if (acquiredWorktreeSessionId !== undefined && this.#worktrees !== undefined) {
-        await this.#worktrees.release(acquiredWorktreeSessionId).catch(() => undefined);
+        if (!personalNativeCreationDispatched || personalNativeCreationClosed) {
+          await this.#worktrees.release(acquiredWorktreeSessionId).catch(() => undefined);
+        }
         this.#store.deleteSetting("service", acquiredWorktreeSessionId, SCHEDULED_WORKTREE_OWNER_SETTING_KEY);
       }
       return this.failClaimedEffect(operationKind, claim.operation.id, claim.operation.bodyHash, error);

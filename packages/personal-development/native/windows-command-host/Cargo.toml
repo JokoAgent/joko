@@ -1,0 +1,18 @@
+[package]
+name = "joko-personal-command-host"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "joko-command-host"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "=1.0.151"
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes"] }
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"
+strip = true

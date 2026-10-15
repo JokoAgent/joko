@@ -3,9 +3,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, rmdir, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { WorktreeServiceError } from "./errors.js";
-import { isEntryLayoutSafe, samePath, validateOrdinaryDirectory, validateWorktreeState } from "./state.js";
+import { isEntryLayoutSafe, samePath, validEntryId, validateOrdinaryDirectory, validateWorktreeState } from "./state.js";
 
 const heldResources = new AsyncLocalStorage<ReadonlyMap<string, { active: boolean }>>();
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u;
@@ -144,14 +144,46 @@ function useDirectory(source: OwnedSource): string { return join(source.storage,
 
 export interface WorktreeSourceUse {
   readonly projectRoot: string;
+  readonly receipt?: WorktreeSourceUseReceipt;
   verify(): Promise<void>;
   /** Unknown native writers retain their durable pin; no timeout/PID cleanup. */
   release(input: { readonly writerRetired: boolean }): Promise<void>;
 }
+export interface WorktreeSourceUseReceipt {
+  readonly format: 1; readonly id: string; readonly entryId: string; readonly ownerId: string; readonly projectRoot: string;
+}
+
+/** A trusted writer owner supplies exact retirement proof before calling.
+ * Recovery never selects by PID, age, another writer, or a directory scan. */
+export async function releaseRetiredWorktreeSourceUse(receipt: WorktreeSourceUseReceipt): Promise<void> {
+  if (receipt.format !== 1 || !UUID.test(receipt.id) || !validEntryId(receipt.entryId)
+    || !receipt.ownerId || receipt.ownerId.length > 512 || receipt.ownerId.includes("\0")
+    || !isAbsolute(receipt.projectRoot) || receipt.projectRoot.includes("\0")) throw busy();
+  const source = await ownedSource(receipt.projectRoot);
+  if (source === undefined || source.entryId !== receipt.entryId) throw busy();
+  await withWorktreeSourceLock(source.root, async () => {
+    const current = await ownedSource(receipt.projectRoot);
+    if (current?.entryId !== receipt.entryId || !samePath(current.root, source.root)) throw busy();
+    const directory = useDirectory(source);
+    if (!await exists(directory)) return;
+    await validateOrdinaryDirectory(directory, "STORAGE_UNSAFE", "The project source lease directory changed unsafely.");
+    const file = join(directory, `${receipt.id}.json`);
+    if (await exists(file)) {
+      const body = await boundedJson(file);
+      if (!record(body) || body["format"] !== 1 || body["id"] !== receipt.id || body["entryId"] !== receipt.entryId
+        || body["ownerId"] !== receipt.ownerId || typeof body["projectRoot"] !== "string"
+        || !samePath(body["projectRoot"], receipt.projectRoot)) throw busy();
+      await unlink(file);
+    }
+    await unlink(`${file}.cancel`).catch(error => { if (!missing(error)) throw error; });
+  });
+}
 
 /** Source selection changes neither the product task nor the source checkout owner. */
-export async function acquireWorktreeSourceUse(projectRoot: string, ownerId: string, controller: AbortController): Promise<WorktreeSourceUse> {
+export async function acquireWorktreeSourceUse(projectRoot: string, ownerId: string, controller: AbortController,
+  options?: { readonly id: string }): Promise<WorktreeSourceUse> {
   if (!ownerId || ownerId.length > 512 || ownerId.includes("\0")) throw new WorktreeServiceError("INVALID_ARGUMENT", "Project source owner identity is invalid.");
+  if (options !== undefined && !UUID.test(options.id)) throw new WorktreeServiceError("INVALID_ARGUMENT", "Project source use identity is invalid.");
   const project = await realpath(resolve(projectRoot));
   await validateOrdinaryDirectory(project, "PATH_UNSAFE", "The selected project source is unavailable.");
   const selected = await ownedSource(project);
@@ -179,7 +211,7 @@ export async function acquireWorktreeSourceUse(projectRoot: string, ownerId: str
       if (pending.some(file => file.endsWith(".cancel"))) throw busy();
       await mkdir(directory, { recursive: true, mode: 0o700 });
       await validateOrdinaryDirectory(directory, "STORAGE_UNSAFE", "The project source lease directory changed unsafely.");
-      useId = randomUUID(); useFile = join(directory, `${useId}.json`);
+      useId = options?.id ?? randomUUID(); useFile = join(directory, `${useId}.json`);
       const handle = await open(useFile, "wx", 0o600);
       try { await handle.writeFile(JSON.stringify({ format: 1, id: useId, entryId: selected.entryId, ownerId, projectRoot: project })); await handle.sync(); }
       finally { await handle.close(); }
@@ -195,6 +227,7 @@ export async function acquireWorktreeSourceUse(projectRoot: string, ownerId: str
   }
   return {
     projectRoot: project,
+    ...(selected === undefined || useId === undefined ? {} : { receipt: { format: 1 as const, id: useId, entryId: selected.entryId, ownerId, projectRoot: project } }),
     verify,
     release: async ({ writerRetired }) => {
       if (retired) return;
@@ -225,6 +258,9 @@ export async function cancelWorktreeSourceUses(root: string): Promise<boolean> {
   const directory = useDirectory(source);
   let files: string[];
   try {
+    // Check absence before the directory validator converts filesystem errors
+    // to a safety failure. An unused checkout has no source-use directory.
+    await lstat(directory);
     await validateOrdinaryDirectory(directory, "STORAGE_UNSAFE", "The project source lease directory changed unsafely.");
     files = await readdir(directory);
   } catch (error) { if (missing(error)) return false; throw error; }

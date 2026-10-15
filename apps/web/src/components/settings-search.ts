@@ -51,6 +51,8 @@ function group(
 
 /** Labels and destinations only: indexing never mounts another page or reads setting values. */
 export const SETTINGS_SEARCH_ENTRIES: readonly SettingsSearchEntry[] = [
+  { id: "about.personalDevelopment", section: "about", subsection: "personalDevelopment", titleKey: "personalDevelopment.title", sectionKey: "settings.about", targetId: "personal-development-title", fallbackTargetId: "settings-subsection-personalDevelopment", capability: "development.personal", aliases: ["source", "personal", "build", "源码", "个人版本", "构建"] },
+  { id: "about.worktreeRecycle", section: "about", subsection: "worktreeRecycle", titleKey: "worktreeRecycle.title", sectionKey: "settings.about", targetId: "worktree-recycle-title", fallbackTargetId: "settings-subsection-worktreeRecycle", aliases: ["worktree", "cleanup", "recovery", "回收", "工作树"] },
   ...Object.entries(CATEGORY_KEYS).map(([section, titleKey]) => ({
     id: section, section: section as SettingsSection, titleKey, sectionKey: titleKey,
     targetId: `settings-panel-${section}`, fallbackTargetId: `settings-panel-${section}`

@@ -25,6 +25,7 @@ import {
   digestFile,
   extensionLibraryElectronSmokeSource,
   normalizeRuntimeCommandShims,
+  personalDevelopmentElectronSmokeSource,
   removeSafeTemporaryDirectory,
   replaceDirectoryFromPrepared,
   rewriteRuntimePackageManifestFile,
@@ -33,6 +34,7 @@ import {
   sqliteVecElectronSmokeSource,
   terminalElectronSmokeSource
 } from "../dist/runtime-staging.js";
+import { buildDevelopmentCommandHost } from "../../../packages/personal-development/scripts/build-command-host.mjs";
 
 const scriptDirectory = dirname(fileURLToPath(import.meta.url));
 const desktopRoot = resolve(scriptDirectory, "..");
@@ -58,6 +60,7 @@ const rootStateBefore = await Promise.all(rootStatePaths.map(digestFile));
 let published = false;
 
 try {
+  buildDevelopmentCommandHost();
   await mkdir(workspaceRoot, { recursive: false, mode: 0o755 });
   for (const path of [isolatedHome, isolatedAppData, isolatedLocalAppData, isolatedTemporaryDirectory]) {
     await mkdir(path, { recursive: false, mode: 0o700 });
@@ -104,6 +107,7 @@ try {
   const extensionLibrarySmoke = await runCandidateExtensionLibrarySmoke(candidateRoot);
   const terminalSmoke = await runCandidateTerminalSmoke(candidateRoot);
   const claudeSessionSmoke = await runCandidateClaudeSessionSmoke(candidateRoot);
+  const personalDevelopmentSmoke = await runCandidatePersonalDevelopmentSmoke(candidateRoot);
   const orchestratorSmoke = await runCandidateOrchestratorSmoke(candidateRoot);
   const audit = await auditRegularRuntimeTree(candidateRoot);
   const rootStateAfter = await assertRepositoryStateUnchanged();
@@ -133,6 +137,7 @@ try {
     extensionLibrary: extensionLibrarySmoke,
     terminal: terminalSmoke,
     claudeSession: claudeSessionSmoke,
+    personalDevelopment: personalDevelopmentSmoke,
     orchestratorHealth: orchestratorSmoke.health,
     orchestratorExitObserved: orchestratorSmoke.exitObserved,
     rootWorkspaceState: rootStatePaths.map((path, index) => ({
@@ -385,6 +390,22 @@ async function runCandidateClaudeSessionSmoke(root) {
   } finally {
     await rm(smokePath, { force: false });
   }
+}
+
+async function runCandidatePersonalDevelopmentSmoke(root) {
+  const smokePath = join(root, ".joko-runtime-personal-development-smoke.mjs");
+  await writeFile(smokePath, personalDevelopmentElectronSmokeSource(process.platform, process.arch), { flag: "wx", mode: 0o600 });
+  try {
+    const result = await runCommand(electronExecutable(), [smokePath, root], {
+      cwd: root, environment: electronNodeEnvironment(), timeoutMs: 25_000, label: "isolated Electron-Node personal command host smoke"
+    });
+    const parsed = JSON.parse(result.stdout);
+    if (parsed?.ok !== true || parsed.commandRetired !== true || typeof parsed.electronVersion !== "string" ||
+        typeof parsed.runtimeRoot !== "string" || !samePath(await realpath(parsed.runtimeRoot), root)) {
+      throw new Error("The isolated personal command smoke returned an invalid runtime identity.");
+    }
+    return parsed;
+  } finally { await rm(smokePath, { force: false }); }
 }
 
 async function runCandidateOrchestratorSmoke(root) {

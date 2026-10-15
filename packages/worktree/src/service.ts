@@ -6,6 +6,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isWorktreeServiceError, WorktreeServiceError } from "./errors.js";
 import { runGit } from "./git.js";
 import { cancelWorktreeSourceUses, withWorktreeSourceLock } from "./source-use.js";
+import { deferRecycle, newRecyclePolicy, recycleFailureReason } from "./recycle-policy.js";
 import {
   DEFAULT_WORKTREE_OPERATION_TIMEOUT_MS,
   WorktreeOperationControl,
@@ -41,6 +42,9 @@ import {
   type WorktreeInitialization,
   type WorktreeInitializeOptions,
   type WorktreeLease,
+  type WorktreeRecycleControl,
+  type WorktreeRecycleGuard,
+  type WorktreeRecycleRecord,
   type WorktreeRelease,
   type WorktreeReleaseOptions,
   type WorktreeRemovalPreview,
@@ -60,6 +64,8 @@ export interface EphemeralWorktreeServiceOptions {
   readonly storageRoot: string;
   readonly operationTimeoutMs?: number;
   readonly now?: () => number;
+  /** Enable only for the Product Session owner, never private child checkouts. */
+  readonly recycle?: boolean;
 }
 
 interface DestructionResult {
@@ -85,6 +91,7 @@ export class EphemeralWorktreeService {
   readonly #storageRoot: string;
   readonly #operationTimeoutMs: number;
   readonly #now: () => number;
+  readonly #recycle: boolean;
   #store: WorktreeStateStore | undefined;
   #initialized = false;
   #disposed = false;
@@ -106,6 +113,7 @@ export class EphemeralWorktreeService {
       "operationTimeoutMs"
     );
     this.#now = options.now ?? Date.now;
+    this.#recycle = options.recycle === true;
   }
 
   initialize(options?: WorktreeInitializeOptions): Promise<WorktreeResult<WorktreeInitialization>> {
@@ -132,6 +140,10 @@ export class EphemeralWorktreeService {
       const records: WorktreeSweepRecord[] = [];
       for (const entry of store.entries()) {
         control.check();
+        if (options?.deferRecycle === true && entry.recycle !== undefined) {
+          records.push(sweepRecord(entry, "preserved", "pending_recycle"));
+          continue;
+        }
         if (options?.preserveUnclaimed === true && !retained.has(entry.sessionId) && !preservedOwners.has(entry.sessionId)) {
           records.push(sweepRecord(entry, "preserved", "external_writer_unconfirmed"));
           continue;
@@ -543,6 +555,62 @@ export class EphemeralWorktreeService {
     });
   }
 
+  listRecycleStatus(): readonly WorktreeRecycleRecord[] {
+    if (!this.#initialized || this.#disposed) return Object.freeze([]);
+    return Object.freeze(this.#requireStore().entries()
+      .filter(entry => entry.recycle !== undefined && entry.status !== "restoring" && entry.status !== "restored")
+      .map(recycleRecord));
+  }
+
+  controlRecycle(input: WorktreeRecycleControl, options?: WorktreeCallOptions): Promise<WorktreeResult<WorktreeRecycleRecord>> {
+    return this.#serialize(options, true, async control => {
+      const accepted = validateRecycleControl(input);
+      const store = this.#requireStore();
+      const candidate = store.get(accepted.id);
+      if (!this.#recycle || candidate?.recycle === undefined) {
+        throw new WorktreeServiceError("SOURCE_NOT_FOUND", "The worktree recycle record was not found.");
+      }
+      return withWorktreeSourceLock(candidate.path, async () => {
+        const current = store.get(accepted.id);
+        if (current?.recycle?.generation !== accepted.generation
+          || current.status === "restoring" || current.status === "restored") {
+          throw new WorktreeServiceError("SESSION_CONFLICT", "The worktree recycle request is stale.");
+        }
+        const next: ManagedWorktreeEntry = {
+          ...current,
+          recycle: {
+            ...current.recycle, state: accepted.action === "keep" ? "kept" : "retrying",
+            reason: accepted.action === "keep" ? "kept" : "pending",
+            failures: 0, failedWorkMs: 0, nextAttemptAt: 0
+          },
+          updatedAt: this.#now()
+        };
+        await store.set(next, control);
+        return recycleRecord(next);
+      }, control.signal);
+    });
+  }
+
+  /** The guard is called inside the same resource lock as removal. A policy
+   * control can only change scheduling; it can never provide native authority. */
+  retryRecycle(
+    input: Pick<WorktreeRecycleControl, "id" | "generation">,
+    canRecycle: WorktreeRecycleGuard,
+    options?: WorktreeCallOptions
+  ): Promise<WorktreeResult<WorktreeRelease>> {
+    return this.#serialize(options, true, async control => {
+      const accepted = validateRecycleControl({ id: input.id, generation: input.generation, action: "retry" });
+      const entry = this.#requireStore().get(accepted.id);
+      if (!this.#recycle || entry?.recycle === undefined) {
+        throw new WorktreeServiceError("SOURCE_NOT_FOUND", "The worktree recycle record was not found.");
+      }
+      if (entry.recycle.generation !== accepted.generation) {
+        throw new WorktreeServiceError("SESSION_CONFLICT", "The worktree recycle request is stale.");
+      }
+      return this.#releaseEntry(entry, entry.recycle.retainForRestore, control, canRecycle);
+    });
+  }
+
   dispose(): void {
     this.#disposed = true;
   }
@@ -629,22 +697,77 @@ export class EphemeralWorktreeService {
   async #releaseEntry(
     entry: ManagedWorktreeEntry,
     retainForRestore: boolean,
-    control: WorktreeOperationControl
+    control: WorktreeOperationControl,
+    canRecycle?: WorktreeRecycleGuard
   ): Promise<WorktreeRelease> {
-    return withWorktreeSourceLock(entry.path, () => this.#releaseLockedEntry(entry, retainForRestore, control), control.signal);
+    return withWorktreeSourceLock(entry.path, async () => {
+      const store = this.#requireStore();
+      let current = store.get(entry.id);
+      if (current === undefined) throw new WorktreeServiceError("SESSION_CONFLICT", "The worktree release owner changed.");
+      if (this.#recycle) {
+        if (current.recycle === undefined || current.recycle.retainForRestore !== retainForRestore) {
+          const previous = current.recycle;
+          const recycle = newRecyclePolicy(retainForRestore);
+          current = { ...current,
+            recycle: previous?.state === "kept" || previous?.state === "paused"
+              ? { ...previous, generation: recycle.generation, retainForRestore }
+              : recycle,
+            updatedAt: this.#now()
+          };
+          await store.set(current, control);
+        }
+        if (current.recycle?.state === "kept" || current.recycle?.state === "paused") {
+          return { status: "preserved", reason: current.recycle.state === "kept" ? "keep" : "paused", pathRemoved: false, branchPreserved: true };
+        }
+        if (canRecycle === undefined && current.recycle !== undefined && current.recycle.nextAttemptAt > this.#now()) {
+          return { status: "preserved", reason: "retry_pending", pathRemoved: false, branchPreserved: true };
+        }
+      }
+      const startedAt = this.#now();
+      const assertCanRecycle = async (): Promise<void> => {
+        if (canRecycle !== undefined && !await canRecycle(leaseFromEntry(current!), retainForRestore)) {
+          throw new RecycleInUseError();
+        }
+      };
+      try {
+        await assertCanRecycle();
+        const result = await this.#releaseLockedEntry(current, retainForRestore, control, assertCanRecycle);
+        const latest = store.get(current.id);
+        if (latest?.recycle !== undefined) {
+          const recycle = result.pathRemoved === true ? undefined : deferRecycle(latest.recycle,
+            result.reason === "in_use" ? "in_use" : result.reason === "keep" ? "kept" : "changed",
+            this.#now() - startedAt, this.#now());
+          await store.set({ ...latest, recycle, updatedAt: this.#now() }, control);
+        }
+        return result;
+      } catch (error) {
+        const latest = store.get(current.id);
+        if (latest?.recycle !== undefined) {
+          await store.set({ ...latest,
+            recycle: deferRecycle(latest.recycle, error instanceof RecycleInUseError ? "in_use" : recycleFailureReason(error),
+              this.#now() - startedAt, this.#now()), updatedAt: this.#now()
+          }, control);
+        }
+        if (error instanceof RecycleInUseError) {
+          return { status: "preserved", reason: "in_use", pathRemoved: false, branchPreserved: true };
+        }
+        throw error;
+      }
+    }, control.signal);
   }
 
   async #releaseLockedEntry(
     entry: ManagedWorktreeEntry,
     retainForRestore: boolean,
-    control: WorktreeOperationControl
+    control: WorktreeOperationControl,
+    assertCanRecycle: () => Promise<void>
   ): Promise<WorktreeRelease> {
     const store = this.#requireStore();
     let current = store.get(entry.id) ?? entry;
     await this.#validateManagedRecord(current);
     if (await cancelWorktreeSourceUses(current.path)) {
       await store.set(preservedEntry(current, this.#now()), control);
-      return Object.freeze({ status: "preserved", reason: "keep", pathRemoved: false, branchPreserved: true });
+      return Object.freeze({ status: "preserved", reason: "in_use", pathRemoved: false, branchPreserved: true });
     }
     let snapshotSha = retainForRestore
       ? await this.#prepareSnapshotForRestore(current, control)
@@ -693,6 +816,7 @@ export class EphemeralWorktreeService {
     }
 
     if (current.checkoutCleanup !== undefined) {
+      await assertCanRecycle();
       if (snapshotSha === undefined || current.checkoutCleanup.sha !== snapshotSha) {
         throw new WorktreeServiceError("STATE_CORRUPT", "The checkout cleanup lost its exact owner snapshot.");
       }
@@ -717,6 +841,7 @@ export class EphemeralWorktreeService {
 
     current = store.get(entry.id) ?? current;
 
+    await assertCanRecycle();
     const prepared = await this.#prepareCheckoutForRemoval(current, snapshotSha, control);
     snapshotSha = prepared.snapshotSha;
     current = store.get(entry.id) ?? current;
@@ -724,6 +849,7 @@ export class EphemeralWorktreeService {
       current = await this.#recordCleanArchive(current, control);
     }
     await this.#assertRecordedBranchTip(current, control);
+    await assertCanRecycle();
     const preserved = preservedEntry(current, this.#now());
     await store.set(preserved, control);
     const result = await this.#destroyEntry(preserved, control, true, true);
@@ -839,6 +965,7 @@ export class EphemeralWorktreeService {
         pendingOwnerRefTransition: undefined,
         checkoutCleanup: undefined,
         deletionTransfer: undefined,
+        recycle: undefined,
         updatedAt: this.#now()
       };
       await store.set(active, control);
@@ -934,6 +1061,7 @@ export class EphemeralWorktreeService {
         pendingOwnerRefTransition: undefined,
         checkoutCleanup: undefined,
         deletionTransfer: undefined,
+        recycle: undefined,
         updatedAt: this.#now()
       };
       await store.set(active, control);
@@ -1960,6 +2088,27 @@ function preservedEntry(entry: ManagedWorktreeEntry, updatedAt: number): Managed
     status: entry.archiveSnapshot === undefined ? "active" : "preserved",
     updatedAt
   };
+}
+
+class RecycleInUseError extends Error {}
+
+function recycleRecord(entry: ManagedWorktreeEntry): WorktreeRecycleRecord {
+  if (entry.recycle === undefined) throw new WorktreeServiceError("STATE_CORRUPT", "The worktree has no recycle intent.");
+  return Object.freeze({
+    id: entry.id, generation: entry.recycle.generation, lease: leaseFromEntry(entry),
+    state: entry.recycle.state, reason: entry.recycle.reason, failures: entry.recycle.failures,
+    nextAttemptAt: entry.recycle.nextAttemptAt, retainForRestore: entry.recycle.retainForRestore
+  });
+}
+
+function validateRecycleControl(value: unknown): WorktreeRecycleControl {
+  if (!isRecord(value) || hasUnsupportedKeys(value, ["id", "generation", "action"])
+    || typeof value["id"] !== "string" || !ENTRY_ID_PATTERN.test(value["id"])
+    || typeof value["generation"] !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u.test(value["generation"])
+    || (value["action"] !== "retry" && value["action"] !== "keep")) {
+    throw invalidArgument("request", "The worktree recycle request is invalid.");
+  }
+  return { id: value["id"], generation: value["generation"], action: value["action"] };
 }
 
 function snapshotHasUnsupportedContent(status: string): boolean {

@@ -71,6 +71,7 @@ import {
   composerMentionItems,
   detectComposerCommandActivation,
   filterComposerPaletteItems,
+  runtimeCommandOwnsApplicationCommand,
   type ComposerCommandActivation,
   type ComposerPaletteItem
 } from "./composer-palette.js";
@@ -94,6 +95,7 @@ import { modelSourceAccess, type ModelSourceSelection } from "../model-source-ac
 import { PermissionSelector, permissionLabel } from "./PermissionSelector.js";
 import { ComposerAddMenu } from "./ComposerAddMenu.js";
 import { ObjectiveDialog, objectiveLimitsFromDialog, type ObjectiveDialogLimits } from "./ObjectiveDialog.js";
+import { PersonalDevelopmentSettings, rememberPersonalDevelopmentDoctor, type PersonalDevelopmentLaunch } from "./PersonalDevelopmentSettings.js";
 import { ComposerAttachmentTray } from "./ComposerAttachmentTray.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { HomeUsageDashboard } from "./HomeUsageDashboard.js";
@@ -256,6 +258,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [draftError, setDraftError] = useState<string>();
   const [dragging, setDragging] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [personalDevelopmentLaunch, setPersonalDevelopmentLaunch] = useState<PersonalDevelopmentLaunch>();
   const [objectiveDialog, setObjectiveDialog] = useState<{
     readonly initialText: string;
     readonly ownerDocument: Document;
@@ -780,7 +783,11 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     && backend?.health !== "unavailable"
     && backend?.capabilities.get("input.text")?.supported === true
     && (selection?.kind === "dialogue" || targetStaticReady && targetWorkspaceReady);
-  const commandOptions = { learnSupported: learnCommandSupported, goalSupported: goalCommandSupported } as const;
+  const personalDevelopmentSupported = controller.state.connectionState === "connected"
+    && controller.state.activeProfile?.managedLocal === true
+    && selected?.remoteWorkspace === undefined
+    && globalThis.window.jokoDesktop?.capabilities.includes("development.personal") === true;
+  const commandOptions = { learnSupported: learnCommandSupported, goalSupported: goalCommandSupported, personalDevelopmentSupported } as const;
   const commandItems = composerCommandItems(availableGlobalCommands, commandOptions);
   const commandCatalogKey = commandItems.map((item) => `${item.id}\u0000${item.value}\u0000${item.meta}`).join("\u0001");
   const selectableExtraDirectories = snapshot.extraDirectories.filter((directory) => directory.workspaceId === usableWorkspace?.id && directory.trusted);
@@ -1404,7 +1411,9 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     && (!worktreeEnabled || (!worktreeLoading && worktreeError === undefined && worktreeEligible))
   );
   const canFinishVoiceSend = hydrated && controller.state.connectionState === "connected" && validContext && modelRouteReady && attachmentsAllowed && mentionsAllowed && worktreeDecisionReady && fullAccessConfirmation === undefined && !submitting;
-  const canSend = canFinishVoiceSend && hasInput && !voice.active;
+  const personalDraft = composerBuiltInCommand(text, commandOptions)?.kind === "personalDevelopment";
+  const canSend = (canFinishVoiceSend || personalDraft && personalDevelopmentSupported && hydrated && !submitting)
+    && hasInput && !voice.active;
   const submissionScope = useMemo(() => ({}), [
     profileScope,
     controller.state.connectionGeneration,
@@ -1437,7 +1446,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   useLayoutEffect(() => {
     const ownerWindow = voiceRoot?.ownerDocument.defaultView;
     const activate = (): void => { submissionEpochRef.current = {}; };
-    const retire = (): void => { submissionEpochRef.current = undefined; submissionRef.current = undefined; submissionAbortRef.current?.abort(); submissionAbortRef.current = undefined; submissionOriginRef.current = undefined; setObjectiveDialog(undefined); setSubmitting(false); };
+    const retire = (): void => { submissionEpochRef.current = undefined; submissionRef.current = undefined; submissionAbortRef.current?.abort(); submissionAbortRef.current = undefined; submissionOriginRef.current = undefined; setObjectiveDialog(undefined); setPersonalDevelopmentLaunch(undefined); setSubmitting(false); };
     activate();
     ownerWindow?.addEventListener("pagehide", retire); ownerWindow?.addEventListener("pageshow", activate);
     return () => { retire(); ownerWindow?.removeEventListener("pagehide", retire); ownerWindow?.removeEventListener("pageshow", activate); };
@@ -1959,10 +1968,15 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const sourceMentions = composerMentionsFromRanges(mentionsRef.current, sourceRanges);
     const sourceBrowserComments = browserCommentsRef.current;
     const sourceAttachments = attachmentsRef.current;
-    const parsedCommand = composerBuiltInCommand(sourceText, commandOptions);
+    const candidateCommand = composerBuiltInCommand(sourceText, commandOptions);
+    const parsedCommand = candidateCommand?.kind === "personalDevelopment" && runtimeCommandOwnsApplicationCommand(availableGlobalCommands,
+      candidateCommand.mode === "check" ? "joko-make-doctor" : "joko-make") ? undefined : candidateCommand;
     const learnCommand = parsedCommand?.kind === "learn" ? parsedCommand : undefined;
     const objectiveCommand = parsedCommand?.kind === "objective" ? parsedCommand : undefined;
-    const activeCanSend = validContext
+    const personalCommand = parsedCommand?.kind === "personalDevelopment" ? parsedCommand : undefined;
+    const activeCanSend = personalCommand !== undefined
+      ? personalDevelopmentSupported && hydrated && hydratedProfileScope === profileScope && !submitting && !voice.isActive()
+      : validContext
       && modelRouteReady
       && (options.allowEmpty === true || !composerDocumentIsEmpty(sourceEditorDocument) || sourceAttachments.length > 0 || sourceBrowserComments.length > 0)
       && attachmentsAllowed
@@ -1971,9 +1985,16 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       && !(worktreePreferenceRelevant && worktreePreferenceSavingRef.current)
       && fullAccessConfirmationRef.current === undefined
       && !submitting && !voice.isActive();
-    if (!activeCanSend || selection === undefined || submissionRef.current) {
+    if (!activeCanSend || personalCommand === undefined && selection === undefined || submissionRef.current) {
       if (options.propagateError === true) throw new Error(t("composer.inputUnavailable"));
       return;
+    }
+    if (personalCommand !== undefined && (!composerDocumentIsPlainTextInvocation(sourceEditorDocument)
+      || sourceAttachments.length > 0 || sourceBrowserComments.length > 0 || sourceMentions.length > 0 || extraDirectoryIds.length > 0)) {
+      setAttachmentError(t("personalDevelopment.noAttachments")); return;
+    }
+    if (personalCommand !== undefined && (personalCommand.mode === "check" ? personalCommand.request.length > 0 : !personalCommand.request.trim() || personalCommand.request.length > 4000)) {
+      setAttachmentError(t(personalCommand.mode === "check" ? "personalDevelopment.doctorUsage" : "personalDevelopment.usage")); return;
     }
     voiceDictionaryLearning.clear();
     const sourceScope = submissionScope;
@@ -2037,7 +2058,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
               text: objectiveCommand.text ?? "",
               limits: { noProgressTurnLimit: 3 }
             });
-    const clearDraftOnAccepted = options.clearDraftOnAccepted === true || objectiveCommand !== undefined;
+    const clearDraftOnAccepted = options.clearDraftOnAccepted === true || objectiveCommand !== undefined || personalCommand !== undefined;
     const clearAcceptedSource = (): void => {
       if (!clearDraftOnAccepted || !mountedRef.current
         || editorDocumentRef.current !== sourceDraft || attachmentsRef.current !== sourceAttachments
@@ -2074,13 +2095,58 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         ? {}
         : { onFirstInputAccepted: acceptFirstInput }),
       isCurrent: () => submissionScopeRef.current === sourceScope && submissionEpochRef.current === sourceEpoch && submissionRef.current === attempt
-        && !request.signal.aborted && submissionValidityRef.current && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
+        && !request.signal.aborted && (personalCommand !== undefined ? personalDevelopmentSupported : submissionValidityRef.current)
+        && voiceRoot?.isConnected === true && voiceRoot.ownerDocument === ownerDocument && !ownerWindow.closed
         && editorDocumentRef.current === sourceDraft && attachmentsRef.current === sourceAttachments && browserCommentsRef.current === sourceBrowserComments
         && newTaskMentionsAllowed(sourceMentions, mentionPolicyRef.current, workspaceIdRef.current)
     };
     submissionOriginRef.current = owner;
     submittingRef.current = true;
     setSubmitting(true);
+    if (personalCommand !== undefined) {
+      closePalette(false);
+      const close = (): void => {
+        if (submissionRef.current !== attempt) return;
+        submissionRef.current = undefined; submissionOriginRef.current = undefined;
+        submissionAbortRef.current = undefined; request.abort();
+        if (mountedRef.current) { setPersonalDevelopmentLaunch(undefined); submittingRef.current = false; setSubmitting(false); }
+      };
+      const launch: PersonalDevelopmentLaunch = { request: personalCommand.request, targetId: selected?.remoteWorkspace === undefined ? selected?.id ?? "" : "",
+        providerId: selectedModel?.providerId ?? "", modelId: selectedModel?.modelId ?? "",
+        onClose: close,
+        onCreated: (sessionId) => {
+          void (async () => {
+            try {
+              if (!owner.isCurrent()) return;
+              const saved = latestDraftRef.current;
+              clearAcceptedSource();
+              if (saved !== undefined) await enqueueNewSessionDraftSave(draftSaveChainRef, controllerRef, {
+                ...saved.draft, text: "", editorDocument: emptyComposerDocument(), attachments: [], browserComments: [], mentions: [], inlineMentionRanges: [], extraDirectoryIds: []
+              });
+              if (submissionScopeRef.current !== sourceScope || submissionEpochRef.current !== sourceEpoch || request.signal.aborted) return;
+              if (sessionId !== undefined) controller.navigate({ kind: "session", sessionId });
+              else { controller.navigate({ kind: "settings" }); window.location.hash = "#/settings/about/personalDevelopment"; }
+            } finally { close(); }
+          })().catch(() => { if (mountedRef.current) setDraftError(t("personalDevelopment.failed")); });
+        }
+      };
+      if (personalCommand.mode === "prepare") setPersonalDevelopmentLaunch(launch);
+      else {
+        const target = selected?.remoteWorkspace === undefined && selected?.trusted ? selected
+          : snapshot.targets.find(target => !target.archived && target.trusted && target.remoteWorkspace === undefined);
+        const id = randomUuid(), draft = { mode: "check", request: "", title: t("personalDevelopment.doctorTitle"), targetId: target?.id ?? "",
+          providerId: selectedModel?.providerId ?? "", modelId: selectedModel?.modelId ?? "", permissionMode: "ask", fastMode: false, planMode: false };
+        void (async () => {
+          try {
+            const forget = rememberPersonalDevelopmentDoctor(controller, draft, id);
+            const report = await controller.startPersonalDevelopmentDoctor(draft, id, request.signal);
+            forget(); if (owner.isCurrent()) launch.onCreated(report.sessionId || undefined);
+          } catch { if (mountedRef.current && !request.signal.aborted) setDraftError(t("personalDevelopment.actionUnknown")); close(); }
+        })();
+      }
+      return;
+    }
+    if (selection === undefined) return;
     const allowedPermissions = execution.permissionModes;
     const resolvedPermission = allowedPermissions.includes(permissionMode) ? permissionMode : allowedPermissions[0] ?? "ask";
     const worktree = effectiveWorktreeEnabled
@@ -2855,6 +2921,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       onClose={() => { if (!submittingRef.current) setObjectiveDialog(undefined); }}
       onSubmit={submitObjectiveDialog}
     />
+    {personalDevelopmentLaunch !== undefined && personalDevelopmentSupported && <PersonalDevelopmentSettings controller={controller} snapshot={snapshot} t={t} launch={personalDevelopmentLaunch} />}
     <ComposerPastedTextDialog
       target={pastedTextTarget}
       title={t("composer.pastedTextEditTitle")}
