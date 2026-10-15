@@ -546,7 +546,7 @@ export function managedOrchestratorEnvironment(source: NodeJS.ProcessEnv): NodeJ
   for (const [name, value] of Object.entries(source)) {
     if (value !== undefined && allowed.has(name)) environment[name] = value;
   }
-  for (const name of ["CODEX_HOME", "CLAUDE_CONFIG_DIR"] as const) {
+  for (const name of ["CODEX_HOME", "CLAUDE_CONFIG_DIR", "JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST"] as const) {
     const value = boundedManagedAbsolutePath(source[name]);
     if (value !== undefined) environment[name] = value;
   }

@@ -38,7 +38,7 @@ describe("mounted Timeline Markdown documents", () => {
     const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Markdown browser" });
     if (challenge.challenge === undefined) throw new Error("Markdown pairing returned no challenge.");
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 1200 }, reducedMotion: "no-preference" });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1200 }, reducedMotion: "no-preference", locale: "en-US" });
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(fixture.baseUrl).origin });
     const pageErrors: string[] = [];
     page.on("pageerror", (error) => pageErrors.push(error.name));

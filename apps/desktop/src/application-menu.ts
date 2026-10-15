@@ -120,6 +120,11 @@ export function buildMacApplicationMenuTemplate(
         // main window is hidden. Mouse activation still uses the native role.
         { role: "close", registerAccelerator: false }
       ]
+    },
+    {
+      role: "help",
+      label: labels.helpMenu,
+      submenu: [{ label: labels.help, click: () => dispatch("open-help") }]
     }
   ];
 }

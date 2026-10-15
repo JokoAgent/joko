@@ -109,6 +109,7 @@ function objectiveHandoff(): ObjectiveDialogHandoffRequest {
     id: "home-objective",
     serverId: "server-one",
     profileId: "profile-one",
+    origin: "https://localhost",
     connectionGeneration: 3,
     sessionId: session.id,
     sessionGeneration: session.generation,

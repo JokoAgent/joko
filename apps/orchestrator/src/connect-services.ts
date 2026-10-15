@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createAppDefaultModelConnectService } from "./app-default-model-connect-service.js";
+import { createHelpConnectService } from "./help-connect-service.js";
+import { createPersonalDevelopmentConnectService } from "./personal-development-connect-service.js";
+import { createPersonalDevelopmentNativeConnectService } from "./personal-development-native-connect-service.js";
 import { createModelWorkingContextConnectMethods } from "./model-working-context-connect-service.js";
 import type { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
@@ -455,6 +458,7 @@ import {
 import { createWorktreeConnectService } from "./worktree-connect-service.js";
 import { installSessionCodeHostContextRuntime } from "./session-code-host-context.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
+import { readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import { RuntimeProcessControl } from "./runtime-process-control.js";
 import {
   DEFAULT_GIT_SAFETY_SETTINGS,
@@ -497,6 +501,8 @@ interface ConnectServiceDependencies {
   readonly runtimeProcesses: RuntimeProcessControl;
   readonly sessionHost: SessionHost;
   readonly sessionWorktrees?: SessionWorktreeCoordinator;
+  readonly personalDevelopment?: () => OrchestratorApplication["personalDevelopmentCoordinator"];
+  readonly assertPersonalDevelopmentLocalConnection?: (connection: ConnectionRecord) => void;
   readonly runtimeActivity?: RuntimeActivityTracker;
   readonly runtimeGovernance?: RuntimeGovernanceSettingsRepository;
   readonly toolPolicies?: ToolPolicySettingsRepository;
@@ -744,6 +750,9 @@ function toProtoArtifactCleanupProgress(progress: ArtifactCleanupJob) {
 }
 
 export interface ConnectServiceSet {
+  readonly personalDevelopment: ServiceImpl<typeof contract.PersonalDevelopmentService>;
+  readonly personalDevelopmentNative: ServiceImpl<typeof contract.DesktopPersonalDevelopmentHostService>;
+  readonly help: ServiceImpl<typeof contract.HelpService>;
   readonly appDefaultModel: ServiceImpl<typeof contract.AppDefaultModelService>;
   readonly connection: ServiceImpl<typeof contract.ConnectionService>;
   readonly event: ServiceImpl<typeof contract.EventService>;
@@ -1165,6 +1174,9 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   const services = createConnectServices(application, projectionShutdownSignal);
   router.service(contract.ConnectionService, withConnectErrors(services.connection));
   router.service(contract.AppDefaultModelService, withConnectErrors(services.appDefaultModel));
+  router.service(contract.HelpService, withConnectErrors(services.help));
+  router.service(contract.PersonalDevelopmentService, withConnectErrors(services.personalDevelopment));
+  router.service(contract.DesktopPersonalDevelopmentHostService, withConnectErrors(services.personalDevelopmentNative));
   router.service(contract.EventService, withConnectErrors(services.event));
   router.service(contract.OperationService, withConnectErrors(services.operation));
   router.service(contract.BackendService, withConnectErrors(services.backend));
@@ -1244,6 +1256,11 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ),
     sessionHost: application.sessionHost,
     sessionWorktrees: application.sessionWorktrees,
+    personalDevelopment: () => application.personalDevelopmentCoordinator,
+    assertPersonalDevelopmentLocalConnection: connection => {
+      if (application.personalDevelopmentNativeBroker === undefined) throw new ConnectError("Personal development is unavailable.", Code.Unavailable);
+      application.personalDevelopmentNativeBroker.assertLocalDesktopConnection(connection);
+    },
     ...(application.runtimeActivity === undefined ? {} : { runtimeActivity: application.runtimeActivity }),
     ...(application.runtimeGovernance === undefined ? {} : { runtimeGovernance: application.runtimeGovernance }),
     ...(application.toolPolicies === undefined ? {} : { toolPolicies: application.toolPolicies }),
@@ -5414,7 +5431,20 @@ export function createConnectServices(application: OrchestratorApplication, proj
     }
   } satisfies ServiceImpl<typeof contract.PiService>;
 
-  return { appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
+  const personalDevelopment = createPersonalDevelopmentConnectService({
+    openDirectory: (directory, signal) => application.personalDevelopmentNativeBroker!.openDirectory(directory, signal),
+    coordinator: () => application.personalDevelopmentCoordinator,
+    doctor: () => application.personalDevelopmentDoctor,
+    owner: () => application.personalDevelopment,
+    authenticateLocal: (context) => {
+      const connection = dependencies.connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
+      if (application.personalDevelopmentNativeBroker === undefined) throw new ConnectError("Personal development is unavailable.", Code.Unavailable);
+      application.personalDevelopmentNativeBroker.assertLocalDesktopConnection(connection);
+      return connection;
+    }
+  });
+  const personalDevelopmentNative = createPersonalDevelopmentNativeConnectService(application.personalDevelopmentNativeBroker, dependencies.connections);
+  return { personalDevelopment, personalDevelopmentNative, help: createHelpConnectService(application.helpAssistant, application.helpFeedback, dependencies.connections), appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -5748,7 +5778,7 @@ function sessionLifecycleOperationOutcome(
 }
 
 async function advanceSessionLifecycleCleanup(
-  dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "sessionWorktrees" | "gitSafety" | "terminals" | "now">,
+  dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "sessionWorktrees" | "gitSafety" | "terminals" | "now" | "personalDevelopment">,
   initial: SessionLifecycleCleanupRecord
 ): Promise<SessionLifecycleCleanupRecord> {
   let cleanup = initial;
@@ -5772,6 +5802,11 @@ async function advanceSessionLifecycleCleanup(
     if (!cleanup.nativeCompleted) {
       await dependencies.sessionHost.deleteNativeSession(cleanup.sessionId, cleanup.operationId);
       advance("native");
+    }
+    if (readPersonalDevelopmentPurpose(dependencies.store, cleanup.sessionId) !== undefined) {
+      const personal = dependencies.personalDevelopment?.();
+      if (personal === undefined) throw new ConnectError("Personal task cleanup is unavailable.", Code.FailedPrecondition);
+      cleanup = await personal.settleSessionLifecycle(cleanup);
     }
     if (!cleanup.worktreeCompleted) {
       const session = dependencies.store.getSession(cleanup.sessionId);
@@ -5995,6 +6030,8 @@ async function resumePendingSessionLifecycleCleanup(
   if (cleanup?.state !== "pending") return cleanup;
   // Service-owned Partner retirement has its own durable recovery coordinator.
   if (dependencies.sessionHost.isPartnerSessionRetiring(cleanup.sessionId)) return cleanup;
+  if (dependencies.sessionHost.isPersonalDevelopmentSessionEnding?.(cleanup.sessionId)
+    && dependencies.store.findOperation(cleanup.operationId) === undefined) return cleanup;
   cleanup = await advanceSessionLifecycleCleanup(dependencies, cleanup);
   return dependencies.store.finalizeSessionLifecycleCleanup({
     operationId,
@@ -16615,6 +16652,12 @@ async function dispatchMutation(
       );
     case "archiveSession": {
       const existing = dependencies.store.getSession(payload.value.sessionId);
+      const personalPurpose = readPersonalDevelopmentPurpose(dependencies.store, payload.value.sessionId);
+      if (personalPurpose !== undefined) {
+        if (dependencies.assertPersonalDevelopmentLocalConnection === undefined) throw new ConnectError("A local Desktop connection is required.", Code.PermissionDenied);
+        dependencies.assertPersonalDevelopmentLocalConnection(connection);
+        if (!payload.value.archived && personalPurpose.editing === "ended") throw new ConnectError("Create a new personal task or resolve the retained source merge from Settings.", Code.FailedPrecondition);
+      }
       if (!payload.value.archived) {
         return updateSessionOperation(
           dependencies,
@@ -16734,6 +16777,10 @@ async function dispatchMutation(
     }
     case "deleteSession": {
       const existing = dependencies.store.getSession(payload.value.sessionId);
+      if (readPersonalDevelopmentPurpose(dependencies.store, payload.value.sessionId) !== undefined) {
+        if (dependencies.assertPersonalDevelopmentLocalConnection === undefined) throw new ConnectError("A local Desktop connection is required.", Code.PermissionDenied);
+        dependencies.assertPersonalDevelopmentLocalConnection(connection);
+      }
       const releaseWorktree = existing.descriptor.worktree !== undefined;
       try {
         const execution = await host.mutate({

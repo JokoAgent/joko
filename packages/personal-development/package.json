@@ -1,0 +1,16 @@
+{
+  "name": "@joko/personal-development",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "build:command-host": "node scripts/build-command-host.mjs",
+    "test:command-host": "node scripts/test-command-host.mjs"
+  },
+  "dependencies": { "jszip": "3.10.2", "tar": "7.5.22" },
+  "devDependencies": { "@types/node": "24.12.4", "typescript": "5.9.3", "vitest": "4.1.9" }
+}

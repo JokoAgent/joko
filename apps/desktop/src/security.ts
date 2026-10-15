@@ -16,6 +16,7 @@ export const DESKTOP_CONTENT_SECURITY_POLICY = [
   // diagrams.net's fixed, self-hosted GraphViewer artifact evaluates its
   // internal graph codec. Inline and remote scripts remain forbidden.
   "script-src 'self' 'unsafe-eval'",
+  "worker-src 'self'",
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data: blob: https: http: joko-wallpaper:",
   "media-src 'self' data: blob:",
@@ -339,6 +340,14 @@ export function mergeContentSecurityPolicyHeaders(
   }
   merged["Content-Security-Policy"] = [...existingPolicies, DESKTOP_CONTENT_SECURITY_POLICY];
   return merged;
+}
+
+/** Apply only after the protocol has resolved a resource inside the immutable Web bundle. */
+export function securePackagedAppScriptResponse(response: Response, resourcePath: string): Response {
+  if (![".js", ".mjs"].includes(extname(resourcePath).toLowerCase())) return response;
+  const headers = new Headers(response.headers);
+  headers.append("content-security-policy", DESKTOP_CONTENT_SECURITY_POLICY);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
 export function isSecureStorageBackend(

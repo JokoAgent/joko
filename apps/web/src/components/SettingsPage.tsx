@@ -107,6 +107,9 @@ import { timelineCodeHighlight } from "./timeline-code-highlighting.js";
 import { resetWindowLayout } from "../layout-reset-orchestration.js";
 import { readVoiceInputPreferences } from "../voice-input-preferences.js";
 import { SettingsSearchBox } from "./SettingsSearchBox.js";
+import { HelpAssistant } from "./HelpAssistant.js";
+import { WorktreeRecycleSettings } from "./WorktreeRecycleSettings.js";
+import { PersonalDevelopmentSettings } from "./PersonalDevelopmentSettings.js";
 import { buildSettingsSearchDocuments, settingsSearchEntryFromHash, settingsSearchHash, type SettingsSearchEntry } from "./settings-search.js";
 import { useSettingsSearchTarget } from "./use-settings-search-target.js";
 
@@ -126,7 +129,7 @@ export const SETTINGS_NAV_SECTION_IDS = [
   "about"
 ] as const;
 export type SettingsSection = typeof SETTINGS_NAV_SECTION_IDS[number];
-export type SettingsSubsection = "appearance" | "policy" | "pi" | "backends" | "credentials" | "remoteDesktop" | "remoteHosts" | "mcp" | "diagnostics" | "runtime";
+export type SettingsSubsection = "appearance" | "policy" | "pi" | "backends" | "credentials" | "remoteDesktop" | "remoteHosts" | "mcp" | "diagnostics" | "runtime" | "worktreeRecycle" | "personalDevelopment";
 interface SettingsLocation {
   readonly section: SettingsSection;
   readonly subsection?: SettingsSubsection;
@@ -166,7 +169,9 @@ const SETTINGS_SUBSECTION_PARENTS: Readonly<Record<SettingsSubsection, SettingsS
   remoteHosts: "connections",
   mcp: "tools",
   diagnostics: "about",
-  runtime: "about"
+  runtime: "about",
+  worktreeRecycle: "about",
+  personalDevelopment: "about"
 };
 const SETTINGS_SUBSECTIONS = new Set<string>(Object.keys(SETTINGS_SUBSECTION_PARENTS));
 
@@ -318,6 +323,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
           </header>
           <SettingsSearchBox key={`${controller.state.activeProfile?.id ?? "offline"}:${locale}`} documents={searchDocuments} onSelect={selectSearchResult} t={t} />
           <nav className="settings-nav" aria-label={t("settings.title")} role="tablist" aria-orientation="vertical">{sections.map((item) => <button type="button" role="tab" id={`settings-tab-${item.id}`} aria-controls={`settings-panel-${item.id}`} aria-selected={section === item.id} tabIndex={section === item.id ? 0 : -1} className={section === item.id ? "is-active" : ""} key={item.id} onClick={() => selectSection(item.id)} onKeyDown={(event) => moveTablistSelection(event, "vertical")}>{item.icon}<span>{item.label}</span></button>)}</nav>
+          <HelpAssistant controller={controller} locale={locale} t={t} onNavigate={selectSection} />
         </aside>
         <div className={cx("settings-content-scroll", (section === "providers" || section === "import") && "settings-content-scroll--workbench")} ref={contentRef} key={section}>
           <div className={cx("settings-content", (section === "providers" || section === "import") && "settings-content--workbench")} id={`settings-panel-${section}`} role="tabpanel" aria-labelledby={`settings-tab-${section}`} tabIndex={0}>
@@ -340,7 +346,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
             {section === "import" && <SettingsPageSection id="import"><TaskImportSettings controller={controller} snapshot={snapshot} onImportPortable={onImportPortableSession} runAction={runAction} onSuccess={showSuccess} t={t} /></SettingsPageSection>}
             {section === "contacts" && <SettingsPageSection id="contacts"><ContactsSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} locale={locale} t={t} /></SettingsPageSection>}
             {section === "messaging" && <SettingsPageSection id="messaging"><MessagingSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection>}
-            {section === "about" && <><SettingsPageSection id="about"><AboutSettings controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection><SettingsPageSection id="backends"><SettingsSectionHeading title={t("settings.backends")} body={t("settings.backendsBody")} /><BackendSettings controller={controller} snapshot={snapshot} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="diagnostics"><DiagnosticSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection><SettingsPageSection id="runtime"><RuntimeProcessMonitor controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
+            {section === "about" && <><SettingsPageSection id="about"><AboutSettings controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection><SettingsPageSection id="backends"><SettingsSectionHeading title={t("settings.backends")} body={t("settings.backendsBody")} /><BackendSettings controller={controller} snapshot={snapshot} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="worktreeRecycle"><WorktreeRecycleSettings controller={controller} t={t} /></SettingsPageSection>{desktopCapabilityKey.split("\n").includes("development.personal") && <SettingsPageSection id="personalDevelopment"><PersonalDevelopmentSettings controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection>}<SettingsPageSection id="diagnostics"><DiagnosticSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection><SettingsPageSection id="runtime"><RuntimeProcessMonitor controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
           </div>
         </div>
       </div>

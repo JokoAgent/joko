@@ -218,8 +218,10 @@ describe("Desktop application-menu App lifecycle", () => {
     Reflect.deleteProperty(window, "jokoDesktop");
   });
 
-  it("shows explicit feedback for a manual native-menu update check", async () => {
-    let menuListener: ((command: "open-about" | "check-for-updates") => void) | undefined;
+  it("shows update feedback and opens native-menu Help through the guarded Settings route", async () => {
+    let menuListener: ((command: "open-about" | "open-help" | "check-for-updates") => void) | undefined;
+    const helpOpened = vi.fn();
+    window.addEventListener("joko:open-help", helpOpened);
     const checkForUpdates = vi.fn(async () => ({ status: "up-to-date" as const }));
     Object.defineProperty(window, "jokoDesktop", {
       configurable: true,
@@ -229,7 +231,7 @@ describe("Desktop application-menu App lifecycle", () => {
         appInfo: { get: vi.fn() },
         applicationMenu: {
           configure: vi.fn(async () => undefined),
-          onCommand: vi.fn((listener: (command: "open-about" | "check-for-updates") => void) => {
+          onCommand: vi.fn((listener: (command: "open-about" | "open-help" | "check-for-updates") => void) => {
             menuListener = listener;
             return vi.fn();
           })
@@ -261,9 +263,16 @@ describe("Desktop application-menu App lifecycle", () => {
     expect(disconnected.navigate).toHaveBeenCalledWith({ kind: "settings" });
     expect(window.location.hash).toBe("#/settings/about");
 
+    await act(async () => { menuListener?.("open-help"); await Promise.resolve(); });
+    expect(disconnected.navigate).toHaveBeenCalledWith({ kind: "settings" });
+    expect(window.location.hash).toBe("#/settings/general?help=1");
+    await act(async () => { menuListener?.("open-help"); await Promise.resolve(); });
+    expect(helpOpened).toHaveBeenCalledTimes(2);
+
     await act(async () => { root.unmount(); });
     container.remove();
     window.location.hash = "";
+    window.removeEventListener("joko:open-help", helpOpened);
     Reflect.deleteProperty(window, "jokoDesktop");
   });
 

@@ -29,7 +29,8 @@ describe("macOS application menu", () => {
       APPLICATION_MENU_LABELS.simplified.file,
       "editMenu",
       APPLICATION_MENU_LABELS.simplified.view,
-      "window"
+      "window",
+      "help"
     ]);
     expect(submenu?.map((item) => item.role ?? item.label ?? item.type)).toEqual([
       APPLICATION_MENU_LABELS.simplified.sidebar,
@@ -114,6 +115,7 @@ describe("macOS application menu", () => {
     });
     const appItems = topSubmenu(template, "Joko");
     const fileItems = topSubmenu(template, "File");
+    const helpItems = topSubmenu(template, "Help");
     const about = appItems.find((item) => item.label === "About Joko");
     const settings = appItems.find((item) => item.label === "Settings…");
     const check = appItems.find((item) => item.label === "Check for Updates…");
@@ -123,8 +125,9 @@ describe("macOS application menu", () => {
     click(settings);
     click(check);
     click(fileItems[0]);
+    click(helpItems[0]);
     expect(onCommand.mock.calls.map(([command]) => command)).toEqual([
-      "open-about", "open-settings", "check-for-updates", "new-session"
+      "open-about", "open-settings", "check-for-updates", "new-session", "open-help"
     ]);
   });
 

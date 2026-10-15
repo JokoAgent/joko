@@ -15,6 +15,7 @@ import {
 export interface ObjectiveDialogOwnerFence {
   readonly serverId: string;
   readonly profileId: string;
+  readonly origin: string;
   readonly connectionGeneration: number;
   readonly sessionId: string;
   readonly sessionGeneration: bigint;
@@ -40,6 +41,7 @@ export function objectiveDialogOwnerFence(
   return {
     serverId: profile.serverId,
     profileId: profile.id,
+    origin: profile.origin,
     connectionGeneration,
     sessionId: session.id,
     sessionGeneration: session.generation
@@ -55,6 +57,7 @@ export function objectiveDialogRequestMatchesOwner(
   return owner !== undefined
     && request.serverId === owner.serverId
     && request.profileId === owner.profileId
+    && request.origin === owner.origin
     && request.connectionGeneration === owner.connectionGeneration
     && request.sessionId === owner.sessionId
     && request.sessionGeneration === owner.sessionGeneration;
@@ -101,6 +104,7 @@ export function ObjectiveIndicator({
   const [now, setNow] = useState(() => Date.now());
   const requestRef = useRef<AbortController | undefined>(undefined);
   const loadOwnerRef = useRef<object | undefined>(undefined);
+  const observerRef = useRef<{ invalidate(): void; refresh(): void } | undefined>(undefined);
   const dialogFenceRef = useRef<ObjectiveDialogFence | undefined>(undefined);
   const latestRef = useRef({
     controller,
@@ -108,6 +112,8 @@ export function ObjectiveIndicator({
     sessionGeneration: session.generation,
     profileId: controller.state.activeProfile?.id,
     serverId: controller.state.activeProfile?.serverId,
+    origin: controller.state.activeProfile?.origin,
+    connectionGeneration: controller.state.connectionGeneration,
     connected: controller.state.connectionState === "connected",
     host
   });
@@ -117,6 +123,8 @@ export function ObjectiveIndicator({
     sessionGeneration: session.generation,
     profileId: controller.state.activeProfile?.id,
     serverId: controller.state.activeProfile?.serverId,
+    origin: controller.state.activeProfile?.origin,
+    connectionGeneration: controller.state.connectionGeneration,
     connected: controller.state.connectionState === "connected",
     host
   };
@@ -124,10 +132,12 @@ export function ObjectiveIndicator({
   const ownerKey = useMemo(() => JSON.stringify([
     controller.state.activeProfile?.id,
     controller.state.activeProfile?.serverId,
+    controller.state.activeProfile?.origin,
+    controller.state.connectionState,
     session.id,
     String(session.generation),
     controller.state.connectionGeneration
-  ]), [controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.connectionGeneration, session.generation, session.id]);
+  ]), [controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, controller.state.connectionState, controller.state.connectionGeneration, session.generation, session.id]);
 
   useEffect(() => {
     requestRef.current?.abort();
@@ -135,6 +145,7 @@ export function ObjectiveIndicator({
     setPending(undefined);
     setActionError(undefined);
     setEditRequestId(undefined);
+    return () => requestRef.current?.abort();
   }, [ownerKey]);
 
   useEffect(() => {
@@ -145,6 +156,7 @@ export function ObjectiveIndicator({
 
   useEffect(() => {
     const owner = {};
+    const source = latestRef.current;
     loadOwnerRef.current = owner;
     setObjective(undefined);
     setLoadError(undefined);
@@ -154,55 +166,97 @@ export function ObjectiveIndicator({
     };
     const request = new AbortController();
     const ownerWindow = host.ownerDocument.defaultView;
-    const retire = (): void => request.abort();
-    ownerWindow?.addEventListener("pagehide", retire);
+    if (ownerWindow === null) return;
+    let timer: number | undefined;
+    let readRequest: AbortController | undefined;
+    let reading = false;
+    let refreshQueued = false;
+    let readGeneration = 0;
+    let initialReady = false;
+    const clearTimer = (): void => {
+      if (timer !== undefined) ownerWindow.clearTimeout(timer);
+      timer = undefined;
+    };
+    const retire = (): void => { request.abort(); readRequest?.abort(); clearTimer(); };
+    ownerWindow.addEventListener("pagehide", retire);
     const isCurrent = (): boolean => loadOwnerRef.current === owner
       && !request.signal.aborted
       && latestRef.current.controller === controller
       && latestRef.current.sessionId === session.id
       && latestRef.current.sessionGeneration === session.generation
-      && latestRef.current.profileId === controller.state.activeProfile?.id
-      && latestRef.current.serverId === controller.state.activeProfile?.serverId
+      && latestRef.current.profileId === source.profileId
+      && latestRef.current.serverId === source.serverId
+      && latestRef.current.origin === source.origin
+      && latestRef.current.connectionGeneration === source.connectionGeneration
       && latestRef.current.connected
       && latestRef.current.host === host
+      && host.ownerDocument.defaultView === ownerWindow
       && host.isConnected;
-    void (async () => {
-      let initialReady = false;
+    const refresh = (): void => {
+      if (!isCurrent()) return;
+      clearTimer();
+      refreshQueued = true;
+      if (!reading && requestRef.current === undefined) void read();
+    };
+    const observer = {
+      invalidate(): void {
+        readGeneration++;
+        readRequest?.abort();
+        clearTimer();
+        refreshQueued = true;
+      },
+      refresh
+    };
+    observerRef.current = observer;
+    const read = async (): Promise<void> => {
+      if (!isCurrent() || reading || requestRef.current !== undefined) return;
+      reading = true;
+      refreshQueued = false;
+      const generation = readGeneration;
+      const readAbort = new AbortController();
+      readRequest = readAbort;
+      let timedOut = false;
+      const valid = (): boolean => isCurrent() && generation === readGeneration;
+      const failed = (reason: unknown): void => {
+        if (!valid()) return;
+        setLoadError(reason instanceof Error ? reason.message : t("objective.loadFailed"));
+        if (!initialReady) setLoadState({ ownerKey, phase: "error" });
+      };
+      const deadline = ownerWindow.setTimeout(() => {
+        timedOut = true;
+        readAbort.abort();
+        failed(new Error(t("objective.loadFailed")));
+      }, 10_000);
       try {
-        const initial = await controller.getObjective(session.id, request.signal);
-        if (!isCurrent()) return;
-        if (initial !== undefined && initial.sessionGeneration !== session.generation) {
+        const next = await controller.getObjective(session.id, readAbort.signal);
+        if (!valid() || readAbort.signal.aborted) return;
+        if (next !== undefined && (next.sessionId !== session.id || next.sessionGeneration !== session.generation)) {
           throw new Error(t("objective.ownerChanged"));
         }
-        objectiveRef.current = initial;
-        setObjective(initial);
+        if (next === undefined) {
+          objectiveRef.current = undefined;
+          setObjective(undefined);
+        } else adopt(next);
         initialReady = true;
+        setLoadError(undefined);
         setLoadState({ ownerKey, phase: "ready" });
-        for await (const update of controller.watchObjective(session.id, initial?.revision, request.signal)) {
-          if (!isCurrent()) return;
-          if (update.kind === "cleared") {
-            objectiveRef.current = undefined;
-            setObjective(undefined);
-            continue;
-          }
-          if (update.objective.sessionGeneration !== session.generation) throw new Error(t("objective.ownerChanged"));
-          setObjective((current) => {
-            if (current !== undefined && current.revision >= update.objective.revision) return current;
-            objectiveRef.current = update.objective;
-            return update.objective;
-          });
-        }
-        if (isCurrent()) setLoadError(t("objective.loadFailed"));
       } catch (reason) {
-        if (isCurrent()) {
-          setLoadError(reason instanceof Error ? reason.message : t("objective.loadFailed"));
-          if (!initialReady) setLoadState({ ownerKey, phase: "error" });
+        if (!readAbort.signal.aborted || timedOut) failed(reason);
+      } finally {
+        ownerWindow.clearTimeout(deadline);
+        if (readRequest === readAbort) readRequest = undefined;
+        reading = false;
+        if (isCurrent() && requestRef.current === undefined) {
+          if (refreshQueued) void read();
+          else timer = ownerWindow.setTimeout(() => { timer = undefined; void read(); }, 2_000);
         }
       }
-    })();
+    };
+    void read();
     return () => {
-      request.abort();
-      ownerWindow?.removeEventListener("pagehide", retire);
+      retire();
+      ownerWindow.removeEventListener("pagehide", retire);
+      if (observerRef.current === observer) observerRef.current = undefined;
       if (loadOwnerRef.current === owner) loadOwnerRef.current = undefined;
     };
   }, [controller, host, ownerKey, reload, session.generation, session.id, t]);
@@ -216,7 +270,7 @@ export function ObjectiveIndicator({
     return () => ownerWindow.clearInterval(timer);
   }, [host, objective?.status]);
 
-  const mutate = async <T,>(name: string, action: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+  const mutate = async <T,>(name: string, action: (signal: AbortSignal) => Promise<T>, apply: (result: T) => void): Promise<T> => {
     if (pending !== undefined || requestRef.current !== undefined) throw new Error(t("objective.actionPending"));
     const source = latestRef.current;
     const sourceHost = source.host;
@@ -227,6 +281,7 @@ export function ObjectiveIndicator({
     }
     const request = new AbortController();
     requestRef.current = request;
+    observerRef.current?.invalidate();
     const retire = (): void => request.abort();
     ownerWindow.addEventListener("pagehide", retire);
     const current = (): boolean => requestRef.current === request
@@ -236,6 +291,8 @@ export function ObjectiveIndicator({
       && latestRef.current.sessionGeneration === source.sessionGeneration
       && latestRef.current.profileId === source.profileId
       && latestRef.current.serverId === source.serverId
+      && latestRef.current.origin === source.origin
+      && latestRef.current.connectionGeneration === source.connectionGeneration
       && latestRef.current.connected
       && latestRef.current.host === sourceHost
       && sourceHost.isConnected
@@ -245,6 +302,7 @@ export function ObjectiveIndicator({
     try {
       const result = await action(request.signal);
       if (!current()) throw new Error(t("objective.ownerChanged"));
+      apply(result);
       return result;
     } catch (reason) {
       if (current()) setActionError(reason instanceof Error ? reason.message : t("objective.actionFailed"));
@@ -254,13 +312,17 @@ export function ObjectiveIndicator({
       if (requestRef.current === request) {
         requestRef.current = undefined;
         setPending(undefined);
+        observerRef.current?.refresh();
       }
     }
   };
 
   const adopt = (next: ObjectiveView): void => {
+    const current = objectiveRef.current;
+    if (current !== undefined && (current.ownerGeneration > next.ownerGeneration
+      || current.ownerGeneration === next.ownerGeneration && current.revision > next.revision)) return;
     objectiveRef.current = next;
-    setObjective((current) => current !== undefined && current.revision > next.revision ? current : next);
+    setObjective(next);
   };
   const submitDialog = async (text: string, limits: ObjectiveDialogLimits): Promise<void> => {
     const fence = dialogFenceRef.current;
@@ -275,20 +337,19 @@ export function ObjectiveIndicator({
     if (!ownerMatches) throw new Error(t("objective.ownerChanged"));
     // A completed Objective is immutable history. Editing it starts a fresh
     // replacement lifecycle instead of changing completed text in place.
-    const next = await mutate("save", (signal) => source === undefined || source.status === "complete"
+    await mutate("save", (signal) => source === undefined || source.status === "complete"
       ? controller.setObjective(session.id, session.generation, text, objectiveLimitsFromDialog(limits), signal)
       : controller.updateObjective(source, {
           text,
           maximumTurns: limits.maximumTurns,
           tokenBudget: limits.tokenBudget,
           noProgressTurnLimit: limits.noProgressTurnLimit
-        }, signal));
-    adopt(next);
+        }, signal), adopt);
   };
   const clear = (): void => {
     const source = objectiveRef.current;
     if (source === undefined) return;
-    void mutate("clear", (signal) => controller.clearObjective(source, signal)).then(() => {
+    void mutate("clear", (signal) => controller.clearObjective(source, signal), () => {
       objectiveRef.current = undefined;
       setObjective(undefined);
     }).catch(() => undefined);
@@ -340,12 +401,12 @@ export function ObjectiveIndicator({
         {objective.status === "active" && <IconButton label={t("objective.pause")} disabled={pending !== undefined} onClick={() => {
           const source = objectiveRef.current;
           if (source === undefined) return;
-          void mutate("pause", (signal) => controller.pauseObjective(source, "Paused by the task owner.", signal)).then(adopt).catch(() => undefined);
+          void mutate("pause", (signal) => controller.pauseObjective(source, "Paused by the task owner.", signal), adopt).catch(() => undefined);
         }}>{pending === "pause" ? <Spinner label={t("common.loading")} /> : <Pause aria-hidden="true" />}</IconButton>}
         {["paused", "blocked", "usageLimited"].includes(objective.status) && <IconButton label={t("objective.resume")} disabled={pending !== undefined} onClick={() => {
           const source = objectiveRef.current;
           if (source === undefined) return;
-          void mutate("resume", (signal) => controller.resumeObjective(source, signal)).then(adopt).catch(() => undefined);
+          void mutate("resume", (signal) => controller.resumeObjective(source, signal), adopt).catch(() => undefined);
         }}>{pending === "resume" ? <Spinner label={t("common.loading")} /> : <Play aria-hidden="true" />}</IconButton>}
         <IconButton label={t("objective.clear")} disabled={pending !== undefined} onClick={clear}>{pending === "clear" ? <Spinner label={t("common.loading")} /> : <Trash2 aria-hidden="true" />}</IconButton>
       </>}

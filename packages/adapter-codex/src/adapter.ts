@@ -44,6 +44,7 @@ import {
   type NativeSessionNavigationResult,
   type NativeMemoryResetResult,
   type NativeMemoryStatus,
+  type NativeTextInferenceInput,
   type NativeHistoryProjection,
   type NativeNavigationTarget,
   type NativeSessionState,
@@ -582,6 +583,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #smartRoutingHostFlight: Promise<number> | undefined;
   #account: CodexAccountSnapshot | undefined;
   #nativeAuthenticationEpoch = 0;
+  readonly #nativeTextFlights = new Set<AbortController>();
   #nativeAuthenticationRevoked = false;
   #nativeAuthenticationLogoutCompletedEpoch: number | undefined;
   #disposed = false;
@@ -2613,6 +2615,85 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
   }
 
+  async inferNativeText(input: NativeTextInferenceInput): Promise<string> {
+    this.#assertOpen();
+    if (input.backendInstanceGeneration !== this.#instanceGeneration) throw nativeAuthenticationObservationStale();
+    if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1_000 || input.timeoutMs > 20_000
+      || input.system.length > 80_000 || input.user.length > 300_000) throw new RangeError("Native text inference input is invalid.");
+    const owner = new AbortController();
+    this.#nativeTextFlights.add(owner);
+    const signal = AbortSignal.any([input.signal, owner.signal, AbortSignal.timeout(input.timeoutMs)]);
+    const epoch = this.#nativeAuthenticationEpoch;
+    const model = "gpt-5.4-mini";
+    const assertOwner = () => {
+      signal.throwIfAborted(); this.#assertOpen(); input.assertCurrent();
+      this.#assertNativeAuthenticationAdmission(epoch);
+      input.assertModelAllowed(this.#providerId, model);
+    };
+    let directory: string | undefined, subscription: HostSubscription | undefined;
+    let threadId: string | undefined, turnId: string | undefined, hostGeneration: number | undefined;
+    let host = this.#host;
+    try {
+      assertOwner();
+      const account = await this.readAccount();
+      assertOwner();
+      if (!account.authenticated) throw nativeAuthenticationObservationStale();
+      host = this.#host;
+      directory = await createReviewWorkingDirectory();
+      // Reuse the audited isolation profile, then remove even the Review read tools.
+      const profile = await this.#buildReviewThreadProfile(directory, directory, signal, assertOwner);
+      assertOwner();
+      if (host !== this.#host) throw nativeAuthenticationObservationStale();
+      hostGeneration = host.generation;
+      const assertDispatch = () => { assertOwner(); if (!host.isActiveGeneration(hostGeneration!)) throw nativeAuthenticationObservationStale(); };
+      const started = await host.request("thread/start", { ...profile, dynamicTools: [], model, modelProvider: "openai",
+        config: { ...(isJsonObject(profile["config"]) ? profile["config"] : {}), ...this.#nativeRouteConfiguration() },
+        developerInstructions: input.system, baseInstructions: "Answer the supplied text only. Do not invoke tools, skills, or external services." },
+      { signal, mutation: true, beforeDispatch: assertDispatch });
+      const thread = objectValue(objectValue(started.value, "temporary text thread")["thread"]!, "temporary text thread");
+      threadId = stringValue(thread["id"], "temporary text thread ID");
+      assertDispatch();
+      type Result = { text: string } | { failed: true };
+      let finish: (value: Result) => void = () => {};
+      const result = new Promise<Result>(resolve => { finish = resolve; });
+      const aborted = () => finish({ failed: true });
+      signal.addEventListener("abort", aborted, { once: true });
+      try {
+        subscription = await host.subscribe(threadId, hostGeneration, {
+          onNotification: (method, params) => {
+            if (!isJsonObject(params)) return;
+            if (method === "turn/started" && isJsonObject(params["turn"])) turnId = optionalString(params["turn"]["id"]);
+            if (method === "item/completed" && isJsonObject(params["item"])) {
+              const item = params["item"];
+              if (item["type"] === "agentMessage" && typeof item["text"] === "string") {
+                finish(item["text"].length <= 24_000 ? { text: item["text"].trim() } : { failed: true });
+              }
+            }
+            if (method === "turn/completed" || (method === "error" && params["willRetry"] !== true)) finish({ failed: true });
+          },
+          onRequest: async () => { finish({ failed: true }); return undefined; },
+          onDisconnect: () => { finish({ failed: true }); }
+        });
+        assertDispatch();
+        await host.request("turn/start", { threadId, input: [{ type: "text", text: input.user }] },
+          { signal, mutation: true, beforeDispatch: assertDispatch });
+        const answer = await result;
+        assertDispatch();
+        if (!("text" in answer) || !answer.text) throw new Error("Native text inference produced no answer.");
+        return answer.text;
+      } finally { signal.removeEventListener("abort", aborted); }
+    } finally {
+      this.#nativeTextFlights.delete(owner);
+      owner.abort();
+      if (threadId !== undefined && turnId !== undefined && hostGeneration !== undefined && host.isActiveGeneration(hostGeneration)) {
+        await host.request("turn/interrupt", { threadId, turnId }, { timeoutMs: 5_000, mutation: true }).catch(() => undefined);
+      }
+      if (subscription !== undefined) await subscription.release().catch(() => undefined);
+      else if (threadId !== undefined && hostGeneration !== undefined) await host.releaseUnboundThread(threadId, hostGeneration).catch(() => undefined);
+      if (directory !== undefined) await removeReviewWorkingDirectory(directory);
+    }
+  }
+
   async readAccountUsage(providerId: string, signal?: AbortSignal): Promise<CodexAccountUsageSnapshot> {
     this.#assertOpen();
     if (providerId !== this.#providerId) {
@@ -2701,6 +2782,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async revokeProviderAuthentication(providerId: string): Promise<void> {
     if (providerId !== this.#providerId) return;
     this.#nativeAuthenticationEpoch += 1;
+    for (const flight of this.#nativeTextFlights) flight.abort();
     this.#nativeAuthenticationRevoked = true;
     this.#nativeAuthenticationLogoutCompletedEpoch = undefined;
     const runtimes = [...this.#sessions.values()].filter((runtime) =>
@@ -2811,6 +2893,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     if (this.#disposeFlight !== undefined) return this.#disposeFlight;
     if (this.#disposed) return Promise.resolve();
     this.#disposed = true;
+    for (const flight of this.#nativeTextFlights) flight.abort();
     this.#managedProviders?.dispose();
     const flight = this.#disposeRuntimes().finally(() => this.#smartRouting?.cleanup());
     this.#disposeFlight = flight;
@@ -2820,6 +2903,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   forceDispose(): Promise<void> {
     if (this.#forceDisposeFlight !== undefined) return this.#forceDisposeFlight;
     this.#disposed = true;
+    for (const flight of this.#nativeTextFlights) flight.abort();
     this.#managedProviders?.dispose();
     const flight = this.#forceDisposeRuntimes().finally(() => this.#smartRouting?.cleanup());
     this.#forceDisposeFlight = flight;
@@ -3907,7 +3991,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return model;
   }
 
-  async #buildReviewThreadProfile(cwd: string, reviewWorkingDirectory: string): Promise<JsonObject> {
+  async #buildReviewThreadProfile(cwd: string, reviewWorkingDirectory: string, signal?: AbortSignal, assertCurrent?: () => void): Promise<JsonObject> {
+    const options = { ...(signal === undefined ? {} : { signal }), ...(assertCurrent === undefined ? {} : { beforeDispatch: assertCurrent }) };
+    signal?.throwIfAborted(); assertCurrent?.();
     await this.#ensureLocalHostStarted();
     if (!supportsIsolatedReview(this.#host.initializeResult?.userAgent)) {
       throw reviewRuntimeUnsupported(this.#host.initializeResult?.userAgent);
@@ -3916,9 +4002,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     let skillInventory: ReviewSkillInventory;
     let config: JsonObject;
     try {
-      const skills = await this.#host.request("skills/list", { cwds: [cwd], forceReload: false });
+      const skills = await this.#host.request("skills/list", { cwds: [cwd], forceReload: false }, options);
       skillInventory = reviewSkillInventory(skills.value, cwd);
-      const configResponse = await this.#host.request("config/read", { cwd, includeLayers: false });
+      const configResponse = await this.#host.request("config/read", { cwd, includeLayers: false }, options);
       config = reviewEffectiveConfig(configResponse.value);
     } catch (error) {
       throw this.#requestFailure(error, "provision", "CODEX_REVIEW_INVENTORY_UNAVAILABLE", false);
@@ -3957,7 +4043,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           limit: 100,
           detail: "toolsAndAuthOnly",
           threadId: null
-        });
+        }, options);
       } catch (error) {
         throw this.#requestFailure(error, "provision", "CODEX_REVIEW_INVENTORY_UNAVAILABLE", false);
       }

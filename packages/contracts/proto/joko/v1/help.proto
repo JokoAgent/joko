@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package joko.v1;
+
+enum HelpRole {
+  HELP_ROLE_UNSPECIFIED = 0;
+  HELP_ROLE_USER = 1;
+  HELP_ROLE_ASSISTANT = 2;
+}
+
+message HelpMessage {
+  HelpRole role = 1;
+  string content = 2;
+}
+
+message AskHelpRequest {
+  repeated HelpMessage messages = 1;
+  string locale = 2;
+}
+
+message HelpAnswer {
+  string text = 1;
+  // A validated current settings section, never a URL or arbitrary route.
+  string settings_section = 2;
+}
+
+message HelpNoAnswer {}
+
+message AskHelpResponse {
+  oneof result {
+    HelpAnswer answer = 1;
+    HelpNoAnswer no_answer = 2;
+  }
+}
+
+message CreateHelpFeedbackDraftRequest {
+  // Reuse this identity after an unknown outcome; changed content is rejected.
+  string request_id = 1;
+  string question = 2;
+  string answer = 3;
+  string title = 4;
+  string body = 5;
+  string locale = 6;
+}
+
+message CreateHelpFeedbackDraftResponse {
+  string draft_id = 1;
+}

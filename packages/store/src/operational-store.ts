@@ -15348,6 +15348,16 @@ export class OperationalStore {
     return row === undefined ? undefined : sessionLifecycleCleanupFromRow(row);
   }
 
+  /** Latest durable close authority, including retained worktrees after deletion. */
+  findLatestSessionLifecycleCleanup(sessionId: string): SessionLifecycleCleanupRecord | undefined {
+    this.assertOpen();
+    const row = this.database.prepare(`
+      SELECT * FROM session_lifecycle_cleanups WHERE session_id = ?
+      ORDER BY created_at DESC, updated_at DESC, operation_id DESC LIMIT 1
+    `).get(nonBlank(sessionId, "Session ID")) as Row | undefined;
+    return row === undefined ? undefined : sessionLifecycleCleanupFromRow(row);
+  }
+
   listPendingSessionLifecycleCleanups(): SessionLifecycleCleanupRecord[] {
     this.assertOpen();
     return (this.database.prepare(`

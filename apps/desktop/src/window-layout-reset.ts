@@ -25,7 +25,7 @@ export interface ResettableWindow {
 
 export interface ManagedWindowGeometry {
   readonly window: ResettableWindow;
-  readonly state: ResettableWindowState;
+  readonly state?: ResettableWindowState;
   readonly defaults: WindowGeometryDefaults;
 }
 
@@ -66,7 +66,7 @@ export async function resetManagedWindowGeometry(targets: readonly ManagedWindow
     }
   }
   await Promise.all(live.map(async (target) => {
-    target.state.unmanage();
+    target.state?.unmanage();
     await leaveWindowState(target.window, "leave-full-screen", () => !target.window.isFullScreen(), () => target.window.setFullScreen(false));
     if (target.window.isDestroyed()) return;
     await leaveWindowState(target.window, "unmaximize", () => !target.window.isMaximized(), () => target.window.unmaximize());
@@ -76,8 +76,8 @@ export async function resetManagedWindowGeometry(targets: readonly ManagedWindow
     // electron-window-state's manage() immediately reapplies its cached
     // maximized/full-screen flags. Persist the reset geometry first so manage
     // cannot restore the state the user just asked us to clear.
-    target.state.saveState(target.window);
-    target.state.manage(target.window);
+    target.state?.saveState(target.window);
+    target.state?.manage(target.window);
   }));
 }
 

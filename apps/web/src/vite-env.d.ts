@@ -255,6 +255,7 @@ type JokoDesktopCapability =
   | "hardware.dedicatedInput"
   | "hardware.nativeGamepad"
   | "app.info"
+  | "development.personal"
   | "app.update"
   | "attention.badge"
   | "appearance.zoom"
@@ -494,12 +495,12 @@ interface JokoDesktopApi {
     close(): Promise<void>;
   };
   readonly sessionWindows: {
-    open(owner: { readonly profileId: string; readonly sessionId: string }): Promise<{ readonly focusedExisting: boolean }>;
-    getOwner(): Promise<{ readonly profileId: string; readonly sessionId: string }>;
+    open(owner: { readonly profileId: string; readonly sessionId: string }): Promise<{ readonly opened: true }>;
+    getOwner(): Promise<{ readonly profileId: string; readonly sessionId: string; readonly draftSlot: number }>;
     beginDragPreview(request: JokoDesktopSessionDragPreviewRequest): Promise<boolean>;
     endDragPreview(gestureId: string): Promise<boolean>;
     openIfDroppedOutside(gestureId: string): Promise<
-      { readonly opened: false } | { readonly opened: true; readonly focusedExisting: boolean }
+      { readonly opened: boolean }
     >;
   };
   readonly runtimeProcessMonitor: {
@@ -575,7 +576,7 @@ interface JokoDesktopApi {
       readonly openSettingsAccelerator?: string | null;
       readonly toggleSidebarAccelerator?: string | null;
     }): Promise<void>;
-    onCommand(listener: (command: "open-about" | "new-session" | "open-settings" | "open-task-status-settings" | "check-for-updates" | "toggle-sidebar" | "zoom-reset" | "zoom-in" | "zoom-out") => void): () => void;
+    onCommand(listener: (command: "open-about" | "open-help" | "new-session" | "open-settings" | "open-task-status-settings" | "check-for-updates" | "toggle-sidebar" | "zoom-reset" | "zoom-in" | "zoom-out") => void): () => void;
   };
   readonly inspectorWindow: {
     activate(): Promise<boolean>;

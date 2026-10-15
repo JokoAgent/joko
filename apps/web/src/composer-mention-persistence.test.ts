@@ -137,7 +137,7 @@ describe("durable composer mention inventory", () => {
     const invalid = { ...draft, inlineMentionRanges } as ComposerDraft;
     await expect(state.saveDraft("server", "profile", "session", invalid)).rejects.toThrow("mention occurrences");
     expect((await state.readDraft("server", "profile", "session"))?.inlineMentionRanges).toEqual(draft.inlineMentionRanges);
-    records.set(JSON.stringify(["server", "profile", "session"]), { revision: 1, draft: invalid });
+    records.set(JSON.stringify(["server", "profile", "session", "application"]), { revision: 1, draft: invalid });
     await expect(state.readDraft("server", "profile", "session")).rejects.toThrow("mention occurrences");
   });
 

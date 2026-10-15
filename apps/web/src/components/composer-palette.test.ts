@@ -13,6 +13,18 @@ import {
 } from "./composer-palette.js";
 
 describe("shared composer palettes", () => {
+  it("parses only explicit personal commands on a capable host and retains exact loaded Skill precedence", () => {
+    const options = { personalDevelopmentSupported: true };
+    expect(composerBuiltInCommand("/joko-make Add a shortcut", options)).toEqual({ kind: "personalDevelopment", mode: "prepare", request: "Add a shortcut" });
+    expect(composerBuiltInCommand("/joko-make-doctor", options)).toEqual({ kind: "personalDevelopment", mode: "check", request: "" });
+    expect(composerBuiltInCommand(" /joko-make-doctor", options)).toBeUndefined();
+    expect(composerBuiltInCommand("/joko-make-doctor", {})).toBeUndefined();
+    expect(composerBuiltInCommand("/joko-makeover", options)).toBeUndefined();
+    const skill: RuntimeCommandView = { id: "personal-skill", name: "joko-make-doctor", source: "skill", description: "Loaded skill", inputMode: "text", loaded: true };
+    expect(runtimeCommandOwnsApplicationCommand([skill], skill.name)).toBe(true);
+    expect(runtimeCommandOwnsApplicationCommand([{ ...skill, loaded: false }], skill.name)).toBe(false);
+    expect(composerCommandItems([skill], options).filter(item => item.value === "/joko-make-doctor")).toEqual([expect.objectContaining({ id: "command:personal-skill" })]);
+  });
   it("exposes and strictly parses the application help, task jump, and generic shell commands", () => {
     const options = { helpSupported: true, jumpSessionSupported: true, userShellSupported: true };
     expect(composerCommandItems([], options).map((item) => item.value)).toEqual([

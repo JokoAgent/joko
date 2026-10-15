@@ -237,6 +237,7 @@ export function isDesktopSystemLocale(value: unknown): value is DesktopSystemLoc
 
 export type DesktopApplicationMenuCommand =
   | "open-about"
+  | "open-help"
   | "new-session"
   | "open-settings"
   | "open-task-status-settings"
@@ -367,7 +368,7 @@ export interface DesktopAppInfo {
 }
 
 export interface DesktopSessionWindowOpenResult {
-  readonly focusedExisting: boolean;
+  readonly opened: true;
 }
 
 export interface DesktopSessionWindowOwner {
@@ -375,10 +376,21 @@ export interface DesktopSessionWindowOwner {
   readonly sessionId: string;
 }
 
+export interface DesktopSessionWindowContext extends DesktopSessionWindowOwner {
+  readonly draftSlot: number;
+}
+
 export function isDesktopSessionWindowOwner(value: unknown): value is DesktopSessionWindowOwner {
   return plainRecordWithKeys(value, ["profileId", "sessionId"])
     && boundedDragText(value.profileId, 256)
     && boundedDragText(value.sessionId, 256);
+}
+
+export function isDesktopSessionWindowContext(value: unknown): value is DesktopSessionWindowContext {
+  return plainRecordWithKeys(value, ["profileId", "sessionId", "draftSlot"])
+    && boundedDragText(value.profileId, 256)
+    && boundedDragText(value.sessionId, 256)
+    && Number.isSafeInteger(value.draftSlot) && (value.draftSlot as number) >= 0;
 }
 
 export interface DesktopExtensionWindowOpenResult {
@@ -452,9 +464,9 @@ export interface DesktopSessionDragPreviewRequest {
   readonly palette: DesktopSessionDragPreviewPalette;
 }
 
-export type DesktopSessionWindowDropResult =
-  | { readonly opened: false }
-  | { readonly opened: true; readonly focusedExisting: boolean };
+export interface DesktopSessionWindowDropResult {
+  readonly opened: boolean;
+}
 
 const DESKTOP_SESSION_DRAG_GESTURE_PATTERN = /^[a-zA-Z0-9_-]{16,128}$/u;
 const DESKTOP_SESSION_DRAG_COLOR_PATTERN = /^(?:#(?:[0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})|(?:rgba?|hsla?)\([0-9a-z+.,%/\s-]+\))$/iu;
@@ -486,6 +498,7 @@ function plainRecordWithKeys(value: unknown, keys: readonly string[]): value is 
 
 export function isDesktopApplicationMenuCommand(value: unknown): value is DesktopApplicationMenuCommand {
   return value === "open-about"
+    || value === "open-help"
     || value === "new-session"
     || value === "open-settings"
     || value === "open-task-status-settings"

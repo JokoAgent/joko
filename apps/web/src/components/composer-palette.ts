@@ -30,6 +30,7 @@ export interface ComposerCommandItemOptions {
   readonly resourceMentionSupported?: boolean;
   /** Application-owned help surface; independent of the selected Backend. */
   readonly helpSupported?: boolean;
+  readonly personalDevelopmentSupported?: boolean;
   /** Application-owned Skill learning command for the selected writable Target. */
   readonly learnSupported?: boolean;
   /** Application-owned autonomous Objective command for the current writable Session. */
@@ -46,6 +47,7 @@ export interface ComposerCommandItemOptions {
 
 export type ComposerBuiltInCommand =
   | { readonly kind: "help" }
+  | { readonly kind: "personalDevelopment"; readonly mode: "check" | "prepare"; readonly request: string }
   | { readonly kind: "learn"; readonly instruction: string }
   | { readonly kind: "objective"; readonly action: "open" | "clear" | "set"; readonly text?: string }
   | { readonly kind: "jumpSession"; readonly sessionId: string }
@@ -105,6 +107,12 @@ export function composerCommandItems(
   options: ComposerCommandItemOptions = {}
 ): readonly ComposerPaletteItem[] {
   const items: ComposerPaletteItem[] = [
+    ...(options.personalDevelopmentSupported === true && !runtimeCommandOwnsApplicationCommand(commands, "joko-make")
+      ? [{ id: "builtin:joko-make", label: "/joko-make", value: "/joko-make", meta: "Develop and build a personal version of Joko" }]
+      : []),
+    ...(options.personalDevelopmentSupported === true && !runtimeCommandOwnsApplicationCommand(commands, "joko-make-doctor")
+      ? [{ id: "builtin:joko-make-doctor", label: "/joko-make-doctor", value: "/joko-make-doctor", meta: "Check the local personal development environment" }]
+      : []),
     ...(options.helpSupported === true
       ? [{ id: "builtin:help", label: "/help", value: "/help", meta: "Show every available command and skill" }]
       : []),
@@ -212,6 +220,10 @@ export function composerBuiltInCommand(
   options: ComposerCommandItemOptions = {}
 ): ComposerBuiltInCommand | undefined {
   if (options.helpSupported === true && /^\/help\s*$/iu.test(text)) return { kind: "help" };
+  if (options.personalDevelopmentSupported === true) {
+    const personal = text.match(/^\/joko-make(-doctor)?(?:\s+([\s\S]*?))?\s*$/iu);
+    if (personal !== null) return { kind: "personalDevelopment", mode: personal[1] === undefined ? "prepare" : "check", request: (personal[2] ?? "").trim() };
+  }
   if (options.learnSupported === true) {
     const learn = text.match(/^\/learn(?:\s+([\s\S]*?))?\s*$/iu);
     if (learn !== null) return { kind: "learn", instruction: (learn[1] ?? "").trim() };

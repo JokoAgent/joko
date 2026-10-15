@@ -24,6 +24,8 @@ export interface OrchestratorConfig {
   readonly piExecutable?: string;
   readonly codexExecutable?: string;
   readonly claudeCodeExecutable?: string;
+  /** Managed Desktop's private command retirement helper. */
+  readonly personalDevelopmentCommandHostPath?: string;
   readonly piAgentHome: string;
   readonly piSettingsFile?: string;
   readonly workspace: {
@@ -119,6 +121,10 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
     throw new Error("JOKO_DOCUMENT_PDF_ELECTRON_APP must be an existing absolute directory.");
   }
   const codexExecutable = discoverCodexExecutable(environment);
+  const personalDevelopmentCommandHostPath = environment.JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST;
+  if (personalDevelopmentCommandHostPath !== undefined && !isAbsolute(personalDevelopmentCommandHostPath)) {
+    throw new Error("JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST must be absolute.");
+  }
   const simulatorResources = environment.JOKO_DESKTOP_RESOURCES_PATH;
   if (simulatorResources !== undefined && (!isAbsolute(simulatorResources) || !existsSync(simulatorResources)
     || !lstatSync(simulatorResources).isDirectory() || lstatSync(simulatorResources).isSymbolicLink())) {
@@ -142,6 +148,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
     voiceDictionaryLanDiscoveryEnabled: environment.JOKO_VOICE_DICTIONARY_LAN_DISCOVERY !== "0",
     ...(environment.JOKO_PI_EXECUTABLE === undefined ? {} : { piExecutable: environment.JOKO_PI_EXECUTABLE }),
     ...(codexExecutable === undefined ? {} : { codexExecutable }),
+    ...(personalDevelopmentCommandHostPath === undefined ? {} : { personalDevelopmentCommandHostPath }),
     ...(environment.JOKO_CLAUDE_CODE_EXECUTABLE === undefined
       ? {}
       : { claudeCodeExecutable: environment.JOKO_CLAUDE_CODE_EXECUTABLE }),

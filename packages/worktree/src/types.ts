@@ -10,6 +10,8 @@ export interface WorktreeCallOptions {
 }
 
 export interface WorktreeInitializeOptions extends WorktreeCallOptions {
+  /** Product recovery resumes pending release intents after native owners are ready. */
+  readonly deferRecycle?: boolean;
   /** Private external-writer owners must retain unclaimed leases until an
    * exact retirement receipt authorizes cleanup; initialization is read-only. */
   readonly preserveUnclaimed?: boolean;
@@ -112,10 +114,44 @@ export interface WorktreeAcquisition {
 
 export interface WorktreeRelease {
   readonly status: "destroyed" | "not_found" | "preserved";
-  readonly reason?: "branch_changed" | "dirty" | "keep" | "restorable";
+  readonly reason?: "branch_changed" | "dirty" | "keep" | "restorable" | "in_use" | "paused" | "retry_pending";
   readonly pathRemoved?: boolean;
   readonly branchPreserved?: boolean;
 }
+
+export type WorktreeRecycleState = "retrying" | "waiting" | "paused" | "kept";
+export type WorktreeRecycleReason = "pending" | "in_use" | "changed" | "kept" | "integrity" | "storage" | "identity" | "failed";
+
+export interface WorktreeRecyclePolicy {
+  readonly generation: string;
+  readonly retainForRestore: boolean;
+  readonly state: WorktreeRecycleState;
+  readonly reason: WorktreeRecycleReason;
+  readonly failures: number;
+  readonly failedWorkMs: number;
+  readonly nextAttemptAt: number;
+}
+
+export interface WorktreeRecycleRecord {
+  readonly id: string;
+  readonly generation: string;
+  readonly lease: WorktreeLease;
+  readonly state: WorktreeRecycleState;
+  readonly reason: WorktreeRecycleReason;
+  readonly failures: number;
+  readonly nextAttemptAt: number;
+  readonly retainForRestore: boolean;
+}
+
+export interface WorktreeRecycleControl {
+  readonly id: string;
+  readonly generation: string;
+  readonly action: "retry" | "keep";
+}
+
+/** The Product owner must confirm the exact inactive Session and native writer
+ * retirement while the physical checkout lock is held. Unknown means wait. */
+export type WorktreeRecycleGuard = (lease: WorktreeLease, retainForRestore: boolean) => Promise<boolean>;
 
 export interface WorktreeReleaseOptions extends WorktreeCallOptions {
   /** Retain the exact owner record so the same Session can rebuild this checkout. */

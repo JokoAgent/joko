@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { create } from "@bufbuild/protobuf";
+import { Code, ConnectError } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
 import {
   OperationalStore,
@@ -14,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { OrchestratorApplication } from "./application.js";
 import { createConnectServices } from "./connect-services.js";
+import { savePersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import type { SessionHost } from "./session-host.js";
 
 const cleanups: Array<() => void> = [];
@@ -24,6 +26,37 @@ afterEach(() => {
 });
 
 describe("durable task lifecycle cleanup", () => {
+  it("routes personal deletion through its owner after native retirement while preserving the original delete manifest", async () => {
+    const fixture = createFixture(); personalPurpose(fixture);
+    const settleSessionLifecycle = vi.fn(async (cleanup: ReturnType<OperationalStore["getSessionLifecycleCleanup"]>) => {
+      expect(cleanup).toMatchObject({ disposition: "delete", closeCompleted: true, nativeCompleted: true });
+      expect(fixture.deleteNativeSession).toHaveBeenCalledOnce();
+      return fixture.store.advanceSessionLifecycleCleanup({ operationId: cleanup.operationId, phase: "worktree" });
+    });
+    const assertLocalDesktopConnection = vi.fn();
+    const services = servicesFor(fixture, { personalDevelopmentCoordinator: { settleSessionLifecycle },
+      personalDevelopmentNativeBroker: { assertLocalDesktopConnection } });
+    const response = await services.operation.submitOperation(deleteRequest(fixture.connection.id, "delete-personal-owner", fixture.sessionId), context());
+    expect(response.operation?.state).toBe(contract.OperationState.SUCCEEDED);
+    expect(assertLocalDesktopConnection).toHaveBeenCalledWith(expect.objectContaining({ id: fixture.connection.id, authKeyDigest: fixture.connection.authKeyDigest, state: "active" }));
+    expect(settleSessionLifecycle).toHaveBeenCalledOnce();
+    expect(fixture.releaseWorktree).not.toHaveBeenCalled(); expect(fixture.archiveWorktree).not.toHaveBeenCalled();
+    expect(fixture.store.getSession(fixture.sessionId).descriptor.deletedAt).toBeDefined();
+    expect(fixture.store.getSessionLifecycleCleanup("delete-personal-owner")).toMatchObject({ disposition: "delete", state: "completed" });
+  });
+
+  it("rejects another connection before personal archive or deletion effects", async () => {
+    const fixture = createFixture(); personalPurpose(fixture);
+    const services = servicesFor(fixture, { personalDevelopmentNativeBroker: { assertLocalDesktopConnection: () => {
+      throw new ConnectError("Committed Desktop connection required.", Code.PermissionDenied);
+    } } });
+    await expect(services.operation.submitOperation(deleteRequest(fixture.connection.id, "denied-personal-delete", fixture.sessionId), context()))
+      .rejects.toMatchObject({ code: Code.PermissionDenied });
+    await expect(services.operation.submitOperation(archiveRequest(fixture.connection.id, "denied-personal-archive", fixture.sessionId), context()))
+      .rejects.toMatchObject({ code: Code.PermissionDenied });
+    expect(fixture.closeIfActive).not.toHaveBeenCalled(); expect(fixture.deleteNativeSession).not.toHaveBeenCalled();
+    expect(fixture.store.findSessionLifecycleCleanup("denied-personal-delete")).toBeUndefined();
+  });
   it("waits for terminal process closure before releasing a task workspace and retries uncertain closure", async () => {
     vi.useFakeTimers();
     const fixture = createFixture();
@@ -230,7 +263,7 @@ describe("durable task lifecycle cleanup", () => {
   });
 });
 
-function servicesFor(fixture: ReturnType<typeof createFixture>) {
+function servicesFor(fixture: ReturnType<typeof createFixture>, overrides: Record<string, unknown> = {}) {
   return createConnectServices({
     config: { publicOrigin: "https://orchestrator.example.test" },
     store: fixture.store,
@@ -261,8 +294,16 @@ function servicesFor(fixture: ReturnType<typeof createFixture>) {
       fixture.serviceCleanups.add(cleanup);
       return () => fixture.serviceCleanups.delete(cleanup);
     },
-    close: async () => undefined
+    close: async () => undefined,
+    ...overrides
   } as unknown as OrchestratorApplication);
+}
+
+function personalPurpose(fixture: ReturnType<typeof createFixture>): void {
+  const session = fixture.store.getSession(fixture.sessionId).descriptor;
+  savePersonalDevelopmentPurpose(fixture.store, { format: 1, ownerId: "personal-owner", taskId: "personal-task", creationOperationId: "personal-create",
+    sessionId: session.id, targetId: session.targetId, targetRevision: fixture.store.getTarget(session.targetId).revision.toString(),
+    backendId: session.backendId, backendGeneration: 0, phase: "adopted", editing: "editing", binding: session.binding, worktree: session.worktree! });
 }
 
 function durableMutationHost(

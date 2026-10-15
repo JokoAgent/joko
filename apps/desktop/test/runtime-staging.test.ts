@@ -13,10 +13,12 @@ import {
   auditRegularRuntimeTree,
   auditClaudeSessionRuntimeAssets,
   auditTerminalRuntimeAssets,
+  auditPersonalDevelopmentRuntimeAssets,
   copyRegularTree,
   claudeSessionElectronSmokeSource,
   extensionLibraryElectronSmokeSource,
   normalizeRuntimeCommandShims,
+  personalDevelopmentElectronSmokeSource,
   replaceDirectoryFromPrepared,
   rewriteRuntimePackageManifest,
   ORCHESTRATOR_BUNDLED_NPM_RUNTIME,
@@ -99,6 +101,33 @@ describe("isolated Orchestrator runtime staging", () => {
     });
     expect(() => sqliteVecRuntimeTarget("freebsd", "x64")).toThrow(/target platform/iu);
     expect(() => sqliteVecRuntimeTarget("linux", "ia32")).toThrow(/target architecture/iu);
+  });
+
+  it("relocates the personal command host with its exact manifest and runs it under Electron-Node", async () => {
+    const runtimeRoot = realpathSync(mkdtempSync(join(tmpdir(), "joko-personal-command-runtime-")));
+    cleanups.push(runtimeRoot);
+    const destination = resolve(runtimeRoot, "node_modules/@joko/personal-development");
+    mkdirSync(destination, { recursive: true });
+    const source = resolve(import.meta.dirname, "../../../packages/personal-development");
+    await copyRegularTree(resolve(source, "dist"), resolve(destination, "dist"));
+    writeFileSync(resolve(destination, "package.json"), JSON.stringify({ name: "@joko/personal-development", type: "module", exports: { ".": "./dist/index.js" } }));
+    const inspected = await auditPersonalDevelopmentRuntimeAssets(runtimeRoot, process.platform, process.arch);
+    expect(inspected.runnerEntry.startsWith(destination)).toBe(true);
+    const smokePath = resolve(runtimeRoot, "personal-command-smoke.mjs");
+    writeFileSync(smokePath, personalDevelopmentElectronSmokeSource(process.platform, process.arch));
+    const result = runNativeProbe({ runtimeRoot, smokePath });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ ok: true, commandRetired: true, runtimeRoot });
+    const manifestPath = resolve(destination, "dist/native-command-host/manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { architecture: string };
+    manifest.architecture = "ia32";
+    writeFileSync(manifestPath, JSON.stringify(manifest));
+    await expect(auditPersonalDevelopmentRuntimeAssets(runtimeRoot, process.platform, process.arch)).rejects.toThrow(/target identity/iu);
+    if (process.platform === "win32") {
+      manifest.architecture = process.arch; writeFileSync(manifestPath, JSON.stringify(manifest));
+      writeFileSync(resolve(destination, "dist/native-command-host/joko-command-host.exe"), "invalid");
+      await expect(auditPersonalDevelopmentRuntimeAssets(runtimeRoot, process.platform, process.arch)).rejects.toThrow(/content or Windows/iu);
+    }
   });
 
   it("loads and exercises the current sqlite-vec binary under Electron-Node", async () => {

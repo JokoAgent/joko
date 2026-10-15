@@ -25,6 +25,7 @@ export const ORCHESTRATOR_WEB_CONTENT_SECURITY_POLICY = [
   // The fixed, self-hosted diagram viewer evaluates its internal graph codec.
   // Inline and remote scripts remain forbidden.
   "script-src 'self' 'unsafe-eval'",
+  "worker-src 'self'",
   "style-src 'self' 'unsafe-inline'",
   // The QR authorization flow accepts only validated HTTPS weixin.qq.com URLs.
   "img-src 'self' blob: data: https://weixin.qq.com https://*.weixin.qq.com",

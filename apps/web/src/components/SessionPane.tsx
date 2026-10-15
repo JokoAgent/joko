@@ -39,6 +39,7 @@ import { RetryStatusIndicator } from "./RetryStatusIndicator.js";
 import { SessionRunningStatusBar } from "./SessionRunningStatusBar.js";
 import { PartnerWorkingStatus } from "./PartnerWorkingStatus.js";
 import { SessionScheduleNotice } from "./SessionScheduleNotice.js";
+import { PersonalDevelopmentReportActions, mergePersonalDevelopmentReports, usePersonalDevelopmentReports } from "./PersonalDevelopmentReport.js";
 import { activeBackgroundTaskIds } from "./running-status.js";
 import { collectTimelineSubagentRuns, timelineSubagentDetailResponseIsCurrent } from "./subagent-inline-card.js";
 import { RecoveryActionSingleFlight, executableRecoveryActions, nextPermissionMode, recoverySettingsHash, waitForRecoveryDelay, type ExecutableRecoveryAction, type RecoveryActionContext } from "./coding-ui-behavior.js";
@@ -554,6 +555,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     [errorTailProjection, recoveryPresentationTimeline]
   );
   const derivationOrigin = session.derivationOrigin;
+  const personalReportsEnabled = !reviewReadOnly && session.remoteWorkspace === undefined && controller.state.activeProfile?.managedLocal === true
+    && window.jokoDesktop?.capabilities.includes("development.personal") === true;
+  const personalReports = usePersonalDevelopmentReports(controller, session.id, personalReportsEnabled);
+  const timelineWithPersonalReports = useMemo(() => mergePersonalDevelopmentReports(visibleTimeline, personalReports), [visibleTimeline, personalReports]);
+  const personalReportActions = useMemo(() => personalReportsEnabled && controller.state.connectionState === "connected"
+    ? { controlPersonalDevelopmentDoctor: controller.controlPersonalDevelopmentDoctor, controlPersonalDevelopmentTask: controller.controlPersonalDevelopmentTask, navigate: controller.navigate, openHttpLink: controller.openHttpLink } : undefined,
+    [personalReportsEnabled, controller.state.connectionState, controller.controlPersonalDevelopmentDoctor, controller.controlPersonalDevelopmentTask, controller.navigate, controller.openHttpLink]);
   const derivationOriginNavigation = sessionDerivationOriginRoute(
     derivationOrigin,
     controller.state.snapshot.sessions
@@ -1922,7 +1930,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         openFileWithApplication: controller.openArtifactFileWithApplication,
         revealSource: controller.revealArtifactSource
       } : undefined}>
-      <Timeline
+      <PersonalDevelopmentReportActions.Provider value={personalReportActions}><Timeline
         key={timelineResourceOwnerKey}
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
         viewportOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, session.id, String(session.generation)])}
@@ -1930,7 +1938,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         sessionName={session.name}
         workspaceId={canOpenWorkspaceReferences && controller.state.connectionState === "connected" ? workspace?.id : undefined}
         onReadArtifact={controller.state.connectionState === "connected" ? controller.readSessionArtifact : undefined}
-        items={visibleTimeline}
+        items={timelineWithPersonalReports}
         sessionActive={running}
         derivationOrigin={derivationOrigin}
         sessionCreatedAt={session.createdAt}
@@ -2035,7 +2043,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           }
         }}
       />
-      </NativeFileActionsContext.Provider>
+      </PersonalDevelopmentReportActions.Provider></NativeFileActionsContext.Provider>
       <div ref={bottomOverlayRef} className="session-bottom-overlay">
       {!reviewReadOnly && <SessionScheduleNotice
         ownerId={controller.state.activeProfile?.serverId ?? controller.state.activeProfile?.id ?? "local"}

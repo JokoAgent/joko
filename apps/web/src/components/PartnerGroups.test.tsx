@@ -7,7 +7,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { emptySnapshot, type PartnerProfileView } from "../model.js";
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { PartnerGroupPage, PartnerGroupsSection } from "./PartnerGroups.js";
+import { PartnerGroupPage, PartnerGroupsNavigation, PartnerGroupsSection } from "./PartnerGroups.js";
 
 const m = wire.partnerGroupMessages("en"), t = (key: string) => key;
 let root: Root, host: HTMLDivElement;
@@ -16,17 +16,17 @@ beforeEach(() => { vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); localStorage
   vi.stubGlobal("IntersectionObserver", class { constructor(callback: IntersectionObserverCallback) { observers.push(callback); } observe() {} disconnect() {} });
   host = document.createElement("div"); document.body.append(host); root = createRoot(host);
 });
-afterEach(async () => { await act(async () => root.unmount()); document.body.replaceChildren(); localStorage.clear(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(async () => { await act(async () => root.unmount()); document.body.replaceChildren(); localStorage.clear(); vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 function fixture(empty = false) {
   let group = create(wire.PartnerGroupSummarySchema, { id: "group-one", name: "Shared project", revision: { value: 1n }, unread: true,
     replyMode: wire.PartnerGroupReplyMode.MENTIONED, speakingMode: wire.PartnerGroupSpeakingMode.AUTO,
     members: ["first", "second"].map(partnerId => ({ partnerId, name: "Alex", status: wire.PartnerGroupMemberStatus.ACTIVE })) });
-  let groups = empty ? [] : [group], messages = [4n, 5n].map(sequence => create(wire.PartnerGroupMessageSchema, { id: `message-${sequence}`, sequence, kind: wire.PartnerGroupMessageKind.MESSAGE,
+  let changeSequence = 1n, groups = empty ? [] : [group], messages = [4n, 5n].map(sequence => create(wire.PartnerGroupMessageSchema, { id: `message-${sequence}`, sequence, kind: wire.PartnerGroupMessageKind.MESSAGE,
     authorKind: wire.PartnerGroupAuthorKind.PARTNER, authorPartnerId: "first", authorName: "Alex", content: `Reply ${sequence}` }));
   let plans: wire.PartnerGroupPlan[] = [];
   const receipts = new Map<string, wire.PartnerGroupMessage>();
   const api: wire.PartnerGroupApi = { ownerKey: "group-node-one", newRequestId: vi.fn(() => "group-request-original-0001"),
-    list: vi.fn(async () => create(wire.ListPartnerGroupsResponseSchema, { revision: { value: 1n }, groups, changeSequence: 1n })),
+    list: vi.fn(async () => create(wire.ListPartnerGroupsResponseSchema, { revision: { value: changeSequence }, groups, changeSequence })),
     get: vi.fn(async (_id, before) => create(wire.GetPartnerGroupResponseSchema, { detail: { group, messages: before === undefined ? messages : [2n, 3n].map(sequence => ({ id: `message-${sequence}`, sequence, content: `Earlier ${sequence}` })),
       plans, hasMoreBefore: before === undefined, canContinue: true } })),
     create: vi.fn(async (_revision, name, ids) => { group = { ...group, name, members: group.members.filter(item => ids.includes(item.partnerId)) }; groups = [group]; throw new Error("Creation response was lost"); }),
@@ -37,19 +37,39 @@ function fixture(empty = false) {
     update: vi.fn(async (_group, patch) => { group = { ...group, name: patch.name ?? group.name }; groups = [group]; return group; }), members: vi.fn(), remove: vi.fn(async () => undefined),
     continue: vi.fn(async () => undefined), stop: vi.fn(async () => undefined), markRead: vi.fn(async () => undefined),
     planAction: vi.fn(async () => undefined), planEdit: vi.fn(async () => undefined), respond: vi.fn(async () => undefined), file: vi.fn(async () => create(wire.BlobRefSchema, { blobId: "handoff-blob", fileName: "result.txt", byteSize: 10n })),
-    changes: async function* (_after, signal) { if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); } };
+    changes: vi.fn(async function* (_after, signal) { if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); }) };
   const partners = group.members.map(member => ({ id: member.partnerId, displayName: member.name, avatar: "orbit", lifecycle: "active" } as PartnerProfileView));
   const controller = { state: { ready: true, connectionState: "connected", connectionGeneration: 1, snapshot: emptySnapshot(), effectiveLocale: "en", preferences: DEFAULT_UI_PREFERENCES,
-    activeProfile: { id: "profile-one", serverId: "node-one", deviceId: "device-one", origin: "http://localhost:4318" } },
+    activeProfile: { id: "profile-one", serverId: "node-one", deviceId: "device-one", origin: "http://localhost:4318" }, route: { kind: "session", sessionId: "session-one" } },
     partnerGroupApi: vi.fn(() => api), listPartners: vi.fn(async () => ({ partners })), navigate: vi.fn(),
     uploadPartnerGroupFile: vi.fn(async (file: File) => create(wire.BlobRefSchema, { blobId: "uploaded-blob", fileName: file.name, mediaType: file.type, byteSize: BigInt(file.size), sha256Hex: "a".repeat(64) })),
     getArtifactUrl: vi.fn(async () => "blob:group-image"), releaseArtifactUrl: vi.fn(), downloadArtifact: vi.fn(async () => ({ status: "downloaded" })),
     openArtifactFile: vi.fn(async () => ({ status: "unavailable" })) } as unknown as AppController;
-  return { api, controller, partners, group, setMessages: (value: wire.PartnerGroupMessage[]) => { messages = value; }, setPlans: (value: wire.PartnerGroupPlan[]) => { plans = value; } };
+  return { api, controller, partners, group, setGroups: (value: wire.PartnerGroupSummary[]) => { groups = value; changeSequence++; },
+    setMessages: (value: wire.PartnerGroupMessage[]) => { messages = value; }, setPlans: (value: wire.PartnerGroupPlan[]) => { plans = value; } };
 }
 async function settle() { for (let i = 0; i < 8; i++) await Promise.resolve(); }
 function button(label: string, parent: ParentNode = host) { const found = [...parent.querySelectorAll<HTMLButtonElement>("button")].find(item => item.getAttribute("aria-label") === label || item.textContent === label); expect(found, label).toBeDefined(); return found!; }
 async function input(element: HTMLInputElement | HTMLTextAreaElement, text: string) { await act(async () => { Object.getOwnPropertyDescriptor(element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, "value")!.set!.call(element, text); element.dispatchEvent(new Event("input", { bubbles: true })); }); }
+it("keeps the ordinary task navigation current from an empty directory and retires finite reads when hidden", async () => {
+  vi.useFakeTimers(); const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  const f = fixture(true);
+  await act(async () => { root.render(<PartnerGroupsNavigation controller={f.controller} t={t} onClose={() => undefined} />); await settle(); });
+  expect(host.querySelector(".partner-group-directory-row")).toBeNull(); expect(f.api.changes).not.toHaveBeenCalled(); expect(f.api.list).toHaveBeenCalledTimes(1);
+  let finish: ((value: wire.ListPartnerGroupsResponse) => void) | undefined, readSignal: AbortSignal | undefined;
+  vi.mocked(f.api.list).mockImplementationOnce(signal => { readSignal = signal; return new Promise(resolve => { finish = resolve; }); });
+  await act(async () => { vi.advanceTimersByTime(1_000); await settle(); }); expect(f.api.list).toHaveBeenCalledTimes(2);
+  await act(async () => { vi.advanceTimersByTime(2_000); await settle(); }); expect(f.api.list).toHaveBeenCalledTimes(2);
+  await act(async () => { visibility.mockReturnValue("hidden"); document.dispatchEvent(new Event("visibilitychange")); await settle(); });
+  expect(readSignal?.aborted).toBe(true);
+  await act(async () => { finish!(create(wire.ListPartnerGroupsResponseSchema, { revision: { value: 99n }, groups: [f.group], changeSequence: 99n })); await settle(); });
+  expect(host.querySelector(".partner-group-directory-row")).toBeNull();
+  f.setGroups([f.group]);
+  await act(async () => { visibility.mockReturnValue("visible"); document.dispatchEvent(new Event("visibilitychange")); await settle(); });
+  expect(host.querySelector(".partner-group-directory-row")?.textContent).toContain("Shared project"); expect(f.api.list).toHaveBeenCalledTimes(3);
+  await act(async () => { window.dispatchEvent(new Event("pagehide")); vi.advanceTimersByTime(10_000); await settle(); });
+  expect(f.api.list).toHaveBeenCalledTimes(3); expect(f.api.changes).not.toHaveBeenCalled();
+});
 it("keeps a persisted unknown creation in the actual StrictMode dialog until its authenticated receipt is recovered", async () => {
   const f = fixture(true); await act(async () => { root.render(<StrictMode><PartnerGroupsSection controller={f.controller} partners={f.partners} t={t} /></StrictMode>); await settle(); });
   await act(async () => button(m.create).click()); const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;

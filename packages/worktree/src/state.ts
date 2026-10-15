@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { WorktreeServiceError, type WorktreeErrorCode } from "./errors.js";
 import { WorktreeOperationControl } from "./operation.js";
-import type { WorktreeSourceResolution } from "./types.js";
+import type { WorktreeRecyclePolicy, WorktreeSourceResolution } from "./types.js";
 
 const STATE_FILE_NAME = "state.json";
 const MAXIMUM_STATE_BYTES = 10 * 1024 * 1024;
@@ -60,6 +60,8 @@ export interface ManagedWorktreeEntry {
   /** State-first transfer of a deleted worktree snapshot into the user's stash.
    * The exact object, never its subject or position, authorizes ref retirement. */
   readonly deletionTransfer?: ManagedWorktreeDeletionTransfer;
+  /** Present only after this exact checkout's Product lifecycle requests release. */
+  readonly recycle?: WorktreeRecyclePolicy;
   readonly createdAt: number;
   readonly updatedAt: number;
 }
@@ -299,6 +301,7 @@ function validateEntry(value: unknown): ManagedWorktreeEntry {
   const pendingOwnerRefTransition = validateOwnerRefTransition(value["pendingOwnerRefTransition"]);
   const checkoutCleanup = validateCheckoutCleanup(value["checkoutCleanup"]);
   const deletionTransfer = validateDeletionTransfer(value["deletionTransfer"]);
+  const recycle = validateRecyclePolicy(value["recycle"]);
   if (pendingOwnerRefTransition !== undefined
     && (archiveSnapshot?.kind !== "dirty" || archiveSnapshot.sha !== pendingOwnerRefTransition.sha)) {
     throw new WorktreeServiceError("STATE_CORRUPT", "A pending owner ref does not match its dirty archive identity.");
@@ -339,8 +342,30 @@ function validateEntry(value: unknown): ManagedWorktreeEntry {
     ...(pendingOwnerRefTransition === undefined ? {} : { pendingOwnerRefTransition }),
     ...(checkoutCleanup === undefined ? {} : { checkoutCleanup }),
     ...(deletionTransfer === undefined ? {} : { deletionTransfer }),
+    ...(recycle === undefined ? {} : { recycle }),
     createdAt: createdAt as number,
     updatedAt: updatedAt as number
+  };
+}
+
+function validateRecyclePolicy(value: unknown): WorktreeRecyclePolicy | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || Object.keys(value).length !== 7
+    || typeof value["generation"] !== "string" || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/u.test(value["generation"])
+    || typeof value["retainForRestore"] !== "boolean"
+    || !["retrying", "waiting", "paused", "kept"].includes(String(value["state"]))
+    || !["pending", "in_use", "changed", "kept", "integrity", "storage", "identity", "failed"].includes(String(value["reason"]))
+    || !["failures", "failedWorkMs", "nextAttemptAt"].every(key => Number.isSafeInteger(value[key]) && Number(value[key]) >= 0)
+    || Number(value["failures"]) > 1_000_000
+    || ((value["state"] === "kept") !== (value["reason"] === "kept"))
+    || (value["state"] !== "retrying" && value["nextAttemptAt"] !== 0)) {
+    throw new WorktreeServiceError("STATE_CORRUPT", "A worktree recycle policy is invalid.");
+  }
+  return {
+    generation: value["generation"], retainForRestore: value["retainForRestore"],
+    state: value["state"] as WorktreeRecyclePolicy["state"], reason: value["reason"] as WorktreeRecyclePolicy["reason"],
+    failures: value["failures"] as number, failedWorkMs: value["failedWorkMs"] as number,
+    nextAttemptAt: value["nextAttemptAt"] as number
   };
 }
 
@@ -444,7 +469,8 @@ function freezeEntry(entry: ManagedWorktreeEntry): ManagedWorktreeEntry {
       : { checkoutCleanup: Object.freeze({ ...entry.checkoutCleanup }) }),
     ...(entry.deletionTransfer === undefined
       ? {}
-      : { deletionTransfer: Object.freeze({ ...entry.deletionTransfer }) })
+      : { deletionTransfer: Object.freeze({ ...entry.deletionTransfer }) }),
+    ...(entry.recycle === undefined ? {} : { recycle: Object.freeze({ ...entry.recycle }) })
   });
 }
 

@@ -1,0 +1,344 @@
+syntax = "proto3";
+
+package joko.v1;
+
+service PersonalDevelopmentService {
+  rpc GetPersonalDevelopmentState(GetPersonalDevelopmentStateRequest) returns (GetPersonalDevelopmentStateResponse);
+  rpc WatchPersonalDevelopmentState(WatchPersonalDevelopmentStateRequest) returns (stream WatchPersonalDevelopmentStateResponse);
+  rpc RunPersonalDevelopmentAction(RunPersonalDevelopmentActionRequest) returns (RunPersonalDevelopmentActionResponse);
+  rpc StartPersonalDevelopmentTask(StartPersonalDevelopmentTaskRequest) returns (StartPersonalDevelopmentTaskResponse);
+  rpc ControlPersonalDevelopmentTask(ControlPersonalDevelopmentTaskRequest) returns (ControlPersonalDevelopmentTaskResponse);
+  rpc StartPersonalDevelopmentDoctor(StartPersonalDevelopmentDoctorRequest) returns (StartPersonalDevelopmentDoctorResponse);
+  rpc ControlPersonalDevelopmentDoctor(ControlPersonalDevelopmentDoctorRequest) returns (ControlPersonalDevelopmentDoctorResponse);
+}
+
+message PersonalDevelopmentEmpty {}
+message GetPersonalDevelopmentStateRequest {}
+message WatchPersonalDevelopmentStateRequest { int64 after_generation = 1; }
+message GetPersonalDevelopmentStateResponse {
+  PersonalDevelopmentState state = 1;
+  bool available = 2;
+  string unavailable_reason = 3;
+}
+message WatchPersonalDevelopmentStateResponse {
+  PersonalDevelopmentState state = 1;
+  bool available = 2;
+  string unavailable_reason = 3;
+}
+
+message PersonalDevelopmentToolCheck {
+  string id = 1;
+  string status = 2;
+  string version = 3;
+  string reason = 4;
+  double free_gib = 5;
+  string source = 6;
+  PersonalDevelopmentToolProgress progress = 7;
+}
+message PersonalDevelopmentToolProgress {
+  int64 loaded = 1;
+  optional int64 total = 2;
+  optional double percent = 3;
+}
+message PersonalDevelopmentEnvironment {
+  string status = 1;
+  repeated PersonalDevelopmentToolCheck checks = 2;
+  PersonalDevelopmentOperation operation = 3;
+  string platform = 4;
+  string arch = 5;
+}
+message PersonalDevelopmentSource {
+  string status = 1;
+  string channel = 2;
+  string version = 3;
+  string ref = 4;
+  string commit = 5;
+  string upstream_commit = 6;
+  string error = 7;
+  string target_channel = 8;
+  string target_version = 9;
+  string current_branch = 10;
+  string base_commit = 11;
+  string main_commit = 12;
+  string main_remote_commit = 13;
+  optional int64 main_ahead = 14;
+  optional int64 main_behind = 15;
+  optional int64 personal_ahead = 16;
+  optional int64 personal_behind = 17;
+  PersonalDevelopmentLatestSourceVersion latest_version = 18;
+}
+message PersonalDevelopmentLatestSourceVersion {
+  string status = 1;
+  string channel = 2;
+  string ref = 3;
+  string commit = 4;
+  optional int64 ahead = 5;
+  optional int64 behind = 6;
+  int64 checked_at_ms = 7;
+}
+message PersonalDevelopmentTask {
+  string task_id = 1;
+  string session_id = 2;
+  string title = 3;
+  string request = 4;
+  string status = 5;
+  string base_commit = 6;
+  string branch = 7;
+  string completion_id = 8;
+  int64 created_at_ms = 9;
+  // Durable preparation intent; operation is the exact current attempt only.
+  string stage = 10;
+  string error = 11;
+  PersonalDevelopmentOperation operation = 12;
+}
+message PersonalDevelopmentHistoryEntry {
+  string id = 1;
+  string task_id = 2;
+  string session_id = 3;
+  string title = 4;
+  string base_commit = 5;
+  string tree = 6;
+  string commit = 7;
+  string state = 8;
+  bool hidden = 9;
+  int64 created_at_ms = 10;
+}
+message PersonalDevelopmentVersion {
+  string generation = 1;
+  string commit = 2;
+  string tree = 3;
+  int64 created_at_ms = 4;
+}
+message PersonalDevelopmentVersionState {
+  string selected = 1;
+  PersonalDevelopmentVersion personal = 2;
+  bool switching = 3;
+  string current_id = 4;
+  string current_generation = 5;
+  string original_version = 6;
+  bool original_development = 7;
+  string pending_status = 8;
+}
+message PersonalDevelopmentOperation {
+  string id = 1;
+  string kind = 2;
+  string status = 3;
+  string stage = 4;
+  string error = 5;
+  int64 started_at_ms = 6;
+  int64 finished_at_ms = 7;
+  optional double percent = 8;
+  PersonalDevelopmentDependencyProgress dependency_progress = 9;
+  repeated PersonalDevelopmentDiagnostic diagnostics = 10;
+}
+message PersonalDevelopmentDependencyProgress {
+  int64 resolved = 1;
+  int64 reused = 2;
+  int64 downloaded = 3;
+  int64 added = 4;
+}
+message PersonalDevelopmentDiagnostic {
+  string stage = 1;
+  string code = 2;
+  optional int32 exit_code = 3;
+}
+message PersonalDevelopmentMerge {
+  string id = 1;
+  string status = 2;
+  string baseline_commit = 3;
+  string upstream_commit = 4;
+  string task_id = 5;
+  string session_id = 6;
+}
+message PersonalDevelopmentTest {
+  string task_id = 1;
+  string completion_id = 2;
+  string status = 3;
+}
+message PersonalDevelopmentState {
+  int64 generation = 1;
+  PersonalDevelopmentEnvironment environment = 2;
+  PersonalDevelopmentSource source = 3;
+  repeated PersonalDevelopmentTask tasks = 4;
+  repeated PersonalDevelopmentHistoryEntry history = 5;
+  PersonalDevelopmentVersionState versions = 6;
+  repeated PersonalDevelopmentOperation operations = 7;
+  PersonalDevelopmentMerge merge = 8;
+  repeated PersonalDevelopmentTest tests = 9;
+  bool sync_latest_before_build = 10;
+  repeated PersonalDevelopmentDoctorRun doctor_runs = 11;
+}
+
+message PersonalDevelopmentUpstreamRuntime {
+  string channel = 1;
+  string version = 2;
+  string commit = 3;
+  // exact, unknown. A source checkout is not running-version proof.
+  string confidence = 4;
+}
+message PersonalDevelopmentUpstreamItem {
+  int32 number = 1;
+  string title = 2;
+  string state = 3;
+  string html_url = 4;
+  string author = 5;
+  string updated_at = 6;
+  string summary = 7;
+  // included, notIncluded, unknown.
+  string inclusion = 8;
+  bool draft = 9;
+}
+message PersonalDevelopmentUpstreamQuery {
+  string status = 1;
+  repeated PersonalDevelopmentUpstreamItem items = 2;
+  repeated string terms = 3;
+  PersonalDevelopmentUpstreamRuntime runtime = 4;
+  int32 excluded_included = 5;
+  bool has_more = 6;
+  string failure = 7;
+}
+message PersonalDevelopmentDoctorRun {
+  string run_id = 1;
+  string session_id = 2;
+  // check, prepare.
+  string mode = 3;
+  string request = 4;
+  // running, completed, cancelled, failed, unknown.
+  string status = 5;
+  string stage = 6;
+  repeated PersonalDevelopmentToolCheck checks = 7;
+  PersonalDevelopmentSource source = 8;
+  PersonalDevelopmentUpstreamQuery upstream = 9;
+  // Empty until the explicit wait/personal choice.
+  string decision = 10;
+  string task_id = 11;
+  string code_session_id = 12;
+  string error = 13;
+  int64 created_at_ms = 14;
+  int64 updated_at_ms = 15;
+  int32 attempt = 16;
+  string platform = 17;
+  string arch = 18;
+  PersonalDevelopmentOperation operation = 19;
+}
+message StartPersonalDevelopmentDoctorRequest {
+  string operation_id = 1;
+  // Empty creates only a durable ordinary Session container, without a turn.
+  string session_id = 2;
+  string mode = 3;
+  string request = 4;
+  string title = 5;
+  string target_id = 6;
+  string provider_id = 7;
+  string model_id = 8;
+  string effort = 9;
+  bool fast_mode = 10;
+  string permission_mode = 11;
+  bool plan_mode = 12;
+}
+message ControlPersonalDevelopmentDoctorRequest {
+  string operation_id = 1;
+  string run_id = 2;
+  // cancel, retry, wait, personal. Retries update the same card.
+  string action = 3;
+}
+message StartPersonalDevelopmentDoctorResponse {
+  PersonalDevelopmentDoctorRun report = 1;
+  string operation_id = 2;
+}
+message ControlPersonalDevelopmentDoctorResponse {
+  PersonalDevelopmentDoctorRun report = 1;
+  string operation_id = 2;
+}
+
+message PersonalDevelopmentPrepareSource {
+  // Exact current channels: dev, beta, release.
+  string channel = 1;
+  string version = 2;
+}
+message PersonalDevelopmentMergeAction {
+  // start, resolve, adopt, cancel.
+  string action = 1;
+  // Local Backend route only; the service owns the managed candidate directory.
+  string target_id = 2;
+}
+message PersonalDevelopmentHistoryAction {
+  string entry_id = 1;
+  // integrate, revert, reapply, hide.
+  string action = 2;
+}
+message PersonalDevelopmentBuildAction {
+  string task_id = 1;
+  repeated string entry_ids = 2;
+}
+message PersonalDevelopmentVersionAction {
+  // switch, remove.
+  string action = 1;
+  // original, personal.
+  string id = 2;
+}
+message PersonalDevelopmentSyncAction { bool enabled = 1; }
+message PersonalDevelopmentCancelAction { string operation_id = 1; }
+enum PersonalDevelopmentDirectoryKind {
+  PERSONAL_DEVELOPMENT_DIRECTORY_KIND_UNSPECIFIED = 0;
+  PERSONAL_DEVELOPMENT_DIRECTORY_KIND_SOURCE = 1;
+  PERSONAL_DEVELOPMENT_DIRECTORY_KIND_TOOLS = 2;
+}
+message PersonalDevelopmentOpenDirectory { PersonalDevelopmentDirectoryKind directory = 1; }
+message RunPersonalDevelopmentActionRequest {
+  // Reuse after an unknown outcome. An admitted action outlives its connection.
+  string operation_id = 1;
+  oneof action {
+    PersonalDevelopmentEmpty check_environment = 2;
+    PersonalDevelopmentEmpty prepare_environment = 3;
+    PersonalDevelopmentPrepareSource prepare_source = 4;
+    PersonalDevelopmentEmpty clear_source = 5;
+    PersonalDevelopmentMergeAction merge_source = 6;
+    PersonalDevelopmentHistoryAction history = 7;
+    PersonalDevelopmentBuildAction build = 8;
+    PersonalDevelopmentEmpty recover_build = 9;
+    PersonalDevelopmentSyncAction sync_latest_before_build = 10;
+    PersonalDevelopmentVersionAction version = 11;
+    PersonalDevelopmentEmpty reveal_build = 12;
+    PersonalDevelopmentCancelAction cancel = 13;
+    PersonalDevelopmentEmpty recover_processes = 14;
+    PersonalDevelopmentEmpty refresh_source_status = 16;
+    PersonalDevelopmentOpenDirectory open_directory = 15;
+  }
+}
+message RunPersonalDevelopmentActionResponse {
+  string operation_id = 1;
+  PersonalDevelopmentState state = 2;
+}
+message ControlPersonalDevelopmentTaskResponse {
+  string operation_id = 1;
+  PersonalDevelopmentState state = 2;
+}
+message StartPersonalDevelopmentTaskRequest {
+  string operation_id = 1;
+  string request = 2;
+  string title = 3;
+  string origin_session_id = 4;
+  // Selects the local Backend/model route. The service owns the source Target.
+  string target_id = 5;
+  string provider_id = 6;
+  string model_id = 7;
+  string effort = 8;
+  bool fast_mode = 9;
+  string permission_mode = 10;
+  bool plan_mode = 11;
+}
+message StartPersonalDevelopmentTaskResponse {
+  string operation_id = 1;
+  string task_id = 2;
+  // Absent until native creation and Session adoption are confirmed.
+  string session_id = 3;
+  PersonalDevelopmentState state = 4;
+}
+message ControlPersonalDevelopmentTaskRequest {
+  string operation_id = 1;
+  string task_id = 2;
+  // continue, end, start_test, stop_test, retry_preparation.
+  string action = 3;
+  string message = 4;
+}

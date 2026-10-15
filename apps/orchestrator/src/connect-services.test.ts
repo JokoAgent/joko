@@ -69,6 +69,9 @@ describe("Connect service composition", () => {
     const expectedServices = [
       contract.ConnectionService,
       contract.AppDefaultModelService,
+      contract.HelpService,
+      contract.PersonalDevelopmentService,
+      contract.DesktopPersonalDevelopmentHostService,
       contract.EventService,
       contract.OperationService,
       contract.BackendService,

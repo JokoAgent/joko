@@ -196,6 +196,16 @@ import {
 } from "./personalization-inference.js";
 import { SessionNavigationCoordinator } from "./session-navigation-coordinator.js";
 import { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
+import { createWorktreeRecycleSafetyCheck } from "./worktree-recycle-safety.js";
+import { PersonalDevelopmentError, PersonalDevelopmentOwner, createSupervisedDevelopmentProcessAuthority } from "@joko/personal-development";
+import { PersonalDevelopmentCoordinator, personalDevelopmentOwnerIdentity } from "./personal-development-coordinator.js";
+import { PersonalDevelopmentNativeBroker } from "./personal-development-native-broker.js";
+import { PersonalDevelopmentReportTools } from "./personal-development-report-tools.js";
+import { createPersonalDevelopmentWorktreeAuthority } from "./personal-development-worktree.js";
+import { PersonalDevelopmentDoctor } from "./personal-development-doctor.js";
+import { createPersonalDevelopmentDoctorPrerequisites } from "./personal-development-doctor-environment.js";
+import { HelpAssistant } from "./help-assistant.js";
+import { HelpFeedbackStore } from "./help-feedback-store.js";
 import { SubagentModelSettings } from "./subagent-model-settings.js";
 import { ModelFavoriteSettings } from "./model-favorite-settings.js";
 import { DeferredBackendRestartCoordinator } from "./deferred-backend-restart.js";
@@ -494,6 +504,12 @@ export interface OrchestratorApplication {
   readonly visionBridge?: VisionBridgeCoordinator;
   readonly promptPrediction?: PromptPredictionService;
   readonly auxiliaryText?: AuxiliaryTextRouting;
+  readonly helpAssistant?: HelpAssistant;
+  readonly helpFeedback?: HelpFeedbackStore;
+  readonly personalDevelopment?: PersonalDevelopmentOwner;
+  readonly personalDevelopmentCoordinator?: PersonalDevelopmentCoordinator;
+  readonly personalDevelopmentNativeBroker?: PersonalDevelopmentNativeBroker;
+  readonly personalDevelopmentDoctor?: PersonalDevelopmentDoctor;
   readonly subagentModels?: SubagentModelSettings;
   readonly modelFavorites: ModelFavoriteSettings;
   readonly sessionNavigation?: SessionNavigationCoordinator;
@@ -643,6 +659,21 @@ export async function createOrchestratorApplication(
   let voiceDictionaryPeers!: VoiceDictionaryPeerManager;
   try {
   let sessionWorktrees!: SessionWorktreeCoordinator;
+  let personalDevelopment: PersonalDevelopmentOwner | undefined;
+  let personalDevelopmentCoordinator: PersonalDevelopmentCoordinator | undefined;
+  let personalDevelopmentNativeBroker: PersonalDevelopmentNativeBroker | undefined;
+  let personalDevelopmentDoctor: PersonalDevelopmentDoctor | undefined;
+  let stopPersonalDevelopmentNotifications = (): void => undefined;
+  let personalDevelopmentClose: Promise<void> | undefined;
+  const closePersonalDevelopment = (): Promise<void> => personalDevelopmentClose ??= (async () => {
+    stopPersonalDevelopmentNotifications();
+    const failures: unknown[] = [];
+    for (const close of [() => personalDevelopmentDoctor?.dispose(), () => personalDevelopmentCoordinator?.dispose(),
+      () => personalDevelopment?.dispose(), () => personalDevelopmentNativeBroker?.close()]) {
+      try { await close(); } catch (error) { failures.push(error); }
+    }
+    if (failures.length > 0) throw new AggregateError(failures, "Personal development owners could not finish shutdown.");
+  })();
   let deferredBackendRestarts: DeferredBackendRestartCoordinator | undefined;
   const subagentModels = new SubagentModelSettings({
     store,
@@ -994,6 +1025,9 @@ export async function createOrchestratorApplication(
     )
   });
   const unregisterImageGenerationBridge = mcpRouter.registerBridgeToolProvider(imageGenerationBridge);
+  const unregisterPersonalDevelopmentTools = mcpRouter.registerBridgeToolProvider(
+    new PersonalDevelopmentReportTools(() => personalDevelopmentCoordinator)
+  );
   let sessionHostForHelperTools: SessionHost | undefined;
   let messageSearchForHelperTools: MessageSearchEmbeddingCoordinator | undefined;
   const unregisterSessionHelperTools = mcpRouter.registerBridgeToolProvider(
@@ -1779,11 +1813,13 @@ export async function createOrchestratorApplication(
       };
     },
     onSessionRuntimeClosed: (sessionId) => {
+      sessionWorktrees.notifyRecycleOpportunity(sessionId);
       androidRuntimeForSessionCleanup?.closeSession(sessionId);
       void computerBridgeForSessionCleanup?.closeSession(sessionId).catch(() => undefined);
     },
     onUserInputAdmitted: (transactionStore, result) => objectives?.onUserInputAdmitted(transactionStore, result),
     onServiceRunSettled: async (input) => {
+      personalDevelopmentCoordinator?.onRunSettled(input);
       const settlements: Promise<void>[] = [];
       if (objectives !== undefined) settlements.push(objectives.onRunSettled(input));
       if (messaging !== undefined) settlements.push(Promise.resolve(messaging.onRunSettled(input)));
@@ -1794,6 +1830,48 @@ export async function createOrchestratorApplication(
     onServiceInteractionOpened: (input) => { partnerGroupRuntime?.interactionChanged(input.sessionId); return messaging?.onInteractionOpened(input); },
     onServiceInteractionSettled: (input) => { partnerGroupRuntime?.interactionChanged(input.sessionId); return messaging?.onInteractionSettled(input); },
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
+  });
+  const personalDevelopmentRoot = join(config.dataDirectory, "personal-development");
+  personalDevelopmentNativeBroker = new PersonalDevelopmentNativeBroker({
+    directory: join(config.dataDirectory, "personal-development-native"), connections
+  });
+  await personalDevelopmentNativeBroker.initialize();
+  const nativeDevelopmentVersions = personalDevelopmentNativeBroker.nativeVersions;
+  const personalDevelopmentProcess = createSupervisedDevelopmentProcessAuthority({
+    journalDirectory: join(personalDevelopmentRoot, "command-journal"),
+    ...(config.personalDevelopmentCommandHostPath === undefined ? {} : { windowsHelperPath: config.personalDevelopmentCommandHostPath }),
+    nodeExecutable: process.execPath
+  });
+  const personalDevelopmentFetch = createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
+    environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) });
+  personalDevelopment = new PersonalDevelopmentOwner({
+    rootDirectory: personalDevelopmentRoot,
+    process: personalDevelopmentProcess,
+    worktrees: createPersonalDevelopmentWorktreeAuthority({ store, worktrees: sessionWorktrees,
+      ownerId: personalDevelopmentOwnerIdentity(personalDevelopmentRoot), sourceRoot: join(personalDevelopmentRoot, "source") }),
+    nativeVersions: { ...nativeDevelopmentVersions,
+      busy: async () => personalDevelopmentCoordinator?.busy() === true || await nativeDevelopmentVersions.busy() },
+    fetch: personalDevelopmentFetch
+  });
+  personalDevelopmentCoordinator = new PersonalDevelopmentCoordinator({ store, owner: personalDevelopment,
+    host: sessionHost, worktrees: sessionWorktrees, closeTerminals: sessionId => terminals.closeSession(sessionId),
+    availability: () => personalDevelopmentNativeBroker!.availability(),
+    sourceTarget: async () => {
+      const original = personalDevelopmentNativeBroker!.metadata()?.original;
+      if (original === undefined) throw new PersonalDevelopmentError("ENVIRONMENT_NOT_READY");
+      return { channel: original.development ? "dev" : /-beta(?:[.+-]|$)/iu.test(original.version) ? "beta" : "release", version: original.version };
+    }
+  });
+  personalDevelopmentNativeBroker.setVersionReconciler(input => personalDevelopment!.reconcileVersionHandoff(input));
+  personalDevelopmentDoctor = new PersonalDevelopmentDoctor({ store, owner: personalDevelopment,
+    host: sessionHost, coordinator: personalDevelopmentCoordinator,
+    prerequisites: createPersonalDevelopmentDoctorPrerequisites({ directory: personalDevelopmentRoot, process: personalDevelopmentProcess }),
+    runtime: async () => {
+      const sourceTarget = await personalDevelopmentCoordinator!.sourceTarget();
+      const current = personalDevelopmentNativeBroker!.metadata()?.current, artifact = personalDevelopment!.versions().personal;
+      return current?.id === "personal" && artifact !== undefined && current.generation === artifact.id
+        ? { ...sourceTarget, commit: artifact.commit, confidence: "exact" } : { ...sourceTarget, confidence: "unknown" };
+    }, fetch: personalDevelopmentFetch
   });
   const workingContextOwner = { ownerId: serverId, generation: durableRuntimeGeneration() };
   modelWorkingContext = composeModelWorkingContext({
@@ -2155,6 +2233,9 @@ export async function createOrchestratorApplication(
   const messageSearch = new MessageSearchEmbeddingCoordinator({ store, providers });
   messageSearchForHelperTools = messageSearch;
   const auxiliaryText = new AuxiliaryTextRouting({ store, routes: modelRoutes, providers });
+  const helpAssistant = new HelpAssistant({ store, auxiliary: auxiliaryText,
+    adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter === undefined ? [] : [adapter]; }) });
+  const helpFeedback = new HelpFeedbackStore(join(config.dataDirectory, "help-feedback"));
   const agentImportSources = dependencies.agentImportSources ?? { home: userInfo().homedir, environment: { ...process.env } };
   partnerImports = new PartnerImportManager({ storage: partnerImportStorage, ...agentImportSources,
     prepareCreation: selection => preparePartnerImportCreation(partners, selection), adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, partnerImportStorage, id, assertOwner),
@@ -2535,6 +2616,14 @@ export async function createOrchestratorApplication(
     });
     await partnerWorkbenches.initialize();
     await sessionHost.initialize();
+    await personalDevelopmentCoordinator.initialize();
+    personalDevelopmentDoctor.initialize();
+    personalDevelopmentCoordinator.setDoctorReports(personalDevelopmentDoctor);
+    stopPersonalDevelopmentNotifications = personalDevelopmentNativeBroker.subscribe(() => {
+      personalDevelopmentCoordinator!.notifyAvailability();
+      if (personalDevelopmentNativeBroker!.metadata() !== undefined) void personalDevelopment!.refreshVersions().catch(() => undefined);
+    });
+    await sessionWorktrees.startRecycleMaintenance(createWorktreeRecycleSafetyCheck({ store, sessionHost, terminals }));
     await partnerGroups.start();
     await partnerSessionTasks.initialize();
     await historyMaintenance.initialize();
@@ -2788,6 +2877,7 @@ export async function createOrchestratorApplication(
       try { await cleanup(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
     };
     closed = true;
+    await attempt(closePersonalDevelopment);
     await attempt(() => partnerImports?.close());
     await attempt(() => partnerImportRuntime.close());
     await attempt(() => deferredBackendRestarts?.dispose());
@@ -2861,6 +2951,7 @@ export async function createOrchestratorApplication(
     await attempt(() => partnerGroups?.close());
     await attempt(() => partnerGroupWorkspaces?.dispose());
     await attempt(() => auxiliaryText.dispose());
+    helpAssistant.close();
     await attempt(() => mcpRouter.dispose());
     await attempt(() => voiceInput.close());
     await attempt(() => sshKeys.close());
@@ -2982,6 +3073,12 @@ export async function createOrchestratorApplication(
     visionBridge,
     promptPrediction,
     auxiliaryText,
+    helpAssistant,
+    helpFeedback,
+    personalDevelopment,
+    personalDevelopmentCoordinator,
+    personalDevelopmentNativeBroker,
+    personalDevelopmentDoctor,
     partnerWorkingStatus,
     subagentModels,
     modelFavorites,
@@ -3023,6 +3120,8 @@ export async function createOrchestratorApplication(
         serviceCleanups.clear();
         deferredBackendRestarts?.dispose();
         for (const cleanup of cleanups) await attempt(cleanup);
+        await attempt(closePersonalDevelopment);
+        await attempt(() => unregisterPersonalDevelopmentTools());
         await attempt(() => partnerImports?.close());
         await attempt(() => partnerSessionTasks?.close());
         await attempt(() => unregisterPartnerSessionTaskTools());
@@ -3054,6 +3153,7 @@ export async function createOrchestratorApplication(
         partnerLearning?.dispose();
         await attempt(() => partnerLearning?.drain());
         await attempt(() => auxiliaryText.dispose());
+        helpAssistant.close();
         await attempt(() => providerAuth.beginShutdown());
         await attempt(() => providerAccountUsage.invalidate());
         await attempt(() => localBackendRuntimeSetup.close());
@@ -3135,6 +3235,7 @@ export async function createOrchestratorApplication(
       try { await cleanup(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
     };
     await attempt(() => startupPartnerImports?.close());
+    await attempt(closePersonalDevelopment);
     await attempt(() => partnerGroups?.close());
     await attempt(() => partnerGroupWorkspaces?.dispose());
     await attempt(() => startupPartnerImportRuntime?.close());

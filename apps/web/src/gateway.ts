@@ -1,5 +1,7 @@
 import { create, type MessageInitShape } from "@bufbuild/protobuf";
 import { AppDefaultModelService } from "@joko/contracts";
+import { HelpService, HelpRole, WorktreeRecycleAction, WorktreeRecycleState, WorktreeRecycleReason, type WorktreeRecycleRecord } from "@joko/contracts";
+import type { HelpMessageView, HelpAnswerView, HelpFeedbackDraftView, WorktreeRecycleRecordView } from "./model.js";
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
@@ -14,8 +16,10 @@ import { mapPartnerWorkingStatus } from "./partner-working-status.js";
 import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
 import { createClient, ConnectError, Code, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
+import { streamSharedOwnerEvents } from "./shared-owner-events.js";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
+import { createPersonalDevelopmentGateway } from "./personal-development-gateway.js";
 import { normalizeExtensionRecommendation } from "./extension-suggestion-handoff.js";
 import { UsageReportGroup } from "@joko/contracts";
 import { localRuntimeGateway } from "./local-runtime-gateway.js";
@@ -993,7 +997,7 @@ export interface PairingOutcome {
 }
 
 export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage">, AppDefaultModelUiPort {
-  connect(): Promise<void>;
+  connect(options?: { readonly snapshotOnly?: boolean }): Promise<void>;
   disconnect(): void;
   pair(origin: string, humanCode: string, deviceName: string): Promise<PairingOutcome>;
   /** Authoritative owner-runtime shutdown fence, sampled only on demand. */
@@ -1151,19 +1155,23 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     };
   }
 
-  async connect(): Promise<void> {
+  async connect(options?: { readonly snapshotOnly?: boolean }): Promise<void> {
     if (this.#profile === undefined || this.#authKey === undefined) {
       throw new GatewayError("A connection profile and credential are required.");
     }
     this.disconnect();
     this.#callbacks.onState?.("connecting", "Connecting to Joko…");
-    this.#transport = this.#transportFactory(this.#profile.origin, this.#authKey);
-    this.#abort = new AbortController();
+    const transport = this.#transportFactory(this.#profile.origin, this.#authKey);
+    const abort = new AbortController();
+    this.#transport = transport;
+    this.#abort = abort;
     try {
       await this.refresh();
+      if (abort.signal.aborted || this.#abort !== abort || this.#transport !== transport) return;
       this.#callbacks.onState?.("connected");
-      this.#streamTask = this.consumeEvents(this.#abort.signal);
+      if (options?.snapshotOnly !== true) this.#streamTask = this.consumeEvents(abort.signal);
     } catch (error) {
+      if (abort.signal.aborted || this.#abort !== abort || this.#transport !== transport) return;
       const gatewayError = normalizeError(error);
       if (isUnauthenticatedError(error)) await this.terminateAuthentication(gatewayError);
       else this.#callbacks.onError?.(gatewayError);
@@ -1545,6 +1553,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   getTerminalCapabilities(...args: Parameters<OperationApi["getTerminalCapabilities"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).getTerminalCapabilities(...args); }
+  getPersonalDevelopment(...args: Parameters<OperationApi["getPersonalDevelopment"]>) { const scope = this.captureActionScope(); return createPersonalDevelopmentGateway(scope.transport, scope.signal).getPersonalDevelopment(...args); }
+  watchPersonalDevelopment(...args: Parameters<OperationApi["watchPersonalDevelopment"]>) { const scope = this.captureActionScope(); return createPersonalDevelopmentGateway(scope.transport, scope.signal).watchPersonalDevelopment(...args); }
+  runPersonalDevelopmentAction(...args: Parameters<OperationApi["runPersonalDevelopmentAction"]>) { const scope = this.captureActionScope(); return createPersonalDevelopmentGateway(scope.transport, scope.signal).runPersonalDevelopmentAction(...args); }
+  startPersonalDevelopmentTask(...args: Parameters<OperationApi["startPersonalDevelopmentTask"]>) { const scope = this.captureActionScope(); return createPersonalDevelopmentGateway(scope.transport, scope.signal).startPersonalDevelopmentTask(...args); }
+  startPersonalDevelopmentDoctor(...args: Parameters<OperationApi["startPersonalDevelopmentDoctor"]>) { const scope = this.captureActionScope(); return createPersonalDevelopmentGateway(scope.transport, scope.signal).startPersonalDevelopmentDoctor(...args); }
+  controlPersonalDevelopmentDoctor(...args: Parameters<OperationApi["controlPersonalDevelopmentDoctor"]>) { const scope = this.captureActionScope(); return createPersonalDevelopmentGateway(scope.transport, scope.signal).controlPersonalDevelopmentDoctor(...args); }
+  controlPersonalDevelopmentTask(...args: Parameters<OperationApi["controlPersonalDevelopmentTask"]>) { const scope = this.captureActionScope(); return createPersonalDevelopmentGateway(scope.transport, scope.signal).controlPersonalDevelopmentTask(...args); }
   listTerminals(...args: Parameters<OperationApi["listTerminals"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).listTerminals(...args); }
   createTerminal(...args: Parameters<OperationApi["createTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).createTerminal(...args); }
   getTerminal(...args: Parameters<OperationApi["getTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).getTerminal(...args); }
@@ -2645,6 +2660,58 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (outcome === CompactSessionOutcome.COMPACTED) return "compacted";
     if (outcome === CompactSessionOutcome.NOOP) return "noop";
     throw new GatewayError("Orchestrator returned an unknown compact Session outcome.");
+  }
+
+  async askHelp(messages: readonly HelpMessageView[], locale: string, signal?: AbortSignal): Promise<HelpAnswerView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(HelpService, scope.transport).askHelp({ locale, messages: messages.map((message) => ({
+      role: message.role === "user" ? HelpRole.USER : HelpRole.ASSISTANT, content: message.content
+    })) }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.result.case === "noAnswer") return { kind: "noAnswer" };
+    if (response.result.case !== "answer" || !response.result.value.text.trim()) throw new GatewayError("The help response is incomplete.");
+    const { text, settingsSection } = response.result.value;
+    return { kind: "answer", text, ...(HELP_SETTINGS_SECTIONS.has(settingsSection) ? { settingsSection } : {}) };
+  }
+
+  async createHelpFeedbackDraft(draft: HelpFeedbackDraftView, signal?: AbortSignal): Promise<string> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(HelpService, scope.transport).createHelpFeedbackDraft(draft, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (!response.draftId || response.draftId.length > 256) throw new GatewayError("The local feedback receipt is incomplete.");
+    return response.draftId;
+  }
+
+  async listWorktreeRecycleStatus(signal?: AbortSignal): Promise<readonly WorktreeRecycleRecordView[]> {
+    const scope = this.captureActionScope(signal);
+    const client = createClient(WorktreeService, scope.transport);
+    const records: WorktreeRecycleRecordView[] = [], tokens = new Set<string>(), ids = new Set<string>();
+    let pageToken = "";
+    for (let page = 0; page < 100; page += 1) {
+      const response = await client.listWorktreeRecycleStatus({ page: { pageSize: 100, pageToken } }, { signal: scope.signal });
+      scope.signal.throwIfAborted();
+      for (const record of response.records) {
+        if (ids.has(record.id)) throw new GatewayError("The worktree recovery catalog changed while paging.");
+        ids.add(record.id);
+        records.push(mapWorktreeRecycleRecord(record));
+      }
+      pageToken = response.page?.nextPageToken ?? "";
+      if (pageToken === "") return records;
+      if (tokens.has(pageToken)) throw new GatewayError("The worktree recovery catalog returned a cyclic page.");
+      tokens.add(pageToken);
+    }
+    throw new GatewayError("The worktree recovery catalog exceeded its page limit.");
+  }
+
+  async controlWorktreeRecycle(record: Pick<WorktreeRecycleRecordView, "id" | "generation">, action: "retry" | "keep", signal?: AbortSignal): Promise<WorktreeRecycleRecordView | undefined> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(WorktreeService, scope.transport).controlWorktreeRecycle({ ...record,
+      action: action === "retry" ? WorktreeRecycleAction.RETRY : WorktreeRecycleAction.KEEP
+    }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    if (response.record === undefined) return undefined;
+    if (response.record.id !== record.id) throw new GatewayError("The worktree recovery receipt belongs to another record.");
+    return mapWorktreeRecycleRecord(response.record);
   }
 
   async probeTargetWorktree(targetId: string, signal?: AbortSignal): Promise<TargetWorktreeProbeView> {
@@ -9787,7 +9854,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         let lastGeneration = this.#snapshot?.generation;
         let lastSequence = this.#snapshot?.cursor;
         this.#callbacks.onState?.("connected");
-        for await (const response of client.streamEvents({ scope: OWNER_SCOPE, afterCursor: cursor }, { signal })) {
+        const profile = this.#profile;
+        const stream = this.#transportFactory === transportFor && profile !== undefined && this.#authKey !== undefined
+          && cursor !== undefined && typeof SharedWorker === "function"
+          ? streamSharedOwnerEvents({ profileId: profile.id, serverId: profile.serverId, deviceId: profile.deviceId, origin: profile.origin },
+            this.#authKey, cursor, signal, () => { if (this.#abort?.signal === signal) this.disconnect(); })
+          : client.streamEvents({ scope: OWNER_SCOPE, afterCursor: cursor }, { signal });
+        for await (const response of stream) {
           if (signal.aborted) return;
           const event = response.event;
           if (event === undefined) continue;
@@ -12768,6 +12841,25 @@ function backendAuthenticationState(value: AuthenticationState): NonNullable<Bac
   if (value === AuthenticationState.REFRESHING) return "refreshing";
   if (value === AuthenticationState.ERROR) return "error";
   return "unknown";
+}
+
+const HELP_SETTINGS_SECTIONS = new Set(["general", "personalization", "providers", "voice", "import", "connections", "messaging", "tools", "about"]);
+
+function mapWorktreeRecycleRecord(record: WorktreeRecycleRecord): WorktreeRecycleRecordView {
+  const states: Partial<Record<WorktreeRecycleState, WorktreeRecycleRecordView["state"]>> = {
+    [WorktreeRecycleState.RETRYING]: "retrying", [WorktreeRecycleState.WAITING]: "waiting",
+    [WorktreeRecycleState.PAUSED]: "paused", [WorktreeRecycleState.KEPT]: "kept"
+  };
+  const reasons: Partial<Record<WorktreeRecycleReason, WorktreeRecycleRecordView["reason"]>> = {
+    [WorktreeRecycleReason.PENDING]: "pending", [WorktreeRecycleReason.IN_USE]: "inUse", [WorktreeRecycleReason.CHANGED]: "changed",
+    [WorktreeRecycleReason.KEPT]: "kept", [WorktreeRecycleReason.INTEGRITY]: "integrity", [WorktreeRecycleReason.STORAGE]: "storage",
+    [WorktreeRecycleReason.IDENTITY]: "identity", [WorktreeRecycleReason.FAILED]: "failed"
+  };
+  const state = states[record.state], reason = reasons[record.reason], nextAttemptAt = Number(record.nextAttemptAtMs);
+  if (!record.id || !record.generation || !record.sessionId || state === undefined || reason === undefined
+    || !Number.isSafeInteger(nextAttemptAt) || nextAttemptAt < 0) throw new GatewayError("The worktree recovery record is incomplete.");
+  return { id: record.id, generation: record.generation, sessionId: record.sessionId, displayName: record.displayName,
+    pathDisplay: record.pathDisplay, state, reason, failures: record.failures, nextAttemptAt };
 }
 
 function mapWorktreeEligibility(value: WorktreeEligibility): TargetWorktreeProbeView["eligibility"] {
@@ -19485,7 +19577,7 @@ export function requiresEventSnapshotResync(error: unknown): boolean {
   let candidate: unknown = error;
   const seen = new Set<unknown>();
   while (candidate instanceof Error && !seen.has(candidate)) {
-    if (candidate instanceof ConnectError && candidate.code === Code.FailedPrecondition) return true;
+    if (candidate instanceof ConnectError && (candidate.code === Code.FailedPrecondition || candidate.code === Code.OutOfRange)) return true;
     seen.add(candidate);
     candidate = candidate.cause;
   }

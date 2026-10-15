@@ -61,6 +61,7 @@ import type {
 import { readHostSystemLocale, resolveLocalePreference } from "./system-locale.js";
 import { appendTextToComposerDocument, composerDocumentKeepingQuotes } from "./composer-quote-document.js";
 import { restoreRejectedComposerDraft } from "./composer-draft-recovery.js";
+import { sessionDraftSurface } from "./session-draft-surface.js";
 import { emptySnapshot } from "./model.js";
 import { visionBridgeToastStore } from "./vision-bridge-toast-store.js";
 import {
@@ -1062,6 +1063,7 @@ export function useAppController(): AppController {
           serverId: profile.serverId,
           profileId: profile.id,
           activeSessionId,
+          draftSurface: () => sessionDraftSurface(profile.id, effect.sessionId, () => gatewayGenerationRef.current === generation),
           isCurrent: () => gatewayGenerationRef.current === generation,
           isLatestEditorEffect: () => latestExtensionEditorEffectRef.current.get(editorScope) === effect.eventId
         });
@@ -2227,6 +2229,23 @@ export function useAppController(): AppController {
   const draftStore = localRef.current;
   const draftServerId = state.activeProfile?.serverId;
   const draftProfileId = state.activeProfile?.id;
+  const withDraftSurface = useCallback(async <T,>(sessionId: string, run: (surface: import("./local-state.js").SessionDraftSurface) => Promise<T>): Promise<T> => {
+    if (draftServerId === undefined || draftProfileId === undefined) throw new Error("Connect to Joko before using a task draft.");
+    const search = window.location.search, bridge = window.jokoDesktop?.sessionWindows;
+    let retired = false;
+    const retire = () => { retired = true; };
+    window.addEventListener("pagehide", retire, { once: true });
+    const current = () => !retired && window.location.search === search && window.jokoDesktop?.sessionWindows === bridge && gatewayRef.current === artifactGateway
+      && gatewayGenerationRef.current === linkGatewayGeneration && activeProfileRef.current?.serverId === draftServerId
+      && activeProfileRef.current.id === draftProfileId;
+    try {
+      const surface = await sessionDraftSurface(draftProfileId, sessionId, current);
+      if (surface !== "application" && !current()) throw new Error("The task draft window owner is no longer current.");
+      const result = await run(surface);
+      if (surface !== "application" && !current()) throw new Error("The task draft window owner is no longer current.");
+      return result;
+    } finally { window.removeEventListener("pagehide", retire); }
+  }, [draftServerId, draftProfileId, artifactGateway, linkGatewayGeneration]);
   const newTaskDraftScope = state.activeProfile === undefined ? undefined : newSessionDraftScope(state.activeProfile);
   const newTaskDraftOperationTailsRef = useRef(new Map<string, Promise<void>>());
   const newTaskDraftApi = useMemo(() => {
@@ -2290,26 +2309,26 @@ export function useAppController(): AppController {
       }
     };
   }, [draftStore, newTaskDraftScope, artifactGateway]);
-  const readDraft = useCallback<AppController["readDraft"]>((sessionId) => {
+  const readDraft = useCallback<AppController["readDraft"]>(async (sessionId) => {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
-    return requireLocal(draftStore).readDraft(draftServerId, draftProfileId, sessionId);
-  }, [draftStore, draftServerId, draftProfileId, artifactGateway]);
-  const saveDraft = useCallback<AppController["saveDraft"]>((sessionId, draft) => {
+    return withDraftSurface(sessionId, surface => requireLocal(draftStore).readDraft(draftServerId, draftProfileId, sessionId, surface));
+  }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
+  const saveDraft = useCallback<AppController["saveDraft"]>(async (sessionId, draft) => {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
-    return requireLocal(draftStore).saveDraft(draftServerId, draftProfileId, sessionId, draft);
-  }, [draftStore, draftServerId, draftProfileId, artifactGateway]);
+    return withDraftSurface(sessionId, surface => requireLocal(draftStore).saveDraft(draftServerId, draftProfileId, sessionId, draft, surface));
+  }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
   const navigateSessionBranch = useCallback<AppController["navigateSessionBranch"]>((sessionId, target, options) => {
     if (artifactGateway === undefined) return Promise.reject(new Error("Connect to Joko before navigating a task."));
     return artifactGateway.navigateSessionBranch(sessionId, target, options);
   }, [artifactGateway]);
-  const readDraftSnapshot = useCallback<AppController["readDraftSnapshot"]>((sessionId) => {
+  const readDraftSnapshot = useCallback<AppController["readDraftSnapshot"]>(async (sessionId) => {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before reading a task draft."));
-    return requireLocal(draftStore).readDraftSnapshot(draftServerId, draftProfileId, sessionId);
-  }, [draftStore, draftServerId, draftProfileId, artifactGateway]);
-  const saveDraftIfRevision = useCallback<AppController["saveDraftIfRevision"]>((sessionId, draft, revision) => {
+    return withDraftSurface(sessionId, surface => requireLocal(draftStore).readDraftSnapshot(draftServerId, draftProfileId, sessionId, surface));
+  }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
+  const saveDraftIfRevision = useCallback<AppController["saveDraftIfRevision"]>(async (sessionId, draft, revision) => {
     if (draftServerId === undefined || draftProfileId === undefined) return Promise.reject(new Error("Connect to Joko before saving a task draft."));
-    return requireLocal(draftStore).saveDraftIfRevision(draftServerId, draftProfileId, sessionId, draft, revision);
-  }, [draftStore, draftServerId, draftProfileId, artifactGateway]);
+    return withDraftSurface(sessionId, surface => requireLocal(draftStore).saveDraftIfRevision(draftServerId, draftProfileId, sessionId, draft, revision, surface));
+  }, [draftStore, draftServerId, draftProfileId, withDraftSurface]);
   const rejectedFirstInputRecoverySequenceRef = useRef(0);
   const restoreFirstInputDraft = useCallback<AppController["restoreFirstInputDraft"]>(async (sessionId, input) => {
     if (draftServerId === undefined || draftProfileId === undefined) throw new Error("Connect to Joko before restoring a task draft.");
@@ -2755,6 +2774,17 @@ export function useAppController(): AppController {
     acknowledgeSessionAttention: (sessionId, throughCursor) => gateway().acknowledgeSessionAttention(sessionId, throughCursor),
     acknowledgeSessionError: (sessionId, throughCursor) => gateway().acknowledgeSessionError(sessionId, throughCursor),
     deleteSession: (sessionId, deleteNative) => gateway().deleteSession(sessionId, deleteNative),
+    askHelp: (messages, locale, signal) => gateway().askHelp(messages, locale, signal),
+    createHelpFeedbackDraft: (draft, signal) => gateway().createHelpFeedbackDraft(draft, signal),
+    listWorktreeRecycleStatus: (signal) => gateway().listWorktreeRecycleStatus(signal),
+    getPersonalDevelopment: (signal) => gateway().getPersonalDevelopment(signal),
+    startPersonalDevelopmentDoctor: (...args: Parameters<OperationApi["startPersonalDevelopmentDoctor"]>) => gateway().startPersonalDevelopmentDoctor(...args),
+    controlPersonalDevelopmentDoctor: (...args: Parameters<OperationApi["controlPersonalDevelopmentDoctor"]>) => gateway().controlPersonalDevelopmentDoctor(...args),
+    watchPersonalDevelopment: (generation, onUpdate, signal) => gateway().watchPersonalDevelopment(generation, onUpdate, signal),
+    runPersonalDevelopmentAction: (action, operationId, signal) => gateway().runPersonalDevelopmentAction(action, operationId, signal),
+    startPersonalDevelopmentTask: (draft, operationId, signal) => gateway().startPersonalDevelopmentTask(draft, operationId, signal),
+    controlPersonalDevelopmentTask: (taskId, action, message, operationId, signal) => gateway().controlPersonalDevelopmentTask(taskId, action, message, operationId, signal),
+    controlWorktreeRecycle: (record, action, signal) => gateway().controlWorktreeRecycle(record, action, signal),
     probeTargetWorktree: (targetId, signal) => gateway().probeTargetWorktree(targetId, signal),
     listTargetWorktreeSources: (targetId, signal) => gateway().listTargetWorktreeSources(targetId, signal),
     discoverNativeSessions: (targetId, signal) => gateway().discoverNativeSessions(targetId, signal),
@@ -3893,6 +3923,7 @@ export function applyExtensionUiEffect(
     readonly serverId?: string;
     readonly profileId?: string;
     readonly activeSessionId?: string;
+    readonly draftSurface?: () => Promise<import("./local-state.js").SessionDraftSurface>;
     readonly isCurrent?: () => boolean;
     readonly isLatestEditorEffect?: () => boolean;
   } = {}
@@ -3938,10 +3969,13 @@ export function applyExtensionUiEffect(
   if (local !== undefined && options.serverId !== undefined && options.profileId !== undefined) {
     const serverId = options.serverId;
     const profileId = options.profileId;
-    void local.readDraft(serverId, profileId, effect.sessionId).then((draft) => {
+    void (async () => {
+      const surface = await options.draftSurface?.() ?? "application";
+      if (!isCurrent() || options.isLatestEditorEffect?.() === false) return;
+      const draft = await local.readDraft(serverId, profileId, effect.sessionId, surface);
       if (!isCurrent() || options.isLatestEditorEffect?.() === false) return undefined;
-      return local.saveDraft(serverId, profileId, effect.sessionId, composerDraftWithEditorText(effect.text, draft));
-    })
+      return local.saveDraft(serverId, profileId, effect.sessionId, composerDraftWithEditorText(effect.text, draft), surface);
+    })()
       .catch(() => {
         if (!isCurrent() || options.isLatestEditorEffect?.() === false) return;
         const suffix = ":editor-draft-persistence-error";

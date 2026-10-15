@@ -18,6 +18,7 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep 
 
 export { auditTerminalRuntimeAssets, terminalElectronSmokeSource } from "./terminal-runtime-probe.js";
 export { auditClaudeSessionRuntimeAssets, claudeSessionElectronSmokeSource } from "./claude-session-runtime-probe.js";
+export { auditPersonalDevelopmentRuntimeAssets, personalDevelopmentElectronSmokeSource } from "./personal-development-runtime-probe.js";
 
 export const ORCHESTRATOR_RUNTIME_MAXIMUM_FILES = 100_000;
 export const ORCHESTRATOR_RUNTIME_MAXIMUM_BYTES = 2 * 1024 * 1024 * 1024;
@@ -50,6 +51,7 @@ export const ORCHESTRATOR_RUNTIME_PACKAGES = [
   { name: "@joko/messaging", workspacePath: "packages/messaging", candidatePath: "node_modules/@joko/messaging" },
   { name: "@joko/node-sync", workspacePath: "packages/node-sync", candidatePath: "node_modules/@joko/node-sync" },
   { name: "@joko/outbound-network", workspacePath: "packages/outbound-network", candidatePath: "node_modules/@joko/outbound-network" },
+  { name: "@joko/personal-development", workspacePath: "packages/personal-development", candidatePath: "node_modules/@joko/personal-development" },
   { name: "@joko/remote-ssh", workspacePath: "packages/remote-ssh", candidatePath: "node_modules/@joko/remote-ssh" },
   { name: "@joko/runtime-governance", workspacePath: "packages/runtime-governance", candidatePath: "node_modules/@joko/runtime-governance" },
   { name: "@joko/store", workspacePath: "packages/store", candidatePath: "node_modules/@joko/store" },
@@ -88,6 +90,7 @@ export const ORCHESTRATOR_RUNTIME_CRITICAL_IMPORTS = [
   "@joko/messaging",
   "@joko/node-sync",
   "@joko/outbound-network",
+  "@joko/personal-development",
   "@joko/remote-ssh",
   "@joko/runtime-governance",
   "@joko/store",
