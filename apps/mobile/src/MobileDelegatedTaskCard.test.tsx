@@ -5,6 +5,7 @@ import { create } from "@bufbuild/protobuf";
 import {
   SubagentRunDetailSchema, SubagentRunSchema, SubagentRunState, SubagentToolPhase, SubagentTranscriptEntrySchema, SubagentTranscriptRole
 } from "@joko/contracts";
+import { BackgroundTaskSchema, BackgroundTaskState, BackgroundTaskOutputSchema, BackgroundTaskOutputState } from "@joko/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileDelegatedControls, MobileDelegatedReadClient } from "./mobile-delegated-reader";
 
@@ -102,5 +103,41 @@ describe("native delegated inline card", () => {
     const newOwner = { ...controls, authorityKey: "new-authority", surfaceOwnerKey: "new-owner" };
     client.taskDelegatedControls = vi.fn(() => newOwner); await render(client, newOwner);
     expect(host.querySelector('button[aria-label="Expand Investigate"]')).not.toBeNull(); expect(host.textContent).not.toContain("Current text");
+  });
+  it("shows finite recent background output states and retires the read on collapse or background", async () => {
+    const client = fixture(), task = create(BackgroundTaskSchema, { backgroundTaskId: "background", sessionId: "session", displayName: "Build", state: BackgroundTaskState.RUNNING });
+    client.loadTaskBackgroundOutput = vi.fn(async () => create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId: "background",
+      state: BackgroundTaskOutputState.AVAILABLE, text: "", capturedAtMs: BigInt(Date.now()) }));
+    await act(async () => root.render(createElement(MobileDelegatedTaskCard, { entry: { key: "background:background", task }, readClient: client,
+      controls, colors, locale: "en", enabled: true })));
+    expect(client.loadTaskBackgroundOutput).not.toHaveBeenCalled(); await click("Expand Build");
+    expect(host.textContent).toContain("No output yet.");
+    vi.mocked(client.loadTaskBackgroundOutput).mockResolvedValueOnce(create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId: "background", state: BackgroundTaskOutputState.UNAVAILABLE }));
+    await click("Refresh output"); expect(host.textContent).toContain("Output is unavailable");
+    vi.mocked(client.loadTaskBackgroundOutput).mockRejectedValueOnce(new Error("Read failed."));
+    await click("Refresh output"); expect(host.textContent).toContain("The output could not be read.");
+    vi.mocked(client.loadTaskBackgroundOutput).mockResolvedValueOnce(create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId: "background",
+      state: BackgroundTaskOutputState.AVAILABLE, text: "Current output", totalBytes: 900n, truncated: true, capturedAtMs: BigInt(Date.now()), modifiedAtMs: BigInt(Date.now() - 3_000) }));
+    await click("Refresh output"); expect(host.textContent).toContain("Current output"); expect(host.textContent).toContain("Truncated"); expect(host.textContent).toContain("900 B");
+    await click("Collapse Build"); expect(host.textContent).not.toContain("Current output");
+    await click("Expand Build"); await act(async () => { for (const listener of native.listeners) listener("background"); });
+    expect(host.textContent).not.toContain("Recent output");
+  });
+  it("rejects a late background output reply after refresh and exact owner retirement", async () => {
+    const client = fixture(), task = create(BackgroundTaskSchema, { backgroundTaskId: "background", sessionId: "session", displayName: "Build", state: BackgroundTaskState.RUNNING });
+    let finish!: (value: ReturnType<typeof create<typeof BackgroundTaskOutputSchema>>) => void, oldSignal!: AbortSignal;
+    client.loadTaskBackgroundOutput = vi.fn<NonNullable<MobileDelegatedReadClient["loadTaskBackgroundOutput"]>>((_key, _id, signal) => {
+      oldSignal = signal!; return new Promise<ReturnType<typeof create<typeof BackgroundTaskOutputSchema>>>(resolve => { finish = resolve; });
+    });
+    const renderBackground = async (owner = controls) => act(async () => root.render(createElement(MobileDelegatedTaskCard, {
+      entry: { key: "background:background", task }, readClient: client, controls: owner, colors, locale: "en", enabled: true })));
+    await renderBackground(); await click("Expand Build"); expect(host.textContent).toContain("Loading output");
+    vi.mocked(client.loadTaskBackgroundOutput!).mockResolvedValueOnce(create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId: "background",
+      state: BackgroundTaskOutputState.AVAILABLE, text: "Fresh output", capturedAtMs: BigInt(Date.now()) }));
+    await click("Refresh output"); expect(oldSignal.aborted).toBe(true); expect(host.textContent).toContain("Fresh output");
+    finish(create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId: "background", state: BackgroundTaskOutputState.AVAILABLE, text: "Late old output" }));
+    await act(async () => { await Promise.resolve(); }); expect(host.textContent).not.toContain("Late old output");
+    const owner = { ...controls, authorityKey: "next-authority", surfaceOwnerKey: "next-owner", generation: 2n };
+    client.taskDelegatedControls = vi.fn(() => owner); await renderBackground(owner); expect(host.textContent).not.toContain("Fresh output");
   });
 });

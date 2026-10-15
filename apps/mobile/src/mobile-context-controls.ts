@@ -232,6 +232,17 @@ export function resolveMobileContextControls(
   };
 }
 
+export function resolveMobileSharedContextControls(detail: Snapshot | undefined, authorityKey: string | undefined): MobileContextControls | undefined {
+  const session = detail?.sessions[0], backend = detail?.backends.find(item => item.backendId === session?.backendId);
+  if (!detail || !session || !backend || !authorityKey) return undefined;
+  const usage = normalizeContextUsage(session.context), compaction = activeCompaction(detail, session);
+  if (usage === null || compaction === null) return undefined;
+  return { authorityKey, surfaceOwnerKey: authorityKey, session, backend,
+    usageSupported: typedContextCapability(backend, capabilityNames.contextUsage)?.reportsBoundary === true,
+    compactSupported: false, usage, activeCompaction: compaction, canCompact: false,
+    compactUnavailableReason: "The task owner manages context compaction." };
+}
+
 export function assertMobileContextCompact(controls: MobileContextControls): Session {
   if (!controls.canCompact) {
     throw new Error(controls.compactUnavailableReason ?? "Context compaction is unavailable for the current task.");

@@ -31,6 +31,16 @@ afterEach(async () => {
 });
 
 describe("SessionHeaderActionsMenu", () => {
+  it("offers host sharing management and restricts the guest task menu to leaving", async () => {
+    const onSharing = vi.fn(), onLeaveSharing = vi.fn();
+    const host = await renderMenu({ ...callbackProps(), onSharing });
+    await click(host.querySelector<HTMLElement>("[data-task-sharing-manage]")!);
+    expect(onSharing).toHaveBeenCalledOnce();
+    const guest = await renderMenu({ ...callbackProps(), guestOnly: true, onLeaveSharing });
+    expect(labels(guest)).toEqual(["taskSharing.leave"]);
+    await click(guest.querySelector<HTMLElement>("[data-task-sharing-leave]")!);
+    expect(onLeaveSharing).toHaveBeenCalledOnce();
+  });
   it("renders the Session-owned pull request projection in the task header", async () => {
     const callbacks = callbackProps();
     const container = await renderMenu({

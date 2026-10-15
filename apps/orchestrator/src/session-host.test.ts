@@ -21,6 +21,7 @@ import {
   type ApprovedDirectory,
   type BackendAdapter,
   type CreateNativeSessionInput,
+  type DurableNativeDispatchPreparation,
   type ContextRebuildInput,
   type EventPayload,
   type InteractionDecision,
@@ -66,6 +67,7 @@ import {
   OperationConflictError,
   OperationPreviouslyFailedError,
   SessionRuntimeHandoffStore,
+  TaskShareStore,
   type PersistedEvent,
   type QueueItemRecord,
   RevisionConflictError,
@@ -90,6 +92,8 @@ import { ScheduleCoordinator } from "./schedule-coordinator.js";
 import { SessionHost, type InteractionDecisionSubmission, type WorkspaceRunCapture, type PartnerLearningHostPort } from "./session-host.js";
 import type { SessionWorktreeCoordinator } from "./session-worktree-coordinator.js";
 import { activeNativeTimeline } from "./snapshot-projector.js";
+import { taskShareEventAuthor } from "./task-sharing-author.js";
+import { toProtoEvent } from "./proto-mapper.js";
 import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD } from "./native-history.js";
 import {
   materializedNativeStateObservation,
@@ -1932,6 +1936,43 @@ describe("SessionHost", () => {
     expect(events.some((event) => event.payload.type === "runtime_recovery")).toBe(false);
     expect(adapter.prompts).toEqual(["Recover a private delivery"]);
     expect(fixture.store.getOperation("private-recovery-input").body).toMatchObject({ originSessionId: sender, partnerPrivateOrigin });
+  });
+
+  it("keeps an authorized service axis selection on the original temporary route and durable baseline", async () => {
+    const fixture = await createFixture(new RuntimeRecoveryFakeAdapter());
+    const sessionId = (await fixture.host.createSession({ operationId: "create-authorized-axes", connection: fixture.connection,
+      targetId: "target-one", title: "Authorized axes", providerId: "provider-a", modelId: "reasoner", effort: "medium",
+      fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    await fixture.host.setSessionRuntimeControl({ sessionId, expectedGeneration: 0,
+      patch: { providerId: "provider-b", modelId: "reasoner" } });
+    const commit = vi.fn(() => "committed"), assertCurrent = vi.fn();
+    await expect(fixture.host.applyAuthorizedSessionModel({ sessionId, providerId: "provider-a", modelId: "reasoner",
+      effort: "high", fastMode: false, assertCurrent, commit })).resolves.toBe("committed");
+    expect(commit).toHaveBeenCalledOnce();
+    expect(assertCurrent).toHaveBeenCalled();
+    expect(fixture.host.getSessionRuntimeControl(sessionId)).toMatchObject({
+      baseline: { providerId: "provider-a", modelId: "reasoner", effort: "high" },
+      effective: { providerId: "provider-b", modelId: "reasoner", effort: "high" }
+    });
+  });
+
+  it("retires an authorized service model effect before final commit when its authority is revoked", async () => {
+    const adapter = new RuntimeRecoveryFakeAdapter(), fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-authorized-model", connection: fixture.connection,
+      targetId: "target-one", title: "Authorized model", providerId: "provider-a", modelId: "reasoner", effort: "medium",
+      fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    let authorized = true;
+    const original = adapter.setEffort.bind(adapter);
+    vi.spyOn(adapter, "setEffort").mockImplementation(async (effort, context) => {
+      await original(effort, context); authorized = false;
+    });
+    const commit = vi.fn();
+    await expect(fixture.host.applyAuthorizedSessionModel({ sessionId, providerId: "provider-a", modelId: "reasoner",
+      effort: "high", fastMode: false, assertCurrent: () => { if (!authorized) throw new StoreError("Membership revoked."); }, commit }))
+      .rejects.toThrow("Membership revoked.");
+    expect(commit).not.toHaveBeenCalled();
+    expect(fixture.store.getSession(sessionId).descriptor).toMatchObject({ providerId: "provider-a", modelId: "reasoner", effort: "medium" });
+    expect(fixture.host.isSessionActive(sessionId)).toBe(false);
   });
 
   it("keeps a temporary route when the owner changes only effort and Fast", async () => {
@@ -5101,6 +5142,123 @@ describe("SessionHost", () => {
     }
   });
 
+  it("binds a normally settled native suffix to its exact shared input and retains attribution after Store restart", async () => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const previousUser = fakeHistoryEvent("previous-user", "message_user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "repeated input" }] });
+    const previousAssistant = { ...fakeHistoryEvent("previous-assistant", "message_assistant", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Previous" }] }), nativeParentEntryId: "previous-user" };
+    let history: NativeHistoryProjection = { events: [previousUser, previousAssistant], activeEntryId: "previous-assistant",
+      activeLineage: [{ entryId: "previous-user" }, { entryId: "previous-assistant", parentEntryId: "previous-user" }] };
+    Object.assign(adapter, {
+      getNativeHistoryProjection: async () => history,
+      sendWithDurableNativeDispatchFence: async (input: PromptInput, context: AdapterContext,
+        persistFence: (preparation: DurableNativeDispatchPreparation) => Promise<void>) => {
+        const fingerprint = createHash("sha256").update(input.text).digest("hex");
+        await persistFence({ inputFingerprint: fingerprint, nativeHistory: history });
+        const user = { ...fakeHistoryEvent("accepted-user", "message_user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }] }),
+          nativeParentEntryId: "previous-assistant", metadata: { namespace: "fake.native_history", fields: { nativeDispatchFingerprint: fingerprint } } };
+        const assistant = { ...fakeHistoryEvent("accepted-assistant", "message_assistant", { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Completed" }] }),
+          nativeParentEntryId: "accepted-user", metadata: { namespace: "fake.native_history", fields: { nativeTerminalOutcome: "completed" } } };
+        history = { events: [...history.events, user, assistant], activeEntryId: "accepted-assistant",
+          activeLineage: [...history.activeLineage!, { entryId: "accepted-user", parentEntryId: "previous-assistant" }, { entryId: "accepted-assistant", parentEntryId: "accepted-user" }] };
+        await context.emit({ type: "message_complete", role: "user", blocks: [{ kind: "text", text: input.text }] });
+        await context.emit({ type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "Completed" }] });
+        await context.emit({ type: "done", outcome: "completed" });
+      }
+    });
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-shared-native-owner", connection: fixture.connection,
+      targetId: "target-one", title: "Shared native owner", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const operationId = "shared-native-input", author = { shareId: "share-native-owner", shareGeneration: 1, sessionId,
+      memberId: "member-native-owner", memberGeneration: 1, displayName: "Participant" };
+    new TaskShareStore(fixture.store).recordAuthor(operationId, author);
+    const queued = fixture.host.enqueueInput({ operationId, connection: fixture.connection, sessionId,
+      prompt: { text: "repeated input", images: [], files: [], mentions: [], disposition: "prompt" } });
+    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    const readCanonical = (store: OperationalStore) => {
+      const messages = store.listEvents({ sessionId, activeNativeTimeline: true }).filter(event => event.payload.type === "message_complete" && event.payload.role === "user");
+      const owned = messages.find(event => event.payload.type === "message_complete" && event.payload.nativeHistory?.identity?.entryId === "accepted-user");
+      expect(owned).toMatchObject({ operationId, runId: queued.value.runId, payload: { acceptedInput: { text: "repeated input" } } });
+      const sameTextPrevious = messages.find(event => event.payload.type === "message_complete" && event.payload.nativeHistory?.identity?.entryId === "previous-user")!;
+      expect(taskShareEventAuthor(store, sameTextPrevious)).toBeUndefined();
+      const projected = toProtoEvent(owned!, { sharedTaskAuthor: taskShareEventAuthor(store, owned!) });
+      expect(projected.payload?.kind).toMatchObject({ case: "messageStarted", value: { userInputAccepted: true, sharedTaskAuthor: { memberId: author.memberId } } });
+      return owned!.id;
+    };
+    const canonicalId = readCanonical(fixture.store);
+    expect(fixture.store.findSetting("session", sessionId, "native.dispatch.recovery")).toBeUndefined();
+    await fixture.host.dispose(); fixture.store.close();
+    const reopened = new OperationalStore(join(fixture.directory, "store.db"));
+    try { expect(readCanonical(reopened)).toBe(canonicalId); } finally { reopened.close(); }
+  });
+
+  it("retains each accepted native occurrence author across shared continuation settlement and Store restart", async () => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const previous = { ...fakeHistoryEvent("previous-user", "message_user", { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "repeated input" }] }),
+      metadata: { namespace: "fake.native_history", fields: { nativeHydration: true } } };
+    let history: NativeHistoryProjection = { events: [previous], activeEntryId: "previous-user", activeLineage: [{ entryId: "previous-user" }] };
+    const contexts = new Map<string, AdapterContext>();
+    Object.assign(adapter, { getNativeHistoryProjection: async () => history,
+      sendWithDurableNativeDispatchFence: async (input: PromptInput, context: AdapterContext,
+        persistFence: (preparation: DurableNativeDispatchPreparation) => Promise<void>) => {
+        await persistFence({ inputFingerprint: createHash("sha256").update(input.text).digest("hex"), nativeHistory: history });
+        contexts.set(input.disposition, context);
+      } });
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-shared-continuations", connection: fixture.connection,
+      targetId: "target-one", title: "Shared continuations", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const admitted = new Map<string, { readonly operationId: string; readonly runId: string; readonly memberId: string }>();
+    for (const disposition of ["prompt", "follow_up", "steer"] as const) {
+      const operationId = `shared-occurrence-${disposition}`, memberId = `member-${disposition}`;
+      new TaskShareStore(fixture.store).recordAuthor(operationId, { shareId: "share-occurrences", shareGeneration: 1, sessionId,
+        memberId, memberGeneration: 1, displayName: disposition });
+      const queued = fixture.host.enqueueInput({ operationId, connection: fixture.connection, sessionId,
+        prompt: { text: "repeated input", images: [], files: [], mentions: [], disposition } });
+      admitted.set(disposition, { operationId, runId: queued.value.runId, memberId });
+      await eventually(() => fixture.store.getQueueItem(queued.value.queueItemId).state === "backend_accepted");
+    }
+    // The same native lifecycle consumes steering before follow-up even though
+    // the follow-up was admitted first. Exact identities carry the distinction.
+    for (const disposition of ["prompt", "steer", "follow_up"] as const) {
+      const entryId = `native-${disposition}`, parentEntryId = history.activeEntryId!;
+      const identity = { entryId, parentEntryId };
+      history = { events: [...history.events, { ...fakeHistoryEvent(entryId, "message_user", {
+        type: "message_complete", role: "user", blocks: [{ kind: "text", text: "repeated input" }]
+      }), nativeParentEntryId: parentEntryId, metadata: { namespace: "fake.native_history", fields: { nativeHydration: true } } }],
+      activeEntryId: entryId, activeLineage: [...history.activeLineage!, identity] };
+      await contexts.get(disposition)!.emit({ type: "message_complete", role: "user", blocks: [{ kind: "text", text: "repeated input" }],
+        nativeHistory: { identity } }, { namespace: "fake.live", fields: { nativeHistoryReplacesTransient: true } });
+    }
+    for (const disposition of ["prompt", "steer", "follow_up"] as const) {
+      await contexts.get(disposition)!.emit({ type: "done", outcome: "completed" });
+    }
+    const readCanonical = (store: OperationalStore) => {
+      const raw = store.listEvents({ sessionId, limit: 1_000 });
+      const timeline = store.listEvents({ sessionId, activeNativeTimeline: true, limit: 1_000 });
+      const snapshot = activeNativeTimeline(raw);
+      for (const events of [timeline, snapshot]) {
+        const users = events.filter(event => event.payload.type === "message_complete" && event.payload.role === "user");
+        expect(users).toHaveLength(4);
+        for (const disposition of ["prompt", "steer", "follow_up"] as const) {
+          const expected = admitted.get(disposition)!;
+          const matches = users.filter(event => event.payload.type === "message_complete" && event.payload.nativeHistory?.identity?.entryId === `native-${disposition}`);
+          expect(matches).toHaveLength(1);
+          expect(matches[0]).toMatchObject({ operationId: expected.operationId, runId: expected.runId,
+            payload: { acceptedInput: { disposition, text: "repeated input" } } });
+          expect(taskShareEventAuthor(store, matches[0]!)).toMatchObject({ memberId: expected.memberId });
+          expect(toProtoEvent(matches[0]!, { sharedTaskAuthor: taskShareEventAuthor(store, matches[0]!) }).payload?.kind)
+            .toMatchObject({ case: "messageStarted", value: { userInputAccepted: true, sharedTaskAuthor: { memberId: expected.memberId } } });
+        }
+        expect(taskShareEventAuthor(store, users.find(event => event.payload.type === "message_complete" && event.payload.nativeHistory?.identity?.entryId === "previous-user")!)).toBeUndefined();
+      }
+      expect(raw.filter(event => event.payload.type === "message_complete" && event.payload.role === "user").length).toBeGreaterThan(timeline.filter(event => event.payload.type === "message_complete" && event.payload.role === "user").length);
+      return timeline.filter(event => event.payload.type === "message_complete" && event.payload.role === "user").map(event => event.id);
+    };
+    const ids = readCanonical(fixture.store);
+    await fixture.host.dispose(); fixture.store.close();
+    const reopened = new OperationalStore(join(fixture.directory, "store.db"));
+    try { expect(readCanonical(reopened)).toEqual(ids); } finally { reopened.close(); }
+  });
+
   it("retains an accepted live receipt without native identity but does not grant it to refreshed history", async () => {
     const adapter = new QuoteGateFakeAdapter({ liveNativeIdentity: false });
     const fixture = await createFixture(adapter);
@@ -7102,6 +7260,26 @@ describe("SessionHost", () => {
     expect(adapter.resumeCalls).toBe(2);
     monotonicNow = 1_001;
     await expect(fixture.host.reapIdleRuntimes(1_000)).resolves.toEqual([sessionId]);
+  });
+
+  it("reads background output only for the exact active durable task and drops a terminal late result without activating", async () => {
+    const adapter = new BackgroundTaskRuntimeFakeAdapter(), fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({ operationId: "create-background-output", connection: fixture.connection,
+      targetId: "target-one", title: "Background output", fastMode: false, permissionMode: "ask", planMode: false })).value.sessionId;
+    const output = vi.fn(async () => ({ status: "available" as const, text: "tail", totalBytes: 4, truncated: false, capturedAtMs: Date.now() }));
+    Object.assign(adapter, { getBackgroundTaskOutput: output });
+    expect((await fixture.host.getBackgroundTaskOutput(sessionId, "missing")).status).toBe("unavailable"); expect(output).not.toHaveBeenCalled();
+    await adapter.emitBackgroundTask({ taskId: "owned-output", title: "Command", state: "running" });
+    expect((await fixture.host.getBackgroundTaskOutput(sessionId, "owned-output", 8)).text).toBe("tail");
+    output.mockImplementationOnce(async () => {
+      await adapter.emitBackgroundTask({ taskId: "owned-output", title: "Command", state: "completed" });
+      return { status: "available", text: "late", totalBytes: 4, truncated: false, capturedAtMs: Date.now() };
+    });
+    expect((await fixture.host.getBackgroundTaskOutput(sessionId, "owned-output", 8)).status).toBe("unavailable");
+    await fixture.host.close(sessionId);
+    const resumes = adapter.resumeCalls;
+    expect((await fixture.host.getBackgroundTaskOutput(sessionId, "owned-output", 8)).status).toBe("unavailable");
+    expect(adapter.resumeCalls).toBe(resumes);
   });
 
   it("persists one observable active-to-terminal background task edge", async () => {

@@ -449,7 +449,7 @@ function ModelOptions({ route, controls, selection, favorite, disabled, colors, 
     <View style={styles.actions}>
       <SheetButton label={mobileMessage(locale, "controls.applyModel")} disabled={disabled || !selectionValid}
         colors={colors} onPress={onApply} />
-      {favorite === undefined
+      {controls.favoritesAvailable !== false && (favorite === undefined
         ? <SheetButton label={mobileMessage(locale, "controls.addFavorite")}
             disabled={disabled || !favoriteSelectionValid || duplicateFavorite} colors={colors} onPress={onAddFavorite} />
         : <>
@@ -458,7 +458,7 @@ function ModelOptions({ route, controls, selection, favorite, disabled, colors, 
               colors={colors} onPress={onSaveFavorite} />
             <SheetButton label={mobileMessage(locale, "controls.removeFavorite")} quiet disabled={disabled}
               colors={colors} onPress={onRemoveFavorite} />
-          </>}
+          </>)}
     </View>
   </View>;
 }

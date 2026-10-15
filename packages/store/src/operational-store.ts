@@ -13,6 +13,7 @@ import path, { type PlatformPath } from "node:path";
 import { backup, DatabaseSync } from "node:sqlite";
 import * as sqliteVec from "sqlite-vec";
 import { SessionRuntimeHandoffStore, type RuntimeHandoffSource } from "./session-runtime-handoff-store.js";
+import { TaskShareStore, taskShareQueueLockOwner, type TaskShareGuestProof } from "./task-share-store.js";
 import { validModelSubstitution } from "@joko/core";
 import { parseCurrentRunUsageEventPayload, parseRunUsageSummary, runUsageSettingKey } from "./run-usage-shape.js";
 
@@ -9623,21 +9624,24 @@ export class OperationalStore {
     queueItemId: string,
     connectionId: string | undefined,
     lockToken: string | undefined,
-    at: number
+    at: number,
+    taskShareOwner?: string
   ): void {
     const row = this.database.prepare(`
-      SELECT edit_lock_token, edit_lock_connection_id, edit_lock_expires_at
+      SELECT edit_lock_token, edit_lock_connection_id, edit_lock_task_share_owner, edit_lock_expires_at
       FROM queue_items WHERE id = ?
     `).get(queueItemId) as Row;
     const expiresAt = optionalNumber("expiresAt", row["edit_lock_expires_at"]).expiresAt;
-    const supplied = connectionId !== undefined || lockToken !== undefined;
-    if (supplied && (connectionId === undefined || lockToken === undefined || expiresAt === undefined || expiresAt <= at)) {
+    const supplied = connectionId !== undefined || lockToken !== undefined || taskShareOwner !== undefined;
+    if (supplied && ((connectionId === undefined && taskShareOwner === undefined) || (connectionId !== undefined && taskShareOwner !== undefined)
+      || lockToken === undefined || expiresAt === undefined || expiresAt <= at)) {
       throw new StoreError("The queued input edit lock is missing or expired.");
     }
     if (!supplied && (expiresAt === undefined || expiresAt <= at)) return;
     if (
-      connectionId === undefined || lockToken === undefined
-      || row["edit_lock_connection_id"] !== connectionId
+      lockToken === undefined
+      || (taskShareOwner === undefined ? row["edit_lock_connection_id"] !== connectionId || row["edit_lock_task_share_owner"] !== null
+        : row["edit_lock_task_share_owner"] !== taskShareOwner || row["edit_lock_connection_id"] !== null)
       || row["edit_lock_token"] !== queueLockToken(lockToken)
     ) {
       throw new StoreError("This queued input is being edited by another interaction.");
@@ -9691,7 +9695,7 @@ export class OperationalStore {
         const expiresAt = at + queueLockTtl(input.ttlMs);
         const result = this.database.prepare(`
           UPDATE queue_items
-          SET edit_lock_token = ?, edit_lock_connection_id = ?, edit_lock_expires_at = ?
+          SET edit_lock_token = ?, edit_lock_connection_id = ?, edit_lock_task_share_owner = NULL, edit_lock_expires_at = ?
           WHERE id = ? AND state = 'accepted'
             AND (
               edit_lock_expires_at IS NULL OR edit_lock_expires_at <= ?
@@ -9702,7 +9706,7 @@ export class OperationalStore {
       } else {
         const result = this.database.prepare(`
           UPDATE queue_items
-          SET edit_lock_token = NULL, edit_lock_connection_id = NULL, edit_lock_expires_at = NULL
+          SET edit_lock_token = NULL, edit_lock_connection_id = NULL, edit_lock_task_share_owner = NULL, edit_lock_expires_at = NULL
           WHERE id = ? AND edit_lock_token = ? AND edit_lock_connection_id = ?
         `).run(current.id, token, input.connectionId);
         if (result.changes !== 1) {
@@ -9721,6 +9725,39 @@ export class OperationalStore {
         this.getSession(updated.sessionId),
         input.traceId ?? `queue:${updated.id}:edit-lock`
       );
+      return updated;
+    });
+  }
+
+  /** Same Queue lock and dispatch fence, with a distinct sharing principal.
+   * No Connection or Device is synthesized for an invited participant. */
+  setTaskShareQueueItemEditLock(input: {
+    readonly proof: TaskShareGuestProof; readonly queueItemId: string; readonly lockToken: string;
+    readonly locked: boolean; readonly ttlMs?: number; readonly traceId?: string; readonly at?: number;
+  }): QueueItemRecord {
+    return this.write(() => {
+      new TaskShareStore(this).assertOwnPending(input.proof, input.queueItemId);
+      const current = this.getQueueItem(input.queueItemId), owner = taskShareQueueLockOwner(input.proof);
+      const token = queueLockToken(input.lockToken), at = input.at ?? this.now();
+      this.assertQueueInteractionAuthority(current.sessionId, undefined, undefined, at);
+      if (input.locked) {
+        const result = this.database.prepare(`UPDATE queue_items
+          SET edit_lock_token = ?, edit_lock_connection_id = NULL, edit_lock_task_share_owner = ?, edit_lock_expires_at = ?
+          WHERE id = ? AND state = 'accepted' AND (edit_lock_expires_at IS NULL OR edit_lock_expires_at <= ?
+            OR (edit_lock_token = ? AND edit_lock_task_share_owner = ?))
+        `).run(token, owner, at + queueLockTtl(input.ttlMs), current.id, at, token, owner);
+        if (result.changes !== 1) throw new StoreError("This queued input is already being edited.");
+      } else {
+        const row = this.database.prepare("SELECT edit_lock_token, edit_lock_expires_at FROM queue_items WHERE id = ?").get(current.id) as Row;
+        const expires = optionalNumber("expiresAt", row["edit_lock_expires_at"]).expiresAt;
+        if (row["edit_lock_token"] !== null && expires !== undefined && expires > at) {
+          this.assertQueueItemEditAuthority(current.id, undefined, token, at, owner);
+        }
+        this.database.prepare(`UPDATE queue_items SET edit_lock_token = NULL, edit_lock_connection_id = NULL,
+          edit_lock_task_share_owner = NULL, edit_lock_expires_at = NULL WHERE id = ?`).run(current.id);
+      }
+      const updated = this.getQueueItem(current.id);
+      this.appendQueueEvent(updated, this.getSession(updated.sessionId), input.traceId ?? `queue:${updated.id}:shared-edit-lock`);
       return updated;
     });
   }
@@ -9811,7 +9848,7 @@ export class OperationalStore {
       for (const queueItemId of queueItemIds) {
         this.database.prepare(`
           UPDATE queue_items
-          SET edit_lock_token = NULL, edit_lock_connection_id = NULL,
+          SET edit_lock_token = NULL, edit_lock_connection_id = NULL, edit_lock_task_share_owner = NULL,
               edit_lock_expires_at = NULL
           WHERE id = ? AND edit_lock_expires_at IS NOT NULL
             AND edit_lock_expires_at <= ?
@@ -9830,6 +9867,7 @@ export class OperationalStore {
     readonly queueItemId: string;
     readonly body: PromptInput;
     readonly connectionId?: string;
+    readonly taskShare?: TaskShareGuestProof;
     readonly lockToken?: string;
     readonly expectedRevision?: bigint;
     readonly traceId: string;
@@ -9845,7 +9883,12 @@ export class OperationalStore {
       }
       const at = input.at ?? this.now();
       this.assertQueueInteractionAuthority(current.sessionId, undefined, undefined, at);
-      this.assertQueueItemEditAuthority(current.id, input.connectionId, input.lockToken, at);
+      if (input.taskShare !== undefined) {
+        if (input.connectionId !== undefined) throw new StoreError("Queue edit has more than one authority.");
+        new TaskShareStore(this).assertOwnPending(input.taskShare, current.id);
+      }
+      this.assertQueueItemEditAuthority(current.id, input.connectionId, input.lockToken, at,
+        input.taskShare === undefined ? undefined : taskShareQueueLockOwner(input.taskShare));
       const result = this.database.prepare(`
         UPDATE queue_items
         SET disposition = ?, body_hash = ?, body_json = ?, updated_at = ?, revision = ?
@@ -9873,6 +9916,7 @@ export class OperationalStore {
     readonly queueItemId: string;
     readonly placement: QueuePlacement;
     readonly connectionId?: string;
+    readonly taskShare?: TaskShareGuestProof;
     readonly lockToken?: string;
     readonly editLockToken?: string;
     readonly expectedRevision?: bigint;
@@ -9888,6 +9932,10 @@ export class OperationalStore {
         throw new InvalidStateTransitionError("queue item reorder", current.state, "accepted");
       }
       const at = input.at ?? this.now();
+      if (input.taskShare !== undefined) {
+        if (input.connectionId !== undefined) throw new StoreError("Queue reorder has more than one authority.");
+        new TaskShareStore(this).assertOwnPending(input.taskShare, current.id);
+      }
       this.assertQueueInteractionAuthority(
         current.sessionId,
         input.lockToken === undefined ? undefined : input.connectionId,
@@ -9898,7 +9946,8 @@ export class OperationalStore {
         current.id,
         input.editLockToken === undefined ? undefined : input.connectionId,
         input.editLockToken,
-        at
+        at,
+        input.taskShare === undefined ? undefined : taskShareQueueLockOwner(input.taskShare)
       );
       const ordered = collectStorePages((offset, limit) => this.listQueueItems({
         sessionId: current.sessionId,
@@ -10000,6 +10049,7 @@ export class OperationalStore {
   cancelQueueItem(input: {
     readonly queueItemId: string;
     readonly connectionId?: string;
+    readonly taskShare?: TaskShareGuestProof;
     readonly expectedRevision?: bigint;
     readonly traceId: string;
     readonly at?: number;
@@ -10014,8 +10064,12 @@ export class OperationalStore {
         throw new InvalidStateTransitionError("queue item", current.state, "cancelled");
       }
       const at = input.at ?? this.now();
-      if (input.connectionId !== undefined) {
-        this.getConnection(input.connectionId);
+      if (input.taskShare !== undefined) {
+        if (input.connectionId !== undefined) throw new StoreError("Queue cancellation has more than one authority.");
+        new TaskShareStore(this).assertOwnPending(input.taskShare, current.id);
+      }
+      if (input.connectionId !== undefined || input.taskShare !== undefined) {
+        if (input.connectionId !== undefined) this.getConnection(input.connectionId);
         this.assertQueueInteractionAuthority(current.sessionId, undefined, undefined, at);
         this.assertQueueItemEditAuthority(current.id, undefined, undefined, at);
       }
@@ -12150,11 +12204,50 @@ export class OperationalStore {
             ON marker_tombstone.event_id = marker_event.id
           WHERE marker_tombstone.event_id IS NULL
             AND marker.event_cursor <= ?${scopeClause}
+        ),
+        confirmed_native_hydration AS (
+          SELECT
+            canonical.session_id,
+            json_extract(canonical.metadata_json, '${bindingPath}') AS binding_fingerprint,
+            json_extract(canonical.payload_json, '$.payload.nativeHistory.identity.entryId') AS entry_id
+          FROM events AS canonical
+          JOIN product_sessions AS native_session
+            ON native_session.id = canonical.session_id AND native_session.deleted_at IS NULL
+          LEFT JOIN message_event_tombstones AS canonical_tombstone
+            ON canonical_tombstone.event_id = canonical.id
+          WHERE canonical.global_cursor <= ?${scopeClause}
+            AND canonical_tombstone.event_id IS NULL
+            AND json_extract(canonical.metadata_json, '$.nativeHydration') = 1
+            AND json_extract(canonical.metadata_json, '${bindingPath}') = native_session.native_binding_fingerprint
+            AND NULLIF(json_extract(canonical.payload_json, '$.payload.nativeHistory.identity.entryId'), '') IS NOT NULL
+            AND (
+              NOT EXISTS (SELECT 1 FROM current_native_marker AS marker WHERE marker.session_id = canonical.session_id)
+              OR EXISTS (
+                SELECT 1 FROM current_native_marker AS marker
+                WHERE marker.session_id = canonical.session_id AND marker.binding_current = 1
+                  AND (marker.leaf_id IS NULL OR EXISTS (
+                    SELECT 1 FROM native_history_active_entries AS active
+                    WHERE active.session_id = marker.session_id AND active.marker_cursor = marker.marker_cursor
+                      AND active.binding_fingerprint = marker.binding_fingerprint
+                      AND active.entry_id = json_extract(canonical.payload_json, '$.payload.nativeHistory.identity.entryId')
+                  ))
+              )
+            )
         )`,
-      params: [asSqlInteger(highWater), ...scopeParams],
+      params: [asSqlInteger(highWater), ...scopeParams, asSqlInteger(highWater), ...scopeParams],
       clause: (eventAlias) => ` AND (
         (
           NULLIF(json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId'), '') IS NOT NULL
+          AND (
+            COALESCE(json_extract(${eventAlias}.metadata_json, '${replacesPath}'), 0) <> 1
+            OR COALESCE(json_extract(${eventAlias}.metadata_json, '$.nativeHydration'), 0) = 1
+            OR NOT EXISTS (
+              SELECT 1 FROM confirmed_native_hydration AS canonical
+              WHERE canonical.session_id = ${eventAlias}.session_id
+                AND canonical.binding_fingerprint = json_extract(${eventAlias}.metadata_json, '${bindingPath}')
+                AND canonical.entry_id = json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId')
+            )
+          )
           AND EXISTS (
             SELECT 1 FROM product_sessions AS current_session
             WHERE current_session.id = ${eventAlias}.session_id
@@ -12171,10 +12264,8 @@ export class OperationalStore {
               SELECT 1
               FROM current_native_marker AS marker
               WHERE marker.session_id = ${eventAlias}.session_id
-                AND marker.binding_current = 1
                 AND (
-                  marker.leaf_id IS NULL
-                  OR EXISTS (
+                  (marker.binding_current = 1 AND (marker.leaf_id IS NULL OR EXISTS (
                     SELECT 1
                     FROM native_history_active_entries AS active
                     WHERE active.session_id = marker.session_id
@@ -12184,7 +12275,9 @@ export class OperationalStore {
                         json_extract(${eventAlias}.payload_json, '$.payload.nativeHistory.identity.entryId'),
                         ''
                       )
-                  )
+                  )))
+                  OR (COALESCE(json_extract(${eventAlias}.metadata_json, '${replacesPath}'), 0) = 1
+                    AND ${eventAlias}.global_cursor > marker.marker_cursor)
                 )
             )
           )

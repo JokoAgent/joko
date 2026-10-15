@@ -94,6 +94,7 @@ interface NativeTaskRecord {
   updatedAt: number;
   endedAt?: number;
   error?: PublicError;
+  outputFile?: string;
 }
 
 export class ClaudeNativeTaskProjection {
@@ -258,6 +259,11 @@ export class ClaudeNativeTaskProjection {
     return { rawTaskId: task.rawId, terminal: !activeState(task.state) };
   }
 
+  outputFile(publicTaskId: string): string | undefined {
+    const task = this.#publicTaskIds.get(publicTaskId);
+    return task !== undefined && activeState(task.state) ? task.outputFile : undefined;
+  }
+
   childId(publicTaskId: string): string | undefined {
     return this.#publicTaskIds.has(publicTaskId) ? childIdFor(publicTaskId) : undefined;
   }
@@ -301,6 +307,8 @@ export class ClaudeNativeTaskProjection {
   ): readonly NativeTaskEmission[] {
     if (!activeState(task.state)) return [];
     this.#mergeIdentity(task, envelope);
+    const outputFile = envelope["output_file"];
+    if (typeof outputFile === "string" && outputFile.length <= 32_768 && !outputFile.includes("\0")) task.outputFile = outputFile;
     task.state = "running";
     task.backgroundState = "running";
     task.updatedAt = this.#now();

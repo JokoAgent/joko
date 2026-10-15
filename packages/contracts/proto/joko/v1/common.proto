@@ -134,6 +134,7 @@ enum ActorKind {
   ACTOR_KIND_ORCHESTRATOR = 4;
   ACTOR_KIND_BACKEND = 5;
   ACTOR_KIND_TOOL_PROVIDER = 6;
+  ACTOR_KIND_TASK_PARTICIPANT = 7;
 }
 
 // Durable identity attached to events. Empty IDs mean the scope does not apply.

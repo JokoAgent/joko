@@ -24,6 +24,7 @@ import {
   type ApprovedDirectory,
   type BackendAuthenticationState,
   type BackendDescriptor,
+  type BackgroundTaskOutputResult,
   type Capability,
   type CreateNativeSessionInput,
   type EventPayload,
@@ -72,6 +73,7 @@ import type { ClaudeManagedChildWorkspace, ClaudeManagedChildWorkspaceFactory } 
 import { claudeCodeError } from "./errors.js";
 import type { ClaudeMcpBridgePort, ClaudeMcpCallResult, ClaudeMcpRuntimeLease, ClaudeMcpTool } from "./mcp-bridge.js";
 import { SessionSdkFailure } from "./session-sdk-owner.js";
+import { readRegisteredBackgroundTaskOutput } from "./background-task-output.js";
 import type { ClaudeFreshContextBindingLookup, ClaudeFreshContextIdentity, ClaudeFreshContextSnapshot } from "./fresh-context-owner.js";
 import { prepareClaudePrompt, type ClaudeInputResolvers, type PreparedClaudePrompt } from "./prompt-input.js";
 import {
@@ -2754,6 +2756,18 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (!Number.isFinite(initialInfo.lastModified) || info.lastModified !== initialInfo.lastModified || runtime.nativeTasks.hasActiveTasks()) {
       throw claudeCodeError("NATIVE_SESSION_FORK_SOURCE_CHANGED", "Native history changed while its fork was being prepared.", "session_fork");
     }
+  }
+
+  async getBackgroundTaskOutput(context: AdapterContext, taskId: string, maximumBytes: number): Promise<BackgroundTaskOutputResult> {
+    const unavailable = (): BackgroundTaskOutputResult => ({ status: "unavailable", text: "", totalBytes: 0, truncated: false, capturedAtMs: Date.now() });
+    const runtime = this.#sessions.get(context.sessionId);
+    if (!runtime || runtime.remote || runtime.runtimePolicy !== "standard" || !runtime.nativeTaskProjectionEnabled) return unavailable();
+    this.#assertCurrent(runtime, context, context.binding);
+    const file = runtime.nativeTasks.outputFile(taskId);
+    if (!file) return unavailable();
+    const output = await readRegisteredBackgroundTaskOutput(file, maximumBytes);
+    this.#assertCurrent(runtime, context, context.binding);
+    return runtime.nativeTasks.outputFile(taskId) === file ? output : unavailable();
   }
 
   async cancelBackgroundTask(context: AdapterContext, taskId: string): Promise<void> {

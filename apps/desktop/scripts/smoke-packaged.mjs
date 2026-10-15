@@ -23,7 +23,7 @@ import {
   sqliteVecElectronSmokeSource,
   terminalElectronSmokeSource
 } from "../dist/runtime-staging.js";
-import { PACKAGED_SMOKE_TIMELINE_PROMPT } from "../dist/packaged-smoke-task.js";
+import { PACKAGED_SMOKE_TIMELINE_PROMPT, PACKAGED_SMOKE_SHARED_TASK_PROMPT } from "../dist/packaged-smoke-task.js";
 import { capturePackagedSmokeProcessBirthIdentitySync } from "../dist/packaged-smoke-process-identity.js";
 import { buildNativeFrontmostSmokeTarget, nativeSystemFrontmostElectronSmokeSource }
   from "./native-system-frontmost-smoke.mjs";
@@ -227,6 +227,7 @@ async function runSmokeJourney() {
     "system_handoff_auxiliary_owner_fenced",
     "system_handoff_tray_reopened",
     "task_windows_same_session_independent_documents",
+    "task_sharing_management_guest_input_and_exit_passed",
     ...(process.platform === "win32" ? [
       "timeline_generation_completed",
       "timeline_code_system_clipboard_verified",
@@ -480,7 +481,8 @@ async function runSmokeJourney() {
   const observedProviderInferenceRequests = providerSmoke?.observations.inferenceRequests;
   const providerInferenceMatches = providerSmokeInferenceRequestsMatch(
     observedProviderInferenceRequests,
-    providerInferenceExpected
+    providerInferenceExpected,
+    smokeScope === "full" ? "POST /v1/chat/completions" : undefined
   );
   const failed = (
     orchestrationError !== undefined || timedOut || marker !== "JOKO_DESKTOP_SMOKE_OK" || result.code !== 0 || result.signal !== null ||
@@ -1019,7 +1021,7 @@ function summarizePaths(paths) {
 async function createProviderSmokeServer() {
   const observations = {
     requests: [],
-    inferenceRequests: { timeline: [], automaticTitle: [], promptRecommendation: [] },
+    inferenceRequests: { timeline: [], sharedTask: [], automaticTitle: [], promptRecommendation: [] },
     inferenceRequestShapes: [],
     unexpectedRequests: []
   };
@@ -1044,7 +1046,7 @@ async function createProviderSmokeServer() {
           response.end('{"error":{"message":"The packaged smoke inference request was invalid or repeated."}}');
           return;
         }
-        if (inference === "timeline") {
+        if (inference === "timeline" || inference === "sharedTask") {
           writeProviderSmokeStreamingChatCompletion(response);
         } else if (inference === "automaticTitle") {
           writeProviderSmokeNonStreamingChatCompletion(response, "joko-packaged-automatic-title", "Clipboard fixture");
@@ -1112,11 +1114,12 @@ function acceptProviderSmokeInferenceRequest(observations, identity, body) {
   return inference;
 }
 
-function providerSmokeInferenceRequestsMatch(observed, expectedIdentity) {
+function providerSmokeInferenceRequestsMatch(observed, expectedIdentity, sharedIdentity) {
   if (typeof observed !== "object" || observed === null || Array.isArray(observed)
-    || Object.keys(observed).sort().join(",") !== "automaticTitle,promptRecommendation,timeline") return false;
+    || Object.keys(observed).sort().join(",") !== "automaticTitle,promptRecommendation,sharedTask,timeline") return false;
   const expectedMinimum = expectedIdentity === undefined ? 0 : 1;
   return providerSmokeInferenceRequestCountMatches(observed.timeline, expectedIdentity, expectedMinimum, expectedMinimum)
+    && providerSmokeInferenceRequestCountMatches(observed.sharedTask, sharedIdentity, sharedIdentity === undefined ? 0 : 1, sharedIdentity === undefined ? 0 : 1)
     // The packaged Task has an explicit manual title, so automatic title
     // inference must remain absent. Both mounted Task surfaces may request the
     // same post-run recommendation, while the service is allowed to satisfy
@@ -1139,6 +1142,7 @@ function classifyProviderSmokeInference(body) {
   if (typeof body !== "object" || body === null || Array.isArray(body)
     || body.model !== "packaged-smoke-model" || !Array.isArray(body.messages)) return undefined;
   if (isExactProviderSmokeTimelineInference(body)) return "timeline";
+  if (isExactProviderSmokeTimelineInference(body, PACKAGED_SMOKE_SHARED_TASK_PROMPT)) return "sharedTask";
   if (body.stream !== false || body.max_tokens !== 64 && body.max_tokens !== 96
     || Object.keys(body).sort().join(",") !== "max_tokens,messages,model,stream"
     || body.messages.length !== 2) return undefined;
@@ -1165,7 +1169,7 @@ function classifyProviderSmokeInference(body) {
   return undefined;
 }
 
-function isExactProviderSmokeTimelineInference(body) {
+function isExactProviderSmokeTimelineInference(body, expectedPrompt = PACKAGED_SMOKE_TIMELINE_PROMPT) {
   const system = exactProviderSmokeTextMessage(body.messages[0], "system");
   if (Object.keys(body).sort().join(",") !== "max_completion_tokens,messages,model,store,stream,stream_options,tools"
     || body.stream !== true || body.store !== false || body.max_completion_tokens !== 65_536
@@ -1180,7 +1184,7 @@ function isExactProviderSmokeTimelineInference(body) {
   const part = user.content[0];
   if (typeof part !== "object" || part === null || Array.isArray(part)
     || Object.keys(part).sort().join(",") !== "text,type"
-    || part.type !== "text" || part.text !== PACKAGED_SMOKE_TIMELINE_PROMPT) return false;
+    || part.type !== "text" || part.text !== expectedPrompt) return false;
   if (!Array.isArray(body.tools) || body.tools.length !== 14) return false;
   const names = new Set();
   for (const tool of body.tools) {
@@ -1249,6 +1253,13 @@ function runProviderSmokeClassifierRegressionTests() {
     "repeated Timeline request is rejected");
   expect(timelineTracking.inferenceRequests.timeline.length === 1,
     "repeated Timeline request is not counted");
+  const sharedTask = cloneProviderSmokeFixture(timeline);
+  sharedTask.messages[1].content[0].text = PACKAGED_SMOKE_SHARED_TASK_PROMPT;
+  const sharedTracking = providerSmokeInferenceTrackingFixture();
+  expect(acceptProviderSmokeInferenceRequest(sharedTracking, identity, sharedTask) === "sharedTask",
+    "exact shared task input is accepted once");
+  expect(acceptProviderSmokeInferenceRequest(sharedTracking, identity, sharedTask) === undefined,
+    "repeated shared task input is rejected");
 
   const recommendation = providerSmokePromptRecommendationInferenceFixture();
   const unescapedRecommendation = cloneProviderSmokeFixture(recommendation);
@@ -1298,11 +1309,16 @@ function runProviderSmokeClassifierRegressionTests() {
     "non-Timeline smoke requires no inference requests");
   expect(!providerSmokeInferenceRequestsMatch(expectedOneRecommendation, undefined),
     "non-Timeline smoke rejects unexpected inference requests");
+  expect(!providerSmokeInferenceRequestsMatch(expectedOneRecommendation, identity, identity),
+    "full smoke requires the shared task inference");
+  expectedOneRecommendation.sharedTask.push(identity);
+  expect(providerSmokeInferenceRequestsMatch(expectedOneRecommendation, identity, identity),
+    "full smoke accepts one shared task inference");
   return assertions;
 }
 
 function providerSmokeInferenceTrackingFixture() {
-  return { inferenceRequests: { timeline: [], automaticTitle: [], promptRecommendation: [] } };
+  return { inferenceRequests: { timeline: [], sharedTask: [], automaticTitle: [], promptRecommendation: [] } };
 }
 
 function providerSmokeTimelineInferenceFixture() {

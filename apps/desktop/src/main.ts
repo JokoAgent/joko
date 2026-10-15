@@ -315,6 +315,7 @@ import {
 import { createManagedExitFence } from "./managed-exit-fence.js";
 import { probeManagedRuntimeActivity } from "./managed-runtime-activity.js";
 import {
+  createPackagedSmokeTaskInvitation,
   createPackagedSmokeTask,
   runPackagedSmokeTimelineTurn,
   verifyPackagedSmokeTask,
@@ -373,6 +374,8 @@ import {
   readRegularFileSnapshot
 } from "./secure-files.js";
 import { materializeDesktopDeepLinkNavigation } from "./portable-deep-link-materialization.js";
+import { DesktopTaskSharingInvitationBuffer } from "./task-sharing-invitation.js";
+import { verifyPackagedSmokeTaskSharing } from "./packaged-smoke-task-sharing.js";
 import {
   atomicCopyExtensionLibraryFile,
   ExtensionLibraryGestureCoordinator,
@@ -580,6 +583,7 @@ const mainWindowContentsByWindow = new WeakMap<BrowserWindow, WebContents>();
 const mainWindowDocuments = new DesktopMainDocumentOccurrenceAuthority<WebContents>(() => randomUUID());
 const desktopDeepLinkDelivery = new DesktopDeepLinkDeliveryBuffer();
 const desktopInboundOpenIntentFence = new DesktopInboundOpenIntentFence();
+const desktopTaskSharingInvitations = new DesktopTaskSharingInvitationBuffer();
 const desktopNotifications = new DesktopNotificationCoordinator<WebContents>({
   isSupported: () => !packagedSmoke && Notification.isSupported(),
   createNotification: (value) => new Notification(value),
@@ -1099,6 +1103,7 @@ function createWindow(): void {
     retireDedicatedHardwareCatalogOwner(retiredDocument.endpoint, retiredDocument.occurrence);
   }
   desktopDeepLinkDelivery.resetRenderer();
+  desktopTaskSharingInvitations.resetDocument();
   const frameOptions = process.platform === "darwin"
     ? { titleBarStyle: "hidden" as const, trafficLightPosition: { x: 12, y: 16 } }
     : { frame: false };
@@ -2359,6 +2364,55 @@ async function verifyPackagedSmokeSessionWindow(owner: BrowserWindow): Promise<v
     reuseConfiguredProvider: true
   } satisfies PackagedSmokeTaskOptions;
   const concurrentTask = await createPackagedSmokeTask(concurrentTaskOptions);
+  const sharingClipboard = capturePackagedSmokeClipboard();
+  let sharingInvitation: string | undefined;
+  let sharingHost: ManagedOrchestratorRuntime | undefined;
+  let sharingHostAuth: string | undefined;
+  try {
+    await verifyPackagedSmokeTaskSharing({ window: owner, task: concurrentTask, serverId: connection.serverId,
+      prepareOwner: () => preparePackagedSmokeTaskOwner(owner, concurrentTask),
+      readClipboard: () => clipboard.readText("clipboard"),
+      recordSurface: async surface => {
+        if (packagedSmokeResultPath === undefined) throw new Error("The packaged smoke evidence owner is missing.");
+        writeFileSync(`${packagedSmokeResultPath}.task-sharing-${surface}.png`,
+          (await owner.webContents.capturePage()).toPNG(), { mode: 0o600 });
+      },
+      copiedInvitation: value => { sharingInvitation = value; }, offerInvitation: handleDesktopDeepLinkUrl,
+      createForeignInvitation: async () => {
+        const ports = await selectManagedOrchestratorPorts();
+        const directory = join(app.getPath("userData"), "shared-task-host");
+        sharingHost = await startManagedOrchestrator({
+          orchestratorEntryPath: resolveManagedOrchestratorEntry(sourceDirectory, {
+            packaged: app.isPackaged, resourcesPath: process.resourcesPath, developmentWorkspace: !app.isPackaged
+          }),
+          ...(!app.isPackaged ? { nodeImportPath: fileURLToPath(import.meta.resolve("tsx")) } : {}),
+          resourcesDirectory: app.isPackaged ? process.resourcesPath : resolve(sourceDirectory, "..", "resources"),
+          dataDirectory: join(directory, "orchestrator"),
+          workspaceRoot: prepareDesktopManagedWorkspaceDirectory({ packagedSmoke: true,
+            userDataDirectory: directory, documentsDirectory: app.getPath("documents") }),
+          deviceId: randomUUID(), defaultDeviceName: "Packaged shared task host", appVersion: app.getVersion(),
+          platform: process.platform, ...ports, environment: process.env, ephemeral: true
+        });
+        sharingHostAuth = sharingHost.takeAuthKey(); await sharingHost.commit();
+        const host = sharingHost;
+        const foreignOptions: PackagedSmokeTaskOptions = {
+          connection: host.connection, displayName: "Packaged shared task", providerOrigin: taskOptions.providerOrigin,
+          readAuthKey: async profileId => profileId === host.connection.profileId ? sharingHostAuth : undefined,
+          isAuthorityCurrent: current => sharingHost === host && sameManagedOrchestratorConnection(current, host.connection)
+        };
+        const foreignTask = await createPackagedSmokeTask(foreignOptions);
+        return { invitation: await createPackagedSmokeTaskInvitation(foreignOptions, foreignTask),
+          sessionId: foreignTask.sessionId, hostServerId: host.connection.serverId };
+      } });
+    recordPackagedSmokeProgress("task_sharing_management_guest_input_and_exit_passed");
+  } finally {
+    sharingHostAuth = undefined;
+    if (sharingHost !== undefined) await sharingHost.stop();
+    sharingHost = undefined;
+    await restorePackagedSmokeClipboard(sharingClipboard,
+      () => sharingInvitation !== undefined && clipboard.readText("clipboard") === sharingInvitation);
+    sharingInvitation = undefined;
+  }
   const concurrentOwner = { profileId: connection.profileId, sessionId: concurrentTask.sessionId } as const;
   if (!await preparePackagedSmokeTaskOwner(owner, concurrentTask)) {
     throw new Error("Packaged smoke owner did not present the concurrent durable Task.");
@@ -5795,6 +5849,7 @@ function captureMainWindowDocument(contents: WebContents, claim: string): string
       releaseDesktopAttentionSource(capture.retired.endpoint.id);
     }
     desktopDeepLinkDelivery.resetRenderer();
+    desktopTaskSharingInvitations.resetDocument();
   }
   if (dedicatedHardwareCatalogOwner?.contents !== contents ||
       dedicatedHardwareCatalogOwner.documentOccurrence !== capture.current.occurrence) {
@@ -5820,6 +5875,7 @@ function retireMainWindowDocument(window: BrowserWindow, contents: WebContents):
     retireDedicatedHardwareCatalogOwner(retired.endpoint, retired.occurrence);
   }
   desktopDeepLinkDelivery.resetRenderer();
+  desktopTaskSharingInvitations.resetDocument();
 }
 
 function handleDesktopDeepLinkUrl(value: unknown): boolean {
@@ -5834,6 +5890,19 @@ function handleDesktopInboundOpenIntent(
   source?: DesktopOpenIntentIngressSource
 ): void {
   if (app.isReady()) showMainWindow();
+  if (intent.kind === "taskShareInvitation") {
+    desktopInboundOpenIntentFence.begin(intent);
+    desktopDeepLinkDelivery.retirePendingForNewNavigation();
+    const delivery = desktopTaskSharingInvitations.offer(intent.invitation);
+    const window = mainWindow;
+    if (delivery && window && !window.isDestroyed() && !window.webContents.isDestroyed()
+      && mainWindowDocuments.isCurrent(window.webContents, delivery.documentOccurrence)) {
+      try { window.webContents.send(DESKTOP_CHANNELS.taskSharingInvitationDeliver, delivery); }
+      catch { /* The next exact Main Document can reclaim the pending invitation. */ }
+    }
+    return;
+  }
+  if (intent.kind !== "focus") desktopTaskSharingInvitations.retirePending();
   const packagedSmokeSecondInstance = source === undefined
     ? false
     : observePackagedSmokeDesktopOpenIntent(intent, source);
@@ -7509,6 +7578,17 @@ function registerIpc(): void {
       recordPackagedSmokeProgress("system_handoff_second_instance_delivery_ready");
     }
     return claim;
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.taskSharingInvitationTake, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("The invitation requires its captured Document.");
+    const documentOccurrence = assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    return desktopTaskSharingInvitations.take(documentOccurrence);
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.taskSharingInvitationAcknowledge, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 1) throw new TypeError("The invitation acknowledgement requires one exact object.");
+    const value = parseDesktopDeepLinkAcknowledgement(parameters[0]);
+    assertCurrentMainApplicationDocumentSender(event, value.documentOccurrence);
+    return desktopTaskSharingInvitations.acknowledge(value.documentOccurrence, value.deliveryOccurrence);
   });
   ipcMain.handle(DESKTOP_CHANNELS.deepLinkAcknowledge, (event, ...parameters: unknown[]) => {
     if (parameters.length !== 1) throw new TypeError("Desktop deep-link acknowledgement requires one exact object.");

@@ -12,7 +12,7 @@ import { ProtoMappingError, toProtoProviderDescriptor, toProtoServerInfo } from 
 import { EXTENSION_STATUSES_SETTING_KEY, EXTENSION_WIDGETS_SETTING_KEY } from "./extension-ui-state.js";
 import { NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD } from "./native-history.js";
 import { nativeBindingFingerprint } from "./native-state-observation.js";
-import { SnapshotProjector } from "./snapshot-projector.js";
+import { activeNativeTimeline, SnapshotProjector } from "./snapshot-projector.js";
 import { runtimeCommandsObservation, SESSION_RUNTIME_COMMANDS_SETTING_KEY } from "./runtime-command-state.js";
 
 const cleanups: Array<() => void> = [];
@@ -566,6 +566,66 @@ describe("SnapshotProjector", () => {
       "native-branch-a",
       "native-branch-b"
     ]));
+  });
+
+  it.each([false, true])("replaces an identified live input only with its visible exact canonical hydration (marker=%s)", (withMarker) => {
+    const { store } = createFixture();
+    const binding = store.getSession("session-1").descriptor.binding;
+    const fingerprint = nativeBindingFingerprint(binding.opaqueRef);
+    const append = (id: string, entryId: string, fields: Readonly<Record<string, string | number | boolean>>,
+      parentEntryId?: string) => store.appendEvent({
+      id, backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: binding.generation, traceId: id,
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "occurrenceneedle" }],
+        nativeHistory: { identity: { entryId, ...(parentEntryId === undefined ? {} : { parentEntryId }) } } },
+      metadata: { namespace: "test.native_history", fields: { [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: fingerprint, ...fields } }
+    });
+    const mark = (id: string, leafId: string) => store.appendEvent({
+      id, backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: binding.generation, traceId: id,
+      payload: { type: "native_session_changed", opaqueRef: binding.opaqueRef, leafId }
+    });
+    if (withMarker) { append("dedup-root", "root-entry", { nativeHydration: true }); mark("dedup-old-marker", "root-entry"); }
+    const live = append("dedup-live", "user-entry", { nativeHistoryReplacesTransient: true }, withMarker ? "root-entry" : undefined);
+    const wrongEntry = append("dedup-other-entry", "other-entry", { nativeHydration: true });
+    const wrongBinding = append("dedup-other-binding", "user-entry", {
+      nativeHydration: true, [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: nativeBindingFingerprint("opaque:other-binding")
+    });
+    const assertLive = (visible: boolean) => {
+      const raw = store.listEvents({ sessionId: "session-1", limit: 1000 });
+      const ids = store.listEvents({ sessionId: "session-1", activeNativeTimeline: true, limit: 1000 }).map(event => event.id);
+      expect(ids.includes(live.id)).toBe(visible);
+      expect(activeNativeTimeline(raw, binding).map(event => event.id)).toEqual(ids);
+      expect(createProjector(store).projectSessionSnapshot({ sessionId: "session-1", recentTimelineItems: 1000 }).timeline
+        .some(event => event.eventId === live.id)).toBe(visible);
+      expect(store.searchSessionMessages({ scope: { sessionId: "session-1" }, query: "occurrenceneedle" }).matches
+        .some(match => match.eventId === live.id)).toBe(visible);
+    };
+    assertLive(true);
+    expect(activeNativeTimeline([live, wrongEntry, wrongBinding, {
+      ...live, id: "dedup-other-session", sessionId: "session-other",
+      payload: { type: "message_complete", role: "user", blocks: [{ kind: "text", text: "occurrenceneedle" }],
+        nativeHistory: { identity: { entryId: "user-entry" } } },
+      metadata: { namespace: "test.native_history", fields: { nativeHydration: true, [NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD]: fingerprint } }
+    }]).map(event => event.id)).toContain(live.id);
+    const frozenSearch = withMarker ? undefined : store.searchSessionMessages({
+      scope: { sessionId: "session-1" }, query: "occurrenceneedle", limit: 1
+    });
+    const frozenEvents = store.listEvents({ sessionId: "session-1", limit: 1000 });
+    if (frozenSearch !== undefined) expect(frozenSearch.nextPageToken).toBeDefined();
+    store.transaction(() => {
+      append("dedup-canonical", "user-entry", { nativeHydration: true }, withMarker ? "root-entry" : undefined);
+      if (withMarker) mark("dedup-current-marker", "user-entry");
+    });
+    assertLive(false);
+    expect(activeNativeTimeline(frozenEvents, binding).map(event => event.id)).toContain(live.id);
+    if (frozenSearch !== undefined) {
+      expect(() => store.searchSessionMessages({ scope: { sessionId: "session-1" }, query: "occurrenceneedle",
+        limit: 1, pageToken: frozenSearch.nextPageToken! })).toThrow(/page token is stale/u);
+    }
+    expect(store.listEvents({ sessionId: "session-1", activeNativeTimeline: true, limit: 1000 }).map(event => event.id)).toContain("dedup-canonical");
+    expect(store.searchSessionMessages({ scope: { sessionId: "session-1" }, query: "occurrenceneedle" }).matches
+      .map(match => match.eventId)).toContain("dedup-canonical");
+    expect(store.findEvent(live.id)).toEqual(live);
+    expect(store.listEvents({ sessionId: "session-1", limit: 1000 }).map(event => event.id)).toEqual(expect.arrayContaining([live.id, "dedup-canonical"]));
   });
 
   it("fences native history to its binding fingerprint across rebinds", () => {

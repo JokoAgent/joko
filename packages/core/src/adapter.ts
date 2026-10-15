@@ -483,6 +483,15 @@ export interface NativeTextInferenceInput {
   readonly assertModelAllowed: (providerId: string, modelId: string) => void;
 }
 
+export interface BackgroundTaskOutputResult {
+  readonly status: "available" | "unavailable" | "failed";
+  readonly text: string;
+  readonly totalBytes: number;
+  readonly truncated: boolean;
+  readonly modifiedAtMs?: number;
+  readonly capturedAtMs: number;
+}
+
 export interface BackendAdapter {
   readonly id: string;
   describe(): Promise<BackendDescriptor>;
@@ -671,6 +680,8 @@ export interface BackendAdapter {
    * belongs to the supplied runtime context.
    */
   cancelBackgroundTask?(context: AdapterContext, taskId: string): Promise<void>;
+  /** Read only the tail of an active task's privately registered local output. */
+  getBackgroundTaskOutput?(context: AdapterContext, taskId: string, maximumBytes: number): Promise<BackgroundTaskOutputResult>;
   /**
    * Control an observed delegated run owned by this exact product Session.
    * The Host verifies durable ownership and per-action capabilities before the

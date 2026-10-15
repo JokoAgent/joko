@@ -52,6 +52,8 @@ export interface RealPiSystemFixtureOptions {
   readonly keepRoot?: boolean;
   readonly webDirectory?: string;
   readonly port?: number;
+  /** Give shared-task invitations the exact loopback server origin. */
+  readonly taskSharing?: boolean;
   readonly internalPort?: number;
   readonly enableInternalServer?: boolean;
   readonly holdProviderResponses?: boolean;
@@ -168,6 +170,11 @@ export class RealPiSystemFixture {
       const internalPort = options.enableInternalServer === true
         ? options.internalPort ?? await availableLoopbackPort()
         : options.internalPort ?? 4317;
+      const publicPort = options.port ?? (options.taskSharing === true ? await availableLoopbackPort() : 0);
+      if (!Number.isInteger(publicPort) || publicPort < 0 || publicPort > 65_535
+        || options.taskSharing === true && publicPort === 0) {
+        throw new Error("The real Pi fixture requires a valid public loopback port.");
+      }
       const provider: PiManagedProvider = {
         id: REAL_PI_PROVIDER_ID,
         baseUrl: `http://127.0.0.1:${providerAddress.port}/v1`,
@@ -183,9 +190,9 @@ export class RealPiSystemFixture {
       };
       const config: OrchestratorConfig = {
         host: "127.0.0.1",
-        port: 0,
+        port: options.taskSharing === true ? publicPort : 0,
         internalPort,
-        publicOrigin: "http://127.0.0.1",
+        publicOrigin: options.taskSharing === true ? `http://127.0.0.1:${publicPort}` : "http://127.0.0.1",
         internalOrigin: `http://127.0.0.1:${internalPort}`,
         dataDirectory,
         databasePath: join(dataDirectory, "orchestrator.db"),
@@ -269,7 +276,7 @@ export class RealPiSystemFixture {
       application.connections.openPairingWindow();
       publicServer = await createPublicServer(application);
       publicServer.log.level = "silent";
-      await publicServer.listen({ host: "127.0.0.1", port: options.port ?? 0 });
+      await publicServer.listen({ host: "127.0.0.1", port: publicPort });
       const orchestratorAddress = publicServer.server.address();
       if (orchestratorAddress === null || typeof orchestratorAddress === "string") {
         throw new Error("Orchestrator did not expose an ephemeral TCP port.");

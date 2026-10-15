@@ -1423,7 +1423,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
     : quotedUserMessage.body;
   const partnerConversation = usePartnerConversation();
   const partner = partnerConversation?.partner;
-  const roleLabel = role === "user" ? t("timeline.you") : partner?.displayName ?? t("timeline.agent");
+  const roleLabel = role === "user" ? item.sharedTaskAuthor?.displayName || t("timeline.you") : partner?.displayName ?? t("timeline.agent");
   const selectionActive = shareSelection !== undefined;
   const shareable = item.streaming !== true && (displayText.trim().length > 0 || (item.attachments?.length ?? 0) > 0);
   const shareSelected = selectionActive && shareSelection.selectedIds.has(item.id);

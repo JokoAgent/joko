@@ -8,6 +8,8 @@ import { createPartnerRoutineApi, newRoutineDefinition, ListPartnerRoutinesRespo
 import { createPartnerMemoryApi, ListPartnerMemoriesResponseSchema, PartnerMemoryKind, ReadPartnerMemoryResponseSchema, UpdatePartnerMemoryResponseSchema, DeletePartnerMemoryResponseSchema,
   GetPartnerMemoryPreferencesResponseSchema, UpdatePartnerMemoryPreferencesResponseSchema } from "@joko/contracts";
 import { Code } from "@connectrpc/connect";
+import { ConnectError } from "@connectrpc/connect";
+import { ActorKind, JoinedTaskShareSchema, TaskShareMethod, TaskShareSnapshotSchema, TaskShareEventBatchSchema, type TaskSharingApi } from "@joko/contracts";
 import { PartnerGroupSummarySchema, PartnerGroupMemberSchema, ListPartnerGroupsResponseSchema, GetPartnerGroupResponseSchema,
   GetPartnerGroupCreationResponseSchema, RetirePartnerGroupCreationResponseSchema, PartnerGroupMemberStatus, type PartnerGroupApi } from "@joko/contracts";
 import { DevicePeerDescriptorSchema, RemoteDesktopControlStateSchema, type RemoteDesktopControlState } from "@joko/contracts";
@@ -1856,6 +1858,88 @@ function iosClient(network: MobileNetwork, storage: MobileStorage): MobileClient
   return instance;
 }
 afterEach(() => { for (const item of clients.splice(0)) item.dispose(); vi.useRealTimers(); });
+
+describe("shared task source on the native task client", () => {
+  function sharedFixture() {
+    const joined = create(JoinedTaskShareSchema, { joinId: "joined-one", status: "active",
+      share: { shareId: "share-one", hostServerId: "remote-node", hostOrigin: "http://127.0.0.1:4567", sessionId: "session", shareGeneration: 2n, status: "active", title: "Remote task" },
+      member: { memberId: "guest-one", memberGeneration: 3n, status: "active", displayName: "Participant" } });
+    const detail = create(SnapshotSchema, { ...snapshot, server: { ...snapshot.server!, serverId: "remote-node" }, generation: 7n,
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: { sessionId: "session" } } }),
+      resumeCursor: create(EventCursorSchema, { opaqueToken: "remote-cursor", generation: 7n, sequence: 10n }),
+      connections: [], devices: [], sessions: [{ ...snapshot.sessions[0]!, displayName: "Remote task" }] });
+    const snapshotRead = vi.fn(async () => create(TaskShareSnapshotSchema, { share: joined.share, member: joined.member, snapshot: detail }));
+    const events = vi.fn(async () => create(TaskShareEventBatchSchema, { generation: 7n, resumeCursor: detail.resumeCursor }));
+    const invoke = vi.fn(async (joinId: string, method: TaskShareMethod, request: { operationId?: string }) => {
+      expect(joinId).toBe(joined.joinId);
+      if (method === TaskShareMethod.SUBMIT_OPERATION) throw new ConnectError("Response lost.", Code.Unavailable);
+      if (method !== TaskShareMethod.GET_OPERATION) throw new Error("Unexpected method.");
+      return { operation: create(OperationSchema, { operationId: request.operationId!, connectionId: "", state: OperationState.SUCCEEDED,
+        actor: { kind: ActorKind.TASK_PARTICIPANT, id: joined.member!.memberId }, sharedTaskAuthor: {
+          shareId: joined.share!.shareId, sessionId: "session", shareGeneration: 2n,
+          memberId: joined.member!.memberId, memberGeneration: 3n, displayName: "Participant" } }) };
+    });
+    return { joined, detail, snapshotRead, events, invoke,
+      api: { snapshot: snapshotRead, events, invoke } as unknown as TaskSharingApi };
+  }
+  it("keeps Home ownership and a colliding remote Session separate, including retained drafts and denied controls", async () => {
+    const value = sharedFixture(), network = fakeNetwork(), instance = client(network, memoryStorage(credential).storage);
+    await instance.start(); const ownerReads = vi.mocked(network.readOwner).mock.calls.length;
+    vi.spyOn(instance, "taskSharingApi").mockReturnValue(value.api);
+    await instance.openJoinedTask(value.joined);
+    expect(instance.state.owner?.server?.serverId).toBe(credential.serverId);
+    expect(instance.state.detail?.server?.serverId).toBe("remote-node");
+    expect(instance.state.detail?.sessions[0]?.displayName).toBe("Remote task");
+    expect(instance.state.taskSource?.kind).toBe("joined");
+    expect(instance.taskDraftProfileId()).toMatch(/^shared-[a-f0-9]{64}$/u);
+    expect(instance.taskDraftProfileId()).not.toBe(credential.profileId);
+    expect(instance.taskRuntimeControls()?.canSetPermission).toBe(false);
+    expect(instance.taskRuntimeControls()?.canSetPlanMode).toBe(false);
+    expect(instance.canOpenFiles()).toBe(false); expect(instance.taskSessionMentionControls()).toBeUndefined();
+    expect(network.readOwner).toHaveBeenCalledTimes(ownerReads);
+    await instance.select("session");
+    expect(instance.state.taskSource?.kind).toBe("own");
+    expect(instance.state.detail?.server?.serverId).toBe(credential.serverId);
+    expect(instance.taskDraftProfileId()).toBe(credential.profileId);
+  });
+  it("retains an unknown guest input and checks only its signed original receipt without ordinary dispatch", async () => {
+    const value = sharedFixture(), network = fakeNetwork(), saved = memoryStorage(credential), instance = client(network, saved.storage);
+    await instance.start(); vi.spyOn(instance, "taskSharingApi").mockReturnValue(value.api);
+    await instance.openJoinedTask(value.joined);
+    expect(await instance.send({ text: "A participant input", mentions: [], atoms: [], slashCommands: [], attachments: [] })).toBe(false);
+    expect(saved.pending()[0]?.taskJoinId).toBe("joined-one");
+    expect(instance.state.pending[0]?.state).toBe("unknown");
+    await instance.reconcile();
+    expect(instance.state.pending).toHaveLength(0);
+    expect(value.invoke.mock.calls.map(call => call[1])).toEqual([TaskShareMethod.SUBMIT_OPERATION, TaskShareMethod.GET_OPERATION]);
+    expect(network.submit).not.toHaveBeenCalled(); expect(network.getOperation).not.toHaveBeenCalled();
+  });
+  it("retires a late finite event read when returning to the owned directory", async () => {
+    const value = sharedFixture(), instance = client(fakeNetwork(), memoryStorage(credential).storage);
+    await instance.start(); vi.spyOn(instance, "taskSharingApi").mockReturnValue(value.api);
+    await instance.openJoinedTask(value.joined);
+    let finish!: (value: ReturnType<typeof create<typeof TaskShareEventBatchSchema>>) => void;
+    value.events.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    vi.useFakeTimers(); await instance.refresh(); await vi.advanceTimersByTimeAsync(1_000);
+    await instance.select();
+    finish(create(TaskShareEventBatchSchema, { generation: 7n })); await Promise.resolve(); await Promise.resolve();
+    expect(instance.state.taskSource?.kind).toBe("own"); expect(instance.state.detail).toBeUndefined();
+    expect(value.snapshotRead).toHaveBeenCalledTimes(2);
+  });
+  it("uses only Home-owned voice methods and cancels a late voice start after the joined task retires", async () => {
+    const value = sharedFixture(), network = fakeNetwork(), instance = client(network, memoryStorage(credential).storage);
+    let finish!: (session: MobileVoiceSession) => void;
+    network.startVoiceInput = vi.fn(() => new Promise<MobileVoiceSession>(resolve => { finish = resolve; }));
+    network.cancelVoiceInput = vi.fn(async () => ({ id: "voice-owned" } as MobileVoiceSession));
+    await instance.start(); vi.spyOn(instance, "taskSharingApi").mockReturnValue(value.api); await instance.openJoinedTask(value.joined);
+    const transport = instance.taskVoiceTransport()!, starting = transport.start("voice-request", "audio/pcm");
+    await instance.select("session"); finish({ id: "voice-owned" } as MobileVoiceSession);
+    await expect(starting).rejects.toThrow("owner changed");
+    expect(network.startVoiceInput).toHaveBeenCalledWith(credential, "voice-request", "audio/pcm", undefined, undefined, undefined);
+    expect(network.cancelVoiceInput).toHaveBeenCalledWith(credential, "voice-owned");
+    expect(value.invoke).not.toHaveBeenCalled();
+  });
+});
 
 describe("paired Partner group sources", () => {
   function fixture() {

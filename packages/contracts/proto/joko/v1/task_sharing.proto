@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/common.proto";
+import "joko/v1/event.proto";
+import "joko/v1/snapshot.proto";
+import "joko/v1/task_sharing_types.proto";
+
+// Descriptor-only internal read mapping. It has no public standalone route;
+// the authenticated sharing envelope owns every invocation.
+service TaskShareRuntimeService {
+  rpc GetRuntimeControl(GetRuntimeControlRequest) returns (GetRuntimeControlResponse);
+}
+message TaskShareRuntimeProfile {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+  optional string effort = 4;
+  bool fast_mode = 5;
+}
+message TaskShareRuntimeControl {
+  uint64 generation = 1;
+  TaskShareRuntimeProfile baseline = 2;
+  TaskShareRuntimeProfile effective = 3;
+  TaskShareRuntimeProfile pending = 4;
+  uint64 pending_generation = 5;
+  string handoff_state = 6;
+}
+message GetRuntimeControlRequest { string session_id = 1; }
+message GetRuntimeControlResponse { TaskShareRuntimeControl control = 1; }
+
+service TaskSharingService {
+  rpc ListTaskShares(ListTaskSharesRequest) returns (ListTaskSharesResponse);
+  rpc GetTaskShare(GetTaskShareRequest) returns (GetTaskShareResponse);
+  rpc CreateTaskShare(CreateTaskShareRequest) returns (CreateTaskShareResponse);
+  rpc CreateTaskShareInvitation(CreateTaskShareInvitationRequest) returns (CreateTaskShareInvitationResponse);
+  rpc RemoveTaskShareMember(RemoveTaskShareMemberRequest) returns (RemoveTaskShareMemberResponse);
+  rpc EndTaskShare(EndTaskShareRequest) returns (EndTaskShareResponse);
+  rpc EndAllTaskShares(EndAllTaskSharesRequest) returns (EndAllTaskSharesResponse);
+  rpc PreviewTaskShareInvitation(PreviewTaskShareInvitationRequest) returns (PreviewTaskShareInvitationResponse);
+  rpc JoinTaskShare(JoinTaskShareRequest) returns (JoinTaskShareResponse);
+  rpc GetTaskShareJoinIntent(GetTaskShareJoinIntentRequest) returns (GetTaskShareJoinIntentResponse);
+  rpc GetTaskSharingActionReceipt(GetTaskSharingActionReceiptRequest) returns (GetTaskSharingActionReceiptResponse);
+  rpc LeaveTaskShare(LeaveTaskShareRequest) returns (LeaveTaskShareResponse);
+  rpc GetJoinedTaskSnapshot(GetJoinedTaskSnapshotRequest) returns (GetJoinedTaskSnapshotResponse);
+  rpc ReadJoinedTaskEvents(ReadJoinedTaskEventsRequest) returns (ReadJoinedTaskEventsResponse);
+  rpc InvokeJoinedTask(InvokeJoinedTaskRequest) returns (InvokeJoinedTaskResponse);
+  rpc TransferJoinedTaskAttachment(TransferJoinedTaskAttachmentRequest) returns (TransferJoinedTaskAttachmentResponse);
+}
+
+// Independent authentication: ordinary Connection credentials are not accepted.
+service TaskSharingGuestService {
+  rpc InspectTaskShareInvitation(InspectTaskShareInvitationRequest) returns (InspectTaskShareInvitationResponse);
+  rpc AcceptTaskShareJoin(AcceptTaskShareJoinRequest) returns (AcceptTaskShareJoinResponse);
+  rpc GetTaskShareJoinReceipt(GetTaskShareJoinReceiptRequest) returns (GetTaskShareJoinReceiptResponse);
+  rpc GetSharedTaskSnapshot(GetSharedTaskSnapshotRequest) returns (GetSharedTaskSnapshotResponse);
+  rpc ReadSharedTaskEvents(ReadSharedTaskEventsRequest) returns (ReadSharedTaskEventsResponse);
+  rpc InvokeSharedTask(InvokeSharedTaskRequest) returns (InvokeSharedTaskResponse);
+  rpc LeaveSharedTask(LeaveSharedTaskRequest) returns (LeaveSharedTaskResponse);
+  rpc GetSharedTaskLeaveReceipt(GetSharedTaskLeaveReceiptRequest) returns (GetSharedTaskLeaveReceiptResponse);
+  rpc TransferSharedTaskAttachment(TransferSharedTaskAttachmentRequest) returns (TransferSharedTaskAttachmentResponse);
+}
+
+message TaskShareSnapshot {
+  TaskShare share = 1;
+  TaskShareMember member = 2;
+  // Only the shared Session and its explicitly allowed dependencies are present.
+  Snapshot snapshot = 3;
+}
+message TaskShareEventBatch {
+  repeated Event events = 1;
+  EventCursor resume_cursor = 2;
+  uint64 generation = 3;
+  bool resync_required = 4;
+}
+message TaskShareJoinIntent {
+  string operation_id = 1;
+  string status = 2;
+  JoinedTaskShare joined = 3;
+  string error_code = 4;
+}
+message ListTaskSharesRequest {}
+message ListTaskSharesResponse { repeated TaskShare owned = 1; repeated JoinedTaskShare joined = 2; repeated TaskShareJoinIntent intents = 3; }
+message GetTaskShareRequest { string share_id = 1; }
+message GetTaskShareResponse { TaskShare share = 1; }
+message CreateTaskShareRequest { string operation_id = 1; string session_id = 2; }
+message CreateTaskShareResponse { string operation_id = 1; TaskShare share = 2; }
+message CreateTaskShareInvitationRequest { string operation_id = 1; string share_id = 2; }
+message CreateTaskShareInvitationResponse { string operation_id = 1; string invitation = 2; TaskShare share = 3; }
+message RemoveTaskShareMemberRequest { string operation_id = 1; string share_id = 2; string member_id = 3; uint64 member_generation = 4; }
+message RemoveTaskShareMemberResponse { string operation_id = 1; TaskShare share = 2; }
+message EndTaskShareRequest { string operation_id = 1; string share_id = 2; }
+message EndTaskShareResponse { string operation_id = 1; TaskShare share = 2; }
+message EndAllTaskSharesRequest { string operation_id = 1; repeated string share_ids = 2; }
+message EndAllTaskSharesResponse { string operation_id = 1; repeated string ended_share_ids = 2; repeated string failed_share_ids = 3; }
+message PreviewTaskShareInvitationRequest { string invitation = 1; }
+message PreviewTaskShareInvitationResponse { TaskShare share = 1; }
+message JoinTaskShareRequest { string operation_id = 1; string invitation = 2; string display_name = 3; }
+message JoinTaskShareResponse { TaskShareJoinIntent intent = 1; }
+message GetTaskShareJoinIntentRequest { string operation_id = 1; }
+message GetTaskShareJoinIntentResponse { TaskShareJoinIntent intent = 1; }
+message TaskSharingActionReceipt {
+  string operation_id = 1;
+  string kind = 2;
+  string status = 3;
+  string error_code = 4;
+  TaskShare share = 5;
+  JoinedTaskShare joined = 6;
+  repeated string ended_share_ids = 7;
+  repeated string failed_share_ids = 8;
+}
+message GetTaskSharingActionReceiptRequest { string operation_id = 1; }
+message GetTaskSharingActionReceiptResponse { TaskSharingActionReceipt receipt = 1; }
+message LeaveTaskShareRequest { string operation_id = 1; string join_id = 2; }
+message LeaveTaskShareResponse { string operation_id = 1; JoinedTaskShare joined = 2; }
+message GetSharedTaskLeaveReceiptRequest { TaskShareScope scope = 1; string operation_id = 2; }
+message GetSharedTaskLeaveReceiptResponse { bool applied = 1; }
+message GetJoinedTaskSnapshotRequest { string join_id = 1; }
+message GetJoinedTaskSnapshotResponse { TaskShareSnapshot state = 1; }
+message ReadJoinedTaskEventsRequest { string join_id = 1; EventCursor after = 2; uint32 limit = 3; }
+message ReadJoinedTaskEventsResponse { TaskShareEventBatch batch = 1; }
+message InvokeJoinedTaskRequest { string join_id = 1; TaskShareMethod method = 2; bytes request_bytes = 3; }
+message InvokeJoinedTaskResponse { bytes response_bytes = 1; }
+
+message InspectTaskShareInvitationRequest { string invitation = 1; }
+message InspectTaskShareInvitationResponse { TaskShare share = 1; }
+message AcceptTaskShareJoinRequest {
+  string intent_id = 1;
+  string invitation = 2;
+  string credential_sha256_hex = 3;
+  string display_name = 4;
+  string home_server_id = 5;
+  string home_device_id = 6;
+}
+message AcceptTaskShareJoinResponse { TaskShare share = 1; TaskShareMember member = 2; }
+message GetTaskShareJoinReceiptRequest { string intent_id = 1; string credential_sha256_hex = 2; }
+message GetTaskShareJoinReceiptResponse { TaskShare share = 1; TaskShareMember member = 2; }
+message GetSharedTaskSnapshotRequest { TaskShareScope scope = 1; }
+message GetSharedTaskSnapshotResponse { TaskShareSnapshot state = 1; }
+message ReadSharedTaskEventsRequest { TaskShareScope scope = 1; EventCursor after = 2; uint32 limit = 3; }
+message ReadSharedTaskEventsResponse { TaskShareEventBatch batch = 1; }
+message InvokeSharedTaskRequest { TaskShareScope scope = 1; TaskShareMethod method = 2; bytes request_bytes = 3; }
+message InvokeSharedTaskResponse { bytes response_bytes = 1; }
+message LeaveSharedTaskRequest { TaskShareScope scope = 1; string operation_id = 2; }
+message LeaveSharedTaskResponse { TaskShare share = 1; TaskShareMember member = 2; }
+
+message TaskShareAttachmentBegin {
+  string operation_id = 1;
+  string name = 2;
+  string media_type = 3;
+  uint64 size_bytes = 4;
+  string sha256_hex = 5;
+}
+message TaskShareAttachmentWrite { string ticket_id = 1; uint64 offset = 2; bytes data = 3; bool finish = 4; }
+message TaskShareAttachmentRead { string blob_id = 1; uint64 offset = 2; uint32 maximum_bytes = 3; }
+message TaskShareAttachmentTransfer {
+  oneof action {
+    TaskShareAttachmentBegin begin = 1;
+    TaskShareAttachmentWrite write = 2;
+    TaskShareAttachmentRead read = 3;
+  }
+}
+message TaskShareAttachmentResult {
+  string ticket_id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool complete = 4;
+  BlobRef blob = 5;
+}
+message TransferJoinedTaskAttachmentRequest { string join_id = 1; TaskShareAttachmentTransfer transfer = 2; }
+message TransferJoinedTaskAttachmentResponse { TaskShareAttachmentResult result = 1; }
+message TransferSharedTaskAttachmentRequest { TaskShareScope scope = 1; TaskShareAttachmentTransfer transfer = 2; }
+message TransferSharedTaskAttachmentResponse { TaskShareAttachmentResult result = 1; }

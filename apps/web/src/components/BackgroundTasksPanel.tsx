@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { BackgroundTaskOutputState, type BackgroundTaskOutput } from "@joko/contracts";
 import type { JSX } from "react";
 import { ArrowLeft, CheckCircle2, CircleDashed, Clock3, ListTodo, RefreshCcw, Square } from "lucide-react";
 import type { BackgroundTaskHistoryView, Locale, TimelineItemView } from "../model.js";
@@ -6,7 +7,7 @@ import { backgroundTaskDuration, isActiveBackgroundTask, projectBackgroundTaskGr
 import type { Translator } from "./types.js";
 import { Button, Pill, StatusDot, formatRelativeTime } from "./ui.js";
 
-export function BackgroundTasksPanel({ timeline, history, historyState, historyError, onRefresh, canCancel, onCancel, locale, t }: {
+export function BackgroundTasksPanel({ timeline, history, historyState, historyError, onRefresh, canCancel, onCancel, onReadOutput, outputOwner, locale, t }: {
   readonly timeline: readonly TimelineItemView[];
   readonly history: readonly BackgroundTaskHistoryView[];
   readonly historyState: "idle" | "loading" | "ready" | "error";
@@ -14,6 +15,8 @@ export function BackgroundTasksPanel({ timeline, history, historyState, historyE
   readonly onRefresh: () => void;
   readonly canCancel: boolean;
   readonly onCancel: (backgroundTaskId: string) => Promise<void>;
+  readonly onReadOutput?: (backgroundTaskId: string, signal: AbortSignal) => Promise<BackgroundTaskOutput>;
+  readonly outputOwner?: string;
   readonly locale: Locale;
   readonly t: Translator;
 }): JSX.Element {
@@ -52,6 +55,8 @@ export function BackgroundTasksPanel({ timeline, history, historyState, historyE
       t={t}
       onBack={() => setSelectedId(undefined)}
       onCancel={() => cancel(selected.id)}
+      onReadOutput={onReadOutput}
+      outputOwner={outputOwner}
     />;
   }
 
@@ -100,7 +105,7 @@ function BackgroundTaskGroup({ title, tasks, canCancel, cancelPendingId, locale,
   </section>;
 }
 
-function BackgroundTaskDetail({ task, canCancel, cancelling, cancelError, locale, t, onBack, onCancel }: {
+function BackgroundTaskDetail({ task, canCancel, cancelling, cancelError, locale, t, onBack, onCancel, onReadOutput, outputOwner }: {
   readonly task: ProjectedBackgroundTask;
   readonly canCancel: boolean;
   readonly cancelling: boolean;
@@ -109,6 +114,8 @@ function BackgroundTaskDetail({ task, canCancel, cancelling, cancelError, locale
   readonly t: Translator;
   readonly onBack: () => void;
   readonly onCancel: () => Promise<void>;
+  readonly onReadOutput?: (backgroundTaskId: string, signal: AbortSignal) => Promise<BackgroundTaskOutput>;
+  readonly outputOwner?: string;
 }): JSX.Element {
   const startedAt = task.startedAt ?? task.createdAt;
   const duration = backgroundTaskDuration(task, Date.now());
@@ -134,9 +141,42 @@ function BackgroundTaskDetail({ task, canCancel, cancelling, cancelError, locale
       <header><h3>{t("background.activity")}</h3></header>
       <div><StatusDot state={task.state} label={backgroundTaskStateLabel(task.state, t)} /><span><strong>{backgroundTaskStateLabel(task.state, t)}</strong>{task.detail !== undefined && <small>{task.detail}</small>}</span><time dateTime={new Date(task.endedAt ?? startedAt).toISOString()}>{formatRelativeTime(task.endedAt ?? startedAt, locale)}</time></div>
     </section>
+    {onReadOutput && <BackgroundTaskRecentOutput key={`${outputOwner}:${task.id}`} taskId={task.id} owner={outputOwner} read={onReadOutput} locale={locale} t={t} />}
     {cancelError !== undefined && <div className="background-task-error" role="alert"><strong>{t("background.cancelFailed")}</strong><span>{cancelError}</span></div>}
     {task.error !== undefined && <div className="background-task-error" role="alert"><strong>{task.error.code}</strong><span>{task.error.message}</span></div>}
   </div>;
+}
+
+function BackgroundTaskRecentOutput({ taskId, owner, read, locale, t }: {
+  readonly taskId: string; readonly owner?: string;
+  readonly read: (taskId: string, signal: AbortSignal) => Promise<BackgroundTaskOutput>;
+  readonly locale: Locale; readonly t: Translator;
+}): JSX.Element {
+  const reader = useRef(read); reader.current = read;
+  const [value, setValue] = useState<BackgroundTaskOutput>(), [error, setError] = useState(false), [loading, setLoading] = useState(true);
+  const refresh = useRef<() => void>(() => undefined);
+  useEffect(() => {
+    const abort = new AbortController(); let flight = false, request: AbortController | undefined, timer: ReturnType<typeof setTimeout> | undefined;
+    const load = async (): Promise<void> => {
+      if (abort.signal.aborted || flight || document.visibilityState === "hidden") return;
+      if (timer) clearTimeout(timer); flight = true; setLoading(true); request = new AbortController();
+      const signal = AbortSignal.any([abort.signal, request.signal]);
+      try { const output = await reader.current(taskId, signal); if (!signal.aborted) { setValue(output); setError(false); } }
+      catch { if (!signal.aborted) setError(true); }
+      finally { flight = false; if (!abort.signal.aborted) { setLoading(false); timer = setTimeout(() => { void load(); }, 2_000); } }
+    };
+    const changed = (): void => { if (document.visibilityState === "hidden") request?.abort(); else void load(); };
+    const retired = (): void => abort.abort();
+    refresh.current = () => { void load(); }; document.addEventListener("visibilitychange", changed); window.addEventListener("pagehide", retired); void load();
+    return () => { abort.abort(); if (timer) clearTimeout(timer); document.removeEventListener("visibilitychange", changed); window.removeEventListener("pagehide", retired); };
+  }, [taskId, owner]);
+  return <section className="background-task-output" aria-label={t("background.output")}>
+    <header><h3>{t("background.output")}</h3><Button disabled={loading} onClick={() => refresh.current()}>{t("common.refresh")}</Button></header>
+    {loading && !value && <p role="status">{t("common.loading")}</p>}
+    {error || value?.state === BackgroundTaskOutputState.FAILED ? <p role="alert">{t("background.outputFailed")}</p>
+      : value?.state === BackgroundTaskOutputState.UNAVAILABLE ? <p role="status">{t("background.outputUnavailable")}</p>
+      : value && <>{value.text ? <pre>{value.text}</pre> : <p role="status">{t("background.outputEmpty")}</p>}{value.truncated && <Pill>{t("background.outputTruncated")}</Pill>}<time dateTime={new Date(Number(value.modifiedAtMs ?? value.capturedAtMs)).toISOString()}>{formatRelativeTime(Number(value.modifiedAtMs ?? value.capturedAtMs), locale)}</time></>}
+  </section>;
 }
 
 function backgroundTaskStateLabel(state: ProjectedBackgroundTask["state"], t: Translator): string {

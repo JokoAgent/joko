@@ -16,7 +16,8 @@ const DURABLE_JSON_SHAPE_BASELINE = [
   "native-derivation-remote-worktree-plan:exact-v1",
   "native-derivation-worktree:optional-remote-owner-exact-v1",
   "task-tag-catalog-event:exact-v1",
-  "partner-learning-turn-and-receipts:exact-v1"
+  "partner-learning-turn-and-receipts:exact-v1",
+  "task-sharing-host:share/member/credential-digest/input-author/operation-receipt-v1"
 ].join("\n");
 
 const SCHEMA_MARKER_SCHEMA = `
@@ -937,6 +938,7 @@ CREATE TABLE queue_items (
         position INTEGER NOT NULL,
         edit_lock_token TEXT,
         edit_lock_connection_id TEXT,
+        edit_lock_task_share_owner TEXT,
         edit_lock_expires_at INTEGER,
         CHECK (
           state NOT IN ('dispatching', 'backend_accepted', 'dispatch_unknown', 'completed')
@@ -949,16 +951,17 @@ CREATE TABLE queue_items (
           backend_instance_generation IS NULL OR attempt_id IS NOT NULL
         ),
         CHECK (
-          (edit_lock_token IS NULL AND edit_lock_connection_id IS NULL AND edit_lock_expires_at IS NULL)
+          (edit_lock_token IS NULL AND edit_lock_connection_id IS NULL AND edit_lock_task_share_owner IS NULL AND edit_lock_expires_at IS NULL)
           OR (
             edit_lock_token IS NOT NULL
-            AND edit_lock_connection_id IS NOT NULL
+            AND ((edit_lock_connection_id IS NOT NULL AND edit_lock_task_share_owner IS NULL)
+              OR (edit_lock_connection_id IS NULL AND edit_lock_task_share_owner IS NOT NULL))
             AND edit_lock_expires_at IS NOT NULL
             AND
             length(edit_lock_token) BETWEEN 16 AND 256
             AND instr(edit_lock_token, char(0)) = 0
-            AND length(edit_lock_connection_id) BETWEEN 1 AND 1024
-            AND instr(edit_lock_connection_id, char(0)) = 0
+            AND length(coalesce(edit_lock_connection_id, edit_lock_task_share_owner)) BETWEEN 1 AND 2048
+            AND instr(coalesce(edit_lock_connection_id, edit_lock_task_share_owner), char(0)) = 0
             AND edit_lock_expires_at >= 0
           )
         )

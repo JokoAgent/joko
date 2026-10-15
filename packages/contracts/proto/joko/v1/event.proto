@@ -14,6 +14,7 @@ import "joko/v1/review.proto";
 import "joko/v1/resource_usage.proto";
 import "joko/v1/settings.proto";
 import "joko/v1/subagent.proto";
+import "joko/v1/task_sharing_types.proto";
 import "joko/v1/tool.proto";
 import "joko/v1/workspace.proto";
 
@@ -231,6 +232,7 @@ message MessageStartedEvent {
   // Host-owned report provenance, absent from public input and native echoes.
   CollaborationReportOrigin collaboration_report_origin = 14;
   TaskMessageOrigin task_message_origin = 15;
+  SharedTaskAuthor shared_task_author = 16;
 }
 
 message TaskMessageOrigin {
@@ -380,6 +382,7 @@ message MessageCompletedEvent {
   optional bool usage_is_estimate = 13;
   // Joined from the exact durable Run summary; per-message generation usage stays separate.
   RunUsageSummary turn_usage = 14;
+  SharedTaskAuthor shared_task_author = 15;
 }
 
 message ModelSubstitution {

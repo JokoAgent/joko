@@ -2,7 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
-import type { AppController } from "../controller.js";
+import type { AppController, ControllerState } from "../controller.js";
 import type { QueueItemView } from "../model.js";
 import { SELECTION_QUOTE_BLOCK_MARKER_LINE } from "../selection-quote.js";
 import { QueueStrip } from "./QueueStrip.js";
@@ -19,6 +19,7 @@ const item = (id: string, ordinal: number): QueueItemView => ({ id, ordinal, ses
   source: "user", mode: "followUp", text: `Queued ${id}`, state: "accepted", editLocked: false, createdAt: ordinal });
 const initial = [item("first", 0), item("second", 1)];
 const api = () => ({
+  state: { sessionAccess: undefined } as Pick<ControllerState, "sessionAccess">,
   setQueueItemEditLock: vi.fn< AppController["setQueueItemEditLock"]>().mockResolvedValue(undefined),
   setQueueInteractionLock: vi.fn< AppController["setQueueInteractionLock"]>().mockResolvedValue(undefined),
   editQueueItem: vi.fn< AppController["editQueueItem"]>().mockResolvedValue(undefined),
@@ -44,6 +45,19 @@ async function fixture() {
 async function change(textarea: HTMLTextAreaElement, text: string) {
   await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, text); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
 }
+it("keeps foreign pending input visible while exposing guest controls only for its canonical own item", async () => {
+  const f = await fixture();
+  const guest = { ...f.controller, state: { sessionAccess: { role: "guest" as const, memberId: "member", editableQueueItemIds: new Set(["first"]) } } };
+  await f.render(initial, guest);
+  expect(f.row("first").querySelector("[data-queue-edit]")).not.toBeNull();
+  expect(f.row("second").querySelector("[data-queue-edit]")).toBeNull();
+  expect(f.row("second").textContent).toContain("Queued second");
+  expect(f.host.querySelector("[draggable='true']")).toBeNull();
+  expect(f.host.querySelector("[aria-label='queue.pause']")).toBeNull();
+  await act(async () => f.button("queue.cancel").click());
+  expect(guest.cancelQueueItem).toHaveBeenCalledExactlyOnceWith("first");
+  expect(guest.reorderQueueItem).not.toHaveBeenCalled();
+});
 async function transactionalChange(textarea: HTMLTextAreaElement, text: string, selectionStart: number, selectionEnd: number, inputType: string) {
   await act(async () => {
     textarea.setSelectionRange(selectionStart, selectionEnd);

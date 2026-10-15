@@ -5,6 +5,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { translate } from "../i18n.js";
 import type { TimelineItemView } from "../model.js";
+import { create } from "@bufbuild/protobuf";
+import { BackgroundTaskOutputSchema, BackgroundTaskOutputState, type BackgroundTaskOutput } from "@joko/contracts";
 import { BackgroundTasksPanel } from "./BackgroundTasksPanel.js";
 
 const roots: Root[] = [];
@@ -19,6 +21,32 @@ afterEach(async () => {
 });
 
 describe("BackgroundTasksPanel cancellation", () => {
+  it("shows bounded recent-output states and cancels late reads when another task is selected", async () => {
+    let resolve!: (value: BackgroundTaskOutput) => void, signal!: AbortSignal;
+    const read = vi.fn((_id: string, owned: AbortSignal) => { signal = owned; return new Promise<BackgroundTaskOutput>(value => { resolve = value; }); });
+    const container = await renderPanel({ canCancel: false, onCancel: vi.fn(), onRefresh: vi.fn(), onReadOutput: read });
+    await act(async () => container.querySelector<HTMLButtonElement>(".background-task-row__select")!.click());
+    expect(container.querySelector(".background-task-output")?.textContent).toContain("Loading");
+    await act(async () => resolve(create(BackgroundTaskOutputSchema, { sessionId: "session", backgroundTaskId: "active", state: BackgroundTaskOutputState.AVAILABLE,
+      text: "Recent output", totalBytes: 32n, truncated: true, capturedAtMs: BigInt(Date.now()) })));
+    expect(container.querySelector(".background-task-output pre")?.textContent).toBe("Recent output");
+    expect(container.querySelector(".background-task-output")?.textContent).toContain("most recent");
+    await act(async () => container.querySelector<HTMLButtonElement>(".background-task-output button")!.click());
+    const pendingSignal = signal, late = resolve;
+    await act(async () => container.querySelector<HTMLButtonElement>(".background-task-detail__back")!.click());
+    expect(pendingSignal.aborted).toBe(true);
+    await act(async () => late(create(BackgroundTaskOutputSchema, { state: BackgroundTaskOutputState.AVAILABLE, text: "Retired output", capturedAtMs: BigInt(Date.now()) })));
+    expect(container.textContent).not.toContain("Retired output");
+    read.mockImplementation(async () => create(BackgroundTaskOutputSchema, { state: BackgroundTaskOutputState.UNAVAILABLE, capturedAtMs: BigInt(Date.now()) }));
+    await act(async () => container.querySelector<HTMLButtonElement>(".background-task-row__select")!.click());
+    expect(container.querySelector(".background-task-output")?.textContent).toContain("unavailable");
+    read.mockImplementation(async () => create(BackgroundTaskOutputSchema, { state: BackgroundTaskOutputState.FAILED, capturedAtMs: BigInt(Date.now()) }));
+    await act(async () => container.querySelector<HTMLButtonElement>(".background-task-output button")!.click());
+    expect(container.querySelector(".background-task-output [role='alert']")?.textContent).toContain("could not be read");
+    read.mockImplementation(async () => create(BackgroundTaskOutputSchema, { state: BackgroundTaskOutputState.AVAILABLE, capturedAtMs: BigInt(Date.now()) }));
+    await act(async () => container.querySelector<HTMLButtonElement>(".background-task-output button")!.click());
+    expect(container.querySelector(".background-task-output")?.textContent).toContain("No output yet");
+  });
   it("shows a real Stop action only for active tasks when the capability is advertised", async () => {
     let resolvePending!: () => void;
     const pending = new Promise<void>((resolve) => { resolvePending = resolve; });
@@ -54,10 +82,11 @@ describe("BackgroundTasksPanel cancellation", () => {
   });
 });
 
-async function renderPanel({ canCancel, onCancel, onRefresh }: {
+async function renderPanel({ canCancel, onCancel, onRefresh, onReadOutput }: {
   readonly canCancel: boolean;
   readonly onCancel: (backgroundTaskId: string) => Promise<void>;
   readonly onRefresh: () => void;
+  readonly onReadOutput?: (id: string, signal: AbortSignal) => Promise<BackgroundTaskOutput>;
 }): Promise<HTMLDivElement> {
   const container = document.createElement("div");
   document.body.append(container);
@@ -70,6 +99,8 @@ async function renderPanel({ canCancel, onCancel, onRefresh }: {
     onRefresh={onRefresh}
     canCancel={canCancel}
     onCancel={onCancel}
+    onReadOutput={onReadOutput}
+    outputOwner="source"
     locale="en"
     t={(key, values) => translate("en", key, values)}
   />));

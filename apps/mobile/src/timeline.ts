@@ -130,7 +130,9 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
           : undefined;
         if (message.role === MessageRole.USER && message.userInputAccepted) acceptedUserInputs.add(message.messageId);
         const images = mobileTimelineGalleryPages(event).map(mobileImageGalleryPageSummary);
-        byId.set(message.messageId, { id: message.messageId, label: roleLabel(message.role),
+        byId.set(message.messageId, { id: message.messageId, label: message.role === MessageRole.USER && message.sharedTaskAuthor
+          && message.sharedTaskAuthor?.sessionId === event.identity?.sessionId && message.sharedTaskAuthor.displayName
+          ? message.sharedTaskAuthor.displayName : roleLabel(message.role),
           text: collaboration?.body || mobileInputSummary(message.userInput, message.userInputAccepted) || "…", sequence, eventId: event.eventId,
           kind: roleKind(message.role), completed: message.role === MessageRole.USER && message.userInputAccepted,
           ...(message.role !== MessageRole.USER ? {} : {
@@ -174,7 +176,9 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
           && message.blocks.every((block) => block.content.case === "text")
           ? mobileObjectiveDisplayText(message.blocks.map((block) => block.content.case === "text" ? block.content.value : "").join("\n"))
           : undefined;
-        byId.set(message.messageId, { id: message.messageId, label: previous?.label || roleLabel(message.role),
+        byId.set(message.messageId, { id: message.messageId, label: message.role === MessageRole.USER && message.sharedTaskAuthor
+          && message.sharedTaskAuthor?.sessionId === event.identity?.sessionId && message.sharedTaskAuthor.displayName
+          ? message.sharedTaskAuthor.displayName : previous?.label || roleLabel(message.role),
           text: acceptedInput || blocks.join("\n") || previous?.text || "Completed", sequence: previous?.sequence ?? sequence,
           eventId: event.eventId, kind: roleKind(message.role), completed: true,
           completionCursor: sequence,

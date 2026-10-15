@@ -73,6 +73,7 @@ export interface MobileRuntimeControls {
   readonly favorites: readonly MobileModelFavoriteConfiguration[];
   readonly favoriteRevision: bigint;
   readonly favoritesSeeded: boolean;
+  readonly favoritesAvailable?: boolean;
 }
 
 export interface MobileModelControlSelection {
@@ -281,6 +282,28 @@ export function resolveMobileRuntimeControls(
     favoriteRevision: favoriteSettings.revision.value,
     favoritesSeeded: favoriteSettings.seeded
   };
+}
+
+export function resolveMobileSharedRuntimeControls(detail: Snapshot | undefined, authorityKey: string | undefined): MobileRuntimeControls | undefined {
+  const session = detail?.sessions[0];
+  const backend = detail?.backends.find(item => item.backendId === session?.backendId);
+  if (!detail || !session || !backend || !authorityKey) return undefined;
+  const models = detail.models.filter(model => model.backendId === backend.backendId).flatMap(model => {
+    const route = mobileModelRoute(model, detail.providers.find(provider => provider.backendId === backend.backendId
+      && provider.providerId === model.key?.providerId));
+    return route ? [route] : [];
+  }).sort(compareModelRoutes);
+  const current = session.model, route = models.find(model => model.providerId === current?.model?.providerId && model.modelId === current?.model?.modelId);
+  return { authorityKey, surfaceOwnerKey: authorityKey, session, backend, models,
+    currentModel: current?.model ? { providerId: current.model.providerId, providerName: route?.providerName ?? current.model.providerId,
+      modelId: current.model.modelId, displayName: route?.displayName ?? current.model.modelId,
+      effortId: current.effortId || undefined, fastMode: current.fastMode, route, selectable: !!route } : undefined,
+    canListModels: typedModelCapability(backend, capabilityNames.modelList)?.providerAware === true,
+    canSwitchModel: typedModelCapability(backend, capabilityNames.modelSwitch)?.switchDuringSession === true,
+    canSetEffort: typedModelCapability(backend, capabilityNames.modelEffort)?.supportsEffort === true,
+    canSetFastMode: typedModelCapability(backend, capabilityNames.modelFastMode)?.supportsFastMode === true,
+    permissionModes: [], canSetPermission: false, canSetPlanMode: false,
+    favorites: [], favoriteRevision: 0n, favoritesSeeded: true, favoritesAvailable: false };
 }
 
 export function resolveMobileSessionModelAuthority(

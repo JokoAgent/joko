@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
+import type { SessionAccess, TaskSource } from "./task-sharing.js";
+import type { TaskSharingApi } from "@joko/contracts";
 import darkAppIconUrl from "@joko/brand-assets/icon-dark.svg?url";
 import lightAppIconUrl from "@joko/brand-assets/icon-light.svg?url";
 import { assertBrowserActionCurrent, WorkspaceHtmlExternalUnavailableError, type HttpLinkOpenOptions } from "./browser-action.js";
@@ -119,6 +121,7 @@ export type ToolsTab = "browser" | "extensions" | "skills" | "resources" | "mcp"
 const TOOLS_TABS: readonly ToolsTab[] = ["browser", "extensions", "skills", "resources", "mcp", "activity"];
 
 export type AppRoute =
+  | { readonly kind: "sharedTask"; readonly joinId: string; readonly profileId: string }
   | { readonly kind: "session"; readonly profileId?: string; readonly sessionId?: string; readonly partnerId?: string; readonly messageId?: string; readonly messageEventId?: string }
   | { readonly kind: "files"; readonly sessionId: string; readonly file?: string; readonly search?: string; readonly line?: number }
   | { readonly kind: "newSession"; readonly targetId?: string; readonly dialogueBackendId?: string; readonly recommendationNonce?: string }
@@ -174,6 +177,8 @@ export interface ControllerState {
   /** Whether an Auth Key can be protected across a full client restart. */
   readonly automaticConnectionAvailable: boolean;
   readonly snapshot: AppSnapshot;
+  readonly taskSource?: TaskSource;
+  readonly sessionAccess?: SessionAccess;
   readonly route: AppRoute;
   /** Non-persistent navigation occurrence; lets the same deep link re-emit focus. */
   readonly navigationRevision?: number;
@@ -203,6 +208,7 @@ export interface ControllerState {
 }
 
 export interface AppController extends OperationApi {
+  readonly taskSharing?: TaskSharingApi;
   readonly appDefaultModelUi?: AppDefaultModelUiPort;
   readonly state: ControllerState;
   /** True only when the Desktop-managed local Orchestrator reports shutdown-blocking work. */
@@ -2605,6 +2611,7 @@ export function useAppController(): AppController {
   }, [artifactGateway]);
   return useMemo<AppController>(() => ({
     state,
+    ...(artifactGateway === undefined || state.connectionState !== "connected" ? {} : { taskSharing: artifactGateway.taskSharingApi() }),
     appDefaultModelUi: {
       watchAppDefaultModel: (id, signal) => gateway().watchAppDefaultModel(id, signal),
       syncAppDefaultModel: (id, mirror, signal) => gateway().syncAppDefaultModel(id, mirror, signal),
@@ -3008,7 +3015,8 @@ export function useAppController(): AppController {
     cancelExtensionSetup: (extensionId, attemptId, expectedRevision) =>
       gateway().cancelExtensionSetup(extensionId, attemptId, expectedRevision),
     revokeExtensionSetup: (extensionId, expectedRevision) => gateway().revokeExtensionSetup(extensionId, expectedRevision),
-    listBackgroundTasks: (sessionId) => gateway().listBackgroundTasks(sessionId),
+    listBackgroundTasks: (sessionId, signal) => gateway().listBackgroundTasks(sessionId, signal),
+    getBackgroundTaskOutput: (sessionId, backgroundTaskId, signal) => gateway().getBackgroundTaskOutput(sessionId, backgroundTaskId, signal),
     cancelBackgroundTask: (sessionId, backgroundTaskId) => gateway().cancelBackgroundTask(sessionId, backgroundTaskId),
     listSubagentRuns: (sessionId, state, pageToken, pageSize) => gateway().listSubagentRuns(sessionId, state, pageToken, pageSize),
     getSubagentRun: (sessionId, subagentRunId) => gateway().getSubagentRun(sessionId, subagentRunId),
@@ -4021,6 +4029,9 @@ export function routeFromHash(hash: string): AppRoute {
   const path = queryIndex < 0 ? normalized : normalized.slice(0, queryIndex);
   const query = new URLSearchParams(queryIndex < 0 ? "" : normalized.slice(queryIndex + 1));
   const parts = path.split("/").filter(Boolean).map(decodeHashComponent);
+  if (parts[0] === "shared-tasks" && parts.length === 2 && parts[1] && query.get("profile")) {
+    return { kind: "sharedTask", joinId: parts[1], profileId: query.get("profile")! };
+  }
   if (parts[0] === "schedules") {
     const scheduleId = query.get("focus")?.trim();
     return {
@@ -4099,6 +4110,7 @@ function routeRecommendationNonce(query: URLSearchParams): string | undefined {
 }
 
 export function appRouteHash(route: AppRoute): string {
+  if (route.kind === "sharedTask") return `#/shared-tasks/${encodeURIComponent(route.joinId)}?profile=${encodeURIComponent(route.profileId)}`;
   if (route.kind === "session") return sessionRouteHash(route);
   if (route.kind === "files") return workspaceFilesHash(route);
   if (route.kind === "newSession") {

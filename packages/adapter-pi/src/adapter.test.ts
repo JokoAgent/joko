@@ -3705,6 +3705,91 @@ describe("PiBackendAdapter", () => {
     }
   });
 
+  it.each([false, true])("preserves exact local user occurrences across priority queues and output ownership (delayed persistence: %s)", async (delayed) => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-input-occurrences-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-input-occurrences-workspace-"));
+    const message = { role: "user", content: [{ type: "text", text: "repeated input" }], timestamp: 0 };
+    const assistant = { role: "assistant", content: [], stopReason: "stop", timestamp: 0, api: "openai-completions", provider: "local", model: "test-model",
+      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } };
+    const options = { holdAgentLifecycle: true, historyEntries: [
+      { type: "message", id: "old-user", parentId: null, timestamp: new Date(0).toISOString(), message },
+      { type: "message", id: "old-assistant", parentId: "old-user", timestamp: new Date(1).toISOString(), message: assistant }
+    ] as Record<string, unknown>[], historyLeafId: "old-assistant" };
+    let scripted!: ScriptedPiProcess;
+    const adapter = createPiAdapter({ agentHome, sessionRoot: agentHome, versionProbe: async () => "pi 99.1.0",
+      providers: [{ id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true,
+        models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096 }] }],
+      processFactory: spec => { scripted = new ScriptedPiProcess(spec, options); return scripted as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "occurrence-target", backendId: "pi", displayName: "Occurrences", workspaceRoot: workspace, managed: true, trusted: true };
+    const ownerEvents: EventPayload[] = [], steerEvents: EventPayload[] = [], followEvents: EventPayload[] = [];
+    const owner = makeContext(target, ownerEvents);
+    const emit = (value: unknown) => scripted.stdout.write(`${JSON.stringify(value)}\n`);
+    const append = (id: string, value: Record<string, unknown>) => {
+      options.historyEntries.push({ type: "message", id, parentId: options.historyLeafId, timestamp: new Date(options.historyEntries.length).toISOString(),
+        message: value.role === "assistant" ? { ...assistant, ...value } : value });
+      options.historyLeafId = id;
+    };
+    const user = (id: string, persist = true) => {
+      emit({ type: "message_start", message }); emit({ type: "message_end", message });
+      if (persist) append(id, message);
+    };
+    const users = (events: EventPayload[]) => events.filter((event): event is Extract<EventPayload, { type: "message_complete" }> => event.type === "message_complete" && event.role === "user");
+    try {
+      const binding = await adapter.createSession({ target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" }, owner);
+      const fences: string[] = [];
+      const send = async (disposition: "prompt" | "steer" | "follow_up", events: EventPayload[]) => {
+        await adapter.sendWithDurableNativeDispatchFence({ text: "repeated input", images: [], files: [], mentions: [], disposition },
+          { ...makeContext(target, events), sessionId: owner.sessionId, binding }, async preparation => {
+            fences.push(disposition); expect(preparation.nativeHistory.activeLineage?.length).toBeGreaterThanOrEqual(2);
+            expect(preparation.inputFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+          });
+      };
+      await send("prompt", ownerEvents); user("prompt-user");
+      await vi.waitFor(() => expect(users(ownerEvents).at(-1)?.nativeHistory?.identity?.entryId).toBe("prompt-user"));
+      const rejectedEvents: EventPayload[] = [];
+      await expect(adapter.sendWithDurableNativeDispatchFence({ text: "repeated input", images: [], files: [], mentions: [], disposition: "steer" },
+        { ...makeContext(target, rejectedEvents), sessionId: owner.sessionId, binding }, async () => { throw new Error("Fence did not commit"); }))
+        .rejects.toThrow("Fence did not commit");
+      // Admission order differs from the Backend's consumption priority. Both
+      // queued inputs have the same text and overlapping pre-effect histories.
+      await send("follow_up", followEvents); await send("steer", steerEvents);
+      user("steer-user", !delayed);
+      await vi.waitFor(() => expect(users(steerEvents)).toHaveLength(1));
+      if (delayed) { expect(users(steerEvents)[0]?.nativeHistory).toBeUndefined(); append("steer-user", message); }
+      scripted.emitAssistant("owner-output");
+      append("owner-reply", { role: "assistant", content: [{ type: "text", text: "owner-output" }], stopReason: "stop" });
+      user("follow-user"); scripted.emitAssistant("follow-output");
+      append("follow-reply", { role: "assistant", content: [{ type: "text", text: "follow-output" }], stopReason: "stop" });
+      const interleavedEvents: EventPayload[] = [], lateSteerEvents: EventPayload[] = [];
+      await send("follow_up", interleavedEvents);
+      await adapter.sendWithDurableNativeDispatchFence({ text: "repeated input", images: [], files: [], mentions: [], disposition: "steer" },
+        { ...makeContext(target, lateSteerEvents), sessionId: owner.sessionId, binding }, async () => {
+          fences.push("steer");
+          // The already-sent follow-up may be consumed while the new steering
+          // input is still awaiting durable permission to reach the Backend.
+          user("interleaved-follow-user");
+          await vi.waitFor(() => expect(users(interleavedEvents).at(-1)?.nativeHistory?.identity?.entryId).toBe("interleaved-follow-user"));
+        });
+      user("later-steer-user");
+      scripted.emitAssistant("interleaved-output");
+      append("interleaved-reply", { role: "assistant", content: [{ type: "text", text: "interleaved-output" }], stopReason: "stop" });
+      scripted.settle();
+      await vi.waitFor(() => expect([ownerEvents, steerEvents, followEvents, interleavedEvents, lateSteerEvents].every(events => events.some(event => event.type === "done"))).toBe(true));
+      expect(fences).toEqual(["prompt", "follow_up", "steer", "follow_up", "steer"]);
+      expect(users(ownerEvents).map(event => event.nativeHistory?.identity?.entryId)).toEqual(["prompt-user"]);
+      expect(users(steerEvents).at(-1)?.nativeHistory?.identity?.entryId).toBe("steer-user");
+      expect(users(followEvents).map(event => event.nativeHistory?.identity?.entryId)).toEqual(["follow-user"]);
+      expect(ownerEvents.filter(event => event.type === "text_delta").map(event => event.delta)).toEqual(["owner-output"]);
+      expect(steerEvents.some(event => event.type === "text_delta" || event.type === "message_complete" && event.role === "assistant")).toBe(false);
+      expect(rejectedEvents).toEqual([]);
+      expect(followEvents.filter(event => event.type === "text_delta").map(event => event.delta)).toEqual(["follow-output"]);
+      expect(users(interleavedEvents).map(event => event.nativeHistory?.identity?.entryId)).toEqual(["interleaved-follow-user"]);
+      expect(users(lateSteerEvents).map(event => event.nativeHistory?.identity?.entryId)).toEqual(["later-steer-user"]);
+      expect(lateSteerEvents.some(event => event.type === "text_delta")).toBe(false);
+      expect(interleavedEvents.filter(event => event.type === "text_delta").map(event => event.delta)).toEqual(["interleaved-output"]);
+    } finally { await adapter.dispose(); }
+  });
+
   it("starts a fresh reviewer with only the policy bridge and rejects every mutable or history-bearing operation", async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-review-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-review-workspace-"));

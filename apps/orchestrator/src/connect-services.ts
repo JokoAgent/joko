@@ -1,4 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
+import { TaskShareStore } from "@joko/store";
+import { taskShareEventAuthor } from "./task-sharing-author.js";
+import { TaskSharingHost } from "./task-sharing-host.js";
+import { TaskSharingReads } from "./task-sharing-reads.js";
+import { createTaskSharingRuntime } from "./task-sharing-runtime.js";
+import { createTaskSharingConnectService, createTaskSharingGuestConnectService } from "./task-sharing-connect-service.js";
+import { readTaskBackgroundOutput } from "./background-task-output.js";
 import { createAppDefaultModelConnectService } from "./app-default-model-connect-service.js";
 import { createHelpConnectService } from "./help-connect-service.js";
 import { createPersonalDevelopmentConnectService } from "./personal-development-connect-service.js";
@@ -486,7 +493,8 @@ import {
 } from "./provider-credential-surface.js";
 import type { LocalCodexRuntime, LocalBackendRuntimeSnapshot } from "./local-codex-runtime.js";
 
-interface ConnectServiceDependencies {
+export interface ConnectServiceDependencies {
+  readonly taskShares?: TaskShareStore;
   readonly connections: ConnectionManager;
   readonly store: OperationalStore;
   readonly adapters: () => readonly BackendAdapter[];
@@ -750,6 +758,8 @@ function toProtoArtifactCleanupProgress(progress: ArtifactCleanupJob) {
 }
 
 export interface ConnectServiceSet {
+  readonly taskSharing?: ServiceImpl<typeof contract.TaskSharingService>;
+  readonly taskSharingGuest?: ServiceImpl<typeof contract.TaskSharingGuestService>;
   readonly personalDevelopment: ServiceImpl<typeof contract.PersonalDevelopmentService>;
   readonly personalDevelopmentNative: ServiceImpl<typeof contract.DesktopPersonalDevelopmentHostService>;
   readonly help: ServiceImpl<typeof contract.HelpService>;
@@ -1172,6 +1182,8 @@ const RUNTIME_GENERATION = BigInt(Date.now());
 /** Register all public v1 services. Every descriptor method receives a concrete handler. */
 export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): void {
   const services = createConnectServices(application, projectionShutdownSignal);
+  if (services.taskSharing) router.service(contract.TaskSharingService, withConnectErrors(services.taskSharing));
+  if (services.taskSharingGuest) router.service(contract.TaskSharingGuestService, withConnectErrors(services.taskSharingGuest));
   router.service(contract.ConnectionService, withConnectErrors(services.connection));
   router.service(contract.AppDefaultModelService, withConnectErrors(services.appDefaultModel));
   router.service(contract.HelpService, withConnectErrors(services.help));
@@ -1240,6 +1252,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     application.registerServiceCleanup?.(() => remoteDesktopCoordinator.close());
   }
   const dependencies: ConnectServiceDependencies = {
+    ...(application.taskSharingHome === undefined ? {} : { taskShares: new TaskShareStore(application.store) }),
     connections: application.connections,
     store: application.store,
     devicePeers,
@@ -1359,6 +1372,17 @@ export function createConnectServices(application: OrchestratorApplication, proj
   });
   const now = dependencies.now ?? Date.now;
   const generation = dependencies.generation ?? 1n;
+  const sharingHost = application.taskSharingHome === undefined ? undefined : new TaskSharingHost({
+    store: dependencies.store, serverId: application.serverId, origin: application.config.publicOrigin,
+    generation: () => generation, artifacts: application.artifacts,
+    runtime: createTaskSharingRuntime(dependencies, new TaskSharingReads(dependencies, () => generation))
+  });
+  if (sharingHost) application.registerServiceCleanup?.(() => sharingHost.close());
+  const taskSharingServices = sharingHost && application.taskSharingHome ? {
+    taskSharing: createTaskSharingConnectService({ host: sharingHost, home: application.taskSharingHome,
+      connections: dependencies.connections }),
+    taskSharingGuest: createTaskSharingGuestConnectService(sharingHost)
+  } : {};
   const sessionCodeHostContext = installSessionCodeHostContextRuntime({
     store: dependencies.store,
     providers: application.codeHostProviders ?? [],
@@ -2627,6 +2651,12 @@ export function createConnectServices(application: OrchestratorApplication, proj
         })
       };
     },
+    getBackgroundTaskOutput: async (request, context) => {
+      const connection = authenticate(context);
+      return { output: await readTaskBackgroundOutput(dependencies.sessionHost, request.sessionId,
+        request.backgroundTaskId, request.maximumBytes || 16_384,
+        () => dependencies.connections.fence(connection), context.signal) };
+    },
     listBackgroundTasks: (request, context) => {
       authenticate(context);
       const sessionId = request.sessionId.trim();
@@ -3092,7 +3122,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
         offset: window.offset
       };
       const values = dependencies.store.listQueueItems(query)
-        .map((item, index) => mapQueueItem(dependencies.store, item, BigInt(window.offset + index)));
+        .map((item, index) => mapQueueItem(dependencies.store, item, BigInt(window.offset + index), dependencies.taskShares));
       const result = storePage(values, dependencies.store.countQueueItems(query), window);
       return { queueItems: result.values, page: result.page };
     },
@@ -5444,7 +5474,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     }
   });
   const personalDevelopmentNative = createPersonalDevelopmentNativeConnectService(application.personalDevelopmentNativeBroker, dependencies.connections);
-  return { personalDevelopment, personalDevelopmentNative, help: createHelpConnectService(application.helpAssistant, application.helpFeedback, dependencies.connections), appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
+  return { ...taskSharingServices, personalDevelopment, personalDevelopmentNative, help: createHelpConnectService(application.helpAssistant, application.helpFeedback, dependencies.connections), appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -6169,7 +6199,7 @@ function unsupportedError(capability: string, detail: string): contract.ErrorInf
   });
 }
 
-function validatePreconditions(store: OperationalStore, mutation: contract.OperationMutation): void {
+export function validatePreconditions(store: OperationalStore, mutation: contract.OperationMutation): void {
   for (const precondition of mutation.preconditions) {
     const entity = precondition.entity;
     if (entity === undefined || entity.id.trim() === "") throw invalidArgument("precondition.entity is required");
@@ -6253,7 +6283,7 @@ function entityVersion(store: OperationalStore, entity: contract.EntityRef): { r
   }
 }
 
-function toProtoOperation(
+export function toProtoOperation(
   dependencies: ConnectServiceDependencies,
   record: OperationRecord<unknown>,
   mutation: contract.OperationMutation,
@@ -6261,10 +6291,17 @@ function toProtoOperation(
   at: number
 ): contract.Operation {
   const base = toProtoStoredOperation(record, Number(dependencies.generation ?? 0n));
+  const sharedAuthor = dependencies.taskShares?.getAuthorForOperation(record.id);
   const result = record.status === "started" ? undefined : operationResult(dependencies, outcome, at);
   const rejected = record.status === "failed" || (record.status === "completed" && !outcome.accepted);
   return create(contract.OperationSchema, {
     ...base,
+    ...(sharedAuthor === undefined ? {} : {
+      sharedTaskAuthor: { $typeName: "joko.v1.SharedTaskAuthor" as const, ...sharedAuthor,
+        shareGeneration: BigInt(sharedAuthor.shareGeneration), memberGeneration: BigInt(sharedAuthor.memberGeneration) },
+      actor: { $typeName: "joko.v1.ActorRef" as const, kind: contract.ActorKind.TASK_PARTICIPANT,
+        id: sharedAuthor.memberId, displayName: sharedAuthor.displayName }
+    }),
     mutation,
     result,
     state: rejected ? contract.OperationState.FAILED : base.state,
@@ -6404,7 +6441,7 @@ function operationResult(
       }
       case "run": payload = { case: "run", value: mapRun(dependencies.store, dependencies.store.getRun(outcome.entityId)) }; break;
       case "reviewRun": payload = { case: "reviewRun", value: mapStoredReviewRun(dependencies.store, dependencies.store.getReviewRun(outcome.entityId)) }; break;
-      case "queueItem": payload = { case: "queueItem", value: mapQueueItem(dependencies.store, dependencies.store.getQueueItem(outcome.entityId), 0n) }; break;
+      case "queueItem": payload = { case: "queueItem", value: mapQueueItem(dependencies.store, dependencies.store.getQueueItem(outcome.entityId), 0n, dependencies.taskShares) }; break;
       case "queueControl": payload = { case: "queueControl", value: mapQueueControl(dependencies.store, outcome.entityId) }; break;
       case "schedule": payload = { case: "schedule", value: mapSchedule(dependencies.store, dependencies.store.getSchedule(outcome.entityId)) }; break;
       case "interaction": payload = { case: "interaction", value: mapInteraction(dependencies.store, dependencies.store.getInteraction(outcome.entityId)) }; break;
@@ -6687,7 +6724,7 @@ function durableOperationBody(
   } satisfies DevicePeerTargetOperationBody);
 }
 
-function mutationFromRecord(store: OperationalStore, record: OperationRecord<unknown>): contract.OperationMutation {
+export function mutationFromRecord(store: OperationalStore, record: OperationRecord<unknown>): contract.OperationMutation {
   const body = asRecord(record.body);
   const storedPayload = asRecord(body["payload"]);
   if (typeof storedPayload["case"] === "string") {
@@ -6811,7 +6848,7 @@ function restoreOperationPreconditions(value: unknown): contract.OperationPrecon
   });
 }
 
-function outcomeFromRecord(record: OperationRecord<unknown>): OperationOutcome {
+export function outcomeFromRecord(record: OperationRecord<unknown>): OperationOutcome {
   if (record.status === "failed") return { accepted: false, unsupportedReason: safePreview(record.error) };
   const response = asRecord(record.response);
   if (typeof response["reviewRunId"] === "string") {
@@ -6886,7 +6923,7 @@ function outcomeFromRecord(record: OperationRecord<unknown>): OperationOutcome {
   return { accepted: record.status === "completed", resultCase: "acknowledgement" };
 }
 
-function serverInfo(dependencies: ConnectServiceDependencies, at: number): contract.ServerInfo {
+export function serverInfo(dependencies: ConnectServiceDependencies, at: number): contract.ServerInfo {
   return create(contract.ServerInfoSchema, {
     serverId: dependencies.server?.id ?? "orchestrator",
     displayName: dependencies.server?.displayName ?? "Joko",
@@ -7033,7 +7070,7 @@ function deviceControlRelationFromRecord(
   });
 }
 
-function paginate<T>(values: readonly T[], request: contract.PageRequest | undefined): PageSlice<T> {
+export function paginate<T>(values: readonly T[], request: contract.PageRequest | undefined): PageSlice<T> {
   const offset = decodePageToken(request?.pageToken ?? "");
   const size = Math.min(Math.max(request?.pageSize || DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
   const selected = values.slice(offset, offset + size);
@@ -7174,7 +7211,7 @@ function validateStreamCursor(cursor: contract.EventCursor, generation: bigint, 
   return decoded.sequence;
 }
 
-function eventWithServiceCursor(item: PersistedEvent, dependencies: ConnectServiceDependencies, generation: bigint): contract.Event {
+export function eventWithServiceCursor(item: PersistedEvent, dependencies: ConnectServiceDependencies, generation: bigint): contract.Event {
   const mapped = toProtoEvent(item, eventContext(item, dependencies));
   return create(contract.EventSchema, {
     ...mapped,
@@ -7221,6 +7258,7 @@ function eventContext(
       })
     : undefined;
   return {
+    sharedTaskAuthor: dependencies.taskShares === undefined ? undefined : taskShareEventAuthor(store, item),
     ...(item.payload.type !== "message_complete" || item.payload.role !== "assistant" ? {} : {
       learning: store.getPartnerLearningFeedback(item.id)
     }),
@@ -7364,7 +7402,7 @@ function placementPlanOrThrow(input: {
   }
 }
 
-function mapSession(
+export function mapSession(
   dependencies: Pick<ConnectServiceDependencies, "store" | "sessionHost" | "resolveSessionContextDefaults">,
   session: StoredSession
 ): contract.Session {
@@ -7377,7 +7415,7 @@ function mapSession(
   }));
 }
 
-function mapRun(store: OperationalStore, record: StoredRun): contract.Run {
+export function mapRun(store: OperationalStore, record: StoredRun): contract.Run {
   const session = store.getSession(record.descriptor.sessionId);
   const queueItem = store.findQueueItemByRunId(record.descriptor.sessionId, record.descriptor.id);
   return toProtoRun(record, {
@@ -7388,19 +7426,20 @@ function mapRun(store: OperationalStore, record: StoredRun): contract.Run {
   });
 }
 
-function mapQueueItem(store: OperationalStore, item: QueueItemRecord, ordinal: bigint): contract.QueueItem {
+export function mapQueueItem(store: OperationalStore, item: QueueItemRecord, ordinal: bigint, taskShares?: TaskShareStore): contract.QueueItem {
   const session = store.getSession(item.sessionId);
   const run = store.getRun(item.runId);
   return toProtoQueueItem(item, {
     backendId: session.descriptor.backendId,
     targetId: session.descriptor.targetId,
     source: run.descriptor.source,
+    sharedTaskAuthor: taskShares?.getAuthorForOperation(item.operationId),
     ...(run.descriptor.parentRunId === undefined ? {} : { parentRunId: run.descriptor.parentRunId }),
     generation: session.descriptor.binding.generation
   }, ordinal);
 }
 
-function mapQueueControl(store: OperationalStore, sessionId: string): contract.QueueControl {
+export function mapQueueControl(store: OperationalStore, sessionId: string): contract.QueueControl {
   const control = store.getQueueControl(sessionId);
   const session = store.getSession(sessionId);
   const queued = store.countQueueItems({ sessionId, states: ["accepted"] });
@@ -7421,7 +7460,7 @@ function runMap(store: OperationalStore, history: readonly import("@joko/store")
   return runs;
 }
 
-function mapInteraction(store: OperationalStore, item: InteractionRecord): contract.Interaction {
+export function mapInteraction(store: OperationalStore, item: InteractionRecord): contract.Interaction {
   const session = store.getSession(item.sessionId);
   return toProtoInteraction(item, { backendId: session.descriptor.backendId, targetId: session.descriptor.targetId });
 }
@@ -7453,7 +7492,7 @@ function visitSessionEvents(
   }
 }
 
-async function sessionStatistics(dependencies: ConnectServiceDependencies, sessionId: string): Promise<contract.SessionStatistics> {
+export async function sessionStatistics(dependencies: ConnectServiceDependencies, sessionId: string): Promise<contract.SessionStatistics> {
   dependencies.store.getSession(sessionId);
   const runtimeState = materializedSessionRuntimeState(dependencies.store.findSetting(
     "session",
@@ -8867,7 +8906,7 @@ function managedProviderCatalogApplies(
     .get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported === true;
 }
 
-function backendCatalogModels(
+export function backendCatalogModels(
   dependencies: ConnectServiceDependencies,
   backend: BackendDescriptor
 ): readonly ProviderModel[] {
@@ -9912,9 +9951,9 @@ function protoManagedProviderLoginMethod(
 
 const BACKEND_PROVIDER_LOGIN_FLOW_LIMIT = 256;
 const BACKEND_PROVIDER_LOGIN_TTL_MS = 10 * 60_000;
-const QUEUE_LOCK_TTL_MS = 90_000;
+export const QUEUE_LOCK_TTL_MS = 90_000;
 
-function wakeQueueAfterLockExpiry(host: SessionHost, sessionId: string, expireLocks: () => void): void {
+export function wakeQueueAfterLockExpiry(host: SessionHost, sessionId: string, expireLocks: () => void): void {
   const timer = setTimeout(() => {
     try {
       expireLocks();
@@ -14004,7 +14043,7 @@ function sameCollaborationSettings(
     && left.workerIdleReleaseMinutes === right.workerIdleReleaseMinutes;
 }
 
-function nativeMessageSearchSemanticMode(
+export function nativeMessageSearchSemanticMode(
   value: contract.SessionMessageSearchSemanticMode
 ): MessageSearchSemanticMode {
   switch (value) {
@@ -14018,7 +14057,7 @@ function nativeMessageSearchSemanticMode(
   }
 }
 
-function nativeSessionMessageSearchFilters(
+export function nativeSessionMessageSearchFilters(
   value: contract.SessionMessageSearchFilters | undefined
 ): {
   readonly targetIds?: readonly string[];
@@ -16951,6 +16990,19 @@ async function dispatchMutation(
         }
       });
       return presented(execution);
+    }
+    case "setSessionRuntime": {
+      const value = payload.value, expectedGeneration = Number(value.expectedRuntimeGeneration);
+      if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0) throw invalidArgument("The runtime generation is invalid.");
+      return effectOperation(dependencies, operationId, connection, mutation, payload.case, { accepted: true }, async () => {
+        await host.setSessionRuntimeControl({ sessionId: value.sessionId, expectedGeneration,
+          patch: { ...(value.backendId === undefined ? {} : { backendId: value.backendId }),
+            ...(value.providerId === undefined ? {} : { providerId: value.providerId }),
+            ...(value.modelId === undefined ? {} : { modelId: value.modelId }),
+            ...(value.effort === undefined ? {} : { effort: value.effort }),
+            ...(value.fastMode === undefined ? {} : { fastMode: value.fastMode }) },
+          assertAuthority: () => dependencies.connections.fence(connection) });
+      });
     }
     case "setSessionModel": {
       const model = payload.value.model;
@@ -23533,7 +23585,7 @@ function protoDeliveryMode(value: PromptInput["disposition"]): contract.QueueDel
   return contract.QueueDeliveryMode.PROMPT;
 }
 
-function interactionDecisionSubmission(resolution: contract.InteractionResolution):
+export function interactionDecisionSubmission(resolution: contract.InteractionResolution):
   | { readonly kind: "decision"; readonly value: InteractionDecisionSubmission }
   | { readonly kind: "dismissal"; readonly reason: string } {
   switch (resolution.decision.case) {
@@ -23687,7 +23739,7 @@ function nestedOperationId(kind: string, operationId: string): string {
   return stableId("internal", `${kind}:${operationId}`);
 }
 
-function coreTurnOverrides(value: contract.PerTurnOverrides | undefined): TurnExecutionOverrides | undefined {
+export function coreTurnOverrides(value: contract.PerTurnOverrides | undefined): TurnExecutionOverrides | undefined {
   if (value === undefined) return undefined;
   const model = value.model?.model;
   if (value.model !== undefined && (model === undefined || model.providerId.trim() === "" || model.modelId.trim() === "")) {

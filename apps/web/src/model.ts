@@ -1,6 +1,6 @@
 import type { JSONContent } from "@tiptap/core";
 import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar.js";
-import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine } from "@joko/contracts";
+import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine, BackgroundTaskOutput } from "@joko/contracts";
 import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask } from "@joko/contracts";
 import type { PersonalDevelopmentApi } from "./personal-development-api.js";
 
@@ -1594,6 +1594,7 @@ export interface TimelineItemView {
   readonly pastedTextRanges?: readonly TimelineInlineTextRangeView[];
   /** Service-authored receipt of the exact accepted user input. */
   readonly userInputAccepted?: true;
+  readonly sharedTaskAuthor?: import("@joko/contracts").SharedTaskAuthor;
   /** Exact operation identity supplied by the generated user-message event. */
   readonly inputOperationId?: string;
   /** Renderer-memory proof that this user input was sent from the same connection scope. */
@@ -1920,6 +1921,7 @@ export interface ErrorRecoveryActionView {
 }
 
 export interface QueueItemView {
+  readonly sharedTaskAuthor?: import("@joko/contracts").SharedTaskAuthor;
   readonly id: string;
   readonly sessionId: string;
   readonly revision: bigint;
@@ -6369,7 +6371,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   completeExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void>;
   cancelExtensionSetup(extensionId: string, attemptId: string, expectedRevision: bigint): Promise<void>;
   revokeExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void>;
-  listBackgroundTasks(sessionId: string): Promise<readonly BackgroundTaskHistoryView[]>;
+  listBackgroundTasks(sessionId: string, signal?: AbortSignal): Promise<readonly BackgroundTaskHistoryView[]>;
+  getBackgroundTaskOutput(sessionId: string, backgroundTaskId: string, signal?: AbortSignal): Promise<BackgroundTaskOutput>;
   cancelBackgroundTask(sessionId: string, backgroundTaskId: string): Promise<void>;
   listSubagentRuns(sessionId: string, state?: SubagentRunStateView, pageToken?: string, pageSize?: number): Promise<SubagentRunPageView>;
   getSubagentRun(sessionId: string, subagentRunId: string): Promise<SubagentRunDetailView>;

@@ -218,6 +218,9 @@ const DESKTOP_CHANNELS = {
   deepLinkTakePending: "joko:deep-link:take-pending",
   deepLinkAcknowledge: "joko:deep-link:acknowledge",
   deepLinkNavigate: "joko:deep-link:navigate",
+  taskSharingInvitationTake: "joko:task-sharing:invitation:take",
+  taskSharingInvitationAcknowledge: "joko:task-sharing:invitation:acknowledge",
+  taskSharingInvitationDeliver: "joko:task-sharing:invitation:deliver",
   saveFile: "joko:files:save",
   copyFile: "joko:files:copy",
   cancelFileCopy: "joko:files:copy-cancel",
@@ -874,6 +877,30 @@ const desktopApi = Object.freeze({
   chooseFiles: (): Promise<readonly DesktopFile[]> => ipcRenderer.invoke(DESKTOP_CHANNELS.chooseFiles),
   choosePortableSessionFile: (): Promise<DesktopFile | undefined> =>
     ipcRenderer.invoke(DESKTOP_CHANNELS.choosePortableSessionFile),
+  taskSharingInvitations: Object.freeze({
+    subscribe: (listener: (invitation: string) => void): (() => void) => {
+      if (typeof listener !== "function") throw new TypeError("The invitation listener must be a function.");
+      let active = true;
+      const delivered = new Set<number>();
+      const adopt = (value: unknown): void => {
+        if (!active || value === undefined || !mainDocumentOccurrence || !value || typeof value !== "object" || Array.isArray(value)) return;
+        const row = value as Record<string, unknown>;
+        if (Object.keys(row).sort().join(",") !== "deliveryOccurrence,documentOccurrence,invitation"
+          || row["documentOccurrence"] !== mainDocumentOccurrence || typeof row["deliveryOccurrence"] !== "number"
+          || !Number.isSafeInteger(row["deliveryOccurrence"]) || row["deliveryOccurrence"] < 1
+          || typeof row["invitation"] !== "string" || row["invitation"].length > 8192
+          || !row["invitation"].startsWith("joko://shared-task/join#")) return;
+        const occurrence = row["deliveryOccurrence"];
+        if (!delivered.has(occurrence)) { listener(row["invitation"]); delivered.add(occurrence); }
+        void ipcRenderer.invoke(DESKTOP_CHANNELS.taskSharingInvitationAcknowledge,
+          { documentOccurrence: mainDocumentOccurrence, deliveryOccurrence: occurrence }).catch(() => undefined);
+      };
+      const wrapped = (_event: IpcRendererEvent, value: unknown): void => { try { adopt(value); } catch { /* Retain Main's pending offer. */ } };
+      ipcRenderer.on(DESKTOP_CHANNELS.taskSharingInvitationDeliver, wrapped);
+      void ipcRenderer.invoke(DESKTOP_CHANNELS.taskSharingInvitationTake, mainDocumentOccurrence).then(adopt).catch(() => undefined);
+      return () => { active = false; delivered.clear(); ipcRenderer.removeListener(DESKTOP_CHANNELS.taskSharingInvitationDeliver, wrapped); };
+    }
+  }),
   deepLinks: Object.freeze({
     takePending: (): Promise<DesktopDeepLinkDelivery | undefined> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.deepLinkTakePending, mainDocumentOccurrence).then((value: unknown) =>

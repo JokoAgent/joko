@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer as createPortProbe } from "node:net";
 import type { IncomingMessage } from "node:http";
 
 import type { AdapterContext, BlobRef, PromptInput } from "@joko/core";
@@ -36,6 +37,7 @@ import {
   VoiceDictionarySyncRepository,
   VoiceDictionaryPeerManager,
   CredentialVault,
+  TaskSharingHome,
   createPublicServer,
   type OrchestratorApplication,
   type BackendInstanceFactory,
@@ -59,6 +61,8 @@ type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
   | "browserSettings" | "browserState" | "voiceInput" | "diagnosticsBundles">;
 
 export interface FixtureOptions {
+  readonly taskSharing?: boolean;
+  readonly serverId?: string;
   readonly rootDirectory?: string;
   readonly webDirectory?: string;
   readonly profiles?: readonly FakeAdapterProfile[];
@@ -194,6 +198,8 @@ export class OrchestratorE2eFixture {
   }
 
   static async start(options: FixtureOptions = {}): Promise<OrchestratorE2eFixture> {
+    const publicPort = options.publicPort ?? (options.taskSharing ? await freeFixturePort() : 0);
+    if (!Number.isInteger(publicPort) || publicPort < 0 || publicPort > 65_535) throw new Error("Invalid fixture public port.");
     const ownsRoot = options.rootDirectory === undefined;
     const requestedRoot = options.rootDirectory ?? await mkdtemp(join(tmpdir(), "joko-e2e-"));
     const rootDirectory = process.env.GITHUB_ACTIONS === "true"
@@ -350,7 +356,7 @@ export class OrchestratorE2eFixture {
       host: "127.0.0.1",
       port: 0,
       internalPort: 4317,
-      publicOrigin: "http://127.0.0.1",
+      publicOrigin: options.taskSharing ? `http://127.0.0.1:${publicPort}` : "http://127.0.0.1",
       internalOrigin: "http://127.0.0.1:4317",
       dataDirectory,
       databasePath,
@@ -371,7 +377,7 @@ export class OrchestratorE2eFixture {
     };
     const connections = new RecordingConnectionManager(store);
     connections.openPairingWindow();
-    const serverId = options.dictionaryPeerNodeId ?? "orchestrator-e2e";
+    const serverId = options.serverId ?? options.dictionaryPeerNodeId ?? "orchestrator-e2e";
     const lanDiscovery = new LanDiscoveryService({
       self: () => ({
         serverId,
@@ -435,6 +441,10 @@ export class OrchestratorE2eFixture {
       workspaceService: workspaces,
       homesRoot: join(dataDirectory, "partner-homes")
     });
+    const taskSharingHome = options.taskSharing ? new TaskSharingHome({ directory: join(dataDirectory, "task-sharing-home"),
+      serverId, vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key")) }) : undefined;
+    await taskSharingHome?.initialize();
+    const serviceCleanups = new Set<() => void>();
     const application: OrchestratorApplication = {
       config,
       store,
@@ -467,6 +477,8 @@ export class OrchestratorE2eFixture {
       browserActivity: [],
       contacts,
       partners,
+      ...(taskSharingHome === undefined ? {} : { taskSharingHome }),
+      registerServiceCleanup(cleanup) { serviceCleanups.add(cleanup); return () => serviceCleanups.delete(cleanup); },
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
       ...auxiliaryServices,
       voiceDictionary,
@@ -476,6 +488,8 @@ export class OrchestratorE2eFixture {
         const attempt = async (cleanup: () => unknown): Promise<void> => {
           try { await cleanup(); } catch (error) { failures.push(error); }
         };
+        for (const cleanup of serviceCleanups) await attempt(cleanup);
+        await attempt(() => taskSharingHome?.dispose());
         await attempt(() => scheduler.stop());
         await attempt(() => auxiliaryServices?.sessionNavigation?.dispose());
         await attempt(() => auxiliaryServices?.auxiliaryText?.dispose());
@@ -510,8 +524,6 @@ export class OrchestratorE2eFixture {
     };
     const server = await createPublicServer(application);
     server.log.level = "silent";
-    const publicPort = options.publicPort ?? 0;
-    if (!Number.isInteger(publicPort) || publicPort < 0 || publicPort > 65_535) throw new Error("Invalid fixture public port.");
     await server.listen({ host: "127.0.0.1", port: publicPort });
     const address = server.server.address();
     if (address === null || typeof address === "string") throw new Error("Fastify did not expose an ephemeral TCP port.");
@@ -620,4 +632,14 @@ export async function waitFor<T>(
 
 function bigintJson(_key: string, value: unknown): unknown {
   return typeof value === "bigint" ? value.toString() : value;
+}
+
+async function freeFixturePort(): Promise<number> {
+  const probe = createPortProbe();
+  await new Promise<void>((resolve, reject) => { probe.once("error", reject); probe.listen(0, "127.0.0.1", resolve); });
+  const address = probe.address();
+  if (!address || typeof address === "string") throw new Error("The fixture could not reserve a loopback port.");
+  const port = address.port;
+  await new Promise<void>((resolve, reject) => probe.close(error => error ? reject(error) : resolve()));
+  return port;
 }

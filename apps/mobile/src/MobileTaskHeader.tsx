@@ -12,7 +12,7 @@ import { useMobileNavigationHeader, type MobileNavigationButton } from "./mobile
 import { mobileTaskHeaderLayout, mobileTaskHeaderTitleWidth } from "./mobile-task-header-layout";
 
 export interface MobileTaskHeaderAction {
-  readonly id: "search" | "clone" | "branches" | "context" | "collaboration" | "controls" | "remote-desktop" | "copy-link" | "files" | "refresh" | "tags" | `tag:${string}`;
+  readonly id: "task-sharing" | "search" | "clone" | "branches" | "context" | "collaboration" | "controls" | "remote-desktop" | "copy-link" | "files" | "refresh" | "tags" | `tag:${string}`;
   readonly label: string;
   readonly disabled: boolean;
   readonly onPress: () => void;

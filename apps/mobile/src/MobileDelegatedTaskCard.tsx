@@ -12,6 +12,7 @@ import { mobileDelegatedErrorText, mobileDelegatedSystemText, mobileDelegatedTas
 import { useMobileExpandedBlock } from "./mobile-expanded-block-memory";
 import { MobileMarkdownMessage } from "./MobileMarkdownMessage";
 import { MobileToolCallCard } from "./MobileToolCallCard";
+import { MobileBackgroundTaskOutput } from "./MobileBackgroundTaskOutput";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 
@@ -93,6 +94,9 @@ export const MobileDelegatedTaskCard = memo(function MobileDelegatedTaskCard({ e
     {projection.progress !== undefined && <Text style={[styles.caption, { color: colors.muted }]}>{Math.round(projection.progress * 100)}%</Text>}
     {projection.error !== "" && <Text selectable style={[styles.caption, { color: colors.negative }]}>{mobileDelegatedErrorText(projection.error, locale)}</Text>}
     {expanded && interactive && <View style={[styles.details, { borderColor: colors.border }]}>
+      {entry.task && ["queued", "running", "waiting"].includes(projection.state) && readClient.loadTaskBackgroundOutput &&
+        <MobileBackgroundTaskOutput client={readClient} controls={controls} taskId={entry.task.backgroundTaskId}
+          enabled={interactive} colors={colors} locale={locale} />}
       {(selectedChild?.assignment || projection.assignment) !== "" && <View><Text style={[styles.section, { color: colors.muted }]}>{t("assignment")}</Text>
         {markdown(selectedChild?.assignment || projection.assignment, "assignment")}</View>}
       {children.length > 0 && <View><Text style={[styles.section, { color: colors.muted }]}>{t("children", { count: children.length })}</Text>

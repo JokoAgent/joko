@@ -3,7 +3,31 @@ import { runInNewContext } from "node:vm";
 import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { describe, expect, it, vi } from "vitest";
 import { DESKTOP_CHANNELS, isDesktopSessionWindowContext, type DesktopSessionWindowContext } from "../src/channels.js";
-import type { DesktopRemoteDesktopApi } from "@joko/contracts";
+import { buildTaskShareInvitation, type DesktopRemoteDesktopApi } from "@joko/contracts";
+
+describe("private task invitation preload handoff", () => {
+  it("delivers once to its captured Document, acknowledges acceptance and retires the listener", async () => {
+    const f = loadPreload("main-document");
+    const value = buildTaskShareInvitation({ hostOrigin: "https://host.example", hostServerId: "host",
+      shareId: "share", shareGeneration: 1n, inviteSecret: "a".repeat(43) });
+    const envelope = { documentOccurrence: "main-document", deliveryOccurrence: 1, invitation: value };
+    f.invoke.mockResolvedValueOnce(envelope);
+    const api = f.exposed["taskSharingInvitations"] as { subscribe(listener: (invitation: string) => void): () => void };
+    const listener = vi.fn(), stop = api.subscribe(listener);
+    await Promise.resolve(); await Promise.resolve();
+    expect(listener).toHaveBeenCalledExactlyOnceWith(value);
+    const deliver = f.listeners.get(DESKTOP_CHANNELS.taskSharingInvitationDeliver)!;
+    deliver({}, envelope);
+    deliver({}, { ...envelope, documentOccurrence: "retired-document", deliveryOccurrence: 2 });
+    deliver({}, { ...envelope, extra: true, deliveryOccurrence: 3 });
+    expect(listener).toHaveBeenCalledOnce();
+    expect(f.invoke).toHaveBeenCalledWith(DESKTOP_CHANNELS.taskSharingInvitationAcknowledge,
+      { documentOccurrence: "main-document", deliveryOccurrence: 1 });
+    stop(); deliver({}, { ...envelope, deliveryOccurrence: 4 });
+    expect(listener).toHaveBeenCalledOnce();
+    expect(f.listeners.has(DESKTOP_CHANNELS.taskSharingInvitationDeliver)).toBe(false);
+  });
+});
 
 interface DeepLinkApi {
   takePending(): Promise<unknown>;

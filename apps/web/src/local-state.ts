@@ -10,6 +10,7 @@ import {
   type NavigationMode
 } from "./navigation-layout.js";
 import { persistentWebSecretEncryptionAvailable } from "./web-crypto.js";
+import type { PendingTaskSharingAction } from "./task-sharing.js";
 import { composerDocumentPlainText, normalizeComposerDocument } from "./composer-quote-document.js";
 import { normalizeComposerInlineMentionRanges } from "./composer-mention-ranges.js";
 import { normalizeAppShortcutOverrides, type AppShortcutOverrides } from "./app-shortcuts.js";
@@ -438,6 +439,45 @@ export class LocalState {
   async listProfiles(): Promise<readonly ConnectionProfile[]> {
     const values = await this.getAll<unknown>(PROFILE_STORE);
     return values.map(normalizeConnectionProfile).filter((value): value is ConnectionProfile => value !== undefined);
+  }
+
+  async taskSharingActions(owner: string): Promise<readonly PendingTaskSharingAction[]> {
+    const prefix = `task-sharing-actions\u0000${owner}\u0000`;
+    const transaction = this.#database.transaction(DRAFT_STORE, "readonly");
+    const rows = await requestResult<unknown[]>(transaction.objectStore(DRAFT_STORE).getAll(IDBKeyRange.bound(prefix, `${prefix}\uffff`), 129));
+    await transactionDone(transaction);
+    if (rows.length > 128) throw new Error("Too many unresolved sharing actions. Check their original results first.");
+    return rows.map(value => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The saved sharing action is invalid.");
+      const row = value as Record<string, unknown>;
+      if (Object.keys(row).sort().join(",") !== "kind,operationId" || typeof row["operationId"] !== "string"
+        || !/^[0-9a-f-]{36}$/iu.test(row["operationId"]) || typeof row["kind"] !== "string"
+        || !["create", "invite", "remove", "end", "endAll", "leave", "join"].includes(row["kind"])) throw new Error("The saved sharing action is invalid.");
+      return row as unknown as PendingTaskSharingAction;
+    });
+  }
+  async saveTaskSharingAction(owner: string, action: PendingTaskSharingAction): Promise<void> {
+    await this.put(DRAFT_STORE, `task-sharing-actions\u0000${owner}\u0000${action.operationId}`, action);
+  }
+  async finishTaskSharingAction(owner: string, operationId: string): Promise<void> {
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    transaction.objectStore(DRAFT_STORE).delete(`task-sharing-actions\u0000${owner}\u0000${operationId}`);
+    await transactionDone(transaction);
+  }
+
+  async taskSharingOperations(source: string): Promise<readonly string[]> {
+    const prefix = `task-sharing-operations\u0000${source}\u0000`;
+    const transaction = this.#database.transaction(DRAFT_STORE, "readonly");
+    const rows = await requestResult<unknown[]>(transaction.objectStore(DRAFT_STORE).getAll(IDBKeyRange.bound(prefix, `${prefix}\uffff`), 129));
+    await transactionDone(transaction);
+    if (rows.length > 128 || rows.some(value => typeof value !== "string" || !/^[0-9a-f-]{36}$/iu.test(value))) throw new Error("The shared task operation journal is invalid.");
+    return rows as string[];
+  }
+  async setTaskSharingOperation(source: string, operationId: string, pending: boolean): Promise<void> {
+    const key = `task-sharing-operations\u0000${source}\u0000${operationId}`;
+    if (pending) { await this.put(DRAFT_STORE, key, operationId); return; }
+    const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
+    transaction.objectStore(DRAFT_STORE).delete(key); await transactionDone(transaction);
   }
 
   async listMachineCaches(): Promise<readonly MachineCacheView[]> {

@@ -9,6 +9,7 @@ import "joko/v1/code_host.proto";
 import "joko/v1/common.proto";
 import "joko/v1/model.proto";
 import "joko/v1/settings.proto";
+import "joko/v1/task_sharing_types.proto";
 import "joko/v1/workspace.proto";
 
 message ServerInfo {
@@ -629,6 +630,7 @@ message QueueItem {
   // Transient presentation state only. Lock authority and ownership remain
   // server-private; snapshots and Events expose only this boolean.
   bool edit_locked = 17;
+  SharedTaskAuthor shared_task_author = 18;
 }
 
 // Durable dispatch control for the serialized queue owned by one product
@@ -967,6 +969,29 @@ message BackgroundTask {
   google.protobuf.Timestamp created_at = 15;
   google.protobuf.Timestamp updated_at = 16;
 }
+
+enum BackgroundTaskOutputState {
+  BACKGROUND_TASK_OUTPUT_STATE_UNSPECIFIED = 0;
+  BACKGROUND_TASK_OUTPUT_STATE_AVAILABLE = 1;
+  BACKGROUND_TASK_OUTPUT_STATE_UNAVAILABLE = 2;
+  BACKGROUND_TASK_OUTPUT_STATE_FAILED = 3;
+}
+message BackgroundTaskOutput {
+  string session_id = 1;
+  string background_task_id = 2;
+  BackgroundTaskOutputState state = 3;
+  string text = 4;
+  uint64 total_bytes = 5;
+  bool truncated = 6;
+  int64 captured_at_ms = 7;
+  optional int64 modified_at_ms = 8;
+}
+message GetBackgroundTaskOutputRequest {
+  string session_id = 1;
+  string background_task_id = 2;
+  uint32 maximum_bytes = 3;
+}
+message GetBackgroundTaskOutputResponse { BackgroundTaskOutput output = 1; }
 
 enum ExtensionWidgetPlacement {
   EXTENSION_WIDGET_PLACEMENT_UNSPECIFIED = 0;
