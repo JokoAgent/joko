@@ -15,10 +15,13 @@ describe("mounted Timeline history windows", () => {
   let fixture: OrchestratorE2eFixture | undefined;
   let browser: Browser | undefined;
   let releasePage: (() => void) | undefined;
+  let releaseEventStreams: (() => void) | undefined;
 
   afterEach(async () => {
     releasePage?.();
     releasePage = undefined;
+    releaseEventStreams?.();
+    releaseEventStreams = undefined;
     try {
       await browser?.close();
     } finally {
@@ -168,13 +171,9 @@ describe("mounted Timeline history windows", () => {
     expect(recentUsers.every((value) => value.inputDelivery === MessageInputDelivery.PROMPT)).toBe(true);
 
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 1200 }, reducedMotion: "reduce" });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1200 }, reducedMotion: "reduce", locale: "en-US" });
     const pageErrors: string[] = [];
-    let failedEventStreams = 0;
     page.on("pageerror", (error) => pageErrors.push(error.name));
-    page.on("requestfailed", (request) => {
-      if (new URL(request.url()).pathname === "/joko.v1.EventService/StreamEvents") failedEventStreams += 1;
-    });
     const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "History browser" });
     if (challenge.challenge === undefined) throw new Error("History pairing returned no challenge.");
     let olderRequests = 0;
@@ -245,11 +244,15 @@ describe("mounted Timeline history windows", () => {
     await page.locator(".message-nav-rail__tick").nth(24).click();
     await frames(page);
     const beforeOffline = await anchor(page);
-    const failuresBeforeOffline = failedEventStreams;
+    const beforeOfflineIds = await navIds(page);
     await page.context().setOffline(true);
-    fixture.dropPublicConnections();
-    await waitFor(async () => failedEventStreams, (value) => value > failuresBeforeOffline, "the history Connect stream to fail", 20_000);
+    releaseEventStreams = fixture.suspendPublicEventStreams();
+    await page.locator(".offline-banner:visible,.error-banner:visible").first().waitFor({ state: "visible", timeout: 20_000 });
     for (let index = 57; index < 113; index += 1) await send(index);
+    expect(await page.locator(".offline-banner:visible,.error-banner:visible").count()).toBeGreaterThan(0);
+    expect(await navIds(page)).toEqual(beforeOfflineIds);
+    releaseEventStreams();
+    releaseEventStreams = undefined;
     await page.context().setOffline(false);
     await waitFor(() => page.locator(".offline-banner,.error-banner").count(), (value) => value === 0, "history reconnect", 20_000);
     await frames(page);
@@ -259,7 +262,11 @@ describe("mounted Timeline history windows", () => {
     expect((await navIds(page)).filter((id) => allInitialIds.includes(id))).toEqual(allInitialIds);
     if ((await navIds(page)).length < 113) {
       await goToHistoryStart(page);
-      await page.getByRole("button", { name: "Load earlier activity", exact: true }).waitFor({ state: "visible" });
+      await waitFor(async () => ({
+        ids: await navIds(page),
+        earlier: await page.getByRole("button", { name: "Load earlier activity", exact: true }).isVisible(),
+        history: await page.locator(".timeline-history").allTextContents()
+      }), (value) => value.ids.length === 113 || value.earlier, "history replay or an older page after reconnect", 20_000);
     }
     await loadAllEarlier(page, 113);
     const finalIds = await navIds(page);

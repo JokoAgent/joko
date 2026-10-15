@@ -16,6 +16,7 @@ import { mapPartnerWorkingStatus } from "./partner-working-status.js";
 import { toPartnerWorkingPhase, workingStatusTurnKey, type SessionWorkingStatus } from "@joko/contracts";
 import { createClient, ConnectError, Code, type Client, type Interceptor, type Transport } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
+import { streamSharedOwnerEvents } from "./shared-owner-events.js";
 import { createTerminalGateway } from "./terminal-gateway.js";
 import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 import { createPersonalDevelopmentGateway } from "./personal-development-gateway.js";
@@ -9853,7 +9854,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         let lastGeneration = this.#snapshot?.generation;
         let lastSequence = this.#snapshot?.cursor;
         this.#callbacks.onState?.("connected");
-        for await (const response of client.streamEvents({ scope: OWNER_SCOPE, afterCursor: cursor }, { signal })) {
+        const profile = this.#profile;
+        const stream = this.#transportFactory === transportFor && profile !== undefined && this.#authKey !== undefined
+          && cursor !== undefined && typeof SharedWorker === "function"
+          ? streamSharedOwnerEvents({ profileId: profile.id, serverId: profile.serverId, deviceId: profile.deviceId, origin: profile.origin },
+            this.#authKey, cursor, signal, () => { if (this.#abort?.signal === signal) this.disconnect(); })
+          : client.streamEvents({ scope: OWNER_SCOPE, afterCursor: cursor }, { signal });
+        for await (const response of stream) {
           if (signal.aborted) return;
           const event = response.event;
           if (event === undefined) continue;
@@ -19570,7 +19577,7 @@ export function requiresEventSnapshotResync(error: unknown): boolean {
   let candidate: unknown = error;
   const seen = new Set<unknown>();
   while (candidate instanceof Error && !seen.has(candidate)) {
-    if (candidate instanceof ConnectError && candidate.code === Code.FailedPrecondition) return true;
+    if (candidate instanceof ConnectError && (candidate.code === Code.FailedPrecondition || candidate.code === Code.OutOfRange)) return true;
     seen.add(candidate);
     candidate = candidate.cause;
   }

@@ -1,5 +1,5 @@
 import { create } from "@bufbuild/protobuf";
-import { EventSchema, SnapshotSchema, type Event } from "@joko/contracts";
+import { EventSchema, GitSafetyMode, SnapshotSchema, type Event } from "@joko/contracts";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -15,7 +15,7 @@ describe("Vision Bridge UI event projection", () => {
       settings: {
         auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
-        gitSafety: {},
+        gitSafety: { mode: GitSafetyMode.EXISTING_GIT },
         modelFavorites: { revision: { value: 0n } },
         visionBridge: {
           enabled: true,

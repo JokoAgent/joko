@@ -468,6 +468,7 @@ import {
   mediaTypeForPath,
   mergeContentSecurityPolicyHeaders,
   resolvePackagedAppResource,
+  securePackagedAppScriptResponse,
   runtimeProcessMonitorEntryUrl,
   shouldMergeDesktopFrameContentSecurityPolicy,
   validateCredentialSecret,
@@ -5685,7 +5686,7 @@ function destroySessionWindows(): void {
 
 function registerPackagedAppProtocol(): void {
   if (navigationPolicy.developmentUrl !== undefined || protocol.isProtocolHandled(DESKTOP_APP_SCHEME)) return;
-  protocol.handle(DESKTOP_APP_SCHEME, (request) => {
+  protocol.handle(DESKTOP_APP_SCHEME, async (request) => {
     if (packagedSmoke && packagedSmokeFailNextMainDocumentRequest
       && request.method === "POST"
       && request.headers.get(PACKAGED_SMOKE_FAILED_DOCUMENT_HEADER) === "1"
@@ -5713,7 +5714,8 @@ function registerPackagedAppProtocol(): void {
         headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" }
       });
     }
-    return net.fetch(pathToFileURL(resourcePath).href, { bypassCustomProtocolHandlers: true });
+    const response = await net.fetch(pathToFileURL(resourcePath).href, { bypassCustomProtocolHandlers: true });
+    return securePackagedAppScriptResponse(response, resourcePath);
   });
 }
 

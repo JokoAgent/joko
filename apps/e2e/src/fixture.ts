@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { IncomingMessage } from "node:http";
 
 import type { AdapterContext, BlobRef, PromptInput } from "@joko/core";
 import {
@@ -572,6 +573,15 @@ export class OrchestratorE2eFixture {
 
   dropPublicConnections(): void {
     this.#server.server.closeAllConnections();
+  }
+
+  suspendPublicEventStreams(): () => void {
+    const rejectStream = (request: IncomingMessage): void => {
+      if (request.url?.split("?", 1)[0] === "/joko.v1.EventService/StreamEvents") request.socket.destroy();
+    };
+    this.#server.server.prependListener("request", rejectStream);
+    this.dropPublicConnections();
+    return () => { this.#server.server.removeListener("request", rejectStream); };
   }
 
   async close(options: { readonly removeRoot?: boolean } = {}): Promise<void> {

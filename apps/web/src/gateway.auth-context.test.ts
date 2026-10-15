@@ -13,12 +13,14 @@ import {
   type GetSnapshotRequest,
   GetServerInfoResponseSchema,
   GetSnapshotResponseSchema,
+  GitSafetyMode,
   ListRuntimeCommandsResponseSchema,
   ListBackgroundTasksResponseSchema,
   NativeSessionCandidateState,
   NativeSessionPlacement,
   PredictNextPromptResponseSchema,
   RuntimeCommandSource,
+  RuntimeCommandInputMode,
   RuntimeToolSourceOrigin,
   RuntimeToolSourceScope,
   SessionState,
@@ -379,6 +381,7 @@ describe("Backend-neutral runtime commands", () => {
             name: "review",
             description: "Review this change",
             source: RuntimeCommandSource.EXTENSION,
+            inputMode: RuntimeCommandInputMode.TEXT,
             loaded: true
           }]
         }));
@@ -400,6 +403,7 @@ describe("Backend-neutral runtime commands", () => {
       name: "review",
       description: "Review this change",
       source: "extension",
+      inputMode: "text",
       loaded: true
     }]);
     expect(calls).toEqual([{
@@ -429,6 +433,7 @@ describe("Backend-neutral runtime commands", () => {
               sessionId: "session-commands",
               name: "learn",
               source: RuntimeCommandSource.SKILL,
+              inputMode: RuntimeCommandInputMode.TEXT,
               loaded: true
             }]
           }));
@@ -479,6 +484,7 @@ describe("Backend-neutral runtime commands", () => {
             sessionId: "another-session",
             name: "learn",
             source: RuntimeCommandSource.SKILL,
+            inputMode: RuntimeCommandInputMode.TEXT,
             loaded: true
           }]
         }));
@@ -953,7 +959,7 @@ describe("authoritative session context state", () => {
     auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
     agentResource: {},
     collaboration: {},
-    gitSafety: {},
+    gitSafety: { mode: GitSafetyMode.EXISTING_GIT },
     modelFavorites: { revision: { value: 0n } }
   } as const;
   const session = {

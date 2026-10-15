@@ -26,6 +26,7 @@ import {
   mediaTypeForPath,
   mergeContentSecurityPolicyHeaders,
   resolvePackagedAppResource,
+  securePackagedAppScriptResponse,
   shouldMergeDesktopFrameContentSecurityPolicy,
   validateCredentialSecret,
   validateProfileId
@@ -53,6 +54,8 @@ describe("Desktop security policy", () => {
     expect(isAllowedPackagedBundleResource(pathToFileURL(outside).href, policy)).toBe(false);
     expect(resolvePackagedAppResource("joko://app/assets/app.js", policy)).toBe(asset);
     expect(resolvePackagedAppResource("joko://app/index.html?debug=1", policy)).toBeUndefined();
+    expect(resolvePackagedAppResource("joko://app/assets/app.js?worker=1", policy)).toBeUndefined();
+    expect(resolvePackagedAppResource("joko://app/assets/app.js#worker", policy)).toBeUndefined();
   });
 
   it("allows a credential-free loopback dev origin without weakening packaged file access", () => {
@@ -181,11 +184,33 @@ describe("Desktop security policy", () => {
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("frame-src 'self' https: http:");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("object-src 'none'");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("script-src 'self' 'unsafe-eval'");
+    expect(DESKTOP_CONTENT_SECURITY_POLICY.split("; ").filter(directive => directive.startsWith("worker-src "))).toEqual(["worker-src 'self'"]);
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("img-src 'self' data: blob: https: http:");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).not.toContain("file:");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("connect-src 'self' blob:");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("media-src 'self' data: blob:");
     expect(DESKTOP_CONTENT_SECURITY_POLICY).toContain("http:");
+  });
+
+  it.each(["app.js", "owner-events.mjs"])("gives bundled %s its own CSP while preserving response content and stricter policy", async filename => {
+    const original = new Response("export const ready = true;", { status: 200, statusText: "Bundle ready",
+      headers: { "content-type": "text/javascript", "cache-control": "no-cache", "content-security-policy": "connect-src 'none'" } });
+    const response = securePackagedAppScriptResponse(original, resolve("dist/web/assets", filename));
+    expect(response.status).toBe(200); expect(response.statusText).toBe("Bundle ready");
+    expect(response.headers.get("content-type")).toBe("text/javascript");
+    expect(response.headers.get("cache-control")).toBe("no-cache");
+    expect(response.headers.get("content-security-policy")).toBe(`connect-src 'none', ${DESKTOP_CONTENT_SECURITY_POLICY}`);
+    expect(await response.text()).toBe("export const ready = true;");
+  });
+
+  it("keeps script HEAD and missing-asset response status while leaving non-script resources untouched", async () => {
+    const head = securePackagedAppScriptResponse(new Response(null, { status: 200, headers: { "content-length": "27" } }), resolve("dist/web/assets/app.js"));
+    expect(head.body).toBeNull(); expect(head.headers.get("content-length")).toBe("27");
+    expect(head.headers.get("content-security-policy")).toBe(DESKTOP_CONTENT_SECURITY_POLICY);
+    const missing = securePackagedAppScriptResponse(new Response("Not found", { status: 404 }), resolve("dist/web/assets/missing.js"));
+    expect(missing.status).toBe(404); expect(await missing.text()).toBe("Not found");
+    const stylesheet = new Response("body {}", { headers: { "content-type": "text/css" } });
+    expect(securePackagedAppScriptResponse(stylesheet, resolve("dist/web/assets/app.css"))).toBe(stylesheet);
   });
 
   it("preserves only exact opaque Extension surface CSP on HTTP(S) subframes", () => {
