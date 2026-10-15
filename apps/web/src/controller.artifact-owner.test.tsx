@@ -83,6 +83,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const remoteCalls = new Map<string, Record<typeof remoteMethods[number], ReturnType<typeof vi.fn>>>();
     const voiceMethods = ["getVoiceInputCapabilities", "getVoiceInputDictionary", "setVoiceInputDictionarySyncEnabled", "addVoiceInputDictionaryTerms", "editVoiceInputDictionaryEntry", "deleteVoiceInputDictionaryEntry", "applyVoiceInputDictionaryLearning", "adviseVoiceInputDictionaryEdit", "startVoiceInput", "appendVoiceAudio", "stopVoiceInput", "cancelVoiceInput", "getVoiceInputSession"] as const;
   const publishSnapshot = new Map<string, (snapshot?: AppSnapshot) => void>();
+  const activeConnections: string[] = [];
   vi.mocked(createOrchestratorGateway).mockImplementation((owner, _key, callbacks) => {
     let disposed = false;
     const live = new Set<string>();
@@ -112,7 +113,6 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
     });
     const navigate = vi.fn(async () => { if (disposed) throw new Error("Navigation owner disconnected"); });
     const workspaceOperations = Object.fromEntries(workspaceMethods.map((method) => [method, vi.fn(async () => { if (disposed) throw new Error("Workspace owner disconnected"); })])) as Record<typeof workspaceMethods[number], ReturnType<typeof vi.fn>>;
-    workspaceCalls.set(owner!.id, workspaceOperations);
     const inputOperations = {
       send: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); }),
       readSessionArtifact: vi.fn(async () => { if (disposed) throw new Error("Input owner disconnected"); return { id: "artifact", blobId: "blob" }; }),
@@ -130,19 +130,13 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
         };
       })
     };
-    inputCalls.set(owner!.id, inputOperations);
     const voiceOperations = Object.fromEntries(voiceMethods.map(method => [method, vi.fn(async () => { if (disposed) throw new Error("Voice owner disconnected"); })]));
-    voiceCalls.set(owner!.id, voiceOperations);
     const queueOperations = Object.fromEntries(queueMethods.map((method) => [method, vi.fn(async () => { if (disposed) throw new Error("Queue owner disconnected"); })])) as Record<typeof queueMethods[number], ReturnType<typeof vi.fn>>;
-    queueCalls.set(owner!.id, queueOperations);
     const loginOperations = Object.fromEntries(loginMethods.map((method) => [method, vi.fn(async () => ({
       id: "shared-flow", providerId: "provider", method: "deviceCode", state: "pending", updatedAt: 1
     }))])) as Record<typeof loginMethods[number], ReturnType<typeof vi.fn>>;
-    loginCalls.set(owner!.id, loginOperations);
     const sshOperations = Object.fromEntries(sshMethods.map((method) => [method, vi.fn(async () => undefined)])) as Record<typeof sshMethods[number], ReturnType<typeof vi.fn>>;
-    sshCalls.set(owner!.id, sshOperations);
     const remoteOperations = Object.fromEntries(remoteMethods.map(method => [method, vi.fn(async () => { if (disposed) throw new Error("Remote workspace owner disconnected"); })])) as Record<typeof remoteMethods[number], ReturnType<typeof vi.fn>>;
-    remoteCalls.set(owner!.id, remoteOperations);
     let browserSnapshot: AppSnapshot = {
       ...emptySnapshot(),
       revision: 1n,
@@ -151,7 +145,6 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       settings: { ...emptySnapshot().settings, browsers: [browserSettings("sidebar")] }
     };
     const openBrowserPage = vi.fn(async () => { if (disposed) throw new Error("Browser owner disconnected"); await pendingFirst; return "opened-page"; });
-    browserCalls.set(owner!.id, openBrowserPage);
     const readWorkspaceHtmlSnapshot = vi.fn(async (_sessionId: string, _workspaceId: string, path: string, signal: AbortSignal) => {
       if (owner!.id === first.id) await pendingFirst;
       if (path === "retire.html") {
@@ -159,13 +152,20 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       }
       return { file: { workspaceId: "workspace", relativePath: path, expectedRevision: `html-revision:${path}` }, html: "<p>Private preview</p>" };
     });
-    htmlCalls.set(owner!.id, readWorkspaceHtmlSnapshot);
     const performBrowserTakeoverAction = vi.fn(async () => "capture");
-    reloadCalls.set(owner!.id, performBrowserTakeoverAction);
-    publishSnapshot.set(owner!.id, (snapshot) => { browserSnapshot = snapshot ?? browserSnapshot; callbacks.onSnapshot?.(browserSnapshot); });
-    gateways.set(owner!.id, { read, get, release, save, predict, download, navigate, live });
     return {
-      connect: async () => { callbacks.onState?.("connected"); callbacks.onSnapshot?.(browserSnapshot); },
+      connect: async (options?: { readonly snapshotOnly?: boolean }) => {
+        if (options?.snapshotOnly !== true) {
+          activeConnections.push(owner!.id);
+          workspaceCalls.set(owner!.id, workspaceOperations); inputCalls.set(owner!.id, inputOperations);
+          voiceCalls.set(owner!.id, voiceOperations); queueCalls.set(owner!.id, queueOperations);
+          loginCalls.set(owner!.id, loginOperations); sshCalls.set(owner!.id, sshOperations); remoteCalls.set(owner!.id, remoteOperations);
+          browserCalls.set(owner!.id, openBrowserPage); htmlCalls.set(owner!.id, readWorkspaceHtmlSnapshot); reloadCalls.set(owner!.id, performBrowserTakeoverAction);
+          publishSnapshot.set(owner!.id, (snapshot) => { browserSnapshot = snapshot ?? browserSnapshot; callbacks.onSnapshot?.(browserSnapshot); });
+          gateways.set(owner!.id, { read, get, release, save, predict, download, navigate, live });
+        }
+        callbacks.onState?.("connected"); callbacks.onSnapshot?.(browserSnapshot);
+      },
       disconnect: () => { disposed = true; live.clear(); },
       ...inputOperations, ...workspaceOperations, ...voiceOperations, ...queueOperations, ...remoteOperations, ...loginOperations, ...sshOperations,
       watchRemoteHosts: async function* () { if (disposed) throw new Error("Remote workspace owner disconnected"); yield []; },
@@ -317,20 +317,20 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const capturedDraft = { text: "Captured", attachments: [], mentions: [], deliveryMode: "prompt" as const };
   await firstController.readDraft("shared-session");
   await firstController.saveDraft("shared-session", capturedDraft);
-  expect(readDraft).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session");
-  expect(saveDraft).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", capturedDraft);
+  expect(readDraft).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", "application");
+  expect(saveDraft).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", capturedDraft, "application");
   await secondController.saveDraft("shared-session", capturedDraft);
-  expect(saveDraft).toHaveBeenLastCalledWith(second.serverId, second.id, "shared-session", capturedDraft);
+  expect(saveDraft).toHaveBeenLastCalledWith(second.serverId, second.id, "shared-session", capturedDraft, "application");
   await firstController.readDraftSnapshot("shared-session");
   await firstController.saveDraftIfRevision("shared-session", capturedDraft, 0);
-  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session");
-  expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", capturedDraft, 0);
+  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", "application");
+  expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", capturedDraft, 0, "application");
   await act(async () => firstController.restoreFirstInputDraft("shared-session", capturedDraft));
-  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session");
+  expect(readDraftSnapshot).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", "application");
   expect(saveDraftIfRevision).toHaveBeenLastCalledWith(first.serverId, first.id, "shared-session", expect.objectContaining({
     text: "Captured",
     deliveryMode: "prompt"
-  }), 0);
+  }), 0, "application");
   const newTaskDraft = { selection: { kind: "dialogue" as const, backendId: "backend" }, nativeStart: { kind: "fresh" as const }, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask" as const, planMode: false, text: "New task", editorDocument: { type: "doc", content: [] }, mentions: [], attachments: [] };
   const supersededNewTaskDraft = { ...newTaskDraft, text: "Superseded new task" };
   let releaseFirstNewTaskSave!: () => void;
@@ -567,7 +567,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
     await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
   });
   expect(current.state.connectionState).toBe("disconnected");
-  expect(createOrchestratorGateway).toHaveBeenCalledTimes(2);
+  expect(activeConnections).toEqual([first.id, second.id]);
   await expect(secondController.cancelProviderLogin(loginFlow.id)).rejects.toThrow("authorization source is no longer current");
   await expect(current.cancelProviderLogin(loginFlow.id)).rejects.toThrow("authorization source is no longer current");
   expect(retiredLoginCalls.cancelProviderLogin).toHaveBeenCalledOnce();

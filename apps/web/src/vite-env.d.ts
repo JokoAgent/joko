@@ -495,12 +495,12 @@ interface JokoDesktopApi {
     close(): Promise<void>;
   };
   readonly sessionWindows: {
-    open(owner: { readonly profileId: string; readonly sessionId: string }): Promise<{ readonly focusedExisting: boolean }>;
-    getOwner(): Promise<{ readonly profileId: string; readonly sessionId: string }>;
+    open(owner: { readonly profileId: string; readonly sessionId: string }): Promise<{ readonly opened: true }>;
+    getOwner(): Promise<{ readonly profileId: string; readonly sessionId: string; readonly draftSlot: number }>;
     beginDragPreview(request: JokoDesktopSessionDragPreviewRequest): Promise<boolean>;
     endDragPreview(gestureId: string): Promise<boolean>;
     openIfDroppedOutside(gestureId: string): Promise<
-      { readonly opened: false } | { readonly opened: true; readonly focusedExisting: boolean }
+      { readonly opened: boolean }
     >;
   };
   readonly runtimeProcessMonitor: {

@@ -226,6 +226,7 @@ async function runSmokeJourney() {
     "system_handoff_primary_surfaces_verified",
     "system_handoff_auxiliary_owner_fenced",
     "system_handoff_tray_reopened",
+    "task_windows_same_session_independent_documents",
     ...(process.platform === "win32" ? [
       "timeline_generation_completed",
       "timeline_code_system_clipboard_verified",

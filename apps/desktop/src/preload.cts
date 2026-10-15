@@ -76,6 +76,7 @@ import type {
   DesktopRuntimeProcessSample,
   DesktopSessionDragPreviewRequest,
   DesktopSessionWindowDropResult,
+  DesktopSessionWindowContext,
   DesktopSessionWindowOwner,
   DesktopSessionWindowOpenResult,
   DesktopUpdateAutoRelaunchSettings,
@@ -363,8 +364,8 @@ const desktopApi = Object.freeze({
       if (!isDesktopSessionWindowOwner(owner)) return Promise.reject(new TypeError("Task window owner is invalid."));
       return ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowOpen, owner).then(parseDesktopSessionWindowOpenResult);
     },
-    getOwner: (): Promise<DesktopSessionWindowOwner> =>
-      ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowGetOwner).then(parseDesktopSessionWindowOwner),
+    getOwner: (): Promise<DesktopSessionWindowContext> =>
+      ipcRenderer.invoke(DESKTOP_CHANNELS.sessionWindowGetOwner).then(parseDesktopSessionWindowContext),
     beginDragPreview: (request: DesktopSessionDragPreviewRequest): Promise<boolean> => {
       if (!isDesktopSessionDragPreviewRequest(request)) {
         return Promise.reject(new TypeError("Task drag preview request is invalid."));
@@ -1643,27 +1644,17 @@ function nativeInteractionKind(value: unknown): value is NonNullable<DesktopNati
 }
 
 function parseDesktopSessionWindowOpenResult(value: unknown): DesktopSessionWindowOpenResult {
-  if (typeof value !== "object" || value === null || Array.isArray(value) ||
-    Object.keys(value).join(",") !== "focusedExisting" ||
-    typeof (value as Record<string, unknown>)["focusedExisting"] !== "boolean") {
+  if (!nativeRecord(value) || nativeKeys(value) !== "opened" || value["opened"] !== true) {
     throw new TypeError("Task window result is invalid.");
   }
-  return Object.freeze({ focusedExisting: (value as DesktopSessionWindowOpenResult).focusedExisting });
+  return Object.freeze({ opened: true });
 }
 
 function parseDesktopSessionWindowDropResult(value: unknown): DesktopSessionWindowDropResult {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+  if (!nativeRecord(value) || nativeKeys(value) !== "opened" || typeof value["opened"] !== "boolean") {
     throw new TypeError("Task window drop result is invalid.");
   }
-  const candidate = value as Record<string, unknown>;
-  if (Object.keys(candidate).join(",") === "opened" && candidate["opened"] === false) {
-    return Object.freeze({ opened: false });
-  }
-  if (Object.keys(candidate).join(",") === "opened,focusedExisting" && candidate["opened"] === true &&
-    typeof candidate["focusedExisting"] === "boolean") {
-    return Object.freeze({ opened: true, focusedExisting: candidate["focusedExisting"] });
-  }
-  throw new TypeError("Task window drop result is invalid.");
+  return Object.freeze({ opened: value["opened"] });
 }
 
 function parseDesktopRuntimeProcessMonitorOpenResult(value: unknown): DesktopRuntimeProcessMonitorOpenResult {
@@ -1976,9 +1967,13 @@ function parseDesktopMainWindowCloseSettings(value: unknown): DesktopMainWindowC
   return Object.freeze({ behavior: entry["behavior"] as DesktopMainWindowCloseSettings["behavior"], revision: entry["revision"] as number });
 }
 
-function parseDesktopSessionWindowOwner(value: unknown): DesktopSessionWindowOwner {
-  if (!isDesktopSessionWindowOwner(value)) throw new TypeError("Task window owner result is invalid.");
-  return Object.freeze({ profileId: value.profileId, sessionId: value.sessionId });
+function parseDesktopSessionWindowContext(value: unknown): DesktopSessionWindowContext {
+  if (!nativeRecord(value) || nativeKeys(value) !== "draftSlot,profileId,sessionId"
+    || !isDesktopNotificationSessionId(value["profileId"]) || !isDesktopNotificationSessionId(value["sessionId"])
+    || !Number.isSafeInteger(value["draftSlot"]) || (value["draftSlot"] as number) < 0) {
+    throw new TypeError("Task window context result is invalid.");
+  }
+  return Object.freeze({ profileId: value["profileId"], sessionId: value["sessionId"], draftSlot: value["draftSlot"] as number });
 }
 
 function parseDesktopExtensionWindowOpenResult(value: unknown): DesktopExtensionWindowOpenResult {

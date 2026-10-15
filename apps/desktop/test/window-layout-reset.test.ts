@@ -6,9 +6,9 @@ import {
 } from "../src/window-layout-reset.js";
 
 describe("desktop window layout reset", () => {
-  it("validates first, then resets and persists every live window before state management resumes", async () => {
+  it("resets persistent Main and independent ephemeral Task instances without creating Task state writes", async () => {
     const calls: string[] = [];
-    const target = (name: string) => ({
+    const target = (name: string, persistent: boolean) => ({
       defaults: { width: 800, height: 600 },
       window: {
         isDestroyed: () => false,
@@ -21,17 +21,19 @@ describe("desktop window layout reset", () => {
         setSize: (width: number, height: number) => calls.push(`${name}:size:${width}x${height}`),
         center: () => calls.push(`${name}:center`)
       },
-      state: {
+      ...(persistent ? { state: {
         unmanage: () => calls.push(`${name}:unmanage`),
         manage: () => calls.push(`${name}:manage`),
         saveState: () => calls.push(`${name}:save`)
-      }
+      } } : {})
     });
-    await resetManagedWindowGeometry([target("main"), target("task")]);
-    for (const name of ["main", "task"]) {
+    await resetManagedWindowGeometry([target("main", true), target("same-session-first", false), target("same-session-second", false)]);
+    expect(calls.filter(call => call.startsWith("main:"))).toEqual([
+      "main:unmanage", "main:fullscreen:false", "main:unmaximize", "main:size:800x600", "main:center", "main:save", "main:manage"
+    ]);
+    for (const name of ["same-session-first", "same-session-second"]) {
       expect(calls.filter((call) => call.startsWith(`${name}:`))).toEqual([
-        `${name}:unmanage`, `${name}:fullscreen:false`, `${name}:unmaximize`, `${name}:size:800x600`,
-        `${name}:center`, `${name}:save`, `${name}:manage`
+        `${name}:fullscreen:false`, `${name}:unmaximize`, `${name}:size:800x600`, `${name}:center`
       ]);
     }
   });

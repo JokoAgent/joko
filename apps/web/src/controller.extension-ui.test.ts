@@ -19,6 +19,25 @@ afterEach(() => {
 });
 
 describe("extension UI controller effects", () => {
+  it("persists editor effects only after their owning native surface resolves and never falls back on lookup failure", async () => {
+    let finish!: (surface: "task-window:3") => void;
+    const readDraft = vi.fn(async () => undefined), saveDraft = vi.fn(async () => undefined);
+    const local = { readDraft, saveDraft } as unknown as LocalState;
+    let state = controllerState();
+    const effect = { eventId: "editor-task-window", sessionId: "session-a", kind: "editorText" as const, text: "Native draft" };
+    applyExtensionUiEffect(effect, local, update => { state = update(state); }, { serverId: "server-a", profileId: "profile-a",
+      draftSurface: () => new Promise(resolve => { finish = resolve; }) });
+    expect(readDraft).not.toHaveBeenCalled(); finish("task-window:3");
+    await vi.waitFor(() => expect(saveDraft).toHaveBeenCalledOnce());
+    expect(readDraft).toHaveBeenCalledWith("server-a", "profile-a", "session-a", "task-window:3");
+    expect(saveDraft).toHaveBeenCalledWith("server-a", "profile-a", "session-a", expect.objectContaining({ text: "Native draft" }), "task-window:3");
+    applyExtensionUiEffect({ ...effect, eventId: "editor-native-failed" }, local, update => { state = update(state); }, {
+      serverId: "server-a", profileId: "profile-a", draftSurface: async () => { throw new Error("Native owner unavailable"); }
+    });
+    await vi.waitFor(() => expect(state.extensionNotifications).toHaveLength(1));
+    expect(readDraft).toHaveBeenCalledOnce(); expect(saveDraft).toHaveBeenCalledOnce();
+  });
+
   it("retains severity in renderer state and sends only the public body to the OS notification", () => {
     vi.useFakeTimers();
     const created: Array<{ readonly title: string; readonly options?: NotificationOptions }> = [];
@@ -134,7 +153,7 @@ describe("extension UI controller effects", () => {
       ...draft,
       mentions: [],
       text: "replacement text"
-    });
+    }, "application");
     expect(state.extensionNotifications[0]).toMatchObject({
       sessionId: "session-a",
       kind: "error",

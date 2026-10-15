@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import { ModuleKind, ScriptTarget, transpileModule } from "typescript";
 import { describe, expect, it, vi } from "vitest";
-import { DESKTOP_CHANNELS } from "../src/channels.js";
+import { DESKTOP_CHANNELS, isDesktopSessionWindowContext, type DesktopSessionWindowContext } from "../src/channels.js";
 import type { DesktopRemoteDesktopApi } from "@joko/contracts";
 
 interface DeepLinkApi {
@@ -31,6 +31,12 @@ interface OpenWithApi {
     readonly file: { readonly name: string; readonly mediaType: string; readonly bytes: Uint8Array };
   }): Promise<unknown>;
   cancelFileOpen(requestId: string): Promise<void>;
+}
+
+interface TaskWindowApi {
+  open(owner: unknown): Promise<{ readonly opened: true }>;
+  getOwner(): Promise<DesktopSessionWindowContext>;
+  openIfDroppedOutside(gestureId: string): Promise<{ readonly opened: boolean }>;
 }
 
 const MAIN_DOCUMENT_CLAIM = "00000000-0000-4000-8000-000000000001";
@@ -161,6 +167,62 @@ function loadPreload(
     setPending: (value: unknown): void => { pending = value; }
   };
 }
+
+describe("Task window preload context and opening receipts", () => {
+  const owner = { profileId: "profile-one", sessionId: "session-one" };
+  const gestureId = "gesture_1234567890";
+  it("keeps the request owner separate from the exact frozen host context and accepts safe draft slots", async () => {
+    const loaded = loadPreload(""), bridge = loaded.exposed["sessionWindows"] as TaskWindowApi;
+    for (const draftSlot of [0, 1, Number.MAX_SAFE_INTEGER]) {
+      loaded.invoke.mockResolvedValueOnce({ draftSlot, ...owner });
+      const context = await bridge.getOwner();
+      expect(context).toEqual({ ...owner, draftSlot }); expect(Object.isFrozen(context)).toBe(true);
+      expect(isDesktopSessionWindowContext(context)).toBe(true);
+      expect(loaded.invoke).toHaveBeenLastCalledWith(DESKTOP_CHANNELS.sessionWindowGetOwner);
+    }
+    loaded.invoke.mockResolvedValueOnce({ opened: true });
+    const opened = await bridge.open(owner);
+    expect(opened).toEqual({ opened: true }); expect(Object.isFrozen(opened)).toBe(true);
+    expect(loaded.invoke).toHaveBeenLastCalledWith(DESKTOP_CHANNELS.sessionWindowOpen, owner);
+    loaded.invoke.mockResolvedValueOnce({ opened: false });
+    await expect(bridge.open(owner)).rejects.toThrow("Task window result is invalid");
+    loaded.invoke.mockClear();
+    await expect(bridge.open({ ...owner, draftSlot: 0 })).rejects.toThrow("Task window owner is invalid");
+    expect(loaded.invoke).not.toHaveBeenCalled();
+  });
+  it.each([
+    undefined, null, [], { profileId: "profile-one", sessionId: "session-one" },
+    { profileId: "profile-one", sessionId: "session-one", draftSlot: -1 },
+    { profileId: "profile-one", sessionId: "session-one", draftSlot: 0.5 },
+    { profileId: "profile-one", sessionId: "session-one", draftSlot: Number.MAX_SAFE_INTEGER + 1 },
+    { profileId: "profile-one", sessionId: "session-one", draftSlot: "0" },
+    { profileId: " profile-one", sessionId: "session-one", draftSlot: 0 },
+    { profileId: "profile-one", sessionId: "session-one", draftSlot: 0, extra: true }
+  ])("rejects an incomplete or malformed current-v1 Task context %#", async value => {
+    const loaded = loadPreload(""), bridge = loaded.exposed["sessionWindows"] as TaskWindowApi;
+    loaded.invoke.mockResolvedValueOnce(value);
+    await expect(bridge.getOwner()).rejects.toThrow("Task window context result is invalid");
+    expect(isDesktopSessionWindowContext(value)).toBe(false);
+  });
+  it("returns only frozen boolean drop receipts", async () => {
+    const loaded = loadPreload(""), bridge = loaded.exposed["sessionWindows"] as TaskWindowApi;
+    for (const opened of [true, false]) {
+      loaded.invoke.mockResolvedValueOnce({ opened });
+      const result = await bridge.openIfDroppedOutside(gestureId);
+      expect(result).toEqual({ opened }); expect(Object.isFrozen(result)).toBe(true);
+      expect(loaded.invoke).toHaveBeenLastCalledWith(DESKTOP_CHANNELS.sessionWindowOpenIfDroppedOutside, gestureId);
+    }
+  });
+  it.each([undefined, null, { focusedExisting: true }, { opened: true, focusedExisting: false }, { opened: "yes" }])(
+    "rejects malformed and retired open/drop receipt shapes %#", async value => {
+      const loaded = loadPreload(""), bridge = loaded.exposed["sessionWindows"] as TaskWindowApi;
+      loaded.invoke.mockResolvedValueOnce(value);
+      await expect(bridge.open(owner)).rejects.toThrow("Task window result is invalid");
+      loaded.invoke.mockResolvedValueOnce(value);
+      await expect(bridge.openIfDroppedOutside(gestureId)).rejects.toThrow("Task window drop result is invalid");
+    }
+  );
+});
 
 describe("main application preload deep-link occurrence fence", () => {
   it("exposes the remote desktop opening bridge only to a captured primary document", async () => {

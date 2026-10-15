@@ -406,12 +406,20 @@ function currentDraftRecord(value: unknown): ComposerDraftRecord | undefined {
   return value as ComposerDraftRecord;
 }
 
-function sessionDraftKey(serverId: string, profileId: string, sessionId: string): string {
+export type SessionDraftSurface = "application" | `task-window:${number}`;
+
+function sessionDraftKey(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface): string {
   if (!validConnectionIdentity(serverId, 512) || !validConnectionIdentity(profileId, 512)
-    || !validConnectionIdentity(sessionId, 512)) {
+    || !validConnectionIdentity(sessionId, 512) || !validSessionDraftSurface(surface)) {
     throw new Error("A task draft requires a valid server, profile and session identity.");
   }
-  return JSON.stringify([serverId, profileId, sessionId]);
+  return JSON.stringify([serverId, profileId, sessionId, surface]);
+}
+function validSessionDraftSurface(surface: string): surface is SessionDraftSurface {
+  if (surface === "application") return true;
+  if (!/^task-window:(?:0|[1-9][0-9]*)$/u.test(surface)) return false;
+  const slot = Number(surface.slice("task-window:".length));
+  return Number.isSafeInteger(slot) && slot >= 0;
 }
 
 export class LocalState {
@@ -523,16 +531,16 @@ export class LocalState {
     await transactionDone(transaction);
   }
 
-  async saveDraft(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft): Promise<void> {
-    await this.writeDraft(serverId, profileId, sessionId, draft);
+  async saveDraft(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft, surface: SessionDraftSurface = "application"): Promise<void> {
+    await this.writeDraft(serverId, profileId, sessionId, draft, undefined, surface);
   }
 
-  async saveDraftIfRevision(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft, expectedRevision: number): Promise<number | undefined> {
+  async saveDraftIfRevision(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft, expectedRevision: number, surface: SessionDraftSurface = "application"): Promise<number | undefined> {
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("The task draft revision is invalid.");
-    return this.writeDraft(serverId, profileId, sessionId, draft, expectedRevision);
+    return this.writeDraft(serverId, profileId, sessionId, draft, expectedRevision, surface);
   }
 
-  private async writeDraft(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft, expectedRevision?: number): Promise<number | undefined> {
+  private async writeDraft(serverId: string, profileId: string, sessionId: string, draft: ComposerDraft, expectedRevision: number | undefined, surface: SessionDraftSurface): Promise<number | undefined> {
     const browserComments = normalizeLiveBrowserComments(draft.browserComments);
     const extraDirectoryIds = normalizeExtraDirectoryIds(draft.extraDirectoryIds);
     const mentions = normalizeDraftMentions(draft.mentions);
@@ -550,7 +558,7 @@ export class LocalState {
       attachments: draft.attachments.map(persistAttachment),
       browserComments: browserComments.map((item) => ({ ...item, screenshot: persistAttachment(item.screenshot) }))
     };
-    const key = sessionDraftKey(serverId, profileId, sessionId);
+    const key = sessionDraftKey(serverId, profileId, sessionId, surface);
     const transaction = this.#database.transaction(DRAFT_STORE, "readwrite");
     const objectStore = transaction.objectStore(DRAFT_STORE);
     return new Promise((resolve, reject) => {
@@ -576,12 +584,12 @@ export class LocalState {
     });
   }
 
-  async readDraft(serverId: string, profileId: string, sessionId: string): Promise<ComposerDraft | undefined> {
-    return (await this.readDraftSnapshot(serverId, profileId, sessionId)).draft;
+  async readDraft(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface = "application"): Promise<ComposerDraft | undefined> {
+    return (await this.readDraftSnapshot(serverId, profileId, sessionId, surface)).draft;
   }
 
-  async readDraftSnapshot(serverId: string, profileId: string, sessionId: string): Promise<ComposerDraftSnapshot> {
-    const record = currentDraftRecord(await this.get<unknown>(DRAFT_STORE, sessionDraftKey(serverId, profileId, sessionId)));
+  async readDraftSnapshot(serverId: string, profileId: string, sessionId: string, surface: SessionDraftSurface = "application"): Promise<ComposerDraftSnapshot> {
+    const record = currentDraftRecord(await this.get<unknown>(DRAFT_STORE, sessionDraftKey(serverId, profileId, sessionId, surface)));
     if (record === undefined) return { revision: 0 };
     const persisted = record.draft;
     const attachments = restorePersistedAttachments(persisted.attachments);
