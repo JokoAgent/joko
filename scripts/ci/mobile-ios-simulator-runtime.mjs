@@ -603,6 +603,10 @@ async function main() {
     }
     const binary = join(app, executable), architecture = process.arch === "arm64" ? "arm64" : "x86_64";
     if (!(await command("lipo", ["-archs", binary])).split(/\s+/u).includes(architecture)) throw new Error("The Simulator binary does not contain this runner's architecture.");
+    const ocr = join(evidence, "screen-text");
+    stage = "screen observer compilation";
+    await command("xcrun", ["swiftc", join(root, "scripts/ci/mobile-ios-screen-text.swift"), "-framework", "Vision", "-o", ocr],
+      { timeout: 60_000, startupLabel: "compile-screen-observer" });
     await startOwnedSimulator({ bundleId, executable, compiledApp: app, executableSha256: await hashFile(binary),
       startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used." });
     stage = "owned application installation";
@@ -618,10 +622,6 @@ async function main() {
       { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(120_000)]) });
     if (!bundle.ok) { await bundle.body?.cancel(); throw new Error("Metro could not compile the actual iOS app entry."); }
     await bundle.body?.cancel();
-    const ocr = join(evidence, "screen-text");
-    stage = "screen observer compilation";
-    await command("xcrun", ["swiftc", join(root, "scripts/ci/mobile-ios-screen-text.swift"), "-framework", "Vision", "-o", ocr],
-      { timeout: 60_000, startupLabel: "compile-screen-observer" });
     stage = "first native launch";
     const firstPid = await launch(port), first = await observe("first-launch", firstPid, ocr);
     stage = "explicit app termination";
