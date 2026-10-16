@@ -78,15 +78,18 @@ async function main() {
   await mkdir(logs, { recursive: true });
   await writeFile(join(logs, "browser-capabilities.json"), JSON.stringify(selected, null, 2) + "\n");
   await appendFile(process.env.GITHUB_OUTPUT, `executable=${selected.executable}\n`);
+  await appendFile(process.env.GITHUB_ENV, [
+    `JOKO_BROWSER_EXECUTABLE=${selected.executable}`, `JOKO_MOUNTED_WEB_DIR=${web}`,
+    `JOKO_GROUP_EVIDENCE_DIR=${join(process.env.RUNNER_TEMP, "joko-web-evidence/groups")}`,
+    `JOKO_DOCUMENT_MOUNTED_CAPTURE_DIR=${join(process.env.RUNNER_TEMP, "joko-web-evidence/documents")}`, ""
+  ].join("\n"));
   if (process.platform === "linux") {
     const desktop = join(root, "apps/desktop");
     const electron = createRequire(join(desktop, "package.json"))("electron");
     await access(electron, constants.X_OK);
     await appendFile(process.env.GITHUB_ENV, [
-      `JOKO_BROWSER_EXECUTABLE=${selected.executable}`, `JOKO_MOUNTED_WEB_DIR=${web}`,
       `JOKO_PDF_ELECTRON_TEST_EXECUTABLE=${electron}`, `JOKO_PDF_ELECTRON_TEST_APP=${desktop}`,
-      `JOKO_GROUP_EVIDENCE_DIR=${join(process.env.RUNNER_TEMP, "joko-web-evidence/groups")}`,
-      `JOKO_DOCUMENT_MOUNTED_CAPTURE_DIR=${join(process.env.RUNNER_TEMP, "joko-web-evidence/documents")}`, ""
+      ""
     ].join("\n"));
   }
   console.log(JSON.stringify(selected));

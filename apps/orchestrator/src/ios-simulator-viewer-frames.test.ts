@@ -100,6 +100,36 @@ it("prefers owned H.264 frames and falls back to MJPEG after native loss", async
   } finally { h.store.close(); }
 });
 
+it("waits for an already cancelling MJPEG transport before applying a replacement quality", async () => {
+  const h = fixture(async function* () {
+    yield { bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), receivedAt: new Date().toISOString() };
+  });
+  const controller = new AbortController();
+  const balanced = { preferNativeH264: false, profile: { framesPerSecond: 20,
+    scalingPercent: 70, orientation: "PORTRAIT" as const },
+    mjpegProfile: { framesPerSecond: 10, jpegQuality: 45, scalingPercent: 70 } };
+  const high = { ...balanced, mjpegProfile: { framesPerSecond: 20, jpegQuality: 70, scalingPercent: 100 } };
+  const first = h.frames.watch(SCOPE, h.route, controller.signal, balanced);
+  const replacement = h.frames.watch(SCOPE, h.route, undefined, high);
+  try {
+    await first.next();
+    await first.next();
+    await replacement.next();
+    const pending = replacement.next().then(value => ({ value }), error => ({ error }));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    controller.abort();
+    await first.return(undefined);
+    expect(await pending).toMatchObject({ value: { done: false, value: { kind: "frame" } } });
+    expect(h.driver.configureMjpegProfile).toHaveBeenLastCalledWith(h.instance,
+      high.mjpegProfile, expect.any(AbortSignal));
+  } finally {
+    controller.abort();
+    await first.return(undefined);
+    await replacement.return(undefined);
+    h.store.close();
+  }
+});
+
 it("raises only the exact MJPEG subscription during interaction and restores its base profile", async () => {
   const h = fixture(async function* (_instance, signal) {
     yield { bytes: new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
