@@ -44,7 +44,26 @@ describe("mounted Partner collaboration product chain", () => {
   let fixture: RealPiSystemFixture | undefined;
   let browser: Browser | undefined;
 
-  afterEach(async () => {
+  afterEach(async ({ task }) => {
+    if (task.result?.state === "fail" && process.env.RUNNER_TEMP !== undefined) {
+      try {
+        const page = browser?.contexts()[0]?.pages()[0];
+        if (page !== undefined) {
+          const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "partners");
+          await mkdir(directory, { recursive: true });
+          await writeFile(join(directory, "product-chain-failed.json"), JSON.stringify({
+            sourceCommit: process.env.GITHUB_SHA,
+            connectionPageVisible: await page.locator(".connection-screen").isVisible(),
+            dialogs: await page.getByRole("dialog").count(),
+            alerts: await page.getByRole("alert").allTextContents(),
+            workspaceStates: await page.locator(".partner-workspace-state").allTextContents(),
+            pageText: (await page.locator("body").innerText({ timeout: 5_000 })).slice(-6_000)
+          }, null, 2));
+          await page.screenshot({ path: join(directory, "product-chain-failed.png"),
+            mask: [page.locator("input,textarea")], fullPage: true, timeout: 5_000 });
+        }
+      } catch { console.error("Partner product-chain failure evidence was unavailable."); }
+    }
     await browser?.close();
     browser = undefined;
     await fixture?.close({ removeRoot: true });

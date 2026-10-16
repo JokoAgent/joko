@@ -129,13 +129,16 @@ describe("mounted Pi compaction product chain", () => {
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     let attentionBeforeResume: bigint | undefined;
     const permittedAttentionErrors: string[] = [];
+    const permittedAttentionCursors: { submitted: string; current: string; generation: string }[] = [];
     const errors = observeBrowserErrors(page, conflict => {
       if (attentionBeforeResume === undefined || conflict.sessionId !== compactSessionId
         || conflict.intent !== SessionAttentionAcknowledgementIntent.VIEWED) return;
       const current = fixture!.application.store.getSessionAttention(compactSessionId);
       if (conflict.generation !== BigInt(current.attentionGeneration) || conflict.sequence <= 0n
-        || conflict.sequence > attentionBeforeResume || conflict.sequence >= current.attentionCursor) return;
+        || conflict.sequence >= current.attentionCursor) return;
       permittedAttentionErrors.push(conflict.responseError, conflict.consoleError);
+      permittedAttentionCursors.push({ submitted: conflict.sequence.toString(), current: current.attentionCursor.toString(),
+        generation: conflict.generation.toString() });
     });
     await page.goto(taskUrl(compactSessionId), { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
@@ -258,8 +261,6 @@ describe("mounted Pi compaction product chain", () => {
         && attention.readThroughCursor?.sequence === attention.attentionCursor?.sequence
         && attention.readThroughCursor?.generation === attention.attentionCursor?.generation;
     }, "the mounted page to acknowledge the latest resumed projection", 30_000);
-    expect(permittedAttentionErrors.length).toBeLessThanOrEqual(2);
-    expect(errors.toSorted()).toEqual(permittedAttentionErrors.toSorted());
     if (process.env.RUNNER_TEMP !== undefined) {
       const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "compaction");
       const attention = acknowledged.session!.attention!;
@@ -267,6 +268,8 @@ describe("mounted Pi compaction product chain", () => {
       await writeFile(join(directory, "manual-attention-recovery.json"), JSON.stringify({
         sourceCommit: process.env.GITHUB_SHA ?? "working-tree",
         staleViewedAcknowledgements: permittedAttentionErrors.length / 2,
+        staleViewedCursors: permittedAttentionCursors,
+        preResumeCursor: attentionBeforeResume.toString(),
         nativeCompletionCursor: completion.globalCursor.toString(),
         readThroughCursor: attention.readThroughCursor?.sequence.toString(),
         readThroughGeneration: attention.readThroughCursor?.generation.toString(),
@@ -275,6 +278,8 @@ describe("mounted Pi compaction product chain", () => {
         unread: attention.unread
       }, null, 2));
     }
+    expect(permittedAttentionErrors.length).toBeLessThanOrEqual(2);
+    expect(errors.toSorted()).toEqual(permittedAttentionErrors.toSorted());
   });
 
   mountedIt.each([

@@ -309,7 +309,7 @@ jobs:
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             files=(src/document-tools.e2e.test.ts)
           else
-            files=(src/skill-learning-mounted-browser.e2e.test.ts src/voice-dictionary.e2e.test.ts)
+            files=(src/partner-mounted-browser.e2e.test.ts src/real-pi-compaction-mounted-browser.e2e.test.ts)
           fi
           echo "selected_files=${files[*]}" >> "$GITHUB_OUTPUT"
           pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
