@@ -524,8 +524,9 @@ async function startOwnedSimulator(applicationIdentity) {
     noApplicationInstalled: true, noAppGuiSuccessClaimed: true,
     framebufferReadiness: { attempts: 1, passed: false } };
   save("startup-state.json", startupState);
+  const framebufferTimeout = startupDiagnosticsOnly ? 30_000 : 90_000;
   try {
-    startupState.framebuffer = await captureStartupFramebuffer("pre-appearance.png", "capture-pre-appearance-framebuffer");
+    startupState.framebuffer = await captureStartupFramebuffer("pre-appearance.png", "capture-pre-appearance-framebuffer", framebufferTimeout);
   } catch (error) {
     const receipt = startupCommandReceipts.at(-1);
     if (abort.signal.aborted || receipt?.step !== "capture-pre-appearance-framebuffer" || receipt.result !== "failed"
@@ -534,7 +535,7 @@ async function startOwnedSimulator(applicationIdentity) {
     // the first deadline receipt and allow only one fresh, equally bounded probe.
     startupState.framebufferReadiness.attempts = 2;
     save("startup-state.json", startupState);
-    startupState.framebuffer = await captureStartupFramebuffer("pre-appearance.png", "retry-pre-appearance-framebuffer");
+    startupState.framebuffer = await captureStartupFramebuffer("pre-appearance.png", "retry-pre-appearance-framebuffer", framebufferTimeout);
   }
   startupState.framebufferReadiness.passed = true;
   save("startup-state.json", startupState);
@@ -550,10 +551,10 @@ async function startOwnedSimulator(applicationIdentity) {
   if (finalAppearance !== "light") throw new Error("The owned Simulator appearance readback is not light.");
 }
 
-async function captureStartupFramebuffer(file, startupLabel) {
+async function captureStartupFramebuffer(file, startupLabel, timeout = 30_000) {
   const image = join(evidence, file);
   if (existsSync(image)) unlinkSync(image);
-  await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", image], { startupLabel });
+  await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", image], { startupLabel, timeout });
   if (!readFileSync(image).subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
     throw new Error("The owned Simulator did not produce a PNG framebuffer capture.");
   }
