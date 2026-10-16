@@ -675,8 +675,20 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
       return;
     }
     stage = "actual size from fullscreen";
-    await interact(`document.querySelector('.remote-viewer-toolbar button[aria-label="Full screen"]').click()`);
-    await until(async () => viewer.isFullScreen());
+    const fullscreenViewer = viewer;
+    let fullscreenEntered = process.platform !== "darwin";
+    const enteredFullscreen = () => { fullscreenEntered = true; };
+    fullscreenViewer.once("enter-full-screen", enteredFullscreen);
+    try {
+      await interact(`document.querySelector('.remote-viewer-toolbar button[aria-label="Full screen"]').click()`);
+      // macOS reports its fullscreen flag before the native transition and a
+      // resulting renderer readiness/control update have finished.
+      await until(async () => viewer === fullscreenViewer && fullscreenEntered && viewer.isFullScreen()
+        && viewer.webContents.executeJavaScript(`(() => {
+          const button=[...document.querySelectorAll('.remote-viewer-toolbar button')].find(item=>item.textContent==='Actual size');
+          return button && !button.disabled && document.querySelector('.remote-viewer-heading')?.textContent.includes('Connected');
+        })()`));
+    } finally { fullscreenViewer.removeListener("enter-full-screen", enteredFullscreen); }
     await interact(`(() => {
       const button=[...document.querySelectorAll('.remote-viewer-toolbar button')].find(item=>item.textContent==='Actual size');
       if(!button || button.disabled) throw new Error('Actual size is unavailable.'); button.click();
