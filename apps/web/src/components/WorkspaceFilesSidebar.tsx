@@ -259,6 +259,8 @@ type WorkspaceFileOperation =
   | { readonly kind: "rename"; readonly entry: WorkspaceFilesEntryView; readonly ownerDocument: Document }
   | { readonly kind: "delete"; readonly entry: WorkspaceFilesEntryView; readonly ownerDocument: Document };
 
+type ActiveWorkspaceFileOperation = WorkspaceFileOperation & { readonly token: number };
+
 interface SearchViewState {
   readonly status: "idle" | "loading" | "done" | "error";
   readonly query: string;
@@ -376,7 +378,10 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [notice, setNotice] = useState<string>();
   const [contextMenu, setContextMenu] = useState<ContextMenuState>();
-  const [operation, setOperation] = useState<WorkspaceFileOperation>();
+  const [operation, setOperation] = useState<ActiveWorkspaceFileOperation>();
+  const operationRef = useRef(operation);
+  operationRef.current = operation;
+  const operationTokenRef = useRef(0);
   const [focusedPath, setFocusedPath] = useState<string>();
   const reportRevealFailure = useCallback((): void => setNotice(labels.loadFailed), [labels.loadFailed]);
   const tree = useWorkspaceDirectoryTree({
@@ -644,8 +649,17 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
     if ((next.kind === "createFile" || next.kind === "createDirectory")
       && next.parentPath !== ""
       && !tree.expanded.has(next.parentPath)) tree.toggleDirectory(next.parentPath);
-    setOperation(next);
+    setOperation({ ...next, token: ++operationTokenRef.current });
   }, [closeContextMenu, tree]);
+
+  const submitInlineOperation = useCallback(async (active: WorkspaceFileOperation, name: string): Promise<void> => {
+    await executeOperation(active, name);
+    setOperation((current) => current === active ? undefined : current);
+  }, [executeOperation]);
+
+  const reportOperationError = useCallback((active: WorkspaceFileOperation, message: string): void => {
+    if (operationRef.current === active) setNotice(message);
+  }, []);
 
   const cancelOperation = useCallback((active: WorkspaceFileOperation): void => {
     setOperation((current) => current === active ? undefined : current);
@@ -727,12 +741,13 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
           {rootDirectory?.status === "error" && <WorkspaceLoadError label={labels.loadFailed} retryLabel={labels.retry} onRetry={() => tree.loadDirectory("", true)} />}
           {!rootLoading && rootDirectory?.status !== "error" && visibleRows.length === 0 && !rootPending && <div className="workspace-files-sidebar__empty">{labels.emptyTree}</div>}
           {rootPending && <WorkspaceFilesInlineInput
+            key={inlineOperation.token}
             operation={inlineOperation}
             depth={0}
             labels={labels}
             onCancel={() => cancelOperation(inlineOperation)}
-            onError={setNotice}
-            onSubmit={(name) => executeOperation(inlineOperation, name).then(() => setOperation(undefined))}
+            onError={(message) => reportOperationError(inlineOperation, message)}
+            onSubmit={(name) => submitInlineOperation(inlineOperation, name)}
           />}
           {visibleRows.map((row) => {
             const directory = row.entry.kind === "directory" ? tree.directories.get(row.entry.path) : undefined;
@@ -740,13 +755,13 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
             const loading = directory?.status === "loading";
             if (inlineOperation?.kind === "rename" && inlineOperation.entry.path === row.entry.path) {
               return <WorkspaceFilesInlineInput
-                key={`rename:${row.entry.path}`}
+                key={`rename:${row.entry.path}:${inlineOperation.token}`}
                 operation={inlineOperation}
                 depth={row.depth}
                 labels={labels}
                 onCancel={() => cancelOperation(inlineOperation)}
-                onError={setNotice}
-                onSubmit={(name) => executeOperation(inlineOperation, name).then(() => setOperation(undefined))}
+                onError={(message) => reportOperationError(inlineOperation, message)}
+                onSubmit={(name) => submitInlineOperation(inlineOperation, name)}
               />;
             }
             return <div key={row.entry.path} className="workspace-files-tree__item">
@@ -779,12 +794,13 @@ const WorkspaceFilesSidebarBody = forwardRef<WorkspaceFilesSidebarHandle, Worksp
                 && inlineOperation.kind !== "rename"
                 && inlineOperation.parentPath === row.entry.path
                 && <WorkspaceFilesInlineInput
+                  key={inlineOperation.token}
                   operation={inlineOperation}
                   depth={row.depth + 1}
                   labels={labels}
                   onCancel={() => cancelOperation(inlineOperation)}
-                  onError={setNotice}
-                  onSubmit={(name) => executeOperation(inlineOperation, name).then(() => setOperation(undefined))}
+                  onError={(message) => reportOperationError(inlineOperation, message)}
+                  onSubmit={(name) => submitInlineOperation(inlineOperation, name)}
                 />}
               {expanded && directory?.status === "error" && <WorkspaceLoadError nested depth={row.depth + 1} label={labels.loadFailed} retryLabel={labels.retry} onRetry={() => tree.loadDirectory(row.entry.path, true)} />}
               {expanded && directory?.status === "loaded" && directory.entries.length === 0 && <div className="workspace-files-tree__empty-folder" style={{ "--workspace-tree-depth": row.depth + 1 } as CSSProperties}>{labels.emptyDirectory}</div>}
