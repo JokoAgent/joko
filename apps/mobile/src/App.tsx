@@ -939,7 +939,7 @@ export function App() {
       <MobileNavigationFrame dark={dark}>
       <MobilePartnerAvatarProvider transport={client.partnerAvatarTransport()}>
       <View style={[styles.root, { backgroundColor: colors.background }]}>
-        <StatusBar style={dark ? "light" : "dark"} />
+        {Platform.OS === "android" && <StatusBar style={dark ? "light" : "dark"} />}
         {updates.forced ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
           <MobileForcedUpdateGate colors={colors} locale={locale.effectiveLocale} state={updates}
             foreground={foreground} actions={mobileUpdateActions} />

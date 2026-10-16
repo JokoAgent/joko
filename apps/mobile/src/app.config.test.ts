@@ -13,6 +13,13 @@ import mobileExpoConfig, {
 describe("mobile update build configuration", () => {
   afterEach(() => vi.unstubAllEnvs());
 
+  it("retains iOS view controller status-bar ownership through the resolved Expo configuration", () => {
+    const directory = dirname(fileURLToPath(import.meta.url));
+    const { expo } = JSON.parse(readFileSync(resolve(directory, "../app.json"), "utf8")) as { expo: ConfigContext["config"] };
+    const config = mobileExpoConfig({ config: expo } as ConfigContext);
+    expect(config.ios?.infoPlist?.UIViewControllerBasedStatusBarAppearance).toBe(true);
+  });
+
   it("declares Android package installation only for builds with the full-package feed", () => {
     const context = { config: { name: "Joko", slug: "joko", android: {
       permissions: ["android.permission.INTERNET"]

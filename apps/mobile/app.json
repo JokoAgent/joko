@@ -26,6 +26,7 @@
         "com.apple.developer.networking.multicast": true
       },
       "infoPlist": {
+        "UIViewControllerBasedStatusBarAppearance": true,
         "NSLocalNetworkUsageDescription": "Connect to a Joko node on your local network.",
         "NSMicrophoneUsageDescription": "Allow Joko to use your microphone only while you are recording voice input for a task.",
         "NSFaceIDUsageDescription": "Allow Joko to verify your identity before using a saved Remote Desktop password.",
