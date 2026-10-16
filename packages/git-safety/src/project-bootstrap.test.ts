@@ -1,11 +1,11 @@
-import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
 import { GitCommandError, NodeGitCommandRunner, type GitCommandRunner } from "./git-command.js";
-import { ProjectGitBootstrap } from "./project-bootstrap.js";
+import { ProjectGitBootstrap, ProjectGitBootstrapIdentityError } from "./project-bootstrap.js";
 
 const roots: string[] = [];
 const runner = new NodeGitCommandRunner();
@@ -64,6 +64,13 @@ describe("ProjectGitBootstrap", () => {
     await expect(access(join(linked, ".git"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("rejects a linked project root before initialization even when its target is empty", async () => {
+    const parent = await directory(), target = await directory(), alias = join(parent, "project-alias");
+    await symlink(target, alias, "junction");
+    await expect(new ProjectGitBootstrap(fixtureRunner).ensure(input(alias))).rejects.toBeInstanceOf(ProjectGitBootstrapIdentityError);
+    await expect(access(join(target, ".git"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("disables every initialization commit hook and signing without modifying persistent configuration", async () => {
     const root = await directory(), template = await directory();
     await mkdir(join(template, "hooks"));
@@ -101,7 +108,7 @@ describe("ProjectGitBootstrap", () => {
 });
 
 async function directory(): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), "joko-project-bootstrap-test-")); roots.push(root); return root;
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-project-bootstrap-test-"))); roots.push(root); return root;
 }
 
 function input(root: string) { return { workspaceRoot: root, assertCurrent: () => undefined }; }

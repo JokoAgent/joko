@@ -200,8 +200,13 @@ export async function downloadLlamaCppAsset(
           callback(new Error('DOWNLOAD_SIZE'));
           return;
         }
-        activeHash.update(chunk);
-        progress(completed);
+        try {
+          activeHash.update(chunk);
+          progress(completed);
+        } catch (error) {
+          callback(error instanceof Error ? error : new Error('DOWNLOAD_FAILED', { cause: error }));
+          return;
+        }
         callback(null, chunk);
       },
     });

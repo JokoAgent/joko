@@ -38,7 +38,7 @@ export interface NativeSkillSnapshot {
 /** Copy complete approved directories once; native loaders retain relative assets. */
 export async function snapshotNativeSkills(seeds: readonly ApprovedSkillSeed[], signal: AbortSignal, parentDirectory?: string, policy?: NativeSkillPolicy): Promise<NativeSkillSnapshot> {
   if (parentDirectory !== undefined) await mkdir(parentDirectory, { recursive: true, mode: 0o700 });
-  const root = await mkdtemp(join(parentDirectory ?? tmpdir(), "joko-skills-"));
+  const root = await realpath(await mkdtemp(join(parentDirectory ?? tmpdir(), "joko-skills-")));
   let disposed = false;
   const originals: NativeSkillMount[] = [];
   let skills: readonly NativeSkillMount[] = [];
