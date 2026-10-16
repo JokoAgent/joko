@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { chmod, link, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile, type FileHandle } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import ssh2 from "ssh2";
 import { afterEach, beforeEach, describe, expect, it, onTestFailed, vi } from "vitest";
@@ -109,20 +109,29 @@ afterEach(async () => {
   managers.splice(0).forEach(manager => manager.close());
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
+async function windowsFixtureScript(script: string, variables: Record<string, string>): Promise<{ stdout: string; stderr: string }> {
+  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  if (systemRoot === undefined || !isAbsolute(systemRoot)) throw new Error("Windows fixture system root is unavailable.");
+  const prelude = "$ErrorActionPreference = 'Stop'\nImport-Module ([System.IO.Path]::Combine($PSHOME, 'Modules', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop\n";
+  return promisify(execFile)(join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", prelude + script], {
+      windowsHide: true, encoding: "utf8", env: { ...process.env, ...variables }
+    });
+}
 async function fixture(agentCommand: SshAgentCommand = async () => ({ code: 2, stdout: "" }), prepareDirectory = true, platform?: NodeJS.Platform) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-ssh-keys-")));
   roots.push(root);
   const directory = join(root, "identity");
   if (process.platform === "win32") {
-    await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl = New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true, $false); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))); [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl)"], { windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: root } });
+    await windowsFixtureScript("$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl = New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true, $false); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))); [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl)", { JOKO_ACL_FIXTURE: root });
     if (prepareDirectory) await mkdir(directory);
   }
   const manager = new SshKeyManager({ directory, agentCommand, ...(platform === undefined ? {} : { platform }) }); managers.push(manager);
   return { manager, root, directory };
 }
 async function allowEveryone(path: string, rights: "Read" | "CreateFiles", directory: boolean): Promise<void> {
-  await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$acl = if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::GetAccessControl($env:JOKO_ACL_FIXTURE) } else { [System.IO.File]::GetAccessControl($env:JOKO_ACL_FIXTURE) }; $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0'); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $env:JOKO_ACL_RIGHTS, 'None', 'None', 'Allow'))); if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) } else { [System.IO.File]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) }"], {
-    windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: path, JOKO_ACL_RIGHTS: rights, JOKO_ACL_DIRECTORY: directory ? "1" : "0" }
+  await windowsFixtureScript("$acl = if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::GetAccessControl($env:JOKO_ACL_FIXTURE) } else { [System.IO.File]::GetAccessControl($env:JOKO_ACL_FIXTURE) }; $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0'); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $env:JOKO_ACL_RIGHTS, 'None', 'None', 'Allow'))); if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) } else { [System.IO.File]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) }", {
+    JOKO_ACL_FIXTURE: path, JOKO_ACL_RIGHTS: rights, JOKO_ACL_DIRECTORY: directory ? "1" : "0"
   });
 }
 async function toggleDirectoryArchive(path: string): Promise<void> {
@@ -133,27 +142,36 @@ async function toggleDirectoryArchive(path: string): Promise<void> {
 
 describe("node SSH keys", () => {
   it("creates an owner-only file exclusively without changing a colliding identity", async () => {
-    const { root } = await fixture();
+    const startedAt = performance.now();
+    const stages: Array<{ phase: string; elapsed: number }> = [];
+    const observe = async <T>(phase: string, action: () => Promise<T>): Promise<T> => {
+      stages.push({ phase: `${phase}-start`, elapsed: Math.round(performance.now() - startedAt) });
+      const value = await action();
+      stages.push({ phase: `${phase}-done`, elapsed: Math.round(performance.now() - startedAt) });
+      return value;
+    };
+    onTestFailed(() => console.info("SSH exclusive file fixture phases:", JSON.stringify(stages)));
+    const { root } = await observe("fixture", () => fixture());
     const original = join(root, "private"); const foreign = join(root, "foreign");
     await writeFile(foreign, "untouched identity", { mode: 0o640 });
-    const held = await createPrivateFile(original, signal());
+    const held = await observe("create-original", () => createPrivateFile(original, signal()));
     try {
       if (process.platform === "win32") {
-        const acl = async (path: string): Promise<string> => (await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$acl = [System.IO.File]::GetAccessControl($env:JOKO_ACL_FIXTURE); $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; ConvertTo-Json -Compress @{ protected = $acl.AreAccessRulesProtected; owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; current = $sid.Value; rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{ sid = $_.IdentityReference.Value; inherited = $_.IsInherited; type = [string]$_.AccessControlType; rights = [string]$_.FileSystemRights } }) }"], {
-          windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: path }
+        const acl = async (path: string): Promise<string> => (await windowsFixtureScript("$acl = [System.IO.File]::GetAccessControl($env:JOKO_ACL_FIXTURE); $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; ConvertTo-Json -Compress @{ protected = $acl.AreAccessRulesProtected; owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; current = $sid.Value; rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{ sid = $_.IdentityReference.Value; inherited = $_.IsInherited; type = [string]$_.AccessControlType; rights = [string]$_.FileSystemRights } }) }", {
+          JOKO_ACL_FIXTURE: path
         })).stdout;
-        const created = JSON.parse(await acl(original));
+        const created = JSON.parse(await observe("acl-original", () => acl(original)));
         expect(created).toEqual({ protected: true, owner: created.current, current: created.current, rules: [{ sid: created.current, inherited: false, type: "Allow", rights: "FullControl" }] });
-        const before = await acl(foreign);
-        await expect(createPrivateFile(foreign, signal())).rejects.toMatchObject({ code: "exists" });
-        expect(await acl(foreign)).toBe(before);
+        const before = await observe("acl-foreign-before", () => acl(foreign));
+        await expect(observe("create-foreign-collision", () => createPrivateFile(foreign, signal()))).rejects.toMatchObject({ code: "exists" });
+        expect(await observe("acl-foreign-after", () => acl(foreign))).toBe(before);
         const uncertain = join(root, "uncertain");
         const prototype = Object.getPrototypeOf(held) as FileHandle;
         const inspect = vi.spyOn(prototype, "stat").mockRejectedValueOnce(new Error("Fixture cannot inspect the reopened file"));
-        try { await expect(createPrivateFile(uncertain, signal())).rejects.toMatchObject({ code: "outcome_unknown" }); }
+        try { await expect(observe("create-uncertain", () => createPrivateFile(uncertain, signal()))).rejects.toMatchObject({ code: "outcome_unknown" }); }
         finally { inspect.mockRestore(); }
         expect(await readFile(uncertain, "utf8")).toBe("");
-        await expect(createPrivateFile(uncertain, signal())).rejects.toMatchObject({ code: "exists" });
+        await expect(observe("create-uncertain-collision", () => createPrivateFile(uncertain, signal()))).rejects.toMatchObject({ code: "exists" });
       } else {
         const before = (await stat(foreign)).mode;
         expect((await held.stat()).mode & 0o777).toBe(0o600);
