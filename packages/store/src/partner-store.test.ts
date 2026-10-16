@@ -493,7 +493,7 @@ describe("PartnerStore", () => {
     expect(reopened.listProfileVersions(partner.id)[0]?.capabilities).toEqual(next);
   });
 
-  it("validates model chains and rolls back rejected creation without advancing the directory", () => {
+  it("rejects duplicate model routes and rolls back creation without advancing the directory", () => {
     const store = memoryStore(["one"]);
     expectStoreError(() => store.createPartner({
       expectedDirectoryRevision: 1n,
@@ -502,7 +502,7 @@ describe("PartnerStore", () => {
         ...capabilities(),
         modelChain: [
           route("backend-one", "provider-one", "model-one"),
-          route("backend-two", "provider-two", "model-two")
+          route("backend-one", "provider-one", "model-one")
         ]
       }
     }), "PARTNER_INVALID");
