@@ -16,8 +16,17 @@ const MAXIMUM_KEYS = 512;
 
 export type SshKeyFailure = "invalid_name" | "invalid_key" | "bad_passphrase" | "key_changed" | "not_found"
   | "agent_unavailable" | "agent_failed" | "busy" | "aborted" | "outcome_unknown" | "io_failed" | "unsafe_permissions";
+type SshKeyGenerationPhase = "private_create" | "private_identity" | "public_create" | "before_write"
+  | "private_write" | "private_sync" | "public_write" | "public_sync" | "after_write"
+  | "written_private_identity" | "written_public_identity" | "private_readback" | "private_contents"
+  | "public_readback" | "public_fingerprint" | "final_private_identity" | "final_public_identity" | "final_directory";
+interface SshKeyGenerationDiagnostic { readonly phase: SshKeyGenerationPhase; readonly failure: string }
 export class SshKeyError extends Error {
-  constructor(readonly code: SshKeyFailure) { super(`ssh_key.${code}`); this.name = "SshKeyError"; }
+  readonly generation?: SshKeyGenerationDiagnostic;
+  constructor(readonly code: SshKeyFailure, generation?: SshKeyGenerationDiagnostic) {
+    super(`ssh_key.${code}`); this.name = "SshKeyError";
+    if (generation !== undefined) this.generation = Object.freeze({ ...generation });
+  }
 }
 export interface SshKeyInfo {
   readonly id: string;
@@ -158,26 +167,44 @@ export class SshKeyManager {
           await this.#assertDirectory(signal);
           abortIfNeeded(signal);
           const handles: Array<{ name: string; handle: FileHandle }> = [];
+          let phase: SshKeyGenerationPhase = "private_create";
           try {
             handles.push({ name: id, handle: await createPrivateFile(join(this.#directory, id), signal) });
+            phase = "private_identity";
             await this.#assertHandle(id, handles[0]!.handle);
+            phase = "public_create";
             handles.push({ name: `${id}.pub`, handle: await open(join(this.#directory, `${id}.pub`), "wx", 0o644) });
+            phase = "before_write";
             await this.#root(false);
             abortIfNeeded(signal);
+            phase = "private_write";
             await handles[0]!.handle.writeFile(secret);
+            phase = "private_sync";
             await handles[0]!.handle.sync();
+            phase = "public_write";
             await handles[1]!.handle.writeFile(`${pair.public.trim()}\n`);
+            phase = "public_sync";
             await handles[1]!.handle.sync();
+            phase = "after_write";
             await this.#root(false);
+            phase = "written_private_identity";
             await this.#assertHandle(id, handles[0]!.handle);
+            phase = "written_public_identity";
             await this.#assertHandle(`${id}.pub`, handles[1]!.handle);
+            phase = "private_readback";
             const writtenSecret = await this.#readHandle(id, handles[0]!.handle, MAXIMUM_KEY_BYTES);
+            phase = "private_contents";
             try { if (!writtenSecret.equals(secret)) throw new SshKeyError("key_changed"); }
             finally { writtenSecret.fill(0); }
+            phase = "public_readback";
             const current = await this.#public(id);
+            phase = "public_fingerprint";
             if (current.info.sha256Fingerprint !== fingerprint(parsePublic(pair.public))) throw new SshKeyError("key_changed");
+            phase = "final_private_identity";
             await this.#assertHandle(id, handles[0]!.handle);
+            phase = "final_public_identity";
             await this.#assertHandle(`${id}.pub`, handles[1]!.handle);
+            phase = "final_directory";
             await this.#assertDirectory(signal);
             abortIfNeeded(signal);
             return current.info;
@@ -185,7 +212,9 @@ export class SshKeyManager {
             // A verified descriptor does not make a later pathname unlink
             // atomic. Preserve files after creation instead of deleting a
             // replacement identity or claiming that cleanup was confirmed.
-            if (handles.length > 0 || error instanceof PrivateFileCreationError && error.code === "outcome_unknown") throw new SshKeyError("outcome_unknown");
+            if (handles.length > 0 || error instanceof PrivateFileCreationError && error.code === "outcome_unknown") {
+              throw new SshKeyError("outcome_unknown", { phase, failure: generationFailureCode(error) });
+            }
             if (isCode(error, "EEXIST") || error instanceof PrivateFileCreationError && error.code === "exists") continue;
             if (signal.aborted) throw new SshKeyError("aborted");
             throw error instanceof SshKeyError ? error : new SshKeyError("io_failed");
@@ -405,6 +434,14 @@ function assertFingerprint(key: SshKeyInfo, expected: string): void { if (key.sh
 function abortIfNeeded(signal: AbortSignal): void { if (signal.aborted) throw new SshKeyError("aborted"); }
 function samePath(a: string, b: string): boolean { return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b; }
 function isCode(error: unknown, code: string): boolean { return error instanceof Error && "code" in error && error.code === code; }
+function generationFailureCode(error: unknown): string {
+  // Only fixed failure codes survive the unknown-outcome boundary. Never retain
+  // the original error, whose message or properties can contain a private path.
+  const codes = ["invalid_name", "invalid_key", "bad_passphrase", "key_changed", "not_found", "agent_unavailable", "agent_failed", "busy",
+    "aborted", "outcome_unknown", "io_failed", "unsafe_permissions", "exists", "failed", "EACCES", "EBADF", "EBUSY", "EDQUOT", "EEXIST",
+    "EINVAL", "EIO", "EMFILE", "ENFILE", "ENOENT", "ENOSPC", "EPERM", "EROFS"];
+  return error instanceof Error && "code" in error && typeof error.code === "string" && codes.includes(error.code) ? error.code : "unexpected";
+}
 function keyError(error: unknown): SshKeyError {
   return error instanceof SshKeyError ? error : error instanceof KeyPermissionError ? new SshKeyError(error.code) : new SshKeyError("io_failed");
 }

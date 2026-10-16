@@ -440,7 +440,9 @@ describe("node SSH keys", () => {
     });
     try {
       await expect(manager.generate({ name: "id_joko", comment: "", passphrase: "boundary fixture" }, signal()))
-        .rejects.toMatchObject({ code: "outcome_unknown" });
+        .rejects.toMatchObject({ code: "outcome_unknown", generation: {
+          phase: change === "replace" ? "written_private_identity" : "private_contents", failure: "key_changed"
+        } });
       expect(changed).toBe(true);
       expect(await readFile(path, "utf8")).toBe("replacement identity");
       expect(await readdir(directory)).toContain("id_joko.pub");
