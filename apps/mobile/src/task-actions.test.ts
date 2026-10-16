@@ -13,6 +13,9 @@ import {
   DeferredSheetAction,
   acceptedQueueItems,
   buildMobileMessageActions,
+  buildMobileMessageCopyText,
+  captureMobileMessageReference,
+  commitMobileMessageReference,
   editQueueItemText,
   mobileQueueCapabilities,
   queueItemHasStructuredInput,
@@ -20,6 +23,7 @@ import {
   queueMove
 } from "./task-actions";
 import type { TimelineRow } from "./timeline";
+import { mobileComposerInput, plainTextMobileComposerDraft } from "./mobile-composer-document";
 
 describe("mobile message action sheet", () => {
   const row: TimelineRow = {
@@ -51,6 +55,7 @@ describe("mobile message action sheet", () => {
       { id: "delete", label: "Delete message", destructive: true, separatorBefore: true }
     ]);
     expect(buildMobileMessageActions({ ...row, text: "" }, { canDelete: false, locale: "zh-CN" })).toEqual([
+      { id: "add-to-composer", label: "添加到编辑器" },
       { id: "copy-link", label: "复制消息链接" },
       { id: "share-image", label: "分享为图片" }
     ]);
@@ -60,6 +65,42 @@ describe("mobile message action sheet", () => {
       .toEqual({ id: "rewind", label: "Rewind before message" });
     expect(buildMobileMessageActions({ ...row, kind: "assistant" }, { canDelete: false, canRewind: true, locale: "en" })
       .some((item) => item.id === "rewind")).toBe(false);
+  });
+
+  it("copies body, secondary body and localized attachment names without losing attachment-only actions", () => {
+    const attachmentOnly = { ...row, text: "[File]", sourceText: "", copySource: {
+      body: "", attachmentNames: ["photo.png", "notes.txt"] } };
+    expect(buildMobileMessageCopyText(attachmentOnly, "en")).toBe("Attachments: photo.png, notes.txt");
+    expect(buildMobileMessageCopyText({ ...attachmentOnly, copySource: {
+      body: "**Exact body**\nsecond line", secondaryBody: "Secondary result", attachmentNames: ["photo.png", "notes.txt"] } }, "zh-CN"))
+      .toBe("**Exact body**\nsecond line\n\nSecondary result\n\n附件：photo.png, notes.txt");
+    expect(buildMobileMessageActions(attachmentOnly, { canDelete: false, locale: "en" }).slice(0, 2))
+      .toEqual([{ id: "copy-text", label: "Copy message" }, { id: "add-to-composer", label: "Add to composer" }]);
+    expect(buildMobileMessageActions(attachmentOnly, { canDelete: false, canAddToComposer: false, locale: "en" })
+      .some(action => action.id === "add-to-composer")).toBe(false);
+  });
+
+  it("inserts an anchored message reference into the captured draft and rejects retired owner/message/draft inputs", () => {
+    const draft = plainTextMobileComposerDraft("Before after");
+    const message = { ...row, text: "A [message] @mention\n" + "summary ".repeat(500) };
+    const lease = captureMobileMessageReference({ ownerKey: "node/task/occurrence", draftOwnerKey: "profile/task",
+      sessionId: "task", row: message, draft, selection: { start: 7, end: 7 }, locale: "en" })!;
+    const input = { lease, ownerKey: lease.ownerKey, draftOwnerKey: lease.draftOwnerKey, sessionId: lease.sessionId,
+      row: message, draft, locale: "en" as const, atomId: "message-reference" };
+    const result = commitMobileMessageReference(input);
+    expect(result.draft.text).toBe("Before #/tasks/task?message=message-1&event=event-completeafter");
+    expect(result.draft.atoms[0]).toMatchObject({ kind: "route-reference", routeKind: "session", sessionId: "task",
+      messageId: row.id, eventId: row.eventId, displayText: expect.stringContaining("A message ＠mention") });
+    expect(result.draft.atoms[0]!.kind === "route-reference" && result.draft.atoms[0]!.displayText.length).toBeLessThanOrEqual(240);
+    expect(mobileComposerInput(result.draft).parts).toMatchObject([{ content: { case: "text", value: result.draft.text } }]);
+    for (const changed of [{ ownerKey: "other-node/task/occurrence" }, { ownerKey: "node/task/new-occurrence" },
+      { draftOwnerKey: "other-profile/task" }, { sessionId: "other-task" }, { draft: plainTextMobileComposerDraft(draft.text) },
+      { row: { ...message, eventId: "new-event" } }, { row: { ...message, text: "changed message" } }, { row: { ...message, completed: false } }]) {
+      expect(() => commitMobileMessageReference({ ...input, ...changed })).toThrow("source message or composer changed");
+    }
+    const attachmentOnly = { ...row, text: "", sourceText: "", copySource: { body: "", attachmentNames: ["notes.txt"] } };
+    expect(captureMobileMessageReference({ ownerKey: lease.ownerKey, draftOwnerKey: lease.draftOwnerKey,
+      sessionId: "task", row: attachmentOnly, draft, selection: { start: 0, end: 0 }, locale: "en" })).toBeDefined();
   });
 
   it("runs a choice only after its matching close and cancels an old choice on reopen", () => {

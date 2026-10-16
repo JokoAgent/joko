@@ -64,6 +64,7 @@ let drawerProps: MobileDrawerProps;
 let finishDrawerClose: (() => void) | undefined;
 let taskNavigationPort: import("./App").TaskHomeNavigationPort | undefined;
 let TaskScreen: typeof import("./App").TaskScreen;
+let messageActionsProps: ComponentProps<typeof import("./MobileActionSheet").MobileActionSheet> | undefined;
 type TaskProps = ComponentProps<typeof import("./App").TaskScreen>;
 let taskProps: TaskProps;
 
@@ -93,7 +94,7 @@ const client = new Proxy({
   partnerConversationTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
   partnerProfileTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
   taskDraftProfileId: () => state.activeProfileId,
-  taskHeaderSourceKey: () => state.selectedId ? `${state.activeProfileId}/${state.selectedId}/${headerSourceEpoch}` : undefined,
+  taskHeaderSourceKey: () => state.status === "connected" && state.selectedId ? `${state.activeProfileId}/${state.selectedId}/${headerSourceEpoch}` : undefined,
   readTaskHeaderRole: async () => observedHeaderRole,
   taskCollaborationApi: () => collaborationApi
 }, { get: (object, key) => key in object ? object[key as keyof typeof object] : () => undefined });
@@ -181,7 +182,7 @@ beforeAll(async () => {
   vi.doMock("./mobile-voice-dictionary-readonly-controller", () => ({ MobileVoiceDictionaryReadOnlyController: class {} }));
   for (const name of ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage",
     "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard",
-    "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileActionSheet",
+    "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard",
     "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker",
     "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet",
     "MobileRuntimeControlsSheet", "MobileContextSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet",
@@ -194,6 +195,10 @@ beforeAll(async () => {
     vi.doMock(`./${name}`, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => null,
       has: () => true, getOwnPropertyDescriptor: () => ({ configurable: true, enumerable: true, value: () => null }) }));
   vi.doMock("./SwipeableSessionRow", () => ({ SwipeableSessionRow: surface }));
+  vi.doMock("./MobileActionSheet", () => ({ MobileActionSheet: (props: NonNullable<typeof messageActionsProps>) => {
+    messageActionsProps = props;
+    return null;
+  } }));
   vi.doMock("./MobilePartnerProfileSheet", () => ({ MobilePartnerProfileSheet: (props: NonNullable<typeof learningProfileProps>) => {
     learningProfileProps = props;
     return props.visible ? createElement("output", { "data-testid": "learning-settings" }, props.initialLearningDestination ?? "profile") : null;
@@ -227,6 +232,7 @@ beforeAll(async () => {
 });
 
 beforeEach(async () => {
+  messageActionsProps = undefined;
   collaborationApi = undefined;
   learningPartner = undefined; learningProfileProps = undefined;
   taskWindowGeometry = undefined;
@@ -499,6 +505,40 @@ describe("actual Home navigation hosts", () => {
 });
 
 describe("actual Task Home navigation composition", () => {
+  it.each(["connected", "offline"] as const)("adds the exact visible message to its original local draft while %s", async status => {
+    const completion = create(EventSchema, { eventId: "reference-completion", identity: { sessionId: "current", runId: "run", backendId: "backend" },
+      cursor: { generation: 1n, sequence: 5n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "reference-message", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Original reply" } }]
+      } } } });
+    state = { ...state, status, detail: create(SnapshotSchema, { ...state.detail!, timeline: [completion] }) };
+    await renderTask();
+    await press(mobileMessage("en", "task.moreFor", { name: "Assistant" }));
+    expect(messageActionsProps?.visible).toBe(true);
+    expect(messageActionsProps?.items.some(action => action.id === "add-to-composer")).toBe(true);
+    if (status === "offline") expect(messageActionsProps?.items.map(action => action.id))
+      .toEqual(["copy-text", "add-to-composer", "copy-link"]);
+    await act(async () => messageActionsProps!.onAction("add-to-composer"));
+    expect(composerProps.draft.text).toBe("Retained composer#/tasks/current?message=reference-message&event=reference-completion");
+    expect(composerProps.draft.atoms[0]).toMatchObject({ kind: "route-reference", sessionId: "current",
+      messageId: "reference-message", eventId: "reference-completion", displayText: "Original reply" });
+    expect(drafts.readSync({ profileId: "profile", sessionId: "current" })).toEqual(composerProps.draft);
+    expect(select).not.toHaveBeenCalled(); expect(reconcile).not.toHaveBeenCalled(); expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("rejects a deferred offline Add after its source snapshot is replaced", async () => {
+    const completion = create(EventSchema, { eventId: "reference-completion", identity: { sessionId: "current" },
+      cursor: { generation: 1n, sequence: 5n }, payload: { kind: { case: "messageCompleted", value: {
+        messageId: "reference-message", role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Original reply" } }]
+      } } } });
+    state = { ...state, status: "offline", detail: create(SnapshotSchema, { ...state.detail!, timeline: [completion] }) };
+    await renderTask(); await press(mobileMessage("en", "task.moreFor", { name: "Assistant" }));
+    const deferred = messageActionsProps!.onAction;
+    state = { ...state, detail: create(SnapshotSchema, { ...state.detail! }) };
+    await act(async () => deferred("add-to-composer"));
+    expect(composerProps.draft.text).toBe("Retained composer");
+    expect(drafts.readSync({ profileId: "profile", sessionId: "current" })?.text).toBe("Retained composer");
+  });
+
   it.each([
     [{ senderSessionId: "other", senderSessionTitle: "Original title" }, "From task Original title"],
     [{ senderSessionId: "other", senderPartnerId: "partner", senderPartnerName: "Partner name" }, "From Partner Partner name"],
