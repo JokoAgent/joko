@@ -10,6 +10,11 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["task.renameSuggest", "Suggest title", "AI 起名", "AI 命名", "タイトルを提案", "제목 제안"],
+  ["task.renameSuggesting", "Suggesting title…", "正在生成标题…", "正在產生標題…", "タイトルを提案中…", "제목 제안 중…"],
+  ["task.renameNoMaterial", "There is not enough conversation to suggest a title. You can enter one.", "对话内容不足，可手动输入标题。", "對話內容不足，可手動輸入標題。", "会話の内容が不足しています。タイトルを入力できます。", "대화 내용이 부족합니다. 제목을 직접 입력할 수 있습니다."],
+  ["task.renameProviderUnavailable", "Title generation is unavailable. You can enter a title or retry.", "暂时无法生成标题，可手动输入或重试。", "暫時無法產生標題，可手動輸入或重試。", "タイトルの生成を利用できません。入力するか再試行してください。", "제목 생성을 사용할 수 없습니다. 직접 입력하거나 다시 시도하세요."],
+  ["task.renameFailed", "A title could not be suggested. Your draft is retained; you can retry.", "标题生成失败，已保留草稿，可重试。", "標題產生失敗，已保留草稿，可重試。", "タイトルを提案できませんでした。下書きは保持されています。再試行できます。", "제목을 제안하지 못했습니다. 초안은 유지되며 다시 시도할 수 있습니다."],
   ["task.modelSubstitution", "This turn used {actual} instead of the selected model {selected}.", "本轮使用了 {actual}，所选模型为 {selected}。", "此回合使用了 {actual}，選取的模型為 {selected}。", "このターンは選択した {selected} ではなく {actual} を使用しました。", "이 차례에는 선택한 {selected} 대신 {actual}을 사용했습니다."],
   ["task.messageTokens", "{tokens} tokens", "{tokens} tokens", "{tokens} tokens", "{tokens} トークン", "{tokens} 토큰"],
   ["task.messageCost", "Cost this turn: {cost}", "本轮费用：{cost}", "此回合費用：{cost}", "このターンの費用: {cost}", "이 차례 비용: {cost}"],

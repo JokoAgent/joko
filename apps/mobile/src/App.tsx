@@ -188,6 +188,7 @@ import type { MobileTimelineArtifact } from "./mobile-timeline-artifacts";
 import { MobileDrawer } from "./MobileDrawer";
 import { MobileActionSheet } from "./MobileActionSheet";
 import { MobileTaskDerivationSheet } from "./MobileTaskDerivationSheet";
+import { MobileTaskRenameSheet } from "./MobileTaskRenameSheet";
 import { MobileMessageRewindSheet } from "./MobileMessageRewindSheet";
 import { MobileSessionDerivationMarker } from "./MobileSessionDerivationMarker";
 import { MobileTaskHeader, type MobileTaskHeaderAction } from "./MobileTaskHeader";
@@ -3421,6 +3422,8 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [messageAction, setMessageAction] = useState<{ readonly sessionId: string; readonly row: TimelineRow }>();
   const [messageActionsVisible, setMessageActionsVisible] = useState(false);
   const [taskActionsVisible, setTaskActionsVisible] = useState(false);
+  const [renameTask, setRenameTask] = useState<{ readonly ownerKey: string; readonly name: string }>();
+  const taskMetadataOccurrence = useRef(0);
   const [quoteSelection, setQuoteSelection] = useState<{
     readonly lease: MobileQuoteSelectionLease;
     readonly draft: MobileComposerDraft;
@@ -3621,6 +3624,39 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const headerSourceKey = client.taskHeaderSourceKey();
   const headerRole = useMobileTaskHeaderRole(client, headerSourceKey);
   const workerReadOnly = headerRole.role === "worker";
+  const taskMetadataContext = useRef({ sourceKey: headerSourceKey, role: headerRole.role, partner: !!partnerIdentity.partner });
+  taskMetadataContext.current = { sourceKey: headerSourceKey, role: headerRole.role, partner: !!partnerIdentity.partner };
+  const taskMetadataCurrent = (key: string): boolean => {
+    const current = taskMetadataContext.current;
+    return taskMountedRef.current && AppState.currentState === "active" && client.state.status === "connected"
+      && client.state.taskSource?.kind !== "joined" && current.sourceKey === key && client.taskHeaderSourceKey() === key
+      && current.role !== undefined && current.role !== "worker" && !current.partner;
+  };
+  const mutateTaskMetadata = (key: string, action: () => Promise<boolean>): void => {
+    if (!taskMetadataCurrent(key) || client.state.busy) return;
+    taskMetadataOccurrence.current++; setLocalError("");
+    void action().catch(error => { if (taskMetadataCurrent(key)) setLocalError(errorText(error, locale)); });
+  };
+  const deleteCurrentTask = (): void => {
+    if (!headerSourceKey || !session || !taskMetadataCurrent(headerSourceKey)) return;
+    const key = headerSourceKey, sessionId = session.sessionId, occurrence = ++taskMetadataOccurrence.current;
+    Alert.alert(mobileMessage(locale, "home.deleteTitle", { name: session.displayName || mobileMessage(locale, "home.untitledTask") }),
+      mobileMessage(locale, "home.deleteBody"), [
+        { text: mobileMessage(locale, "common.cancel"), style: "cancel", onPress: () => {
+          if (taskMetadataOccurrence.current === occurrence) taskMetadataOccurrence.current++;
+        } },
+        { text: mobileMessage(locale, "common.deleteTask"), style: "destructive", onPress: () => {
+          if (taskMetadataOccurrence.current === occurrence) mutateTaskMetadata(key, () => client.deleteSession(sessionId));
+        } }
+      ], { cancelable: true, onDismiss: () => { if (taskMetadataOccurrence.current === occurrence) taskMetadataOccurrence.current++; } });
+  };
+  useEffect(() => {
+    taskMetadataOccurrence.current++; setRenameTask(undefined);
+    const listener = AppState.addEventListener("change", value => {
+      if (value !== "active") { taskMetadataOccurrence.current++; setRenameTask(undefined); }
+    });
+    return () => { taskMetadataOccurrence.current++; listener.remove(); };
+  }, [headerSourceKey, headerRole.role, state.status, session?.displayName]);
   const newTaskInSystemBar = Platform.OS === "ios" && adaptiveWindow.barEdge !== "none" && homeLayout.mode === "persistent";
   const remoteDesktopControllerDeviceId = state.saved.find((profile) => profile.profileId === state.activeProfileId)?.deviceId;
   const remoteDesktopDeviceId = mobileRemoteDesktopSessionDeviceId(session,
@@ -6123,6 +6159,23 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         modelId={session?.model?.model?.modelId} providerName={usageProvider.displayName} loading={taskAccountUsage.loading}
         failed={taskAccountUsage.failed} now={taskAccountUsage.now} colors={colors} locale={locale} />}
       actions={([
+        ...(!partnerIdentity.partner && state.taskSource?.kind !== "joined" && headerRole.role !== "worker" ? [
+          { id: "rename" as const, label: mobileMessage(locale, "common.rename"),
+            onPress: () => {
+              if (!headerSourceKey || !session || !taskMetadataCurrent(headerSourceKey)) return;
+              taskMetadataOccurrence.current++; setRenameTask({ ownerKey: headerSourceKey, name: session.displayName });
+            },
+            disabled: !headerSourceKey || headerRole.role === undefined || state.status !== "connected" || state.busy || attachmentBusy || voice.busy },
+          { id: "pin" as const, label: mobileMessage(locale, session?.pinned ? "common.unpin" : "common.pin"),
+            onPress: () => { if (headerSourceKey && session) mutateTaskMetadata(headerSourceKey, () => client.setSessionPinned(session.sessionId, !session.pinned)); },
+            disabled: !headerSourceKey || headerRole.role === undefined || state.status !== "connected" || state.busy || attachmentBusy || voice.busy },
+          { id: "archive" as const, label: mobileMessage(locale, session?.archived ? "common.restore" : "common.archive"),
+            onPress: () => { if (headerSourceKey && session) mutateTaskMetadata(headerSourceKey, () => client.setSessionArchived(session.sessionId, !session.archived)); },
+            disabled: !headerSourceKey || headerRole.role === undefined || state.status !== "connected" || state.busy || attachmentBusy || voice.busy },
+          { id: "delete" as const, label: mobileMessage(locale, "common.deleteTask"), destructive: true,
+            onPress: deleteCurrentTask,
+            disabled: !headerSourceKey || headerRole.role === undefined || state.status !== "connected" || state.busy || attachmentBusy || voice.busy }
+        ] : []),
         ...(onTaskSharing ? [{ id: "task-sharing" as const, label: state.taskSource?.kind === "joined" ? mobileTaskSharingCopy(locale).leave : mobileTaskSharingCopy(locale).title,
           disabled: state.busy || attachmentBusy || voice.busy, onPress: onTaskSharing }] : []),
         { id: "search", label: mobileMessage(locale, "conversationSearch.title"), onPress: openConversationSearch,
@@ -6653,6 +6706,14 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     <MobileQuoteSelectionSheet lease={state.status === "connected" ? quoteSelection?.lease : undefined} locale={locale}
       colors={colors} busy={state.busy || voice.busy}
       onClose={() => setQuoteSelection(undefined)} onAdd={addSelectedQuote} />
+    <MobileTaskRenameSheet visible={renameTask !== undefined && renameTask.ownerKey === headerSourceKey
+      && state.status === "connected" && headerRole.role !== undefined && !workerReadOnly && !partnerIdentity.partner}
+      ownerKey={renameTask?.ownerKey} name={renameTask?.name ?? ""} busy={state.busy || attachmentBusy || voice.busy}
+      colors={colors} locale={locale} isCurrent={taskMetadataCurrent} onClose={() => setRenameTask(undefined)}
+      onSuggest={(key, signal) => client.suggestTaskTitle(key, signal)}
+      onConfirm={(key, name) => {
+        if (session) mutateTaskMetadata(key, () => client.renameSession(session.sessionId, name));
+      }} />
     <MobileTaskDerivationSheet kind="clone" visible={cloneVisible}
       controls={cloneControls ? { ...cloneControls, canDerive: cloneControls.canClone } : undefined} locale={locale} colors={colors}
       busy={state.busy || attachmentBusy || voice.busy} onClose={() => setCloneVisible(false)}

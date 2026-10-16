@@ -1,5 +1,6 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
+import { SuggestSessionTitleResponseSchema, SessionTitleSuggestionStatus } from "@joko/contracts";
 import type { MobileCollaborationRpc } from "./mobile-collaboration";
 import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
 import { createPartnerRoutineApi, newRoutineDefinition, ListPartnerRoutinesResponseSchema, PartnerRoutineSchema,
@@ -1020,6 +1021,7 @@ function fakeNetwork(): MobileNetwork {
     unregisterMobilePush: vi.fn(async () => undefined),
     readSession: vi.fn(async () => snapshot),
     readTaskHeaderRole: vi.fn(async () => "ordinary" as const),
+    suggestSessionTitle: vi.fn(async () => create(SuggestSessionTitleResponseSchema, { title: "Suggested title", status: SessionTitleSuggestionStatus.OK })),
     listBackgroundTasks: vi.fn(async () => ({ tasks: [], nextPageToken: "" })),
     listSubagentRuns: vi.fn(async () => ({ runs: [], nextPageToken: "" })),
     getSubagentRun: vi.fn(async () => { throw new Error("No delegated run fixture was configured."); }),
@@ -1765,6 +1767,35 @@ describe("mobile current task delegated reads", () => {
     const background = app.readTaskHeaderRole(app.taskHeaderSourceKey()!, new AbortController().signal);
     app.setForeground(false); expect(active.aborted).toBe(true); expect(app.taskHeaderSourceKey()).toBeUndefined();
     finish("worker"); await expect(background).rejects.toThrow("source changed");
+  });
+
+  it("suggests a title through the current owned task without saving and rejects worker or foreign sources before dispatch", async () => {
+    const { network } = delegatedNetwork();
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const source = app.taskHeaderSourceKey()!, signal = new AbortController().signal;
+    expect(await app.suggestTaskTitle(source, signal)).toMatchObject({ title: "Suggested title", status: SessionTitleSuggestionStatus.OK });
+    expect(network.suggestSessionTitle).toHaveBeenCalledExactlyOnceWith(credential, "session", expect.any(AbortSignal));
+    expect(network.submit).not.toHaveBeenCalled();
+    await expect(app.suggestTaskTitle("foreign", signal)).rejects.toThrow("owned task");
+    vi.mocked(network.readTaskHeaderRole).mockResolvedValueOnce("worker");
+    await expect(app.suggestTaskTitle(source, signal)).rejects.toThrow("Worker titles");
+    expect(network.suggestSessionTitle).toHaveBeenCalledOnce();
+  });
+
+  it.each(["runtime", "cancel", "background"] as const)("rejects a late title suggestion after %s retirement", async kind => {
+    const { network, owner, detail } = delegatedNetwork();
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    let finish!: (value: import("@joko/contracts").SuggestSessionTitleResponse) => void;
+    vi.mocked(network.suggestSessionTitle).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const caller = new AbortController();
+    const pending = app.suggestTaskTitle(app.taskHeaderSourceKey()!, caller.signal);
+    const rejected = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(network.suggestSessionTitle).toHaveBeenCalledOnce());
+    if (kind === "runtime") { owner.sessions[0]!.nativeBinding!.runtimeGeneration = 2n; detail.sessions[0]!.nativeBinding!.runtimeGeneration = 2n; }
+    else if (kind === "cancel") caller.abort();
+    else app.setForeground(false);
+    finish(create(SuggestSessionTitleResponseSchema, { title: "Retired title", status: SessionTitleSuggestionStatus.OK }));
+    await rejected; expect(network.submit).not.toHaveBeenCalled();
   });
 
   it("reads typed Session scoped background/run/detail/child pages only through the current authenticated owner", async () => {

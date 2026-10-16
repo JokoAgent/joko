@@ -2,7 +2,8 @@
 import { act, createElement, forwardRef, useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { SessionSchema, SessionState, SnapshotSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction } from "@joko/contracts";
+import { SessionSchema, SessionState, SnapshotSchema, EventSchema, MessageRole, PartnerLearningKind, PartnerLearningAction,
+  SessionTitleSuggestionStatus, SuggestSessionTitleResponseSchema } from "@joko/contracts";
 import { profilePartner } from "./test/mobile-partner-profile";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { MobileState } from "./mobile-client";
@@ -36,6 +37,11 @@ const searchHome = vi.fn(async () => {});
 const setSessionPinned = vi.fn(async () => true);
 const setSessionArchived = vi.fn(async () => true);
 const renameSession = vi.fn(async () => true);
+const deleteSession = vi.fn(async () => true);
+const suggestTaskTitle = vi.fn(async (_key: string, _signal: AbortSignal) => create(SuggestSessionTitleResponseSchema, {
+  title: "Suggested title", status: SessionTitleSuggestionStatus.OK
+}));
+const alert = vi.fn();
 const reconcile = vi.fn(async () => {});
 const refresh = vi.fn(async () => {});
 const writeClipboard = vi.fn(async () => true);
@@ -81,11 +87,12 @@ let learningPartner: typeof profilePartner | undefined;
 let collaborationApi: import("./mobile-collaboration").MobileCollaborationApi | undefined;
 let learningProfileProps: ComponentProps<typeof import("./MobilePartnerProfileSheet").MobilePartnerProfileSheet> | undefined;
 const client = new Proxy({
-  get state() { return state; }, select, searchHome, setSessionPinned, setSessionArchived, renameSession, reconcile, refresh,
+  get state() { return state; }, select, searchHome, setSessionPinned, setSessionArchived, renameSession, deleteSession, suggestTaskTitle, reconcile, refresh,
   taskQueueItems: () => empty, taskInteractions: () => empty, taskTimelineRows: () => empty,
   subscribe: () => () => {}, taskForeground: () => true, taskQueueCapabilities: () => ({}), taskPendingImagePasteCount: () => 0,
   partnerConversationTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
   partnerProfileTransport: () => learningPartner ? { ownerKey: "original-partner-owner" } : undefined,
+  taskDraftProfileId: () => state.activeProfileId,
   taskHeaderSourceKey: () => state.selectedId ? `${state.activeProfileId}/${state.selectedId}/${headerSourceEpoch}` : undefined,
   readTaskHeaderRole: async () => observedHeaderRole,
   taskCollaborationApi: () => collaborationApi
@@ -135,7 +142,7 @@ beforeAll(async () => {
     BackHandler: { addEventListener: () => ({ remove() {} }) }, Keyboard: { dismiss() {}, addListener: () => ({ remove() {} }) },
     PanResponder: { create: () => ({ panHandlers: {} }) },
     AccessibilityInfo: { announceForAccessibility() {}, setAccessibilityFocus() {}, addEventListener: () => ({ remove() {} }) },
-    Linking: {}, Alert: { alert() {} }, findNodeHandle: () => null, useColorScheme: () => "light",
+    Linking: {}, Alert: { alert }, findNodeHandle: () => null, useColorScheme: () => "light",
     useWindowDimensions: () => dimensions
   }));
   vi.doMock("react-native-safe-area-context", () => ({ SafeAreaProvider: surface, SafeAreaView: surface,
@@ -228,7 +235,7 @@ beforeEach(async () => {
   headerSourceEpoch = 0;
   vi.useFakeTimers();
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => setTimeout(() => callback(0), 1));
-  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, renameSession, reconcile, refresh,
+  for (const spy of [select, searchHome, setSessionPinned, setSessionArchived, renameSession, deleteSession, suggestTaskTitle, alert, reconcile, refresh,
     writeClipboard, onNew, onSelect, onMenu, onOpenShare, runNavigation, onBack, onSearchFocus, onNavigated, newTaskFlush]) spy.mockClear();
   dimensions = { width: 390, height: 844, scale: 1, fontScale: 1 }; taskNavigationPort = undefined; finishDrawerClose = undefined;
   draftFlush.mockReset().mockImplementation(originalDraftFlush);
@@ -291,6 +298,96 @@ async function renderTask(patch: Partial<TaskProps> = {}): Promise<void> {
 async function closeTaskDrawer(): Promise<void> { await act(async () => finishDrawerClose?.()); }
 
 describe("actual Home navigation hosts", () => {
+  it("offers current-task rename, pin and archive/restore with the exact task and read-only exclusions", async () => {
+    await renderTask();
+    expect(headerProps.actions.filter(action => ["rename", "pin", "archive", "delete"].includes(action.id)).map(action => action.id))
+      .toEqual(["rename", "pin", "archive", "delete"]);
+    await act(async () => headerProps.actions.find(action => action.id === "pin")!.onPress());
+    await act(async () => headerProps.actions.find(action => action.id === "archive")!.onPress());
+    expect(setSessionPinned).toHaveBeenCalledExactlyOnceWith("current", false);
+    expect(setSessionArchived).toHaveBeenCalledExactlyOnceWith("current", true);
+    state = { ...state, detail: create(SnapshotSchema, { ...state.detail!, sessions: state.detail!.sessions.map(session =>
+      create(SessionSchema, { ...session, archived: session.sessionId === "current" })) }) };
+    await renderTask();
+    expect(headerProps.actions.find(action => action.id === "archive")?.label).toBe(message("common.restore"));
+    await act(async () => headerProps.actions.find(action => action.id === "archive")!.onPress());
+    expect(setSessionArchived).toHaveBeenLastCalledWith("current", false);
+    state = { ...state, status: "offline" }; await renderTask();
+    for (const action of headerProps.actions.filter(action => ["rename", "pin", "archive", "delete"].includes(action.id))) expect(action.disabled).toBe(true);
+    state = { ...state, status: "connected", taskSource: { kind: "joined" } as MobileState["taskSource"] }; await renderTask();
+    expect(headerProps.actions.some(action => ["rename", "pin", "archive", "delete"].includes(action.id))).toBe(false);
+    state = { ...state, taskSource: undefined }; observedHeaderRole = "worker"; headerSourceEpoch++; await renderTask();
+    expect(headerProps.actions.some(action => ["rename", "pin", "archive", "delete"].includes(action.id))).toBe(false);
+  });
+
+  it("keeps AI titles as drafts, restores cancel and retires late suggestions after manual typing or task change", async () => {
+    await renderTask();
+    const openRename = async () => act(async () => headerProps.actions.find(action => action.id === "rename")!.onPress());
+    await openRename();
+    expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.taskName")}"]`)?.value).toBe("Alpha");
+    await press(message("task.renameSuggest"));
+    expect(renameSession).not.toHaveBeenCalled();
+    expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.taskName")}"]`)?.value).toBe("Suggested title");
+    await press(message("common.cancel")); await openRename();
+    expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.taskName")}"]`)?.value).toBe("Alpha");
+    let resolve!: (value: ReturnType<typeof create<typeof SuggestSessionTitleResponseSchema>>) => void;
+    suggestTaskTitle.mockImplementationOnce(() => new Promise(accept => { resolve = accept; }));
+    await press(message("task.renameSuggest")); const firstSignal = suggestTaskTitle.mock.calls.at(-1)![1];
+    await type(message("home.taskName"), "Manual title");
+    expect(firstSignal.aborted).toBe(true);
+    await act(async () => resolve(create(SuggestSessionTitleResponseSchema, { title: "Stale AI", status: SessionTitleSuggestionStatus.OK })));
+    expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.taskName")}"]`)?.value).toBe("Manual title");
+    await press(message("common.rename"));
+    expect(renameSession).toHaveBeenCalledExactlyOnceWith("current", "Manual title");
+    await openRename();
+    suggestTaskTitle.mockImplementationOnce(() => new Promise(accept => { resolve = accept; }));
+    await press(message("task.renameSuggest")); const retired = suggestTaskTitle.mock.calls.at(-1)![1];
+    state = { ...state, selectedId: "other" }; await renderTask();
+    expect(retired.aborted).toBe(true);
+    await act(async () => resolve(create(SuggestSessionTitleResponseSchema, { title: "Retired title", status: SessionTitleSuggestionStatus.OK })));
+    expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.taskName")}"]`)).toBeNull();
+    expect(renameSession).toHaveBeenCalledTimes(1);
+    await openRename(); await press(message("common.rename"));
+    expect(renameSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires exact delete confirmation, preserves cancel, and rejects an old connection's or older occurrence's alert", async () => {
+    await renderTask();
+    const chooseDelete = async () => act(async () => headerProps.actions.find(action => action.id === "delete")!.onPress());
+    await chooseDelete();
+    const first = alert.mock.calls.at(-1)![2] as { style?: string; onPress?: () => void }[];
+    expect(deleteSession).not.toHaveBeenCalled();
+    await act(async () => first.find(action => action.style === "cancel")!.onPress!());
+    await act(async () => first.find(action => action.style === "destructive")!.onPress!());
+    expect(deleteSession).not.toHaveBeenCalled();
+    await chooseDelete(); const retired = alert.mock.calls.at(-1)![2] as typeof first;
+    state = { ...state, activeProfileId: "replacement-profile" }; await renderTask();
+    await act(async () => retired.find(action => action.style === "destructive")!.onPress!());
+    expect(deleteSession).not.toHaveBeenCalled();
+    await chooseDelete(); const oldOccurrence = alert.mock.calls.at(-1)![2] as typeof first;
+    await chooseDelete(); const current = alert.mock.calls.at(-1)![2] as typeof first;
+    await act(async () => oldOccurrence.find(action => action.style === "destructive")!.onPress!());
+    expect(deleteSession).not.toHaveBeenCalled();
+    await act(async () => current.find(action => action.style === "destructive")!.onPress!());
+    expect(deleteSession).toHaveBeenCalledExactlyOnceWith("current");
+  });
+
+  it.each([SessionTitleSuggestionStatus.NO_MATERIAL, SessionTitleSuggestionStatus.PROVIDER_UNAVAILABLE,
+    SessionTitleSuggestionStatus.GENERATION_FAILED])("retains a manual title after suggestion status %s and retries only on a new press", async status => {
+    await renderTask();
+    await act(async () => headerProps.actions.find(action => action.id === "rename")!.onPress());
+    await type(message("home.taskName"), "Keep this draft");
+    suggestTaskTitle.mockResolvedValueOnce(create(SuggestSessionTitleResponseSchema, { status }));
+    await press(message("task.renameSuggest"));
+    expect(host.querySelector<HTMLInputElement>(`input[aria-label="${message("home.taskName")}"]`)?.value).toBe("Keep this draft");
+    expect(host.textContent).toContain(message(status === SessionTitleSuggestionStatus.NO_MATERIAL ? "task.renameNoMaterial"
+      : status === SessionTitleSuggestionStatus.PROVIDER_UNAVAILABLE ? "task.renameProviderUnavailable" : "task.renameFailed"));
+    expect(renameSession).not.toHaveBeenCalled(); expect(suggestTaskTitle).toHaveBeenCalledOnce();
+    await press(message("task.renameSuggest"));
+    expect(suggestTaskTitle).toHaveBeenCalledTimes(2); expect(renameSession).not.toHaveBeenCalled();
+    await press(message("common.rename"));
+    expect(renameSession).toHaveBeenCalledExactlyOnceWith("current", "Suggested title");
+  });
   it.each(["memory", "skills"] as const)("opens original %s settings through an actual assistant learning footer without navigating the task", async destination => {
     learningPartner = { ...profilePartner, canonicalSessionId: "current", homeTargetId: "dialogue" };
     const completion = create(EventSchema, { eventId: "original-completion", identity: { sessionId: "current", runId: "run", backendId: "backend" },
