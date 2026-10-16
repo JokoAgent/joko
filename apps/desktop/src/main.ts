@@ -310,6 +310,11 @@ import {
   ExternalTextInsertionCoordinator
 } from "./external-text-insertion.js";
 import {
+  MacShortcutVoicePasteTarget,
+  captureShortcutVoiceDocumentTarget,
+  type ShortcutVoiceDocumentTarget
+} from "./global-voice-paste-target.js";
+import {
   createSystemAudioMuteBackend,
   SystemAudioMuteGuard
 } from "./system-audio-mute.js";
@@ -648,6 +653,15 @@ const globalVoiceInputLease = new SourceAwareVoiceLease<GlobalVoiceInputSource>(
   }
 });
 const externalTextInsertionCoordinator = new ExternalTextInsertionCoordinator();
+let desktopSystemFrontmostInput: ReturnType<typeof createPlatformSystemFrontmostInput> | undefined;
+const macShortcutVoicePasteTarget = new MacShortcutVoicePasteTarget(
+  () => {
+    if (process.platform !== "darwin") return undefined;
+    const input = getDesktopSystemFrontmostInput();
+    return input.status === "available" ? input.runner : undefined;
+  },
+  captureMacShortcutApplicationTarget
+);
 const GLOBAL_VOICE_APPLICATION_SHORTCUT_RECORDING_SUSPENSION = "application-shortcut-recording";
 const GLOBAL_VOICE_NATIVE_CAPTURE_SUSPENSION = "native-shortcut-capture";
 const globalVoiceNativeShortcut = new NativeVoiceShortcutListener({
@@ -4189,6 +4203,31 @@ function globalVoiceAdmissionUnavailable(): boolean {
   return quitting || globalVoiceExitAdmissionClosed || managedOrchestratorExitFence.shutdownStarted;
 }
 
+function captureMacShortcutApplicationTarget(): ShortcutVoiceDocumentTarget | undefined {
+  if (process.platform !== "darwin") return undefined;
+  const window = BrowserWindow.getFocusedWindow();
+  if (window === null || window.isDestroyed() || !window.isFocused()) return undefined;
+  const contents = window.webContents;
+  if (!isTrustedClipboardWriteContents(contents)) return undefined;
+  const occurrence = nativeGamepadDocuments.currentFor(contents);
+  if (occurrence === undefined) return undefined;
+  const isCurrentDocument = (): boolean => !window.isDestroyed() && window.webContents === contents
+    && !contents.isDestroyed() && !contents.isCrashed() && !contents.isLoadingMainFrame()
+    && trustedApplicationWindowForContents(contents) === window && isTrustedClipboardWriteContents(contents)
+    && nativeGamepadDocuments.isCurrent(contents, occurrence);
+  if (!isCurrentDocument()) return undefined;
+  return captureShortcutVoiceDocumentTarget({
+    contents,
+    isCurrentDocument,
+    focus: () => {
+      if (window.isMinimized()) window.restore();
+      window.show();
+      window.focus();
+      contents.focus();
+    }
+  });
+}
+
 async function cancelGlobalVoiceForExit(): Promise<void> {
   const recording = globalVoiceInputLease.snapshot();
   if (recording.state === "idle") {
@@ -4214,6 +4253,8 @@ function startGlobalVoiceInputLease(
   globalVoiceRetry = undefined;
   globalVoiceCancellingGeneration = undefined;
   globalVoiceCommitFence = { generation, state: "open" };
+  macShortcutVoicePasteTarget.retire();
+  if (process.platform === "darwin" && source === "shortcut") macShortcutVoicePasteTarget.capture(generation);
   beginGlobalVoiceSystemAudio();
   setGlobalVoiceStatus({ state: "starting", generation: generationValue });
   try {
@@ -4254,6 +4295,7 @@ function stopGlobalVoiceInputLease(
     globalVoiceStopWaiters.set(generation, { resolve, reject, timeout });
   });
   if (reason === "cancel") {
+    macShortcutVoicePasteTarget.retire(generation);
     globalVoiceCancellingGeneration = generation;
     if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
     if (!sendGlobalVoiceCommand({
@@ -4554,6 +4596,7 @@ function failGlobalVoiceGeneration(
     || (globalVoiceActiveGeneration !== undefined && globalVoiceActiveGeneration !== generation)) return false;
   const generationValue = globalVoiceGenerationValue(generation);
   globalVoiceActiveGeneration = undefined;
+  macShortcutVoicePasteTarget.retire(generation);
   if (globalVoiceCancellingGeneration === generation) globalVoiceCancellingGeneration = undefined;
   globalVoiceStartModes.delete(generation);
   if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
@@ -4570,6 +4613,7 @@ function markGlobalVoiceStopUncertain(generation: number): boolean {
   const recording = globalVoiceInputLease.snapshot();
   if (recording.state === "idle" || recording.generation !== generation) return false;
   globalVoiceActiveGeneration = undefined;
+  macShortcutVoicePasteTarget.retire(generation);
   globalVoiceRetry = undefined;
   globalVoiceStartModes.delete(generation);
   if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
@@ -4592,6 +4636,7 @@ function resetGlobalVoicePresentation(expectedGeneration?: number): boolean {
   if (expectedGeneration !== undefined && generation === undefined) return false;
 
   if (generation === undefined) {
+    macShortcutVoicePasteTarget.retire();
     globalVoiceActiveGeneration = undefined;
     globalVoiceRetry = undefined;
     globalVoiceCommitFence = undefined;
@@ -4602,6 +4647,7 @@ function resetGlobalVoicePresentation(expectedGeneration?: number): boolean {
     dedicatedHardwareSystemVoiceController?.retire();
     setGlobalVoiceStatus({ state: "idle", generation: "0" });
   } else {
+    macShortcutVoicePasteTarget.retire(generation);
     const generationValue = globalVoiceGenerationValue(generation);
     if (globalVoiceActiveGeneration === generation) globalVoiceActiveGeneration = undefined;
     if (globalVoiceRetry?.failedGeneration === generation) globalVoiceRetry = undefined;
@@ -8401,8 +8447,10 @@ function registerIpc(): void {
       || fence.state !== "open") return false;
     fence.state = "pending";
     const hardwareVoice = recording.source === "hardware";
+    const macShortcutVoice = process.platform === "darwin" && recording.source === "shortcut";
     const systemVoice = dedicatedHardwareSystemVoiceController;
-    if (hardwareVoice && (systemVoice === undefined || !systemVoice.hasTargetForActiveRecording())) {
+    if ((hardwareVoice && (systemVoice === undefined || !systemVoice.hasTargetForActiveRecording()))
+      || (macShortcutVoice && !macShortcutVoicePasteTarget.hasTarget(generation))) {
       fence.state = "consumed";
       failGlobalVoiceGeneration(generation, "insertion");
       return false;
@@ -8418,7 +8466,10 @@ function registerIpc(): void {
           clipboard,
           paste: () => systemVoice!.postPasteForActiveRecording()
         })
-        : await externalTextInsertionCoordinator.insertForeground(request.text, {
+        : macShortcutVoice ? await externalTextInsertionCoordinator.insertCaptured(request.text, {
+          clipboard,
+          paste: () => macShortcutVoicePasteTarget.paste(generation)
+        }) : await externalTextInsertionCoordinator.insertForeground(request.text, {
           clipboard,
           platform: process.platform,
           runCommand: runBoundedHostCommand
@@ -9413,10 +9464,8 @@ function initializeNativeGamepad(): void {
   });
 }
 
-async function initializeDedicatedHardwareInput(): Promise<void> {
-  dedicatedHardwareTaskFocusFence.clear();
-  dedicatedHardwareSystemVoiceController?.retire();
-  dedicatedHardwareSystemVoiceController = undefined;
+function getDesktopSystemFrontmostInput(): ReturnType<typeof createPlatformSystemFrontmostInput> {
+  if (desktopSystemFrontmostInput?.status === "available") return desktopSystemFrontmostInput;
   const nativeHelper = loadNativeSystemFrontmostInput({
     directory: app.isPackaged
       ? resolve(process.resourcesPath, "native-system-frontmost-input")
@@ -9424,7 +9473,7 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
     platform: process.platform,
     architecture: process.arch
   });
-  const systemFrontmost = createPlatformSystemFrontmostInput({
+  desktopSystemFrontmostInput = createPlatformSystemFrontmostInput({
     platform: process.platform,
     linuxSession: {
       sessionType: process.env.XDG_SESSION_TYPE,
@@ -9435,6 +9484,14 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
       : process.platform === "darwin" ? { macHelper: nativeHelper }
       : process.platform === "linux" ? { linuxHelper: nativeHelper } : {})
   });
+  return desktopSystemFrontmostInput;
+}
+
+async function initializeDedicatedHardwareInput(): Promise<void> {
+  dedicatedHardwareTaskFocusFence.clear();
+  dedicatedHardwareSystemVoiceController?.retire();
+  dedicatedHardwareSystemVoiceController = undefined;
+  const systemFrontmost = getDesktopSystemFrontmostInput();
   if (packagedSmoke && (process.platform === "win32" || process.platform === "darwin" || process.platform === "linux")) {
     if (systemFrontmost.status !== "available") throw new Error("Native foreground sampler was not admitted by Main.");
     process.stdout.write("JOKO_DESKTOP_FRONTMOST_INPUT_READY\n");

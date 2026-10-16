@@ -53,6 +53,10 @@ export class DesktopNativeGamepadDocumentAuthority<TEndpoint> {
     return this.#current.get(endpoint)?.occurrence === occurrence;
   }
 
+  currentFor(endpoint: TEndpoint): string | undefined {
+    return this.#current.get(endpoint)?.occurrence;
+  }
+
   retire(endpoint: TEndpoint): void {
     const current = this.#current.get(endpoint);
     if (current === undefined) return;
