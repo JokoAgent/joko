@@ -84,7 +84,13 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       };
       await pollOwned(async () => {
         if (await replies.count() < minimumReplies || !await replies.last().isVisible()) return false;
-        await replies.last().scrollIntoViewIfNeeded();
+        try { await replies.last().scrollIntoViewIfNeeded(); }
+        catch (error) {
+          // Hydration may retire the transient reply while Playwright waits for
+          // its geometry. Resolve the current reply again within this same poll.
+          if (error instanceof Error && error.message.includes("Element is not attached to the DOM")) return false;
+          throw error;
+        }
         if (!await settled()) return false;
         const bytes = await currentPage.screenshot({ fullPage: false, animations: "disabled",
           mask: [currentPage.locator(".pair-form input"), currentPage.locator('input[type="password"]')] });
