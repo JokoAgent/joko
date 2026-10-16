@@ -143,7 +143,10 @@ async function waitForMetro(origin) {
   throw new Error("The matched checkout's Metro server did not become ready.");
 }
 async function observe(phase, pid, ocr) {
-  const until = Date.now() + 90_000;
+  // A cold Simulator can expose the real page and then spend over 30 seconds
+  // capturing its next frame. Leave room for the same two fresh observations
+  // and one bounded capture retry within the unchanged overall 15m deadline.
+  const until = Date.now() + 180_000;
   let productSeenAt;
   let retriedCapture = false;
   const captures = [];
