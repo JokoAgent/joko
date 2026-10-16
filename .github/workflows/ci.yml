@@ -272,6 +272,41 @@ jobs:
         shell: bash
         run: pnpm --filter @joko/desktop exec vitest run test/managed-orchestrator-real.test.ts test/runtime-staging.test.ts test/remote-desktop-native-build.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-native-regressions.log"
 
+      - name: Diagnose the affected macOS Desktop runtime checks
+        id: macos_runtime_regressions
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'macOS' && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: pnpm --filter @joko/desktop exec vitest run test/managed-orchestrator-real.test.ts test/runtime-staging.test.ts -t "survives persistent Desktop release after the durable ACK and then stops explicitly|relocates the personal command host with its exact manifest and runs it under Electron-Node" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/macos-runtime-regressions.log"
+
+      - name: Upload the immediate macOS Desktop runtime observations
+        if: ${{ !cancelled() && (steps.macos_runtime_regressions.outcome == 'success' || steps.macos_runtime_regressions.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-macos-runtime-regressions-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/macos-runtime-regressions.log
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Diagnose the isolated Linux PDF startup failures
+        id: linux_pdf_startup
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'Linux' && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" node scripts/ci/diagnose-linux-pdf.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/linux-pdf-startup.log"
+        env:
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Upload the immediate Linux PDF startup observations
+        if: ${{ !cancelled() && (steps.linux_pdf_startup.outcome == 'success' || steps.linux_pdf_startup.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-linux-pdf-startup-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/linux-pdf-startup.log
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Run the affected Windows queue checks
         if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
         timeout-minutes: 2
