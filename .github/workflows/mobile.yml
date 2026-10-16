@@ -337,6 +337,7 @@ jobs:
             ${{ runner.temp }}/joko-ios-runtime-evidence/gui-summary.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/gui-steps.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/gui-local-probe.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-setup-pre-input-hierarchy.txt
             ${{ runner.temp }}/joko-ios-runtime-evidence/gui-screenshots/**/*.png
             ${{ runner.temp }}/joko-ios-runtime-evidence/gui-screenshots/**/*.json
           if-no-files-found: warn

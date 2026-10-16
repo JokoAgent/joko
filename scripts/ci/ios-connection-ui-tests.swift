@@ -14,11 +14,45 @@ final class JokoConnectionUITests: XCTestCase {
             throw NSError(domain: "JokoCI", code: 1, userInfo: [NSLocalizedDescriptionKey: "Owned local servers were not passed to the UI runner."])
         }
         app = XCUIApplication(bundleIdentifier: "app.joko.mobile")
-        app.launchArguments = ["-RCT_jsLocation", "127.0.0.1:\(metro)", "-RCT_packager_scheme", "http", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        let launchArguments = ["-RCT_jsLocation", "127.0.0.1:\(metro)", "-RCT_packager_scheme", "http", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        app.launchArguments = launchArguments
         app.launch()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 30))
-        XCTAssertTrue(app.buttons["Nearby"].firstMatch.waitForExistence(timeout: 45))
+        let nearbyExists = app.buttons["Nearby"].firstMatch.waitForExistence(timeout: 45)
+        if !nearbyExists { try? recordPreInputSetupFailure(launchArguments: launchArguments) }
+        XCTAssertTrue(nearbyExists)
         XCTAssertEqual(app.webViews.count, 1, "The real connection page must be present.")
+    }
+
+    private func recordPreInputSetupFailure(launchArguments: [String]) throws {
+        // This is called only from setUp, before the test method or any address,
+        // pairing code or other connection input. Never attach a later UI tree.
+        screenshot("00-setup-pre-input-screen")
+        let hierarchy = Data(app.debugDescription.utf8)
+        let boundedHierarchy = Data(hierarchy.prefix(128 * 1024))
+        let state: [String: Any] = [
+            "stage": "pre-input-setup", "connectionInputNotStarted": true,
+            "configuredBundleIdentifier": "app.joko.mobile",
+            "configuredLaunchArgumentsMatchOwnedServers": app.launchArguments == launchArguments,
+            "ownedMetroPortReceived": true, "ownedProbePortReceived": true,
+            "applicationState": app.state.rawValue, "webViewCount": app.webViews.count,
+            "expectedControls": [
+                "Nearby": ["buttons": app.buttons.matching(identifier: "Nearby").count,
+                           "staticTexts": app.staticTexts.matching(identifier: "Nearby").count,
+                           "allRoles": app.descendants(matching: .any).matching(NSPredicate(format: "label == %@", "Nearby")).count],
+                "Saved nodes": ["buttons": app.buttons.matching(identifier: "Saved nodes").count],
+                "Add Joko node": ["buttons": app.buttons.matching(identifier: "Add Joko node").count]
+            ],
+            "hierarchyBytes": boundedHierarchy.count, "hierarchyTruncated": hierarchy.count > boundedHierarchy.count
+        ]
+        let controlState = XCTAttachment(data: try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]), uniformTypeIdentifier: "public.json")
+        controlState.name = "00-setup-pre-input-state"
+        controlState.lifetime = .keepAlways
+        add(controlState)
+        let tree = XCTAttachment(data: boundedHierarchy, uniformTypeIdentifier: "public.plain-text")
+        tree.name = "00-setup-pre-input-hierarchy"
+        tree.lifetime = .keepAlways
+        add(tree)
     }
 
     private func screenshot(_ name: String) {

@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { createReadStream, appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -202,6 +202,73 @@ async function guiCommand(args, logName, timeout) {
   }
 }
 
+async function exportPreInputSetupFailure(screenshots, files, { expectedSha, expectedHash, requests, unexpectedRequests, steps }) {
+  // Only our explicitly named setUp attachments are eligible. Automatic XCTest
+  // trees from later actions can contain connection inputs and stay unexported.
+  if (requests !== 0 || unexpectedRequests !== 0 || steps.some(step => step.screenshotExported)) return;
+  const manifests = files.filter(name => name.endsWith(".json")).flatMap(name => {
+    const manifest = JSON.parse(readFileSync(join(screenshots, name), "utf8"));
+    return Array.isArray(manifest) ? manifest : [];
+  });
+  const attachments = manifests.filter(entry => entry.testIdentifier === "JokoConnectionUITests/testConnectionPageInteractions()")
+    .flatMap(entry => entry.attachments ?? []).filter(attachment => attachment.deviceId === udid);
+  const readAttachment = (name, extensions, maxBytes) => {
+    const matches = attachments.filter(attachment => new RegExp(`^${name}(?:_[0-9]+_[A-Fa-f0-9-]{36})?(?:\\.(?:${extensions}))?$`, "u")
+      .test(attachment.suggestedHumanReadableName ?? ""));
+    if (matches.length === 0) return;
+    if (matches.length !== 1 || !/^[A-Fa-f0-9-]{36}(?:\.(?:png|json|txt))?$/u.test(matches[0].exportedFileName ?? "")) {
+      throw new Error("The pre-input setup attachment identity was ambiguous.");
+    }
+    const path = join(screenshots, matches[0].exportedFileName), stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size <= 0 || stat.size > maxBytes) {
+      throw new Error("The pre-input setup attachment exceeded its file boundary.");
+    }
+    return readFileSync(path);
+  };
+  const stateBytes = readAttachment("00-setup-pre-input-state", "json|txt", 16 * 1024);
+  if (stateBytes === undefined) {
+    save("gui-setup-export-receipt.json", { stage: "pre-input-setup", result: "unavailable", reason: "fixed-setup-state-attachment-not-exported" });
+    return;
+  }
+  const state = JSON.parse(stateBytes.toString("utf8"));
+  const count = value => Number.isSafeInteger(value) && value >= 0;
+  const expectedRoles = { Nearby: ["buttons", "staticTexts", "allRoles"], "Saved nodes": ["buttons"], "Add Joko node": ["buttons"] };
+  if (state.stage !== "pre-input-setup" || state.connectionInputNotStarted !== true
+    || state.configuredBundleIdentifier !== bundleId || typeof state.configuredLaunchArgumentsMatchOwnedServers !== "boolean"
+    || state.ownedMetroPortReceived !== true || state.ownedProbePortReceived !== true
+    || !count(state.applicationState) || !count(state.webViewCount) || !count(state.hierarchyBytes) || state.hierarchyBytes > 128 * 1024
+    || typeof state.hierarchyTruncated !== "boolean"
+    || Object.entries(expectedRoles).some(([label, roles]) => roles.some(role => !count(state.expectedControls?.[label]?.[role])))) {
+    throw new Error("The pre-input setup control receipt did not match its fixed scope.");
+  }
+  // Rebuild the receipt from fixed fields; never forward arbitrary attachment
+  // JSON, launch arguments, server ports, environment or application text.
+  const controls = Object.fromEntries(Object.entries(expectedRoles).map(([label, roles]) =>
+    [label, Object.fromEntries(roles.map(role => [role, state.expectedControls[label][role]]))]));
+  const receipt = { sourceCommit: expectedSha, executableSha256: expectedHash, simulatorUdid: udid, bundleId,
+    stage: state.stage, connectionInputNotStarted: true,
+    configuredLaunchArgumentsMatchOwnedServers: state.configuredLaunchArgumentsMatchOwnedServers,
+    ownedMetroPortReceived: true, ownedProbePortReceived: true, applicationState: state.applicationState,
+    webViewCount: state.webViewCount, expectedControls: controls, hierarchyTruncated: state.hierarchyTruncated, attachments: [] };
+  save("gui-setup-control-receipt.json", receipt);
+  const screen = readAttachment("00-setup-pre-input-screen", "png", 8 * 1024 * 1024);
+  if (screen !== undefined) {
+    if (!screen.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) throw new Error("The pre-input setup screenshot was not a PNG.");
+    writeFileSync(join(evidence, "gui-setup-pre-input.png"), screen);
+    receipt.attachments.push({ file: "gui-setup-pre-input.png", bytes: screen.length, sha256: createHash("sha256").update(screen).digest("hex") });
+    save("gui-setup-control-receipt.json", receipt);
+  }
+  const tree = readAttachment("00-setup-pre-input-hierarchy", "txt", 128 * 1024);
+  if (tree !== undefined) {
+    if (tree.length !== state.hierarchyBytes) throw new Error("The pre-input setup hierarchy did not match its bounded receipt.");
+    writeFileSync(join(evidence, "gui-setup-pre-input-hierarchy.txt"), tree);
+    receipt.attachments.push({ file: "gui-setup-pre-input-hierarchy.txt", bytes: tree.length, sha256: createHash("sha256").update(tree).digest("hex") });
+    save("gui-setup-control-receipt.json", receipt);
+  }
+  save("gui-setup-export-receipt.json", { stage: "pre-input-setup", result: "exported",
+    screenshotExported: screen !== undefined, hierarchyExported: tree !== undefined });
+}
+
 async function runConnectionUiTests(app, port, expectedSha, expectedHash) {
   const assertIdentity = async () => {
     if (await command("git", ["rev-parse", "HEAD"]) !== expectedSha || await hashFile(join(app, executable)) !== expectedHash) {
@@ -266,6 +333,10 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash) {
         steps, screenshotCount: files.filter(name => name.endsWith(".png")).length, localIdentityRequests: requests, unexpectedRequests,
         testExitSucceeded: !executionError, passed: !executionError && summary.result === "Passed" && summary.passedTests === 1
           && summary.failedTests === 0 && summary.skippedTests === 0 && steps.every(step => step.screenshotExported) });
+      if (executionError || summary.result !== "Passed") {
+        try { await exportPreInputSetupFailure(screenshots, files, { expectedSha, expectedHash, requests, unexpectedRequests, steps }); }
+        catch { save("gui-setup-export-receipt.json", { stage: "pre-input-setup", result: "failed", onlyAllowlistedSetupAttachmentsExported: true }); }
+      }
       if (executionError) throw executionError;
       if (summary.result !== "Passed" || summary.passedTests !== 1 || summary.failedTests !== 0 || summary.skippedTests !== 0
         || !steps.every(step => step.screenshotExported) || requests !== 2 || unexpectedRequests !== 0) {
