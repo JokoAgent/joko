@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import ssh2 from "ssh2";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFailed, vi } from "vitest";
 import { SshKeyError, SshKeyManager, sshKeyInstallCommand, type SshAgentCommand } from "./keys.js";
 import { encodeAgentPrivateKey } from "./agent-private-key.js";
 import { createPrivateFile } from "./create-private-file.js";
@@ -13,6 +13,57 @@ import * as keyPermissions from "./key-permissions.js";
 const roots: string[] = [];
 const managers: SshKeyManager[] = [];
 const signal = (): AbortSignal => new AbortController().signal;
+const nativeHelperObservations = vi.hoisted(() => ({ values: [] as Array<{
+  helper: "permissions" | "create";
+  events: Array<{ phase: string; elapsed: number; success?: boolean }>;
+}> }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, spawn: ((...parameters: Parameters<typeof original.spawn>) => {
+    const child = original.spawn(...parameters);
+    const args = parameters[1];
+    const command = Array.isArray(args) ? args.at(-1) : undefined;
+    const helper = typeof command === "string" && command.includes("public static class JokoKeyPermissions") ? "permissions"
+      : typeof command === "string" && command.includes("public static class JokoKeyFile") ? "create" : undefined;
+    if (process.platform === "win32" && helper !== undefined) {
+      const started = Date.now();
+      const observation: typeof nativeHelperObservations.values[number] = { helper, events: [{ phase: "spawn", elapsed: 0 }] };
+      nativeHelperObservations.values.push(observation);
+      const record = (phase: string, success?: boolean): void => {
+        observation.events.push({ phase, elapsed: Date.now() - started, ...(success === undefined ? {} : { success }) });
+      };
+      let buffered = "";
+      child.once("spawn", () => record("started", true));
+      child.stdout?.once("data", () => record("first-output", true));
+      child.stdout?.on("data", (bytes: Buffer) => {
+        // Only fixed protocol phases leave the observer: no command, path,
+        // environment, native identity, stderr content or private bytes.
+        buffered += bytes.toString("ascii");
+        let newline: number;
+        while ((newline = buffered.indexOf("\n")) >= 0) {
+          const line = buffered.slice(0, newline).replace(/\r$/u, "");
+          buffered = buffered.slice(newline + 1);
+          if (/^verified:[0-9:]+$/u.test(line)) record("admitted", true);
+          else if (/^created:[0-9:]+$/u.test(line)) record("created", true);
+          else if (line === "stable") record("final-verified", true);
+          else if (["unsafe", "changed", "unverified", "exists"].includes(line)) record("rejected", false);
+          else record("unexpected-protocol", false);
+        }
+        if (buffered.length > 160) { record("unexpected-protocol", false); buffered = ""; }
+      });
+      child.stdin?.once("finish", () => record("input-closed"));
+      child.once("error", () => record("process-error", false));
+      child.once("close", code => record("closed", code === 0));
+    }
+    return child;
+  }) as typeof original.spawn };
+});
+beforeEach(() => {
+  nativeHelperObservations.values = [];
+  onTestFailed(() => {
+    if (nativeHelperObservations.values.length > 0) console.info("SSH key native helper phases:", JSON.stringify(nativeHelperObservations.values));
+  });
+});
 afterEach(async () => {
   managers.splice(0).forEach(manager => manager.close());
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });

@@ -4,26 +4,31 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation scope
+        type: choice
+        default: full
+        options:
+          - full
+          - windows-native
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || '' }}
   cancel-in-progress: false
 
 jobs:
   verify:
-    name: ${{ matrix.os }} / Node 24.16
+    name: ${{ matrix.os }} / Node 24.16${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-24.04
-          - windows-latest
-          - macos-15
+        os: ${{ fromJSON(inputs.scope == 'windows-native' && '["windows-latest"]' || '["ubuntu-24.04","windows-latest","macos-15"]') }}
 
     steps:
       - name: Check out repository
@@ -98,6 +103,22 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Diagnose the Windows SSH key permission failure
+        id: ssh_key_permissions
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && runner.os == 'Windows' }}
+        timeout-minutes: 5
+        shell: bash
+        run: pnpm --filter @joko/remote-ssh exec vitest run src/keys.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/ssh-key-permissions.log"
+
+      - name: Upload the immediate SSH key permission failure diagnosis
+        if: ${{ !cancelled() && steps.ssh_key_permissions.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-ssh-key-permissions-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/ssh-key-permissions.log
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Prepare Chromium for the production Web mounted chains
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 15
@@ -108,7 +129,7 @@ jobs:
 
       - name: Run workspace test suite and headed Browser chains (Linux)
         id: workspace_tests_linux
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm test:ci 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests.log"
         env:
@@ -117,7 +138,7 @@ jobs:
 
       - name: Run workspace test suite, including Connect end-to-end coverage (Windows/macOS)
         id: workspace_tests_desktop
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' }}
         shell: bash
         run: pnpm test:ci 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests.log"
 
@@ -130,8 +151,26 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Run the affected Windows Desktop checks
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 5
+        shell: bash
+        run: pnpm --filter @joko/desktop exec vitest run test/managed-orchestrator-real.test.ts test/runtime-staging.test.ts test/remote-desktop-native-build.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-native-regressions.log"
+
+      - name: Run the affected Windows queue checks
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/store exec vitest run src/operational-store.test.ts -t queue 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/store-queue-regressions.log"
+
+      - name: Check the Windows document worker regression
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/tool-document test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/document-regressions.log"
+
       - name: Amplify the short queue soak and fault matrix
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
         shell: bash
         run: pnpm test:soak 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/soak.log"
         env:
@@ -141,7 +180,7 @@ jobs:
 
       - name: Build and verify isolated Desktop Orchestrator runtime
         id: desktop_runtime
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
         timeout-minutes: 45
         shell: bash
         run: pnpm stage:desktop:orchestrator-runtime 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-runtime.log"
