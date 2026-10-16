@@ -356,7 +356,8 @@ it("runs a durable two-Device project through public Connect and the shared Node
       const route = agent.observation();
       throw new Error(`Device peer terminal phase failed: ${JSON.stringify({
         ...terminalObservation, routeClosed: route.closed,
-        outboundMessages: route.outbound.length, inboundMessages: route.inbound.length
+        outboundMessages: route.outbound.length, inboundMessages: route.inbound.length,
+        nativeTerminal: route.terminal
       })}.`, { cause: error });
     } finally {
       watchAbort.abort();
@@ -649,15 +650,19 @@ class RunningPeerAgent {
     recentPath: string;
     initialRecentDirectory?: string;
   }): Promise<RunningPeerAgent> {
+    const observation: PeerRouteObservation = {
+      outbound: [], inbound: [], closed: false,
+      terminal: { opened: 0, outputEvents: 0, outputBytes: 0, writes: 0, inputBytes: 0,
+        cursorPositionQueries: 0, cursorPositionReplies: 0, exits: 0 }
+    };
     const executor = new NodeDevicePeerAgentExecutor({
       recentDirectoriesPath: input.recentPath,
-      terminals: terminalPort()
+      terminals: terminalPort(observation.terminal)
     });
     if (input.initialRecentDirectory !== undefined) {
       await executor.recordRecentDirectory(await realpath(input.initialRecentDirectory));
     }
     const controller = new AbortController();
-    const observation: PeerRouteObservation = { outbound: [], inbound: [], closed: false };
     const routePort = createNodeDevicePeerAgentRoutePort();
     const settled = runNodeDevicePeerAgentRoute({
       connection: {
@@ -704,6 +709,7 @@ class RunningPeerAgent {
       outbound: [...this.#observation.outbound],
       inbound: [...this.#observation.inbound],
       closed: this.#observation.closed,
+      terminal: { ...this.#observation.terminal },
       ...(this.#observation.failure === undefined ? {} : { failure: this.#observation.failure })
     };
   }
@@ -714,6 +720,18 @@ interface PeerRouteObservation {
   readonly inbound: string[];
   closed: boolean;
   failure?: string;
+  readonly terminal: PeerTerminalObservation;
+}
+
+interface PeerTerminalObservation {
+  opened: number;
+  outputEvents: number;
+  outputBytes: number;
+  writes: number;
+  inputBytes: number;
+  cursorPositionQueries: number;
+  cursorPositionReplies: number;
+  exits: number;
 }
 
 function observingRoutePort(
@@ -989,7 +1007,7 @@ function requiredRoute(route: DevicePeerRouteIdentity | undefined): DevicePeerRo
   return route;
 }
 
-function terminalPort(): DevicePeerTerminalTransportPort {
+function terminalPort(observation: PeerTerminalObservation): DevicePeerTerminalTransportPort {
   const environment = Object.freeze(terminalEnvironment(process.env));
   const port: DevicePeerTerminalTransportPort = {
     async open(request) {
@@ -999,11 +1017,25 @@ function terminalPort(): DevicePeerTerminalTransportPort {
       rows: request.rows,
       env: environment
       }, request.signal);
+      observation.opened += 1;
+      let queryTail = "";
       return {
         pid: terminal.pid,
-        onData: listener => terminal.onData(listener),
-        onExit: listener => terminal.onExit(listener),
-        write: async data => { await terminal.write(data); },
+        onData: listener => terminal.onData((data) => {
+          observation.outputEvents += 1;
+          observation.outputBytes += Buffer.byteLength(data);
+          const query = queryTail + data;
+          observation.cursorPositionQueries += query.split("\u001b[6n").length - 1;
+          queryTail = query.slice(-3);
+          listener(data);
+        }),
+        onExit: listener => terminal.onExit((event) => { observation.exits += 1; listener(event); }),
+        write: async data => {
+          observation.writes += 1;
+          observation.inputBytes += Buffer.byteLength(data);
+          observation.cursorPositionReplies += [...data.matchAll(/\u001b\[[0-9]+;[0-9]+R/gu)].length;
+          await terminal.write(data);
+        },
         resize: async (cols, rows) => { await terminal.resize(cols, rows); },
         kill: async () => { await terminal.kill(); },
         pause: () => terminal.pause(),
