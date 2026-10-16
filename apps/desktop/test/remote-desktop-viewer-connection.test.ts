@@ -215,6 +215,23 @@ describe("Desktop viewer connection authority", () => {
     await f.connection.stop();
   });
 
+  it.each([true, false])("keeps an in-flight screenshot when control changes to %s without changing its capture", async enabled => {
+    const frame = deferred<object>();
+    const f = fixture({
+      startRemoteDesktop: () => ({ peer: PEER, lease: { ...LEASE, controlling: !enabled } }),
+      getRemoteDesktopFrame: () => frame.promise,
+      setRemoteDesktopControl: () => ({ peer: PEER, state: { controlling: enabled, controlGeneration: 2n } })
+    });
+    await f.request("startRemoteDesktop", { displayId: "display", mode: 1 });
+    const pendingFrame = f.request("getRemoteDesktopFrame", { leaseId: "lease" });
+    await vi.waitFor(() => expect(f.calls.at(-1)?.name).toBe("getRemoteDesktopFrame"));
+    expect((await f.request("setRemoteDesktopControl", { leaseId: "lease", enabled })).ok).toBe(true);
+    frame.resolve({ peer: PEER, result: { frame: { jpeg: new Uint8Array([255, 216, 255, 217]) } } });
+    expect((await pendingFrame).ok).toBe(true);
+    expect(f.connection.lease).toMatchObject({ ...LEASE, controlling: enabled, controlGeneration: 2n });
+    await f.connection.stop();
+  });
+
   it("blocks input after an uncertain temporary write and accepts explicit old STOPPED cleanup before NEW", async () => {
     const f = fixture({
       getRemoteDesktopCapabilities: () => ({ peer: PEER, capabilities: { displayModes: true, resolutionRestore: true } }),

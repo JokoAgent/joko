@@ -19,6 +19,7 @@ export class DesktopRemoteDesktopViewerConnection {
   #starting = false;
   #modePending = false;
   #modeUncertain = false;
+  #geometryRevision = 0;
   #lastTransport?: Transport;
   constructor(readonly owner: DesktopRemoteDesktopViewerOwner, readonly targetDeviceId: string,
     private readonly deps: {
@@ -71,6 +72,7 @@ export class DesktopRemoteDesktopViewerConnection {
     let modeLease: RemoteDesktopLease | undefined;
     let modeCaps: RemoteDesktopCapabilities | undefined;
     const geometryLease = this.#lease;
+    const geometryRevision = this.#geometryRevision;
     let requestLeaseId: string | undefined;
     let ordinaryStop = false;
     try {
@@ -101,11 +103,18 @@ export class DesktopRemoteDesktopViewerConnection {
           throw new ConnectError("Display geometry authority retired.", Code.FailedPrecondition);
         }
         modeLease = this.#lease; modeCaps = this.#caps; this.#modePending = true; acquiredMode = true;
+        ++this.#geometryRevision;
       }
       const checkGeometry = (): void => {
         if (!geometryLease || changingGeometry || name === "stopRemoteDesktop" || input.leaseId === undefined) return;
-        if (this.#modePending || this.#modeUncertain || this.#lease?.leaseId !== geometryLease.leaseId ||
-          this.#lease.controlGeneration !== geometryLease.controlGeneration) throw new ConnectError("Display geometry occurrence retired.", Code.Canceled);
+        // A screenshot remains valid through a control-only transition. Capture
+        // changes still fence it, including a change that settled while awaiting it.
+        const changed = name === "getRemoteDesktopFrame"
+          ? this.#geometryRevision !== geometryRevision
+          : this.#lease?.controlGeneration !== geometryLease.controlGeneration;
+        if (this.#modePending || this.#modeUncertain || this.#lease?.leaseId !== geometryLease.leaseId || changed) {
+          throw new ConnectError("Display geometry occurrence retired.", Code.Canceled);
+        }
       };
       const sync = name === "setRemoteDesktopClipboardSync" || name === "getRemoteDesktopClipboardVersion"
         ? (input as Message & { request?: { leaseId: string; controlGeneration: bigint; enabled?: boolean; syncGeneration?: bigint } }).request
