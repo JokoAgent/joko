@@ -18,7 +18,7 @@ function object(properties: Record<string, unknown>, required: string[] = []) {
 function tool(name: string, description: string, properties: Record<string, unknown>, required: string[] = [], write = false): McpToolDescriptor {
   return { serverId: providerId, name, description, inputSchema: object(properties, required), requiresPermission: write };
 }
-const triggerSchema = { oneOf: [
+const triggerSchema = { type: "object", oneOf: [
   object({ id, kind: { const: "cron" }, expression: { type: "string", minLength: 1, maxLength: 128 },
     timezone: { type: "string", minLength: 1, maxLength: 128 } }, ["id", "kind", "expression", "timezone"]),
   object({ id, kind: { const: "interval" }, intervalMs: { type: "integer", minimum: 60_000, maximum: Number.MAX_SAFE_INTEGER },

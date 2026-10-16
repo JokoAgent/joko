@@ -7,6 +7,7 @@ import * as contract from "@joko/contracts";
 import { OperationalStore, PartnerStore, PartnerRoutineStore } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import type { AdapterContext, PromptInput, Routine } from "@joko/core";
+import { projectPiInputSchema } from "@joko/adapter-pi";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { ArtifactStore } from "./artifact-store.js";
@@ -54,7 +55,7 @@ async function fixture(streamDelayMs = 0) {
   await vi.waitFor(() => expect(partners.getPartner(created.id).initializationState).toBe("ready"), { timeout: 5000 });
   const partner = partners.getPartner(created.id);
   adapter.sent.length = 0;
-  return { root, store, profiles, host, partners, partner, routines, storage, adapter };
+  return { root, store, profiles, host, partners, partner, routines, storage, adapter, scheduler };
 }
 function context(): HandlerContext { return { signal: new AbortController().signal } as HandlerContext; }
 async function toolsFixture(f: Awaited<ReturnType<typeof fixture>>) {
@@ -73,11 +74,59 @@ async function toolsFixture(f: Awaited<ReturnType<typeof fixture>>) {
   return { tools, router, caller, notifications };
 }
 describe("Partner routine authority and canonical execution", () => {
+  it("settles the exact routine after its own native runtime activation renews the Queue attempt", async () => {
+    const f = await fixture(); const sessionId = f.partner.canonicalSessionId!;
+    await f.host.closeIfActive(sessionId);
+    const before = f.store.getSession(sessionId).descriptor.binding;
+    const saved = await f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision,
+      requestId: "routine-resume-creation", definition: { ...definition, enabled: false,
+        triggers: [{ id: "timer", kind: "interval", intervalMs: 3600000 }] } });
+    await f.routines.run({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: saved.id,
+      revision: saved.revision, requestId: "routine-resume-explicit-run" });
+    await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs[0]?.status).toBe("success"));
+    const receipt = f.routines.history(f.partner.id, saved.id).runs[0]!;
+    const after = f.store.getSession(sessionId).descriptor.binding;
+    expect(after).toEqual({ ...before, generation: before.generation + 1 });
+    const queue = f.store.findQueueItemByRunId(sessionId, receipt.scheduleRunId!)!;
+    expect(f.store.getRun(receipt.scheduleRunId!).descriptor.activeAttemptId).toBe(queue.attemptId);
+    expect(f.store.listAttempts(receipt.scheduleRunId!).map(attempt => attempt.descriptor.generation))
+      .toEqual(expect.arrayContaining([before.generation, after.generation]));
+    expect(f.adapter.sent).toHaveLength(1);
+  });
+  it.each(["binding-replacement", "generation-reset"] as const)("rejects an external %s after native routine completion", async change => {
+    const f = await fixture(); const sessionId = f.partner.canonicalSessionId!;
+    await f.host.closeIfActive(sessionId);
+    const dispatch = f.scheduler.runNowWithResult.bind(f.scheduler);
+    vi.spyOn(f.scheduler, "runNowWithResult").mockImplementation(async (...args) => {
+      const result = await dispatch(...args);
+      await vi.waitFor(() => expect(f.store.getRun(result.runId).descriptor.state).toBe("completed"));
+      const current = f.store.getSession(sessionId);
+      f.store.updateSession(sessionId, { binding: change === "binding-replacement"
+        ? { ...current.descriptor.binding, opaqueRef: "external-native-replacement", nativeSessionId: "external-native-replacement" }
+        : { ...current.descriptor.binding, generation: current.descriptor.binding.generation + 1 } }, current.revision);
+      return result;
+    });
+    const saved = await f.routines.save({ partnerId: f.partner.id, partnerRevision: f.partner.revision,
+      requestId: "routine-fenced-creation", definition: { ...definition, enabled: false,
+        triggers: [{ id: "timer", kind: "interval", intervalMs: 3600000 }] } });
+    await f.routines.run({ partnerId: f.partner.id, partnerRevision: f.partner.revision, routineId: saved.id,
+      revision: saved.revision, requestId: "routine-fenced-explicit-run" });
+    await vi.waitFor(() => expect(f.routines.history(f.partner.id, saved.id).runs[0]?.status).toBe("failed"));
+    expect(f.adapter.sent).toHaveLength(1);
+  });
   it("manages own routines through the frozen tool catalog and shared UI owner with stable execution receipts", async () => {
     const f = await fixture(200), t = await toolsFixture(f);
     const snapshot = t.router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: t.caller.sessionId,
       targetId: t.caller.targetId, expectedPiGeneration: t.caller.generation, includeToolPolicy: () => false });
     expect(snapshot.mcpBridge.tools.filter(tool => tool.serverId === t.tools.id).map(tool => tool.name)).toEqual(t.tools.tools.map(tool => tool.name).sort());
+    const saveTool = t.tools.tools.find(tool => tool.name === "routine_save")!;
+    expect(projectPiInputSchema(saveTool.inputSchema, saveTool.name).fields).toContainEqual(expect.objectContaining({
+      fieldPath: "triggers[]", type: "object", required: true
+    }));
+    expect(saveTool.inputSchema).toMatchObject({ properties: { triggers: { items: { type: "object", oneOf: [
+      { properties: { kind: { const: "cron" } } }, { properties: { kind: { const: "interval" } } },
+      { properties: { kind: { const: "once" } } }, { properties: { kind: { const: "event" } } }
+    ] } } } });
     const listed = await t.router.executeBridgeCall({ authorization: `Bearer ${snapshot.mcpBridge.token}`, requestId: "routine-tool-list", generation: t.caller.generation,
       sessionId: t.caller.sessionId, targetId: t.caller.targetId, serverId: t.tools.id, toolName: "routine_list", arguments: {} });
     expect(listed).toMatchObject({ isError: false, content: [{ type: "text", text: JSON.stringify({ ok: true, result: [] }) }] });

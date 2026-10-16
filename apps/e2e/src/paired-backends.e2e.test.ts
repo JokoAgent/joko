@@ -1074,12 +1074,14 @@ it("replaces three native Backend instances independently and rejects a busy rep
       const sessionEvents = fixture.application.store.listEvents({ sessionId });
       const allAssistantEvents = sessionEvents.filter((event) =>
         event.payload.type === "message_complete" && event.payload.role === "assistant");
-      const assistantEvents = allAssistantEvents.filter((event) => event.runId === runId);
+      const assistantEvents = allAssistantEvents.filter((event) => event.runId === runId
+        && event.metadata?.fields["nativeHydration"] !== true);
       const assistantDelta = allAssistantEvents.slice(assistantCountsBeforeFinal.get(backendId));
       const allUsageEvents = sessionEvents.filter((event) => event.payload.type === "usage");
       const usageEvents = allUsageEvents.slice(usageCountsBeforeFinal.get(backendId));
       const doneEvents = sessionEvents.filter((event) => event.payload.type === "done" && event.runId === runId);
-      expect(assistantEvents, `${backendId} run-bound final assistant`).toHaveLength(1);
+      expect(assistantEvents, `${backendId} run-bound live final assistant`).toHaveLength(1);
+      assertSingleVisibleRunAssistant(fixture, sessionId, runId, finalAnswers.get(backendId)!);
       expect(assistantDelta.length).toBeGreaterThan(0);
       expect(assistantDelta.every((event) =>
         event.backendId === backendId
@@ -1501,12 +1503,14 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
       const assistantEventsWhileUnknown = eventsWhileUnknown.filter((event) =>
         event.runId === runWhileUnknown
         && event.payload.type === "message_complete"
-        && event.payload.role === "assistant");
+        && event.payload.role === "assistant"
+        && event.metadata?.fields["nativeHydration"] !== true);
       const doneEventsWhileUnknown = eventsWhileUnknown.filter((event) =>
         event.runId === runWhileUnknown && event.payload.type === "done");
       const usageDeltaWhileUnknown = eventsWhileUnknown.filter((event) => event.payload.type === "usage")
         .slice(usageEventsBeforeUnknownRun);
       expect(assistantEventsWhileUnknown).toHaveLength(1);
+      assertSingleVisibleRunAssistant(fixture, sessionId, runWhileUnknown, answerWhileUnknown);
       expect(jsonWithBigints(assistantEventsWhileUnknown)).toContain(answerWhileUnknown);
       expect(assistantEventsWhileUnknown[0]).toMatchObject({
         backendId,
@@ -1671,7 +1675,8 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
       const assistantEvents = events.filter((event) =>
         event.runId === runId
         && event.payload.type === "message_complete"
-        && event.payload.role === "assistant");
+        && event.payload.role === "assistant"
+        && event.metadata?.fields["nativeHydration"] !== true);
       const assistantDelta = events.filter((event) =>
         event.payload.type === "message_complete" && event.payload.role === "assistant")
         .slice(assistantCountsBeforeFinal.get(backendId));
@@ -1679,6 +1684,7 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
         .slice(usageCountsBeforeFinal.get(backendId));
       const doneEvents = events.filter((event) => event.runId === runId && event.payload.type === "done");
       expect(assistantEvents).toHaveLength(1);
+      assertSingleVisibleRunAssistant(fixture, sessionId, runId, finalAnswers.get(backendId)!);
       expect(assistantDelta.length).toBeGreaterThan(0);
       expect(jsonWithBigints(assistantEvents)).toContain(finalAnswers.get(backendId));
       for (const event of assistantEvents) {
@@ -1862,10 +1868,12 @@ it("keeps published replacements authoritative while exact old-generation cleanu
       const assistantEvents = events.filter((event) =>
         event.runId === runId
         && event.payload.type === "message_complete"
-        && event.payload.role === "assistant");
+        && event.payload.role === "assistant"
+        && event.metadata?.fields["nativeHydration"] !== true);
       const doneEvents = events.filter((event) => event.runId === runId && event.payload.type === "done");
       const usageDelta = events.filter((event) => event.payload.type === "usage").slice(usageEventsBefore);
       expect(assistantEvents).toHaveLength(1);
+      assertSingleVisibleRunAssistant(fixture, sessionId, runId, answer);
       expect(jsonWithBigints(assistantEvents)).toContain(answer);
       expect(assistantEvents[0]).toMatchObject({
         backendId,
@@ -3789,6 +3797,20 @@ function throwCleanupErrors(errors: readonly unknown[], message: string): void {
 
 function jsonWithBigints(value: unknown): string {
   return JSON.stringify(value, (_key, entry: unknown) => typeof entry === "bigint" ? entry.toString() : entry);
+}
+
+function assertSingleVisibleRunAssistant(
+  fixture: OrchestratorE2eFixture,
+  sessionId: string,
+  runId: string,
+  answer: string
+): void {
+  // The raw event log retains live delivery and canonical native hydration.
+  // The production timeline must expose their one authoritative completion.
+  const messages = fixture.application.store.listEvents({ sessionId, activeNativeTimeline: true, limit: 1_000 })
+    .filter(event => event.runId === runId && event.payload.type === "message_complete" && event.payload.role === "assistant");
+  expect(messages, "one visible final assistant after native reconciliation").toHaveLength(1);
+  expect(jsonWithBigints(messages[0])).toContain(answer);
 }
 
 async function waitForStableNumber(
