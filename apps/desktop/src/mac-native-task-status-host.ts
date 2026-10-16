@@ -29,6 +29,7 @@ const TASK_STATUS_POINTER_POLL_MS = 50;
 const TASK_STATUS_WINDOW_RECOVERY_MIN_MS = 250;
 const TASK_STATUS_WINDOW_RECOVERY_MAX_MS = 30_000;
 const TASK_STATUS_WINDOW_RECOVERY_RESET_MS = 60_000;
+const TASK_STATUS_NAVIGATION_ABORT_GRACE_MS = 50;
 export const NATIVE_TASK_STATUS_HOVER_INTENT_MS = 500;
 export const NATIVE_TASK_STATUS_POINTER_LEAVE_GRACE_MS = 150;
 export const NATIVE_TASK_STATUS_HOVER_COOLDOWN_MS = 300;
@@ -110,6 +111,7 @@ interface HostedWindow {
   displayIndex: number;
   bounds: NativeTaskStatusWindowBounds;
   renderToken: number;
+  loadFailure?: { readonly timer: unknown };
   retiring: boolean;
 }
 
@@ -117,6 +119,11 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
   const now = options.now ?? Date.now;
   const setTimer = options.setTimer ?? ((listener: () => void, delayMs: number): unknown => setTimeout(listener, delayMs));
   const clearTimer = options.clearTimer ?? ((timer: unknown): void => clearTimeout(timer as ReturnType<typeof setTimeout>));
+  const cancelLoadFailure = (entry: HostedWindow): void => {
+    if (entry.loadFailure === undefined) return;
+    clearTimer(entry.loadFailure.timer);
+    entry.loadFailure = undefined;
+  };
   let settings: DesktopNativeTaskStatusSettings | undefined;
   let snapshot: DesktopNativeTaskStatusSnapshot | undefined;
   let manualExpandedDisplayId: number | undefined;
@@ -500,6 +507,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     recoveryAtByDisplay.clear();
     recentWindowFailures.clear();
     for (const entry of hosted.values()) {
+      cancelLoadFailure(entry);
       entry.retiring = true;
       if (!entry.window.isDestroyed()) entry.window.destroy(reason);
     }
@@ -679,6 +687,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
         window.onBoundsChanged((next) => handleWindowBoundsChanged(target, next));
         window.denyNewWindows();
         window.onClosed(() => {
+          cancelLoadFailure(target);
           if (hosted.get(display.id)?.window !== window) return;
           hosted.delete(display.id);
           if (target.retiring || disposed || settings?.enabled !== true) return;
@@ -699,17 +708,28 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
         entry.bounds = bounds;
         entry.window.setBounds(bounds);
       }
+      cancelLoadFailure(entry);
       entry.renderToken += 1;
       const renderToken = entry.renderToken;
       const target = entry;
       void entry.window.loadDocument(dataUrl).then(() => {
         if (!disposed && hosted.get(display.id) === target && target.renderToken === renderToken &&
           !target.window.isDestroyed()) target.window.showInactive();
-      }).catch(() => {
-        if (!disposed && hosted.get(display.id) === target && target.renderToken === renderToken &&
-          !target.window.isDestroyed()) {
-          target.window.destroy("document-load-failed");
-        }
+      }).catch((error: unknown) => {
+        const current = (): boolean => !disposed && hosted.get(display.id) === target &&
+          target.renderToken === renderToken && !target.window.isDestroyed();
+        if (!current()) return;
+        const retire = (): void => { if (current()) target.window.destroy("document-load-failed"); };
+        if (error !== null && typeof error === "object" && "code" in error && error.code === "ERR_ABORTED") {
+          // Electron can reject a cancelled load before delivering the owned
+          // action navigation. A new render must actually take ownership;
+          // otherwise this same failed document is still retired within bounds.
+          target.loadFailure = { timer: setTimer(() => {
+            if (!current()) return;
+            target.loadFailure = undefined;
+            retire();
+          }, TASK_STATUS_NAVIGATION_ABORT_GRACE_MS) };
+        } else retire();
       });
     }
     syncPointerTimer();
