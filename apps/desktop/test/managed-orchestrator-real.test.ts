@@ -29,28 +29,46 @@ afterEach(async () => {
 });
 
 describe("real managed Orchestrator child", () => {
-  it("survives persistent Desktop release after the durable ACK and then stops explicitly", async () => {
+  it("survives persistent Desktop release after the durable ACK and then stops explicitly", async (context) => {
     const fixture = createFixture();
+    const startedAt = performance.now();
+    const phases: Array<{ readonly phase: string; readonly elapsedMs: number }> = [];
+    const checkpoint = (phase: string): void => {
+      phases.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) });
+    };
+    context.onTestFailed(() => {
+      // Fixed phases and process state only: neither bootstrap credentials nor RPC bodies are diagnostic output.
+      console.error(`Real managed Orchestrator lifecycle failed: ${JSON.stringify({ phases, children: fixture.children })}`);
+    });
+    checkpoint("first_start");
     const runtime = await startRealManagedOrchestrator(fixture);
+    checkpoint("first_commit");
     const authKey = runtime.takeAuthKey();
     await runtime.commit();
+    checkpoint("initial_device");
     const clients = authenticatedClients(runtime, authKey);
     const initial = (await clients.connections.getDevice({ deviceId: fixture.deviceId })).device!;
     expect(initial).toMatchObject({ displayName: "Joko Desktop integration", defaultDisplayName: "Joko Desktop integration" });
     expect(initial.manualDisplayName).toBeUndefined();
+    checkpoint("manual_name");
     await updateName(clients, runtime, initial, "Manual desktop");
+    checkpoint("hostname_snapshot");
     const sourceSnapshot = (await clients.events.getSnapshot({
       scope: { kind: { case: "owner", value: {} } },
       currentDeviceNameSource: { defaultDisplayName: "Changed OS hostname" }
     })).snapshot!;
     const latest = sourceSnapshot.devices.find((device) => device.deviceId === fixture.deviceId)!;
     expect(latest).toMatchObject({ displayName: "Manual desktop", manualDisplayName: "Manual desktop", defaultDisplayName: "Changed OS hostname" });
+    checkpoint("reset_name");
     const reset = await updateName(clients, runtime, latest);
     expect(reset.displayName).toBe("Changed OS hostname");
     expect(reset.manualDisplayName).toBeUndefined();
+    checkpoint("retain_name");
     await updateName(clients, runtime, reset, reset.displayName);
+    checkpoint("release");
     runtime.release();
 
+    checkpoint("released_probe");
     const probe = await probeManagedOrchestratorConnection({
       connection: runtime.connection,
       readAuthKey: async () => authKey
@@ -65,18 +83,26 @@ describe("real managed Orchestrator child", () => {
       throw new Error(`Managed probe failed (${probe}; identity=${identity}; authenticated=${authenticated}).`);
     }
 
+    checkpoint("first_stop");
     await runtime.stop();
+    checkpoint("first_absent");
     await expectEventuallyAbsent(runtime);
+    checkpoint("restart");
     const restarted = await startRealManagedOrchestrator(fixture, {
       defaultDeviceName: "Second OS hostname",
       previousConnection: { connectionId: runtime.connection.profileId, authKey }
     });
+    checkpoint("restart_commit");
     const restartedClients = authenticatedClients(restarted, restarted.takeAuthKey());
     await restarted.commit();
+    checkpoint("retained_device");
     const retained = (await restartedClients.connections.getDevice({ deviceId: fixture.deviceId })).device!;
     expect(retained).toMatchObject({ displayName: "Changed OS hostname", manualDisplayName: "Changed OS hostname", defaultDisplayName: "Second OS hostname" });
+    checkpoint("restart_reset_name");
     expect((await updateName(restartedClients, restarted, retained)).displayName).toBe("Second OS hostname");
+    checkpoint("restart_stop");
     await restarted.stop();
+    checkpoint("completed");
   }, 45_000);
 
   it("recovers persisted metadata when the commit ACK was lost and fences an ephemeral smoke child", async () => {
@@ -110,6 +136,13 @@ function createFixture() {
   const workspaceRoot = resolve(root, "workspace");
   mkdirSync(workspaceRoot, { recursive: true });
   const runtimes: ManagedOrchestratorRuntime[] = [];
+  const children: Array<{
+    spawned: boolean;
+    exitAfterMs?: number;
+    responseEndedAfterMs?: number;
+    exitCode?: number | null;
+    signalCode?: NodeJS.Signals | null;
+  }> = [];
   cleanups.push(async () => {
     for (const runtime of runtimes.reverse()) await runtime.stop().catch(() => undefined);
     rmSync(root, { recursive: true, force: true });
@@ -119,7 +152,8 @@ function createFixture() {
     workspaceRoot,
     dataDirectory: resolve(root, "data"),
     deviceId: randomUUID(),
-    runtimes
+    runtimes,
+    children
   };
 }
 
@@ -137,7 +171,10 @@ async function startRealManagedOrchestrator(
     spawned: boolean;
     exitAfterMs?: number;
     responseEndedAfterMs?: number;
+    exitCode?: number | null;
+    signalCode?: NodeJS.Signals | null;
   } = { spawned: false };
+  fixture.children.push(startup);
   let runtime: ManagedOrchestratorRuntime;
   try {
     runtime = await startManagedOrchestrator({
@@ -158,8 +195,10 @@ async function startRealManagedOrchestrator(
       spawnChild(_executable: string, args: readonly string[], spawnOptions: SpawnOptions) {
         const child = spawn(process.execPath, ["--import", tsxLoader, ...args], spawnOptions);
         child.once("spawn", () => { startup.spawned = true; });
-        child.once("exit", () => {
+        child.once("exit", (code, signal) => {
           startup.exitAfterMs = Math.round(performance.now() - startedAt);
+          startup.exitCode = code;
+          startup.signalCode = signal;
         });
         const requestPipe = child.stdio[3];
         const responsePipe = child.stdio[4];
