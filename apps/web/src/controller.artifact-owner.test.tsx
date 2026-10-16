@@ -194,6 +194,10 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(current.updateAuxiliaryTextSettings).toBe(firstController.updateAuxiliaryTextSettings);
   expect(current.predictNextPrompt).toBe(firstController.predictNextPrompt);
   expect(current.getCollaborationDirectory).toBe(firstController.getCollaborationDirectory);
+  for (const method of ["listSkillMarketCatalog", "getSkillMarketEntry", "openSkillMarketPreview",
+    "listSkillMarketPreviewFiles", "readSkillMarketPreviewFile", "closeSkillMarketPreview"] as const) {
+    expect(current[method]).toBe(firstController[method]);
+  }
   expect(current.downloadArtifact).toBe(firstController.downloadArtifact);
   expect(current.exportSession).toBe(firstController.exportSession);
   expect(current.exportPortableSession).toBe(firstController.exportPortableSession);
@@ -243,6 +247,8 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await act(async () => current.connect(second));
   const secondController = current;
   expect(secondController.getCollaborationDirectory).not.toBe(firstController.getCollaborationDirectory);
+  expect(secondController.listSkillMarketCatalog).not.toBe(firstController.listSkillMarketCatalog);
+  await expect(firstController.listSkillMarketCatalog({})).rejects.toThrow("The Skill market connection is no longer current.");
   await expect(secondController.getCollaborationDirectory(new AbortController().signal))
     .resolves.toMatchObject({ actor: { id: second.id } });
   expect(secondController.getPersonalizationPrompt()).toBe("Explain tradeoffs.");

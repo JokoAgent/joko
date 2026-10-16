@@ -2399,6 +2399,28 @@ export function useAppController(): AppController {
       uninstallRemoteBackendRuntime: async (...args: Parameters<OperationApi["uninstallRemoteBackendRuntime"]>) => original().uninstallRemoteBackendRuntime(...args)
     };
   }, [artifactGateway]);
+  const skillMarketReadApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined) throw new Error("Connect to Joko before reading the Skill market.");
+      return artifactGateway;
+    };
+    const current = (): OrchestratorGateway => {
+      const source = original();
+      if (gatewayRef.current !== source || gatewayGenerationRef.current !== linkGatewayGeneration
+        || connectionStateRef.current !== "connected") {
+        throw new Error("The Skill market connection is no longer current.");
+      }
+      return source;
+    };
+    return {
+      listSkillMarketCatalog: async (...args: Parameters<OperationApi["listSkillMarketCatalog"]>) => current().listSkillMarketCatalog(...args),
+      getSkillMarketEntry: async (...args: Parameters<OperationApi["getSkillMarketEntry"]>) => current().getSkillMarketEntry(...args),
+      openSkillMarketPreview: async (...args: Parameters<OperationApi["openSkillMarketPreview"]>) => current().openSkillMarketPreview(...args),
+      listSkillMarketPreviewFiles: async (...args: Parameters<OperationApi["listSkillMarketPreviewFiles"]>) => current().listSkillMarketPreviewFiles(...args),
+      readSkillMarketPreviewFile: async (...args: Parameters<OperationApi["readSkillMarketPreviewFile"]>) => current().readSkillMarketPreviewFile(...args),
+      closeSkillMarketPreview: async (...args: Parameters<OperationApi["closeSkillMarketPreview"]>) => original().closeSkillMarketPreview(...args)
+    };
+  }, [artifactGateway, linkGatewayGeneration]);
   const mcpApi = useMemo(() => {
     const original = (): OrchestratorGateway => {
       if (artifactGateway === undefined) throw new Error("Connect to Joko before configuring tools.");
@@ -2919,13 +2941,7 @@ export function useAppController(): AppController {
       gateway().refreshSkillMarketSource(sourceId, expectedRevision, signal),
     removeSkillMarketSource: (sourceId, expectedRevision, signal) =>
       gateway().removeSkillMarketSource(sourceId, expectedRevision, signal),
-    listSkillMarketCatalog: (options) => gateway().listSkillMarketCatalog(options),
-    getSkillMarketEntry: (identity, signal) => gateway().getSkillMarketEntry(identity, signal),
-    openSkillMarketPreview: (identity, signal) => gateway().openSkillMarketPreview(identity, signal),
-    listSkillMarketPreviewFiles: (preview, pageToken, pageSize, signal) =>
-      gateway().listSkillMarketPreviewFiles(preview, pageToken, pageSize, signal),
-    readSkillMarketPreviewFile: (preview, key, signal) => gateway().readSkillMarketPreviewFile(preview, key, signal),
-    closeSkillMarketPreview: (previewId, signal) => gateway().closeSkillMarketPreview(previewId, signal),
+    ...skillMarketReadApi,
     createSkillMarketInstallPlan: (identity, target, signal) =>
       gateway().createSkillMarketInstallPlan(identity, target, signal),
     getSkillMarketInstallPlan: (planId, signal) => gateway().getSkillMarketInstallPlan(planId, signal),
@@ -3417,7 +3433,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-  }), [deviceNameApi, saveProvider, getCollaborationDirectory, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+  }), [skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

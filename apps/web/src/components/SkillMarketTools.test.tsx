@@ -86,6 +86,26 @@ describe("Skill market sources", () => {
 });
 
 describe("Skill market catalog", () => {
+  it("keeps one preview lease through same-connection snapshot wrappers", async () => {
+    const controller = marketController();
+    let refreshSnapshot = (): void => undefined;
+    function Harness(): ReactElement {
+      const [, refresh] = useState(0);
+      refreshSnapshot = () => refresh(value => value + 1);
+      return <SkillMarketCatalogTools controller={{ ...controller }} backends={backends} targets={targets} locale="en"
+        t={t} initialSelection={entry().identity} onOpenSources={vi.fn()} />;
+    }
+    const container = await render(<Harness />);
+    await settle(120);
+    expect(container.textContent).toContain("# Review safely");
+    await act(async () => refreshSnapshot());
+    await settle(120);
+    expect(controller.openSkillMarketPreview).toHaveBeenCalledTimes(1);
+    expect(controller.closeSkillMarketPreview).not.toHaveBeenCalled();
+    expect(controller.readSkillMarketPreviewFile).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("# Review safely");
+  });
+
   it("does not read a retired preview while adopting a replacement presentation", async () => {
     const closed = new Set<string>();
     const retiredReads: string[] = [];

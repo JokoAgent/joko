@@ -286,7 +286,13 @@ function observeBrowserErrors(page: Page): string[] {
     if (response.status() >= 400) errors.push(`response:${response.status()}:${response.request().method()}:${response.url()}`);
   });
   page.on("console", (message) => {
-    if (message.type() === "error") errors.push(`console:${message.text()}`);
+    if (message.type() !== "error") return;
+    let location = "";
+    try {
+      const url = new URL(message.location().url);
+      location = `${url.origin}${url.pathname}`.slice(0, 512);
+    } catch { /* Some browser errors have no source location. */ }
+    errors.push(`console:${message.text()}:${location}`);
   });
   return errors;
 }
