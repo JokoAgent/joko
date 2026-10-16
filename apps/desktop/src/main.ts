@@ -277,7 +277,8 @@ import {
   NATIVE_TASK_STATUS_WINDOW_INTERACTION,
   type MacNativeTaskStatusHost,
   type NativeTaskStatusWindow,
-  type NativeTaskStatusWindowBounds
+  type NativeTaskStatusWindowBounds,
+  type NativeTaskStatusWindowRetirementReason
 } from "./mac-native-task-status-host.js";
 import {
   isAllowedDesktopClipboardWriteRequest,
@@ -513,6 +514,21 @@ const packagedSmokePublicHttpOrigin = process.env["JOKO_DESKTOP_SMOKE_PUBLIC_HTT
 const packagedSmokeProviderOrigin = process.env["JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN"];
 const packagedSmokeClipboardNonce = process.env["JOKO_DESKTOP_SMOKE_CLIPBOARD_NONCE"];
 const packagedSmokeResultPath = process.env["JOKO_DESKTOP_SMOKE_RESULT"];
+interface PackagedSmokeNativeTaskStatusLifecycleReceipt {
+  readonly event: "created" | "bounds-requested" | "load-started" | "load-completed" | "load-failed" |
+    "show-inactive" | "destroy-requested" | "renderer-gone" | "closed" | "navigation-prevented";
+  readonly elapsedMs: number;
+  readonly load?: number;
+  readonly current?: boolean;
+  readonly width?: number;
+  readonly height?: number;
+  readonly reason?: NativeTaskStatusWindowRetirementReason | "unspecified" | "other" |
+    "ERR_ABORTED" | "ERR_INVALID_URL" | "ERR_FAILED" | "ERR_ACCESS_DENIED" |
+    "clean-exit" | "abnormal-exit" | "killed" | "crashed" | "oom" | "launch-failed" |
+    "integrity-failure" | "memory-eviction";
+  readonly exitCode?: number;
+}
+const packagedSmokeNativeTaskStatusLifecycle = new WeakMap<BrowserWindow, PackagedSmokeNativeTaskStatusLifecycleReceipt[]>();
 const packagedSmokeUserData = process.env["JOKO_DESKTOP_SMOKE_USER_DATA"];
 const packagedSmokeRequests = new Map<number, {
   readonly method: string; readonly path: string; readonly contents: number;
@@ -1766,7 +1782,8 @@ async function verifyPackagedSmokeNativeTaskStatus(owner: BrowserWindow): Promis
       before: focusedBefore === null ? "none" : focusedBefore === owner ? "owner" : focusedBefore === ambient ? "ambient" : "other",
       after: focusedAfter === null ? "none" : focusedAfter === owner ? "owner" : focusedAfter === ambient ? "ambient" : "other",
       pointerInside: !destroyed && pointIsInsideRectangle(screen.getCursorScreenPoint(), ambient.getBounds()),
-      surfaceMode: macNativeTaskStatusHost?.surface()?.mode
+      surfaceMode: macNativeTaskStatusHost?.surface()?.mode,
+      lifecycle: packagedSmokeNativeTaskStatusLifecycle.get(ambient) ?? []
     };
     process.stdout.write(`JOKO_DESKTOP_SMOKE_TASK_STATUS_EXPANSION ${JSON.stringify(observation)}\n`);
     if (!destroyed && !ambient.webContents.isDestroyed() && packagedSmokeResultPath !== undefined) {
@@ -6681,6 +6698,19 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
       safeDialogs: true
     }
   });
+  const createdAt = Date.now();
+  const lifecycle: PackagedSmokeNativeTaskStatusLifecycleReceipt[] = [];
+  let loads = 0;
+  if (packagedSmoke) packagedSmokeNativeTaskStatusLifecycle.set(window, lifecycle);
+  const record = (
+    event: PackagedSmokeNativeTaskStatusLifecycleReceipt["event"],
+    detail: Omit<PackagedSmokeNativeTaskStatusLifecycleReceipt, "event" | "elapsedMs"> = {}
+  ): void => {
+    if (!packagedSmoke) return;
+    lifecycle.push({ event, elapsedMs: Math.max(0, Date.now() - createdAt), ...detail });
+    if (lifecycle.length > 32) lifecycle.shift();
+  };
+  record("created", { width: bounds.width, height: bounds.height });
   if (process.platform === "darwin") {
     window.setAlwaysOnTop(true, "screen-saver", 1);
     window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
@@ -6688,18 +6718,40 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
   } else {
     window.setAlwaysOnTop(true, "pop-up-menu");
   }
-  window.webContents.on("render-process-gone", () => {
+  window.on("closed", () => record("closed"));
+  window.webContents.on("render-process-gone", (_event, details) => {
+    const reason = (["clean-exit", "abnormal-exit", "killed", "crashed", "oom", "launch-failed",
+      "integrity-failure", "memory-eviction"] as const).find((candidate) => candidate === details.reason) ?? "other";
+    record("renderer-gone", { reason, ...(Number.isSafeInteger(details.exitCode) ? { exitCode: details.exitCode } : {}) });
     if (!window.isDestroyed()) window.destroy();
   });
   return Object.freeze({
     isDestroyed: () => window.isDestroyed(),
-    setBounds: (next: NativeTaskStatusWindowBounds) => window.setBounds(next, false),
-    loadDocument: (dataUrl: string) => window.loadURL(dataUrl),
-    showInactive: () => window.showInactive(),
-    destroy: () => window.destroy(),
+    setBounds: (next: NativeTaskStatusWindowBounds) => {
+      record("bounds-requested", { width: next.width, height: next.height });
+      window.setBounds(next, false);
+    },
+    loadDocument: (dataUrl: string) => {
+      const load = ++loads;
+      record("load-started", { load });
+      const loading = window.loadURL(dataUrl);
+      void loading.then(() => record("load-completed", { load, current: load === loads }), (error: unknown) => {
+        const code = error !== null && typeof error === "object" && "code" in error ? error.code : undefined;
+        const reason = (["ERR_ABORTED", "ERR_INVALID_URL", "ERR_FAILED", "ERR_ACCESS_DENIED"] as const)
+          .find((candidate) => candidate === code) ?? "other";
+        record("load-failed", { load, current: load === loads, reason });
+      });
+      return loading;
+    },
+    showInactive: () => { record("show-inactive"); window.showInactive(); },
+    destroy: (reason?: NativeTaskStatusWindowRetirementReason) => {
+      record("destroy-requested", { reason: reason ?? "unspecified" });
+      window.destroy();
+    },
     onClosed: (listener: () => void) => window.on("closed", listener),
     onWillNavigate: (listener: (url: string) => void) => window.webContents.on("will-navigate", (event, url) => {
       event.preventDefault();
+      record("navigation-prevented");
       listener(url);
     }),
     onBoundsChanged: (listener: (next: NativeTaskStatusWindowBounds) => void) => {

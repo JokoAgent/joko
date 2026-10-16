@@ -60,12 +60,15 @@ export interface NativeTaskStatusWindowBounds {
   readonly height: number;
 }
 
+export type NativeTaskStatusWindowRetirementReason =
+  "host-inactive" | "surface-closed" | "display-removed" | "document-load-failed" | "disposed";
+
 export interface NativeTaskStatusWindow {
   readonly isDestroyed: () => boolean;
   readonly setBounds: (bounds: NativeTaskStatusWindowBounds) => void;
   readonly loadDocument: (dataUrl: string) => Promise<void>;
   readonly showInactive: () => void;
-  readonly destroy: () => void;
+  readonly destroy: (reason?: NativeTaskStatusWindowRetirementReason) => void;
   readonly onClosed: (listener: () => void) => void;
   readonly onWillNavigate: (listener: (url: string) => void) => void;
   readonly onBoundsChanged: (listener: (bounds: NativeTaskStatusWindowBounds) => void) => void;
@@ -491,14 +494,14 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     syncPointerTimer();
   };
 
-  const destroyWindows = (): void => {
+  const destroyWindows = (reason: NativeTaskStatusWindowRetirementReason): void => {
     cancelPointerTimer();
     cancelRecoveryTimer();
     recoveryAtByDisplay.clear();
     recentWindowFailures.clear();
     for (const entry of hosted.values()) {
       entry.retiring = true;
-      if (!entry.window.isDestroyed()) entry.window.destroy();
+      if (!entry.window.isDestroyed()) entry.window.destroy(reason);
     }
     hosted.clear();
     hoveredDisplayId = undefined;
@@ -623,7 +626,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       cancelTerminalTimer();
       cancelSmartTimer();
       cancelCompactTimer();
-      destroyWindows();
+      destroyWindows("host-inactive");
       return;
     }
     const allDisplays = options.getDisplays();
@@ -638,7 +641,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     syncSmartTimer(resolved.smartDeadline);
     syncCompactTimer(resolved.compactDeadline);
     if (surface === undefined || surface.mode === "closed") {
-      destroyWindows();
+      destroyWindows("surface-closed");
       return;
     }
     const selectedIds = new Set(displays.map((display) => display.id));
@@ -648,7 +651,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     for (const [displayId, entry] of hosted) {
       if (selectedIds.has(displayId)) continue;
       entry.retiring = true;
-      if (!entry.window.isDestroyed()) entry.window.destroy();
+      if (!entry.window.isDestroyed()) entry.window.destroy("display-removed");
       hosted.delete(displayId);
     }
     for (const display of displays) {
@@ -705,7 +708,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       }).catch(() => {
         if (!disposed && hosted.get(display.id) === target && target.renderToken === renderToken &&
           !target.window.isDestroyed()) {
-          target.window.destroy();
+          target.window.destroy("document-load-failed");
         }
       });
     }
@@ -764,7 +767,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       cancelSmartTimer();
       cancelCompactTimer();
       cancelRecoveryTimer();
-      destroyWindows();
+      destroyWindows("disposed");
     }
   });
 }
