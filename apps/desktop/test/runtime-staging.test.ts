@@ -103,6 +103,7 @@ describe("isolated Orchestrator runtime staging", () => {
     expect(() => sqliteVecRuntimeTarget("linux", "ia32")).toThrow(/target architecture/iu);
   });
 
+  // Includes the pinned Electron binary's first-use installation before the bounded native probe.
   it("relocates the personal command host with its exact manifest and runs it under Electron-Node", async () => {
     const runtimeRoot = realpathSync(mkdtempSync(join(tmpdir(), "joko-personal-command-runtime-")));
     cleanups.push(runtimeRoot);
@@ -128,7 +129,7 @@ describe("isolated Orchestrator runtime staging", () => {
       writeFileSync(resolve(destination, "dist/native-command-host/joko-command-host.exe"), "invalid");
       await expect(auditPersonalDevelopmentRuntimeAssets(runtimeRoot, process.platform, process.arch)).rejects.toThrow(/content or Windows/iu);
     }
-  });
+  }, 50_000);
 
   it("loads and exercises the current sqlite-vec binary under Electron-Node", async () => {
     const fixture = await sqliteVecRuntimeFixture("sqlite-vec-electron");

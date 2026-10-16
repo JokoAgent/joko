@@ -132,32 +132,49 @@ async function startRealManagedOrchestrator(
   } = {}
 ): Promise<ManagedOrchestratorRuntime> {
   const ports = await selectManagedOrchestratorPorts();
-  const runtime = await startManagedOrchestrator({
-    orchestratorEntryPath,
-    dataDirectory: fixture.dataDirectory,
-    workspaceRoot: fixture.workspaceRoot,
-    deviceId: fixture.deviceId,
-    defaultDeviceName: options.defaultDeviceName ?? "Joko Desktop integration",
-    appVersion: "0.1.0-test",
-    publicPort: ports.publicPort,
-    internalPort: ports.internalPort,
-    environment: {
-      ...process.env,
-      JOKO_BROWSER_ENABLED: "0"
-    },
-    ...(options.previousConnection === undefined ? {} : { previousConnection: options.previousConnection }),
-    ...(options.ephemeral === undefined ? {} : { ephemeral: options.ephemeral }),
-    spawnChild(_executable: string, args: readonly string[], spawnOptions: SpawnOptions) {
-      const child = spawn(process.execPath, ["--import", tsxLoader, ...args], spawnOptions);
-      const requestPipe = child.stdio[3];
-      const responsePipe = child.stdio[4];
-      if (!isWritable(requestPipe) || !isReadable(responsePipe)) {
-        child.kill("SIGKILL");
-        throw new Error("Real managed Orchestrator pipes were unavailable.");
+  const startedAt = performance.now();
+  const startup: {
+    spawned: boolean;
+    exitAfterMs?: number;
+    responseEndedAfterMs?: number;
+  } = { spawned: false };
+  let runtime: ManagedOrchestratorRuntime;
+  try {
+    runtime = await startManagedOrchestrator({
+      orchestratorEntryPath,
+      dataDirectory: fixture.dataDirectory,
+      workspaceRoot: fixture.workspaceRoot,
+      deviceId: fixture.deviceId,
+      defaultDeviceName: options.defaultDeviceName ?? "Joko Desktop integration",
+      appVersion: "0.1.0-test",
+      publicPort: ports.publicPort,
+      internalPort: ports.internalPort,
+      environment: {
+        ...process.env,
+        JOKO_BROWSER_ENABLED: "0"
+      },
+      ...(options.previousConnection === undefined ? {} : { previousConnection: options.previousConnection }),
+      ...(options.ephemeral === undefined ? {} : { ephemeral: options.ephemeral }),
+      spawnChild(_executable: string, args: readonly string[], spawnOptions: SpawnOptions) {
+        const child = spawn(process.execPath, ["--import", tsxLoader, ...args], spawnOptions);
+        child.once("spawn", () => { startup.spawned = true; });
+        child.once("exit", () => {
+          startup.exitAfterMs = Math.round(performance.now() - startedAt);
+        });
+        const requestPipe = child.stdio[3];
+        const responsePipe = child.stdio[4];
+        if (!isWritable(requestPipe) || !isReadable(responsePipe)) {
+          child.kill("SIGKILL");
+          throw new Error("Real managed Orchestrator pipes were unavailable.");
+        }
+        responsePipe.once("end", () => { startup.responseEndedAfterMs = Math.round(performance.now() - startedAt); });
+        return { child, requestPipe, responsePipe };
       }
-      return { child, requestPipe, responsePipe };
-    }
-  });
+    });
+  } catch (cause) {
+    // Record process/pipe timing only; bootstrap frames and child output can contain credentials.
+    throw new Error(`Real managed Orchestrator startup failed: ${JSON.stringify({ elapsedMs: Math.round(performance.now() - startedAt), ...startup })}`, { cause });
+  }
   fixture.runtimes.push(runtime);
   return runtime;
 }
