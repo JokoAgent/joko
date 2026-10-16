@@ -343,8 +343,25 @@ describe("CollaborationGoalManager", () => {
     })).rejects.toThrow(/different collaboration input or authority/u);
   });
 
-  it("refreshes runtime generations across release and wake, then stops and archives the durable worker task", async () => {
+  it("refreshes runtime generations across release and wake, then stops and archives the durable worker task", async ({ signal, onTestFailed, onTestFinished }) => {
+    const startedAt = performance.now();
+    let phase = "fixture";
+    const completedPhases: Array<{ phase: string; elapsedMs: number }> = [];
+    const advance = (next: string) => {
+      completedPhases.push({ phase, elapsedMs: Math.round(performance.now() - startedAt) });
+      phase = next;
+    };
+    const snapshot = () => ({ phase, elapsedMs: Math.round(performance.now() - startedAt), completedPhases: [...completedPhases] });
+    let aborted: ReturnType<typeof snapshot> | undefined;
+    const captureAbort = () => { aborted ??= snapshot(); };
+    signal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => signal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => {
+      try { console.error("[worker-lifecycle-boundary]", JSON.stringify(aborted ?? snapshot())); }
+      catch { /* Diagnostic failure must not replace the original assertion. */ }
+    });
     const fixture = await createFixture();
+    advance("goal");
     const goal = fixture.manager.createGoal({
       operationId: "goal-lifecycle",
       leadSessionId: fixture.leadSessionId,
@@ -352,12 +369,14 @@ describe("CollaborationGoalManager", () => {
       title: "Lifecycle work",
       objective: "Exercise worker release, wake, stop, and archive."
     }).goal;
+    advance("create-worker");
     const created = await fixture.manager.createWorker(workerInput(
       goal.id,
       goal.revision,
       fixture.leadSessionId,
       { operationId: "worker-lifecycle", label: "Lifecycle", role: "operator", assignment: "Finish setup." }
     ));
+    advance("initial-settlement");
     await vi.waitFor(() => {
       expect(["idle", "completed"]).toContain(
         fixture.store.getCollaborationWorker(created.worker.id).status
@@ -367,6 +386,7 @@ describe("CollaborationGoalManager", () => {
 
     let worker = fixture.store.getCollaborationWorker(created.worker.id);
     const generationBeforeRelease = worker.sessionGeneration!;
+    advance("release");
     worker = (await fixture.manager.releaseWorker({
       operationId: "worker-release",
       workerId: worker.id,
@@ -376,6 +396,7 @@ describe("CollaborationGoalManager", () => {
     })).worker;
     expect(worker.runtimeReleased).toBe(true);
 
+    advance("wake");
     worker = (await fixture.manager.wakeWorker({
       operationId: "worker-wake",
       workerId: worker.id,
@@ -395,6 +416,7 @@ describe("CollaborationGoalManager", () => {
       revision: worker.revision
     });
 
+    advance("send-after-wake");
     const sent = await fixture.manager.sendMessage({
       operationId: "worker-after-wake-send",
       goalId: goal.id,
@@ -405,6 +427,7 @@ describe("CollaborationGoalManager", () => {
       message: "Confirm the resumed runtime."
     });
     expect(sent.dispatch.queueItemId).toBeDefined();
+    advance("resumed-settlement");
     await vi.waitFor(() => {
       expect(fixture.store.listRuns({ sessionId: worker.sessionId!, activeOnly: true })).toHaveLength(0);
     });
@@ -412,6 +435,7 @@ describe("CollaborationGoalManager", () => {
       status: "completed",
       sessionGeneration: worker.sessionGeneration
     });
+    advance("stale-input-fence");
     await expect(fixture.manager.sendMessage({
       operationId: "worker-stale-after-wake",
       goalId: goal.id,
@@ -424,6 +448,7 @@ describe("CollaborationGoalManager", () => {
     expect(fixture.store.findOperation("worker-stale-after-wake")).toBeUndefined();
 
     worker = fixture.store.getCollaborationWorker(worker.id);
+    advance("stop");
     worker = (await fixture.manager.stopWorker({
       operationId: "worker-stop",
       workerId: worker.id,
@@ -432,6 +457,7 @@ describe("CollaborationGoalManager", () => {
       expectedSessionGeneration: worker.sessionGeneration
     })).worker;
     expect(worker).toMatchObject({ status: "stopped", runtimeReleased: true });
+    advance("archive");
     worker = fixture.manager.archiveWorker({
       operationId: "worker-archive",
       workerId: worker.id,
@@ -440,6 +466,7 @@ describe("CollaborationGoalManager", () => {
     }).worker;
     expect(worker.status).toBe("archived");
     expect(fixture.store.getSession(worker.sessionId!).descriptor.archived).toBe(true);
+    advance("complete");
   });
 
   it("stops a Goal by durably stopping and archiving every worker before committing the Goal terminal state", async () => {

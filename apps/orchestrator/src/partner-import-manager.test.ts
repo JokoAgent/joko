@@ -27,7 +27,7 @@ const backendProfile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.c
   ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true },
   { key: "runtime.resources", supported: true, options: ["skill", "prompt"] }] };
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean } = {}) {
+async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; observeImport?: (phase: string) => void } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-import-owner-")); const native = join(root, ".hermes");
   await mkdir(join(native, "skills", "reports"), { recursive: true }); await mkdir(join(native, "memories")); await mkdir(join(native, "cron"));
   await writeFile(join(native, "config.yaml"), "name: Analyst\n" + (options.nativeTools ? "tools:\n  allowed: [read]\n" : "")); await writeFile(join(native, ".env"), `ACCESS_TOKEN=${secret}\n`);
@@ -60,9 +60,29 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     return frozen;
   },
     adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, storage, id, assertOwner),
-    runPass: (id, action) => partners.runImportManagement(id, action), effects: context => createPartnerImportEffects({ partners, routines, storage, store, memory, resources, artifacts,
+    runPass: (id, action) => partners.runImportManagement(id, options.observeImport ? observedImportEffect("pass", action, options.observeImport) : action), effects: context => {
+      options.observeImport?.("effects-start");
+      const pendingEffects = createPartnerImportEffects({ partners, routines, storage, store, memory, resources, artifacts,
       verification: { readEnvironment: (id, owner) => storage.environment.read(id, owner), canonicalSessionId: async id => partners.getPartner(id).canonicalSessionId!,
-        plan: async () => undefined, authorize: async () => { throw new Error("No external probe is authorized by this fixture"); }, verifyDelivery: async () => { throw new Error("No channel is authorized by this fixture"); } }, home: root, environment: {} }, context) });
+        plan: async () => undefined, authorize: async () => { throw new Error("No external probe is authorized by this fixture"); }, verifyDelivery: async () => { throw new Error("No channel is authorized by this fixture"); } }, home: root, environment: {} }, context);
+      if (!options.observeImport) return pendingEffects;
+      const observe = options.observeImport;
+      return pendingEffects.then(effects => {
+        observe("effects-ready");
+        return { ...effects,
+        validateItems: observedImportEffect("validate", effects.validateItems, observe),
+        createPartner: observedImportEffect("create-partner", effects.createPartner, observe),
+        importItem: observedImportEffect("import-item", effects.importItem, observe),
+        saveEnvironment: observedImportEffect("save-environment", effects.saveEnvironment, observe),
+        createConversation: observedImportEffect("create-conversation", effects.createConversation, observe),
+        createRoutine: observedImportEffect("create-routine", effects.createRoutine, observe),
+        verifyAutomation: observedImportEffect("verify-automation", effects.verifyAutomation, observe),
+        pauseSource: observedImportEffect("pause-source", effects.pauseSource, observe),
+        resumeSource: observedImportEffect("resume-source", effects.resumeSource, observe),
+        enableRoutine: observedImportEffect("enable-routine", effects.enableRoutine, observe)
+        };
+      });
+    } });
   let authenticated = "device-a";
   const context = (): HandlerContext => ({ signal: new AbortController().signal } as HandlerContext);
   const service = createPartnerImportConnectService(imports, () => { if (!authenticated) throw new ConnectError("Revoked", Code.Unauthenticated); return { id: authenticated }; });
@@ -73,6 +93,17 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
   return { root, native, store, profiles, artifacts, host, storage, resources, memory, partners, routines, imports, service, api, context, manifest,
     authenticate: (value: string) => { authenticated = value; } };
 }
+
+function observedImportEffect<Args extends unknown[], Result>(phase: string, action: (...args: Args) => Promise<Result>, observe: (phase: string) => void) {
+  return (...args: Args): Promise<Result> => {
+    observe(`${phase}-start`);
+    const result = action(...args);
+    // Observe the existing promise; return it unchanged so the fixture does not
+    // replace the import's value, rejection or await boundary.
+    void result.then(() => observe(`${phase}-complete`), () => observe(`${phase}-failed`));
+    return result;
+  };
+}
 describe("native import service and owning effects", () => {
   it("saves the complete five-category selection through the generated boundary and retains usable full originals after cold recovery", async ({ signal: testSignal, onTestFailed, onTestFinished }) => {
     type Phase = "fixture" | "sources" | "preview" | "start" | "completion" | "environment"
@@ -80,7 +111,20 @@ describe("native import service and owning effects", () => {
     const startedAt = performance.now();
     let phase: Phase = "fixture";
     const completedPhases: Array<{ phase: Phase; elapsedMs: number }> = [];
-    const snapshot = () => ({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), completedPhases: [...completedPhases] });
+    let importPhase = "not-started";
+    let effectStarted = 0;
+    let effectCompleted = 0;
+    let effectFailed = 0;
+    const effectCounts: Record<string, number> = {};
+    const observeImport = (next: string) => {
+      importPhase = next;
+      effectCounts[next] = (effectCounts[next] ?? 0) + 1;
+      if (next.endsWith("-start")) effectStarted += 1;
+      else if (next.endsWith("-complete")) effectCompleted += 1;
+      else if (next.endsWith("-failed")) effectFailed += 1;
+    };
+    const snapshot = () => ({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), completedPhases: [...completedPhases],
+      importPhase, effectStarted, effectCompleted, effectFailed, effectCounts: { ...effectCounts } });
     let abortedSnapshot: ReturnType<typeof snapshot> | undefined;
     const captureAbort = () => { abortedSnapshot ??= snapshot(); };
     const advance = (next: Phase) => {
@@ -94,7 +138,7 @@ describe("native import service and owning effects", () => {
         console.error("[partner-import-boundary]", JSON.stringify({ boundary: abortedSnapshot ? "test-abort" : "failure", ...(abortedSnapshot ?? snapshot()) }));
       } catch { /* The observation must not replace the original test failure. */ }
     });
-    const f = await fixture({ changeDefaults: true }); const signal = new AbortController().signal;
+    const f = await fixture({ changeDefaults: true, observeImport }); const signal = new AbortController().signal;
     advance("sources");
     const sources = await f.api.sources(signal);
     advance("preview");
