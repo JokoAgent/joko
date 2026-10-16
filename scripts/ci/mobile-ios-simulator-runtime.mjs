@@ -21,7 +21,7 @@ let stage = "preconditions";
 const startupCommandReceipts = [];
 const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", "list-available-devices",
   "create-owned-simulator", "boot-owned-simulator", "wait-owned-boot", "set-light-appearance",
-  "install-owned-application", "locate-installed-application", "capture-simulator-springboard",
+  "install-owned-application", "locate-installed-application", "launch-owned-application", "capture-simulator-springboard",
   "capture-pre-appearance-framebuffer", "retry-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance"]);
 
 function save(name, value) { writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + "\n"); }
@@ -166,8 +166,8 @@ async function observe(phase, pid, ocr) {
   throw new Error(`${phase}: Joko's real connection page was not observed without a loader, error or permission overlay. See the screenshot and OCR; no GUI success is claimed.`);
 }
 async function launch(port) {
-  const output = await sim("launch", udid, bundleId, "-RCT_jsLocation", `127.0.0.1:${port}`, "-RCT_packager_scheme", "http",
-    "-AppleLanguages", "(en)", "-AppleLocale", "en_US");
+  const output = await command("xcrun", ["simctl", "launch", udid, bundleId, "-RCT_jsLocation", `127.0.0.1:${port}`, "-RCT_packager_scheme", "http",
+    "-AppleLanguages", "(en)", "-AppleLocale", "en_US"], { startupLabel: "launch-owned-application" });
   const matched = new RegExp(`^${bundleId.replaceAll(".", "\\.")}:\\s+(\\d+)$`, "u").exec(output);
   if (!matched) throw new Error("simctl did not return the selected app's actual launch PID.");
   const pid = Number(matched[1]);
