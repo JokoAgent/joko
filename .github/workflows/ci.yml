@@ -79,6 +79,11 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install ripgrep
 
+      - name: Route same-runner multicast fixtures through macOS loopback
+        if: runner.os == 'macOS'
+        timeout-minutes: 1
+        run: node scripts/ci/macos-loopback-multicast.mjs configure
+
       - name: Install dependencies from lockfile
         id: dependencies
         shell: bash
@@ -534,6 +539,11 @@ jobs:
         if: ${{ matrix.workload == 'product' && always() }}
         shell: bash
         run: node scripts/ci/collect-desktop-diagnostics.mjs
+
+      - name: Remove only the macOS multicast route created by this job
+        if: ${{ always() && runner.os == 'macOS' }}
+        timeout-minutes: 1
+        run: node scripts/ci/macos-loopback-multicast.mjs cleanup
 
       - name: Upload validation logs and bounded smoke failure receipts
         if: ${{ always() }}
