@@ -36,10 +36,13 @@ interface BrokerFrame {
 class FrameReader {
   readonly #iterator: AsyncIterator<Buffer | string>;
   #pending = Buffer.alloc(0);
+  #receivedBytes = 0;
 
   constructor(stream: Readable) {
     this.#iterator = stream[Symbol.asyncIterator]() as AsyncIterator<Buffer | string>;
   }
+
+  get receivedBytes(): number { return this.#receivedBytes; }
 
   async next(): Promise<BrokerFrame> {
     while (this.#pending.byteLength < 5) await this.#read();
@@ -53,10 +56,9 @@ class FrameReader {
   async #read(): Promise<void> {
     const next = await this.#iterator.next();
     if (next.done) throw new Error("Broker frame stream ended unexpectedly.");
-    this.#pending = Buffer.concat([
-      this.#pending,
-      typeof next.value === "string" ? Buffer.from(next.value) : next.value
-    ]);
+    const chunk = typeof next.value === "string" ? Buffer.from(next.value) : next.value;
+    this.#receivedBytes += chunk.byteLength;
+    this.#pending = Buffer.concat([this.#pending, chunk]);
   }
 }
 
@@ -527,6 +529,7 @@ async function startBridge(
   readonly authority: AuthorityEnvelope;
   readonly state: AuthorityState;
 }> {
+  const startedAt = performance.now();
   const child = spawn(process.execPath, [
     fixture.sourcePath,
     "bridge",
@@ -539,12 +542,15 @@ async function startBridge(
     stdio: ["pipe", "pipe", "pipe"]
   });
   let diagnostics = "";
+  let stderrBytes = 0;
   child.stderr.on("data", (chunk: Buffer) => {
+    stderrBytes += chunk.byteLength;
     if (diagnostics.length < 16_384) diagnostics += chunk.toString("utf8");
   });
   child.stdin.write(`${JSON.stringify(value)}\n`);
   const reader = new FrameReader(child.stdout);
-  const control = await nextFrameOfType(reader, FRAME_AUTHORITY).catch((error: unknown) => {
+  const control = await nextFrameOfType(reader, FRAME_AUTHORITY).catch(async (error: unknown) => {
+    await reportBridgeStartupBoundary(fixture, child, reader, "authority-frame", startedAt, stderrBytes);
     throw new Error(`${error instanceof Error ? error.message : "Broker startup failed."}${diagnostics === "" ? "" : `\n${diagnostics}`}`);
   });
   const declaredEnvironment = value["env"] as Record<string, string> | undefined;
@@ -569,7 +575,8 @@ async function startBridge(
       authorityDigest: parsed.state.authorityDigest,
       attestation: parsed.authority.attestation
     }))));
-    const committedFrame = await nextFrameOfType(reader, FRAME_AUTHORITY_COMMIT_ACK).catch((error: unknown) => {
+    const committedFrame = await nextFrameOfType(reader, FRAME_AUTHORITY_COMMIT_ACK).catch(async (error: unknown) => {
+      await reportBridgeStartupBoundary(fixture, child, reader, "commit-ack", startedAt, stderrBytes);
       throw new Error(`${error instanceof Error ? error.message : "Broker commit failed."}${diagnostics === "" ? "" : `\n${diagnostics}`}`);
     });
     const committed = JSON.parse(committedFrame.content.toString("utf8")) as {
@@ -584,6 +591,52 @@ async function startBridge(
     });
   }
   return { process: child, reader, authority: parsed.authority, state: parsed.state };
+}
+
+async function reportBridgeStartupBoundary(
+  fixture: BrokerFixture,
+  child: ChildProcess,
+  reader: FrameReader,
+  phase: "authority-frame" | "commit-ack",
+  startedAt: number,
+  stderrBytes: number
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const sessionRoot = join(fixture.managedRoot, "sessions", fixture.identity);
+    const markers = [
+      ["startLockOwner", join(fixture.managedRoot, "start.lock", "owner.json")],
+      ["daemonLockOwner", join(fixture.managedRoot, "daemon.lock", "owner.json")],
+      ["daemonMetadata", join(fixture.managedRoot, "broker.json")],
+      ["sessionBootstrap", join(sessionRoot, "bootstrap.json")],
+      ["sessionOwner", join(sessionRoot, "owner.json")],
+      ["sessionReaped", join(sessionRoot, "reaped.json")],
+      ["sessionTombstone", join(fixture.managedRoot, "sessions", `${fixture.identity}.tombstone.json`)]
+    ] as const;
+    const observations = await Promise.race([
+      Promise.all(markers.map(async ([name, path]) => {
+        const present = await lstat(path).then(info => info.isFile() && !info.isSymbolicLink(),
+          (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT" ? false : null);
+        return [name, present] as const;
+      })),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Fixture observation deadline.")), 250);
+      })
+    ]);
+    const signal = child.signalCode === null ? null
+      : ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(child.signalCode) ? child.signalCode : "other";
+    console.error("[remote-pi-broker-startup-boundary]", JSON.stringify({
+      phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      exitCode: child.exitCode, signal, stdoutBytes: reader.receivedBytes, stderrBytes,
+      markers: Object.fromEntries(observations)
+    }));
+  } catch {
+    try {
+      console.error("[remote-pi-broker-startup-boundary]", JSON.stringify({ phase, receiptUnavailable: true }));
+    } catch { /* Observations must not replace the original protocol failure. */ }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 async function startRejectedBridge(

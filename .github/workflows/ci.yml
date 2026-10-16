@@ -212,6 +212,12 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Diagnose the exact Windows remote broker startup regression
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-native' && runner.os == 'Windows' && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: pnpm --filter @joko/orchestrator exec vitest run src/remote-pi-broker-source.test.ts -t "keeps the exact child and replay alive across manager crash, then rotates relay authority" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/remote-pi-broker-regression.log"
+
       - name: Run the affected Windows Desktop checks
         if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
         timeout-minutes: 5
