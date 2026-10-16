@@ -16,8 +16,13 @@ interface ReadRequest {
 }
 
 class WorkerReadError extends Error {
-  constructor(readonly code: "FILE_TOO_LARGE" | "SHEET_NOT_FOUND", readonly available?: readonly string[]) {
+  readonly code: "FILE_TOO_LARGE" | "SHEET_NOT_FOUND";
+  readonly available: readonly string[] | undefined;
+
+  constructor(code: "FILE_TOO_LARGE" | "SHEET_NOT_FOUND", available?: readonly string[]) {
     super(code);
+    this.code = code;
+    this.available = available;
   }
 }
 
