@@ -117,6 +117,7 @@ jobs:
 
       - name: Build a real APK with an ephemeral CI test signer
         id: native-artifact
+        timeout-minutes: 30
         run: node scripts/ci/android-native.mjs build
 
       - name: Verify the actual APK installer permission

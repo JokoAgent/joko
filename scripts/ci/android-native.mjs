@@ -40,7 +40,9 @@ function build() {
     // The existing builder retains assembleRelease. Gradle's project-property
     // environment override selects only the actual CI emulator architecture.
     ORG_GRADLE_PROJECT_reactNativeArchitectures: "x86_64",
-    GRADLE_OPTS: `${process.env.GRADLE_OPTS ?? ""} -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2`
+    // Configure the daemon, not just the lightweight Gradle launcher. Release
+    // lint exhausted the template's 512 MiB metaspace and then failed to stop.
+    GRADLE_OPTS: `${process.env.GRADLE_OPTS ?? ""} -Dorg.gradle.daemon=false -Dorg.gradle.workers.max=2 -Dorg.gradle.jvmargs="-Xmx2048m -XX:MaxMetaspaceSize=1024m -XX:+ExitOnOutOfMemoryError"`
   };
   const keytool = join(process.env.JAVA_HOME, "bin", "keytool");
   const output = join(temporary, "artifacts");
