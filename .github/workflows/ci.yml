@@ -294,6 +294,12 @@ jobs:
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
 
+      - name: Check the actual macOS PDF report renderer
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && runner.os == 'macOS' && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/orchestrator exec vitest run src/document-pdf-renderer.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/report-pdf-renderer.log"
+
       - name: Run the affected production Web chains (Windows/macOS)
         id: browser_regressions
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os != 'Linux' }}
@@ -301,7 +307,7 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
-            files=(src/timeline-history.e2e.test.ts)
+            files=(src/document-tools.e2e.test.ts)
           else
             files=(src/skill-learning-mounted-browser.e2e.test.ts src/voice-dictionary.e2e.test.ts)
           fi

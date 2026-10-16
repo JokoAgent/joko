@@ -1,8 +1,8 @@
 import { createServer } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inspectPdf } from "@joko/tool-document";
+import { inspectPdf, renderPdf } from "@joko/tool-document";
 import { expect, it } from "vitest";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 
@@ -32,3 +32,27 @@ it.runIf(Boolean(process.env.JOKO_BROWSER_EXECUTABLE))("renders a real PDF in a 
     await rm(root, { recursive: true, force: true });
   }
 }, 45_000);
+
+it.runIf(Boolean(process.env.JOKO_BROWSER_EXECUTABLE) && process.platform === "darwin")(
+  "prints the actual report template with readable Latin and Chinese system-font text", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-pdf-report-font-"));
+    try {
+      const text = "Visible print 中文报告";
+      const renderer = new ChromiumDocumentPdfRenderer(process.env.JOKO_BROWSER_EXECUTABLE!);
+      const output = await renderPdf({ html: `<h1>${text}</h1>`, outPath: "report.pdf", theme: "navy" }, root, renderer);
+      await writeFile(join(root, "report.pdf"), output.buffer);
+      const inspection = await inspectPdf({ path: "report.pdf" }, root);
+      if (process.env.RUNNER_TEMP !== undefined) {
+        const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "document-tools");
+        await mkdir(directory, { recursive: true });
+        await writeFile(join(directory, "bilingual-report.pdf"), output.buffer);
+        await writeFile(join(directory, "bilingual-report.json"), JSON.stringify({
+          sourceCommit: process.env.GITHUB_SHA, fontsReady: output.fontsReady, inspection
+        }, null, 2));
+      }
+      expect(output.fontsReady).toBe(true);
+      expect(inspection).toMatchObject({ numPages: 1, verdict: "ok", blankPages: [],
+        pages: [{ page: 1, paper: "A4", blank: false }] });
+      expect(inspection.pages[0]?.textPreview.replace(/\s/gu, "")).toBe(text.replace(/\s/gu, ""));
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 45_000);
