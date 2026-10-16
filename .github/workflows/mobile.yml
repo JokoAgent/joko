@@ -1,7 +1,15 @@
-name: Mobile compilation
+name: Mobile native builds and GUI checks
 
 on:
   push:
+    paths:
+      - '*'
+      - '.github/workflows/mobile.yml'
+      - 'apps/mobile/**'
+      - 'apps/e2e/**'
+      - 'apps/orchestrator/**'
+      - 'packages/**'
+      - 'scripts/**'
   pull_request:
   workflow_dispatch:
 

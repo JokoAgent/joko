@@ -194,7 +194,8 @@ async function main() {
     result = { passed: true, sourceCommit: await command("git", ["rev-parse", "HEAD"]), bundleId, simulatorUdid: udid,
       observations: [first, reopened], firstProcessTerminated: true,
       scope: "Actual unsigned iOS Simulator Debug process launch, visible Joko connection page, terminate and reopen with same-checkout Metro.",
-      limits: ["Screenshots and local OCR observe startup; no taps, typing, paired node, task execution, physical device, signed IPA or APNs were tested."] };
+      limits: ["Screenshots and local OCR observe startup; no taps, typing, paired node, task execution, physical device, signed IPA or APNs were tested.",
+        "Simulator does not exercise the physical device's first local network privacy permission."] };
   } catch (error) {
     if (evidence) {
       if (udid) await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", join(evidence, "failure.png")], { cleanup: true }).catch(() => undefined);
