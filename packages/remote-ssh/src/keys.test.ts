@@ -468,7 +468,9 @@ describe("node SSH keys", () => {
         expect((await stat(`${path}.retained`)).size).toBeGreaterThan(0);
       }
     } finally { interception.mockRestore(); }
-  });
+    // Windows runs two permission probes and an exclusive-create helper before
+    // reaching this mutation; each native helper retains its own 10s deadline.
+  }, process.platform === "win32" ? 30_000 : 5_000);
 
   it("distinguishes an empty agent from unavailable and rejected observations", async () => {
     for (const [code, stdout, state] of [[1, "The agent has no identities.\n", "ready"], [2, "", "unavailable"], [1, "untrusted process text", "failed"], [0, "malformed public key", "failed"]] as const) {
