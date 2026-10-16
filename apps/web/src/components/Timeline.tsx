@@ -1115,6 +1115,9 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
         }}
         onKeyDown={(event) => {
           if (event.defaultPrevented || !TIMELINE_HISTORY_NAVIGATION_KEYS.has(event.key) || isEditableTimelineKeyboardTarget(event.target)) return;
+          cancelTimelineNavigation();
+          setFocusedItemId(undefined);
+          restoreAnchorRef.current = undefined;
           stopFollowingForUpIntent(event.currentTarget);
           if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
         }}

@@ -352,9 +352,15 @@ async function assertWorkHistory(page: Page): Promise<void> {
     ["activity-long", "activity-short", "activity-next", "activity-thinking:thinking:0", "activity-after-thinking"],
     ["activity-gap", "activity-no-delta:thinking:0"]
   ]);
-  for (const button of await page.locator(".work-group__header").all()) {
-    if (await button.getAttribute("aria-expanded") !== "true") await button.click();
+  for (const firstChildId of ["activity-long", "activity-gap"]) {
+    const group = page.locator(`[data-timeline-item-ids~="${firstChildId}"] .work-group`);
+    const more = group.locator(".work-group__hidden");
+    const header = group.locator(".work-group__header");
+    if (await more.isVisible()) await more.click();
+    else if (await header.getAttribute("aria-expanded") !== "true") await header.click();
   }
+  const thinking = page.locator('[data-work-child-id="activity-thinking:thinking:0"] details.thinking-block');
+  if (await thinking.getAttribute("open") === null) await thinking.locator("summary").click();
   await page.getByText("Observed thinking activity.", { exact: true }).waitFor({ state: "visible" });
   const finalThinking = page.locator('[data-work-child-id="activity-no-delta:thinking:0"]');
   expect(await finalThinking.locator("summary time").count()).toBe(1);

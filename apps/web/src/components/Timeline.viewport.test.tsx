@@ -116,6 +116,22 @@ afterEach(async () => {
 });
 
 describe("Timeline viewport journeys", () => {
+  it("lets Home retire a programmatic scroll before requesting the earlier page", async () => {
+    const loadEarlier = vi.fn(async () => undefined);
+    await render({ hasEarlier: true, messageNavRailEnabled: false, onLoadEarlier: loadEarlier });
+    const viewport = timeline();
+    expect(viewport.scrollTop).toBeGreaterThan(0);
+    await act(async () => {
+      viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
+      // JSDOM has no native keyboard scroll; deliver its resulting scroll event.
+      viewport.scrollTop = 0;
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(loadEarlier).toHaveBeenCalledTimes(1);
+    await flushFrames();
+    expect(viewport.scrollTop).toBe(0);
+  });
+
   it("shows whole-Run accounting only on its current completion while keeping segment usage private to running status", async () => {
     const segmentUsage = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0,
       totalTokens: 15, cost: 0.004, currency: "USD", generationDurationMs: 1_000, generationReliable: true };
