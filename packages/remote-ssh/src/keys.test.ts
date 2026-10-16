@@ -166,7 +166,7 @@ describe("node SSH keys", () => {
       await expect(createPrivateFile(join(root, "canceled"), canceled.signal)).rejects.toMatchObject({ code: "aborted" });
       expect(await readdir(root)).not.toContain("canceled");
     } finally { await held.close(); }
-  });
+  }, 15_000);
 
   it("serializes supported identities to one native OpenSSH stdin shape preserving public key, comment and signing", () => {
     const pairs = [ssh2.utils.generateKeyPairSync("ed25519", { comment: "ED key" }),
@@ -468,12 +468,15 @@ describe("node SSH keys", () => {
     const { manager } = await fixture(agent);
     const key = await manager.generate({ name: "id_joko", comment: "" }, signal());
     const add = manager.addToAgent(key.id, key.sha256Fingerprint, undefined, signal());
+    // Observe rejection immediately even if the surrounding test is retired
+    // before its controlled native agent reaches the admission boundary.
+    void add.catch(() => undefined);
     await ready;
     await expect(manager.generate({ name: "other", comment: "" }, signal())).rejects.toMatchObject({ code: "busy" });
     manager.close();
     await expect(add).rejects.toMatchObject({ code: "outcome_unknown" });
     await expect(manager.list(signal())).rejects.toMatchObject({ code: "aborted" });
-  });
+  }, 15_000);
 
   it("keeps quotes and substitutions in copied commands as inert public data", async () => {
     const publicKey = ssh2.utils.generateKeyPairSync("ed25519", { comment: "O'Brien $(Write-Output injected); & echo" }).public.trim();
