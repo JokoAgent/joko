@@ -416,6 +416,13 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
       JSON.stringify(event.payload).includes("Claude still isolated"))).toBe(false);
 
     const reviewSourceId = sessions.get("claude-paired")!;
+    // Run completion precedes the asynchronous workspace change-set capture.
+    // Review must start from that settled evidence, not race its publication.
+    await waitFor(() => paired.clients.workspace.listWorkspaceChangeSets({
+      workspaceId: "workspace-main", sessionId: reviewSourceId
+    }), (response) => response.changeSets.some((changeSet) =>
+      changeSet.runId === claudeSecondRunId && changeSet.completeBaseline),
+    "settled Claude review source change-set");
     const review = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
       payload: { case: "startReview", value: create(StartReviewMutationSchema, {
         sourceSessionId: reviewSourceId,
@@ -424,7 +431,9 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
       }) }
     }));
     if (review.state !== OperationState.SUCCEEDED) {
-      throw new Error(`Paired Review failed: ${review.error?.code ?? "unknown"}: ${review.error?.message ?? "no detail"}`);
+      const failures = fixture.application.store.listReviewRunsBySource(reviewSourceId)
+        .map((run) => ({ state: run.state, failureCode: run.failureCode }));
+      throw new Error(`Paired Review failed: ${review.error?.code ?? "unknown"}: ${review.error?.message ?? "no detail"}; ${JSON.stringify(failures)}`);
     }
     if (review.result?.payload.case !== "reviewRun") throw new Error("Paired Review did not return a ReviewRun.");
     const reviewRunId = review.result.payload.value.reviewRunId;

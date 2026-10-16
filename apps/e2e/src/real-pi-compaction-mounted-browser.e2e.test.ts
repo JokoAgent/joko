@@ -1,4 +1,6 @@
 import { create } from "@bufbuild/protobuf";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
 import {
   CompactionState,
   RunState,
@@ -19,8 +21,30 @@ describe("mounted Pi compaction product chain", () => {
   let fixture: RealPiSystemFixture | undefined;
   let browser: Browser | undefined;
   let releasePendingProvider: (() => void) | undefined;
+  let failureState: (() => Promise<unknown>) | undefined;
 
-  afterEach(async () => {
+  afterEach(async ({ task }) => {
+    if (task.result?.state === "fail" && browser !== undefined) {
+      try {
+        const page = browser.contexts()[0]?.pages()[0];
+        console.error("Mounted compaction failure state", JSON.stringify({
+          server: await failureState?.(),
+          page: (await page?.locator("body").innerText())?.slice(0, 6_000),
+          rings: await page?.locator(".context-capacity-ring").evaluateAll((elements) =>
+            elements.map((element) => element.outerHTML.slice(0, 2_000)))
+        }));
+        if (page !== undefined && process.env.RUNNER_TEMP !== undefined) {
+          const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "compaction");
+          await mkdir(directory, { recursive: true });
+          await page.screenshot({ path: join(directory, task.name.includes("overflow")
+            ? "overflow-failed.png" : task.name.includes("threshold") ? "threshold-failed.png" : "manual-failed.png"),
+          fullPage: true, timeout: 5_000 });
+        }
+      } catch {
+        console.error("Mounted compaction failure evidence was unavailable.");
+      }
+    }
+    failureState = undefined;
     releasePendingProvider?.();
     releasePendingProvider = undefined;
     await browser?.close();
@@ -67,6 +91,14 @@ describe("mounted Pi compaction product chain", () => {
       })
     ));
     const compactSessionId = await createSession("Mounted compact outcomes");
+    failureState = async () => {
+      const { session } = await manager.clients.session.getSession({ sessionId: compactSessionId });
+      return { state: session?.state, compacting: session?.contextState?.compacting,
+        usedTokens: session?.context?.usedTokens.toString(),
+        compactions: fixture!.application.store.listEvents({ sessionId: compactSessionId })
+          .flatMap((event) => event.payload.type === "compaction"
+            ? [{ state: event.payload.state, reason: event.payload.reason }] : []).slice(-8) };
+    };
     const otherSessionId = await createSession("Mounted route owner");
     const failingSessionId = await createSession("Mounted compact failure");
     const send = async (sessionId: string, text: string) => {
@@ -243,6 +275,14 @@ describe("mounted Pi compaction product chain", () => {
         backendId: "pi", targetId: "workspace-real-pi", displayName: `Mounted Pi ${reason}`,
         providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, effortId: "off"
       })));
+    failureState = async () => {
+      const { session } = await manager.clients.session.getSession({ sessionId });
+      return { state: session?.state, compacting: session?.contextState?.compacting,
+        usedTokens: session?.context?.usedTokens.toString(),
+        compactions: fixture!.application.store.listEvents({ sessionId })
+          .flatMap((event) => event.payload.type === "compaction"
+            ? [{ state: event.payload.state, reason: event.payload.reason }] : []).slice(-8) };
+    };
     const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted Pi automatic Web" });
     if (challenge.challenge === undefined) throw new Error("Mounted Web pairing returned no challenge.");
     const pairingCode = fixture.pairingCode(challenge.challenge.challengeId);
