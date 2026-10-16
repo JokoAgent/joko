@@ -1,5 +1,7 @@
 import { createPrivateKey, createPublicKey, diffieHellman, hkdfSync, createDecipheriv, createHmac, randomInt } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import net from "node:net";
+import { networkInterfaces, release } from "node:os";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -12,7 +14,13 @@ import { NodeSyncLanTransport, type NodeSyncDeliveryContext, type NodeSyncLanIde
 import { NodeSyncTcpTransport, validNodeSyncEndpoint } from "./tcp.js";
 
 const cleanups: Array<() => void> = [];
-afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
+const lanTrace: Array<Readonly<Record<string, unknown>>> = [];
+const lanInstances: Array<{ readonly nodeId: string; readonly purpose: NodeSyncPurpose; readonly discoveryPort: number; readonly instance: NodeSyncLanTransport }> = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+  lanTrace.length = 0;
+  lanInstances.length = 0;
+});
 
 describe("purpose-isolated node encryption", () => {
   it.each(["contacts", "voice-dictionary"] as const)("binds %s ciphertext and proofs to purpose, nodes and all frame fields", (purpose) => {
@@ -251,10 +259,19 @@ function encryptedFrame(first: { publicKey: string; privateKey: string }, second
 }
 function transport(port: number, purpose: NodeSyncPurpose, self: NodeSyncLanIdentity, peer: NodeSyncLanIdentity,
   onFrame: NodeSyncLanTransportOptions["onFrame"], overrides: Partial<NodeSyncLanTransportOptions> = {}): NodeSyncLanTransport {
+  const trace = (event: string, details: Readonly<Record<string, unknown>> = {}): void => {
+    lanTrace.push({ at: Date.now(), nodeId: self.nodeId, purpose, event, ...details });
+    if (lanTrace.length > 48) lanTrace.shift();
+  };
   const instance = new NodeSyncLanTransport({ purpose, getSelf: () => self,
     isPeerAllowed: (nodeId, key) => nodeId === peer.nodeId && key === peer.publicKey,
-    onCandidate: () => undefined, onFrame, logger: { debug: () => undefined, warn: () => undefined },
+    onCandidate: (candidate) => trace("candidate", { peerNodeId: candidate.nodeId, address: candidate.address, port: candidate.port }),
+    onFrame, logger: {
+      debug: (message, metadata) => trace("debug", { message, code: metadata?.code }),
+      warn: (message, metadata) => trace("warn", { message, code: metadata?.code })
+    },
     multicastPort: port, beaconIntervalMilliseconds: 150, endpointTtlMilliseconds: 2_000, connectTimeoutMilliseconds: 800, ...overrides });
+  lanInstances.push({ nodeId: self.nodeId, purpose, discoveryPort: port, instance });
   cleanups.push(() => instance.stop());
   return instance;
 }
@@ -265,8 +282,34 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 async function waitUntil(predicate: () => boolean): Promise<void> {
   const deadline = Date.now() + 5_000;
   while (!predicate()) {
-    if (Date.now() > deadline) throw new Error("Timed out waiting for node sync state.");
+    if (Date.now() > deadline) throw new Error(`Timed out waiting for node sync state.\n${JSON.stringify({
+      platform: process.platform,
+      release: release(),
+      interfaces: Object.entries(networkInterfaces()).map(([name, addresses]) => ({
+        name,
+        addresses: addresses?.map(({ address, family, internal, scopeid }) => ({ address, family, internal, scopeid }))
+      })),
+      multicastRoute: multicastRouteSnapshot(),
+      transports: lanInstances.map(({ nodeId, purpose, discoveryPort, instance }) => ({
+        nodeId, purpose, discoveryPort, listenerPort: instance.listenerPort(), onlinePeerIds: instance.onlinePeerIds(),
+        candidates: instance.candidates().map(({ nodeId: peerNodeId, address, port, seenAt }) => ({ peerNodeId, address, port, seenAt }))
+      })),
+      trace: lanTrace
+    }, null, 2)}`);
     await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+function multicastRouteSnapshot(): Readonly<Record<string, unknown>> {
+  const group = "239.255.74.75";
+  const command = process.platform === "darwin" ? "/sbin/route" : process.platform === "win32" ? "route.exe" : "ip";
+  const args = process.platform === "darwin" ? ["-n", "get", group] : process.platform === "win32" ? ["print", group] : ["-4", "route", "get", group];
+  try {
+    return { command: [command, ...args], output: execFileSync(command, args, {
+      encoding: "utf8", timeout: 1_000, maxBuffer: 4_096, windowsHide: true, stdio: ["ignore", "pipe", "pipe"]
+    }).trim() };
+  } catch (error) {
+    const failure = error as { readonly code?: unknown; readonly status?: unknown };
+    return { command: [command, ...args], code: failure.code, status: failure.status };
   }
 }
 async function packetGetsAck(endpoint: { address: string; port: number }, body: Buffer): Promise<boolean> {
