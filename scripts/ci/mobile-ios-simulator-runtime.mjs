@@ -22,7 +22,7 @@ const startupCommandReceipts = [];
 const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", "list-available-devices",
   "create-owned-simulator", "boot-owned-simulator", "wait-owned-boot", "set-light-appearance",
   "install-owned-application", "locate-installed-application", "capture-simulator-springboard",
-  "capture-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance"]);
+  "capture-pre-appearance-framebuffer", "retry-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance"]);
 
 function save(name, value) { writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + "\n"); }
 async function command(binary, args, { timeout = 30_000, cleanup = false, startupLabel } = {}) {
@@ -342,7 +342,21 @@ async function startOwnedSimulator(applicationIdentity) {
   stage = "owned Simulator appearance confirmation";
   const startupState = { scope: "simulator-startup-command-probe", simulatorUdid: udid,
     noApplicationInstalled: true, noAppGuiSuccessClaimed: true,
-    framebuffer: await captureStartupFramebuffer("pre-appearance.png", "capture-pre-appearance-framebuffer") };
+    framebufferReadiness: { attempts: 1, passed: false } };
+  save("startup-state.json", startupState);
+  try {
+    startupState.framebuffer = await captureStartupFramebuffer("pre-appearance.png", "capture-pre-appearance-framebuffer");
+  } catch (error) {
+    const receipt = startupCommandReceipts.at(-1);
+    if (abort.signal.aborted || receipt?.step !== "capture-pre-appearance-framebuffer" || receipt.result !== "failed"
+      || receipt.killed !== true || receipt.signal !== "SIGTERM" || receipt.cancelled !== false) throw error;
+    // The owned framebuffer can become usable after bootstatus has exited. Keep
+    // the first deadline receipt and allow only one fresh, equally bounded probe.
+    startupState.framebufferReadiness.attempts = 2;
+    save("startup-state.json", startupState);
+    startupState.framebuffer = await captureStartupFramebuffer("pre-appearance.png", "retry-pre-appearance-framebuffer");
+  }
+  startupState.framebufferReadiness.passed = true;
   save("startup-state.json", startupState);
   const initialAppearance = await readAppearance("read-initial-appearance");
   Object.assign(startupState, { initialAppearance, appearanceWriteRequired: initialAppearance !== "light" });
@@ -358,6 +372,7 @@ async function startOwnedSimulator(applicationIdentity) {
 
 async function captureStartupFramebuffer(file, startupLabel) {
   const image = join(evidence, file);
+  if (existsSync(image)) unlinkSync(image);
   await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", image], { startupLabel });
   if (!readFileSync(image).subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
     throw new Error("The owned Simulator did not produce a PNG framebuffer capture.");
