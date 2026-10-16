@@ -12,16 +12,18 @@ on:
         options:
           - full
           - windows-native
+          - windows-runtime-diagnostics
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || '' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || '' }}
   cancel-in-progress: false
 
 jobs:
   verify:
+    if: ${{ inputs.scope != 'windows-runtime-diagnostics' }}
     name: ${{ matrix.os }} / Node 24.16${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
@@ -306,5 +308,47 @@ jobs:
             ${{ runner.temp }}/joko-viewer-evidence/lifecycle/identity.json
             ${{ runner.temp }}/joko-viewer-evidence/lifecycle/result.json
             ${{ runner.temp }}/joko-viewer-evidence/lifecycle/failure.json
+          if-no-files-found: warn
+          retention-days: 3
+
+  windows_runtime_diagnostics:
+    name: Windows compiler and PDF startup observations
+    if: ${{ inputs.scope == 'windows-runtime-diagnostics' }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+      - name: Install dependencies from lockfile
+        shell: bash
+        run: pnpm install --frozen-lockfile
+      - name: Observe the owned permission compiler with controlled startup environments
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/joko-runtime-diagnostics"
+          node scripts/ci/diagnose-windows-compiler.mjs 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/compiler.log"
+      - name: Build the document worker for source and compiled startup observations
+        run: pnpm --filter @joko/tool-document build
+      - name: Observe PDF imports and parsing within the original Worker limits
+        timeout-minutes: 2
+        shell: bash
+        run: node scripts/ci/diagnose-pdf-worker.mjs 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/pdf-worker.log"
+      - name: Upload the bounded runtime observations
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtime-diagnostics-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-runtime-diagnostics/
           if-no-files-found: warn
           retention-days: 3

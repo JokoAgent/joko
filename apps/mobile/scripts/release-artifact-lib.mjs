@@ -1,6 +1,6 @@
 import { createHash, X509Certificate } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 export const ANDROID_ARTIFACT_KINDS = Object.freeze(["apk", "aab"]);
@@ -13,6 +13,42 @@ export function platformCommand(command, args, platform = process.platform) {
   return platform === "win32" && command.toLowerCase().endsWith(".bat")
     ? { command: "cmd.exe", args: ["/d", "/s", "/c", command, ...args] }
     : { command, args };
+}
+
+export function locateAndroidTool(name) {
+  const executables = androidToolExecutableNames(name);
+  const sdk = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT;
+  if (sdk) {
+    const root = join(sdk, "build-tools");
+    if (existsSync(root)) {
+      for (const version of readdirSync(root).sort((left, right) => right.localeCompare(left, undefined, { numeric: true }))) {
+        for (const executable of executables) {
+          const candidate = join(root, version, executable);
+          if (existsSync(candidate)) return candidate;
+        }
+      }
+    }
+  }
+  for (const executable of executables) {
+    const invocation = platformCommand(executable, ["version"]);
+    const probe = spawnSync(invocation.command, invocation.args, { encoding: "utf8" });
+    if (probe.status === 0) return executable;
+  }
+  throw new Error(`${name} was not found in the Android SDK build-tools directory.`);
+}
+
+export function captureAndroidArtifactCommand(command, args, options = {}) {
+  const invocation = platformCommand(command, args);
+  const result = spawnSync(invocation.command, invocation.args, { maxBuffer: 32 * 1024 * 1024, ...options, encoding: "buffer" });
+  if (result.error?.code === "ENOENT") throw new Error(`${invocation.command} is not installed or not on PATH.`);
+  if (result.error) throw new Error(`${invocation.command} could not start (${result.error.code ?? "unknown error"}).`);
+  if (result.status !== 0) throw new Error(`${command} failed while validating the Android artifact.`);
+  return {
+    stdout: result.stdout?.toString("utf8") ?? "",
+    stderr: result.stderr?.toString("utf8") ?? "",
+    stdoutBytes: result.stdout?.length ?? 0,
+    stderrBytes: result.stderr?.length ?? 0
+  };
 }
 
 export function buildJarsignerVerificationArgs(artifactPath, keystorePath) {
@@ -169,7 +205,30 @@ export function apkSignerCertificateSha256(output, expectedCertificateSha256) {
   return certificate;
 }
 
-export function apkSignerCertificateDiagnostics(output, toolVersion) {
+function apkSignerStreamMetadata(output, byteLength) {
+  const lines = output.split(/\r\n|\n|\r/u);
+  return {
+    bytes: byteLength,
+    characters: output.length,
+    newlines: (output.match(/\n/gu) ?? []).length,
+    carriageReturns: (output.match(/\r/gu) ?? []).length,
+    nuls: (output.match(/\0/gu) ?? []).length,
+    hasLiteralNewlineEscapes: output.includes("\\n"),
+    hasVerifies: lines.includes("Verifies"),
+    hasDoesNotVerify: lines.includes("DOES NOT VERIFY"),
+    hasSignerWord: /\bSigner\b/iu.test(output),
+    hasCertificateWord: /\bcertificate\b/iu.test(output),
+    hasSha256Word: /\bSHA-?256\b/iu.test(output),
+    hasPemBoundary: lines.includes("-----BEGIN CERTIFICATE-----"),
+    hasUsage: lines.some(line => /^(?:USAGE|Usage):/u.test(line)),
+    hasJavaOptionNotice: lines.some(line => /^Picked up (?:JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS):/u.test(line)),
+    signerCounts: lines.map(line => /^Number of signers: ([0-9]{1,10})$/u.exec(line)?.[1])
+      .filter(value => value !== undefined).slice(0, 16).map(Number)
+  };
+}
+
+export function apkSignerCertificateDiagnostics(capture, toolVersion) {
+  const output = `${capture.stdout}\n${capture.stderr}`;
   const records = apkSignerDigestRecords(output);
   return {
     phase: "apk-signer-certificate-read",
@@ -177,6 +236,10 @@ export function apkSignerCertificateDiagnostics(output, toolVersion) {
     toolVersion: /^[0-9]+(?:\.[0-9]+){0,5}$/u.test(String(toolVersion).trim()) ? String(toolVersion).trim() : "unavailable",
     exitCode: 0,
     hasOutput: String(output ?? "").trim().length > 0,
+    streams: {
+      stdout: apkSignerStreamMetadata(capture.stdout, capture.stdoutBytes),
+      stderr: apkSignerStreamMetadata(capture.stderr, capture.stderrBytes)
+    },
     signerDigestLineCount: records.length,
     signerDigests: records.slice(0, 16).map((record) => {
       let sha256;

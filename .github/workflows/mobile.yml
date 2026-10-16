@@ -12,17 +12,26 @@ on:
       - 'scripts/**'
   pull_request:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation scope
+        type: choice
+        default: full
+        options:
+          - full
+          - android-signer-diagnostics
 
 permissions:
   contents: read
 
 concurrency:
-  group: mobile-${{ github.workflow }}-${{ github.ref }}
+  group: mobile-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'android-signer-diagnostics' && '-android-signer-diagnostics' || '' }}
   # Native builds finish while subsequent pushes replace only the pending run.
   cancel-in-progress: false
 
 jobs:
   hermes:
+    if: ${{ inputs.scope != 'android-signer-diagnostics' }}
     name: Android and iOS JS/Hermes exports
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -72,6 +81,7 @@ jobs:
           retention-days: 3
 
   android-native:
+    if: ${{ inputs.scope != 'android-signer-diagnostics' }}
     name: Android x86_64 test-signed APK and native GUI
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -159,7 +169,43 @@ jobs:
           compression-level: 0
           retention-days: 3
 
+  android_signer_diagnostics:
+    name: Android SDK signing and certificate-output observations
+    if: ${{ inputs.scope == 'android-signer-diagnostics' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+      - name: Set up the matched JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare the matched Android platform and build tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platforms;android-36 build-tools;36.0.0
+      - name: Observe actual SDK signing with a temporary no-code APK
+        timeout-minutes: 2
+        run: node scripts/ci/diagnose-android-signer.mjs
+      - name: Upload only the bounded public signer observations
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-signer-diagnostics-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-android-signer-diagnostic.json
+          if-no-files-found: warn
+          retention-days: 3
+
   ios-simulator:
+    if: ${{ inputs.scope != 'android-signer-diagnostics' }}
     name: iOS Simulator Debug build, Swift and startup observations
     runs-on: macos-latest
     timeout-minutes: 75
@@ -244,6 +290,7 @@ jobs:
             ${{ runner.temp }}/joko-ios-runtime-evidence/failure.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/cleanup.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/*-screen.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/*-capture.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/metro.log
             ${{ runner.temp }}/joko-ios-runtime-evidence/metro-status.json
           if-no-files-found: warn

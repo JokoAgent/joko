@@ -5,18 +5,18 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import {
-  androidToolExecutableNames,
   apkSignerCertificateDiagnostics,
   apkSignerCertificateSha256,
   assertAllowedArgs,
   assertProductionGitGate,
   buildJarsignerVerificationArgs,
+  captureAndroidArtifactCommand,
   certificateSha256FromPem,
   createArtifactManifest,
   loadMobileReleaseIdentity,
+  locateAndroidTool,
   parseArgs,
   patchAndroidReleaseSigning,
-  platformCommand,
   readAndroidRuntimeVersion,
   readGitSource,
   resolveAndroidArtifactKinds,
@@ -37,14 +37,8 @@ function run(command, args, options = {}) {
 }
 
 function capture(command, args, options = {}) {
-  const invocation = platformCommand(command, args);
-  const result = spawnSync(invocation.command, invocation.args, {
-    cwd: MOBILE_DIRECTORY, encoding: "utf8", maxBuffer: 32 * 1024 * 1024, ...options
-  });
-  if (result.error?.code === "ENOENT") throw new Error(`${invocation.command} is not installed or not on PATH.`);
-  if (result.error) throw new Error(`${invocation.command} could not start (${result.error.code ?? "unknown error"}).`);
-  if (result.status !== 0) throw new Error(`${command} failed while validating the Android artifact.`);
-  return `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  const result = captureAndroidArtifactCommand(command, args, { cwd: MOBILE_DIRECTORY, ...options });
+  return `${result.stdout}\n${result.stderr}`;
 }
 
 function uniqueArtifact(directory, extension, label) {
@@ -53,28 +47,6 @@ function uniqueArtifact(directory, extension, label) {
     : [];
   if (matches.length !== 1) throw new Error(`${label} produced ${matches.length} ${extension} files; expected exactly one.`);
   return join(directory, matches[0]);
-}
-
-function locateAndroidTool(name) {
-  const executables = androidToolExecutableNames(name);
-  const sdk = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT;
-  if (sdk) {
-    const root = join(sdk, "build-tools");
-    if (existsSync(root)) {
-      for (const version of readdirSync(root).sort((left, right) => right.localeCompare(left, undefined, { numeric: true }))) {
-        for (const executable of executables) {
-          const candidate = join(root, version, executable);
-          if (existsSync(candidate)) return candidate;
-        }
-      }
-    }
-  }
-  for (const executable of executables) {
-    const invocation = platformCommand(executable, ["version"]);
-    const probe = spawnSync(invocation.command, invocation.args, { encoding: "utf8" });
-    if (probe.status === 0) return executable;
-  }
-  throw new Error(`${name} was not found in the Android SDK build-tools directory.`);
 }
 
 function locateJavaTool(name) {
@@ -96,8 +68,8 @@ function validateApk(path, identity, expectedCertificateSha256) {
     throw new Error("APK package, versionCode, or versionName does not match app.json.");
   }
   const apksigner = locateAndroidTool("apksigner");
-  const signature = capture(apksigner, ["verify", "--verbose", "--print-certs", path]);
-  try { return apkSignerCertificateSha256(signature, expectedCertificateSha256); }
+  const signature = captureAndroidArtifactCommand(apksigner, ["verify", "--verbose", "--print-certs", path], { cwd: MOBILE_DIRECTORY });
+  try { return apkSignerCertificateSha256(`${signature.stdout}\n${signature.stderr}`, expectedCertificateSha256); }
   catch (error) {
     let version;
     try { version = capture(apksigner, ["version"]).trim(); }

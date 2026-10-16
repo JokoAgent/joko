@@ -1,6 +1,6 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { createReadStream, appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -88,17 +88,38 @@ async function waitForMetro(origin) {
 async function observe(phase, pid, ocr) {
   const until = Date.now() + 90_000;
   let productSeenAt;
+  let retriedCapture = false;
+  const captures = [];
   while (Date.now() < until) {
     abort.signal.throwIfAborted();
     if (metroClosed || !await alive(pid)) throw new Error(`${phase}: the actual app or its Metro server exited.`);
     const image = join(evidence, `${phase}.png`);
-    await sim("io", udid, "screenshot", "--type=png", image);
+    // Every accepted observation must come from a fresh successful capture.
+    try { unlinkSync(image); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    const started = Date.now();
+    try {
+      await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", image],
+        { timeout: Math.min(30_000, Math.max(1, until - Date.now())) });
+      captures.push({ succeeded: true, elapsedMs: Date.now() - started });
+      save(`${phase}-capture.json`, { captures });
+    } catch (error) {
+      const timedOut = error.killed === true && error.signal === "SIGTERM" && !abort.signal.aborted;
+      captures.push({ succeeded: false, timedOut, killed: error.killed === true,
+        exitCode: Number.isInteger(error.code) ? error.code : null,
+        signal: error.signal === "SIGTERM" || error.signal === "SIGKILL" ? error.signal : null,
+        elapsedMs: Date.now() - started });
+      save(`${phase}-capture.json`, { captures });
+      productSeenAt = undefined;
+      if (!timedOut || retriedCapture || Date.now() >= until || metroClosed || !await alive(pid)) throw error;
+      retriedCapture = true;
+      continue;
+    }
     const screen = JSON.parse(await command(ocr, [image]));
     save(`${phase}-screen.json`, screen);
     const text = screen.lines.map(line => line.text).join("\n");
     const blocked = /uncaught|unhandled js|no bundle url|could not connect|unable to resolve module|failed to load bundle|development server|connect to metro|runtime not ready|invariant violation|expo go|development build|would like to|don['’]t allow|find and connect to devices|while using the app/iu.test(text);
     const appVisible = /\bjoko\b/iu.test(text) && /\bnearby\b|saved nodes|add joko node/iu.test(text);
-    if (appVisible && !blocked) {
+    if (appVisible && !blocked && Date.now() < until) {
       productSeenAt ??= Date.now();
       if (Date.now() - productSeenAt >= 3000) {
         if (metroClosed || !await alive(pid)) throw new Error(`${phase}: the observed app process or its Metro server did not remain alive.`);

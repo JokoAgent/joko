@@ -124,19 +124,44 @@ describe("mobile release artifact configuration", () => {
 
   it("limits failed APK signer diagnostics to public digests and fixed metadata", () => {
     const certificate = "ab".repeat(32);
-    expect(apkSignerCertificateDiagnostics([
-      "Signer #1 certificate DN: CN=Uncontrolled public subject",
-      "WARNING: /private/build/path and untrusted diagnostic text",
+    const subject = "CN=Uncontrolled public subject";
+    const diagnosticPath = "/private/build/path";
+    const stdout = [
+      "Verifies",
+      "Number of signers: 1",
+      `Signer #1 certificate DN: ${subject}`,
       `Signer #1 certificate SHA-256 digest: ${certificate}`,
       "Signer #2 certificate SHA-256 digest: malformed"
-    ].join("\n"), "0.9\n")).toEqual({
+    ].join("\r\n");
+    const stderr = `Picked up JAVA_TOOL_OPTIONS: /uncontrolled/runtime/option\nWARNING: ${diagnosticPath}`;
+    const diagnostic = apkSignerCertificateDiagnostics({ stdout, stderr,
+      stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr) }, "0.9\n");
+    expect(diagnostic).toMatchObject({
       phase: "apk-signer-certificate-read", tool: "apksigner", toolVersion: "0.9", exitCode: 0,
       hasOutput: true, signerDigestLineCount: 2,
+      streams: {
+        stdout: { bytes: Buffer.byteLength(stdout), characters: stdout.length, newlines: 4, carriageReturns: 4,
+          nuls: 0, hasVerifies: true, hasSignerWord: true, hasCertificateWord: true, hasSha256Word: true,
+          hasUsage: false, hasJavaOptionNotice: false, signerCounts: [1] },
+        stderr: { bytes: Buffer.byteLength(stderr), characters: stderr.length, newlines: 1, carriageReturns: 0,
+          nuls: 0, hasVerifies: false, hasSignerWord: false, hasCertificateWord: false,
+          hasSha256Word: false, hasUsage: false, hasJavaOptionNotice: true, signerCounts: [] }
+      },
       signerDigests: [{ signer: "#1", sha256: certificate }, { signer: "#2", validDigest: false }]
     });
-    expect(apkSignerCertificateDiagnostics("", "uncontrolled version output")).toEqual({
+    const serialized = JSON.stringify(diagnostic);
+    expect(serialized).not.toContain(subject);
+    expect(serialized).not.toContain(diagnosticPath);
+    expect(serialized).not.toContain("/uncontrolled/runtime/option");
+    expect(apkSignerCertificateDiagnostics({ stdout: "", stderr: "", stdoutBytes: 0, stderrBytes: 0 }, "uncontrolled version output")).toMatchObject({
       phase: "apk-signer-certificate-read", tool: "apksigner", toolVersion: "unavailable", exitCode: 0,
-      hasOutput: false, signerDigestLineCount: 0, signerDigests: []
+      hasOutput: false, signerDigestLineCount: 0, signerDigests: [],
+      streams: { stdout: { bytes: 0, characters: 0 }, stderr: { bytes: 0, characters: 0 } }
+    });
+    expect(apkSignerCertificateDiagnostics({ stdout: "", stderr: "Usage: apksigner verify\n\0",
+      stdoutBytes: 0, stderrBytes: 25 }, "0.9")).toMatchObject({
+      hasOutput: true, signerDigestLineCount: 0,
+      streams: { stdout: { bytes: 0, hasUsage: false }, stderr: { bytes: 25, hasUsage: true, nuls: 1 } }
     });
   });
 
