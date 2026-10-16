@@ -1757,9 +1757,25 @@ async function verifyPackagedSmokeNativeTaskStatus(owner: BrowserWindow): Promis
   while (Date.now() < expansionDeadline && !ambient.isDestroyed() && ambient.getBounds().height <= compactHeight) {
     await waitForPackagedSmokePoll();
   }
-  if (ambient.isDestroyed() || ambient.getBounds().height <= compactHeight ||
-    BrowserWindow.getFocusedWindow() !== focusedBefore) {
-    throw new Error("Native Task Status did not expand without changing application focus.");
+  const destroyed = ambient.isDestroyed();
+  const expandedHeight = destroyed ? null : ambient.getBounds().height;
+  const focusedAfter = BrowserWindow.getFocusedWindow();
+  if (expandedHeight === null || expandedHeight <= compactHeight || focusedAfter !== focusedBefore) {
+    const observation = {
+      destroyed, compactHeight, expandedHeight, focusChanged: focusedAfter !== focusedBefore,
+      before: focusedBefore === null ? "none" : focusedBefore === owner ? "owner" : focusedBefore === ambient ? "ambient" : "other",
+      after: focusedAfter === null ? "none" : focusedAfter === owner ? "owner" : focusedAfter === ambient ? "ambient" : "other",
+      pointerInside: !destroyed && pointIsInsideRectangle(screen.getCursorScreenPoint(), ambient.getBounds()),
+      surfaceMode: macNativeTaskStatusHost?.surface()?.mode
+    };
+    process.stdout.write(`JOKO_DESKTOP_SMOKE_TASK_STATUS_EXPANSION ${JSON.stringify(observation)}\n`);
+    if (!destroyed && !ambient.webContents.isDestroyed() && packagedSmokeResultPath !== undefined) {
+      try {
+        const image = await waitForPackagedSmokeDeadline(ambient.webContents.capturePage(), 2_000, "Task Status failure capture");
+        if (!image.isEmpty()) writeFileSync(`${packagedSmokeResultPath}.native-task-status.png`, image.toPNG(), { flag: "wx", mode: 0o600 });
+      } catch { /* The original expansion/focus failure remains authoritative. */ }
+    }
+    throw new Error(`Native Task Status did not expand without changing application focus (${JSON.stringify(observation)}).`);
   }
   await owner.webContents.executeJavaScript(`(async () => {
     const bridge = window.jokoDesktop.nativeTaskStatus;
