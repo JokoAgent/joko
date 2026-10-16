@@ -1702,7 +1702,9 @@ class AgentOutput {
     }
     const result = create(DevicePeerAgentResultSchema, { phase, sequence: ++this.#sequence, payload });
     const pending = this.#pending.then(() => this.#emitResult(result));
-    this.#pending = pending.then(() => undefined);
+    // Keep the rejection for callers/drain, but observe it before asynchronous resource cleanup.
+    this.#pending = pending;
+    void pending.catch(() => undefined);
     return pending;
   }
 

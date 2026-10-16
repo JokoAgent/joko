@@ -306,36 +306,63 @@ it("runs a durable two-Device project through public Connect and the shared Node
       generation: terminal.generation,
       appearance
     }, { signal: watchAbort.signal })[Symbol.asyncIterator]();
-    const checkpoint = await watch.next();
-    expect(checkpoint.done).toBe(false);
-    const focused = await controller.clients.terminal.updateTerminalAppearance({
-      sessionId: piSessionId,
-      terminalId: terminal.id,
-      generation: terminal.generation,
-      appearance: { ...appearance, viewRevision: 2n },
-      claimFocus: true,
-      expectedAppearanceRevision: checkpoint.value!.appearanceRevision
-    });
-    expect(focused.accepted).toBe(true);
-    await controller.clients.terminal.writeTerminal({
-      sessionId: piSessionId,
-      terminalId: terminal.id,
-      generation: terminal.generation,
-      writerId: appearance.viewId,
-      inputSequence: 1n,
-      data: `echo PEER_TERMINAL${process.platform === "win32" ? "\r\n" : "\n"}`
-    });
-    await waitFor(
-      async () => (await controller.clients.terminal.getTerminal({
+    const shellName = terminal.shellId.split(/[\\/]/u).at(-1)?.toLowerCase() ?? "";
+    const terminalObservation = {
+      phase: "checkpoint", status: terminal.status,
+      shell: ["pwsh.exe", "powershell.exe", "cmd.exe", "bash", "zsh", "sh", "fish"].includes(shellName) ? shellName : "other",
+      serializedBytes: 0, focusModeOnly: false, inputAcknowledged: false, reads: 0
+    };
+    let terminalFailed = false;
+    try {
+      const checkpoint = await watch.next();
+      expect(checkpoint.done).toBe(false);
+      terminalObservation.phase = "focus";
+      const focused = await controller.clients.terminal.updateTerminalAppearance({
         sessionId: piSessionId,
         terminalId: terminal.id,
-        generation: terminal.generation
-      })).serialized,
-      screen => screen.includes("PEER_TERMINAL"),
-      "Device peer terminal output"
-    );
-    watchAbort.abort();
-    await watch.return?.();
+        generation: terminal.generation,
+        appearance: { ...appearance, viewRevision: 2n },
+        claimFocus: true,
+        expectedAppearanceRevision: checkpoint.value!.appearanceRevision
+      });
+      expect(focused.accepted).toBe(true);
+      terminalObservation.phase = "input";
+      const written = await controller.clients.terminal.writeTerminal({
+        sessionId: piSessionId,
+        terminalId: terminal.id,
+        generation: terminal.generation,
+        writerId: appearance.viewId,
+        inputSequence: 1n,
+        data: `echo PEER_TERMINAL${process.platform === "win32" ? "\r\n" : "\n"}`
+      });
+      terminalObservation.inputAcknowledged = written.nextInputSequence === 2n;
+      terminalObservation.phase = "output";
+      await waitFor(
+        async () => {
+          const current = await controller.clients.terminal.getTerminal({
+            sessionId: piSessionId, terminalId: terminal.id, generation: terminal.generation
+          });
+          terminalObservation.status = current.terminal?.status ?? TerminalStatus.UNSPECIFIED;
+          terminalObservation.serializedBytes = Buffer.byteLength(current.serialized);
+          terminalObservation.focusModeOnly = current.serialized === "\u001b[?1004h";
+          terminalObservation.reads += 1;
+          return current.serialized;
+        },
+        screen => screen.includes("PEER_TERMINAL"),
+        "Device peer terminal output"
+      );
+    } catch (error) {
+      terminalFailed = true;
+      const route = agent.observation();
+      throw new Error(`Device peer terminal phase failed: ${JSON.stringify({
+        ...terminalObservation, routeClosed: route.closed,
+        outboundMessages: route.outbound.length, inboundMessages: route.inbound.length
+      })}.`, { cause: error });
+    } finally {
+      watchAbort.abort();
+      try { await watch.return?.(); }
+      catch (error) { if (!terminalFailed) throw error; }
+    }
     await controller.clients.terminal.closeTerminal({
       sessionId: piSessionId,
       terminalId: terminal.id,
