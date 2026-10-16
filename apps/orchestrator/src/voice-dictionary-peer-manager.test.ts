@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CredentialVault } from "./credential-vault.js";
 import { VoiceDictionaryPeerManager } from "./voice-dictionary-peer-manager.js";
+import { createVoiceDictionaryPeerTransport } from "./voice-dictionary-peer-transport.js";
 import { VoiceDictionarySyncRepository } from "./voice-dictionary-sync-repository.js";
 import {
   decodeVoiceDictionaryPeerMessage,
@@ -144,8 +145,12 @@ describe("Voice dictionary peer authority and exchange", () => {
         return encodeVoiceDictionaryPeerMessage(options);
       } finally { count.active -= 1; }
     } };
-    const firstManager = new VoiceDictionaryPeerManager({ ...first.options, codec, enableLan: true, debounceMilliseconds: 30 });
-    const secondManager = new VoiceDictionaryPeerManager({ ...second.options, codec, enableLan: true, debounceMilliseconds: 30 });
+    const transportFactory = (peers: VoiceDictionaryPeerStore) => (options: NodeSyncLanTransportOptions) =>
+      createVoiceDictionaryPeerTransport({ ...options, multicastInterface: "127.0.0.1" }, peers, true);
+    const firstManager = new VoiceDictionaryPeerManager({ ...first.options, codec, enableLan: true, debounceMilliseconds: 30,
+      transportFactory: transportFactory(first.peers) });
+    const secondManager = new VoiceDictionaryPeerManager({ ...second.options, codec, enableLan: true, debounceMilliseconds: 30,
+      transportFactory: transportFactory(second.peers) });
     cleanups.push(() => firstManager.close(), () => secondManager.close(), () => release.resolve());
     await firstManager.initialize();
     await secondManager.initialize();
@@ -154,7 +159,7 @@ describe("Voice dictionary peer authority and exchange", () => {
     first.dictionary.addManualTerm(first.dictionary.snapshot().revision, "Initial shared state");
     await firstManager.setEnabled(first.dictionary.snapshot().revision, true);
     await secondManager.setEnabled(second.dictionary.snapshot().revision, true);
-    // Neither owner has an explicit peer route yet, so these candidates come from real default LAN discovery.
+    // Neither owner has an explicit peer route yet; real multicast discovery stays on this host's loopback interface.
     await waitUntil(() => firstManager.status().candidates.some((value) => value.nodeId === second.options.nodeId) &&
       secondManager.status().candidates.some((value) => value.nodeId === first.options.nodeId), 7_000);
     const firstInvitation = await firstManager.invitation();
@@ -576,7 +581,7 @@ async function lanFixture(name: string, multicastPort: number) {
     const vault = await CredentialVault.open(join(directory, "master.key"));
     manager = new VoiceDictionaryPeerManager({ store: peers, dictionary, vault, nodeId, displayName: `${name} computer`,
       debounceMilliseconds: 30, transportFactory: (options) => {
-        const transport = new NodeSyncLanTransport({ ...options, multicastPort, beaconIntervalMilliseconds: 150,
+        const transport = new NodeSyncLanTransport({ ...options, multicastInterface: "127.0.0.1", multicastPort, beaconIntervalMilliseconds: 150,
           endpointTtlMilliseconds: 2_000, connectTimeoutMilliseconds: 4_000 });
         return { start: () => transport.start(), stop: () => transport.stop(), candidates: () => transport.candidates(),
           onlinePeerIds: () => transport.onlinePeerIds(), send: (peerId, frame) => { sends += 1; return transport.send(peerId, frame); } };
