@@ -40,8 +40,8 @@ export async function extractPdfText(
     workerData: { kind: "extract_text", data: bytes, maxPages: PDF_TEXT_MAX_PAGES, maxChars },
     transferList: [bytes.buffer],
     resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 16 },
-    execArgv: sourceMode ? ["--import", import.meta.resolve("tsx")] : [],
-    env: sourceMode ? { TSX_DISABLE_CACHE: "1" } : {}, stdout: true, stderr: true
+    execArgv: [],
+    env: {}, stdout: true, stderr: true
   });
   worker.stdout?.resume(); worker.stderr?.resume();
   return await new Promise<PdfTextWorkerResult>((resolveResult, reject) => {

@@ -14,6 +14,7 @@ export class PrivateFileCreationError extends Error {
 // empty file's volume/file identity leaves this process; it never sees a key.
 const CREATE_WINDOWS_FILE = [
   "$ErrorActionPreference = 'Stop'",
+  "Import-Module ([System.IO.Path]::Combine($PSHOME, 'Modules', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop",
   "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; using Microsoft.Win32.SafeHandles; public static class JokoKeyFile { [StructLayout(LayoutKind.Sequential)] public struct Info { public uint Attributes; public System.Runtime.InteropServices.ComTypes.FILETIME Creation; public System.Runtime.InteropServices.ComTypes.FILETIME Access; public System.Runtime.InteropServices.ComTypes.FILETIME Write; public uint Volume; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow; } [DllImport(\"kernel32.dll\", SetLastError=true)] public static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Info info); }'",
   "$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User",
   "$acl = New-Object System.Security.AccessControl.FileSecurity",

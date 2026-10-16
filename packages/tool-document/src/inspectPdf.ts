@@ -67,13 +67,13 @@ async function inspectInWorker(data: Buffer, pages: readonly number[], maxPages:
   signal?.throwIfAborted();
   const sourceMode = fileURLToPath(import.meta.url).endsWith(".ts");
   const workerFile = fileURLToPath(new URL(sourceMode ? "./inspectPdf-worker.ts" : "./inspectPdf-worker.js", import.meta.url));
-  const execArgv = sourceMode ? ["--import", import.meta.resolve("tsx")] : [];
   return await new Promise<PdfWorkerResult>((resolveResult, reject) => {
     const worker = new Worker(workerFile, {
       workerData: { kind: "inspect", data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), pages, maxPages },
       transferList: [data.buffer as ArrayBuffer],
       resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 16 },
-      execArgv
+      // The supported Node runtime executes this worker's erasable types directly.
+      execArgv: []
     });
     let settled = false;
     const finish = (result?: PdfWorkerResult, error?: Error): void => {

@@ -330,9 +330,11 @@ jobs:
           node-version: 24.16.0
           cache: pnpm
       - name: Install dependencies from lockfile
+        id: dependencies
         shell: bash
         run: pnpm install --frozen-lockfile
       - name: Observe the owned permission compiler with controlled startup environments
+        id: compiler
         timeout-minutes: 4
         shell: bash
         run: |
@@ -344,6 +346,16 @@ jobs:
         timeout-minutes: 2
         shell: bash
         run: node scripts/ci/diagnose-pdf-worker.mjs 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/pdf-worker.log"
+      - name: Verify the actual SSH key permission and creation operations
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && steps.compiler.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: pnpm --filter @joko/remote-ssh exec vitest run src/keys.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/ssh-keys.log"
+      - name: Verify the actual document owner after native startup observations
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && steps.compiler.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/tool-document exec vitest run 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/document.log"
       - name: Upload the bounded runtime observations
         if: ${{ always() }}
         uses: actions/upload-artifact@v4

@@ -21,8 +21,7 @@ function inputs() {
     source: resolve(root, "packages/tool-document/src/inspectPdf-worker.ts"),
     compiled: resolve(root, "packages/tool-document/dist/inspectPdf-worker.js"),
     pdfWorker: requireDocument.resolve("pdfjs-dist/legacy/build/pdf.worker.mjs"),
-    pdfLibrary: requireDocument.resolve("pdfjs-dist/legacy/build/pdf.mjs"),
-    tsx: requireDocument.resolve("tsx")
+    pdfLibrary: requireDocument.resolve("pdfjs-dist/legacy/build/pdf.mjs")
   };
   for (const file of Object.values(selected)) {
     const entry = lstatSync(file);
@@ -69,7 +68,7 @@ async function observeWorker(mode, files) {
   const data = syntheticPdf();
   const worker = new Worker(new URL(`data:text/javascript,${encodeURIComponent(bootstrap)}`), {
     workerData: { kind: "inspect", data, pages: [], maxPages: 1 }, transferList: [data.buffer],
-    resourceLimits, execArgv: mode === "source" ? ["--import", pathToFileURL(files.tsx).href] : [],
+    resourceLimits, execArgv: [],
     stdout: true, stderr: true
   });
   // The library may write warnings. Consume them without forwarding content or paths.
