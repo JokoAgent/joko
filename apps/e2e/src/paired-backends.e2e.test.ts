@@ -781,8 +781,12 @@ it("replaces three native Backend instances independently and rejects a busy rep
       failedRestartOperationId
     );
     expect(failedRestart.state).toBe(OperationState.FAILED);
-    expect(failedRestart.error?.message)
-      .toBe("A Backend can be replaced only after every native side effect has settled.");
+    // Dispatch can release its native call before this request arrives while the
+    // Run remains active. Both exact busy guards must leave the instance intact.
+    expect([
+      "A Backend can be replaced only after every native side effect has settled.",
+      "A Backend can be restarted only after every affected task has no active or queued work."
+    ]).toContain(failedRestart.error?.message);
     expect(fixture.application.store.getBackend("codex-paired").descriptor)
       .toEqual(backendBeforeBusyRestart);
     expect(fixture.application.store.getBackendInstanceGenerationAuthority("codex-paired"))
