@@ -19,7 +19,7 @@ const evidenceSteps = {
   "install-apk": { action: "installation", assertions: ["fresh-application-data", "installed-apk-sha256"] },
   "prepare-fixture": { action: "fixture-setup", assertions: ["local-orchestrator-ready", "fixture-task-created", "port-reverse-ready"] },
   "pair-application": { action: "pairing", assertions: ["application-started", "pairing-request-issued"] },
-  "open-task-header": { action: "navigation", assertions: ["task-title-visible", "title-width", "header-actions-within-viewport"] },
+  "open-task-header": { action: "navigation", assertions: ["task-title-visible", "title-between-header-controls", "header-actions-within-viewport"] },
   "task-actions-menu": { action: "menu", assertions: ["complete-task-actions", "actions-within-viewport"] },
   "send-native-input": { action: "text-entry", assertions: ["one-completed-run", "exact-fixture-dispatch", "one-active-mobile-connection", "persisted-timeline", "owner-generation-consistent"] },
   "open-image-gallery": { action: "resource-navigation", assertions: ["gallery-visible", "image-decoded", "gallery-retained-across-observations"] },
@@ -232,6 +232,10 @@ async function runNativeScenario(): Promise<void> {
       await screenshot("connection-error").catch(() => undefined);
       throw error;
     }
+    await waitFor(nodes, (items) => items.some((node) => node.enabled
+      && (node.text === "Joko node address" || node.contentDescription === "Joko node address"))
+      && items.some((node) => node.enabled && node.className === "android.widget.EditText"
+        && node.bounds.x2 > node.bounds.x1 && node.bounds.y2 > node.bounds.y1), "empty native node address field", 25_000);
     await screenshot("connection-add");
     await fill("Joko node address", current.baseUrl);
     await tap("Check node identity");
@@ -248,14 +252,13 @@ async function runNativeScenario(): Promise<void> {
     ?.match(/(\d+)x(\d+)/u);
   if (!screen) throw new Error("The isolated native viewport was unavailable.");
   const screenWidth = Number(screen[1]);
-  const title = await waitNode((node) => node.text === taskName, "visible native task title");
-  expect(title.bounds.x2 - title.bounds.x1).toBeGreaterThan(screenWidth / 2);
-  for (const label of ["Back to Tasks", "Task actions"]) {
-    const button = await waitNode((node) => node.contentDescription === label, label);
-    expect(button.bounds.x1).toBeGreaterThanOrEqual(0);
-    expect(button.bounds.x2).toBeLessThanOrEqual(screenWidth);
-  }
+  const headerLabels = ["Back to Tasks", "Remote Desktop", "Files", "Task actions"];
+  const headerNodes = await waitFor(nodes, (items) => items.some((node) => node.text === taskName)
+    && headerLabels.every((label) => items.some((node) => node.contentDescription === label)), "visible native task header", 25_000);
   await screenshot("header");
+  const title = headerNodes.find((node) => node.text === taskName)!;
+  const headerControls = headerLabels.map((label) => headerNodes.find((node) => node.contentDescription === label)!);
+  assertTaskHeaderBounds(title, headerControls, screenWidth);
   await completeStep();
   await beginStep("task-actions-menu");
   await tap("Task actions");
@@ -444,6 +447,26 @@ async function adb(...args: string[]): Promise<string> {
         } else accept(stdout);
       });
   });
+}
+
+function assertTaskHeaderBounds(title: AndroidUiNode, controls: readonly AndroidUiNode[], screenWidth: number): void {
+  // Android's Text node reports its rendered text bounds, not the flex title
+  // slot. Check the real slot between the current leading/trailing controls.
+  expect(title.text).toBe(taskName);
+  expect(title.bounds.x2).toBeGreaterThan(title.bounds.x1);
+  expect(title.bounds.y2).toBeGreaterThan(title.bounds.y1);
+  const leading = controls.find((node) => node.contentDescription === "Back to Tasks")!;
+  const trailing = controls.filter((node) => node !== leading);
+  expect(title.bounds.x1).toBeGreaterThanOrEqual(leading.bounds.x2);
+  expect(title.bounds.x2).toBeLessThanOrEqual(Math.min(...trailing.map((node) => node.bounds.x1)));
+  expect(title.bounds.y1).toBeGreaterThanOrEqual(Math.min(...controls.map((node) => node.bounds.y1)));
+  expect(title.bounds.y2).toBeLessThanOrEqual(Math.max(...controls.map((node) => node.bounds.y2)));
+  for (const button of controls) {
+    expect(button.bounds.x1).toBeGreaterThanOrEqual(0);
+    expect(button.bounds.x2).toBeLessThanOrEqual(screenWidth);
+    expect(button.bounds.x2).toBeGreaterThan(button.bounds.x1);
+    expect(button.bounds.y2).toBeGreaterThan(button.bounds.y1);
+  }
 }
 
 async function nodes(): Promise<readonly AndroidUiNode[]> {
