@@ -12055,6 +12055,8 @@ export class SessionHost {
         sessionId,
         (this.#compactionEventEpochs.get(sessionId) ?? 0) + 1
       );
+      const active = this.#active.get(sessionId);
+      if (active !== undefined) this.markNativeStateObservationStale(sessionId, active, generation);
     }
     const wasBlocked = this.compactionBlocksDispatch(sessionId);
     if (compacting) {
@@ -14360,11 +14362,20 @@ export class SessionHost {
         ) {
           throw new Error("The native state response belongs to a different binding.");
         }
+        const window = this.#compactionQueueWindows.get(sessionId);
+        const eventChanged = (this.#compactionEventEpochs.get(sessionId) ?? 0) !== compactionEventEpoch;
+        const eventStillCompacting = window?.generation === generation && window.eventStarted
+          && this.#nativeCompactions.get(sessionId) === generation;
+        // RPC state and lifecycle events travel independently. An idle response
+        // cannot override a newer event or a start whose terminal event is pending.
+        const committedObservation = eventChanged || (!state.compacting && eventStillCompacting)
+          ? staleNativeStateObservation(observation, observation.observedAt)
+          : observation;
         store.setSetting(
           "session",
           sessionId,
           SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY,
-          observation,
+          committedObservation,
           observation.observedAt
         );
         return state;

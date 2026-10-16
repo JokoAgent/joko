@@ -7069,6 +7069,42 @@ describe("SessionHost", () => {
     await adapter.settle(sessionId);
   });
 
+  it("retires an idle inspection that overlaps a durable compaction start", async () => {
+    const adapter = new CompactionQueueFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-compaction-observation-race", connection: fixture.connection,
+      targetId: "target-one", title: "Compaction observation race", fastMode: false,
+      permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const gate = new AsyncGate();
+    const inspect = adapter.inspectSession.bind(adapter);
+    vi.spyOn(adapter, "inspectSession").mockImplementationOnce(async (binding, context) => {
+      const state = await inspect(binding, context);
+      gate.enter();
+      await gate.wait;
+      return state;
+    });
+    const pending = fixture.host.inspect(sessionId);
+    await gate.entered;
+    await adapter.beginNativeCompaction(sessionId);
+    gate.release();
+    await pending;
+    const stored = fixture.store.getSession(sessionId);
+    const observed = materializedNativeStateObservation(fixture.store.getSetting(
+      "session", sessionId, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY
+    ).value)!;
+    expect(nativeStateObservationIsCurrent(observed,
+      stored.descriptor.binding.generation, stored.descriptor.binding.opaqueRef)).toBe(false);
+    await adapter.finishNativeCompaction(sessionId);
+    await fixture.host.inspect(sessionId);
+    const settled = materializedNativeStateObservation(fixture.store.getSetting(
+      "session", sessionId, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY
+    ).value)!;
+    expect(settled.staleAt).toBeUndefined();
+    expect(settled.state.compacting).toBe(false);
+  });
+
   it("holds steer and follow-up together during native compaction and flushes each exactly once", async () => {
     const adapter = new CompactionQueueFakeAdapter();
     const fixture = await createFixture(adapter);
@@ -7114,6 +7150,13 @@ describe("SessionHost", () => {
     // and promote the steer while exact terminal metadata is still pending.
     adapter.endNativeCompactionState(sessionId);
     fixture.host.requestQueueDrain(sessionId);
+    await fixture.host.inspect(sessionId);
+    const stored = fixture.store.getSession(sessionId);
+    const observation = materializedNativeStateObservation(fixture.store.getSetting(
+      "session", sessionId, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY
+    ).value)!;
+    expect(nativeStateObservationIsCurrent(observation,
+      stored.descriptor.binding.generation, stored.descriptor.binding.opaqueRef)).toBe(false);
     await nextTurn();
     expect(fixture.store.getQueueItem(steer.value.queueItemId)).toMatchObject({
       state: "accepted",
