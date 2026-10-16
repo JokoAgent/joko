@@ -90,12 +90,23 @@ jobs:
           retention-days: 3
 
       - name: Configure the installed Electron sandbox helper on Linux
+        id: electron_sandbox
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' }}
         shell: bash
         run: |
+          exec > >(tee "$RUNNER_TEMP/joko-ci-logs/linux-sandbox.log") 2>&1
           helper="$(pnpm --filter @joko/desktop exec node -e "const fs=require('node:fs'); const path=require('node:path'); const executable=fs.realpathSync(require('electron')); const helper=path.join(path.dirname(executable),'chrome-sandbox'); const root=fs.realpathSync(process.env.GITHUB_WORKSPACE); const relative=path.relative(root,helper); const info=fs.lstatSync(helper); if(!relative || relative.startsWith('..'+path.sep) || path.isAbsolute(relative) || !info.isFile() || info.isSymbolicLink() || fs.realpathSync(helper)!==helper) throw new Error('Electron sandbox helper is outside the checked-out installation'); process.stdout.write(helper)")"
           sudo chown root:root "$helper"
           sudo chmod 4755 "$helper"
+
+      - name: Upload a Linux sandbox setup failure immediately
+        if: ${{ !cancelled() && steps.electron_sandbox.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-linux-sandbox-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/linux-sandbox.log
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Check build, boundaries, generated contracts, and types
         id: source_check
