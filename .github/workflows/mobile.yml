@@ -38,10 +38,10 @@ jobs:
           version: 11.22.0
           run_install: false
 
-      - name: Install Node.js 22.19.0
+      - name: Install Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
+          node-version: 24.16.0
           cache: pnpm
 
       - name: Install dependencies from lockfile
@@ -92,10 +92,10 @@ jobs:
           version: 11.22.0
           run_install: false
 
-      - name: Install Node.js 22.19.0
+      - name: Install Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
+          node-version: 24.16.0
           cache: pnpm
 
       - name: Set up JDK 17
@@ -174,10 +174,10 @@ jobs:
           version: 11.22.0
           run_install: false
 
-      - name: Install Node.js 22.19.0
+      - name: Install Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
+          node-version: 24.16.0
           cache: pnpm
 
       - name: Verify the runner's Xcode and CocoaPods

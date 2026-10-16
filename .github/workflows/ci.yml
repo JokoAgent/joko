@@ -10,11 +10,11 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   verify:
-    name: ${{ matrix.os }} / Node 22.19
+    name: ${{ matrix.os }} / Node 24.16
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -35,10 +35,10 @@ jobs:
           version: 11.22.0
           run_install: false
 
-      - name: Install Node.js 22.19.0
+      - name: Install Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
+          node-version: 24.16.0
           cache: pnpm
 
       - name: Use the canonical temporary directory
@@ -107,6 +107,7 @@ jobs:
           pnpm --filter @joko/e2e exec node -e "const fs=require('node:fs'); const path=require('node:path'); const browser=require('playwright-core').chromium.executablePath(); const web=path.join(process.env.GITHUB_WORKSPACE,'apps','web','dist'); fs.accessSync(browser,fs.constants.X_OK); fs.accessSync(path.join(web,'index.html')); fs.appendFileSync(process.env.GITHUB_ENV,['JOKO_BROWSER_EXECUTABLE='+fs.realpathSync(browser),'JOKO_MOUNTED_WEB_DIR='+fs.realpathSync(web),''].join('\n'));"
 
       - name: Run workspace test suite and headed Browser chains (Linux)
+        id: workspace_tests_linux
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm test:ci 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests.log"
@@ -115,9 +116,19 @@ jobs:
           WAYLAND_DISPLAY: ""
 
       - name: Run workspace test suite, including Connect end-to-end coverage (Windows/macOS)
+        id: workspace_tests_desktop
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' }}
         shell: bash
         run: pnpm test:ci 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests.log"
+
+      - name: Upload a failed workspace suite before runtime and packaging checks
+        if: ${{ !cancelled() && (steps.workspace_tests_linux.outcome == 'failure' || steps.workspace_tests_desktop.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-workspace-tests-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/tests.log
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Amplify the short queue soak and fault matrix
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
