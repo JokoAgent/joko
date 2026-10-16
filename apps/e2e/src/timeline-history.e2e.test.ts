@@ -345,9 +345,9 @@ class WorkHistoryAdapter extends InstrumentedFakeAdapter {
 async function assertWorkHistory(page: Page): Promise<void> {
   await goToHistoryStart(page);
   await waitFor(() => page.locator(".timeline-history-gap").count(), (value) => value === 1, "the actual native history gap");
-  await waitFor(() => page.locator(".work-group").count(), (value) => value === 2, "two bounded native work groups");
-  const groups = await page.locator("[data-timeline-item-ids]:has(.work-group)").evaluateAll((nodes) =>
-    nodes.map((node) => node.getAttribute("data-timeline-item-ids")?.split(" ")));
+  const groups = await waitFor(() => page.locator(".work-group").evaluateAll((nodes) =>
+    nodes.map((node) => node.closest("[data-timeline-item-ids]")?.getAttribute("data-timeline-item-ids")?.split(" "))),
+  (value) => value.length === 2, "two bounded native work groups with their current row ownership");
   expect(groups).toEqual([
     ["activity-long", "activity-short", "activity-next", "activity-thinking:thinking:0", "activity-after-thinking"],
     ["activity-gap", "activity-no-delta:thinking:0"]

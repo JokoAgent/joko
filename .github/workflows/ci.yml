@@ -14,6 +14,7 @@ on:
           - windows-native
           - windows-runtime-diagnostics
           - desktop-product
+          - browser-regressions
       platform:
         description: Platform for manual verification
         type: choice
@@ -28,7 +29,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && format('-platform-{0}', inputs.platform || 'all') || '' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'browser-regressions' && format('-browser-regressions-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && format('-platform-{0}', inputs.platform || 'all') || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -41,7 +42,7 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(inputs.scope == 'windows-native' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'windows' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'linux' && '["ubuntu-24.04"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'macos' && '["macos-15"]' || '["ubuntu-24.04","windows-latest","macos-15"]') }}
-        workload: ${{ fromJSON((inputs.scope == 'windows-native' || inputs.scope == 'desktop-product') && '["product"]' || '["product","e2e-1","e2e-2","e2e-3","e2e-4"]') }}
+        workload: ${{ fromJSON(inputs.scope == 'browser-regressions' && '["browser-regressions"]' || (inputs.scope == 'windows-native' || inputs.scope == 'desktop-product') && '["product"]' || '["product","e2e-1","e2e-2","e2e-3","e2e-4"]') }}
 
     steps:
       - name: Check out repository
@@ -256,7 +257,7 @@ jobs:
       - name: Run Connect end-to-end tests and Browser chains (Linux)
         id: workspace_e2e_linux
         timeout-minutes: 35
-        if: ${{ matrix.workload != 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ startsWith(matrix.workload, 'e2e-') && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/4' || matrix.workload == 'e2e-2' && '2/4' || matrix.workload == 'e2e-3' && '3/4' || '4/4' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
         env:
@@ -266,17 +267,41 @@ jobs:
       - name: Run Connect end-to-end tests (Windows/macOS)
         id: workspace_e2e_desktop
         timeout-minutes: 35
-        if: ${{ matrix.workload != 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ startsWith(matrix.workload, 'e2e-') && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/4' || matrix.workload == 'e2e-2' && '2/4' || matrix.workload == 'e2e-3' && '3/4' || '4/4' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
 
       - name: Upload completed Connect end-to-end test logs
-        if: ${{ matrix.workload != 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ startsWith(matrix.workload, 'e2e-') && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-workspace-e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}-${{ matrix.workload }}
           path: ${{ runner.temp }}/joko-ci-logs/tests-e2e.log
           if-no-files-found: error
+          retention-days: 3
+
+      - name: Run the affected production Web chains (Linux)
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 15
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/skill-market-mounted-browser.e2e.test.ts src/real-pi-compaction-mounted-browser.e2e.test.ts src/simulator-viewer.e2e.test.ts src/message-nav-rail.e2e.test.ts src/paired-backends.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+        env:
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Run the affected production Web chains (Windows/macOS)
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os != 'Linux' }}
+        timeout-minutes: 15
+        shell: bash
+        run: pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/skill-market-mounted-browser.e2e.test.ts src/real-pi-compaction-mounted-browser.e2e.test.ts src/simulator-viewer.e2e.test.ts src/message-nav-rail.e2e.test.ts src/paired-backends.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+
+      - name: Upload the affected Web chain logs
+        if: ${{ matrix.workload == 'browser-regressions' && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-browser-regressions-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/browser-regressions.log
+          if-no-files-found: warn
           retention-days: 3
 
       - name: Diagnose the exact Windows remote broker startup regression
