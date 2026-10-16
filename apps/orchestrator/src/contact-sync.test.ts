@@ -210,7 +210,20 @@ describe("Contacts sync node lifecycle", () => {
     } finally { manager.close(); vi.useRealTimers(); }
   });
 
-  it("discovers explicit candidates, converges two real LAN nodes, and revokes delivery", { timeout: 25_000 }, async () => {
+  it("discovers explicit candidates, converges two real LAN nodes, and revokes delivery", { timeout: 25_000 }, async ({ signal, onTestFailed, onTestFinished }) => {
+    type Phase = "fixture" | "enable-first" | "enable-second" | "discovery" | "grant" | "convergence" | "settlement" | "revoke" | "revoked-delivery" | "complete";
+    const startedAt = performance.now();
+    let phase: Phase = "fixture";
+    const observed = { firstEnabled: false, secondEnabled: false, firstSeesSecond: false, secondSeesFirst: false };
+    const snapshot = () => ({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), ...observed });
+    let abortedSnapshot: ReturnType<typeof snapshot> | undefined;
+    const captureAbort = () => { abortedSnapshot ??= snapshot(); };
+    signal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => signal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => {
+      try { console.error("[contact-sync-boundary]", JSON.stringify(abortedSnapshot ?? snapshot())); }
+      catch { /* Observations must preserve the original failure. */ }
+    });
     const port = randomInt(54_000, 60_000);
     const first = await managerFixture("first", port);
     const second = await managerFixture("second", port);
@@ -222,31 +235,45 @@ describe("Contacts sync node lifecycle", () => {
       identities: [{ platform: "email", value: "lin@example.com" }]
     }).contact!;
 
+    phase = "enable-first";
     await first.manager.setEnabled(first.manager.status().configurationRevision, true);
+    observed.firstEnabled = first.manager.status().enabled;
+    phase = "enable-second";
     await second.manager.setEnabled(second.manager.status().configurationRevision, true);
-    await waitUntil(() => first.manager.status().candidates.some((candidate) => candidate.nodeId === "node-second") &&
-      second.manager.status().candidates.some((candidate) => candidate.nodeId === "node-first"));
+    observed.secondEnabled = second.manager.status().enabled;
+    phase = "discovery";
+    await waitUntil(() => {
+      observed.firstSeesSecond = first.manager.status().candidates.some((candidate) => candidate.nodeId === "node-second");
+      observed.secondSeesFirst = second.manager.status().candidates.some((candidate) => candidate.nodeId === "node-first");
+      return observed.firstSeesSecond && observed.secondSeesFirst;
+    });
 
+    phase = "grant";
     const firstCandidate = first.manager.status().candidates.find((candidate) => candidate.nodeId === "node-second")!;
     const secondCandidate = second.manager.status().candidates.find((candidate) => candidate.nodeId === "node-first")!;
     expect(firstCandidate.granted).toBe(false);
     await first.manager.grantCandidate(firstCandidate.nodeId, firstCandidate.fingerprint);
     await second.manager.grantCandidate(secondCandidate.nodeId, secondCandidate.fingerprint);
+    phase = "convergence";
     await waitUntil(() => second.store.allContacts().some((contact) => contact.id === created.id), 10_000);
     expect(second.store.getContact(created.id)).toMatchObject({
       displayName: "Lin Xiao",
       summary: "Local before pairing",
       identityCount: 1
     });
+    phase = "settlement";
     await waitUntil(() => first.manager.status().phase === "up_to_date" || second.manager.status().phase === "up_to_date");
 
+    phase = "revoke";
     const granted = first.manager.status().peers.find((peer) => peer.peerId === "node-second")!;
     first.manager.revokePeer(granted.peerId, granted.revision);
     const remote = second.store.getContact(created.id);
     second.store.updateContact(remote.id, remote.revision, { summary: "Must not cross a revoked grant" });
+    phase = "revoked-delivery";
     await expect(second.manager.syncNow("node-first")).rejects.toThrow(/could not be reached|reachable/iu);
     expect(first.store.getContact(created.id).summary).toBe("Local before pairing");
     expect(first.manager.status().peers).toEqual([]);
+    phase = "complete";
   });
 });
 
@@ -316,6 +343,8 @@ async function managerFixture(name: string, multicastPort: number): Promise<{
     codec: inProcessContactSyncCodec,
     transportFactory: (options) => new NodeSyncLanTransport({
       ...options,
+      // Both real peers belong to this host; use its loopback multicast route.
+      multicastInterface: "127.0.0.1",
       multicastPort,
       beaconIntervalMilliseconds: 150,
       endpointTtlMilliseconds: 2_000,

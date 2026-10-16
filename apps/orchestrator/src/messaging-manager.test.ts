@@ -425,21 +425,41 @@ describe("MessagingManager", () => {
       .map((interaction) => interaction.status)).toEqual(["completed", "completed", "completed", "completed"]);
   });
 
-  it("refreshes WeChat typing and persists bounded progress notices until the run settles", async () => {
+  it("refreshes WeChat typing and persists bounded progress notices until the run settles", async ({ signal, onTestFailed, onTestFinished }) => {
+    type Phase = "fixture" | "route" | "authorization" | "progress-receipt" | "durable-progress" | "finish" | "settlement" | "no-later-typing" | "complete";
+    const startedAt = performance.now();
+    let phase: Phase = "fixture";
+    let releaseSecondProgress!: () => void;
+    const secondProgress = new Promise<void>((resolve) => { releaseSecondProgress = resolve; });
     const batch = weChatDirectBatch();
-    const transport = new FakeWeChatTransport({
+    const transport: FakeWeChatTransport = new FakeWeChatTransport({
       ...batch,
       events: batch.events.slice(0, 1),
       privateContexts: batch.privateContexts.slice(0, 1)
+    }, () => {
+      if (transport.sentText.filter((entry) => entry.text === "Task is still in progress…").length === 2) releaseSecondProgress();
+    });
+    const snapshot = () => ({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      progressTexts: transport.sentText.filter((entry) => entry.text === "Task is still in progress…").length,
+      typingStarts: transport.typingStarts, typingStops: transport.typingStops });
+    let abortedSnapshot: ReturnType<typeof snapshot> | undefined;
+    const captureAbort = () => { abortedSnapshot ??= snapshot(); };
+    signal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => signal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => {
+      try { console.error("[wechat-presence-boundary]", JSON.stringify(abortedSnapshot ?? snapshot())); }
+      catch { /* Observations must preserve the original failure. */ }
     });
     const adapter = new SlowFakeAdapter();
     const fixture = await createFixture(
       undefined, () => adapter, undefined, undefined, undefined, undefined,
       () => transport, { tickMs: 10, firstProgressMs: 30, repeatProgressMs: 40 }
     );
+    phase = "route";
     fixture.manager.putRoute({
       targetId: "target-one", fastMode: false, permissionMode: "ask", planMode: false
     });
+    phase = "authorization";
     const created = fixture.manager.createWeChatConnection();
     const enabled = await fixture.manager.commitWeChatAuthorization({
       clientConnectionId: "desktop-one", connectionId: created.id,
@@ -452,21 +472,26 @@ describe("MessagingManager", () => {
       },
       enable: true
     });
-    await vi.waitFor(() => {
-      expect(transport.sentText.filter((entry) => entry.text === "Task is still in progress…"))
-        .toHaveLength(2);
-    }, { timeout: 5_000 });
+    phase = "progress-receipt";
+    await secondProgress;
+    expect(transport.sentText.filter((entry) => entry.text === "Task is still in progress…"))
+      .toHaveLength(2);
     expect(transport.typingStarts).toBeGreaterThan(2);
+    phase = "durable-progress";
     expect(fixture.store.listMessagingDeliveries({ connectionId: enabled.id, limit: 20 })
       .filter((delivery) => delivery.kind === "notice")).toHaveLength(2);
+    phase = "finish";
     await adapter.finish();
+    phase = "settlement";
     await vi.waitFor(() => {
       expect(transport.sentText.some((entry) => entry.text === "Finished." )).toBe(true);
       expect(transport.typingStops).toBe(1);
     }, { timeout: 5_000 });
+    phase = "no-later-typing";
     const startsAtSettlement = transport.typingStarts;
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(transport.typingStarts).toBe(startsAtSettlement);
+    phase = "complete";
   });
 
   it("resolves a non-owner WeChat peer's exact text permission without admitting a second task", async () => {
@@ -1910,7 +1935,7 @@ class FakeWeChatTransport {
   #generation = 0;
   #polled = false;
 
-  constructor(readonly batch: WeChatNormalizationResult) {}
+  constructor(readonly batch: WeChatNormalizationResult, readonly onTextSent?: () => void) {}
 
   get connectionId(): string { return this.#connectionId; }
   get generation(): number { return this.#generation; }
@@ -1960,6 +1985,7 @@ class FakeWeChatTransport {
     readonly context?: { readonly contextToken: string; readonly clientId: string };
   }) {
     this.sentText.push(input);
+    this.onTextSent?.();
     return { providerMessageId: `wx-out-${this.sentText.length}`, address: input.address };
   }
 
