@@ -75,7 +75,7 @@ async function runHost() {
   let locked = false, lockRequests = 0, lockCalls = 0, expiredLockReplies = 0, locks = 0, failNextLock = true;
   let activeLeaseId = "";
   let deferViewerStart = false, pendingViewerStart;
-  const viewerRequests = [], viewerFocus = [], viewerReadiness = [];
+  const viewerRequests = [], viewerFocus = [], viewerReadiness = [], viewerGeometry = [];
   const retainReceipt = (receipts, receipt) => { receipts.push(receipt); if (receipts.length > 64) receipts.shift(); };
   let fixtureFlavor = "mac", portalConsent = "pending", portalPickers = 0, portalOffers = 0, portalFrames = 0, portalHeartbeats = 0, portalLateFrames = 0;
   let deferPortalFrame = false, deferredPortalFrame;
@@ -419,6 +419,15 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
     } catch (error) {
       retainReceipt(viewerReadiness, { ...receipt, completedAt: Date.now(), rejected: true }); throw error;
     }
+  } : channel === C.resize ? (event, generation, width, height) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    const receipt = { generation: Number.isSafeInteger(generation) ? generation : undefined,
+      width: Number.isSafeInteger(width) ? width : undefined, height: Number.isSafeInteger(height) ? height : undefined };
+    recordGeometry(window, "resize-request", receipt);
+    try {
+      const result = listener(event, generation, width, height);
+      recordGeometry(window, "resize-handler-returned", receipt); return result;
+    } catch (error) { recordGeometry(window, "resize-handler-rejected", receipt); throw error; }
   } : channel !== C.request ? listener : async (event, generation, name, bytes) => {
     const observed = ["getRemoteDesktopFrame", "heartbeatRemoteDesktop", "setRemoteDesktopControl", "startRemoteDesktop"].includes(name);
     const receipt = { name, generation, at: Date.now(), controlGeneration: String(controlGeneration) };
@@ -439,6 +448,15 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
     for (const type of ["show", "focus", "blur", "hide"]) window.on(type, () => {
       retainReceipt(viewerFocus, { type, windowId, at: Date.now(), controlGeneration: String(controlGeneration) });
     });
+    for (const type of ["show", "hide", "resize", "enter-full-screen", "leave-full-screen"]) {
+      window.on(type, () => recordGeometry(window, type));
+    }
+    const setBounds = window.setBounds;
+    window.setBounds = function(bounds, ...args) {
+      recordGeometry(window, "set-bounds-request", { requested: Object.fromEntries(
+        ["x", "y", "width", "height"].filter(field => Number.isFinite(bounds[field])).map(field => [field, bounds[field]])) });
+      return setBounds.call(this, bounds, ...args);
+    };
   };
   app.on("browser-window-created", observeFocus);
   const sourceCall = (channel, ...args) => source.webContents.executeJavaScript(`window.smokeSource.invoke(${JSON.stringify(channel)},...${JSON.stringify(args)})`);
@@ -461,9 +479,16 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
   const prewarmEffects = () => ({ starts, stops, frames, inputRequests, control, controlCalls: controlCalls.length, httpRequests, authReads,
     preferenceReads, credentialFactories, credentialNativeRequests, clipboardFactories, clipboardNativeReads, clipboardNativeWrites });
   let stage = "open", viewer, cachedWindowEvidence, rendererRecoveryEvidence, prewarmEvidence;
+  function recordGeometry(window, phase, details = {}) {
+    if (stage !== "actual size from fullscreen" || !window || window.isDestroyed()) return;
+    retainReceipt(viewerGeometry, { phase, at: Date.now(), windowId: window.id,
+      readyGeneration: viewerReadiness.findLast(receipt => receipt.windowId === window.id && receipt.ok)?.generation,
+      ...details, fullscreen: window.isFullScreen(), maximized: window.isMaximized(), visible: window.isVisible(),
+      bounds: window.getBounds(), content: window.getContentBounds(), workArea: screen.getDisplayMatching(window.getBounds()).workArea });
+  }
   const deadline = setTimeout(() => {
     writeFileSync(resolve(output, "failure.json"), JSON.stringify({ scope, stage, deadline: true, starts, stops, frames,
-      cachedWindowEvidence, rendererRecoveryEvidence, prewarmEvidence, prewarmEffects: prewarmEffects(), activeLeaseId, control, viewerRequests, viewerFocus, viewerReadiness,
+      cachedWindowEvidence, rendererRecoveryEvidence, prewarmEvidence, prewarmEffects: prewarmEffects(), activeLeaseId, control, viewerRequests, viewerFocus, viewerReadiness, viewerGeometry,
       viewerDestroyed: viewer?.isDestroyed() ?? true, pendingViewerStart: pendingViewerStart !== undefined }, null, 2));
     process.stderr.write(`Remote desktop viewer Electron smoke deadline exceeded at ${stage}.\n`);
     quitting = true; manager.dispose(); app.exit(1);
@@ -1310,7 +1335,7 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
       modeRequests, modeRestores, modeRestoreRefusals, currentMode, display,
       portalPickers, portalOffers, portalFrames, portalHeartbeats, portalLateFrames,
       linuxClipboardLocalWriteCalls, linuxClipboardExplicitCopies, linuxClipboardExplicitPastes,
-      linuxAudioOffers, linuxAudioFailures, cachedWindowEvidence, rendererRecoveryEvidence, viewerRequests, viewerFocus, viewerReadiness,
+      linuxAudioOffers, linuxAudioFailures, cachedWindowEvidence, rendererRecoveryEvidence, viewerRequests, viewerFocus, viewerReadiness, viewerGeometry,
       scaleFactor: screen.getDisplayMatching(resizedBounds).scaleFactor, preferencePath,
       checks: ["standalone preload", "generated HTTP RPC", "presented JPEG", "confirmed control", "target reuse",
         "confirmed close retires authority and hides the same BrowserWindow", "cached same-target reopen preserves memory bounds with one fresh lease",
@@ -1361,7 +1386,7 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
   } catch (error) {
     process.stderr.write(`Remote desktop viewer Electron smoke failed at ${stage}: ${error instanceof Error ? error.message : "unknown"}\n`);
     writeFileSync(resolve(output, "failure.json"), JSON.stringify({ scope, stage, starts, stops, frames,
-      cachedWindowEvidence, rendererRecoveryEvidence, prewarmEvidence, prewarmEffects: prewarmEffects(), activeLeaseId, control, viewerRequests, viewerFocus, viewerReadiness,
+      cachedWindowEvidence, rendererRecoveryEvidence, prewarmEvidence, prewarmEffects: prewarmEffects(), activeLeaseId, control, viewerRequests, viewerFocus, viewerReadiness, viewerGeometry,
       viewerDestroyed: viewer?.isDestroyed() ?? true, pendingViewerStart: pendingViewerStart !== undefined }, null, 2));
     if (viewer && !viewer.isDestroyed()) {
       const state = await viewer.webContents.executeJavaScript("window.jokoRemoteDesktopViewer.state()").catch(() => undefined);
@@ -1374,7 +1399,7 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
         fixtureFlavor, portalConsent, portalPickers, portalOffers, portalFrames, portalHeartbeats, portalLateFrames,
         deferredPortalLeaseId: deferredPortalFrame?.leaseId,
         linuxClipboardLocalWriteCalls, linuxClipboardExplicitCopies, linuxClipboardExplicitPastes,
-        linuxAudioOffers, linuxAudioFailures, cachedWindowEvidence, rendererRecoveryEvidence, prewarmEvidence, prewarmEffects: prewarmEffects(), viewerRequests, viewerFocus, viewerReadiness,
+        linuxAudioOffers, linuxAudioFailures, cachedWindowEvidence, rendererRecoveryEvidence, prewarmEvidence, prewarmEffects: prewarmEffects(), viewerRequests, viewerFocus, viewerReadiness, viewerGeometry,
         pendingViewerStart: pendingViewerStart !== undefined,
         linuxClipboardWritePending: pendingLinuxClipboardWrite !== undefined,
         visible: viewer.isVisible(), minimized: viewer.isMinimized(), focused: viewer.isFocused(),
