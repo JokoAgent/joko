@@ -117,10 +117,14 @@ export function buildNativeRemoteDesktop({
     let hostAddonBinary = null;
     if (platform === "darwin") {
       const target = nativeRemoteDesktopMacTarget(architecture);
+      // Swift requires a main.swift entry when compiling multiple source files.
+      // Keep the authenticated helper unchanged and name only its isolated copy.
+      const inputEntry = join(cache, "main.swift");
+      copyFileSync(join(source, "macos-input.swift"), inputEntry);
       run("xcrun", [
         "--sdk", "macosx", "swiftc",
         join(source, "macos-caller.swift"),
-        join(source, "macos-input.swift"),
+        inputEntry,
         "-O", "-target", target.triple,
         "-framework", "ApplicationServices", "-framework", "AppKit", "-framework", "Security",
         "-framework", "IOKit",

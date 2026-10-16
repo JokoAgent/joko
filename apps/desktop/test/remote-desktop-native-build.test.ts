@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -13,6 +13,68 @@ const { buildNativeRemoteDesktop } = await import(buildUrl) as {
 };
 const metadata = { version: "0.56.2", hash: "1".repeat(40), source: "2".repeat(64) };
 const roots: string[] = [];
+
+describe("macOS input helper entry", () => {
+  beforeEach(() => {
+    runtime.spawnSync.mockReset();
+    vi.stubGlobal("process", new Proxy(process, { get(target, property) {
+      if (property === "platform") return "darwin";
+      if (property === "arch") return "arm64";
+      return Reflect.get(target, property);
+    } }));
+  });
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
+  });
+
+  it.each(["x64", "arm64"])("compiles the unchanged authenticated entry as main.swift for %s", async architecture => {
+    const output = await directory();
+    let stagedEntry = "";
+    runtime.spawnSync.mockImplementation((command: string, args: string[]) => {
+      expect(command).toBe("xcrun");
+      if (args.includes("swiftc")) {
+        const sources = args.filter(argument => argument.endsWith(".swift"));
+        expect(sources).toHaveLength(2);
+        const caller = sources.find(path => basename(path) === "macos-caller.swift")!;
+        stagedEntry = sources.find(path => basename(path) === "main.swift") ?? "";
+        expect(stagedEntry).not.toBe("");
+        expect(readFileSync(stagedEntry)).toEqual(readFileSync(new URL("../native/remote-desktop/macos-input.swift", import.meta.url)));
+        expect(readFileSync(caller)).toEqual(readFileSync(new URL("../native/remote-desktop/macos-caller.swift", import.meta.url)));
+        expect(args[args.indexOf("-target") + 1]).toBe(`${architecture === "x64" ? "x86_64" : "arm64"}-apple-macos11.0`);
+        writeFileSync(args[args.indexOf("-o") + 1]!, machO(architecture));
+        return { status: 0 };
+      }
+      expect(args).toContain("clang");
+      return { status: 1 };
+    });
+
+    expect(() => buildNativeRemoteDesktop({ platform: "darwin", architecture, output }))
+      .toThrow("The Remote Desktop capture helper requires the macOS command-line developer tools.");
+    expect(stagedEntry).not.toBe("");
+    expect(existsSync(stagedEntry)).toBe(false);
+    expect(JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"))).toMatchObject({ inputHelper: null, captureHelper: null });
+  });
+
+  it.each(["compiler", "architecture"])("cleans the temporary entry and publishes no helper after an input %s failure", async defect => {
+    const output = await directory();
+    let stagedEntry = "";
+    runtime.spawnSync.mockImplementation((_command: string, args: string[]) => {
+      stagedEntry = args.find(argument => basename(argument) === "main.swift") ?? "";
+      expect(stagedEntry).not.toBe("");
+      if (defect === "compiler") return { status: 1 };
+      writeFileSync(args[args.indexOf("-o") + 1]!, machO("x64"));
+      return { status: 0 };
+    });
+
+    expect(() => buildNativeRemoteDesktop({ platform: "darwin", architecture: "arm64", output }))
+      .toThrow(defect === "compiler" ? "The Remote Desktop input helper requires" : "does not match the macOS build target");
+    expect(runtime.spawnSync).toHaveBeenCalledOnce();
+    expect(existsSync(stagedEntry)).toBe(false);
+    expect(JSON.parse(readFileSync(join(output, "manifest.json"), "utf8"))).toMatchObject({ inputHelper: null, captureHelper: null });
+    expect(existsSync(join(output, "joko-macos-remote-desktop-input"))).toBe(false);
+  });
+});
 
 describe("optional Remote Desktop compositor plugin build", () => {
   beforeEach(() => {
@@ -94,5 +156,12 @@ function elf(architecture: string): Buffer {
   bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]);
   bytes.writeUInt16LE(3, 16); bytes.writeUInt16LE(architecture === "arm64" ? 183 : 62, 18);
   bytes.writeUInt32LE(1, 20); bytes.writeUInt16LE(64, 52);
+  return bytes;
+}
+
+function machO(architecture: string): Buffer {
+  const bytes = Buffer.alloc(64);
+  bytes.writeUInt32LE(0xfeedfacf, 0);
+  bytes.writeUInt32LE(architecture === "arm64" ? 0x0100000c : 0x01000007, 4);
   return bytes;
 }
