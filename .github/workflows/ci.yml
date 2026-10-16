@@ -409,6 +409,9 @@ jobs:
         with:
           node-version: 24.16.0
           cache: pnpm
+      - name: Use the canonical temporary directory for parser owners
+        run: |
+          node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync.native(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV,['TMPDIR='+canonical,'TMP='+canonical,'TEMP='+canonical,''].join('\n'));"
       - name: Install dependencies from lockfile
         id: dependencies
         shell: bash
@@ -440,7 +443,9 @@ jobs:
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
-        run: pnpm --filter @joko/orchestrator exec vitest run src/extension-library-sql.test.ts src/extension-library-manager.test.ts src/review-evidence-provider.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/native-parser-owners.log"
+        run: |
+          pnpm --filter @joko/contracts build
+          pnpm --filter @joko/orchestrator exec vitest run src/extension-library-sql.test.ts src/extension-library-manager.test.ts src/review-evidence-provider.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/native-parser-owners.log"
       - name: Upload the bounded runtime observations
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
