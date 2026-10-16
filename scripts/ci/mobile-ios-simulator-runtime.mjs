@@ -10,8 +10,10 @@ import { fileURLToPath } from "node:url";
 
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+const startupDiagnosticsOnly = process.argv.length === 3 && process.argv[2] === "--startup-diagnostics";
 const abort = new AbortController();
-const deadline = setTimeout(() => abort.abort(new Error("iOS startup and UI operation deadline exceeded.")), 15 * 60_000);
+const deadline = setTimeout(() => abort.abort(new Error("iOS startup and UI operation deadline exceeded.")),
+  (startupDiagnosticsOnly ? 4 : 15) * 60_000);
 const stop = () => abort.abort(new Error("iOS startup observation was cancelled."));
 process.once("SIGINT", stop); process.once("SIGTERM", stop);
 let evidence, udid, deviceName, bundleId, executable, installedExecutable, metro, metroClosed = false;
@@ -19,7 +21,7 @@ let stage = "preconditions";
 const startupCommandReceipts = [];
 const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", "list-available-devices",
   "create-owned-simulator", "boot-owned-simulator", "wait-owned-boot", "set-light-appearance",
-  "install-owned-application", "locate-installed-application"]);
+  "install-owned-application", "locate-installed-application", "capture-simulator-springboard"]);
 
 function save(name, value) { writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + "\n"); }
 async function command(binary, args, { timeout = 30_000, cleanup = false, startupLabel } = {}) {
@@ -311,13 +313,59 @@ async function cleanup() {
   return errors;
 }
 
+async function startOwnedSimulator(applicationIdentity) {
+  stage = "owned Simulator creation";
+  const runtimes = JSON.parse(await command("xcrun", ["simctl", "list", "runtimes", "--json"],
+    { startupLabel: "list-ios-runtimes" })).runtimes.filter(runtime => runtime.isAvailable
+    && runtime.identifier.startsWith("com.apple.CoreSimulator.SimRuntime.iOS-"));
+  runtimes.sort((left, right) => right.version.localeCompare(left.version, undefined, { numeric: true }));
+  const runtime = runtimes[0]; if (!runtime) throw new Error("No available iOS Simulator runtime is installed.");
+  const types = JSON.parse(await command("xcrun", ["simctl", "list", "devicetypes", "--json"],
+    { startupLabel: "list-device-types" })).devicetypes;
+  const devices = JSON.parse(await command("xcrun", ["simctl", "list", "devices", "available", "--json"],
+    { startupLabel: "list-available-devices" })).devices[runtime.identifier] ?? [];
+  const template = devices.find(device => device.name.startsWith("iPhone"));
+  const type = types.find(type => type.identifier === template?.deviceTypeIdentifier || type.name === template?.name)
+    ?? types.find(type => type.name === "iPhone 16") ?? types.find(type => type.name === "iPhone 15");
+  if (!type) throw new Error("No compatible iPhone Simulator device type is available.");
+  deviceName = `joko-ci-${process.env.GITHUB_RUN_ID ?? "runtime"}-${randomUUID().slice(0, 8)}`;
+  const created = await command("xcrun", ["simctl", "create", deviceName, type.identifier, runtime.identifier],
+    { startupLabel: "create-owned-simulator" });
+  if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(created)) throw new Error("Simulator creation returned no exact UDID.");
+  udid = created;
+  save("identity.json", { sourceCommit: await command("git", ["rev-parse", "HEAD"]), ...applicationIdentity,
+    simulatorUdid: udid, simulatorName: deviceName, runtime: runtime.identifier, deviceType: type.identifier,
+    architecture: process.arch === "arm64" ? "arm64" : "x86_64", xcode: await command("xcodebuild", ["-version"]) });
+  await command("xcrun", ["simctl", "boot", udid], { startupLabel: "boot-owned-simulator" });
+  await command("xcrun", ["simctl", "bootstatus", udid, "-b"], { timeout: 180_000, startupLabel: "wait-owned-boot" });
+  await command("xcrun", ["simctl", "ui", udid, "appearance", "light"], { startupLabel: "set-light-appearance" });
+}
+
 async function main() {
   let result;
   try {
     if (process.platform !== "darwin") throw new Error("The real Simulator runtime check requires macOS and Xcode.");
+    if (process.argv.length > 2 && !startupDiagnosticsOnly) throw new Error("Unknown iOS runtime observation mode.");
     const output = process.env.JOKO_IOS_RUNTIME_EVIDENCE_DIR, appInput = process.env.JOKO_IOS_SIMULATOR_APP_PATH;
-    if (!output || !isAbsolute(output) || !appInput || !isAbsolute(appInput)) throw new Error("Absolute evidence and compiled Simulator .app paths are required.");
+    if (!output || !isAbsolute(output)) throw new Error("An absolute evidence path is required.");
     evidence = resolve(output); mkdirSync(evidence, { recursive: true });
+    if (startupDiagnosticsOnly) {
+      await startOwnedSimulator({ scope: "simulator-startup-command-probe", noApplicationInstalled: true });
+      stage = "owned Simulator framebuffer capture";
+      const image = join(evidence, "simulator-startup.png");
+      await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", image],
+        { startupLabel: "capture-simulator-springboard" });
+      if (!readFileSync(image).subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+        throw new Error("The owned Simulator did not produce a PNG framebuffer capture.");
+      }
+      const identity = JSON.parse(readFileSync(join(evidence, "identity.json"), "utf8"));
+      result = { passed: true, sourceCommit: identity.sourceCommit, simulatorUdid: udid,
+        scope: "simulator-startup-command-probe", screenshot: "simulator-startup.png", screenshotSha256: await hashFile(image),
+        noApplicationInstalled: true, noAppGuiSuccessClaimed: true,
+        limits: ["Only owned Simulator creation, boot, bootstatus, appearance and framebuffer capture were executed. No Joko application, Metro, XCTest or device interaction was tested."] };
+      return;
+    }
+    if (!appInput || !isAbsolute(appInput)) throw new Error("An absolute compiled Simulator .app path is required.");
     const app = realpathSync(appInput);
     const info = JSON.parse(await command("plutil", ["-convert", "json", "-o", "-", join(app, "Info.plist")]));
     const config = JSON.parse(readFileSync(join(root, "apps/mobile/app.json"), "utf8")).expo;
@@ -328,32 +376,8 @@ async function main() {
     }
     const binary = join(app, executable), architecture = process.arch === "arm64" ? "arm64" : "x86_64";
     if (!(await command("lipo", ["-archs", binary])).split(/\s+/u).includes(architecture)) throw new Error("The Simulator binary does not contain this runner's architecture.");
-    stage = "owned Simulator creation";
-    const runtimes = JSON.parse(await command("xcrun", ["simctl", "list", "runtimes", "--json"],
-      { startupLabel: "list-ios-runtimes" })).runtimes.filter(runtime => runtime.isAvailable
-      && runtime.identifier.startsWith("com.apple.CoreSimulator.SimRuntime.iOS-"));
-    runtimes.sort((left, right) => right.version.localeCompare(left.version, undefined, { numeric: true }));
-    const runtime = runtimes[0]; if (!runtime) throw new Error("No available iOS Simulator runtime is installed.");
-    const types = JSON.parse(await command("xcrun", ["simctl", "list", "devicetypes", "--json"],
-      { startupLabel: "list-device-types" })).devicetypes;
-    const devices = JSON.parse(await command("xcrun", ["simctl", "list", "devices", "available", "--json"],
-      { startupLabel: "list-available-devices" })).devices[runtime.identifier] ?? [];
-    const template = devices.find(device => device.name.startsWith("iPhone"));
-    const type = types.find(type => type.identifier === template?.deviceTypeIdentifier || type.name === template?.name)
-      ?? types.find(type => type.name === "iPhone 16") ?? types.find(type => type.name === "iPhone 15");
-    if (!type) throw new Error("No compatible iPhone Simulator device type is available.");
-    deviceName = `joko-ci-${process.env.GITHUB_RUN_ID ?? "runtime"}-${randomUUID().slice(0, 8)}`;
-    const created = await command("xcrun", ["simctl", "create", deviceName, type.identifier, runtime.identifier],
-      { startupLabel: "create-owned-simulator" });
-    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(created)) throw new Error("Simulator creation returned no exact UDID.");
-    udid = created;
-    save("identity.json", { sourceCommit: await command("git", ["rev-parse", "HEAD"]), bundleId, executable,
-      simulatorUdid: udid, simulatorName: deviceName, runtime: runtime.identifier, deviceType: type.identifier, architecture,
-      compiledApp: app, executableSha256: await hashFile(binary), xcode: await command("xcodebuild", ["-version"]),
+    await startOwnedSimulator({ bundleId, executable, compiledApp: app, executableSha256: await hashFile(binary),
       startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used." });
-    await command("xcrun", ["simctl", "boot", udid], { startupLabel: "boot-owned-simulator" });
-    await command("xcrun", ["simctl", "bootstatus", udid, "-b"], { timeout: 180_000, startupLabel: "wait-owned-boot" });
-    await command("xcrun", ["simctl", "ui", udid, "appearance", "light"], { startupLabel: "set-light-appearance" });
     await command("xcrun", ["simctl", "install", udid, app], { startupLabel: "install-owned-application" });
     const container = await command("xcrun", ["simctl", "get_app_container", udid, bundleId, "app"],
       { startupLabel: "locate-installed-application" });
@@ -387,12 +411,17 @@ async function main() {
   } catch (error) {
     if (evidence) {
       if (udid) await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", join(evidence, "failure.png")], { cleanup: true }).catch(() => undefined);
-      save("failure.json", { stage, message: error.message, simulatorUdid: udid, bundleId, noGuiSuccessClaimed: true });
+      save("failure.json", { stage, message: error.message, simulatorUdid: udid, bundleId,
+        scope: startupDiagnosticsOnly ? "simulator-startup-command-probe" : "joko-app-runtime-and-gui", noGuiSuccessClaimed: true });
     }
     throw error;
   } finally {
     const errors = await cleanup();
-    if (result && errors.length === 0) { save("result.json", result); process.stdout.write("Actual Joko Simulator startup, reopen and connection-page UI operations passed.\n"); }
+    if (result && errors.length === 0) {
+      save("result.json", result);
+      process.stdout.write(startupDiagnosticsOnly ? "Owned Simulator startup commands and framebuffer capture passed; no application GUI was tested.\n"
+        : "Actual Joko Simulator startup, reopen and connection-page UI operations passed.\n");
+    }
     else if (result) throw new Error("Simulator observations passed but owned cleanup failed; see cleanup.json.");
   }
 }

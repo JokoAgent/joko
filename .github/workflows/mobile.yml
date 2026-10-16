@@ -20,18 +20,19 @@ on:
         options:
           - full
           - android-signer-diagnostics
+          - ios-startup-diagnostics
 
 permissions:
   contents: read
 
 concurrency:
-  group: mobile-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'android-signer-diagnostics' && '-android-signer-diagnostics' || '' }}
+  group: mobile-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'android-signer-diagnostics' && '-android-signer-diagnostics' || inputs.scope == 'ios-startup-diagnostics' && '-ios-startup-diagnostics' || '' }}
   # Native builds finish while subsequent pushes replace only the pending run.
   cancel-in-progress: false
 
 jobs:
   hermes:
-    if: ${{ inputs.scope != 'android-signer-diagnostics' }}
+    if: ${{ inputs.scope != 'android-signer-diagnostics' && inputs.scope != 'ios-startup-diagnostics' }}
     name: Android and iOS JS/Hermes exports
     runs-on: ubuntu-latest
     timeout-minutes: 25
@@ -81,7 +82,7 @@ jobs:
           retention-days: 3
 
   android-native:
-    if: ${{ inputs.scope != 'android-signer-diagnostics' }}
+    if: ${{ inputs.scope != 'android-signer-diagnostics' && inputs.scope != 'ios-startup-diagnostics' }}
     name: Android x86_64 test-signed APK and native GUI
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -204,8 +205,42 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
 
+  ios-startup-diagnostics:
+    if: ${{ inputs.scope == 'ios-startup-diagnostics' }}
+    name: Owned iOS Simulator startup command probe (no application)
+    runs-on: macos-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+      - name: Observe owned Simulator boot, appearance and framebuffer
+        timeout-minutes: 7
+        run: node scripts/ci/mobile-ios-simulator-runtime.mjs --startup-diagnostics
+        env:
+          JOKO_IOS_RUNTIME_EVIDENCE_DIR: ${{ runner.temp }}/joko-ios-startup-diagnostics
+      - name: Upload only the Simulator command probe evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-startup-diagnostics-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/*.png
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/identity.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/result.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/failure.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/cleanup.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/startup-command-receipts.json
+          if-no-files-found: warn
+          retention-days: 3
+
   ios-simulator:
-    if: ${{ inputs.scope != 'android-signer-diagnostics' }}
+    if: ${{ inputs.scope != 'android-signer-diagnostics' && inputs.scope != 'ios-startup-diagnostics' }}
     name: iOS Simulator Debug build, Swift and startup observations
     runs-on: macos-latest
     timeout-minutes: 75
