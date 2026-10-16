@@ -18,7 +18,8 @@ permissions:
 
 concurrency:
   group: mobile-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Native builds finish while subsequent pushes replace only the pending run.
+  cancel-in-progress: false
 
 jobs:
   hermes:
