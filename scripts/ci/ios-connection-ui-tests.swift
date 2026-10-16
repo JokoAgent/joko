@@ -25,12 +25,12 @@ final class JokoConnectionUITests: XCTestCase {
         guard running else { return }
         app.activate()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 30))
-        let nearbyExists = button("Nearby").waitForExistence(timeout: 45)
+        let nearbyExists = tab("Nearby").waitForExistence(timeout: 45)
         if !nearbyExists { try? recordPreInputSetupFailure(launchArguments: launchArguments) }
         XCTAssertTrue(nearbyExists)
         XCTAssertTrue(connectionPage.exists, "The real connection page must be present.")
         for label in ["Nearby", "Saved nodes", "Add Joko node"] {
-            XCTAssertEqual(connectionPage.buttons.matching(identifier: label).count, 1,
+            XCTAssertEqual(tabQuery(label).count, 1,
                            "The real connection page must own one exact \(label) control.")
         }
     }
@@ -80,6 +80,12 @@ final class JokoConnectionUITests: XCTestCase {
 
     private var connectionPage: XCUIElement { app.webViews.firstMatch }
     private func button(_ label: String) -> XCUIElement { connectionPage.buttons[label].firstMatch }
+    // The shipped WKWebView exposes the segmented tabs as accessibility switches.
+    // Keep the exact role/label query inside this application's connection page.
+    private func tabQuery(_ label: String) -> XCUIElementQuery {
+        connectionPage.switches.matching(NSPredicate(format: "label == %@", label))
+    }
+    private func tab(_ label: String) -> XCUIElement { tabQuery(label).firstMatch }
 
     private func tap(_ element: XCUIElement) {
         XCTAssertTrue(element.waitForExistence(timeout: 10))
@@ -138,13 +144,13 @@ final class JokoConnectionUITests: XCTestCase {
 
     func testConnectionPageInteractions() throws {
         screenshot("01-connection-page")
-        tap(button("Saved nodes"))
+        tap(tab("Saved nodes"))
         XCTAssertTrue(connectionPage.staticTexts["Connect a Joko node to begin."].firstMatch.waitForExistence(timeout: 10))
         screenshot("02-saved-nodes")
-        tap(button("Nearby"))
+        tap(tab("Nearby"))
         XCTAssertTrue(connectionPage.staticTexts["Nearby Joko nodes"].firstMatch.waitForExistence(timeout: 10))
         screenshot("03-nearby")
-        tap(button("Add Joko node"))
+        tap(tab("Add Joko node"))
         let address = connectionPage.textFields["Joko node address"].firstMatch
         XCTAssertTrue(address.waitForExistence(timeout: 10))
         let inspect = button("Check node identity")
@@ -171,7 +177,7 @@ final class JokoConnectionUITests: XCTestCase {
         let cancel = button("Cancel")
         XCTAssertTrue(cancel.waitForExistence(timeout: 10))
         try waitForPendingRequest(port)
-        XCTAssertFalse(button("Add Joko node").isEnabled)
+        XCTAssertFalse(tab("Add Joko node").isEnabled)
         screenshot("06-inspection-pending")
         tap(cancel)
         wait(inspect, "enabled == true")
@@ -180,9 +186,9 @@ final class JokoConnectionUITests: XCTestCase {
         XCTAssertFalse(button("Request pairing").isEnabled)
         screenshot("07-cancelled-draft-retained")
 
-        tap(button("Saved nodes"))
+        tap(tab("Saved nodes"))
         XCTAssertFalse(address.exists, "Leaving Add must remove its active form.")
-        tap(button("Add Joko node"))
+        tap(tab("Add Joko node"))
         XCTAssertTrue(address.waitForExistence(timeout: 10))
         XCTAssertEqual(address.value as? String, origin, "Mode changes must preserve the address draft.")
         screenshot("08-returned-address-draft")
