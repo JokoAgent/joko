@@ -305,7 +305,7 @@ guard let input = readInput(),
       let first = parsePath(input["first"]) else {
     reply("INVALID_ARGUMENT")
 }
-let second: [TouchSample]?
+private let second: [TouchSample]?
 if input["second"] == nil {
     second = nil
 } else {
@@ -320,8 +320,8 @@ if input["second"] == nil {
 }
 signal(SIGTERM) { _ in cancellationRequested = 1 }
 signal(SIGINT) { _ in cancellationRequested = 1 }
-var lastFirst = first[0]
-var lastSecond = second?[0]
+private var lastFirst = first[0]
+private var lastSecond = second?[0]
 var contactActive = false
 for index in first.indices {
     let point = first[index]
