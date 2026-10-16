@@ -870,6 +870,31 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
     await interact(`([...document.querySelectorAll('.remote-viewer-close-dialog button')].find(item=>item.textContent==='Cancel')).click()`);
     await interact(`([...document.querySelectorAll('.remote-viewer-connection button')].find(item=>item.textContent==='Reconnect')).click()`);
     await until(async () => starts > startsBeforeRecovery && viewer.webContents.executeJavaScript(`document.querySelector('#image')?.naturalWidth===160 && document.querySelector('.remote-viewer-heading')?.textContent.includes('Connected')`));
+    stage = "normal memory bounds before successful lock exit";
+    // Actual size already proved the fullscreen exit and work-area clamp above.
+    // Test cached window geometry separately from a WM remapping a window that
+    // fills its whole work area (including its native frame constraints).
+    const memoryWindow = viewer, memoryArea = screen.getDisplayMatching(viewer.getBounds()).workArea;
+    const [minimumWidth, minimumHeight] = memoryWindow.getMinimumSize();
+    const memoryWidth = Math.min(memoryArea.width, Math.max(minimumWidth, Math.min(900, memoryArea.width - 64)));
+    const memoryHeight = Math.min(memoryArea.height, Math.max(minimumHeight, Math.min(620, memoryArea.height - 64)));
+    const requestedMemoryBounds = { x: memoryArea.x + Math.floor((memoryArea.width - memoryWidth) / 2),
+      y: memoryArea.y + Math.floor((memoryArea.height - memoryHeight) / 2), width: memoryWidth, height: memoryHeight };
+    let geometryRevision = 0;
+    const geometryChanged = () => { geometryRevision++; };
+    memoryWindow.on("move", geometryChanged); memoryWindow.on("resize", geometryChanged);
+    try {
+      memoryWindow.setBounds(requestedMemoryBounds);
+      await until(async () => {
+        if (["x", "y", "width", "height"].some(field => memoryWindow.getBounds()[field] !== requestedMemoryBounds[field])) return false;
+        const revision = geometryRevision;
+        await memoryWindow.webContents.executeJavaScript("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
+        return revision === geometryRevision &&
+          ["x", "y", "width", "height"].every(field => memoryWindow.getBounds()[field] === requestedMemoryBounds[field]);
+      });
+    } finally {
+      memoryWindow.removeListener("move", geometryChanged); memoryWindow.removeListener("resize", geometryChanged);
+    }
     stage = "explicit lock exit on fresh lease";
     const cachedViewer = viewer, cachedBounds = viewer.getBounds(), closingLeaseId = activeLeaseId;
     const closingGeneration = (await viewer.webContents.executeJavaScript("window.jokoRemoteDesktopViewer.state()")).generation;
@@ -897,13 +922,13 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
     if (!viewer || viewer !== cachedViewer || !reopened.focusedExisting) throw new Error("Confirmed close did not reuse the same target window.");
     await until(async () => starts === startsBeforeReopen + 1 && viewer.webContents.executeJavaScript(`document.querySelector('#image')?.naturalWidth===160 && document.querySelector('.remote-viewer-heading')?.textContent.includes('Connected')`));
     const reopenedBounds = viewer.getBounds(), reopenedScope = await viewer.webContents.executeJavaScript("window.jokoRemoteDesktopViewer.state()");
+    cachedWindowEvidence = { windowId: viewer.id, sameBrowserWindow: true, cachedBounds, reopenedBounds,
+      closingLeaseId, reopenedLeaseId: activeLeaseId, closingGeneration, closedGeneration: closedScope.generation,
+      reopenedGeneration: reopenedScope.generation, retiredGenerationRejected: true };
     if (!viewer.isVisible() || !activeLeaseId || activeLeaseId === closingLeaseId || reopenedScope.generation < closedScope.generation ||
       ["x", "y", "width", "height"].some(field => reopenedBounds[field] !== cachedBounds[field])) {
       throw new Error("Cached target reopen did not preserve memory bounds and establish a fresh lease.");
     }
-    cachedWindowEvidence = { windowId: viewer.id, sameBrowserWindow: true, cachedBounds, reopenedBounds,
-      closingLeaseId, reopenedLeaseId: activeLeaseId, closingGeneration, closedGeneration: closedScope.generation,
-      reopenedGeneration: reopenedScope.generation, retiredGenerationRejected: true };
     writeFileSync(resolve(output, "viewer-cached-reopen.png"), (await captureViewport(viewer)).toPNG());
     stage = "reopened viewer control";
     // A new native window may receive focus after its fast synthetic start ACK.
