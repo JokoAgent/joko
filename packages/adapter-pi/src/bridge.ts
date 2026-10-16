@@ -74,6 +74,7 @@ const RUNTIME_TOOL_CATALOG_CHUNK_BYTES = ${PI_RUNTIME_TOOL_CATALOG_CHUNK_BYTES};
 const COMMAND_GATE_REQUEST_PREFIX = "joko:command-gate/v1/";
 const PARTNER_LEARNING_REQUEST_PREFIX = "joko:tool-turn/v1/";
 const PARTNER_LEARNING_REPLY_STATUS_KEY = "joko-reply-identity/v1";
+const COMPACTION_IDENTITY_STATUS_KEY = "joko-compaction-identity/v1";
 const POLICY_DECISION_REQUEST_PREFIX = "joko:policy-decision/v1/";
 const MAX_POLICY_DECISION_ENVELOPE_CHARACTERS = ${MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS};
 
@@ -1022,6 +1023,27 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
       });
     }
   }
+
+  let automaticCompactionParent: { entryId: string | null; reason: string } | undefined;
+  pi.on("session_before_compact", (event, ctx) => {
+    automaticCompactionParent = ctx.mode === "rpc" && (event.reason === "threshold" || event.reason === "overflow")
+      ? { entryId: ctx.sessionManager.getLeafId(), reason: event.reason } : undefined;
+  });
+  pi.on("session_compact_failed", () => { automaticCompactionParent = undefined; });
+  pi.on("session_compact", (event, ctx) => {
+    const before = automaticCompactionParent;
+    automaticCompactionParent = undefined;
+    if (ctx.mode !== "rpc" || before === undefined || event.reason !== before.reason) return;
+    // The published runtime appends and synchronously persists the compaction
+    // before this hook. Read its current leaf rather than matching summary
+    // text: repeated summaries can make event.compactionEntry refer to an
+    // earlier entry in the published runtime.
+    const entry = ctx.sessionManager.getLeafEntry();
+    if (entry?.type !== "compaction" || ctx.sessionManager.getLeafId() !== entry.id || entry.parentId !== before.entryId) return;
+    ctx.ui.setStatus(COMPACTION_IDENTITY_STATUS_KEY, JSON.stringify({
+      entryId: entry.id, parentEntryId: entry.parentId, reason: event.reason
+    }));
+  });
 
   pi.on("turn_end", (event, ctx) => {
     if (ctx.mode !== "rpc" || event.message.role !== "assistant") return;

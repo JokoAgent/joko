@@ -5258,6 +5258,7 @@ export class PiBackendAdapter implements
               })
             );
           } else if (isExtensionUiRequest(event)) {
+            if (runtime.translator.consumeCompactionNativeIdentity(rawEvent)) return;
             if (learningReply) return;
             if (learningRequest !== undefined) {
               if (learningRequest.id !== "" && !runtime.transport.closed) {

@@ -13335,7 +13335,16 @@ export class SessionHost {
           }
         }
         const durablePayload = this.withAcceptedInputMetadata(payload, sessionId, runId);
-        const durableMetadata = bindNativeHistoryEventMetadata(durablePayload, binding?.opaqueRef, metadata);
+        // An automatic compaction lifecycle belongs to the native binding even
+        // before its newly persisted entry ID is available. Keep that known
+        // lifecycle through a managed-process generation change as well.
+        const durableMetadata = bindNativeHistoryEventMetadata(
+          durablePayload.type === "compaction" && durablePayload.automatic === true
+            ? { ...durablePayload, nativeHistory: durablePayload.nativeHistory ?? {} }
+            : durablePayload,
+          binding?.opaqueRef,
+          metadata
+        );
         // Close the event-delivery race synchronously: once a live compaction
         // start reaches Orchestrator, no queue claim can interleave before its
         // durable event append. Terminal states release only after that append has
@@ -14682,6 +14691,7 @@ export class SessionHost {
     const acceptedUserMetadata = new Map<string, AcceptedUserMetadata>();
     const privateMessageMetadata = new Map<string, PartnerPrivateMessageOrigin>();
     const acceptedQueueInputs = new Map<string, QueueItemRecord>();
+    const observedAutomaticCompactions = new Set<string>();
     const nativeIdentityAdapter = adapter as BackendAdapter & {
       readonly nativeUserEntryIdForOperation?: (operationId: string) => string;
     };
@@ -14701,6 +14711,11 @@ export class SessionHost {
     }
     visitVisibleSessionEvents(store, session.id, (event) => {
       const privateEntryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
+      if (event.payload.type === "compaction" && event.payload.automatic === true
+        && event.payload.state === "completed" && privateEntryId !== undefined
+        && event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint) {
+        observedAutomaticCompactions.add(privateEntryId);
+      }
       if (event.payload.type === "message_complete" && event.payload.partnerPrivateOrigin !== undefined
         && privateEntryId !== undefined && event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint) {
         privateMessageMetadata.set(privateEntryId, event.payload.partnerPrivateOrigin);
@@ -14751,6 +14766,11 @@ export class SessionHost {
     const projections = projectNativeHistory(session.id, session.binding.opaqueRef, history);
     for (const projection of projections) {
       const projectionEntryId = nativeHistoryEventContext(projection.payload)?.identity?.entryId;
+      // A live automatic lifecycle has a more precise reason and stable
+      // compaction ID than the persisted native summary. Only an exact entry
+      // identity permits omitting its otherwise duplicate hydration card.
+      if (projection.payload.type === "compaction" && projectionEntryId !== undefined
+        && observedAutomaticCompactions.has(projectionEntryId)) continue;
       const acceptedQueueItem = projection.payload.type === "message_complete"
         && projection.payload.role === "user"
         && projectionEntryId !== undefined
