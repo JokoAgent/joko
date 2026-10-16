@@ -1,0 +1,12 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- REQUEST_INSTALL_PACKAGES is added only by the Joko release-feed build config. -->
+  <application>
+    <provider
+      android:name="app.joko.appinstaller.UpdateFileProvider"
+      android:authorities="${applicationId}.joko.updates"
+      android:exported="false"
+      android:grantUriPermissions="true">
+      <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/joko_update_paths" />
+    </provider>
+  </application>
+</manifest>
