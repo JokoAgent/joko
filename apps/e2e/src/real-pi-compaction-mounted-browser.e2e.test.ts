@@ -91,7 +91,7 @@ describe("mounted Pi compaction product chain", () => {
     const pairingCode = fixture.pairingCode(challenge.challenge.challengeId);
     const taskUrl = (sessionId: string) => `${fixture!.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`;
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     const errors = observeBrowserErrors(page);
     await page.goto(taskUrl(compactSessionId), { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
@@ -101,7 +101,14 @@ describe("mounted Pi compaction product chain", () => {
     await page.locator("form.pair-form button[type=submit]").click();
 
     const trigger = page.getByRole("button", { name: "Click to compact context" });
-    await trigger.waitFor({ state: "visible", timeout: 30_000 });
+    try {
+      await trigger.waitFor({ state: "visible", timeout: 30_000 });
+    } catch (error) {
+      throw new Error(`The mounted compact control was unavailable: ${JSON.stringify({
+        page: (await page.locator("body").innerText()).slice(0, 5_000),
+        rings: await page.locator(".context-capacity-ring").allTextContents()
+      })}`, { cause: error });
+    }
     errors.splice(0);
     await trigger.click();
     const confirmation = page.getByRole("dialog", { name: "Compact context?" });
@@ -240,7 +247,7 @@ describe("mounted Pi compaction product chain", () => {
     if (challenge.challenge === undefined) throw new Error("Mounted Web pairing returned no challenge.");
     const pairingCode = fixture.pairingCode(challenge.challenge.challengeId);
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     const errors = observeBrowserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
