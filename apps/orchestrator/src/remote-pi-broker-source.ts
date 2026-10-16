@@ -538,11 +538,19 @@ function parseWindowsCommandLine(commandLine) {
   }
   return argv;
 }
+function windowsProcessQueryPrelude() {
+  // CIM initialization needs Utility's Set-Alias before the query uses ConvertTo-Json.
+  return [
+    '$ErrorActionPreference = "Stop"',
+    'Import-Module ([System.IO.Path]::Combine($PSHOME, "Modules", "Microsoft.PowerShell.Utility", "Microsoft.PowerShell.Utility.psd1")) -ErrorAction Stop',
+    'Import-Module ([System.IO.Path]::Combine($PSHOME, "Modules", "CimCmdlets", "CimCmdlets.psd1")) -ErrorAction Stop'
+  ];
+}
 async function windowsProcessQuery(pid) {
   const powershell = await trustedWindowsPowerShell();
   if (powershell === undefined) return undefined;
   const script = [
-    '$ErrorActionPreference = "Stop"',
+    ...windowsProcessQueryPrelude(),
     '$p = Get-CimInstance Win32_Process -Filter "ProcessId = ' + pid + '"',
     'if ($null -eq $p) { exit 3 }',
     '$created = if ($null -eq $p.CreationDate) { "" } else { $p.CreationDate.ToUniversalTime().Ticks }',
@@ -668,7 +676,7 @@ async function processIdCandidates() {
   try {
     const result = await execFileAsync(powershell, [
       "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-      "@(Get-CimInstance Win32_Process | ForEach-Object { [string]$_.ProcessId }) | ConvertTo-Json -Compress"
+      [...windowsProcessQueryPrelude(), "@(Get-CimInstance Win32_Process | ForEach-Object { [string]$_.ProcessId }) | ConvertTo-Json -Compress"].join("\n")
     ], { encoding: "utf8", windowsHide: true, timeout: 10_000, maxBuffer: 1024 * 1024 });
     const value = JSON.parse(result.stdout);
     const entries = Array.isArray(value) ? value : [value];

@@ -1155,6 +1155,48 @@ describe("remote Pi broker source", () => {
     expect(expected).not.toContain("opaque-runtime-value");
   });
 
+  it.runIf(process.platform === "win32")("queries exact Windows identities without module auto-loading", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-broker-query-"));
+    const sourcePath = join(root, "query.mjs");
+    const prelude = "'$ErrorActionPreference = \"Stop\"',";
+    const harness = REMOTE_PI_BROKER_SOURCE
+      .replace(prelude, `${prelude}\n    '$PSModuleAutoLoadingPreference = "None"',`)
+      .replace("main().catch(() => process.exit(1));", String.raw`
+windowsProcessFingerprint(process.pid).then(async (value) => {
+  if (value === undefined) return process.stdout.write(JSON.stringify({ found: false }));
+  const expectedExecutable = await realpath(process.execPath);
+  process.stdout.write(JSON.stringify({
+    found: true,
+    executableMatches: sameNativePath(value.executable, expectedExecutable),
+    exactArguments: exactProcessArguments(value.args, [process.execPath, process.argv[1]]),
+    startIdentity: /^[0-9]+$/.test(value.startTicks),
+    commandHashMatches: value.commandHash === digestBytes(Buffer.from(value.args.join("\0") + "\0")),
+    executableHashMatches: value.executableHash === digestBytes(Buffer.from(value.executable))
+  }));
+}).catch(() => process.exit(1));
+`);
+    expect(harness).not.toBe(REMOTE_PI_BROKER_SOURCE);
+    await writeFile(sourcePath, harness, { mode: 0o600 });
+    try {
+      const environment: Record<string, string> = { JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 };
+      for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR"]) {
+        const value = process.env[name];
+        if (value !== undefined) environment[name] = value;
+      }
+      const result = spawnSync(process.execPath, [sourcePath], {
+        env: environment, encoding: "utf8", windowsHide: true, timeout: 8_000
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        found: true, executableMatches: true, exactArguments: true,
+        startIdentity: true, commandHashMatches: true, executableHashMatches: true
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   it.runIf(process.platform === "linux")(
     "rejects a regular file changed or replaced while its bytes are being read",
     async () => {
