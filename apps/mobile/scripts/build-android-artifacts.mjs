@@ -6,13 +6,14 @@ import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 import {
   androidToolExecutableNames,
+  apkSignerCertificateDiagnostics,
+  apkSignerCertificateSha256,
   assertAllowedArgs,
   assertProductionGitGate,
   buildJarsignerVerificationArgs,
   certificateSha256FromPem,
   createArtifactManifest,
   loadMobileReleaseIdentity,
-  normalizeCertificateSha256,
   parseArgs,
   patchAndroidReleaseSigning,
   platformCommand,
@@ -96,11 +97,14 @@ function validateApk(path, identity, expectedCertificateSha256) {
   }
   const apksigner = locateAndroidTool("apksigner");
   const signature = capture(apksigner, ["verify", "--verbose", "--print-certs", path]);
-  const actual = signature.match(/Signer #1 certificate SHA-256 digest:\s*([0-9a-f:]+)/iu)?.[1];
-  if (!actual) throw new Error("apksigner did not return the APK signing certificate.");
-  const certificate = normalizeCertificateSha256(actual, "APK signing certificate");
-  if (certificate !== expectedCertificateSha256) throw new Error("APK signing certificate does not match the pinned release identity.");
-  return certificate;
+  try { return apkSignerCertificateSha256(signature, expectedCertificateSha256); }
+  catch (error) {
+    let version;
+    try { version = capture(apksigner, ["version"]).trim(); }
+    catch { /* The verification command's successful exit remains distinct. */ }
+    process.stderr.write(`  APK signer verification metadata: ${JSON.stringify(apkSignerCertificateDiagnostics(signature, version))}\n`);
+    throw error;
+  }
 }
 
 function validateAab(path, androidDirectory, identity, signing) {

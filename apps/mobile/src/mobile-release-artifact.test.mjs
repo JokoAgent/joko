@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   androidToolExecutableNames,
+  apkSignerCertificateDiagnostics,
+  apkSignerCertificateSha256,
   assertProductionGitGate,
   buildJarsignerVerificationArgs,
   buildIosExportOptionsPlist,
@@ -75,6 +77,67 @@ describe("mobile release artifact configuration", () => {
       "D:/release/joko.aab"
     ]);
     expect(args.join(" ")).not.toContain("store-secret");
+  });
+
+  it("pins every APK signer certificate from numbered and v3.1 SDK-range output", () => {
+    const certificate = "ab".repeat(32);
+    expect(apkSignerCertificateSha256([
+      "Verifies",
+      "Number of signers: 1",
+      `Signer #1 certificate SHA-256 digest: ${certificate}`,
+      `Signer #1 public key SHA-256 digest: ${"cd".repeat(32)}`,
+      `Source Stamp Signer certificate SHA-256 digest: ${"ef".repeat(32)}`
+    ].join("\r\n"), certificate)).toBe(certificate);
+    expect(apkSignerCertificateSha256([
+      `Signer (minSdkVersion=33 (dev release=true), maxSdkVersion=2147483647) certificate SHA-256 digest: ${certificate.toUpperCase()}`,
+      `Signer (minSdkVersion=24, maxSdkVersion=32) certificate SHA-256 digest: ${certificate}`,
+      `Signer #1 certificate SHA-256 digest: ${certificate}`
+    ].join("\n"), certificate)).toBe(certificate);
+    expect(() => apkSignerCertificateSha256(`Signer #1 certificate SHA-256 digest: ${certificate}`, "cd".repeat(32)))
+      .toThrow(/pinned release identity/u);
+  });
+
+  it("rejects missing, malformed and conflicting APK signer certificates", () => {
+    const certificate = "ab".repeat(32);
+    expect(() => apkSignerCertificateSha256("Verifies\nNumber of signers: 0", certificate)).toThrow(/did not return/u);
+    expect(() => apkSignerCertificateSha256(`Source Stamp Signer certificate SHA-256 digest: ${certificate}`, certificate))
+      .toThrow(/did not return/u);
+    for (const digest of ["", "ab".repeat(31), `${certificate}extra`, "not-a-certificate"]) {
+      expect(() => apkSignerCertificateSha256(`Signer #1 certificate SHA-256 digest: ${digest}`, certificate))
+        .toThrow(/64 hexadecimal/u);
+    }
+    for (const signer of ["Signer #0", "Signer (minSdkVersion=33, maxSdkVersion=32)", "Signer unknown"]) {
+      expect(() => apkSignerCertificateSha256(`${signer} certificate SHA-256 digest: ${certificate}`, certificate))
+        .toThrow(/unsupported APK signer/u);
+    }
+    for (const signer of ["Signer #2", "Signer (minSdkVersion=33, maxSdkVersion=2147483647)"]) {
+      expect(() => apkSignerCertificateSha256([
+        `Signer #1 certificate SHA-256 digest: ${certificate}`,
+        `${signer} certificate SHA-256 digest: ${"cd".repeat(32)}`
+      ].join("\n"), certificate)).toThrow(/different signing certificates/u);
+    }
+    expect(() => apkSignerCertificateSha256([
+      `Signer #1 certificate SHA-256 digest: ${certificate}`,
+      "Signer #2 certificate SHA-256 digest: malformed"
+    ].join("\n"), certificate)).toThrow(/64 hexadecimal/u);
+  });
+
+  it("limits failed APK signer diagnostics to public digests and fixed metadata", () => {
+    const certificate = "ab".repeat(32);
+    expect(apkSignerCertificateDiagnostics([
+      "Signer #1 certificate DN: CN=Uncontrolled public subject",
+      "WARNING: /private/build/path and untrusted diagnostic text",
+      `Signer #1 certificate SHA-256 digest: ${certificate}`,
+      "Signer #2 certificate SHA-256 digest: malformed"
+    ].join("\n"), "0.9\n")).toEqual({
+      phase: "apk-signer-certificate-read", tool: "apksigner", toolVersion: "0.9", exitCode: 0,
+      hasOutput: true, signerDigestLineCount: 2,
+      signerDigests: [{ signer: "#1", sha256: certificate }, { signer: "#2", validDigest: false }]
+    });
+    expect(apkSignerCertificateDiagnostics("", "uncontrolled version output")).toEqual({
+      phase: "apk-signer-certificate-read", tool: "apksigner", toolVersion: "unavailable", exitCode: 0,
+      hasOutput: false, signerDigestLineCount: 0, signerDigests: []
+    });
   });
 
   it("keeps Android release secrets external and pins an independent certificate", () => {

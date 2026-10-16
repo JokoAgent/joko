@@ -140,6 +140,53 @@ export function normalizeCertificateSha256(raw, label = "signing certificate SHA
   return normalized;
 }
 
+function apkSignerDigestRecords(output) {
+  return String(output ?? "").split(/\r?\n/u)
+    .filter((line) => /^Signer\b.* certificate SHA-256 digest:/iu.test(line))
+    .map((line) => {
+      // ApkSignerTool labels v3.1 certificates by their SDK range, and other
+      // certificates by signer number. Source Stamp certificates are separate.
+      const match = /^Signer (#([1-9][0-9]{0,9})|\(minSdkVersion=([1-9][0-9]{0,9})(?: \(dev release=true\))?, maxSdkVersion=([1-9][0-9]{0,9})\)) certificate SHA-256 digest:[ \t]*(.*)$/iu.exec(line);
+      const valid = match !== null && (match[2] !== undefined
+        ? Number(match[2]) <= 2_147_483_647
+        : Number(match[3]) <= Number(match[4]) && Number(match[4]) <= 2_147_483_647);
+      return { label: valid ? match[1] : undefined, value: match?.[5] };
+    });
+}
+
+export function apkSignerCertificateSha256(output, expectedCertificateSha256) {
+  const records = apkSignerDigestRecords(output);
+  if (records.length === 0) throw new Error("apksigner did not return the APK signing certificate.");
+  const certificates = new Set(records.map((record) => {
+    if (record.label === undefined) throw new Error("apksigner returned an unsupported APK signer certificate label.");
+    return normalizeCertificateSha256(record.value, "APK signing certificate");
+  }));
+  if (certificates.size !== 1) throw new Error("APK contains different signing certificates across its signers or SDK ranges.");
+  const certificate = [...certificates][0];
+  if (certificate !== normalizeCertificateSha256(expectedCertificateSha256, "Pinned APK signing certificate")) {
+    throw new Error("APK signing certificate does not match the pinned release identity.");
+  }
+  return certificate;
+}
+
+export function apkSignerCertificateDiagnostics(output, toolVersion) {
+  const records = apkSignerDigestRecords(output);
+  return {
+    phase: "apk-signer-certificate-read",
+    tool: "apksigner",
+    toolVersion: /^[0-9]+(?:\.[0-9]+){0,5}$/u.test(String(toolVersion).trim()) ? String(toolVersion).trim() : "unavailable",
+    exitCode: 0,
+    hasOutput: String(output ?? "").trim().length > 0,
+    signerDigestLineCount: records.length,
+    signerDigests: records.slice(0, 16).map((record) => {
+      let sha256;
+      try { sha256 = normalizeCertificateSha256(record.value, "APK signing certificate"); }
+      catch { /* Malformed command output is not suitable for diagnostics. */ }
+      return { signer: record.label ?? "unsupported", ...(sha256 === undefined ? { validDigest: false } : { sha256 }) };
+    })
+  };
+}
+
 export function certificateSha256FromPem(raw, label = "signing certificate") {
   const pem = String(raw ?? "").match(/-----BEGIN CERTIFICATE-----[\s\S]+?-----END CERTIFICATE-----/u)?.[0];
   if (!pem) throw new Error(`${label} output did not contain a certificate.`);
