@@ -99,11 +99,15 @@ final class JokoConnectionUITests: XCTestCase {
         for prefix in ["Open debugger to view warnings.", "[expo-notifications] Error reading persisted"] {
             let notice = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
             if notice.exists && notice.isHittable {
-                // LogBox's nativeID is not a UIKit accessibility identifier.
-                // Its fixed close area is at the native toast's right edge;
-                // anchor this physical tap to the observed notice, in points.
-                app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
-                    .withOffset(CGVector(dx: app.frame.width - 32, dy: notice.frame.midY - app.frame.minY)).tap()
+                // A native toast's text frame does not describe its close area.
+                // Open the actual inspector and dismiss it through its labeled
+                // control, including when a prior interaction already opened it.
+                let dismiss = app.descendants(matching: .any)
+                    .matching(NSPredicate(format: "label == %@", "Dismiss")).firstMatch
+                if !dismiss.exists { notice.tap() }
+                XCTAssertTrue(dismiss.waitForExistence(timeout: 5), "The native development inspector must expose its real Dismiss control.")
+                XCTAssertTrue(dismiss.isHittable)
+                dismiss.tap()
             }
         }
         XCTAssertTrue(element.waitForExistence(timeout: 10))

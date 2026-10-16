@@ -425,7 +425,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
     stage = "actual connection page UI operations";
     try {
       await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
-        "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], "gui-test.log", 3 * 60_000);
+        "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], "gui-test.log", 5 * 60_000);
     } catch (error) { executionError = error; }
     if (existsSync(xcresult)) {
       stage = "Apple UI-test evidence export";
