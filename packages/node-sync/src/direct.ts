@@ -56,6 +56,7 @@ interface DirectRoute {
   nextProbeAt: number;
   authenticatedAt: number;
   onlineUntil: number;
+  recoverAfterProbe?: boolean;
   pending?: PendingProbe;
 }
 
@@ -198,8 +199,12 @@ export class NodeSyncDirectTransport {
     if (!callerIsCurrent(delivery)) return;
     this.#reconcile();
     const route = this.#routes.get(peerId);
-    if (route === undefined || route.endpoint.publicKey !== publicKey || !this.#isCurrent(route) || !callerIsCurrent(delivery) ||
-      route.onlineUntil > Date.now() || route.pending !== undefined) return;
+    if (route === undefined || route.endpoint.publicKey !== publicKey || !this.#isCurrent(route) || !callerIsCurrent(delivery)) return;
+    if (route.pending !== undefined) {
+      route.recoverAfterProbe = true;
+      return;
+    }
+    if (route.onlineUntil > Date.now()) return;
     // A newly reachable authenticated peer may wake a failed route; only the outgoing probe establishes presence.
     route.nextProbeAt = 0;
     this.#enqueue(route);
@@ -333,8 +338,16 @@ export class NodeSyncDirectTransport {
       success = false;
       if (this.#isCurrent(route) && callerIsCurrent(pending.delivery)) this.#failed(route, Date.now());
     } finally {
+      const recover = route.recoverAfterProbe === true;
+      route.recoverAfterProbe = false;
       if (route.pending === pending) route.pending = undefined;
       pending.resolve(success && this.#isCurrent(route) && callerIsCurrent(pending.delivery));
+      // An old failed probe must not hide newer authenticated reachability for
+      // the whole cooldown. A fresh outgoing proof still owns presence.
+      if (!success && recover && this.#isCurrent(route)) {
+        route.nextProbeAt = 0;
+        this.#enqueue(route);
+      }
     }
   }
 

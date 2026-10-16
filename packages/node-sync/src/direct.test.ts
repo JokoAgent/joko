@@ -72,6 +72,37 @@ describe("authenticated explicit node routes", () => {
     expect(candidates).toEqual([second.nodeId, second.nodeId]);
   });
 
+  it("retains an authenticated recovery hint while an older outgoing probe is still pending", { timeout: 10_000 }, async () => {
+    const first = identity("pending-first"), second = identity("pending-second");
+    const senderPort = await freePort(), receiverPort = await freePort();
+    const receiver = new NodeSyncTcpTransport({
+      purpose: "voice-dictionary", getSelf: () => second, listenHost: "127.0.0.1", listenPort: receiverPort,
+      isPeerAllowed: (nodeId, publicKey) => nodeId === first.nodeId && publicKey === first.publicKey,
+      onFrame: () => undefined, logger: { debug: () => undefined, warn: () => undefined }
+    });
+    cleanups.push(() => receiver.stop());
+    let release!: (success: boolean) => void;
+    const oldProbe = new Promise<boolean>(resolve => { release = resolve; });
+    let outgoingProbes = 0;
+    const originalProbe = NodeSyncTcpTransport.prototype.probe;
+    const probe = vi.spyOn(NodeSyncTcpTransport.prototype, "probe").mockImplementation(function (this: NodeSyncTcpTransport, endpoint, nodeId, delivery) {
+      if (nodeId === second.nodeId && ++outgoingProbes === 1) return oldProbe;
+      return originalProbe.call(this, endpoint, nodeId, delivery);
+    });
+    try {
+      await receiver.start();
+      const sender = direct(first, senderPort, [endpoint(second, receiverPort)], second);
+      await sender.start();
+      await waitUntil(() => outgoingProbes === 1);
+      expect(await receiver.probe(endpoint(first, senderPort), first.nodeId)).toBe(true);
+      expect(sender.onlinePeerIds()).toEqual([]);
+      release(false);
+      await waitUntil(() => sender.onlinePeerIds().includes(second.nodeId));
+      expect(outgoingProbes).toBe(2);
+      expect(sender.listenerPort()).toBe(senderPort);
+    } finally { release(false); probe.mockRestore(); }
+  });
+
   it("cancels an old route probe and recovers on the replacement without inheriting its failure cooldown", { timeout: 10_000 }, async () => {
     const first = identity("first");
     const second = identity("second");
