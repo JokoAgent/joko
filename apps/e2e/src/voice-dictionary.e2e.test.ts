@@ -246,13 +246,22 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     peerFixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "readonly-node-b", keepRoot: true });
     const originalFetch = globalThis.fetch;
     const streamSignals: Array<{ method: string; signal: AbortSignal }> = [];
+    const readonlyRequests = new Map<string, { started: number; headersReceived: number; failed: number }>();
     const fetchProbe = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = input instanceof Request ? input.url : String(input);
       const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
       if (signal && (url.endsWith("/StreamEvents") || url.endsWith("/WatchVoiceInputDictionaryReadOnly"))) {
         streamSignals.push({ method: new URL(url).pathname.split("/").at(-1)!, signal });
       }
-      return originalFetch(input, init);
+      const phase = ["GetServerInfo", "GetSnapshot", "GetVoiceInputDictionaryReadOnly", "WatchVoiceInputDictionaryReadOnly"]
+        .find((method) => url.endsWith(`/${method}`));
+      const progress = phase === undefined ? undefined : readonlyRequests.get(phase) ?? { started: 0, headersReceived: 0, failed: 0 };
+      if (phase !== undefined && progress) { readonlyRequests.set(phase, progress); progress.started += 1; }
+      try {
+        const response = await originalFetch(input, init);
+        if (progress) progress.headersReceived += 1;
+        return response;
+      } catch (error) { if (progress) progress.failed += 1; throw error; }
     });
     streamCleanups.push(async () => { fetchProbe.mockRestore(); });
     await expect(fixture.anonymous.voiceInput.getVoiceInputDictionaryReadOnly({})).rejects.toMatchObject({ code: Code.Unauthenticated });
@@ -303,11 +312,22 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       streamCleanups.push(async () => { controller.setVisible(false); unsubscribe(); app.dispose(); });
       return { cache, app, controller, stop: () => { controller.setVisible(false); unsubscribe(); app.dispose(); } };
     };
+    readonlyRequests.clear();
     let phone = createPhone(); await phone.app.start(); phone.controller.setVisible(true);
-    await vi.waitFor(() => {
-      expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]);
-      expect(phone.controller.state.selected?.snapshot.entries.map((entry: { text: string }) => entry.text).sort()).toEqual(["DeleteMe", "OfficeTerm", "PhoneTerm"]);
-    });
+    try {
+      await vi.waitFor(() => {
+        expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]);
+        expect(phone.controller.state.selected?.snapshot.entries.map((entry: { text: string }) => entry.text).sort()).toEqual(["DeleteMe", "OfficeTerm", "PhoneTerm"]);
+      });
+    } catch (error) {
+      // Fixed phases and state only: no origins, profile IDs, keys or payloads.
+      console.error("Readonly dictionary initial projection diagnostic", JSON.stringify({
+        visible: phone.controller.state.visible, refreshing: phone.controller.state.refreshing,
+        hosts: phone.controller.state.hosts.map((host: { status: string; cacheError: boolean }) => ({ status: host.status, cacheError: host.cacheError })),
+        requests: [...readonlyRequests].map(([phase, progress]) => ({ phase, ...progress }))
+      }));
+      throw error;
+    }
     expect(phone.app.state.activeProfileId).toBe(a.profileId);
     const grantedB = await mobileNetwork.getVoiceInputDictionaryPeerStatus(b);
     await mobileNetwork.revokeVoiceInputDictionaryPeer(b, a.serverId, grantedB.peers[0]!.revision);

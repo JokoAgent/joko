@@ -5,15 +5,16 @@ import { join } from "node:path";
 
 import {
   ContactStore,
+  contactSyncPublicKeyFingerprint,
   captureContactSnapshot,
   createEmptyContactSnapshot,
   createEmptyContactSyncState,
   type ContactDataSnapshot
 } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ContactSyncWorkerCodec } from "./contact-sync-codec.js";
-import { generateNodeSyncIdentity, NodeSyncLanTransport, type NodeSyncCipherChunkFrame } from "@joko/node-sync";
+import { generateNodeSyncIdentity, NodeSyncLanTransport, type NodeSyncCipherChunkFrame, type NodeSyncLanTransportOptions } from "@joko/node-sync";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import {
   ContactSyncWireDecoder,
@@ -174,6 +175,39 @@ describe("Contacts sync node lifecycle", () => {
     expect(retried).toMatchObject({ enabled: true, phase: "waiting" });
     expect(retried.errorCode).toBeUndefined();
     expect(starts).toBe(2);
+  });
+
+  it("does not postpone a granted peer's scheduled sync on each more frequent LAN beacon", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-contact-sync-beacons-"));
+    const store = new ContactStore(join(directory, "contacts.db"));
+    const vault = await CredentialVault.open(join(directory, "master.key"));
+    const identity = generateNodeSyncIdentity();
+    const candidate = { nodeId: "node-peer", displayName: "Peer", publicKey: identity.publicKey,
+      fingerprint: contactSyncPublicKeyFingerprint(identity.publicKey), address: "127.0.0.1", port: 4318, seenAt: Date.now() };
+    let transportOptions: NodeSyncLanTransportOptions | undefined;
+    const send = vi.fn(async (_peerId: string, _frame: NodeSyncCipherChunkFrame) => true);
+    const manager = new ContactSyncManager({ store, vault, nodeId: "node-beacons", displayName: "Beacon receiver",
+      codec: inProcessContactSyncCodec, now: () => Date.now(), transportFactory: (options) => {
+        transportOptions = options;
+        return { start: async () => undefined, stop: () => undefined, send, candidates: () => [candidate], onlinePeerIds: () => [candidate.nodeId] };
+      } });
+    await manager.initialize();
+    cleanups.push(() => { manager.close(); store.close(); rmSync(directory, { recursive: true, force: true }); });
+    vi.useFakeTimers();
+    try {
+      await manager.setEnabled(manager.status().configurationRevision, true);
+      await manager.grantCandidate(candidate.nodeId, candidate.fingerprint);
+      await vi.advanceTimersByTimeAsync(50);
+      for (let beacon = 0; beacon < 8; beacon++) {
+        // NodeSyncLanTransport reports both callbacks for every 150 ms beacon.
+        transportOptions!.onCandidate(candidate);
+        transportOptions!.onPresenceChanged?.();
+        await vi.advanceTimersByTimeAsync(150);
+      }
+      expect(send).toHaveBeenCalled();
+      expect(send.mock.calls.every(call => call[0] === candidate.nodeId)).toBe(true);
+      expect(manager.status().peers).toHaveLength(1);
+    } finally { manager.close(); vi.useRealTimers(); }
   });
 
   it("discovers explicit candidates, converges two real LAN nodes, and revokes delivery", { timeout: 25_000 }, async () => {
