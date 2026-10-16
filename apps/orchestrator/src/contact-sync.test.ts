@@ -215,7 +215,9 @@ describe("Contacts sync node lifecycle", () => {
     const startedAt = performance.now();
     let phase: Phase = "fixture";
     const observed = { firstEnabled: false, secondEnabled: false, firstSeesSecond: false, secondSeesFirst: false };
-    const snapshot = () => ({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), ...observed });
+    let transportSnapshot: (() => unknown) | undefined;
+    const snapshot = () => ({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), ...observed,
+      transports: transportSnapshot?.() });
     let abortedSnapshot: ReturnType<typeof snapshot> | undefined;
     const captureAbort = () => { abortedSnapshot ??= snapshot(); };
     signal.addEventListener("abort", captureAbort, { once: true });
@@ -227,6 +229,12 @@ describe("Contacts sync node lifecycle", () => {
     const port = randomInt(54_000, 60_000);
     const first = await managerFixture("first", port);
     const second = await managerFixture("second", port);
+    transportSnapshot = () => [first, second].map(({ manager, diagnostics }) => {
+      const status = manager.status();
+      return { phase: status.phase, errorCode: status.errorCode, candidates: status.candidates.length,
+        peers: status.peers.length, onlinePeers: status.onlinePeerCount, diagnostics,
+        multicastInterface: process.platform === "win32" ? "os-default" : "loopback" };
+    });
     const created = first.store.createContact({
       expectedDirectoryRevision: first.store.directoryState().revision,
       kind: "person",
@@ -331,10 +339,16 @@ function multiChunkState() {
 async function managerFixture(name: string, multicastPort: number): Promise<{
   readonly manager: ContactSyncManager;
   readonly store: ContactStore;
+  readonly diagnostics: readonly { readonly level: string; readonly code?: string }[];
 }> {
   const directory = mkdtempSync(join(tmpdir(), `joko-contact-sync-manager-${name}-`));
   const store = new ContactStore(join(directory, "contacts.db"));
   const vault = await CredentialVault.open(join(directory, "master.key"));
+  const diagnostics: { level: string; code?: string }[] = [];
+  const record = (level: string, metadata?: Readonly<Record<string, unknown>>) => {
+    if (diagnostics.length === 20) diagnostics.shift();
+    diagnostics.push({ level, ...(typeof metadata?.code === "string" ? { code: metadata.code.slice(0, 48) } : {}) });
+  };
   const manager = new ContactSyncManager({
     store,
     vault,
@@ -343,13 +357,15 @@ async function managerFixture(name: string, multicastPort: number): Promise<{
     codec: inProcessContactSyncCodec,
     transportFactory: (options) => new NodeSyncLanTransport({
       ...options,
-      // Both real peers belong to this host; use its loopback multicast route.
-      multicastInterface: "127.0.0.1",
+      // Windows uses the same OS-selected interface as the production LAN chain;
+      // the Unix same-host fixtures use their configured loopback route.
+      ...(process.platform === "win32" ? {} : { multicastInterface: "127.0.0.1" }),
       multicastPort,
       beaconIntervalMilliseconds: 150,
       endpointTtlMilliseconds: 2_000,
       connectTimeoutMilliseconds: 800,
-      multicastLoopback: true
+      multicastLoopback: true,
+      logger: { debug: (_message, metadata) => record("debug", metadata), warn: (_message, metadata) => record("warn", metadata) }
     })
   });
   await manager.initialize();
@@ -358,7 +374,7 @@ async function managerFixture(name: string, multicastPort: number): Promise<{
     store.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { manager, store };
+  return { manager, store, diagnostics };
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMilliseconds = 5_000): Promise<void> {
