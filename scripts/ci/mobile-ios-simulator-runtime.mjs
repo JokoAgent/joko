@@ -22,7 +22,8 @@ const startupCommandReceipts = [];
 const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", "list-available-devices",
   "create-owned-simulator", "boot-owned-simulator", "wait-owned-boot", "set-light-appearance",
   "install-owned-application", "locate-installed-application", "retry-locate-installed-application", "launch-owned-application", "capture-simulator-springboard",
-  "capture-pre-appearance-framebuffer", "retry-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance", "compile-screen-observer"]);
+  "capture-pre-appearance-framebuffer", "retry-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance", "compile-screen-observer",
+  "locate-launched-application-process", "locate-ui-tested-application-process"]);
 
 function save(name, value) { writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + "\n"); }
 async function command(binary, args, { timeout = 30_000, cleanup = false, startupLabel } = {}) {
@@ -186,13 +187,69 @@ async function observe(phase, pid, ocr) {
   throw new Error(`${phase}: Joko's real connection page was not observed without a loader, error or permission overlay. See the screenshot and OCR; no GUI success is claimed.`);
 }
 async function launch(port) {
-  const output = await command("xcrun", ["simctl", "launch", udid, bundleId, "-RCT_jsLocation", `127.0.0.1:${port}`, "-RCT_packager_scheme", "http",
-    "-AppleLanguages", "(en)", "-AppleLocale", "en_US"], { startupLabel: "launch-owned-application" });
+  const ownedUdid = udid, application = bundleId, installed = installedExecutable;
+  let output;
+  try {
+    output = await command("xcrun", ["simctl", "launch", udid, bundleId, "-RCT_jsLocation", `127.0.0.1:${port}`, "-RCT_packager_scheme", "http",
+      "-AppleLanguages", "(en)", "-AppleLocale", "en_US"], { startupLabel: "launch-owned-application" });
+  } catch (error) {
+    const receipt = startupCommandReceipts.at(-1);
+    if (abort.signal.aborted || !ownedUdid || !application || !installed || udid !== ownedUdid
+      || bundleId !== application || installedExecutable !== installed || !deviceName?.startsWith("joko-ci-")
+      || receipt?.step !== "launch-owned-application" || receipt.result !== "failed"
+      || receipt.timeoutMs !== 30_000 || receipt.elapsedMs < receipt.timeoutMs || receipt.cancelled !== false
+      || receipt.killed !== true || receipt.signal !== "SIGTERM" || receipt.exitCode !== null || receipt.errorCode !== null) throw error;
+    // A timed-out host launcher can leave a running Simulator application.
+    // Query that exact occurrence once; never issue a second launch command.
+    const launchStage = stage;
+    stage = "launch timeout process identity lookup";
+    const pid = await findOwnedApplicationProcess("launch-timeout-recovery");
+    stage = launchStage;
+    return pid;
+  }
   const matched = new RegExp(`^${bundleId.replaceAll(".", "\\.")}:\\s+(\\d+)$`, "u").exec(output);
   if (!matched) throw new Error("simctl did not return the selected app's actual launch PID.");
   const pid = Number(matched[1]);
   if (!Number.isSafeInteger(pid) || pid < 2 || !await alive(pid)) throw new Error("The launch PID does not own the installed Joko executable.");
   return pid;
+}
+
+async function findOwnedApplicationProcess(phase) {
+  const label = phase === "launch-timeout-recovery" ? "locate-launched-application-process"
+    : phase === "post-ui-test" ? "locate-ui-tested-application-process" : undefined;
+  const owner = { udid, bundleId, deviceName, installedExecutable };
+  const assertOwner = () => {
+    abort.signal.throwIfAborted();
+    if (!label || !owner.udid || !owner.bundleId || !owner.installedExecutable || !owner.deviceName?.startsWith("joko-ci-")
+      || udid !== owner.udid || bundleId !== owner.bundleId || deviceName !== owner.deviceName
+      || installedExecutable !== owner.installedExecutable || metroClosed) {
+      throw new Error("No unchanged owned Simulator application is available for the process query.");
+    }
+  };
+  assertOwner();
+  const processes = await command("xcrun", ["simctl", "spawn", owner.udid, "launchctl", "list"], { startupLabel: label });
+  const receipt = startupCommandReceipts.at(-1);
+  if (receipt?.step !== label || receipt.result !== "passed") throw new Error("The owned application process query has no successful command receipt.");
+  const lookup = { phase, category: "rejected", exactCandidateCount: 0, unique: false, safePid: false, installedExecutableMatches: false };
+  receipt.processLookup = lookup;
+  try {
+    assertOwner();
+    const escaped = owner.bundleId.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const exactLabel = new RegExp(`^UIKitApplication:${escaped}(?:\\[[^\\[\\]\\s]+\\])+$`, "u");
+    const rows = processes.split(/\r?\n/u).map(line => line.trim().split(/\s+/u))
+      .filter(columns => columns.length === 3 && exactLabel.test(columns[2]));
+    lookup.exactCandidateCount = rows.length;
+    lookup.unique = rows.length === 1;
+    if (!lookup.unique) throw new Error("The owned application process query did not return one exact application occurrence.");
+    const pid = Number(rows[0][0]);
+    lookup.safePid = /^[1-9][0-9]*$/u.test(rows[0][0]) && Number.isSafeInteger(pid) && pid > 1;
+    if (!lookup.safePid) throw new Error("The owned application process query returned no safe native PID.");
+    lookup.installedExecutableMatches = await alive(pid);
+    assertOwner();
+    if (!lookup.installedExecutableMatches) throw new Error("The queried native process does not own the verified installed Joko executable.");
+    lookup.category = phase === "launch-timeout-recovery" ? "recovered-existing-process" : "matched-ui-test-process";
+    return pid;
+  } finally { save("startup-command-receipts.json", { commands: startupCommandReceipts }); }
 }
 
 async function guiCommand(args, logName, timeout) {
@@ -366,11 +423,8 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash) {
     await assertIdentity();
     // XCTest owns its launch occurrence; re-obtain the exact process identity
     // instead of reusing the earlier simctl launch PID after app.launch().
-    const processes = await command("xcrun", ["simctl", "spawn", udid, "launchctl", "list"]);
-    const rows = processes.split("\n").map(line => line.trim().split(/\s+/u));
-    const row = rows.find(columns => columns[2]?.startsWith(`UIKitApplication:${bundleId}[`));
-    const pid = Number(row?.[0]);
-    if (!Number.isSafeInteger(pid) || pid <= 1 || !await alive(pid)) throw new Error("The UI-tested application has no verified current native process.");
+    stage = "UI-tested application process identity lookup";
+    const pid = await findOwnedApplicationProcess("post-ui-test");
     return { passed: true, test: "JokoConnectionUITests/testConnectionPageInteractions", sourceCommit: expectedSha,
       executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount: 10,
       scope: "Real connection-page mode changes, address typing/validation, local transport error, explicit cancellation, retained draft and theme changes." };
