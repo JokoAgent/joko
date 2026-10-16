@@ -2485,11 +2485,12 @@ class InteractiveWeComTransport extends FakeWeComTransport {
 class RecoveringWeComTransport extends FakeWeComTransport {
   probes = 0;
   polls = 0;
+  #recoveryResumed = false;
   #resumeRecovery: (() => void) | undefined;
 
   override async probe(signal?: AbortSignal) {
     this.probes += 1;
-    if (this.probes > 1) {
+    if (this.probes > 1 && !this.#recoveryResumed) {
       await new Promise<void>((resolve, reject) => {
         const finish = () => {
           signal?.removeEventListener("abort", abort);
@@ -2522,6 +2523,9 @@ class RecoveringWeComTransport extends FakeWeComTransport {
   }
 
   resumeRecovery(): void {
+    // The durable offline projection may be observed during the retry delay,
+    // before the next probe installs its waiter. Preserve that explicit release.
+    this.#recoveryResumed = true;
     this.#resumeRecovery?.();
     this.#resumeRecovery = undefined;
   }
