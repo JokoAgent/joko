@@ -354,8 +354,9 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
     const codexSessionId = sessions.get("codex-paired")!;
     const codexThreadId = fixture.application.store.getSession(codexSessionId).descriptor.binding.nativeSessionId;
     if (codexThreadId === undefined) throw new Error("Codex task has no native thread.");
-    await waitFor(async () => codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
-      (dispatched) => dispatched, "paired Codex dispatch");
+    await withCodexDispatchFailureState(waitFor(
+      async () => codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
+      (dispatched) => dispatched, "paired Codex dispatch"), fixture, codex, codexSessionId, codexRunId);
     await waitFor(async () => claude.queries.some((query) => query.receivedInputs.length > 0),
       (dispatched) => dispatched, "paired Claude dispatch");
     const approval = codex.requestCommandApproval(codexThreadId, "turn-1");
@@ -488,8 +489,10 @@ it("resumes three native tasks through service restart and isolates one missing 
     const codexSessionId = sessions.get("codex-paired")!;
     const firstCodexThreadId = fixture.application.store.getSession(codexSessionId).descriptor.binding.nativeSessionId;
     if (firstCodexThreadId === undefined) throw new Error("Restart fixture Codex task has no native thread.");
-    await waitFor(async () => setup.codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
-      (dispatched) => dispatched, "Codex dispatch before service restart");
+    await withCodexDispatchFailureState(waitFor(
+      async () => setup.codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
+      (dispatched) => dispatched, "Codex dispatch before service restart"),
+    fixture, setup.codex, codexSessionId, firstRuns.get("codex-paired")!);
     await waitFor(async () => setup.claude.queries.some((query) => query.receivedInputs.length === 1),
       (dispatched) => dispatched, "Claude dispatch before service restart");
     setup.claude.queries.at(-1)!.complete("Claude before restart answer");
@@ -2636,13 +2639,13 @@ it("fences consumed native inputs with lost receipts without blocking sibling Ba
       "Pi sibling Provider dispatch"
     );
     const codexControlNativeId = nativeSessionId("codex-paired", "control");
-    await waitFor(
+    await withCodexDispatchFailureState(waitFor(
       async () => (setup.codex.transport?.requests ?? []).filter((request) =>
         request.method === "turn/start"
         && jsonWithBigints(request.params).includes(controlTexts.get("codex-paired")!)).length,
       (count) => count === 1,
       "Codex sibling dispatch"
-    );
+    ), setup.fixture, setup.codex, sessions.get("codex-paired")!.control, controlRuns.get("codex-paired")!);
     const claudeControlNativeId = nativeSessionId("claude-paired", "control");
     const claudeControlQuery = await waitFor(
       async () => setup.claude.queries.findLast((query) =>
@@ -3779,6 +3782,32 @@ async function startPairedFixture(
       throw new AggregateError([error, ...cleanupErrors], "Paired fixture startup and cleanup both failed.");
     }
     throw error;
+  }
+}
+
+async function withCodexDispatchFailureState<T>(
+  pending: Promise<T>,
+  fixture: OrchestratorE2eFixture,
+  codex: FakeCodexAppServer,
+  sessionId: string,
+  runId: string
+): Promise<T> {
+  try {
+    return await pending;
+  } catch (cause) {
+    const run = fixture.application.store.getRun(runId).descriptor;
+    const session = fixture.application.store.getSession(sessionId).descriptor;
+    const queue = fixture.application.store.findQueueItemByRunId(sessionId, runId);
+    throw new Error(`Codex dispatch ownership state: ${JSON.stringify({
+      runState: run.state,
+      errorCode: run.error?.code,
+      errorPhase: run.error?.phase,
+      generation: session.binding.generation,
+      queueState: queue?.state,
+      queueClaimed: queue?.attemptId !== undefined,
+      transportRunning: codex.transport?.running,
+      requestMethods: [...new Set(codex.transport?.requests.map((request) => request.method) ?? [])]
+    })}`, { cause });
   }
 }
 

@@ -331,8 +331,19 @@ describe("mounted Pi compaction product chain", () => {
 function observeBrowserErrors(page: Page): string[] {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
+  page.on("response", (response) => {
+    if (response.status() < 400) return;
+    const url = new URL(response.url());
+    errors.push(`response:${response.status()}:${response.request().method()}:${url.origin}${url.pathname}`);
+  });
   page.on("console", (message) => {
-    if (message.type() === "error") errors.push(`console:${message.text()}`);
+    if (message.type() !== "error") return;
+    let location = "";
+    try {
+      const url = new URL(message.location().url);
+      location = `${url.origin}${url.pathname}`.slice(0, 512);
+    } catch { /* Some browser errors have no source location. */ }
+    errors.push(`console:${message.text()}:${location}`);
   });
   return errors;
 }
