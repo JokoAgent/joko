@@ -30,6 +30,7 @@ export function SkillPublicationDialog({ controller, session, locale, t, onClose
   readonly onPublished: () => void;
   readonly onOpenPublished: (result: SkillPublicationResultView) => void;
 }): JSX.Element {
+  const { listSkillMarketSources, listSkillPublicationJobs, getSkillPublicationJob, getCollaborationDirectory } = controller;
   const [sources, setSources] = useState<LoadState<readonly SkillMarketSourceView[]>>({ kind: "loading" });
   const [collaboration, setCollaboration] = useState<LoadState<CollaborationDirectoryView>>({ kind: "loading" });
   const [selectedSourceId, setSelectedSourceId] = useState("");
@@ -57,7 +58,7 @@ export function SkillPublicationDialog({ controller, session, locale, t, onClose
   const initialJobsLoaded = useRef(false);
 
   const loadJobs = useCallback(async (signal?: AbortSignal): Promise<readonly SkillPublicationJobView[]> => {
-    const catalog = await controller.listSkillPublicationJobs(session.skill.id, signal);
+    const catalog = await listSkillPublicationJobs(session.skill.id, signal);
     if (!initialJobsLoaded.current) {
       for (const job of catalog.items) if (job.state === "published") publishedNotices.current.add(job.id);
       initialJobsLoaded.current = true;
@@ -68,14 +69,14 @@ export function SkillPublicationDialog({ controller, session, locale, t, onClose
       ? current
       : catalog.items[0]?.id);
     return catalog.items;
-  }, [controller, session.skill.id]);
+  }, [listSkillPublicationJobs, session.skill.id]);
 
   useEffect(() => {
     const abort = new AbortController();
     void Promise.all([
-      controller.listSkillMarketSources(abort.signal),
+      listSkillMarketSources(abort.signal),
       loadJobs(abort.signal),
-      controller.getCollaborationDirectory(abort.signal)
+      getCollaborationDirectory(abort.signal)
     ]).then(([catalog, _jobs, directory]) => {
       if (abort.signal.aborted) return;
       const available = catalog.sources.filter((source) => source.kind === "local" && source.state === "ready");
@@ -91,7 +92,7 @@ export function SkillPublicationDialog({ controller, session, locale, t, onClose
       }
     });
     return () => abort.abort();
-  }, [controller, loadJobs, t]);
+  }, [listSkillMarketSources, getCollaborationDirectory, loadJobs, t]);
 
   const selectedJob = jobs.find((job) => job.id === selectedJobId);
   const activeJob = jobs.find((job) => !isTerminalPublication(job));
@@ -102,7 +103,7 @@ export function SkillPublicationDialog({ controller, session, locale, t, onClose
     let timer: number | undefined;
     const poll = async (): Promise<void> => {
       try {
-        const next = await controller.getSkillPublicationJob(activeJob.id, abort.signal);
+        const next = await getSkillPublicationJob(activeJob.id, abort.signal);
         if (abort.signal.aborted || sequence !== pollSequence.current) return;
         setJobs((current) => current.map((job) => job.id === next.id ? next : job));
         if (!isTerminalPublication(next)) timer = window.setTimeout(() => { void poll(); }, 500);
@@ -116,7 +117,7 @@ export function SkillPublicationDialog({ controller, session, locale, t, onClose
       abort.abort();
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [activeJob?.id, activeJob?.revision, activeJob?.state, controller, t]);
+  }, [activeJob?.id, activeJob?.revision, activeJob?.state, getSkillPublicationJob, t]);
 
   useEffect(() => {
     let changed = false;

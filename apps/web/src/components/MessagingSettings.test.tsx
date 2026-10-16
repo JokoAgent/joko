@@ -16,6 +16,7 @@ import {
   type WeChatAuthorizationAttemptView
 } from "../model.js";
 import { MessagingSettings } from "./MessagingSettings.js";
+import type { Translator } from "./types.js";
 
 const roots: Root[] = [];
 
@@ -31,6 +32,38 @@ afterEach(async () => {
 });
 
 describe("Messaging settings", () => {
+  it("keeps its polling owner through connection snapshots and projects a later connected state", async () => {
+    let poll: (() => void) | undefined;
+    const interval = vi.spyOn(window, "setInterval").mockImplementation((callback: TimerHandler) => {
+      poll = callback as () => void;
+      return 19 as unknown as ReturnType<typeof window.setInterval>;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => undefined);
+    const get = vi.fn(async (_signal?: AbortSignal) => messagingSettings([discordConnection({ runtimeStatus: "connecting" })]));
+    const controller = controllerFixture(messagingSettings([]), { getMessagingSettings: get });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const t: Translator = (key, values) => translate("en", key, values);
+    const render = (current: AppController) => root.render(<MessagingSettings controller={current} snapshot={snapshot()} t={t} />);
+    await act(async () => render(controller));
+    const signal = get.mock.calls[0]?.[0] as AbortSignal | undefined;
+    await act(async () => render({ ...controller, state: { ...controller.state } }));
+    expect(interval).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(signal?.aborted).toBe(false);
+    get.mockResolvedValue(messagingSettings([discordConnection({ runtimeStatus: "connected" })]));
+    await act(async () => poll?.());
+    expect(container.textContent).toContain("Connected");
+    expect(get).toHaveBeenCalledTimes(2);
+    const next = vi.fn(async () => messagingSettings([]));
+    await act(async () => render({ ...controller, getMessagingSettings: next }));
+    expect(signal?.aborted).toBe(true);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(container.querySelectorAll(".messaging-connection-card")).toHaveLength(0);
+  });
+
   it("renders the complete capability and runtime state, reports test failures, and saves a new-only route", async () => {
     const connection = telegramConnection({
       runtimeStatus: "conflict",

@@ -33,7 +33,7 @@ describe("mounted Skill management surface", () => {
     const pairingCode = fixture.pairingCode(challenge.challenge.challengeId);
 
     browser = await chromium.launch({ executablePath, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     const browserErrors = observeBrowserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/tools`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();

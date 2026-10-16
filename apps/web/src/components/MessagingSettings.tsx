@@ -95,6 +95,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
   readonly t: Translator;
 }): JSX.Element {
   const ownerKey = controller.state.activeProfile?.id ?? "disconnected";
+  const getMessagingSettings = controller.getMessagingSettings;
   const [settings, setSettings] = useState<MessagingSettingsView>();
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -113,7 +114,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
       if (initial) setLoading(true);
       else setRefreshing(true);
       try {
-        const next = await controller.getMessagingSettings(abort.signal);
+        const next = await getMessagingSettings(abort.signal);
         if (!abort.signal.aborted) {
           setSettings(next);
           setError(undefined);
@@ -136,7 +137,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
       abort.abort();
       reloadRef.current = async () => undefined;
     };
-  }, [controller, ownerKey, t]);
+  }, [getMessagingSettings, ownerKey, t]);
 
   const replaceConnection = (connection: MessagingConnectionView): void => {
     setSettings((current) => current === undefined ? current : {

@@ -173,6 +173,10 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       readWorkspaceFile: read, readWorkspaceHtmlSnapshot, performBrowserTakeoverAction, getArtifactUrl: get, releaseArtifactUrl: release,
       navigateSessionBranch: navigate, copyArtifactFile: download, openArtifactFile: download, openArtifactFileWithApplication: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
       updateAuxiliaryTextSettings: save, predictNextPrompt: predict, openBrowserPage,
+      getMessagingSettings: async () => {
+        if (owner!.id === first.id) await pendingFirst;
+        return { connections: [], routes: [], channels: [] };
+      },
       getCollaborationDirectory: async () => {
         if (owner!.id === first.id) await pendingFirst;
         return { available: true, revision: 1n, actor: { id: owner!.id, displayName: owner!.id }, scopes: [], recoveredFromCorruption: false };
@@ -194,8 +198,11 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(current.updateAuxiliaryTextSettings).toBe(firstController.updateAuxiliaryTextSettings);
   expect(current.predictNextPrompt).toBe(firstController.predictNextPrompt);
   expect(current.getCollaborationDirectory).toBe(firstController.getCollaborationDirectory);
+  expect(current.getMessagingSettings).toBe(firstController.getMessagingSettings);
   for (const method of ["listSkillMarketCatalog", "getSkillMarketEntry", "openSkillMarketPreview",
-    "listSkillMarketPreviewFiles", "readSkillMarketPreviewFile", "closeSkillMarketPreview"] as const) {
+    "listSkillMarketPreviewFiles", "readSkillMarketPreviewFile", "closeSkillMarketPreview", "listSkillMarketSources",
+    "getSkillPublicationPreview", "listSkillPublicationJobs", "getSkillPublicationJob", "listSkills", "openSkill",
+    "listSkillFiles", "readSkillFile", "getSkillDiff", "listSkillRecoveries", "closeSkill"] as const) {
     expect(current[method]).toBe(firstController[method]);
   }
   expect(current.downloadArtifact).toBe(firstController.downloadArtifact);
@@ -244,11 +251,18 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const oldAcquisition = firstController.getArtifactUrl("shared").then((url) => { firstController.releaseArtifactUrl("shared"); return url; });
   const oldDirectory = expect(firstController.getCollaborationDirectory(new AbortController().signal))
     .rejects.toThrow("The collaboration connection is no longer current.");
+  const oldMessaging = expect(firstController.getMessagingSettings(new AbortController().signal))
+    .rejects.toThrow("The messaging connection is no longer current.");
   await act(async () => current.connect(second));
   const secondController = current;
   expect(secondController.getCollaborationDirectory).not.toBe(firstController.getCollaborationDirectory);
+  expect(secondController.getMessagingSettings).not.toBe(firstController.getMessagingSettings);
+  await expect(firstController.getMessagingSettings()).rejects.toThrow("The messaging connection is no longer current.");
+  await expect(secondController.getMessagingSettings()).resolves.toMatchObject({ connections: [] });
   expect(secondController.listSkillMarketCatalog).not.toBe(firstController.listSkillMarketCatalog);
   await expect(firstController.listSkillMarketCatalog({})).rejects.toThrow("The Skill market connection is no longer current.");
+  expect(secondController.listSkills).not.toBe(firstController.listSkills);
+  await expect(firstController.listSkills()).rejects.toThrow("The Skill connection is no longer current.");
   await expect(secondController.getCollaborationDirectory(new AbortController().signal))
     .resolves.toMatchObject({ actor: { id: second.id } });
   expect(secondController.getPersonalizationPrompt()).toBe("Explain tradeoffs.");
@@ -452,6 +466,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   await act(async () => finishFirst());
   await oldBrowser;
   await oldDirectory;
+  await oldMessaging;
   await oldHtml;
   expect(htmlCalls.get(first.id)).toHaveBeenCalledOnce();
   expect(htmlCalls.get(second.id)).not.toHaveBeenCalled();

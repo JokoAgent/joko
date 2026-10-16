@@ -338,6 +338,11 @@ describe("SkillTools", () => {
     const dialog = required(document.body.querySelector<HTMLElement>('[role="dialog"]'));
     await act(async () => buttonWithText(dialog, "Review publication target").click());
     await settle();
+    await act(async () => roots.at(-1)!.render(<SkillTools controller={{ ...controller }} backends={backends} targets={targets} locale="en" t={skillTranslator} />));
+    await settle();
+    expect(document.body.querySelector('[role="dialog"]')).toBe(dialog);
+    expect(controller.openSkill).toHaveBeenCalledTimes(1);
+    expect(controller.closeSkill).not.toHaveBeenCalled();
     await act(async () => buttonWithText(dialog, "Publish Skill").click());
     await settle();
     expect(document.body.querySelector('[role="dialog"]')).toBe(dialog);
