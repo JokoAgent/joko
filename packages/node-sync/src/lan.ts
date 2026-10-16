@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import dgram, { type RemoteInfo, type Socket as DgramSocket } from "node:dgram";
+import { isIPv4 } from "node:net";
 import { constants } from "node:os";
 
 import { isValidNodeSyncPublicKey, nodeSyncDomain, type NodeSyncPurpose } from "./crypto.js";
@@ -57,6 +58,7 @@ export interface NodeSyncLanTransportOptions {
   readonly onPresenceChanged?: () => void;
   readonly logger: NodeSyncLanLogger;
   readonly multicastGroup?: string;
+  readonly multicastInterface?: string;
   readonly multicastPort?: number;
   readonly beaconIntervalMilliseconds?: number;
   readonly endpointTtlMilliseconds?: number;
@@ -85,7 +87,9 @@ export class NodeSyncLanTransport {
       endpointTtlMilliseconds: options.endpointTtlMilliseconds ?? DEFAULT_ENDPOINT_TTL_MILLISECONDS,
       connectTimeoutMilliseconds: options.connectTimeoutMilliseconds ?? DEFAULT_CONNECT_TIMEOUT_MILLISECONDS,
       multicastLoopback: options.multicastLoopback ?? true };
-    if (!isPort(this.#options.multicastPort) || this.#options.beaconIntervalMilliseconds < 100 ||
+    if (!isPort(this.#options.multicastPort) ||
+      (this.#options.multicastInterface !== undefined && !isIPv4(this.#options.multicastInterface)) ||
+      this.#options.beaconIntervalMilliseconds < 100 ||
       this.#options.endpointTtlMilliseconds < this.#options.beaconIntervalMilliseconds || this.#options.connectTimeoutMilliseconds < 100) {
       throw new TypeError("Node sync LAN transport options are invalid.");
     }
@@ -181,7 +185,12 @@ export class NodeSyncLanTransport {
       udp.bind(this.#options.multicastPort, "0.0.0.0", () => {
         udp.off("error", failed);
         if (generation !== this.#generation || this.#udpSocket !== udp) { reject(new Error("Node sync LAN discovery start was superseded.")); return; }
-        try { udp.addMembership(this.#options.multicastGroup); udp.setMulticastTTL(1); udp.setMulticastLoopback(this.#options.multicastLoopback); }
+        try {
+          udp.addMembership(this.#options.multicastGroup, this.#options.multicastInterface);
+          if (this.#options.multicastInterface !== undefined) udp.setMulticastInterface(this.#options.multicastInterface);
+          udp.setMulticastTTL(1);
+          udp.setMulticastLoopback(this.#options.multicastLoopback);
+        }
         catch (error) { reject(error); return; }
         resolve();
       });

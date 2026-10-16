@@ -15,7 +15,8 @@ import { NodeSyncTcpTransport, validNodeSyncEndpoint } from "./tcp.js";
 
 const cleanups: Array<() => void> = [];
 const lanTrace: Array<Readonly<Record<string, unknown>>> = [];
-const lanInstances: Array<{ readonly nodeId: string; readonly purpose: NodeSyncPurpose; readonly discoveryPort: number; readonly instance: NodeSyncLanTransport }> = [];
+const lanInstances: Array<{ readonly nodeId: string; readonly purpose: NodeSyncPurpose; readonly discoveryPort: number;
+  readonly multicastInterface?: string; readonly instance: NodeSyncLanTransport }> = [];
 afterEach(() => {
   for (const cleanup of cleanups.splice(0).reverse()) cleanup();
   lanTrace.length = 0;
@@ -263,15 +264,19 @@ function transport(port: number, purpose: NodeSyncPurpose, self: NodeSyncLanIden
     lanTrace.push({ at: Date.now(), nodeId: self.nodeId, purpose, event, ...details });
     if (lanTrace.length > 48) lanTrace.shift();
   };
-  const instance = new NodeSyncLanTransport({ purpose, getSelf: () => self,
+  const options: NodeSyncLanTransportOptions = { purpose, getSelf: () => self,
     isPeerAllowed: (nodeId, key) => nodeId === peer.nodeId && key === peer.publicKey,
     onCandidate: (candidate) => trace("candidate", { peerNodeId: candidate.nodeId, address: candidate.address, port: candidate.port }),
     onFrame, logger: {
       debug: (message, metadata) => trace("debug", { message, code: metadata?.code }),
       warn: (message, metadata) => trace("warn", { message, code: metadata?.code })
     },
-    multicastPort: port, beaconIntervalMilliseconds: 150, endpointTtlMilliseconds: 2_000, connectTimeoutMilliseconds: 800, ...overrides });
-  lanInstances.push({ nodeId: self.nodeId, purpose, discoveryPort: port, instance });
+    // Every peer in this fixture is local. Keep its real multicast exchange on
+    // loopback instead of depending on the host's external LAN route or policy.
+    multicastInterface: "127.0.0.1", multicastPort: port,
+    beaconIntervalMilliseconds: 150, endpointTtlMilliseconds: 2_000, connectTimeoutMilliseconds: 800, ...overrides };
+  const instance = new NodeSyncLanTransport(options);
+  lanInstances.push({ nodeId: self.nodeId, purpose, discoveryPort: port, multicastInterface: options.multicastInterface, instance });
   cleanups.push(() => instance.stop());
   return instance;
 }
@@ -289,9 +294,9 @@ async function waitUntil(predicate: () => boolean): Promise<void> {
         name,
         addresses: addresses?.map(({ address, family, internal, scopeid }) => ({ address, family, internal, scopeid }))
       })),
-      multicastRoute: multicastRouteSnapshot(),
-      transports: lanInstances.map(({ nodeId, purpose, discoveryPort, instance }) => ({
-        nodeId, purpose, discoveryPort, listenerPort: instance.listenerPort(), onlinePeerIds: instance.onlinePeerIds(),
+      systemDefaultMulticastRoute: multicastRouteSnapshot(),
+      transports: lanInstances.map(({ nodeId, purpose, discoveryPort, multicastInterface, instance }) => ({
+        nodeId, purpose, discoveryPort, multicastInterface, listenerPort: instance.listenerPort(), onlinePeerIds: instance.onlinePeerIds(),
         candidates: instance.candidates().map(({ nodeId: peerNodeId, address, port, seenAt }) => ({ peerNodeId, address, port, seenAt }))
       })),
       trace: lanTrace
