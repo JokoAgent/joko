@@ -646,10 +646,10 @@ mountedIt.for(["native-h264", "wda-mjpeg"] as const)("shows the production Simul
       await expectFittedFrame(852, 393);
       await panel.getByRole("button", { name: "Lock screen", exact: true }).click();
       await panel.getByRole("button", { name: "Unlock screen", exact: true }).click();
-      expect(deviceCommands.map(item => item.url)).toEqual([
+      await vi.waitFor(() => expect(deviceCommands.map(item => item.url)).toEqual([
         "/session/SESSION-1/wda/pressButton", "/session/SESSION-1/orientation",
         "/session/SESSION-1/wda/lock", "/session/SESSION-1/wda/unlock"
-      ]);
+      ]), { timeout: 5_000 });
       expect(deviceCommands.every(item => item.claimed)).toBe(true);
       await panel.getByRole("button", { name: "Copy screenshot" }).click();
       await panel.getByText("Screenshot copied to clipboard.").waitFor();
