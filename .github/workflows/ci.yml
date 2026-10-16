@@ -295,6 +295,7 @@ jobs:
           WAYLAND_DISPLAY: ""
 
       - name: Run the affected production Web chains (Windows/macOS)
+        id: browser_regressions
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os != 'Linux' }}
         timeout-minutes: 15
         shell: bash
@@ -305,6 +306,11 @@ jobs:
             files=(src/partner-mounted-browser.e2e.test.ts src/messaging-mounted-browser.e2e.test.ts src/slack-mounted-browser.e2e.test.ts src/real-pi-compaction-mounted-browser.e2e.test.ts)
           fi
           pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+
+      - name: Observe the failing macOS report PDF fonts and layout
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && runner.os == 'macOS' && steps.browser_regressions.outcome == 'failure' }}
+        timeout-minutes: 2
+        run: node scripts/ci/document-pdf-font-observations.mjs
 
       - name: Upload the affected Web chain logs
         if: ${{ matrix.workload == 'browser-regressions' && always() }}
