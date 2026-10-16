@@ -61,6 +61,8 @@ const privateDirectory = vi.fn(async () => ({ directory: { revision: 1n, activeC
   errorCount: 0, updatedAt: 2000 }, partners: [activePartner!, peer] }));
 const openPrivateThread = vi.fn();
 const client = new Proxy({
+  get state() { return renderedState; },
+  taskDraftProfileId: () => renderedState.activeProfileId,
   taskAppCommandControls: () => current ? appControls : undefined,
   taskRuntimeCommandControls: () => current ? runtime : undefined,
   listTaskRuntimeCommands: vi.fn(async () => catalog),

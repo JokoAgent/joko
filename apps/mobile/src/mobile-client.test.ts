@@ -1731,10 +1731,11 @@ function committedAttachment(attachment: MobileLocalComposerAttachment) {
 describe("mobile current task delegated reads", () => {
   function delegatedNetwork() {
     const network = fakeNetwork();
-    const owner = create(SnapshotSchema, { ...snapshot, scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema) } }),
-      backends: [create(BackendDescriptorSchema, { ...snapshot.backends[0]!, capabilities: create(CapabilityManifestSchema, { capabilities: [capabilityNames.backgroundTasks, capabilityNames.subagentsList,
+    const base = clone(SnapshotSchema, snapshot);
+    const owner = create(SnapshotSchema, { ...base, scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema) } }),
+      backends: [create(BackendDescriptorSchema, { ...base.backends[0]!, capabilities: create(CapabilityManifestSchema, { capabilities: [capabilityNames.backgroundTasks, capabilityNames.subagentsList,
         capabilityNames.subagentsDetail, capabilityNames.subagentsTranscript].map((name) => create(CapabilitySchema, { name, support: CapabilitySupport.SUPPORTED })) }) })] });
-    const detail = create(SnapshotSchema, { ...owner, scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "session" }) } }) });
+    const detail = create(SnapshotSchema, { ...clone(SnapshotSchema, owner), scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "session" }) } }) });
     network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
     network.readSession = vi.fn(async () => detail);
     return { network, owner, detail };
@@ -6898,7 +6899,7 @@ describe("native mobile connection and operation ownership", () => {
     ];
     expect(timelineRows([...events, events[2]!])).toMatchObject([
       { id: "message", label: "Assistant", text: "final" },
-      { id: "status", label: "Activity", text: "run Aborted" }
+      { id: "status", label: "Run", text: "Run stopped" }
     ]);
   });
 
