@@ -103,9 +103,11 @@ describe("standalone Service Device peer agent", () => {
   });
 
   it("composes the audited native terminal host into the full Node executor", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "joko-service-peer-executor-")));
+    roots.push(root);
     let capabilities: readonly DevicePeerCapabilityKind[] | undefined;
     const agent = new ServiceDevicePeerAgent({
-      config: fixtureConfig("C:\\protected\\service-auth-key"),
+      config: { ...fixtureConfig(join(root, "service-auth-key")), stateDirectory: root },
       validateCredential: async () => undefined,
       readAuthKey: async () => AUTH_KEY,
       async runRoute(options) {
