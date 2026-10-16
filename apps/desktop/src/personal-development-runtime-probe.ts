@@ -159,7 +159,12 @@ process.stdout.write(JSON.stringify({ ok: true, ...inspected, commandRetired: tr
       observePersonalCommandJournal(journalDirectory, { filesystem, paths }, observationAbort.signal).then(markers => ({ markers }), () => ({ observationUnavailable: true })),
       new Promise(resolve => { observationTimer = setTimeout(() => { observationAbort.abort(); resolve({ observationUnavailable: true }); }, 250); })
     ]);
-    console.error("[personal-command-smoke-boundary]", JSON.stringify({ phase, elapsedMs, ...receipt }));
+    const cause = error && typeof error === "object" && "cause" in error ? error.cause : undefined;
+    const commandFailure = cause && typeof cause === "object" && "stage" in cause && "systemCode" in cause
+      && ["leader", "birth", "terminate", "quiescence", "drain", "receipt"].includes(String(cause.stage))
+      && ["ESRCH", "EPERM", "EACCES", "EIO", "ENOENT", "ENOSPC", "unknown"].includes(String(cause.systemCode))
+      ? { stage: cause.stage, systemCode: cause.systemCode } : undefined;
+    console.error("[personal-command-smoke-boundary]", JSON.stringify({ phase, elapsedMs, ...receipt, commandFailure }));
   } catch { /* The observation must not replace the original native failure. */ }
   finally { clearTimeout(observationTimer); observationAbort.abort(); }
   throw error;

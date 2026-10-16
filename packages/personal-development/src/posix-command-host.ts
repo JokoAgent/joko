@@ -90,9 +90,14 @@ async function retire(cancel: boolean) {
     cancelled = true; return;
   }
   if (stopping) return; stopping = true; clearTimeout(timeout);
+  let stage = "leader";
   try {
-    if (sentinel.exitCode !== null || sentinel.signalCode !== null || await birth(groupPid) !== groupBirth) throw new Error();
+    if (sentinel.exitCode !== null || sentinel.signalCode !== null) throw new Error();
+    stage = "birth";
+    if (await birth(groupPid) !== groupBirth) throw new Error();
+    stage = "terminate";
     process.kill(-groupPid, "SIGKILL");
+    stage = "quiescence";
     const deadline = Date.now() + 5000; let absent = false;
     while (Date.now() < deadline) {
       try { process.kill(-groupPid, 0); }
@@ -100,12 +105,18 @@ async function retire(cancel: boolean) {
       await pause(20);
     }
     if (!absent) throw new Error();
+    stage = "drain";
     await new Promise<void>(resolve => { if (sentinel!.exitCode !== null || sentinel!.signalCode !== null) resolve(); else sentinel!.once("close", () => resolve()); });
+    stage = "receipt";
     const receipt = { ...started, activeProcesses: 0, exitCode: rootExit ?? 1, cancelled, forcedDescendants: false };
     await writeJson(join(journal.directory, "retired.json"), receipt);
     emit({ event: "retired", pid: groupPid, identity: groupBirth, activeProcesses: 0, exitCode: receipt.exitCode, cancelled, forcedDescendants: false });
     process.stdin.destroy(); control.end(); process.exitCode = broken ? 2 : 0;
-  } catch { sentinel.stdin.destroy(); process.stdin.destroy(); control.end(); process.exitCode = 2; }
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+    emit({ event: "failed", stage, systemCode: ["ESRCH", "EPERM", "EACCES", "EIO", "ENOENT", "ENOSPC"].includes(String(code)) ? code : "unknown" });
+    sentinel.stdin.destroy(); process.stdin.destroy(); control.end(); process.exitCode = 2;
+  }
 }
 async function birth(pid: number): Promise<string> {
   if (process.platform === "linux") {
