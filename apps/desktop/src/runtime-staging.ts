@@ -4,6 +4,7 @@ import {
   copyFile,
   lstat,
   mkdir,
+  open,
   readFile,
   readdir,
   realpath,
@@ -637,6 +638,23 @@ export async function normalizeRuntimeCommandShims(
       if (!info.isFile() || info.isSymbolicLink() || !samePath(await realpath(path), path)) {
         throw new Error(`Runtime command shim is not a canonical regular file: ${path}`);
       }
+      // The pinned installer can link a native ELF/Mach-O executable into
+      // .bin. These copied bytes are not pnpm's bounded text command shims.
+      const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      let nativeCommand = false;
+      try {
+        const held = await handle.stat();
+        if (!held.isFile() || held.dev !== info.dev || held.ino !== info.ino || held.size !== info.size) {
+          throw new Error(`Runtime command changed before normalization: ${path}`);
+        }
+        const header = Buffer.alloc(4);
+        const { bytesRead } = await handle.read(header, 0, header.length, 0);
+        nativeCommand = bytesRead === 4 && (header.readUInt32BE(0) === 0x7f454c46
+          || header.readUInt32LE(0) === 0xfeedfacf);
+      } finally {
+        await handle.close();
+      }
+      if (nativeCommand) continue;
       if (info.size > 256 * 1024) {
         throw new Error(`Runtime command shim exceeds the normalization limit: ${path}`);
       }

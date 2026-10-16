@@ -304,6 +304,30 @@ describe("isolated Orchestrator runtime staging", () => {
     expect(resolve(dirname(second.shimPath), marker!)).toBe(second.targetPath);
   });
 
+  it.each([
+    ["ELF", [0x7f, 0x45, 0x4c, 0x46]],
+    ["Mach-O", [0xcf, 0xfa, 0xed, 0xfe]]
+  ] as const)("preserves large %s native command binaries while normalizing adjacent text shims", async (_format, magic) => {
+    const fixture = commandShimFixture("native-command");
+    const binaryPath = resolve(dirname(fixture.shimPath), "esbuild");
+    const bytes = Buffer.alloc(256 * 1024 + 64);
+    bytes.set(magic);
+    // A native executable can also contain text resembling a shim marker.
+    bytes.write(`# cmd-shim-target=${fixture.sourceRoot}`, 32);
+    writeFileSync(binaryPath, bytes, { mode: 0o755 });
+    const before = createHash("sha256").update(bytes).digest("hex");
+    await expect(normalizeRuntimeCommandShims(fixture.sourceRoot, fixture.candidateRoot)).resolves.toBe(1);
+    expect(createHash("sha256").update(readFileSync(binaryPath)).digest("hex")).toBe(before);
+    expect(readFileSync(fixture.shimPath, "utf8")).toContain("# cmd-shim-target=../fixture-cli/bin/cli.js");
+  });
+
+  it("retains the normalization size bound for oversized text command shims", async () => {
+    const fixture = commandShimFixture("oversized-text-command");
+    writeFileSync(fixture.shimPath, `#!/bin/sh\n${"# padded text\n".repeat(24_000)}# cmd-shim-target=${fixture.targetPath}\n`);
+    await expect(normalizeRuntimeCommandShims(fixture.sourceRoot, fixture.candidateRoot))
+      .rejects.toThrow("exceeds the normalization limit");
+  });
+
   it("passes only OS launch necessities and never inherited Node/npm/provider secrets", () => {
     const environment = runtimeBuildEnvironment({
       PATH: "bin",
