@@ -129,6 +129,7 @@ describe("mobile update contracts", () => {
 
 function runtimeStub(patch: Partial<MobileUpdateRuntime> = {}): MobileUpdateRuntime {
   return {
+    bundleUpdatesSupported: true,
     info: {
       appVersion: "1.0.0",
       runtimeVersion: "runtime-1",
@@ -141,7 +142,7 @@ function runtimeStub(patch: Partial<MobileUpdateRuntime> = {}): MobileUpdateRunt
     fetchOta: async () => ({ isNew: false }),
     reload: async () => undefined,
     fetchRelease: async () => null,
-    openUrl: async () => undefined,
+    openRelease: async () => undefined,
     ...patch
   };
 }

@@ -49,6 +49,7 @@ export interface MobileUpdateRuntimeInfo {
 
 export interface MobileUpdateRuntime {
   readonly info: MobileUpdateRuntimeInfo;
+  readonly bundleUpdatesSupported: boolean;
   configureChannel(channel: MobileUpdateChannel): void;
   checkOta(): Promise<MobileOtaCheckResult>;
   fetchOta(): Promise<MobileOtaFetchResult>;
@@ -59,7 +60,7 @@ export interface MobileUpdateRuntime {
     channel: MobileUpdateChannel,
     timeoutMs: number
   ): Promise<unknown | null>;
-  openUrl(url: string): Promise<void>;
+  openRelease(target: MobileUpdateRelease): Promise<void>;
 }
 
 export interface MobileOtaRequestClient {

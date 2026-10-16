@@ -34,6 +34,13 @@ export default function mobileExpoConfig({ config }: ConfigContext): ExpoConfig 
     ...config,
     name,
     slug,
+    android: {
+      ...config.android,
+      permissions: [...new Set([
+        ...(config.android?.permissions ?? []),
+        ...(update.releaseFeedUrl === null ? [] : ["android.permission.REQUEST_INSTALL_PACKAGES"])
+      ])]
+    },
     runtimeVersion: { policy: "fingerprint" },
     updates: {
       enabled: update.otaUrl !== null,

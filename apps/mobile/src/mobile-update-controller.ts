@@ -200,9 +200,11 @@ export class MobileUpdateController {
     if (!current || !sameRelease(current, target)) return;
     this.#patch({ actionError: undefined });
     try {
-      await this.#runtime.openUrl(current.installUrl);
+      await this.#runtime.openRelease(current);
     } catch (cause) {
-      this.#patch({ actionError: "install" });
+      if (sameRelease(this.#state.forced ?? this.#state.prompt, current)) {
+        this.#patch({ actionError: "install" });
+      }
       throw cause;
     }
   }
@@ -555,6 +557,7 @@ export class MobileUpdateController {
 
   #canCheckBundle(): boolean {
     return Boolean(this.#configuration?.releaseFeedUrl
+      && this.#runtime.bundleUpdatesSupported
       && (this.#platform === "android" || this.#platform === "ios"));
   }
 

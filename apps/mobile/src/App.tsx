@@ -334,6 +334,7 @@ import { mobileFilesThumbnailCache } from "./mobile-files-thumbnail-cache";
 import { MobileFilesClipboard, type MobileFilesClipboardLease, type MobileFilesClipboardResult } from "./mobile-files-clipboard";
 import type { MobileFilesPreferences } from "./mobile-files-presentation";
 import { MobileSettingsScreen } from "./MobileSettingsScreen";
+import { MobileAndroidUpdateSheet } from "./MobileAndroidUpdateSheet";
 import { MobileTaskSharingScreen, mobileTaskSharingCopy, MobileSharedTaskEntries } from "./MobileTaskSharingScreen";
 import { parseTaskShareInvitation } from "@joko/contracts";
 import { QueueDeliveryMode } from "@joko/contracts";
@@ -1158,6 +1159,7 @@ export function App() {
         <MobileUpdatePrompt colors={colors} locale={locale.effectiveLocale} state={updates}
           actions={mobileUpdateActions} />
         </>}
+        <MobileAndroidUpdateSheet colors={colors} locale={locale.effectiveLocale} />
       </View>
       </MobilePartnerAvatarProvider>
       </MobileNavigationFrame>
