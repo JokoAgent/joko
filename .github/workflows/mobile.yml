@@ -1,0 +1,212 @@
+name: Mobile compilation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hermes:
+    name: Android and iOS JS/Hermes exports
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 22.19.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared Mobile inputs
+        run: |
+          pnpm --filter @joko/contracts build
+          pnpm --filter @joko/remote-desktop-sync build
+
+      - name: Export Android JS/Hermes
+        run: pnpm --filter @joko/mobile exec expo export --platform android --max-workers 2 --output-dir dist/android
+
+      - name: Export iOS JS/Hermes
+        run: pnpm --filter @joko/mobile exec expo export --platform ios --max-workers 2 --output-dir dist/ios
+
+      - name: Record JS export scope
+        run: printf '%s\n' 'Android and iOS JS/Hermes exports only; these are not APK/IPA, signed releases, or device test results.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload JS/Hermes exports
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-js-hermes-${{ github.sha }}
+          path: |
+            apps/mobile/dist/android
+            apps/mobile/dist/ios
+          if-no-files-found: error
+          retention-days: 3
+
+  android-debug:
+    name: Android x86_64 Debug compilation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # A reserved example domain enables the build-time installer permission branch.
+      # This job never starts the app or requests an update from this placeholder.
+      JOKO_MOBILE_UPDATE_FEED_URL: https://example.com/joko-ci-releases
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 22.19.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK, NDK and CMake
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools platforms;android-36 build-tools;36.0.0 ndk;27.1.12297006 cmake;3.30.5
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared Mobile inputs
+        run: |
+          pnpm --filter @joko/contracts build
+          pnpm --filter @joko/remote-desktop-sync build
+
+      - name: Generate the current Android project
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --platform android --clean --no-install
+
+      - name: Compile the generated x86_64 Debug APK
+        working-directory: apps/mobile
+        run: ./android/gradlew -p android :app:assembleDebug --no-daemon --max-workers=2 -PreactNativeArchitectures=x86_64
+
+      - name: Verify the Debug APK installer permission
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump permissions apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk > "$RUNNER_TEMP/joko-mobile-debug-permissions.txt"
+          node -e "const fs=require('node:fs'); const path=require('node:path'); const text=fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'joko-mobile-debug-permissions.txt'), 'utf8'); if (!text.includes('android.permission.REQUEST_INSTALL_PACKAGES')) throw new Error('The Debug APK is missing its configured package-installer permission.');"
+
+      - name: Record Android compilation scope
+        run: printf '%s\n' 'Android x86_64 Debug APK compiled with the generated debug key. No release signer, emulator run, device installation, or actual update was verified.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Android Debug compilation outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-android-x86_64-debug-${{ github.sha }}
+          path: |
+            apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk
+            ${{ runner.temp }}/joko-mobile-debug-permissions.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  ios-simulator:
+    name: iOS Simulator Debug compilation and Swift checks
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 22.19.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+
+      - name: Verify the runner's Xcode and CocoaPods
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          pod --version
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared Mobile inputs
+        run: |
+          pnpm --filter @joko/contracts build
+          pnpm --filter @joko/remote-desktop-sync build
+
+      - name: Check the Swift receiver and clipboard state machines
+        run: node apps/mobile/scripts/test-remote-desktop-native.mjs
+
+      - name: Generate the current iOS project
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --platform ios --clean --no-install
+
+      - name: Install the generated iOS Pods
+        working-directory: apps/mobile
+        run: pod install --project-directory=ios
+
+      - name: Compile the generated iOS Simulator Debug app
+        working-directory: apps/mobile
+        run: |
+          xcodebuild \
+            -workspace ios/Joko.xcworkspace \
+            -scheme Joko \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/joko-ios-simulator" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Archive the compiled Simulator app
+        run: tar -C "$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator" -czf "$RUNNER_TEMP/joko-ios-simulator-debug.tar.gz" Joko.app
+
+      - name: Record iOS compilation scope
+        run: printf '%s\n' 'Unsigned iOS Simulator Debug app compilation plus host Swift receiver/clipboard checks. No signed IPA, simulator app run, physical device, APNs delivery, or account integration was verified.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload iOS Simulator Debug app
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-ios-simulator-debug-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ios-simulator-debug.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3

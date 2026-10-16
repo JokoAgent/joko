@@ -16,14 +16,14 @@ jobs:
   verify:
     name: ${{ matrix.os }} / Node 22.19
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
+          - ubuntu-24.04
           - windows-latest
-          - macos-latest
+          - macos-15
 
     steps:
       - name: Check out repository
@@ -42,14 +42,15 @@ jobs:
           cache: pnpm
 
       - name: Use the canonical temporary directory
+        id: temporary
         run: |
-          node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV, ['TMPDIR='+canonical, 'TMP='+canonical, 'TEMP='+canonical, ''].join('\n'));"
+          node -e "const fs=require('node:fs'); const os=require('node:os'); const path=require('node:path'); const canonical=fs.realpathSync(os.tmpdir()); fs.mkdirSync(path.join(process.env.RUNNER_TEMP,'joko-ci-logs'),{recursive:true}); fs.appendFileSync(process.env.GITHUB_ENV, ['TMPDIR='+canonical, 'TMP='+canonical, 'TEMP='+canonical, ''].join('\n')); fs.appendFileSync(process.env.GITHUB_OUTPUT,'directory='+canonical+'\n');"
 
       - name: Install Linux test dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev ripgrep xauth xvfb
+          sudo apt-get install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev libwayland-dev libwayland-bin libxkbcommon-dev libjson-c-dev libturbojpeg0-dev libpng-dev ripgrep xauth xvfb
 
       - name: Install Windows test dependencies
         if: runner.os == 'Windows'
@@ -61,19 +62,39 @@ jobs:
 
       - name: Install dependencies from lockfile
         id: dependencies
-        run: pnpm install --frozen-lockfile
+        shell: bash
+        run: pnpm install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/install.log"
 
       - name: Check build, boundaries, generated contracts, and types
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: pnpm check
+        shell: bash
+        run: pnpm check 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/check.log"
 
-      - name: Run workspace test suite, including Connect end-to-end coverage
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: pnpm test:ci
+      - name: Prepare Chromium for the production Web mounted chains
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          pnpm --filter @joko/e2e exec playwright-core install --with-deps chromium 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/chromium.log"
+          pnpm --filter @joko/e2e exec node -e "const fs=require('node:fs'); const path=require('node:path'); const browser=require('playwright-core').chromium.executablePath(); const web=path.join(process.env.GITHUB_WORKSPACE,'apps','web','dist'); fs.accessSync(browser,fs.constants.X_OK); fs.accessSync(path.join(web,'index.html')); fs.appendFileSync(process.env.GITHUB_ENV,['JOKO_BROWSER_EXECUTABLE='+fs.realpathSync(browser),'JOKO_MOUNTED_WEB_DIR='+fs.realpathSync(web),''].join('\n'));"
+
+      - name: Run workspace test suite and headed Browser chains (Linux)
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' }}
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm test:ci 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests.log"
+        env:
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Run workspace test suite, including Connect end-to-end coverage (Windows/macOS)
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' }}
+        shell: bash
+        run: pnpm test:ci 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests.log"
 
       - name: Amplify the short queue soak and fault matrix
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: pnpm test:soak
+        shell: bash
+        run: pnpm test:soak 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/soak.log"
         env:
           JOKO_E2E_SOAK_ITERATIONS: "2"
           JOKO_E2E_SOAK_DURATION_MS: "3000"
@@ -82,19 +103,128 @@ jobs:
       - name: Build and verify isolated Desktop Orchestrator runtime
         id: desktop_runtime
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        timeout-minutes: 15
-        run: pnpm stage:desktop:orchestrator-runtime
+        timeout-minutes: 45
+        shell: bash
+        run: pnpm stage:desktop:orchestrator-runtime 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-runtime.log"
 
-      - name: Run Electron development-host smoke (Linux)
-        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
-        timeout-minutes: 5
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm test:desktop:host
+      - name: Package the current platform Desktop application
+        id: desktop_package
+        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: bash
+        run: pnpm --filter @joko/desktop package:dir 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-package.log"
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Run the packaged Desktop smoke (Linux)
+        if: ${{ !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 10
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm test:desktop:artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-smoke.log"
         env:
           JOKO_DESKTOP_SMOKE_NO_SANDBOX: "1"
+          JOKO_DESKTOP_SMOKE_KEEP_FAILED: "1"
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
 
-      - name: Run Electron development-host smoke (Windows/macOS)
+      - name: Run the packaged Desktop smoke (Windows/macOS)
+        if: ${{ !cancelled() && steps.desktop_package.outcome == 'success' && runner.os != 'Linux' }}
+        timeout-minutes: 10
+        shell: bash
+        run: pnpm test:desktop:artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-smoke.log"
+        env:
+          JOKO_DESKTOP_SMOKE_KEEP_FAILED: "1"
+
+      - name: Run the independent Desktop viewer GUI chain (Linux)
+        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 5
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer.log"
+        env:
+          JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR: ${{ runner.temp }}/joko-viewer-evidence
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Run the independent Desktop viewer GUI chain (Windows/macOS)
         if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
         timeout-minutes: 5
-        run: pnpm test:desktop:host
+        shell: bash
+        run: node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer.log"
+        env:
+          JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR: ${{ runner.temp }}/joko-viewer-evidence
+
+      - name: Verify the viewer's unbound prewarm lifecycle (Linux)
+        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 5
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs --scope viewer-lifecycle 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer-lifecycle.log"
+        env:
+          JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR: ${{ runner.temp }}/joko-viewer-evidence
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Verify the viewer's unbound prewarm lifecycle (Windows/macOS)
+        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
+        timeout-minutes: 5
+        shell: bash
+        run: node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs --scope viewer-lifecycle 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer-lifecycle.log"
+        env:
+          JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR: ${{ runner.temp }}/joko-viewer-evidence
+
+      - name: Archive the packaged application with its source identity
+        id: desktop_archive
+        if: ${{ !cancelled() && steps.desktop_package.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          mkdir -p ci-artifacts
+          archive="Joko-${RUNNER_OS}-${RUNNER_ARCH}-${GITHUB_SHA}.tar.gz"
+          tar -czf "ci-artifacts/$archive" -C apps/desktop release
+          node --input-type=module - "$archive" <<'NODE'
+          import { createReadStream, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          const archive = process.argv[2], hash = createHash('sha256');
+          for await (const chunk of createReadStream(`ci-artifacts/${archive}`)) hash.update(chunk);
+          writeFileSync('ci-artifacts/manifest.json', JSON.stringify({ sourceCommit: process.env.GITHUB_SHA,
+            platform: process.env.RUNNER_OS, architecture: process.env.RUNNER_ARCH, archive,
+            sha256: hash.digest('hex') }, null, 2) + '\n');
+          NODE
+
+      - name: Upload the current platform application
+        if: ${{ !cancelled() && steps.desktop_archive.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ci-artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload validation logs and bounded smoke failure receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-diagnostics-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ci-logs/
+            ${{ steps.temporary.outputs.directory }}/joko-desktop-smoke-*/result.txt
+            ${{ steps.temporary.outputs.directory }}/joko-desktop-smoke-*/result.txt.managed-process.json
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload bounded Desktop viewer GUI evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-viewer-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-viewer-evidence/*.png
+            ${{ runner.temp }}/joko-viewer-evidence/identity.json
+            ${{ runner.temp }}/joko-viewer-evidence/result.json
+            ${{ runner.temp }}/joko-viewer-evidence/failure.json
+            ${{ runner.temp }}/joko-viewer-evidence/lifecycle/*.png
+            ${{ runner.temp }}/joko-viewer-evidence/lifecycle/identity.json
+            ${{ runner.temp }}/joko-viewer-evidence/lifecycle/result.json
+            ${{ runner.temp }}/joko-viewer-evidence/lifecycle/failure.json
+          if-no-files-found: warn
+          retention-days: 3
