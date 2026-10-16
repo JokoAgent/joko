@@ -62,14 +62,15 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  android-debug:
-    name: Android x86_64 Debug compilation
+  android-native:
+    name: Android x86_64 test-signed APK and native GUI
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       # A reserved example domain enables the build-time installer permission branch.
-      # This job never starts the app or requests an update from this placeholder.
+      # The GUI emulator has unavailable test DNS; no update service is supplied.
       JOKO_MOBILE_UPDATE_FEED_URL: https://example.com/joko-ci-releases
+      JOKO_ANDROID_TEST_AVD: joko-ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -102,42 +103,56 @@ jobs:
       - name: Install dependencies from lockfile
         run: pnpm install --frozen-lockfile
 
-      - name: Build shared Mobile inputs
+      - name: Build shared Mobile and native E2E inputs
+        run: pnpm --filter @joko/e2e... --filter @joko/remote-desktop-sync --if-present build
+
+      - name: Build a real APK with an ephemeral CI test signer
+        id: native-artifact
+        run: node scripts/ci/android-native.mjs build
+
+      - name: Verify the actual APK installer permission
+        env:
+          JOKO_ANDROID_TEST_APK: ${{ steps.native-artifact.outputs.apk-path }}
         run: |
-          pnpm --filter @joko/contracts build
-          pnpm --filter @joko/remote-desktop-sync build
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump permissions "$JOKO_ANDROID_TEST_APK" > "$(dirname "$JOKO_ANDROID_TEST_APK")/android-permissions.txt"
+          node -e "const fs=require('node:fs'); const path=require('node:path'); const text=fs.readFileSync(path.join(path.dirname(process.env.JOKO_ANDROID_TEST_APK), 'android-permissions.txt'), 'utf8'); if (!text.includes('android.permission.REQUEST_INSTALL_PACKAGES')) throw new Error('The actual APK is missing its configured package-installer permission.');"
 
-      - name: Generate the current Android project
-        working-directory: apps/mobile
-        run: pnpm exec expo prebuild --platform android --clean --no-install
-
-      - name: Compile the generated x86_64 Debug APK
-        working-directory: apps/mobile
-        run: ./android/gradlew -p android :app:assembleDebug --no-daemon --max-workers=2 -PreactNativeArchitectures=x86_64
-
-      - name: Verify the Debug APK installer permission
+      - name: Enable the hosted runner's KVM device
         run: |
-          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump permissions apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk > "$RUNNER_TEMP/joko-mobile-debug-permissions.txt"
-          node -e "const fs=require('node:fs'); const path=require('node:path'); const text=fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'joko-mobile-debug-permissions.txt'), 'utf8'); if (!text.includes('android.permission.REQUEST_INSTALL_PACKAGES')) throw new Error('The Debug APK is missing its configured package-installer permission.');"
+          test -c /dev/kvm
+          sudo chmod 666 /dev/kvm
 
-      - name: Record Android compilation scope
-        run: printf '%s\n' 'Android x86_64 Debug APK compiled with the generated debug key. No release signer, emulator run, device installation, or actual update was verified.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Exercise native pairing, input, resources and recovery on the isolated AVD
+        uses: ReactiveCircus/android-emulator-runner@v2
+        env:
+          JOKO_ANDROID_TEST_APK: ${{ steps.native-artifact.outputs.apk-path }}
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          avd-name: ${{ env.JOKO_ANDROID_TEST_AVD }}
+          emulator-port: 5554
+          emulator-boot-timeout: 600
+          disable-animations: true
+          disable-spellchecker: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -dns-server 127.0.0.1 -accel on
+          script: node scripts/ci/android-native.mjs test
 
-      - name: Upload Android Debug compilation outputs
+      - name: Upload the test-signed APK, original manifest and native GUI evidence
+        if: always() && steps.native-artifact.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
-          name: mobile-android-x86_64-debug-${{ github.sha }}
-          path: |
-            apps/mobile/android/app/build/outputs/apk/debug/app-debug.apk
-            ${{ runner.temp }}/joko-mobile-debug-permissions.txt
+          name: mobile-android-x86_64-ci-test-${{ github.sha }}
+          path: ${{ steps.native-artifact.outputs.artifact-directory }}
           if-no-files-found: error
           compression-level: 0
           retention-days: 3
 
   ios-simulator:
-    name: iOS Simulator Debug compilation and Swift checks
+    name: iOS Simulator Debug build, Swift and startup observations
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -197,12 +212,37 @@ jobs:
             build
 
       - name: Archive the compiled Simulator app
+        id: ios-archive
         run: tar -C "$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator" -czf "$RUNNER_TEMP/joko-ios-simulator-debug.tar.gz" Joko.app
 
+      - name: Observe the actual iOS app startup, termination and reopen
+        timeout-minutes: 12
+        run: node scripts/ci/mobile-ios-simulator-runtime.mjs
+        env:
+          JOKO_IOS_SIMULATOR_APP_PATH: ${{ runner.temp }}/joko-ios-simulator/Build/Products/Debug-iphonesimulator/Joko.app
+          JOKO_IOS_RUNTIME_EVIDENCE_DIR: ${{ runner.temp }}/joko-ios-runtime-evidence
+
+      - name: Upload bounded iOS Simulator startup evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-ios-simulator-runtime-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ios-runtime-evidence/*.png
+            ${{ runner.temp }}/joko-ios-runtime-evidence/identity.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/result.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/failure.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/cleanup.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/*-screen.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/metro.log
+          if-no-files-found: warn
+          retention-days: 3
+
       - name: Record iOS compilation scope
-        run: printf '%s\n' 'Unsigned iOS Simulator Debug app compilation plus host Swift receiver/clipboard checks. No signed IPA, simulator app run, physical device, APNs delivery, or account integration was verified.' >> "$GITHUB_STEP_SUMMARY"
+        run: printf '%s\n' 'Unsigned Simulator app build and actual startup/terminate/reopen observed with PID identity and visible Joko connection-page OCR. No taps, typing, task execution, signed IPA, physical device, APNs or account integration was verified.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload iOS Simulator Debug app
+        if: ${{ !cancelled() && steps.ios-archive.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: mobile-ios-simulator-debug-${{ github.sha }}

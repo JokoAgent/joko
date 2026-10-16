@@ -44,7 +44,7 @@ jobs:
       - name: Use the canonical temporary directory
         id: temporary
         run: |
-          node -e "const fs=require('node:fs'); const os=require('node:os'); const path=require('node:path'); const canonical=fs.realpathSync(os.tmpdir()); fs.mkdirSync(path.join(process.env.RUNNER_TEMP,'joko-ci-logs'),{recursive:true}); fs.appendFileSync(process.env.GITHUB_ENV, ['TMPDIR='+canonical, 'TMP='+canonical, 'TEMP='+canonical, ''].join('\n')); fs.appendFileSync(process.env.GITHUB_OUTPUT,'directory='+canonical+'\n');"
+          node -e "const fs=require('node:fs'); const os=require('node:os'); const path=require('node:path'); const canonical=fs.realpathSync.native(os.tmpdir()); fs.mkdirSync(path.join(process.env.RUNNER_TEMP,'joko-ci-logs'),{recursive:true}); fs.appendFileSync(process.env.GITHUB_ENV, ['TMPDIR='+canonical, 'TMP='+canonical, 'TEMP='+canonical, ''].join('\n')); fs.appendFileSync(process.env.GITHUB_OUTPUT,'directory='+canonical+'\n');"
 
       - name: Install Linux test dependencies
         if: runner.os == 'Linux'
@@ -66,9 +66,21 @@ jobs:
         run: pnpm install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/install.log"
 
       - name: Check build, boundaries, generated contracts, and types
+        id: source_check
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         shell: bash
         run: pnpm check 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/check.log"
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
+
+      - name: Upload an immediately available source-check failure log
+        if: ${{ !cancelled() && steps.source_check.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-source-check-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/check.log
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Prepare Chromium for the production Web mounted chains
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' }}
@@ -200,15 +212,17 @@ jobs:
           compression-level: 0
           retention-days: 3
 
+      - name: Collect bounded smoke receipts beside validation logs
+        if: ${{ always() }}
+        shell: bash
+        run: node scripts/ci/collect-desktop-diagnostics.mjs
+
       - name: Upload validation logs and bounded smoke failure receipts
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-diagnostics-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
-          path: |
-            ${{ runner.temp }}/joko-ci-logs/
-            ${{ steps.temporary.outputs.directory }}/joko-desktop-smoke-*/result.txt
-            ${{ steps.temporary.outputs.directory }}/joko-desktop-smoke-*/result.txt.managed-process.json
+          path: ${{ runner.temp }}/joko-ci-logs/
           if-no-files-found: warn
           retention-days: 3
 
