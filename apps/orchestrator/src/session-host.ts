@@ -12980,6 +12980,12 @@ export class SessionHost {
             await active.adapter.send(dispatchBody, context);
           }
           if (this.#disposed) return;
+          if (this.finishCancelledDispatch(item.id, attemptId)) {
+            this.#pendingDispatchAcceptances.delete(run.descriptor.id);
+            this.#workspaceCapture?.abortRun?.({ sessionId, runId: run.descriptor.id });
+            await this.restoreTurnOverrideLease(run.descriptor.id);
+            continue;
+          }
           this.#store.transaction((store) => {
             store.updateQueueState({
               queueItemId: item.id,
@@ -13045,6 +13051,7 @@ export class SessionHost {
           if (this.#disposed) return;
           await this.restoreTurnOverrideLease(run.descriptor.id);
           if (this.#disposed) return;
+          if (this.finishCancelledDispatch(item.id, attemptId)) continue;
           if (this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) {
             this.#store.transaction((store) => {
               const queueItem = store.getQueueItem(item.id);
@@ -13152,6 +13159,18 @@ export class SessionHost {
       settle();
       this.#onBackendMayBeIdle?.(initialBackendId);
     }
+  }
+
+  private finishCancelledDispatch(queueItemId: string, attemptId: string | undefined): boolean {
+    return this.#store.transaction((store) => {
+      if (store.getQueueItem(queueItemId).state !== "cancelled") return false;
+      // The cancellation owner has already terminalized the Queue and Run.
+      // A late dispatch receipt may finish its Attempt, but cannot replace that outcome.
+      if (attemptId !== undefined && store.getAttempt(attemptId).descriptor.endedAt === undefined) {
+        store.finishAttempt(attemptId);
+      }
+      return true;
+    });
   }
 
   private targetForSession(stored: StoredSession): TargetDescriptor {

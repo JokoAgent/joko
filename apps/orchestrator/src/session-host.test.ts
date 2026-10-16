@@ -5458,6 +5458,58 @@ describe("SessionHost", () => {
     expect(adapter.sendCalls).toBe(1); expect(fenced).toHaveBeenCalledTimes(mode === "fenced" ? 1 : 0);
   });
 
+  it.each(["accepted", "rejected"] as const)("preserves cancellation when an in-flight dispatch is later %s", async (outcome) => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const gate = new AsyncGate();
+    vi.spyOn(adapter, "send").mockImplementationOnce(async () => {
+      gate.enter();
+      await gate.wait;
+      if (outcome === "rejected") throw new Error("Dispatch interrupted after cancellation");
+    });
+    const idle = vi.fn();
+    const fixture = await createFixture(adapter, { onBackendMayBeIdle: idle });
+    const sessionId = (await fixture.host.createSession({
+      operationId: `create-cancelled-dispatch-${outcome}`,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Cancelled dispatch",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const queued = fixture.host.enqueueInput({
+      operationId: `cancelled-dispatch-${outcome}`,
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "cancel while dispatching", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await gate.entered;
+    const cancelled = fixture.store.cancelQueueItem({
+      queueItemId: queued.value.queueItemId,
+      traceId: "test:cancel-in-flight-dispatch"
+    });
+    const aborted = fixture.store.getRun(queued.value.runId);
+    const transition = vi.spyOn(fixture.store, "updateQueueState");
+    const next = fixture.host.enqueueInput({
+      operationId: `after-cancelled-dispatch-${outcome}`,
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "continue with the next input", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    idle.mockClear();
+    gate.release();
+    await vi.waitFor(() => expect(idle).toHaveBeenCalled());
+
+    expect(fixture.store.getQueueItem(queued.value.queueItemId)).toEqual(cancelled);
+    expect(fixture.store.getRun(queued.value.runId)).toEqual(aborted);
+    expect(transition.mock.calls.filter(([input]) => input.queueItemId === cancelled.id)).toEqual([]);
+    expect(fixture.store.getAttempt(queued.value.attemptId).descriptor).toMatchObject({
+      endedAt: expect.any(Number)
+    });
+    expect(fixture.store.getAttempt(queued.value.attemptId).descriptor.error).toBeUndefined();
+    await eventually(() => fixture.store.getRun(next.value.runId).descriptor.state === "completed");
+  });
+
   it("records a definite managed runtime preparation failure without dispatching Backend input", async () => {
     const adapter = new SendCountingFakeAdapter();
     const fixture = await createFixture(adapter, { prepareManagedProviderRuntime: async () => { throw new Error("Local runtime unavailable"); } });
