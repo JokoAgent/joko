@@ -1305,7 +1305,9 @@ describe("PiResourceManager", () => {
       expectedResourceVersion: enabled.versionNumber
     });
     expect(lease.dirty).toBe(false);
-    expect(stringify(lease)).not.toContain(root);
+    expect(await readFile(lease.entryFilePath, "utf8")).toContain("old");
+    expect(JSON.parse(stringify(lease))).not.toHaveProperty("entryFilePath");
+    expect(stringify(lease)).not.toContain(JSON.stringify(root).slice(1, -1));
     const snapshot = join(root, "managed-skill-snapshot");
     await mkdir(snapshot);
     expect((await lease.snapshotTo(snapshot)).discoveredRevision).toBe(enabled.discoveredRevision);

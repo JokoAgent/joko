@@ -836,7 +836,7 @@ export class PiResourceManager {
           throw new Error("Skill content changed after the content lease was acquired.");
         }
       };
-      return {
+      const lease: PiSkillContentLease = {
         resource,
         entryFilePath: join(root, "SKILL.md"),
         approvedRevision: record.discoveredRevision,
@@ -869,6 +869,8 @@ export class PiResourceManager {
           await releasePromise;
         }
       };
+      Object.defineProperty(lease, "entryFilePath", { enumerable: false });
+      return lease;
     });
   }
 
