@@ -14,7 +14,15 @@ import { expect, it } from "vitest";
 import { OrchestratorE2eFixture } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 
-it("returns the platform diagnosis through authenticated Connect and task Tool dispatch", async () => {
+it("returns the platform diagnosis through authenticated Connect and task Tool dispatch", {
+  // Three real inspections each run up to three bounded 15s Xcode commands.
+  timeout: process.platform === "darwin" ? 150_000 : 20_000
+}, async (context) => {
+  const startedAt = performance.now();
+  let phase = "fixture";
+  context.onTestFailed(() => console.error("Simulator diagnosis boundary", JSON.stringify({
+    phase, elapsedMs: Math.round(performance.now() - startedAt)
+  })));
   let fixture: OrchestratorE2eFixture | undefined;
   let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
   try {
@@ -63,6 +71,7 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
     expect(await call("call_tool", { name: "list_instances", args: {} })).toMatchObject({ isError: false, details: {
       mcpStructuredContent: { data: { instances: [{ instanceId: owned.instanceId, simulatorUdid: owned.simulatorUdid }] } }
     } });
+    phase = "doctor";
     const diagnosis = await call("call_tool", { name: "doctor", args: {} });
     if (process.platform === "win32") expect(diagnosis).toMatchObject({ isError: false, details: { mcpStructuredContent: {
       data: { environment: { issue: "UNSUPPORTED_PLATFORM" }, availability: {
@@ -70,13 +79,16 @@ it("returns the platform diagnosis through authenticated Connect and task Tool d
       }, resources: { state: "unavailable", reasonCode: "UNSUPPORTED_PLATFORM" },
       instanceControl: { state: "unavailable" } }
     } } });
+    phase = "check_environment";
     const environment = await call("call_tool", { name: "check_environment", args: {} });
     if (process.platform === "win32") expect(environment).toMatchObject({ isError: false, details: { mcpStructuredContent: {
       data: { supported: false, ready: false, issue: "UNSUPPORTED_PLATFORM" }
     } } });
+    phase = "list_simulator_devices";
     const devices = await call("call_tool", { name: "list_simulator_devices", args: {} });
     if (process.platform === "win32") expect(devices).toMatchObject({ isError: true, details: { mcpStructuredContent: { errorCode: "UNSUPPORTED_PLATFORM" } } });
     bridge.revoke();
+    phase = "cleanup";
   } finally {
     await internal?.close();
     await fixture?.close();

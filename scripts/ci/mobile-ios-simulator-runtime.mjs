@@ -513,7 +513,12 @@ async function startOwnedSimulator(applicationIdentity) {
     simulatorUdid: udid, simulatorName: deviceName, runtime: runtime.identifier, deviceType: type.identifier,
     architecture: process.arch === "arm64" ? "arm64" : "x86_64", xcode: await command("xcodebuild", ["-version"]) });
   await command("xcrun", ["simctl", "boot", udid], { startupLabel: "boot-owned-simulator" });
-  await command("xcrun", ["simctl", "bootstatus", udid, "-b"], { timeout: 180_000, startupLabel: "wait-owned-boot" });
+  // Fresh CI devices can still be migrating at the old 3-minute cutoff. Full
+  // GUI runs own this same device through cold boot within the existing 15m
+  // observation deadline; the short startup-only diagnostic keeps its budget.
+  await command("xcrun", ["simctl", "bootstatus", udid, "-b"], {
+    timeout: startupDiagnosticsOnly ? 180_000 : 600_000, startupLabel: "wait-owned-boot"
+  });
   stage = "owned Simulator appearance confirmation";
   const startupState = { scope: "simulator-startup-command-probe", simulatorUdid: udid,
     noApplicationInstalled: true, noAppGuiSuccessClaimed: true,
