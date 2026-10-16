@@ -5,6 +5,7 @@ import XCTest
 // injected JavaScript, mocked controls, external node or account is involved.
 final class JokoConnectionUITests: XCTestCase {
     private var app: XCUIApplication!
+    private var ownedLaunchArguments: [String] = []
 
     override func setUpWithError() throws {
         continueAfterFailure = false
@@ -15,6 +16,7 @@ final class JokoConnectionUITests: XCTestCase {
         }
         app = XCUIApplication(bundleIdentifier: "app.joko.mobile")
         let launchArguments = ["-RCT_jsLocation", "127.0.0.1:\(metro)", "-RCT_packager_scheme", "http", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        ownedLaunchArguments = launchArguments
         // The native owner has already launched, terminated, reopened and
         // observed this exact application. Do not create a third occurrence.
         app.launchArguments = launchArguments
@@ -35,14 +37,15 @@ final class JokoConnectionUITests: XCTestCase {
         }
     }
 
-    private func recordPreInputSetupFailure(launchArguments: [String]) throws {
-        // This is called only from setUp, before the test method or any address,
-        // pairing code or other connection input. Never attach a later UI tree.
-        screenshot("00-setup-pre-input-screen")
+    private func recordPreInputSetupFailure(launchArguments: [String], stage: String = "pre-input-setup") throws {
+        // Both call sites precede any address or pairing input. Never attach a
+        // later UI tree, including after a validation or transport operation.
+        let prefix = stage == "pre-input-address" ? "00-address-pre-input" : "00-setup-pre-input"
+        screenshot("\(prefix)-screen")
         let hierarchy = Data(app.debugDescription.utf8)
         let boundedHierarchy = Data(hierarchy.prefix(128 * 1024))
         let state: [String: Any] = [
-            "stage": "pre-input-setup", "connectionInputNotStarted": true,
+            "stage": stage, "connectionInputNotStarted": true,
             "configuredBundleIdentifier": "app.joko.mobile",
             "configuredLaunchArgumentsMatchOwnedServers": app.launchArguments == launchArguments,
             "ownedMetroPortReceived": true, "ownedProbePortReceived": true,
@@ -57,11 +60,11 @@ final class JokoConnectionUITests: XCTestCase {
             "hierarchyBytes": boundedHierarchy.count, "hierarchyTruncated": hierarchy.count > boundedHierarchy.count
         ]
         let controlState = XCTAttachment(data: try JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]), uniformTypeIdentifier: "public.json")
-        controlState.name = "00-setup-pre-input-state"
+        controlState.name = "\(prefix)-state"
         controlState.lifetime = .keepAlways
         add(controlState)
         let tree = XCTAttachment(data: boundedHierarchy, uniformTypeIdentifier: "public.plain-text")
-        tree.name = "00-setup-pre-input-hierarchy"
+        tree.name = "\(prefix)-hierarchy"
         tree.lifetime = .keepAlways
         add(tree)
     }
@@ -152,7 +155,10 @@ final class JokoConnectionUITests: XCTestCase {
         screenshot("03-nearby")
         tap(tab("Add Joko node"))
         let address = connectionPage.textFields["Joko node address"].firstMatch
-        XCTAssertTrue(address.waitForExistence(timeout: 10))
+        let addressExists = address.waitForExistence(timeout: 10)
+        if !addressExists { try? recordPreInputSetupFailure(launchArguments: ownedLaunchArguments, stage: "pre-input-address") }
+        XCTAssertTrue(addressExists)
+        guard addressExists else { return }
         let inspect = button("Check node identity")
         replace(address, with: "not-an-address")
         wait(inspect, "enabled == false")

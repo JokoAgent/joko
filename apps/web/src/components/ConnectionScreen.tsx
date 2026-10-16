@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useReducer, useRef, useState } from "react";
 import type { JSX } from "react";
 import { AlertTriangle, ArrowRight, KeyRound, Laptop, Moon, RefreshCcw, Server, Sun, Trash2, Wifi } from "lucide-react";
 import { connectionArtworkGroupAt, nextConnectionArtworkGroupIndex } from "../connection-artwork.js";
@@ -11,6 +11,7 @@ import { Button, ErrorBanner, IconButton, Pill, Spinner, formatRelativeTime, Che
 
 export function ConnectionScreen({ controller, t }: { readonly controller: ConnectionScreenController; readonly t: Translator }): JSX.Element {
   const { state } = controller;
+  const originHintId = useId();
   const remoteProfiles = useMemo(() => state.profiles.filter((profile) => profile.managedLocal !== true), [state.profiles]);
   const [{ mode, artworkGroupIndex, artworkVariant }, dispatchView] = useReducer(connectionViewReducer, {
     mode: state.initialMode ?? (remoteProfiles.length === 0 ? "nearby" : "saved"),
@@ -320,8 +321,8 @@ export function ConnectionScreen({ controller, t }: { readonly controller: Conne
             </div>
             <label>
               <span>{t("connection.origin")}</span>
-              <input type="url" inputMode="url" required disabled={actionsDisabled} value={origin} onChange={(event) => { setOrigin(event.target.value); setInsecureConfirmed(false); invalidatePairing(); }} placeholder="http://192.168.1.20:4318" autoComplete="url" />
-              <small>{t("connection.secureHint")}</small>
+              <input type="url" inputMode="url" aria-label={t("connection.origin")} aria-describedby={originHintId} required disabled={actionsDisabled} value={origin} onChange={(event) => { setOrigin(event.target.value); setInsecureConfirmed(false); invalidatePairing(); }} placeholder="http://192.168.1.20:4318" autoComplete="url" />
+              <small id={originHintId}>{t("connection.secureHint")}</small>
             </label>
             {insecureLan && <div className="lan-http-warning" role="note">
               <AlertTriangle aria-hidden="true" />

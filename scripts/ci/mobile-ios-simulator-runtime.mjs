@@ -296,9 +296,9 @@ async function guiCommand(args, logName, timeout) {
 }
 
 async function exportPreInputSetupFailure(screenshots, files, { expectedSha, expectedHash, requests, unexpectedRequests, steps }) {
-  // Only our explicitly named setUp attachments are eligible. Automatic XCTest
+  // Only our explicitly named pre-input attachments are eligible. Automatic XCTest
   // trees from later actions can contain connection inputs and stay unexported.
-  if (requests !== 0 || unexpectedRequests !== 0 || steps.some(step => step.screenshotExported)) return;
+  if (requests !== 0 || unexpectedRequests !== 0 || steps.slice(3).some(step => step.screenshotExported)) return;
   const manifests = files.filter(name => name.endsWith(".json")).flatMap(name => {
     const manifest = JSON.parse(readFileSync(join(screenshots, name), "utf8"));
     return Array.isArray(manifest) ? manifest : [];
@@ -318,15 +318,20 @@ async function exportPreInputSetupFailure(screenshots, files, { expectedSha, exp
     }
     return readFileSync(path);
   };
-  const stateBytes = readAttachment("00-setup-pre-input-state", "json|txt", 16 * 1024);
+  const addressStage = steps.slice(0, 3).every(step => step.screenshotExported) && steps.length >= 3;
+  if (!addressStage && steps.some(step => step.screenshotExported)) return;
+  const phase = addressStage ? "address" : "setup";
+  const expectedStage = addressStage ? "pre-input-address" : "pre-input-setup";
+  const prefix = `00-${phase}-pre-input`;
+  const stateBytes = readAttachment(`${prefix}-state`, "json|txt", 16 * 1024);
   if (stateBytes === undefined) {
-    save("gui-setup-export-receipt.json", { stage: "pre-input-setup", result: "unavailable", reason: "fixed-setup-state-attachment-not-exported" });
+    save(`gui-${phase}-export-receipt.json`, { stage: expectedStage, result: "unavailable", reason: "fixed-pre-input-state-attachment-not-exported" });
     return;
   }
   const state = JSON.parse(stateBytes.toString("utf8"));
   const count = value => Number.isSafeInteger(value) && value >= 0;
   const expectedRoles = { Nearby: ["buttons", "staticTexts", "allRoles"], "Saved nodes": ["buttons"], "Add Joko node": ["buttons"] };
-  if (state.stage !== "pre-input-setup" || state.connectionInputNotStarted !== true
+  if (state.stage !== expectedStage || state.connectionInputNotStarted !== true
     || state.configuredBundleIdentifier !== bundleId || typeof state.configuredLaunchArgumentsMatchOwnedServers !== "boolean"
     || state.ownedMetroPortReceived !== true || state.ownedProbePortReceived !== true
     || !count(state.applicationState) || !count(state.webViewCount) || !count(state.hierarchyBytes) || state.hierarchyBytes > 128 * 1024
@@ -343,22 +348,24 @@ async function exportPreInputSetupFailure(screenshots, files, { expectedSha, exp
     configuredLaunchArgumentsMatchOwnedServers: state.configuredLaunchArgumentsMatchOwnedServers,
     ownedMetroPortReceived: true, ownedProbePortReceived: true, applicationState: state.applicationState,
     webViewCount: state.webViewCount, expectedControls: controls, hierarchyTruncated: state.hierarchyTruncated, attachments: [] };
-  save("gui-setup-control-receipt.json", receipt);
-  const screen = readAttachment("00-setup-pre-input-screen", "png", 8 * 1024 * 1024);
+  save(`gui-${phase}-control-receipt.json`, receipt);
+  const screen = readAttachment(`${prefix}-screen`, "png", 8 * 1024 * 1024);
   if (screen !== undefined) {
     if (!screen.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex"))) throw new Error("The pre-input setup screenshot was not a PNG.");
-    writeFileSync(join(evidence, "gui-setup-pre-input.png"), screen);
-    receipt.attachments.push({ file: "gui-setup-pre-input.png", bytes: screen.length, sha256: createHash("sha256").update(screen).digest("hex") });
-    save("gui-setup-control-receipt.json", receipt);
+    const file = `gui-${phase}-pre-input.png`;
+    writeFileSync(join(evidence, file), screen);
+    receipt.attachments.push({ file, bytes: screen.length, sha256: createHash("sha256").update(screen).digest("hex") });
+    save(`gui-${phase}-control-receipt.json`, receipt);
   }
-  const tree = readAttachment("00-setup-pre-input-hierarchy", "txt", 128 * 1024);
+  const tree = readAttachment(`${prefix}-hierarchy`, "txt", 128 * 1024);
   if (tree !== undefined) {
     if (tree.length !== state.hierarchyBytes) throw new Error("The pre-input setup hierarchy did not match its bounded receipt.");
-    writeFileSync(join(evidence, "gui-setup-pre-input-hierarchy.txt"), tree);
-    receipt.attachments.push({ file: "gui-setup-pre-input-hierarchy.txt", bytes: tree.length, sha256: createHash("sha256").update(tree).digest("hex") });
-    save("gui-setup-control-receipt.json", receipt);
+    const file = `gui-${phase}-pre-input-hierarchy.txt`;
+    writeFileSync(join(evidence, file), tree);
+    receipt.attachments.push({ file, bytes: tree.length, sha256: createHash("sha256").update(tree).digest("hex") });
+    save(`gui-${phase}-control-receipt.json`, receipt);
   }
-  save("gui-setup-export-receipt.json", { stage: "pre-input-setup", result: "exported",
+  save(`gui-${phase}-export-receipt.json`, { stage: expectedStage, result: "exported",
     screenshotExported: screen !== undefined, hierarchyExported: tree !== undefined });
 }
 
@@ -436,7 +443,7 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
           && summary.failedTests === 0 && summary.skippedTests === 0 && steps.every(step => step.screenshotExported) });
       if (executionError || summary.result !== "Passed") {
         try { await exportPreInputSetupFailure(screenshots, files, { expectedSha, expectedHash, requests, unexpectedRequests, steps }); }
-        catch { save("gui-setup-export-receipt.json", { stage: "pre-input-setup", result: "failed", onlyAllowlistedSetupAttachmentsExported: true }); }
+        catch { save("gui-pre-input-export-receipt.json", { result: "failed", onlyAllowlistedPreInputAttachmentsExported: true }); }
       }
       if (executionError) throw executionError;
       if (summary.result !== "Passed" || summary.passedTests !== 1 || summary.failedTests !== 0 || summary.skippedTests !== 0
