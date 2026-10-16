@@ -8,7 +8,7 @@ import { capabilityNames, RunState } from "@joko/contracts";
 import type { AdapterContext, PromptInput, SessionTree } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { parseAndroidUiNodes, type AndroidUiNode } from "@joko/tool-android";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
@@ -59,6 +59,9 @@ type AndroidEvidence = {
   scenarioResult: EvidenceResult;
   cleanupResult: EvidenceResult;
   elapsedMs: number;
+  fixtureReadiness?: Partial<Record<"workspace-directory" | "workspace-index" | "session-artifacts", {
+    passed: boolean; count?: number;
+  }>>;
   target?: { serial: string; avd: string };
   artifact?: {
     kind: "apk"; package: string; sha256: string; manifestSha256: string;
@@ -216,6 +219,29 @@ async function runNativeScenario(): Promise<void> {
   const manager = await current.pair("Android fixture manager");
   const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
     createSessionMutation({ backendId: profile.id, targetId: current.targetId(profile.id), displayName: taskName })));
+  const { mobileNetwork } = await vi.importActual<{ mobileNetwork: {
+    listWorkspaceDirectory(credential: { origin: string; authKey: string }, workspaceId: string, parent: string): Promise<{ entries: readonly unknown[] }>;
+    listWorkspaceFileIndex(credential: { origin: string; authKey: string }, workspaceId: string): Promise<{ paths: readonly string[] }>;
+    listSessionArtifacts(credential: { origin: string; authKey: string }, sessionId: string): Promise<{ artifacts: readonly unknown[] }>;
+  } }>("../../mobile/src/network.js");
+  const fixtureCredential = { origin: current.baseUrl, authKey: manager.authKey };
+  for (const [phase, read] of [
+    ["workspace-directory", async () => (await mobileNetwork.listWorkspaceDirectory(fixtureCredential, "workspace-main", "")).entries.length],
+    ["workspace-index", async () => (await mobileNetwork.listWorkspaceFileIndex(fixtureCredential, "workspace-main")).paths.length],
+    ["session-artifacts", async () => (await mobileNetwork.listSessionArtifacts(fixtureCredential, sessionId)).artifacts.length]
+  ] as const) {
+    let count: number;
+    try { count = await read(); }
+    catch {
+      evidence!.fixtureReadiness = { ...evidence!.fixtureReadiness, [phase]: { passed: false } };
+      await persistEvidence();
+      console.info(JSON.stringify({ phase: `android-fixture-${phase}`, passed: false }));
+      throw new Error(`The authenticated native fixture ${phase} read failed.`);
+    }
+    evidence!.fixtureReadiness = { ...evidence!.fixtureReadiness, [phase]: { passed: true, count } };
+    await persistEvidence();
+    console.info(JSON.stringify({ phase: `android-fixture-${phase}`, passed: true, count }));
+  }
   reversedPort = "tcp:" + new URL(current.baseUrl).port;
   await adb("reverse", reversedPort, reversedPort);
   await completeStep();

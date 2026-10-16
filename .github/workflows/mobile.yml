@@ -131,6 +131,12 @@ jobs:
       - name: Install dependencies from lockfile
         run: pnpm install --frozen-lockfile
 
+      - name: Prepare the fixture's Workspace file index
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes ripgrep
+          rg --version
+
       - name: Build shared Mobile and native E2E inputs
         run: pnpm --filter @joko/e2e... --filter @joko/remote-desktop-sync --if-present build
 
