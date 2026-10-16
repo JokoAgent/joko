@@ -51,6 +51,37 @@ function fixture(empty = false) {
 async function settle() { for (let i = 0; i < 8; i++) await Promise.resolve(); }
 function button(label: string, parent: ParentNode = host) { const found = [...parent.querySelectorAll<HTMLButtonElement>("button")].find(item => item.getAttribute("aria-label") === label || item.textContent === label); expect(found, label).toBeDefined(); return found!; }
 async function input(element: HTMLInputElement | HTMLTextAreaElement, text: string) { await act(async () => { Object.getOwnPropertyDescriptor(element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype, "value")!.set!.call(element, text); element.dispatchEvent(new Event("input", { bubbles: true })); }); }
+it("retains an authenticated text attachment preview through snapshots and retires it on connection replacement", async () => {
+  const f = fixture();
+  vi.mocked(f.controller.partnerGroupApi).mockImplementation(ownerKey => ({ ...f.api, ownerKey }));
+  vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, blob: async () => ({
+    size: 22, text: async () => "Group attachment bytes"
+  }) } as Response)));
+  f.setMessages([create(wire.PartnerGroupMessageSchema, {
+    id: "attachment-message", sequence: 6n, kind: wire.PartnerGroupMessageKind.MESSAGE,
+    authorKind: wire.PartnerGroupAuthorKind.USER, attachments: [{ id: "attachment-one", name: "notes.txt",
+      category: wire.PartnerGroupAttachmentCategory.TEXT,
+      blob: { blobId: "attachment-blob", fileName: "notes.txt", mediaType: "text/plain", byteSize: 22n } }]
+  })]);
+  const render = async (controller: AppController) => act(async () => {
+    root.render(<PartnerGroupPage controller={controller} groupId={f.group.id} t={t} onOpenNavigation={() => undefined} />);
+    await settle();
+  });
+  await render(f.controller);
+  await act(async () => { button("workspace.preview: notes.txt").click(); await settle(); });
+  expect(document.querySelector("[role='dialog'] pre")?.textContent).toBe("Group attachment bytes");
+
+  const next = { ...f.controller, state: { ...f.controller.state, snapshot: { ...f.controller.state.snapshot } } };
+  await render(next);
+  expect(document.querySelector("[role='dialog'] pre")?.textContent).toBe("Group attachment bytes");
+  expect(f.controller.getArtifactUrl).toHaveBeenCalledTimes(1);
+  expect(f.controller.releaseArtifactUrl).not.toHaveBeenCalled();
+
+  await render({ ...next, state: { ...next.state, connectionGeneration: 2 } });
+  expect(document.querySelector("[role='dialog']")).toBeNull();
+  expect(f.controller.releaseArtifactUrl).toHaveBeenCalledExactlyOnceWith("attachment-blob");
+});
+
 it("keeps the ordinary task navigation current from an empty directory and retires finite reads when hidden", async () => {
   vi.useFakeTimers(); const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
   const f = fixture(true);

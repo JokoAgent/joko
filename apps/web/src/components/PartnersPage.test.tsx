@@ -553,6 +553,45 @@ describe("PartnersPage", () => {
     expect(setPartnerLifecycle).toHaveBeenLastCalledWith("partner-one", 9n, "active");
   });
 
+  it("retains the invitation draft through snapshots of the same connection", async () => {
+    const view = await mount({ partners: [] });
+    await fillInvite("Nova");
+    const dialog = required(document.body.querySelector<HTMLElement>("[role='dialog']"));
+    const avatar = required(dialog.querySelectorAll<HTMLButtonElement>(".partner-avatar-picker button")[1]);
+    await act(async () => avatar.click());
+    expect(button(dialog, "partners.invite").disabled).toBe(false);
+
+    const nextSnapshot = { ...snapshot() };
+    const next = { ...view.app, state: { ...view.app.state, snapshot: nextSnapshot } };
+    await act(async () => { view.root.render(page(next, nextSnapshot)); await settle(); });
+
+    expect(required(dialog.querySelector<HTMLInputElement>("input[required]")).value).toBe("Nova");
+    expect(avatar.getAttribute("aria-pressed")).toBe("true");
+    expect(button(dialog, "partners.invite").disabled).toBe(false);
+  });
+
+  it("settles the original invitation through snapshots without aborting or resending it", async () => {
+    let release!: (value: PartnerMutationView) => void;
+    const pending = new Promise<PartnerMutationView>((resolve) => { release = resolve; });
+    const createPartner = vi.fn<AppController["createPartner"]>(() => pending);
+    const view = await mount({ partners: [], createPartner });
+    await fillInvite("Nova");
+    await act(async () => {
+      button(required(document.body.querySelector<HTMLElement>("[role='dialog']")), "partners.invite").click();
+      await settle();
+    });
+    const signal = createPartner.mock.calls[0]![3];
+    const nextSnapshot = { ...snapshot() };
+    const next = { ...view.app, state: { ...view.app.state, snapshot: nextSnapshot } };
+    await act(async () => { view.root.render(page(next, nextSnapshot)); await settle(); });
+    expect(signal?.aborted).toBe(false);
+    await act(async () => { release({ partner: partner({ id: "created-original" }), directory: directory() }); await settle(); });
+
+    expect(createPartner).toHaveBeenCalledTimes(1);
+    expect(view.navigate).toHaveBeenCalledWith({ kind: "partners", partnerId: "created-original" });
+    expect(localStorage.length).toBe(0);
+  });
+
   it("keeps an ambiguous creation locked across directory refresh and recovers the same request without resending", async () => {
     const createPartner = vi.fn<AppController["createPartner"]>(async () => { throw new Error("Lost response"); });
     const getPartnerCreation = vi.fn()

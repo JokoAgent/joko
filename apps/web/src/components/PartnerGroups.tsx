@@ -43,7 +43,7 @@ function connectionScope(controller: AppController): string {
 }
 function useGroups(controller: AppController, groupId?: string) {
   const currentKey = connectionKey(controller), scope = connectionScope(controller), root = useRef<HTMLDivElement>(null);
-  const current = useMemo(() => controller.state.ready && controller.state.connectionState === "connected" ? controller.partnerGroupApi(currentKey) : undefined, [controller, currentKey]);
+  const current = useMemo(() => controller.state.ready && controller.state.connectionState === "connected" ? controller.partnerGroupApi(currentKey) : undefined, [currentKey, controller.state.ready]);
   const retained = useRef<{ scope: string; key: string; api: groupWire.PartnerGroupApi } | undefined>(undefined);
   if (current) retained.current = { scope, key: currentKey, api: current }; else if (retained.current?.scope !== scope) retained.current = undefined;
   const api = retained.current?.api, key = retained.current?.key ?? currentKey;
@@ -55,7 +55,7 @@ function useGroups(controller: AppController, groupId?: string) {
     const update = () => view.setActive(document.visibilityState !== "hidden" && controller.state.ready && controller.state.connectionState === "connected");
     const hide = () => view.setActive(false); update(); document.addEventListener("visibilitychange", update); document.defaultView?.addEventListener("pagehide", hide);
     return () => { document.removeEventListener("visibilitychange", update); document.defaultView?.removeEventListener("pagehide", hide); view.setActive(false); };
-  }, [view, controller, current]);
+  }, [view, current]);
   useEffect(() => { view?.select(groupId); }, [view, groupId]);
   return { root, view, state, key, scope, m: groupWire.partnerGroupMessages(controller.state.effectiveLocale) };
 }
