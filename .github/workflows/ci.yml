@@ -67,7 +67,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev libwayland-dev libwayland-bin libxkbcommon-dev libjson-c-dev libturbojpeg0-dev libpng-dev ripgrep xauth xvfb openbox x11-utils
+          sudo apt-get install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev libwayland-dev libwayland-bin libxkbcommon-dev libjson-c-dev libturbojpeg0-dev libpng-dev ripgrep xauth xvfb openbox x11-utils apparmor
 
       - name: Install Windows test dependencies
         if: runner.os == 'Windows'
@@ -188,6 +188,22 @@ jobs:
           fi
           pnpm --filter @joko/e2e exec node -e "const fs=require('node:fs'); const path=require('node:path'); const {createRequire}=require('node:module'); const browser=fs.realpathSync(require('playwright-core').chromium.executablePath()); const web=fs.realpathSync(path.join(process.env.GITHUB_WORKSPACE,'apps','web','dist')); fs.accessSync(browser,fs.constants.X_OK); fs.accessSync(path.join(web,'index.html')); fs.appendFileSync(process.env.GITHUB_OUTPUT,'executable='+browser+'\n'); if(process.platform==='linux'){const desktop=path.join(process.env.GITHUB_WORKSPACE,'apps','desktop'); const electron=createRequire(path.join(desktop,'package.json'))('electron'); fs.accessSync(electron,fs.constants.X_OK); fs.appendFileSync(process.env.GITHUB_ENV,['JOKO_BROWSER_EXECUTABLE='+browser,'JOKO_MOUNTED_WEB_DIR='+web,'JOKO_PDF_ELECTRON_TEST_EXECUTABLE='+electron,'JOKO_PDF_ELECTRON_TEST_APP='+desktop,'JOKO_GROUP_EVIDENCE_DIR='+path.join(process.env.RUNNER_TEMP,'joko-web-evidence','groups'),'JOKO_DOCUMENT_MOUNTED_CAPTURE_DIR='+path.join(process.env.RUNNER_TEMP,'joko-web-evidence','documents'),''].join('\n'));}"
 
+      - name: Configure the installed Chromium sandbox profile on Linux
+        id: chromium_sandbox
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.browser.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: node scripts/ci/configure-linux-browser-sandbox.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/linux-browser-sandbox.log"
+
+      - name: Upload an immediately available Chromium sandbox setup failure
+        if: ${{ !cancelled() && steps.chromium_sandbox.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-linux-browser-sandbox-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/linux-browser-sandbox.log
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Run workspace package tests (Linux)
         id: workspace_packages_linux
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
@@ -288,22 +304,22 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      - name: Diagnose the isolated Linux PDF startup failures
-        id: linux_pdf_startup
-        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'Linux' && steps.source_check.outcome == 'success' }}
-        timeout-minutes: 2
+      - name: Run the affected Linux PDF rendering checks
+        id: linux_pdf_regressions
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'Linux' && steps.source_check.outcome == 'success' && steps.chromium_sandbox.outcome == 'success' }}
+        timeout-minutes: 3
         shell: bash
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" node scripts/ci/diagnose-linux-pdf.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/linux-pdf-startup.log"
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/orchestrator exec vitest run src/document-electron-pdf-renderer.test.ts src/document-pdf-renderer.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/linux-pdf-regressions.log"
         env:
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
 
-      - name: Upload the immediate Linux PDF startup observations
-        if: ${{ !cancelled() && (steps.linux_pdf_startup.outcome == 'success' || steps.linux_pdf_startup.outcome == 'failure') }}
+      - name: Upload the immediate Linux PDF rendering results
+        if: ${{ !cancelled() && (steps.linux_pdf_regressions.outcome == 'success' || steps.linux_pdf_regressions.outcome == 'failure') }}
         uses: actions/upload-artifact@v4
         with:
-          name: ci-linux-pdf-startup-${{ github.sha }}
-          path: ${{ runner.temp }}/joko-ci-logs/linux-pdf-startup.log
+          name: ci-linux-pdf-regressions-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/linux-pdf-regressions.log
           if-no-files-found: error
           retention-days: 3
 
