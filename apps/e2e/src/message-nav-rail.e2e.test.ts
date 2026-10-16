@@ -50,7 +50,7 @@ describe("mounted message navigation rail", () => {
     const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Mounted rail Web" });
     if (challenge.challenge === undefined) throw new Error("Mounted rail pairing returned no challenge.");
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1600, height: 960 }, reducedMotion: "reduce" });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1600, height: 960 }, reducedMotion: "reduce" });
     const pageErrors: string[] = [];
     page.on("pageerror", (error) => pageErrors.push(error.name));
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
@@ -171,23 +171,48 @@ describe("mounted message navigation rail", () => {
     await page.mouse.down();
     await page.mouse.move((await tickCenter(page, 6)).x, (await tickCenter(page, 6)).y + 1);
     expect(await hasCapturedPointer(page, 6)).toBe(true);
+    const capturedTick = await tick(6).elementHandle();
+    if (capturedTick === null) throw new Error("The captured navigation control disappeared before retirement.");
+    const retiredHover = await tickCenter(page, 5);
     // Retire while a captured pointer, preview, and newly requested jump coexist.
     await tick(0).evaluate((node) => {
       (node as HTMLButtonElement).click();
       window.dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true }));
     });
     await browserFrames(page);
-    expect(await hasCapturedPointer(page, 6)).toBe(false);
+    expect(await capturedTick.evaluate((button) => button.dataset.capturedPointerId !== undefined
+      && button.hasPointerCapture(Number(button.dataset.capturedPointerId)))).toBe(false);
     expect(await rail.getByRole("tooltip").count()).toBe(0);
     expect(await rail.locator(".is-active,.is-interaction-target").count()).toBe(0);
     await page.mouse.up();
-    await tick(5).hover();
+    await page.mouse.move(retiredHover.x, retiredHover.y);
     await page.waitForTimeout(180);
     expect(await rail.getByRole("tooltip").count()).toBe(0);
     await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
     await browserFrames(page);
+    // Retiring this Document also retires its shared event connection. Re-enter
+    // the exact saved node before exercising navigation through a fresh scope.
+    const savedProfile = page.locator(".profile-card").filter({ hasText: "Mounted rail Web" });
+    if (await savedProfile.isVisible()) {
+      await savedProfile.getByText(fixture.baseUrl, { exact: true }).waitFor({ state: "visible" });
+      await savedProfile.getByRole("button", { name: "Connect", exact: true }).click();
+      await timeline.waitFor({ state: "visible", timeout: 20_000 });
+      const closeDetails = page.getByRole("button", { name: "Close details", exact: true });
+      if (await closeDetails.isVisible()) await closeDetails.click();
+    }
     await page.mouse.move(1450, 100);
-    await tick(3).click();
+    try {
+      await tick(3).click();
+    } catch (error) {
+      throw new Error(`Navigation did not restore: ${JSON.stringify(await page.evaluate(() => ({
+        text: document.body.innerText.slice(0, 3000), appClass: document.querySelector(".app")?.className,
+        timelines: [...document.querySelectorAll<HTMLElement>(".timeline")].map(node => ({
+          width: node.clientWidth, height: node.clientHeight, scrollTop: node.scrollTop,
+          rows: node.querySelectorAll("[data-timeline-item-id]").length,
+          leftGutter: (node.querySelector(".timeline__virtual")?.getBoundingClientRect().left ?? 0) - node.getBoundingClientRect().left
+        })), ticks: [...document.querySelectorAll("[data-message-nav-index]")].map(node => node.getAttribute("data-message-nav-index"))
+      })))}`, { cause: error });
+    }
     await alignedMessage(page, messageIds[3]!);
     await tick(3).getByRole("tooltip").waitFor({ state: "visible" });
     expect(pageErrors).toEqual([]);
