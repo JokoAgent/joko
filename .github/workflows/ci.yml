@@ -416,6 +416,11 @@ jobs:
         timeout-minutes: 2
         shell: bash
         run: pnpm --filter @joko/tool-document exec vitest run 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/document.log"
+      - name: Verify native SQL deadlines, authority revocation and Review parser retirement
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: pnpm --filter @joko/orchestrator exec vitest run src/extension-library-sql.test.ts src/extension-library-manager.test.ts src/review-evidence-provider.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/native-parser-owners.log"
       - name: Upload the bounded runtime observations
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
