@@ -20,11 +20,39 @@ const nativeHelperObservations = vi.hoisted(() => ({ values: [] as Array<{
 vi.mock("node:child_process", async (importOriginal) => {
   const original = await importOriginal<typeof import("node:child_process")>();
   return { ...original, spawn: ((...parameters: Parameters<typeof original.spawn>) => {
-    const child = original.spawn(...parameters);
     const args = parameters[1];
     const command = Array.isArray(args) ? args.at(-1) : undefined;
     const helper = typeof command === "string" && command.includes("public static class JokoKeyPermissions") ? "permissions"
       : typeof command === "string" && command.includes("public static class JokoKeyFile") ? "create" : undefined;
+    const phases = ["script-entry", "type-compiled", "native-open-start", "native-open-done", "identity-checked", "admission-ready"];
+    const markerPrefix = "joko-ssh-stage:";
+    if (process.platform === "win32" && helper !== undefined && typeof command === "string") {
+      const mark = (phase: string): string => `[Console]::Error.WriteLine('${markerPrefix}${phase}'); `;
+      let observedCommand = `${mark("script-entry")}\n${command}`;
+      if (helper === "permissions") {
+        observedCommand = observedCommand
+          .replace("$root = $null", `${mark("type-compiled")}$root = $null`)
+          .replace("$root = [JokoKeyPermissions]::Open", `${mark("native-open-start")}$root = [JokoKeyPermissions]::Open`)
+          .replace("$rootInfo = [JokoKeyPermissions]::Identity", `${mark("native-open-done")}$rootInfo = [JokoKeyPermissions]::Identity`)
+          .replace("$rootAcl = [JokoKeyPermissions]::Descriptor", `${mark("identity-checked")}$rootAcl = [JokoKeyPermissions]::Descriptor`)
+          .replace("if ($env:JOKO_SSH_FILE)", `${mark("admission-ready")}if ($env:JOKO_SSH_FILE)`);
+      } else {
+        observedCommand = observedCommand
+          .replace("$identity = [System.Security.Principal.WindowsIdentity]", `${mark("type-compiled")}$identity = [System.Security.Principal.WindowsIdentity]`)
+          .replace("$file = [System.IO.FileStream]::new", `${mark("native-open-start")}$file = [System.IO.FileStream]::new`)
+          .replace("$created = $true", `$created = $true; ${mark("native-open-done")}`)
+          .replace("$fileId =", `${mark("identity-checked")}$fileId =`)
+          .replace("[Console]::Out.WriteLine(('created:", `${mark("admission-ready")}[Console]::Out.WriteLine(('created:`);
+      }
+      const options = parameters[2];
+      parameters = [parameters[0], [...args!.slice(0, -1), observedCommand], {
+        ...options,
+        // The creation helper normally discards stderr. In this test only,
+        // drain it to recognize our fixed markers; all other bytes are ignored.
+        ...(Array.isArray(options?.stdio) ? { stdio: [options.stdio[0], options.stdio[1], "pipe"] } : {})
+      }];
+    }
+    const child = original.spawn(...parameters);
     if (process.platform === "win32" && helper !== undefined) {
       const started = Date.now();
       const observation: typeof nativeHelperObservations.values[number] = { helper, events: [{ phase: "spawn", elapsed: 0 }] };
@@ -52,6 +80,19 @@ vi.mock("node:child_process", async (importOriginal) => {
         if (buffered.length > 160) { record("unexpected-protocol", false); buffered = ""; }
       });
       child.stdin?.once("finish", () => record("input-closed"));
+      const markers = phases.map(phase => `${markerPrefix}${phase}\n`);
+      let partialMarker = "";
+      child.stderr?.on("data", (bytes: Buffer) => {
+        for (const character of bytes.toString("ascii")) {
+          if (character === "\r") continue;
+          const candidate = partialMarker + character;
+          if (markers.includes(candidate)) {
+            record(candidate.slice(markerPrefix.length, -1), true);
+            partialMarker = "";
+          } else if (markers.some(marker => marker.startsWith(candidate))) partialMarker = candidate;
+          else partialMarker = character === markerPrefix[0] ? character : "";
+        }
+      });
       child.once("error", () => record("process-error", false));
       child.once("close", code => record("closed", code === 0));
     }

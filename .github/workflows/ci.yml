@@ -167,7 +167,7 @@ jobs:
         if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
         timeout-minutes: 2
         shell: bash
-        run: pnpm --filter @joko/tool-document test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/document-regressions.log"
+        run: pnpm --filter @joko/tool-document exec node --import ../../scripts/ci/observe-document-workers.mjs ../../node_modules/vitest/vitest.mjs run 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/document-regressions.log"
 
       - name: Amplify the short queue soak and fault matrix
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
