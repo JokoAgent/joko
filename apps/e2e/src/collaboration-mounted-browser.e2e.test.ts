@@ -75,7 +75,7 @@ describe("mounted Collaboration Goal product chain", () => {
     const taskUrl = `${fixture.baseUrl}/#/tasks/${encodeURIComponent(leadSessionId)}`;
 
     browser = await chromium.launch({ executablePath, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     const browserErrors = observeBrowserErrors(page);
     await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
@@ -130,11 +130,15 @@ describe("mounted Collaboration Goal product chain", () => {
     let tree = required((await waitFor(
       () => paired.clients.collaboration.getCollaborationGoal({ goalId, viewerSessionId: leadSessionId }),
       (value) => value.tree?.workers.some((worker) => worker.label === WORKER_LABEL
-        && [CollaborationWorkerStatus.IDLE, CollaborationWorkerStatus.COMPLETED].includes(worker.status)) === true,
+        && worker.status === CollaborationWorkerStatus.COMPLETED) === true,
       "the worker created through production Web to settle",
       60_000
     )).tree, "settled mounted collaboration tree");
     const mountedWorker = required(tree.workers.find((worker) => worker.label === WORKER_LABEL), "mounted worker");
+    // The initial assignment must settle in the actual Web projection too.
+    // A backend-only read can otherwise race the next poll and submit stale CAS.
+    await panel.locator(".collaboration-panel__worker-header").getByText("Completed", { exact: true })
+      .waitFor({ state: "visible", timeout: 30_000 });
     const workerSessionId = required(mountedWorker.sessionId, "mounted worker Session");
     const queueControl = required(
       (await paired.clients.queue.getQueueControl({ sessionId: workerSessionId })).queueControl,

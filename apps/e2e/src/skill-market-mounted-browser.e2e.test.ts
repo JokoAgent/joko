@@ -41,7 +41,7 @@ describe("mounted Skill market surface", () => {
     const pairingCode = fixture.pairingCode(challenge.challenge.challengeId);
 
     browser = await chromium.launch({ executablePath, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     const browserErrors = observeBrowserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/tools`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
@@ -214,6 +214,8 @@ describe("mounted Skill market surface", () => {
       () => publishedCard.evaluate((element) => ({
         focused: element === document.activeElement,
         connected: element.isConnected,
+        cardClass: element.className,
+        activeCards: [...element.ownerDocument.querySelectorAll(".skill-market-card.is-active")].map(card => card.textContent?.slice(0, 100)),
         disabled: (element as HTMLButtonElement).disabled,
         activeTag: document.activeElement?.tagName ?? "",
         activeClass: document.activeElement?.className ?? "",
