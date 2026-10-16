@@ -199,6 +199,7 @@ jobs:
         run: pnpm --filter @joko/desktop exec vitest run test/smoke-packaged-helpers.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/smoke-evidence-owner.log"
 
       - name: Operate production Web with the isolated standalone backend and recover after restart
+        id: standalone_web
         if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && steps.browser.outcome == 'success' }}
         timeout-minutes: 7
         shell: bash
@@ -217,6 +218,17 @@ jobs:
           else
             pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/standalone-web-cli.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/web-standalone.log"
           fi
+
+      - name: Upload a failed standalone Web chain before Desktop packaging
+        if: ${{ !cancelled() && steps.standalone_web.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-standalone-failure-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ci-logs/web-standalone.log
+            ${{ runner.temp }}/joko-standalone-web-evidence/
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Package the current platform Desktop application
         id: desktop_package
