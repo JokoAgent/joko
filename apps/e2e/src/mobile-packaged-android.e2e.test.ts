@@ -38,7 +38,7 @@ type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" |
 type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "gallery-zoomed" | "gallery-drag-reset"
   | "gallery-dismissed" | "resource-links" | "file-opened" | "file" | "restored"
   | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error"
-  | "connection-add" | "connection-error";
+  | "connection-add" | "connection-error" | "actions-scrolled";
 type EvidenceResult = "running" | "passed" | "failed";
 type EvidenceStep = {
   name: EvidenceStepName;
@@ -262,15 +262,7 @@ async function runNativeScenario(): Promise<void> {
   await completeStep();
   await beginStep("task-actions-menu");
   await tap("Task actions");
-  const requiredActions = ["Branches", "Controls", "Copy task link", "Files", "Refresh"];
-  const actionNodes = await waitFor(nodes, (items) => requiredActions.every((label) => items.some((node) => node.contentDescription === label))
-    && items.some((node) => node.contentDescription?.startsWith("Context") === true), "the complete native task actions", 25_000);
-  await screenshot("actions");
-  for (const label of requiredActions) {
-    const item = actionNodes.find((node) => node.contentDescription === label)!;
-    expect(item.bounds.x1).toBeGreaterThanOrEqual(0);
-    expect(item.bounds.x2).toBeLessThanOrEqual(screenWidth);
-  }
+  await inspectTaskActions(screenWidth);
   await tap("Cancel");
   await completeStep();
   await beginStep("send-native-input");
@@ -467,6 +459,45 @@ function assertTaskHeaderBounds(title: AndroidUiNode, controls: readonly Android
     expect(button.bounds.x2).toBeGreaterThan(button.bounds.x1);
     expect(button.bounds.y2).toBeGreaterThan(button.bounds.y1);
   }
+}
+
+async function inspectTaskActions(screenWidth: number): Promise<void> {
+  const required = ["Branches", "Controls", "Copy task link", "Files", "Refresh", "Context"];
+  const observed = new Set<string>();
+  let previousViewport: string | undefined;
+  let swipes = 0;
+  await waitFor(async () => {
+    const items = await nodes();
+    const viewport = items.filter((node) => node.scrollable && node.enabled
+      && node.bounds.x2 > node.bounds.x1 && node.bounds.y2 > node.bounds.y1)
+      .sort((left, right) => (right.bounds.x2 - right.bounds.x1) * (right.bounds.y2 - right.bounds.y1)
+        - (left.bounds.x2 - left.bounds.x1) * (left.bounds.y2 - left.bounds.y1))[0];
+    if (!viewport) return false;
+    const visible = items.filter((node) => node.contentDescription && node.bounds.x2 > node.bounds.x1 && node.bounds.y2 > node.bounds.y1
+      && node.bounds.x1 >= viewport.bounds.x1 && node.bounds.x2 <= viewport.bounds.x2
+      && node.bounds.y1 >= viewport.bounds.y1 && node.bounds.y2 <= viewport.bounds.y2);
+    for (const label of required) {
+      const item = visible.find((node) => label === "Context" ? node.contentDescription?.startsWith("Context") : node.contentDescription === label);
+      if (!item) continue;
+      expect(item.bounds.x1).toBeGreaterThanOrEqual(0);
+      expect(item.bounds.x2).toBeLessThanOrEqual(screenWidth);
+      observed.add(label);
+    }
+    if (required.every((label) => observed.has(label))) {
+      await screenshot(swipes === 0 ? "actions" : "actions-scrolled");
+      return true;
+    }
+    if (swipes === 0) await screenshot("actions");
+    const signature = JSON.stringify(visible.map((node) => [node.contentDescription, node.bounds]));
+    if (signature === previousViewport || swipes >= 7) throw new Error("The native task menu stopped before all required actions became visible.");
+    previousViewport = signature;
+    const x = Math.round((viewport.bounds.x1 + viewport.bounds.x2) / 2);
+    const inset = Math.max(1, Math.round((viewport.bounds.y2 - viewport.bounds.y1) * 0.15));
+    await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(viewport.bounds.y2 - inset),
+      String(x), String(viewport.bounds.y1 + inset), "300"));
+    swipes += 1;
+    return false;
+  }, (complete) => complete, "the complete visible native task actions", 25_000);
 }
 
 async function nodes(): Promise<readonly AndroidUiNode[]> {
