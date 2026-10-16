@@ -21,7 +21,7 @@ let stage = "preconditions";
 const startupCommandReceipts = [];
 const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", "list-available-devices",
   "create-owned-simulator", "boot-owned-simulator", "wait-owned-boot", "set-light-appearance",
-  "install-owned-application", "locate-installed-application", "launch-owned-application", "capture-simulator-springboard",
+  "install-owned-application", "locate-installed-application", "retry-locate-installed-application", "launch-owned-application", "capture-simulator-springboard",
   "capture-pre-appearance-framebuffer", "retry-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance"]);
 
 function save(name, value) { writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + "\n"); }
@@ -57,6 +57,26 @@ async function command(binary, args, { timeout = 30_000, cleanup = false, startu
   } finally { record(); }
 }
 function sim(...args) { return command("xcrun", ["simctl", ...args]); }
+async function locateInitiallyInstalledApplication() {
+  const ownedUdid = udid, application = bundleId;
+  if (!ownedUdid || !application || !deviceName?.startsWith("joko-ci-")) throw new Error("No owned Simulator application is available for the installation query.");
+  const args = ["simctl", "get_app_container", ownedUdid, application, "app"];
+  stage = "installed application identity lookup";
+  try {
+    return await command("xcrun", args, { timeout: 30_000, startupLabel: "locate-installed-application" });
+  } catch (error) {
+    const receipt = startupCommandReceipts.at(-1);
+    if (abort.signal.aborted || udid !== ownedUdid || bundleId !== application
+      || receipt?.step !== "locate-installed-application" || receipt.result !== "failed"
+      || receipt.killed !== true || receipt.signal !== "SIGTERM" || receipt.cancelled !== false
+      || receipt.exitCode !== null || receipt.errorCode !== null || receipt.timeoutMs !== 30_000
+      || receipt.elapsedMs < receipt.timeoutMs) throw error;
+    // Preserve the failed receipt; this one fresh read must independently exit
+    // successfully before the original installed-executable hash check runs.
+    stage = "retry installed application identity lookup";
+    return command("xcrun", args, { timeout: 30_000, startupLabel: "retry-locate-installed-application" });
+  }
+}
 async function hashFile(path) {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
@@ -495,9 +515,9 @@ async function main() {
     if (!(await command("lipo", ["-archs", binary])).split(/\s+/u).includes(architecture)) throw new Error("The Simulator binary does not contain this runner's architecture.");
     await startOwnedSimulator({ bundleId, executable, compiledApp: app, executableSha256: await hashFile(binary),
       startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used." });
+    stage = "owned application installation";
     await command("xcrun", ["simctl", "install", udid, app], { startupLabel: "install-owned-application" });
-    const container = await command("xcrun", ["simctl", "get_app_container", udid, bundleId, "app"],
-      { startupLabel: "locate-installed-application" });
+    const container = await locateInitiallyInstalledApplication();
     installedExecutable = realpathSync(join(container, executable));
     if (await hashFile(installedExecutable) !== await hashFile(binary)) throw new Error("The installed app bytes do not match the compiled artifact.");
     stage = "same-checkout Metro startup";
