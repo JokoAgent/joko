@@ -107,9 +107,9 @@ export class DesktopRemoteDesktopViewerConnection {
       }
       const checkGeometry = (): void => {
         if (!geometryLease || changingGeometry || name === "stopRemoteDesktop" || input.leaseId === undefined) return;
-        // A screenshot remains valid through a control-only transition. Capture
-        // changes still fence it, including a change that settled while awaiting it.
-        const changed = name === "getRemoteDesktopFrame"
+        // Capture and heartbeat observations survive a control-only transition.
+        // Capture changes still fence them, even when the change already settled.
+        const changed = name === "getRemoteDesktopFrame" || name === "heartbeatRemoteDesktop"
           ? this.#geometryRevision !== geometryRevision
           : this.#lease?.controlGeneration !== geometryLease.controlGeneration;
         if (this.#modePending || this.#modeUncertain || this.#lease?.leaseId !== geometryLease.leaseId || changed) {
