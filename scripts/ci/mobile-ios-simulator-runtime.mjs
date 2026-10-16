@@ -24,7 +24,8 @@ const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", 
   "install-owned-application", "locate-installed-application", "retry-locate-installed-application", "launch-owned-application", "capture-simulator-springboard",
   "capture-pre-appearance-framebuffer", "retry-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance", "compile-screen-observer",
   "locate-launched-application-process", "locate-ui-tested-application-process",
-  "locate-pre-ui-build-application-process", "locate-post-ui-build-application-process"]);
+  "locate-pre-ui-build-application-process", "locate-post-ui-build-application-process",
+  "ocr-first-launch-frame", "ocr-reopened-frame"]);
 
 function save(name, value) { writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + "\n"); }
 async function command(binary, args, { timeout = 30_000, cleanup = false, startupLabel } = {}) {
@@ -170,7 +171,9 @@ async function observe(phase, pid, ocr) {
       retriedCapture = true;
       continue;
     }
-    const screen = JSON.parse(await command(ocr, [image]));
+    const screen = JSON.parse(await command(ocr, [image], {
+      startupLabel: phase === "first-launch" ? "ocr-first-launch-frame" : "ocr-reopened-frame"
+    }));
     save(`${phase}-screen.json`, screen);
     const text = screen.lines.map(line => line.text).join("\n");
     const blocked = /uncaught|unhandled js|no bundle url|could not connect|unable to resolve module|failed to load bundle|development server|connect to metro|runtime not ready|invariant violation|expo go|development build|would like to|don['’]t allow|find and connect to devices|while using the app/iu.test(text);
