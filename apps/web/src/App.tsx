@@ -289,6 +289,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [retryableMessageDeepLinkKey, setRetryableMessageDeepLinkKey] = useState<string>();
   const [applicationMenuNotice, setApplicationMenuNotice] = useState<(DesktopUpdateCheckNotice & { readonly id: number })>();
   const [busyAction, setBusyAction] = useState<string>();
+  const actionFlightRef = useRef(0);
   const [layoutNotice, setLayoutNotice] = useState<string>();
   const [sessionProjectOverrides, setSessionProjectOverrides] = useState<ReadonlyMap<string, SessionProjectNavigationPlacement>>(() => new Map());
   const [movingSessionProjectIds, setMovingSessionProjectIds] = useState<ReadonlySet<string>>(() => new Set());
@@ -685,9 +686,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }, [applicationMenuNoticeId]);
 
   const runAction = useCallback<RunAction>((key, action) => {
+    const flight = ++actionFlightRef.current;
     setActionError(undefined);
     setBusyAction(key);
-    void action().catch((error: unknown) => setActionError(messageOf(error, t("error.unexpected")))).finally(() => setBusyAction((current) => current === key ? undefined : current));
+    void action().catch((error: unknown) => {
+      if (actionFlightRef.current === flight) setActionError(messageOf(error, t("error.unexpected")));
+    }).finally(() => {
+      if (actionFlightRef.current === flight) setBusyAction(undefined);
+    });
   }, [t]);
   const runSidebarScheduleAction = useCallback(async (action: () => Promise<void>): Promise<void> => {
     setActionError(undefined);
