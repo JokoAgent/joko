@@ -95,9 +95,34 @@ jobs:
         shell: bash
         run: |
           exec > >(tee "$RUNNER_TEMP/joko-ci-logs/linux-sandbox.log") 2>&1
-          helper="$(pnpm --filter @joko/desktop exec node -e "const fs=require('node:fs'); const path=require('node:path'); const executable=fs.realpathSync(require('electron')); const helper=path.join(path.dirname(executable),'chrome-sandbox'); const root=fs.realpathSync(process.env.GITHUB_WORKSPACE); const relative=path.relative(root,helper); const info=fs.lstatSync(helper); if(!relative || relative.startsWith('..'+path.sep) || path.isAbsolute(relative) || !info.isFile() || info.isSymbolicLink() || fs.realpathSync(helper)!==helper) throw new Error('Electron sandbox helper is outside the checked-out installation'); process.stdout.write(helper)")"
-          sudo chown root:root "$helper"
-          sudo chmod 4755 "$helper"
+          pnpm --filter @joko/desktop exec node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { spawnSync } = require('node:child_process');
+          // Electron may download its binary and write progress to stdout here.
+          // Keep the validated filename in memory instead of parsing that output.
+          const executable = fs.realpathSync(require('electron'));
+          const helper = path.join(path.dirname(executable), 'chrome-sandbox');
+          const root = fs.realpathSync(process.env.GITHUB_WORKSPACE);
+          const relative = path.relative(root, helper);
+          const info = fs.lstatSync(helper);
+          if (!relative || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)
+            || !info.isFile() || info.isSymbolicLink() || fs.realpathSync(helper) !== helper) {
+            throw new Error('Electron sandbox helper is outside the checked-out installation');
+          }
+          for (const args of [['chown', 'root:root', helper], ['chmod', '4755', helper]]) {
+            const result = spawnSync('sudo', args, { shell: false, stdio: 'inherit' });
+            if (result.error || result.signal || result.status !== 0) {
+              throw new Error('Electron sandbox helper permission setup failed');
+            }
+          }
+          const configured = fs.lstatSync(helper);
+          if (!configured.isFile() || configured.isSymbolicLink() || fs.realpathSync(helper) !== helper
+            || configured.dev !== info.dev || configured.ino !== info.ino
+            || configured.uid !== 0 || configured.gid !== 0 || (configured.mode & 0o7777) !== 0o4755) {
+            throw new Error('Electron sandbox helper root ownership or setuid mode was not established');
+          }
+          NODE
 
       - name: Upload a Linux sandbox setup failure immediately
         if: ${{ !cancelled() && steps.electron_sandbox.outcome == 'failure' }}
