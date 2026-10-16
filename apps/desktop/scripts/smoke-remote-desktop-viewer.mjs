@@ -714,18 +714,26 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
           return button && !button.disabled && document.querySelector('.remote-viewer-heading')?.textContent.includes('Connected');
         })()`));
     } finally { fullscreenViewer.removeListener("enter-full-screen", enteredFullscreen); }
+    const actualSizeRequestedAt = Date.now();
     await interact(`(() => {
       const button=[...document.querySelectorAll('.remote-viewer-toolbar button')].find(item=>item.textContent==='Actual size');
       if(!button || button.disabled) throw new Error('Actual size is unavailable.'); button.click();
     })()`);
-    await until(async () => {
-      if (viewer.isFullScreen() || viewer.isMaximized()) return false;
+    const actualSizeWindowSettled = () => {
+      const maximized = viewer.isMaximized();
+      if (viewer.isFullScreen() || maximized && process.platform !== "darwin") return false;
       const bounds = viewer.getBounds(), display = screen.getDisplayMatching(bounds), area = display.workArea;
       // Windows round-trips fractional physical-pixel edges through integer DIP bounds.
       const tolerance = process.platform === "win32" && display.scaleFactor !== 1 ? 1 : 0;
-      return Math.abs(bounds.width - area.width) <= tolerance && Math.abs(bounds.height - area.height) <= tolerance &&
-        Math.abs(bounds.x - area.x) <= tolerance && Math.abs(bounds.y - area.y) <= tolerance;
-    });
+      if (Math.abs(bounds.width - area.width) > tolerance || Math.abs(bounds.height - area.height) > tolerance ||
+        Math.abs(bounds.x - area.x) > tolerance || Math.abs(bounds.y - area.y) > tolerance) return false;
+      // AppKit reports a normal setBounds(workArea) window as zoomed. In that
+      // case require this action's actual non-fullscreen, non-maximized request.
+      return !maximized || viewerGeometry.some(receipt => receipt.phase === "set-bounds-request" &&
+        receipt.windowId === viewer.id && receipt.at >= actualSizeRequestedAt && receipt.fullscreen === false && receipt.maximized === false &&
+        ["x", "y", "width", "height"].every(field => receipt.requested?.[field] === bounds[field]));
+    };
+    await until(actualSizeWindowSettled);
     const resizedBounds = viewer.getBounds();
     writeFileSync(resolve(output, "viewer-actual-size.png"), (await captureViewport(viewer)).toPNG());
     if (!await viewer.webContents.executeJavaScript(`([...document.querySelectorAll('.remote-viewer-toolbar button')].find(item=>item.textContent==='Actual size'))?.getAttribute('aria-pressed')==='true'`)) {
