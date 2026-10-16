@@ -55,7 +55,7 @@ describe("mounted WeChat Messaging Settings", () => {
     const settings = page.locator(".messaging-settings");
     await settings.getByRole("heading", { name: "Messaging", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
     browserErrors.splice(0);
-    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(7);
+    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(8);
     await settings.getByRole("button", { name: "Add WeChat", exact: true }).first().click();
     const authorization = page.getByRole("dialog", { name: "Authorize with WeChat" });
     await authorization.getByRole("img", { name: "WeChat authorization QR code" }).waitFor({ state: "visible" });
