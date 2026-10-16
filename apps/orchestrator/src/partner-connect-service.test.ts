@@ -788,32 +788,45 @@ describe("PartnerService", () => {
     const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));
     const service = createPartnerConnectService(fixture.manager, authenticate);
     const callContext = context();
+    const expectAuthentication = (...boundaries: string[]): void => {
+      expect(authenticate.mock.calls, boundaries.join(" → ")).toEqual(boundaries.map(() => [callContext]));
+      authenticate.mockClear();
+    };
     const request = create(contract.CreatePartnerRequestSchema, {
       requestId: "creation-request-rpc",
       expectedDirectoryRevision: revision(1n),
       draft: { displayName: "Aster", avatar: { value: { case: "presetId" as const, value: "orbit" } }, identitySource: "You help with ongoing work.", templateId: "general", capabilities: protoCapabilities() }
     });
     const created = await service.createPartner(request, callContext);
+    expectAuthentication("request", "after avatar validation, before create commit", "before response");
     const found = await service.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: request.requestId }), callContext);
+    expectAuthentication("request");
     expect(found.partner).toEqual(created.partner);
     expect((await service.createPartner(request, callContext)).partner).toEqual(created.partner);
+    expectAuthentication("request", "after avatar validation, before replay lookup", "before response");
     await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, draft: { ...request.draft!, displayName: "Changed intent" } }), callContext))
       .rejects.toMatchObject({ code: Code.Aborted });
+    expectAuthentication("request", "after avatar validation, before conflicting create");
     await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, requestId: "", expectedDirectoryRevision: create(contract.RevisionSchema, created.directory!.revision) }), callContext))
       .rejects.toMatchObject({ code: Code.InvalidArgument });
+    expectAuthentication("request", "after avatar validation, before invalid request ID");
     await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, draft: { ...request.draft!, usesDirectoryDefaults: true } }), callContext))
       .rejects.toMatchObject({ code: Code.InvalidArgument });
+    expectAuthentication("request, before invalid capability combination");
     const absent = "creation-request-absent-rpc";
     expect(() => service.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: absent }), callContext))
       .toThrow(expect.objectContaining({ code: Code.NotFound }));
+    expectAuthentication("request");
     const retired = await service.retirePartnerCreation(create(contract.RetirePartnerCreationRequestSchema, { requestId: absent }), callContext);
+    expectAuthentication("request");
     expect(retired.retired).toBe(true);
     expect(retired.partner).toBeUndefined();
     await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, requestId: absent, expectedDirectoryRevision: create(contract.RevisionSchema, created.directory!.revision) }), callContext))
       .rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expectAuthentication("request", "after avatar validation, before retired intent lookup");
     expect(await service.retirePartnerCreation(create(contract.RetirePartnerCreationRequestSchema, { requestId: request.requestId }), callContext))
       .toMatchObject({ retired: false, partner: created.partner });
-    expect(authenticate).toHaveBeenCalledTimes(10);
+    expectAuthentication("request");
     const denied = createPartnerConnectService(fixture.manager, () => { throw new ConnectError("Denied", Code.Unauthenticated); });
     expect(() => denied.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: request.requestId }), callContext))
       .toThrow(expect.objectContaining({ code: Code.Unauthenticated }));
@@ -827,10 +840,15 @@ describe("PartnerService", () => {
     const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));
     const service = createPartnerConnectService(fixture.manager, authenticate);
     const callContext = context();
+    const expectAuthentication = (...boundaries: string[]): void => {
+      expect(authenticate.mock.calls, boundaries.join(" → ")).toEqual(boundaries.map(() => [callContext]));
+      authenticate.mockClear();
+    };
 
     const initial = await service.getPartnerDirectory(
       create(contract.GetPartnerDirectoryRequestSchema), callContext
     );
+    expectAuthentication("request");
     expect(initial.directory).toMatchObject({
       revision: { value: 1n },
       activeCount: 0,
@@ -844,6 +862,7 @@ describe("PartnerService", () => {
       expectedDirectoryRevision: initial.directory!.revision,
       capabilities: protoCapabilities()
     }), callContext);
+    expectAuthentication("request", "after updating defaults, before response");
     expect(defaults.directory).toMatchObject({ defaultCapabilities: protoCapabilities() });
 
     const created = await service.createPartner(create(contract.CreatePartnerRequestSchema, {
@@ -857,6 +876,7 @@ describe("PartnerService", () => {
         usesDirectoryDefaults: true
       })
     }), callContext);
+    expectAuthentication("request", "after avatar validation, before create commit", "before response");
     expect(created.partner).toMatchObject({
       displayName: "Aster",
       lifecycle: contract.PartnerLifecycle.ACTIVE,
@@ -875,6 +895,7 @@ describe("PartnerService", () => {
         usesDirectoryDefaults: false
       })
     }), callContext);
+    expectAuthentication("request", "after serialization, before profile commit", "before response");
     expect(updated.partner).toMatchObject({
       displayName: "Aster Prime",
       usesDirectoryDefaults: false,
@@ -885,24 +906,27 @@ describe("PartnerService", () => {
       expectedRevision: createdRevision,
       patch: create(contract.PartnerPatchSchema, { displayName: "Stale" })
     }), callContext)).rejects.toMatchObject({ code: Code.Aborted });
+    expectAuthentication("request, before stale profile revision rejection");
 
     const archived = await service.setPartnerLifecycle(create(contract.SetPartnerLifecycleRequestSchema, {
       partnerId: updated.partner!.partnerId,
       expectedRevision: updated.partner!.revision,
       lifecycle: contract.PartnerLifecycle.ARCHIVED
     }), callContext);
+    expectAuthentication("request", "after lifecycle update, before response");
     expect(archived.partner?.lifecycle).toBe(contract.PartnerLifecycle.ARCHIVED);
     const listed = await service.listPartners(create(contract.ListPartnersRequestSchema, {
       lifecycle: contract.PartnerLifecycle.ARCHIVED
     }), callContext);
+    expectAuthentication("request");
     expect(listed.partners?.map((partner) => partner.partnerId) ?? []).toEqual([created.partner!.partnerId]);
     const restored = await service.setPartnerLifecycle(create(contract.SetPartnerLifecycleRequestSchema, {
       partnerId: archived.partner!.partnerId,
       expectedRevision: archived.partner!.revision,
       lifecycle: contract.PartnerLifecycle.ACTIVE
     }), callContext);
+    expectAuthentication("request", "after lifecycle update, before response");
     expect(restored.partner?.lifecycle).toBe(contract.PartnerLifecycle.ACTIVE);
-    expect(authenticate).toHaveBeenCalledTimes(10);
   });
 
   it("fails closed for unavailable ownership and invalid public enums", async () => {
