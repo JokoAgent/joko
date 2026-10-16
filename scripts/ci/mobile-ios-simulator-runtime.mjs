@@ -16,12 +16,42 @@ const stop = () => abort.abort(new Error("iOS startup observation was cancelled.
 process.once("SIGINT", stop); process.once("SIGTERM", stop);
 let evidence, udid, deviceName, bundleId, executable, installedExecutable, metro, metroClosed = false;
 let stage = "preconditions";
+const startupCommandReceipts = [];
+const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", "list-available-devices",
+  "create-owned-simulator", "boot-owned-simulator", "wait-owned-boot", "set-light-appearance",
+  "install-owned-application", "locate-installed-application"]);
 
 function save(name, value) { writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + "\n"); }
-async function command(binary, args, { timeout = 30_000, cleanup = false } = {}) {
-  const value = await exec(binary, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024,
-    signal: cleanup ? undefined : abort.signal, windowsHide: true });
-  return value.stdout.trim();
+async function command(binary, args, { timeout = 30_000, cleanup = false, startupLabel } = {}) {
+  if (startupLabel !== undefined && !startupCommandLabels.has(startupLabel)) throw new Error("Unknown Simulator startup observation label.");
+  const started = performance.now();
+  const receipt = startupLabel === undefined ? undefined : { step: startupLabel, result: "running", timeoutMs: timeout };
+  const record = () => {
+    if (receipt === undefined) return;
+    receipt.elapsedMs = Math.round(performance.now() - started);
+    receipt.cancelled = !cleanup && abort.signal.aborted;
+    save("startup-command-receipts.json", { commands: startupCommandReceipts });
+  };
+  const byteLength = value => typeof value === "string" || Buffer.isBuffer(value) ? Buffer.byteLength(value) : 0;
+  if (receipt !== undefined) { startupCommandReceipts.push(receipt); record(); }
+  try {
+    const value = await exec(binary, args, { cwd: root, timeout, maxBuffer: 4 * 1024 * 1024,
+      signal: cleanup ? undefined : abort.signal, windowsHide: true });
+    if (receipt !== undefined) Object.assign(receipt, { result: "passed", exitCode: 0, signal: null, killed: false,
+      stdoutBytes: byteLength(value.stdout), stderrBytes: byteLength(value.stderr) });
+    return value.stdout.trim();
+  } catch (error) {
+    if (receipt !== undefined) {
+      const errorCodes = ["ENOENT", "EACCES", "ETIMEDOUT", "ABORT_ERR", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"];
+      const signals = ["SIGTERM", "SIGKILL", "SIGINT", "SIGABRT", "SIGSEGV", "SIGHUP"];
+      Object.assign(receipt, { result: "failed", exitCode: Number.isInteger(error.code) ? error.code : null,
+        errorCode: errorCodes.includes(error.code) ? error.code : null,
+        signal: signals.includes(error.signal) ? error.signal : null, killed: error.killed === true,
+        stdoutBytes: byteLength(error.stdout), stderrBytes: byteLength(error.stderr) });
+      throw new Error(`Simulator startup step '${startupLabel}' failed; see startup-command-receipts.json.`);
+    }
+    throw error;
+  } finally { record(); }
 }
 function sim(...args) { return command("xcrun", ["simctl", ...args]); }
 async function hashFile(path) {
@@ -299,29 +329,34 @@ async function main() {
     const binary = join(app, executable), architecture = process.arch === "arm64" ? "arm64" : "x86_64";
     if (!(await command("lipo", ["-archs", binary])).split(/\s+/u).includes(architecture)) throw new Error("The Simulator binary does not contain this runner's architecture.");
     stage = "owned Simulator creation";
-    const runtimes = JSON.parse(await sim("list", "runtimes", "--json")).runtimes.filter(runtime => runtime.isAvailable
+    const runtimes = JSON.parse(await command("xcrun", ["simctl", "list", "runtimes", "--json"],
+      { startupLabel: "list-ios-runtimes" })).runtimes.filter(runtime => runtime.isAvailable
       && runtime.identifier.startsWith("com.apple.CoreSimulator.SimRuntime.iOS-"));
     runtimes.sort((left, right) => right.version.localeCompare(left.version, undefined, { numeric: true }));
     const runtime = runtimes[0]; if (!runtime) throw new Error("No available iOS Simulator runtime is installed.");
-    const types = JSON.parse(await sim("list", "devicetypes", "--json")).devicetypes;
-    const devices = JSON.parse(await sim("list", "devices", "available", "--json")).devices[runtime.identifier] ?? [];
+    const types = JSON.parse(await command("xcrun", ["simctl", "list", "devicetypes", "--json"],
+      { startupLabel: "list-device-types" })).devicetypes;
+    const devices = JSON.parse(await command("xcrun", ["simctl", "list", "devices", "available", "--json"],
+      { startupLabel: "list-available-devices" })).devices[runtime.identifier] ?? [];
     const template = devices.find(device => device.name.startsWith("iPhone"));
     const type = types.find(type => type.identifier === template?.deviceTypeIdentifier || type.name === template?.name)
       ?? types.find(type => type.name === "iPhone 16") ?? types.find(type => type.name === "iPhone 15");
     if (!type) throw new Error("No compatible iPhone Simulator device type is available.");
     deviceName = `joko-ci-${process.env.GITHUB_RUN_ID ?? "runtime"}-${randomUUID().slice(0, 8)}`;
-    const created = await sim("create", deviceName, type.identifier, runtime.identifier);
+    const created = await command("xcrun", ["simctl", "create", deviceName, type.identifier, runtime.identifier],
+      { startupLabel: "create-owned-simulator" });
     if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(created)) throw new Error("Simulator creation returned no exact UDID.");
     udid = created;
     save("identity.json", { sourceCommit: await command("git", ["rev-parse", "HEAD"]), bundleId, executable,
       simulatorUdid: udid, simulatorName: deviceName, runtime: runtime.identifier, deviceType: type.identifier, architecture,
       compiledApp: app, executableSha256: await hashFile(binary), xcode: await command("xcodebuild", ["-version"]),
       startupBinding: "Debug RCT_jsLocation points to the owned same-checkout Metro; no development-client DeepLink is used." });
-    await sim("boot", udid);
-    await command("xcrun", ["simctl", "bootstatus", udid, "-b"], { timeout: 180_000 });
-    await sim("ui", udid, "appearance", "light");
-    await sim("install", udid, app);
-    const container = await sim("get_app_container", udid, bundleId, "app");
+    await command("xcrun", ["simctl", "boot", udid], { startupLabel: "boot-owned-simulator" });
+    await command("xcrun", ["simctl", "bootstatus", udid, "-b"], { timeout: 180_000, startupLabel: "wait-owned-boot" });
+    await command("xcrun", ["simctl", "ui", udid, "appearance", "light"], { startupLabel: "set-light-appearance" });
+    await command("xcrun", ["simctl", "install", udid, app], { startupLabel: "install-owned-application" });
+    const container = await command("xcrun", ["simctl", "get_app_container", udid, bundleId, "app"],
+      { startupLabel: "locate-installed-application" });
     installedExecutable = realpathSync(join(container, executable));
     if (await hashFile(installedExecutable) !== await hashFile(binary)) throw new Error("The installed app bytes do not match the compiled artifact.");
     stage = "same-checkout Metro startup";
