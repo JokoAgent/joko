@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { createReadStream, appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { createServer } from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -10,7 +11,7 @@ import { fileURLToPath } from "node:url";
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const abort = new AbortController();
-const deadline = setTimeout(() => abort.abort(new Error("iOS startup observation deadline exceeded.")), 8 * 60_000);
+const deadline = setTimeout(() => abort.abort(new Error("iOS startup and UI operation deadline exceeded.")), 15 * 60_000);
 const stop = () => abort.abort(new Error("iOS startup observation was cancelled."));
 process.once("SIGINT", stop); process.once("SIGTERM", stop);
 let evidence, udid, deviceName, bundleId, executable, installedExecutable, metro, metroClosed = false;
@@ -140,6 +141,121 @@ async function launch(port) {
   if (!Number.isSafeInteger(pid) || pid < 2 || !await alive(pid)) throw new Error("The launch PID does not own the installed Joko executable.");
   return pid;
 }
+
+async function guiCommand(args, logName, timeout) {
+  const started = Date.now(), log = join(evidence, logName);
+  writeFileSync(log, "");
+  const child = spawn("xcodebuild", ["-quiet", ...args], { cwd: root, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  let bytes = 0, timedOut = false, spawnError;
+  const record = chunk => {
+    const remaining = 4 * 1024 * 1024 - bytes;
+    if (remaining > 0) { const bounded = chunk.subarray(0, remaining); appendFileSync(log, bounded); bytes += bounded.length; }
+  };
+  child.stdout.on("data", record); child.stderr.on("data", record);
+  const kill = signal => { if (child.pid) { try { process.kill(-child.pid, signal); } catch (error) { if (error.code !== "ESRCH") throw error; } } };
+  let hardStop;
+  const stopChild = () => { kill("SIGTERM"); hardStop ??= setTimeout(() => kill("SIGKILL"), 5000); };
+  const timer = setTimeout(() => { timedOut = true; stopChild(); }, timeout);
+  abort.signal.addEventListener("abort", stopChild, { once: true });
+  if (abort.signal.aborted) stopChild();
+  child.once("error", error => { spawnError = error; });
+  const receipt = await new Promise(accept => child.once("close", (code, signal) => accept({ exitCode: code, signal })));
+  clearTimeout(timer); clearTimeout(hardStop); abort.signal.removeEventListener("abort", stopChild);
+  save(logName.replace(/\.log$/u, "-receipt.json"), { ...receipt, elapsedMs: Date.now() - started, timedOut,
+    cancelled: abort.signal.aborted, logTruncated: bytes === 4 * 1024 * 1024 });
+  if (spawnError || receipt.exitCode !== 0 || timedOut || abort.signal.aborted) {
+    kill("SIGKILL");
+    throw new Error(`Apple UI-test ${logName === "gui-build.log" ? "build" : "execution"} failed; see ${logName} and its receipt.`);
+  }
+}
+
+async function runConnectionUiTests(app, port, expectedSha, expectedHash) {
+  const assertIdentity = async () => {
+    if (await command("git", ["rev-parse", "HEAD"]) !== expectedSha || await hashFile(join(app, executable)) !== expectedHash) {
+      throw new Error("The source or compiled application changed during UI testing; refusing a different artifact identity.");
+    }
+    const container = await sim("get_app_container", udid, bundleId, "app");
+    const installed = realpathSync(join(container, executable));
+    if (await hashFile(installed) !== expectedHash) throw new Error("The installed application changed during UI testing.");
+    installedExecutable = installed;
+    if (metroClosed) throw new Error("The owned same-checkout Metro exited during UI testing.");
+  };
+  await assertIdentity();
+  // A loopback-only Connect error endpoint exercises the real native transport.
+  // It never supplies a node identity, challenge, credential or successful pair.
+  let requests = 0, unexpectedRequests = 0;
+  const probe = createHttpServer((request, response) => {
+    if (request.method === "GET" && request.url === "/ci-probe-status") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ identityRequests: requests })); return;
+    }
+    if (request.method !== "POST" || !request.url?.endsWith("/GetServerInfo")) {
+      unexpectedRequests++; response.writeHead(404); response.end(); return;
+    }
+    request.resume(); requests++;
+    if (requests === 1) {
+      response.writeHead(503, { "content-type": "application/json" });
+      response.end(JSON.stringify({ code: "unavailable", message: "CI local identity probe unavailable" }));
+    } else if (requests > 2) { response.writeHead(503); response.end(); }
+    // Request two deliberately remains pending until the user presses Cancel.
+  });
+  await new Promise((accept, reject) => { probe.once("error", reject); probe.listen(0, "127.0.0.1", accept); });
+  const probePort = probe.address().port;
+  const derivedData = resolve(app, "../../../.."), workspace = join(root, "apps/mobile/ios/Joko.xcworkspace");
+  const common = ["-workspace", workspace, "-scheme", "JokoCIUITests", "-configuration", "Debug", "-sdk", "iphonesimulator",
+    "-destination", `platform=iOS Simulator,id=${udid}`, "-destination-timeout", "30", "-derivedDataPath", derivedData,
+    "-parallel-testing-enabled", "NO", "-maximum-concurrent-test-simulator-destinations", "1"];
+  const xcresult = join(evidence, "gui.xcresult"), screenshots = join(evidence, "gui-screenshots");
+  let executionError;
+  try {
+    stage = "Apple UI-test target preparation";
+    await command("ruby", [join(root, "scripts/ci/ios-prepare-ui-tests.rb"), join(root, "apps/mobile/ios/Joko.xcodeproj"),
+      join(root, "scripts/ci/ios-connection-ui-tests.swift"), String(port), String(probePort)]);
+    stage = "Apple UI-test runner build";
+    await guiCommand([...common, "build-for-testing"], "gui-build.log", 5 * 60_000);
+    await assertIdentity();
+    stage = "actual connection page UI operations";
+    try {
+      await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
+        "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], "gui-test.log", 3 * 60_000);
+    } catch (error) { executionError = error; }
+    if (existsSync(xcresult)) {
+      stage = "Apple UI-test evidence export";
+      const summary = JSON.parse(await command("xcrun", ["xcresulttool", "get", "test-results", "summary", "--path", xcresult]));
+      save("gui-summary.json", summary);
+      await command("xcrun", ["xcresulttool", "export", "attachments", "--path", xcresult, "--output-path", screenshots], { timeout: 60_000 });
+      const names = ["01-connection-page", "02-saved-nodes", "03-nearby", "04-invalid-address", "05-local-identity-error",
+        "06-inspection-pending", "07-cancelled-draft-retained", "08-returned-address-draft", "09-dark-theme", "10-light-theme"];
+      const files = readdirSync(screenshots, { recursive: true });
+      const manifests = files.filter(name => name.endsWith(".json")).map(name => readFileSync(join(screenshots, name), "utf8")).join("\n");
+      const steps = names.map(name => ({ name, screenshotExported: manifests.includes(name) }));
+      save("gui-steps.json", { sourceCommit: expectedSha, executableSha256: expectedHash, simulatorUdid: udid, bundleId,
+        steps, screenshotCount: files.filter(name => name.endsWith(".png")).length, localIdentityRequests: requests, unexpectedRequests,
+        testExitSucceeded: !executionError, passed: !executionError && summary.result === "Passed" && summary.passedTests === 1
+          && summary.failedTests === 0 && summary.skippedTests === 0 && steps.every(step => step.screenshotExported) });
+      if (executionError) throw executionError;
+      if (summary.result !== "Passed" || summary.passedTests !== 1 || summary.failedTests !== 0 || summary.skippedTests !== 0
+        || !steps.every(step => step.screenshotExported) || requests !== 2 || unexpectedRequests !== 0) {
+        throw new Error("The actual UI test or its complete screenshot/transport receipts did not pass; see gui-summary.json and gui-steps.json.");
+      }
+    } else throw executionError ?? new Error("Apple UI testing produced no xcresult receipt.");
+    await assertIdentity();
+    // XCTest owns its launch occurrence; re-obtain the exact process identity
+    // instead of reusing the earlier simctl launch PID after app.launch().
+    const processes = await command("xcrun", ["simctl", "spawn", udid, "launchctl", "list"]);
+    const rows = processes.split("\n").map(line => line.trim().split(/\s+/u));
+    const row = rows.find(columns => columns[2]?.startsWith(`UIKitApplication:${bundleId}[`));
+    const pid = Number(row?.[0]);
+    if (!Number.isSafeInteger(pid) || pid <= 1 || !await alive(pid)) throw new Error("The UI-tested application has no verified current native process.");
+    return { passed: true, test: "JokoConnectionUITests/testConnectionPageInteractions", sourceCommit: expectedSha,
+      executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount: 10,
+      scope: "Real connection-page mode changes, address typing/validation, local transport error, explicit cancellation, retained draft and theme changes." };
+  } finally {
+    save("gui-local-probe.json", { loopbackOnly: true, localIdentityRequests: requests, unexpectedRequests });
+    probe.closeAllConnections();
+    await new Promise(accept => probe.close(accept));
+  }
+}
 async function cleanup() {
   const errors = [];
   if (metro?.pid) {
@@ -226,10 +342,12 @@ async function main() {
     if (await alive(firstPid)) throw new Error("The first app occurrence did not terminate.");
     stage = "native reopen";
     const reopenedPid = await launch(port), reopened = await observe("reopened", reopenedPid, ocr);
+    const identity = JSON.parse(readFileSync(join(evidence, "identity.json"), "utf8"));
+    const gui = await runConnectionUiTests(app, port, identity.sourceCommit, identity.executableSha256);
     result = { passed: true, sourceCommit: await command("git", ["rev-parse", "HEAD"]), bundleId, simulatorUdid: udid,
-      observations: [first, reopened], firstProcessTerminated: true,
-      scope: "Actual unsigned iOS Simulator Debug process launch, visible Joko connection page, terminate and reopen with same-checkout Metro.",
-      limits: ["Screenshots and local OCR observe startup; no taps, typing, paired node, task execution, physical device, signed IPA or APNs were tested.",
+      observations: [first, reopened], firstProcessTerminated: true, gui,
+      scope: "Actual iOS Simulator startup/reopen plus Apple XCTest connection-page taps, typing, local error/cancel, draft retention and theme changes on the same application bytes.",
+      limits: ["Connection-page interactions use an owned loopback failure endpoint; no paired node, task execution, physical device, signed IPA or APNs were tested.",
         "Simulator does not exercise the physical device's first local network privacy permission."] };
   } catch (error) {
     if (evidence) {
@@ -239,7 +357,7 @@ async function main() {
     throw error;
   } finally {
     const errors = await cleanup();
-    if (result && errors.length === 0) { save("result.json", result); process.stdout.write("Actual Joko Simulator startup and reopen observations passed.\n"); }
+    if (result && errors.length === 0) { save("result.json", result); process.stdout.write("Actual Joko Simulator startup, reopen and connection-page UI operations passed.\n"); }
     else if (result) throw new Error("Simulator observations passed but owned cleanup failed; see cleanup.json.");
   }
 }

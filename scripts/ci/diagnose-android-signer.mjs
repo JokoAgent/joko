@@ -66,6 +66,13 @@ try {
   try { version = text(capture(apksigner, ["version"])).trim(); }
   catch { /* Verification success and tool-version availability are separate. */ }
   const buildTools = basename(dirname(apksigner));
+  // This APK and its certificate subject were created above without user data.
+  // Observe only public digest labels, never full tool streams or subject DNs.
+  const publicCertificateLines = ["stdout", "stderr"].flatMap(stream => verified[stream].split(/\r?\n/u)
+    .flatMap(line => {
+      const match = /^([A-Za-z0-9#:.(),= -]{1,160}) certificate SHA-256 digest:[ \t]*([0-9A-Fa-f]{64})[ \t]*$/u.exec(line);
+      return match === null ? [] : [{ stream, label: match[1], sha256: match[2].toLowerCase() }];
+    })).slice(0, 16);
   const metadata = {
     purpose: "minimal-no-code-sdk-signer-diagnostic",
     buildToolsVersion: /^[0-9]+(?:\.[0-9]+){2}(?:-[a-z0-9]+)?$/iu.test(buildTools) ? buildTools : "unavailable",
@@ -76,6 +83,7 @@ try {
       apkArguments: 1
     },
     apkBytes: statSync(signed).size,
+    publicCertificateLines,
     ...apkSignerCertificateDiagnostics(verified, version)
   };
   phase = "pin-no-code-diagnostic-apk";

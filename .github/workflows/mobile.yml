@@ -272,7 +272,7 @@ jobs:
         run: tar -C "$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator" -czf "$RUNNER_TEMP/joko-ios-simulator-debug.tar.gz" Joko.app
 
       - name: Observe the actual iOS app startup, termination and reopen
-        timeout-minutes: 12
+        timeout-minutes: 18
         run: node scripts/ci/mobile-ios-simulator-runtime.mjs
         env:
           JOKO_IOS_SIMULATOR_APP_PATH: ${{ runner.temp }}/joko-ios-simulator/Build/Products/Debug-iphonesimulator/Joko.app
@@ -293,11 +293,19 @@ jobs:
             ${{ runner.temp }}/joko-ios-runtime-evidence/*-capture.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/metro.log
             ${{ runner.temp }}/joko-ios-runtime-evidence/metro-status.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-build.log
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-test.log
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-*-receipt.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-summary.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-steps.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-local-probe.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-screenshots/**/*.png
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-screenshots/**/*.json
           if-no-files-found: warn
           retention-days: 3
 
       - name: Record iOS compilation scope
-        run: printf '%s\n' 'Unsigned Simulator app build and actual startup/terminate/reopen observed with PID identity and visible Joko connection-page OCR. No taps, typing, task execution, signed IPA, physical device, APNs or account integration was verified.' >> "$GITHUB_STEP_SUMMARY"
+        run: printf '%s\n' 'Simulator app startup/terminate/reopen and XCUITest connection-page tap/type/error/cancel/theme operations passed with exact app identity, XCTest receipts and named screenshots. No paired task execution, signed IPA, physical device, APNs or account integration was verified.' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload iOS Simulator Debug app
         if: ${{ !cancelled() && steps.ios-archive.outcome == 'success' }}

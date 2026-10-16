@@ -13,12 +13,13 @@ on:
           - full
           - windows-native
           - windows-runtime-diagnostics
+          - desktop-product
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || '' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && '-desktop-product' || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -121,17 +122,22 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      - name: Prepare Chromium for the production Web mounted chains
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' }}
+      - name: Prepare Chromium for production Web and standalone backend chains
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
+        id: browser
         timeout-minutes: 15
         shell: bash
         run: |
-          pnpm --filter @joko/e2e exec playwright-core install --with-deps chromium 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/chromium.log"
-          pnpm --filter @joko/e2e exec node -e "const fs=require('node:fs'); const path=require('node:path'); const browser=require('playwright-core').chromium.executablePath(); const web=path.join(process.env.GITHUB_WORKSPACE,'apps','web','dist'); fs.accessSync(browser,fs.constants.X_OK); fs.accessSync(path.join(web,'index.html')); fs.appendFileSync(process.env.GITHUB_ENV,['JOKO_BROWSER_EXECUTABLE='+fs.realpathSync(browser),'JOKO_MOUNTED_WEB_DIR='+fs.realpathSync(web),''].join('\n'));"
+          if [ "$RUNNER_OS" = Linux ]; then
+            pnpm --filter @joko/e2e exec playwright-core install --with-deps chromium 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/chromium.log"
+          else
+            pnpm --filter @joko/e2e exec playwright-core install chromium 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/chromium.log"
+          fi
+          pnpm --filter @joko/e2e exec node -e "const fs=require('node:fs'); const path=require('node:path'); const {createRequire}=require('node:module'); const browser=fs.realpathSync(require('playwright-core').chromium.executablePath()); const web=fs.realpathSync(path.join(process.env.GITHUB_WORKSPACE,'apps','web','dist')); fs.accessSync(browser,fs.constants.X_OK); fs.accessSync(path.join(web,'index.html')); fs.appendFileSync(process.env.GITHUB_OUTPUT,'executable='+browser+'\n'); if(process.platform==='linux'){const desktop=path.join(process.env.GITHUB_WORKSPACE,'apps','desktop'); const electron=createRequire(path.join(desktop,'package.json'))('electron'); fs.accessSync(electron,fs.constants.X_OK); fs.appendFileSync(process.env.GITHUB_ENV,['JOKO_BROWSER_EXECUTABLE='+browser,'JOKO_MOUNTED_WEB_DIR='+web,'JOKO_PDF_ELECTRON_TEST_EXECUTABLE='+electron,'JOKO_PDF_ELECTRON_TEST_APP='+desktop,'JOKO_GROUP_EVIDENCE_DIR='+path.join(process.env.RUNNER_TEMP,'joko-web-evidence','groups'),'JOKO_DOCUMENT_MOUNTED_CAPTURE_DIR='+path.join(process.env.RUNNER_TEMP,'joko-web-evidence','documents'),''].join('\n'));}"
 
-      - name: Run workspace test suite and headed Browser chains (Linux)
+      - name: Run workspace test suite and Browser chains (Linux)
         id: workspace_tests_linux
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm test:ci 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests.log"
         env:
@@ -140,7 +146,7 @@ jobs:
 
       - name: Run workspace test suite, including Connect end-to-end coverage (Windows/macOS)
         id: workspace_tests_desktop
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: pnpm test:ci 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests.log"
 
@@ -172,7 +178,7 @@ jobs:
         run: pnpm --filter @joko/tool-document exec node --import ../../scripts/ci/observe-document-workers.mjs ../../node_modules/vitest/vitest.mjs run 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/document-regressions.log"
 
       - name: Amplify the short queue soak and fault matrix
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: pnpm test:soak 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/soak.log"
         env:
@@ -186,6 +192,31 @@ jobs:
         timeout-minutes: 45
         shell: bash
         run: pnpm stage:desktop:orchestrator-runtime 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-runtime.log"
+
+      - name: Check smoke evidence preservation before profile cleanup
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'desktop-product' }}
+        shell: bash
+        run: pnpm --filter @joko/desktop exec vitest run test/smoke-packaged-helpers.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/smoke-evidence-owner.log"
+
+      - name: Operate production Web with the isolated standalone backend and recover after restart
+        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && steps.browser.outcome == 'success' }}
+        timeout-minutes: 7
+        shell: bash
+        env:
+          JOKO_STANDALONE_WEB_CLI: "1"
+          JOKO_STANDALONE_WEB_CLI_HEADED: "1"
+          JOKO_BROWSER_EXECUTABLE: ${{ steps.browser.outputs.executable }}
+          JOKO_MOUNTED_WEB_DIR: ${{ github.workspace }}/apps/web/dist
+          JOKO_STANDALONE_ORCHESTRATOR_ENTRY: ${{ github.workspace }}/apps/desktop/dist/orchestrator-runtime/dist/main.js
+          JOKO_STANDALONE_WEB_EVIDENCE_DIR: ${{ runner.temp }}/joko-standalone-web-evidence
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/standalone-web-cli.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/web-standalone.log"
+          else
+            pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/standalone-web-cli.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/web-standalone.log"
+          fi
 
       - name: Package the current platform Desktop application
         id: desktop_package
@@ -204,6 +235,7 @@ jobs:
         env:
           JOKO_DESKTOP_SMOKE_NO_SANDBOX: "1"
           JOKO_DESKTOP_SMOKE_KEEP_FAILED: "1"
+          JOKO_DESKTOP_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/joko-packaged-evidence
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
 
@@ -214,6 +246,7 @@ jobs:
         run: pnpm test:desktop:artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-smoke.log"
         env:
           JOKO_DESKTOP_SMOKE_KEEP_FAILED: "1"
+          JOKO_DESKTOP_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/joko-packaged-evidence
 
       - name: Run the independent Desktop viewer GUI chain (Linux)
         if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
@@ -308,6 +341,33 @@ jobs:
             ${{ runner.temp }}/joko-viewer-evidence/lifecycle/identity.json
             ${{ runner.temp }}/joko-viewer-evidence/lifecycle/result.json
             ${{ runner.temp }}/joko-viewer-evidence/lifecycle/failure.json
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload packaged Desktop operation screenshots and receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-gui-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-packaged-evidence/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload Web operation screenshots
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-gui-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-web-evidence/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload standalone Web and backend operation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-standalone-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-standalone-web-evidence/
           if-no-files-found: warn
           retention-days: 3
 
