@@ -106,6 +106,38 @@ describe("Skill market catalog", () => {
     expect(container.textContent).toContain("# Review safely");
   });
 
+  it("aborts an active preview file read before releasing its native lease", async () => {
+    const reads = new Map<string, AbortSignal>();
+    const closed: Array<{ id: string; aborted: boolean }> = [];
+    let opened = 0;
+    let refreshPresentation = (): void => undefined;
+    const controller = marketController({
+      openSkillMarketPreview: vi.fn(async () => ({ ...preview(), id: `preview-${++opened}` })),
+      readSkillMarketPreviewFile: vi.fn((_owner, _key, signal) => {
+        reads.set(_owner.id, signal!);
+        return new Promise<never>((_resolve, reject) => {
+          signal!.addEventListener("abort", () => reject(new DOMException("Read retired", "AbortError")), { once: true });
+        });
+      }),
+      closeSkillMarketPreview: vi.fn(async id => {
+        closed.push({ id, aborted: reads.get(id)?.aborted === true });
+        return true;
+      })
+    });
+    function Harness(): ReactElement {
+      const [, refresh] = useState(0);
+      refreshPresentation = () => refresh(value => value + 1);
+      return <SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale="en"
+        t={(key, values) => t(key, values)} initialSelection={entry().identity} onOpenSources={vi.fn()} />;
+    }
+    await render(<Harness />);
+    await vi.waitFor(() => expect(reads.has("preview-1")).toBe(true));
+    await act(async () => refreshPresentation());
+    await settle(120);
+    expect(closed).toContainEqual({ id: "preview-1", aborted: true });
+    expect(reads.get("preview-2")?.aborted).toBe(false);
+  });
+
   it("does not read a retired preview while adopting a replacement presentation", async () => {
     const closed = new Set<string>();
     const retiredReads: string[] = [];
