@@ -455,6 +455,52 @@ describe("Voice dictionary peer authority and exchange", () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it("keeps the mutation debounce when an older exchange finishes before that timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = await localFixture("debounce-inflight");
+      const remote = generateNodeSyncIdentity();
+      const started = deferred<void>();
+      const acknowledgement = deferred<boolean>();
+      const messages: VoiceDictionaryPeerMessage[] = [];
+      let online = false;
+      let delayFirst = true;
+      const manager = new VoiceDictionaryPeerManager({ ...fixture.options, debounceMilliseconds: 8_000,
+        codec: { ...inProcessCodec, encode: async (options) => {
+          messages.push(options.message);
+          return encodeVoiceDictionaryPeerMessage(options);
+        } },
+        transportFactory: () => ({ ...emptyTransport(), onlinePeerIds: () => online ? ["node-remote"] : [],
+          send: async () => {
+            if (!delayFirst) return true;
+            delayFirst = false;
+            started.resolve();
+            return acknowledgement.promise;
+          } })
+      });
+      cleanups.push(() => manager.close());
+      await manager.initialize();
+      fixture.dictionary.setEnabled(fixture.dictionary.snapshot().revision, true);
+      fixture.peers.grantPeer({ expectedRevision: fixture.peers.configurationRevision(), peerId: "node-remote",
+        displayName: "Remote", publicKey: remote.publicKey, fingerprint: keyFingerprint(remote.publicKey) });
+      await manager.syncNow();
+      online = true;
+      const initialExchange = manager.syncNow();
+      await started.promise;
+      fixture.dictionary.addManualTerm(fixture.dictionary.snapshot().revision, "After initial exchange");
+      await vi.advanceTimersByTimeAsync(7_000);
+      acknowledgement.resolve(true);
+      await initialExchange;
+      expect(messages).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(messages).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(messages).toHaveLength(2);
+      expect(messages[1]!.state).toEqual(fixture.dictionary.stateForSync());
+      expect(messages[1]!.requestReply).toBeUndefined();
+    } finally { vi.useRealTimers(); }
+  });
+
   it.each((["explicit", "fallback"] as const).flatMap((trigger) =>
     (["complete", "revoke", "disable", "close"] as const).map((retirement) => ({ trigger, retirement }))
   ))("attempts every peer after an earlier failure on $trigger and fences $retirement", async ({ trigger, retirement }) => {

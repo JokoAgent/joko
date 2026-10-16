@@ -410,7 +410,9 @@ export class VoiceDictionaryPeerManager {
     if (!this.#store.recordSuccess(peer.peerId, peer.revision, Date.now())) throw unavailable();
     this.#peerKnown.set(peer.peerId, marker);
     this.#errorCode = undefined;
-    if (stateMarker(this.#dictionary.stateForSync()) !== marker) this.#scheduleChanges();
+    // A mutation already owns its debounce. Finishing an older exchange must
+    // not postpone that pending delivery by another complete debounce window.
+    if (stateMarker(this.#dictionary.stateForSync()) !== marker && this.#changeTimer === undefined) this.#scheduleChanges();
   }
 
   async #receive(source: string, frame: NodeSyncCipherChunkFrame, delivery: NodeSyncDeliveryContext): Promise<void> {
