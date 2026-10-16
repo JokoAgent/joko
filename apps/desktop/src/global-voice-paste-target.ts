@@ -16,8 +16,12 @@ export interface ShortcutVoiceDocumentTarget {
 }
 
 export interface ShortcutVoiceDocumentEndpoint {
-  readonly on: (event: "did-navigate" | "render-process-gone" | "destroyed", listener: () => void) => unknown;
-  readonly removeListener: (event: "did-navigate" | "render-process-gone" | "destroyed", listener: () => void) => unknown;
+  on(event: "did-navigate", listener: () => void): unknown;
+  on(event: "render-process-gone", listener: () => void): unknown;
+  on(event: "destroyed", listener: () => void): unknown;
+  removeListener(event: "did-navigate", listener: () => void): unknown;
+  removeListener(event: "render-process-gone", listener: () => void): unknown;
+  removeListener(event: "destroyed", listener: () => void): unknown;
   readonly paste: () => void;
 }
 
@@ -27,14 +31,17 @@ export function captureShortcutVoiceDocumentTarget(options: {
   readonly focus: () => void;
 }): ShortcutVoiceDocumentTarget {
   let retired = false;
-  const events = ["did-navigate", "render-process-gone", "destroyed"] as const;
   const dispose = (): void => {
     if (retired) return;
     retired = true;
-    for (const event of events) options.contents.removeListener(event, dispose);
+    options.contents.removeListener("did-navigate", dispose);
+    options.contents.removeListener("render-process-gone", dispose);
+    options.contents.removeListener("destroyed", dispose);
   };
   const isCurrent = (): boolean => !retired && options.isCurrentDocument();
-  for (const event of events) options.contents.on(event, dispose);
+  options.contents.on("did-navigate", dispose);
+  options.contents.on("render-process-gone", dispose);
+  options.contents.on("destroyed", dispose);
   return {
     isCurrent,
     paste: () => {
