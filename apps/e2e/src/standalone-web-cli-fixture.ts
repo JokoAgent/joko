@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:net";
+import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,6 +22,14 @@ interface ChildObservation {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   stderrBytes: number;
+  startupFailure?: {
+    readonly elapsedMs: number;
+    readonly stderrSampledBytes: number;
+    readonly stderrCodes: readonly string[];
+    readonly spawnErrorCode: string | null;
+    readonly publicListener: "open" | "closed" | "unknown";
+    readonly internalListener: "open" | "closed" | "unknown";
+  };
   retirement?: "production-sigterm" | "windows-owned-tree" | "forced-root";
   treeRetirementSucceeded?: boolean;
 }
@@ -99,6 +107,7 @@ export class StandaloneWebCliFixture {
 
   async start(): Promise<void> {
     if (this.#closed || this.#child !== undefined) throw new Error("The owned CLI is already running or retired.");
+    const startedAt = performance.now();
     this.#pairingCode = undefined;
     const nodeArguments = this.dependencyLoader === "none" ? [] : ["--import", import.meta.resolve("tsx")];
     const child = spawn(process.execPath, [...nodeArguments, this.cliEntry], {
@@ -125,18 +134,44 @@ export class StandaloneWebCliFixture {
         }
       }
     });
-    child.stderr.on("data", (bytes: Buffer) => { observation.stderrBytes += bytes.byteLength; });
-    child.once("error", () => { observation.exited = true; });
+    let stderrPrefix = Buffer.alloc(0);
+    let spawnErrorCode: string | null = null;
+    child.stderr.on("data", (bytes: Buffer) => {
+      observation.stderrBytes += bytes.byteLength;
+      const remaining = 4096 - stderrPrefix.byteLength;
+      if (remaining > 0) stderrPrefix = Buffer.concat([stderrPrefix, bytes.subarray(0, remaining)]);
+    });
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      observation.exited = true;
+      spawnErrorCode = ["EACCES", "EPERM", "ENOENT"].includes(error.code ?? "") ? error.code! : "other";
+    });
     child.once("exit", (code, signal) => {
       observation.exited = true; observation.exitCode = code; observation.signal = signal;
     });
-    await pollOwned(async () => {
-      if (observation.exited) throw new Error("The independent production CLI exited during startup.");
-      try {
-        const response = await fetch(`${this.baseUrl}/healthz`, { signal: AbortSignal.timeout(1000) });
-        return response.ok && (await response.json() as { status?: string }).status === "ok";
-      } catch { return false; }
-    }, value => value, "independent CLI health", 60_000);
+    try {
+      await pollOwned(async () => {
+        if (observation.exited) throw new Error("The independent production CLI exited during startup.");
+        try {
+          const response = await fetch(`${this.baseUrl}/healthz`, { signal: AbortSignal.timeout(1000) });
+          return response.ok && (await response.json() as { status?: string }).status === "ok";
+        } catch { return false; }
+      }, value => value, "independent CLI health", 60_000);
+    } catch (error) {
+      const [publicListener, internalListener] = await Promise.all([
+        loopbackListenerState(this.publicPort), loopbackListenerState(this.internalPort)
+      ]);
+      // Retain fixed error codes only. Console text may contain a pairing code,
+      // paths or other private data and must never enter operation evidence.
+      const text = stderrPrefix.toString("utf8");
+      observation.startupFailure = {
+        elapsedMs: Math.round(performance.now() - startedAt), stderrSampledBytes: stderrPrefix.byteLength,
+        stderrCodes: ["EADDRINUSE", "EACCES", "EPERM", "ENOENT", "SQLITE_BUSY", "SQLITE_LOCKED",
+          "ERR_SQLITE_ERROR", "ERR_DLOPEN_FAILED", "ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND"]
+          .filter(code => new RegExp(`(?:^|[^A-Z0-9_])${code}(?:$|[^A-Z0-9_])`, "u").test(text)),
+        spawnErrorCode, publicListener, internalListener
+      };
+      throw error;
+    } finally { stderrPrefix = Buffer.alloc(0); }
   }
 
   async pairingCode(): Promise<string> {
@@ -235,6 +270,16 @@ async function freeLoopbackPort(): Promise<number> {
   if (address === null || typeof address === "string") throw new Error("No owned loopback port was allocated.");
   await new Promise<void>((accept, reject) => server.close(error => error ? reject(error) : accept()));
   return address.port;
+}
+
+async function loopbackListenerState(port: number): Promise<"open" | "closed" | "unknown"> {
+  return new Promise(accept => {
+    const socket = createConnection({ host: "127.0.0.1", port });
+    const finish = (state: "open" | "closed" | "unknown"): void => { socket.destroy(); accept(state); };
+    socket.setTimeout(500, () => finish("unknown"));
+    socket.once("connect", () => finish("open"));
+    socket.once("error", (error: NodeJS.ErrnoException) => finish(error.code === "ECONNREFUSED" ? "closed" : "unknown"));
+  });
 }
 
 async function removeOwnedRoot(root: string): Promise<void> {
