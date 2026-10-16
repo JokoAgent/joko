@@ -343,6 +343,7 @@ export class NodeDevicePeerAgentExecutor {
     this.#activeForwards.clear();
     this.#activeListeners.clear();
     this.#reverseConnections.clear();
+    await this.#recentDirectories.flush();
   }
 
   async #perform(
@@ -1449,6 +1450,10 @@ export class NodeDevicePeerRecentDirectoryStore {
 
   constructor(path: string) {
     this.#path = localPath(path);
+  }
+
+  flush(): Promise<void> {
+    return this.#mutations;
   }
 
   async list(maximumEntries: number, signal: AbortSignal): Promise<{

@@ -113,6 +113,22 @@ afterEach(async () => {
 });
 
 describe("Node Device peer recent project ownership", () => {
+  it("settles admitted recent-directory writes before retirement completes", async () => {
+    const root = await testRoot();
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "private", "recent.json")
+    });
+    let recorded = false;
+    const writing = executor.recordRecentDirectory(root, "Adopted project").then(() => { recorded = true; });
+    try {
+      await executor.retire();
+      expect(recorded).toBe(true);
+    } finally {
+      await writing;
+      await executor.retire();
+    }
+  });
+
   it("credentials admit authenticated controller and preserve the signal without a media lease", async () => {
     const root = await testRoot(); const fixture = remoteDesktopHost();
     const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "credentials.json"), remoteDesktop: fixture.port });
