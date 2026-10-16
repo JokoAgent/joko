@@ -322,7 +322,8 @@ async function exportPreInputSetupFailure(screenshots, files, { expectedSha, exp
     return readFileSync(path);
   };
   const addressStage = steps.slice(0, 3).every(step => step.screenshotExported) && steps.length >= 3;
-  if (!addressStage && steps.some(step => step.screenshotExported)) return;
+  const firstTabStage = steps[0]?.screenshotExported === true && steps.slice(1).every(step => !step.screenshotExported);
+  if (!addressStage && !firstTabStage && steps.some(step => step.screenshotExported)) return;
   const phase = addressStage ? "address" : "setup";
   const expectedStage = addressStage ? "pre-input-address" : "pre-input-setup";
   const prefix = `00-${phase}-pre-input`;

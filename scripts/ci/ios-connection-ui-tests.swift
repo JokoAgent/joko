@@ -38,7 +38,7 @@ final class JokoConnectionUITests: XCTestCase {
     }
 
     private func recordPreInputSetupFailure(launchArguments: [String], stage: String = "pre-input-setup") throws {
-        // Both call sites precede any address or pairing input. Never attach a
+        // Every call site precedes any address or pairing input. Never attach a
         // later UI tree, including after a validation or transport operation.
         let prefix = stage == "pre-input-address" ? "00-address-pre-input" : "00-setup-pre-input"
         screenshot("\(prefix)-screen")
@@ -92,7 +92,7 @@ final class JokoConnectionUITests: XCTestCase {
     }
     private func tab(_ label: String) -> XCUIElement { tabQuery(label).firstMatch }
 
-    private func tap(_ element: XCUIElement) {
+    private func tap(_ element: XCUIElement, atCenter: Bool = false) {
         // Debug builds can present native LogBox toasts over WKWebView controls.
         // Close those exact development surfaces through their real UI; keep
         // application errors, dialogs, and every connection assertion visible.
@@ -122,7 +122,13 @@ final class JokoConnectionUITests: XCTestCase {
             connectionPage.swipeDown()
         }
         XCTAssertTrue(element.isHittable)
-        element.tap()
+        if atCenter {
+            // WebView tabs are exposed as switches. Hit the exact labeled tab's
+            // measured center instead of using a native switch's chosen point.
+            element.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        } else {
+            element.tap()
+        }
     }
 
     private func replace(_ field: XCUIElement, with text: String) {
@@ -167,13 +173,15 @@ final class JokoConnectionUITests: XCTestCase {
 
     func testConnectionPageInteractions() throws {
         screenshot("01-connection-page")
-        tap(tab("Saved nodes"))
-        XCTAssertTrue(connectionPage.staticTexts["Connect a Joko node to begin."].firstMatch.waitForExistence(timeout: 10))
+        tap(tab("Saved nodes"), atCenter: true)
+        let savedNodesVisible = connectionPage.staticTexts["Connect a Joko node to begin."].firstMatch.waitForExistence(timeout: 10)
+        if !savedNodesVisible { try? recordPreInputSetupFailure(launchArguments: ownedLaunchArguments) }
+        XCTAssertTrue(savedNodesVisible, "The real Saved nodes tab did not activate.")
         screenshot("02-saved-nodes")
-        tap(tab("Nearby"))
+        tap(tab("Nearby"), atCenter: true)
         XCTAssertTrue(connectionPage.staticTexts["Nearby Joko nodes"].firstMatch.waitForExistence(timeout: 10))
         screenshot("03-nearby")
-        tap(tab("Add Joko node"))
+        tap(tab("Add Joko node"), atCenter: true)
         let address = connectionPage.textFields["Joko node address"].firstMatch
         let addressExists = address.waitForExistence(timeout: 10)
         if !addressExists { try? recordPreInputSetupFailure(launchArguments: ownedLaunchArguments, stage: "pre-input-address") }
@@ -212,9 +220,9 @@ final class JokoConnectionUITests: XCTestCase {
         XCTAssertFalse(button("Request pairing").isEnabled)
         screenshot("07-cancelled-draft-retained")
 
-        tap(tab("Saved nodes"))
+        tap(tab("Saved nodes"), atCenter: true)
         XCTAssertFalse(address.exists, "Leaving Add must remove its active form.")
-        tap(tab("Add Joko node"))
+        tap(tab("Add Joko node"), atCenter: true)
         XCTAssertTrue(address.waitForExistence(timeout: 10))
         XCTAssertEqual(address.value as? String, origin, "Mode changes must preserve the address draft.")
         screenshot("08-returned-address-draft")
