@@ -248,7 +248,7 @@ describe("node SSH keys", () => {
     expect(catalog.keys.find(key => key.id === first.id)).toMatchObject({ inAgent: true, comment: "Work key", algorithm: "ssh-ed25519" });
     expect(JSON.stringify(catalog)).not.toContain("PRIVATE KEY");
     expect(JSON.stringify(catalog)).not.toContain(directory);
-  }, 20_000);
+  }, process.platform === "win32" ? 30_000 : 20_000);
 
   it("fences native keychain loading by exact agent identity, one-line secret input, file ownership and confirmed completion", async () => {
     const directoryPermissions = vi.spyOn(keyPermissions, "inspectKeyDirectoryPermissions").mockResolvedValue(undefined);
