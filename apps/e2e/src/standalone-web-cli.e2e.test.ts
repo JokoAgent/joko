@@ -126,8 +126,14 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       await screenshot("02-new-task-input.png");
       record("browser-paired-and-entered-first-task-input", "02-new-task-input.png");
       await composer.locator(".send-button").click();
-      await page.waitForURL(url => /^#\/tasks\/[^/?]+$/u.test(url.hash) && url.hash !== "#/tasks/new", { timeout: 45_000 });
-      sessionId = decodeURIComponent(new URL(page.url()).hash.slice("#/tasks/".length));
+      await page.waitForURL(url => {
+        const route = new URL(url.hash.slice(1), url.origin);
+        return /^\/tasks\/[^/]+$/u.test(route.pathname) && route.pathname !== "/tasks/new";
+      }, { timeout: 45_000 });
+      const createdRoute = new URL(new URL(page.url()).hash.slice(1), fixture.baseUrl);
+      sessionId = decodeURIComponent(createdRoute.pathname.slice("/tasks/".length));
+      const connectionProfileId = createdRoute.searchParams.get("profile");
+      expect(connectionProfileId).not.toBeNull();
       const sessionScope = create(SnapshotScopeSchema, {
         kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId, recentTimelineItems: 100 }) }
       });
@@ -152,7 +158,9 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       expect((await inspector.clients.session.getSession({ sessionId })).session?.sessionId).toBe(sessionId);
       await page.reload({ waitUntil: "domcontentloaded" });
       await page.locator(".timeline").getByText(controlledReply, { exact: true }).first().waitFor({ state: "visible", timeout: 45_000 });
-      expect(new URL(page.url()).hash).toBe(`#/tasks/${encodeURIComponent(sessionId)}`);
+      const restoredRoute = new URL(new URL(page.url()).hash.slice(1), fixture.baseUrl);
+      expect(restoredRoute.pathname).toBe(`/tasks/${encodeURIComponent(sessionId)}`);
+      expect(restoredRoute.searchParams.get("profile")).toBe(connectionProfileId);
       expect(await page.locator(".pair-form").count()).toBe(0);
       await screenshot("05-restored-task.png");
       record("same-node-and-task-restored-using-saved-browser-pairing", "05-restored-task.png");
