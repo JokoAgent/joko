@@ -284,7 +284,7 @@ jobs:
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 15
         shell: bash
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/skill-market-mounted-browser.e2e.test.ts src/skill-mounted-browser.e2e.test.ts src/messaging-mounted-browser.e2e.test.ts src/real-pi-compaction-mounted-browser.e2e.test.ts src/simulator-viewer.e2e.test.ts src/message-nav-rail.e2e.test.ts src/paired-backends.e2e.test.ts src/voice-input.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/partner-mounted-browser.e2e.test.ts src/partner-groups-mounted.e2e.test.ts src/messaging-mounted-browser.e2e.test.ts src/slack-mounted-browser.e2e.test.ts src/usage-report-mounted-browser.e2e.test.ts src/paired-backends.e2e.test.ts src/real-pi-compaction-mounted-browser.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
         env:
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
@@ -293,7 +293,14 @@ jobs:
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os != 'Linux' }}
         timeout-minutes: 15
         shell: bash
-        run: pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/skill-market-mounted-browser.e2e.test.ts src/skill-mounted-browser.e2e.test.ts src/messaging-mounted-browser.e2e.test.ts src/real-pi-compaction-mounted-browser.e2e.test.ts src/simulator-viewer.e2e.test.ts src/message-nav-rail.e2e.test.ts src/paired-backends.e2e.test.ts src/voice-input.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+        run: |
+          files=(src/partner-mounted-browser.e2e.test.ts src/partner-groups-mounted.e2e.test.ts src/messaging-mounted-browser.e2e.test.ts src/slack-mounted-browser.e2e.test.ts src/usage-report-mounted-browser.e2e.test.ts)
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            files+=(src/document-tools.e2e.test.ts src/voice-dictionary.e2e.test.ts)
+          else
+            files+=(src/paired-backends.e2e.test.ts src/real-pi-compaction-mounted-browser.e2e.test.ts src/skill-mounted-browser.e2e.test.ts)
+          fi
+          pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
 
       - name: Upload the affected Web chain logs
         if: ${{ matrix.workload == 'browser-regressions' && always() }}

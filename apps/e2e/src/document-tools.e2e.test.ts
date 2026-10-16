@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -250,7 +250,19 @@ it("advertises the document tool from the production application composition", a
           serverId: "joko-document-tools", toolName: "inspect_pdf", arguments: { path: "documents/rendered.pdf" } })
       });
       expect(inspectRendered.ok).toBe(true);
-      expect(await inspectRendered.json()).toMatchObject({ isError: false, details: { mcpStructuredContent: {
+      const inspection = await inspectRendered.json();
+      if (process.env.RUNNER_TEMP !== undefined) {
+        const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "document-tools");
+        const pdf = await readFile(renderedPath);
+        await mkdir(directory, { recursive: true });
+        await writeFile(join(directory, "rendered-replacement.pdf"), pdf);
+        await writeFile(join(directory, "rendered-replacement.json"), JSON.stringify({
+          sourceCommit: process.env.GITHUB_SHA,
+          sha256: createHash("sha256").update(pdf).digest("hex"),
+          inspection
+        }, null, 2) + "\n");
+      }
+      expect(inspection).toMatchObject({ isError: false, details: { mcpStructuredContent: {
         numPages: 1, verdict: "ok", blankPages: [], pages: [{ page: 1, paper: "A4", textPreview: "Replacement PDF", blank: false }]
       } } });
     }

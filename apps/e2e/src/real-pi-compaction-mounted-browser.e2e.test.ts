@@ -1,11 +1,12 @@
-import { create } from "@bufbuild/protobuf";
+import { create, fromBinary } from "@bufbuild/protobuf";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import {
   CompactionState,
   RunState,
   SessionSnapshotScopeSchema,
-  SnapshotScopeSchema
+  SnapshotScopeSchema,
+  SubmitOperationRequestSchema
 } from "@joko/contracts";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
@@ -334,7 +335,22 @@ function observeBrowserErrors(page: Page): string[] {
   page.on("response", (response) => {
     if (response.status() < 400) return;
     const url = new URL(response.url());
-    errors.push(`response:${response.status()}:${response.request().method()}:${url.origin}${url.pathname}`);
+    let operation = "";
+    if (url.pathname === "/joko.v1.OperationService/SubmitOperation") {
+      operation = ":operation=unavailable";
+      const request = response.request();
+      const bytes = request.postDataBuffer();
+      if (request.headers()["content-type"]?.startsWith("application/proto") && bytes !== null && bytes.length <= 64 * 1024) {
+        try {
+          const mutation = fromBinary(SubmitOperationRequestSchema, bytes).mutation?.payload;
+          operation = `:operation=${mutation?.case ?? "unavailable"}`;
+          if (mutation?.case === "acknowledgeSessionAttention") {
+            operation += `:cursorGeneration=${mutation.value.throughCursor?.generation.toString() ?? "unavailable"}:intent=${mutation.value.intent}`;
+          }
+        } catch { /* Never include request bytes or free-form decode failures. */ }
+      }
+    }
+    errors.push(`response:${response.status()}:${response.request().method()}:${url.origin}${url.pathname}${operation}`);
   });
   page.on("console", (message) => {
     if (message.type() !== "error") return;

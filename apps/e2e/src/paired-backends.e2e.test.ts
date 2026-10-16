@@ -354,7 +354,7 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
     const codexSessionId = sessions.get("codex-paired")!;
     const codexThreadId = fixture.application.store.getSession(codexSessionId).descriptor.binding.nativeSessionId;
     if (codexThreadId === undefined) throw new Error("Codex task has no native thread.");
-    await withCodexDispatchFailureState(waitFor(
+    await withNativeDispatchFailureState(waitFor(
       async () => codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
       (dispatched) => dispatched, "paired Codex dispatch"), fixture, codex, codexSessionId, codexRunId);
     await waitFor(async () => claude.queries.some((query) => query.receivedInputs.length > 0),
@@ -489,7 +489,7 @@ it("resumes three native tasks through service restart and isolates one missing 
     const codexSessionId = sessions.get("codex-paired")!;
     const firstCodexThreadId = fixture.application.store.getSession(codexSessionId).descriptor.binding.nativeSessionId;
     if (firstCodexThreadId === undefined) throw new Error("Restart fixture Codex task has no native thread.");
-    await withCodexDispatchFailureState(waitFor(
+    await withNativeDispatchFailureState(waitFor(
       async () => setup.codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
       (dispatched) => dispatched, "Codex dispatch before service restart"),
     fixture, setup.codex, codexSessionId, firstRuns.get("codex-paired")!);
@@ -1477,11 +1477,11 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
       const runWhileUnknown = await send(backendId, inputWhileUnknown);
       let answerWhileUnknown: string;
       if (backendId === "pi") {
-        await waitFor(
+        await withNativeDispatchFailureState(waitFor(
           async () => setup.requests.length,
           (count) => count === providerRequestsBeforeUnknownRun + 1,
           "Pi dispatch while candidate cleanup is unknown"
-        );
+        ), fixture, undefined, sessionId, runWhileUnknown);
         answerWhileUnknown = REAL_PI_RESPONSE_TEXT;
       } else if (backendId === "codex-paired") {
         await waitFor(
@@ -2639,7 +2639,7 @@ it("fences consumed native inputs with lost receipts without blocking sibling Ba
       "Pi sibling Provider dispatch"
     );
     const codexControlNativeId = nativeSessionId("codex-paired", "control");
-    await withCodexDispatchFailureState(waitFor(
+    await withNativeDispatchFailureState(waitFor(
       async () => (setup.codex.transport?.requests ?? []).filter((request) =>
         request.method === "turn/start"
         && jsonWithBigints(request.params).includes(controlTexts.get("codex-paired")!)).length,
@@ -3785,10 +3785,10 @@ async function startPairedFixture(
   }
 }
 
-async function withCodexDispatchFailureState<T>(
+async function withNativeDispatchFailureState<T>(
   pending: Promise<T>,
   fixture: OrchestratorE2eFixture,
-  codex: FakeCodexAppServer,
+  codex: FakeCodexAppServer | undefined,
   sessionId: string,
   runId: string
 ): Promise<T> {
@@ -3798,15 +3798,16 @@ async function withCodexDispatchFailureState<T>(
     const run = fixture.application.store.getRun(runId).descriptor;
     const session = fixture.application.store.getSession(sessionId).descriptor;
     const queue = fixture.application.store.findQueueItemByRunId(sessionId, runId);
-    throw new Error(`Codex dispatch ownership state: ${JSON.stringify({
+    throw new Error(`Native dispatch ownership state: ${JSON.stringify({
+      backendId: session.backendId,
       runState: run.state,
       errorCode: run.error?.code,
       errorPhase: run.error?.phase,
       generation: session.binding.generation,
       queueState: queue?.state,
       queueClaimed: queue?.attemptId !== undefined,
-      transportRunning: codex.transport?.running,
-      requestMethods: [...new Set(codex.transport?.requests.map((request) => request.method) ?? [])]
+      transportRunning: codex?.transport?.running,
+      requestMethods: codex === undefined ? undefined : [...new Set(codex.transport?.requests.map((request) => request.method) ?? [])]
     })}`, { cause });
   }
 }
