@@ -103,7 +103,8 @@ describe("real managed Orchestrator child", () => {
     checkpoint("restart_stop");
     await restarted.stop();
     checkpoint("completed");
-  }, 45_000);
+    // Two native bootstraps may each use 30s, with explicit shutdown between them.
+  }, process.platform === "win32" ? 75_000 : 45_000);
 
   it("recovers persisted metadata when the commit ACK was lost and fences an ephemeral smoke child", async () => {
     const fixture = createFixture();
