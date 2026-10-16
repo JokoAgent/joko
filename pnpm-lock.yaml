@@ -7,6 +7,7 @@ settings:
 patchedDependencies:
   expo-image-manipulator@57.0.14: b915dc53eb3865a506a79d570a57400e9fc5c334fcd01936c1de12c92c8d3c50
   expo-image@57.0.3: 1bf15c6ffcc41b386bf5ef471bd7952141a01d05cc647d7dc8fe1f904db6ef9c
+  node-pty@1.1.0: 71094ec4b6fc187c311576d26f24fa7dac0507816dcf94e5e9ac00913c6992c3
 
 importers:
 
@@ -1305,7 +1306,7 @@ importers:
         version: 6.0.0
       node-pty:
         specifier: 1.1.0
-        version: 1.1.0
+        version: 1.1.0(patch_hash=71094ec4b6fc187c311576d26f24fa7dac0507816dcf94e5e9ac00913c6992c3)
     devDependencies:
       '@types/node':
         specifier: 24.12.4
@@ -15308,7 +15309,7 @@ snapshots:
 
   node-int64@0.4.0: {}
 
-  node-pty@1.1.0:
+  node-pty@1.1.0(patch_hash=71094ec4b6fc187c311576d26f24fa7dac0507816dcf94e5e9ac00913c6992c3):
     dependencies:
       node-addon-api: 7.1.1
 
