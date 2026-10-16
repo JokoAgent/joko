@@ -14,12 +14,21 @@ on:
           - windows-native
           - windows-runtime-diagnostics
           - desktop-product
+      platform:
+        description: Platform for manual verification
+        type: choice
+        default: all
+        options:
+          - all
+          - windows
+          - linux
+          - macos
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && format('-platform-{0}', inputs.platform || 'all') || '' }}
   cancel-in-progress: false
 
 jobs:
@@ -31,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.scope == 'windows-native' && '["windows-latest"]' || '["ubuntu-24.04","windows-latest","macos-15"]') }}
+        os: ${{ fromJSON(inputs.scope == 'windows-native' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'windows' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'linux' && '["ubuntu-24.04"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'macos' && '["macos-15"]' || '["ubuntu-24.04","windows-latest","macos-15"]') }}
 
     steps:
       - name: Check out repository
