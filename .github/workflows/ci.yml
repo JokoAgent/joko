@@ -19,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && '-desktop-product' || '' }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || '' }}
   cancel-in-progress: false
 
 jobs:
