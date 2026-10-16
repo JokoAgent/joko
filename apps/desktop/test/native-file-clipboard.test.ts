@@ -10,7 +10,7 @@ import * as secureFiles from "../src/secure-files.js";
 
 const spawn = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", () => ({ spawn }));
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); spawn.mockReset(); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); spawn.mockReset(); });
 const scope = () => ({ id: randomUUID(), isCurrent: () => true });
 const input = (name = "clip's video.mp4") => ({ requestId: randomUUID(), file: { name, mediaType: "video/mp4", bytes: new Uint8Array([1, 2, 3]) } });
 const root = () => mkdtemp(join(tmpdir(), "joko-file-clipboard-"));
@@ -149,14 +149,21 @@ describe("native file clipboard ownership", () => {
   });
 
   it.each(["before", "after"] as const)("does not release the OS writer on a process error %s the spawn event without confirmed close", async (phase) => {
+    const helperError = deferred<void>();
     const child = new EventEmitter() as EventEmitter & { kill(): boolean };
     Object.assign(child, { pid: 4242 });
     child.kill = vi.fn(() => { child.emit("error", new Error("Termination was not confirmed")); return false; });
-    spawn.mockImplementation(() => { queueMicrotask(() => { if (phase === "after") child.emit("spawn"); child.emit("error", new Error("Native helper process error")); }); return child; });
+    spawn.mockImplementation(() => { queueMicrotask(() => { if (phase === "after") child.emit("spawn"); child.emit("error", new Error("Native helper process error")); helperError.resolve(); }); return child; });
     const directory = await root(); let now = 1_000;
+    // The 40 ms probe targets an already owned helper, not runner disk speed
+    // while writing its private script or recording its process identity.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const owner = new NativeFileClipboard({ directory, platform: "darwin", timeoutMs: 40, now: () => now });
     const request = input(); const caller = scope();
-    await expect(owner.copy(request, caller)).resolves.toEqual({ status: "unknown" });
+    const pending = owner.copy(request, caller);
+    await helperError.promise;
+    await vi.advanceTimersByTimeAsync(40);
+    await expect(pending).resolves.toEqual({ status: "unknown" });
     await expect(owner.copy(input(), scope())).resolves.toEqual({ status: "blocked" });
     expect(spawn).toHaveBeenCalledOnce(); expect(child.kill).toHaveBeenCalledOnce();
     expect((await manifest(directory)).entries[0]?.retainUntil).toBeUndefined();
