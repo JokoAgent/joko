@@ -207,7 +207,7 @@ async function runNativeScenario(): Promise<void> {
     ...PI_LIKE_PROFILE.capabilities,
     { key: capabilityNames.workspaceFiles, supported: true as const }
   ] };
-  fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: (entry) => new AndroidResourceAdapter(entry) });
+  fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: (entry) => new AndroidResourceAdapter(entry), collaborationGoals: true });
   const current = fixture;
   await mkdir(join(current.workspaceDirectory, "images"));
   await writeFile(join(current.workspaceDirectory, "images", "pixel.png"), Buffer.from(

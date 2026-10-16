@@ -12,6 +12,7 @@ import {
   BackendInstanceRegistry,
   BlobTransferCoordinator,
   ConnectionManager,
+  CollaborationGoalManager,
   ContactManager,
   DevicePeerOwner,
   LanDiscoveryService,
@@ -27,6 +28,7 @@ import {
   ReviewCoordinator,
   RemoteExecutionRouter,
   RemoteWorkspaceService,
+  RuntimeGovernanceSettingsRepository,
   ScheduleCoordinator,
   ScheduleHookScriptInstaller,
   createScheduleHookScriptGenerator,
@@ -64,6 +66,7 @@ type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
 
 export interface FixtureOptions {
   readonly taskSharing?: boolean;
+  readonly collaborationGoals?: boolean;
   readonly serverId?: string;
   readonly rootDirectory?: string;
   readonly webDirectory?: string;
@@ -449,6 +452,11 @@ export class OrchestratorE2eFixture {
       workspaceService: workspaces,
       homesRoot: join(dataDirectory, "partner-homes")
     });
+    const runtimeGovernance = options.collaborationGoals ? new RuntimeGovernanceSettingsRepository({ store }) : undefined;
+    const collaborationGoals = runtimeGovernance === undefined ? undefined : new CollaborationGoalManager({
+      store, sessionHost, readSettings: () => runtimeGovernance.collaboration()
+    });
+    await collaborationGoals?.initialize();
     const taskSharingHome = options.taskSharing ? new TaskSharingHome({ directory: join(dataDirectory, "task-sharing-home"),
       serverId, vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key")) }) : undefined;
     await taskSharingHome?.initialize();
@@ -486,6 +494,7 @@ export class OrchestratorE2eFixture {
       browserActivity: [],
       contacts,
       partners,
+      ...(collaborationGoals === undefined ? {} : { collaborationGoals }),
       ...(taskSharingHome === undefined ? {} : { taskSharingHome }),
       registerServiceCleanup(cleanup) { serviceCleanups.add(cleanup); return () => serviceCleanups.delete(cleanup); },
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
@@ -499,6 +508,7 @@ export class OrchestratorE2eFixture {
         };
         for (const cleanup of serviceCleanups) await attempt(cleanup);
         await attempt(() => taskSharingHome?.dispose());
+        await attempt(() => collaborationGoals?.close());
         await attempt(() => scheduler.stop());
         await attempt(() => auxiliaryServices?.sessionNavigation?.dispose());
         await attempt(() => auxiliaryServices?.auxiliaryText?.dispose());

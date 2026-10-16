@@ -20,6 +20,7 @@ export * from "./browser-tool-bridge.js";
 export * from "./config.js";
 export * from "./connection-manager.js";
 export * from "./collaboration-manager.js";
+export { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 export * from "./objective-manager.js";
 export * from "./objective-connect-service.js";
 export * from "./objective-directive.js";
