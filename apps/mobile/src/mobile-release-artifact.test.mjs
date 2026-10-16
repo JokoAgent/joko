@@ -171,6 +171,7 @@ describe("mobile release artifact configuration", () => {
       },
       signerDigests: [{ signer: "#1", sha256: certificate }, { signer: "#2", validDigest: false }]
     });
+    expect(diagnostic.publicCertificateLines).toEqual([{ stream: "stdout", label: "Signer #1", sha256: certificate }]);
     const serialized = JSON.stringify(diagnostic);
     expect(serialized).not.toContain(subject);
     expect(serialized).not.toContain(diagnosticPath);
@@ -196,6 +197,17 @@ describe("mobile release artifact configuration", () => {
       stdoutBytes: Buffer.byteLength(observedSdk37), stderrBytes: 0 }, "0.9")).toMatchObject({
       signerDigestLineCount: 1, signerDigests: [{ signer: "V3.0 Signer:", sha256: certificate }]
     });
+    const labels = ["Signer unknown:", `V3.0 ${"x".repeat(150)}`, "Signer /private/path", "Signer\u001b[31m"];
+    const untrusted = labels.map(label => `${label} certificate SHA-256 digest: ${certificate}`).join("\n");
+    const bounded = apkSignerCertificateDiagnostics({ stdout: untrusted,
+      stderr: `V3.0 Signer: certificate SHA-256 digest: ${certificate.toUpperCase()}`,
+      stdoutBytes: Buffer.byteLength(untrusted), stderrBytes: 0 }, "0.9");
+    expect(bounded.publicCertificateLines).toEqual([
+      { stream: "stdout", label: "Signer unknown:", sha256: certificate },
+      { stream: "stderr", label: "V3.0 Signer:", sha256: certificate }
+    ]);
+    expect(() => apkSignerCertificateSha256(`Signer unknown: certificate SHA-256 digest: ${certificate}`, certificate))
+      .toThrow(/unsupported APK signer/u);
   });
 
   it("keeps Android release secrets external and pins an independent certificate", () => {

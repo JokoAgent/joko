@@ -232,12 +232,18 @@ function apkSignerStreamMetadata(output, byteLength) {
 export function apkSignerCertificateDiagnostics(capture, toolVersion) {
   const output = `${capture.stdout}\n${capture.stderr}`;
   const records = apkSignerDigestRecords(output);
+  const publicCertificateLines = ["stdout", "stderr"].flatMap(stream => capture[stream].split(/\r?\n/u)
+    .flatMap(line => {
+      const match = /^((?:Signer\b|V[0-9]+(?:\.[0-9]+)?\b)[A-Za-z0-9#:.(),= -]{0,150}) certificate SHA-256 digest:[ \t]*([0-9A-Fa-f]{64})[ \t]*$/u.exec(line);
+      return match === null || match[1].length > 160 ? [] : [{ stream, label: match[1], sha256: match[2].toLowerCase() }];
+    })).slice(0, 16);
   return {
     phase: "apk-signer-certificate-read",
     tool: "apksigner",
     toolVersion: /^[0-9]+(?:\.[0-9]+){0,5}$/u.test(String(toolVersion).trim()) ? String(toolVersion).trim() : "unavailable",
     exitCode: 0,
     hasOutput: String(output ?? "").trim().length > 0,
+    publicCertificateLines,
     streams: {
       stdout: apkSignerStreamMetadata(capture.stdout, capture.stdoutBytes),
       stderr: apkSignerStreamMetadata(capture.stderr, capture.stderrBytes)

@@ -55,8 +55,15 @@ try {
 
   phase = "sign-no-code-diagnostic-apk";
   const apksigner = locateAndroidTool("apksigner");
+  // The generated release uses the locked AGP defaults: minSdk 24 enables v2,
+  // disables v1, and leaves the opt-in v3/v4 schemes disabled. The standalone
+  // apksigner CLI otherwise enables v3 and exercises a different output branch.
+  const signing = { minSdk: 24, targetSdk: 36, v1: false, v2: true, v3: false, v4: false };
   capture(apksigner, ["sign", "--ks", keystore, "--ks-key-alias", "joko-ci-diagnostic",
     "--ks-pass", "env:JOKO_SIGNER_DIAGNOSTIC_PASSWORD", "--key-pass", "env:JOKO_SIGNER_DIAGNOSTIC_PASSWORD",
+    "--min-sdk-version", String(signing.minSdk), "--v1-signing-enabled", String(signing.v1),
+    "--v2-signing-enabled", String(signing.v2), "--v3-signing-enabled", String(signing.v3),
+    "--v4-signing-enabled", String(signing.v4),
     "--out", signed, unsigned], environment);
 
   phase = "verify-no-code-diagnostic-apk";
@@ -66,13 +73,6 @@ try {
   try { version = text(capture(apksigner, ["version"])).trim(); }
   catch { /* Verification success and tool-version availability are separate. */ }
   const buildTools = basename(dirname(apksigner));
-  // This APK and its certificate subject were created above without user data.
-  // Observe only public digest labels, never full tool streams or subject DNs.
-  const publicCertificateLines = ["stdout", "stderr"].flatMap(stream => verified[stream].split(/\r?\n/u)
-    .flatMap(line => {
-      const match = /^([A-Za-z0-9#:.(),= -]{1,160}) certificate SHA-256 digest:[ \t]*([0-9A-Fa-f]{64})[ \t]*$/u.exec(line);
-      return match === null ? [] : [{ stream, label: match[1], sha256: match[2].toLowerCase() }];
-    })).slice(0, 16);
   const metadata = {
     purpose: "minimal-no-code-sdk-signer-diagnostic",
     buildToolsVersion: /^[0-9]+(?:\.[0-9]+){2}(?:-[a-z0-9]+)?$/iu.test(buildTools) ? buildTools : "unavailable",
@@ -82,8 +82,9 @@ try {
       printCertificates: verificationArguments.includes("--print-certs"),
       apkArguments: 1
     },
+    signing,
     apkBytes: statSync(signed).size,
-    publicCertificateLines,
+    // Share the formal builder's bounded public labels; never full streams/DNs.
     ...apkSignerCertificateDiagnostics(verified, version)
   };
   phase = "pin-no-code-diagnostic-apk";
