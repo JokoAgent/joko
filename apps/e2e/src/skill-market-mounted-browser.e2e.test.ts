@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 
-import { chromium, type Browser, type Page } from "playwright-core";
+import { chromium, type Browser, type Page, type Request } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { waitFor } from "./fixture.js";
@@ -43,6 +43,23 @@ describe("mounted Skill market surface", () => {
     browser = await chromium.launch({ executablePath, headless: true });
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     const browserErrors = observeBrowserErrors(page);
+    const previewRequests = new Set<Request>();
+    const previewMethods = new Set(["GetSkillMarketEntry", "OpenSkillMarketPreview",
+      "ListSkillMarketPreviewFiles", "ReadSkillMarketPreviewFile", "CloseSkillMarketPreview"]);
+    page.on("request", request => {
+      const path = new URL(request.url()).pathname;
+      if (path.startsWith("/joko.v1.SkillService/") && previewMethods.has(path.split("/").at(-1)!)) previewRequests.add(request);
+    });
+    page.on("requestfinished", request => { previewRequests.delete(request); });
+    page.on("requestfailed", request => { previewRequests.delete(request); });
+    const settlePreview = async (): Promise<void> => {
+      let quietFrames = 0;
+      await waitFor(async () => {
+        await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
+        quietFrames = previewRequests.size === 0 ? quietFrames + 1 : 0;
+        return quietFrames;
+      }, value => value >= 2, "the current Skill preview requests to settle");
+    };
     await page.goto(`${fixture.baseUrl}/#/tools`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -102,8 +119,11 @@ describe("mounted Skill market surface", () => {
       "initial mounted usage Resource"
     );
 
-    await writeSkillMarketSource(fixture, "1.1.0", "# Version two");
+    await settlePreview();
     await skillTabs.getByRole("tab", { name: "Sources", exact: true }).click();
+    await sourceCard.waitFor({ state: "visible" });
+    await settlePreview();
+    await writeSkillMarketSource(fixture, "1.1.0", "# Version two");
     await sourceCard.getByRole("button", { name: "Refresh", exact: true }).click();
     await waitFor(
       () => sourceCard.textContent(),
@@ -117,7 +137,10 @@ describe("mounted Skill market surface", () => {
     await page.getByText("# Version two", { exact: false }).waitFor({ state: "visible", timeout: 20_000 });
     dialog = await openGlobalPlan(page);
     await dialog.getByRole("button", { name: "Check now", exact: true }).click();
-    await page.waitForTimeout(1_000);
+    await waitFor(async () => fixture!.application.piResources?.list({ kind: "skill" }).some(resource =>
+      resource.id === initialUsageResource.id && resource.version === "1.1.0") === true,
+    value => value, "the automatic Skill update to publish its actual Resource revision");
+    await settlePreview();
     await closeDialog(dialog);
     await page.locator(".skill-market-controls").getByRole("button", { name: "Refresh", exact: true }).click();
     await expectText(card, "Installed", "synchronized market install state");
@@ -135,6 +158,7 @@ describe("mounted Skill market surface", () => {
       current: currentUsageResource
     });
 
+    await settlePreview();
     await skillTabs.getByRole("tab", { name: "Installed", exact: true }).click();
     const globalGroup = page.locator(".skill-catalog__groups > section").filter({ hasText: "Global" });
     const installedSkill = globalGroup.locator("button.skill-card", { hasText: MARKET_SLUG });
