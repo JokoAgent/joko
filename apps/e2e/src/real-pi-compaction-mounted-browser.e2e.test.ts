@@ -1,9 +1,10 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   CompactionState,
   RunState,
+  SessionAttentionAcknowledgementIntent,
   SessionSnapshotScopeSchema,
   SnapshotScopeSchema,
   SubmitOperationRequestSchema
@@ -109,6 +110,7 @@ describe("mounted Pi compaction product chain", () => {
       const runId = queueRunIdFrom(queued);
       await waitFor(() => manager.clients.run.getRun({ runId }),
         (response) => response.run?.state === RunState.SUCCEEDED, `Pi turn: ${text}`, 30_000);
+      return runId;
     };
     const timelineStates = async (sessionId: string) => {
       const response = await manager.clients.event.getSnapshot({ scope: create(SnapshotScopeSchema, {
@@ -125,7 +127,16 @@ describe("mounted Pi compaction product chain", () => {
     const taskUrl = (sessionId: string) => `${fixture!.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`;
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
     const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
-    const errors = observeBrowserErrors(page);
+    let attentionBeforeResume: bigint | undefined;
+    const permittedAttentionErrors: string[] = [];
+    const errors = observeBrowserErrors(page, conflict => {
+      if (attentionBeforeResume === undefined || conflict.sessionId !== compactSessionId
+        || conflict.intent !== SessionAttentionAcknowledgementIntent.VIEWED) return;
+      const current = fixture!.application.store.getSessionAttention(compactSessionId);
+      if (conflict.generation !== BigInt(current.attentionGeneration) || conflict.sequence <= 0n
+        || conflict.sequence > attentionBeforeResume || conflict.sequence >= current.attentionCursor) return;
+      permittedAttentionErrors.push(conflict.responseError, conflict.consoleError);
+    });
     await page.goto(taskUrl(compactSessionId), { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -235,8 +246,35 @@ describe("mounted Pi compaction product chain", () => {
     expect(await page.locator(".compact-action-feedback").count()).toBe(0);
     // Background Connect polls may fail while the service is deliberately stopped.
     errors.splice(0);
-    await send(compactSessionId, "The same native Pi context continues after service restart.");
-    expect(errors).toEqual([]);
+    attentionBeforeResume = fixture.application.store.getSessionAttention(compactSessionId).attentionCursor;
+    const continuationRunId = await send(compactSessionId, "The same native Pi context continues after service restart.");
+    const completion = await waitFor(async () => fixture!.application.store.listEvents({ sessionId: compactSessionId })
+      .findLast(event => event.runId === continuationRunId && event.payload.type === "done" && event.payload.outcome === "completed"),
+    event => event !== undefined, "the resumed native completion", 30_000);
+    if (completion === undefined) throw new Error("The resumed Pi Run has no durable completion.");
+    const acknowledged = await waitFor(() => reconnected.session.getSession({ sessionId: compactSessionId }), response => {
+      const attention = response.session?.attention;
+      return attention?.unread === false && (attention.readThroughCursor?.sequence ?? 0n) >= completion.globalCursor
+        && attention.readThroughCursor?.sequence === attention.attentionCursor?.sequence
+        && attention.readThroughCursor?.generation === attention.attentionCursor?.generation;
+    }, "the mounted page to acknowledge the latest resumed projection", 30_000);
+    expect(permittedAttentionErrors.length).toBeLessThanOrEqual(2);
+    expect(errors.toSorted()).toEqual(permittedAttentionErrors.toSorted());
+    if (process.env.RUNNER_TEMP !== undefined) {
+      const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "compaction");
+      const attention = acknowledged.session!.attention!;
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, "manual-attention-recovery.json"), JSON.stringify({
+        sourceCommit: process.env.GITHUB_SHA ?? "working-tree",
+        staleViewedAcknowledgements: permittedAttentionErrors.length / 2,
+        nativeCompletionCursor: completion.globalCursor.toString(),
+        readThroughCursor: attention.readThroughCursor?.sequence.toString(),
+        readThroughGeneration: attention.readThroughCursor?.generation.toString(),
+        attentionCursor: attention.attentionCursor?.sequence.toString(),
+        attentionGeneration: attention.attentionCursor?.generation.toString(),
+        unread: attention.unread
+      }, null, 2));
+    }
   });
 
   mountedIt.each([
@@ -329,13 +367,23 @@ describe("mounted Pi compaction product chain", () => {
   }, 120_000);
 });
 
-function observeBrowserErrors(page: Page): string[] {
+interface StaleViewedAcknowledgement {
+  readonly sessionId: string;
+  readonly sequence: bigint;
+  readonly generation: bigint;
+  readonly intent: SessionAttentionAcknowledgementIntent;
+  readonly responseError: string;
+  readonly consoleError: string;
+}
+
+function observeBrowserErrors(page: Page, onAttentionConflict?: (conflict: StaleViewedAcknowledgement) => void): string[] {
   const errors: string[] = [];
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
   page.on("response", (response) => {
     if (response.status() < 400) return;
     const url = new URL(response.url());
     let operation = "";
+    let acknowledgement: Omit<StaleViewedAcknowledgement, "responseError" | "consoleError"> | undefined;
     if (url.pathname === "/joko.v1.OperationService/SubmitOperation") {
       operation = ":operation=unavailable";
       const request = response.request();
@@ -346,11 +394,20 @@ function observeBrowserErrors(page: Page): string[] {
           operation = `:operation=${mutation?.case ?? "unavailable"}`;
           if (mutation?.case === "acknowledgeSessionAttention") {
             operation += `:cursorGeneration=${mutation.value.throughCursor?.generation.toString() ?? "unavailable"}:intent=${mutation.value.intent}`;
+            if (mutation.value.throughCursor !== undefined) acknowledgement = {
+              sessionId: mutation.value.sessionId, sequence: mutation.value.throughCursor.sequence,
+              generation: mutation.value.throughCursor.generation, intent: mutation.value.intent
+            };
           }
         } catch { /* Never include request bytes or free-form decode failures. */ }
       }
     }
-    errors.push(`response:${response.status()}:${response.request().method()}:${url.origin}${url.pathname}${operation}`);
+    const responseError = `response:${response.status()}:${response.request().method()}:${url.origin}${url.pathname}${operation}`;
+    errors.push(responseError);
+    if (response.status() === 409 && acknowledgement !== undefined) onAttentionConflict?.({
+      ...acknowledgement, responseError,
+      consoleError: `console:Failed to load resource: the server responded with a status of 409 (Conflict):${url.origin}${url.pathname}`
+    });
   });
   page.on("console", (message) => {
     if (message.type() !== "error") return;
