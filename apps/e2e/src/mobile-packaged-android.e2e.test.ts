@@ -37,7 +37,8 @@ type EvidenceStepName = keyof typeof evidenceSteps;
 type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" | "force-stop" | "install";
 type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "gallery-zoomed" | "gallery-drag-reset"
   | "gallery-dismissed" | "resource-links" | "file-opened" | "file" | "restored"
-  | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error";
+  | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error"
+  | "connection-add" | "connection-error";
 type EvidenceResult = "running" | "passed" | "failed";
 type EvidenceStep = {
   name: EvidenceStepName;
@@ -224,7 +225,14 @@ async function runNativeScenario(): Promise<void> {
   const removeListener = current.application.connections.onPairingIssued((challenge) => { mobileChallengeId = challenge.id; });
   try {
     await launch();
-    await tap("Add");
+    try {
+      await tap("Add Joko node");
+    } catch (error) {
+      // This first surface has no entered node address or pairing credential.
+      await screenshot("connection-error").catch(() => undefined);
+      throw error;
+    }
+    await screenshot("connection-add");
     await fill("Joko node address", current.baseUrl);
     await tap("Check node identity");
     await tap("Request pairing", true);
@@ -362,7 +370,7 @@ async function runNativeScenario(): Promise<void> {
   await interaction("force-stop", () => adb("shell", "am", "force-stop", packageName));
   expect((await adb("shell", "pidof", packageName)).trim()).toBe("");
   await launch();
-  await tap("Saved (1)");
+  await tap("Saved nodes");
   await tap("Connect", true);
   await tap("Open task " + taskName);
   await waitNode((node) => node.text === taskName, "restored native task title");
