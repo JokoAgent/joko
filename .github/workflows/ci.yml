@@ -236,6 +236,12 @@ jobs:
         shell: bash
         run: pnpm --filter @joko/tool-document exec node --import ../../scripts/ci/observe-document-workers.mjs ../../node_modules/vitest/vitest.mjs run 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/document-regressions.log"
 
+      - name: Run the affected Windows service product chains
+        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 7
+        shell: bash
+        run: pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/device-peer-product.e2e.test.ts src/ssh-keys.e2e.test.ts src/controlled-pi-process.e2e.test.ts src/paired-backends.e2e.test.ts -t "runs a durable two-Device project|uses authenticated single-use passphrase uploads|forwards the native input write failure|fences consumed native inputs with lost receipts" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/e2e-native-regressions.log"
+
       - name: Amplify the short queue soak and fault matrix
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
