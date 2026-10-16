@@ -2286,6 +2286,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onNewTaskInTarget={(target) => controller.navigate({ kind: "newSession", targetId: target.id })}
         onNewDialogue={(backendId) => controller.navigate({ kind: "newSession", dialogueBackendId: backendId })}
         onRename={(session, name) => runAction(`rename:${session.id}`, () => controller.renameSession(session.id, name))}
+        onSuggestTitle={(session, signal) => controller.suggestSessionTitle(session.id, signal)}
+        titleSuggestionOwnerKey={JSON.stringify([
+          state.activeProfile.id, state.activeProfile.serverId, state.activeProfile.deviceId, state.activeProfile.origin,
+          state.connectionGeneration, state.snapshot.generation.toString()
+        ])}
         onToggleTaskTag={(session, tagId, attached) => runAction(
           `task-tag:${session.id}:${tagId}:${attached ? "attach" : "detach"}`,
           () => controller.setSessionTaskTags(session.id, [session.id], [tagId], attached)
