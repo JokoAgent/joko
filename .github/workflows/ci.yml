@@ -187,7 +187,7 @@ jobs:
           else
             pnpm --filter @joko/e2e exec playwright-core install chromium 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/chromium.log"
           fi
-          pnpm --filter @joko/e2e exec node -e "const fs=require('node:fs'); const path=require('node:path'); const {createRequire}=require('node:module'); const browser=fs.realpathSync(require('playwright-core').chromium.executablePath()); const web=fs.realpathSync(path.join(process.env.GITHUB_WORKSPACE,'apps','web','dist')); fs.accessSync(browser,fs.constants.X_OK); fs.accessSync(path.join(web,'index.html')); fs.appendFileSync(process.env.GITHUB_OUTPUT,'executable='+browser+'\n'); if(process.platform==='linux'){const desktop=path.join(process.env.GITHUB_WORKSPACE,'apps','desktop'); const electron=createRequire(path.join(desktop,'package.json'))('electron'); fs.accessSync(electron,fs.constants.X_OK); fs.appendFileSync(process.env.GITHUB_ENV,['JOKO_BROWSER_EXECUTABLE='+browser,'JOKO_MOUNTED_WEB_DIR='+web,'JOKO_PDF_ELECTRON_TEST_EXECUTABLE='+electron,'JOKO_PDF_ELECTRON_TEST_APP='+desktop,'JOKO_GROUP_EVIDENCE_DIR='+path.join(process.env.RUNNER_TEMP,'joko-web-evidence','groups'),'JOKO_DOCUMENT_MOUNTED_CAPTURE_DIR='+path.join(process.env.RUNNER_TEMP,'joko-web-evidence','documents'),''].join('\n'));}"
+          node scripts/ci/prepare-browser.mjs
 
       - name: Configure the installed Chromium sandbox profile on Linux
         id: chromium_sandbox
@@ -255,6 +255,7 @@ jobs:
 
       - name: Run Connect end-to-end tests and Browser chains (Linux)
         id: workspace_e2e_linux
+        timeout-minutes: 35
         if: ${{ matrix.workload != 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/4' || matrix.workload == 'e2e-2' && '2/4' || matrix.workload == 'e2e-3' && '3/4' || '4/4' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
@@ -264,6 +265,7 @@ jobs:
 
       - name: Run Connect end-to-end tests (Windows/macOS)
         id: workspace_e2e_desktop
+        timeout-minutes: 35
         if: ${{ matrix.workload != 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/4' || matrix.workload == 'e2e-2' && '2/4' || matrix.workload == 'e2e-3' && '3/4' || '4/4' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"

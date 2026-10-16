@@ -31,14 +31,30 @@ async function main() {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   phase = "browser-identity";
   const { chromium } = createRequire(resolve(root, "apps/e2e/package.json"))("playwright-core");
-  const executable = await realpath(chromium.executablePath());
-  if (await realpath(process.env.JOKO_BROWSER_EXECUTABLE ?? "") !== executable) {
+  const installed = await realpath(chromium.executablePath());
+  const chrome = await realpath("/opt/google/chrome/chrome").catch(error => {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  });
+  const executable = await realpath(process.env.JOKO_BROWSER_EXECUTABLE ?? "");
+  if (executable !== installed && executable !== chrome) {
     throw new Error("Prepared browser identity does not match the installed browser.");
   }
   const binary = await lstat(executable);
   if (!binary.isFile() || binary.isSymbolicLink()) throw new Error("Installed browser is not regular.");
   await access(executable, constants.X_OK);
   const restriction = await restrictionValue();
+  if (executable === chrome && executable !== installed) {
+    // Chrome can already own an OS-provided AppArmor attachment. Verify its
+    // real sandbox instead of installing a second profile for the same binary.
+    const browser = await chromium.launch({ executablePath: executable, headless: true, chromiumSandbox: true, timeout: 15_000 });
+    await browser.close();
+    if (await restrictionValue() !== restriction) throw new Error("Browser sandbox restriction state changed.");
+    console.log(JSON.stringify({ phase: "browser-sandbox-available", exactInstalledExecutable: true,
+      existingSystemPolicy: true, sandboxedBrowserLaunched: true,
+      apparmorRestrictUnprivilegedUserns: restriction, globalRestrictionUnchanged: true }));
+    return;
+  }
   const content = browserSandboxProfile(executable);
   const existing = await lstat(destination).catch((error) => {
     if (error.code === "ENOENT") return undefined;
