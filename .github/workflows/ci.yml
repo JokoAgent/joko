@@ -65,6 +65,22 @@ jobs:
         shell: bash
         run: pnpm install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/install.log"
 
+      - name: Diagnose the reproducible macOS LAN discovery failure
+        id: lan_discovery
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'macOS' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/node-sync exec vitest run src/node-sync.test.ts -t "delivers on its granted purpose" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/lan-discovery.log"
+
+      - name: Upload the immediate LAN failure diagnosis
+        if: ${{ !cancelled() && steps.lan_discovery.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-lan-discovery-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/lan-discovery.log
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Check build, boundaries, generated contracts, and types
         id: source_check
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
