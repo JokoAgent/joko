@@ -20,6 +20,7 @@ import {
   type SubagentVirtualAnchor
 } from "./subagent-virtual-state.js";
 import { StreamingMarkdown } from "./Timeline.js";
+import { observeActiveElementOffset } from "./subagent-virtual-scroll.js";
 import type { Translator } from "./types.js";
 import { Button, Pill, Spinner, cx, formatDateTime } from "./ui.js";
 
@@ -85,6 +86,7 @@ export function VirtualSubagentRunGroups({
     getItemKey: (index) => items[index]?.id ?? index,
     initialRect: DEFAULT_VIEWPORT_RECT,
     observeElementRect: observeDefaultViewportRect,
+    observeElementOffset: observeActiveElementOffset,
     scrollToFn: scrollSubagentElement,
     measureElement: (element) => element.getBoundingClientRect().height || (items[Number(element.getAttribute("data-index"))]?.kind === "heading" ? 30 : RUN_ROW_ESTIMATE_PX)
   });
@@ -171,6 +173,7 @@ export function VirtualSubagentChildTabs({
     getItemKey: (index) => items[index]?.id || "overview",
     initialRect: DEFAULT_HORIZONTAL_RECT,
     observeElementRect: observeHorizontalRect,
+    observeElementOffset: observeActiveElementOffset,
     scrollToFn: scrollSubagentElement,
     measureElement: (element) => element.getBoundingClientRect().width || (items[Number(element.getAttribute("data-index"))]?.child === undefined ? 96 : 164)
   });
@@ -254,6 +257,7 @@ export function VirtualSubagentChildList({
     getItemKey: (index) => children[index]?.id ?? index,
     initialRect: { width: DEFAULT_VIEWPORT_RECT.width, height: 320 },
     observeElementRect: observeCompactViewportRect,
+    observeElementOffset: observeActiveElementOffset,
     scrollToFn: scrollSubagentElement,
     measureElement: (element) => element.getBoundingClientRect().height || CHILD_ROW_ESTIMATE_PX
   });
@@ -313,6 +317,7 @@ export function VirtualSubagentConversation({
     getItemKey: (index) => items[index]?.id ?? index,
     initialRect: DEFAULT_VIEWPORT_RECT,
     observeElementRect: observeDefaultViewportRect,
+    observeElementOffset: observeActiveElementOffset,
     scrollToFn: scrollSubagentElement,
     measureElement: (element) => element.getBoundingClientRect().height || estimateConversationItemHeight(items[Number(element.getAttribute("data-index"))])
   });
@@ -592,6 +597,7 @@ function VirtualTechnicalList({ items, locale, t }: {
     getItemKey: (index) => items[index]?.id ?? index,
     initialRect: { width: DEFAULT_VIEWPORT_RECT.width, height: 320 },
     observeElementRect: observeCompactViewportRect,
+    observeElementOffset: observeActiveElementOffset,
     scrollToFn: scrollSubagentElement,
     measureElement: (element) => element.getBoundingClientRect().height || TECHNICAL_ROW_ESTIMATE_PX
   });

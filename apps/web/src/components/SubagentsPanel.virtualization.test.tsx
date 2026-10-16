@@ -16,10 +16,10 @@ beforeAll(() => {
 });
 
 afterEach(async () => {
-  vi.useRealTimers();
-  vi.unstubAllGlobals();
   for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
   document.body.replaceChildren();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 describe("SubagentsPanel virtual interaction", () => {
