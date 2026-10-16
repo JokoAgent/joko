@@ -163,44 +163,82 @@ describe("PartnerService", () => {
   });
 
   it("serves an accepted sealed Task output over generated authenticated HTTP and preserves it across SQLite reopen", async () => {
-    const f = await createFixture(0, false, [], true);
-    const partner = await f.manager.createPartner(partnerInput(f.partnerStore, "Output requester"));
-    const tasks = new PartnerSessionTaskManager(f.operationalStore, f.manager, f.sessionHost,
-      { register: async input => input }, f.directory); await tasks.initialize(); cleanups.push(() => tasks.close());
-    const outputs = new PartnerTaskOutputProjection(f.operationalStore, tasks, f.partnerStore, f.workspaceCapture!);
-    const task = await tasks.start(partner.canonicalSessionId!, "output-http-task", { instruction: "Produce the report", title: "Report" }, () => undefined);
-    await vi.waitFor(async () => { await tasks.check(partner.canonicalSessionId!, task.id);
-      expect((await outputs.list(partner.id)).find(row => row.id === task.id)).toMatchObject({ readiness: "ready", files: [{ path: "task-report.txt", status: "added" }] }); });
-    const connections = new ConnectionManager(f.operationalStore), challenge = connections.issuePairing("Output reader");
-    const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Output reader" });
-    const server = await createPublicServer({ config: { publicOrigin: "http://127.0.0.1", allowInsecureLoopback: true, allowInsecureLan: false, corsOrigins: [],
-      webDirectory: join(f.directory, "no-web"), dataDirectory: f.directory }, store: f.operationalStore, connections, artifacts: {}, blobTransfers: {},
-      artifactRepository: {}, workspaces: {}, workspaceChanges: {}, scheduler: {}, adapters: [], browserActivity: [], sessionHost: f.sessionHost,
-      partners: f.manager, partnerSessionTasks: tasks, partnerTaskOutputs: outputs } as unknown as OrchestratorApplication); server.log.level = "silent";
+    const boundary = { phase: "create-fixture", observations: 0, taskState: "not-created", taskRunCount: 0,
+      outputCount: 0, outputReadiness: "unobserved", hasExpectedFile: false };
     try {
-      const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
-      const client = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1", interceptors: [next => request => {
-        request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request);
-      }] }));
-      const response = await client.listPartnerTaskOutputs({ partnerId: partner.id });
-      expect(response.partnerId).toBe(partner.id);
-      expect(response.outputs).toMatchObject([{ sourceId: task.id, sessionId: task.sessionId, execution: 1n,
-        readiness: contract.PartnerTaskOutputReadiness.READY, files: [{ path: "task-report.txt", status: contract.PartnerTaskOutputFileStatus.ADDED }] }]);
-      expect(JSON.stringify(response, (_, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Private report contents");
-      const unauthenticated = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1" }));
-      await expect(unauthenticated.listPartnerTaskOutputs({ partnerId: partner.id })).rejects.toMatchObject({ code: Code.Unauthenticated });
-    } finally { await server.close(); }
-    await tasks.close(); await f.close();
-    const reopened = new OperationalStore(join(f.directory, "operational.db")), reopenedPartners = new PartnerStore(join(f.directory, "partners.db"));
-    try {
-      const changes = new WorkspaceChangeSetService({ snapshotDirectory: join(f.directory, "snapshots"), repository: new OperationalWorkspaceSnapshotRepository(reopened) });
-      await changes.initialize();
-      const capture = new DurableWorkspaceRunCapture(reopened, changes);
-      const stored = reopened.findSetting("service", "partner.session-tasks", task.id)!.value as typeof task;
-      const restored = new PartnerTaskOutputProjection(reopened, { list: () => [stored] }, reopenedPartners, capture);
-      expect((await restored.list(partner.id))[0]).toMatchObject({ id: task.id, readiness: "ready", runIds: stored.executionRunIds,
-        files: [{ path: "task-report.txt", status: "added" }] });
-    } finally { reopenedPartners.close(); reopened.close(); }
+      const f = await createFixture(0, false, [], true);
+      boundary.phase = "create-partner";
+      const partner = await f.manager.createPartner(partnerInput(f.partnerStore, "Output requester"));
+      boundary.phase = "initialize-tasks";
+      const tasks = new PartnerSessionTaskManager(f.operationalStore, f.manager, f.sessionHost,
+        { register: async input => input }, f.directory); await tasks.initialize(); cleanups.push(() => tasks.close());
+      const outputs = new PartnerTaskOutputProjection(f.operationalStore, tasks, f.partnerStore, f.workspaceCapture!);
+      boundary.phase = "start-task";
+      const task = await tasks.start(partner.canonicalSessionId!, "output-http-task", { instruction: "Produce the report", title: "Report" }, () => undefined);
+      boundary.phase = "await-sealed-output";
+      await vi.waitFor(async () => { await tasks.check(partner.canonicalSessionId!, task.id);
+        const current = tasks.list(partner.id).find(row => row.id === task.id);
+        const rows = await outputs.list(partner.id), output = rows.find(row => row.id === task.id);
+        boundary.observations += 1;
+        boundary.taskState = current?.status ?? "missing";
+        boundary.taskRunCount = current?.executionRunIds.length ?? 0;
+        boundary.outputCount = rows.length;
+        boundary.outputReadiness = output?.readiness ?? "missing";
+        boundary.hasExpectedFile = output?.files.some(file => file.path === "task-report.txt" && file.status === "added") ?? false;
+        expect(output).toMatchObject({ readiness: "ready", files: [{ path: "task-report.txt", status: "added" }] }); });
+      boundary.phase = "pair-reader";
+      const connections = new ConnectionManager(f.operationalStore), challenge = connections.issuePairing("Output reader");
+      const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Output reader" });
+      boundary.phase = "create-http-server";
+      const server = await createPublicServer({ config: { publicOrigin: "http://127.0.0.1", allowInsecureLoopback: true, allowInsecureLan: false, corsOrigins: [],
+        webDirectory: join(f.directory, "no-web"), dataDirectory: f.directory }, store: f.operationalStore, connections, artifacts: {}, blobTransfers: {},
+        artifactRepository: {}, workspaces: {}, workspaceChanges: {}, scheduler: {}, adapters: [], browserActivity: [], sessionHost: f.sessionHost,
+        partners: f.manager, partnerSessionTasks: tasks, partnerTaskOutputs: outputs } as unknown as OrchestratorApplication); server.log.level = "silent";
+      try {
+        boundary.phase = "listen-http";
+        const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
+        const client = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1", interceptors: [next => request => {
+          request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request);
+        }] }));
+        boundary.phase = "authenticated-http";
+        const response = await client.listPartnerTaskOutputs({ partnerId: partner.id });
+        boundary.phase = "assert-http-output";
+        expect(response.partnerId).toBe(partner.id);
+        expect(response.outputs).toMatchObject([{ sourceId: task.id, sessionId: task.sessionId, execution: 1n,
+          readiness: contract.PartnerTaskOutputReadiness.READY, files: [{ path: "task-report.txt", status: contract.PartnerTaskOutputFileStatus.ADDED }] }]);
+        expect(JSON.stringify(response, (_, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Private report contents");
+        const unauthenticated = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1" }));
+        boundary.phase = "assert-unauthenticated-rejection";
+        await expect(unauthenticated.listPartnerTaskOutputs({ partnerId: partner.id })).rejects.toMatchObject({ code: Code.Unauthenticated });
+      } finally {
+        const precedingPhase = boundary.phase;
+        boundary.phase = "close-http";
+        await server.close();
+        boundary.phase = precedingPhase;
+      }
+      boundary.phase = "close-stores";
+      await tasks.close(); await f.close();
+      boundary.phase = "reopen-stores";
+      const reopened = new OperationalStore(join(f.directory, "operational.db")), reopenedPartners = new PartnerStore(join(f.directory, "partners.db"));
+      try {
+        const changes = new WorkspaceChangeSetService({ snapshotDirectory: join(f.directory, "snapshots"), repository: new OperationalWorkspaceSnapshotRepository(reopened) });
+        await changes.initialize();
+        const capture = new DurableWorkspaceRunCapture(reopened, changes);
+        const stored = reopened.findSetting("service", "partner.session-tasks", task.id)!.value as typeof task;
+        const restored = new PartnerTaskOutputProjection(reopened, { list: () => [stored] }, reopenedPartners, capture);
+        boundary.phase = "assert-reopened-output";
+        expect((await restored.list(partner.id))[0]).toMatchObject({ id: task.id, readiness: "ready", runIds: stored.executionRunIds,
+          files: [{ path: "task-report.txt", status: "added" }] });
+      } finally {
+        const precedingPhase = boundary.phase;
+        boundary.phase = "close-reopened-stores";
+        reopenedPartners.close(); reopened.close();
+        boundary.phase = precedingPhase;
+      }
+    } catch (error) {
+      console.error("[sealed-output-boundary]", JSON.stringify(boundary));
+      throw error;
+    }
   });
 
   it("reads and patches the caller's own profile and full mixed model chain with private authority", async () => {

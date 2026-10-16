@@ -4673,44 +4673,79 @@ describe("SessionHost", () => {
   });
 
   it("accounts cumulative delegated-run usage independently without inflating parent context", async () => {
-    const fixture = await createFixture(new DelegatedUsageFakeAdapter());
-    const sessionId = (await fixture.host.createSession({
-      operationId: "create-delegated-usage",
-      connection: fixture.connection,
-      targetId: "target-one",
-      title: "Delegated usage",
-      providerId: "test",
-      modelId: "text",
-      fastMode: false,
-      permissionMode: "ask",
-      planMode: false
-    })).value.sessionId;
-    const queued = fixture.host.enqueueInput({
-      operationId: "send-delegated-usage",
-      connection: fixture.connection,
-      sessionId,
-      prompt: { text: "delegate", images: [], files: [], mentions: [], disposition: "prompt" }
-    });
-    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    let phase = "create-fixture";
+    let inspectBoundary: () => Record<string, unknown> = () => ({});
+    try {
+      const fixture = await createFixture(new DelegatedUsageFakeAdapter());
+      let sessionId: string | undefined;
+      let runId: string | undefined;
+      inspectBoundary = () => {
+        const run = runId === undefined ? undefined : fixture.store.getRun(runId).descriptor;
+        const usage = sessionId === undefined ? undefined : materializedSessionRuntimeState(
+          fixture.store.findSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY)?.value
+        )?.usage;
+        const ledger = fixture.store.summarizeUsageLedger({ ownerId: "orchestrator" });
+        return {
+          runState: run?.state ?? "not-created",
+          parentTotalTokens: usage?.totalTokens ?? null,
+          parentContextTokens: usage?.contextTokens ?? null,
+          runTotalTokens: run?.usage?.totalTokens ?? null,
+          ledgerTotalTokens: ledger.totalTokens,
+          ledgerCostMicros: ledger.costMicros,
+          ledgerRows: fixture.store.listUsageLedger({ ownerId: "orchestrator" }).length
+        };
+      };
+      phase = "create-session";
+      sessionId = (await fixture.host.createSession({
+        operationId: "create-delegated-usage",
+        connection: fixture.connection,
+        targetId: "target-one",
+        title: "Delegated usage",
+        providerId: "test",
+        modelId: "text",
+        fastMode: false,
+        permissionMode: "ask",
+        planMode: false
+      })).value.sessionId;
+      phase = "enqueue-input";
+      const queued = fixture.host.enqueueInput({
+        operationId: "send-delegated-usage",
+        connection: fixture.connection,
+        sessionId,
+        prompt: { text: "delegate", images: [], files: [], mentions: [], disposition: "prompt" }
+      });
+      runId = queued.value.runId;
+      phase = "await-completed-run";
+      await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
 
-    const runtimeUsage = materializedSessionRuntimeState(
-      fixture.store.getSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY).value
-    )?.usage;
-    expect(runtimeUsage).toMatchObject({ totalTokens: 20, contextTokens: 20, contextWindow: 32_000 });
-    const ledger = fixture.store.listUsageLedger({ ownerId: "orchestrator" });
-    expect(ledger.find((row) => row.providerId === "test" && row.modelId === "text"))
-      .toMatchObject({ totalTokens: 20, costMicros: 1_000 });
-    expect(ledger.find((row) => row.providerId === "vision" && row.modelId === "multimodal"))
-      .toMatchObject({ inputTokens: 20, outputTokens: 10, totalTokens: 30, costMicros: 5_000 });
-    expect(fixture.store.summarizeUsageLedger({ ownerId: "orchestrator" }))
-      .toMatchObject({ inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000 });
-    const completion = fixture.store.listEvents({ sessionId }).find(event => event.runId === queued.value.runId
-      && event.payload.type === "message_complete" && event.payload.role === "assistant");
-    expect(completion).toBeDefined();
-    expect(fixture.store.getRun(queued.value.runId).descriptor.usage).toMatchObject({
-      inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000, currencyCode: "USD",
-      completionEventId: completion!.id, messageId: completion!.id
-    });
+      phase = "assert-runtime-and-ledger";
+      const runtimeUsage = materializedSessionRuntimeState(
+        fixture.store.getSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY).value
+      )?.usage;
+      expect(runtimeUsage).toMatchObject({ totalTokens: 20, contextTokens: 20, contextWindow: 32_000 });
+      const ledger = fixture.store.listUsageLedger({ ownerId: "orchestrator" });
+      expect(ledger.find((row) => row.providerId === "test" && row.modelId === "text"))
+        .toMatchObject({ totalTokens: 20, costMicros: 1_000 });
+      expect(ledger.find((row) => row.providerId === "vision" && row.modelId === "multimodal"))
+        .toMatchObject({ inputTokens: 20, outputTokens: 10, totalTokens: 30, costMicros: 5_000 });
+      expect(fixture.store.summarizeUsageLedger({ ownerId: "orchestrator" }))
+        .toMatchObject({ inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000 });
+      const completion = fixture.store.listEvents({ sessionId }).find(event => event.runId === queued.value.runId
+        && event.payload.type === "message_complete" && event.payload.role === "assistant");
+      expect(completion).toBeDefined();
+      phase = "assert-run-completion-usage";
+      expect(fixture.store.getRun(queued.value.runId).descriptor.usage).toMatchObject({
+        inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000, currencyCode: "USD",
+        completionEventId: completion!.id, messageId: completion!.id
+      });
+    } catch (error) {
+      try {
+        console.error("[delegated-usage-boundary]", JSON.stringify({ phase, ...inspectBoundary() }));
+      } catch {
+        console.error("[delegated-usage-boundary]", JSON.stringify({ phase, diagnosticsUnavailable: true }));
+      }
+      throw error;
+    }
   });
 
   it("records a terminal Provider limit for the effective turn model and clears it after live usage succeeds", async () => {
