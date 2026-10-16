@@ -6,6 +6,7 @@ import { createWriteStream } from "node:fs";
 import { createHash } from "node:crypto";
 import { readJson, writeJson } from "./storage.js";
 import type { CommandJournal } from "./command-journal.js";
+import { waitForDevelopmentProcessGroupExit } from "./process.js";
 
 // The monitor is outside the command's reserved group and survives its caller's EOF.
 const control = createWriteStream("", { fd: 3 });
@@ -13,7 +14,6 @@ let input = "", received = false, nonce = "", stopping = false, broken = false, 
 let sentinel: ChildProcessWithoutNullStreams | undefined, groupPid: number | undefined, groupBirth: string | undefined;
 let journal: CommandJournal | undefined, started: Record<string, unknown> | undefined;
 let rootExit: number | undefined, timeout: ReturnType<typeof setTimeout> | undefined;
-const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const emit = (value: object) => { if (!broken) control.write(`${JSON.stringify({ protocol: 1, nonce, ...value })}\n`); };
 const fail = () => {
   broken = true;
@@ -98,13 +98,7 @@ async function retire(cancel: boolean) {
     stage = "terminate";
     process.kill(-groupPid, "SIGKILL");
     stage = "quiescence";
-    const deadline = Date.now() + 5000; let absent = false;
-    while (Date.now() < deadline) {
-      try { process.kill(-groupPid, 0); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; absent = true; break; }
-      await pause(20);
-    }
-    if (!absent) throw new Error();
+    await waitForDevelopmentProcessGroupExit(groupPid);
     stage = "drain";
     await new Promise<void>(resolve => { if (sentinel!.exitCode !== null || sentinel!.signalCode !== null) resolve(); else sentinel!.once("close", () => resolve()); });
     stage = "receipt";
