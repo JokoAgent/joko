@@ -15,13 +15,24 @@ final class JokoConnectionUITests: XCTestCase {
         }
         app = XCUIApplication(bundleIdentifier: "app.joko.mobile")
         let launchArguments = ["-RCT_jsLocation", "127.0.0.1:\(metro)", "-RCT_packager_scheme", "http", "-AppleLanguages", "(en)", "-AppleLocale", "en_US"]
+        // The native owner has already launched, terminated, reopened and
+        // observed this exact application. Do not create a third occurrence.
         app.launchArguments = launchArguments
-        app.launch()
+        let priorState = app.state
+        let running = priorState == .runningForeground || priorState == .runningBackground || priorState == .runningBackgroundSuspended
+        if !running { try? recordPreInputSetupFailure(launchArguments: launchArguments) }
+        XCTAssertTrue(running, "The already verified reopened application must still be running before activation.")
+        guard running else { return }
+        app.activate()
         XCTAssertTrue(app.wait(for: .runningForeground, timeout: 30))
-        let nearbyExists = app.buttons["Nearby"].firstMatch.waitForExistence(timeout: 45)
+        let nearbyExists = button("Nearby").waitForExistence(timeout: 45)
         if !nearbyExists { try? recordPreInputSetupFailure(launchArguments: launchArguments) }
         XCTAssertTrue(nearbyExists)
-        XCTAssertEqual(app.webViews.count, 1, "The real connection page must be present.")
+        XCTAssertTrue(connectionPage.exists, "The real connection page must be present.")
+        for label in ["Nearby", "Saved nodes", "Add Joko node"] {
+            XCTAssertEqual(connectionPage.buttons.matching(identifier: label).count, 1,
+                           "The real connection page must own one exact \(label) control.")
+        }
     }
 
     private func recordPreInputSetupFailure(launchArguments: [String]) throws {
@@ -67,7 +78,8 @@ final class JokoConnectionUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed)
     }
 
-    private func button(_ label: String) -> XCUIElement { app.buttons[label].firstMatch }
+    private var connectionPage: XCUIElement { app.webViews.firstMatch }
+    private func button(_ label: String) -> XCUIElement { connectionPage.buttons[label].firstMatch }
 
     private func tap(_ element: XCUIElement) {
         XCTAssertTrue(element.waitForExistence(timeout: 10))
@@ -75,11 +87,11 @@ final class JokoConnectionUITests: XCTestCase {
         // the actual page to expose the control rather than tapping coordinates.
         for _ in 0..<4 {
             if element.isHittable { break }
-            app.webViews.firstMatch.swipeUp()
+            connectionPage.swipeUp()
         }
         for _ in 0..<5 {
             if element.isHittable { break }
-            app.webViews.firstMatch.swipeDown()
+            connectionPage.swipeDown()
         }
         XCTAssertTrue(element.isHittable)
         element.tap()
@@ -97,7 +109,7 @@ final class JokoConnectionUITests: XCTestCase {
         let done = app.buttons["Done"].firstMatch
         if done.exists && done.isHittable { done.tap() }
         else {
-            let heading = app.staticTexts["Pair this device"].firstMatch
+            let heading = connectionPage.staticTexts["Pair this device"].firstMatch
             tap(heading)
         }
     }
@@ -127,13 +139,13 @@ final class JokoConnectionUITests: XCTestCase {
     func testConnectionPageInteractions() throws {
         screenshot("01-connection-page")
         tap(button("Saved nodes"))
-        XCTAssertTrue(app.staticTexts["Connect a Joko node to begin."].firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(connectionPage.staticTexts["Connect a Joko node to begin."].firstMatch.waitForExistence(timeout: 10))
         screenshot("02-saved-nodes")
         tap(button("Nearby"))
-        XCTAssertTrue(app.staticTexts["Nearby Joko nodes"].firstMatch.waitForExistence(timeout: 10))
+        XCTAssertTrue(connectionPage.staticTexts["Nearby Joko nodes"].firstMatch.waitForExistence(timeout: 10))
         screenshot("03-nearby")
         tap(button("Add Joko node"))
-        let address = app.textFields["Joko node address"].firstMatch
+        let address = connectionPage.textFields["Joko node address"].firstMatch
         XCTAssertTrue(address.waitForExistence(timeout: 10))
         let inspect = button("Check node identity")
         replace(address, with: "not-an-address")
@@ -149,7 +161,7 @@ final class JokoConnectionUITests: XCTestCase {
         replace(address, with: origin)
         wait(inspect, "enabled == true")
         tap(inspect)
-        let error = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "CI local identity probe unavailable")).firstMatch
+        let error = connectionPage.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "CI local identity probe unavailable")).firstMatch
         XCTAssertTrue(error.waitForExistence(timeout: 15), "The real transport error must be visible.")
         wait(inspect, "enabled == true")
         screenshot("05-local-identity-error")

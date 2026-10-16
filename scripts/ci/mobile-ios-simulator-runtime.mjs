@@ -23,7 +23,8 @@ const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", 
   "create-owned-simulator", "boot-owned-simulator", "wait-owned-boot", "set-light-appearance",
   "install-owned-application", "locate-installed-application", "retry-locate-installed-application", "launch-owned-application", "capture-simulator-springboard",
   "capture-pre-appearance-framebuffer", "retry-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance", "compile-screen-observer",
-  "locate-launched-application-process", "locate-ui-tested-application-process"]);
+  "locate-launched-application-process", "locate-ui-tested-application-process",
+  "locate-pre-ui-build-application-process", "locate-post-ui-build-application-process"]);
 
 function save(name, value) { writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + "\n"); }
 async function command(binary, args, { timeout = 30_000, cleanup = false, startupLabel } = {}) {
@@ -216,7 +217,9 @@ async function launch(port) {
 
 async function findOwnedApplicationProcess(phase) {
   const label = phase === "launch-timeout-recovery" ? "locate-launched-application-process"
-    : phase === "post-ui-test" ? "locate-ui-tested-application-process" : undefined;
+    : phase === "post-ui-test" ? "locate-ui-tested-application-process"
+    : phase === "pre-ui-build" ? "locate-pre-ui-build-application-process"
+    : phase === "post-ui-build" ? "locate-post-ui-build-application-process" : undefined;
   const owner = { udid, bundleId, deviceName, installedExecutable };
   const assertOwner = () => {
     abort.signal.throwIfAborted();
@@ -250,6 +253,16 @@ async function findOwnedApplicationProcess(phase) {
     lookup.category = phase === "launch-timeout-recovery" ? "recovered-existing-process" : "matched-ui-test-process";
     return pid;
   } finally { save("startup-command-receipts.json", { commands: startupCommandReceipts }); }
+}
+
+async function assertReopenedApplicationProcess(expectedPid, phase) {
+  if (!Number.isSafeInteger(expectedPid) || expectedPid <= 1) throw new Error("The UI test has no verified reopened native process.");
+  const pid = await findOwnedApplicationProcess(phase);
+  const receipt = startupCommandReceipts.at(-1);
+  receipt.processLookup.sameReopenedPid = pid === expectedPid;
+  save("startup-command-receipts.json", { commands: startupCommandReceipts });
+  if (pid !== expectedPid) throw new Error("The verified reopened application occurrence changed during UI testing.");
+  return pid;
 }
 
 async function guiCommand(args, logName, timeout) {
@@ -346,18 +359,25 @@ async function exportPreInputSetupFailure(screenshots, files, { expectedSha, exp
     screenshotExported: screen !== undefined, hierarchyExported: tree !== undefined });
 }
 
-async function runConnectionUiTests(app, port, expectedSha, expectedHash) {
-  const assertIdentity = async () => {
+async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopenedPid) {
+  const owner = { udid, bundleId, installedExecutable };
+  const assertIdentity = async (phase) => {
+    abort.signal.throwIfAborted();
+    if (udid !== owner.udid || bundleId !== owner.bundleId || installedExecutable !== owner.installedExecutable) {
+      throw new Error("The owned Simulator application identity changed during UI testing.");
+    }
     if (await command("git", ["rev-parse", "HEAD"]) !== expectedSha || await hashFile(join(app, executable)) !== expectedHash) {
       throw new Error("The source or compiled application changed during UI testing; refusing a different artifact identity.");
     }
-    const container = await sim("get_app_container", udid, bundleId, "app");
+    const container = await sim("get_app_container", owner.udid, owner.bundleId, "app");
     const installed = realpathSync(join(container, executable));
-    if (await hashFile(installed) !== expectedHash) throw new Error("The installed application changed during UI testing.");
+    if (installed !== owner.installedExecutable || await hashFile(installed) !== expectedHash) throw new Error("The installed application changed during UI testing.");
     installedExecutable = installed;
     if (metroClosed) throw new Error("The owned same-checkout Metro exited during UI testing.");
+    return assertReopenedApplicationProcess(reopenedPid, phase);
   };
-  await assertIdentity();
+  stage = "UI-test reopened application identity verification";
+  await assertIdentity("pre-ui-build");
   // A loopback-only Connect error endpoint exercises the real native transport.
   // It never supplies a node identity, challenge, credential or successful pair.
   let requests = 0, unexpectedRequests = 0;
@@ -390,7 +410,8 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash) {
       join(root, "scripts/ci/ios-connection-ui-tests.swift"), String(port), String(probePort)]);
     stage = "Apple UI-test runner build";
     await guiCommand([...common, "build-for-testing"], "gui-build.log", 5 * 60_000);
-    await assertIdentity();
+    stage = "UI-test runner prepared application identity verification";
+    await assertIdentity("post-ui-build");
     stage = "actual connection page UI operations";
     try {
       await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
@@ -420,11 +441,10 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash) {
         throw new Error("The actual UI test or its complete screenshot/transport receipts did not pass; see gui-summary.json and gui-steps.json.");
       }
     } else throw executionError ?? new Error("Apple UI testing produced no xcresult receipt.");
-    await assertIdentity();
-    // XCTest owns its launch occurrence; re-obtain the exact process identity
-    // instead of reusing the earlier simctl launch PID after app.launch().
+    // XCTest activates the already observed reopened occurrence. A replacement
+    // with the same executable bytes still fails this exact process fence.
     stage = "UI-tested application process identity lookup";
-    const pid = await findOwnedApplicationProcess("post-ui-test");
+    const pid = await assertIdentity("post-ui-test");
     return { passed: true, test: "JokoConnectionUITests/testConnectionPageInteractions", sourceCommit: expectedSha,
       executableSha256: expectedHash, simulatorUdid: udid, bundleId, pid, screenshotCount: 10,
       scope: "Real connection-page mode changes, address typing/validation, local transport error, explicit cancellation, retained draft and theme changes." };
@@ -595,7 +615,7 @@ async function main() {
     stage = "native reopen";
     const reopenedPid = await launch(port), reopened = await observe("reopened", reopenedPid, ocr);
     const identity = JSON.parse(readFileSync(join(evidence, "identity.json"), "utf8"));
-    const gui = await runConnectionUiTests(app, port, identity.sourceCommit, identity.executableSha256);
+    const gui = await runConnectionUiTests(app, port, identity.sourceCommit, identity.executableSha256, reopenedPid);
     result = { passed: true, sourceCommit: await command("git", ["rev-parse", "HEAD"]), bundleId, simulatorUdid: udid,
       observations: [first, reopened], firstProcessTerminated: true, gui,
       scope: "Actual iOS Simulator startup/reopen plus Apple XCTest connection-page taps, typing, local error/cancel, draft retention and theme changes on the same application bytes.",
