@@ -180,6 +180,8 @@ describe("Timeline viewport journeys", () => {
     const viewport = timeline();
     const startingTop = viewport.scrollTop;
     await scrollbarPress(viewport);
+    const content = host.querySelector<HTMLElement>(".timeline__virtual")!;
+    expect(content.style.minHeight).toBe(`${extent}px`);
     const writesAfterPress = scrollWrites.length;
     extent += 400;
     await append([{ ...item("streamed-answer", 9, "assistant"), streaming: true }]);
@@ -192,6 +194,7 @@ describe("Timeline viewport journeys", () => {
     await act(async () => window.dispatchEvent(new MouseEvent("mousemove", { buttons: 1 })));
     expectUnread(0);
     await act(async () => window.dispatchEvent(new MouseEvent("mouseup", { button: 0 })));
+    expect(content.style.minHeight).toBe("");
     const detachedTop = viewport.scrollTop;
     extent += 200;
     await append([item("detached-answer", 10, "assistant")]);
@@ -207,7 +210,6 @@ describe("Timeline viewport journeys", () => {
     await act(async () => window.dispatchEvent(new MouseEvent("mouseup", { button: 0 })));
     expectUnread(0);
     await act(async () => jumpLatest()?.click());
-    const content = host.querySelector<HTMLElement>(".timeline__virtual")!;
     await act(async () => content.dispatchEvent(new MouseEvent("mousedown", { button: 0, clientX: 640, bubbles: true })));
     extent += 100;
     await append([item("content-click-answer", 11, "assistant")]);
@@ -233,6 +235,7 @@ describe("Timeline viewport journeys", () => {
     const oldOwnerFrames = [...frames.values()];
     await scrollbarPress(viewport);
     await render({ ownerKey: `${props.ownerKey}:next`, viewportOwnerKey: `${props.viewportOwnerKey}:2` });
+    expect(host.querySelector<HTMLElement>(".timeline__virtual")!.style.minHeight).toBe("");
     expect(jumpLatest()).toBeNull();
     const writesAfterOwnerChange = scrollWrites.length;
     await replayFrames(oldOwnerFrames);
@@ -246,6 +249,7 @@ describe("Timeline viewport journeys", () => {
     const hiddenFrames = [...frames.values()];
     await scrollbarPress(viewport);
     await act(async () => window.dispatchEvent(new Event("pagehide")));
+    expect(host.querySelector<HTMLElement>(".timeline__virtual")!.style.minHeight).toBe("");
     scrollWrites.length = 0;
     await replayFrames(hiddenFrames);
     await contentResize();

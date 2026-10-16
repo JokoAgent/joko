@@ -752,11 +752,18 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     if (node === null || view === null || view === undefined) return;
     const document = node.ownerDocument;
     const owner = navigationOwnerRef.current;
+    const content = contentRef.current;
+    const originalMinHeight = content?.style.minHeight ?? "";
+    let contentFloor: string | undefined;
     let active = true;
     const suppressScrollbarAdjustment = (): boolean => false;
     const releaseScrollbarAdjustment = (): void => {
       if (virtualizer.shouldAdjustScrollPositionOnItemSizeChange === suppressScrollbarAdjustment) {
         virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+      }
+      if (content !== null && contentFloor !== undefined && content.style.minHeight === contentFloor) {
+        content.style.minHeight = originalMinHeight;
+        contentFloor = undefined;
       }
     };
     const isCurrent = (): boolean => active && navigationOwnerRef.current === owner && scrollRef.current === node;
@@ -781,6 +788,13 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       setFocusedItemId(undefined);
       previousScrollTopRef.current = node.scrollTop;
       scrollbarDragRef.current = { owner, node, startScrollTop: node.scrollTop, previousScrollTop: node.scrollTop };
+      // A transiently smaller virtual extent would let the browser clamp its
+      // native scroll position before the incoming tail grows. Keep that floor
+      // while the user owns the thumb, without writing a scroll offset.
+      if (content !== null) {
+        contentFloor = `${node.scrollHeight}px`;
+        content.style.minHeight = contentFloor;
+      }
       virtualizer.shouldAdjustScrollPositionOnItemSizeChange = suppressScrollbarAdjustment;
     };
     const onMouseMove = (event: MouseEvent): void => {

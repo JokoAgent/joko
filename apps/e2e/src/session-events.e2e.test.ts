@@ -60,10 +60,13 @@ describe("session host, durable events, and reconnect semantics", () => {
   let fixture: OrchestratorE2eFixture | undefined;
   let browser: Browser | undefined;
   let releaseBrowserRequest: (() => void) | undefined;
+  let releaseEventStreams: (() => void) | undefined;
 
   afterEach(async () => {
     releaseBrowserRequest?.();
     releaseBrowserRequest = undefined;
+    releaseEventStreams?.();
+    releaseEventStreams = undefined;
     try {
       await Promise.all(browser?.contexts().map((context) => context.setOffline(false)) ?? []);
     } finally {
@@ -661,10 +664,6 @@ describe("session host, durable events, and reconnect semantics", () => {
     const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
     const pageErrors: string[] = [];
     page.on("pageerror", (error) => pageErrors.push(error.name));
-    let failedEventStreams = 0;
-    page.on("requestfailed", (request) => {
-      if (new URL(request.url()).pathname === "/joko.v1.EventService/StreamEvents") failedEventStreams += 1;
-    });
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -804,10 +803,10 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(await unreadCount(page)).toBe(1);
 
     const anchor = await visibleTimelineAnchor(page);
-    const failuresBeforeFault = failedEventStreams;
     await page.context().setOffline(true);
-    fixture.dropPublicConnections();
-    await waitFor(async () => failedEventStreams, (value) => value > failuresBeforeFault, "the actual Connect stream network failure");
+    // The event stream may belong to the SharedWorker rather than this Page.
+    // Interrupt its real server socket and reject retries until recovery.
+    releaseEventStreams = fixture.suspendPublicEventStreams();
     await page.locator(".offline-banner:visible,.error-banner:visible").first().waitFor({ state: "visible", timeout: 20_000 });
     const remoteOperation = await send(MOUNTED_TIMELINE_REMOTE);
     const remoteContext = await waitFor(async () => adapter.contexts.get(MOUNTED_TIMELINE_REMOTE),
@@ -818,6 +817,8 @@ describe("session host, durable events, and reconnect semantics", () => {
     await waitFor(() => manager.clients.run.getRun({ runId: queueRunIdFrom(remoteOperation) }),
       (value) => value.run?.state === RunState.SUCCEEDED, "the offline remote Run to settle");
     expect(fixture.application.store.getSession(sessionId).descriptor.binding.generation).toBe(generation);
+    releaseEventStreams();
+    releaseEventStreams = undefined;
     await page.context().setOffline(false);
     await waitFor(() => page.locator(".offline-banner,.error-banner").count(), (value) => value === 0,
       "the automatic connection recovery to clear its public error state", 20_000);
