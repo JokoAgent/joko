@@ -84,6 +84,7 @@ async function fixture() {
 }
 
 test("projects a complete large personal catalog while preserving originals outside native plugin discovery", async () => {
+  // Copy and revalidate every asset in the 120-entry catalog on real disk.
   const { seed, body, asset } = await fixture();
   const seeds = Array.from({ length: 120 }, (_, index): ApprovedSkillSeed => ({ ...seed,
     resource: { ...seed.resource, id: `personal-${index}` }, personal: { slug: `skill-${index}`, name: `Skill ${index}`,
@@ -104,4 +105,4 @@ test("projects a complete large personal catalog while preserving originals outs
   try { expect(small.skills[0]!.discovery).toBeUndefined(); expect(small.indexedResourceIds).toEqual([]);
     expect(await readFile(small.skills[0]!.filePath, "utf8")).toBe(body); }
   finally { await small.dispose(); }
-});
+}, 30_000);

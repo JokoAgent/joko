@@ -99,8 +99,10 @@ describe("SkillTools", () => {
 
   it("shows loading, catalog failure, empty, and independently retryable recovery states", async () => {
     let rejectCatalog!: (error: Error) => void;
+    let resolveCatalogStarted!: () => void;
+    const catalogStarted = new Promise<void>((resolve) => { resolveCatalogStarted = resolve; });
     const listSkills = vi.fn()
-      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectCatalog = reject; }))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectCatalog = reject; resolveCatalogStarted(); }))
       .mockResolvedValue({ revision: 2n, skills: [] });
     const listSkillRecoveries = vi.fn()
       .mockResolvedValueOnce([])
@@ -110,6 +112,7 @@ describe("SkillTools", () => {
     const container = await renderSkills(controller);
 
     expect(container.textContent).toContain("Loading Skills");
+    await act(async () => { await catalogStarted; });
     await act(async () => rejectCatalog(new Error("Catalog unavailable.")));
     await settle();
     expect(container.textContent).toContain("Catalog unavailable.");

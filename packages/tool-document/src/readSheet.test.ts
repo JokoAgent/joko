@@ -6,6 +6,7 @@ import { expect, it } from "vitest";
 import { createXlsxBuffer, readSheet } from "./index.js";
 
 it("reads bounded workbook and delimited windows with explicit row and column continuation", async () => {
+  // This chain starts several real parser Workers; allow cold Windows startup.
   const root = await mkdtemp(join(tmpdir(), "joko-read-sheet-"));
   const outside = await mkdtemp(join(tmpdir(), "joko-read-sheet-outside-"));
   try {
@@ -58,4 +59,4 @@ it("reads bounded workbook and delimited windows with explicit row and column co
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
   }
-});
+}, 30_000);
