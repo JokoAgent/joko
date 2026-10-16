@@ -5475,7 +5475,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     doctor: () => application.personalDevelopmentDoctor,
     owner: () => application.personalDevelopment,
     authenticateLocal: (context) => {
-      const connection = dependencies.connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
+      const connection = authenticate(context);
       if (application.personalDevelopmentNativeBroker === undefined) throw new ConnectError("Personal development is unavailable.", Code.Unavailable);
       application.personalDevelopmentNativeBroker.assertLocalDesktopConnection(connection);
       return connection;

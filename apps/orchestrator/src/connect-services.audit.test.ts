@@ -895,12 +895,15 @@ describe("Connect security and protocol audit", () => {
   });
 
   it("maps live Backend commands through SessionService without resource inference", async () => {
+    const connection = { id: "connection-runtime-commands", authKeyDigest: "digest", state: "active" };
+    const authenticate = vi.fn(() => connection);
+    const fence = vi.fn();
     const getCommands = vi.fn(async () => [
-      { name: "review", description: "Review this change", source: "extension" as const, path: "extensions/review.ts", loaded: true },
-      { name: "plan", description: "Open a plan", source: "prompt" as const, loaded: false }
+      { name: "review", description: "Review this change", source: "extension" as const, path: "extensions/review.ts", loaded: true, inputMode: "text" as const },
+      { name: "plan", description: "Open a plan", source: "prompt" as const, loaded: false, inputMode: "text" as const }
     ]);
     const services = createConnectServices(stubApplication({
-      connections: { authenticate: () => ({ id: "connection-runtime-commands", authKeyDigest: "digest", state: "active" }) },
+      connections: { authenticate, fence },
       sessionHost: { getCommands }
     }));
 
@@ -909,6 +912,8 @@ describe("Connect security and protocol audit", () => {
     }, context()) as { commands: readonly contract.RuntimeCommand[] };
 
     expect(getCommands).toHaveBeenCalledExactlyOnceWith("session-runtime-commands");
+    expect(authenticate).toHaveBeenCalledTimes(2);
+    expect(fence).toHaveBeenCalledExactlyOnceWith(connection);
     expect(response.commands).toHaveLength(2);
     expect(response.commands[0]).toMatchObject({
       sessionId: "session-runtime-commands",
@@ -916,6 +921,7 @@ describe("Connect security and protocol audit", () => {
       description: "Review this change",
       source: contract.RuntimeCommandSource.EXTENSION,
       resourceId: "",
+      inputMode: contract.RuntimeCommandInputMode.TEXT,
       loaded: true
     });
     expect(response.commands[0]?.commandId).toMatch(/^[a-f0-9]{64}$/u);
@@ -923,6 +929,7 @@ describe("Connect security and protocol audit", () => {
       sessionId: "session-runtime-commands",
       name: "plan",
       source: contract.RuntimeCommandSource.PROMPT,
+      inputMode: contract.RuntimeCommandInputMode.TEXT,
       loaded: false
     });
   });
