@@ -1,7 +1,8 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
-import { createServer } from "node:net";
+import { request as createHttpRequest, type IncomingMessage } from "node:http";
+import { createServer, isIP } from "node:net";
 import { isAbsolute, resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
@@ -306,7 +307,7 @@ export async function probeManagedOrchestratorConnection(options: {
   readonly readAuthKey: (profileId: string) => Promise<string | undefined>;
   readonly fetch?: typeof fetch;
 }): Promise<ManagedOrchestratorProbeResult> {
-  const fetchImpl = options.fetch ?? fetch;
+  const fetchImpl = options.fetch;
   const identity = await connectJson(fetchImpl, options.connection.origin, "joko.v1.ConnectionService/GetServerInfo");
   if (identity.kind === "absent") return "absent";
   if (identity.kind === "indeterminate") return "serviceUnavailable";
@@ -343,7 +344,7 @@ export async function verifyManagedOrchestratorAdoption(options: {
   readonly fetch?: typeof fetch;
 }): Promise<ManagedOrchestratorAdoptionResult> {
   if (options.connection.serverId !== options.expectedServerId) return "identityConflict";
-  const fetchImpl = options.fetch ?? fetch;
+  const fetchImpl = options.fetch;
   const identity = await connectJson(fetchImpl, options.connection.origin, "joko.v1.ConnectionService/GetServerInfo");
   if (identity.kind !== "response") return "serviceUnavailable";
   if (identity.status !== 200 || !isRecord(identity.body) || !isRecord(identity.body["server"]) ||
@@ -732,7 +733,7 @@ function spawnManagedOrchestratorChild(
 }
 
 async function connectJson(
-  fetchImpl: typeof fetch,
+  fetchImpl: typeof fetch | undefined,
   origin: string,
   method: string,
   authKey?: string
@@ -742,6 +743,7 @@ async function connectJson(
   | { readonly kind: "indeterminate" }
 > {
   try {
+    if (fetchImpl === undefined) return await requestManagedOrchestratorJson(origin, method, authKey);
     const response = await fetchImpl(`${origin}/${method}`, {
       method: "POST",
       headers: {
@@ -758,6 +760,62 @@ async function connectJson(
   } catch (error) {
     return connectionRefused(error) ? { kind: "absent" } : { kind: "indeterminate" };
   }
+}
+
+/** These two bootstrap probes are local RPCs, independent of the runtime's
+ * bundled fetch dispatcher and its process-wide connection pool. */
+async function requestManagedOrchestratorJson(
+  origin: string,
+  method: string,
+  authKey?: string
+): Promise<{ readonly kind: "response"; readonly status: number; readonly body?: unknown }> {
+  const target = new URL(origin);
+  const hostname = target.hostname.replace(/^\[|\]$/gu, "");
+  if (target.protocol !== "http:" || target.origin !== origin ||
+    !(hostname === "localhost" || hostname === "::1" || (isIP(hostname) === 4 && hostname.startsWith("127.")))) {
+    throw new Error("The managed local RPC origin is invalid.");
+  }
+  target.pathname = `/${method}`;
+  return new Promise((resolvePromise, reject) => {
+    let response: IncomingMessage | undefined;
+    let finished = false;
+    const finish = (body?: unknown, error?: unknown): void => {
+      if (finished) return;
+      finished = true;
+      const status = response?.statusCode ?? 0;
+      response?.destroy();
+      outgoing.destroy();
+      if (error !== undefined && response === undefined) {
+        reject(error);
+      } else {
+        resolvePromise({ kind: "response", status, ...(body === undefined ? {} : { body }) });
+      }
+    };
+    const outgoing = createHttpRequest(target, {
+      method: "POST",
+      agent: false,
+      headers: {
+        "content-type": "application/json",
+        "connect-protocol-version": "1",
+        ...(authKey === undefined ? {} : { authorization: `Bearer ${authKey}` })
+      },
+      signal: AbortSignal.timeout(2_000)
+    }, (incoming) => {
+      response = incoming;
+      let text = "";
+      incoming.setEncoding("utf8");
+      incoming.on("data", (chunk: string) => { text += chunk; });
+      incoming.once("error", (error) => finish(undefined, error));
+      incoming.once("close", () => finish());
+      incoming.once("end", () => {
+        let body: unknown;
+        try { body = JSON.parse(text); } catch { body = undefined; }
+        finish(body);
+      });
+    });
+    outgoing.once("error", (error) => finish(undefined, error));
+    outgoing.end("{}");
+  });
 }
 
 function connectionRefused(value: unknown): boolean {

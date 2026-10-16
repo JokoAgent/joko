@@ -1,4 +1,5 @@
-import { ChildProcess, type SpawnOptions } from "node:child_process";
+import { ChildProcess, spawnSync, type SpawnOptions } from "node:child_process";
+import { createServer as createHttpServer, type RequestListener, type Server } from "node:http";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -282,6 +283,121 @@ describe("managed local Orchestrator", () => {
       connection,
       readAuthKey: async () => "opaque-key",
       fetch: vi.fn(async () => { throw Object.assign(new Error("refused"), { code: "ECONNREFUSED" }); }) as typeof fetch
+    })).resolves.toBe("absent");
+  });
+
+  it("probes and adopts over local HTTP when socket priority marking throws outside fetch", () => {
+    const script = [
+      "import { createServer } from 'node:http';",
+      "import { Socket } from 'node:net';",
+      "const { probeManagedOrchestratorConnection, verifyManagedOrchestratorAdoption } = await import("
+        + JSON.stringify(new URL("../src/managed-orchestrator.ts", import.meta.url).href) + ");",
+      "const prior = Socket.prototype.setTypeOfService;",
+      "let priorityCalls = 0, keyReads = 0, publicHadAuth = false, authenticatedRequests = 0;",
+      "const order = [];",
+      "Socket.prototype.setTypeOfService = function () {",
+      "  priorityCalls += 1;",
+      "  throw Object.assign(new Error('setTypeOfService EINVAL'), { code: 'EINVAL', syscall: 'setTypeOfService' });",
+      "};",
+      "const server = createServer((request, response) => {",
+      "  response.setHeader('content-type', 'application/json');",
+      "  if (request.url.endsWith('/GetServerInfo')) {",
+      "    order.push('identity');",
+      "    publicHadAuth ||= request.headers.authorization !== undefined;",
+      "    response.end(JSON.stringify({ server: { serverId: 'orchestrator-managed' } }));",
+      "  } else {",
+      "    order.push('authenticated');",
+      "    if (request.headers.authorization === 'Bearer controlled-local-key') authenticatedRequests += 1;",
+      "    response.end(JSON.stringify({ connections: [{ connectionId: 'desktop-connection_probe',",
+      "      deviceId: 'd6a365ef-ef33-4fb7-a0f1-a02eb57fef75', state: 'CONNECTION_STATE_CONNECTED' }] }));",
+      "  }",
+      "});",
+      "await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));",
+      "const connection = { profileId: 'desktop-connection_probe', deviceId: 'd6a365ef-ef33-4fb7-a0f1-a02eb57fef75',",
+      "  serverId: 'orchestrator-managed', name: 'Local Joko', origin: 'http://127.0.0.1:' + server.address().port };",
+      "const readAuthKey = async () => { order.push('read-key'); keyReads += 1; return 'controlled-local-key'; };",
+      "try {",
+      "  const probe = await probeManagedOrchestratorConnection({ connection, readAuthKey });",
+      "  const adoption = await verifyManagedOrchestratorAdoption({ expectedServerId: connection.serverId, connection, readAuthKey });",
+      "  console.log(JSON.stringify({ probe, adoption, priorityCalls, keyReads, publicHadAuth, authenticatedRequests,",
+      "    orderCorrect: order.join(',') === 'identity,read-key,authenticated,identity,read-key,authenticated' }));",
+      "} finally {",
+      "  Socket.prototype.setTypeOfService = prior;",
+      "  server.closeAllConnections();",
+      "  await new Promise(resolve => server.close(resolve));",
+      "}"
+    ].join("\n");
+    const result = spawnSync(process.execPath, ["--import", import.meta.resolve("tsx"), "--input-type=module", "--eval", script], {
+      encoding: "utf8", timeout: 8_000, windowsHide: true
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.signal).toBeNull();
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout.trim())).toEqual({
+      probe: "authenticated", adoption: "verified", priorityCalls: 0, keyReads: 2,
+      publicHadAuth: false, authenticatedRequests: 2, orderCorrect: true
+    });
+  }, 10_000);
+
+  it("does not follow local RPC redirects before identity or with the saved credential", async () => {
+    let publicRedirect = true;
+    let redirectRequests = 0;
+    let redirectedCredential = false;
+    const readAuthKey = vi.fn(async () => "controlled-local-key");
+    await withManagedProbeServer((request, response) => {
+      if (request.url === "/redirected") {
+        redirectRequests += 1;
+        redirectedCredential ||= request.headers.authorization !== undefined;
+        response.end("{}");
+      } else if (publicRedirect || request.url?.endsWith("/ListConnections")) {
+        response.writeHead(302, { location: "/redirected" });
+        response.end("{}");
+      } else {
+        response.end(JSON.stringify({ server: { serverId: "orchestrator-managed" } }));
+      }
+    }, async (origin) => {
+      const connection = managedProbeConnection(origin);
+      await expect(probeManagedOrchestratorConnection({ connection, readAuthKey })).resolves.toBe("identityConflict");
+      expect(readAuthKey).not.toHaveBeenCalled();
+      publicRedirect = false;
+      await expect(probeManagedOrchestratorConnection({ connection, readAuthKey })).resolves.toBe("serviceUnavailable");
+      expect(readAuthKey).toHaveBeenCalledOnce();
+    });
+    expect(redirectRequests).toBe(0);
+    expect(redirectedCredential).toBe(false);
+  });
+
+  it.each(["headers", "body"] as const)("retires an owned local RPC stalled at %s within the original deadline", async (phase) => {
+    let requestClosed = false;
+    await withManagedProbeServer((request, response) => {
+      request.socket.once("close", () => { requestClosed = true; });
+      if (phase === "body") {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.write('{"server":');
+      }
+    }, async (origin) => {
+      const started = performance.now();
+      await expect(probeManagedOrchestratorConnection({
+        connection: managedProbeConnection(origin), readAuthKey: async () => undefined
+      })).resolves.toBe(phase === "headers" ? "serviceUnavailable" : "identityConflict");
+      expect(performance.now() - started).toBeLessThan(3_000);
+      await vi.waitFor(() => expect(requestClosed).toBe(true));
+    });
+  }, 5_000);
+
+  it("preserves malformed JSON and refused-port probe results on the default transport", async () => {
+    let closedOrigin = "";
+    const readAuthKey = vi.fn(async () => "controlled-local-key");
+    await withManagedProbeServer((_request, response) => { response.end("{"); }, async (origin) => {
+      closedOrigin = origin;
+      await expect(probeManagedOrchestratorConnection({
+        connection: managedProbeConnection(origin), readAuthKey
+      })).resolves.toBe("identityConflict");
+      expect(readAuthKey).not.toHaveBeenCalled();
+    });
+    await expect(probeManagedOrchestratorConnection({
+      connection: managedProbeConnection(closedOrigin), readAuthKey
     })).resolves.toBe("absent");
   });
 
@@ -831,6 +947,34 @@ describe("managed local Orchestrator", () => {
       .toThrow(/could not start securely/u);
   });
 });
+
+function managedProbeConnection(origin: string) {
+  return {
+    profileId: "desktop-connection_probe", deviceId: DEVICE_ID, serverId: "orchestrator-managed",
+    name: "Local Joko", origin
+  };
+}
+
+async function withManagedProbeServer(
+  listener: RequestListener,
+  run: (origin: string, server: Server) => Promise<void>
+): Promise<void> {
+  const server = createHttpServer(listener);
+  await new Promise<void>((resolvePromise, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolvePromise);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") throw new Error("The local RPC fixture did not bind TCP.");
+  try {
+    await run("http://127.0.0.1:" + address.port, server);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolvePromise, reject) => {
+      server.close((error) => error === undefined ? resolvePromise() : reject(error));
+    });
+  }
+}
 
 function fakeOrchestratorChild(options: {
   readonly expectedParentPid: number;
