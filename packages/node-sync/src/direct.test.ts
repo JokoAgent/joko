@@ -1,11 +1,11 @@
 import net, { type Socket } from "node:net";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { decryptNodeSyncBytes, encryptNodeSyncBytes, generateNodeSyncIdentity, type NodeSyncPurpose } from "./crypto.js";
 import { NodeSyncDirectTransport, type NodeSyncDirectEndpoint, type NodeSyncDirectTransportOptions } from "./direct.js";
 import type { NodeSyncCipherChunkFrame } from "./frames.js";
-import type { NodeSyncDeliveryContext, NodeSyncTcpIdentity } from "./tcp.js";
+import { NodeSyncTcpTransport, type NodeSyncDeliveryContext, type NodeSyncTcpIdentity } from "./tcp.js";
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -205,6 +205,27 @@ describe("authenticated explicit node routes", () => {
     const first = identity("first");
     const pendingServer = await blackhole();
     const endpoints = Array.from({ length: 12 }, (_, index) => endpoint(identity(`peer-${index}`), pendingServer.port));
+    const startedPeers: string[] = [];
+    const activePeers = new Map<string, number>();
+    const maximumPerPeer = new Map<string, number>();
+    let activeProbes = 0;
+    let maximumProbes = 0;
+    const nativeProbe = NodeSyncTcpTransport.prototype.probe;
+    // Probe settlement includes its local socket close. The remote socket's
+    // close callback can lag the next connection and is not a probe-slot count.
+    const observedProbe = vi.spyOn(NodeSyncTcpTransport.prototype, "probe").mockImplementation(function (this: NodeSyncTcpTransport, endpoint, peerId, delivery) {
+      startedPeers.push(peerId);
+      activeProbes += 1;
+      maximumProbes = Math.max(maximumProbes, activeProbes);
+      const active = (activePeers.get(peerId) ?? 0) + 1;
+      activePeers.set(peerId, active);
+      maximumPerPeer.set(peerId, Math.max(maximumPerPeer.get(peerId) ?? 0, active));
+      return nativeProbe.call(this, endpoint, peerId, delivery).finally(() => {
+        activeProbes -= 1;
+        activePeers.set(peerId, activePeers.get(peerId)! - 1);
+      });
+    });
+    cleanups.push(() => observedProbe.mockRestore());
     const sender = direct(first, await freePort(), endpoints, identity("unused"), {
       isPeerAllowed: () => true,
       connectTimeoutMilliseconds: 600
@@ -213,11 +234,15 @@ describe("authenticated explicit node routes", () => {
     const probes = endpoints.map((peer) => sender.probe(peer.nodeId));
     await waitUntil(() => pendingServer.accepted >= 8);
     expect(pendingServer.accepted).toBe(8);
-    expect(pendingServer.maxActive).toBeLessThanOrEqual(8);
+    expect(maximumProbes).toBeLessThanOrEqual(8);
+    expect(startedPeers).toEqual(endpoints.slice(0, 8).map((peer) => peer.nodeId));
     expect(await Promise.all(probes)).toEqual(Array<boolean>(12).fill(false));
     await waitUntil(() => pendingServer.active === 0);
     expect(pendingServer.accepted).toBe(12);
-    expect(pendingServer.maxActive).toBeLessThanOrEqual(8);
+    expect(maximumProbes).toBeLessThanOrEqual(8);
+    expect(activeProbes).toBe(0);
+    expect(startedPeers).toEqual(endpoints.map((peer) => peer.nodeId));
+    expect([...maximumPerPeer.values()]).toEqual(Array<number>(12).fill(1));
     expect(sender.eligiblePeerIds()).toHaveLength(12);
     expect(sender.onlinePeerIds()).toEqual([]);
   });
@@ -284,14 +309,12 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-async function blackhole(): Promise<{ readonly port: number; readonly active: number; readonly accepted: number; readonly maxActive: number }> {
+async function blackhole(): Promise<{ readonly port: number; readonly active: number; readonly accepted: number }> {
   const sockets = new Set<Socket>();
   let accepted = 0;
-  let maxActive = 0;
   const server = net.createServer((socket) => {
     accepted += 1;
     sockets.add(socket);
-    maxActive = Math.max(maxActive, sockets.size);
     socket.on("data", () => undefined);
     socket.on("error", () => undefined);
     socket.on("close", () => { sockets.delete(socket); });
@@ -302,7 +325,7 @@ async function blackhole(): Promise<{ readonly port: number; readonly active: nu
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   });
-  return { port, get active() { return sockets.size; }, get accepted() { return accepted; }, get maxActive() { return maxActive; } };
+  return { port, get active() { return sockets.size; }, get accepted() { return accepted; } };
 }
 
 async function waitUntil(condition: () => boolean, timeout = 3_000): Promise<void> {
