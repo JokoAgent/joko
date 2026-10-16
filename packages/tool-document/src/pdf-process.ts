@@ -21,6 +21,7 @@ export function createPdfParserProcess(request: PdfParserRequest): PdfParserProc
     env: {
       PATH: process.env["PATH"], SystemRoot: process.env["SystemRoot"], WINDIR: process.env["WINDIR"],
       TEMP: process.env["TEMP"], TMP: process.env["TMP"],
+      JOKO_PARENT_PROCESS_ID: String(process.pid),
       ...(process.versions["electron"] ? { ELECTRON_RUN_AS_NODE: "1" } : {})
     },
     stdio: ["ignore", "ignore", "ignore", "ipc"]

@@ -1,5 +1,24 @@
+import { Worker } from "node:worker_threads";
 import "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
+
+const parentPid = Number(process.env["JOKO_PARENT_PROCESS_ID"]);
+if (!process.send || !Number.isSafeInteger(parentPid) || parentPid <= 1 || process.ppid !== parentPid) throw new Error("PDF parser owner process is unavailable.");
+// Only this small pure-JS watchdog uses a thread. PDF/native modules run on the
+// process main thread; its blocked parser cannot prevent orphan retirement.
+const parentWatchdog = new Worker(`
+  const { workerData } = require('node:worker_threads');
+  const check = () => {
+    try {
+      if (process.ppid !== workerData.parentPid) throw new Error('Owner changed');
+      process.kill(workerData.parentPid, 0);
+    } catch { process.kill(process.pid, 'SIGKILL'); }
+  };
+  check(); setInterval(check, 250);
+`, { eval: true, execArgv: [], env: {}, workerData: { parentPid },
+  resourceLimits: { maxOldGenerationSizeMb: 8, maxYoungGenerationSizeMb: 1 } });
+parentWatchdog.on("error", () => process.kill(process.pid, "SIGKILL"));
+parentWatchdog.unref();
 
 interface WorkerRequest {
   readonly kind: "inspect";

@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
+import { fork, type ChildProcess, type ForkOptions } from "node:child_process";
 import { constants, type BigIntStats } from "node:fs";
 import { lstat, open, unlink, type FileHandle } from "node:fs/promises";
 import { toNamespacedPath } from "node:path";
 import { backup, constants as sqliteConstants, DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
-import { Worker, type WorkerOptions } from "node:worker_threads";
 
 import {
   ExtensionLibraryError,
@@ -85,7 +85,6 @@ export interface ExtensionLibrarySqlWorkerStartup {
   readonly root: string;
   readonly extensionId: string;
   readonly limits: ExtensionLibrarySqlLimits;
-  readonly authorityState: SharedArrayBuffer;
 }
 
 interface PendingWorkerCall {
@@ -135,12 +134,11 @@ const FAILURE_CODES = new Set<ExtensionLibraryFailureCode>([
 export class ExtensionLibrarySqlService {
   readonly #vault: ExtensionLibraryVault;
   readonly #limits: ExtensionLibrarySqlLimits;
-  readonly #workerFactory: (url: URL, options: WorkerOptions) => Worker;
   readonly #requestTimeoutMilliseconds: number;
   readonly #authorityState: SharedArrayBuffer;
   readonly #pending = new Map<number, PendingWorkerCall>();
   readonly #handles = new Map<string, { readonly readonly: boolean }>();
-  #worker?: Worker;
+  #worker?: ChildProcess;
   #retiring?: Promise<void>;
   #nextRequestId = 1;
   #disposed = false;
@@ -148,7 +146,6 @@ export class ExtensionLibrarySqlService {
   constructor(vault: ExtensionLibraryVault, options: {
     readonly limits?: Partial<ExtensionLibrarySqlLimits>;
     readonly requestTimeoutMilliseconds?: number;
-    readonly workerFactory?: (url: URL, options: WorkerOptions) => Worker;
     readonly authorityState?: SharedArrayBuffer;
   } = {}) {
     this.#vault = vault;
@@ -161,7 +158,6 @@ export class ExtensionLibrarySqlService {
       throw new TypeError("Extension Library SQL authority state is invalid.");
     }
     this.#authorityState = options.authorityState ?? new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
-    this.#workerFactory = options.workerFactory ?? ((url, workerOptions) => new Worker(url, workerOptions));
   }
 
   get limits(): ExtensionLibrarySqlLimits {
@@ -221,12 +217,7 @@ export class ExtensionLibrarySqlService {
     this.#handles.clear();
     if (this.#worker === worker) this.#worker = undefined;
     if (worker !== undefined) {
-      worker.unref();
-      const retiring = worker.terminate().then(() => undefined, () => undefined);
-      this.#retiring = retiring;
-      void retiring.finally(() => {
-        if (this.#retiring === retiring) this.#retiring = undefined;
-      });
+      this.#retireProcess(worker);
     }
     await this.#awaitRetirement();
     this.#rejectPending(new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker was closed."));
@@ -303,8 +294,10 @@ export class ExtensionLibrarySqlService {
   }
 
   async #call<T>(request: ExtensionLibrarySqlWorkerRequest): Promise<T> {
-    if (this.#disposed) return Promise.reject(new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker is closed."));
-    let worker: Worker;
+    if (this.#disposed || Atomics.load(new Int32Array(this.#authorityState), 0) !== 0) {
+      return Promise.reject(new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker is closed."));
+    }
+    let worker: ChildProcess;
     try {
       worker = this.#ensureWorker();
     } catch (error) {
@@ -323,7 +316,9 @@ export class ExtensionLibrarySqlService {
         timer
       });
       try {
-        worker.postMessage(request);
+        worker.send(request, (error) => {
+          if (error) this.#retireWorker(worker, new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker disconnected."));
+        });
       } catch (error) {
         clearTimeout(timer);
         this.#pending.delete(request.id);
@@ -334,34 +329,53 @@ export class ExtensionLibrarySqlService {
     });
   }
 
-  #ensureWorker(): Worker {
+  #ensureWorker(): ChildProcess {
     if (this.#worker !== undefined) return this.#worker;
     const sourceRuntime = import.meta.url.endsWith(".ts");
     const url = new URL(sourceRuntime ? "./extension-library-sql-worker.ts" : "./extension-library-sql-worker.js", import.meta.url);
-    const worker = this.#workerFactory(url, {
-      workerData: {
-        root: this.#vault.root,
-        extensionId: this.#vault.extensionId,
-        limits: this.#limits,
-        authorityState: this.#authorityState
-      } satisfies ExtensionLibrarySqlWorkerStartup,
-      execArgv: sourceRuntime ? ["--import", "tsx"] : [],
-      resourceLimits: { maxOldGenerationSizeMb: 256 }
-    });
+    const options: ForkOptions & { readonly windowsHide: boolean } = {
+      execArgv: ["--max-old-space-size=256", ...(sourceRuntime ? ["--import", "tsx"] : [])],
+      serialization: "advanced", windowsHide: true,
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      env: {
+        PATH: process.env["PATH"], SystemRoot: process.env["SystemRoot"], WINDIR: process.env["WINDIR"],
+        TEMP: process.env["TEMP"], TMP: process.env["TMP"],
+        JOKO_PARENT_PROCESS_ID: String(process.pid),
+        ...(process.versions["electron"] ? { ELECTRON_RUN_AS_NODE: "1" } : {})
+      }
+    };
+    const worker = fork(url, [], options);
     this.#worker = worker;
-    worker.on("message", (value: unknown) => this.#receive(worker, value));
+    worker.on("message", (value: unknown) => {
+      if (value !== null && typeof value === "object" && "kind" in value && value.kind === "mutation_fence"
+        && "id" in value && Number.isSafeInteger(value.id) && Number(value.id) >= 1) {
+        // The authority flag remains in the owning host. Every child-side
+        // filesystem mutation obtains a fresh permit, including after awaits.
+        const allowed = this.#worker === worker && !this.#disposed
+          && Atomics.load(new Int32Array(this.#authorityState), 0) === 0;
+        if (worker.connected) worker.send({ kind: "mutation_fence", id: value.id, allowed }, (error) => {
+          if (error) this.#retireWorker(worker, new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker disconnected."));
+        });
+        return;
+      }
+      this.#receive(worker, value);
+    });
     worker.on("error", () => this.#retireWorker(worker, new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker failed.")));
-    worker.on("exit", (code) => {
+    worker.on("close", (code) => {
       if (this.#worker !== worker) return;
       this.#retireWorker(worker, new ExtensionLibraryError(
         "UNAVAILABLE",
         code === 0 ? "Library SQL worker exited." : "Library SQL worker exited unexpectedly."
       ));
     });
+    worker.send({ kind: "startup", root: this.#vault.root, extensionId: this.#vault.extensionId,
+      limits: this.#limits } satisfies ExtensionLibrarySqlWorkerStartup & { kind: "startup" }, (error) => {
+      if (error) this.#retireWorker(worker, new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker failed to initialize."));
+    });
     return worker;
   }
 
-  #receive(worker: Worker, value: unknown): void {
+  #receive(worker: ChildProcess, value: unknown): void {
     if (this.#worker !== worker || !validWorkerReply(value)) {
       this.#retireWorker(worker, new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker returned an invalid response."));
       return;
@@ -374,35 +388,38 @@ export class ExtensionLibrarySqlService {
     else pending.reject(new ExtensionLibraryError(value.error.code, value.error.message));
   }
 
-  #retireWorker(worker: Worker, failure: ExtensionLibraryError): void {
+  #retireWorker(worker: ChildProcess, failure: ExtensionLibraryError): void {
     if (this.#worker !== worker) return;
     this.#disposed = true;
     this.#worker = undefined;
     this.#handles.clear();
     this.#rejectPending(failure);
-    worker.unref();
-    const retiring = worker.terminate().then(() => undefined, () => undefined);
-    this.#retiring = retiring;
-    void retiring.finally(() => {
-      if (this.#retiring === retiring) this.#retiring = undefined;
+    this.#retireProcess(worker);
+  }
+
+  #retireProcess(worker: ChildProcess): void {
+    // Worker.terminate cannot interrupt a synchronous SQLite native call. The
+    // separately owned process can be stopped by the OS even during that call.
+    if (worker.exitCode !== null || worker.signalCode !== null) return;
+    const retiring = new Promise<void>((resolve, reject) => {
+      let hardStop: ReturnType<typeof setTimeout>, deadline: ReturnType<typeof setTimeout>;
+      const clear = (): void => { clearTimeout(hardStop); clearTimeout(deadline); worker.removeListener("close", closed); };
+      const closed = (): void => { clear(); resolve(); };
+      worker.once("close", closed);
+      try { worker.kill("SIGTERM"); } catch { /* Require a real exit receipt. */ }
+      hardStop = setTimeout(() => { try { worker.kill("SIGKILL"); } catch { /* Keep the retirement unknown. */ } }, 250);
+      deadline = setTimeout(() => {
+        clear(); reject(new ExtensionLibraryError("UNAVAILABLE", "Library SQL worker exit could not be confirmed."));
+      }, 1_000);
     });
+    this.#retiring = retiring;
+    void retiring.then(() => { if (this.#retiring === retiring) this.#retiring = undefined; }, () => undefined);
   }
 
   async #awaitRetirement(): Promise<void> {
     const retiring = this.#retiring;
     if (retiring === undefined) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        retiring,
-        new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, 1_000);
-          timer.unref?.();
-        })
-      ]);
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-    }
+    await retiring;
   }
 
   #rejectPending(failure: ExtensionLibraryError): void {

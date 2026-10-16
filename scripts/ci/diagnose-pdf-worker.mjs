@@ -66,6 +66,7 @@ async function observeChild(mode) {
   const started = performance.now();
   const environment = { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
     TEMP: process.env.TEMP, TMP: process.env.TMP, GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+    JOKO_PARENT_PROCESS_ID: String(process.pid),
     ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}) };
   const child = spawn(process.execPath, ["--max-old-space-size=128", "--max-semi-space-size=4", fileURLToPath(import.meta.url), "--child", mode], {
     cwd: root, env: environment, stdio: ["ignore", "ignore", "ignore", "ipc"], windowsHide: true, serialization: "advanced"
