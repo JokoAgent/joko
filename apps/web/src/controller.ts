@@ -971,6 +971,9 @@ export function useAppController(): AppController {
 
   const beginGatewayTransition = useCallback((): number => {
     explicitDisconnectRef.current = false;
+    discoveryGenerationRef.current += 1;
+    discoveryAbortRef.current?.abort();
+    discoveryAbortRef.current = undefined;
     const generation = ++gatewayGenerationRef.current;
     const previous = gatewayRef.current;
     gatewayRef.current = undefined;
@@ -980,6 +983,8 @@ export function useAppController(): AppController {
     document.title = "Joko";
     setState((current) => ({
       ...clearTransientExtensionUiState(current),
+      discoveryState: "idle",
+      discoveryError: undefined,
       connectionGeneration: generation
     }));
     return generation;

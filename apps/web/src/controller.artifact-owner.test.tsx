@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 
 import { useAppController, type AppController } from "./controller.js";
-import { createOrchestratorGateway, probeOrchestratorOrigin, type OrchestratorGateway } from "./gateway.js";
+import { createOrchestratorGateway, discoverOrchestratorNodesAt, probeOrchestratorOrigin, type OrchestratorGateway } from "./gateway.js";
 import { DEFAULT_UI_PREFERENCES, LocalState, type UiPreferences, type UiPreferencesMutation } from "./local-state.js";
 import { emptySnapshot, type AppSnapshot, type BrowserSettingsView, type SessionView, type TimelineItemView, type ConnectionProfile } from "./model.js";
 import { registerWorkspaceHtmlPreviewSurface } from "./workspace-html-auto-reload.js";
@@ -30,6 +30,49 @@ afterEach(async () => {
   document.body.replaceChildren();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it("retires anonymous discovery when an explicit connection begins and rejects its late completion", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  vi.mocked(persistentWebSecretEncryptionAvailable).mockResolvedValue(false);
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [], listMachineCaches: async () => [],
+    readPreferences: async () => ({ ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] }),
+    readAuthKey: async () => "test-key", saveProfile: async () => undefined, saveMachineCache: async () => undefined
+  } as unknown as LocalState);
+  const signals: AbortSignal[] = [];
+  let releaseDiscovery!: (value: Awaited<ReturnType<typeof discoverOrchestratorNodesAt>>) => void;
+  const discovery = new Promise<Awaited<ReturnType<typeof discoverOrchestratorNodesAt>>>(resolve => { releaseDiscovery = resolve; });
+  vi.mocked(discoverOrchestratorNodesAt).mockImplementation(async (_origin, signal) => {
+    if (signal !== undefined) signals.push(signal);
+    return discovery;
+  });
+  const owner = profile("discovery-owner");
+  let releaseProbe!: (value: Awaited<ReturnType<typeof probeOrchestratorOrigin>>) => void;
+  vi.mocked(probeOrchestratorOrigin).mockImplementation(() => new Promise(resolve => { releaseProbe = resolve; }));
+  vi.mocked(createOrchestratorGateway).mockImplementation((_profile, _key, callbacks) => ({
+    connect: async () => { callbacks.onState?.("connected"); callbacks.onSnapshot?.(emptySnapshot()); },
+    disconnect: vi.fn(), taskSharingApi: () => undefined
+  } as unknown as OrchestratorGateway));
+  let current!: AppController;
+  function Probe(): null { current = useAppController(); return null; }
+  root = createRoot(document.body.appendChild(document.createElement("div")));
+  await act(async () => root!.render(<Probe />));
+  expect(signals.length).toBeGreaterThan(0);
+  let connecting!: Promise<void>;
+  await act(async () => { connecting = current.connect(owner); await Promise.resolve(); });
+  try {
+    expect(signals.every(signal => signal.aborted)).toBe(true);
+    expect(current.state.discoveryState).toBe("idle");
+  } finally {
+    await act(async () => {
+      releaseDiscovery([]);
+      releaseProbe({ serverId: owner.serverId, displayName: owner.name, version: "1", apiVersion: "1", pairingEnabled: false });
+      await connecting;
+    });
+  }
+  expect(current.state.connectionState).toBe("connected");
+  expect(current.state.discoveryState).toBe("idle");
 });
 
 it("keeps resource and auxiliary operations bound to the controller snapshot's gateway", async () => {
