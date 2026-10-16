@@ -180,13 +180,13 @@ function apkSignerDigestRecords(output) {
   return String(output ?? "").split(/\r?\n/u)
     .filter((line) => /^(?:Signer\b|V[0-9]+(?:\.[0-9]+)?\b).* certificate SHA-256 digest:/iu.test(line))
     .map((line) => {
-      // SDK 37 prefixes v3 SDK ranges with the scheme and a colon; its
-      // non-range labels also end in a colon. Source Stamp stays separate.
+      // SDK 37 also emits the observed range-free "V3.0 Signer:" label.
+      // Range and ordinary labels retain their own strict forms below.
       const match = /^(.*?) certificate SHA-256 digest:[ \t]*(.*)$/iu.exec(line);
       const label = match?.[1];
       const numbered = /^Signer #([1-9][0-9]{0,9}):?$/iu.exec(label ?? "");
       const range = /^(?:Signer|V3\.[01] Signer:) \(minSdkVersion=([1-9][0-9]{0,9})(?: \(dev release=true\))?, maxSdkVersion=([1-9][0-9]{0,9})\)$/iu.exec(label ?? "");
-      const valid = label === "Signer:" || (numbered !== null && Number(numbered[1]) <= 2_147_483_647)
+      const valid = label === "Signer:" || label === "V3.0 Signer:" || (numbered !== null && Number(numbered[1]) <= 2_147_483_647)
         || (range !== null && Number(range[1]) <= Number(range[2]) && Number(range[2]) <= 2_147_483_647);
       return { label: valid ? label.replace(/^Signer /iu, "") : undefined, value: match?.[2] };
     });

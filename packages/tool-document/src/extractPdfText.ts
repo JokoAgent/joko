@@ -1,5 +1,4 @@
-import { fileURLToPath } from "node:url";
-import { Worker } from "node:worker_threads";
+import { createPdfParserProcess } from "./pdf-process.js";
 
 import type { PdfTextWorkerResult } from "./inspectPdf-worker.js";
 
@@ -33,16 +32,9 @@ export async function extractPdfText(
   if (data.byteLength === 0 || data.byteLength > PDF_TEXT_MAX_BYTES || !Number.isSafeInteger(maxChars) || maxChars < 1 || maxChars > 48_000) {
     throw new PdfTextExtractionError("INVALID_INPUT");
   }
-  const sourceMode = fileURLToPath(import.meta.url).endsWith(".ts");
-  const workerFile = fileURLToPath(new URL(sourceMode ? "./inspectPdf-worker.ts" : "./inspectPdf-worker.js", import.meta.url));
   const bytes = Uint8Array.from(data);
-  const worker = options.workerFactory?.() ?? new Worker(workerFile, {
-    workerData: { kind: "extract_text", data: bytes, maxPages: PDF_TEXT_MAX_PAGES, maxChars },
-    transferList: [bytes.buffer],
-    resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 16 },
-    execArgv: [],
-    env: {}, stdout: true, stderr: true
-  });
+  const worker: PdfTextWorker = options.workerFactory?.() ?? createPdfParserProcess({ kind: "extract_text", data: bytes,
+    maxPages: PDF_TEXT_MAX_PAGES, maxChars });
   worker.stdout?.resume(); worker.stderr?.resume();
   return await new Promise<PdfTextWorkerResult>((resolveResult, reject) => {
     let settled = false, exitConfirmed = false;
