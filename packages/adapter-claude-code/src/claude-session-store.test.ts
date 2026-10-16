@@ -1028,6 +1028,18 @@ describe("ClaudeDurableSessionStore", () => {
     listingStore.close();
   });
 
+  it.each(["source_project_key", "target_project_key"] as const)("rejects a NUL-bearing persisted operation %s as CORRUPT", async (column) => {
+    const fixture = await createFixture();
+    const child = await createAdoptedChild(fixture, "workspace.operation-nul", "project-operation-nul");
+    const database = new DatabaseSync(await onlyDatabasePath(fixture.root));
+    database.prepare(`UPDATE operations SET ${column} = ? WHERE operation_id = ?`)
+      .run("bad\u0000project", child.operation.operationId);
+    database.close();
+    expect(() => readClaudeSessionStoreOperation(fixture.authority, child.operation)).toThrowError(
+      expect.objectContaining({ code: "CORRUPT" })
+    );
+  });
+
   it("rejects a reopened database with foreign-key violations", async () => {
     const fixture = await createFixture();
     const child = await createAdoptedChild(fixture, "workspace.orphan", "project-orphan");

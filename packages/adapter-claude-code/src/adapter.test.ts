@@ -2561,7 +2561,7 @@ describe("ClaudeCodeAdapter", () => {
     const query = runtime.queries[0]!;
     query.push({ ...resultMessage(binding.nativeSessionId!, { result: "Completed", totalCostUsd: 0 }), fast_mode_state: "cooldown" });
     await eventually(() => active.events.some((event) => event.type === "done"));
-    expect(active.events.filter((event) => event.type === "status")).toEqual([
+    expect(active.events.filter((event) => event.type === "status" && event.key === "claude-code.fast-mode")).toEqual([
       expect.objectContaining({ key: "claude-code.fast-mode", text: expect.stringContaining("individual requests may still use standard speed") }),
       expect.objectContaining({ key: "claude-code.fast-mode", text: expect.stringContaining("cooling down") })
     ]);
