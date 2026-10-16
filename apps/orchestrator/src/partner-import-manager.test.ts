@@ -74,37 +74,70 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     authenticate: (value: string) => { authenticated = value; } };
 }
 describe("native import service and owning effects", () => {
-  it("saves the complete five-category selection through the generated boundary and retains usable full originals after cold recovery", async () => {
+  it("saves the complete five-category selection through the generated boundary and retains usable full originals after cold recovery", async ({ signal: testSignal, onTestFailed, onTestFinished }) => {
+    type Phase = "fixture" | "sources" | "preview" | "start" | "completion" | "environment"
+      | "published-tree" | "resources" | "resource-recovery" | "receipt-recovery" | "persistence" | "idempotency" | "complete";
+    const startedAt = performance.now();
+    let phase: Phase = "fixture";
+    const completedPhases: Array<{ phase: Phase; elapsedMs: number }> = [];
+    const snapshot = () => ({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), completedPhases: [...completedPhases] });
+    let abortedSnapshot: ReturnType<typeof snapshot> | undefined;
+    const captureAbort = () => { abortedSnapshot ??= snapshot(); };
+    const advance = (next: Phase) => {
+      completedPhases.push({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)) });
+      phase = next;
+    };
+    testSignal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => testSignal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => {
+      try {
+        console.error("[partner-import-boundary]", JSON.stringify({ boundary: abortedSnapshot ? "test-abort" : "failure", ...(abortedSnapshot ?? snapshot()) }));
+      } catch { /* The observation must not replace the original test failure. */ }
+    });
     const f = await fixture({ changeDefaults: true }); const signal = new AbortController().signal;
-    const sources = await f.api.sources(signal); const preview = await f.api.preview(sources[0]!.id, signal);
+    advance("sources");
+    const sources = await f.api.sources(signal);
+    advance("preview");
+    const preview = await f.api.preview(sources[0]!.id, signal);
     expect(preview.entries.length).toBeGreaterThan(20); expect(new Set(preview.entries.map(entry => entry.category)).size).toBe(5);
     expect(JSON.stringify(preview)).not.toContain(secret);
     const selection = { previewId: preview.id, requestId: "owner_import_request_0001", name: "Imported analyst", entryIds: preview.entries.map(entry => entry.id), takeover: true, deferSetup: true };
-    await f.api.start(selection, signal); const saved = await f.imports.waitForRequest(selection.requestId);
+    advance("start");
+    await f.api.start(selection, signal);
+    advance("completion");
+    const saved = await f.imports.waitForRequest(selection.requestId);
     expect(saved, JSON.stringify({ checks: saved.checks, receipt: f.storage.readReceipt(selection.requestId)?.routines,
       profiles: f.partners.listPartners().map(p => ({ initialization: p.initializationState, failure: p.initializationErrorCode })) })).toMatchObject({ saved: true, status: "complete" }); expect(saved.savedEntryIds).toHaveLength(selection.entryIds.length);
     const profile = f.partners.getPartner(saved.partnerId); expect(profile.initializationState).toBe("ready"); expect(profile.canonicalSessionId).toBe(saved.canonicalSessionId);
     expect(profile.capabilities.permissionMode).toBe("ask"); expect(f.profiles.directoryState().defaultCapabilities?.permissionMode).toBe("auto");
+    advance("environment");
     const environment = await f.storage.environment.read(profile.id, () => {});
     expect(environment?.env.ACCESS_TOKEN).toBe(secret); expect(environment?.pendingImport).toBeUndefined();
     expect(environment?.profileProjection.identity.length).toBeGreaterThan(8000); expect(profile.identitySource.length).toBeLessThanOrEqual(8000);
     expect(environment?.documents[preview.entries.find(entry => entry.name === "notes-0.md")!.id]).toContain("Retained original.");
+    advance("published-tree");
     const published = await readImportTree(f.store.getTarget(profile.homeTargetId).descriptor.workspaceRoot, () => true, createImportBudget());
     expect(published.some(file => file.name.includes("imported-memory/") && file.bytes[0] === 137)).toBe(true);
     expect(published.every(file => !file.bytes.includes(Buffer.from(secret)))).toBe(true);
+    advance("resources");
     const resource = f.resources.list({ targetId: profile.homeTargetId, kind: "skill" })[0]!; expect(resource.enabled).toBe(true);
     const text = await f.resources.runtimeTextSnapshot(profile.capabilities.modelChain[0]!.backendId, profile.homeTargetId, signal);
     expect(text[0]!.content.length).toBeGreaterThan(256 * 1024); expect(text[0]!.content).not.toContain(secret);
+    advance("resource-recovery");
     const restoredResources = new PiResourceManager({ store: f.store, managedRoot: join(f.root, "resources"), maximumFiles: 2 }); await restoredResources.initialize();
     expect((await restoredResources.runtimeTextSnapshot(profile.capabilities.modelChain[0]!.backendId, profile.homeTargetId, signal))[0]!.content).toBe(text[0]!.content);
     const routine = f.routines.list(profile.id)[0]!; expect(routine.enabled).toBe(false); expect(environment?.automations[routine.id]?.handover).toBe("ready");
+    advance("receipt-recovery");
     const receipts = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")));
     expect(receipts.readReceipt(selection.requestId)?.result).toEqual(saved);
     expect((await receipts.environment.read(profile.id, () => {}))?.skillFiles).toEqual(environment?.skillFiles);
+    advance("persistence");
     expect(JSON.stringify(f.store.listEvents({ sessionId: profile.canonicalSessionId! }), (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain(secret);
     expect((await readFile(join(f.root, "operational.db"))).includes(Buffer.from(secret))).toBe(false);
+    advance("idempotency");
     expect((await f.api.start(selection, signal)).partnerId).toBe(profile.id); expect(f.profiles.listPartners()).toHaveLength(1);
     await expect(f.api.start({ ...selection, name: "Another intent" }, signal)).rejects.toMatchObject({ code: Code.AlreadyExists });
+    advance("complete");
   }, 20_000);
   it("fences preview theft/revocation and serializes import deletion without recreating private data", async () => {
     const f = await fixture(); const signal = new AbortController().signal; const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
