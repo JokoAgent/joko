@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import dgram, { type RemoteInfo, type Socket as DgramSocket } from "node:dgram";
+import { constants } from "node:os";
 
 import { isValidNodeSyncPublicKey, nodeSyncDomain, type NodeSyncPurpose } from "./crypto.js";
 import { type NodeSyncCipherChunkFrame } from "./frames.js";
@@ -246,5 +247,6 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
 function normalizeAddress(value: string): string { return value.startsWith("::ffff:") ? value.slice("::ffff:".length) : value; }
 function transportErrorCode(error: unknown): string {
   const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
-  return typeof code === "string" && ["EADDRINUSE", "EACCES", "EADDRNOTAVAIL", "ENETUNREACH", "ECONNREFUSED"].includes(code) ? code : "unavailable";
+  return typeof code === "string" && (Object.hasOwn(constants.errno, code) ||
+    ["EADDRINUSE", "EACCES", "EADDRNOTAVAIL", "ENETUNREACH", "ECONNREFUSED"].includes(code)) ? code : "unavailable";
 }
