@@ -1,4 +1,6 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { Code } from "@connectrpc/connect";
 import {
   CreatePartnerRequestSchema,
@@ -264,8 +266,26 @@ describe("mounted Partner collaboration product chain", () => {
     await page.goto(`${fixture.baseUrl}/#/partners`);
     const firstCard = page.locator(partnerCard(first.partnerId));
     await firstCard.waitFor({ state: "visible", timeout: 30_000 });
-    await firstCard.getByRole("button", { name: "Open task" }).dispatchEvent("click");
-    await page.waitForURL((url) => url.hash.includes(encodeURIComponent(first.canonicalSessionId)), { timeout: 30_000 });
+    await firstCard.getByRole("button", { name: "Open task" }).click();
+    await page.waitForURL((url) => url.hash.includes(encodeURIComponent(first.canonicalSessionId)), { timeout: 30_000 }).catch(async (cause: unknown) => {
+      let observation: Record<string, unknown> = { available: false };
+      try {
+        observation = {
+          available: true, documentVisibility: await page.evaluate(() => document.visibilityState),
+          pages: browser!.contexts().reduce((count, context) => count + context.pages().length, 0),
+          alerts: await page.locator('[role="alert"]').count(), dialogs: await page.getByRole("dialog").count(),
+          targetHashMatched: new URL(page.url()).hash.includes(encodeURIComponent(first.canonicalSessionId))
+        };
+        if (process.env.RUNNER_TEMP !== undefined) {
+          const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "partners");
+          await mkdir(directory, { recursive: true });
+          await page.screenshot({ path: join(directory, "open-task-failed.png"), fullPage: true, timeout: 5_000,
+            mask: [page.locator("input, textarea")] });
+          await writeFile(join(directory, "open-task-failed.json"), JSON.stringify({ sourceCommit: process.env.GITHUB_SHA, ...observation }, null, 2) + "\n");
+        }
+      } catch { /* Preserve the original navigation failure when its observation is unavailable. */ }
+      throw new Error(`The Partner task navigation did not complete: ${JSON.stringify(observation)}`, { cause });
+    });
     const completedCard = page.getByLabel(`Delegated work: ${COMPLETE_TITLE}`);
     try {
       await completedCard.waitFor({ state: "visible", timeout: 10_000 });
