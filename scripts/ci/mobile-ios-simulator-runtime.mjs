@@ -44,7 +44,9 @@ async function alive(pid) {
 function startMetro(port) {
   const cli = join(root, "apps/mobile/node_modules/expo/bin/cli");
   if (!existsSync(cli)) throw new Error("Install the matched checkout's Expo dependencies before starting Metro.");
-  metro = spawn(process.execPath, [cli, "start", "--host", "localhost", "--port", String(port), "--max-workers", "2"], {
+  // Expo binds the literal localhost name. Match the IPv4 address used by the
+  // readiness probe and the Simulator's RCT_jsLocation even when ::1 is first.
+  metro = spawn(process.execPath, ["--dns-result-order=ipv4first", cli, "start", "--host", "localhost", "--port", String(port), "--max-workers", "2"], {
     cwd: join(root, "apps/mobile"), detached: true, stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, CI: "1", EXPO_NO_TELEMETRY: "1", NODE_ENV: "development" }
   });
@@ -60,16 +62,27 @@ function startMetro(port) {
   metro.once("close", () => { metroClosed = true; });
 }
 async function waitForMetro(origin) {
+  const startedAt = Date.now();
   const until = Date.now() + 90_000;
+  let attempts = 0, lastProbe;
+  const recordStatus = ready => save("metro-status.json", { origin, ready, attempts, elapsedMs: Date.now() - startedAt,
+    nodeDnsResultOrder: "ipv4first", lastProbe });
   while (Date.now() < until) {
     abort.signal.throwIfAborted();
-    if (metroClosed) throw new Error("The owned Metro process exited before it became ready; see metro.log.");
+    if (metroClosed) { recordStatus(false); throw new Error("The owned Metro process exited before it became ready; see metro.log."); }
+    attempts += 1;
     try {
       const response = await fetch(`${origin}/status`, { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(3000)]) });
-      if (response.ok && (await response.text()).trim() === "packager-status:running") return;
-    } catch { abort.signal.throwIfAborted(); }
+      const body = (await response.text()).trim();
+      lastProbe = { status: response.status, packagerRunning: body === "packager-status:running" };
+      if (response.ok && lastProbe.packagerRunning) { recordStatus(true); return; }
+    } catch (error) {
+      lastProbe = { error: error.name, code: error.cause?.code ?? null };
+      abort.signal.throwIfAborted();
+    }
     await delay(1000, undefined, { signal: abort.signal });
   }
+  recordStatus(false);
   throw new Error("The matched checkout's Metro server did not become ready.");
 }
 async function observe(phase, pid, ocr) {
@@ -177,6 +190,7 @@ async function main() {
     stage = "same-checkout Metro startup";
     const port = await freePort(), origin = `http://127.0.0.1:${port}`;
     startMetro(port); await waitForMetro(origin);
+    stage = "same-checkout iOS bundle compilation";
     const bundle = await fetch(`${origin}/.expo/.virtual-metro-entry.bundle?platform=ios&dev=true&minify=false`,
       { signal: AbortSignal.any([abort.signal, AbortSignal.timeout(120_000)]) });
     if (!bundle.ok) { await bundle.body?.cancel(); throw new Error("Metro could not compile the actual iOS app entry."); }

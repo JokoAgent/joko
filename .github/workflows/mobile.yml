@@ -244,6 +244,7 @@ jobs:
             ${{ runner.temp }}/joko-ios-runtime-evidence/cleanup.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/*-screen.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/metro.log
+            ${{ runner.temp }}/joko-ios-runtime-evidence/metro-status.json
           if-no-files-found: warn
           retention-days: 3
 
