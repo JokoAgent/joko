@@ -20,7 +20,11 @@ afterEach(async () => {
 });
 
 describe("ProjectGitBootstrap", () => {
-  it("serializes initialization of an empty project and preserves empty directories and OS metadata", async () => {
+  // Two serialized admissions include the real native Git initialization and
+  // verification chain. Keep the Windows aggregate within its command bound.
+  it("serializes initialization of an empty project and preserves empty directories and OS metadata", {
+    timeout: process.platform === "win32" ? 30_000 : 5_000
+  }, async () => {
     const root = await directory();
     await mkdir(join(root, "nested", "empty"), { recursive: true });
     for (const name of [".DS_Store", "Thumbs.db", "desktop.ini"]) await writeFile(join(root, name), "metadata");
