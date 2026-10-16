@@ -88,7 +88,8 @@ it("uses authenticated single-use passphrase uploads and current Host authority 
     fixture.application.connections.revoke(first.connectionId);
     await expect(api.readSshPublicKey({ keyId: key.id, expectedFingerprint: key.sha256Fingerprint })).rejects.toMatchObject({ code: Code.Unauthenticated });
     expect(await readFile(join(identityDirectory, key.id), "utf8")).not.toContain(secret);
-    expect(JSON.stringify(fixture.application.store.listSettings())).not.toContain(secret);
+    expect(JSON.stringify(fixture.application.store.listSettings(),
+      (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)).not.toContain(secret);
   } finally { await fixture.close(); }
 }, 60_000);
 
