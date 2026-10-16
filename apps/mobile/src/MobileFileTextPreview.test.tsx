@@ -33,10 +33,13 @@ vi.mock("react-native-webview", () => ({ WebView: forwardRef((props: NonNullable
 vi.mock("react-native", () => {
   const box = ({ children }: { children?: ReactNode }) => createElement("div", {}, children);
   return { View: box,
-    FlatList: forwardRef((props: { data: readonly string[]; renderItem(value: { item: string; index: number }): ReactNode;
+    FlatList: forwardRef((props: { data: readonly string[]; initialNumToRender?: number; renderItem(value: { item: string; index: number }): ReactNode;
       onScrollToIndexFailed(info: { averageItemLength: number; index: number }): void }, ref) => {
       native.list = props; useImperativeHandle(ref, () => ({ scrollToIndex: native.scrollToIndex, scrollToOffset: native.scrollToOffset }));
-      return createElement("div", {}, props.data.map((item, index) => createElement("div", { key: index }, props.renderItem({ item, index }))));
+      // Keep the complete source in data while respecting the native list's
+      // initial render window instead of mounting thousands of DOM-only rows.
+      return createElement("div", {}, props.data.slice(0, props.initialNumToRender ?? props.data.length)
+        .map((item, index) => createElement("div", { key: index }, props.renderItem({ item, index }))));
     }),
     Text: ({ children, onTextLayout, selectable, accessibilityRole }: { children?: ReactNode; selectable?: boolean; accessibilityRole?: string;
       onTextLayout?: typeof native.layout }) => {
