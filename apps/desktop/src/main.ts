@@ -3539,12 +3539,40 @@ async function verifyPackagedSmokeTaskWindowDrag(
     ...applicationWindows(),
     ...(inspectorWindow === undefined || inspectorWindow.isDestroyed() ? [] : [inspectorWindow])
   ])].map((window) => ({ window, visible: window.isVisible(), bounds: window.getBounds() }));
+  const originalCursor = screen.getCursorScreenPoint();
+  let cursorMoved = false;
+  let dragFailure: unknown;
   try {
-    const cursor = screen.getCursorScreenPoint();
-    owner.setBounds(screen.getDisplayNearestPoint(cursor).bounds, false);
+    const display = screen.getDisplayNearestPoint(originalCursor);
+    const requestedBounds = process.platform === "darwin" ? display.workArea : display.bounds;
+    owner.setBounds(requestedBounds, false);
     owner.showInactive();
-    if (!owner.isVisible() || owner.isMinimized() || !pointIsInsideRectangle(cursor, owner.getBounds())) {
-      throw new Error("Packaged smoke could not place a visible owner around the system cursor.");
+    process.stdout.write(`JOKO_DESKTOP_SMOKE_DRAG_GEOMETRY ${JSON.stringify({ phase: "preparation",
+      cursor: screen.getCursorScreenPoint(), originalCursor, requestedBounds, realizedBounds: owner.getBounds(),
+      workArea: display.workArea, visible: owner.isVisible(), minimized: owner.isMinimized() })}\n`);
+    // macOS clamps ordinary windows below its menu bar. A pointer in that bar
+    // cannot be enclosed by requesting the complete display rectangle.
+    if (process.platform === "darwin" && owner.isVisible() && !owner.isMinimized()
+      && !pointIsInsideRectangle(screen.getCursorScreenPoint(), owner.getBounds())) {
+      const bounds = owner.getBounds();
+      const left = Math.max(bounds.x, display.workArea.x);
+      const top = Math.max(bounds.y, display.workArea.y);
+      const right = Math.min(bounds.x + bounds.width, display.workArea.x + display.workArea.width);
+      const bottom = Math.min(bounds.y + bounds.height, display.workArea.y + display.workArea.height);
+      const point = { x: Math.floor((left + right) / 2), y: Math.floor((top + bottom) / 2) };
+      if (right <= left || bottom <= top || !pointIsInsideRectangle(point, bounds)
+        || !pointIsInsideRectangle(point, display.workArea)) {
+        throw new Error(`Packaged smoke has no owned cursor target: ${JSON.stringify({ bounds, workArea: display.workArea })}.`);
+      }
+      cursorMoved = true;
+      await movePackagedSmokeMacCursor(point);
+    }
+    const cursor = screen.getCursorScreenPoint();
+    const observation = { cursor, originalCursor, requestedBounds, realizedBounds: owner.getBounds(),
+      workArea: display.workArea, visible: owner.isVisible(), minimized: owner.isMinimized(), cursorMoved };
+    process.stdout.write(`JOKO_DESKTOP_SMOKE_DRAG_GEOMETRY ${JSON.stringify(observation)}\n`);
+    if (!observation.visible || observation.minimized || !pointIsInsideRectangle(cursor, observation.realizedBounds)) {
+      throw new Error(`Packaged smoke could not place a visible owner around the system cursor: ${JSON.stringify(observation)}.`);
     }
     const inside = await runPackagedSmokeTaskDragGesture(owner, task, profileId, "smoke_inside_0002", false);
     if (!inside.started || inside.ended || inside.opened || inside.replayedOpened) {
@@ -3581,6 +3609,9 @@ async function verifyPackagedSmokeTaskWindowDrag(
     }
     recordPackagedSmokeProgress("task_drag_outside_opened");
     return taskWindow;
+  } catch (error: unknown) {
+    dragFailure = error;
+    throw error;
   } finally {
     for (const entry of savedWindows) {
       if (entry.window.isDestroyed()) continue;
@@ -3588,7 +3619,43 @@ async function verifyPackagedSmokeTaskWindowDrag(
       if (entry.visible) entry.window.showInactive();
       else entry.window.hide();
     }
+    if (cursorMoved) {
+      try {
+        await movePackagedSmokeMacCursor(originalCursor);
+        const restored = screen.getCursorScreenPoint();
+        if (restored.x !== originalCursor.x || restored.y !== originalCursor.y) {
+          throw new Error(`Packaged smoke cursor restoration did not settle: ${JSON.stringify({ originalCursor, restored })}.`);
+        }
+      } catch (error: unknown) {
+        if (dragFailure === undefined) throw error;
+        process.stderr.write("JOKO_DESKTOP_SMOKE_CURSOR_RESTORE_FAILED\n");
+      }
+    }
   }
+}
+
+async function movePackagedSmokeMacCursor(point: { readonly x: number; readonly y: number }): Promise<void> {
+  if (!packagedSmoke || process.platform !== "darwin" || !Number.isSafeInteger(point.x) || !Number.isSafeInteger(point.y)) {
+    throw new Error("Packaged smoke cursor preparation requires an exact macOS screen point.");
+  }
+  // CoreGraphics changes the actual global cursor without posting an input
+  // event. The caller still samples Electron's real cursor and runs every
+  // production drag/drop ownership check.
+  const source = [
+    "import CoreGraphics",
+    "import Darwin",
+    `if CGWarpMouseCursorPosition(CGPoint(x: ${point.x}, y: ${point.y})) != .success { exit(1) }`
+  ].join("\n");
+  await new Promise<void>((resolveMove, rejectMove) => {
+    execFile("/usr/bin/swift", ["-e", source], {
+      timeout: 10_000, killSignal: "SIGKILL", maxBuffer: 8 * 1024, windowsHide: true
+    }, (error) => {
+      if (error === null) resolveMove();
+      else rejectMove(new Error(`Packaged smoke could not move the actual macOS system cursor: ${JSON.stringify({
+        code: error.code, signal: error.signal, killed: error.killed
+      })}.`));
+    });
+  });
 }
 
 async function runPackagedSmokeTaskDragGesture(
