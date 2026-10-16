@@ -219,6 +219,7 @@ import {
 } from "./dedicated-hardware-main-controller.js";
 import { dedicatedHardwareSdkStagingDirectory } from "./dedicated-hardware-sdk.js";
 import { resolveDedicatedHardwareRuntime } from "./dedicated-hardware-runtime.js";
+import { createDedicatedHardwarePermissionRecovery } from "./dedicated-hardware/permission-recovery.js";
 import {
   DEDICATED_HARDWARE_MODEL_IDS,
   createDedicatedHardwareHostClient,
@@ -731,6 +732,21 @@ let dedicatedHardwareSystemVoiceController: SystemFrontmostVoiceController | und
 const dedicatedHardwareTaskFocusFence = new DedicatedHardwareTaskFocusFence<WebContents>();
 const dedicatedHardwareWindowLifecycles = new WeakMap<WebContents, { readonly retire: () => void }>();
 let dedicatedHardwarePowerLifecycleInstalled = false;
+const dedicatedHardwarePermissionRecovery = createDedicatedHardwarePermissionRecovery({
+  platform: process.platform,
+  openSettings: async () => {
+    await shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent");
+    return true;
+  },
+  retry: () => {
+    const controller = dedicatedHardwareController;
+    if (controller === undefined) return;
+    const state = controller.snapshot();
+    const model = DEDICATED_HARDWARE_MODEL_IDS.find((candidate) =>
+      state.models[candidate].settings.enabled && state.models[candidate].reason === "permission-required");
+    if (model !== undefined) controller.probe(model);
+  }
+});
 let nativeGamepadRuntime: NativeGamepadRuntime<NativeGamepadClientOwner> | undefined;
 const nativeGamepadDocuments = new DesktopNativeGamepadDocumentAuthority<WebContents>(
   () => randomUUID(),
@@ -968,6 +984,7 @@ if (!app.requestSingleInstanceLock()) {
     macNativeTaskStatusHost?.setApplicationFocused(true);
     providerModelRefreshHostLifecycle.syncApplicationFocused(isProviderModelApplicationForeground());
     void globalVoiceShortcutRecovery.request();
+    dedicatedHardwarePermissionRecovery.applicationFocused();
   });
   app.on("browser-window-blur", () => {
     setImmediate(() => {
@@ -8162,7 +8179,9 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareGetState, (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event);
     if (parameters.length !== 0) throw new TypeError("Dedicated hardware state does not accept parameters.");
-    return requireDedicatedHardwareController().snapshot();
+    const controller = requireDedicatedHardwareController();
+    controller.poll();
+    return controller.snapshot();
   });
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareSetSettings, async (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event, { focused: true });
@@ -8227,7 +8246,7 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareOpenInputSettings, (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event, { focused: true });
     if (parameters.length !== 0) throw new TypeError("Dedicated hardware input settings do not accept parameters.");
-    return openGlobalVoiceInputMonitoringSettings();
+    return dedicatedHardwarePermissionRecovery.openSettings();
   });
   ipcMain.on(DESKTOP_CHANNELS.nativeTaskStatusGetAvailability, (event) => {
     event.returnValue = nativeTaskStatusSupported;
@@ -9537,6 +9556,7 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
     dedicatedHardwarePowerLifecycleInstalled = true;
     powerMonitor.on("suspend", suspendDedicatedHardwareInput);
     powerMonitor.on("lock-screen", suspendDedicatedHardwareInput);
+    powerMonitor.on("unlock-screen", dedicatedHardwarePermissionRecovery.screenUnlocked);
   }
 }
 

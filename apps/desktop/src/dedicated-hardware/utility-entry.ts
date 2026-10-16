@@ -1,5 +1,6 @@
 import { pathToFileURL } from "node:url";
 import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import type { ParentPort } from "electron";
 
 import {
@@ -26,7 +27,8 @@ export async function loadDedicatedHardwareStagedAdapter(
   const entryUrl = pathToFileURL(dedicatedHardwareSdkEntryPath(verified));
   entryUrl.searchParams.set("joko-sdk-manifest", verified.manifest.manifestIntegrity);
   const loaded: unknown = await import(entryUrl.href);
-  return createDedicatedHardwareVendorAdapter({ sdk: loaded, sink, platform: process.platform });
+  return createDedicatedHardwareVendorAdapter({ sdk: loaded, sink, platform: process.platform,
+    loadFilesystemApi: filesystemApiLoader(dedicatedHardwareSdkEntryPath(verified)) });
 }
 
 export async function loadDedicatedHardwareAdapter(
@@ -40,7 +42,24 @@ export async function loadDedicatedHardwareAdapter(
       onFatalError: () => { setImmediate(() => process.exit(1)); } });
   }
   const loaded: unknown = createRequire(import.meta.url)(identity.entryPath);
-  return createDedicatedHardwareVendorAdapter({ sdk: loaded, sink, platform: process.platform });
+  return createDedicatedHardwareVendorAdapter({ sdk: loaded, sink, platform: process.platform,
+    loadFilesystemApi: filesystemApiLoader(identity.entryPath) });
+}
+
+function filesystemApiLoader(entryPath: string): (comm: unknown, log: unknown) => unknown {
+  const sdkDirectory = dirname(entryPath);
+  return (comm, log) => {
+    const nestedKit = join(sdkDirectory, "node_modules", "@worklouder", "wl-device-kit");
+    for (const root of [sdkDirectory, nestedKit]) {
+      try {
+        const kit: unknown = createRequire(join(root, "package.json"))("@worklouder/wl-device-kit");
+        if (typeof kit === "object" && kit !== null && "WLRPCApi" in kit && typeof kit.WLRPCApi === "function") {
+          return new (kit.WLRPCApi as new (comm: unknown, log: unknown) => unknown)(comm, log);
+        }
+      } catch { /* The SDK may expose its filesystem API directly instead. */ }
+    }
+    return undefined;
+  };
 }
 
 export function startDedicatedHardwareUtility(port: ParentPort): void {

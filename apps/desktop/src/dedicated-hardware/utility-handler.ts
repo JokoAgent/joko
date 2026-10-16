@@ -309,10 +309,10 @@ export function createDedicatedHardwareUtilityRequestHandler(options: {
         const state = await adapter.probe(request.model);
         if (state.model !== request.model) throw new Error("Adapter returned the wrong model.");
         await acceptAdapterState(state);
-        post({ version: 1, generation, requestId: request.requestId, kind: "ack" });
       } catch {
         postState(failedState(request.model));
       }
+      post({ version: 1, generation, requestId: request.requestId, kind: "ack" });
       return "continue";
     }
 

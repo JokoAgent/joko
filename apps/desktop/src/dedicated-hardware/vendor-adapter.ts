@@ -33,7 +33,8 @@ const STOP_LIGHTING_TIMEOUT_MS = 500;
 const EMPTY_LIGHTING_STATE: DedicatedHardwareLightingState = {
   version: 1, taskSlots: [null, null, null, null, null, null], revealOccurrence: "0", primaryVisible: false
 };
-const logger = Object.freeze({ debug() {}, info() {}, warn() {}, error() {} });
+const logger = Object.freeze({ debug(..._args: unknown[]) {}, info(..._args: unknown[]) {},
+  warn(..._args: unknown[]) {}, error(..._args: unknown[]) {} });
 
 interface Device {
   readonly isUsbConnection: boolean;
@@ -45,22 +46,24 @@ interface Communication {
   parseRpcData(data: string): boolean;
   rpcResponse?: string;
 }
+interface FilesystemApi {
+  readFile(name: string): Promise<unknown>;
+  writeFile(name: string, contents: string): Promise<unknown>;
+}
 interface DeviceApi {
-  readonly api: {
-    readFile(name: string): Promise<unknown>;
-    writeFile(name: string, contents: string): Promise<unknown>;
-  };
-  getDeviceStatus(): Promise<unknown>;
+  readonly api?: FilesystemApi;
+  getDeviceStatus?(): Promise<unknown>;
   sendLightingConfig(config: Pick<DedicatedHardwareLightingFrame, "ambient" | "keys">): Promise<unknown>;
   sendThreadsLighting(threads: DedicatedHardwareLightingFrame["threads"]): Promise<unknown>;
   onHidReceived(listener: (value: unknown) => void): (() => void) | void;
   onJoystickMove(listener: (value: unknown) => void): (() => void) | void;
 }
 interface Sdk {
-  readonly DeviceType: { readonly CodexMicro: unknown; readonly CreatorMicroV2: unknown };
+  readonly DeviceType: { readonly CodexMicro: unknown; readonly CreatorMicroV2?: unknown };
   readonly WLDeviceDiscovery: new (log: typeof logger) => { findWLDevices(filter: unknown[]): unknown[] };
   readonly WLDeviceCommImpl: new (log: typeof logger) => Communication;
   readonly RPCApiOAI: new (comm: Communication, log: typeof logger) => DeviceApi;
+  readonly WLRPCApi?: new (comm: Communication, log: typeof logger) => FilesystemApi;
 }
 interface Status {
   readonly firmwareVersion: string | null;
@@ -74,6 +77,7 @@ interface Connection {
   readonly device: Device;
   readonly comm: Communication;
   readonly api: DeviceApi;
+  readonly filesystem?: FilesystemApi;
   readonly codec: ReturnType<typeof createDedicatedHardwareNotificationCodec>;
   readonly lighting: DedicatedHardwareLightingRuntime;
   readonly unsubscribers: (() => void)[];
@@ -85,6 +89,7 @@ interface Connection {
   mapping?: ReadonlyMap<DedicatedHardwarePhysicalKey, DedicatedHardwarePhysicalKey>;
   mappingIdentity?: string;
   lightingRpc?: Promise<unknown>;
+  transportFaulted: boolean;
 }
 interface Slot {
   readonly model: DedicatedHardwareModelId;
@@ -102,6 +107,7 @@ export function createDedicatedHardwareVendorAdapter(options: {
   readonly sink: DedicatedHardwareUtilityAdapterSink;
   readonly platform: NodeJS.Platform;
   readonly settle?: (milliseconds: number) => Promise<void>;
+  readonly loadFilesystemApi?: (comm: unknown, log: typeof logger) => unknown;
 }): DedicatedHardwareUtilityAdapter {
   const sdk = admitSdk(options.sdk);
   const discovery = new sdk.WLDeviceDiscovery(logger);
@@ -121,6 +127,7 @@ export function createDedicatedHardwareVendorAdapter(options: {
   };
   const candidates = (model: DedicatedHardwareModelId): Device[] => {
     const type = model === "codex-micro" ? sdk.DeviceType.CodexMicro : sdk.DeviceType.CreatorMicroV2;
+    if (type === undefined) return [];
     const found = discovery.findWLDevices([type]);
     if (!Array.isArray(found) || found.length > 32) throw failure();
     const parsed = found.map((device) => {
@@ -143,7 +150,7 @@ export function createDedicatedHardwareVendorAdapter(options: {
     catch { return false; }
   };
   const lightingAdmitted = (slot: Slot, connection: Connection): boolean =>
-    current(slot, connection) && slot.enabled && connection.ready && slot.maintenanceDepth === 0 &&
+    current(slot, connection) && !connection.transportFaulted && slot.enabled && connection.ready && slot.maintenanceDepth === 0 &&
     (slot.model !== "creator-micro-2" || creatorMappingConfirmed(connection));
   const synchronizeLighting = (slot: Slot): void => {
     const connection = slot.connection;
@@ -225,50 +232,85 @@ export function createDedicatedHardwareVendorAdapter(options: {
     await bounded(connection.comm.disconnect());
     if (offFailed) throw failure();
   };
-  const readStatus = async (slot: Slot, connection: Connection): Promise<Status> => {
+  const readStatus = async (slot: Slot, connection: Connection, allowIdle = false): Promise<Status> => {
     if (!current(slot, connection)) throw failure();
     const found = candidates(slot.model);
     if (!found.some((device) => device.serialNumber === connection.device.serialNumber &&
       device.isUsbConnection === connection.device.isUsbConnection)) throw failure();
-    const status = parseStatus(await bounded(connection.api.getDeviceStatus()));
+    if (connection.transportFaulted) throw failure();
+    if (connection.api.getDeviceStatus === undefined) {
+      if (slot.model === "creator-micro-2") throw failure();
+      return connection.status;
+    }
+    let status: Status;
+    try {
+      status = parseStatus(await bounded(connection.api.getDeviceStatus()));
+    } catch (error) {
+      // Creator firmware idles its HID reader. A visible-state liveness probe
+      // may retain the last confirmed handle; keymap reads still require fresh status.
+      if (!connection.transportFaulted && current(slot, connection) &&
+          (isOptionalStatusError(error) || (allowIdle && slot.model === "creator-micro-2" &&
+            connection.status.firmwareVersion !== null &&
+            ["device-disconnected", "connection-timeout"].includes(errorReason(error, options.platform)!)))) {
+        return connection.status;
+      }
+      throw error;
+    }
     if (!current(slot, connection)) throw failure();
     connection.status = status;
     return status;
   };
-  const connect = async (slot: Slot): Promise<Connection | undefined> => {
+  const connect = async (slot: Slot, allowIdle = false): Promise<Connection | undefined> => {
     if (slot.connection !== undefined) {
-      await readStatus(slot, slot.connection);
+      await readStatus(slot, slot.connection, allowIdle);
       return slot.connection;
     }
     const device = candidates(slot.model)[0];
     if (device === undefined) return undefined;
-    const comm = new sdk.WLDeviceCommImpl(logger);
+    let connection: Connection | undefined;
+    const connectionLogger = { ...logger, error: (...args: unknown[]) => {
+      const detail = args.map((value) => value instanceof Error ? value.message : typeof value === "string" ? value : "").join(" ");
+      if (connection !== undefined && current(slot, connection) && transportDeath(detail, slot.model)) {
+        const wasReady = connection.ready;
+        connection.transportFaulted = true;
+        connection.ready = false;
+        connection.lighting.pause();
+        connection.codec.reset();
+        if (wasReady) options.sink.publishState(snapshot(slot, "error", "device-disconnected"));
+      }
+    } };
+    const comm = new sdk.WLDeviceCommImpl(connectionLogger);
     if (typeof comm.connect !== "function" || typeof comm.disconnect !== "function" ||
       typeof comm.parseRpcData !== "function") throw failure();
     const generation = ++slot.generation;
     try {
       if (await bounded(comm.connect(device)) !== true || stopped || slot.generation !== generation) throw failure();
-      const api = new sdk.RPCApiOAI(comm, logger);
-      if (typeof api.getDeviceStatus !== "function" || typeof api.onHidReceived !== "function" ||
-        typeof api.onJoystickMove !== "function" || !record(api.api) ||
-        typeof api.sendLightingConfig !== "function" || typeof api.sendThreadsLighting !== "function" ||
-        typeof api.api.readFile !== "function" || typeof api.api.writeFile !== "function") throw failure();
-      let connection: Connection;
+      const api = new sdk.RPCApiOAI(comm, connectionLogger);
+      if ((api.getDeviceStatus !== undefined && typeof api.getDeviceStatus !== "function") ||
+        typeof api.onHidReceived !== "function" || typeof api.onJoystickMove !== "function" ||
+        typeof api.sendLightingConfig !== "function" || typeof api.sendThreadsLighting !== "function") throw failure();
+      const filesystem = slot.model === "creator-micro-2"
+        ? isFilesystemApi(api.api) ? api.api
+          : sdk.WLRPCApi !== undefined ? new sdk.WLRPCApi(comm, connectionLogger)
+            : options.loadFilesystemApi?.(comm, connectionLogger)
+        : undefined;
+      if (slot.model === "creator-micro-2" && !isFilesystemApi(filesystem)) throw failure();
+      let active: Connection;
       const codec = createDedicatedHardwareNotificationCodec({
-        resolvePhysicalKey: (wire) => slot.model === "creator-micro-2" ? connection.mapping?.get(wire) : wire
+        resolvePhysicalKey: (wire) => slot.model === "creator-micro-2" ? active.mapping?.get(wire) : wire
       });
       const lighting = createDedicatedHardwareLightingRuntime({
         apply: async (frame, signal) => {
           const assertOwned = (): void => {
-            if (signal.aborted || !lightingAdmitted(slot, connection)) throw failure();
+            if (signal.aborted || !lightingAdmitted(slot, active)) throw failure();
           };
           assertOwned();
-          success(await lightingRpc(connection, () => {
+          success(await lightingRpc(active, () => {
             assertOwned();
             return api.sendLightingConfig({ ambient: frame.ambient, keys: frame.keys });
           }));
           assertOwned();
-          success(await lightingRpc(connection, () => {
+          success(await lightingRpc(active, () => {
             assertOwned();
             return api.sendThreadsLighting(frame.threads);
           }));
@@ -276,18 +318,19 @@ export function createDedicatedHardwareVendorAdapter(options: {
         }
       });
       lighting.pause();
-      connection = {
+      active = connection = {
         generation, device, comm, api, codec, lighting, ready: false, unsubscribers: [],
+        ...(isFilesystemApi(filesystem) ? { filesystem } : {}), transportFaulted: false,
         restoreParser: installCompactHardwareNotifications(comm),
         status: { firmwareVersion: null, batteryPercentage: null, isCharging: null, profileIndex: null, layerIndex: null }
       };
       slot.connection = connection;
       const receive = (kind: "hid" | "joystick", value: unknown): void => {
-        if (!current(slot, connection) || !slot.enabled || !connection.ready ||
-          (slot.model === "creator-micro-2" && connection.mapping === undefined)) return;
+        if (!current(slot, active) || !slot.enabled || !active.ready || active.transportFaulted ||
+          (slot.model === "creator-micro-2" && active.mapping === undefined)) return;
         const input = codec[kind](value);
         if (input !== undefined) {
-          connection.lighting.physicalActivity();
+          active.lighting.physicalActivity();
           options.sink.publishInput(slot.model, input);
         }
       };
@@ -329,14 +372,14 @@ export function createDedicatedHardwareVendorAdapter(options: {
       slot.connection.lighting.pause();
     }
     try {
-      const connection = await connect(slot);
+      const connection = await connect(slot, true);
       if (connection === undefined) return snapshot(slot, "not-detected");
       connection.ready = true;
       synchronizeLighting(slot);
       return snapshot(slot, "connected");
     } catch (error) {
       await retire(slot).catch(() => undefined);
-      return snapshot(slot, "error", errorReason(error));
+      return snapshot(slot, "error", errorReason(error, options.platform));
     }
   };
   const creator = async (expected?: string): Promise<Readonly<{ slot: Slot; connection: Connection; identity: string }>> => {
@@ -349,7 +392,8 @@ export function createDedicatedHardwareVendorAdapter(options: {
     return { slot, connection, identity };
   };
   const readContents = async (slot: Slot, connection: Connection): Promise<string> => {
-    const value = success(await bounded(connection.api.api.readFile(KEYMAP_FILE)));
+    if (connection.filesystem === undefined) throw failure();
+    const value = success(await bounded(connection.filesystem.readFile(KEYMAP_FILE)));
     if (!current(slot, connection) || typeof value !== "string" || value.length === 0 ||
       Buffer.byteLength(value, "utf8") > DEDICATED_HARDWARE_KEYMAP_MAX_BYTES) throw failure();
     return value;
@@ -379,7 +423,8 @@ export function createDedicatedHardwareVendorAdapter(options: {
         const { slot, connection } = await creator(expected);
         if (connection.context === undefined) throw failure();
         connection.ready = false;
-        success(await bounded(connection.api.api.writeFile(KEYMAP_FILE, contents)));
+        if (connection.filesystem === undefined) throw failure();
+        success(await bounded(connection.filesystem.writeFile(KEYMAP_FILE, contents)));
         if (!current(slot, connection)) throw failure();
         connection.expectedContents = contents;
       }),
@@ -413,7 +458,7 @@ export function createDedicatedHardwareVendorAdapter(options: {
             if (!current(slot, connection) || slot.enabled || connection.ready) throw failure();
           });
         } catch (error) {
-          return snapshot(slot, "error", errorReason(error));
+          return snapshot(slot, "error", errorReason(error, options.platform));
         }
       }
       return refresh(slot);
@@ -438,18 +483,25 @@ export function createDedicatedHardwareVendorAdapter(options: {
 
 function admitSdk(value: unknown): Sdk {
   if (!record(value) || !record(value.DeviceType) || value.DeviceType.CodexMicro === undefined ||
-    value.DeviceType.CreatorMicroV2 === undefined || value.DeviceType.CodexMicro === value.DeviceType.CreatorMicroV2 ||
+    value.DeviceType.CodexMicro === value.DeviceType.CreatorMicroV2 ||
     typeof value.WLDeviceDiscovery !== "function" || typeof value.WLDeviceCommImpl !== "function" ||
-    typeof value.RPCApiOAI !== "function") throw failure();
+    typeof value.RPCApiOAI !== "function" ||
+    (value.WLRPCApi !== undefined && typeof value.WLRPCApi !== "function")) throw failure();
   return value as unknown as Sdk;
 }
 function success(value: unknown): unknown {
   if (!record(value) || value.ok !== true ||
-    value.error !== undefined) throw failure();
+    value.error !== undefined) {
+    if (record(value) && record(value.error) && typeof value.error.message === "string") {
+      throw new Error(value.error.message.slice(0, 512));
+    }
+    throw failure();
+  }
   return value.value;
 }
 function parseStatus(envelope: unknown): Status {
-  const value = success(envelope);
+  if (!record(envelope)) throw failure();
+  const value = envelope.ok === undefined ? envelope : success(envelope);
   if (!record(value)) throw failure();
   const optional = <T>(field: unknown, valid: (candidate: unknown) => candidate is T): T | null => {
     if (field === undefined) return null;
@@ -457,12 +509,14 @@ function parseStatus(envelope: unknown): Status {
     return field;
   };
   return {
-    firmwareVersion: optional(value.firmwareVersion, validIdentityPart),
-    batteryPercentage: optional(value.batteryPercentage, (field): field is number =>
+    firmwareVersion: optional(value.firmwareVersion ?? value.version, validIdentityPart),
+    batteryPercentage: optional(value.batteryPercentage ?? value.battery, (field): field is number =>
       typeof field === "number" && Number.isFinite(field) && field >= 0 && field <= 100),
-    isCharging: optional(value.isCharging, (field): field is boolean => typeof field === "boolean"),
-    profileIndex: optional(value.profileIndex, (field): field is number => Number.isSafeInteger(field) && Number(field) >= 0),
-    layerIndex: optional(value.layerIndex, (field): field is number => Number.isSafeInteger(field) && Number(field) >= 1)
+    isCharging: optional(value.isCharging ?? value.is_charging, (field): field is boolean => typeof field === "boolean"),
+    profileIndex: optional(value.profile_index ?? value.profileIndex ?? value.selectedProfileIndex,
+      (field): field is number => Number.isSafeInteger(field) && Number(field) >= 0),
+    layerIndex: optional(value.layer_index ?? value.layerIndex ?? value.selectedLayerIndex,
+      (field): field is number => Number.isSafeInteger(field) && Number(field) >= 1)
   };
 }
 function contextOf(status: Status): CreatorKeymapContext {
@@ -483,12 +537,27 @@ function validIdentityPart(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 128 && value.trim() === value &&
     !/[\u0000-\u001f\u007f]/u.test(value);
 }
-function errorReason(error: unknown): DedicatedHardwareUtilityDeviceSnapshot["reason"] {
+function errorReason(error: unknown, platform: NodeJS.Platform): DedicatedHardwareUtilityDeviceSnapshot["reason"] {
   const code = record(error) ? error.code : undefined;
-  if (code === "EACCES" || code === "EPERM") return "permission-required";
-  if (code === "EBUSY") return "device-in-use";
+  const message = error instanceof Error ? error.message : "";
+  if (code === "EBUSY" || contention(message)) return "device-in-use";
+  if (platform === "darwin" && (code === "EACCES" || code === "EPERM" ||
+      /permission|not permitted|access denied|input monitoring|operation not allowed/i.test(message))) return "permission-required";
   if (code === "ETIMEDOUT") return "connection-timeout";
   return "device-disconnected";
+}
+function isFilesystemApi(value: unknown): value is FilesystemApi {
+  return record(value) && typeof value.readFile === "function" && typeof value.writeFile === "function";
+}
+function isOptionalStatusError(error: unknown): boolean {
+  return error instanceof Error && /method not found|unknown method|not implemented|unsupported/i.test(error.message);
+}
+function contention(detail: string): boolean {
+  return /0xE00002C1|0xE00002E2|device has been closed|\(iokit\/common\) not permitted/i.test(detail);
+}
+function transportDeath(detail: string, model: DedicatedHardwareModelId): boolean {
+  if (contention(detail) || (model === "creator-micro-2" && /hid_read_timeout|device disconnected|could not read/i.test(detail))) return false;
+  return /hid_read_timeout|cannot send, no device connected|device disconnected|hid_unavailable|0xE00002C5|error sending message|could not write|hid device disconnected/i.test(detail);
 }
 async function bounded<T>(operation: Promise<T>, timeout = RPC_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
