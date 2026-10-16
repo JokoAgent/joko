@@ -53,9 +53,16 @@ describe("production Extension Library chain", () => {
       bytes: 0n
     });
 
-    const opened = await paired.clients.extension.openExtensionLibrary({
+    const surface = await paired.clients.extension.openExtensionMainView({
       extensionId: installed.extensionId,
       expectedRevision: { value: revision }
+    });
+    const surfaceId = surface.surface?.surfaceId;
+    if (surfaceId === undefined) throw new Error("The production service returned no Extension surface.");
+    const opened = await paired.clients.extension.openExtensionLibrary({
+      extensionId: installed.extensionId,
+      expectedRevision: { value: revision },
+      surfaceId
     });
     const sessionId = opened.library?.sessionId;
     if (sessionId === undefined) throw new Error("The production service returned no Library session.");
@@ -138,9 +145,16 @@ describe("production Extension Library chain", () => {
     }));
     expect(restored.extensionId).toBe(installed.extensionId);
     const restoredRevision = requiredRevision(restored);
-    const reopened = await restarted.clients.extension.openExtensionLibrary({
+    const restartedSurface = await restarted.clients.extension.openExtensionMainView({
       extensionId: restored.extensionId,
       expectedRevision: { value: restoredRevision }
+    });
+    const restartedSurfaceId = restartedSurface.surface?.surfaceId;
+    if (restartedSurfaceId === undefined) throw new Error("The restarted service returned no Extension surface.");
+    const reopened = await restarted.clients.extension.openExtensionLibrary({
+      extensionId: restored.extensionId,
+      expectedRevision: { value: restoredRevision },
+      surfaceId: restartedSurfaceId
     });
     const restartedSessionId = reopened.library?.sessionId;
     if (restartedSessionId === undefined) throw new Error("The restarted service returned no Library session.");
