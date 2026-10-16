@@ -551,6 +551,7 @@ export interface PiSkillContentLeaseInput {
 }
 
 export interface PiSkillContentLease {
+  /** Internal Resource authority, never serialized with the content lease. */
   readonly resource: PiResourceDescriptor;
   /** Private native file location, never copied into a generated contract. */
   readonly entryFilePath: string;
@@ -869,7 +870,10 @@ export class PiResourceManager {
           await releasePromise;
         }
       };
-      Object.defineProperty(lease, "entryFilePath", { enumerable: false });
+      Object.defineProperties(lease, {
+        entryFilePath: { enumerable: false },
+        resource: { enumerable: false }
+      });
       return lease;
     });
   }
