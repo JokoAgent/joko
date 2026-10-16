@@ -27,12 +27,65 @@ describe("native tool-free text inference", () => {
     fake.reviewConfig = { mcp_servers: { external: { command: "external" } } };
     const pending = adapter.inferNativeText(input), threadId = await runningThread(fake);
     const start = fake.transport!.requests.find(request => request.method === "thread/start")!.params as JsonObject;
-    expect(start).toMatchObject({ ephemeral: true, approvalPolicy: "never", modelProvider: "openai", dynamicTools: [], environments: [], selectedCapabilityRoots: [],
+    expect(start).toMatchObject({ ephemeral: true, approvalPolicy: "never", model: "gpt-5.4-mini", modelProvider: "openai", dynamicTools: [], environments: [], selectedCapabilityRoots: [],
       config: { "features.shell_tool": false, "features.plugins": false, "features.memories": false, "mcp_servers.external.enabled": false,
         "skills.config": [{ path: "/private/SKILL.md", enabled: false }] } });
     await fake.completeTurn(threadId, "Use the General page.");
     await expect(pending).resolves.toBe("Use the General page.");
     expect(fake.transport!.requests.some(request => request.method === "turn/interrupt")).toBe(true);
+    expect(fake.transport!.requests.some(request => request.method === "thread/unsubscribe")).toBe(true);
+  });
+
+  it("uses the explicitly selected model from the current native Provider catalog", async () => {
+    const { fake, adapter, input } = setup();
+    await adapter.listModels();
+    const assertModelAllowed = vi.fn();
+    const pending = adapter.inferNativeText({ ...input, timeoutMs: 90_000, providerId: "openai", modelId: "gpt-test", assertModelAllowed });
+    const threadId = await runningThread(fake);
+    expect(fake.transport!.requests.find(request => request.method === "thread/start")!.params).toMatchObject({ model: "gpt-test", modelProvider: "openai" });
+    expect(fake.transport!.requests.find(request => request.method === "turn/start")!.params).toMatchObject({ threadId, input: [{ type: "text", text: input.user }] });
+    await fake.completeTurn(threadId, "Generated using the selected model.");
+    await expect(pending).resolves.toBe("Generated using the selected model.");
+    expect(assertModelAllowed).toHaveBeenCalledWith("openai", "gpt-test");
+  });
+
+  it.each([
+    { providerId: "other-provider", modelId: "gpt-test" },
+    { providerId: "openai", modelId: "missing-model" },
+    { providerId: "openai" },
+    { modelId: "gpt-test" }
+  ])("does not dispatch a mismatched explicit route: %j", async (selection) => {
+    const { fake, adapter, input } = setup();
+    await adapter.listModels();
+    await expect(adapter.inferNativeText({ ...input, ...selection })).rejects.toThrow("unavailable");
+    expect(fake.transport!.requests.some(request => request.method === "thread/start" || request.method === "turn/start")).toBe(false);
+  });
+
+  it("rejects a late answer after the selected model is withdrawn from the current catalog", async () => {
+    const { fake, adapter, input } = setup();
+    await adapter.listModels();
+    const pending = adapter.inferNativeText({ ...input, providerId: "openai", modelId: "gpt-test" });
+    const rejected = expect(pending).rejects.toThrow("unavailable");
+    const threadId = await runningThread(fake);
+    fake.modelList = [];
+    await adapter.listModels();
+    await fake.completeTurn(threadId, "Answer from a withdrawn model.");
+    await rejected;
+    expect(fake.transport!.requests.some(request => request.method === "turn/interrupt")).toBe(true);
+    expect(fake.transport!.requests.some(request => request.method === "thread/unsubscribe")).toBe(true);
+  });
+
+  it("does not send the prompt if the selected model is withdrawn while creating its temporary thread", async () => {
+    const { fake, host, adapter, input } = setup();
+    await adapter.listModels();
+    const original = host.request.bind(host);
+    vi.spyOn(host, "request").mockImplementation(async (method, params, options) => {
+      const response = await original(method, params, options);
+      if (method === "thread/start") { fake.modelList = []; await adapter.listModels(); }
+      return response;
+    });
+    await expect(adapter.inferNativeText({ ...input, providerId: "openai", modelId: "gpt-test" })).rejects.toThrow("unavailable");
+    expect(fake.transport!.requests.some(request => request.method === "turn/start")).toBe(false);
     expect(fake.transport!.requests.some(request => request.method === "thread/unsubscribe")).toBe(true);
   });
 

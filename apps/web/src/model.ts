@@ -2520,6 +2520,11 @@ export interface WorkspaceDiffView {
   readonly baseRevision?: string;
   readonly headRevision?: string;
   readonly mergeBaseRevision?: string;
+  readonly pushTarget?: {
+    readonly remote: string;
+    readonly remoteRef: string;
+    readonly hasUpstream: boolean;
+  };
 }
 
 export interface WorkspaceDiffQuery {
@@ -2829,6 +2834,20 @@ export interface ScheduleDraft {
   readonly preRunHook?: ScheduleView["preRunHook"];
   readonly overlapPolicy: ScheduleView["overlapPolicy"];
   readonly misfirePolicy: ScheduleView["misfirePolicy"];
+}
+
+export interface ScheduleHookPreparationView {
+  readonly hook: NonNullable<ScheduleView["preRunHook"]>;
+  readonly content: string;
+  readonly test?: SchedulePreRunResultView;
+}
+export type ScheduleHookSourceView = { readonly kind: "script" | "description" | "workspaceFile"; readonly value: string }
+  | { readonly kind: "readCurrent"; readonly value: true };
+export interface ScheduleHookOperationView {
+  readonly state: "running" | "completed" | "failed";
+  readonly preparation?: ScheduleHookPreparationView;
+  readonly test?: SchedulePreRunResultView;
+  readonly error?: string;
 }
 
 export interface BrowserView {
@@ -6191,6 +6210,9 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   cloneProjectScheduleToUser(scheduleId: string, displayName: string): Promise<void>;
   removeProjectSchedule(scheduleId: string, keepPersonalCopy: boolean): Promise<void>;
   saveSchedule(scheduleId: string | undefined, draft: ScheduleDraft): Promise<void>;
+  prepareScheduleHook(scheduleId: string | undefined, draft: ScheduleDraft, source: ScheduleHookSourceView, signal?: AbortSignal, operationId?: string): Promise<ScheduleHookPreparationView>;
+  testScheduleHook(scheduleId: string | undefined, draft: ScheduleDraft, signal?: AbortSignal, operationId?: string): Promise<SchedulePreRunResultView>;
+  getScheduleHookOperation(operationId: string, signal?: AbortSignal): Promise<ScheduleHookOperationView>;
   listScheduleRunHistory(scheduleId: string, pageToken?: string, pageSize?: number): Promise<ScheduleHistoryPageView>;
   getSchedulerRuntime(signal?: AbortSignal): Promise<SchedulerRuntimeView>;
   cancelQueueItem(queueItemId: string): Promise<void>;

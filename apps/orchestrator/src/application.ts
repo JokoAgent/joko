@@ -416,6 +416,7 @@ export interface OrchestratorApplication {
   /** Opt-in shadow savepoints for local Git workspaces. */
   readonly gitSafety?: GitSafetyCoordinator;
   readonly scheduler: ScheduleCoordinator;
+  readonly scheduleHookScripts: ScheduleHookScriptInstaller;
   readonly reviewCoordinator?: ReviewCoordinator;
   /** Authenticated reverse routes for exact controller-to-Device execution. */
   readonly devicePeers?: DevicePeerOwner;
@@ -1204,7 +1205,11 @@ export async function createOrchestratorApplication(
     })
   );
   const scheduleHookScripts = new ScheduleHookScriptInstaller({
-    generate: createScheduleHookScriptGenerator(providers)
+    generate: createScheduleHookScriptGenerator(providers, { store,
+      adapters: () => backendInstances.snapshots().flatMap(instance => {
+        const adapter = backendInstances.adapter(instance.instanceId);
+        return adapter === undefined ? [] : [adapter];
+      }) })
   });
   const scheduleRunNotifications = new ScheduleRunNotificationController(store);
   let schedulerForBridgeTools: ScheduleCoordinator | undefined;
@@ -3011,6 +3016,7 @@ export async function createOrchestratorApplication(
     toolPolicies,
     gitSafety,
     scheduler,
+    scheduleHookScripts,
     reviewCoordinator,
     devicePeers,
     remoteDesktop,

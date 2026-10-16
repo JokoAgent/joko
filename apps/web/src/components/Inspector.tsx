@@ -1807,7 +1807,7 @@ export function FileTreeNode({ controller, workspaceId, entry, selectedPath, onS
   return <div role="treeitem" tabIndex={-1} data-inspector-tree-key={entry.path} aria-label={entry.name} aria-level={level} aria-selected={selectedPath === entry.path}><button className={cx("file-tree__row", selectedPath === entry.path && "is-active")} type="button" tabIndex={-1} data-inspector-tree-primary="" onClick={() => onSelect(entry.path)}><span className="tree-spacer" /><File aria-hidden="true" /><span>{entry.name}</span>{entry.status !== undefined && <i className={`file-status file-status--${entry.status}`} aria-label={entry.status} />}</button></div>;
 }
 
-function ChangesPanel({ controller, session, workspace, focusRequest, canDiff, canDiffImagePreview, canStageDiff, canUnstageDiff, canRevertDiff, canCommitDiff, canPushDiff, canRewind, gitWriteDisabledReason, t, runAction }: {
+export function ChangesPanel({ controller, session, workspace, focusRequest, canDiff, canDiffImagePreview, canStageDiff, canUnstageDiff, canRevertDiff, canCommitDiff, canPushDiff, canRewind, gitWriteDisabledReason, t, runAction }: {
   readonly controller: AppController;
   readonly session: SessionView;
   readonly workspace?: WorkspaceView;
@@ -1852,8 +1852,8 @@ function ChangesPanel({ controller, session, workspace, focusRequest, canDiff, c
   const [imagePreview, setImagePreview] = useState<{ readonly key: string; readonly loading: boolean; readonly value?: WorkspaceDiffImageView; readonly error?: string }>();
   const [commitMessage, setCommitMessage] = useState("");
   const [includeUnstaged, setIncludeUnstaged] = useState(false);
-  const [remote, setRemote] = useState("origin");
-  const [remoteRef, setRemoteRef] = useState("");
+  const [remote, setRemote] = useState<string>();
+  const [remoteRef, setRemoteRef] = useState<string>();
   const [pendingGitWrite, setPendingGitWrite] = useState<"commit" | "commitPush" | "push">();
   const [forceConfirmation, setForceConfirmation] = useState<WorkspaceGitPushResultView>();
   const [operationNotice, setOperationNotice] = useState<string>();
@@ -1901,7 +1901,8 @@ function ChangesPanel({ controller, session, workspace, focusRequest, canDiff, c
   }, [diff, focusRequest?.requestId, focusRequest?.selectedPath, focusRequest?.sessionId, session.id, sourceKind, turnSetId]);
 
   useEffect(() => {
-    setRemoteRef(workspace?.branch === undefined ? "" : `refs/heads/${workspace.branch}`);
+    setRemote(undefined);
+    setRemoteRef(undefined);
   }, [workspace?.branch, workspace?.id]);
 
   useEffect(() => {
@@ -2052,11 +2053,13 @@ function ChangesPanel({ controller, session, workspace, focusRequest, canDiff, c
     }).catch((cause: unknown) => setImagePreview({ key, loading: false, error: messageOf(cause) }));
   };
   const currentMutationFence = (): Promise<WorkspaceDiffView> => controller.getWorkspaceDiff(workspace.id, { source: "unstaged" });
+  const displayedRemote = remote ?? diff?.pushTarget?.remote ?? "";
+  const displayedRemoteRef = remoteRef ?? diff?.pushTarget?.remoteRef ?? "";
   const executePush = async (confirmation?: WorkspaceGitPushResultView): Promise<void> => {
-    const selectedRemote = (confirmation?.remote ?? remote).trim();
-    const selectedRemoteRef = (confirmation?.remoteRef ?? remoteRef).trim();
-    if (selectedRemote === "" || selectedRemoteRef === "") throw new Error(t("workspace.reviewPushTargetRequired"));
     const fence = await currentMutationFence();
+    const selectedRemote = (confirmation?.remote ?? remote ?? fence.pushTarget?.remote ?? "").trim();
+    const selectedRemoteRef = (confirmation?.remoteRef ?? remoteRef ?? fence.pushTarget?.remoteRef ?? "").trim();
+    if (selectedRemote === "" || selectedRemoteRef === "") throw new Error(t("workspace.reviewPushTargetRequired"));
     if (fence.headRevision === undefined || fence.headRevision === "") throw new Error(t("workspace.reviewPushHeadRequired"));
     const result = await controller.pushWorkspaceBranch(workspace.id, {
       remote: selectedRemote,
@@ -2186,11 +2189,11 @@ function ChangesPanel({ controller, session, workspace, focusRequest, canDiff, c
             {gitWriteDisabledReason !== undefined && <p className="review-write-disabled" role="status"><AlertTriangle aria-hidden="true" />{gitWriteDisabledReason}</p>}
             {canCommitDiff && <textarea rows={3} value={commitMessage} onChange={(event) => setCommitMessage(event.target.value)} placeholder={t("workspace.reviewCommitPlaceholder")} maxLength={65_536} />}
             {canCommitDiff && <label className="review-checkbox"><CheckboxControl checked={includeUnstaged} onChange={(event) => setIncludeUnstaged(event.target.checked)} /><span>{t("workspace.reviewIncludeUnstaged")}</span></label>}
-            {canPushDiff && <div className="review-push-target"><label><span>{t("workspace.reviewRemote")}</span><input value={remote} onChange={(event) => setRemote(event.target.value)} autoComplete="off" /></label><label><span>{t("workspace.reviewRemoteRef")}</span><input value={remoteRef} onChange={(event) => setRemoteRef(event.target.value)} autoComplete="off" /></label></div>}
+            {canPushDiff && <div className="review-push-target"><label><span>{t("workspace.reviewRemote")}</span><input value={displayedRemote} onChange={(event) => setRemote(event.target.value)} autoComplete="off" /></label><label><span>{t("workspace.reviewRemoteRef")}</span><input value={displayedRemoteRef} onChange={(event) => setRemoteRef(event.target.value)} autoComplete="off" /></label></div>}
             <div className="review-write-actions">
               {canCommitDiff && <Button disabled={gitWriteDisabledReason !== undefined || pendingGitWrite !== undefined || commitMessage.trim() === ""} onClick={() => requestCommit(false)}><Check aria-hidden="true" />{t("workspace.reviewCommit")}</Button>}
-              {canCommitDiff && canPushDiff && <Button tone="primary" disabled={gitWriteDisabledReason !== undefined || pendingGitWrite !== undefined || commitMessage.trim() === "" || remote.trim() === "" || remoteRef.trim() === ""} onClick={() => requestCommit(true)}><Upload aria-hidden="true" />{t("workspace.reviewCommitAndPush")}</Button>}
-              {canPushDiff && <Button disabled={gitWriteDisabledReason !== undefined || pendingGitWrite !== undefined || remote.trim() === "" || remoteRef.trim() === ""} onClick={() => requestPush()}><Upload aria-hidden="true" />{t("workspace.reviewPush")}</Button>}
+              {canCommitDiff && canPushDiff && <Button tone="primary" disabled={gitWriteDisabledReason !== undefined || pendingGitWrite !== undefined || commitMessage.trim() === "" || displayedRemote.trim() === "" || displayedRemoteRef.trim() === ""} onClick={() => requestCommit(true)}><Upload aria-hidden="true" />{t("workspace.reviewCommitAndPush")}</Button>}
+              {canPushDiff && <Button disabled={gitWriteDisabledReason !== undefined || pendingGitWrite !== undefined || displayedRemote.trim() === "" || displayedRemoteRef.trim() === ""} onClick={() => requestPush()}><Upload aria-hidden="true" />{t("workspace.reviewPush")}</Button>}
               {pendingGitWrite !== undefined && <Spinner label={t("workspace.reviewWritePending")} />}
             </div>
           </section>}

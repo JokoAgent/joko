@@ -10,7 +10,9 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
-import { redactSecrets } from "@joko/core";
+import { redactSecrets, type BackendAdapter } from "@joko/core";
+import type { OperationalStore } from "@joko/store";
+import { backendModelAccessSettingKey, modelRoutingEnabled } from "./backend-model-access.js";
 
 import type { ProviderCatalogManager, ProviderInferenceRoute } from "./credential-manager.js";
 import { requestManagedTextInference } from "./personalization-inference.js";
@@ -32,6 +34,7 @@ export interface ScheduleHookScriptGenerationInput {
   readonly currentScript?: string;
   readonly providerId?: string;
   readonly modelId?: string;
+  readonly assertCurrent?: () => void;
 }
 
 export type ScheduleHookScriptGenerator = (
@@ -51,6 +54,8 @@ export interface ScheduleHookScriptInstallInput {
   readonly modelId?: string;
   readonly signal?: AbortSignal;
   readonly assertCurrent?: () => void;
+  /** GUI preparation never rewrites the script of an already saved Schedule. */
+  readonly draft?: boolean;
 }
 
 export interface ScheduleHookScriptInstallResult {
@@ -95,7 +100,7 @@ export class ScheduleHookScriptInstaller {
     const content = await this.#resolveContent(input, workspace, currentFilePath);
     input.signal?.throwIfAborted();
     input.assertCurrent?.();
-    const filePath = currentFilePath ?? await availableScriptPath(
+    const filePath = (input.draft ? undefined : currentFilePath) ?? await availableScriptPath(
       installDirectory,
       scheduleHookScriptSlug(input.scheduleName, input.description)
     );
@@ -155,7 +160,8 @@ export class ScheduleHookScriptInstaller {
       workspaceRoot,
       ...(currentScript === undefined ? {} : { currentScript }),
       ...(input.providerId === undefined ? {} : { providerId: input.providerId }),
-      ...(input.modelId === undefined ? {} : { modelId: input.modelId })
+      ...(input.modelId === undefined ? {} : { modelId: input.modelId }),
+      ...(input.assertCurrent === undefined ? {} : { assertCurrent: input.assertCurrent })
     }, input.signal);
     const extracted = extractScheduleHookScript(generated);
     if (extracted === undefined) throw new Error("Generated pre-run hook did not contain executable JavaScript.");
@@ -164,7 +170,8 @@ export class ScheduleHookScriptInstaller {
 }
 
 export function createScheduleHookScriptGenerator(
-  providers: Pick<ProviderCatalogManager, "resolveInferenceRoute" | "list">
+  providers: Pick<ProviderCatalogManager, "resolveInferenceRoute" | "list">,
+  native?: { readonly store: OperationalStore; readonly adapters: () => readonly BackendAdapter[] }
 ): (input: ScheduleHookScriptGenerationInput, signal?: AbortSignal) => Promise<string> {
   return async (input, signal) => {
     signal?.throwIfAborted();
@@ -189,7 +196,53 @@ export function createScheduleHookScriptGenerator(
             `<existing-script>${escapeScheduleHookReference(currentScript)}</existing-script>`
           ])
     ].join("\n");
-    return requestManagedTextInference({
+    input.assertCurrent?.();
+    if (route === undefined) {
+      if (native === undefined) throw missingScheduleHookRoute(input);
+      const adapter = native.adapters().find(candidate => candidate.id === input.backendId && candidate.inferNativeText !== undefined);
+      if (adapter?.inferNativeText === undefined) throw missingScheduleHookRoute(input);
+      const backend = native.store.getBackend(input.backendId).descriptor;
+      const backendSettingKey = `settings.backend.${input.backendId}`;
+      const accessSettingKey = backendModelAccessSettingKey(input.backendId);
+      const backendRevision = native.store.findSetting("service", "orchestrator", backendSettingKey)?.revision;
+      const accessRevision = native.store.findSetting("service", "orchestrator", accessSettingKey)?.revision;
+      const assertCurrent = () => {
+        signal?.throwIfAborted(); input.assertCurrent?.();
+        const current = native.store.getBackend(input.backendId).descriptor;
+        if (!native.adapters().includes(adapter) || current.instanceGeneration !== backend.instanceGeneration
+          || current.authenticationState !== "authenticated" || current.installationState !== "installed"
+          || current.health === "unavailable"
+          || native.store.findSetting("service", "orchestrator", backendSettingKey)?.revision !== backendRevision
+          || native.store.findSetting("service", "orchestrator", accessSettingKey)?.revision !== accessRevision
+          || native.store.findSetting<{ enabled?: boolean }>("service", "orchestrator", backendSettingKey)?.value.enabled === false) {
+          throw new Error("The scheduled native Backend has retired.");
+        }
+      };
+      const assertModelAllowed = (providerId: string, modelId: string) => {
+        assertCurrent();
+        if (input.providerId !== undefined && (providerId !== input.providerId || modelId !== input.modelId)
+          || !modelRoutingEnabled(native.store, input.backendId, providerId, modelId)) {
+          throw new Error("The scheduled native model is disabled or changed.");
+        }
+      };
+      assertCurrent();
+      if (input.providerId !== undefined) assertModelAllowed(input.providerId, input.modelId!);
+      const text = await adapter.inferNativeText({ system, user, timeoutMs: 60_000,
+        signal: signal ?? new AbortController().signal, backendInstanceGeneration: backend.instanceGeneration,
+        assertCurrent, assertModelAllowed,
+        ...(input.providerId === undefined ? {} : { providerId: input.providerId, modelId: input.modelId! }) });
+      assertCurrent();
+      if (input.providerId !== undefined) assertModelAllowed(input.providerId, input.modelId!);
+      return text;
+    }
+    const assertCurrent = () => {
+      signal?.throwIfAborted(); input.assertCurrent?.();
+      if (providers.resolveInferenceRoute(route.backendId, route.providerId, route.modelId)?.generationId !== route.generationId) {
+        throw new Error("The scheduled model route changed during script generation.");
+      }
+    };
+    assertCurrent();
+    const text = await requestManagedTextInference({
       route,
       system,
       user,
@@ -197,20 +250,21 @@ export function createScheduleHookScriptGenerator(
       ...(signal === undefined ? {} : { signal }),
       timeoutMs: 60_000
     });
+    assertCurrent();
+    return text;
   };
 }
 
 function resolveScheduleHookInferenceRoute(
   providers: Pick<ProviderCatalogManager, "resolveInferenceRoute" | "list">,
   input: Pick<ScheduleHookScriptGenerationInput, "backendId" | "providerId" | "modelId">
-): ProviderInferenceRoute {
+): ProviderInferenceRoute | undefined {
   if (typeof input.backendId !== "string" || input.backendId.trim() === "") throw new Error("Pre-run hook generation requires an authenticated Backend.");
   if ((input.providerId === undefined) !== (input.modelId === undefined)) {
     throw new Error("Pre-run hook generation requires both Provider and model IDs.");
   }
   if (input.providerId !== undefined && input.modelId !== undefined) {
     const explicit = providers.resolveInferenceRoute(input.backendId, input.providerId, input.modelId);
-    if (explicit === undefined) throw new Error("The scheduled Provider and model cannot generate a pre-run hook.");
     return explicit;
   }
   const eligible = new Map<string, ProviderInferenceRoute>();
@@ -220,10 +274,14 @@ function resolveScheduleHookInferenceRoute(
       if (route !== undefined) eligible.set(`${route.backendId}\0${route.providerId}\0${route.modelId}\0${route.generationId}`, route);
     }
   }
-  if (eligible.size !== 1) {
-    throw new Error("Pre-run hook generation needs an explicit scheduled Provider/model or exactly one eligible route on its authenticated Backend.");
-  }
-  return [...eligible.values()][0]!;
+  if (eligible.size > 1) throw missingScheduleHookRoute(input);
+  return [...eligible.values()][0];
+}
+
+function missingScheduleHookRoute(input: Pick<ScheduleHookScriptGenerationInput, "providerId">): Error {
+  return new Error(input.providerId !== undefined
+    ? "The scheduled Provider and model cannot generate a pre-run hook."
+    : "Pre-run hook generation needs an explicit scheduled Provider/model or exactly one eligible route on its authenticated Backend.");
 }
 
 function escapeScheduleHookReference(value: string): string {
@@ -260,6 +318,8 @@ export async function validateScheduleHookScriptBinding(input: {
   readonly filePath: string;
   readonly command: string;
 }): Promise<string> {
+  // An explicitly authored shell command has no managed-file binding.
+  if (input.filePath === "") return "";
   const workspace = await canonicalDirectory(input.workspaceRoot, "Schedule workspace");
   const installDirectory = await safeInstallDirectory(workspace);
   const filePath = await reusableScriptPath(input.filePath, installDirectory);
@@ -389,7 +449,7 @@ async function atomicWriteScript(filePath: string, content: string): Promise<voi
 
 function shellQuote(value: string, platform: NodeJS.Platform): string {
   if (platform === "win32") {
-    if (value.includes('"')) throw new Error("Pre-run hook path cannot be represented safely by the Windows shell.");
+    if (/["%!]/u.test(value)) throw new Error("Pre-run hook path cannot be represented safely by the Windows shell.");
     return `"${value}"`;
   }
   return `'${value.replaceAll("'", `'"'"'`)}'`;

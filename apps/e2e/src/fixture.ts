@@ -28,6 +28,8 @@ import {
   RemoteExecutionRouter,
   RemoteWorkspaceService,
   ScheduleCoordinator,
+  ScheduleHookScriptInstaller,
+  createScheduleHookScriptGenerator,
   SessionHost,
   availableBackendProviderIds,
   withSessionReferenceCapability,
@@ -351,6 +353,12 @@ export class OrchestratorE2eFixture {
     await historyMaintenance.initialize();
     const scheduler = new ScheduleCoordinator(store, sessionHost, { tickMs: 25 });
     scheduler.start();
+    const scheduleHookScripts = new ScheduleHookScriptInstaller(auxiliaryServices?.providers === undefined ? {} : {
+      generate: createScheduleHookScriptGenerator(auxiliaryServices.providers, {
+        store,
+        adapters: () => backendInstances.availableAdapters()
+      })
+    });
 
     const config: OrchestratorConfig = {
       host: "127.0.0.1",
@@ -465,6 +473,7 @@ export class OrchestratorE2eFixture {
       objectives,
       reviewCoordinator,
       scheduler,
+      scheduleHookScripts,
       get adapters() {
         return backendInstances.availableAdapters();
       },

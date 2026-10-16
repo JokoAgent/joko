@@ -481,6 +481,8 @@ export interface NativeTextInferenceInput {
   readonly backendInstanceGeneration: number;
   readonly assertCurrent: () => void;
   readonly assertModelAllowed: (providerId: string, modelId: string) => void;
+  readonly providerId?: string;
+  readonly modelId?: string;
 }
 
 export interface BackgroundTaskOutputResult {

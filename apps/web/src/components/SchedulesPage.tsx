@@ -29,6 +29,7 @@ import { createScheduleRunNowDispatchTracker } from "../schedule-run-now-dispatc
 import { ScheduleDeleteDialog } from "./ScheduleDeleteDialog.js";
 import { ScheduleRunHistoryCard } from "./ScheduleRunHistoryCard.js";
 import { groupScheduleHistoryRuns } from "./schedule-history-grouping.js";
+import { ScheduleHookEditor } from "./ScheduleHookEditor.js";
 
 const SCHEDULE_LIST_WIDTH_KEY = "joko.scheduler.listWidth";
 const SCHEDULE_COLLAPSED_GROUPS_KEY = "joko.scheduler.collapsedProjects";
@@ -792,6 +793,8 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
   const [templateParameters, setTemplateParameters] = useState<Readonly<Record<string, string>>>({});
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string>();
+  const [hookBusy, setHookBusy] = useState(false);
+  const [hookValid, setHookValid] = useState(true);
   const [worktreeProbe, setWorktreeProbe] = useState<TargetWorktreeProbeView>();
   const [worktreeSources, setWorktreeSources] = useState<readonly WorktreeSourceView[]>([]);
   const [worktreeLoading, setWorktreeLoading] = useState(false);
@@ -904,6 +907,7 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
       effort: model?.efforts[0],
       fastMode: false,
       extraDirectoryIds: [],
+      preRunHook: undefined,
       ...(workspace?.kind === "userProject" ? {} : {
         useWorktree: false,
         worktreeSourceRef: undefined,
@@ -917,10 +921,10 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
     : undefined;
   const onceInvalid = draft.kind === "once" && draft.expression.length > 0 && !timezoneInvalid && onceEpoch === undefined;
   const oncePast = draft.kind === "once" && draft.enabled && onceEpoch !== undefined && onceEpoch <= Date.now();
-  return <Modal open={open} title={schedule === undefined ? t("scheduler.editorNew") : `${t("scheduler.editorEdit")} · ${schedule.name}`} description={t("scheduler.editorBody")} size="large" onClose={() => { if (!saving) onClose(); }}>
+  return <Modal open={open} title={schedule === undefined ? t("scheduler.editorNew") : `${t("scheduler.editorEdit")} · ${schedule.name}`} description={t("scheduler.editorBody")} size="large" onClose={() => { if (!saving && !hookBusy) onClose(); }}>
     <form className="schedule-editor" onSubmit={(event) => {
       event.preventDefault();
-      if (!valid || saving) return;
+      if (!valid || saving || hookBusy || !hookValid) return;
       setSaving(true);
       setSaveError(undefined);
       void onSave(draft).catch((cause: unknown) => setSaveError(cause instanceof Error ? cause.message : String(cause))).finally(() => setSaving(false));
@@ -1069,11 +1073,12 @@ function ScheduleEditor({ controller, open, schedule, initialDraft, targets, ses
         {draft.executionMode === "script" && <label><CheckboxControl checked={draft.scriptDispatchSessions} onChange={(event) => setDraft((current) => ({ ...current, scriptDispatchSessions: event.target.checked }))} />{t("scheduler.scriptDispatchSessions")}</label>}
         {draft.executionMode === "agent" && <label><CheckboxControl disabled={!execution.planModeSupported} checked={draft.planMode} onChange={(event) => setDraft((current) => ({ ...current, planMode: event.target.checked }))} />{t("scheduler.planMode")}</label>}
       </div>
-      {draft.preRunHook !== undefined && <div className="schedule-editor__managed-hook"><strong>{t("scheduler.managedPreRunHook")}</strong><code>{draft.preRunHook.command}</code><small>{draft.preRunHook.filePath}</small></div>}
+      <ScheduleHookEditor controller={controller} scheduleId={schedule?.targetId === draft.targetId && schedule.backendId === draft.backendId ? schedule.id : undefined} draft={draft} open={open} saving={saving} t={t}
+        onChange={hook => setDraft(current => ({ ...current, preRunHook: hook }))} onBusyChange={setHookBusy} onValidityChange={setHookValid} />
       {draft.executionMode === "agent" && extraDirectoriesSupported && selectableExtraDirectories.length > 0 && <div className="schedule-editor__directories"><strong>{t("projects.extraDirectories")}</strong>{selectableExtraDirectories.map((directory) => <label key={directory.id}><CheckboxControl checked={draft.extraDirectoryIds.includes(directory.id)} onChange={(event) => setDraft((current) => ({ ...current, extraDirectoryIds: event.target.checked ? [...new Set([...current.extraDirectoryIds, directory.id])] : current.extraDirectoryIds.filter((id) => id !== directory.id) }))} /><span>{directory.serverPath}<small>{directory.access === "readWrite" ? t("projects.readWrite") : t("projects.readOnly")}</small></span></label>)}</div>}
       </fieldset>
       {saveError !== undefined && <p className="inline-error" role="alert">{saveError}</p>}
-      <div className="modal__actions"><Button disabled={saving} onClick={onClose}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={!valid || saving}>{saving ? t("common.loading") : schedule === undefined ? t("scheduler.new") : t("scheduler.saveChanges")}</Button></div>
+      <div className="modal__actions"><Button disabled={saving || hookBusy} onClick={onClose}>{t("common.cancel")}</Button><Button type="submit" tone="primary" disabled={!valid || saving || hookBusy || !hookValid}>{saving ? t("common.loading") : schedule === undefined ? t("scheduler.new") : t("scheduler.saveChanges")}</Button></div>
     </form>
   </Modal>;
 }
