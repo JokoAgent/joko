@@ -255,6 +255,11 @@ class PeerProcessHandle extends EventEmitter implements DevicePeerProcessHandle 
       },
       final: (callback) => this.#writeInput(new Uint8Array(), true).then(() => callback(), callback)
     });
+    // Route stream failures through the process handle's error channel. A late
+    // input acknowledgement can fail even after the peer has reported its exit.
+    for (const stream of [this.stdin, this.stdout, this.stderr]) {
+      stream.on("error", (error) => this.#fail(error));
+    }
   }
 
   attach(processId: string, stream: DevicePeerStreamLease): void {
@@ -326,8 +331,9 @@ class PeerProcessHandle extends EventEmitter implements DevicePeerProcessHandle 
   #fail(error: Error): void {
     if (this.#terminal) return;
     this.#terminal = true;
-    this.stdout.destroy(error);
-    this.stderr.destroy(error);
+    this.stdin.destroy();
+    this.stdout.destroy();
+    this.stderr.destroy();
     this.#stream?.close();
     this.emit("error", error);
   }

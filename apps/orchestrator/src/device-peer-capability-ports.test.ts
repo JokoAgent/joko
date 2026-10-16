@@ -100,6 +100,42 @@ describe("Device peer capability ports", () => {
     expect(fixture.owner.list(fixture.controller)).toHaveLength(1);
   });
 
+  it.each([false, true])("owns a failed input acknowledgement without losing an earlier process exit: %s", async (exitFirst) => {
+    const fixture = setup();
+    let rejectInput!: (value: { outcome: "failed"; errorCode: string }) => void;
+    const inputReply = new Promise<{ outcome: "failed"; errorCode: string }>(resolve => { rejectInput = resolve; });
+    const harness = createInProcessDevicePeerHarness({
+      targetDeviceId: fixture.target.deviceId,
+      capabilities: ["files", "process"],
+      agent: { handle: async frame => (frame.payload as DevicePeerCommand).action.case === "startProcess"
+        ? { outcome: "completed", value: { case: "processStarted", value: { processId: "process-1" } } }
+        : await inputReply }
+    });
+    fixture.owner.registerRoute(fixture.target, harness.transport);
+    const authority = fixture.owner.capture(fixture.controller, fixture.owner.list(fixture.controller)[0]!);
+    const child = await createDevicePeerCapabilityPorts({ owner: fixture.owner, authority }).processes!
+      .open({ executable: "tool", args: [], cwd: "C:\\peer\\project" });
+    const handleErrors: Error[] = [], inputErrors: Error[] = [], exits: unknown[] = [];
+    child.on("error", error => handleErrors.push(error));
+    child.stdin.on("error", error => inputErrors.push(error));
+    child.on("exit", (code, signal) => exits.push([code, signal]));
+    const input = new Promise<Error | null | undefined>(resolve => child.stdin.write("input", resolve));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (exitFirst) {
+      const start = harness.acceptedRequests.find(frame => (frame.payload as DevicePeerCommand).action.case === "startProcess")!;
+      harness.emit({ protocolVersion: 1, kind: "stream_event", requestId: start.requestId,
+        targetDeviceId: fixture.target.deviceId, routeGeneration: authority.identity.routeGeneration,
+        streamId: "process-1", sequence: 1, channel: "process_exit", exitCode: 0, signal: null });
+    }
+    rejectInput({ outcome: "failed", errorCode: "not_found" });
+    const error = await input;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(error).toMatchObject({ code: "not_found", stateMayHaveChanged: false });
+    expect(inputErrors).toEqual([error]);
+    expect(handleErrors).toEqual(exitFirst ? [] : [error]);
+    expect(exits).toEqual(exitFirst ? [[0, null]] : []);
+  });
+
   it("retains terminal startup queries until the runtime attaches its output consumer", async () => {
     const fixture = setupTerminal();
     const terminal = await fixture.terminals.open({ executable: "C:\\peer\\pwsh.exe", args: ["-NoLogo"], cwd: "C:\\peer\\project", cols: 90, rows: 30 });
