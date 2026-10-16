@@ -68,6 +68,33 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       await page.screenshot({ path: join(evidenceDirectory, name), fullPage: false, animations: "disabled",
         mask: [page.locator(".pair-form input"), page.locator('input[type="password"]')] });
     };
+    const captureReplies = async (name: string, minimumReplies: number): Promise<void> => {
+      if (page === undefined || sessionId === undefined) throw new Error("A reply capture requires its current task.");
+      const currentPage = page;
+      const timeline = currentPage.locator(".timeline");
+      const replies = timeline.getByText(controlledReply, { exact: true });
+      const settled = async (): Promise<boolean> => {
+        if (await timeline.getAttribute("data-timeline-session-id") !== sessionId
+          || await currentPage.locator(".timeline--empty, .timeline-history .spinner").count() !== 0
+          || await replies.count() < minimumReplies || !await replies.last().isVisible()) return false;
+        const bounds = await replies.last().boundingBox();
+        const viewport = currentPage.viewportSize();
+        return bounds !== null && viewport !== null && bounds.y >= 0 && bounds.y + bounds.height <= viewport.height
+          && bounds.x >= 0 && bounds.x + bounds.width <= viewport.width;
+      };
+      await pollOwned(async () => {
+        if (await replies.count() < minimumReplies || !await replies.last().isVisible()) return false;
+        await replies.last().scrollIntoViewIfNeeded();
+        if (!await settled()) return false;
+        const bytes = await currentPage.screenshot({ fullPage: false, animations: "disabled",
+          mask: [currentPage.locator(".pair-form input"), currentPage.locator('input[type="password"]')] });
+        // Native-history hydration can replace a just-visible transient reply
+        // while the screenshot is captured. Save only the settled task frame.
+        if (!await settled()) return false;
+        await writeFile(join(evidenceDirectory, name), bytes, { mode: 0o600 });
+        return true;
+      }, value => value, "the current task's visible reply capture", 30_000);
+    };
 
     try {
       fixture = await StandaloneWebCliFixture.create(webDirectory);
@@ -144,7 +171,7 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
         && JSON.stringify(request.body).includes(firstPrompt))).toBe(true);
       expect(completedTurn.snapshot?.pi?.sessions.some(session => session.productSessionId === sessionId)).toBe(true);
       await page.locator(".timeline").getByText(controlledReply, { exact: true }).first().waitFor({ state: "visible", timeout: 30_000 });
-      await screenshot("03-completed-turn.png");
+      await captureReplies("03-completed-turn.png", 1);
       record("first-input-persisted-and-controlled-provider-reply-rendered", "03-completed-turn.png");
 
       const previousGeneration = fixture.observations.at(-1)!.generation;
@@ -162,7 +189,7 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       expect(restoredRoute.pathname).toBe(`/tasks/${encodeURIComponent(sessionId)}`);
       expect(restoredRoute.searchParams.get("profile")).toBe(connectionProfileId);
       expect(await page.locator(".pair-form").count()).toBe(0);
-      await screenshot("05-restored-task.png");
+      await captureReplies("05-restored-task.png", 1);
       record("same-node-and-task-restored-using-saved-browser-pairing", "05-restored-task.png");
 
       const recoveredComposer = page.locator(".session-pane .composer").first();
@@ -175,7 +202,7 @@ standaloneIt("pairs the production Web with an independent CLI, sends a task and
       expect(requests.some(request => JSON.stringify(request.body).includes(secondPrompt))).toBe(true);
       await pollOwned(() => page!.locator(".timeline").getByText(controlledReply, { exact: true }).count(), count => count >= 2,
         "the second controlled Provider reply in the recovered browser task", 30_000);
-      await screenshot("06-followup-after-restart.png");
+      await captureReplies("06-followup-after-restart.png", 2);
       record("restored-task-accepted-second-input-and-rendered-reply", "06-followup-after-restart.png");
       expect(pageErrorCount).toBe(0);
       completed = true;
