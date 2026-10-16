@@ -118,6 +118,25 @@ function test() {
   } finally {
     const logs = spawnSync(adb, ["-s", serial, "logcat", "-d", "-t", "2000"], { encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
     writeFileSync(join(directory, "android-logcat.txt"), logs.stdout ?? logs.stderr ?? "No logcat output was available.\n");
+    const diagnosticReceipts = [];
+    for (const [file, args] of [
+      ["android-crash-logcat.txt", ["-b", "crash", "-d", "--max-count=200", "-v", "threadtime"]],
+      ["android-runtime-errors.txt", ["-b", "main", "-d", "--max-count=400", "-v", "threadtime",
+        "ReactNativeJS:E", "ReactNative:E", "AndroidRuntime:E", "libc:F", "*:S"]]
+    ]) {
+      // Read the dedicated crash buffer and tag-filtered retained main buffer,
+      // rather than letting repeated UI hierarchy dumps consume the log tail.
+      const result = spawnSync(adb, ["-s", serial, "logcat", ...args], {
+        encoding: "utf8", maxBuffer: 2 * 1024 * 1024, timeout: 10_000
+      });
+      const stdout = Buffer.from(result.stdout ?? "");
+      const bytes = stdout.subarray(0, 2 * 1024 * 1024);
+      writeFileSync(join(directory, file), bytes);
+      diagnosticReceipts.push({ file, exitCode: result.status, signal: result.signal, error: !!result.error,
+        stdoutBytes: stdout.length, stderrBytes: Buffer.byteLength(result.stderr ?? ""), savedBytes: bytes.length,
+        clipped: stdout.length > bytes.length });
+    }
+    writeFileSync(join(directory, "android-diagnostic-logs.json"), `${JSON.stringify({ captures: diagnosticReceipts }, null, 2)}\n`);
     summary(`Android native GUI ${passed ? "passed" : "did not complete successfully"} on ${avd} (${serial}). `
       + `The existing packaged E2E verifies installed APK bytes, real native pairing, rich input, canonical image/file resources, `
       + `force-stop/reopen and no duplicate dispatch against a local instrumented Orchestrator fixture. `
