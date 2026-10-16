@@ -90,7 +90,7 @@ describe("native file clipboard ownership", () => {
     ];
     for (const entry of entries) { await mkdir(join(directory, entry.id)); await writeFile(join(directory, entry.id, entry.name), new Uint8Array([1, 2, 3])); }
     await writeFile(join(directory, "unlisted.txt"), "never discover or delete");
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }), { mode: 0o600 });
     const owner = new NativeFileClipboard({ directory, platform: "win32", now: () => now, processExists: () => false, execute: async () => ({ status: "copied", dispatched: true, closed: true }) });
     await expect(owner.copy(input(), scope())).resolves.toEqual({ status: "copied" });
     const restored = await manifest(directory);
@@ -106,7 +106,7 @@ describe("native file clipboard ownership", () => {
     const count = limit === "bytes" ? 2 : 32;
     const entries = Array.from({ length: count }, () => ({ id: randomUUID(), name: "retained.mp4", bytes: limit === "bytes" ? FILE_COPY_MAXIMUM_BYTES : 1, state: "retained", retainUntil: FILE_COPY_RETENTION_MS }));
     expect(entries.reduce((sum, entry) => sum + entry.bytes, 0)).toBeLessThanOrEqual(FILE_COPY_TOTAL_BYTES);
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }), { mode: 0o600 });
     const owner = new NativeFileClipboard({ directory, platform: "win32", execute, now: () => 100 });
     await expect(owner.copy(input(), scope())).resolves.toEqual({ status: "failed", reason: "capacity" });
     expect((await manifest(directory)).entries).toHaveLength(count);
@@ -119,7 +119,7 @@ describe("native file clipboard ownership", () => {
     const oversized = input(); Object.defineProperty(oversized.file.bytes, "byteLength", { value: FILE_COPY_MAXIMUM_BYTES + 1 });
     expect(() => parseDesktopCopyFileRequest(oversized)).toThrow();
     const directory = await root();
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries: [{ id: "../outside", name: "file.mp4", bytes: 3, state: "prepared" }] }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries: [{ id: "../outside", name: "file.mp4", bytes: 3, state: "prepared" }] }), { mode: 0o600 });
     const execute = vi.fn(); const owner = new NativeFileClipboard({ directory, platform: "win32", execute });
     await expect(owner.copy(input(), scope())).resolves.toEqual({ status: "failed", reason: "storage" });
     const linux = new NativeFileClipboard({ directory, platform: "linux", execute });
@@ -191,7 +191,7 @@ describe("native file clipboard ownership", () => {
     const directory = await root(); const id = randomUUID();
     await mkdir(join(directory, id)); await writeFile(join(directory, id, "held.mp4"), new Uint8Array([1, 2, 3]));
     const entry = { id, name: "held.mp4", bytes: 3, state: "dispatched", ...(proof === "missing" ? {} : { pid: 4242 }) };
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries: [entry] }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries: [entry] }), { mode: 0o600 });
     const execute = vi.fn(async (): Promise<FileCopyHelperResult> => ({ status: "copied", dispatched: true, closed: true }));
     const probe = vi.fn(() => proof === "present" ? true : "unknown" as const);
     const now = FILE_COPY_RETENTION_MS * 3;

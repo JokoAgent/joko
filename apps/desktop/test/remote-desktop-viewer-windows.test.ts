@@ -104,6 +104,11 @@ function fixture(syncClipboard?: DesktopViewerSyncClipboard, credentialNative?: 
 
 function targetWindows(): any[] { return state.windows.filter(window => window.title !== "Remote Desktop"); }
 
+function electronClipboardPort(): DesktopViewerSyncClipboard {
+  const unused = vi.fn(async (): Promise<never> => { throw new Error("This transfer uses the Main-owned Electron clipboard."); });
+  return { platform: "win32", available: true, version: unused, read: unused, write: unused, stop: vi.fn() };
+}
+
 describe("Desktop viewer native windows", () => {
   it("fences native menu bypass to the current trusted viewer focus and retires it with its owner", async () => {
     const f = fixture(); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
@@ -678,7 +683,7 @@ describe("Desktop viewer native windows", () => {
   });
 
   it("copies a portable item directly to the native clipboard and prevents renderer access to the raw transfer", async () => {
-    const f = fixture(); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+    const f = fixture(electronClipboardPort()); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
     const event = f.viewerEvent(), generation = f.invoke(C.state, event).generation;
     await f.invoke(C.ready, event, generation);
     const connection = state.connections.at(-1);
@@ -757,7 +762,7 @@ describe("Desktop viewer native windows", () => {
   });
 
   it("never commits a paste or allows another transfer after the original focus occurrence retires", async () => {
-    const f = fixture(); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+    const f = fixture(electronClipboardPort()); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
     const window = targetWindows()[0], event = f.viewerEvent(), generation = f.invoke(C.state, event).generation;
     await f.invoke(C.ready, event, generation);
     const connection = state.connections.at(-1);

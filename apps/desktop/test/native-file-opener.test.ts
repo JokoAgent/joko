@@ -124,7 +124,7 @@ describe("native file open ownership", () => {
       await writeFile(join(directory, entry.id, entry.name), new Uint8Array([1, 2, 3]));
     }
     await writeFile(join(directory, "unlisted.txt"), "never discover or delete");
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }), { mode: 0o600 });
     const owner = new NativeFileOpener({ directory, openPath: async () => "", now: () => 1_000 });
     await expect(owner.open(input(), scope())).resolves.toEqual({ status: "opened" });
     const restored = await manifest(directory);
@@ -146,7 +146,7 @@ describe("native file open ownership", () => {
       retainUntil: FILE_OPEN_RETENTION_MS
     }));
     expect(entries.reduce((sum, entry) => sum + entry.bytes, 0)).toBeLessThanOrEqual(FILE_OPEN_TOTAL_BYTES);
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }), { mode: 0o600 });
     const openPath = vi.fn();
     const owner = new NativeFileOpener({ directory, openPath, now: () => 100 });
     await expect(owner.open(input(), scope())).resolves.toEqual({ status: "failed", reason: "capacity" });
@@ -167,7 +167,7 @@ describe("native file open ownership", () => {
     await writeFile(join(directory, "files.json"), JSON.stringify({
       version: 1,
       entries: [{ id: "../outside", name: "file.mp4", bytes: 3, state: "prepared" }]
-    }));
+    }), { mode: 0o600 });
     const openPath = vi.fn();
     const owner = new NativeFileOpener({ directory, openPath });
     await expect(owner.open(input(), scope())).resolves.toEqual({ status: "failed", reason: "storage" });
