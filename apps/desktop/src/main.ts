@@ -9323,17 +9323,24 @@ async function initializeManagedOrchestrator(controlledStopConfirmed = false): P
   const deviceId = previous?.deviceId ?? await loadOrCreateManagedOrchestratorDeviceId(deviceIdPath);
   let runtime: ManagedOrchestratorRuntime | undefined;
   let authKey: string | undefined;
+  let startupPhase: "launch-runtime" | "capture-runtime-birth" | "move-authorization" | "persist-authorization"
+    | "persist-connection" | "commit-bootstrap" = "launch-runtime";
   try {
     runtime = await launchManagedOrchestratorBootstrap(previous, deviceId);
+    startupPhase = "capture-runtime-birth";
     writePackagedSmokeManagedRuntimeProcess(runtime);
+    startupPhase = "move-authorization";
     authKey = runtime.takeAuthKey();
+    startupPhase = "persist-authorization";
     await storeCredential(runtime.connection.profileId, authKey);
     try {
+      startupPhase = "persist-connection";
       await writeManagedOrchestratorConnection(join(hostDirectory, "connection.json"), runtime.connection);
     } catch (error) {
       await deleteCredential(runtime.connection.profileId).catch(() => undefined);
       throw error;
     }
+    startupPhase = "commit-bootstrap";
     await runtime.commit();
     managedOrchestratorConnection = runtime.connection;
     managedOrchestratorRecoveryTarget = undefined;
@@ -9346,6 +9353,18 @@ async function initializeManagedOrchestrator(controlledStopConfirmed = false): P
       });
     }
   } catch (error) {
+    if (packagedSmoke) {
+      // Observe fixed startup phases without copying exception text, subprocess
+      // output, paths or any authorization material into GUI evidence.
+      const failure = error as { readonly code?: unknown; readonly status?: unknown; readonly signal?: unknown; readonly killed?: unknown } | undefined;
+      const codes = ["ENOENT", "EACCES", "EPERM", "ETIMEDOUT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"];
+      const signals = ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV"];
+      process.stderr.write(`JOKO_DESKTOP_MANAGED_SMOKE_FAILURE ${JSON.stringify({ phase: startupPhase,
+        code: typeof failure?.code === "string" && codes.includes(failure.code) ? failure.code : null,
+        exitCode: typeof failure?.status === "number" && Number.isSafeInteger(failure.status) ? failure.status : null,
+        signal: typeof failure?.signal === "string" && signals.includes(failure.signal) ? failure.signal : null,
+        killed: failure?.killed === true })}\n`);
+    }
     managedOrchestratorConnection = undefined;
     if (runtime !== undefined) await runtime.stop().catch(() => undefined);
     throw error;
