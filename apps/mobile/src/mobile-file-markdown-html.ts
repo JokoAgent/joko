@@ -8,7 +8,9 @@ export function buildMobileFileMarkdownHtml(input: {
   readonly text: string; readonly colors: MobileMarkdownColors; readonly label: string;
   readonly focusLine?: number; readonly resources?: MobileMarkdownResourceDescriptor;
 }, runtime: MobileMarkdownRichRuntime): string {
-  if (input.text.length > 2_097_152 || Object.values(input.colors).some((value) => !/^#[0-9a-f]{6}$/iu.test(value))) {
+  const { background, surface, ink, muted, accent, border, negative } = input.colors;
+  if (input.text.length > 2_097_152 || [background, surface, ink, muted, accent, border, negative]
+    .some((value) => !/^#[0-9a-f]{6}$/iu.test(value))) {
     throw new Error("The Markdown file preview is too large or has invalid colors.");
   }
   const blocks = parseMobileMarkdown(input.text, { srcLines: true });
