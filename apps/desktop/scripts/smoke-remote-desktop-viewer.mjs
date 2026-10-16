@@ -9,6 +9,10 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const scope = args.length === 0 ? "full" : args.length === 2 && args[0] === "--scope" && args[1] === "viewer-lifecycle" ? "viewer-lifecycle" : undefined;
 if (!scope) throw new Error("Expected no arguments or --scope viewer-lifecycle.");
+// The full journey combines repeated checks and native window transitions.
+// Keep individual waits unchanged while budgeting their sum on hosted macOS.
+const journeyTimeoutMs = scope === "full" && process.platform === "darwin" && process.env.GITHUB_ACTIONS === "true"
+  ? 180_000 : 80_000;
 const command = `node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs${scope === "full" ? "" : " --scope viewer-lifecycle"}`;
 const evidenceRoot = process.env.JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR
   ? resolve(process.env.JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR)
@@ -19,7 +23,7 @@ if (!process.versions.electron) {
   const electron = createRequire(import.meta.url)("electron");
   const child = spawn(electron, [fileURLToPath(import.meta.url), ...args], { cwd: root, windowsHide: true,
     env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined }, stdio: "inherit" });
-  const timeout = setTimeout(() => { child.kill(); }, 90000);
+  const timeout = setTimeout(() => { child.kill(); }, journeyTimeoutMs + 10_000);
   child.once("exit", (code) => { clearTimeout(timeout); process.exitCode = code ?? 1; });
 } else {
   void runHost().catch((error) => {
@@ -35,7 +39,7 @@ async function runHost() {
     return { path, bytes: content.byteLength, sha256: createHash("sha256").update(content).digest("hex") };
   };
   writeFileSync(resolve(output, "identity.json"), JSON.stringify({ command, scope,
-    cwd: resolve(root, "../.."), startedAt: new Date().toISOString(), platform: process.platform,
+    cwd: resolve(root, "../.."), startedAt: new Date().toISOString(), platform: process.platform, timeoutMs: journeyTimeoutMs,
     node: process.versions.node, electron: process.versions.electron,
     sources: ["scripts/smoke-remote-desktop-viewer.mjs", "src/remote-desktop-viewer-windows.ts",
       "src/remote-desktop-viewer-presentation.ts", "src/remote-desktop-viewer-preload.cts",
@@ -492,7 +496,7 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
       viewerDestroyed: viewer?.isDestroyed() ?? true, pendingViewerStart: pendingViewerStart !== undefined }, null, 2));
     process.stderr.write(`Remote desktop viewer Electron smoke deadline exceeded at ${stage}.\n`);
     quitting = true; manager.dispose(); app.exit(1);
-  }, 80000);
+  }, journeyTimeoutMs);
   const focusInteraction = async () => {
     const current = viewer;
     if (!current || current.isDestroyed() || !current.isVisible()) throw new Error("Interactive viewer window is unavailable.");

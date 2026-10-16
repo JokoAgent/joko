@@ -406,6 +406,12 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
+      - name: Prepare the macOS cursor smoke compiler
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        shell: bash
+        run: /usr/bin/time -p /usr/bin/swift -e 'import CoreGraphics; import Darwin; print("CoreGraphics cursor smoke compiler ready")' 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/macos-cursor-compiler.log"
+
       - name: Run the packaged Desktop smoke (Linux)
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 10
