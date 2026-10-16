@@ -301,14 +301,15 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
-            files=(src/document-tools.e2e.test.ts)
+            files=(src/timeline-history.e2e.test.ts)
           else
-            files=(src/partner-mounted-browser.e2e.test.ts src/messaging-mounted-browser.e2e.test.ts src/slack-mounted-browser.e2e.test.ts src/real-pi-compaction-mounted-browser.e2e.test.ts)
+            files=(src/skill-learning-mounted-browser.e2e.test.ts src/voice-dictionary.e2e.test.ts)
           fi
+          echo "selected_files=${files[*]}" >> "$GITHUB_OUTPUT"
           pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
 
       - name: Observe the failing macOS report PDF fonts and layout
-        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && runner.os == 'macOS' && steps.browser_regressions.outcome == 'failure' }}
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && runner.os == 'macOS' && steps.browser_regressions.outcome == 'failure' && contains(steps.browser_regressions.outputs.selected_files, 'src/document-tools.e2e.test.ts') }}
         timeout-minutes: 2
         run: node scripts/ci/document-pdf-font-observations.mjs
 

@@ -189,16 +189,31 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     }))).rejects.toMatchObject({ code: Code.Unavailable });
     expect((await mobileNetwork.getVoiceInputDictionary(credential)).dictionary.entries.map((entry: { text: string }) => entry.text)).toEqual(["PhoneTerm"]);
     const grantedB = await mobileNetwork.grantVoiceInputDictionaryPeer(credential, b.configurationRevision, a.nodeId, a.fingerprint);
-    await vi.waitFor(async () => {
-      expect(firstContent.error).toBeUndefined(); expect(phoneContent.error).toBeUndefined();
-      expect(firstSharing.error).toBeUndefined(); expect(phoneSharing.error).toBeUndefined();
-      const current = (await first.getVoiceInputDictionary(dictionaryRequest)).dictionary!;
-      expect(firstContent.latest?.dictionary?.revision).toBe(current.revision);
-      expect(firstContent.latest?.dictionary?.refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
-      expect(phoneContent.latest?.refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
-      expect(firstSharing.latest?.status?.configurationRevision).toBe(grantedA.configurationRevision);
-      expect(phoneSharing.latest?.configurationRevision).toBe(grantedB.configurationRevision);
-    }, { timeout: 8_000, interval: 100 });
+    try {
+      await vi.waitFor(async () => {
+        expect(firstContent.error).toBeUndefined(); expect(phoneContent.error).toBeUndefined();
+        expect(firstSharing.error).toBeUndefined(); expect(phoneSharing.error).toBeUndefined();
+        const current = (await first.getVoiceInputDictionary(dictionaryRequest)).dictionary!;
+        expect(firstContent.latest?.dictionary?.revision).toBe(current.revision);
+        expect(firstContent.latest?.dictionary?.refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
+        expect(phoneContent.latest?.refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
+        expect(firstSharing.latest?.status?.configurationRevision).toBe(grantedA.configurationRevision);
+        expect(phoneSharing.latest?.configurationRevision).toBe(grantedB.configurationRevision);
+      }, { timeout: 8_000, interval: 100 });
+    } catch (error) {
+      const state = (node: OrchestratorE2eFixture) => {
+        const status = node.application.voiceDictionaryPeers!.status();
+        const dictionary = node.application.voiceDictionary!.snapshot();
+        return { phase: status.phase, errorCode: status.errorCode, enabled: status.enabled,
+          configurationRevision: status.configurationRevision.toString(), candidates: status.candidates.length,
+          peers: status.peers.map(peer => ({ online: peer.online, synchronized: peer.lastSyncAt !== undefined })),
+          dictionaryRevision: dictionary.revision, termCount: dictionary.refinementTerms.length };
+      };
+      console.error("Bilateral dictionary completion state", JSON.stringify({ first: state(fixture), phone: state(peerFixture),
+        firstProjectedTerms: firstContent.latest?.dictionary?.refinementTerms.length,
+        phoneProjectedTerms: phoneContent.latest?.refinementTerms.length }));
+      throw error;
+    }
     await expect(mobileNetwork.syncVoiceInputDictionaryNow(credential, b.configurationRevision, undefined)).rejects.toMatchObject({ code: Code.Aborted });
     await expect(mobileNetwork.syncVoiceInputDictionaryNow(credential, grantedB.configurationRevision, undefined)).resolves.toMatchObject({
       fingerprint: b.fingerprint, peers: [{ fingerprint: a.fingerprint }]

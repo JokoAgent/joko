@@ -1,4 +1,6 @@
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { GetSnapshotRequestSchema, ListSessionTimelineRequestSchema, MessageInputDelivery, MessageRole, RunState, type Event } from "@joko/contracts";
 import type { AdapterContext, EventPayload, NativeHistoryProjectedEvent, NativeHistoryProjection, PromptInput } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
@@ -16,8 +18,29 @@ describe("mounted Timeline history windows", () => {
   let browser: Browser | undefined;
   let releasePage: (() => void) | undefined;
   let releaseEventStreams: (() => void) | undefined;
+  let historyFailureState: (() => unknown) | undefined;
 
-  afterEach(async () => {
+  afterEach(async ({ task }) => {
+    if (task.result?.state === "fail" && process.env.RUNNER_TEMP !== undefined && historyFailureState !== undefined) {
+      try {
+        const page = browser?.contexts()[0]?.pages()[0];
+        const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "timeline-history");
+        await mkdir(directory, { recursive: true });
+        await writeFile(join(directory, "history-failure.json"), JSON.stringify({
+          sourceCommit: process.env.GITHUB_SHA, requests: historyFailureState(),
+          viewport: await page?.locator(".timeline").evaluate(element => ({
+            scrollTop: element.scrollTop, scrollHeight: element.scrollHeight, clientHeight: element.clientHeight,
+            focused: document.activeElement === element, visibleDocument: document.visibilityState,
+            errorCount: document.querySelectorAll(".timeline-history--error").length,
+            statusCount: document.querySelectorAll(".timeline-history [role=status]").length,
+            renderedPrompts: element.querySelectorAll(".message--user").length
+          }), undefined, { timeout: 5_000 })
+        }, null, 2));
+        await page?.screenshot({ path: join(directory, "history-failure.png"),
+          mask: [page.locator("input,textarea")], fullPage: true, timeout: 5_000 });
+      } catch { console.error("Timeline history failure evidence was unavailable."); }
+    }
+    historyFailureState = undefined;
     releasePage?.();
     releasePage = undefined;
     releaseEventStreams?.();
@@ -179,6 +202,7 @@ describe("mounted Timeline history windows", () => {
     let olderRequests = 0;
     let rejectOlder = true;
     let holdOlder: Promise<void> | undefined;
+    historyFailureState = () => ({ olderRequests, rejectedFirstOlder: !rejectOlder, holdingOlder: holdOlder !== undefined });
     await page.route("**/joko.v1.SessionService/ListSessionTimeline", async (route) => {
       const bytes = route.request().postDataBuffer();
       if (bytes === null) throw new Error("History request has no protobuf body.");
