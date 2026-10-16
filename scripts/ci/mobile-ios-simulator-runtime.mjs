@@ -21,7 +21,8 @@ let stage = "preconditions";
 const startupCommandReceipts = [];
 const startupCommandLabels = new Set(["list-ios-runtimes", "list-device-types", "list-available-devices",
   "create-owned-simulator", "boot-owned-simulator", "wait-owned-boot", "set-light-appearance",
-  "install-owned-application", "locate-installed-application", "capture-simulator-springboard"]);
+  "install-owned-application", "locate-installed-application", "capture-simulator-springboard",
+  "capture-pre-appearance-framebuffer", "read-initial-appearance", "read-final-appearance"]);
 
 function save(name, value) { writeFileSync(join(evidence, name), JSON.stringify(value, null, 2) + "\n"); }
 async function command(binary, args, { timeout = 30_000, cleanup = false, startupLabel } = {}) {
@@ -338,7 +339,42 @@ async function startOwnedSimulator(applicationIdentity) {
     architecture: process.arch === "arm64" ? "arm64" : "x86_64", xcode: await command("xcodebuild", ["-version"]) });
   await command("xcrun", ["simctl", "boot", udid], { startupLabel: "boot-owned-simulator" });
   await command("xcrun", ["simctl", "bootstatus", udid, "-b"], { timeout: 180_000, startupLabel: "wait-owned-boot" });
-  await command("xcrun", ["simctl", "ui", udid, "appearance", "light"], { startupLabel: "set-light-appearance" });
+  stage = "owned Simulator appearance confirmation";
+  const startupState = { scope: "simulator-startup-command-probe", simulatorUdid: udid,
+    noApplicationInstalled: true, noAppGuiSuccessClaimed: true,
+    framebuffer: await captureStartupFramebuffer("pre-appearance.png", "capture-pre-appearance-framebuffer") };
+  save("startup-state.json", startupState);
+  const initialAppearance = await readAppearance("read-initial-appearance");
+  Object.assign(startupState, { initialAppearance, appearanceWriteRequired: initialAppearance !== "light" });
+  save("startup-state.json", startupState);
+  if (initialAppearance !== "light") {
+    await command("xcrun", ["simctl", "ui", udid, "appearance", "light"], { startupLabel: "set-light-appearance" });
+  }
+  const finalAppearance = initialAppearance === "light" ? initialAppearance : await readAppearance("read-final-appearance");
+  Object.assign(startupState, { finalAppearance, passed: finalAppearance === "light" });
+  save("startup-state.json", startupState);
+  if (finalAppearance !== "light") throw new Error("The owned Simulator appearance readback is not light.");
+}
+
+async function captureStartupFramebuffer(file, startupLabel) {
+  const image = join(evidence, file);
+  await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", image], { startupLabel });
+  if (!readFileSync(image).subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    throw new Error("The owned Simulator did not produce a PNG framebuffer capture.");
+  }
+  return { file, sha256: await hashFile(image) };
+}
+
+async function readAppearance(startupLabel) {
+  const appearance = await command("xcrun", ["simctl", "ui", udid, "appearance"], { startupLabel });
+  if (!["light", "dark", "unknown", "unsupported"].includes(appearance)) {
+    throw new Error("The owned Simulator returned an unrecognized appearance value.");
+  }
+  const receipt = startupCommandReceipts.at(-1);
+  if (receipt?.step !== startupLabel || receipt.result !== "passed") throw new Error("The appearance command receipt identity changed.");
+  receipt.observedAppearance = appearance;
+  save("startup-command-receipts.json", { commands: startupCommandReceipts });
+  return appearance;
 }
 
 async function main() {
@@ -352,15 +388,10 @@ async function main() {
     if (startupDiagnosticsOnly) {
       await startOwnedSimulator({ scope: "simulator-startup-command-probe", noApplicationInstalled: true });
       stage = "owned Simulator framebuffer capture";
-      const image = join(evidence, "simulator-startup.png");
-      await command("xcrun", ["simctl", "io", udid, "screenshot", "--type=png", image],
-        { startupLabel: "capture-simulator-springboard" });
-      if (!readFileSync(image).subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
-        throw new Error("The owned Simulator did not produce a PNG framebuffer capture.");
-      }
+      const framebuffer = await captureStartupFramebuffer("simulator-startup.png", "capture-simulator-springboard");
       const identity = JSON.parse(readFileSync(join(evidence, "identity.json"), "utf8"));
       result = { passed: true, sourceCommit: identity.sourceCommit, simulatorUdid: udid,
-        scope: "simulator-startup-command-probe", screenshot: "simulator-startup.png", screenshotSha256: await hashFile(image),
+        scope: "simulator-startup-command-probe", screenshot: framebuffer.file, screenshotSha256: framebuffer.sha256,
         noApplicationInstalled: true, noAppGuiSuccessClaimed: true,
         limits: ["Only owned Simulator creation, boot, bootstatus, appearance and framebuffer capture were executed. No Joko application, Metro, XCTest or device interaction was tested."] };
       return;

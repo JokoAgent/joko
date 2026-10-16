@@ -236,6 +236,7 @@ jobs:
             ${{ runner.temp }}/joko-ios-startup-diagnostics/failure.json
             ${{ runner.temp }}/joko-ios-startup-diagnostics/cleanup.json
             ${{ runner.temp }}/joko-ios-startup-diagnostics/startup-command-receipts.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/startup-state.json
           if-no-files-found: warn
           retention-days: 3
 
@@ -329,6 +330,7 @@ jobs:
             ${{ runner.temp }}/joko-ios-runtime-evidence/metro.log
             ${{ runner.temp }}/joko-ios-runtime-evidence/metro-status.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/startup-command-receipts.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/startup-state.json
             ${{ runner.temp }}/joko-ios-runtime-evidence/gui-build.log
             ${{ runner.temp }}/joko-ios-runtime-evidence/gui-test.log
             ${{ runner.temp }}/joko-ios-runtime-evidence/gui-*-receipt.json
