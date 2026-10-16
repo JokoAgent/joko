@@ -1194,11 +1194,19 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
       expect(accepted.state).toBe(OperationState.SUCCEEDED);
       return queueRunIdFrom(accepted);
     };
-    const waitForRun = (runId: string) => waitFor(
-      () => paired.clients.run.getRun({ runId }),
-      (value) => value.run?.state === RunState.SUCCEEDED,
-      `${runId} to complete`
-    );
+    const waitForRun = async (runId: string) => {
+      const response = await waitFor(
+        () => paired.clients.run.getRun({ runId }),
+        (value) => value.run?.state === RunState.SUCCEEDED,
+        `${runId} to complete`
+      );
+      const sessionId = response.run?.sessionId;
+      if (sessionId === undefined) throw new Error("The completed candidate probe Run has no Session.");
+      await waitFor(async () => fixture.application.store.listEvents({ sessionId }).filter(event =>
+        event.runId === runId && event.payload.type === "done" && event.payload.outcome === "completed").length,
+      count => count === 1, "the durable native completion before the candidate probe baseline");
+      return response;
+    };
 
     const baselineRuns = new Map<BackendId, string>();
     for (const backendId of backendIds) {
