@@ -34,13 +34,14 @@ concurrency:
 jobs:
   verify:
     if: ${{ inputs.scope != 'windows-runtime-diagnostics' }}
-    name: ${{ matrix.os }} / Node 24.16${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
+    name: ${{ matrix.os }} / Node 24.16 / ${{ matrix.workload }}${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(inputs.scope == 'windows-native' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'windows' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'linux' && '["ubuntu-24.04"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'macos' && '["macos-15"]' || '["ubuntu-24.04","windows-latest","macos-15"]') }}
+        workload: ${{ fromJSON((inputs.scope == 'windows-native' || inputs.scope == 'desktop-product') && '["product"]' || '["product","e2e-1","e2e-2"]') }}
 
     steps:
       - name: Check out repository
@@ -84,13 +85,13 @@ jobs:
 
       - name: Diagnose the reproducible macOS LAN discovery failure
         id: lan_discovery
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'macOS' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'macOS' }}
         timeout-minutes: 2
         shell: bash
         run: pnpm --filter @joko/node-sync exec vitest run src/node-sync.test.ts -t "delivers on its granted purpose" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/lan-discovery.log"
 
       - name: Upload the immediate LAN failure diagnosis
-        if: ${{ !cancelled() && steps.lan_discovery.outcome == 'failure' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.lan_discovery.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-lan-discovery-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -137,7 +138,7 @@ jobs:
         if: ${{ !cancelled() && steps.electron_sandbox.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ci-linux-sandbox-${{ github.sha }}
+          name: ci-linux-sandbox-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
           path: ${{ runner.temp }}/joko-ci-logs/linux-sandbox.log
           if-no-files-found: error
           retention-days: 3
@@ -154,20 +155,20 @@ jobs:
         if: ${{ !cancelled() && steps.source_check.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ci-source-check-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          name: ci-source-check-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
           path: ${{ runner.temp }}/joko-ci-logs/check.log
           if-no-files-found: error
           retention-days: 3
 
       - name: Diagnose the Windows SSH key permission failure
         id: ssh_key_permissions
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && runner.os == 'Windows' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && runner.os == 'Windows' }}
         timeout-minutes: 5
         shell: bash
         run: pnpm --filter @joko/remote-ssh exec vitest run src/keys.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/ssh-key-permissions.log"
 
       - name: Upload the immediate SSH key permission failure diagnosis
-        if: ${{ !cancelled() && steps.ssh_key_permissions.outcome == 'failure' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.ssh_key_permissions.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-ssh-key-permissions-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -199,14 +200,14 @@ jobs:
         if: ${{ !cancelled() && steps.chromium_sandbox.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ci-linux-browser-sandbox-${{ github.sha }}
+          name: ci-linux-browser-sandbox-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
           path: ${{ runner.temp }}/joko-ci-logs/linux-browser-sandbox.log
           if-no-files-found: error
           retention-days: 3
 
       - name: Run workspace package tests (Linux)
         id: workspace_packages_linux
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm -r --workspace-concurrency=1 --no-bail --if-present --filter '!@joko/orchestrator' --filter '!@joko/e2e' test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-packages.log"
         env:
@@ -215,12 +216,12 @@ jobs:
 
       - name: Run workspace package tests (Windows/macOS)
         id: workspace_packages_desktop
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: pnpm -r --workspace-concurrency=1 --no-bail --if-present --filter '!@joko/orchestrator' --filter '!@joko/e2e' test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-packages.log"
 
       - name: Upload completed workspace package test logs
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-workspace-packages-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -230,7 +231,7 @@ jobs:
 
       - name: Run Orchestrator tests (Linux)
         id: workspace_orchestrator_linux
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/orchestrator test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-orchestrator.log"
         env:
@@ -239,12 +240,12 @@ jobs:
 
       - name: Run Orchestrator tests (Windows/macOS)
         id: workspace_orchestrator_desktop
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: pnpm --filter @joko/orchestrator test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-orchestrator.log"
 
       - name: Upload completed Orchestrator test logs
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-workspace-orchestrator-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -254,49 +255,49 @@ jobs:
 
       - name: Run Connect end-to-end tests and Browser chains (Linux)
         id: workspace_e2e_linux
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload != 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/2' || '2/2' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
         env:
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
 
       - name: Run Connect end-to-end tests (Windows/macOS)
         id: workspace_e2e_desktop
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload != 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
-        run: pnpm --filter @joko/e2e test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
+        run: pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/2' || '2/2' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
 
       - name: Upload completed Connect end-to-end test logs
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload != 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         uses: actions/upload-artifact@v4
         with:
-          name: ci-workspace-e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          name: ci-workspace-e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}-${{ matrix.workload }}
           path: ${{ runner.temp }}/joko-ci-logs/tests-e2e.log
           if-no-files-found: error
           retention-days: 3
 
       - name: Diagnose the exact Windows remote broker startup regression
-        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-native' && runner.os == 'Windows' && steps.source_check.outcome == 'success' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-native' && runner.os == 'Windows' && steps.source_check.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
         run: pnpm --filter @joko/orchestrator exec vitest run src/remote-pi-broker-source.test.ts -t "keeps the exact child and replay alive across manager crash, then rotates relay authority" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/remote-pi-broker-regression.log"
 
       - name: Run the affected Windows Desktop checks
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
         timeout-minutes: 5
         shell: bash
         run: pnpm --filter @joko/desktop exec vitest run test/managed-orchestrator-real.test.ts test/runtime-staging.test.ts test/remote-desktop-native-build.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-native-regressions.log"
 
       - name: Diagnose the affected macOS Desktop runtime checks
         id: macos_runtime_regressions
-        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'macOS' && steps.source_check.outcome == 'success' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'macOS' && steps.source_check.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
         run: pnpm --filter @joko/desktop exec vitest run test/managed-orchestrator-real.test.ts test/runtime-staging.test.ts -t "survives persistent Desktop release after the durable ACK and then stops explicitly|relocates the personal command host with its exact manifest and runs it under Electron-Node" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/macos-runtime-regressions.log"
 
       - name: Upload the immediate macOS Desktop runtime observations
-        if: ${{ !cancelled() && (steps.macos_runtime_regressions.outcome == 'success' || steps.macos_runtime_regressions.outcome == 'failure') }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && (steps.macos_runtime_regressions.outcome == 'success' || steps.macos_runtime_regressions.outcome == 'failure') }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-macos-runtime-regressions-${{ github.sha }}
@@ -306,7 +307,7 @@ jobs:
 
       - name: Run the affected Linux PDF rendering checks
         id: linux_pdf_regressions
-        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'Linux' && steps.source_check.outcome == 'success' && steps.chromium_sandbox.outcome == 'success' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'Linux' && steps.source_check.outcome == 'success' && steps.chromium_sandbox.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/orchestrator exec vitest run src/document-electron-pdf-renderer.test.ts src/document-pdf-renderer.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/linux-pdf-regressions.log"
@@ -315,7 +316,7 @@ jobs:
           WAYLAND_DISPLAY: ""
 
       - name: Upload the immediate Linux PDF rendering results
-        if: ${{ !cancelled() && (steps.linux_pdf_regressions.outcome == 'success' || steps.linux_pdf_regressions.outcome == 'failure') }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && (steps.linux_pdf_regressions.outcome == 'success' || steps.linux_pdf_regressions.outcome == 'failure') }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-linux-pdf-regressions-${{ github.sha }}
@@ -324,25 +325,25 @@ jobs:
           retention-days: 3
 
       - name: Run the affected Windows queue checks
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
         timeout-minutes: 2
         shell: bash
         run: pnpm --filter @joko/store exec vitest run src/operational-store.test.ts -t queue 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/store-queue-regressions.log"
 
       - name: Check the Windows document worker regression
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
         timeout-minutes: 2
         shell: bash
         run: pnpm --filter @joko/tool-document exec node --import ../../scripts/ci/observe-document-workers.mjs ../../node_modules/vitest/vitest.mjs run 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/document-regressions.log"
 
       - name: Run the affected Windows service product chains
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
         timeout-minutes: 7
         shell: bash
         run: pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/device-peer-product.e2e.test.ts src/ssh-keys.e2e.test.ts src/controlled-pi-process.e2e.test.ts src/paired-backends.e2e.test.ts -t "runs a durable two-Device project|uses authenticated single-use passphrase uploads|forwards the native input write failure|fences consumed native inputs with lost receipts" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/e2e-native-regressions.log"
 
       - name: Amplify the short queue soak and fault matrix
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
         shell: bash
         run: pnpm test:soak 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/soak.log"
         env:
@@ -352,19 +353,19 @@ jobs:
 
       - name: Build and verify isolated Desktop Orchestrator runtime
         id: desktop_runtime
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
         timeout-minutes: 45
         shell: bash
         run: pnpm stage:desktop:orchestrator-runtime 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-runtime.log"
 
       - name: Check smoke evidence preservation before profile cleanup
-        if: ${{ !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'desktop-product' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'desktop-product' }}
         shell: bash
         run: pnpm --filter @joko/desktop exec vitest run test/smoke-packaged-helpers.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/smoke-evidence-owner.log"
 
       - name: Operate production Web with the isolated standalone backend and recover after restart
         id: standalone_web
-        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && steps.browser.outcome == 'success' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && steps.browser.outcome == 'success' }}
         timeout-minutes: 7
         shell: bash
         env:
@@ -384,7 +385,7 @@ jobs:
           fi
 
       - name: Upload a failed standalone Web chain before Desktop packaging
-        if: ${{ !cancelled() && steps.standalone_web.outcome == 'failure' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.standalone_web.outcome == 'failure' }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-standalone-failure-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -396,7 +397,7 @@ jobs:
 
       - name: Package the current platform Desktop application
         id: desktop_package
-        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' }}
         timeout-minutes: 20
         shell: bash
         run: pnpm --filter @joko/desktop package:dir 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-package.log"
@@ -404,7 +405,7 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
       - name: Run the packaged Desktop smoke (Linux)
-        if: ${{ !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'Linux' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 10
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bash scripts/ci/run-linux-gui.sh pnpm test:desktop:artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-smoke.log"
@@ -416,7 +417,7 @@ jobs:
           WAYLAND_DISPLAY: ""
 
       - name: Run the packaged Desktop smoke (Windows/macOS)
-        if: ${{ !cancelled() && steps.desktop_package.outcome == 'success' && runner.os != 'Linux' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os != 'Linux' }}
         timeout-minutes: 10
         shell: bash
         run: pnpm test:desktop:artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-smoke.log"
@@ -425,7 +426,7 @@ jobs:
           JOKO_DESKTOP_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/joko-packaged-evidence
 
       - name: Run the independent Desktop viewer GUI chain (Linux)
-        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 5
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bash scripts/ci/run-linux-gui.sh node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer.log"
@@ -435,7 +436,7 @@ jobs:
           WAYLAND_DISPLAY: ""
 
       - name: Run the independent Desktop viewer GUI chain (Windows/macOS)
-        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
         timeout-minutes: 5
         shell: bash
         run: node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer.log"
@@ -443,7 +444,7 @@ jobs:
           JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR: ${{ runner.temp }}/joko-viewer-evidence
 
       - name: Verify the viewer's unbound prewarm lifecycle (Linux)
-        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 5
         shell: bash
         run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bash scripts/ci/run-linux-gui.sh node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs --scope viewer-lifecycle 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer-lifecycle.log"
@@ -453,7 +454,7 @@ jobs:
           WAYLAND_DISPLAY: ""
 
       - name: Verify the viewer's unbound prewarm lifecycle (Windows/macOS)
-        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
         timeout-minutes: 5
         shell: bash
         run: node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs --scope viewer-lifecycle 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer-lifecycle.log"
@@ -462,7 +463,7 @@ jobs:
 
       - name: Archive the packaged application with its source identity
         id: desktop_archive
-        if: ${{ !cancelled() && steps.desktop_package.outcome == 'success' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' }}
         timeout-minutes: 15
         shell: bash
         run: |
@@ -480,7 +481,7 @@ jobs:
           NODE
 
       - name: Upload the current platform application
-        if: ${{ !cancelled() && steps.desktop_archive.outcome == 'success' }}
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_archive.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -490,7 +491,7 @@ jobs:
           retention-days: 3
 
       - name: Collect bounded smoke receipts beside validation logs
-        if: ${{ always() }}
+        if: ${{ matrix.workload == 'product' && always() }}
         shell: bash
         run: node scripts/ci/collect-desktop-diagnostics.mjs
 
@@ -498,13 +499,13 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: ci-diagnostics-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          name: ci-diagnostics-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
           path: ${{ runner.temp }}/joko-ci-logs/
           if-no-files-found: warn
           retention-days: 3
 
       - name: Upload bounded Desktop viewer GUI evidence
-        if: ${{ always() }}
+        if: ${{ matrix.workload == 'product' && always() }}
         uses: actions/upload-artifact@v4
         with:
           name: desktop-viewer-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -521,7 +522,7 @@ jobs:
           retention-days: 3
 
       - name: Upload packaged Desktop operation screenshots and receipts
-        if: ${{ always() }}
+        if: ${{ matrix.workload == 'product' && always() }}
         uses: actions/upload-artifact@v4
         with:
           name: desktop-gui-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
@@ -533,13 +534,13 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: web-gui-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          name: web-gui-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
           path: ${{ runner.temp }}/joko-web-evidence/
           if-no-files-found: warn
           retention-days: 3
 
       - name: Upload standalone Web and backend operation evidence
-        if: ${{ always() }}
+        if: ${{ matrix.workload == 'product' && always() }}
         uses: actions/upload-artifact@v4
         with:
           name: web-standalone-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
