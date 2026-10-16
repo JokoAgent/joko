@@ -473,9 +473,11 @@ describe("MessagingManager", () => {
       enable: true
     });
     phase = "progress-receipt";
-    await secondProgress;
-    expect(transport.sentText.filter((entry) => entry.text === "Task is still in progress…"))
-      .toHaveLength(2);
+    await vi.waitFor(async () => {
+      await secondProgress;
+      expect(transport.sentText.filter((entry) => entry.text === "Task is still in progress…"))
+        .toHaveLength(2);
+    }, { timeout: 5_000 });
     expect(transport.typingStarts).toBeGreaterThan(2);
     phase = "durable-progress";
     expect(fixture.store.listMessagingDeliveries({ connectionId: enabled.id, limit: 20 })
