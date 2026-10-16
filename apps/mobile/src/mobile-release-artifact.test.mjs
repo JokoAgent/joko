@@ -93,6 +93,13 @@ describe("mobile release artifact configuration", () => {
       `Signer (minSdkVersion=24, maxSdkVersion=32) certificate SHA-256 digest: ${certificate}`,
       `Signer #1 certificate SHA-256 digest: ${certificate}`
     ].join("\n"), certificate)).toBe(certificate);
+    // These labels are from the distributed SDK 37 ApkSignerTool class.
+    for (const signer of ["Signer:", "Signer #1:",
+      "V3.0 Signer: (minSdkVersion=24, maxSdkVersion=2147483647)",
+      "V3.1 Signer: (minSdkVersion=33 (dev release=true), maxSdkVersion=2147483647)"]) {
+      expect(apkSignerCertificateSha256(`${signer} certificate SHA-256 digest: ${certificate}`, certificate))
+        .toBe(certificate);
+    }
     expect(() => apkSignerCertificateSha256(`Signer #1 certificate SHA-256 digest: ${certificate}`, "cd".repeat(32)))
       .toThrow(/pinned release identity/u);
   });
@@ -102,15 +109,22 @@ describe("mobile release artifact configuration", () => {
     expect(() => apkSignerCertificateSha256("Verifies\nNumber of signers: 0", certificate)).toThrow(/did not return/u);
     expect(() => apkSignerCertificateSha256(`Source Stamp Signer certificate SHA-256 digest: ${certificate}`, certificate))
       .toThrow(/did not return/u);
+    expect(() => apkSignerCertificateSha256(`Source Stamp Signer: certificate SHA-256 digest: ${certificate}`, certificate))
+      .toThrow(/did not return/u);
     for (const digest of ["", "ab".repeat(31), `${certificate}extra`, "not-a-certificate"]) {
       expect(() => apkSignerCertificateSha256(`Signer #1 certificate SHA-256 digest: ${digest}`, certificate))
         .toThrow(/64 hexadecimal/u);
     }
-    for (const signer of ["Signer #0", "Signer (minSdkVersion=33, maxSdkVersion=32)", "Signer unknown"]) {
+    for (const signer of ["Signer #0", "Signer #0:", "Signer (minSdkVersion=33, maxSdkVersion=32)", "Signer unknown",
+      "V3.0 Signer: (minSdkVersion=33, maxSdkVersion=32)",
+      "V3.1 Signer: (minSdkVersion=33, maxSdkVersion=2147483648)",
+      "V3.2 Hybrid PQC Signer: (minSdkVersion=24, maxSdkVersion=2147483647)"]) {
       expect(() => apkSignerCertificateSha256(`${signer} certificate SHA-256 digest: ${certificate}`, certificate))
         .toThrow(/unsupported APK signer/u);
     }
-    for (const signer of ["Signer #2", "Signer (minSdkVersion=33, maxSdkVersion=2147483647)"]) {
+    for (const signer of ["Signer #2", "Signer #2:", "Signer (minSdkVersion=33, maxSdkVersion=2147483647)",
+      "V3.0 Signer: (minSdkVersion=24, maxSdkVersion=32)",
+      "V3.1 Signer: (minSdkVersion=33, maxSdkVersion=2147483647)"]) {
       expect(() => apkSignerCertificateSha256([
         `Signer #1 certificate SHA-256 digest: ${certificate}`,
         `${signer} certificate SHA-256 digest: ${"cd".repeat(32)}`
@@ -119,6 +133,10 @@ describe("mobile release artifact configuration", () => {
     expect(() => apkSignerCertificateSha256([
       `Signer #1 certificate SHA-256 digest: ${certificate}`,
       "Signer #2 certificate SHA-256 digest: malformed"
+    ].join("\n"), certificate)).toThrow(/64 hexadecimal/u);
+    expect(() => apkSignerCertificateSha256([
+      `V3.0 Signer: (minSdkVersion=24, maxSdkVersion=32) certificate SHA-256 digest: ${certificate}`,
+      "V3.1 Signer: (minSdkVersion=33, maxSdkVersion=2147483647) certificate SHA-256 digest: malformed"
     ].join("\n"), certificate)).toThrow(/64 hexadecimal/u);
   });
 
@@ -162,6 +180,12 @@ describe("mobile release artifact configuration", () => {
       stdoutBytes: 0, stderrBytes: 25 }, "0.9")).toMatchObject({
       hasOutput: true, signerDigestLineCount: 0,
       streams: { stdout: { bytes: 0, hasUsage: false }, stderr: { bytes: 25, hasUsage: true, nuls: 1 } }
+    });
+    const sdk37 = `V3.0 Signer: (minSdkVersion=24, maxSdkVersion=2147483647) certificate SHA-256 digest: ${certificate}`;
+    expect(apkSignerCertificateDiagnostics({ stdout: sdk37, stderr: "",
+      stdoutBytes: Buffer.byteLength(sdk37), stderrBytes: 0 }, "0.9")).toMatchObject({
+      signerDigestLineCount: 1,
+      signerDigests: [{ signer: "V3.0 Signer: (minSdkVersion=24, maxSdkVersion=2147483647)", sha256: certificate }]
     });
   });
 

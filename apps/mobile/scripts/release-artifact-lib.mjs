@@ -178,15 +178,17 @@ export function normalizeCertificateSha256(raw, label = "signing certificate SHA
 
 function apkSignerDigestRecords(output) {
   return String(output ?? "").split(/\r?\n/u)
-    .filter((line) => /^Signer\b.* certificate SHA-256 digest:/iu.test(line))
+    .filter((line) => /^(?:Signer\b|V[0-9]+(?:\.[0-9]+)?\b).* certificate SHA-256 digest:/iu.test(line))
     .map((line) => {
-      // ApkSignerTool labels v3.1 certificates by their SDK range, and other
-      // certificates by signer number. Source Stamp certificates are separate.
-      const match = /^Signer (#([1-9][0-9]{0,9})|\(minSdkVersion=([1-9][0-9]{0,9})(?: \(dev release=true\))?, maxSdkVersion=([1-9][0-9]{0,9})\)) certificate SHA-256 digest:[ \t]*(.*)$/iu.exec(line);
-      const valid = match !== null && (match[2] !== undefined
-        ? Number(match[2]) <= 2_147_483_647
-        : Number(match[3]) <= Number(match[4]) && Number(match[4]) <= 2_147_483_647);
-      return { label: valid ? match[1] : undefined, value: match?.[5] };
+      // SDK 37 prefixes v3 SDK ranges with the scheme and a colon; its
+      // non-range labels also end in a colon. Source Stamp stays separate.
+      const match = /^(.*?) certificate SHA-256 digest:[ \t]*(.*)$/iu.exec(line);
+      const label = match?.[1];
+      const numbered = /^Signer #([1-9][0-9]{0,9}):?$/iu.exec(label ?? "");
+      const range = /^(?:Signer|V3\.[01] Signer:) \(minSdkVersion=([1-9][0-9]{0,9})(?: \(dev release=true\))?, maxSdkVersion=([1-9][0-9]{0,9})\)$/iu.exec(label ?? "");
+      const valid = label === "Signer:" || (numbered !== null && Number(numbered[1]) <= 2_147_483_647)
+        || (range !== null && Number(range[1]) <= Number(range[2]) && Number(range[2]) <= 2_147_483_647);
+      return { label: valid ? label.replace(/^Signer /iu, "") : undefined, value: match?.[2] };
     });
 }
 
