@@ -782,6 +782,7 @@ async function readBoundedPrivateFile(path: string, maximum: number, unsafe: () 
     // Preserve ENOENT for optional private files such as runner.claim.json;
     // callers use that exact absence to distinguish an unclaimed launch.
     const before = await lstat(path);
+    if (privateFileStatIsRetired(before, maximum)) continue;
     if (!privateFileStatIsSafe(before, maximum)) throw unsafe();
     const handle = await open(path, flags).catch(() => undefined);
     if (handle === undefined) continue;
@@ -790,7 +791,9 @@ async function readBoundedPrivateFile(path: string, maximum: number, unsafe: () 
       const current = await lstat(path).catch(() => undefined);
       const canonical = await realpath(path).catch(() => undefined);
       if (opened === undefined || current === undefined || canonical === undefined) continue;
-      if (!privateFileStatIsSafe(current, maximum) || !samePath(canonical, path)) throw unsafe();
+      if (!samePath(canonical, path)) throw unsafe();
+      if (privateFileStatIsRetired(current, maximum)) continue;
+      if (!privateFileStatIsSafe(current, maximum)) throw unsafe();
       // The detached owner publishes heartbeats and sanitizes its launch manifest
       // through atomic replacement. If replacement unlinks the already-open
       // inode, retry the new canonical file while still failing closed on links,
@@ -801,7 +804,9 @@ async function readBoundedPrivateFile(path: string, maximum: number, unsafe: () 
       const finalCurrent = await lstat(path).catch(() => undefined);
       const finalCanonical = await realpath(path).catch(() => undefined);
       if (bytes === undefined || after === undefined || finalCurrent === undefined || finalCanonical === undefined) continue;
-      if (!privateFileStatIsSafe(finalCurrent, maximum) || !samePath(finalCanonical, path)) throw unsafe();
+      if (!samePath(finalCanonical, path)) throw unsafe();
+      if (privateFileStatIsRetired(finalCurrent, maximum)) continue;
+      if (!privateFileStatIsSafe(finalCurrent, maximum)) throw unsafe();
       if (!sameOpenedFile(opened, after) || !sameOpenedFile(finalCurrent, after)) continue;
       if (bytes.byteLength !== opened.size || bytes.byteLength > maximum) throw unsafe();
       return bytes;
@@ -818,6 +823,12 @@ async function waitForPrivateFileReplacement(): Promise<void> {
 
 function privateFileStatIsSafe(value: import("node:fs").Stats, maximum: number): boolean {
   return value.isFile() && !value.isSymbolicLink() && value.nlink === 1 && value.size <= maximum;
+}
+
+function privateFileStatIsRetired(value: import("node:fs").Stats, maximum: number): boolean {
+  // An atomic replacement can retire an inode during lstat itself. Never use
+  // its bytes: retry the canonical file within the same bounded read budget.
+  return value.isFile() && !value.isSymbolicLink() && value.nlink === 0 && value.size <= maximum;
 }
 
 function sameOpenedFile(left: import("node:fs").Stats, right: import("node:fs").Stats): boolean {
