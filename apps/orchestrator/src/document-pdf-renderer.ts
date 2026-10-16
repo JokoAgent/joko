@@ -43,12 +43,17 @@ export class ChromiumDocumentPdfRenderer implements PdfRenderer {
       const page = await context.newPage();
       page.on("popup", popup => { void popup.close().catch(() => undefined); });
       await page.setContent(input.html, { waitUntil: "load", timeout: remaining() });
+      await page.emulateMedia({ media: "print" });
+      await page.evaluate(() => { document.documentElement.getBoundingClientRect(); });
       if (expired) throw renderTimeout();
       let fontTimer: ReturnType<typeof setTimeout> | undefined;
       const fontsReady = await Promise.race([
         page.evaluate(() => document.fonts.ready.then(() => true)).catch(() => false),
         new Promise<false>(resolve => { fontTimer = setTimeout(() => resolve(false), Math.min(input.fontTimeoutMs, remaining())); })
       ]).finally(() => { if (fontTimer) clearTimeout(fontTimer); });
+      await page.evaluate(() => new Promise<void>(resolve => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }));
       if (expired) throw renderTimeout();
       const buffer = await page.pdf({
         format: input.pageSize,
