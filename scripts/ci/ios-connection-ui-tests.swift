@@ -76,9 +76,11 @@ final class JokoConnectionUITests: XCTestCase {
         add(attachment)
     }
 
-    private func wait(_ element: XCUIElement, _ predicate: String, timeout: TimeInterval = 10) {
+    private func wait(_ element: XCUIElement, _ predicate: String, timeout: TimeInterval = 10,
+                      file: StaticString = #filePath, line: UInt = #line) {
         let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: predicate), object: element)
-        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed)
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed,
+                       "Connection control did not satisfy: \(predicate)", file: file, line: line)
     }
 
     private var connectionPage: XCUIElement { app.webViews.firstMatch }
@@ -91,6 +93,13 @@ final class JokoConnectionUITests: XCTestCase {
     private func tab(_ label: String) -> XCUIElement { tabQuery(label).firstMatch }
 
     private func tap(_ element: XCUIElement) {
+        // Debug builds can present native LogBox toasts over WKWebView controls.
+        // Close those exact development surfaces through their real UI; keep
+        // application errors, dialogs, and every connection assertion visible.
+        for identifier in ["logbox_dismiss_button_warn", "logbox_dismiss_button_error"] {
+            let dismiss = app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+            if dismiss.exists && dismiss.isHittable { dismiss.tap() }
+        }
         XCTAssertTrue(element.waitForExistence(timeout: 10))
         // WKWebView's page can scroll while the native keyboard is open. Scroll
         // the actual page to expose the control rather than tapping coordinates.
