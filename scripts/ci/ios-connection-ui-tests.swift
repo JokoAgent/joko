@@ -96,9 +96,15 @@ final class JokoConnectionUITests: XCTestCase {
         // Debug builds can present native LogBox toasts over WKWebView controls.
         // Close those exact development surfaces through their real UI; keep
         // application errors, dialogs, and every connection assertion visible.
-        for identifier in ["logbox_dismiss_button_warn", "logbox_dismiss_button_error"] {
-            let dismiss = app.descendants(matching: .any).matching(identifier: identifier).firstMatch
-            if dismiss.exists && dismiss.isHittable { dismiss.tap() }
+        for prefix in ["Open debugger to view warnings.", "[expo-notifications] Error reading persisted"] {
+            let notice = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
+            if notice.exists && notice.isHittable {
+                // LogBox's nativeID is not a UIKit accessibility identifier.
+                // Its fixed close area is at the native toast's right edge;
+                // anchor this physical tap to the observed notice, in points.
+                app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+                    .withOffset(CGVector(dx: app.frame.width - 32, dy: notice.frame.midY - app.frame.minY)).tap()
+            }
         }
         XCTAssertTrue(element.waitForExistence(timeout: 10))
         // WKWebView's page can scroll while the native keyboard is open. Scroll
