@@ -93,6 +93,7 @@ function controller(
     navigate,
     dismissExtensionNotification,
     refreshMachines: vi.fn(async () => undefined),
+    partnerGroupApi: () => undefined,
     setNavigationOpen: vi.fn(async () => undefined),
     setNavigationLayout: vi.fn(async () => undefined),
     resetLayoutPreferences: vi.fn(async () => undefined),

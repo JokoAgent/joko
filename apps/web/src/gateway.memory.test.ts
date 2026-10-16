@@ -4,6 +4,7 @@ import {
   BackendMemoryKind,
   CapabilitySupport,
   GetSnapshotResponseSchema,
+  GitSafetyMode,
   MemoryResetResultSchema,
   MemoryResetScope,
   OperationState,
@@ -21,7 +22,7 @@ describe("OrchestratorGateway Memory reset scopes", () => {
         auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
         agentResource: {},
         collaboration: {},
-        gitSafety: {},
+        gitSafety: { mode: GitSafetyMode.EXISTING_GIT },
         modelFavorites: { revision: { value: 0n } },
         memory: {
           makerEnabled: false,
@@ -55,7 +56,7 @@ describe("OrchestratorGateway Memory reset scopes", () => {
         auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
         agentResource: {},
         collaboration: {},
-        gitSafety: {},
+        gitSafety: { mode: GitSafetyMode.EXISTING_GIT },
         modelFavorites: { revision: { value: 0n } },
         memory: {
           backends: [{

@@ -360,7 +360,13 @@ describe("new-task native draft recovery", () => {
     const { container } = await renderPage(api, vi.fn(async () => undefined));
     expect(api.listWorkspaceFiles).not.toHaveBeenCalled();
     const add = container.querySelector<HTMLButtonElement>('button[aria-label="common.add"]');
-    expect(add).toBeNull();
+    expect(add).not.toBeNull();
+    await act(async () => add!.click());
+    expect(document.body.querySelector('[role="menuitem"]')?.textContent).toContain("objective.newAction");
+    expect([...document.body.querySelectorAll('[role="menuitem"]')].some(item => item.textContent?.includes("composer.mention"))).toBe(false);
+    expect(container.querySelector(".composer-add-menu__directories")).toBeNull();
+    expect(document.body.querySelector('[role="option"]')).toBeNull();
+    await act(async () => add!.click());
     await act(async () => required(latestEditorProps?.onDocumentChange)(plainTextToComposerDocument("@"), false, (ranges) => ranges));
     expect(document.body.querySelector('[role="option"]')).toBeNull();
   });

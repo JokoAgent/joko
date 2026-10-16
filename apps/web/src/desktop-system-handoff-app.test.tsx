@@ -754,6 +754,7 @@ function renderApp(
       state,
       navigate: vi.fn(),
       refreshMachines: vi.fn(async () => undefined),
+      partnerGroupApi: () => undefined,
       probeRuntimeActivity: vi.fn(async () => ({ state: "idle" as const })),
       setMachineSelection: vi.fn(async () => undefined),
       setNavigationOpen: vi.fn(async () => undefined),

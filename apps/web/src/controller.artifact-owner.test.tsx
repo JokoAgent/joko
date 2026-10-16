@@ -167,6 +167,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
         callbacks.onState?.("connected"); callbacks.onSnapshot?.(browserSnapshot);
       },
       disconnect: () => { disposed = true; live.clear(); },
+      taskSharingApi: () => undefined,
       ...inputOperations, ...workspaceOperations, ...voiceOperations, ...queueOperations, ...remoteOperations, ...loginOperations, ...sshOperations,
       watchRemoteHosts: async function* () { if (disposed) throw new Error("Remote workspace owner disconnected"); yield []; },
       readWorkspaceFile: read, readWorkspaceHtmlSnapshot, performBrowserTakeoverAction, getArtifactUrl: get, releaseArtifactUrl: release,
@@ -613,7 +614,7 @@ it("retains a message deep-link target while connecting its saved machine", asyn
       callbacks.onState?.("connected");
       callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
     },
-    disconnect: vi.fn()
+    disconnect: vi.fn(), taskSharingApi: () => undefined
   } as unknown as OrchestratorGateway));
 
   let current!: AppController;
@@ -706,7 +707,7 @@ it("does not let a stale cross-machine task open replace a newer navigation occu
       callbacks.onState?.("connected");
       callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
     },
-    disconnect: vi.fn()
+    disconnect: vi.fn(), taskSharingApi: () => undefined
   } as unknown as OrchestratorGateway));
 
   let current!: AppController;

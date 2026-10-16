@@ -181,7 +181,7 @@ async function mount(options: { unavailable?: boolean; pending?: boolean; sendFa
   const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft, owner: NewSessionSubmissionOwner) => {
     if (options.sendFailure) throw new Error("Send failed");
     await owner.beforeFirstInput?.("created-runtime");
-    owner.onFirstInputAccepted?.();
+    owner.onFirstInputAccepted?.({ kind: "sent", sessionId: "created-runtime" });
   });
   const host = document.body.appendChild(document.createElement("div")); const root = createRoot(host); roots.push(root);
   const render = async (): Promise<void> => { await act(async () => { const page = <NewSessionPage controller={controller} snapshot={snapshot} recommendationNonce={options.pending ? nonce : undefined}

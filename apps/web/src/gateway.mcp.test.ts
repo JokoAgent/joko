@@ -2,6 +2,7 @@ import { create } from "@bufbuild/protobuf";
 import type { Transport } from "@connectrpc/connect";
 import {
   GetSnapshotResponseSchema,
+  GitSafetyMode,
   McpCredentialTarget,
   McpServerState,
   McpTransport,
@@ -19,7 +20,7 @@ describe("MCP gateway", () => {
       settings: {
         auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, agentResource: {},
         collaboration: {},
-        gitSafety: {},
+        gitSafety: { mode: GitSafetyMode.EXISTING_GIT },
         modelFavorites: { revision: { value: 0n } },
         mcpServers: [{
           mcpServerId: "local-tools",

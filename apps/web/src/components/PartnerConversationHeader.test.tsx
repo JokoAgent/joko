@@ -196,7 +196,12 @@ async function mount(app: AppController, initialSession = session()) {
 }
 
 function controller(overrides: Partial<AppController> = {}, ownerId = "owner-one"): AppController {
-  const snapshot = emptySnapshot();
+  const snapshot = { ...emptySnapshot(), backends: [{ id: "backend-one", name: "Backend", version: "1", health: "healthy" as const,
+    installationState: "installed" as const, authenticationState: "notRequired" as const,
+    capabilities: new Map([["permission.modes", { name: "permission.modes", supported: true, options: ["ask"] }]]) }],
+  models: [{ backendId: "backend-one", providerId: "provider-one", modelId: "model-one", providerName: "Provider", name: "Model", available: true,
+    routingEnabled: true, supportsImages: false, supportsFast: false, inputModalities: ["text"] as const, outputModalities: ["text"] as const,
+    efforts: [], contextWindow: 8192, maximumOutputTokens: 2048, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, currencyCode: "USD" }] };
   return {
     state: { ready: true, connectionState: "connected", activeProfile: { id: ownerId, serverId: ownerId, origin: "https://node.invalid" }, snapshot },
     listPartners: vi.fn(async () => catalog()), listPartnerSessions: vi.fn(async () => [link()]),
