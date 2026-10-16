@@ -3816,20 +3816,58 @@ async function verifyPackagedSmokeNewTaskDraftCrash(window: BrowserWindow): Prom
   await waitForPackagedSmokeDeadline(lost, 10_000, "new-task renderer crash");
   await waitForPackagedSmokeOwnerDocument(window, "new-task crash reload", () => window.reload());
   const restoreDeadline = Date.now() + 20_000;
+  let reconnectRequested = false;
+  let lastObservation: Readonly<Record<string, boolean>> = { observed: false };
+  const captureRecovery = async (): Promise<void> => {
+    if (packagedSmokeResultPath === undefined) return;
+    try {
+      const image = await waitForPackagedSmokeDeadline(contents.capturePage(), 2_000, "new-task draft recovery capture");
+      if (!image.isEmpty()) writeFileSync(`${packagedSmokeResultPath}.new-task-draft-recovery.png`, image.toPNG(), { flag: "wx", mode: 0o600 });
+    } catch { /* The original recovery result remains authoritative. */ }
+  };
   while (Date.now() < restoreDeadline) {
-    const restored = await window.webContents.executeJavaScript([
-      "(() => {",
+    const observation = await window.webContents.executeJavaScript([
+      "(async () => {",
       "  const editor = document.querySelector('.new-task-page .composer-rich-editor__content');",
-      `  return editor?.textContent === ${JSON.stringify(draftText)};`,
+      "  const connectionScreen = Boolean(document.querySelector('.connection-screen'));",
+      "  let reconnected = false;",
+      // Linux runners may correctly have no secure persistent credential
+      // storage. A new-task route has no explicit Profile, so a fresh renderer
+      // then requires the same normal local-connect action as initial startup.
+      `  if (connectionScreen && ${JSON.stringify(!reconnectRequested)}) {`,
+      "    const connect = document.querySelector('button[data-managed-local-connect]');",
+      "    if (connect instanceof HTMLButtonElement && !connect.disabled) {",
+      "      const current = await window.jokoDesktop.managedOrchestrator.getConnection();",
+      `      if (current?.serverId !== ${JSON.stringify(serverId)} || current?.profileId !== ${JSON.stringify(profileId)}) {`,
+      "        throw new Error('New-task recovery crossed its managed connection owner.');",
+      "      }",
+      "      connect.click();",
+      "      reconnected = true;",
+      "    }",
+      "  }",
+      `  return { restored: editor?.textContent === ${JSON.stringify(draftText)}, reconnected, connectionScreen,`,
+      "    newTaskRoute: location.hash.startsWith('#/tasks/new'), editorPresent: Boolean(editor),",
+      "    editorEditable: editor?.getAttribute('contenteditable') === 'true' };",
       "})()"
     ].join("\n"), true) as unknown;
-    if (restored === true) {
+    if (typeof observation !== "object" || observation === null || Array.isArray(observation)) {
+      throw new Error("Packaged smoke new-task recovery returned an invalid observation.");
+    }
+    const result = observation as Readonly<Record<string, boolean>>;
+    lastObservation = result;
+    if (result["reconnected"] === true) {
+      reconnectRequested = true;
+      recordPackagedSmokeProgress("new_task_draft_reconnected_after_renderer_crash");
+    }
+    if (result["restored"] === true) {
+      await captureRecovery();
       recordPackagedSmokeProgress("new_task_draft_recovered_after_renderer_crash");
       return;
     }
     await waitForPackagedSmokePoll();
   }
-  throw new Error("Packaged smoke new-task draft was not restored after the renderer crash.");
+  await captureRecovery();
+  throw new Error(`Packaged smoke new-task draft was not restored after the renderer crash: ${JSON.stringify(lastObservation)}.`);
 }
 
 async function waitForPackagedSmokeTaskPresentation(

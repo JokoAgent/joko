@@ -6,7 +6,7 @@ import { canonicalSmokeDirectoryForRemoval } from "./smoke-packaged-helpers.mjs"
 
 const names = ["result.txt", "result.txt.progress", "result.txt.managed-process.json",
   "result.txt.task-sharing-management.png", "result.txt.task-sharing-guest-ready.png", "result.txt.task-sharing-guest.png",
-  "result.txt.task-presentation.png"];
+  "result.txt.task-presentation.png", "result.txt.new-task-draft-recovery.png"];
 
 export async function preservePackagedSmokeEvidence(options) {
   if (!options.destination) return;
