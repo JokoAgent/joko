@@ -33,13 +33,13 @@ it.runIf(Boolean(process.env.JOKO_BROWSER_EXECUTABLE))("renders a real PDF in a 
   }
 }, 45_000);
 
-it.runIf(Boolean(process.env.JOKO_BROWSER_EXECUTABLE) && process.platform === "darwin")(
+it.runIf(Boolean(process.env.JOKO_BROWSER_EXECUTABLE))(
   "prints the actual report template with readable Latin and Chinese system-font text", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-pdf-report-font-"));
     try {
       const text = "Visible print 中文报告";
       const renderer = new ChromiumDocumentPdfRenderer(process.env.JOKO_BROWSER_EXECUTABLE!);
-      const output = await renderPdf({ html: `<h1>${text}</h1>`, outPath: "report.pdf", theme: "navy" }, root, renderer);
+      const output = await renderPdf({ html: `<h1>${text}</h1>`, theme: "navy" }, root, renderer);
       await writeFile(join(root, "report.pdf"), output.buffer);
       const inspection = await inspectPdf({ path: "report.pdf" }, root);
       if (process.env.RUNNER_TEMP !== undefined) {
