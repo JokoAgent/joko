@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,6 +15,7 @@ import { PersonalDevelopmentError, type DevelopmentOwnerOptions, type Developmen
 import { createDevelopmentProcessAuthority } from "./process.js";
 
 const execute = promisify(execFile);
+const hostPath = process.env.PATH ?? process.env.Path ?? "";
 const cleanup: string[] = [];
 const signal = new AbortController().signal;
 afterEach(async () => {
@@ -29,7 +30,7 @@ async function runtime(directory: string): Promise<void> {
   await writeFile(join(directory, "Joko.exe"), "controlled native executable\n");
 }
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "joko-personal-owner-")); cleanup.push(root);
+  const root = await realpath(await mkdtemp(join(tmpdir(), "joko-personal-owner-"))); cleanup.push(root);
   const source = join(root, "source"); await mkdir(source);
   await git(source, ["init", "-b", PERSONAL_BRANCH]); await git(source, ["remote", "add", "origin", SOURCE_REPOSITORY]);
   await git(source, ["config", "--local", "core.autocrlf", "false"]);
@@ -41,18 +42,21 @@ async function fixture() {
   const compatibilityIdentity = await developmentRuntimeCompatibilityIdentity(original, "win32");
   const fakeTools = join(root, "controlled-tools"); await mkdir(fakeTools);
   for (const name of ["node", "pnpm", "python3", "git-lfs"]) await writeFile(join(fakeTools, `${name}.exe`), "controlled tool port\n");
+  const fakeGit = join(root, "controlled-git"); await mkdir(fakeGit);
+  await writeFile(join(fakeGit, "git.exe"), "controlled host Git port\n");
   const leases = new Map<string, DevelopmentWorktreeLease>();
   const released = new Map<string, string>();
   let failCheck = false; let uncertainInstall = false; let packaged = 0; let activeUses = 0; let stoppedTests = 0; let loseRelease = false;
   let current: { id: "original" | "personal"; generation?: string } = { id: "original" };
   const handoffs = new Map<string, { id: "original" | "personal"; generation?: string }>();
   const options: DevelopmentOwnerOptions = {
-    rootDirectory: root, platform: "win32", arch: "x64", environment: { ...process.env, PATH: `${fakeTools};${process.env.PATH ?? process.env.Path ?? ""}` },
+    rootDirectory: root, platform: "win32", arch: "x64", environment: { ...process.env, PATH: `${fakeTools};${fakeGit}` },
     process: { async run(input: DevelopmentProcessInput) {
       input.signal.throwIfAborted();
       const name = basename(input.executable).replace(/\.exe$/iu, "");
       if (name === "git") {
-        try { return { stdout: (await execute(input.executable, [...input.args], { cwd: input.cwd, env: { ...process.env, ...input.environment }, windowsHide: true, signal: input.signal })).stdout, exitCode: 0 }; }
+        try { return { stdout: (await execute("git", [...input.args], { cwd: input.cwd,
+          env: { ...process.env, ...input.environment, PATH: hostPath }, windowsHide: true, signal: input.signal })).stdout, exitCode: 0 }; }
         catch (error) { return { stdout: "", exitCode: typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1 }; }
       }
       if (input.args[0] === "--version") {
@@ -105,7 +109,10 @@ async function fixture() {
 
 describe("personal development ownership", { timeout: 60_000 }, () => {
   it("keeps the real index untouched while snapshotting binary and untracked content, then rolls back a failed integrated build", async () => {
-    const f = await fixture(); const tools = new DevelopmentTools(f.root, f.options); await tools.check(signal);
+    const f = await fixture(); const tools = new DevelopmentTools(f.root, f.options);
+    expect((await tools.check(signal)).map(check => [check.id, check.status])).toEqual([
+      ["git", "ready"], ["node", "ready"], ["pnpm", "ready"], ["python", "ready"], ["gitLfs", "ready"]
+    ]);
     const repo = new DevelopmentRepository(f.root, tools);
     await writeFile(join(f.source, "feature.txt"), "staged\n"); await git(f.source, ["add", "feature.txt"]);
     await writeFile(join(f.source, "feature.txt"), "working\n"); await writeFile(join(f.source, "new.bin"), Buffer.from([0, 255, 127, 1]));
