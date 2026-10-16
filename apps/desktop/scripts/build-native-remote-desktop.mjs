@@ -225,7 +225,7 @@ export function buildNativeRemoteDesktop({
         ...process.env, PATH: `${dirname(cargo)};${process.env.PATH ?? process.env.Path ?? ""}`
       });
       hostServiceBinary = join(targetDirectory, target, "release", windowsHostService);
-      hostAddonBinary = join(targetDirectory, target, "release", "joko_windows_remote_desktop_host.dll");
+      hostAddonBinary = join(targetDirectory, target, "release", "joko_windows_remote_desktop_host_addon.dll");
       assertWindowsHostArtifact(readFileSync(hostServiceBinary), architecture, false);
       assertWindowsHostArtifact(readFileSync(hostAddonBinary), architecture, true);
     }
