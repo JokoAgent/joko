@@ -108,8 +108,9 @@ final class JokoConnectionUITests: XCTestCase {
 
     private func replace(_ field: XCUIElement, with text: String) {
         tap(field)
-        let current = field.value as? String ?? ""
-        if !current.isEmpty { field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count)) }
+        // A real field tap can place the caret before existing text. Select the
+        // complete value through the native keyboard before replacing it.
+        field.typeKey("a", modifierFlags: .command)
         field.typeText(text)
         let changed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", text), object: field)
         XCTAssertEqual(XCTWaiter.wait(for: [changed], timeout: 10), .completed)
