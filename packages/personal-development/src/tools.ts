@@ -15,10 +15,12 @@ export const TOOL_IDS: readonly DevelopmentToolId[] = ["git", "node", "pnpm", "p
 export function supportedDevelopmentHost(platform: string, arch: string): boolean {
   return platform === "win32" && arch === "x64" || (platform === "darwin" || platform === "linux") && (arch === "x64" || arch === "arm64");
 }
+const NODE_VERSION = "24.16.0";
+// https://nodejs.org/dist/v24.16.0/SHASUMS256.txt
 const NODE_HASH: Record<string, string> = {
-  "win32-x64": "1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97",
-  "darwin-arm64": "61130f394c1630d211dd50aecc4353d379480f36d3ac913cd85dbba1aed585c6", "darwin-x64": "58e99022c2ff89395576cc7fd4d98cea24bb68081475d5f88b801ee8729fb026",
-  "linux-arm64": "013b59cfd2819703a6f4a14ab891fc46fc2a4e3f5bcd92de3fb4929b43e35b30", "linux-x64": "b294a556e639d64338823920e5866c21c02741742d2e1529ee1a225c1ec9252a"
+  "win32-x64": "edaca9bd58ec8e92037dac4e877d52f6b8f430b81c18b57e264b4e2fb111cd56",
+  "darwin-arm64": "39189dab4eeb15706c424af0ac08a3044c9e48f7db12a7d77f6b7aafc7dd5df6", "darwin-x64": "298b4c7b3cb80765c8703e42b90324a4ece3b6634947b89e769c3c980ab55185",
+  "linux-arm64": "589f5b6dd4fcfee4dfda73013903c966abaa8abd93dbc9d436544e472b4f0e74", "linux-x64": "2faf6a387e9b62b888e21c54f01249fb27537ffecf1842f29f4c919d0a59a0ff"
 };
 // Publisher release v11.22.0 asset digests, matching this product's packageManager.
 const PNPM_HASH: Record<string, string> = {
@@ -41,14 +43,14 @@ const LFS: Record<string, string> = {
 export function developmentToolCatalog(platform: string, arch: string): readonly DevelopmentToolArtifact[] {
   if (!supportedDevelopmentHost(platform, arch)) return [];
   const host = `${platform}-${arch}`; const windows = platform === "win32";
-  const node = `node-v22.23.2-${windows ? "win" : platform}-${arch}`;
+  const node = `node-v${NODE_VERSION}-${windows ? "win" : platform}-${arch}`;
   const python = PYTHON[host]!; const lfsFormat = platform === "linux" ? "tar.gz" : "zip";
   return [
     ...(windows ? [{ id: "git" as const, version: "2.55.0.5", host, format: "zip" as const,
       url: "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/MinGit-2.55.0.5-64-bit.zip",
       sha256: "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e", executable: "cmd/git.exe" }] : []),
-    { id: "node", version: "22.23.2", host, format: windows ? "zip" : "tar.gz", sha256: NODE_HASH[host]!,
-      url: `https://nodejs.org/dist/v22.23.2/${node}.${windows ? "zip" : "tar.gz"}`, executable: `${node}/${windows ? "node.exe" : "bin/node"}` },
+    { id: "node", version: NODE_VERSION, host, format: windows ? "zip" : "tar.gz", sha256: NODE_HASH[host]!,
+      url: `https://nodejs.org/dist/v${NODE_VERSION}/${node}.${windows ? "zip" : "tar.gz"}`, executable: `${node}/${windows ? "node.exe" : "bin/node"}` },
     ...(PNPM_HASH[host] ? [{ id: "pnpm" as const, version: "11.22.0", host, format: windows ? "zip" as const : "tar.gz" as const,
       sha256: PNPM_HASH[host]!, url: host === "darwin-x64" ? "https://registry.npmjs.org/pnpm/-/pnpm-11.22.0.tgz"
         : `https://github.com/pnpm/pnpm/releases/download/v11.22.0/pnpm-${host}.${windows ? "zip" : "tar.gz"}`,
@@ -177,7 +179,7 @@ export class DevelopmentTools {
       if (result.exitCode !== 0) return;
       const match = /(?:^v|git version |git-lfs\/|Python )?(\d+)\.(\d+)\.(\d+)/u.exec(result.stdout.trim()); if (!match) return;
       const major = Number(match[1]); const minor = Number(match[2]);
-      const valid = id === "node" ? major > 22 || major === 22 && minor >= 19
+      const valid = id === "node" ? major > 24 || major === 24 && minor >= 16
         : id === "pnpm" ? `${major}.${minor}.${match[3]}` === "11.22.0"
         : id === "git" ? major >= 2 : id === "python" ? major === 3 && minor >= ((this.options.platform ?? process.platform) === "darwin" ? 10 : 9) : true;
       return valid ? `${major}.${minor}.${match[3]}` : undefined;

@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import JSZip from "jszip";
 import { PersonalDevelopmentOwner } from "./owner.js";
 import { developmentSourceTarget, DevelopmentRepository } from "./repository.js";
-import { DevelopmentTools, extractDevelopmentTool } from "./tools.js";
+import { DevelopmentTools, developmentToolCatalog, extractDevelopmentTool } from "./tools.js";
 import { developmentRuntimeCompatibilityIdentity } from "./build.js";
 import { exists, PERSONAL_BRANCH, SOURCE_REPOSITORY } from "./storage.js";
 import { PersonalDevelopmentError, type DevelopmentOwnerOptions, type DevelopmentProcessInput, type DevelopmentToolCheck, type DevelopmentWorktreeLease } from "./types.js";
@@ -60,7 +60,7 @@ async function fixture() {
         catch (error) { return { stdout: "", exitCode: typeof (error as { code?: unknown }).code === "number" ? (error as { code: number }).code : 1 }; }
       }
       if (input.args[0] === "--version") {
-        const versions: Record<string, string> = { node: "v22.23.2", pnpm: "11.22.0", python3: "Python 3.13.15", "git-lfs": "git-lfs/3.8.0" };
+        const versions: Record<string, string> = { node: "v24.16.0", pnpm: "11.22.0", python3: "Python 3.13.15", "git-lfs": "git-lfs/3.8.0" };
         return { stdout: versions[name] ?? "", exitCode: versions[name] ? 0 : 1 };
       }
       if (uncertainInstall && input.args[0] === "install") throw new PersonalDevelopmentError("PROCESS_UNKNOWN");
@@ -108,6 +108,32 @@ async function fixture() {
 }
 
 describe("personal development ownership", { timeout: 60_000 }, () => {
+  it.each([
+    ["win32", "x64", "node-v24.16.0-win-x64.zip", "edaca9bd58ec8e92037dac4e877d52f6b8f430b81c18b57e264b4e2fb111cd56"],
+    ["darwin", "x64", "node-v24.16.0-darwin-x64.tar.gz", "298b4c7b3cb80765c8703e42b90324a4ece3b6634947b89e769c3c980ab55185"],
+    ["darwin", "arm64", "node-v24.16.0-darwin-arm64.tar.gz", "39189dab4eeb15706c424af0ac08a3044c9e48f7db12a7d77f6b7aafc7dd5df6"],
+    ["linux", "x64", "node-v24.16.0-linux-x64.tar.gz", "2faf6a387e9b62b888e21c54f01249fb27537ffecf1842f29f4c919d0a59a0ff"],
+    ["linux", "arm64", "node-v24.16.0-linux-arm64.tar.gz", "589f5b6dd4fcfee4dfda73013903c966abaa8abd93dbc9d436544e472b4f0e74"]
+  ])("pins the existing %s/%s Node archive to the official 24.16.0 digest", (platform, arch, fileName, sha256) => {
+    const node = developmentToolCatalog(platform!, arch!).find(tool => tool.id === "node");
+    const directory = fileName!.replace(/\.(?:zip|tar\.gz)$/u, "");
+    expect(node).toEqual({ id: "node", version: "24.16.0", host: `${platform}-${arch}`, sha256,
+      format: platform === "win32" ? "zip" : "tar.gz", url: `https://nodejs.org/dist/v24.16.0/${fileName}`,
+      executable: `${directory}/${platform === "win32" ? "node.exe" : "bin/node"}` });
+  });
+
+  it.each(["v22.19.0", "v22.23.2", "v24.15.9"])("retires Node %s instead of admitting it below the project minimum", async oldVersion => {
+    const f = await fixture(); let version = "v24.16.0";
+    const tools = new DevelopmentTools(f.root, { ...f.options, toolArtifacts: [], process: { async run(input) {
+      if (basename(input.executable) === "node.exe" && input.args[0] === "--version") return { stdout: version, exitCode: 0 };
+      return f.options.process.run(input);
+    } } });
+    expect((await tools.check(signal)).find(check => check.id === "node")).toMatchObject({ status: "ready", version: "24.16.0" });
+    version = oldVersion;
+    expect((await tools.check(signal)).find(check => check.id === "node")).toEqual({ id: "node", status: "missing" });
+    expect(() => tools.executable("node")).toThrow(expect.objectContaining({ code: "ENVIRONMENT_NOT_READY" }));
+  });
+
   it("keeps the real index untouched while snapshotting binary and untracked content, then rolls back a failed integrated build", async () => {
     const f = await fixture(); const tools = new DevelopmentTools(f.root, f.options);
     expect((await tools.check(signal)).map(check => [check.id, check.status])).toEqual([
