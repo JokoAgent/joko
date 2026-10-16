@@ -287,6 +287,11 @@ describe("SkillTools", () => {
     let started = false;
     const getSkillMarketEntry = vi.fn(async () => marketEntryFixture());
     const controller = skillController({
+      listSkills: vi.fn(async () => ({
+        revision: started ? 2n : 1n,
+        skills: [{ ...globalSkill(), revision: started ? 2n : 1n }]
+      })),
+      openSkill: vi.fn(async () => sessionFor({ ...globalSkill(), revision: started ? 2n : 1n })),
       listSkillMarketSources: vi.fn(async () => ({ revision: 4n, sources: [marketSourceFixture()], recoveredFromCorruption: false })),
       getSkillPublicationPreview: vi.fn(async () => preview),
       listSkillPublicationJobs: vi.fn(async () => ({ items: started ? [published] : [], recoveredFromCorruption: false })),
@@ -335,7 +340,18 @@ describe("SkillTools", () => {
     await settle();
     await act(async () => buttonWithText(dialog, "Publish Skill").click());
     await settle();
-    await act(async () => buttonWithText(dialog, "Open in Skill market").click());
+    expect(document.body.querySelector('[role="dialog"]')).toBe(dialog);
+    expect(dialog.textContent).toContain("Version 1.0.0 is published");
+    expect(controller.listSkills).toHaveBeenCalledTimes(1);
+    await act(async () => dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    await settle();
+    expect(controller.listSkills).toHaveBeenCalledTimes(2);
+    expect(controller.openSkill).toHaveBeenLastCalledWith("resource-global", 2n, expect.any(AbortSignal));
+    await act(async () => buttonWithText(container, "Publish").click());
+    await settle();
+    const reopened = required(document.body.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(reopened.textContent).toContain("Version 1.0.0 is published");
+    await act(async () => buttonWithText(reopened, "Open in Skill market").click());
     await settle(140);
 
     const identity = marketEntryFixture().identity;

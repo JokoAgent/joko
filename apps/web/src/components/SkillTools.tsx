@@ -152,6 +152,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
   const [renameValue, setRenameValue] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
+  const publicationCatalogDirty = useRef(false);
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [recoveries, setRecoveries] = useState<readonly SkillRecoveryView[]>([]);
   const [recoveryError, setRecoveryError] = useState<string>();
@@ -233,6 +234,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
     setActionError(undefined);
     setPreview(undefined);
     setPublishOpen(false);
+    publicationCatalogDirty.current = false;
     if (selected === undefined) {
       setSessionState(undefined);
       return () => abort.abort();
@@ -500,8 +502,14 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
       session={session}
       locale={locale}
       t={t}
-      onClose={() => setPublishOpen(false)}
-      onPublished={loadCatalog}
+      onClose={() => {
+        setPublishOpen(false);
+        if (publicationCatalogDirty.current) {
+          publicationCatalogDirty.current = false;
+          loadCatalog();
+        }
+      }}
+      onPublished={() => { publicationCatalogDirty.current = true; }}
       onOpenPublished={onOpenPublished}
     />}
 

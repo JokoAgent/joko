@@ -86,6 +86,36 @@ describe("Skill market sources", () => {
 });
 
 describe("Skill market catalog", () => {
+  it("does not read a retired preview while adopting a replacement presentation", async () => {
+    const closed = new Set<string>();
+    const retiredReads: string[] = [];
+    let opened = 0;
+    let refreshPresentation = (): void => undefined;
+    const controller = marketController({
+      openSkillMarketPreview: vi.fn(async () => ({ ...preview(), id: `preview-${++opened}` })),
+      closeSkillMarketPreview: vi.fn(async (id) => { closed.add(id); return true; }),
+      readSkillMarketPreviewFile: vi.fn(async (owner) => {
+        if (closed.has(owner.id)) retiredReads.push(owner.id);
+        return { previewId: owner.id, snapshotRevision: HASH, key: "SKILL.md", size: 96, previewable: true, content: "# Current preview" };
+      })
+    });
+    function Harness(): ReactElement {
+      const [, refresh] = useState(0);
+      refreshPresentation = () => refresh(value => value + 1);
+      return <SkillMarketCatalogTools controller={controller} backends={backends} targets={targets} locale="en"
+        t={(key, values) => t(key, values)} initialSelection={entry().identity} onOpenSources={vi.fn()} />;
+    }
+    const container = await render(<Harness />);
+    await settle(120);
+    expect(container.textContent).toContain("# Current preview");
+    await act(async () => refreshPresentation());
+    await settle(120);
+    expect(retiredReads).toEqual([]);
+    expect(opened).toBe(2);
+    expect(controller.readSkillMarketPreviewFile).toHaveBeenLastCalledWith(expect.objectContaining({ id: "preview-2" }), "SKILL.md", expect.any(AbortSignal));
+    expect(container.textContent).toContain("# Current preview");
+  });
+
   it("hydrates the install picker when Backend capabilities arrive after the dialog mounts", async () => {
     const controller = marketController();
     let publishBackends = (): void => undefined;

@@ -245,9 +245,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
   useEffect(() => {
     const request = ++detailRequest.current;
     const abort = new AbortController();
-    const prior = previewRef.current;
     previewRef.current = undefined;
-    if (prior !== undefined) void controller.closeSkillMarketPreview(prior.id).catch(() => undefined);
     setSelectedFile(undefined);
     setFile(undefined);
     if (selected === undefined) {
@@ -256,12 +254,24 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
     }
     setDetail({ kind: "loading" });
     let opened: SkillMarketPreviewView | undefined;
+    const retireOpened = (): void => {
+      const preview = opened;
+      opened = undefined;
+      if (preview === undefined) return;
+      if (previewRef.current?.id === preview.id) previewRef.current = undefined;
+      void controller.closeSkillMarketPreview(preview.id).catch(() => undefined);
+    };
     void controller.getSkillMarketEntry(selected, abort.signal).then(async (entry) => {
+      if (abort.signal.aborted || request !== detailRequest.current) return;
       const preview = await controller.openSkillMarketPreview(entry.identity, abort.signal);
       opened = preview;
+      if (abort.signal.aborted || request !== detailRequest.current) {
+        retireOpened();
+        return;
+      }
       const files = await controller.listSkillMarketPreviewFiles(preview, "", 100, abort.signal);
       if (abort.signal.aborted || request !== detailRequest.current) {
-        void controller.closeSkillMarketPreview(preview.id).catch(() => undefined);
+        retireOpened();
         return;
       }
       previewRef.current = preview;
@@ -273,10 +283,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
     });
     return () => {
       abort.abort();
-      if (opened !== undefined) {
-        if (previewRef.current?.id === opened.id) previewRef.current = undefined;
-        void controller.closeSkillMarketPreview(opened.id).catch(() => undefined);
-      }
+      retireOpened();
     };
   }, [controller, detailReload, selected?.contentRevision, selected?.entryRevision, selected?.sourceRevision, t]);
 
@@ -284,7 +291,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
   useEffect(() => {
     const request = ++fileRequest.current;
     const abort = new AbortController();
-    if (readyDetail === undefined || selectedFile === undefined) {
+    if (readyDetail === undefined || selectedFile === undefined || previewRef.current?.id !== readyDetail.preview.id) {
       setFile(undefined);
       return () => abort.abort();
     }
