@@ -172,7 +172,11 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       watchRemoteHosts: async function* () { if (disposed) throw new Error("Remote workspace owner disconnected"); yield []; },
       readWorkspaceFile: read, readWorkspaceHtmlSnapshot, performBrowserTakeoverAction, getArtifactUrl: get, releaseArtifactUrl: release,
       navigateSessionBranch: navigate, copyArtifactFile: download, openArtifactFile: download, openArtifactFileWithApplication: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
-      updateAuxiliaryTextSettings: save, predictNextPrompt: predict, openBrowserPage
+      updateAuxiliaryTextSettings: save, predictNextPrompt: predict, openBrowserPage,
+      getCollaborationDirectory: async () => {
+        if (owner!.id === first.id) await pendingFirst;
+        return { available: true, revision: 1n, actor: { id: owner!.id, displayName: owner!.id }, scopes: [], recoveredFromCorruption: false };
+      }
     } as unknown as OrchestratorGateway;
   });
   let current!: AppController;
@@ -189,6 +193,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(current.releaseArtifactUrl).toBe(firstController.releaseArtifactUrl);
   expect(current.updateAuxiliaryTextSettings).toBe(firstController.updateAuxiliaryTextSettings);
   expect(current.predictNextPrompt).toBe(firstController.predictNextPrompt);
+  expect(current.getCollaborationDirectory).toBe(firstController.getCollaborationDirectory);
   expect(current.downloadArtifact).toBe(firstController.downloadArtifact);
   expect(current.exportSession).toBe(firstController.exportSession);
   expect(current.exportPortableSession).toBe(firstController.exportPortableSession);
@@ -233,8 +238,13 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const oldHtml = expect(firstController.openWorkspaceHtml("shared-session", "workspace", "index.html", { action: downloadContext })).rejects.toThrow("source is no longer current");
   const oldDownload = expect(firstController.downloadArtifact("shared", "same.txt", downloadContext)).rejects.toThrow("Download owner disconnected");
   const oldAcquisition = firstController.getArtifactUrl("shared").then((url) => { firstController.releaseArtifactUrl("shared"); return url; });
+  const oldDirectory = expect(firstController.getCollaborationDirectory(new AbortController().signal))
+    .rejects.toThrow("The collaboration connection is no longer current.");
   await act(async () => current.connect(second));
   const secondController = current;
+  expect(secondController.getCollaborationDirectory).not.toBe(firstController.getCollaborationDirectory);
+  await expect(secondController.getCollaborationDirectory(new AbortController().signal))
+    .resolves.toMatchObject({ actor: { id: second.id } });
   expect(secondController.getPersonalizationPrompt()).toBe("Explain tradeoffs.");
   const queueArguments: { [Method in typeof queueMethods[number]]: Parameters<AppController[Method]> } = {
     cancelQueueItem: ["shared-item"],
@@ -435,6 +445,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(gateways.get(second.id)!.get).toHaveBeenCalledTimes(1);
   await act(async () => finishFirst());
   await oldBrowser;
+  await oldDirectory;
   await oldHtml;
   expect(htmlCalls.get(first.id)).toHaveBeenCalledOnce();
   expect(htmlCalls.get(second.id)).not.toHaveBeenCalled();

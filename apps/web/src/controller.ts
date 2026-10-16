@@ -2604,6 +2604,20 @@ export function useAppController(): AppController {
     }
     return artifactGateway.saveProvider(draft, signal);
   }, [artifactGateway, linkGatewayGeneration]);
+  const getCollaborationDirectory = useCallback<AppController["getCollaborationDirectory"]>(async (signal) => {
+    signal?.throwIfAborted();
+    if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+      || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+      throw new Error("The collaboration connection is no longer current.");
+    }
+    const directory = await artifactGateway.getCollaborationDirectory(signal);
+    signal?.throwIfAborted();
+    if (gatewayRef.current !== artifactGateway || gatewayGenerationRef.current !== linkGatewayGeneration
+      || connectionStateRef.current !== "connected") {
+      throw new Error("The collaboration connection is no longer current.");
+    }
+    return directory;
+  }, [artifactGateway, linkGatewayGeneration]);
   const predictNextPrompt = useCallback<AppController["predictNextPrompt"]>(async (sessionId, expectedLastActivityAt, expectedGeneration, signal) => {
     signal.throwIfAborted();
     if (artifactGateway === undefined) throw new Error("Connect to Joko before requesting a prompt recommendation.");
@@ -2931,7 +2945,7 @@ export function useAppController(): AppController {
       gateway().getSkillPublicationPreview(resourceId, expectedResourceRevision, sourceId, expectedSourceRevision, slug, signal),
     listSkillPublicationJobs: (resourceId, signal) => gateway().listSkillPublicationJobs(resourceId, signal),
     getSkillPublicationJob: (jobId, signal) => gateway().getSkillPublicationJob(jobId, signal),
-    getCollaborationDirectory: (signal) => gateway().getCollaborationDirectory(signal),
+    getCollaborationDirectory,
     createCollaborationScope: (kind, name, expectedCatalogRevision, signal) =>
       gateway().createCollaborationScope(kind, name, expectedCatalogRevision, signal),
     updateCollaborationScope: (scope, name, signal) => gateway().updateCollaborationScope(scope, name, signal),
@@ -3403,7 +3417,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-  }), [deviceNameApi, saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+  }), [deviceNameApi, saveProvider, getCollaborationDirectory, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {
