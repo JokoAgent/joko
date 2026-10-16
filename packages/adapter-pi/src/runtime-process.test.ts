@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import {
   createDefaultManagedProcessSupervisor,
@@ -32,6 +34,30 @@ function snapshot(rows: readonly ProcessTableRow[]): ProcessTableSnapshot {
 }
 
 describe("managed runtime process supervision", () => {
+  it.runIf(process.platform === "win32")("captures the same live Windows birth and executable fence asynchronously and synchronously", async () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore", windowsHide: true,
+      env: { PATH: process.env["PATH"], SystemRoot: process.env["SystemRoot"], WINDIR: process.env["WINDIR"],
+        TEMP: process.env["TEMP"], TMP: process.env["TMP"], ...(process.versions["electron"] ? { ELECTRON_RUN_AS_NODE: "1" } : {}) }
+    });
+    const closed = once(child, "close");
+    try {
+      await once(child, "spawn");
+      const pid = child.pid!;
+      const supervisor = createDefaultManagedProcessSupervisor();
+      const identity = await supervisor.capture(pid);
+      expect(identity).toMatch(/^[a-f0-9]{64}$/u);
+      expect(supervisor.captureSync(pid)).toBe(identity);
+      expect(child.kill()).toBe(true);
+      await closed;
+      await expect(supervisor.capture(pid)).resolves.toBeUndefined();
+      expect(supervisor.captureSync(pid)).toBeUndefined();
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await closed;
+    }
+  }, 25_000);
+
   it.runIf(process.platform === "win32")(
     "treats a missing Windows process as confirmed absent for capture and recovery",
     async () => {
