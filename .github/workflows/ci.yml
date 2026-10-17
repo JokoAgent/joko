@@ -450,7 +450,7 @@ jobs:
           if [[ "$RUNNER_OS" == 'Windows' ]]; then
             packaged_files+=(src/settings-packaged-desktop.e2e.test.ts src/message-search-packaged-desktop.e2e.test.ts src/document-tools-packaged-desktop.e2e.test.ts)
             if [[ "$JOKO_PACKAGED_WINDOWS_REGRESSIONS" == '1' ]]; then
-              packaged_files=(src/settings-packaged-desktop.e2e.test.ts src/document-tools-packaged-desktop.e2e.test.ts)
+              packaged_files=(src/document-tools-packaged-desktop.e2e.test.ts)
             fi
           fi
           if [[ "$RUNNER_OS" == 'Linux' ]]; then

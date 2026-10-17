@@ -458,25 +458,45 @@ do {
       (New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'FileNameControlHost')))
     if ($null -eq $fileNameHost) { throw 'The native file name control is unavailable.' }
-    $fileNameEdit = $fileNameHost.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-      (New-Object System.Windows.Automation.AndCondition(
-        (New-Object System.Windows.Automation.PropertyCondition(
-          [System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1001')),
-        (New-Object System.Windows.Automation.PropertyCondition(
-          [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-          [System.Windows.Automation.ControlType]::Edit)))))
-    if ($null -eq $fileNameEdit) { throw 'The native file name editor is unavailable.' }
+    $fileNameEditors = $fileNameHost.FindAll([System.Windows.Automation.TreeScope]::Subtree,
+      (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit)))
+    if ($fileNameEditors.Count -ne 1) {
+      throw "Expected one owned native file name editor; found $($fileNameEditors.Count)."
+    }
+    $fileNameEdit = $fileNameEditors[0]
     $valuePattern = [System.Windows.Automation.ValuePattern]$fileNameEdit.GetCurrentPattern(
       [System.Windows.Automation.ValuePattern]::Pattern)
     $valuePattern.SetValue($target)
     $fileNameSet = $true
+    [pscustomobject]@{
+      automationId = $fileNameEdit.Current.AutomationId
+      className = $fileNameEdit.Current.ClassName
+      controlType = $fileNameEdit.Current.ControlType.ProgrammaticName
+    } | ConvertTo-Json -Compress
   } catch {
     $lastFileNameError = $_.Exception.GetBaseException().Message
     Start-Sleep -Milliseconds 100
   }
 } while (-not $fileNameSet -and [DateTime]::UtcNow -lt $deadline)
 if (-not $fileNameSet) {
-  throw "The native file name editor did not become writable: $lastFileNameError; enabled=$($fileNameEdit.Current.IsEnabled); offscreen=$($fileNameEdit.Current.IsOffscreen); class=$($fileNameEdit.Current.ClassName)."
+  $controlState = 'unavailable'
+  try {
+    if ($null -ne $fileNameHost) {
+      $controls = @($fileNameHost.FindAll([System.Windows.Automation.TreeScope]::Subtree,
+        [System.Windows.Automation.Condition]::TrueCondition) | Select-Object -First 12 | ForEach-Object {
+          [pscustomobject]@{
+            automationId = $_.Current.AutomationId
+            className = $_.Current.ClassName
+            controlType = $_.Current.ControlType.ProgrammaticName
+            enabled = $_.Current.IsEnabled
+          }
+        })
+      $controlState = ConvertTo-Json -InputObject $controls -Compress
+    }
+  } catch { }
+  throw "The native file name editor did not become writable: $lastFileNameError; controls=$controlState."
 }
 $saveButton = $null
 do {
@@ -502,9 +522,14 @@ if (-not $saveInvoked) { throw 'The native save action did not become invokable.
       windowsHide: true,
       timeout: 30_000,
       env: { ...process.env, JOKO_E2E_MAIN_PID: String(mainPid), JOKO_E2E_SAVE_TARGET: target }
-    }, (error, _stdout, stderr) => error
-      ? rejectSave(new Error(`Native save selection failed: ${stderr.trim()}`, { cause: error }))
-      : resolveSave());
+    }, (error, stdout, stderr) => {
+      if (error !== null) {
+        rejectSave(new Error(`Native save selection failed: ${stderr.trim()}`, { cause: error }));
+        return;
+      }
+      console.info("Packaged documents: native file name editor.", stdout.trim());
+      resolveSave();
+    });
   });
 }
 
