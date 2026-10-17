@@ -361,26 +361,33 @@ export class VoiceDictionaryPeerManager {
     }
     const generation = this.#generation;
     const promise = (async () => {
-      let exchange: PendingExchange | undefined = { requestReply, force, ...(delivery === undefined ? {} : { delivery }) };
-      while (exchange !== undefined) {
-        try { await this.#exchange(peer, generation, exchange); }
-        catch (error) {
+      try {
+        let exchange: PendingExchange | undefined = { requestReply, force, ...(delivery === undefined ? {} : { delivery }) };
+        while (exchange !== undefined) {
+          try { await this.#exchange(peer, generation, exchange); }
+          catch (error) {
+            this.#assertPeer(generation, peer);
+            const pending = this.#pendingExchange.get(peer.peerId);
+            if (deliveryCurrent(exchange.delivery) && (pending === undefined || !deliveryCurrent(pending.delivery))) throw error;
+          }
           this.#assertPeer(generation, peer);
-          const pending = this.#pendingExchange.get(peer.peerId);
-          if (deliveryCurrent(exchange.delivery) && (pending === undefined || !deliveryCurrent(pending.delivery))) throw error;
+          exchange = this.#pendingExchange.get(peer.peerId);
+          this.#pendingExchange.delete(peer.peerId);
         }
-        this.#assertPeer(generation, peer);
-        exchange = this.#pendingExchange.get(peer.peerId);
-        this.#pendingExchange.delete(peer.peerId);
+      } finally {
+        // Retire the exchange in the same continuation that drains its queue.
+        // Later promise handlers must not erase a newly requested exchange.
+        // Retirement advances the authority generation before clearing these
+        // maps, so an old exchange cannot clear a replacement owner's state.
+        if (generation === this.#generation) {
+          this.#sending.delete(peer.peerId);
+          this.#pendingExchange.delete(peer.peerId);
+        }
       }
     })().catch((error: unknown) => {
       if (generation === this.#generation && !this.#closed) this.#failed();
       throw error;
     }).finally(() => {
-      if (this.#sending.get(peer.peerId) === promise) {
-        this.#sending.delete(peer.peerId);
-        this.#pendingExchange.delete(peer.peerId);
-      }
       if (generation === this.#generation && !this.#closed) this.#emit();
     });
     this.#sending.set(peer.peerId, promise);

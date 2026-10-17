@@ -455,6 +455,35 @@ describe("Voice dictionary peer authority and exchange", () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it.each([0, 1, 2, 3, 4, 5])("retains a new exchange requested %i microtasks after a transfer acknowledgement", async offset => {
+    const fixture = await localFixture(`ack-followup-${offset}`), remote = generateNodeSyncIdentity();
+    const messages: VoiceDictionaryPeerMessage[] = [], requested = deferred<void>();
+    let online = false, scheduleFollowup = true, followup: Promise<void> | undefined;
+    let manager!: VoiceDictionaryPeerManager;
+    manager = new VoiceDictionaryPeerManager({ ...fixture.options, codec: { ...inProcessCodec, encode: async options => {
+      messages.push(options.message); return encodeVoiceDictionaryPeerMessage(options);
+    } }, transportFactory: () => ({ ...emptyTransport(), onlinePeerIds: () => online ? ["node-remote"] : [],
+      send: async () => {
+        if (scheduleFollowup) {
+          scheduleFollowup = false;
+          void (async () => {
+            for (let index = 0; index < offset; index++) await Promise.resolve();
+            fixture.dictionary.addManualTerm(fixture.dictionary.snapshot().revision, "After acknowledgement");
+            followup = manager.syncNow(); requested.resolve();
+          })();
+        }
+        return true;
+      } }) });
+    cleanups.push(() => manager.close()); await manager.initialize();
+    fixture.dictionary.setEnabled(fixture.dictionary.snapshot().revision, true);
+    fixture.peers.grantPeer({ expectedRevision: fixture.peers.configurationRevision(), peerId: "node-remote",
+      displayName: "Remote", publicKey: remote.publicKey, fingerprint: keyFingerprint(remote.publicKey) });
+    await manager.syncNow(); online = true;
+    await manager.syncNow(); await requested.promise; await followup;
+    expect(messages.at(-1)?.state).toEqual(fixture.dictionary.stateForSync());
+    expect(messages).toHaveLength(2);
+  });
+
   it("keeps the mutation debounce when an older exchange finishes before that timer", async () => {
     vi.useFakeTimers();
     try {
