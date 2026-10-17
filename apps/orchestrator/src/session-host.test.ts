@@ -14880,7 +14880,22 @@ describe("SessionHost", () => {
       sessionId,
       prompt: { text: "new explicit input", images: [], files: [], mentions: [], disposition: "prompt" }
     });
-    await eventually(() => fixture.store.getQueueItem(next.value.queueItemId).state === "completed");
+    await eventually(() => fixture.store.getQueueItem(next.value.queueItemId).state === "completed").catch((error: unknown) => {
+      const pending = fixture.store.findPendingContextRebuild(sessionId);
+      console.error("[prompt-timeout-rebuild-boundary]", JSON.stringify({
+        generation: fixture.store.getSession(sessionId).descriptor.binding.generation,
+        adapterSteps: adapter.sequence.map((step) => step === "rebuild" ? "rebuild" : "send"),
+        rebuildCalls: adapter.rebuildInputs.length,
+        pending: pending === undefined ? null : { state: pending.state, reason: pending.reason },
+        executions: [timedOut, next].map((execution) => {
+          const queue = fixture.store.getQueueItem(execution.value.queueItemId);
+          const run = fixture.store.getRun(execution.value.runId).descriptor;
+          return { queue: queue.state, run: run.state, queueError: queue.error?.code, runError: run.error?.code };
+        }),
+        diagnostics: fixture.store.listDiagnostics({ limit: 5 }).map(({ code, component }) => ({ code, component }))
+      }));
+      throw error;
+    });
     expect(fixture.store.getQueueItem(timedOut.value.queueItemId)).toMatchObject({
       state: "failed",
       error: { code: "NATIVE_CONTEXT_REPLACED", stateMayHaveChanged: true }
