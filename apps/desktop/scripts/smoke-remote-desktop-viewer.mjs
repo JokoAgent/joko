@@ -563,6 +563,7 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
       return presented;
     });
     stage = "preload and control";
+    await until(() => viewer.webContents.executeJavaScript(`document.hasFocus() && document.querySelector('.remote-viewer-toolbar .button')?.getAttribute('aria-pressed') === 'true'`));
     const boundary = await viewer.webContents.executeJavaScript(`(async()=>({broad:typeof window.jokoDesktop, dedicated:typeof window.jokoRemoteDesktopViewer?.request,
       state:await window.jokoRemoteDesktopViewer.state(), control:document.querySelector('.remote-viewer-toolbar .button')?.getAttribute('aria-pressed')}))()`);
     if (boundary.broad !== "undefined" || boundary.dedicated !== "function" || !boundary.state.active || boundary.state.generation < 1 || boundary.control !== "true") throw new Error("Viewer preload or control boundary failed.");
