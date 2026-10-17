@@ -484,7 +484,8 @@ public static class NativeDocumentDialog {
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassNameW(IntPtr handle, StringBuilder name, int count);
   [DllImport("user32.dll")] private static extern bool IsChild(IntPtr parent, IntPtr child);
   [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr handle);
-  [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr handle);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle);
+  [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] private static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
   [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
   private static extern IntPtr SendMessageTimeoutW(IntPtr handle, uint message, UIntPtr wParam,
@@ -517,14 +518,22 @@ public static class NativeDocumentDialog {
       || actual.ToString() != target) throw new InvalidOperationException("Native filename readback did not match.");
   }
 
-  public static void ClickSave(IntPtr dialog, uint processId) {
+  public static void SubmitSave(IntPtr dialog, uint processId) {
     RequireOwnedControl(dialog, processId, "#32770");
     var button = GetDlgItem(dialog, 1);
     RequireOwnedControl(button, processId, "Button");
     if (!IsChild(dialog, button)) throw new InvalidOperationException("The save button is outside the owned dialog.");
-    if (!PostMessageW(button, 0x00F5, UIntPtr.Zero, IntPtr.Zero)) {
-      throw new Win32Exception(Marshal.GetLastWin32Error(), "Native save click could not be queued.");
+    // Deliver the real button's BN_CLICKED notification without requiring foreground activation.
+    if (!PostMessageW(dialog, 0x0111, (UIntPtr)1, button)) {
+      throw new Win32Exception(Marshal.GetLastWin32Error(), "Native save command could not be queued.");
     }
+  }
+
+  public static string DescribeSave(IntPtr dialog) {
+    var button = GetDlgItem(dialog, 1);
+    return "dialogVisible=" + IsWindowVisible(dialog) + ";dialogEnabled=" + IsWindowEnabled(dialog)
+      + ";dialogForeground=" + (GetForegroundWindow() == dialog)
+      + ";saveButtonEnabled=" + IsWindowEnabled(button);
   }
 }
 '@
@@ -549,6 +558,7 @@ do {
   Start-Sleep -Milliseconds 100
 } while ([DateTime]::UtcNow -lt $deadline)
 if ($null -eq $dialog) { throw 'The owned native save dialog did not appear.' }
+$ownedDialogHandle = [IntPtr]$dialog.Current.NativeWindowHandle
 $fileNameSet = $false
 $lastFileNameError = $null
 do {
@@ -600,7 +610,7 @@ $saveInvoked = $false
 $lastSaveError = $null
 do {
   try {
-    [NativeDocumentDialog]::ClickSave([IntPtr]$dialog.Current.NativeWindowHandle, $mainPid)
+    [NativeDocumentDialog]::SubmitSave($ownedDialogHandle, $mainPid)
     $saveInvoked = $true
   } catch {
     $lastSaveError = $_.Exception.GetBaseException().Message
@@ -608,6 +618,19 @@ do {
   }
 } while (-not $saveInvoked -and [DateTime]::UtcNow -lt $deadline)
 if (-not $saveInvoked) { throw "The native save action did not become invokable: $lastSaveError." }
+$dialogClosed = $false
+do {
+  if (-not [NativeDocumentDialog]::IsWindowVisible($ownedDialogHandle)) {
+    $dialogClosed = $true
+    break
+  }
+  Start-Sleep -Milliseconds 100
+} while ([DateTime]::UtcNow -lt $deadline)
+if (-not $dialogClosed) {
+  $saveState = [NativeDocumentDialog]::DescribeSave($ownedDialogHandle)
+  throw "The owned native save dialog did not close after its Save command: $saveState."
+}
+'Native save command dismissed the owned dialog.'
 `;
   await new Promise<void>((resolveSave, rejectSave) => {
     execFile("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
