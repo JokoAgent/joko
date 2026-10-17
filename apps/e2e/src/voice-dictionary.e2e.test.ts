@@ -330,10 +330,12 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     readonlyRequests.clear();
     let phone = createPhone(); await phone.app.start(); phone.controller.setVisible(true);
     try {
+      // Both authenticated hosts start independent real HTTP read/watch
+      // projections. Vitest's one-second default is not their network budget.
       await vi.waitFor(() => {
         expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]);
         expect(phone.controller.state.selected?.snapshot.entries.map((entry: { text: string }) => entry.text).sort()).toEqual(["DeleteMe", "OfficeTerm", "PhoneTerm"]);
-      });
+      }, { timeout: 5_000 });
     } catch (error) {
       // Fixed phases and state only: no origins, profile IDs, keys or payloads.
       console.error("Readonly dictionary initial projection diagnostic", JSON.stringify({
