@@ -695,9 +695,9 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
           "repeated prewarm retains exactly one unbound spare", "authorized open adopts the same BrowserWindow and webContents with fresh binding",
           "authorized open refills exactly one hidden unbound spare", "same-target reuse preserves the spare and original lease",
           "source retirement destroys the remaining unbound spare"],
-        limits: ["selected viewer lifecycle scope; full runner attempts remain failed or timed out and are preserved separately",
-          "real Windows Electron with staged production Web and controlled generated HTTP host, pixels and display geometry",
-          "no physical capture/input, paired reference pixels, real macOS fullscreen, Linux/macOS native window proof or signature/install"] }, null, 2));
+        limits: ["selected viewer lifecycle scope; full-scope results are recorded separately",
+          `real ${process.platform} Electron with staged production Web and controlled generated HTTP host, pixels and display geometry`,
+          "no physical capture/input, paired reference pixels, native fullscreen-mode transitions or signature/install; native window observations apply only to this runner platform"] }, null, 2));
       process.stdout.write("Remote desktop viewer Electron lifecycle smoke passed (20 checks).\n");
       app.removeListener("browser-window-created", observeFocus);
       quitting = true; manager.dispose(); source.destroy(); server.close(); clearTimeout(deadline); app.exit(0);
@@ -1382,14 +1382,14 @@ contextBridge.exposeInMainWorld('smokeSource',{invoke:(channel,...args)=>ipcRend
         "confirmed audio preference saves to disk before the muted same-lease offer",
         "same-target Linux reopen uses the saved muted intent in its first fresh offer"],
       evidence: "E2", limits: ["synthetic host, display geometry and pixels", "Windows scaled native bounds allow one DIP of round-trip rounding",
-        "real Windows Electron renderer crash/replacement and cached BrowserWindow bounds; no actual macOS fullscreen exit or other operating system window recovery",
+        `real ${process.platform} Electron renderer crash/replacement and cached BrowserWindow bounds; native window recovery on other operating systems is outside this run`,
         "synthetic Linux systemAudio capability and typed offer failure with real settings, JPEG fallback and saved intent; no real Linux PCM, PipeWire sink, playback, WebRTC audio track or replaceTrack proof",
         "synthetic lock acknowledgement only; no physical OS lock or unlock",
         "synthetic privacy acknowledgement only; no physical screens, native input gate, local confirmation dialog or capture filter",
         "injected system-only clipboard adapter and synthetic remote clipboard; no physical OS clipboard contents were read or written",
-        "Windows Electron with injected macOS viewer platform and synthetic native credential port; no real macOS Keychain, Secure Enclave, password dialog or OS unlock",
+        `${process.platform} Electron with injected macOS viewer platform and synthetic native credential port; no real macOS Keychain, Secure Enclave, password dialog or OS unlock`,
         "synthetic physical-mode enumeration, native mode effects and restoration; no real CoreGraphics, macOS HiDPI, hotplug, original-mode restoration or physical control proof",
-        "Windows Electron with synthetic Linux native/portal capabilities, consent decisions and late JPEG receipt; no real Hyprland, Wayland portal, Linux helper, OS input, consent picker or MediaStream track disposal proof",
+        `${process.platform} Electron with synthetic Linux native/portal capabilities, consent decisions and late JPEG receipt; no real Hyprland, Wayland portal, Linux helper, OS input, consent picker or MediaStream track disposal proof`,
         "synthetic Linux local clipboard port and controlled remote clipboard with SHA256 content versions; no user OS clipboard, real wl-paste, PRIMARY selection, native writer ready/roundtrip or Linux session proof",
         "no physical capture/input", "no WebRTC NAT/TURN", "no system clipboard/audio", "no signature/install or paired reference pixels"] }, null, 2));
     process.stdout.write("Remote desktop viewer Electron smoke passed.\n");
