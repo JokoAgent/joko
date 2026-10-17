@@ -132,6 +132,33 @@ describe("Timeline viewport journeys", () => {
     expect(viewport.scrollTop).toBe(0);
   });
 
+  it("keeps virtual-row corrections from detaching a growing tail after a delayed scroll event", async () => {
+    await render({ items: Array.from({ length: 60 }, (_, index) => item(`measured-${index}`, index + 1, "user")) });
+    await flushFrames();
+    const viewport = timeline();
+    await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    const above = [...viewport.querySelectorAll<HTMLElement>(".timeline__row")]
+      .filter(row => row.getBoundingClientRect().bottom <= 0).slice(0, 2);
+    expect(above).toHaveLength(2);
+    const before = viewport.scrollTop;
+    const now = vi.spyOn(performance, "now").mockReturnValue(10_000);
+    await act(async () => {
+      for (const observer of [...observers]) {
+        const entries = above.filter(row => observer.targets.has(row)).map(target => ({
+          target, borderBoxSize: [{ blockSize: 10, inlineSize: 592 }]
+        }) as unknown as ResizeObserverEntry);
+        if (entries.length > 0) observer.callback(entries, observer);
+      }
+    });
+    expect(viewport.scrollTop).toBeLessThan(before);
+    extent += 200;
+    now.mockReturnValue(11_000);
+    await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    expect(jumpLatest()).toBeNull();
+    await contentResize();
+    expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+  });
+
   it("shows whole-Run accounting only on its current completion while keeping segment usage private to running status", async () => {
     const segmentUsage = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0,
       totalTokens: 15, cost: 0.004, currency: "USD", generationDurationMs: 1_000, generationReliable: true };

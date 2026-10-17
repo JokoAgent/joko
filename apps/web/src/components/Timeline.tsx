@@ -3,7 +3,7 @@ import type { ComponentProps, CSSProperties, JSX, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { sessionHandoffMessages as handoffMessages } from "@joko/contracts";
 import { assertBrowserActionCurrent, type BrowserActionContext, type HttpLinkOpenOptions } from "../browser-action.js";
-import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
+import { defaultRangeExtractor, elementScroll, useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
   ArrowRight,
@@ -391,6 +391,12 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     count: renderItems.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: (index) => estimateRenderHeight(renderItems[index]),
+    scrollToFn: (offset, options, instance) => {
+      elementScroll(offset, options, instance);
+      // Measurement corrections are our own movement, including when their
+      // native scroll notification arrives after the programmatic window.
+      if (instance.scrollElement !== null) previousScrollTopRef.current = instance.scrollElement.scrollTop;
+    },
     overscan: 8,
     getItemKey: (index) => renderItems[index]?.key ?? index,
     rangeExtractor: extractTimelineRange
