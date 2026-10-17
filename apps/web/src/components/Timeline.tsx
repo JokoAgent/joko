@@ -1125,6 +1125,13 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
           setFocusedItemId(undefined);
           restoreAnchorRef.current = undefined;
           stopFollowingForUpIntent(event.currentTarget);
+          if (event.key === "Home" && event.target === event.currentTarget
+              && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+            // Virtual-row corrections can interrupt native animated Home
+            // before it reaches the history boundary.
+            event.preventDefault();
+            writeScrollTop(0);
+          }
           if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
         }}
         onTouchStart={(event) => { touchYRef.current = navigationDocumentActiveRef.current && event.touches.length === 1 ? event.touches[0]?.clientY : undefined; }}

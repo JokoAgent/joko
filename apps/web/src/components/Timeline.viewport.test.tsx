@@ -116,15 +116,16 @@ afterEach(async () => {
 });
 
 describe("Timeline viewport journeys", () => {
-  it("lets Home retire a programmatic scroll before requesting the earlier page", async () => {
+  it("lands Home at the history boundary before virtual-row corrections can interrupt native keyboard scrolling", async () => {
     const loadEarlier = vi.fn(async () => undefined);
     await render({ hasEarlier: true, messageNavRailEnabled: false, onLoadEarlier: loadEarlier });
     const viewport = timeline();
     expect(viewport.scrollTop).toBeGreaterThan(0);
     await act(async () => {
-      viewport.dispatchEvent(new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true }));
-      // JSDOM has no native keyboard scroll; deliver its resulting scroll event.
-      viewport.scrollTop = 0;
+      const intent = new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true });
+      viewport.dispatchEvent(intent);
+      expect(viewport.scrollTop).toBe(0);
+      expect(intent.defaultPrevented).toBe(true);
       viewport.dispatchEvent(new Event("scroll"));
     });
     expect(loadEarlier).toHaveBeenCalledTimes(1);
