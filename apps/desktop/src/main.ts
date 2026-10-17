@@ -1122,6 +1122,12 @@ if (!app.requestSingleInstanceLock()) {
     installDesktopApplicationMenu();
     createWindow();
     recordPackagedSmokeProgress("main_window_created");
+    if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
+      writeFileSync(`${packagedSmokeResultPath}.startup.json`, JSON.stringify({
+        pid: process.pid, executablePath: process.execPath,
+        userDataPath: app.getPath("userData"), packaged: app.isPackaged
+      }), { flag: "wx", mode: 0o600 });
+    }
     initializeDesktopDevicePeerAgentLifecycle();
     void beginDesktopUpdateStartup();
     if (!packagedSmoke) ensureTray();

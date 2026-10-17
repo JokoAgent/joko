@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -13,7 +13,7 @@ import {
   createInternalServer
 } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE, type FakeAdapterProfile } from "@joko/testkit";
-import { _electron, type ElectronApplication, type Page } from "playwright-core";
+import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -36,17 +36,20 @@ interface OwnedDesktopProcess {
 
 let fixture: OrchestratorE2eFixture | undefined;
 let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
-let desktop: ElectronApplication | undefined;
+let desktop: Browser | undefined;
+let desktopProcess: ChildProcess | undefined;
+let desktopPage: Page | undefined;
 let desktopIdentity: OwnedDesktopProcess | undefined;
 let profileDirectory: string | undefined;
 
 afterEach(async ({ task }) => {
   if (task.result?.state === "fail") {
     console.error("Packaged documents: failed window routes.", JSON.stringify({
-      launcherPid: desktop?.process().pid,
+      spawnedPid: desktopProcess?.pid,
       mainPid: desktopIdentity?.pid,
-      exitCode: desktop?.process().exitCode,
-      windows: desktop?.windows().map((page) => ({ route: new URL(page.url()).hash, closed: page.isClosed() })) ?? []
+      exitCode: desktopProcess?.exitCode,
+      windows: desktop?.contexts().flatMap((context) => context.pages())
+        .map((page) => ({ route: new URL(page.url()).hash, closed: page.isClosed() })) ?? []
     }));
     const startupProgress = profileDirectory === undefined ? "" : await readFile(join(profileDirectory, "launch.progress"), "utf8").catch(() => "");
     console.error("Packaged documents: startup stages.", startupProgress.split(/\r?\n/u)
@@ -224,9 +227,9 @@ tr:nth-child(even) td { background: #fafafa; }
   if (challenge.challenge === undefined) throw new Error("Desktop pairing returned no challenge.");
   console.info("Packaged documents: generated outputs and pairing ready.");
   profileDirectory = await mkdtemp(join(tmpdir(), "joko-document-desktop-"));
-  desktop = await _electron.launch({
-    executablePath,
-    args: ["--disable-gpu", "--enable-logging=stderr"],
+  const launchDeadline = Date.now() + 60_000;
+  desktopProcess = spawn(executablePath, ["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1",
+    "--disable-gpu", "--enable-logging=stderr"], {
     env: {
       ...process.env,
       JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
@@ -235,34 +238,70 @@ tr:nth-child(even) td { background: #fafafa; }
       JOKO_DESKTOP_SMOKE_RESULT: join(profileDirectory, "launch"),
       JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory
     },
-    timeout: 60_000
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
   });
-  console.info("Packaged documents: Desktop launch returned.");
-  const launcherPid = desktop.process().pid;
-  if (launcherPid === undefined) throw new Error("Document Desktop returned no spawned process ID.");
-  desktopIdentity = await readLaunchedDesktopProcess(launcherPid, executablePath);
+  let devtoolsEndpoint: string | undefined;
+  let launchError: Error | undefined;
+  let stderrLine = "";
+  desktopProcess.once("error", (error) => { launchError = error; });
+  desktopProcess.stdout?.resume();
+  desktopProcess.stderr?.on("data", (bytes: Buffer) => {
+    stderrLine += bytes.toString();
+    let newline: number;
+    while ((newline = stderrLine.indexOf("\n")) >= 0) {
+      const line = stderrLine.slice(0, newline).trim();
+      stderrLine = stderrLine.slice(newline + 1);
+      const match = /^DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[a-zA-Z0-9-]+)$/u.exec(line);
+      if (match !== null) devtoolsEndpoint = match[1];
+    }
+    stderrLine = stderrLine.slice(-8192);
+  });
+  const mainPid = desktopProcess.pid;
+  if (mainPid === undefined) throw new Error("Document Desktop returned no spawned process ID.");
+  desktopIdentity = await readOwnedDesktopProcess(mainPid);
   if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
     throw new Error("Document Desktop launched an unexpected executable.");
   }
   console.info("Packaged documents: owned process confirmed.");
-  const page = await desktop.firstWindow({ timeout: 60_000 });
-  page.setDefaultTimeout(30_000);
-  const pageErrors: string[] = [];
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-  await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
-  console.info("Packaged documents: connection page visible.");
-  let profileTimer: ReturnType<typeof setTimeout> | undefined;
-  const userDataPath = await Promise.race([
-    desktop.evaluate(({ app }) => app.getPath("userData")),
-    new Promise<never>((_resolveProfile, rejectProfile) => {
-      profileTimer = setTimeout(() => rejectProfile(new Error("Document Desktop main-process profile query timed out.")), 30_000);
-    })
-  ]).finally(() => { if (profileTimer !== undefined) clearTimeout(profileTimer); });
-  const profileRelative = relative(profileDirectory, userDataPath);
+  const startupPath = join(profileDirectory, "launch.startup.json");
+  let startup: { readonly pid: number; readonly executablePath: string; readonly userDataPath: string; readonly packaged: boolean } | undefined;
+  await waitFor(async () => {
+    if (launchError !== undefined) throw launchError;
+    if (desktopProcess?.exitCode !== null) throw new Error("Document Desktop exited before automation connected.");
+    startup = await readFile(startupPath, "utf8").then((value) => JSON.parse(value) as NonNullable<typeof startup>).catch(() => undefined);
+    return startup !== undefined && devtoolsEndpoint !== undefined;
+  }, Boolean, "Document Desktop owned startup receipt", Math.max(1, launchDeadline - Date.now()));
+  if (startup === undefined || devtoolsEndpoint === undefined || startup.pid !== mainPid || !startup.packaged
+    || typeof startup.userDataPath !== "string" || typeof startup.executablePath !== "string"
+    || resolve(startup.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
+    throw new Error("Document Desktop returned an unexpected packaged startup identity.");
+  }
+  const profileRelative = relative(profileDirectory, startup.userDataPath);
   if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
     throw new Error("Document Desktop did not use its isolated profile.");
   }
-  console.info("Packaged documents: isolated profile confirmed.");
+  console.info("Packaged documents: isolated packaged profile confirmed.");
+  desktop = await chromium.connectOverCDP(devtoolsEndpoint, { timeout: Math.max(1, launchDeadline - Date.now()) });
+  const context = desktop.contexts()[0];
+  if (context === undefined) throw new Error("Document Desktop returned no renderer context.");
+  const errorsByPage = new Map<Page, string[]>();
+  const observePage = (candidate: Page): void => {
+    if (errorsByPage.has(candidate)) return;
+    const errors: string[] = [];
+    errorsByPage.set(candidate, errors);
+    candidate.on("pageerror", (error) => errors.push(error.message));
+  };
+  context.on("page", observePage);
+  for (const candidate of context.pages()) observePage(candidate);
+  const page = await waitFor(async () => context.pages()[0], (candidate) => candidate !== undefined,
+    "Document Desktop first window", 60_000);
+  if (page === undefined) throw new Error("Document Desktop returned no application window.");
+  desktopPage = page;
+  const pageErrors = errorsByPage.get(page)!;
+  page.setDefaultTimeout(30_000);
+  await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged documents: connection page visible.");
   await page.locator(".connection-tabs > button").nth(2).click();
   await page.locator('form.pair-form input[type="url"]').fill(fixture.baseUrl);
   await page.locator('form.pair-form input[autocomplete="one-time-code"]')
@@ -446,7 +485,7 @@ do {
       [System.Windows.Automation.ControlType]::Window)))
   foreach ($window in $windows) {
     if ($window.Current.ProcessId -ne $mainPid) { continue }
-    $dialog = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+    $dialog = $window.FindFirst([System.Windows.Automation.TreeScope]::Subtree,
       (New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ClassNameProperty, '#32770')))
     if ($null -ne $dialog) { break }
@@ -539,7 +578,11 @@ if (-not $saveInvoked) { throw 'The native save action did not become invokable.
 }
 
 async function closeDesktop(afterFailure = false): Promise<void> {
-  if (desktopIdentity === undefined) return;
+  if (desktopIdentity === undefined) {
+    if (afterFailure && desktopProcess?.exitCode === null) desktopProcess.kill();
+    await desktop?.close().catch(() => undefined);
+    return;
+  }
   const original = desktopIdentity;
   const current = await readOwnedDesktopProcess(original.pid);
   if (current !== undefined && (current.executablePath.toLowerCase() !== original.executablePath.toLowerCase()
@@ -553,11 +596,22 @@ async function closeDesktop(afterFailure = false): Promise<void> {
           { windowsHide: true, timeout: 10_000 }, (error) => error ? rejectKill(error) : resolveKill());
       });
     } else {
-      await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
+      await desktopPage?.evaluate(async () => {
+        const api = (window as unknown as { jokoDesktop: {
+          mainWindowClose: { get(): Promise<{ revision: number }>; set(change: { behavior: "quit"; expectedRevision: number }): Promise<unknown> };
+          window: { close(): Promise<void> };
+        } }).jokoDesktop;
+        const current = await api.mainWindowClose.get();
+        await api.mainWindowClose.set({ behavior: "quit", expectedRevision: current.revision });
+        setTimeout(() => { void api.window.close(); }, 50);
+        return true;
+      }).catch(() => undefined);
     }
     try {
-      await waitFor(() => readOwnedDesktopProcess(original.pid), (candidate) => candidate === undefined,
+      const exited = await waitFor(async () => ({ process: await readOwnedDesktopProcess(original.pid), exitCode: desktopProcess?.exitCode }),
+        (candidate) => candidate.process === undefined && candidate.exitCode !== null,
         "Document Desktop complete exit", 30_000);
+      if (!afterFailure && exited.exitCode !== 0) throw new Error("Document Desktop returned a nonzero normal exit code.");
     } catch (error) {
       const stillOwned = await readOwnedDesktopProcess(original.pid);
       if (stillOwned !== undefined && stillOwned.executablePath.toLowerCase() === original.executablePath.toLowerCase()
@@ -570,24 +624,11 @@ async function closeDesktop(afterFailure = false): Promise<void> {
       throw new Error("Document Desktop did not complete its normal exit.", { cause: error });
     }
   }
+  await desktop?.close().catch(() => undefined);
   desktopIdentity = undefined;
   desktop = undefined;
-}
-
-async function readLaunchedDesktopProcess(launcherPid: number, executablePath: string): Promise<OwnedDesktopProcess> {
-  if (!Number.isSafeInteger(launcherPid) || launcherPid <= 0) throw new Error("Invalid Document Desktop launcher PID.");
-  const script = "$ErrorActionPreference = 'Stop'; $ownedCandidates = @(Get-CimInstance Win32_Process -Filter 'ProcessId = "
-    + launcherPid + " OR ParentProcessId = " + launcherPid
-    + "' | Where-Object { $_.ExecutablePath -eq $env:JOKO_E2E_DESKTOP_EXECUTABLE }); "
-    + "if ($ownedCandidates.Count -ne 1) { throw 'Expected one Desktop main process under its launcher.' }; "
-    + "$ownedProcess = $ownedCandidates[0]; [pscustomobject]@{ pid = $ownedProcess.ProcessId; executablePath = $ownedProcess.ExecutablePath; startedAt = $ownedProcess.CreationDate.ToUniversalTime().ToString('O') } | ConvertTo-Json -Compress";
-  const output = await new Promise<string>((resolveOutput, rejectOutput) => {
-    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-      windowsHide: true, timeout: 10_000,
-      env: { ...process.env, JOKO_E2E_DESKTOP_EXECUTABLE: executablePath }
-    }, (error, stdout) => error ? rejectOutput(error) : resolveOutput(stdout));
-  });
-  return JSON.parse(output) as OwnedDesktopProcess;
+  desktopPage = undefined;
+  desktopProcess = undefined;
 }
 
 async function readOwnedDesktopProcess(pid: number): Promise<OwnedDesktopProcess | undefined> {
