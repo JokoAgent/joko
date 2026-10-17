@@ -34,9 +34,14 @@ let desktopIdentity: OwnedProcess | undefined;
 let profileDirectory: string | undefined;
 const workspaceRequests = new WeakMap<Page, string[]>();
 
-afterEach(async () => {
+afterEach(async ({ task }) => {
+  if (task.result?.state === "fail") {
+    console.error("Packaged settings: failed window routes.", JSON.stringify(
+      desktop?.windows().map((page) => ({ route: new URL(page.url()).hash, closed: page.isClosed() })) ?? []
+    ));
+  }
   try {
-    await closeDesktop();
+    await closeDesktop(task.result?.state === "fail");
   } finally {
     await fixture?.close();
     fixture = undefined;
@@ -86,6 +91,7 @@ packagedIt("converges conversation settings across real application windows and 
     sessionIds.push(sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
       createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId, displayName }))));
   }
+  console.info("Packaged settings: fixture and both tasks ready.");
   const challenge = await activeFixture.anonymous.connection.beginPairing({ deviceDisplayName: "Settings Desktop" });
   if (challenge.challenge === undefined) throw new Error("Settings Desktop pairing returned no challenge.");
   const executablePath = resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!);
@@ -101,6 +107,7 @@ packagedIt("converges conversation settings across real application windows and 
     },
     timeout: 60_000
   });
+  console.info("Packaged settings: Desktop launch returned.");
   const application = desktop;
   desktopIdentity = await readProcess(await application.evaluate(() => process.pid));
   if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
@@ -110,9 +117,11 @@ packagedIt("converges conversation settings across real application windows and 
   if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
     throw new Error("Settings Desktop did not use its isolated profile.");
   }
+  console.info("Packaged settings: process and isolated profile confirmed.");
   const main = await application.firstWindow({ timeout: 60_000 });
   const pageErrors: string[] = [];
   const observe = (page: Page): void => {
+    page.setDefaultTimeout(30_000);
     const requests: string[] = [];
     workspaceRequests.set(page, requests);
     page.on("pageerror", (error) => pageErrors.push(error.message));
@@ -123,6 +132,7 @@ packagedIt("converges conversation settings across real application windows and 
   };
   observe(main);
   await main.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged settings: connection page visible.");
   const pairingTabBounds = await main.locator(".connection-tabs > button").nth(2).boundingBox();
   if (pairingTabBounds === null) throw new Error("Settings Desktop pairing tab has no visible bounds.");
   await main.mouse.click(pairingTabBounds.x + pairingTabBounds.width / 2,
@@ -134,7 +144,10 @@ packagedIt("converges conversation settings across real application windows and 
   await main.locator('form.pair-form input[autocomplete="off"]').fill("Settings Desktop");
   await main.locator("form.pair-form button[type=submit]").click();
   await main.locator(".app").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged settings: authenticated application visible.");
   await main.evaluate(() => { location.hash = "/settings/general"; });
+  await main.locator(".settings-page").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged settings: general settings visible.");
   await main.getByRole("combobox", { name: /^(?:Language|语言)$/u }).click();
   await main.getByRole("option", { name: "English", exact: true }).click();
   await selected(main.getByRole("combobox", { name: "Language", exact: true }), "English");
@@ -321,7 +334,7 @@ async function personalized(page: Page, prompt: string, fade: boolean, rail: boo
   }
 }
 
-async function closeDesktop(): Promise<void> {
+async function closeDesktop(afterFailure = false): Promise<void> {
   if (desktopIdentity === undefined) return;
   const original = desktopIdentity;
   const current = await readProcess(original.pid);
@@ -330,7 +343,14 @@ async function closeDesktop(): Promise<void> {
     throw new Error("Settings Desktop cleanup refused a changed process identity.");
   }
   if (current !== undefined) {
-    await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
+    if (afterFailure) {
+      await new Promise<void>((resolveKill, rejectKill) => {
+        execFile("taskkill.exe", ["/PID", String(original.pid), "/T", "/F"],
+          { windowsHide: true, timeout: 10_000 }, (error) => error ? rejectKill(error) : resolveKill());
+      });
+    } else {
+      await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
+    }
     await waitFor(() => readProcess(original.pid), (candidate) => candidate === undefined,
       "Settings Desktop complete exit", 30_000);
   }

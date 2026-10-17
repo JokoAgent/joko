@@ -238,11 +238,16 @@ tr:nth-child(even) td { background: #fafafa; }
   page.on("pageerror", (error) => pageErrors.push(error.message));
   await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
   await page.locator(".connection-tabs > button").nth(2).click();
-  await page.getByLabel("Joko node address").fill(fixture.baseUrl);
-  await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
-  await page.getByLabel("Device name").fill("Document Desktop");
+  await page.locator('form.pair-form input[type="url"]').fill(fixture.baseUrl);
+  await page.locator('form.pair-form input[autocomplete="one-time-code"]')
+    .fill(fixture.pairingCode(challenge.challenge.challengeId));
+  await page.locator('form.pair-form input[autocomplete="off"]').fill("Document Desktop");
   await page.locator("form.pair-form button[type=submit]").click();
   await page.locator(".app").waitFor({ state: "visible", timeout: 30_000 });
+  await page.evaluate(() => { location.hash = "/settings/general"; });
+  await page.locator(".settings-page").waitFor({ state: "visible", timeout: 30_000 });
+  await page.getByRole("combobox", { name: /^(?:Language|语言)$/u }).click({ timeout: 30_000 });
+  await page.getByRole("option", { name: "English", exact: true }).click({ timeout: 30_000 });
   const filesHash = `#/files/${encodeURIComponent(sessionId)}?file=documents%2Fchart-report.pdf`;
   await page.evaluate((hash) => { window.location.hash = hash; }, filesHash);
   await page.locator('[data-file-kind="pdf"]').waitFor({ state: "visible", timeout: 30_000 });
@@ -421,22 +426,34 @@ do {
   Start-Sleep -Milliseconds 100
 } while ([DateTime]::UtcNow -lt $deadline)
 if ($null -eq $dialog) { throw 'The owned native save dialog did not appear.' }
-$fileNameHost = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-  (New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'FileNameControlHost')))
-if ($null -eq $fileNameHost) { throw 'The native file name control is unavailable.' }
-$fileNameEdit = $fileNameHost.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-  (New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1001')))
-if ($null -eq $fileNameEdit) { throw 'The native file name editor is unavailable.' }
 $fileNameSet = $false
+$lastFileNameError = $null
 do {
   try {
-    $fileNameEdit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($target)
+    $fileNameHost = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+      (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'FileNameControlHost')))
+    if ($null -eq $fileNameHost) { throw 'The native file name control is unavailable.' }
+    $fileNameEdit = $fileNameHost.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+      (New-Object System.Windows.Automation.AndCondition(
+        (New-Object System.Windows.Automation.PropertyCondition(
+          [System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1001')),
+        (New-Object System.Windows.Automation.PropertyCondition(
+          [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+          [System.Windows.Automation.ControlType]::Edit)))))
+    if ($null -eq $fileNameEdit) { throw 'The native file name editor is unavailable.' }
+    $valuePattern = [System.Windows.Automation.ValuePattern]$fileNameEdit.GetCurrentPattern(
+      [System.Windows.Automation.ValuePattern]::Pattern)
+    $valuePattern.SetValue($target)
     $fileNameSet = $true
-  } catch { Start-Sleep -Milliseconds 100 }
+  } catch {
+    $lastFileNameError = $_.Exception.GetBaseException().Message
+    Start-Sleep -Milliseconds 100
+  }
 } while (-not $fileNameSet -and [DateTime]::UtcNow -lt $deadline)
-if (-not $fileNameSet) { throw 'The native file name editor did not become writable.' }
+if (-not $fileNameSet) {
+  throw "The native file name editor did not become writable: $lastFileNameError; enabled=$($fileNameEdit.Current.IsEnabled); offscreen=$($fileNameEdit.Current.IsOffscreen); class=$($fileNameEdit.Current.ClassName)."
+}
 $saveButton = $null
 do {
   $saveButton = $dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants,
