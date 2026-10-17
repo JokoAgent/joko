@@ -40,9 +40,17 @@ let desktop: ElectronApplication | undefined;
 let desktopIdentity: OwnedDesktopProcess | undefined;
 let profileDirectory: string | undefined;
 
-afterEach(async () => {
+afterEach(async ({ task }) => {
+  if (task.result?.state === "fail") {
+    console.error("Packaged documents: failed window routes.", JSON.stringify({
+      launcherPid: desktop?.process().pid,
+      mainPid: desktopIdentity?.pid,
+      exitCode: desktop?.process().exitCode,
+      windows: desktop?.windows().map((page) => ({ route: new URL(page.url()).hash, closed: page.isClosed() })) ?? []
+    }));
+  }
   try {
-    await closeDesktop();
+    await closeDesktop(task.result?.state === "fail");
   } finally {
     await internal?.close();
     internal = undefined;
@@ -211,6 +219,7 @@ tr:nth-child(even) td { background: #fafafa; }
 
   const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Document Desktop" });
   if (challenge.challenge === undefined) throw new Error("Desktop pairing returned no challenge.");
+  console.info("Packaged documents: generated outputs and pairing ready.");
   profileDirectory = await mkdtemp(join(tmpdir(), "joko-document-desktop-"));
   desktop = await _electron.launch({
     executablePath,
@@ -223,20 +232,32 @@ tr:nth-child(even) td { background: #fafafa; }
     },
     timeout: 60_000
   });
-  const mainPid = await desktop.evaluate(() => process.pid);
-  desktopIdentity = await readOwnedDesktopProcess(mainPid);
+  console.info("Packaged documents: Desktop launch returned.");
+  const launcherPid = desktop.process().pid;
+  if (launcherPid === undefined) throw new Error("Document Desktop returned no spawned process ID.");
+  desktopIdentity = await readLaunchedDesktopProcess(launcherPid, executablePath);
   if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
     throw new Error("Document Desktop launched an unexpected executable.");
   }
-  const userDataPath = await desktop.evaluate(({ app }) => app.getPath("userData"));
+  console.info("Packaged documents: owned process confirmed.");
+  const page = await desktop.firstWindow({ timeout: 60_000 });
+  page.setDefaultTimeout(30_000);
+  const pageErrors: string[] = [];
+  page.on("pageerror", (error) => pageErrors.push(error.message));
+  await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged documents: connection page visible.");
+  let profileTimer: ReturnType<typeof setTimeout> | undefined;
+  const userDataPath = await Promise.race([
+    desktop.evaluate(({ app }) => app.getPath("userData")),
+    new Promise<never>((_resolveProfile, rejectProfile) => {
+      profileTimer = setTimeout(() => rejectProfile(new Error("Document Desktop main-process profile query timed out.")), 30_000);
+    })
+  ]).finally(() => { if (profileTimer !== undefined) clearTimeout(profileTimer); });
   const profileRelative = relative(profileDirectory, userDataPath);
   if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
     throw new Error("Document Desktop did not use its isolated profile.");
   }
-  const page = await desktop.firstWindow({ timeout: 60_000 });
-  const pageErrors: string[] = [];
-  page.on("pageerror", (error) => pageErrors.push(error.message));
-  await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged documents: isolated profile confirmed.");
   await page.locator(".connection-tabs > button").nth(2).click();
   await page.locator('form.pair-form input[type="url"]').fill(fixture.baseUrl);
   await page.locator('form.pair-form input[autocomplete="one-time-code"]')
@@ -248,6 +269,7 @@ tr:nth-child(even) td { background: #fafafa; }
   await page.locator(".settings-page").waitFor({ state: "visible", timeout: 30_000 });
   await page.getByRole("combobox", { name: /^(?:Language|语言)$/u }).click({ timeout: 30_000 });
   await page.getByRole("option", { name: "English", exact: true }).click({ timeout: 30_000 });
+  console.info("Packaged documents: formal connection and locale ready.");
   const filesHash = `#/files/${encodeURIComponent(sessionId)}?file=documents%2Fchart-report.pdf`;
   await page.evaluate((hash) => { window.location.hash = hash; }, filesHash);
   await page.locator('[data-file-kind="pdf"]').waitFor({ state: "visible", timeout: 30_000 });
@@ -390,6 +412,7 @@ tr:nth-child(even) td { background: #fafafa; }
 
 async function expectExactNativeSave(page: Page, mainPid: number, directory: string, expectedBytes: Buffer,
   fileName = "chart-report.pdf"): Promise<void> {
+  console.info("Packaged documents: native save starting.", fileName);
   const target = join(directory, `${randomUUID()}-${fileName}`);
   await page.locator(".workspace-file-body__download").click();
   await chooseNativeSaveTarget(mainPid, target);
@@ -399,6 +422,7 @@ async function expectExactNativeSave(page: Page, mainPid: number, directory: str
   await waitFor(() => page.locator(".workspace-file-body__download").getAttribute("aria-busy"),
     (busy) => busy !== "true", "Document Desktop native save acknowledgement", 10_000);
   expect(await page.locator(".workspace-file-body__state.is-error").count()).toBe(0);
+  console.info("Packaged documents: exact native save verified.", fileName);
 }
 
 async function chooseNativeSaveTarget(mainPid: number, target: string): Promise<void> {
@@ -484,7 +508,7 @@ if (-not $saveInvoked) { throw 'The native save action did not become invokable.
   });
 }
 
-async function closeDesktop(): Promise<void> {
+async function closeDesktop(afterFailure = false): Promise<void> {
   if (desktopIdentity === undefined) return;
   const original = desktopIdentity;
   const current = await readOwnedDesktopProcess(original.pid);
@@ -493,7 +517,14 @@ async function closeDesktop(): Promise<void> {
     throw new Error("Document Desktop cleanup refused a changed process identity.");
   }
   if (current !== undefined) {
-    await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
+    if (afterFailure) {
+      await new Promise<void>((resolveKill, rejectKill) => {
+        execFile("taskkill.exe", ["/PID", String(original.pid), "/T", "/F"],
+          { windowsHide: true, timeout: 10_000 }, (error) => error ? rejectKill(error) : resolveKill());
+      });
+    } else {
+      await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
+    }
     try {
       await waitFor(() => readOwnedDesktopProcess(original.pid), (candidate) => candidate === undefined,
         "Document Desktop complete exit", 30_000);
@@ -511,6 +542,22 @@ async function closeDesktop(): Promise<void> {
   }
   desktopIdentity = undefined;
   desktop = undefined;
+}
+
+async function readLaunchedDesktopProcess(launcherPid: number, executablePath: string): Promise<OwnedDesktopProcess> {
+  if (!Number.isSafeInteger(launcherPid) || launcherPid <= 0) throw new Error("Invalid Document Desktop launcher PID.");
+  const script = "$ErrorActionPreference = 'Stop'; $ownedCandidates = @(Get-CimInstance Win32_Process -Filter 'ProcessId = "
+    + launcherPid + " OR ParentProcessId = " + launcherPid
+    + "' | Where-Object { $_.ExecutablePath -eq $env:JOKO_E2E_DESKTOP_EXECUTABLE }); "
+    + "if ($ownedCandidates.Count -ne 1) { throw 'Expected one Desktop main process under its launcher.' }; "
+    + "$ownedProcess = $ownedCandidates[0]; [pscustomobject]@{ pid = $ownedProcess.ProcessId; executablePath = $ownedProcess.ExecutablePath; startedAt = $ownedProcess.CreationDate.ToUniversalTime().ToString('O') } | ConvertTo-Json -Compress";
+  const output = await new Promise<string>((resolveOutput, rejectOutput) => {
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true, timeout: 10_000,
+      env: { ...process.env, JOKO_E2E_DESKTOP_EXECUTABLE: executablePath }
+    }, (error, stdout) => error ? rejectOutput(error) : resolveOutput(stdout));
+  });
+  return JSON.parse(output) as OwnedDesktopProcess;
 }
 
 async function readOwnedDesktopProcess(pid: number): Promise<OwnedDesktopProcess | undefined> {

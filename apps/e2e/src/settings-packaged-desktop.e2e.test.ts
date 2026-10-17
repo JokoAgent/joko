@@ -109,15 +109,13 @@ packagedIt("converges conversation settings across real application windows and 
   });
   console.info("Packaged settings: Desktop launch returned.");
   const application = desktop;
-  desktopIdentity = await readProcess(await application.evaluate(() => process.pid));
+  const launcherPid = application.process().pid;
+  if (launcherPid === undefined) throw new Error("Settings Desktop returned no spawned process ID.");
+  desktopIdentity = await readLaunchedProcess(launcherPid, executablePath);
   if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
     throw new Error("Settings Desktop launched an unexpected executable.");
   }
-  const profileRelative = relative(profileDirectory, await application.evaluate(({ app }) => app.getPath("userData")));
-  if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
-    throw new Error("Settings Desktop did not use its isolated profile.");
-  }
-  console.info("Packaged settings: process and isolated profile confirmed.");
+  console.info("Packaged settings: owned process confirmed.");
   const main = await application.firstWindow({ timeout: 60_000 });
   const pageErrors: string[] = [];
   const observe = (page: Page): void => {
@@ -133,6 +131,18 @@ packagedIt("converges conversation settings across real application windows and 
   observe(main);
   await main.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
   console.info("Packaged settings: connection page visible.");
+  let profileTimer: ReturnType<typeof setTimeout> | undefined;
+  const userDataPath = await Promise.race([
+    application.evaluate(({ app }) => app.getPath("userData")),
+    new Promise<never>((_resolveProfile, rejectProfile) => {
+      profileTimer = setTimeout(() => rejectProfile(new Error("Settings Desktop main-process profile query timed out.")), 30_000);
+    })
+  ]).finally(() => { if (profileTimer !== undefined) clearTimeout(profileTimer); });
+  const profileRelative = relative(profileDirectory, userDataPath);
+  if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
+    throw new Error("Settings Desktop did not use its isolated profile.");
+  }
+  console.info("Packaged settings: isolated profile confirmed.");
   const pairingTabBounds = await main.locator(".connection-tabs > button").nth(2).boundingBox();
   if (pairingTabBounds === null) throw new Error("Settings Desktop pairing tab has no visible bounds.");
   await main.mouse.click(pairingTabBounds.x + pairingTabBounds.width / 2,
@@ -356,6 +366,22 @@ async function closeDesktop(afterFailure = false): Promise<void> {
   }
   desktopIdentity = undefined;
   desktop = undefined;
+}
+
+async function readLaunchedProcess(launcherPid: number, executablePath: string): Promise<OwnedProcess> {
+  if (!Number.isSafeInteger(launcherPid) || launcherPid <= 0) throw new Error("Invalid Settings Desktop launcher PID.");
+  const script = "$ErrorActionPreference = 'Stop'; $ownedCandidates = @(Get-CimInstance Win32_Process -Filter 'ProcessId = "
+    + launcherPid + " OR ParentProcessId = " + launcherPid
+    + "' | Where-Object { $_.ExecutablePath -eq $env:JOKO_E2E_DESKTOP_EXECUTABLE }); "
+    + "if ($ownedCandidates.Count -ne 1) { throw 'Expected one Desktop main process under its launcher.' }; "
+    + "$ownedProcess = $ownedCandidates[0]; [pscustomobject]@{ pid = $ownedProcess.ProcessId; executablePath = $ownedProcess.ExecutablePath; startedAt = $ownedProcess.CreationDate.ToUniversalTime().ToString('O') } | ConvertTo-Json -Compress";
+  const output = await new Promise<string>((resolveOutput, rejectOutput) => {
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true, timeout: 10_000,
+      env: { ...process.env, JOKO_E2E_DESKTOP_EXECUTABLE: executablePath }
+    }, (error, stdout) => error ? rejectOutput(error) : resolveOutput(stdout));
+  });
+  return JSON.parse(output) as OwnedProcess;
 }
 
 async function readProcess(pid: number): Promise<OwnedProcess | undefined> {
