@@ -295,12 +295,6 @@ jobs:
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
 
-      - name: Check the actual macOS PDF report renderer
-        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && runner.os == 'macOS' && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' }}
-        timeout-minutes: 2
-        shell: bash
-        run: pnpm --filter @joko/orchestrator exec vitest run src/document-pdf-renderer.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/report-pdf-renderer.log"
-
       - name: Run the affected production Web chains (Windows/macOS)
         id: browser_regressions
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os != 'Linux' }}
@@ -308,17 +302,12 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
-            files=(src/document-tools.e2e.test.ts)
+            files=(src/timeline-history.e2e.test.ts)
           else
-            files=(src/voice-dictionary.e2e.test.ts)
+            files=(src/session-events.e2e.test.ts)
           fi
           echo "selected_files=${files[*]}" >> "$GITHUB_OUTPUT"
           pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
-
-      - name: Observe the failing macOS report PDF fonts and layout
-        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && runner.os == 'macOS' && steps.browser_regressions.outcome == 'failure' && contains(steps.browser_regressions.outputs.selected_files, 'src/document-tools.e2e.test.ts') }}
-        timeout-minutes: 2
-        run: node scripts/ci/document-pdf-font-observations.mjs
 
       - name: Upload the affected Web chain logs
         if: ${{ matrix.workload == 'browser-regressions' && always() }}
@@ -379,22 +368,23 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-      - name: Run the affected Linux PDF rendering checks
-        id: linux_pdf_regressions
+      - name: Run the affected Linux observation and viewer owners
+        id: linux_viewer_regressions
         if: ${{ matrix.workload == 'product' && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'Linux' && steps.source_check.outcome == 'success' && steps.chromium_sandbox.outcome == 'success' }}
         timeout-minutes: 3
         shell: bash
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/orchestrator exec vitest run src/document-electron-pdf-renderer.test.ts src/document-pdf-renderer.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/linux-pdf-regressions.log"
-        env:
-          XDG_SESSION_TYPE: x11
-          WAYLAND_DISPLAY: ""
+        run: |
+          pnpm --filter @joko/orchestrator exec vitest run src/ios-simulator-screen-observation.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/linux-observation-regressions.log"
+          pnpm --filter @joko/web exec vitest run src/remote-desktop-viewer-controller.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/linux-viewer-regressions.log"
 
-      - name: Upload the immediate Linux PDF rendering results
-        if: ${{ matrix.workload == 'product' && !cancelled() && (steps.linux_pdf_regressions.outcome == 'success' || steps.linux_pdf_regressions.outcome == 'failure') }}
+      - name: Upload the immediate Linux observation and viewer results
+        if: ${{ matrix.workload == 'product' && !cancelled() && (steps.linux_viewer_regressions.outcome == 'success' || steps.linux_viewer_regressions.outcome == 'failure') }}
         uses: actions/upload-artifact@v4
         with:
-          name: ci-linux-pdf-regressions-${{ github.sha }}
-          path: ${{ runner.temp }}/joko-ci-logs/linux-pdf-regressions.log
+          name: ci-linux-viewer-regressions-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ci-logs/linux-observation-regressions.log
+            ${{ runner.temp }}/joko-ci-logs/linux-viewer-regressions.log
           if-no-files-found: error
           retention-days: 3
 

@@ -16,6 +16,7 @@ import {
   SessionSnapshotScopeSchema,
   SnapshotScopeSchema,
   SubmitOperationRequestSchema,
+  SubmitOperationResponseSchema,
   nativeSessionTreeRoots
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE, type FakeAdapterProfile } from "@joko/testkit";
@@ -739,6 +740,8 @@ describe("session host, durable events, and reconnect semantics", () => {
     const releaseAcknowledgement = browserGate();
     releaseBrowserRequest = () => { forwardRequest.release(); releaseAcknowledgement.release(); };
     let heldBrowserRequest = false;
+    const localInputObservation: { inputMatches?: boolean; forwarded: boolean; responseStatus?: number;
+      operationState?: OperationState; failed?: string } = { forwarded: false };
     await page.route("**/joko.v1.OperationService/SubmitOperation", async (route) => {
       const bytes = route.request().postDataBuffer();
       if (bytes === null) throw new Error("Mounted Web sent no binary Operation request.");
@@ -748,9 +751,19 @@ describe("session host, durable events, and reconnect semantics", () => {
         return;
       }
       heldBrowserRequest = true;
+      localInputObservation.inputMatches = body.mutation.payload.value.input?.parts
+        .map(part => part.content.case === "text" ? part.content.value : "").join("") === MOUNTED_TIMELINE_LOCAL;
       requestEntered.release();
       await forwardRequest.promise;
-      const response = await route.fetch();
+      localInputObservation.forwarded = true;
+      const response = await route.fetch().catch((error: unknown) => {
+        localInputObservation.failed = error instanceof Error ? error.name : "unknown"; throw error;
+      });
+      localInputObservation.responseStatus = response.status();
+      if (response.status() === 200) {
+        localInputObservation.operationState = fromBinary(SubmitOperationResponseSchema,
+          new Uint8Array(await response.body())).operation?.state;
+      }
       await releaseAcknowledgement.promise;
       await route.fulfill({ response });
     });
@@ -782,7 +795,16 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(await acceptedLocalInput.count()).toBe(0);
     forwardRequest.release();
     const localContext = await waitFor(async () => adapter.contexts.get(MOUNTED_TIMELINE_LOCAL),
-      (value) => value !== undefined, "the durable local input before its unary acknowledgement");
+      (value) => value !== undefined, "the durable local input before its unary acknowledgement").catch(async (error: unknown) => {
+      throw new Error(`${error instanceof Error ? error.message : "Local input did not start"}. ${JSON.stringify({
+        request: localInputObservation,
+        adapter: { calls: adapter.sendCalls.length, localInputSeen: adapter.sendCalls.some(input => input.text === MOUNTED_TIMELINE_LOCAL),
+          contextCount: adapter.contexts.size },
+        queue: fixture!.application.store.listQueueItems({ sessionId }).map(item => item.state),
+        runs: fixture!.application.store.listRuns({ sessionId }).map(run => run.descriptor.state),
+        viewport: await viewportGeometry(page), pageErrors
+      })}`);
+    });
     if (localContext === undefined) throw new Error("The local input has no active Run.");
     await acceptedLocalInput.waitFor({ state: "attached" });
     expect(await unreadCount(page)).toBe(0);

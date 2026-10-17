@@ -33,11 +33,12 @@ describe("mounted Timeline history windows", () => {
             focused: document.activeElement === element, visibleDocument: document.visibilityState,
             errorCount: document.querySelectorAll(".timeline-history--error").length,
             statusCount: document.querySelectorAll(".timeline-history [role=status]").length,
-            renderedPrompts: element.querySelectorAll(".message--user").length
+            renderedPrompts: element.querySelectorAll(".message--user").length,
+            navigation: (element as HTMLElement & { timelineScrollObservations?: readonly unknown[] }).timelineScrollObservations
           }), undefined, { timeout: 5_000 })
         }, null, 2));
         await page?.screenshot({ path: join(directory, "history-failure.png"),
-          mask: [page.locator("input,textarea")], fullPage: true, timeout: 5_000 });
+          mask: [page.locator('.pair-form input,input[type="password"]')], fullPage: true, timeout: 5_000 });
       } catch { console.error("Timeline history failure evidence was unavailable."); }
     }
     historyFailureState = undefined;
@@ -241,6 +242,23 @@ describe("mounted Timeline history windows", () => {
     }), (value) => value.ticks >= 8, "the bounded initial history to render");
     const initialIds = await navIds(page);
     expect(initialIds.length).toBeLessThan(56);
+    await page.locator(".timeline").evaluate(element => {
+      const observations: unknown[] = [];
+      Object.defineProperty(element, "timelineScrollObservations", { value: observations });
+      const record = (kind: string, detail?: unknown): void => {
+        observations.push({ kind, at: performance.now(), scrollTop: element.scrollTop,
+          scrollHeight: element.scrollHeight, clientHeight: element.clientHeight, detail });
+        if (observations.length > 64) observations.shift();
+      };
+      const original = element.scrollTo;
+      element.scrollTo = ((...args: unknown[]) => {
+        record("write", typeof args[0] === "object" && args[0] !== null ? (args[0] as ScrollToOptions).top : args[1]);
+        Reflect.apply(original, element, args);
+      }) as typeof element.scrollTo;
+      element.addEventListener("keydown", event => record("key", { key: (event as KeyboardEvent).key, trusted: event.isTrusted }), true);
+      element.addEventListener("scroll", event => record("scroll", { trusted: event.isTrusted }));
+      record("installed");
+    });
     await goToHistoryStart(page);
     await page.locator(".timeline-history--error").waitFor({ state: "visible" });
     expect(olderRequests).toBe(1);
