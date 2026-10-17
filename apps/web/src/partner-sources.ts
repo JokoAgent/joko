@@ -301,7 +301,14 @@ export class PartnerSourceDirectory {
     try { validatePartnerSourceOwner(source.profile, source.snapshot); }
     catch (error) { this.invalidate(source.profile.id); throw error; }
   }
-  #retire(source: SourceBinding): void { source.epoch = ++this.#epoch; source.abort?.abort(); source.abort = undefined; const gateway = source.gateway; source.gateway = undefined; source.snapshot = undefined; source.flight = undefined; gateway?.disconnect(); }
+  #retire(source: SourceBinding): void {
+    source.epoch = ++this.#epoch;
+    // Retired reads may settle late; they must not hold a replacement epoch.
+    source.reads.clear();
+    source.abort?.abort(); source.abort = undefined;
+    const gateway = source.gateway; source.gateway = undefined; source.snapshot = undefined; source.flight = undefined;
+    gateway?.disconnect();
+  }
   #publish(): void { this.#dependencies.publish(this.getSources()); }
   #removeCache(key: string): void { try { this.#dependencies.storage?.removeItem(CACHE_PREFIX + key); } catch { /* optional display cache */ } }
   #saveCache(source: SourceBinding): void {

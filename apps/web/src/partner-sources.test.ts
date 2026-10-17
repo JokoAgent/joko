@@ -136,6 +136,25 @@ it("keeps explicit source revocation immediate while a periodic refresh waits fo
   view.directory.dispose();
 });
 
+it("lets a foreground replacement resolve without waiting for a retired source read", async () => {
+  const view = fixture(); view.directory.sync([first]); await view.directory.refreshAll();
+  const key = partnerSourceKey(first), late = deferred(); view.pendingSnapshots.set(first.id, late.promise);
+  const retired = view.directory.resolve(key, "same-partner", new AbortController().signal)
+    .then(value => ({ value }), error => ({ error }));
+  await vi.waitFor(() => expect(view.ownerReads).toEqual([first.id]));
+  view.directory.setForeground(false); view.directory.setForeground(true);
+  view.pendingSnapshots.delete(first.id);
+  let replacement: Awaited<ReturnType<typeof view.directory.resolve>> | undefined;
+  const current = view.directory.resolve(key, "same-partner", new AbortController().signal).then(value => { replacement = value; });
+  try {
+    await vi.waitFor(() => expect(replacement?.session.id).toBe("session-node-a"));
+  } finally {
+    late.resolve(); await current;
+    expect(await retired).toHaveProperty("error");
+    view.directory.dispose();
+  }
+});
+
 describe("fresh Partner canonical navigation", () => {
   it.each(["duplicate", "unavailable", "zeroVersion", "futureVersion", "wrongHome", "wrongBackend", "remoteHome", "closed", "differentPartner", "missingBackend"])("fails closed for %s instead of producing an ordinary task", change => {
     const partner = profile(first), snapshot = ownerSnapshot(first), links = [link(first)];
