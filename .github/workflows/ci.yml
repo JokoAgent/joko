@@ -286,11 +286,17 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Check the affected Timeline scroll owners
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/web exec vitest run src/components/Timeline.viewport.test.tsx src/components/Timeline.test.ts src/components/timeline-follow-intent.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/timeline-scroll-owners.log"
+
       - name: Run the affected production Web chains (Linux)
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 15
         shell: bash
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/paired-backends.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
         env:
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
@@ -301,11 +307,7 @@ jobs:
         timeout-minutes: 15
         shell: bash
         run: |
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            files=(src/timeline-history.e2e.test.ts)
-          else
-            files=(src/session-events.e2e.test.ts)
-          fi
+          files=(src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts)
           echo "selected_files=${files[*]}" >> "$GITHUB_OUTPUT"
           pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
 
@@ -314,7 +316,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ci-browser-regressions-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
-          path: ${{ runner.temp }}/joko-ci-logs/browser-regressions.log
+          path: |
+            ${{ runner.temp }}/joko-ci-logs/browser-regressions.log
+            ${{ runner.temp }}/joko-ci-logs/timeline-scroll-owners.log
           if-no-files-found: warn
           retention-days: 3
 
