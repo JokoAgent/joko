@@ -97,7 +97,10 @@ final class JokoConnectionUITests: XCTestCase {
         // Close those exact development surfaces through their real UI; keep
         // application errors, dialogs, and every connection assertion visible.
         for prefix in ["Open debugger to view warnings.", "[expo-notifications] Error reading persisted"] {
-            let notice = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
+            // This native LogBox version exposes the combined icon and message
+            // as Other, with the exact observed "!, " label prefix.
+            let notice = app.descendants(matching: .any).matching(NSPredicate(
+                format: "label BEGINSWITH %@ OR label BEGINSWITH %@", prefix, "!, \(prefix)")).firstMatch
             if notice.exists && notice.isHittable {
                 // A native toast's text frame does not describe its close area.
                 // Open the actual inspector and dismiss it through its labeled
