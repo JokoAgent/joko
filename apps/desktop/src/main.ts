@@ -3921,7 +3921,12 @@ async function verifyPackagedSmokeNewTaskDraftCrash(window: BrowserWindow): Prom
   const captureRecovery = async (): Promise<void> => {
     if (packagedSmokeResultPath === undefined) return;
     try {
-      const image = await waitForPackagedSmokeDeadline(contents.capturePage(), 2_000, "new-task draft recovery capture");
+      const image = await waitForPackagedSmokeDeadline((async () => {
+        // The restored DOM can precede its compositor frame after a renderer
+        // crash. Keep paint and capture inside the original evidence deadline.
+        await contents.executeJavaScript("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))", true);
+        return contents.capturePage();
+      })(), 2_000, "new-task draft recovery capture");
       if (!image.isEmpty()) writeFileSync(`${packagedSmokeResultPath}.new-task-draft-recovery.png`, image.toPNG(), { flag: "wx", mode: 0o600 });
     } catch { /* The original recovery result remains authoritative. */ }
   };
