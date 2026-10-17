@@ -8796,12 +8796,35 @@ function registerIpc(): void {
       defaultPath: request.name,
       ...(extension === undefined ? {} : { filters: [{ name: "Joko file", extensions: [extension] }] })
     };
-    const selection = owner === undefined
-      ? await dialog.showSaveDialog(options)
-      : await dialog.showSaveDialog(owner, options);
-    if (selection.canceled || selection.filePath === undefined) return false;
-    await atomicWriteUserSelectedFile(selection.filePath, request.bytes, MAXIMUM_NATIVE_FILE_BYTES);
-    return true;
+    if (externalPackagedE2e) recordPackagedSmokeProgress("native_file_save_entered");
+    try {
+      const selection = owner === undefined
+        ? await dialog.showSaveDialog(options)
+        : await dialog.showSaveDialog(owner, options);
+      if (externalPackagedE2e) {
+        const path = selection.filePath;
+        const normalized = path === undefined ? undefined : resolve(path);
+        recordPackagedSmokeProgress(`native_file_save_selection ${JSON.stringify({
+          canceled: selection.canceled, hasFilePath: path !== undefined,
+          normalizedAbsolute: path !== undefined && isAbsolute(path) && normalized === path,
+          selectedDefaultName: path !== undefined && basename(path) === request.name,
+          selectedPathSha256: normalized === undefined ? undefined : createHash("sha256")
+            .update(process.platform === "win32" ? normalized.toLowerCase() : normalized).digest("hex")
+        })}`);
+      }
+      if (selection.canceled || selection.filePath === undefined) return false;
+      await atomicWriteUserSelectedFile(selection.filePath, request.bytes, MAXIMUM_NATIVE_FILE_BYTES);
+      if (externalPackagedE2e) recordPackagedSmokeProgress("native_file_save_completed");
+      return true;
+    } catch (error) {
+      if (externalPackagedE2e) {
+        const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+        recordPackagedSmokeProgress(`native_file_save_failed ${JSON.stringify({
+          code: typeof code === "string" && /^[A-Z_]{1,64}$/u.test(code) ? code : "unclassified"
+        })}`);
+      }
+      throw error;
+    }
   });
   ipcMain.handle(DESKTOP_CHANNELS.copyFile, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);

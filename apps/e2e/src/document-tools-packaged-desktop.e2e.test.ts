@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -41,6 +41,7 @@ let desktopProcess: ChildProcess | undefined;
 let desktopPage: Page | undefined;
 let desktopIdentity: OwnedDesktopProcess | undefined;
 let profileDirectory: string | undefined;
+let preloadLoadFailed = false;
 
 afterEach(async ({ task }) => {
   if (task.result?.state === "fail") {
@@ -54,6 +55,7 @@ afterEach(async ({ task }) => {
     const startupProgress = profileDirectory === undefined ? "" : await readFile(join(profileDirectory, "launch.progress"), "utf8").catch(() => "");
     console.error("Packaged documents: startup stages.", startupProgress.split(/\r?\n/u)
       .filter(Boolean).slice(0, 12).map((line) => line.split(" ", 1)[0]));
+    console.error("Packaged documents: native save stages.", await readNativeSaveStages());
   }
   try {
     await closeDesktop(task.result?.state === "fail");
@@ -244,6 +246,7 @@ tr:nth-child(even) td { background: #fafafa; }
   let devtoolsEndpoint: string | undefined;
   let launchError: Error | undefined;
   let stderrLine = "";
+  preloadLoadFailed = false;
   desktopProcess.once("error", (error) => { launchError = error; });
   desktopProcess.stdout?.resume();
   desktopProcess.stderr?.on("data", (bytes: Buffer) => {
@@ -252,6 +255,7 @@ tr:nth-child(even) td { background: #fafafa; }
     while ((newline = stderrLine.indexOf("\n")) >= 0) {
       const line = stderrLine.slice(0, newline).trim();
       stderrLine = stderrLine.slice(newline + 1);
+      if (line.includes("Unable to load preload script")) preloadLoadFailed = true;
       const match = /^DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[a-zA-Z0-9-]+)$/u.exec(line);
       if (match !== null) devtoolsEndpoint = match[1];
     }
@@ -450,23 +454,54 @@ tr:nth-child(even) td { background: #fafafa; }
     process.stdout.write(`JOKO_VISUAL_DESKTOP=${capturePath}\n`);
   }
   expect(pageErrors).toEqual([]);
+  console.info("Packaged documents: native save stages.", await readNativeSaveStages());
   bridge.revoke();
   await closeDesktop();
 });
 
 async function expectExactNativeSave(page: Page, mainPid: number, directory: string, expectedBytes: Buffer,
   fileName = "chart-report.pdf"): Promise<void> {
-  console.info("Packaged documents: native save starting.", fileName);
   const target = join(directory, `${randomUUID()}-${fileName}`);
-  await page.locator(".workspace-file-body__download").click();
-  await chooseNativeSaveTarget(mainPid, target);
-  await waitFor(() => readFile(target).catch(() => undefined), (bytes) => bytes !== undefined,
-    "Document Desktop native PDF save", 10_000);
-  expect(await readFile(target)).toEqual(expectedBytes);
-  await waitFor(() => page.locator(".workspace-file-body__download").getAttribute("aria-busy"),
-    (busy) => busy !== "true", "Document Desktop native save acknowledgement", 10_000);
-  expect(await page.locator(".workspace-file-body__state.is-error").count()).toBe(0);
-  console.info("Packaged documents: exact native save verified.", fileName);
+  const targetSha256 = createHash("sha256").update(resolve(target).toLowerCase()).digest("hex");
+  console.info("Packaged documents: native save starting.", fileName, targetSha256);
+  let browserDownloads = 0;
+  const observeDownload = (): void => { browserDownloads += 1; };
+  page.on("download", observeDownload);
+  try {
+    await page.locator(".workspace-file-body__download").click();
+    await chooseNativeSaveTarget(mainPid, target);
+    await waitFor(() => readFile(target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    }), (bytes) => bytes !== undefined,
+      "Document Desktop native PDF save", 10_000);
+    expect(await readFile(target)).toEqual(expectedBytes);
+    await waitFor(() => page.locator(".workspace-file-body__download").getAttribute("aria-busy"),
+      (busy) => busy !== "true", "Document Desktop native save acknowledgement", 10_000);
+    expect(await page.locator(".workspace-file-body__state.is-error").count()).toBe(0);
+    console.info("Packaged documents: exact native save verified.", fileName, { browserDownloads });
+  } catch (error) {
+    let observationTimer: ReturnType<typeof setTimeout> | undefined;
+    const renderer = await Promise.race([
+      page.evaluate(() => ({
+        nativeSaveAvailable: typeof (window as unknown as { jokoDesktop?: { saveFile?: unknown } }).jokoDesktop?.saveFile === "function",
+        pending: document.querySelector(".workspace-file-body__download")?.getAttribute("aria-busy"),
+        alerts: document.querySelectorAll('[role="alert"]').length
+      })).catch(() => undefined),
+      new Promise<undefined>((resolveObservation) => { observationTimer = setTimeout(() => resolveObservation(undefined), 1_000); })
+    ]);
+    clearTimeout(observationTimer);
+    console.error("Packaged documents: save outcome.", { renderer, browserDownloads, preloadLoadFailed });
+    throw error;
+  } finally {
+    page.off("download", observeDownload);
+  }
+}
+
+async function readNativeSaveStages(): Promise<string[]> {
+  if (profileDirectory === undefined) return [];
+  const progress = await readFile(join(profileDirectory, "launch.progress"), "utf8").catch(() => "");
+  return progress.split(/\r?\n/u).filter((line) => line.startsWith("native_file_save_")).slice(0, 24);
 }
 
 async function chooseNativeSaveTarget(mainPid: number, target: string): Promise<void> {
