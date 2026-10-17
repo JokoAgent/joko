@@ -94,6 +94,11 @@ describe("Artifact storage visual harness", () => {
     expect(document.querySelector('[role="alertdialog"]')).toBeNull();
     expect(state().cleanupRequests).toBe(0);
 
+    const readBytes = File.prototype.arrayBuffer;
+    vi.spyOn(File.prototype, "arrayBuffer").mockImplementationOnce(async function (this: File) {
+      await wait(80);
+      return readBytes.call(this);
+    });
     await click(scan);
     await settle("success");
     const acceptedToken = required(state().scan).token;
@@ -190,10 +195,11 @@ function button(label: string): HTMLButtonElement {
 async function click(control: HTMLButtonElement): Promise<void> {
   await act(async () => { control.click(); await wait(35); });
 }
-async function settle(outcome: "healthy" | "failure" | "warning" | "success" | "completed", attempt = required(state().pending)): Promise<void> {
+async function settle(outcome: "healthy" | "failure" | "warning" | "success" | "completed", attempt?: NonNullable<VisualArtifactStorageState["pending"]>): Promise<void> {
   await act(async () => {
+    const currentAttempt = attempt ?? await vi.waitFor(() => required(state().pending), { interval: 5 });
     window.dispatchEvent(new CustomEvent(VISUAL_ARTIFACT_STORAGE_SETTLE_EVENT, {
-      detail: { ownerId: state().ownerId, ...attempt, outcome }
+      detail: { ownerId: state().ownerId, ...currentAttempt, outcome }
     }));
     await wait(35);
   });
