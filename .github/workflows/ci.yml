@@ -324,6 +324,20 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
 
+      - name: Check current Windows Gateway and complete SessionHost regressions
+        if: ${{ matrix.workload == 'product' && !cancelled() && inputs.scope == 'desktop-product' && runner.os == 'Windows' && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          pnpm --filter @joko/web exec vitest run src/gateway.operation-id.test.ts src/gateway.send-admission.test.ts src/gateway.task-sharing.test.ts src/sidebar-layout.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/gateway-regressions.log"
+          pnpm --filter @joko/orchestrator exec vitest run src/session-host.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/session-host-regressions.log"
+
+      - name: Verify the complete Windows mounted Pi compaction chain
+        if: ${{ matrix.workload == 'product' && !cancelled() && inputs.scope == 'desktop-product' && runner.os == 'Windows' && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: bash
+        run: pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/real-pi-compaction-mounted-browser.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/pi-compaction-regressions.log"
+
       - name: Diagnose the exact Windows remote broker startup regression
         if: ${{ matrix.workload == 'product' && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-native' && runner.os == 'Windows' && steps.source_check.outcome == 'success' }}
         timeout-minutes: 3
@@ -415,6 +429,60 @@ jobs:
         run: pnpm --filter @joko/desktop package:dir 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-package.log"
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Run applicable GUI regressions against the current packaged Desktop
+        id: packaged_regressions
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' }}
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          packaged_executable="$(node --input-type=module <<'NODE'
+          import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
+          import { isAbsolute, relative, resolve, sep } from 'node:path';
+          const root = resolve('apps/desktop/release');
+          const candidates = process.platform === 'win32'
+            ? [resolve(root, 'win-unpacked/Joko.exe'), resolve(root, `win-${process.arch}-unpacked/Joko.exe`)]
+            : process.platform === 'linux'
+              ? [resolve(root, 'linux-unpacked/joko'), resolve(root, `linux-${process.arch}-unpacked/joko`)]
+              : readdirSync(root, { withFileTypes: true })
+                .filter(entry => entry.isDirectory() && /^mac(?:-(?:arm64|x64|universal))?$/.test(entry.name))
+                .map(entry => resolve(root, entry.name, 'Joko.app/Contents/MacOS/Joko'));
+          const matches = [...new Set(candidates)].filter(existsSync);
+          if (matches.length !== 1) throw new Error('Expected one current packaged Desktop executable.');
+          const executable = matches[0];
+          const withinRoot = relative(root, realpathSync(executable));
+          const info = lstatSync(executable);
+          if (!info.isFile() || info.isSymbolicLink() || isAbsolute(withinRoot)
+              || withinRoot === '..' || withinRoot.startsWith('..' + sep)) {
+            throw new Error('The packaged Desktop executable must remain a regular file inside its release directory.');
+          }
+          process.stdout.write(executable);
+          NODE
+          )"
+          export JOKO_PACKAGED_DESKTOP_EXECUTABLE="$packaged_executable"
+          packaged_files=(src/real-pi-compaction-packaged-desktop.e2e.test.ts)
+          if [[ "$RUNNER_OS" == 'Windows' ]]; then
+            packaged_files+=(src/settings-packaged-desktop.e2e.test.ts src/message-search-packaged-desktop.e2e.test.ts src/document-tools-packaged-desktop.e2e.test.ts)
+          fi
+          if [[ "$RUNNER_OS" == 'Linux' ]]; then
+            export XDG_SESSION_TYPE=x11 WAYLAND_DISPLAY='' JOKO_DESKTOP_SMOKE_NO_SANDBOX=1
+            xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bash scripts/ci/run-linux-gui.sh pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${packaged_files[@]}"
+          else
+            pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${packaged_files[@]}"
+          fi 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/packaged-desktop-regressions.log"
+        env:
+          JOKO_DOCUMENT_VISUAL_CAPTURE_DIR: ${{ runner.temp }}/joko-web-evidence/packaged-desktop/documents
+
+      - name: Upload packaged Desktop regression evidence
+        if: ${{ matrix.workload == 'product' && always() && (steps.packaged_regressions.outcome == 'success' || steps.packaged_regressions.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-desktop-gui-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ci-logs/packaged-desktop-regressions.log
+            ${{ runner.temp }}/joko-web-evidence/packaged-desktop/
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Prepare the macOS cursor smoke compiler
         if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'macOS' }}

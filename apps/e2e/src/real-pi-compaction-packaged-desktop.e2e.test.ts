@@ -73,6 +73,7 @@ describe("packaged Desktop Pi compaction", () => {
     profileDirectory = await mkdtemp(join(tmpdir(), "joko-pi-desktop-"));
     desktop = await _electron.launch({
       executablePath: process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!,
+      args: process.platform === "linux" && process.env.JOKO_DESKTOP_SMOKE_NO_SANDBOX === "1" ? ["--no-sandbox"] : [],
       env: {
         ...process.env,
         JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
