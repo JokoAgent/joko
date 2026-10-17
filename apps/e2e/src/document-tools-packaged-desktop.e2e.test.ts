@@ -473,6 +473,61 @@ async function chooseNativeSaveTarget(mainPid: number, target: string): Promise<
   const script = String.raw`
 Add-Type -AssemblyName UIAutomationClient
 $ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class NativeDocumentDialog {
+  [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr handle, out uint processId);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassNameW(IntPtr handle, StringBuilder name, int count);
+  [DllImport("user32.dll")] private static extern bool IsChild(IntPtr parent, IntPtr child);
+  [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr handle);
+  [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr handle);
+  [DllImport("user32.dll")] private static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern IntPtr SendMessageTimeoutW(IntPtr handle, uint message, UIntPtr wParam,
+    string text, uint flags, uint timeout, out UIntPtr result);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern IntPtr SendMessageTimeoutW(IntPtr handle, uint message, UIntPtr wParam,
+    StringBuilder text, uint flags, uint timeout, out UIntPtr result);
+  [DllImport("user32.dll", SetLastError = true)]
+  private static extern bool PostMessageW(IntPtr handle, uint message, UIntPtr wParam, IntPtr lParam);
+
+  private static void RequireOwnedControl(IntPtr handle, uint processId, string className) {
+    uint owner;
+    var actualClass = new StringBuilder(256);
+    if (handle == IntPtr.Zero || GetWindowThreadProcessId(handle, out owner) == 0 || owner != processId
+      || GetClassNameW(handle, actualClass, actualClass.Capacity) == 0
+      || actualClass.ToString() != className || !IsWindowEnabled(handle) || !IsWindowVisible(handle)) {
+      throw new InvalidOperationException("The native dialog control is not owned, visible, and enabled.");
+    }
+  }
+
+  public static void SetFileName(IntPtr dialog, IntPtr editor, uint processId, string target) {
+    RequireOwnedControl(dialog, processId, "#32770");
+    RequireOwnedControl(editor, processId, "Edit");
+    if (!IsChild(dialog, editor)) throw new InvalidOperationException("The filename editor is outside the owned dialog.");
+    UIntPtr result;
+    if (SendMessageTimeoutW(editor, 0x000C, UIntPtr.Zero, target, 2, 1_000, out result) == IntPtr.Zero
+      || result == UIntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "Native filename setting failed.");
+    var actual = new StringBuilder(target.Length + 1);
+    if (SendMessageTimeoutW(editor, 0x000D, (UIntPtr)actual.Capacity, actual, 2, 1_000, out result) == IntPtr.Zero
+      || actual.ToString() != target) throw new InvalidOperationException("Native filename readback did not match.");
+  }
+
+  public static void ClickSave(IntPtr dialog, uint processId) {
+    RequireOwnedControl(dialog, processId, "#32770");
+    var button = GetDlgItem(dialog, 1);
+    RequireOwnedControl(button, processId, "Button");
+    if (!IsChild(dialog, button)) throw new InvalidOperationException("The save button is outside the owned dialog.");
+    if (!PostMessageW(button, 0x00F5, UIntPtr.Zero, IntPtr.Zero)) {
+      throw new Win32Exception(Marshal.GetLastWin32Error(), "Native save click could not be queued.");
+    }
+  }
+}
+'@
 $mainPid = [int]$env:JOKO_E2E_MAIN_PID
 $target = $env:JOKO_E2E_SAVE_TARGET
 $deadline = [DateTime]::UtcNow.AddSeconds(25)
@@ -504,15 +559,14 @@ do {
     if ($null -eq $fileNameHost) { throw 'The native file name control is unavailable.' }
     $fileNameEditors = $fileNameHost.FindAll([System.Windows.Automation.TreeScope]::Subtree,
       (New-Object System.Windows.Automation.PropertyCondition(
-        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-        [System.Windows.Automation.ControlType]::Edit)))
+        [System.Windows.Automation.AutomationElement]::ClassNameProperty, 'Edit')))
     if ($fileNameEditors.Count -ne 1) {
       throw "Expected one owned native file name editor; found $($fileNameEditors.Count)."
     }
     $fileNameEdit = $fileNameEditors[0]
-    $valuePattern = [System.Windows.Automation.ValuePattern]$fileNameEdit.GetCurrentPattern(
-      [System.Windows.Automation.ValuePattern]::Pattern)
-    $valuePattern.SetValue($target)
+    # The runner's UIA provider can expose a real Win32 Edit as Pane without ValuePattern.
+    [NativeDocumentDialog]::SetFileName([IntPtr]$dialog.Current.NativeWindowHandle,
+      [IntPtr]$fileNameEdit.Current.NativeWindowHandle, $mainPid, $target)
     $fileNameSet = $true
     [pscustomobject]@{
       automationId = $fileNameEdit.Current.AutomationId
@@ -542,24 +596,18 @@ if (-not $fileNameSet) {
   } catch { }
   throw "The native file name editor did not become writable: $lastFileNameError; controls=$controlState."
 }
-$saveButton = $null
-do {
-  $saveButton = $dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-      [System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'))) |
-    Where-Object { $_.Current.ClassName -eq 'Button' } | Select-Object -Last 1
-  if ($null -ne $saveButton) { break }
-  Start-Sleep -Milliseconds 100
-} while ([DateTime]::UtcNow -lt $deadline)
-if ($null -eq $saveButton) { throw 'The native save action is unavailable.' }
 $saveInvoked = $false
+$lastSaveError = $null
 do {
   try {
-    $saveButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    [NativeDocumentDialog]::ClickSave([IntPtr]$dialog.Current.NativeWindowHandle, $mainPid)
     $saveInvoked = $true
-  } catch { Start-Sleep -Milliseconds 100 }
+  } catch {
+    $lastSaveError = $_.Exception.GetBaseException().Message
+    Start-Sleep -Milliseconds 100
+  }
 } while (-not $saveInvoked -and [DateTime]::UtcNow -lt $deadline)
-if (-not $saveInvoked) { throw 'The native save action did not become invokable.' }
+if (-not $saveInvoked) { throw "The native save action did not become invokable: $lastSaveError." }
 `;
   await new Promise<void>((resolveSave, rejectSave) => {
     execFile("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
