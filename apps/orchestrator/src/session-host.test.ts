@@ -5811,8 +5811,22 @@ describe("SessionHost", () => {
 
     fixture.store.setQueuePaused({ sessionId, paused: false, traceId: "test:provider-auth:resume" });
     fixture.host.requestQueueDrain(sessionId);
+    const dispatchStartedAt = performance.now();
     await eventually(() => [siblingRoute, siblingServiceRoute].every((execution) =>
-      fixture.store.getRun(execution.value.runId).descriptor.state === "completed"));
+      fixture.store.getRun(execution.value.runId).descriptor.state === "completed")).catch((error: unknown) => {
+      console.error("[provider-sibling-dispatch-boundary]", JSON.stringify({
+        elapsedMs: Math.round(performance.now() - dispatchStartedAt),
+        sendCalls: adapter.sendCalls,
+        queuePaused: fixture.store.getQueueControl(sessionId).paused,
+        runtimeClosed: onSessionRuntimeClosed.mock.calls.length,
+        executions: [revoked, siblingRoute, siblingServiceRoute].map((execution) => {
+          const queue = fixture.store.getQueueItem(execution.value.queueItemId);
+          const run = fixture.store.getRun(execution.value.runId).descriptor;
+          return { queue: queue.state, run: run.state, queueError: queue.error?.code, runError: run.error?.code };
+        })
+      }));
+      throw error;
+    });
     expect(adapter.sendCalls).toBe(2);
     expect(onSessionRuntimeClosed).not.toHaveBeenCalled();
 
