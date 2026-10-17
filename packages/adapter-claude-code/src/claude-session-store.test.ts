@@ -551,7 +551,9 @@ describe("ClaudeDurableSessionStore", () => {
     database.close();
     expect(Number(remaining?.["count"] ?? -1)).toBe(0);
     phase = "complete";
-  });
+  // Seven real durable states each flush and reopen their filesystem/database
+  // boundaries; the Windows aggregate can exceed Vitest's five-second default.
+  }, process.platform === "win32" ? 30_000 : 5_000);
 
   it("fails closed when operation and reserved-child receipt states disagree", async () => {
     const fixture = await createFixture();
