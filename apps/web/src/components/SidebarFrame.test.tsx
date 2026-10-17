@@ -14,6 +14,7 @@ const noop = (): void => undefined;
 const probeRuntimeActivity = async (): Promise<boolean> => false;
 const roots: Root[] = [];
 const originalMatchMedia = window.matchMedia;
+const originalDesktopBridge = Object.getOwnPropertyDescriptor(window, "jokoDesktop");
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -21,9 +22,44 @@ afterEach(async () => {
   for (const root of roots.splice(0).reverse()) await act(async () => root.unmount());
   document.body.replaceChildren();
   Object.defineProperty(window, "matchMedia", { configurable: true, value: originalMatchMedia });
+  if (originalDesktopBridge === undefined) Reflect.deleteProperty(window, "jokoDesktop");
+  else Object.defineProperty(window, "jokoDesktop", originalDesktopBridge);
 });
 
 describe("SidebarFrame", () => {
+  it.each([
+    ["darwin", "⌘N"],
+    ["win32", "Ctrl+N"],
+    ["linux", "Ctrl+N"]
+  ] as const)("shows the active new-task shortcut for %s", (platform, label) => {
+    Object.defineProperty(window, "jokoDesktop", { configurable: true, value: { platform } });
+    const host = document.createElement("div");
+    host.innerHTML = renderToStaticMarkup(<SidebarFrame {...frameProps()} />);
+
+    expect(host.querySelector(".new-task-button kbd")?.textContent).toBe(label);
+  });
+
+  it("updates the new-task hint after rebinding, unbinding, and restoring defaults", async () => {
+    Object.defineProperty(window, "jokoDesktop", { configurable: true, value: { platform: "win32" } });
+    const onNewTask = vi.fn();
+    const mounted = await mountFrame({ onNewTask });
+    const hint = (): string | null | undefined => mounted.host.querySelector(".new-task-button kbd")?.textContent;
+    expect(hint()).toBe("Ctrl+N");
+
+    await mounted.render({ appShortcutOverrides: {
+      "new-maker": { code: "KeyP", ctrl: true, alt: false, shift: true, meta: false }
+    } });
+    expect(hint()).toBe("Ctrl+Shift+P");
+
+    await mounted.render({ appShortcutOverrides: { "new-maker": null } });
+    expect(mounted.host.querySelector(".new-task-button kbd")).toBeNull();
+    await act(async () => required(mounted.host.querySelector<HTMLButtonElement>(".new-task-button")).click());
+    expect(onNewTask).toHaveBeenCalledTimes(1);
+
+    await mounted.render({ appShortcutOverrides: {} });
+    expect(hint()).toBe("Ctrl+N");
+  });
+
   it("keeps Joko brand chrome and Orchestrator state around a feature-owned body", () => {
     const markup = renderToStaticMarkup(<SidebarFrame {...frameProps({
       expandedBody: <div>Expanded files tree</div>,

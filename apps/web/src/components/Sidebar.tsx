@@ -125,7 +125,7 @@ import {
   type ConversationSearchStatusFilter
 } from "./conversation-search.js";
 import type { Translator } from "./types.js";
-import { SidebarFrame } from "./SidebarFrame.js";
+import { SidebarFrame, type SidebarFrameProps } from "./SidebarFrame.js";
 import { sidebarSessionInfoPieces } from "./sidebar-session-info.js";
 import { SortableList } from "./SortableList.js";
 import { Button, IconButton, Modal, TipSummary, cx, formatRelativeTime, CheckboxControl, SelectControl } from "./ui.js";
@@ -279,6 +279,7 @@ const SIDEBAR_SESSION_INFO_OPTIONS = [
   { value: "cost", label: "nav.sessionInfoCost", Icon: Wallet }
 ] as const;
 export interface SidebarProps {
+  readonly appShortcutOverrides?: SidebarFrameProps["appShortcutOverrides"];
   readonly groupNavigation?: ReactNode;
   readonly snapshot: AppSnapshot;
   readonly activeSessionId?: string;
@@ -1613,6 +1614,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
 
   return <><SidebarFrame
     server={snapshot.server}
+    appShortcutOverrides={props.appShortcutOverrides}
     probeRuntimeActivity={props.probeRuntimeActivity}
     open={props.open}
     mode={props.mode}

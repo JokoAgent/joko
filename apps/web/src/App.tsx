@@ -2219,6 +2219,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       <DesktopPageSearchBar overrides={shortcutOverrides} t={t} />
       {applicationMenuFeedback}
       {!formalFilesMode && !settingsRoute && <Sidebar
+        appShortcutOverrides={shortcutOverrides}
         groupNavigation={<><TaskSharingNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerGroupsNavigation controller={controller} t={t} onClose={closeNavigation} /></>}
         snapshot={sidebarSnapshot}
         activeSessionId={creatingNewSession ? undefined : activeSession?.id}
@@ -2398,6 +2399,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             onSelectionQuote={insertFileSelectionQuote}
             onImageToChat={activeImageAttachments ? insertFileAttachment : undefined}
             navigation={{
+              appShortcutOverrides: shortcutOverrides,
               open: navigationOpen,
               mode: navigationMode,
               width: navigationWidth,
