@@ -53,6 +53,9 @@ it.runIf(Boolean(process.env.JOKO_BROWSER_EXECUTABLE))(
       expect(output.fontsReady).toBe(true);
       expect(inspection).toMatchObject({ numPages: 1, verdict: "ok", blankPages: [],
         pages: [{ page: 1, paper: "A4", blank: false }] });
-      expect(inspection.pages[0]?.textPreview.replace(/\s/gu, "")).toBe(text.replace(/\s/gu, ""));
+      // Native PDF font maps may expose CJK compatibility ideographs for the
+      // same printed glyph. Compare their Unicode compatibility forms.
+      expect(inspection.pages[0]?.textPreview.normalize("NFKC").replace(/\s/gu, ""))
+        .toBe(text.normalize("NFKC").replace(/\s/gu, ""));
     } finally { await rm(root, { recursive: true, force: true }); }
   }, 45_000);
