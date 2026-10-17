@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -3381,7 +3381,40 @@ mountedIt("keeps three native tasks distinct through mounted Web, approval and o
 
     await sendFromWeb("Pi mounted first");
     await page.locator(".timeline").getByText("real npm Pi reached Orchestrator over binary Connect", { exact: true })
-      .first().waitFor({ state: "visible", timeout: 20_000 });
+      .first().waitFor({ state: "visible", timeout: 20_000 }).catch(async (cause: unknown) => {
+        const events = fixture.application.store.listEvents({ sessionId: piSessionId, activeNativeTimeline: true, limit: 1_000 });
+        const observation = {
+          sourceCommit: process.env.GITHUB_SHA ?? "working-tree",
+          providerRequests: setup.requests.length,
+          unexpectedRuntimeExits: setup.unexpectedPiRuntimeExits.length,
+          runs: fixture.application.store.listRuns({ sessionId: piSessionId }).map(run => run.descriptor.state),
+          queue: fixture.application.store.listQueueItems({ sessionId: piSessionId }).map(item => ({
+            state: item.state, inputMatches: item.body.text === "Pi mounted first"
+          })),
+          eventCount: events.length,
+          eventTypes: [...new Set(events.map(event => event.payload.type))],
+          durableAnswer: events.some(event => event.payload.type === "message_complete" && event.payload.role === "assistant"
+            && event.payload.blocks.some(block => block.kind === "text" && block.text === REAL_PI_RESPONSE_TEXT)),
+          pageErrorCount: errors.length,
+          renderedAnswerCount: await page.locator(".timeline").getByText(REAL_PI_RESPONSE_TEXT, { exact: true }).count(),
+          viewport: await page.locator(".timeline").evaluate(node => ({
+            scrollTop: node.scrollTop, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight,
+            rows: node.querySelectorAll("[data-timeline-item-id]").length,
+            hasRunStatus: document.querySelector(".session-running-status") !== null,
+            composerEmpty: document.querySelector(".composer-rich-editor__content")?.getAttribute("data-empty")
+          })).catch(() => undefined)
+        };
+        if (process.env.RUNNER_TEMP !== undefined) {
+          try {
+            const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "paired-backends");
+            await mkdir(directory, { recursive: true });
+            await writeFile(join(directory, "pi-first-reply-failure.json"), JSON.stringify(observation, null, 2));
+            await page.screenshot({ path: join(directory, "pi-first-reply-failure.png"), fullPage: true, timeout: 5_000,
+              mask: [page.locator('.pair-form input,input[type="password"]')] });
+          } catch { console.error("Mounted native reply failure evidence was unavailable."); }
+        }
+        throw new Error(`The first mounted native reply did not become visible: ${JSON.stringify(observation)}`, { cause });
+      });
     await openTask("claude-paired");
     expect(await page.locator(".timeline").getByText("real npm Pi reached Orchestrator over binary Connect", { exact: true }).count()).toBe(0);
     await sendFromWeb("Claude mounted first");
