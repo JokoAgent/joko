@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
@@ -376,7 +377,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     peerFixture = await OrchestratorE2eFixture.start({ rootDirectory: rootB, dictionaryPeerNodeId: "readonly-node-b", publicPort: portB });
     expect((await mobileNetwork.getVoiceInputDictionaryReadOnly(a))).toEqual(disabledSnapshot);
     phone.controller.setVisible(false); await phone.app.connectSaved(a.profileId); phone.controller.setVisible(true);
-    await vi.waitFor(() => expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]));
+    await vi.waitFor(() => expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]), { timeout: 5_000 });
     const enabled = await mobileNetwork.setVoiceInputDictionarySyncEnabled(a, disabled.revision, true);
     await vi.waitFor(() => expect(phone.controller.state.selected?.snapshot).toMatchObject({ revision: enabled.revision, syncEnabled: true,
       entries: expect.arrayContaining([{ text: "OfficeTerm", frequency: 1, aliases: [] }, { text: "PhoneTerm", frequency: 1, aliases: [] }]) }));
@@ -394,6 +395,8 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     const observations: ReturnType<typeof observeProductionDictionary>[] = [];
     const phoneAbort = new AbortController();
     const phoneStreams: Promise<void>[] = [];
+    const connectionTiming = observeDictionaryConnectionTiming();
+    streamCleanups.push(async () => connectionTiming.stop());
     let journeyFailed = false;
     let journeyError: unknown;
     const start = async (name: string) => {
@@ -510,6 +513,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       let convergenceAttempt = 0;
       const converge = async (terms: readonly string[], evidence?: number) => {
         convergenceAttempt += 1;
+        const convergenceStarted = connectionTiming.begin();
         try { await vi.waitFor(async () => {
           const [dictionaryA, dictionaryB, dictionaryC] = await Promise.all([readA(), readB(), readC()]);
           for (const dictionary of [dictionaryA, dictionaryB, dictionaryC]) expect(dictionary.refinementTerms.slice().sort()).toEqual(terms.slice().sort());
@@ -565,6 +569,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
           // failure cleans up the real nodes. Never export keys or content.
           try {
             console.error("[dictionary-bridge-convergence]", JSON.stringify({ direct, convergenceAttempt,
+              timing: connectionTiming.summary(convergenceStarted),
               expectedTerms: terms.length, nodes: [a, b, c].map(node => {
                 const dictionary = node.application.voiceDictionary!.snapshot();
                 const status = node.application.voiceDictionaryPeers!.status();
@@ -572,6 +577,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
                   matchingTerms: dictionary.refinementTerms.filter(term => terms.includes(term)).length,
                   available: status.available, enabled: status.enabled, phase: status.phase, errorCode: status.errorCode,
                   peers: status.peers.map(peer => ({ online: peer.online, hasRoute: peer.route !== undefined,
+                    candidateVisible: status.candidates.some(candidate => candidate.nodeId === peer.peerId),
                     sinceLastSyncMs: peer.lastSyncAt === undefined ? undefined : Math.max(0, Date.now() - peer.lastSyncAt) })) };
               }) }));
           } catch { /* Preserve the original convergence failure. */ }
@@ -714,6 +720,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       journeyFailed = true; journeyError = error;
       throw error;
     } finally {
+      connectionTiming.stop();
       phoneAbort.abort();
       const streams = await Promise.allSettled([dictionaryDeadline(Promise.all(phoneStreams), 5_000), ...observations.map((observation) => observation.close())]);
       const closed = await Promise.allSettled([...running].map((node) => node.close()));
@@ -784,6 +791,45 @@ async function dictionaryDeadline<T>(operation: Promise<T>, milliseconds: number
 }
 
 /** Starts the actual application composition; dictionary timing, codec and transport are never substituted. */
+function observeDictionaryConnectionTiming() {
+  const loop = monitorEventLoopDelay({ resolution: 20 }); loop.enable();
+  const connections: Array<{ completedAt: number; connected: boolean; connectMs?: number; elapsedMs: number;
+    bytesRead: number; bytesWritten: number; hadError: boolean }> = [];
+  const cleanups = new Set<() => void>();
+  const original = net.createConnection;
+  let active = true;
+  // Observe the original sockets; retain no endpoints, frames or credentials,
+  // and do not add an error listener or change any timer/result/promise.
+  const spy = vi.spyOn(net, "createConnection").mockImplementation((...args: unknown[]) => {
+    const socket = Reflect.apply(original, net, args) as net.Socket;
+    if (!active || cleanups.size >= 128) return socket;
+    const started = performance.now(); let connectMs: number | undefined;
+    const connected = () => { connectMs = Math.round(performance.now() - started); };
+    const closed = (hadError: boolean) => {
+      const completedAt = performance.now(), elapsedMs = Math.round(completedAt - started);
+      if (elapsedMs >= 500) {
+        connections.push({ completedAt, connected: connectMs !== undefined,
+          ...(connectMs === undefined ? {} : { connectMs }), elapsedMs,
+          bytesRead: socket.bytesRead, bytesWritten: socket.bytesWritten, hadError });
+        if (connections.length > 64) connections.shift();
+      }
+      cleanup();
+    };
+    const cleanup = () => {
+      socket.removeListener("connect", connected); socket.removeListener("close", closed); cleanups.delete(cleanup);
+    };
+    cleanups.add(cleanup); socket.once("connect", connected); socket.once("close", closed);
+    return socket;
+  });
+  return {
+    begin() { loop.reset(); return performance.now(); },
+    summary(since: number) { return { maximumEventLoopDelayMs: Math.round(loop.max / 1e6),
+      slowConnections: connections.filter(item => item.completedAt >= since).slice(-16)
+        .map(({ completedAt: _completedAt, ...item }) => item) }; },
+    stop() { if (!active) return; active = false; spy.mockRestore(); loop.disable(); for (const cleanup of [...cleanups]) cleanup(); }
+  };
+}
+
 class ProductionDictionaryNode {
   readonly application: OrchestratorApplication;
   readonly baseUrl: string;
