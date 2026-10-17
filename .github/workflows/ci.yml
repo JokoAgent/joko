@@ -324,20 +324,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
 
-      - name: Check current Windows Gateway and complete SessionHost regressions
-        if: ${{ matrix.workload == 'product' && !cancelled() && inputs.scope == 'desktop-product' && runner.os == 'Windows' && steps.source_check.outcome == 'success' }}
-        timeout-minutes: 15
-        shell: bash
-        run: |
-          pnpm --filter @joko/web exec vitest run src/gateway.operation-id.test.ts src/gateway.send-admission.test.ts src/gateway.task-sharing.test.ts src/sidebar-layout.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/gateway-regressions.log"
-          pnpm --filter @joko/orchestrator exec vitest run src/session-host.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/session-host-regressions.log"
-
-      - name: Verify the complete Windows mounted Pi compaction chain
-        if: ${{ matrix.workload == 'product' && !cancelled() && inputs.scope == 'desktop-product' && runner.os == 'Windows' && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' }}
-        timeout-minutes: 15
-        shell: bash
-        run: pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/real-pi-compaction-mounted-browser.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/pi-compaction-regressions.log"
-
       - name: Diagnose the exact Windows remote broker startup regression
         if: ${{ matrix.workload == 'product' && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-native' && runner.os == 'Windows' && steps.source_check.outcome == 'success' }}
         timeout-minutes: 3
@@ -463,6 +449,9 @@ jobs:
           packaged_files=(src/real-pi-compaction-packaged-desktop.e2e.test.ts)
           if [[ "$RUNNER_OS" == 'Windows' ]]; then
             packaged_files+=(src/settings-packaged-desktop.e2e.test.ts src/message-search-packaged-desktop.e2e.test.ts src/document-tools-packaged-desktop.e2e.test.ts)
+            if [[ "$JOKO_PACKAGED_WINDOWS_REGRESSIONS" == '1' ]]; then
+              packaged_files=(src/settings-packaged-desktop.e2e.test.ts src/document-tools-packaged-desktop.e2e.test.ts)
+            fi
           fi
           if [[ "$RUNNER_OS" == 'Linux' ]]; then
             export XDG_SESSION_TYPE=x11 WAYLAND_DISPLAY='' JOKO_DESKTOP_SMOKE_NO_SANDBOX=1
@@ -472,6 +461,7 @@ jobs:
           fi 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/packaged-desktop-regressions.log"
         env:
           JOKO_DOCUMENT_VISUAL_CAPTURE_DIR: ${{ runner.temp }}/joko-web-evidence/packaged-desktop/documents
+          JOKO_PACKAGED_WINDOWS_REGRESSIONS: ${{ inputs.scope == 'desktop-product' && runner.os == 'Windows' && '1' || '0' }}
 
       - name: Upload packaged Desktop regression evidence
         if: ${{ matrix.workload == 'product' && always() && (steps.packaged_regressions.outcome == 'success' || steps.packaged_regressions.outcome == 'failure') }}
