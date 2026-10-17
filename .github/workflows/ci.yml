@@ -2,6 +2,7 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -309,7 +310,7 @@ jobs:
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             files=(src/document-tools.e2e.test.ts)
           else
-            files=(src/partner-mounted-browser.e2e.test.ts)
+            files=(src/partner-mounted-browser.e2e.test.ts src/voice-dictionary.e2e.test.ts)
           fi
           echo "selected_files=${files[*]}" >> "$GITHUB_OUTPUT"
           pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
@@ -339,6 +340,28 @@ jobs:
         timeout-minutes: 5
         shell: bash
         run: pnpm --filter @joko/desktop exec vitest run test/managed-orchestrator-real.test.ts test/runtime-staging.test.ts test/remote-desktop-native-build.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-native-regressions.log"
+
+      - name: Run the affected Windows durable state and App checks
+        id: windows_state_regressions
+        if: ${{ matrix.workload == 'product' && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'desktop-product' && runner.os == 'Windows' && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          pnpm --filter @joko/adapter-claude-code exec vitest run src/claude-session-store.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/windows-durable-state.log"
+          pnpm --filter @joko/web exec vitest run src/desktop-system-handoff-app.test.tsx 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/windows-app-handoff.log"
+          pnpm --filter @joko/orchestrator exec vitest run src/partner-import-manager.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/windows-partner-import.log"
+
+      - name: Upload the immediate Windows state observations
+        if: ${{ matrix.workload == 'product' && !cancelled() && (steps.windows_state_regressions.outcome == 'success' || steps.windows_state_regressions.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-windows-state-regressions-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ci-logs/windows-durable-state.log
+            ${{ runner.temp }}/joko-ci-logs/windows-app-handoff.log
+            ${{ runner.temp }}/joko-ci-logs/windows-partner-import.log
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Diagnose the affected macOS Desktop runtime checks
         id: macos_runtime_regressions
