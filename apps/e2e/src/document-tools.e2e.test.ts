@@ -87,7 +87,14 @@ it("creates and reads back a Word document through an authenticated task Tool br
   }
 });
 
-it("advertises the document tool from the production application composition", async () => {
+it("advertises the document tool from the production application composition", async (context) => {
+  const startedAt = performance.now();
+  const phases: Array<{ readonly name: string; readonly elapsedMs: number }> = [];
+  const observe = (name: string): void => { phases.push({ name, elapsedMs: Math.round(performance.now() - startedAt) }); };
+  context.onTestFailed(() => console.error("[document-production-boundary]", JSON.stringify({
+    elapsedMs: Math.round(performance.now() - startedAt), phases
+  })));
+  observe("prepare-workspace");
   const root = await mkdtemp(join(tmpdir(), "joko-document-app-"));
   const workspace = join(root, "workspace");
   const dataDirectory = join(root, "data");
@@ -105,9 +112,11 @@ it("advertises the document tool from the production application composition", a
       ...(process.env.JOKO_PDF_ELECTRON_TEST_APP ? { appPath: process.env.JOKO_PDF_ELECTRON_TEST_APP } : {}) } } : {}),
     artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web"), corsOrigins: []
   };
+  observe("create-application");
   const application = await createOrchestratorApplication(config);
   let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
   try {
+    observe("application-ready");
     const target = application.store.getTarget("workspace").descriptor;
     application.store.createSession({
       id: "document-task", backendId: target.backendId, targetId: target.id, title: "Document task",
@@ -126,6 +135,7 @@ it("advertises the document tool from the production application composition", a
     expect(bridge.mcpBridge.tools.filter(tool => tool.serverId === "joko-document-tools").map(tool => tool.name)).toEqual(hasRenderer
       ? ["inspect_pdf", "make_docx", "make_pptx", "make_xlsx", "read_sheet", "render_pdf"]
       : ["inspect_pdf", "make_docx", "make_pptx", "make_xlsx", "read_sheet"]);
+    observe("make-docx");
     const response = await fetch(`${url}/internal/mcp`, {
       method: "POST",
       headers: {
@@ -142,6 +152,7 @@ it("advertises the document tool from the production application composition", a
     expect(response.ok).toBe(true);
     expect(await response.json()).toMatchObject({ isError: false, details: { mcpStructuredContent: { format: "docx" } } });
     expect((await readFile(join(workspace, "documents", "actual.docx"))).subarray(0, 2).toString("ascii")).toBe("PK");
+    observe("make-pptx");
     const presentationResponse = await fetch(`${url}/internal/mcp`, {
       method: "POST",
       headers: {
@@ -163,6 +174,7 @@ it("advertises the document tool from the production application composition", a
       format: "pptx", slides: 2, layouts: ["cover", "metrics"], relativePath: join("documents", "actual.pptx")
     } } });
     expect((await readFile(join(workspace, "documents", "actual.pptx"))).subarray(0, 2).toString("ascii")).toBe("PK");
+    observe("make-xlsx");
     const workbookResponse = await fetch(`${url}/internal/mcp`, {
       method: "POST",
       headers: {
@@ -183,6 +195,7 @@ it("advertises the document tool from the production application composition", a
       format: "xlsx", sheets: [{ name: "Results", rows: 2 }], relativePath: join("documents", "actual.xlsx")
     } } });
     expect((await readFile(join(workspace, "documents", "actual.xlsx"))).subarray(0, 2).toString("ascii")).toBe("PK");
+    observe("read-sheet");
     const readResponse = await fetch(`${url}/internal/mcp`, {
       method: "POST",
       headers: {
@@ -201,6 +214,7 @@ it("advertises the document tool from the production application composition", a
       format: "xlsx", sheet: "Results", rows: [["Total", 0.98]], totalRows: 3, truncated: false
     } } });
     await writeFile(join(workspace, "documents", "actual.pdf"), visiblePdf());
+    observe("inspect-source-pdf");
     const inspectResponse = await fetch(`${url}/internal/mcp`, {
       method: "POST",
       headers: {
@@ -220,6 +234,7 @@ it("advertises the document tool from the production application composition", a
       pages: [{ page: 1, paper: "A4", textPreview: "Visible report", blank: false }]
     } } });
     if (hasRenderer) {
+      observe("render-pdf");
       const renderCall = async (html: string, overwrite = false) => {
         const response = await fetch(`${url}/internal/mcp`, {
           method: "POST",
@@ -237,12 +252,15 @@ it("advertises the document tool from the production application composition", a
       const renderedPath = join(workspace, "documents", "rendered.pdf");
       const renderedBytes = await readFile(renderedPath);
       expect(renderedBytes.subarray(0, 5).toString()).toBe("%PDF-");
+      observe("reject-existing-pdf");
       expect(await renderCall("<h1>Rejected replacement</h1>")).toMatchObject({ isError: true,
         details: { mcpStructuredContent: { errorCode: "FILE_EXISTS" } } });
       expect(await readFile(renderedPath)).toEqual(renderedBytes);
+      observe("replace-pdf");
       expect(await renderCall("<h1>Replacement PDF</h1>", true)).toMatchObject({ isError: false,
         details: { mcpStructuredContent: { format: "pdf" } } });
       expect(await readFile(renderedPath)).not.toEqual(renderedBytes);
+      observe("inspect-rendered-pdf");
       const inspectRendered = await fetch(`${url}/internal/mcp`, {
         method: "POST",
         headers: { authorization: `Bearer ${bridge.mcpBridge.token}`, "content-type": "application/json", "x-joko-pi-generation": "1" },
@@ -268,8 +286,12 @@ it("advertises the document tool from the production application composition", a
     }
     bridge.revoke();
   } finally {
+    observe("close-internal");
     await internal?.close();
+    observe("close-application");
     await application.close().catch(() => undefined);
+    observe("remove-workspace");
     await rm(root, { recursive: true, force: true });
+    observe("cleanup-complete");
   }
 });

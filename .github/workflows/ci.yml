@@ -286,6 +286,12 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+      - name: Check history navigation and artifact fixture ownership
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: pnpm --filter @joko/web exec vitest run src/components/Timeline.viewport.test.tsx src/components/Timeline.test.ts src/components/timeline-follow-intent.test.ts src/dev/VisualHarness.artifact-storage.test.tsx 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-owners.log"
+
       - name: Run the affected production Web chains (Linux)
         if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 15
@@ -302,7 +308,7 @@ jobs:
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            files=(src/paired-backends.e2e.test.ts)
+            files=(src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/document-tools.e2e.test.ts)
           else
             files=(src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts)
           fi
