@@ -19759,7 +19759,7 @@ function isUncertainOperationSubmissionError(error: unknown): boolean {
   while (candidate instanceof Error && !seen.has(candidate)) {
     if (
       candidate instanceof ConnectError
-      && [Code.Unavailable, Code.DeadlineExceeded, Code.Aborted].includes(candidate.code)
+      && [Code.Unavailable, Code.DeadlineExceeded].includes(candidate.code)
     ) return true;
     seen.add(candidate);
     candidate = candidate.cause;
