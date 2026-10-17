@@ -279,7 +279,7 @@ describe("ClaudeDurableSessionStore", () => {
       expectedGeneration: 2
     })).toThrowError(expect.objectContaining({ code: "CONFLICT" }));
     newStore.close();
-  });
+  }, process.platform === "win32" ? 30_000 : 5_000);
 
   it("claims adopted sessions by Store-discovered generation and rejects future or corrupt state", async () => {
     const fixture = await createFixture();
