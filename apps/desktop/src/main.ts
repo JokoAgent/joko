@@ -1121,10 +1121,11 @@ if (!app.requestSingleInstanceLock()) {
     applicationMenuLocale = preferredSystemLocale;
     installDesktopApplicationMenu();
     createWindow();
+    recordPackagedSmokeProgress("main_window_created");
     initializeDesktopDevicePeerAgentLifecycle();
     void beginDesktopUpdateStartup();
     if (!packagedSmoke) ensureTray();
-  }, (error: unknown) => {
+  }).catch((error: unknown) => {
     const message = safeSmokeError(error);
     recordPackagedSmokeProgress(`app_ready_failed ${message}`);
     process.stderr.write(`JOKO_DESKTOP_APP_READY_FAILED ${message}\n`);
@@ -4122,7 +4123,7 @@ function finishPackagedSmoke(result: string, exitCode: number): void {
 }
 
 function recordPackagedSmokeProgress(step: string): void {
-  if (!packagedSmoke || packagedSmokeResultPath === undefined) return;
+  if (!packagedSmokeRequested || packagedSmokeResultPath === undefined) return;
   try {
     appendFileSync(`${packagedSmokeResultPath}.progress`, `${step}\n`, { encoding: "utf8", mode: 0o600 });
   } catch {

@@ -48,6 +48,9 @@ afterEach(async ({ task }) => {
       exitCode: desktop?.process().exitCode,
       windows: desktop?.windows().map((page) => ({ route: new URL(page.url()).hash, closed: page.isClosed() })) ?? []
     }));
+    const startupProgress = profileDirectory === undefined ? "" : await readFile(join(profileDirectory, "launch.progress"), "utf8").catch(() => "");
+    console.error("Packaged documents: startup stages.", startupProgress.split(/\r?\n/u)
+      .filter(Boolean).slice(0, 12).map((line) => line.split(" ", 1)[0]));
   }
   try {
     await closeDesktop(task.result?.state === "fail");
@@ -223,11 +226,13 @@ tr:nth-child(even) td { background: #fafafa; }
   profileDirectory = await mkdtemp(join(tmpdir(), "joko-document-desktop-"));
   desktop = await _electron.launch({
     executablePath,
+    args: ["--disable-gpu", "--enable-logging=stderr"],
     env: {
       ...process.env,
       JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
       JOKO_DESKTOP_PACKAGED_SMOKE: "1",
       JOKO_DESKTOP_SMOKE_SCOPE: "external",
+      JOKO_DESKTOP_SMOKE_RESULT: join(profileDirectory, "launch"),
       JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory
     },
     timeout: 60_000
