@@ -146,6 +146,7 @@ interface SourceBinding {
   snapshot?: AppSnapshot;
   abort?: AbortController;
   flight?: Promise<void>;
+  readonly reads: Set<Promise<void>>;
 }
 
 /** Independent source shards mirror the reference roster's success-only merge and epoch retirement. */
@@ -165,7 +166,7 @@ export class PartnerSourceDirectory {
       else {
         let rows: readonly PartnerSourceRow[] = [];
         try { rows = parsePartnerSourceCache(this.#dependencies.storage?.getItem(CACHE_PREFIX + key) ?? null, key); } catch { /* display cache is optional */ }
-        this.#sources.set(key, { key, profile, epoch: ++this.#epoch, status: "loading", rows });
+        this.#sources.set(key, { key, profile, epoch: ++this.#epoch, status: "loading", rows, reads: new Set() });
       }
     }
     this.#publish();
@@ -186,7 +187,13 @@ export class PartnerSourceDirectory {
     const source = this.#sources.get(key);
     if (source === undefined || !this.#foreground) return Promise.resolve();
     if (source.flight !== undefined) return source.flight;
-    const flight = this.#refresh(source);
+    const epoch = source.epoch;
+    // A periodic catalog refresh must not revoke the gateway while a formal
+    // read is proving its owner. Explicit retirement still aborts it at once.
+    const flight = source.reads.size === 0 ? this.#refresh(source)
+      : Promise.all([...source.reads]).then(() => {
+        if (this.#foreground && this.#sources.get(key) === source && source.epoch === epoch) return this.#refresh(source);
+      });
     source.flight = flight;
     void flight.finally(() => { if (source.flight === flight) source.flight = undefined; }).catch(() => undefined);
     return flight;
@@ -196,46 +203,63 @@ export class PartnerSourceDirectory {
     signal.throwIfAborted();
     const source = this.#sources.get(key);
     if (!this.#foreground || source?.status !== "online" || source.gateway === undefined || source.abort === undefined) throw new Error("The Partner source is unavailable. Retry its connection.");
-    const epoch = source.epoch;
-    const current = () => this.#foreground && this.#sources.get(key) === source && source.epoch === epoch && source.status === "online";
-    const combined = AbortSignal.any([signal, source.abort.signal]);
-    const resolution = await resolvePartnerSourceSession(source.gateway, partnerId, () => source.snapshot, combined, () => this.#assertOwner(source, epoch));
-    if (!current()) throw new Error("The Partner source changed while opening it.");
-    validatePartnerSourceOwner(source.profile, source.snapshot!);
-    return resolution;
+    const finish = this.#beginRead(source);
+    try {
+      const epoch = source.epoch;
+      const current = () => this.#foreground && this.#sources.get(key) === source && source.epoch === epoch && source.status === "online";
+      const combined = AbortSignal.any([signal, source.abort.signal]);
+      const resolution = await resolvePartnerSourceSession(source.gateway, partnerId, () => source.snapshot, combined, () => this.#assertOwner(source, epoch));
+      if (!current()) throw new Error("The Partner source changed while opening it.");
+      validatePartnerSourceOwner(source.profile, source.snapshot!);
+      return resolution;
+    } finally { finish(); }
   }
   async resolvePreparationProfile(key: string, partnerId: string, signal: AbortSignal): Promise<PartnerProfileView> {
     await this.refresh(key); signal.throwIfAborted();
     const source = this.#sources.get(key);
     if (!this.#foreground || source?.status !== "online" || source.gateway === undefined || source.abort === undefined) throw new Error("The Partner source is unavailable. Retry its connection.");
-    const epoch = source.epoch;
-    const partner = await resolvePartnerSourceProfile(source.gateway, partnerId, AbortSignal.any([signal, source.abort.signal]), () => this.#assertOwner(source, epoch));
-    if (!this.#foreground || this.#sources.get(key) !== source || source.epoch !== epoch || source.status !== "online") throw new Error("The Partner source changed while opening preparation.");
-    validatePartnerSourceOwner(source.profile, source.snapshot!);
-    return partner;
+    const finish = this.#beginRead(source);
+    try {
+      const epoch = source.epoch;
+      const partner = await resolvePartnerSourceProfile(source.gateway, partnerId, AbortSignal.any([signal, source.abort.signal]), () => this.#assertOwner(source, epoch));
+      if (!this.#foreground || this.#sources.get(key) !== source || source.epoch !== epoch || source.status !== "online") throw new Error("The Partner source changed while opening preparation.");
+      validatePartnerSourceOwner(source.profile, source.snapshot!);
+      return partner;
+    } finally { finish(); }
   }
   async readAvatar(key: string, partnerId: string, revision: bigint, image: Exclude<PartnerAvatarView, string>, signal: AbortSignal): Promise<string> {
+    const flight = this.#sources.get(key)?.flight;
+    if (flight !== undefined) await flight;
     const source = this.#sources.get(key), epoch = source?.epoch;
     const row = source?.rows.find(candidate => candidate.id === partnerId);
     if (!this.#foreground || source?.status !== "online" || source.gateway === undefined || source.abort === undefined
       || row?.revision !== revision || typeof row.avatar === "string" || row.avatar.sha256 !== image.sha256) throw new Error("The Partner image source is unavailable.");
-    const gateway = source.gateway, combined = AbortSignal.any([signal, source.abort.signal]);
-    combined.throwIfAborted();
-    await gateway.refresh();
-    combined.throwIfAborted();
-    this.#assertOwner(source, epoch!);
-    const currentRow = source.rows.find(candidate => candidate.id === partnerId);
-    if (currentRow?.revision !== revision || typeof currentRow.avatar === "string" || currentRow.avatar.sha256 !== image.sha256) throw new Error("The Partner image source changed.");
-    const result = await gateway.readPartnerAvatar(partnerId, revision, image, combined);
-    combined.throwIfAborted();
-    if (this.#sources.get(key) !== source || source.epoch !== epoch || source.status !== "online") throw new Error("The Partner image source changed.");
-    return result;
+    const finish = this.#beginRead(source);
+    try {
+      const gateway = source.gateway, combined = AbortSignal.any([signal, source.abort.signal]);
+      combined.throwIfAborted();
+      await gateway.refresh();
+      combined.throwIfAborted();
+      this.#assertOwner(source, epoch!);
+      const currentRow = source.rows.find(candidate => candidate.id === partnerId);
+      if (currentRow?.revision !== revision || typeof currentRow.avatar === "string" || currentRow.avatar.sha256 !== image.sha256) throw new Error("The Partner image source changed.");
+      const result = await gateway.readPartnerAvatar(partnerId, revision, image, combined);
+      combined.throwIfAborted();
+      if (this.#sources.get(key) !== source || source.epoch !== epoch || source.status !== "online") throw new Error("The Partner image source changed.");
+      return result;
+    } finally { finish(); }
   }
   invalidate(profileId: string): void {
     for (const source of this.#sources.values()) if (source.profile.id === profileId) { this.#retire(source); source.rows = []; source.status = "accessDenied"; this.#removeCache(source.key); }
     this.#publish();
   }
   dispose(): void { for (const source of this.#sources.values()) this.#retire(source); this.#sources.clear(); }
+  #beginRead(source: SourceBinding): () => void {
+    let release!: () => void;
+    const finished = new Promise<void>(resolve => { release = resolve; });
+    source.reads.add(finished);
+    return () => { source.reads.delete(finished); release(); };
+  }
   async #refresh(source: SourceBinding): Promise<void> {
     this.#retire(source);
     const epoch = source.epoch;

@@ -100,6 +100,42 @@ describe("independent Partner source directory", () => {
   });
 });
 
+it.each(["canonical", "preparation", "avatar"] as const)("lets an active %s read finish before a periodic source refresh", async operation => {
+  const view = fixture(); view.images.add(first.id); view.directory.sync([first]); await view.directory.refreshAll();
+  const key = partnerSourceKey(first), late = deferred(), signal = new AbortController().signal;
+  view.pendingSnapshots.set(first.id, late.promise);
+  const reading = operation === "canonical" ? view.directory.resolve(key, "same-partner", signal)
+    : operation === "preparation" ? view.directory.resolvePreparationProfile(key, "same-partner", signal)
+      : view.directory.readAvatar(key, "same-partner", 1n, { sha256: "a".repeat(64), mimeType: "image/png", byteLength: 8 }, signal);
+  const outcome = reading.then(value => ({ value }), error => ({ error }));
+  await vi.waitFor(() => expect(view.ownerReads).toEqual([first.id]));
+  const refresh = view.directory.refresh(key);
+  await settle();
+  late.resolve();
+  const result = await outcome;
+  expect(result).not.toHaveProperty("error");
+  expect(result).toMatchObject({ value: operation === "avatar" ? "data:node-a"
+    : operation === "canonical" ? { session: { id: "session-node-a" } } : { id: "same-partner" } });
+  await refresh;
+  expect(view.directory.getSources()[0]?.status).toBe("online");
+  view.directory.dispose();
+});
+
+it("keeps explicit source revocation immediate while a periodic refresh waits for a navigation read", async () => {
+  const view = fixture(); view.directory.sync([first]); await view.directory.refreshAll();
+  const key = partnerSourceKey(first), late = deferred(); view.pendingSnapshots.set(first.id, late.promise);
+  const reading = view.directory.resolve(key, "same-partner", new AbortController().signal);
+  const outcome = reading.then(value => ({ value }), error => ({ error }));
+  await vi.waitFor(() => expect(view.ownerReads).toEqual([first.id]));
+  const refresh = view.directory.refresh(key), credentialReads = view.readAuthKey.mock.calls.length;
+  view.directory.invalidate(first.id); late.resolve();
+  expect(await outcome).toHaveProperty("error");
+  await refresh;
+  expect(view.readAuthKey).toHaveBeenCalledTimes(credentialReads);
+  expect(view.directory.getSources()[0]).toMatchObject({ status: "accessDenied", rows: [] });
+  view.directory.dispose();
+});
+
 describe("fresh Partner canonical navigation", () => {
   it.each(["duplicate", "unavailable", "zeroVersion", "futureVersion", "wrongHome", "wrongBackend", "remoteHome", "closed", "differentPartner", "missingBackend"])("fails closed for %s instead of producing an ordinary task", change => {
     const partner = profile(first), snapshot = ownerSnapshot(first), links = [link(first)];
