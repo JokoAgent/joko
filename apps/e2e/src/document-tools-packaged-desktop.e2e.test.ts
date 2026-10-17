@@ -471,15 +471,22 @@ async function expectExactNativeSave(page: Page, mainPid: number, directory: str
 
 async function chooseNativeSaveTarget(mainPid: number, target: string): Promise<void> {
   const script = String.raw`
-Add-Type -AssemblyName UIAutomationClient
 $ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -ReferencedAssemblies UIAutomationClient,UIAutomationTypes -TypeDefinition @'
 using System;
-using System.ComponentModel;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Windows.Automation;
 
 public static class NativeDocumentDialog {
+  [MethodImpl(MethodImplOptions.NoInlining)]
+  public static void InitializeControlProviders() {
+    // Default Win32 provider discovery needs a managed caller type, which PowerShell's dynamic frames lack.
+    ClientSettings.RegisterClientSideProviders(new ClientSideProviderDescription[0]);
+  }
+
   [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr handle, out uint processId);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassNameW(IntPtr handle, StringBuilder name, int count);
   [DllImport("user32.dll")] private static extern bool IsChild(IntPtr parent, IntPtr child);
@@ -487,14 +494,6 @@ public static class NativeDocumentDialog {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle);
   [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] private static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
-  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-  private static extern IntPtr SendMessageTimeoutW(IntPtr handle, uint message, UIntPtr wParam,
-    string text, uint flags, uint timeout, out UIntPtr result);
-  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-  private static extern IntPtr SendMessageTimeoutW(IntPtr handle, uint message, UIntPtr wParam,
-    StringBuilder text, uint flags, uint timeout, out UIntPtr result);
-  [DllImport("user32.dll", SetLastError = true)]
-  private static extern bool PostMessageW(IntPtr handle, uint message, UIntPtr wParam, IntPtr lParam);
 
   private static void RequireOwnedControl(IntPtr handle, uint processId, string className) {
     uint owner;
@@ -506,27 +505,18 @@ public static class NativeDocumentDialog {
     }
   }
 
-  public static void SetFileName(IntPtr dialog, IntPtr editor, uint processId, string target) {
+  public static void RequireFileNameEditor(IntPtr dialog, IntPtr editor, uint processId) {
     RequireOwnedControl(dialog, processId, "#32770");
     RequireOwnedControl(editor, processId, "Edit");
     if (!IsChild(dialog, editor)) throw new InvalidOperationException("The filename editor is outside the owned dialog.");
-    UIntPtr result;
-    if (SendMessageTimeoutW(editor, 0x000C, UIntPtr.Zero, target, 2, 1_000, out result) == IntPtr.Zero
-      || result == UIntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error(), "Native filename setting failed.");
-    var actual = new StringBuilder(target.Length + 1);
-    if (SendMessageTimeoutW(editor, 0x000D, (UIntPtr)actual.Capacity, actual, 2, 1_000, out result) == IntPtr.Zero
-      || actual.ToString() != target) throw new InvalidOperationException("Native filename readback did not match.");
   }
 
-  public static void SubmitSave(IntPtr dialog, uint processId) {
+  public static IntPtr RequireSaveButton(IntPtr dialog, uint processId) {
     RequireOwnedControl(dialog, processId, "#32770");
     var button = GetDlgItem(dialog, 1);
     RequireOwnedControl(button, processId, "Button");
     if (!IsChild(dialog, button)) throw new InvalidOperationException("The save button is outside the owned dialog.");
-    // Deliver the real button's BN_CLICKED notification without requiring foreground activation.
-    if (!PostMessageW(dialog, 0x0111, (UIntPtr)1, button)) {
-      throw new Win32Exception(Marshal.GetLastWin32Error(), "Native save command could not be queued.");
-    }
+    return button;
   }
 
   public static string DescribeSave(IntPtr dialog) {
@@ -537,9 +527,14 @@ public static class NativeDocumentDialog {
   }
 }
 '@
+[NativeDocumentDialog]::InitializeControlProviders()
 $mainPid = [int]$env:JOKO_E2E_MAIN_PID
 $target = $env:JOKO_E2E_SAVE_TARGET
 $deadline = [DateTime]::UtcNow.AddSeconds(25)
+[pscustomobject]@{
+  runtime = [System.Environment]::Version.ToString()
+  automation = [System.Windows.Automation.AutomationElement].Assembly.GetName().Version.ToString()
+} | ConvertTo-Json -Compress
 $dialog = $null
 do {
   $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
@@ -574,14 +569,18 @@ do {
       throw "Expected one owned native file name editor; found $($fileNameEditors.Count)."
     }
     $fileNameEdit = $fileNameEditors[0]
-    # The runner's UIA provider can expose a real Win32 Edit as Pane without ValuePattern.
-    [NativeDocumentDialog]::SetFileName([IntPtr]$dialog.Current.NativeWindowHandle,
-      [IntPtr]$fileNameEdit.Current.NativeWindowHandle, $mainPid, $target)
+    [NativeDocumentDialog]::RequireFileNameEditor($ownedDialogHandle,
+      [IntPtr]$fileNameEdit.Current.NativeWindowHandle, $mainPid)
+    $value = [System.Windows.Automation.ValuePattern]$fileNameEdit.GetCurrentPattern(
+      [System.Windows.Automation.ValuePattern]::Pattern)
+    $value.SetValue($target)
+    if ($value.Current.Value -ne $target) { throw 'The native file name value did not match.' }
     $fileNameSet = $true
     [pscustomobject]@{
       automationId = $fileNameEdit.Current.AutomationId
       className = $fileNameEdit.Current.ClassName
       controlType = $fileNameEdit.Current.ControlType.ProgrammaticName
+      valuePattern = $true
     } | ConvertTo-Json -Compress
   } catch {
     $lastFileNameError = $_.Exception.GetBaseException().Message
@@ -610,7 +609,11 @@ $saveInvoked = $false
 $lastSaveError = $null
 do {
   try {
-    [NativeDocumentDialog]::SubmitSave($ownedDialogHandle, $mainPid)
+    $buttonHandle = [NativeDocumentDialog]::RequireSaveButton($ownedDialogHandle, $mainPid)
+    $saveButton = [System.Windows.Automation.AutomationElement]::FromHandle($buttonHandle)
+    $invoke = [System.Windows.Automation.InvokePattern]$saveButton.GetCurrentPattern(
+      [System.Windows.Automation.InvokePattern]::Pattern)
+    $invoke.Invoke()
     $saveInvoked = $true
   } catch {
     $lastSaveError = $_.Exception.GetBaseException().Message
@@ -630,10 +633,14 @@ if (-not $dialogClosed) {
   $saveState = [NativeDocumentDialog]::DescribeSave($ownedDialogHandle)
   throw "The owned native save dialog did not close after its Save command: $saveState."
 }
-'Native save command dismissed the owned dialog.'
+'Native Save InvokePattern dismissed the owned dialog.'
 `;
+  const systemRoot = process.env.SystemRoot;
+  if (systemRoot === undefined) throw new Error("The Windows system directory is unavailable.");
+  // Use Windows' matching .NET Framework UIA client and Win32 control providers.
+  const automationHost = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   await new Promise<void>((resolveSave, rejectSave) => {
-    execFile("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    execFile(automationHost, ["-NoProfile", "-NonInteractive", "-STA", "-Command", script], {
       windowsHide: true,
       timeout: 30_000,
       env: { ...process.env, JOKO_E2E_MAIN_PID: String(mainPid), JOKO_E2E_SAVE_TARGET: target }
