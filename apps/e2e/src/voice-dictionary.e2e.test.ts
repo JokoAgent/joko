@@ -505,8 +505,10 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       await grant(apiB, identityC.nodeId, identityC.fingerprint);
       await grantC();
 
+      let convergenceAttempt = 0;
       const converge = async (terms: readonly string[], evidence?: number) => {
-        await vi.waitFor(async () => {
+        convergenceAttempt += 1;
+        try { await vi.waitFor(async () => {
           const [dictionaryA, dictionaryB, dictionaryC] = await Promise.all([readA(), readB(), readC()]);
           for (const dictionary of [dictionaryA, dictionaryB, dictionaryC]) expect(dictionary.refinementTerms.slice().sort()).toEqual(terms.slice().sort());
           expect(a.application.voiceDictionary!.stateForSync()).toEqual(b.application.voiceDictionary!.stateForSync());
@@ -555,7 +557,24 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
           }
           expect(phonePeers.latest?.configurationRevision).toBe(peersC.configurationRevision);
           expect(bridgeObservation.peers.latest?.status?.configurationRevision).toBe(peersB.configurationRevision);
-        }, { timeout: 24_000, interval: 100 });
+        }, { timeout: 24_000, interval: 100 }); }
+        catch (error) {
+          // Observe only counters and transport state before the original
+          // failure cleans up the real nodes. Never export keys or content.
+          try {
+            console.error("[dictionary-bridge-convergence]", JSON.stringify({ direct, convergenceAttempt,
+              expectedTerms: terms.length, nodes: [a, b, c].map(node => {
+                const dictionary = node.application.voiceDictionary!.snapshot();
+                const status = node.application.voiceDictionaryPeers!.status();
+                return { revision: String(dictionary.revision), terms: dictionary.refinementTerms.length,
+                  matchingTerms: dictionary.refinementTerms.filter(term => terms.includes(term)).length,
+                  available: status.available, enabled: status.enabled, phase: status.phase, errorCode: status.errorCode,
+                  peers: status.peers.map(peer => ({ online: peer.online, hasRoute: peer.route !== undefined,
+                    sinceLastSyncMs: peer.lastSyncAt === undefined ? undefined : Math.max(0, Date.now() - peer.lastSyncAt) })) };
+              }) }));
+          } catch { /* Preserve the original convergence failure. */ }
+          throw error;
+        }
       };
       await converge(["DeleteMe", "Editable", "OfficeTerm", "PhoneTerm"]);
       const autoForwarded = (await apiA.addVoiceInputDictionaryTerms({ expectedRevision: (await readA()).revision, terms: ["Across bridge"] })).dictionary!;

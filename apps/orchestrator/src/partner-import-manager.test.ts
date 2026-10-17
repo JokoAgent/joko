@@ -183,20 +183,35 @@ describe("native import service and owning effects", () => {
     await expect(f.api.start({ ...selection, name: "Another intent" }, signal)).rejects.toMatchObject({ code: Code.AlreadyExists });
     advance("complete");
   }, 20_000);
-  it("fences preview theft/revocation and serializes import deletion without recreating private data", async () => {
-    const f = await fixture(); const signal = new AbortController().signal; const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+  it("fences preview theft/revocation and serializes import deletion without recreating private data", async ({ signal: testSignal, onTestFailed, onTestFinished }) => {
+    const started = performance.now(); let phase = "fixture";
+    const effects: Array<{ phase: string; elapsedMs: number }> = [];
+    const observation = () => ({ phase, elapsedMs: Math.round(performance.now() - started), effects: effects.slice(-24) });
+    let aborted: ReturnType<typeof observation> | undefined;
+    const captureAbort = () => { aborted ??= observation(); };
+    testSignal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => testSignal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => { console.error("[import-deletion-boundary]", JSON.stringify(aborted ?? observation())); });
+    const f = await fixture({ observeImport: value => { effects.push({ phase: value, elapsedMs: Math.round(performance.now() - started) }); } });
+    const signal = new AbortController().signal; phase = "preview";
+    const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
     const selection = { previewId: preview.id, requestId: "owner_import_request_0002", name: "Owned import", entryIds: preview.entries.filter(entry => entry.category !== PartnerImportCategory.AUTOMATIONS).map(entry => entry.id), takeover: false, deferSetup: true };
     f.authenticate("device-b"); await expect(f.service.startPartnerImport(create(StartPartnerImportRequestSchema, { controllerId: "sheet", selection }), f.context())).rejects.toMatchObject({ code: Code.FailedPrecondition });
     f.authenticate(""); await expect(f.service.getPartnerImportStatus(create(GetPartnerImportStatusRequestSchema, { requestId: selection.requestId }), f.context())).rejects.toMatchObject({ code: Code.Unauthenticated });
-    f.authenticate("device-a"); await f.api.start(selection, signal); const saved = await f.imports.waitForRequest(selection.requestId);
+    f.authenticate("device-a"); phase = "start"; await f.api.start(selection, signal);
+    phase = "completion"; const saved = await f.imports.waitForRequest(selection.requestId);
     expect(saved.saved).toBe(true); expect(saved.status).toBe("complete");
+    phase = "private-environment";
     const partner = f.partners.getPartner(saved.partnerId); expect(await f.storage.environment.read(partner.id, () => {})).toBeDefined();
+    phase = "delete";
     const deletion = await f.partners.deletePartner({ requestId: "owner_import_delete_0002", partnerId: partner.id, expectedRevision: partner.revision, confirmName: partner.displayName });
     expect(deletion.phase).toBe("completed");
     expect(f.storage.readReceipt(selection.requestId)?.cancelled).toBe(true);
+    phase = "retired-storage";
     await expect(f.storage.environment.read(partner.id, () => {})).rejects.toMatchObject({ code: "IMPORT_OWNER_RETIRED" });
-    expect((await f.api.retry(selection.requestId, true, signal)).status).toBe(PartnerImportStatus.NEEDS_ATTENTION);
+    phase = "retry"; expect((await f.api.retry(selection.requestId, true, signal)).status).toBe(PartnerImportStatus.NEEDS_ATTENTION);
     expect(() => f.partners.getPartner(partner.id)).toThrowError("The partner profile was not found."); expect(f.profiles.listPartners()).toHaveLength(0);
+    phase = "complete";
   }, 20_000);
   it("adopts an explicit current model and policy mapping under the same saved intent while refusing identity edits", async () => {
     const f = await fixture({ nativeTools: true }); const signal = new AbortController().signal;
