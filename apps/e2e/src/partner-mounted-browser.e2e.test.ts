@@ -1,4 +1,5 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
+import { createHash } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Code } from "@connectrpc/connect";
@@ -364,7 +365,14 @@ describe("mounted Partner collaboration product chain", () => {
     ]);
     expect(restartedThread.readState?.throughSequence).toBe(1n);
 
-    await page.goto(`${fixture.baseUrl}/#/partners/${encodeURIComponent(first.partnerId)}`, { waitUntil: "domcontentloaded" });
+    expect(new URL(page.url()).hash).toBe(`#/partners/${encodeURIComponent(first.partnerId)}`);
+    const restartedDocument = await page.reload({ waitUntil: "domcontentloaded" });
+    expect(restartedDocument?.ok()).toBe(true);
+    // Automatic entry was not enabled. Reopen this exact saved node through
+    // the real connection control before checking its durable workspace.
+    await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+    await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
+      .getByRole("button", { name: "Connect", exact: true }).click();
     const restartedWorkspace = page.getByRole("dialog", { name: "Aster workspace" });
     await restartedWorkspace.getByText(ARTIFACT_FILE, { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
     await restartedWorkspace.getByText(COMPLETE_TITLE, { exact: true }).waitFor({ state: "visible" });
@@ -374,6 +382,19 @@ describe("mounted Partner collaboration product chain", () => {
     await restartedWorkspace.getByText(ARTIFACT_FILE, { exact: true }).waitFor({ state: "visible" });
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
+    if (process.env.RUNNER_TEMP !== undefined) {
+      const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "partners");
+      await mkdir(directory, { recursive: true });
+      await restartedWorkspace.getByText(ARTIFACT_FILE, { exact: true }).scrollIntoViewIfNeeded({ timeout: 5_000 });
+      const screenshot = await page.screenshot({ path: join(directory, "restarted-workspace.png"),
+        mask: [restartedWorkspace.locator("input,textarea")], fullPage: true, timeout: 5_000 });
+      await writeFile(join(directory, "restarted-workspace.json"), JSON.stringify({
+        sourceCommit: process.env.GITHUB_SHA ?? "working-tree",
+        navigationType: await page.evaluate(() => (performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined)?.type),
+        artifactVisible: await restartedWorkspace.getByText(ARTIFACT_FILE, { exact: true }).isVisible(),
+        screenshotSha256: createHash("sha256").update(screenshot).digest("hex"), pageErrors: browserErrors.length
+      }, null, 2));
+    }
   }, 180_000);
 });
 
