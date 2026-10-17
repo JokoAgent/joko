@@ -102,15 +102,14 @@ final class JokoConnectionUITests: XCTestCase {
             let notice = app.descendants(matching: .any).matching(NSPredicate(
                 format: "label BEGINSWITH %@ OR label BEGINSWITH %@", prefix, "!, \(prefix)")).firstMatch
             if notice.exists && notice.isHittable {
-                // A native toast's text frame does not describe its close area.
-                // Open the actual inspector and dismiss it through its labeled
-                // control, including when a prior interaction already opened it.
-                let dismiss = app.descendants(matching: .any)
-                    .matching(NSPredicate(format: "label == %@", "Dismiss")).firstMatch
-                if !dismiss.exists { notice.tap() }
-                XCTAssertTrue(dismiss.waitForExistence(timeout: 5), "The native development inspector must expose its real Dismiss control.")
-                XCTAssertTrue(dismiss.isHittable)
-                dismiss.tap()
+                // The installed notification groups its unlabeled close icon
+                // into this full-width accessibility element. Its real layout
+                // is 12 points of right padding plus a 20-point close button.
+                // Tapping the message itself opens external developer tools.
+                XCTAssertGreaterThan(notice.frame.width, 44)
+                notice.coordinate(withNormalizedOffset: CGVector(dx: 1, dy: 0.5))
+                    .withOffset(CGVector(dx: -22, dy: 0)).tap()
+                wait(notice, "exists == false", timeout: 5)
             }
         }
         XCTAssertTrue(element.waitForExistence(timeout: 10))
