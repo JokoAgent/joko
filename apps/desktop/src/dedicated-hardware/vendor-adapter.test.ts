@@ -77,10 +77,12 @@ function sdkFixture(options: { synchronousNotification?: boolean } = {}) {
   let lightingResult: unknown = { ok: true, value: null };
   let connectResult = true;
   let serialNumber: string | undefined = "controlled-device-a";
+  let isUsbConnection = true;
+  const sdkLoggers: Array<{ error: (...args: unknown[]) => void }> = [];
   const devices = { [CODEX]: "codex", [CREATOR]: "creator" } as const;
   const discovery = vi.fn((filter: unknown[]) => {
     const model = filter[0] === devices[CREATOR] ? CREATOR : CODEX;
-    return [{ model, serialNumber, isUsbConnection: true }];
+    return [{ model, serialNumber, isUsbConnection }];
   });
 
   class Comm {
@@ -147,18 +149,19 @@ function sdkFixture(options: { synchronousNotification?: boolean } = {}) {
       readonly findWLDevices = discovery;
     },
     WLDeviceCommImpl: class extends Comm {
-      constructor() { super(); comms.push(this); }
+      constructor(log: { error: (...args: unknown[]) => void }) { super(); comms.push(this); sdkLoggers.push(log); }
     },
     RPCApiOAI: Api
   };
   return {
-    sdk, order, comms, apis, discovery,
+    sdk, order, comms, apis, discovery, sdkLoggers,
     current: () => current,
     setStatus: (value: unknown) => { deviceStatus = value; },
     setWriteResult: (value: unknown) => { writeResult = value; },
     setReadResult: (value: unknown) => { readResult = value; },
     setLightingResult: (value: unknown) => { lightingResult = value; },
     setConnectResult: (value: boolean) => { connectResult = value; },
+    setUsbConnection: (value: boolean) => { isUsbConnection = value; },
     setSerialNumber: (value: string | undefined) => { serialNumber = value; }
   };
 }
@@ -223,6 +226,73 @@ function stagedIdentity(): Extract<DedicatedHardwareSdkIdentity, { kind: "staged
 
 describe("dedicated hardware vendor adapter", () => {
   afterEach(() => vi.useRealTimers());
+
+  it("uses raw firmware status for Bluetooth Creator occupancy and retains idle HID until a real transport fault", async () => {
+    const fixture = sdkFixture();
+    fixture.setUsbConnection(false);
+    fixture.setStatus({ version: "1.2.3", battery: 71, is_charging: false, profile_index: 1, layer_index: 2 });
+    const sink = sinkFixture();
+    const adapter = createDedicatedHardwareVendorAdapter({ sdk: fixture.sdk, sink, platform: "darwin", settle: async () => undefined });
+    try {
+      expect(await adapter.setDesiredState(CREATOR, desired(CREATOR))).toMatchObject({
+        status: "connected", transport: "bluetooth", firmwareVersion: "1.2.3", batteryPercent: 71, charging: false
+      });
+      const identity = await adapter.creatorKeymap.readDeviceFirmwareIdentity();
+      const original = await adapter.creatorKeymap.readCurrent(identity);
+      await adapter.creatorKeymap.writeCurrent(identity, adapter.creatorKeymap.buildManaged(original, ["AG03", "ACT10"]));
+      await adapter.creatorKeymap.reload(identity);
+      const api = fixture.apis.at(-1)!;
+      fixture.setStatus({ ok: false, error: { message: "Device disconnected: hid_read_timeout" } });
+      fixture.sdkLoggers.at(-1)!.error("Device disconnected: hid_read_timeout");
+      expect((await adapter.probe(CREATOR)).status).toBe("connected");
+      expect(fixture.comms.at(-1)!.disconnect).not.toHaveBeenCalled();
+      api.emitHid({ key: "AG00", act: 1 });
+      expect(sink.publishInput).toHaveBeenLastCalledWith(CREATOR, { kind: "key", key: "AG03", pressed: true });
+      await expect(adapter.creatorKeymap.readCurrent(identity)).rejects.toThrow();
+      fixture.sdkLoggers.at(-1)!.error("cannot send, no device connected");
+      expect(sink.publishState).toHaveBeenLastCalledWith(expect.objectContaining({
+        model: CREATOR, status: "error", reason: "device-disconnected"
+      }));
+      const count = sink.publishInput.mock.calls.length;
+      api.emitHid({ key: "AG00", act: 0 });
+      expect(sink.publishInput).toHaveBeenCalledTimes(count);
+      expect((await adapter.probe(CREATOR)).status).toBe("error");
+      expect(fixture.comms[0]!.disconnect).toHaveBeenCalledOnce();
+      fixture.setStatus({ ok: true, value: status().value });
+      expect((await adapter.probe(CREATOR)).status).toBe("connected");
+      expect(fixture.comms).toHaveLength(2);
+    } finally { await adapter.stop(); }
+  });
+
+  it("keeps the Codex SDK usable without Creator or filesystem exports", async () => {
+    const fixture = sdkFixture();
+    const sdk = { ...fixture.sdk, DeviceType: { CodexMicro: fixture.sdk.DeviceType.CodexMicro },
+      RPCApiOAI: class extends fixture.sdk.RPCApiOAI {
+        constructor(comm: ConstructorParameters<typeof fixture.sdk.RPCApiOAI>[0]) {
+          super(comm);
+          Object.defineProperty(this, "api", { value: undefined });
+        }
+      }
+    };
+    const adapter = createDedicatedHardwareVendorAdapter({ sdk, sink: sinkFixture(), platform: "darwin" });
+    try {
+      expect((await adapter.setDesiredState(CODEX, desired(CODEX))).status).toBe("connected");
+      expect((await adapter.setDesiredState(CREATOR, desired(CREATOR))).status).toBe("not-detected");
+    } finally { await adapter.stop(); }
+  });
+
+  it.each([
+    ["darwin", "permission-required"], ["win32", "device-disconnected"]
+  ] as const)("classifies access denial at the %s platform boundary", async (platform, reason) => {
+    const fixture = sdkFixture();
+    fixture.setStatus({ ok: false, error: { message: "Access denied: Input Monitoring permission" } });
+    const adapter = createDedicatedHardwareVendorAdapter({ sdk: fixture.sdk, sink: sinkFixture(), platform });
+    try {
+      expect(await adapter.setDesiredState(CODEX, desired(CODEX))).toMatchObject({ status: "error", reason });
+      fixture.setStatus({ ok: false, error: { message: "(iokit/common) not permitted: 0xE00002E2" } });
+      expect(await adapter.probe(CODEX)).toMatchObject({ status: "error", reason: "device-in-use" });
+    } finally { await adapter.stop(); }
+  });
 
   it("spends a bounded stop budget waiting for the real lighting RPC and disconnects without racing an off write", async () => {
     vi.useFakeTimers();

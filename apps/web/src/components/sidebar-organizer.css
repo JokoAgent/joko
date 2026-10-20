@@ -233,6 +233,33 @@
   cursor: text;
 }
 
+.session-row__rename-field {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+}
+
+.session-row__rename-magic {
+  display: grid;
+  flex: 0 0 24px;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+}
+
+.session-row__rename-magic:hover { background: var(--sidebar-item-hover); }
+.session-row__rename-magic:focus-visible { outline: 2px solid var(--accent-edge); outline-offset: -2px; }
+.session-row__rename-magic[aria-disabled="true"] { cursor: wait; }
+.session-row__rename-magic svg { width: 14px; height: 14px; }
+.session-row[data-sidebar-session-row].has-rename-notice { height: auto; }
+.session-row.has-rename-notice .session-row__main--editing { flex-wrap: wrap; padding-bottom: 6px; }
+.session-row__rename-notice { flex-basis: 100%; color: var(--red); font-size: var(--text-10); line-height: 1.4; white-space: normal; }
+
 .session-row__rename-input {
   min-width: 0;
   width: 100%;

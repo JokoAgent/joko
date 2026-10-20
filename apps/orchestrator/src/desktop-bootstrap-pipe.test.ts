@@ -1,4 +1,4 @@
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 
 import {
   DesktopBootstrapFrameDecoder,
@@ -14,6 +14,7 @@ import {
 import { describe, expect, it } from "vitest";
 
 import {
+  exchangeDesktopBootstrapCommit,
   receiveDesktopBootstrapRequest,
   sendDesktopBootstrapCommitted,
   sendDesktopBootstrapResponse
@@ -103,6 +104,75 @@ describe("Desktop bootstrap pipe", () => {
     finalDecoder.finish();
     expect(decodeDesktopBootstrapCommittedPayload(finalPayload!)).toEqual(committed);
     received.close();
+  });
+
+  it("accepts a parent's immediate commit before the readiness write has returned", async () => {
+    const request = createRequest();
+    const grant = DesktopBootstrapGrant.accept(request, { expectedParentPid: 321, now: () => 1_001 });
+    const response = grant.exchange({
+      serverId: "orchestrator-node",
+      origin: "http://127.0.0.1:4318",
+      issueConnection: () => ({
+        connection: { id: `desktop-connection_${INSTANCE_ID}`, deviceId: DEVICE_ID },
+        authKey: Buffer.alloc(32, 9).toString("base64url")
+      })
+    });
+    const input = new PassThrough();
+    const requestPromise = receiveDesktopBootstrapRequest(input);
+    input.write(encodeDesktopBootstrapRequestFrame(request));
+    const lease = await requestPromise;
+    const commit = createDesktopBootstrapCommit(request, response, { now: () => 1_002 });
+    const output = new Writable({
+      write(bytes: Buffer, _encoding, callback) {
+        const decoder = new DesktopBootstrapFrameDecoder();
+        const [payload] = decoder.push(bytes);
+        decoder.finish();
+        expect(decodeDesktopBootstrapResponsePayload(payload!)).toEqual(response);
+        input.write(encodeDesktopBootstrapCommitFrame(commit));
+        callback();
+      }
+    });
+    try {
+      const received = await exchangeDesktopBootstrapCommit({
+        ...lease, receiveCommit: () => lease.receiveCommit({ timeoutMs: 50 })
+      }, output, response);
+      expect(received).toEqual(commit);
+      expect(() => grant.confirmCommit(received)).not.toThrow();
+    } finally {
+      lease.close();
+      output.destroy();
+    }
+  });
+
+  it("retires a pending commit when publishing readiness fails without leaking the transport error", async () => {
+    const request = createRequest();
+    const grant = DesktopBootstrapGrant.accept(request, { expectedParentPid: 321, now: () => 1_001 });
+    const response = grant.exchange({
+      serverId: "orchestrator-node",
+      origin: "http://127.0.0.1:4318",
+      issueConnection: () => ({
+        connection: { id: `desktop-connection_${INSTANCE_ID}`, deviceId: DEVICE_ID },
+        authKey: Buffer.alloc(32, 9).toString("base64url")
+      })
+    });
+    const input = new PassThrough();
+    const requestPromise = receiveDesktopBootstrapRequest(input);
+    input.write(encodeDesktopBootstrapRequestFrame(request));
+    const lease = await requestPromise;
+    const output = new Writable({
+      write(_bytes, _encoding, _callback) {
+        input.end();
+        this.destroy(new Error("Fixture readiness transport failed."));
+      }
+    });
+    try {
+      await expect(exchangeDesktopBootstrapCommit(lease, output, response))
+        .rejects.toThrow("private Desktop bootstrap pipe is unavailable");
+      await lease.parentDisconnected;
+    } finally {
+      lease.close();
+      output.destroy();
+    }
   });
 
   it("rejects premature EOF, malformed extra data, and unbounded timeouts without secret-bearing errors", async () => {

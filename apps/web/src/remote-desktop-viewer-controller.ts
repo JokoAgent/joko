@@ -116,6 +116,10 @@ export class DesktopRemoteDesktopViewerController {
   #sourceDisplayId?: string;
   #geometryUnknown = false;
   #wantedControl = false;
+  #initialControlPending = false;
+  readonly #onWindowFocus = (): void => {
+    void this.acquireInitialControl(); this.syncControl(); this.syncHostMute();
+  };
   #credentialRetry?: { readonly action: DesktopRemoteDesktopViewerCredentialAction; readonly enabled?: boolean };
   constructor(private readonly api: DesktopRemoteDesktopViewerApi, private readonly root: HTMLElement,
     private readonly changed: (snapshot: DesktopViewerSnapshot) => void) {
@@ -127,6 +131,7 @@ export class DesktopRemoteDesktopViewerController {
       this.scope(scope);
     }).catch(() => { if (this.#scope === undefined) this.publish({ status: "error", error: "connection" }); });
     this.#timers = [setInterval(() => void this.heartbeat(), 3000), setInterval(() => void this.frame(), 350)];
+    window.addEventListener("focus", this.#onWindowFocus);
   }
   get snapshot(): DesktopViewerSnapshot { return this.#snapshot; }
   private publish(patch: Partial<DesktopViewerSnapshot>): void {
@@ -172,6 +177,7 @@ export class DesktopRemoteDesktopViewerController {
     if (scope.target !== null && scope.active) void this.connect();
   }
   private cancel(): void {
+    this.#initialControlPending = false;
     this.#modePending = false; this.#wantedControl = false; this.#geometryUnknown = false;
     this.#epoch++; this.#abort.abort(); this.#abort = new AbortController(); this.#attempt = undefined;
     clearTimeout(this.#connectionDeadline); this.#connectionDeadline = undefined;
@@ -263,11 +269,15 @@ export class DesktopRemoteDesktopViewerController {
       if (started.lease === undefined || !started.lease.leaseId || started.lease.display === undefined) throw new Error("Invalid lease.");
       this.#sourceDisplayId = display.displayId;
       this.publish({ lease: started.lease, sourceDisplayId: display.displayId, viewerDisplayFitted: started.lease.display.displayId !== display.displayId });
+      this.#initialControlPending = caps.canControl;
       this.initMedia();
-      if (caps.canControl && document.hasFocus()) await this.control(true);
+      await this.acquireInitialControl();
       if (this.current(epoch) && caps.displayModes) void this.loadModes();
     } catch (error) { if (this.current(epoch)) await this.fail(error); }
     finally { if (this.current(epoch)) this.#opening = false; }
+  }
+  private async acquireInitialControl(): Promise<void> {
+    if (this.#initialControlPending && document.hasFocus()) await this.control(true);
   }
   private initMedia(): void {
     if (this.#geometryUnknown || this.#modePending) return;
@@ -459,9 +469,11 @@ export class DesktopRemoteDesktopViewerController {
     finally { if (this.current(epoch)) this.publish({ clipboardSyncPending: this.#scope?.clipboardSyncState.pending ?? false }); }
   }
   async control(enabled: boolean): Promise<void> {
+    if (!enabled) this.#initialControlPending = false;
     if (this.#modePending || this.#geometryUnknown) { if (!enabled) this.#wantedControl = false; return; }
     const { lease } = this.#snapshot;
     if (lease === undefined || !this.#client || this.#snapshot.controlPending || this.#snapshot.closing || this.#snapshot.closeNotice) return;
+    this.#initialControlPending = false;
     this.#wantedControl = enabled;
     const epoch = this.#epoch;
     const occurrence = ++this.#lastControlRequest;
@@ -856,6 +868,7 @@ export class DesktopRemoteDesktopViewerController {
     }
   }
   dispose(): void {
+    window.removeEventListener("focus", this.#onWindowFocus);
     this.cancel(); this.#disposed = true; this.#off(); for (const timer of this.#timers) clearInterval(timer); this.#runtime.dispose();
   }
 }

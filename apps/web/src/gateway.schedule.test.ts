@@ -3,6 +3,9 @@ import type { Transport } from "@connectrpc/connect";
 import {
   GetSchedulerRuntimeResponseSchema,
   GetSnapshotResponseSchema,
+  PrepareScheduleHookResponseSchema,
+  TestScheduleHookResponseSchema,
+  GetScheduleHookOperationResponseSchema,
   ManualRecurrenceSchema,
   OperationState,
   PermissionMode,
@@ -24,8 +27,35 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
+import { scheduleDraft } from "./components/SchedulesPage.js";
 
 describe("schedule gateway snapshots", () => {
+  it("binds preparation, testing, and recovery to typed Schedule hook requests", async () => {
+    const requests: Array<{ method: string; input: any }> = [];
+    const hook = { command: "joko-node gate.mjs", filePath: "gate.mjs", timeout: { seconds: 2n } };
+    const result = { status: "skipped", decision: "skip", exitCode: 2, duration: { seconds: 0n, nanos: 4_000_000 }, stdout: "idle" };
+    const transport = {
+      unary: vi.fn(async (method: any, _signal: unknown, _timeout: unknown, _headers: unknown, input: any) => {
+        if (method.localName === "getSnapshot") return response(method, create(GetSnapshotResponseSchema, { snapshot: { generation: 1n, resumeCursor: { generation: 1n, sequence: 0n } } }));
+        requests.push({ method: method.localName, input });
+        if (method.localName === "prepareScheduleHook") return response(method, create(PrepareScheduleHookResponseSchema, { hook, content: "process.exit(2)", test: result }));
+        if (method.localName === "testScheduleHook") return response(method, create(TestScheduleHookResponseSchema, { result }));
+        if (method.localName === "getScheduleHookOperation") return response(method, create(GetScheduleHookOperationResponseSchema, {
+          operation: { operationId: input.operationId, state: OperationState.SUCCEEDED }, result: { case: "test", value: { result } }
+        }));
+        throw new Error(method.localName);
+      }), stream: vi.fn(async (method: any) => response(method, idleStream(), true))
+    } as unknown as Transport;
+    const gateway = createOrchestratorGateway({ id: "hook-connection", deviceId: "device", name: "Browser", origin: "https://node.example", serverId: "node" }, "secret", {}, () => transport);
+    await gateway.connect();
+    const draft = { ...scheduleDraft(undefined, [], [], []), name: "Check", backendId: "backend", targetId: "target", providerId: "provider", modelId: "model", preRunHook: { command: "node old.mjs", filePath: "", timeoutMs: 2000 } };
+    const prepared = await gateway.prepareScheduleHook("schedule", draft, { kind: "description", value: "Skip when idle" }, undefined, "prepare-hook-request");
+    expect(prepared).toMatchObject({ content: "process.exit(2)", hook: { command: hook.command, filePath: hook.filePath, timeoutMs: 2000 }, test: { status: "skipped", durationMs: 4 } });
+    expect(requests.find(request => request.method === "prepareScheduleHook")).toMatchObject({ method: "prepareScheduleHook", input: { operationId: "prepare-hook-request", context: { targetId: "target", backendId: "backend", scheduleId: "schedule", model: { providerId: "provider", modelId: "model" } }, source: { case: "description", value: "Skip when idle" } } });
+    expect(await gateway.testScheduleHook("schedule", draft, undefined, "test-hook-request")).toMatchObject({ decision: "skip", stdout: "idle" });
+    expect(await gateway.getScheduleHookOperation("test-hook-request")).toMatchObject({ state: "completed", test: { status: "skipped" } });
+    gateway.disconnect();
+  });
   it("serializes a one-shot wall clock in its IANA timezone and retains scoped directories", async () => {
     const payloads: any[] = [];
     const transport = {

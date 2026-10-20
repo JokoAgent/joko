@@ -62,6 +62,7 @@ export interface DedicatedHardwarePhysicalInputController {
 export interface DedicatedHardwareMainController<Owner> {
   readonly initialize: () => Promise<DedicatedHardwareProjectedState>;
   readonly snapshot: () => DedicatedHardwareProjectedState;
+  readonly poll: () => void;
   readonly setSettings: (
     model: DedicatedHardwareModelId,
     settings: DedicatedHardwareSettings
@@ -346,6 +347,12 @@ export function createDedicatedHardwareMainController<Owner>(options: {
         options.input.setPreview(model, false);
         const read = reads.get(model);
         if (read !== undefined) options.host.setDesiredState(model, { settings: read.settings, preview: false });
+      }
+    },
+    poll: () => {
+      assertReady();
+      for (const model of DEDICATED_HARDWARE_MODEL_IDS) {
+        if (reads.get(model)!.settings.enabled) options.host.probe(model);
       }
     },
     probe: (model) => {

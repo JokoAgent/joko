@@ -30,8 +30,9 @@ export function buildMobileMarkdownRichHtml(input: {
   readonly colors: MobileMarkdownColors;
   readonly zoomable?: boolean;
 }, runtime: MobileMarkdownRichRuntime): string {
+  const { background, surface, ink, muted, accent, border, negative } = input.colors;
   if (!/^[A-Za-z0-9._:-]{1,160}$/u.test(input.instanceId) || input.source.length > 100_000
-    || Object.values(input.colors).some((color) => !/^#[0-9a-f]{3,8}$/iu.test(color))) {
+    || [background, surface, ink, muted, accent, border, negative].some((color) => !/^#[0-9a-f]{3,8}$/iu.test(color))) {
     throw new Error("The rich Markdown surface is invalid.");
   }
   const { colors, source, instanceId, kind } = input;

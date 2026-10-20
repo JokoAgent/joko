@@ -11,6 +11,8 @@ import { createHelpConnectService } from "./help-connect-service.js";
 import { createPersonalDevelopmentConnectService } from "./personal-development-connect-service.js";
 import { createPersonalDevelopmentNativeConnectService } from "./personal-development-native-connect-service.js";
 import { createModelWorkingContextConnectMethods } from "./model-working-context-connect-service.js";
+import { createScheduleHookConnectMethods } from "./schedule-hook-connect-service.js";
+import { validateScheduleHookScriptBinding, type ScheduleHookScriptInstaller } from "./schedule-hook-script-installer.js";
 import type { ModelWorkingContextCoordinator } from "./model-working-context.js";
 import { mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";
@@ -523,6 +525,7 @@ export interface ConnectServiceDependencies {
   readonly historyMaintenance: OrchestratorApplication["historyMaintenance"];
   readonly blobTransfers: BlobTransferCoordinator;
   readonly scheduleCoordinator: ScheduleCoordinator;
+  readonly scheduleHookScripts?: ScheduleHookScriptInstaller;
   readonly projectAutomations: ProjectAutomationConfigController;
   readonly artifactRepository?: ArtifactRepository;
   readonly browserProvider?: BrowserProvider;
@@ -1286,6 +1289,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     historyMaintenance: application.historyMaintenance,
     blobTransfers: application.blobTransfers,
     scheduleCoordinator: application.scheduler,
+    scheduleHookScripts: application.scheduleHookScripts,
     projectAutomations,
     artifactRepository: application.artifactRepository,
     ...(application.browser === undefined ? {} : { browserProvider: application.browser }),
@@ -3133,6 +3137,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
   } satisfies ServiceImpl<typeof contract.QueueService>;
 
   const scheduler = {
+    ...createScheduleHookConnectMethods({ store: dependencies.store, installer: dependencies.scheduleHookScripts, sessionHost: dependencies.sessionHost, authenticate }),
     listSchedules: (request, context) => {
       authenticate(context);
       let records = dependencies.store.listSchedules({
@@ -3436,6 +3441,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
               truncated: parsed.truncated,
               repositoryRevision: layers.repositoryRevision,
               source: request.source,
+              ...(layers.pushTarget === undefined ? {} : {
+                pushTarget: create(contract.WorkspaceGitPushTargetSchema, layers.pushTarget)
+              }),
               ...(layers.sourceRevision === undefined ? {} : { sourceRevision: layers.sourceRevision }),
               ...(layers.requestedBaseRef === undefined ? {} : { requestedBaseRef: layers.requestedBaseRef }),
               ...(layers.resolvedBaseRef === undefined ? {} : { resolvedBaseRef: layers.resolvedBaseRef }),
@@ -5467,7 +5475,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     doctor: () => application.personalDevelopmentDoctor,
     owner: () => application.personalDevelopment,
     authenticateLocal: (context) => {
-      const connection = dependencies.connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
+      const connection = authenticate(context);
       if (application.personalDevelopmentNativeBroker === undefined) throw new ConnectError("Personal development is unavailable.", Code.Unavailable);
       application.personalDevelopmentNativeBroker.assertLocalDesktopConnection(connection);
       return connection;
@@ -23216,6 +23224,13 @@ async function validateScheduleWorktreeEligibility(
   dependencies: ConnectServiceDependencies,
   schedule: Pick<ScheduleRecord, "targetId" | "sessionMode" | "sessionId" | "enabled" | "executionSnapshot">
 ): Promise<void> {
+  const hook = scheduleExtensionSnapshot(schedule.executionSnapshot).preRunHook;
+  if (hook !== undefined) {
+    const target = dependencies.store.getTarget(schedule.targetId).descriptor;
+    if (!target.trusted || target.remoteWorkspace !== undefined) throw invalidArgument("Pre-run checks require this node's trusted workspace");
+    try { await validateScheduleHookScriptBinding({ workspaceRoot: target.workspaceRoot, filePath: hook.filePath, command: hook.command }); }
+    catch { throw invalidArgument("The managed pre-run script is unavailable or does not match this workspace"); }
+  }
   let worktree: ReturnType<typeof scheduleWorktreeConfiguration>;
   try {
     worktree = scheduleWorktreeConfiguration(schedule.executionSnapshot);
@@ -23338,11 +23353,8 @@ function scheduleExecutionSnapshot(
   if ((executionMode === "script") !== (scriptConfig !== undefined)) {
     throw invalidArgument("Script execution mode requires script configuration, and agent mode forbids it.");
   }
-  const priorExtension = existing === undefined
-    ? undefined
-    : scheduleExtensionSnapshot(existing);
   const requestedPreRunHook = publicSchedulePreRunHook(input.preRunHook);
-  const preRunHook = preservedPublicSchedulePreRunHook(priorExtension?.preRunHook, requestedPreRunHook);
+  const preRunHook = requestedPreRunHook;
   const expireAt = fromProtoTimestamp(input.expireAt, "schedule.execution.expire_at");
   const extension: ScheduleExtensionSnapshot = {
     format: 1,
@@ -23389,7 +23401,8 @@ function publicSchedulePreRunHook(
 ): SchedulePreRunHookConfiguration | undefined {
   if (input === undefined) return undefined;
   const command = boundedPublicScheduleText(input.command, "schedule.execution.pre_run_hook.command", 32_768);
-  const filePath = boundedPublicScheduleText(input.filePath, "schedule.execution.pre_run_hook.file_path", 4_096);
+  if (redactSecrets(command) !== command) throw invalidArgument("schedule.execution.pre_run_hook.command cannot contain credential material");
+  const filePath = input.filePath === "" ? "" : boundedPublicScheduleText(input.filePath, "schedule.execution.pre_run_hook.file_path", 4_096);
   const timeoutMs = fromProtoDuration(input.timeout, "schedule.execution.pre_run_hook.timeout");
   if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0)) {
     throw invalidArgument("schedule.execution.pre_run_hook.timeout must be a positive safe duration");
@@ -23399,27 +23412,6 @@ function publicSchedulePreRunHook(
     filePath,
     ...(timeoutMs === undefined ? {} : { timeoutMs })
   };
-}
-
-function preservedPublicSchedulePreRunHook(
-  existing: SchedulePreRunHookConfiguration | undefined,
-  requested: SchedulePreRunHookConfiguration | undefined
-): SchedulePreRunHookConfiguration | undefined {
-  if (existing === undefined) {
-    if (requested !== undefined) {
-      throw invalidArgument("schedule.execution.pre_run_hook must be installed through the managed Schedule hook workflow");
-    }
-    return undefined;
-  }
-  if (requested === undefined) return existing;
-  if (
-    requested.command !== existing.command ||
-    requested.filePath !== existing.filePath ||
-    requested.timeoutMs !== existing.timeoutMs
-  ) {
-    throw invalidArgument("schedule.execution.pre_run_hook cannot be changed through a generic Schedule update");
-  }
-  return existing;
 }
 
 function assertPublicScheduleExecutionCompatibility(

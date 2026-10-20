@@ -164,8 +164,12 @@ export class LlamaCppRuntimeManager {
         const archivePath = join(staging, asset.name), destination = join(staging, "extracted"), started = this.#now();
         await downloadLlamaCppAsset(asset, archivePath, "github", signal, bytes => this.#progress(owner, signal, bytes, asset.size, started), false, this.#options.fetchStreaming);
         const binary = await (this.#options.extractArchive ?? extractLlamaCppArchive)({ archivePath, destination, platform: this.#platform, signal });
-        assertPathWithin(destination, binary); this.#assert(owner); signal.throwIfAborted();
-        const binaryRelative = relative(destination, await realpath(binary)); await rename(destination, published);
+        const extracted = await lstat(destination);
+        if (!extracted.isDirectory() || extracted.isSymbolicLink()) throw new LocalRuntimeError("ARCHIVE_REJECTED", "The runtime extraction directory is unavailable.");
+        const canonicalDestination = await realpath(destination), canonicalBinary = await realpath(binary);
+        assertPathWithin(await realpath(staging), canonicalDestination);
+        assertPathWithin(canonicalDestination, canonicalBinary); this.#assert(owner); signal.throwIfAborted();
+        const binaryRelative = relative(canonicalDestination, canonicalBinary); await rename(destination, published);
         this.#assert(owner); signal.throwIfAborted(); await atomicRecord(join(this.#root, "current.json"), { format: 1, version: asset.version, binary: relative(this.#root, join(published, binaryRelative)) }); promoted = true;
         await this.#changed(owner);
       } finally { await rm(staging, { recursive: true, force: true }); if (!promoted) await rm(published, { recursive: true, force: true }); }

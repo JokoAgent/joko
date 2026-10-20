@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { OperationalStore, PartnerStore } from "@joko/store";
 import type { AdapterContext, PromptInput } from "@joko/core";
+import { projectPiInputSchema } from "@joko/adapter-pi";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createClient, Code } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
@@ -185,6 +186,10 @@ describe("Partner independent Session tasks", () => {
   });
   it("binds tools to the actual canonical Caller and accepts only discovered explicit routes", async () => {
     const f = await fixture(), tools = new PartnerSessionTaskTools(f.tasks), descriptor = f.store.getSession(f.parent).descriptor;
+    const messageTool = tools.tools.find(tool => tool.name === "message_session_task")!;
+    expect(projectPiInputSchema(messageTool.inputSchema, messageTool.name).fields).toContainEqual(expect.objectContaining({
+      fieldPath: "answers[].value.value", type: "unknown"
+    }));
     const context = { sessionId: f.parent, targetId: descriptor.targetId, generation: descriptor.binding.generation, providerGeneration: 1, effectIdentity: "a".repeat(64) };
     const directory = JSON.parse((await tools.callTool("get_session_task_models", {}, undefined, context)).content[0]!.text!);
     const route = directory.available.find((entry: { backendId: string; efforts: string[] }) => entry.backendId === f.secondary.id && entry.efforts.includes("high"));

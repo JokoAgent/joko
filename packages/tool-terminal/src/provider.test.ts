@@ -219,6 +219,34 @@ describe("TerminalProvider", () => {
     } finally { restored.dispose(); await fixture.dispose(); }
   });
 
+  test("retains five thousand history lines across reattachment while evicting older output", async () => {
+    const fixture = await setup();
+    const restored = new Terminal({ cols: 40, rows: 10, scrollback: 5_000, allowProposedApi: true, logLevel: "off" });
+    try {
+      const descriptor = await fixture.provider.create({ ...fixture.scope, id: "history", cols: 40, rows: 10 });
+      const reference = ref(fixture.scope, descriptor);
+      const lines = (start: number, count: number) => Array.from({ length: count }, (_, offset) => `history-${String(start + offset).padStart(4, "0")}\r\n`).join("");
+      fixture.ptys[0]!.output(lines(0, 4_500));
+      await fixture.provider.snapshot(reference);
+      const stream = fixture.provider.stream({ ...reference, appearance: appearance() });
+      const checkpoint = (await stream.next()).value;
+      if (checkpoint === undefined || checkpoint.kind !== "reset") throw new Error("Reattachment did not provide a terminal checkpoint.");
+      await parsed(restored, checkpoint.serialized);
+      const history = () => Array.from({ length: restored.buffer.normal.length }, (_, index) => restored.buffer.normal.getLine(index)!.translateToString(true));
+      expect(history()).toContain("history-0000");
+      expect(history()).toContain("history-4499");
+      await stream.return!();
+      expect(fixture.ptys[0]!.killCalls).toBe(0);
+      fixture.ptys[0]!.output(lines(4_500, 1_000));
+      restored.reset();
+      await parsed(restored, (await fixture.provider.snapshot(reference)).serialized);
+      expect(history()).not.toContain("history-0000");
+      expect(history()).toContain("history-1000");
+      expect(history()).toContain("history-5499");
+      expect(restored.buffer.normal.baseY).toBe(5_000);
+    } finally { restored.dispose(); await fixture.dispose(); }
+  });
+
   test("resets an expired output cursor and disconnects a stream without closing its process", async () => {
     const fixture = await setup({ maximumOutputFrames: 2 });
     try {

@@ -19,6 +19,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { waitFor } from "./fixture.js";
 import { createE2eClients } from "./connect-clients.js";
 import { createSessionMutation, queueRunIdFrom, sendInputMutation, sessionIdFrom, submit } from "./operations.js";
+import { createPackagedDesktopStartupEvidence } from "./packaged-desktop-startup.js";
 import {
   REAL_PI_MODEL_ID, REAL_PI_PROVIDER_ID, REAL_PI_RESPONSE_TEXT, RealPiSystemFixture,
   startLocalProvider, type CapturedProviderRequest
@@ -40,8 +41,24 @@ describe("packaged Desktop Pi compaction", () => {
   let releasePendingProvider: (() => void) | undefined;
   let providerServer: Server | undefined;
   let managedDesktopIdentity: OwnedProcessIdentity | undefined;
+  let lifecycleStarted: number | undefined;
+  const lifecyclePhases: { phase: string; elapsedMs: number }[] = [];
+  const startupEvidence = createPackagedDesktopStartupEvidence();
+  const recordLifecycle = (phase: string): void => {
+    if (lifecycleStarted !== undefined) lifecyclePhases.push({ phase, elapsedMs: Math.round(performance.now() - lifecycleStarted) });
+  };
 
-  afterEach(async () => {
+  afterEach(async ({ task }) => {
+    if (task.result?.state === "fail") {
+      console.info("Packaged Pi startup state:", JSON.stringify(await startupEvidence.snapshot(desktop)));
+    }
+    startupEvidence.reset();
+    if (task.result?.state === "fail" && lifecycleStarted !== undefined) {
+      recordLifecycle("failed");
+      console.info("Managed Desktop lifecycle phases:", JSON.stringify(lifecyclePhases));
+    }
+    lifecycleStarted = undefined;
+    lifecyclePhases.length = 0;
     releasePendingProvider?.();
     releasePendingProvider = undefined;
     if (managedDesktopIdentity !== undefined) await terminateOwnedWindowsProcess(managedDesktopIdentity);
@@ -73,11 +90,13 @@ describe("packaged Desktop Pi compaction", () => {
     profileDirectory = await mkdtemp(join(tmpdir(), "joko-pi-desktop-"));
     desktop = await _electron.launch({
       executablePath: process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!,
+      args: process.platform === "linux" && process.env.JOKO_DESKTOP_SMOKE_NO_SANDBOX === "1" ? ["--no-sandbox"] : [],
       env: {
         ...process.env,
         JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
         JOKO_DESKTOP_PACKAGED_SMOKE: "1",
         JOKO_DESKTOP_SMOKE_SCOPE: "external",
+        ...startupEvidence.environment(profileDirectory),
         JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory
       },
       timeout: 60_000
@@ -104,19 +123,23 @@ describe("packaged Desktop Pi compaction", () => {
     profileDirectory = await mkdtemp(join(tmpdir(), "joko-pi-desktop-"));
     const piSettingsFile = join(profileDirectory, "pi-settings.json");
     await writeFile(piSettingsFile, JSON.stringify(settings));
+    recordLifecycle("launch");
     desktop = await _electron.launch({
       executablePath: process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!,
       env: {
         ...process.env,
         JOKO_DESKTOP_PACKAGED_SMOKE: "1",
         JOKO_DESKTOP_SMOKE_SCOPE: "external",
+        ...startupEvidence.environment(profileDirectory),
         JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory,
         JOKO_PI_SETTINGS_FILE: piSettingsFile
       },
       timeout: 60_000
     });
+    recordLifecycle("launched");
     const managedPid = await desktop.evaluate(() => process.pid);
     managedDesktopIdentity = await readOwnedWindowsProcess(managedPid);
+    recordLifecycle("process-identity");
     if (managedDesktopIdentity === undefined || resolve(managedDesktopIdentity.executablePath).toLowerCase()
       !== resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!).toLowerCase()) {
       throw new Error(`Managed Desktop launched an unexpected executable: ${JSON.stringify(managedDesktopIdentity)}.`);
@@ -129,6 +152,7 @@ describe("packaged Desktop Pi compaction", () => {
     const page = await desktop.firstWindow({ timeout: 60_000 });
     const managedConnect = page.locator("button[data-managed-local-connect]");
     await managedConnect.waitFor({ state: "visible", timeout: 60_000 });
+    recordLifecycle("local-connect-ready");
     await managedConnect.click();
     await page.locator(".app").waitFor({ state: "visible", timeout: 30_000 });
     const managed = await page.evaluate(() => (window as Window & {
@@ -167,6 +191,7 @@ describe("packaged Desktop Pi compaction", () => {
       return current === undefined || authKey === undefined ? undefined : { ...current, authKey };
     });
     if (connection === undefined) throw new Error("Managed Desktop did not expose its current test connection.");
+    recordLifecycle("provider-ready");
     return { page, connection, clients: createE2eClients(connection.origin, connection.authKey), piSettingsFile };
   };
 
@@ -302,6 +327,7 @@ describe("packaged Desktop Pi compaction", () => {
     expect(restarted.snapshot?.timeline.some((item) => item.payload?.kind.case === "compactionChanged"
       && item.payload.kind.value.state === CompactionState.COMPLETED)).toBe(true);
     await route(compactSessionId);
+    await fixture.application.sessionHost.resume(compactSessionId);
     await send(compactSessionId, "The same Pi context continues after Desktop service restart.");
     expect(errors.filter((error) => error.startsWith("pageerror:"))).toEqual([]);
   });
@@ -477,7 +503,7 @@ describe("packaged Desktop Pi compaction", () => {
     const requestCountBeforeSecondTurn = requests.length;
     await page.locator(".session-pane [data-composer-editor='true'] .composer-rich-editor__content")
       .fill("A second managed Desktop Pi turn before route switching.");
-    await page.locator(".session-pane .send-button").click();
+    await page.locator(".session-pane").getByRole("button", { name: "Send", exact: true }).click();
     await waitFor(() => Promise.resolve(requests.length), (count) => count > requestCountBeforeSecondTurn,
       "second managed Desktop Pi provider request", 30_000);
     await waitFor(() => page.getByText(REAL_PI_RESPONSE_TEXT, { exact: true }).count(),
@@ -539,6 +565,7 @@ describe("packaged Desktop Pi compaction", () => {
         ...process.env,
         JOKO_DESKTOP_PACKAGED_SMOKE: "1",
         JOKO_DESKTOP_SMOKE_SCOPE: "external",
+        ...startupEvidence.environment(profileDirectory),
         JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory,
         JOKO_PI_SETTINGS_FILE: piSettingsFile
       },
@@ -598,7 +625,7 @@ describe("packaged Desktop Pi compaction", () => {
     const requestsBeforeResume = requests.length;
     await resumedPage.locator(".session-pane [data-composer-editor='true'] .composer-rich-editor__content")
       .fill("The managed Desktop Pi task continues after process restart.");
-    await resumedPage.locator(".session-pane .send-button").click();
+    await resumedPage.locator(".session-pane").getByRole("button", { name: "Send", exact: true }).click();
     try {
       await waitFor(() => Promise.resolve(requests.length), (count) => count > requestsBeforeResume,
         "managed Desktop Pi native continuation after restart", 30_000);
@@ -650,6 +677,8 @@ describe("packaged Desktop Pi compaction", () => {
   });
 
   managedPackagedIt("normally exits its managed Pi service after tasks and compaction", { timeout: 150_000 }, async () => {
+    lifecycleStarted = performance.now();
+    recordLifecycle("started");
     const requests: CapturedProviderRequest[] = [];
     providerServer = await startLocalProvider(requests);
     const address = providerServer.address() as AddressInfo;
@@ -666,6 +695,7 @@ describe("packaged Desktop Pi compaction", () => {
     await newTask.getByRole("button", { name: "Send", exact: true }).click();
     await page.getByText(REAL_PI_RESPONSE_TEXT, { exact: true }).first()
       .waitFor({ state: "visible", timeout: 30_000 });
+    recordLifecycle("task-completed");
     const sessionId = await page.locator(".session-pane [data-timeline-session-id]")
       .getAttribute("data-timeline-session-id");
     if (sessionId === null) throw new Error("Managed Pi normal exit created no task.");
@@ -678,15 +708,18 @@ describe("packaged Desktop Pi compaction", () => {
     await waitFor(() => clients.session.getSession({ sessionId }),
       (response) => response.session?.state === SessionState.IDLE,
       "managed Pi task idle before normal exit", 30_000);
+    recordLifecycle("compaction-idle");
     if (managedDesktopIdentity === undefined) throw new Error("Managed Desktop lost its process identity.");
     if (profileDirectory === undefined) throw new Error("Managed Desktop lost its isolated profile.");
     const owned = managedDesktopIdentity;
     const profile = profileDirectory;
+    recordLifecycle("first-quit");
     await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; });
     await waitFor(() => readOwnedWindowsProcess(owned.pid), (candidate) => candidate === undefined,
       "managed Desktop normal complete exit", 30_000);
     await waitFor(() => readOwnedWindowsChildPids(owned.pid), (pids) => pids.length === 0,
       "managed Desktop owned child exit", 10_000);
+    recordLifecycle("first-exited");
     expect(await fetch(`${connection.origin}/joko.v1.ConnectionService/GetServerInfo`, {
       method: "POST", headers: { "content-type": "application/json" }, body: "{}",
       signal: AbortSignal.timeout(3_000)
@@ -694,16 +727,19 @@ describe("packaged Desktop Pi compaction", () => {
     managedDesktopIdentity = undefined;
     desktop = undefined;
 
+    recordLifecycle("relaunch");
     desktop = await _electron.launch({
       executablePath: process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!,
       env: {
         ...process.env,
         JOKO_DESKTOP_PACKAGED_SMOKE: "1",
         JOKO_DESKTOP_SMOKE_SCOPE: "external",
+        ...startupEvidence.environment(profile),
         JOKO_DESKTOP_SMOKE_USER_DATA: profile,
         JOKO_PI_SETTINGS_FILE: join(profile, "pi-settings.json")
       }, timeout: 60_000
     });
+    recordLifecycle("relaunched");
     managedDesktopIdentity = await readOwnedWindowsProcess(await desktop.evaluate(() => process.pid));
     if (managedDesktopIdentity === undefined || resolve(managedDesktopIdentity.executablePath).toLowerCase()
       !== resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!).toLowerCase()) {
@@ -727,12 +763,14 @@ describe("packaged Desktop Pi compaction", () => {
       .waitFor({ state: "visible", timeout: 30_000 });
     await resumedPage.getByText("Context compacted", { exact: true }).first()
       .waitFor({ state: "visible", timeout: 30_000 });
+    recordLifecycle("restored");
     const resumedOwned = managedDesktopIdentity;
     await desktop.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; });
     await waitFor(() => readOwnedWindowsProcess(resumedOwned.pid), (candidate) => candidate === undefined,
       "restarted managed Desktop normal complete exit", 30_000);
     await waitFor(() => readOwnedWindowsChildPids(resumedOwned.pid), (pids) => pids.length === 0,
       "restarted managed Desktop owned child exit", 10_000);
+    recordLifecycle("restarted-exited");
     managedDesktopIdentity = undefined;
     desktop = undefined;
   });
@@ -753,6 +791,8 @@ describe("packaged Desktop Pi compaction", () => {
   ])("shows the managed Pi $reason state in the current Desktop artifact", { timeout: 180_000 }, async ({
     reason, settings, usage, expectedStatus
   }) => {
+    lifecycleStarted = performance.now();
+    recordLifecycle("automatic-started");
     const requests: CapturedProviderRequest[] = [];
     let overflowDelivered = false;
     let releaseSummary: (() => void) | undefined;
@@ -776,13 +816,16 @@ describe("packaged Desktop Pi compaction", () => {
     await newTask.waitFor({ state: "visible", timeout: 30_000 });
     await newTask.locator(".new-task-composer__select--model", { hasText: "Managed Pi compaction model" })
       .waitFor({ state: "visible", timeout: 30_000 });
+    recordLifecycle("automatic-composer-ready");
     await newTask.locator("[data-composer-editor='true'] .composer-rich-editor__content")
       .fill(`Establish context for managed Pi ${reason} compaction.`);
     await newTask.getByRole("button", { name: "Send", exact: true }).click();
+    recordLifecycle("automatic-input-sent");
     const sessionTimeline = page.locator(".session-pane [data-timeline-session-id]");
     await sessionTimeline.waitFor({ state: "visible", timeout: 30_000 });
     const sessionId = await sessionTimeline.getAttribute("data-timeline-session-id");
     if (sessionId === null) throw new Error("Managed Pi automatic compaction created no task identity.");
+    recordLifecycle("automatic-task-visible");
     const automaticDiagnostic = async () => ({
       requests: requests.map((request, index) => ({
         number: index + 1,
@@ -811,29 +854,35 @@ describe("packaged Desktop Pi compaction", () => {
         "managed Pi pre-overflow task idle", 30_000);
       await page.locator(".session-pane [data-composer-editor='true'] .composer-rich-editor__content")
         .fill("Trigger managed Pi context overflow.");
-      await page.locator(".session-pane .send-button").click();
+      await page.locator(".session-pane").getByRole("button", { name: "Send", exact: true }).click();
+      recordLifecycle("automatic-overflow-input-sent");
     }
     try {
       await waitFor(() => Promise.resolve(requests.some((request) =>
         JSON.stringify(request.body).includes("You are a context summarization assistant"))),
       (seen) => seen, `managed Pi ${reason} summary request`, 30_000);
     } catch (error) {
+      recordLifecycle("automatic-summary-request-failed");
       throw new Error(`Managed Pi ${reason} did not request a summary: ${JSON.stringify(await automaticDiagnostic())}`, { cause: error });
     }
+    recordLifecycle("automatic-summary-requested");
     const status = page.locator(".compaction-status-indicator");
     await status.waitFor({ state: "visible", timeout: 30_000 });
     expect(await status.getAttribute("role")).toBe("status");
     expect(await status.getAttribute("aria-live")).toBe("polite");
     expect(await status.innerText()).toContain(expectedStatus);
+    recordLifecycle("automatic-status-visible");
     releaseSummary?.();
     releasePendingProvider = undefined;
     await waitFor(() => clients.run.listRuns({ sessionId }),
       (response) => response.runs.filter((run) => run.state === RunState.SUCCEEDED).length
         >= (reason === "overflow" ? 2 : 1),
       `managed Pi ${reason} run`, 30_000);
+    recordLifecycle("automatic-run-succeeded");
     await page.getByText("Context compacted", { exact: true }).first()
       .waitFor({ state: "visible", timeout: 30_000 });
     await status.waitFor({ state: "hidden", timeout: 30_000 });
+    recordLifecycle("automatic-status-completed");
     const snapshot = await clients.event.getSnapshot({ scope: create(SnapshotScopeSchema, {
       kind: { case: "session", value: create(SessionSnapshotScopeSchema, {
         sessionId, recentTimelineItems: 500
@@ -846,6 +895,7 @@ describe("packaged Desktop Pi compaction", () => {
     if (reason === "threshold") expect(states).toContain(CompactionState.STARTED);
     expect(states).toContain(CompactionState.COMPLETED);
     expect(errors.filter((error) => error.startsWith("pageerror:"))).toEqual([]);
+    recordLifecycle("automatic-verified");
   });
 });
 

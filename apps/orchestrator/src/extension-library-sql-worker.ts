@@ -1,5 +1,5 @@
 import { isAbsolute, resolve } from "node:path";
-import { parentPort, workerData } from "node:worker_threads";
+import { Worker } from "node:worker_threads";
 
 import {
   ExtensionLibrarySqlCore,
@@ -9,26 +9,56 @@ import {
 } from "./extension-library-sql.js";
 import { ExtensionLibraryError, ExtensionLibraryVault } from "./extension-library-vault.js";
 
-const port = parentPort;
-if (port === null) throw new Error("Extension Library SQL worker requires a parent port.");
-
-const startup = validateStartup(workerData);
-const core = initialize(startup);
+if (!process.send) throw new Error("Extension Library SQL worker requires an owning process.");
+const parentPid = Number(process.env["JOKO_PARENT_PROCESS_ID"]);
+if (!Number.isSafeInteger(parentPid) || parentPid <= 1 || process.ppid !== parentPid) throw new Error("Library SQL owner process is unavailable.");
+// IPC disconnect cannot run while SQLite occupies this main thread. This pure
+// JS isolate remains schedulable and may terminate only its own OS process.
+const parentWatchdog = new Worker(`
+  const { workerData } = require('node:worker_threads');
+  const check = () => {
+    try {
+      if (process.ppid !== workerData.parentPid) throw new Error('Owner changed');
+      process.kill(workerData.parentPid, 0);
+    } catch { process.kill(process.pid, 'SIGKILL'); }
+  };
+  check(); setInterval(check, 250);
+`, { eval: true, execArgv: [], env: {}, workerData: { parentPid },
+  resourceLimits: { maxOldGenerationSizeMb: 8, maxYoungGenerationSizeMb: 1 } });
+parentWatchdog.on("error", () => process.kill(process.pid, "SIGKILL"));
+parentWatchdog.unref();
+const fences = new Map<number, (allowed: boolean) => void>();
+let nextFenceId = 1;
+let initialized = false;
+let acceptStartup!: (value: ExtensionLibrarySqlWorkerStartup) => void;
+const core = new Promise<ExtensionLibrarySqlWorkerStartup>((accept) => { acceptStartup = accept; }).then(initialize);
 let tail: Promise<void> = Promise.resolve();
 
-port.on("message", (value: unknown) => {
+process.once("disconnect", () => process.exit(1));
+process.on("message", (value: unknown) => {
+  if (value !== null && typeof value === "object" && "kind" in value) {
+    if (value.kind === "startup" && !initialized) {
+      initialized = true; acceptStartup(validateStartup(value)); return;
+    }
+    if (value.kind === "mutation_fence" && "id" in value && typeof value.id === "number") {
+      const accept = fences.get(value.id);
+      fences.delete(value.id);
+      accept?.("allowed" in value && value.allowed === true);
+      return;
+    }
+  }
   tail = tail.then(async () => {
     const request = validateRequest(value);
     if (request === undefined) throw new ExtensionLibraryError("PATH_INVALID", "Library SQL worker request is invalid.");
     try {
       const owner = await core;
       const result = await dispatch(owner, request);
-      port.postMessage({ id: request.id, ok: true, value: result } satisfies ExtensionLibrarySqlWorkerReply);
+      process.send?.({ id: request.id, ok: true, value: result } satisfies ExtensionLibrarySqlWorkerReply);
     } catch (error) {
       const failure = error instanceof ExtensionLibraryError
         ? error
         : new ExtensionLibraryError("SQL_FAILED", "Library SQL worker operation failed.", { cause: error });
-      port.postMessage({
+      process.send?.({
         id: request.id,
         ok: false,
         error: { code: failure.code, message: boundedMessage(failure.message) }
@@ -36,14 +66,20 @@ port.on("message", (value: unknown) => {
     }
   }).catch(() => {
     process.exitCode = 1;
-    port.close();
+    process.disconnect?.();
   });
 });
 
 async function initialize(input: ExtensionLibrarySqlWorkerStartup): Promise<ExtensionLibrarySqlCore> {
-  const authorityState = new Int32Array(input.authorityState);
-  const assertAuthorityCurrent = (): void => {
-    if (Atomics.load(authorityState, 0) !== 0) {
+  const assertAuthorityCurrent = async (): Promise<void> => {
+    const id = nextFenceId++;
+    const allowed = await new Promise<boolean>((accept) => {
+      fences.set(id, accept);
+      process.send?.({ kind: "mutation_fence", id }, (error) => {
+        if (error) { fences.delete(id); accept(false); }
+      });
+    });
+    if (!allowed) {
       throw new ExtensionLibraryError("UNAVAILABLE", "Extension Library session authority was revoked.");
     }
   };
@@ -78,9 +114,7 @@ function validateStartup(value: unknown): ExtensionLibrarySqlWorkerStartup {
   const input = value as Record<string, unknown>;
   if (typeof input["root"] !== "string" || !isAbsolute(input["root"]) || resolve(input["root"]) !== input["root"]
     || typeof input["extensionId"] !== "string" || !/^extension_[a-f0-9]{32}$/u.test(input["extensionId"])
-    || input["limits"] === null || typeof input["limits"] !== "object" || Array.isArray(input["limits"])
-    || !(input["authorityState"] instanceof SharedArrayBuffer)
-    || input["authorityState"].byteLength !== Int32Array.BYTES_PER_ELEMENT) {
+    || input["limits"] === null || typeof input["limits"] !== "object" || Array.isArray(input["limits"])) {
     throw new Error("Invalid Extension Library SQL worker startup.");
   }
   return value as ExtensionLibrarySqlWorkerStartup;

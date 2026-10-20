@@ -2618,16 +2618,23 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async inferNativeText(input: NativeTextInferenceInput): Promise<string> {
     this.#assertOpen();
     if (input.backendInstanceGeneration !== this.#instanceGeneration) throw nativeAuthenticationObservationStale();
-    if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1_000 || input.timeoutMs > 20_000
+    if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1_000 || input.timeoutMs > 90_000
       || input.system.length > 80_000 || input.user.length > 300_000) throw new RangeError("Native text inference input is invalid.");
+    if ((input.providerId === undefined) !== (input.modelId === undefined)) {
+      throw new Error("The selected native text model is unavailable on this Backend.");
+    }
     const owner = new AbortController();
     this.#nativeTextFlights.add(owner);
     const signal = AbortSignal.any([input.signal, owner.signal, AbortSignal.timeout(input.timeoutMs)]);
     const epoch = this.#nativeAuthenticationEpoch;
-    const model = "gpt-5.4-mini";
+    const model = input.modelId ?? "gpt-5.4-mini";
     const assertOwner = () => {
       signal.throwIfAborted(); this.#assertOpen(); input.assertCurrent();
       this.#assertNativeAuthenticationAdmission(epoch);
+      if (input.providerId !== undefined && (input.providerId !== this.#providerId
+        || !this.#models.some(candidate => candidate.providerId === input.providerId && candidate.modelId === model))) {
+        throw new Error("The selected native text model is unavailable on this Backend.");
+      }
       input.assertModelAllowed(this.#providerId, model);
     };
     let directory: string | undefined, subscription: HostSubscription | undefined;

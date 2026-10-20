@@ -32,38 +32,49 @@ function buildPdf(pageSpecs: Array<string | null | { raw: string }>, mediaBox = 
 it("inspects real PDF pages, preserves batch evidence, and rejects changed or untrusted input", async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-inspect-pdf-"));
   const outside = await mkdtemp(join(tmpdir(), "joko-inspect-pdf-outside-"));
+  const started = performance.now();
+  let phase = "first-batch";
   try {
     await writeFile(join(root, "report.pdf"), buildPdf(["First page", null, "Third page"]));
     const first = await inspectPdf({ path: "report.pdf", maxPages: 1 }, root);
     expect(first).toMatchObject({ numPages: 3, pagesInspected: 1, inspectedThrough: 1,
       blankPages: [], nextPages: [2], verdict: "incomplete",
       pages: [{ page: 1, paper: "A4", textPreview: "First page", blank: false, visibilityUnverified: false }] });
+    phase = "second-batch";
     const second = await inspectPdf({ path: "report.pdf", pages: first.nextPages,
       inspectedThrough: first.inspectedThrough, previousVerdict: first.verdict,
       previousPdfSha256: first.pdfSha256, maxPages: 1 }, root);
     expect(second).toMatchObject({ inspectedThrough: 2, blankPages: [2], nextPages: [3], verdict: "partial-blank",
       pages: [{ page: 2, textChars: 0, drawOps: 0, imageOps: 0, blank: true }] });
+    phase = "third-batch";
     const third = await inspectPdf({ path: "report.pdf", pages: second.nextPages,
       inspectedThrough: second.inspectedThrough, previousVerdict: second.verdict,
       previousPdfSha256: second.pdfSha256, maxPages: 1 }, root);
     expect(third).toMatchObject({ inspectedThrough: 3, verdict: "partial-blank", blankPages: [], pages: [{ page: 3, textPreview: "Third page" }] });
     expect(third.nextPages).toBeUndefined();
+    phase = "selected-pages";
     expect((await inspectPdf({ path: "report.pdf", pages: [3, 1, 3, 99], maxPages: 2 }, root)).pages.map(page => page.page)).toEqual([1, 3]);
+    phase = "invalid-cursors";
     await expect(inspectPdf({ path: "report.pdf", pages: [99] }, root)).rejects.toMatchObject({ code: "NO_PAGES_INSPECTED" });
     await expect(inspectPdf({ path: "report.pdf", inspectedThrough: 1 }, root)).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
     await expect(inspectPdf({ path: "report.pdf", inspectedThrough: 4,
       previousVerdict: "ok", previousPdfSha256: first.pdfSha256 }, root)).rejects.toMatchObject({ code: "INVALID_ARGUMENT" });
     await writeFile(join(root, "report.pdf"), buildPdf(["Changed"]));
+    phase = "changed-source";
     await expect(inspectPdf({ path: "report.pdf", inspectedThrough: 1,
       previousVerdict: first.verdict, previousPdfSha256: first.pdfSha256 }, root)).rejects.toMatchObject({ code: "PDF_CHANGED" });
     await writeFile(join(root, "blank.pdf"), buildPdf([null, { raw: "q 1 0 0 1 0 0 cm Q" }]));
+    phase = "blank-pages";
     expect(await inspectPdf({ path: "blank.pdf" }, root)).toMatchObject({ verdict: "blank", blankPages: [1, 2] });
     await writeFile(join(root, "vector.pdf"), buildPdf([{ raw: "72 72 100 100 re f" }]));
+    phase = "vector-page";
     expect(await inspectPdf({ path: "vector.pdf" }, root)).toMatchObject({ verdict: "ok", blankPages: [],
       pages: [{ textChars: 0, blank: false, visibilityUnverified: false }] });
     await writeFile(join(root, "letter.pdf"), buildPdf(["Hello"], "[0 0 612 792]"));
+    phase = "letter-page";
     expect((await inspectPdf({ path: "letter.pdf" }, root)).pages[0]).toMatchObject({ paper: "Letter", textPreview: "Hello" });
     await writeFile(join(root, "empty.pdf"), Buffer.alloc(0));
+    phase = "invalid-inputs";
     await expect(inspectPdf({ path: "empty.pdf" }, root)).rejects.toMatchObject({ code: "EMPTY_FILE" });
     await writeFile(join(root, "broken.pdf"), Buffer.from("not a PDF"));
     await expect(inspectPdf({ path: "broken.pdf" }, root)).rejects.toMatchObject({ code: "INSPECT_FAILED" });
@@ -80,6 +91,9 @@ it("inspects real PDF pages, preserves batch evidence, and rejects changed or un
     const controller = new AbortController();
     controller.abort();
     await expect(inspectPdf({ path: "report.pdf" }, root, controller.signal)).rejects.toMatchObject({ name: "AbortError" });
+  } catch (error) {
+    console.info("PDF inspection failure phase:", JSON.stringify({ phase, elapsedMs: Math.round(performance.now() - started) }));
+    throw error;
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });

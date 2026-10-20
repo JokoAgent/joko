@@ -604,6 +604,9 @@ async function renderPage(
     setNewSessionWorktreeEnabled: vi.fn(async () => undefined),
     getPersonalDevelopment: vi.fn(async () => ({ available: true, unavailableReason: "", state: create(PersonalDevelopmentStateSchema, { generation: 1n, environment: { status: "ready" }, source: { status: "ready" }, versions: { selected: "original" } }) })),
     watchPersonalDevelopment: vi.fn(async () => undefined),
+    runPersonalDevelopmentAction: vi.fn(async () => create(PersonalDevelopmentStateSchema, {
+      generation: 1n, environment: { status: "ready" }, source: { status: "ready" }, versions: { selected: "original" }
+    })),
     startPersonalDevelopmentDoctor: vi.fn(async (input: { readonly mode?: string }) => create(PersonalDevelopmentDoctorRunSchema, { runId: "doctor-run", sessionId: "doctor-session", mode: input.mode ?? "check" })),
     startPersonalDevelopmentTask: vi.fn(async () => ({ taskId: "coding-task", sessionId: "coding-session" })),
     navigate: vi.fn()

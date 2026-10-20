@@ -149,6 +149,7 @@ describe("Personalization visual harness", () => {
       "settings-tab-contacts",
       "settings-tab-messaging",
       "settings-tab-connections",
+      "settings-tab-sharing",
       "settings-tab-tools",
       "settings-tab-automation",
       "settings-tab-about"
@@ -309,7 +310,7 @@ describe("Personalization visual harness", () => {
 
     const page = required(container.querySelector<HTMLElement>(".settings-page"));
     expect(page.dataset.mobileMode).toBe("index");
-    expect(container.querySelectorAll('.settings-nav [role="tab"]')).toHaveLength(12);
+    expect(container.querySelectorAll('.settings-nav [role="tab"]')).toHaveLength(13);
 
     await act(async () => required(container.querySelector<HTMLButtonElement>("#settings-tab-providers")).click());
     await flushFrame();

@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import dgram, { type RemoteInfo, type Socket as DgramSocket } from "node:dgram";
+import { isIPv4 } from "node:net";
+import { constants } from "node:os";
 
 import { isValidNodeSyncPublicKey, nodeSyncDomain, type NodeSyncPurpose } from "./crypto.js";
 import { type NodeSyncCipherChunkFrame } from "./frames.js";
@@ -56,6 +58,7 @@ export interface NodeSyncLanTransportOptions {
   readonly onPresenceChanged?: () => void;
   readonly logger: NodeSyncLanLogger;
   readonly multicastGroup?: string;
+  readonly multicastInterface?: string;
   readonly multicastPort?: number;
   readonly beaconIntervalMilliseconds?: number;
   readonly endpointTtlMilliseconds?: number;
@@ -70,6 +73,7 @@ export class NodeSyncLanTransport {
   readonly #tcp: NodeSyncTcpTransport;
   readonly #endpoints = new Map<string, PeerEndpoint>();
   readonly #retryAfter = new Map<string, { readonly until: number; readonly endpoint: PeerEndpoint }>();
+  readonly #authentication = new Map<string, object>();
   #udpSocket?: DgramSocket;
   #beaconTimer?: NodeJS.Timeout;
   #starting?: Promise<void>;
@@ -84,12 +88,16 @@ export class NodeSyncLanTransport {
       endpointTtlMilliseconds: options.endpointTtlMilliseconds ?? DEFAULT_ENDPOINT_TTL_MILLISECONDS,
       connectTimeoutMilliseconds: options.connectTimeoutMilliseconds ?? DEFAULT_CONNECT_TIMEOUT_MILLISECONDS,
       multicastLoopback: options.multicastLoopback ?? true };
-    if (!isPort(this.#options.multicastPort) || this.#options.beaconIntervalMilliseconds < 100 ||
+    if (!isPort(this.#options.multicastPort) ||
+      (this.#options.multicastInterface !== undefined && !isIPv4(this.#options.multicastInterface)) ||
+      this.#options.beaconIntervalMilliseconds < 100 ||
       this.#options.endpointTtlMilliseconds < this.#options.beaconIntervalMilliseconds || this.#options.connectTimeoutMilliseconds < 100) {
       throw new TypeError("Node sync LAN transport options are invalid.");
     }
     this.#tcp = new NodeSyncTcpTransport({ purpose: options.purpose, getSelf: options.getSelf, isPeerAllowed: options.isPeerAllowed,
-      onFrame: options.onFrame, logger: { debug: (message, metadata) => options.logger.debug(message, metadata),
+      onFrame: options.onFrame,
+      onPeerAuthenticated: (nodeId, publicKey, delivery) => this.#authenticatedIngress(nodeId, publicKey, delivery),
+      logger: { debug: (message, metadata) => options.logger.debug(message, metadata),
         warn: (message, metadata) => { options.logger.warn(message, metadata); this.stop(); } },
       connectTimeoutMilliseconds: this.#options.connectTimeoutMilliseconds });
   }
@@ -119,6 +127,7 @@ export class NodeSyncLanTransport {
     this.#tcp.stop();
     this.#endpoints.clear();
     this.#retryAfter.clear();
+    this.#authentication.clear();
     this.#options.onPresenceChanged?.();
   }
 
@@ -150,18 +159,36 @@ export class NodeSyncLanTransport {
     const current = (): boolean => generation === this.#generation && this.#running &&
       this.#options.isPeerAllowed(nodeId, endpoint.publicKey) &&
       (delivery === undefined || (!delivery.signal.aborted && delivery.isCurrent()));
+    const authentication = this.#authentication.get(nodeId);
     const sent = await this.#tcp.send({ host: endpoint.address, port: endpoint.port, publicKey: endpoint.publicKey }, nodeId, frame, delivery);
     if (!current()) return false;
     if (sent) this.#retryAfter.delete(nodeId);
     else {
       const latest = this.#endpoints.get(nodeId);
-      if (latest === undefined || sameRoute(latest, endpoint)) {
+      const newestAuthentication = this.#authentication.get(nodeId);
+      // A late send failure must not suppress a newer, authenticated peer occurrence.
+      if ((newestAuthentication === undefined || newestAuthentication === authentication)
+        && (latest === undefined || sameRoute(latest, endpoint))) {
         this.#endpoints.delete(nodeId);
         this.#retryAfter.set(nodeId, { until: Date.now() + DIRECT_RETRY_COOLDOWN_MILLISECONDS, endpoint });
       }
       this.#options.onPresenceChanged?.();
     }
     return sent;
+  }
+
+  #authenticatedIngress(nodeId: string, publicKey: string, delivery: NodeSyncDeliveryContext): void {
+    if (!this.#running || !delivery.isCurrent() || !this.#options.isPeerAllowed(nodeId, publicKey)) return;
+    const retry = this.#retryAfter.get(nodeId);
+    const endpoint = this.#endpoints.get(nodeId) ?? retry?.endpoint;
+    if (endpoint === undefined || endpoint.publicKey !== publicKey
+      || Date.now() - endpoint.seenAt > this.#options.endpointTtlMilliseconds) return;
+    this.#authentication.set(nodeId, {});
+    if (retry !== undefined && sameRoute(retry.endpoint, endpoint)) {
+      this.#retryAfter.delete(nodeId);
+      this.#endpoints.set(nodeId, endpoint);
+      this.#options.onPresenceChanged?.();
+    }
   }
 
   async #startDiscovery(generation: number): Promise<void> {
@@ -180,7 +207,12 @@ export class NodeSyncLanTransport {
       udp.bind(this.#options.multicastPort, "0.0.0.0", () => {
         udp.off("error", failed);
         if (generation !== this.#generation || this.#udpSocket !== udp) { reject(new Error("Node sync LAN discovery start was superseded.")); return; }
-        try { udp.addMembership(this.#options.multicastGroup); udp.setMulticastTTL(1); udp.setMulticastLoopback(this.#options.multicastLoopback); }
+        try {
+          udp.addMembership(this.#options.multicastGroup, this.#options.multicastInterface);
+          if (this.#options.multicastInterface !== undefined) udp.setMulticastInterface(this.#options.multicastInterface);
+          udp.setMulticastTTL(1);
+          udp.setMulticastLoopback(this.#options.multicastLoopback);
+        }
         catch (error) { reject(error); return; }
         resolve();
       });
@@ -213,6 +245,8 @@ export class NodeSyncLanTransport {
     if (!this.#endpoints.has(parsed.nodeId) && this.#endpoints.size >= MAX_PEER_ENDPOINTS) return;
     const endpoint: PeerEndpoint = { address: normalizeAddress(remote.address), port: parsed.port,
       publicKey: parsed.publicKey, displayName: parsed.displayName, seenAt: Date.now() };
+    const previous = this.#endpoints.get(parsed.nodeId) ?? this.#retryAfter.get(parsed.nodeId)?.endpoint;
+    if (previous?.publicKey !== endpoint.publicKey) this.#authentication.delete(parsed.nodeId);
     this.#endpoints.set(parsed.nodeId, endpoint);
     const retryAfter = this.#retryAfter.get(parsed.nodeId);
     if (retryAfter !== undefined && (retryAfter.until <= endpoint.seenAt ||
@@ -228,6 +262,7 @@ export class NodeSyncLanTransport {
       this.#endpoints.delete(nodeId); changed = true;
     }
     for (const [nodeId, retry] of this.#retryAfter) if (retry.until <= now) { this.#retryAfter.delete(nodeId); changed = true; }
+    for (const nodeId of this.#authentication.keys()) if (!this.#endpoints.has(nodeId) && !this.#retryAfter.has(nodeId)) this.#authentication.delete(nodeId);
     if (changed) this.#options.onPresenceChanged?.();
   }
 }
@@ -246,5 +281,6 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: readonly string[]): b
 function normalizeAddress(value: string): string { return value.startsWith("::ffff:") ? value.slice("::ffff:".length) : value; }
 function transportErrorCode(error: unknown): string {
   const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
-  return typeof code === "string" && ["EADDRINUSE", "EACCES", "EADDRNOTAVAIL", "ENETUNREACH", "ECONNREFUSED"].includes(code) ? code : "unavailable";
+  return typeof code === "string" && (Object.hasOwn(constants.errno, code) ||
+    ["EADDRINUSE", "EACCES", "EADDRNOTAVAIL", "ENETUNREACH", "ECONNREFUSED"].includes(code)) ? code : "unavailable";
 }

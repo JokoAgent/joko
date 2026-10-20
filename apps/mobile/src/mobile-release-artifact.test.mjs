@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   androidToolExecutableNames,
+  apkSignerCertificateDiagnostics,
+  apkSignerCertificateSha256,
   assertProductionGitGate,
   buildJarsignerVerificationArgs,
   buildIosExportOptionsPlist,
@@ -75,6 +77,148 @@ describe("mobile release artifact configuration", () => {
       "D:/release/joko.aab"
     ]);
     expect(args.join(" ")).not.toContain("store-secret");
+  });
+
+  it("pins every APK signer certificate from numbered and v3.1 SDK-range output", () => {
+    const certificate = "ab".repeat(32);
+    expect(apkSignerCertificateSha256([
+      "Verifies",
+      "Number of signers: 1",
+      `Signer #1 certificate SHA-256 digest: ${certificate}`,
+      `Signer #1 public key SHA-256 digest: ${"cd".repeat(32)}`,
+      `Source Stamp Signer certificate SHA-256 digest: ${"ef".repeat(32)}`
+    ].join("\r\n"), certificate)).toBe(certificate);
+    expect(apkSignerCertificateSha256([
+      `Signer (minSdkVersion=33 (dev release=true), maxSdkVersion=2147483647) certificate SHA-256 digest: ${certificate.toUpperCase()}`,
+      `Signer (minSdkVersion=24, maxSdkVersion=32) certificate SHA-256 digest: ${certificate}`,
+      `Signer #1 certificate SHA-256 digest: ${certificate}`
+    ].join("\n"), certificate)).toBe(certificate);
+    // These labels are from the distributed SDK 37 ApkSignerTool class.
+    for (const signer of ["Signer:", "Signer #1:", "V2 Signer:", "V3.0 Signer:",
+      "V3.0 Signer: (minSdkVersion=24, maxSdkVersion=2147483647)",
+      "V3.1 Signer: (minSdkVersion=33 (dev release=true), maxSdkVersion=2147483647)"]) {
+      expect(apkSignerCertificateSha256(`${signer} certificate SHA-256 digest: ${certificate}`, certificate))
+        .toBe(certificate);
+    }
+    expect(() => apkSignerCertificateSha256(`Signer #1 certificate SHA-256 digest: ${certificate}`, "cd".repeat(32)))
+      .toThrow(/pinned release identity/u);
+    expect(() => apkSignerCertificateSha256(`V3.0 Signer: certificate SHA-256 digest: ${certificate}`, "cd".repeat(32)))
+      .toThrow(/pinned release identity/u);
+    expect(() => apkSignerCertificateSha256(`V2 Signer: certificate SHA-256 digest: ${certificate}`, "cd".repeat(32)))
+      .toThrow(/pinned release identity/u);
+  });
+
+  it("rejects missing, malformed and conflicting APK signer certificates", () => {
+    const certificate = "ab".repeat(32);
+    expect(() => apkSignerCertificateSha256("Verifies\nNumber of signers: 0", certificate)).toThrow(/did not return/u);
+    expect(() => apkSignerCertificateSha256(`Source Stamp Signer certificate SHA-256 digest: ${certificate}`, certificate))
+      .toThrow(/did not return/u);
+    expect(() => apkSignerCertificateSha256(`Source Stamp Signer: certificate SHA-256 digest: ${certificate}`, certificate))
+      .toThrow(/did not return/u);
+    for (const digest of ["", "ab".repeat(31), `${certificate}extra`, "not-a-certificate"]) {
+      expect(() => apkSignerCertificateSha256(`Signer #1 certificate SHA-256 digest: ${digest}`, certificate))
+        .toThrow(/64 hexadecimal/u);
+      expect(() => apkSignerCertificateSha256(`V3.0 Signer: certificate SHA-256 digest: ${digest}`, certificate))
+        .toThrow(/64 hexadecimal/u);
+      expect(() => apkSignerCertificateSha256(`V2 Signer: certificate SHA-256 digest: ${digest}`, certificate))
+        .toThrow(/64 hexadecimal/u);
+    }
+    for (const signer of ["Signer #0", "Signer #0:", "Signer (minSdkVersion=33, maxSdkVersion=32)", "Signer unknown",
+      "V2.0 Signer:", "V2 Signer: (minSdkVersion=24, maxSdkVersion=2147483647)", "V1 Signer:",
+      "V3.0 Signer: (minSdkVersion=33, maxSdkVersion=32)",
+      "V3.1 Signer: (minSdkVersion=33, maxSdkVersion=2147483648)",
+      "V3.2 Hybrid PQC Signer: (minSdkVersion=24, maxSdkVersion=2147483647)"]) {
+      expect(() => apkSignerCertificateSha256(`${signer} certificate SHA-256 digest: ${certificate}`, certificate))
+        .toThrow(/unsupported APK signer/u);
+    }
+    for (const signer of ["Signer #2", "Signer #2:", "V2 Signer:", "V3.0 Signer:", "Signer (minSdkVersion=33, maxSdkVersion=2147483647)",
+      "V3.0 Signer: (minSdkVersion=24, maxSdkVersion=32)",
+      "V3.1 Signer: (minSdkVersion=33, maxSdkVersion=2147483647)"]) {
+      expect(() => apkSignerCertificateSha256([
+        `Signer #1 certificate SHA-256 digest: ${certificate}`,
+        `${signer} certificate SHA-256 digest: ${"cd".repeat(32)}`
+      ].join("\n"), certificate)).toThrow(/different signing certificates/u);
+    }
+    expect(() => apkSignerCertificateSha256([
+      `Signer #1 certificate SHA-256 digest: ${certificate}`,
+      "Signer #2 certificate SHA-256 digest: malformed"
+    ].join("\n"), certificate)).toThrow(/64 hexadecimal/u);
+    expect(() => apkSignerCertificateSha256([
+      `V3.0 Signer: (minSdkVersion=24, maxSdkVersion=32) certificate SHA-256 digest: ${certificate}`,
+      "V3.1 Signer: (minSdkVersion=33, maxSdkVersion=2147483647) certificate SHA-256 digest: malformed"
+    ].join("\n"), certificate)).toThrow(/64 hexadecimal/u);
+  });
+
+  it("limits failed APK signer diagnostics to public digests and fixed metadata", () => {
+    const certificate = "ab".repeat(32);
+    const subject = "CN=Uncontrolled public subject";
+    const diagnosticPath = "/private/build/path";
+    const stdout = [
+      "Verifies",
+      "Number of signers: 1",
+      `Signer #1 certificate DN: ${subject}`,
+      `Signer #1 certificate SHA-256 digest: ${certificate}`,
+      "Signer #2 certificate SHA-256 digest: malformed"
+    ].join("\r\n");
+    const stderr = `Picked up JAVA_TOOL_OPTIONS: /uncontrolled/runtime/option\nWARNING: ${diagnosticPath}`;
+    const diagnostic = apkSignerCertificateDiagnostics({ stdout, stderr,
+      stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr) }, "0.9\n");
+    expect(diagnostic).toMatchObject({
+      phase: "apk-signer-certificate-read", tool: "apksigner", toolVersion: "0.9", exitCode: 0,
+      hasOutput: true, signerDigestLineCount: 2,
+      streams: {
+        stdout: { bytes: Buffer.byteLength(stdout), characters: stdout.length, newlines: 4, carriageReturns: 4,
+          nuls: 0, hasVerifies: true, hasSignerWord: true, hasCertificateWord: true, hasSha256Word: true,
+          hasUsage: false, hasJavaOptionNotice: false, signerCounts: [1] },
+        stderr: { bytes: Buffer.byteLength(stderr), characters: stderr.length, newlines: 1, carriageReturns: 0,
+          nuls: 0, hasVerifies: false, hasSignerWord: false, hasCertificateWord: false,
+          hasSha256Word: false, hasUsage: false, hasJavaOptionNotice: true, signerCounts: [] }
+      },
+      signerDigests: [{ signer: "#1", sha256: certificate }, { signer: "#2", validDigest: false }]
+    });
+    expect(diagnostic.publicCertificateLines).toEqual([{ stream: "stdout", label: "Signer #1", sha256: certificate }]);
+    const serialized = JSON.stringify(diagnostic);
+    expect(serialized).not.toContain(subject);
+    expect(serialized).not.toContain(diagnosticPath);
+    expect(serialized).not.toContain("/uncontrolled/runtime/option");
+    expect(apkSignerCertificateDiagnostics({ stdout: "", stderr: "", stdoutBytes: 0, stderrBytes: 0 }, "uncontrolled version output")).toMatchObject({
+      phase: "apk-signer-certificate-read", tool: "apksigner", toolVersion: "unavailable", exitCode: 0,
+      hasOutput: false, signerDigestLineCount: 0, signerDigests: [],
+      streams: { stdout: { bytes: 0, characters: 0 }, stderr: { bytes: 0, characters: 0 } }
+    });
+    expect(apkSignerCertificateDiagnostics({ stdout: "", stderr: "Usage: apksigner verify\n\0",
+      stdoutBytes: 0, stderrBytes: 25 }, "0.9")).toMatchObject({
+      hasOutput: true, signerDigestLineCount: 0,
+      streams: { stdout: { bytes: 0, hasUsage: false }, stderr: { bytes: 25, hasUsage: true, nuls: 1 } }
+    });
+    const sdk37 = `V3.0 Signer: (minSdkVersion=24, maxSdkVersion=2147483647) certificate SHA-256 digest: ${certificate}`;
+    expect(apkSignerCertificateDiagnostics({ stdout: sdk37, stderr: "",
+      stdoutBytes: Buffer.byteLength(sdk37), stderrBytes: 0 }, "0.9")).toMatchObject({
+      signerDigestLineCount: 1,
+      signerDigests: [{ signer: "V3.0 Signer: (minSdkVersion=24, maxSdkVersion=2147483647)", sha256: certificate }]
+    });
+    const observedSdk37 = `V3.0 Signer: certificate SHA-256 digest: ${certificate}`;
+    expect(apkSignerCertificateDiagnostics({ stdout: observedSdk37, stderr: "",
+      stdoutBytes: Buffer.byteLength(observedSdk37), stderrBytes: 0 }, "0.9")).toMatchObject({
+      signerDigestLineCount: 1, signerDigests: [{ signer: "V3.0 Signer:", sha256: certificate }]
+    });
+    const observedV2 = `V2 Signer: certificate SHA-256 digest: ${certificate}`;
+    expect(apkSignerCertificateDiagnostics({ stdout: observedV2, stderr: "",
+      stdoutBytes: Buffer.byteLength(observedV2), stderrBytes: 0 }, "0.9")).toMatchObject({
+      publicCertificateLines: [{ stream: "stdout", label: "V2 Signer:", sha256: certificate }],
+      signerDigestLineCount: 1, signerDigests: [{ signer: "V2 Signer:", sha256: certificate }]
+    });
+    const labels = ["Signer unknown:", `V3.0 ${"x".repeat(150)}`, "Signer /private/path", "Signer\u001b[31m"];
+    const untrusted = labels.map(label => `${label} certificate SHA-256 digest: ${certificate}`).join("\n");
+    const bounded = apkSignerCertificateDiagnostics({ stdout: untrusted,
+      stderr: `V3.0 Signer: certificate SHA-256 digest: ${certificate.toUpperCase()}`,
+      stdoutBytes: Buffer.byteLength(untrusted), stderrBytes: 0 }, "0.9");
+    expect(bounded.publicCertificateLines).toEqual([
+      { stream: "stdout", label: "Signer unknown:", sha256: certificate },
+      { stream: "stderr", label: "V3.0 Signer:", sha256: certificate }
+    ]);
+    expect(() => apkSignerCertificateSha256(`Signer unknown: certificate SHA-256 digest: ${certificate}`, certificate))
+      .toThrow(/unsupported APK signer/u);
   });
 
   it("keeps Android release secrets external and pins an independent certificate", () => {

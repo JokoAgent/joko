@@ -434,6 +434,7 @@ export interface MobileNetwork {
   readNativeSessionTree(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<NativeSessionTree>;
   previewTaskTagDeletion(credential: PairedCredential, taskTagId: string, signal?: AbortSignal): Promise<TaskTagDeletePreview>;
   readTaskHeaderRole(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<MobileTaskHeaderRole>;
+  suggestSessionTitle(credential: PairedCredential, sessionId: string, signal?: AbortSignal): Promise<import("@joko/contracts").SuggestSessionTitleResponse>;
   listBackgroundTasks(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ tasks: readonly BackgroundTask[]; nextPageToken: string }>;
   readBackgroundTaskOutput?(credential: PairedCredential, sessionId: string, backgroundTaskId: string, signal?: AbortSignal): Promise<import("@joko/contracts").BackgroundTaskOutput>;
   listSubagentRuns(credential: PairedCredential, sessionId: string, pageToken?: string, signal?: AbortSignal): Promise<{ runs: readonly SubagentRun[]; nextPageToken: string }>;
@@ -2493,6 +2494,14 @@ export const mobileNetwork: MobileNetwork = {
       .listCollaborationGoals({ sessionId, includeArchived: true }, options(signal));
     signal?.throwIfAborted();
     return mobileTaskHeaderRole(sessionId, response.access);
+  },
+  async suggestSessionTitle(credential, sessionId, signal) {
+    signal?.throwIfAborted();
+    if (!sessionId) throw new Error("A current task is required to suggest its title.");
+    const response = await createClient(SessionService, transport(credential.origin, credential.authKey))
+      .suggestSessionTitle({ sessionId }, options(signal));
+    signal?.throwIfAborted();
+    return response;
   },
   async listBackgroundTasks(credential, sessionId, pageToken = "", signal) {
     signal?.throwIfAborted();

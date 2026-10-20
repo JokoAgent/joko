@@ -251,6 +251,15 @@ message WorkspaceDiff {
   optional string requested_base_ref = 11;
   optional string resolved_base_ref = 12;
   WorkspaceBranchBaseWarning branch_base_warning = 13;
+  // Current branch's configured upstream, or its configured first-push target.
+  // Omitted when no supported configured remote destination can be resolved.
+  WorkspaceGitPushTarget push_target = 14;
+}
+
+message WorkspaceGitPushTarget {
+  string remote = 1;
+  string remote_ref = 2;
+  bool has_upstream = 3;
 }
 
 enum WorkspaceBranchBaseWarningCode {

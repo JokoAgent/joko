@@ -3240,7 +3240,7 @@ describe("Remote Desktop boundaries", () => {
     expect(html).toContain("message.type==='cursor'");
     expect(html).toContain("keys.length===8");
     expect(html).toContain("width>=1&&width<=512&&height>=1&&height<=512");
-    expect(html).toContain("!cursorOverlay&&control&&mode==='trackpad'");
+    expect(html).toContain("!cursorOverlay&&control&&(mode==='trackpad'||nativeTouchpad!==null||localCursorAwake)");
     expect(html).toContain("performance.now()-lastLocalMove>200");
     expect(html).toContain("token!==localCursorGeneration||epoch!==cursorEpoch");
     expect(html).toContain("localCursorTimer=setTimeout");

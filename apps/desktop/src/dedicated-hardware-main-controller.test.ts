@@ -275,6 +275,8 @@ describe("dedicated hardware main controller", () => {
     const controller = createDedicatedHardwareMainController({ store: owner.store, host: owner.host, input: owner.input });
     await controller.initialize();
     vi.mocked(owner.host.probe).mockReturnValue(false);
+    controller.poll();
+    expect(owner.host.probe).not.toHaveBeenCalled();
     expect(controller.probe("codex-micro")).toBe(false);
     expect(owner.host.retry).not.toHaveBeenCalled();
 
@@ -282,6 +284,9 @@ describe("dedicated hardware main controller", () => {
       ...createDefaultDedicatedHardwareSettings("codex-micro"),
       enabled: true
     });
+    controller.poll();
+    expect(owner.host.probe).toHaveBeenLastCalledWith("codex-micro");
+    expect(owner.host.retry).not.toHaveBeenCalled();
     expect(controller.probe("codex-micro")).toBe(true);
     expect(owner.host.retry).toHaveBeenCalledOnce();
   });

@@ -85,6 +85,7 @@ function samePath(a: string, b: string): boolean { return resolve(a).toLowerCase
 // reads private bytes, and retains both handles until Node completes its read.
 const WINDOWS_PERMISSION_CHECK = String.raw`
 $ErrorActionPreference = 'Stop'
+Import-Module ([System.IO.Path]::Combine($PSHOME, 'Modules', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop
 Add-Type -TypeDefinition @'
 using System;
 using System.Collections;

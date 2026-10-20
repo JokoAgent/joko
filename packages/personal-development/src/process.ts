@@ -10,6 +10,23 @@ export function developmentEnvironment(source: Readonly<NodeJS.ProcessEnv> = pro
     .map(([name, value]) => [process.platform === "win32" ? name.toUpperCase() : name, value])),
     LC_ALL: "C", LANG: "C", GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null", CI: "1" };
 }
+/** Confirm group absence before releasing its command journal. */
+export async function waitForDevelopmentProcessGroupExit(groupPid: number): Promise<void> {
+  if (!Number.isSafeInteger(groupPid) || groupPid <= 1) throw new TypeError("Invalid owned process group.");
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try { process.kill(-groupPid, 0); }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ESRCH") return;
+      // Darwin can report EPERM for an exiting group with no signalable members.
+      // It never proves absence: keep querying within the same five-second bound.
+      if (process.platform !== "darwin" || code !== "EPERM") throw error;
+    }
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+  }
+  throw new Error("The owned process group did not disappear.");
+}
 /** A usable native runner with exact process ownership supplied by the existing runtime supervisor. */
 export function createDevelopmentProcessAuthority(supervisor: DevelopmentProcessSupervisor): DevelopmentProcessAuthority {
   return { run: (input: DevelopmentProcessInput) => new Promise((resolve, reject) => {

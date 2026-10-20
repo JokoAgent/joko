@@ -1,3 +1,4 @@
+import { join, resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -5,6 +6,8 @@ import {
   type DedicatedHardwareSettingsStoreIo
 } from "./settings-store.js";
 import { createDefaultDedicatedHardwareSettings } from "./settings.js";
+
+const settingsDirectory = resolve("settings");
 
 function memoryIo(initial: Readonly<Record<string, Uint8Array>> = {}) {
   const files = new Map(Object.entries(initial).map(([path, bytes]) => [path, new Uint8Array(bytes)]));
@@ -22,7 +25,7 @@ function memoryIo(initial: Readonly<Record<string, Uint8Array>> = {}) {
 describe("dedicated hardware settings store", () => {
   it("defaults both models off and publishes only after a successful atomic write", async () => {
     const memory = memoryIo();
-    const store = createDedicatedHardwareSettingsStore({ directory: "D:\\settings", io: memory.io });
+    const store = createDedicatedHardwareSettingsStore({ directory: settingsDirectory, io: memory.io });
     const published = vi.fn();
     store.subscribe(published);
     const initialized = await store.initialize();
@@ -46,11 +49,11 @@ describe("dedicated hardware settings store", () => {
       { failRead: true, error: "unavailable" }
     ];
     for (const [index, entry] of cases.entries()) {
-      const path = `D:\\settings\\dedicated-hardware.codex-micro.v1.json`;
+      const path = join(settingsDirectory, "dedicated-hardware.codex-micro.v1.json");
       const original = entry.bytes === undefined ? undefined : new Uint8Array(entry.bytes);
       const writes = vi.fn();
       const store = createDedicatedHardwareSettingsStore({
-        directory: "D:\\settings",
+        directory: settingsDirectory,
         io: {
           readFile: async (candidate) => {
             if (candidate !== path) return undefined;
@@ -74,7 +77,7 @@ describe("dedicated hardware settings store", () => {
       if (fail) throw new Error("disk full");
     });
     const store = createDedicatedHardwareSettingsStore({
-      directory: "D:\\settings",
+      directory: settingsDirectory,
       io: { readFile: async () => undefined, atomicWriteFile: writes }
     });
     const published = vi.fn();
@@ -91,7 +94,7 @@ describe("dedicated hardware settings store", () => {
 
   it("does not let a throwing subscriber turn a persisted commit into a failure", async () => {
     const memory = memoryIo();
-    const store = createDedicatedHardwareSettingsStore({ directory: "D:\\settings", io: memory.io });
+    const store = createDedicatedHardwareSettingsStore({ directory: settingsDirectory, io: memory.io });
     await store.initialize();
     store.subscribe(() => { throw new Error("observer failed"); });
     const observer = vi.fn();
@@ -104,7 +107,7 @@ describe("dedicated hardware settings store", () => {
 
   it("resets layout or all settings while preserving the enabled choice", async () => {
     const memory = memoryIo();
-    const store = createDedicatedHardwareSettingsStore({ directory: "D:\\settings", io: memory.io });
+    const store = createDedicatedHardwareSettingsStore({ directory: settingsDirectory, io: memory.io });
     await store.initialize();
     const defaults = createDefaultDedicatedHardwareSettings("creator-micro-2");
     const customized = {
@@ -141,7 +144,7 @@ describe("dedicated hardware settings store", () => {
         if (call === 1) throw new Error("first failed");
       }
     };
-    const store = createDedicatedHardwareSettingsStore({ directory: "D:\\settings", io });
+    const store = createDedicatedHardwareSettingsStore({ directory: settingsDirectory, io });
     const first = { ...createDefaultDedicatedHardwareSettings("codex-micro"), enabled: true };
     const second = { ...first, lighting: { ...first.lighting, brightnessPercent: 40 } };
     const failed = store.save("codex-micro", first);

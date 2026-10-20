@@ -12,6 +12,7 @@ import { afterEach, expect, it } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+import { createPackagedDesktopStartupEvidence } from "./packaged-desktop-startup.js";
 
 const packagedIt = process.platform === "win32" && process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE?.trim()
   ? it : it.skip;
@@ -33,10 +34,18 @@ let desktop: ElectronApplication | undefined;
 let desktopIdentity: OwnedProcess | undefined;
 let profileDirectory: string | undefined;
 const workspaceRequests = new WeakMap<Page, string[]>();
+const startupEvidence = createPackagedDesktopStartupEvidence();
 
-afterEach(async () => {
+afterEach(async ({ task }) => {
+  if (task.result?.state === "fail") {
+    console.error("Packaged settings: failed window routes.", JSON.stringify(
+      desktop?.windows().map((page) => ({ route: new URL(page.url()).hash, closed: page.isClosed() })) ?? []
+    ));
+    console.error("Packaged settings: startup state.", JSON.stringify(await startupEvidence.snapshot(desktop)));
+  }
+  startupEvidence.reset();
   try {
-    await closeDesktop();
+    await closeDesktop(task.result?.state === "fail");
   } finally {
     await fixture?.close();
     fixture = undefined;
@@ -86,6 +95,7 @@ packagedIt("converges conversation settings across real application windows and 
     sessionIds.push(sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
       createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId, displayName }))));
   }
+  console.info("Packaged settings: fixture and both tasks ready.");
   const challenge = await activeFixture.anonymous.connection.beginPairing({ deviceDisplayName: "Settings Desktop" });
   if (challenge.challenge === undefined) throw new Error("Settings Desktop pairing returned no challenge.");
   const executablePath = resolve(process.env.JOKO_PACKAGED_DESKTOP_EXECUTABLE!);
@@ -97,22 +107,24 @@ packagedIt("converges conversation settings across real application windows and 
       JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
       JOKO_DESKTOP_PACKAGED_SMOKE: "1",
       JOKO_DESKTOP_SMOKE_SCOPE: "external",
+      ...startupEvidence.environment(profileDirectory),
       JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory
     },
     timeout: 60_000
   });
+  console.info("Packaged settings: Desktop launch returned.");
   const application = desktop;
-  desktopIdentity = await readProcess(await application.evaluate(() => process.pid));
+  const launcherPid = application.process().pid;
+  if (launcherPid === undefined) throw new Error("Settings Desktop returned no spawned process ID.");
+  desktopIdentity = await readLaunchedProcess(launcherPid, executablePath);
   if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
     throw new Error("Settings Desktop launched an unexpected executable.");
   }
-  const profileRelative = relative(profileDirectory, await application.evaluate(({ app }) => app.getPath("userData")));
-  if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
-    throw new Error("Settings Desktop did not use its isolated profile.");
-  }
+  console.info("Packaged settings: owned process confirmed.");
   const main = await application.firstWindow({ timeout: 60_000 });
   const pageErrors: string[] = [];
   const observe = (page: Page): void => {
+    page.setDefaultTimeout(30_000);
     const requests: string[] = [];
     workspaceRequests.set(page, requests);
     page.on("pageerror", (error) => pageErrors.push(error.message));
@@ -123,6 +135,19 @@ packagedIt("converges conversation settings across real application windows and 
   };
   observe(main);
   await main.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged settings: connection page visible.");
+  let profileTimer: ReturnType<typeof setTimeout> | undefined;
+  const userDataPath = await Promise.race([
+    application.evaluate(({ app }) => app.getPath("userData")),
+    new Promise<never>((_resolveProfile, rejectProfile) => {
+      profileTimer = setTimeout(() => rejectProfile(new Error("Settings Desktop main-process profile query timed out.")), 30_000);
+    })
+  ]).finally(() => { if (profileTimer !== undefined) clearTimeout(profileTimer); });
+  const profileRelative = relative(profileDirectory, userDataPath);
+  if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
+    throw new Error("Settings Desktop did not use its isolated profile.");
+  }
+  console.info("Packaged settings: isolated profile confirmed.");
   const pairingTabBounds = await main.locator(".connection-tabs > button").nth(2).boundingBox();
   if (pairingTabBounds === null) throw new Error("Settings Desktop pairing tab has no visible bounds.");
   await main.mouse.click(pairingTabBounds.x + pairingTabBounds.width / 2,
@@ -134,7 +159,10 @@ packagedIt("converges conversation settings across real application windows and 
   await main.locator('form.pair-form input[autocomplete="off"]').fill("Settings Desktop");
   await main.locator("form.pair-form button[type=submit]").click();
   await main.locator(".app").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged settings: authenticated application visible.");
   await main.evaluate(() => { location.hash = "/settings/general"; });
+  await main.locator(".settings-page").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged settings: general settings visible.");
   await main.getByRole("combobox", { name: /^(?:Language|语言)$/u }).click();
   await main.getByRole("option", { name: "English", exact: true }).click();
   await selected(main.getByRole("combobox", { name: "Language", exact: true }), "English");
@@ -321,7 +349,7 @@ async function personalized(page: Page, prompt: string, fade: boolean, rail: boo
   }
 }
 
-async function closeDesktop(): Promise<void> {
+async function closeDesktop(afterFailure = false): Promise<void> {
   if (desktopIdentity === undefined) return;
   const original = desktopIdentity;
   const current = await readProcess(original.pid);
@@ -330,12 +358,35 @@ async function closeDesktop(): Promise<void> {
     throw new Error("Settings Desktop cleanup refused a changed process identity.");
   }
   if (current !== undefined) {
-    await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
+    if (afterFailure) {
+      await new Promise<void>((resolveKill, rejectKill) => {
+        execFile("taskkill.exe", ["/PID", String(original.pid), "/T", "/F"],
+          { windowsHide: true, timeout: 10_000 }, (error) => error ? rejectKill(error) : resolveKill());
+      });
+    } else {
+      await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
+    }
     await waitFor(() => readProcess(original.pid), (candidate) => candidate === undefined,
       "Settings Desktop complete exit", 30_000);
   }
   desktopIdentity = undefined;
   desktop = undefined;
+}
+
+async function readLaunchedProcess(launcherPid: number, executablePath: string): Promise<OwnedProcess> {
+  if (!Number.isSafeInteger(launcherPid) || launcherPid <= 0) throw new Error("Invalid Settings Desktop launcher PID.");
+  const script = "$ErrorActionPreference = 'Stop'; $ownedCandidates = @(Get-CimInstance Win32_Process -Filter 'ProcessId = "
+    + launcherPid + " OR ParentProcessId = " + launcherPid
+    + "' | Where-Object { $_.ExecutablePath -eq $env:JOKO_E2E_DESKTOP_EXECUTABLE }); "
+    + "if ($ownedCandidates.Count -ne 1) { throw 'Expected one Desktop main process under its launcher.' }; "
+    + "$ownedProcess = $ownedCandidates[0]; [pscustomobject]@{ pid = $ownedProcess.ProcessId; executablePath = $ownedProcess.ExecutablePath; startedAt = $ownedProcess.CreationDate.ToUniversalTime().ToString('O') } | ConvertTo-Json -Compress";
+  const output = await new Promise<string>((resolveOutput, rejectOutput) => {
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true, timeout: 10_000,
+      env: { ...process.env, JOKO_E2E_DESKTOP_EXECUTABLE: executablePath }
+    }, (error, stdout) => error ? rejectOutput(error) : resolveOutput(stdout));
+  });
+  return JSON.parse(output) as OwnedProcess;
 }
 
 async function readProcess(pid: number): Promise<OwnedProcess | undefined> {

@@ -6,6 +6,7 @@ import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import type { AdapterContext, NativeSessionBinding, PromptInput, BackendAdapter, DurableNativeDispatchPreparation } from "@joko/core";
 import {
   OperationalStore,
+  NotFoundError,
   PartnerStore,
   PartnerStoreError,
   type PartnerCapabilitiesRecord,
@@ -702,6 +703,24 @@ describe("PartnerManager", () => {
       expect.objectContaining({ sessionId: recovered.canonicalSessionId, role: "canonical" }),
       expect.objectContaining({ sessionId: "missing-session", role: "history" })
     ]);
+  });
+
+  it("does not recreate an unavailable home Target while its canonical Session still exists", async () => {
+    const fixture = await createFixture();
+    const created = await fixture.manager.createPartner(createInput(fixture.partnerStore, "Retained canonical"));
+    fixture.partnerStore.prepareInitialization(created.id, created.revision);
+    const readTarget = fixture.operationalStore.getTarget.bind(fixture.operationalStore);
+    const targetRead = vi.spyOn(fixture.operationalStore, "getTarget").mockImplementation((targetId) => {
+      if (targetId === created.homeTargetId) throw new NotFoundError("target", targetId);
+      return readTarget(targetId);
+    });
+    const register = vi.spyOn(fixture.sessionHost, "registerTarget");
+    try { await fixture.manager.recoverPending(); }
+    finally { targetRead.mockRestore(); }
+    expect(fixture.partnerStore.getPartner(created.id)).toMatchObject({ initializationState: "error",
+      initializationErrorCode: "session_unavailable", canonicalSessionId: created.canonicalSessionId });
+    expect(register).not.toHaveBeenCalled();
+    expect(fixture.operationalStore.listSessions({ includeArchived: true, includeDeleted: true })).toHaveLength(1);
   });
 
   it("applies directory defaults only to inheriting partners and preserves lifecycle Session isolation", async () => {

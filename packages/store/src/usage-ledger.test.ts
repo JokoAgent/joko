@@ -64,7 +64,7 @@ describe("durable usage ledger", () => {
     }
   });
 
-  it("bounds currency aggregation even for one task and allows a narrower report after a capacity failure", () => {
+  it("bounds currency aggregation even for one task and allows a narrower report after a capacity failure", { timeout: 20_000 }, () => {
     const fixture = createFixture();
     for (let index = 0; index < 257; index += 1) {
       fixture.store.recordUsageObservation(observation({

@@ -43,6 +43,7 @@ interface ScriptedPiProcessOptions {
   readonly historyResponseData?: unknown;
   readonly messages?: readonly Record<string, unknown>[];
   readonly tree?: readonly Record<string, unknown>[];
+  readonly treeLeafId?: string;
   readonly forkMessages?: readonly Record<string, unknown>[];
   readonly forkText?: string;
   readonly availableModels?: readonly Record<string, unknown>[];
@@ -89,6 +90,7 @@ class ScriptedPiProcess extends EventEmitter {
   sessionName: string | undefined;
   isStreaming = false;
   isCompacting = false;
+  contextUsageUnavailable = false;
   omitModelFromState = false;
   contextRebuildHandoff: string | undefined;
   model = {
@@ -267,6 +269,7 @@ class ScriptedPiProcess extends EventEmitter {
           cost: 0,
           contextUsage: {
             ...contextUsage,
+            tokens: this.contextUsageUnavailable ? null : contextUsage.tokens,
             percent: contextUsage.contextWindow === 0 ? 0 : contextUsage.tokens / contextUsage.contextWindow * 100
           }
         });
@@ -427,7 +430,7 @@ class ScriptedPiProcess extends EventEmitter {
               ]
             }
           ],
-          leafId: "entry-1"
+          leafId: this.options.treeLeafId ?? "entry-1"
         });
         return;
       case "get_entries":
@@ -565,6 +568,43 @@ class ScriptedPiProcess extends EventEmitter {
 }
 
 describe("PiBackendAdapter", () => {
+  it("recovers unknown native context from the current tree without inheriting another branch's usage", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-context-tree-"));
+    const options = { treeLeafId: "current", tree: [{
+      entry: { type: "message", id: "root", parentId: null,
+        message: { role: "user", content: [{ type: "text", text: "root" }] } },
+      children: [
+        { entry: { type: "message", id: "current", parentId: "root",
+          message: { role: "assistant", usage: { input: 40, cacheRead: 10, cacheWrite: 5, output: 200 } } }, children: [] },
+        { entry: { type: "message", id: "other", parentId: "root",
+          message: { role: "assistant", usage: { input: 800, cacheRead: 100, cacheWrite: 100 } } }, children: [] }
+      ]
+    }] };
+    let process!: ScriptedPiProcess;
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory,
+      versionProbe: async () => "pi 0.85.1",
+      processFactory: spec => (process = new ScriptedPiProcess(spec, options)) as unknown as PiProcessHandle });
+    const target: TargetDescriptor = { id: "context-target", backendId: adapter.id,
+      displayName: "Context", workspaceRoot: directory, managed: true, trusted: true };
+    const context = makeContext(target, []);
+    try {
+      const binding = await adapter.createSession({ target, permissionMode: "ask", fastMode: false }, context);
+      const bound = { ...context, binding };
+      expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({ contextTokens: 18 });
+      process.contextUsageUnavailable = true;
+      expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({
+        contextTokens: 55, contextWindow: 32_768, totalTokens: 18
+      });
+      options.treeLeafId = "other";
+      expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({ contextTokens: 1_000 });
+      options.treeLeafId = "root";
+      expect((await adapter.inspectSession(binding, bound)).usage).toMatchObject({ contextTokens: 0 });
+    } finally {
+      await adapter.dispose();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("uses a process-private working context and compaction reserve while preserving the same binding and public capacity", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-working-context-")); const processes: ScriptedPiProcess[] = [];
     let budget: number | undefined = 16_000;

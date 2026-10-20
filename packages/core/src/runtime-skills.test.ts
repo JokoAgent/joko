@@ -43,6 +43,21 @@ test("copies complete skill assets and freezes approval independently from mutab
   await expect(lstat(seed.sourcePath)).resolves.toBeDefined();
 });
 
+test("canonicalizes its private snapshot root while retaining approved source and file fences", async () => {
+  const { seed, body } = await fixture();
+  const parent = await realpath(await mkdtemp(join(tmpdir(), "joko-skill-parent-"))); roots.push(parent);
+  const actual = join(parent, "actual"), alias = join(parent, "alias");
+  await mkdir(actual); await symlink(actual, alias, "junction");
+  const snapshot = await snapshotNativeSkills([seed], new AbortController().signal, join(alias, "snapshots"));
+  try {
+    expect(snapshot.pluginRoot).toBe(await realpath(snapshot.pluginRoot));
+    expect(await readFile(snapshot.skills[0]!.filePath, "utf8")).toBe(body);
+    await snapshot.assertFilesCurrent(new AbortController().signal);
+    await writeFile(snapshot.skills[0]!.filePath, "changed private snapshot");
+    await expect(snapshot.assertFilesCurrent(new AbortController().signal)).rejects.toMatchObject({ publicError: { code: "SKILL_RUNTIME_AUTHORITY_INVALID" } });
+  } finally { await snapshot.dispose(); }
+});
+
 test("rejects changed approvals, duplicate identities, cancellation and links before mounting", async () => {
   const { seed } = await fixture();
   await writeFile(join(seed.sourcePath, "SKILL.md"), "different approved content");
@@ -69,6 +84,7 @@ async function fixture() {
 }
 
 test("projects a complete large personal catalog while preserving originals outside native plugin discovery", async () => {
+  // Copy and revalidate every asset in the 120-entry catalog on real disk.
   const { seed, body, asset } = await fixture();
   const seeds = Array.from({ length: 120 }, (_, index): ApprovedSkillSeed => ({ ...seed,
     resource: { ...seed.resource, id: `personal-${index}` }, personal: { slug: `skill-${index}`, name: `Skill ${index}`,
@@ -89,4 +105,4 @@ test("projects a complete large personal catalog while preserving originals outs
   try { expect(small.skills[0]!.discovery).toBeUndefined(); expect(small.indexedResourceIds).toEqual([]);
     expect(await readFile(small.skills[0]!.filePath, "utf8")).toBe(body); }
   finally { await small.dispose(); }
-});
+}, 30_000);

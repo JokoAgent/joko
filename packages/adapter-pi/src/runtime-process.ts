@@ -501,10 +501,13 @@ function linuxIdentity(stat: string, executable: string, bootId: string): string
 
 async function capturePortableIdentity(pid: number, platform: NodeJS.Platform): Promise<string | undefined> {
   if (platform === "win32") {
-    const { stdout } = await execFileAsync("powershell.exe", portableWindowsIdentityArgs(pid), {
-      encoding: "utf8", windowsHide: true, timeout: 5_000
-    });
-    return stdout.trim() === "" ? undefined : digestIdentity(stdout.trim());
+    const started = performance.now();
+    try {
+      const { stdout } = await execFileAsync("powershell.exe", portableWindowsIdentityArgs(pid), {
+        encoding: "utf8", windowsHide: true, timeout: 5_000
+      });
+      return stdout.trim() === "" ? undefined : digestIdentity(stdout.trim());
+    } catch (error) { return windowsIdentityFailure(error, started); }
   }
   const { stdout } = await execFileAsync("ps", ["-p", String(pid), "-o", "lstart=", "-o", "command="], {
     encoding: "utf8", windowsHide: true, timeout: 5_000
@@ -513,23 +516,45 @@ async function capturePortableIdentity(pid: number, platform: NodeJS.Platform): 
 }
 
 function capturePortableIdentitySync(pid: number, platform: NodeJS.Platform): string | undefined {
-  const stdout = platform === "win32"
-    ? execFileSync("powershell.exe", portableWindowsIdentityArgs(pid), {
-        encoding: "utf8", windowsHide: true, timeout: 5_000
-      })
-    : execFileSync("ps", ["-p", String(pid), "-o", "lstart=", "-o", "command="], {
-        encoding: "utf8", windowsHide: true, timeout: 5_000
+  if (platform === "win32") {
+    const started = performance.now();
+    try {
+      const stdout = execFileSync("powershell.exe", portableWindowsIdentityArgs(pid), {
+        encoding: "utf8", windowsHide: true, timeout: 5_000, stdio: ["ignore", "pipe", "ignore"]
       });
+      return stdout.trim() === "" ? undefined : digestIdentity(stdout.trim());
+    } catch (error) { return windowsIdentityFailure(error, started); }
+  }
+  const stdout = execFileSync("ps", ["-p", String(pid), "-o", "lstart=", "-o", "command="], {
+    encoding: "utf8", windowsHide: true, timeout: 5_000
+  });
   return stdout.trim() === "" ? undefined : digestIdentity(stdout.trim());
 }
 
 function portableWindowsIdentityArgs(pid: number): readonly string[] {
   const script = [
-    `$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue`,
-    "if ($null -eq $p) { exit 3 }",
-    "[Console]::Out.Write($p.StartTime.ToUniversalTime().Ticks.ToString() + '|' + $p.Path)"
+    "$PSModuleAutoLoadingPreference = 'None'",
+    "$ErrorActionPreference = 'Stop'",
+    // Direct .NET avoids implicit PowerShell Management module discovery. The
+    // same birth ticks and native executable path remain the identity fence.
+    `try { $p = [System.Diagnostics.Process]::GetProcessById(${pid}) } catch [System.ArgumentException] { exit 3 }`,
+    "try { $birth = $p.StartTime.ToUniversalTime().Ticks.ToString([System.Globalization.CultureInfo]::InvariantCulture); $path = $p.MainModule.FileName; if ([String]::IsNullOrWhiteSpace($path)) { exit 4 }; [Console]::Out.Write($birth + '|' + $path) } finally { $p.Dispose() }"
   ].join("; ");
   return ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script];
+}
+
+function windowsIdentityFailure(error: unknown, started: number): undefined {
+  try { return identityFailure(error); } catch { /* Keep absence semantics; sanitize actual query failures. */ }
+  const failure = error as { code?: unknown; status?: unknown; signal?: unknown; killed?: unknown };
+  const knownCodes = ["ENOENT", "EACCES", "EPERM", "ETIMEDOUT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"];
+  const receipt = {
+    code: typeof failure.code === "string" && knownCodes.includes(failure.code) ? failure.code : "PROCESS_IDENTITY_QUERY_FAILED",
+    exitCode: typeof failure.code === "number" ? failure.code : typeof failure.status === "number" ? failure.status : null,
+    signal: typeof failure.signal === "string" && ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV"].includes(failure.signal) ? failure.signal : null,
+    killed: failure.killed === true,
+    elapsedMs: Math.max(0, Math.round(performance.now() - started))
+  };
+  throw Object.assign(new Error(`Windows process birth identity query failed (${JSON.stringify(receipt)}).`), { receipt });
 }
 
 function identityFailure(error: unknown): undefined {

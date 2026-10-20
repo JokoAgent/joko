@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { Code, ConnectError } from "@connectrpc/connect";
 
 import type { SessionView, TargetView } from "./model.js";
 import {
@@ -382,6 +383,22 @@ describe("sidebar task sorting", () => {
     expect(retry.begin("session\u0000cursor-51")).toBe(false);
     retry.activate(undefined);
     expect(retry.release("session\u0000cursor-51")).toBe(false);
+  });
+
+  it("waits for a fresh projection after a Connect RPC cursor conflict while retrying availability failures", () => {
+    const conflict = new ConnectError("The attention projection changed.", Code.Aborted);
+    expect(retrySessionAttentionAcknowledgement(conflict)).toBe(false);
+    const retry = new SessionAttentionAcknowledgementRetryTracker();
+    retry.activate("old-cursor");
+    expect(retry.begin("old-cursor")).toBe(true);
+    expect(retry.failed("old-cursor", conflict)).toBeUndefined();
+    expect(retry.release("old-cursor")).toBe(false);
+    expect(retry.begin("old-cursor")).toBe(false);
+    retry.activate("new-cursor");
+    expect(retry.begin("new-cursor")).toBe(true);
+    expect(retry.failed("new-cursor", new ConnectError("The service is unavailable.", Code.Unavailable))).toBe(250);
+    expect(retry.release("new-cursor")).toBe(true);
+    expect(retry.begin("new-cursor")).toBe(true);
   });
 
   it("shares the 500ms done visibility gate across priority and indicators", () => {

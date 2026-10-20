@@ -28,6 +28,64 @@ async function initializedRepository(prefix: string): Promise<string> {
 }
 
 describe("WorkspaceService Git Review backend", () => {
+  it("resolves and pushes the exact configured upstream when remote and branch names contain slashes", async () => {
+    const root = await initializedRepository("joko-review-push-upstream-");
+    await git(root, "branch", "-m", "feature/local");
+    await writeFile(join(root, "source.txt"), "base\n", "utf8");
+    await git(root, "add", "--", "source.txt");
+    await git(root, "commit", "--quiet", "-m", "base");
+    const upstream = await mkdtemp(join(tmpdir(), "joko-review-push-upstream-remote-"));
+    const origin = await mkdtemp(join(tmpdir(), "joko-review-push-origin-remote-"));
+    await git(upstream, "init", "--bare", "--quiet");
+    await git(origin, "init", "--bare", "--quiet");
+    await git(root, "remote", "add", "team/upstream", upstream);
+    await git(root, "remote", "add", "origin", origin);
+    await git(root, "push", "--quiet", "--set-upstream", "team/upstream", "HEAD:refs/heads/published/topic");
+    await git(root, "config", "branch.feature/local.pushRemote", "origin");
+    await git(root, "config", "remote.pushDefault", "origin");
+    await writeFile(join(root, "source.txt"), "next\n", "utf8");
+    await git(root, "commit", "--quiet", "-am", "next");
+    const service = new WorkspaceService();
+    await service.register({ id: "upstream", root, displayName: "Upstream", trusted: true });
+    const diff = await service.gitReviewDiff("upstream", { source: "unstaged" });
+    expect(diff.pushTarget).toEqual({ remote: "team/upstream", remoteRef: "refs/heads/published/topic", hasUpstream: true });
+    await expect(service.pushGitReview("upstream", {
+      ...diff.pushTarget!, expectedRepositoryRevision: diff.repositoryRevision, expectedHeadRevision: diff.headRevision!
+    })).resolves.toMatchObject({ kind: "pushed", remote: "team/upstream", remoteRef: "refs/heads/published/topic" });
+    expect(await git(upstream, "rev-parse", "refs/heads/published/topic")).toBe(await git(root, "rev-parse", "HEAD"));
+    expect(await git(origin, "show-ref").catch(() => "")).toBe("");
+    expect(await git(root, "config", "--get", "branch.feature/local.merge")).toBe("refs/heads/published/topic");
+  }, 30_000);
+
+  it.each(["branch", "default", "origin"] as const)("uses the %s first-push destination and establishes its upstream", async (choice) => {
+    const root = await initializedRepository("joko-review-first-push-");
+    await git(root, "branch", "-m", "feature/local");
+    await writeFile(join(root, "source.txt"), "base\n", "utf8");
+    await git(root, "add", "--", "source.txt");
+    await git(root, "commit", "--quiet", "-m", "base");
+    const destinations = new Map<string, string>();
+    for (const remote of ["origin", "publish/default", "publish/branch"]) {
+      const bare = await mkdtemp(join(tmpdir(), "joko-review-first-push-remote-"));
+      await git(bare, "init", "--bare", "--quiet");
+      await git(root, "remote", "add", remote, bare);
+      destinations.set(remote, bare);
+    }
+    if (choice !== "origin") await git(root, "config", "remote.pushDefault", "publish/default");
+    if (choice === "branch") await git(root, "config", "branch.feature/local.pushRemote", "publish/branch");
+    const remote = choice === "branch" ? "publish/branch" : choice === "default" ? "publish/default" : "origin";
+    const service = new WorkspaceService();
+    await service.register({ id: "first-push", root, displayName: "First push", trusted: true });
+    const diff = await service.gitReviewDiff("first-push", { source: "staged" });
+    expect(diff.pushTarget).toEqual({ remote, remoteRef: "refs/heads/feature/local", hasUpstream: false });
+    await service.pushGitReview("first-push", {
+      ...diff.pushTarget!, expectedRepositoryRevision: diff.repositoryRevision, expectedHeadRevision: diff.headRevision!
+    });
+    expect(await git(root, "config", "--get", "branch.feature/local.remote")).toBe(remote);
+    expect(await git(root, "config", "--get", "branch.feature/local.merge")).toBe("refs/heads/feature/local");
+    expect(await git(destinations.get(remote)!, "rev-parse", "refs/heads/feature/local")).toBe(diff.headRevision);
+    expect((await service.gitReviewDiff("first-push", { source: "unstaged" })).pushTarget?.hasUpstream).toBe(true);
+  }, 30_000);
+
   it("recognizes every porcelain unmerged XY form without classifying ordinary changes", () => {
     for (const status of ["U", "UU", "AA", "DD", "AU", "UA", "DU", "UD"]) {
       expect(isUnmergedGitStatus(status)).toBe(true);

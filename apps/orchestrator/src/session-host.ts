@@ -12055,6 +12055,8 @@ export class SessionHost {
         sessionId,
         (this.#compactionEventEpochs.get(sessionId) ?? 0) + 1
       );
+      const active = this.#active.get(sessionId);
+      if (active !== undefined) this.markNativeStateObservationStale(sessionId, active, generation);
     }
     const wasBlocked = this.compactionBlocksDispatch(sessionId);
     if (compacting) {
@@ -12980,6 +12982,12 @@ export class SessionHost {
             await active.adapter.send(dispatchBody, context);
           }
           if (this.#disposed) return;
+          if (this.finishCancelledDispatch(item.id, attemptId)) {
+            this.#pendingDispatchAcceptances.delete(run.descriptor.id);
+            this.#workspaceCapture?.abortRun?.({ sessionId, runId: run.descriptor.id });
+            await this.restoreTurnOverrideLease(run.descriptor.id);
+            continue;
+          }
           this.#store.transaction((store) => {
             store.updateQueueState({
               queueItemId: item.id,
@@ -13045,6 +13053,7 @@ export class SessionHost {
           if (this.#disposed) return;
           await this.restoreTurnOverrideLease(run.descriptor.id);
           if (this.#disposed) return;
+          if (this.finishCancelledDispatch(item.id, attemptId)) continue;
           if (this.#store.findPendingScheduleDeletionCleanupForSession(sessionId) !== undefined) {
             this.#store.transaction((store) => {
               const queueItem = store.getQueueItem(item.id);
@@ -13152,6 +13161,18 @@ export class SessionHost {
       settle();
       this.#onBackendMayBeIdle?.(initialBackendId);
     }
+  }
+
+  private finishCancelledDispatch(queueItemId: string, attemptId: string | undefined): boolean {
+    return this.#store.transaction((store) => {
+      if (store.getQueueItem(queueItemId).state !== "cancelled") return false;
+      // The cancellation owner has already terminalized the Queue and Run.
+      // A late dispatch receipt may finish its Attempt, but cannot replace that outcome.
+      if (attemptId !== undefined && store.getAttempt(attemptId).descriptor.endedAt === undefined) {
+        store.finishAttempt(attemptId);
+      }
+      return true;
+    });
   }
 
   private targetForSession(stored: StoredSession): TargetDescriptor {
@@ -13335,7 +13356,16 @@ export class SessionHost {
           }
         }
         const durablePayload = this.withAcceptedInputMetadata(payload, sessionId, runId);
-        const durableMetadata = bindNativeHistoryEventMetadata(durablePayload, binding?.opaqueRef, metadata);
+        // An automatic compaction lifecycle belongs to the native binding even
+        // before its newly persisted entry ID is available. Keep that known
+        // lifecycle through a managed-process generation change as well.
+        const durableMetadata = bindNativeHistoryEventMetadata(
+          durablePayload.type === "compaction" && durablePayload.automatic === true
+            ? { ...durablePayload, nativeHistory: durablePayload.nativeHistory ?? {} }
+            : durablePayload,
+          binding?.opaqueRef,
+          metadata
+        );
         // Close the event-delivery race synchronously: once a live compaction
         // start reaches Orchestrator, no queue claim can interleave before its
         // durable event append. Terminal states release only after that append has
@@ -14332,11 +14362,20 @@ export class SessionHost {
         ) {
           throw new Error("The native state response belongs to a different binding.");
         }
+        const window = this.#compactionQueueWindows.get(sessionId);
+        const eventChanged = (this.#compactionEventEpochs.get(sessionId) ?? 0) !== compactionEventEpoch;
+        const eventStillCompacting = window?.generation === generation && window.eventStarted
+          && this.#nativeCompactions.get(sessionId) === generation;
+        // RPC state and lifecycle events travel independently. An idle response
+        // cannot override a newer event or a start whose terminal event is pending.
+        const committedObservation = eventChanged || (!state.compacting && eventStillCompacting)
+          ? staleNativeStateObservation(observation, observation.observedAt)
+          : observation;
         store.setSetting(
           "session",
           sessionId,
           SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY,
-          observation,
+          committedObservation,
           observation.observedAt
         );
         return state;
@@ -14682,6 +14721,7 @@ export class SessionHost {
     const acceptedUserMetadata = new Map<string, AcceptedUserMetadata>();
     const privateMessageMetadata = new Map<string, PartnerPrivateMessageOrigin>();
     const acceptedQueueInputs = new Map<string, QueueItemRecord>();
+    const observedAutomaticCompactions = new Set<string>();
     const nativeIdentityAdapter = adapter as BackendAdapter & {
       readonly nativeUserEntryIdForOperation?: (operationId: string) => string;
     };
@@ -14701,6 +14741,11 @@ export class SessionHost {
     }
     visitVisibleSessionEvents(store, session.id, (event) => {
       const privateEntryId = nativeHistoryEventContext(event.payload)?.identity?.entryId;
+      if (event.payload.type === "compaction" && event.payload.automatic === true
+        && event.payload.state === "completed" && privateEntryId !== undefined
+        && event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint) {
+        observedAutomaticCompactions.add(privateEntryId);
+      }
       if (event.payload.type === "message_complete" && event.payload.partnerPrivateOrigin !== undefined
         && privateEntryId !== undefined && event.metadata?.fields[NATIVE_HISTORY_BINDING_FINGERPRINT_FIELD] === bindingFingerprint) {
         privateMessageMetadata.set(privateEntryId, event.payload.partnerPrivateOrigin);
@@ -14751,6 +14796,11 @@ export class SessionHost {
     const projections = projectNativeHistory(session.id, session.binding.opaqueRef, history);
     for (const projection of projections) {
       const projectionEntryId = nativeHistoryEventContext(projection.payload)?.identity?.entryId;
+      // A live automatic lifecycle has a more precise reason and stable
+      // compaction ID than the persisted native summary. Only an exact entry
+      // identity permits omitting its otherwise duplicate hydration card.
+      if (projection.payload.type === "compaction" && projectionEntryId !== undefined
+        && observedAutomaticCompactions.has(projectionEntryId)) continue;
       const acceptedQueueItem = projection.payload.type === "message_complete"
         && projection.payload.role === "user"
         && projectionEntryId !== undefined

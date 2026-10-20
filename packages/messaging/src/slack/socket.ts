@@ -86,6 +86,12 @@ export class SlackSocketClient {
         else resolve();
       });
     });
+    if (this.#stopped) throw cancelled();
+    signal?.throwIfAborted();
+    if (this.#terminalError !== null) throw this.#terminalError;
+    if (this.#socket !== pending.socket || pending.socket.readyState !== WebSocket.OPEN || this.#pending[0] !== pending) {
+      throw network("Slack Socket closed before ACK completion.");
+    }
     this.#pending.shift();
     this.#cursor = `slack:${envelopeId}`;
     this.#lastAcknowledgedEnvelopeId = envelopeId;
@@ -139,18 +145,11 @@ export class SlackSocketClient {
         }
       });
       socket.once("error", () => {
-        if (this.#socket === socket) this.#socket = null;
-        this.#notify();
+        this.#retireSocket(socket);
         finish(network("Slack Socket connection failed."));
       });
       socket.once("close", () => {
-        if (this.#socket === socket) this.#socket = null;
-        // A closed Socket cannot receive an ACK. Let Slack redeliver these
-        // envelopes on a fresh connection instead of trapping the head forever.
-        for (let index = this.#pending.length - 1; index >= 0; index -= 1) {
-          if (this.#pending[index]?.socket === socket) this.#pending.splice(index, 1);
-        }
-        this.#notify();
+        this.#retireSocket(socket);
         finish(network("Slack Socket disconnected."));
       });
     });
@@ -168,8 +167,8 @@ export class SlackSocketClient {
       if (packet.reason === "link_disabled") this.#terminalError = new MessagingTransportError(
         "invalid_credential", "Slack Socket Mode was disabled.", { retryable: false, effect: "none" }
       );
+      this.#retireSocket(socket);
       socket.close(1000, "Slack requested a new connection");
-      this.#notify();
       return;
     }
     const envelopeId = packet.envelope_id;
@@ -202,6 +201,16 @@ export class SlackSocketClient {
       this.#waiters.add(onChange);
       signal?.addEventListener("abort", onAbort, { once: true });
     });
+  }
+
+  #retireSocket(socket: WebSocket): void {
+    if (this.#socket === socket) this.#socket = null;
+    // Retiring starts at the disconnect frame, before the asynchronous close
+    // event. Its envelopes can no longer be ACKed and must be redelivered.
+    for (let index = this.#pending.length - 1; index >= 0; index -= 1) {
+      if (this.#pending[index]?.socket === socket) this.#pending.splice(index, 1);
+    }
+    this.#notify();
   }
 
   #notify(): void { for (const waiter of [...this.#waiters]) waiter(); }

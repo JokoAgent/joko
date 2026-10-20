@@ -55,6 +55,7 @@ import type {
   SubagentTranscriptEntryView,
   SubagentTranscriptPageView,
   Theme,
+  VoiceInputDictionarySnapshotView,
   WorkspaceEntryDeleteDraft,
   WorkspaceEntryMoveDraft,
   WorkspaceEntryMutationDraft,
@@ -133,6 +134,31 @@ export function VisualHarness(): JSX.Element {
   const draftRevisions = useRef(new Map<string, number>());
   const newSessionDraft = useRef<NewSessionLocalDraft | undefined>(undefined);
   const pendingExtensionUse = useRef<PendingExtensionUseView | undefined>(undefined);
+  const voiceDictionaryActions = useMemo(() => {
+    let dictionary: VoiceInputDictionarySnapshotView = { revision: 1n, syncEnabled: false, entries: [], candidates: [],
+      suppressedAutomaticTerms: [], refinementTerms: [] };
+    return {
+      getVoiceInputDictionary: async (signal?: AbortSignal) => { signal?.throwIfAborted(); return dictionary; },
+      watchVoiceInputDictionary: async function* (signal: AbortSignal) {
+        signal.throwIfAborted(); yield dictionary;
+        await new Promise<void>(resolve => {
+          if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+      addVoiceInputDictionaryTerms: async (revision: bigint, terms: readonly string[], signal?: AbortSignal) => {
+        signal?.throwIfAborted();
+        if (revision !== dictionary.revision) throw new Error("The visual dictionary revision changed.");
+        const entries = [...dictionary.entries];
+        for (const text of terms.map(term => term.trim()).filter(Boolean)) {
+          if (!entries.some(entry => entry.text.toLocaleLowerCase() === text.toLocaleLowerCase())) entries.push({
+            id: `visual-term-${entries.length + 1}`, text, source: "manual", frequency: 1, aliases: [], createdAt: FIXED_NOW, updatedAt: FIXED_NOW
+          });
+        }
+        dictionary = { ...dictionary, revision: dictionary.revision + 1n, entries, refinementTerms: entries.map(entry => entry.text) };
+        return dictionary;
+      }
+    } satisfies Pick<AppController, "getVoiceInputDictionary" | "watchVoiceInputDictionary" | "addVoiceInputDictionaryTerms">;
+  }, []);
   const pendingExtensionSuggestion = useRef<PendingExtensionSuggestionView | undefined>(undefined);
   const recentExtensionSuggestions = useRef<readonly string[]>([]);
   const draftActions = useMemo(() => ({
@@ -448,6 +474,7 @@ export function VisualHarness(): JSX.Element {
       },
       ...mcpActions,
       ...draftActions,
+      ...voiceDictionaryActions,
       ...(scenario.scenario === "maintenance" ? {
         getTaskHistoryMaintenanceSupport: historyMaintenance.getTaskHistoryMaintenanceSupport,
         scanTaskHistory: historyMaintenance.scanTaskHistory,
@@ -2319,13 +2346,16 @@ export function VisualHarness(): JSX.Element {
       },
       hasPendingDeviceNameUpdate: () => false
     } satisfies Partial<AppController>;
+    const fallbackMethods = new Map<PropertyKey, () => Promise<undefined>>();
     return new Proxy(implemented, {
       get(target, property, receiver) {
         if (Reflect.has(target, property)) return Reflect.get(target, property, receiver);
-        return async (): Promise<undefined> => undefined;
+        let method = fallbackMethods.get(property);
+        if (method === undefined) { method = async (): Promise<undefined> => undefined; fallbackMethods.set(property, method); }
+        return method;
       }
     }) as unknown as AppController;
-  }, [artifactActions, artifactStorage, draftActions, historyMaintenance, interactionFixture, mcpActions, partnerGroups, remoteHosts, send, state, toolPolicy, usageHistory]);
+  }, [artifactActions, artifactStorage, draftActions, voiceDictionaryActions, historyMaintenance, interactionFixture, mcpActions, partnerGroups, remoteHosts, send, state, toolPolicy, usageHistory]);
 
   if (scenario.scenario === "usage") return <main style={{ maxWidth: 1040, margin: "0 auto" }}>
     <UsageHistorySection controller={controller} t={(key, values) => translate(state.effectiveLocale, key, values)} />

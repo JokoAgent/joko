@@ -3,7 +3,7 @@ import type { ComponentProps, CSSProperties, JSX, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { sessionHandoffMessages as handoffMessages } from "@joko/contracts";
 import { assertBrowserActionCurrent, type BrowserActionContext, type HttpLinkOpenOptions } from "../browser-action.js";
-import { defaultRangeExtractor, useVirtualizer } from "@tanstack/react-virtual";
+import { defaultRangeExtractor, elementScroll, useVirtualizer } from "@tanstack/react-virtual";
 import {
   AlertCircle,
   ArrowRight,
@@ -391,6 +391,12 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     count: renderItems.length,
     getScrollElement: () => scrollRef.current,
     estimateSize: (index) => estimateRenderHeight(renderItems[index]),
+    scrollToFn: (offset, options, instance) => {
+      elementScroll(offset, options, instance);
+      // Measurement corrections are our own movement, including when their
+      // native scroll notification arrives after the programmatic window.
+      if (instance.scrollElement !== null) previousScrollTopRef.current = instance.scrollElement.scrollTop;
+    },
     overscan: 8,
     getItemKey: (index) => renderItems[index]?.key ?? index,
     rangeExtractor: extractTimelineRange
@@ -752,11 +758,18 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     if (node === null || view === null || view === undefined) return;
     const document = node.ownerDocument;
     const owner = navigationOwnerRef.current;
+    const content = contentRef.current;
+    const originalMinHeight = content?.style.minHeight ?? "";
+    let contentFloor: string | undefined;
     let active = true;
     const suppressScrollbarAdjustment = (): boolean => false;
     const releaseScrollbarAdjustment = (): void => {
       if (virtualizer.shouldAdjustScrollPositionOnItemSizeChange === suppressScrollbarAdjustment) {
         virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+      }
+      if (content !== null && contentFloor !== undefined && content.style.minHeight === contentFloor) {
+        content.style.minHeight = originalMinHeight;
+        contentFloor = undefined;
       }
     };
     const isCurrent = (): boolean => active && navigationOwnerRef.current === owner && scrollRef.current === node;
@@ -781,6 +794,13 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
       setFocusedItemId(undefined);
       previousScrollTopRef.current = node.scrollTop;
       scrollbarDragRef.current = { owner, node, startScrollTop: node.scrollTop, previousScrollTop: node.scrollTop };
+      // A transiently smaller virtual extent would let the browser clamp its
+      // native scroll position before the incoming tail grows. Keep that floor
+      // while the user owns the thumb, without writing a scroll offset.
+      if (content !== null) {
+        contentFloor = `${node.scrollHeight}px`;
+        content.style.minHeight = contentFloor;
+      }
       virtualizer.shouldAdjustScrollPositionOnItemSizeChange = suppressScrollbarAdjustment;
     };
     const onMouseMove = (event: MouseEvent): void => {
@@ -1101,7 +1121,17 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
         }}
         onKeyDown={(event) => {
           if (event.defaultPrevented || !TIMELINE_HISTORY_NAVIGATION_KEYS.has(event.key) || isEditableTimelineKeyboardTarget(event.target)) return;
+          cancelTimelineNavigation();
+          setFocusedItemId(undefined);
+          restoreAnchorRef.current = undefined;
           stopFollowingForUpIntent(event.currentTarget);
+          if (event.key === "Home" && event.target === event.currentTarget
+              && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey) {
+            // Virtual-row corrections can interrupt native animated Home
+            // before it reaches the history boundary.
+            event.preventDefault();
+            writeScrollTop(0);
+          }
           if (historyError === undefined && shouldLoadEarlierTimeline({ scrollTop: event.currentTarget.scrollTop, hasEarlier, loading: historyLoading })) requestEarlier();
         }}
         onTouchStart={(event) => { touchYRef.current = navigationDocumentActiveRef.current && event.touches.length === 1 ? event.touches[0]?.clientY : undefined; }}

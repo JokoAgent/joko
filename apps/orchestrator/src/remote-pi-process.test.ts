@@ -526,9 +526,11 @@ describe("RemotePiProcessFactory", () => {
     expect(JSON.stringify(managedStoreOperations)).not.toContain("bridge-token-a");
   });
 
-  it("fails closed when process, file, or forwarding capabilities are absent", async () => {
+  it("rejects missing transport capabilities without initializing unused authority storage", async () => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-capabilities-"));
     temporaryDirectories.push(fixture);
+    const authorityRoot = join(fixture, "authority");
+    await writeFile(authorityRoot, "unused authority storage", { mode: 0o600 });
     const registry = {
       transports: async () => ({
         host: {},
@@ -543,8 +545,9 @@ describe("RemotePiProcessFactory", () => {
         }
       })
     } as unknown as RemoteHostRegistry;
-    const factory = remoteFactory(registry, join(fixture, "authority"));
+    const factory = remoteFactory(registry, authorityRoot);
     await expect(factory.validate(TEST_REMOTE_WORKSPACE)).rejects.toThrow("file transport is unavailable");
+    expect(await readFile(authorityRoot, "utf8")).toBe("unused authority storage");
   });
 
   it("stages immutable snapshots when local launch assets and a resumed session mutate during transfer", async () => {

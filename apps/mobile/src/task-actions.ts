@@ -12,7 +12,8 @@ import {
   type QueueTextEditSplice
 } from "@joko/contracts";
 import type { TimelineRow } from "./timeline";
-import { mobileVisibleSelectionQuoteText } from "./mobile-composer-document";
+import { insertMobileMessageReference, mobileVisibleSelectionQuoteText,
+  type MobileComposerDraft, type MobileComposerEditResult, type MobileComposerSelection } from "./mobile-composer-document";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 
@@ -26,17 +27,63 @@ export interface MobileMessageActionItem {
   readonly separatorBefore?: boolean;
 }
 
+export function buildMobileMessageCopyText(row: TimelineRow, locale: MobileSupportedLocale): string {
+  const source = row.copySource ?? { body: row.sourceText ?? row.text, attachmentNames: [] };
+  const parts = [source.body, source.secondaryBody ?? ""];
+  const names = source.attachmentNames.filter(Boolean);
+  if (names.length) parts.push(mobileMessage(locale, "actions.messageAttachments", { names: names.join(", ") }));
+  return parts.filter(part => part.trim().length > 0).join("\n\n");
+}
+
+export interface MobileMessageReferenceLease {
+  readonly ownerKey: string;
+  readonly draftOwnerKey: string;
+  readonly sessionId: string;
+  readonly messageId: string;
+  readonly eventId: string;
+  readonly text: string;
+  readonly draft: MobileComposerDraft;
+  readonly selection: MobileComposerSelection;
+}
+
+export function captureMobileMessageReference(input: { readonly ownerKey: string; readonly draftOwnerKey: string;
+  readonly sessionId: string; readonly row: TimelineRow; readonly draft: MobileComposerDraft;
+  readonly selection: MobileComposerSelection; readonly locale: MobileSupportedLocale }): MobileMessageReferenceLease | undefined {
+  const row = input.row;
+  if (!input.ownerKey || !input.draftOwnerKey || !input.sessionId || !row.completed || row.optimistic || row.internalInput
+    || row.kind === "user" && row.partnerPrivateOrigin || row.kind !== "user" && row.kind !== "assistant") return undefined;
+  return { ownerKey: input.ownerKey, draftOwnerKey: input.draftOwnerKey, sessionId: input.sessionId,
+    messageId: row.id, eventId: row.eventId, text: buildMobileMessageCopyText(row, input.locale), draft: input.draft,
+    selection: { ...input.selection } };
+}
+
+export function commitMobileMessageReference(input: { readonly lease: MobileMessageReferenceLease;
+  readonly ownerKey: string | undefined; readonly draftOwnerKey: string | undefined; readonly sessionId: string | undefined;
+  readonly row: TimelineRow; readonly draft: MobileComposerDraft; readonly locale: MobileSupportedLocale;
+  readonly atomId: string }): MobileComposerEditResult {
+  const { lease, row } = input;
+  if (lease.ownerKey !== input.ownerKey || lease.draftOwnerKey !== input.draftOwnerKey || lease.sessionId !== input.sessionId
+    || lease.draft !== input.draft || !row.completed || row.optimistic || row.internalInput || row.partnerPrivateOrigin
+    || row.id !== lease.messageId || row.eventId !== lease.eventId || row.kind !== "user" && row.kind !== "assistant"
+    || buildMobileMessageCopyText(row, input.locale) !== lease.text) {
+    throw new Error("The source message or composer changed. Open the message actions again.");
+  }
+  return insertMobileMessageReference(input.draft, lease.selection,
+    { sessionId: lease.sessionId, messageId: lease.messageId, eventId: lease.eventId, text: lease.text }, input.atomId);
+}
+
 export function buildMobileMessageActions(
   row: TimelineRow,
-  input: { readonly canDelete: boolean; readonly canFork?: boolean; readonly canRewind?: boolean; readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly shareDisabled?: boolean }
+  input: { readonly canDelete: boolean; readonly canFork?: boolean; readonly canRewind?: boolean; readonly canAddToComposer?: boolean;
+    readonly locale: MobileSupportedLocale; readonly copyDisabled?: boolean; readonly shareDisabled?: boolean }
 ): readonly MobileMessageActionItem[] {
   if (!row.completed || row.optimistic || row.internalInput || row.kind === "user" && row.partnerPrivateOrigin
     || (row.kind !== "user" && row.kind !== "assistant")) return [];
   const actions: MobileMessageActionItem[] = [];
-  if ((row.sourceText ?? row.text).trim()) actions.push({ id: "copy-text",
+  if (buildMobileMessageCopyText(row, input.locale).trim()) actions.push({ id: "copy-text",
     label: mobileMessage(input.locale, input.copyDisabled ? "actions.copyingMessage" : "actions.copyMessage"),
     ...(input.copyDisabled ? { disabled: true } : {}) });
-  if (row.text.trim()) actions.push({ id: "add-to-composer", label: mobileMessage(input.locale, "actions.addToComposer") });
+  if (input.canAddToComposer !== false) actions.push({ id: "add-to-composer", label: mobileMessage(input.locale, "actions.addToComposer") });
   if (row.quoteSource !== undefined) actions.push({ id: "quote-selection", label: mobileMessage(input.locale, "actions.quoteSelection") });
   actions.push({
     id: "copy-link",

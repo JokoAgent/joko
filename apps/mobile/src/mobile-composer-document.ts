@@ -779,6 +779,22 @@ export function updateMobileRouteReferenceAtom(
   }));
 }
 
+/** Insert an exact current-task message link with its bounded visible summary. */
+export function insertMobileMessageReference(
+  draft: MobileComposerDraft,
+  selection: MobileComposerSelection,
+  source: { readonly sessionId: string; readonly messageId: string; readonly eventId: string; readonly text: string },
+  atomId: string
+): MobileComposerEditResult {
+  const href = `#/tasks/${encodeURIComponent(source.sessionId)}?message=${encodeURIComponent(source.messageId)}&event=${encodeURIComponent(source.eventId)}`;
+  const result = insertMobileRouteReferencePaste(draft, selection, [{ kind: "route-reference", routeKind: "session",
+    href, label: null, sessionId: source.sessionId, messageId: source.messageId, eventId: source.eventId }], () => atomId);
+  const atom = result.draft.atoms.find(candidate => candidate.atomId === atomId);
+  if (atom?.kind !== "route-reference") throw new Error("The current message reference could not be inserted.");
+  const label = sanitizeMobileComposerReferenceLabel(source.text.slice(0, mobileComposerMessageReferenceTextMaximumCharacters));
+  return updateMobileRouteReferenceAtom(result.draft, atom, label) ?? result;
+}
+
 export function insertMobilePastedText(
   draft: MobileComposerDraft,
   selection: MobileComposerSelection,

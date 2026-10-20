@@ -55,13 +55,16 @@ export function MobileSharedConnectionScreen(props: MobileSharedConnectionScreen
   };
 
   useEffect(() => {
+    // A replacement ref is attached before the retired effect is cleaned up.
+    // Close this occurrence's document, never whichever renderer is current.
+    const renderer = webView.current;
     activeSurface.current = surface;
     ready.current = false;
     lastRequestId.current = 0;
     return () => {
       if (activeSurface.current === surface) activeSurface.current = "";
       ready.current = false;
-      webView.current?.injectJavaScript("window.jokoConnection?.close();true;");
+      renderer?.injectJavaScript("window.jokoConnection?.close();true;");
     };
   }, [surface]);
 

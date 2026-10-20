@@ -109,7 +109,8 @@ describe("Connect Git Review contracts", () => {
       headRevision: "b".repeat(40),
       mergeBaseRevision: "a".repeat(40),
       source: "commit" as const,
-      sourceRevision: "b".repeat(40)
+      sourceRevision: "b".repeat(40),
+      pushTarget: { remote: "team/upstream", remoteRef: "refs/heads/published/topic", hasUpstream: true }
     }));
     const services = createConnectServices(application({ workspaces: { gitReviewDiff } }));
     const response = await services.workspace.getWorkspaceDiff(create(contract.GetWorkspaceDiffRequestSchema, {
@@ -120,7 +121,8 @@ describe("Connect Git Review contracts", () => {
     expect(response.diff).toMatchObject({
       source: contract.GitDiffSource.COMMIT,
       sourceRevision: "b".repeat(40),
-      repositoryRevision: "repo-fence"
+      repositoryRevision: "repo-fence",
+      pushTarget: { remote: "team/upstream", remoteRef: "refs/heads/published/topic", hasUpstream: true }
     });
     expect(response.diff?.files?.[0]?.source).toBe(contract.GitDiffSource.COMMIT);
     expect(response.diff?.files?.[0]?.relativePath).toBe("space name.txt");

@@ -242,7 +242,7 @@ export class DesktopRemoteDesktopViewerWindows {
         if (window.isMaximized()) { window.once("unmaximize", () => { setImmediate(resize); }); window.unmaximize(); }
         else resize();
       };
-      if (window.isFullScreen()) { window.once("leave-full-screen", () => { setImmediate(restore); }); window.setFullScreen(false); }
+      if (window.isFullScreen()) { window.once("leave-full-screen", () => { setImmediate(restore); }); entry.presentation.fullscreen(false); }
       else restore();
     });
     ipcMain.handle(c.close, async (event, generation: unknown) => {

@@ -38,7 +38,7 @@ describe("mounted WeChat Messaging Settings", () => {
     const challengeId = required(challenge.challenge?.challengeId, "pairing challenge");
     const pairingCode = fixture.pairingCode(challengeId);
     browser = await chromium.launch({ executablePath, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     const browserErrors = observeBrowserErrors(page);
     await page.route("https://weixin.qq.com/x/qr-system", (route) => route.fulfill({
       status: 200,
@@ -55,7 +55,7 @@ describe("mounted WeChat Messaging Settings", () => {
     const settings = page.locator(".messaging-settings");
     await settings.getByRole("heading", { name: "Messaging", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
     browserErrors.splice(0);
-    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(7);
+    expect(await settings.locator(".messaging-channel.is-available").count()).toBe(8);
     await settings.getByRole("button", { name: "Add WeChat", exact: true }).first().click();
     const authorization = page.getByRole("dialog", { name: "Authorize with WeChat" });
     await authorization.getByRole("img", { name: "WeChat authorization QR code" }).waitFor({ state: "visible" });

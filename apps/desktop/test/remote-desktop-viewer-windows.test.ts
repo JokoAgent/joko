@@ -104,6 +104,11 @@ function fixture(syncClipboard?: DesktopViewerSyncClipboard, credentialNative?: 
 
 function targetWindows(): any[] { return state.windows.filter(window => window.title !== "Remote Desktop"); }
 
+function electronClipboardPort(): DesktopViewerSyncClipboard {
+  const unused = vi.fn(async (): Promise<never> => { throw new Error("This transfer uses the Main-owned Electron clipboard."); });
+  return { platform: "win32", available: true, version: unused, read: unused, write: unused, stop: vi.fn() };
+}
+
 describe("Desktop viewer native windows", () => {
   it("fences native menu bypass to the current trusted viewer focus and retires it with its owner", async () => {
     const f = fixture(); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
@@ -660,6 +665,73 @@ describe("Desktop viewer native windows", () => {
     expect(() => f.invoke(C.resize, event, generation, 1.5, 500)).toThrow("Invalid");
   });
 
+  it("keeps a visible Mac native fullscreen transition in its authorized generation until actual-size restoration", async () => {
+    const f = fixture(undefined, undefined, "darwin"); f.invoke(C.bind, f.event, "document", OWNER);
+    await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+    const window = targetWindows()[0], event = f.viewerEvent(), generation = f.invoke(C.state, event).generation;
+    await f.invoke(C.ready, event, generation);
+    const connection = state.connections[0];
+    f.invoke(C.fullscreen, event);
+    // Native macOS space transitions can notify hide while isVisible stays true.
+    window.emit("hide");
+    expect(window.isVisible()).toBe(true);
+    expect(f.invoke(C.state, event)).toMatchObject({ active: true, generation });
+    expect(connection.retire).not.toHaveBeenCalled();
+    window.emit("enter-full-screen"); window.emit("show");
+    f.invoke(C.resize, event, generation, 32000, 32000);
+    window.emit("hide");
+    expect(f.invoke(C.state, event)).toMatchObject({ active: true, generation });
+    window.emit("leave-full-screen"); window.emit("show");
+    await new Promise<void>(resolve => { setImmediate(resolve); });
+    expect(window.setBounds).toHaveBeenCalledOnce();
+    expect(window.bounds).toEqual({ x: 0, y: 0, width: 1440, height: 900 });
+    expect(state.connections[0]).toBe(connection); expect(connection.retire).not.toHaveBeenCalled();
+    window.hide(); window.show();
+    expect(connection.retire).toHaveBeenCalledOnce();
+    expect(f.invoke(C.state, event).generation).toBeGreaterThan(generation);
+    expect(() => f.invoke(C.resize, event, generation, 1000, 700)).toThrow("retired");
+  });
+
+  it.each(["hide", "minimize", "close-reopen", "reload"] as const)(
+    "still retires a pending Mac fullscreen resize on %s", async interruption => {
+      const f = fixture(undefined, undefined, "darwin"); f.invoke(C.bind, f.event, "document", OWNER);
+      await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+      const window = targetWindows()[0], event = f.viewerEvent(), generation = f.invoke(C.state, event).generation;
+      await f.invoke(C.ready, event, generation);
+      const connection = state.connections[0];
+      f.invoke(C.fullscreen, event); window.emit("enter-full-screen");
+      f.invoke(C.resize, event, generation, 32000, 32000);
+      expect(window.setBounds).not.toHaveBeenCalled();
+      if (interruption === "hide") { window.hide(); window.show(); }
+      else if (interruption === "minimize") { window.minimize(); window.restore(); }
+      else if (interruption === "close-reopen") {
+        await f.invoke(C.close, event, generation);
+        await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+      } else window.webContents.emit("did-start-navigation", {}, window.webContents.mainFrame.url, false, true);
+      window.emit("leave-full-screen");
+      await new Promise<void>(resolve => { setImmediate(resolve); });
+      expect(connection.retire).toHaveBeenCalledOnce();
+      expect(f.invoke(C.state, event).generation).toBeGreaterThan(generation);
+      expect(window.setBounds).not.toHaveBeenCalled();
+      expect(() => f.invoke(C.ready, event, generation)).toThrow("retired");
+      expect(() => f.invoke(C.resize, event, generation, 1000, 700)).toThrow("retired");
+    });
+
+  it.each(["darwin", "win32"] as const)(
+    "does not retain a visible hide outside an owned Mac fullscreen transition on %s", async platform => {
+      const f = fixture(undefined, undefined, platform); f.invoke(C.bind, f.event, "document", OWNER);
+      await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+      const window = targetWindows()[0], event = f.viewerEvent(), generation = f.invoke(C.state, event).generation;
+      await f.invoke(C.ready, event, generation);
+      const connection = state.connections[0];
+      if (platform === "win32") f.invoke(C.fullscreen, event);
+      else { f.invoke(C.fullscreen, event); window.emit("enter-full-screen"); }
+      window.emit("hide");
+      expect(window.isVisible()).toBe(true);
+      expect(connection.retire).toHaveBeenCalledOnce();
+      expect(f.invoke(C.state, event)).toMatchObject({ active: false, generation: generation + 1 });
+    });
+
   it("waits for fullscreen and maximized exit and prevents delayed resize after the viewer retires", async () => {
     const f = fixture(); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
     const window = targetWindows()[0], event = f.viewerEvent(), generation = f.invoke(C.state, event).generation;
@@ -678,7 +750,7 @@ describe("Desktop viewer native windows", () => {
   });
 
   it("copies a portable item directly to the native clipboard and prevents renderer access to the raw transfer", async () => {
-    const f = fixture(); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+    const f = fixture(electronClipboardPort()); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
     const event = f.viewerEvent(), generation = f.invoke(C.state, event).generation;
     await f.invoke(C.ready, event, generation);
     const connection = state.connections.at(-1);
@@ -757,7 +829,7 @@ describe("Desktop viewer native windows", () => {
   });
 
   it("never commits a paste or allows another transfer after the original focus occurrence retires", async () => {
-    const f = fixture(); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
+    const f = fixture(electronClipboardPort()); f.invoke(C.bind, f.event, "document", OWNER); await f.invoke(C.open, f.event, "document", OWNER, TARGET);
     const window = targetWindows()[0], event = f.viewerEvent(), generation = f.invoke(C.state, event).generation;
     await f.invoke(C.ready, event, generation);
     const connection = state.connections.at(-1);

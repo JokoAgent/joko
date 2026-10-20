@@ -48,7 +48,7 @@ describe("mounted Slack Messaging Settings", () => {
     const challengeId = required(challenge.challenge?.challengeId, "pairing challenge");
     const pairingCode = fixture.pairingCode(challengeId);
     browser = await chromium.launch({ executablePath, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
     const browserErrors = observeBrowserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/settings/messaging`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();

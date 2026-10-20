@@ -11614,6 +11614,26 @@ export class MobileClient {
     return role;
   }
 
+  async suggestTaskTitle(sourceKey: string, signal: AbortSignal): Promise<import("@joko/contracts").SuggestSessionTitleResponse> {
+    if (this.#joinedTask || !sourceKey || this.taskHeaderSourceKey() !== sourceKey) {
+      throw new Error("A current owned task is required to suggest its title.");
+    }
+    const credential = this.#ready(), epoch = this.#epoch, sessionId = this.#state.selectedId!;
+    const combined = AbortSignal.any([this.#abort!.signal, signal]);
+    const assertCurrent = (): void => {
+      combined.throwIfAborted();
+      if (!this.#current(epoch) || this.#credential !== credential || this.taskHeaderSourceKey() !== sourceKey) {
+        throw new Error("The title suggestion belongs to a retired task owner.");
+      }
+    };
+    const role = await this.readTaskHeaderRole(sourceKey, combined);
+    assertCurrent();
+    if (role === "worker") throw new Error("Worker titles are managed through their collaboration.");
+    const response = await this.network.suggestSessionTitle(credential, sessionId, combined);
+    assertCurrent();
+    return response;
+  }
+
   taskDelegatedControls(): import("./mobile-delegated-reader").MobileDelegatedControls | undefined {
     const authorityKey = this.#taskAuthorityKey();
     const sessionId = this.#state.selectedId;

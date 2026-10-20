@@ -33,10 +33,13 @@ vi.mock("react-native-webview", () => ({ WebView: forwardRef((props: NonNullable
 vi.mock("react-native", () => {
   const box = ({ children }: { children?: ReactNode }) => createElement("div", {}, children);
   return { View: box,
-    FlatList: forwardRef((props: { data: readonly string[]; renderItem(value: { item: string; index: number }): ReactNode;
+    FlatList: forwardRef((props: { data: readonly string[]; initialNumToRender?: number; renderItem(value: { item: string; index: number }): ReactNode;
       onScrollToIndexFailed(info: { averageItemLength: number; index: number }): void }, ref) => {
       native.list = props; useImperativeHandle(ref, () => ({ scrollToIndex: native.scrollToIndex, scrollToOffset: native.scrollToOffset }));
-      return createElement("div", {}, props.data.map((item, index) => createElement("div", { key: index }, props.renderItem({ item, index }))));
+      // Keep the complete source in data while respecting the native list's
+      // initial render window instead of mounting thousands of DOM-only rows.
+      return createElement("div", {}, props.data.slice(0, props.initialNumToRender ?? props.data.length)
+        .map((item, index) => createElement("div", { key: index }, props.renderItem({ item, index }))));
     }),
     Text: ({ children, onTextLayout, selectable, accessibilityRole }: { children?: ReactNode; selectable?: boolean; accessibilityRole?: string;
       onTextLayout?: typeof native.layout }) => {
@@ -128,7 +131,7 @@ describe("native file reading", () => {
     expect(native.scrollToIndex).not.toHaveBeenCalled(); await act(async () => { root.unmount(); });
   });
 
-  it("opens Markdown rendered, switches the same source without rereading, adopts images without reload and fences retired navigation", async () => {
+  it.each([false, true])("opens Markdown with the application theme, switches source without rereading and fences retired navigation, dark=%s", async (dark) => {
     const container = document.createElement("div"); const root = createRoot(container); let finish!: (value: MobileMarkdownResourceDescriptor) => void;
     const descriptor = { leaseId: "file-resource", references: new Map([['["image","pixel.png"]', {
       key: '["image","pixel.png"]', kind: "image" as const, label: "Pixel", relativePath: "docs/pixel.png", image: { uri: "data:image/png;base64,AAAA", width: 1, height: 1 }
@@ -139,7 +142,10 @@ describe("native file reading", () => {
       assertMarkdownResourcesCurrent: vi.fn(), releaseMarkdownResources: vi.fn(), subscribe: () => () => undefined
     };
     const preview = { ...base, sourceLabel: "docs/README.md", fileName: "README.md", text: "# Heading\n\n**bold** ![Pixel](pixel.png)\n\n[web](https://example.invalid)\n", totalLines: 7 };
-    const props = { preview, colors, locale: "en" as const, client };
+    const theme = { ...colors, background: dark ? "#15191d" : "#f7f6f3", surface: dark ? "#24292d" : "#ffffff",
+      ink: dark ? "#f4f4f2" : "#242a2d", muted: dark ? "#adb6b7" : "#637073", border: dark ? "#394246" : "#e1e2df",
+      brandBackground: dark ? "#302920" : "#fff1db", dark };
+    const props = { preview, colors: theme, locale: "en" as const, client };
     await act(async () => { root.render(createElement(MobileFileTextPreview, props)); });
     expect(container.querySelector('[aria-label="Rendered"]')?.getAttribute("aria-pressed")).toBe("true");
     expect(native.web!.source.html).toContain("<h1>Heading</h1>"); const html = native.web!.source.html;

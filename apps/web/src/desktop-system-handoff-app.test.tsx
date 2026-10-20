@@ -2,7 +2,7 @@
 
 import { act, createElement } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AppWithController, reserveMessageDeepLinkHistoryPage } from "./App.js";
 import { useAppController, type AppController, type ControllerState } from "./controller.js";
@@ -18,11 +18,23 @@ import {
 } from "./model.js";
 
 Reflect.set(globalThis, "IS_REACT_ACT_ENVIRONMENT", true);
+const originalScrollTo = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTo");
+const renderedApps = new Set<() => Promise<void>>();
+beforeEach(() => {
+  Object.defineProperty(HTMLElement.prototype, "scrollTo", { configurable: true, value: vi.fn() });
+  // This App boundary owns handoff and message traversal; provide a normal
+  // occupied viewport so jsdom's zero dimensions do not request extra history.
+  vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(600);
+  vi.spyOn(Element.prototype, "scrollHeight", "get").mockReturnValue(1_200);
+});
 
-afterEach(() => {
+afterEach(async () => {
+  for (const dispose of [...renderedApps]) await dispose();
   Reflect.deleteProperty(window, "jokoDesktop");
   window.location.hash = "";
   vi.restoreAllMocks();
+  if (originalScrollTo) Object.defineProperty(HTMLElement.prototype, "scrollTo", originalScrollTo);
+  else Reflect.deleteProperty(HTMLElement.prototype, "scrollTo");
 });
 
 describe("Desktop system handoff App boundary", () => {
@@ -754,6 +766,7 @@ function renderApp(
       state,
       navigate: vi.fn(),
       refreshMachines: vi.fn(async () => undefined),
+      partnerGroupApi: () => undefined,
       probeRuntimeActivity: vi.fn(async () => ({ state: "idle" as const })),
       setMachineSelection: vi.fn(async () => undefined),
       setNavigationOpen: vi.fn(async () => undefined),
@@ -761,14 +774,17 @@ function renderApp(
       resetLayoutPreferences: vi.fn(async () => undefined),
       refreshProviderModels: vi.fn(async () => undefined),
       loadSessionTimelinePage: vi.fn(async () => ({ items: [] })),
+      getPortableReplacementCleanup: vi.fn(async () => undefined),
       ...methods
     } as unknown as AppController;
     await act(async () => { root.render(createElement(AppWithController, { controller })); });
   };
   const dispose = async (): Promise<void> => {
+    renderedApps.delete(dispose);
     await act(async () => { root.unmount(); });
     container.remove();
   };
+  renderedApps.add(dispose);
   return { container, render, dispose };
 }
 

@@ -154,7 +154,7 @@ function scheduleScriptExecutionConfiguration(value: unknown): ScheduleScriptExe
 function schedulePreRunHookConfiguration(value: unknown): SchedulePreRunHookConfiguration {
   if (!isRecord(value)) throw new Error("Stored Schedule pre-run hook is invalid.");
   const command = boundedString(value["command"], 32_768);
-  const filePath = boundedString(value["filePath"], 4_096);
+  const filePath = value["filePath"] === "" ? "" : boundedString(value["filePath"], 4_096);
   const timeoutMs = value["timeoutMs"];
   if (
     command === undefined || filePath === undefined ||

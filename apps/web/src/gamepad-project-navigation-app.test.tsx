@@ -262,6 +262,7 @@ function controller(route: AppRoute, connectionState: ControllerState["connectio
     get state() { return state; },
     navigate,
     openHttpLink,
+    partnerGroupApi: () => undefined,
     refreshDiscoveredNodes: vi.fn(async () => undefined),
     disconnect: vi.fn(async () => undefined),
     retryManagedOrchestrator: vi.fn(async () => undefined),

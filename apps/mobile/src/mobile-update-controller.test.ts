@@ -27,6 +27,31 @@ const fullConfiguration: MobileUpdateConfiguration = {
 };
 
 describe("MobileUpdateController", () => {
+  it("skips full-package feeds on store-managed installs while retaining OTA checks", async () => {
+    const harness = createHarness({
+      configuration: fullConfiguration,
+      runtimePatch: { bundleUpdatesSupported: false }
+    });
+    await harness.controller.start(true);
+    await harness.controller.manualCheck();
+    expect(harness.runtime.fetchRelease).not.toHaveBeenCalled();
+    expect(harness.runtime.checkOta).toHaveBeenCalled();
+  });
+
+  it("hands the selected release identity to installation and retries an explicit failed open", async () => {
+    const target = releaseRecord();
+    const harness = createHarness({ configuration: fullConfiguration,
+      runtimePatch: { fetchRelease: vi.fn(async () => target) } });
+    await harness.controller.start(true);
+    await harness.controller.manualCheck();
+    harness.runtime.openRelease.mockRejectedValueOnce(new Error("installer unavailable"));
+    await expect(harness.controller.openUpdate(target)).rejects.toThrow("installer unavailable");
+    expect(harness.controller.snapshot).toMatchObject({ prompt: target, actionError: "install" });
+    await harness.controller.openUpdate(target);
+    expect(harness.runtime.openRelease).toHaveBeenNthCalledWith(2, target);
+    expect(harness.controller.snapshot.actionError).toBeUndefined();
+  });
+
   it("makes an unconfigured build explicitly unavailable without touching the network", async () => {
     const harness = createHarness({ configuration: disabledConfiguration });
     await harness.controller.start(true);
@@ -367,18 +392,19 @@ type MockRuntime = MobileUpdateRuntime & {
   fetchOta: ReturnType<typeof vi.fn<MobileUpdateRuntime["fetchOta"]>>;
   reload: ReturnType<typeof vi.fn<MobileUpdateRuntime["reload"]>>;
   fetchRelease: ReturnType<typeof vi.fn<MobileUpdateRuntime["fetchRelease"]>>;
-  openUrl: ReturnType<typeof vi.fn<MobileUpdateRuntime["openUrl"]>>;
+  openRelease: ReturnType<typeof vi.fn<MobileUpdateRuntime["openRelease"]>>;
 };
 
 function runtimeStub(patch: Partial<MockRuntime> = {}): MockRuntime {
   return {
     info: runtimeInfo(),
+    bundleUpdatesSupported: true,
     configureChannel: vi.fn(() => undefined),
     checkOta: vi.fn(async () => ({ isAvailable: false })),
     fetchOta: vi.fn(async () => ({ isNew: false })),
     reload: vi.fn(async () => undefined),
     fetchRelease: vi.fn(async () => null),
-    openUrl: vi.fn(async () => undefined),
+    openRelease: vi.fn(async () => undefined),
     ...patch
   } as MockRuntime;
 }

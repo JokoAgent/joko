@@ -7,8 +7,10 @@ describe("Review derived sources", () => {
     const sets: WorkspaceChangeSetView[] = [changeSet("older", "turn-1", 10, "old.ts"), changeSet("new-a", "turn-2", 20, "src/a.ts"), changeSet("new-b", "turn-2", 21, "src/b.ts")];
     const paths = latestTurnPaths(sets);
     expect([...paths]).toEqual(["src/a.ts", "src/b.ts"]);
-    const result = combineLastTurnDiff(diff("unstaged", ["src/a.ts", "ignore.ts"]), diff("staged", ["src/b.ts"]), paths);
+    const pushTarget = { remote: "team/upstream", remoteRef: "refs/heads/published/topic", hasUpstream: true };
+    const result = combineLastTurnDiff({ ...diff("unstaged", ["src/a.ts", "ignore.ts"]), pushTarget }, diff("staged", ["src/b.ts"]), paths);
     expect(result.source).toBe("lastTurn");
+    expect(result.pushTarget).toEqual(pushTarget);
     expect(result.files.map((file) => [file.source, file.path])).toEqual([["unstaged", "src/a.ts"], ["staged", "src/b.ts"]]);
   });
 

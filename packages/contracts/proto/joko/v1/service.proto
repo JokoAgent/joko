@@ -175,6 +175,9 @@ service SchedulerService {
   rpc GetSchedule(GetScheduleRequest) returns (GetScheduleResponse);
   rpc ListScheduleRunHistory(ListScheduleRunHistoryRequest) returns (ListScheduleRunHistoryResponse);
   rpc GetSchedulerRuntime(GetSchedulerRuntimeRequest) returns (GetSchedulerRuntimeResponse);
+  rpc PrepareScheduleHook(PrepareScheduleHookRequest) returns (PrepareScheduleHookResponse);
+  rpc TestScheduleHook(TestScheduleHookRequest) returns (TestScheduleHookResponse);
+  rpc GetScheduleHookOperation(GetScheduleHookOperationRequest) returns (GetScheduleHookOperationResponse);
 }
 
 service InteractionService {
@@ -1574,6 +1577,52 @@ message GetSchedulerRuntimeRequest {}
 
 message GetSchedulerRuntimeResponse {
   SchedulerRuntimeSnapshot runtime = 1;
+}
+
+message ScheduleHookContext {
+  string target_id = 1;
+  string backend_id = 2;
+  string schedule_id = 3;
+  string session_id = 4;
+  string schedule_name = 5;
+  ModelKey model = 6;
+}
+
+message PrepareScheduleHookRequest {
+  ScheduleHookContext context = 1;
+  SchedulePreRunHook current_hook = 2;
+  oneof source {
+    string script = 3;
+    string description = 4;
+    string workspace_file = 5;
+    bool read_current = 6;
+  }
+  string operation_id = 7;
+}
+
+message PrepareScheduleHookResponse {
+  SchedulePreRunHook hook = 1;
+  string content = 2;
+  SchedulePreRunResult test = 3;
+}
+
+message TestScheduleHookRequest {
+  ScheduleHookContext context = 1;
+  SchedulePreRunHook hook = 2;
+  string operation_id = 3;
+}
+
+message TestScheduleHookResponse {
+  SchedulePreRunResult result = 1;
+}
+
+message GetScheduleHookOperationRequest { string operation_id = 1; }
+message GetScheduleHookOperationResponse {
+  Operation operation = 1;
+  oneof result {
+    PrepareScheduleHookResponse preparation = 2;
+    TestScheduleHookResponse test = 3;
+  }
 }
 
 message ListInteractionsRequest {

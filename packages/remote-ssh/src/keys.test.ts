@@ -1,10 +1,13 @@
 import { execFile } from "node:child_process";
+import { createPrivateKey, createPublicKey } from "node:crypto";
 import { chmod, link, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, stat, symlink, writeFile, type FileHandle } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
+import { Script } from "node:vm";
 import ssh2 from "ssh2";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFailed, vi } from "vitest";
 import { SshKeyError, SshKeyManager, sshKeyInstallCommand, type SshAgentCommand } from "./keys.js";
 import { encodeAgentPrivateKey } from "./agent-private-key.js";
 import { createPrivateFile } from "./create-private-file.js";
@@ -13,24 +16,125 @@ import * as keyPermissions from "./key-permissions.js";
 const roots: string[] = [];
 const managers: SshKeyManager[] = [];
 const signal = (): AbortSignal => new AbortController().signal;
+const nativeHelperObservations = vi.hoisted(() => ({ values: [] as Array<{
+  helper: "permissions" | "create";
+  events: Array<{ phase: string; elapsed: number; success?: boolean }>;
+}> }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:child_process")>();
+  return { ...original, spawn: ((...parameters: Parameters<typeof original.spawn>) => {
+    const args = parameters[1];
+    const command = Array.isArray(args) ? args.at(-1) : undefined;
+    const helper = typeof command === "string" && command.includes("public static class JokoKeyPermissions") ? "permissions"
+      : typeof command === "string" && command.includes("public static class JokoKeyFile") ? "create" : undefined;
+    const phases = ["script-entry", "type-compiled", "native-open-start", "native-open-done", "identity-checked", "admission-ready"];
+    const markerPrefix = "joko-ssh-stage:";
+    if (process.platform === "win32" && helper !== undefined && typeof command === "string") {
+      const mark = (phase: string): string => `[Console]::Error.WriteLine('${markerPrefix}${phase}'); `;
+      let observedCommand = `${mark("script-entry")}\n${command}`;
+      if (helper === "permissions") {
+        observedCommand = observedCommand
+          .replace("$root = $null", `${mark("type-compiled")}$root = $null`)
+          .replace("$root = [JokoKeyPermissions]::Open", `${mark("native-open-start")}$root = [JokoKeyPermissions]::Open`)
+          .replace("$rootInfo = [JokoKeyPermissions]::Identity", `${mark("native-open-done")}$rootInfo = [JokoKeyPermissions]::Identity`)
+          .replace("$rootAcl = [JokoKeyPermissions]::Descriptor", `${mark("identity-checked")}$rootAcl = [JokoKeyPermissions]::Descriptor`)
+          .replace("if ($env:JOKO_SSH_FILE)", `${mark("admission-ready")}if ($env:JOKO_SSH_FILE)`);
+      } else {
+        observedCommand = observedCommand
+          .replace("$identity = [System.Security.Principal.WindowsIdentity]", `${mark("type-compiled")}$identity = [System.Security.Principal.WindowsIdentity]`)
+          .replace("$file = [System.IO.FileStream]::new", `${mark("native-open-start")}$file = [System.IO.FileStream]::new`)
+          .replace("$created = $true", `$created = $true; ${mark("native-open-done")}`)
+          .replace("$fileId =", `${mark("identity-checked")}$fileId =`)
+          .replace("[Console]::Out.WriteLine(('created:", `${mark("admission-ready")}[Console]::Out.WriteLine(('created:`);
+      }
+      const options = parameters[2];
+      parameters = [parameters[0], [...args!.slice(0, -1), observedCommand], {
+        ...options,
+        // The creation helper normally discards stderr. In this test only,
+        // drain it to recognize our fixed markers; all other bytes are ignored.
+        ...(Array.isArray(options?.stdio) ? { stdio: [options.stdio[0], options.stdio[1], "pipe"] } : {})
+      }];
+    }
+    const child = original.spawn(...parameters);
+    if (process.platform === "win32" && helper !== undefined) {
+      const started = Date.now();
+      const observation: typeof nativeHelperObservations.values[number] = { helper, events: [{ phase: "spawn", elapsed: 0 }] };
+      nativeHelperObservations.values.push(observation);
+      const record = (phase: string, success?: boolean): void => {
+        observation.events.push({ phase, elapsed: Date.now() - started, ...(success === undefined ? {} : { success }) });
+      };
+      let buffered = "";
+      child.once("spawn", () => record("started", true));
+      child.stdout?.once("data", () => record("first-output", true));
+      child.stdout?.on("data", (bytes: Buffer) => {
+        // Only fixed protocol phases leave the observer: no command, path,
+        // environment, native identity, stderr content or private bytes.
+        buffered += bytes.toString("ascii");
+        let newline: number;
+        while ((newline = buffered.indexOf("\n")) >= 0) {
+          const line = buffered.slice(0, newline).replace(/\r$/u, "");
+          buffered = buffered.slice(newline + 1);
+          if (/^verified:[0-9:]+$/u.test(line)) record("admitted", true);
+          else if (/^created:[0-9:]+$/u.test(line)) record("created", true);
+          else if (line === "stable") record("final-verified", true);
+          else if (["unsafe", "changed", "unverified", "exists"].includes(line)) record("rejected", false);
+          else record("unexpected-protocol", false);
+        }
+        if (buffered.length > 160) { record("unexpected-protocol", false); buffered = ""; }
+      });
+      child.stdin?.once("finish", () => record("input-closed"));
+      const markers = phases.map(phase => `${markerPrefix}${phase}\n`);
+      let partialMarker = "";
+      child.stderr?.on("data", (bytes: Buffer) => {
+        for (const character of bytes.toString("ascii")) {
+          if (character === "\r") continue;
+          const candidate = partialMarker + character;
+          if (markers.includes(candidate)) {
+            record(candidate.slice(markerPrefix.length, -1), true);
+            partialMarker = "";
+          } else if (markers.some(marker => marker.startsWith(candidate))) partialMarker = candidate;
+          else partialMarker = character === markerPrefix[0] ? character : "";
+        }
+      });
+      child.once("error", () => record("process-error", false));
+      child.once("close", code => record("closed", code === 0));
+    }
+    return child;
+  }) as typeof original.spawn };
+});
+beforeEach(() => {
+  nativeHelperObservations.values = [];
+  onTestFailed(() => {
+    if (nativeHelperObservations.values.length > 0) console.info("SSH key native helper phases:", JSON.stringify(nativeHelperObservations.values));
+  });
+});
 afterEach(async () => {
   managers.splice(0).forEach(manager => manager.close());
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
+async function windowsFixtureScript(script: string, variables: Record<string, string>): Promise<{ stdout: string; stderr: string }> {
+  const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
+  if (systemRoot === undefined || !isAbsolute(systemRoot)) throw new Error("Windows fixture system root is unavailable.");
+  const prelude = "$ErrorActionPreference = 'Stop'\nImport-Module ([System.IO.Path]::Combine($PSHOME, 'Modules', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop\n";
+  return promisify(execFile)(join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", prelude + script], {
+      windowsHide: true, encoding: "utf8", env: { ...process.env, ...variables }
+    });
+}
 async function fixture(agentCommand: SshAgentCommand = async () => ({ code: 2, stdout: "" }), prepareDirectory = true, platform?: NodeJS.Platform) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-ssh-keys-")));
   roots.push(root);
   const directory = join(root, "identity");
   if (process.platform === "win32") {
-    await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl = New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true, $false); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))); [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl)"], { windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: root } });
+    await windowsFixtureScript("$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; $acl = New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetOwner($sid); $acl.SetAccessRuleProtection($true, $false); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))); [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl)", { JOKO_ACL_FIXTURE: root });
     if (prepareDirectory) await mkdir(directory);
   }
   const manager = new SshKeyManager({ directory, agentCommand, ...(platform === undefined ? {} : { platform }) }); managers.push(manager);
   return { manager, root, directory };
 }
 async function allowEveryone(path: string, rights: "Read" | "CreateFiles", directory: boolean): Promise<void> {
-  await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$acl = if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::GetAccessControl($env:JOKO_ACL_FIXTURE) } else { [System.IO.File]::GetAccessControl($env:JOKO_ACL_FIXTURE) }; $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0'); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $env:JOKO_ACL_RIGHTS, 'None', 'None', 'Allow'))); if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) } else { [System.IO.File]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) }"], {
-    windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: path, JOKO_ACL_RIGHTS: rights, JOKO_ACL_DIRECTORY: directory ? "1" : "0" }
+  await windowsFixtureScript("$acl = if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::GetAccessControl($env:JOKO_ACL_FIXTURE) } else { [System.IO.File]::GetAccessControl($env:JOKO_ACL_FIXTURE) }; $sid = New-Object System.Security.Principal.SecurityIdentifier('S-1-1-0'); $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $env:JOKO_ACL_RIGHTS, 'None', 'None', 'Allow'))); if ($env:JOKO_ACL_DIRECTORY -eq '1') { [System.IO.Directory]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) } else { [System.IO.File]::SetAccessControl($env:JOKO_ACL_FIXTURE, $acl) }", {
+    JOKO_ACL_FIXTURE: path, JOKO_ACL_RIGHTS: rights, JOKO_ACL_DIRECTORY: directory ? "1" : "0"
   });
 }
 async function toggleDirectoryArchive(path: string): Promise<void> {
@@ -40,28 +144,80 @@ async function toggleDirectoryArchive(path: string): Promise<void> {
 }
 
 describe("node SSH keys", () => {
+  it("preserves a leading zero in generated Ed25519 public keys and their signing identity", async () => {
+    const requireDependency = createRequire(import.meta.url);
+    const keygenPath = requireDependency.resolve("ssh2/lib/keygen.js");
+    const requireKeygen = createRequire(keygenPath);
+    const crypto = requireKeygen("crypto") as typeof import("node:crypto");
+    // This fixed test seed has a 32-byte public key beginning with zero. The
+    // DER BIT STRING's unused-bit byte and this key byte must remain distinct.
+    const seed = Buffer.alloc(32);
+    seed.writeUInt32BE(36, 28);
+    const privateKey = createPrivateKey({ key: Buffer.concat([
+      Buffer.from("302e020100300506032b657004220420", "hex"), seed
+    ]), format: "der", type: "pkcs8" });
+    const publicDer = createPublicKey(privateKey).export({ format: "der", type: "spki" });
+    const privateDer = privateKey.export({ format: "der", type: "pkcs8" });
+    expect(publicDer.subarray(-32).length).toBe(32);
+    expect(publicDer[publicDer.length - 32]).toBe(0);
+    const generatorModule = { exports: {} as Pick<typeof ssh2.utils, "generateKeyPairSync"> };
+    const load = new Script(`(function(require, module, exports) {\n${await readFile(keygenPath, "utf8")}\n})`,
+      { filename: keygenPath }).runInThisContext() as (require: (name: string) => unknown, module: typeof generatorModule,
+        exports: typeof generatorModule.exports) => void;
+    load(name => name === "crypto" ? { ...crypto, generateKeyPairSync: (type: string) => {
+      expect(type).toBe("ed25519");
+      return { publicKey: Buffer.from(publicDer), privateKey: Buffer.from(privateDer) };
+    } } : requireKeygen(name), generatorModule, generatorModule.exports);
+    for (const passphrase of [undefined, "fixture passphrase"]) {
+      const pair = generatorModule.exports.generateKeyPairSync("ed25519", { comment: "Leading zero fixture",
+        ...(passphrase === undefined ? {} : { passphrase, cipher: "aes256-ctr", rounds: 16 }) });
+      const parsedPublic = ssh2.utils.parseKey(pair.public);
+      const parsedPrivate = ssh2.utils.parseKey(pair.private, passphrase);
+      expect(parsedPublic).not.toBeInstanceOf(Error);
+      expect(parsedPrivate).not.toBeInstanceOf(Error);
+      if (parsedPublic instanceof Error || parsedPrivate instanceof Error) throw new Error("Generated key fixture was invalid.");
+      expect(parsedPublic.getPublicSSH().equals(parsedPrivate.getPublicSSH())).toBe(true);
+      expect(parsedPublic.getPublicSSH().subarray(-32).equals(publicDer.subarray(-32))).toBe(true);
+      const challenge = Buffer.from("leading-zero identity proof");
+      const signature = parsedPrivate.sign(challenge);
+      if (signature instanceof Error) throw signature;
+      expect(parsedPublic.verify(challenge, signature)).toBe(true);
+    }
+  });
+
+  // Hosted Windows may spend most of the original budget starting the cold
+  // PowerShell fixture. Keep native helper deadlines and permission checks.
   it("creates an owner-only file exclusively without changing a colliding identity", async () => {
-    const { root } = await fixture();
+    const startedAt = performance.now();
+    const stages: Array<{ phase: string; elapsed: number }> = [];
+    const observe = async <T>(phase: string, action: () => Promise<T>): Promise<T> => {
+      stages.push({ phase: `${phase}-start`, elapsed: Math.round(performance.now() - startedAt) });
+      const value = await action();
+      stages.push({ phase: `${phase}-done`, elapsed: Math.round(performance.now() - startedAt) });
+      return value;
+    };
+    onTestFailed(() => console.info("SSH exclusive file fixture phases:", JSON.stringify(stages)));
+    const { root } = await observe("fixture", () => fixture());
     const original = join(root, "private"); const foreign = join(root, "foreign");
     await writeFile(foreign, "untouched identity", { mode: 0o640 });
-    const held = await createPrivateFile(original, signal());
+    const held = await observe("create-original", () => createPrivateFile(original, signal()));
     try {
       if (process.platform === "win32") {
-        const acl = async (path: string): Promise<string> => (await promisify(execFile)("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "$acl = [System.IO.File]::GetAccessControl($env:JOKO_ACL_FIXTURE); $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; ConvertTo-Json -Compress @{ protected = $acl.AreAccessRulesProtected; owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; current = $sid.Value; rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{ sid = $_.IdentityReference.Value; inherited = $_.IsInherited; type = [string]$_.AccessControlType; rights = [string]$_.FileSystemRights } }) }"], {
-          windowsHide: true, env: { ...process.env, JOKO_ACL_FIXTURE: path }
+        const acl = async (path: string): Promise<string> => (await windowsFixtureScript("$acl = [System.IO.File]::GetAccessControl($env:JOKO_ACL_FIXTURE); $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User; ConvertTo-Json -Compress @{ protected = $acl.AreAccessRulesProtected; owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; current = $sid.Value; rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { @{ sid = $_.IdentityReference.Value; inherited = $_.IsInherited; type = [string]$_.AccessControlType; rights = [string]$_.FileSystemRights } }) }", {
+          JOKO_ACL_FIXTURE: path
         })).stdout;
-        const created = JSON.parse(await acl(original));
+        const created = JSON.parse(await observe("acl-original", () => acl(original)));
         expect(created).toEqual({ protected: true, owner: created.current, current: created.current, rules: [{ sid: created.current, inherited: false, type: "Allow", rights: "FullControl" }] });
-        const before = await acl(foreign);
-        await expect(createPrivateFile(foreign, signal())).rejects.toMatchObject({ code: "exists" });
-        expect(await acl(foreign)).toBe(before);
+        const before = await observe("acl-foreign-before", () => acl(foreign));
+        await expect(observe("create-foreign-collision", () => createPrivateFile(foreign, signal()))).rejects.toMatchObject({ code: "exists" });
+        expect(await observe("acl-foreign-after", () => acl(foreign))).toBe(before);
         const uncertain = join(root, "uncertain");
         const prototype = Object.getPrototypeOf(held) as FileHandle;
         const inspect = vi.spyOn(prototype, "stat").mockRejectedValueOnce(new Error("Fixture cannot inspect the reopened file"));
-        try { await expect(createPrivateFile(uncertain, signal())).rejects.toMatchObject({ code: "outcome_unknown" }); }
+        try { await expect(observe("create-uncertain", () => createPrivateFile(uncertain, signal()))).rejects.toMatchObject({ code: "outcome_unknown" }); }
         finally { inspect.mockRestore(); }
         expect(await readFile(uncertain, "utf8")).toBe("");
-        await expect(createPrivateFile(uncertain, signal())).rejects.toMatchObject({ code: "exists" });
+        await expect(observe("create-uncertain-collision", () => createPrivateFile(uncertain, signal()))).rejects.toMatchObject({ code: "exists" });
       } else {
         const before = (await stat(foreign)).mode;
         expect((await held.stat()).mode & 0o777).toBe(0o600);
@@ -74,7 +230,7 @@ describe("node SSH keys", () => {
       await expect(createPrivateFile(join(root, "canceled"), canceled.signal)).rejects.toMatchObject({ code: "aborted" });
       expect(await readdir(root)).not.toContain("canceled");
     } finally { await held.close(); }
-  });
+  }, process.platform === "win32" && process.env.GITHUB_ACTIONS === "true" ? 60_000 : 15_000);
 
   it("serializes supported identities to one native OpenSSH stdin shape preserving public key, comment and signing", () => {
     const pairs = [ssh2.utils.generateKeyPairSync("ed25519", { comment: "ED key" }),
@@ -138,7 +294,7 @@ describe("node SSH keys", () => {
     expect(catalog.keys.find(key => key.id === first.id)).toMatchObject({ inAgent: true, comment: "Work key", algorithm: "ssh-ed25519" });
     expect(JSON.stringify(catalog)).not.toContain("PRIVATE KEY");
     expect(JSON.stringify(catalog)).not.toContain(directory);
-  }, 20_000);
+  }, process.platform === "win32" ? 30_000 : 20_000);
 
   it("fences native keychain loading by exact agent identity, one-line secret input, file ownership and confirmed completion", async () => {
     const directoryPermissions = vi.spyOn(keyPermissions, "inspectKeyDirectoryPermissions").mockResolvedValue(undefined);
@@ -348,7 +504,9 @@ describe("node SSH keys", () => {
     });
     try {
       await expect(manager.generate({ name: "id_joko", comment: "", passphrase: "boundary fixture" }, signal()))
-        .rejects.toMatchObject({ code: "outcome_unknown" });
+        .rejects.toMatchObject({ code: "outcome_unknown", generation: {
+          phase: change === "replace" ? "written_private_identity" : "private_contents", failure: "key_changed"
+        } });
       expect(changed).toBe(true);
       expect(await readFile(path, "utf8")).toBe("replacement identity");
       expect(await readdir(directory)).toContain("id_joko.pub");
@@ -356,7 +514,9 @@ describe("node SSH keys", () => {
         expect((await stat(`${path}.retained`)).size).toBeGreaterThan(0);
       }
     } finally { interception.mockRestore(); }
-  });
+    // Windows runs two permission probes and an exclusive-create helper before
+    // reaching this mutation; each native helper retains its own 10s deadline.
+  }, process.platform === "win32" ? 30_000 : 5_000);
 
   it("distinguishes an empty agent from unavailable and rejected observations", async () => {
     for (const [code, stdout, state] of [[1, "The agent has no identities.\n", "ready"], [2, "", "unavailable"], [1, "untrusted process text", "failed"], [0, "malformed public key", "failed"]] as const) {
@@ -376,12 +536,15 @@ describe("node SSH keys", () => {
     const { manager } = await fixture(agent);
     const key = await manager.generate({ name: "id_joko", comment: "" }, signal());
     const add = manager.addToAgent(key.id, key.sha256Fingerprint, undefined, signal());
+    // Observe rejection immediately even if the surrounding test is retired
+    // before its controlled native agent reaches the admission boundary.
+    void add.catch(() => undefined);
     await ready;
     await expect(manager.generate({ name: "other", comment: "" }, signal())).rejects.toMatchObject({ code: "busy" });
     manager.close();
     await expect(add).rejects.toMatchObject({ code: "outcome_unknown" });
     await expect(manager.list(signal())).rejects.toMatchObject({ code: "aborted" });
-  });
+  }, 15_000);
 
   it("keeps quotes and substitutions in copied commands as inert public data", async () => {
     const publicKey = ssh2.utils.generateKeyPairSync("ed25519", { comment: "O'Brien $(Write-Output injected); & echo" }).public.trim();

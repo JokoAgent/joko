@@ -163,44 +163,94 @@ describe("PartnerService", () => {
   });
 
   it("serves an accepted sealed Task output over generated authenticated HTTP and preserves it across SQLite reopen", async () => {
-    const f = await createFixture(0, false, [], true);
-    const partner = await f.manager.createPartner(partnerInput(f.partnerStore, "Output requester"));
-    const tasks = new PartnerSessionTaskManager(f.operationalStore, f.manager, f.sessionHost,
-      { register: async input => input }, f.directory); await tasks.initialize(); cleanups.push(() => tasks.close());
-    const outputs = new PartnerTaskOutputProjection(f.operationalStore, tasks, f.partnerStore, f.workspaceCapture!);
-    const task = await tasks.start(partner.canonicalSessionId!, "output-http-task", { instruction: "Produce the report", title: "Report" }, () => undefined);
-    await vi.waitFor(async () => { await tasks.check(partner.canonicalSessionId!, task.id);
-      expect((await outputs.list(partner.id)).find(row => row.id === task.id)).toMatchObject({ readiness: "ready", files: [{ path: "task-report.txt", status: "added" }] }); });
-    const connections = new ConnectionManager(f.operationalStore), challenge = connections.issuePairing("Output reader");
-    const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Output reader" });
-    const server = await createPublicServer({ config: { publicOrigin: "http://127.0.0.1", allowInsecureLoopback: true, allowInsecureLan: false, corsOrigins: [],
-      webDirectory: join(f.directory, "no-web"), dataDirectory: f.directory }, store: f.operationalStore, connections, artifacts: {}, blobTransfers: {},
-      artifactRepository: {}, workspaces: {}, workspaceChanges: {}, scheduler: {}, adapters: [], browserActivity: [], sessionHost: f.sessionHost,
-      partners: f.manager, partnerSessionTasks: tasks, partnerTaskOutputs: outputs } as unknown as OrchestratorApplication); server.log.level = "silent";
+    const boundary = { phase: "create-fixture", observations: 0, taskState: "not-created", taskRunCount: 0,
+      outputCount: 0, outputReadiness: "unobserved", hasExpectedFile: false };
     try {
-      const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
-      const client = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1", interceptors: [next => request => {
-        request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request);
-      }] }));
-      const response = await client.listPartnerTaskOutputs({ partnerId: partner.id });
-      expect(response.partnerId).toBe(partner.id);
-      expect(response.outputs).toMatchObject([{ sourceId: task.id, sessionId: task.sessionId, execution: 1n,
-        readiness: contract.PartnerTaskOutputReadiness.READY, files: [{ path: "task-report.txt", status: contract.PartnerTaskOutputFileStatus.ADDED }] }]);
-      expect(JSON.stringify(response, (_, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Private report contents");
-      const unauthenticated = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1" }));
-      await expect(unauthenticated.listPartnerTaskOutputs({ partnerId: partner.id })).rejects.toMatchObject({ code: Code.Unauthenticated });
-    } finally { await server.close(); }
-    await tasks.close(); await f.close();
-    const reopened = new OperationalStore(join(f.directory, "operational.db")), reopenedPartners = new PartnerStore(join(f.directory, "partners.db"));
-    try {
-      const changes = new WorkspaceChangeSetService({ snapshotDirectory: join(f.directory, "snapshots"), repository: new OperationalWorkspaceSnapshotRepository(reopened) });
-      await changes.initialize();
-      const capture = new DurableWorkspaceRunCapture(reopened, changes);
-      const stored = reopened.findSetting("service", "partner.session-tasks", task.id)!.value as typeof task;
-      const restored = new PartnerTaskOutputProjection(reopened, { list: () => [stored] }, reopenedPartners, capture);
-      expect((await restored.list(partner.id))[0]).toMatchObject({ id: task.id, readiness: "ready", runIds: stored.executionRunIds,
-        files: [{ path: "task-report.txt", status: "added" }] });
-    } finally { reopenedPartners.close(); reopened.close(); }
+      const f = await createFixture(0, false, [], true);
+      boundary.phase = "create-partner";
+      const partner = await f.manager.createPartner(partnerInput(f.partnerStore, "Output requester"));
+      boundary.phase = "initialize-tasks";
+      const tasks = new PartnerSessionTaskManager(f.operationalStore, f.manager, f.sessionHost,
+        { register: async input => input }, f.directory); await tasks.initialize(); cleanups.push(() => tasks.close());
+      const outputs = new PartnerTaskOutputProjection(f.operationalStore, tasks, f.partnerStore, f.workspaceCapture!);
+      boundary.phase = "start-task";
+      const task = await tasks.start(partner.canonicalSessionId!, "output-http-task", { instruction: "Produce the report", title: "Report" }, () => undefined);
+      expect(task.sessionId).toBeDefined();
+      boundary.phase = "await-sealed-output";
+      // The committed capture follows the terminal Run; subscribe before checking
+      // persisted events so an already completed capture cannot race this wait.
+      await new Promise<void>(resolve => {
+        const unsubscribe = f.operationalStore.subscribe(event => {
+          if (event.sessionId === task.sessionId && event.payload.type === "workspace_diff") { unsubscribe(); resolve(); }
+        });
+        cleanups.push(unsubscribe);
+        if (f.operationalStore.listEvents({ sessionId: task.sessionId! }).some(event => event.payload.type === "workspace_diff")) {
+          unsubscribe(); resolve();
+        }
+      });
+      await tasks.check(partner.canonicalSessionId!, task.id);
+      const current = tasks.list(partner.id).find(row => row.id === task.id);
+      const rows = await outputs.list(partner.id), output = rows.find(row => row.id === task.id);
+      boundary.observations += 1;
+      boundary.taskState = current?.status ?? "missing";
+      boundary.taskRunCount = current?.executionRunIds.length ?? 0;
+      boundary.outputCount = rows.length;
+      boundary.outputReadiness = output?.readiness ?? "missing";
+      boundary.hasExpectedFile = output?.files.some(file => file.path === "task-report.txt" && file.status === "added") ?? false;
+      expect(output).toMatchObject({ readiness: "ready", files: [{ path: "task-report.txt", status: "added" }] });
+      boundary.phase = "pair-reader";
+      const connections = new ConnectionManager(f.operationalStore), challenge = connections.issuePairing("Output reader");
+      const paired = connections.completePairing({ challengeId: challenge.id, code: challenge.code, connectionName: "Output reader" });
+      boundary.phase = "create-http-server";
+      const server = await createPublicServer({ config: { publicOrigin: "http://127.0.0.1", allowInsecureLoopback: true, allowInsecureLan: false, corsOrigins: [],
+        webDirectory: join(f.directory, "no-web"), dataDirectory: f.directory }, store: f.operationalStore, connections, artifacts: {}, blobTransfers: {},
+        artifactRepository: {}, workspaces: {}, workspaceChanges: {}, scheduler: {}, adapters: [], browserActivity: [], sessionHost: f.sessionHost,
+        partners: f.manager, partnerSessionTasks: tasks, partnerTaskOutputs: outputs } as unknown as OrchestratorApplication); server.log.level = "silent";
+      try {
+        boundary.phase = "listen-http";
+        const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
+        const client = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1", interceptors: [next => request => {
+          request.header.set("authorization", `Bearer ${paired.authKey}`); return next(request);
+        }] }));
+        boundary.phase = "authenticated-http";
+        const response = await client.listPartnerTaskOutputs({ partnerId: partner.id });
+        boundary.phase = "assert-http-output";
+        expect(response.partnerId).toBe(partner.id);
+        expect(response.outputs).toMatchObject([{ sourceId: task.id, sessionId: task.sessionId, execution: 1n,
+          readiness: contract.PartnerTaskOutputReadiness.READY, files: [{ path: "task-report.txt", status: contract.PartnerTaskOutputFileStatus.ADDED }] }]);
+        expect(JSON.stringify(response, (_, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("Private report contents");
+        const unauthenticated = createClient(contract.PartnerService, createConnectTransport({ baseUrl, httpVersion: "1.1" }));
+        boundary.phase = "assert-unauthenticated-rejection";
+        await expect(unauthenticated.listPartnerTaskOutputs({ partnerId: partner.id })).rejects.toMatchObject({ code: Code.Unauthenticated });
+      } finally {
+        const precedingPhase = boundary.phase;
+        boundary.phase = "close-http";
+        await server.close();
+        boundary.phase = precedingPhase;
+      }
+      boundary.phase = "close-stores";
+      await tasks.close(); await f.close();
+      boundary.phase = "reopen-stores";
+      const reopened = new OperationalStore(join(f.directory, "operational.db")), reopenedPartners = new PartnerStore(join(f.directory, "partners.db"));
+      try {
+        const changes = new WorkspaceChangeSetService({ snapshotDirectory: join(f.directory, "snapshots"), repository: new OperationalWorkspaceSnapshotRepository(reopened) });
+        await changes.initialize();
+        const capture = new DurableWorkspaceRunCapture(reopened, changes);
+        const stored = reopened.findSetting("service", "partner.session-tasks", task.id)!.value as typeof task;
+        const restored = new PartnerTaskOutputProjection(reopened, { list: () => [stored] }, reopenedPartners, capture);
+        boundary.phase = "assert-reopened-output";
+        expect((await restored.list(partner.id))[0]).toMatchObject({ id: task.id, readiness: "ready", runIds: stored.executionRunIds,
+          files: [{ path: "task-report.txt", status: "added" }] });
+      } finally {
+        const precedingPhase = boundary.phase;
+        boundary.phase = "close-reopened-stores";
+        reopenedPartners.close(); reopened.close();
+        boundary.phase = precedingPhase;
+      }
+    } catch (error) {
+      console.error("[sealed-output-boundary]", JSON.stringify(boundary));
+      throw error;
+    }
   });
 
   it("reads and patches the caller's own profile and full mixed model chain with private authority", async () => {
@@ -788,32 +838,45 @@ describe("PartnerService", () => {
     const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));
     const service = createPartnerConnectService(fixture.manager, authenticate);
     const callContext = context();
+    const expectAuthentication = (...boundaries: string[]): void => {
+      expect(authenticate.mock.calls, boundaries.join(" → ")).toEqual(boundaries.map(() => [callContext]));
+      authenticate.mockClear();
+    };
     const request = create(contract.CreatePartnerRequestSchema, {
       requestId: "creation-request-rpc",
       expectedDirectoryRevision: revision(1n),
       draft: { displayName: "Aster", avatar: { value: { case: "presetId" as const, value: "orbit" } }, identitySource: "You help with ongoing work.", templateId: "general", capabilities: protoCapabilities() }
     });
     const created = await service.createPartner(request, callContext);
+    expectAuthentication("request", "after avatar validation, before create commit", "before response");
     const found = await service.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: request.requestId }), callContext);
+    expectAuthentication("request");
     expect(found.partner).toEqual(created.partner);
     expect((await service.createPartner(request, callContext)).partner).toEqual(created.partner);
+    expectAuthentication("request", "after avatar validation, before replay lookup", "before response");
     await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, draft: { ...request.draft!, displayName: "Changed intent" } }), callContext))
       .rejects.toMatchObject({ code: Code.Aborted });
+    expectAuthentication("request", "after avatar validation, before conflicting create");
     await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, requestId: "", expectedDirectoryRevision: create(contract.RevisionSchema, created.directory!.revision) }), callContext))
       .rejects.toMatchObject({ code: Code.InvalidArgument });
+    expectAuthentication("request", "after avatar validation, before invalid request ID");
     await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, draft: { ...request.draft!, usesDirectoryDefaults: true } }), callContext))
       .rejects.toMatchObject({ code: Code.InvalidArgument });
+    expectAuthentication("request, before invalid capability combination");
     const absent = "creation-request-absent-rpc";
     expect(() => service.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: absent }), callContext))
       .toThrow(expect.objectContaining({ code: Code.NotFound }));
+    expectAuthentication("request");
     const retired = await service.retirePartnerCreation(create(contract.RetirePartnerCreationRequestSchema, { requestId: absent }), callContext);
+    expectAuthentication("request");
     expect(retired.retired).toBe(true);
     expect(retired.partner).toBeUndefined();
     await expect(service.createPartner(create(contract.CreatePartnerRequestSchema, { ...request, requestId: absent, expectedDirectoryRevision: create(contract.RevisionSchema, created.directory!.revision) }), callContext))
       .rejects.toMatchObject({ code: Code.FailedPrecondition });
+    expectAuthentication("request", "after avatar validation, before retired intent lookup");
     expect(await service.retirePartnerCreation(create(contract.RetirePartnerCreationRequestSchema, { requestId: request.requestId }), callContext))
       .toMatchObject({ retired: false, partner: created.partner });
-    expect(authenticate).toHaveBeenCalledTimes(10);
+    expectAuthentication("request");
     const denied = createPartnerConnectService(fixture.manager, () => { throw new ConnectError("Denied", Code.Unauthenticated); });
     expect(() => denied.getPartnerCreation(create(contract.GetPartnerCreationRequestSchema, { requestId: request.requestId }), callContext))
       .toThrow(expect.objectContaining({ code: Code.Unauthenticated }));
@@ -827,10 +890,15 @@ describe("PartnerService", () => {
     const authenticate = vi.fn(() => ({ connectionId: "connection-1" }));
     const service = createPartnerConnectService(fixture.manager, authenticate);
     const callContext = context();
+    const expectAuthentication = (...boundaries: string[]): void => {
+      expect(authenticate.mock.calls, boundaries.join(" → ")).toEqual(boundaries.map(() => [callContext]));
+      authenticate.mockClear();
+    };
 
     const initial = await service.getPartnerDirectory(
       create(contract.GetPartnerDirectoryRequestSchema), callContext
     );
+    expectAuthentication("request");
     expect(initial.directory).toMatchObject({
       revision: { value: 1n },
       activeCount: 0,
@@ -844,6 +912,7 @@ describe("PartnerService", () => {
       expectedDirectoryRevision: initial.directory!.revision,
       capabilities: protoCapabilities()
     }), callContext);
+    expectAuthentication("request", "after updating defaults, before response");
     expect(defaults.directory).toMatchObject({ defaultCapabilities: protoCapabilities() });
 
     const created = await service.createPartner(create(contract.CreatePartnerRequestSchema, {
@@ -857,6 +926,7 @@ describe("PartnerService", () => {
         usesDirectoryDefaults: true
       })
     }), callContext);
+    expectAuthentication("request", "after avatar validation, before create commit", "before response");
     expect(created.partner).toMatchObject({
       displayName: "Aster",
       lifecycle: contract.PartnerLifecycle.ACTIVE,
@@ -875,6 +945,7 @@ describe("PartnerService", () => {
         usesDirectoryDefaults: false
       })
     }), callContext);
+    expectAuthentication("request", "after serialization, before profile commit", "before response");
     expect(updated.partner).toMatchObject({
       displayName: "Aster Prime",
       usesDirectoryDefaults: false,
@@ -885,24 +956,27 @@ describe("PartnerService", () => {
       expectedRevision: createdRevision,
       patch: create(contract.PartnerPatchSchema, { displayName: "Stale" })
     }), callContext)).rejects.toMatchObject({ code: Code.Aborted });
+    expectAuthentication("request, before stale profile revision rejection");
 
     const archived = await service.setPartnerLifecycle(create(contract.SetPartnerLifecycleRequestSchema, {
       partnerId: updated.partner!.partnerId,
       expectedRevision: updated.partner!.revision,
       lifecycle: contract.PartnerLifecycle.ARCHIVED
     }), callContext);
+    expectAuthentication("request", "after lifecycle update, before response");
     expect(archived.partner?.lifecycle).toBe(contract.PartnerLifecycle.ARCHIVED);
     const listed = await service.listPartners(create(contract.ListPartnersRequestSchema, {
       lifecycle: contract.PartnerLifecycle.ARCHIVED
     }), callContext);
+    expectAuthentication("request");
     expect(listed.partners?.map((partner) => partner.partnerId) ?? []).toEqual([created.partner!.partnerId]);
     const restored = await service.setPartnerLifecycle(create(contract.SetPartnerLifecycleRequestSchema, {
       partnerId: archived.partner!.partnerId,
       expectedRevision: archived.partner!.revision,
       lifecycle: contract.PartnerLifecycle.ACTIVE
     }), callContext);
+    expectAuthentication("request", "after lifecycle update, before response");
     expect(restored.partner?.lifecycle).toBe(contract.PartnerLifecycle.ACTIVE);
-    expect(authenticate).toHaveBeenCalledTimes(10);
   });
 
   it("fails closed for unavailable ownership and invalid public enums", async () => {

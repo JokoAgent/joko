@@ -16,6 +16,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { preservePackagedSmokeEvidence } from "./smoke-packaged-evidence.mjs";
 
 import {
   claudeSessionElectronSmokeSource,
@@ -135,6 +136,11 @@ if (smokeOptions.providerSmokeClassifierTest) {
 } else {
   await finalizeSmokeRun({
     runJourney: runSmokeJourney,
+    preserveEvidence: ({ passed }) => preservePackagedSmokeEvidence({
+      passed, scope: smokeScope, packaged: useUnpackedArtifact,
+      directory: markerDirectory, temporaryRoot: tmpdir(), applicationRoot: appRoot, executable,
+      destination: process.env.JOKO_DESKTOP_SMOKE_EVIDENCE_DIR
+    }),
     cleanupTemporaryDirectory: () => removeMarkerDirectory(markerDirectory),
     retainFailure: process.env.JOKO_DESKTOP_SMOKE_KEEP_FAILED === "1",
     reportRetained: () => process.stderr.write(`JOKO_DESKTOP_SMOKE_RETAINED ${markerDirectory}\n`),

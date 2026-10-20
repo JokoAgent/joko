@@ -29,8 +29,8 @@ async function mount() {
   vi.mocked(probeOrchestratorOrigin).mockResolvedValue({ serverId: PROFILE.serverId, displayName: "Local", version: "1", apiVersion: "1", pairingEnabled: false });
   vi.mocked(createOrchestratorGateway).mockImplementation((_profile, _key, callbacks) => ({
     connect: async () => { callbacks.onState?.("connected"); callbacks.onSnapshot?.({ ...emptySnapshot(), revision: 1n }); },
-    disconnect: () => undefined
-  }) as OrchestratorGateway);
+    disconnect: () => undefined, taskSharingApi: () => undefined
+  }) as unknown as OrchestratorGateway);
   let current!: AppController;
   function Probe() { current = useAppController(); return null; }
   root = createRoot(document.body.appendChild(document.createElement("div")));

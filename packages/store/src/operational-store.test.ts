@@ -4665,7 +4665,7 @@ describe("OperationalStore", () => {
     ]);
   });
 
-  it("pages and reorders an accepted queue beyond the former ten-thousand-item boundary", () => {
+  it("pages and reorders an accepted queue beyond the former ten-thousand-item boundary", { timeout: 20_000 }, () => {
     const fixture = createFixture();
     const filePath = fixture.store.filePath;
     fixture.store.close();

@@ -8,6 +8,7 @@ import type { AppController } from "../controller.js";
 import { translate } from "../i18n.js";
 import type { CollaborationDirectoryView, CollaborationScopeView } from "../model.js";
 import { SkillCollaborationTools } from "./SkillCollaborationTools.js";
+import type { Translator } from "./types.js";
 
 const roots: Root[] = [];
 
@@ -22,6 +23,37 @@ afterEach(async () => {
 });
 
 describe("SkillCollaborationTools", () => {
+  it("keeps the scope form through same-connection snapshots and retires it for a new read owner", async () => {
+    const directory: CollaborationDirectoryView = { available: true, revision: 1n,
+      actor: { id: "local-owner", displayName: "Local owner" }, scopes: [], recoveredFromCorruption: false };
+    let resolveNext!: (value: CollaborationDirectoryView) => void;
+    const pending = new Promise<CollaborationDirectoryView>(resolve => { resolveNext = resolve; });
+    const getDirectory = vi.fn().mockResolvedValueOnce(directory).mockReturnValue(pending);
+    const controller = { getCollaborationDirectory: getDirectory } as unknown as AppController;
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const t: Translator = (key, values) => translate("en", key, values);
+    await act(async () => root.render(<SkillCollaborationTools controller={controller} t={t} />));
+    await settle();
+    const control = required(container.querySelector<HTMLElement>("[data-select-control=true]"));
+    const input = required(container.querySelector<HTMLInputElement>(".skill-collaboration__create input"));
+    await act(async () => setInputValue(input, "Engineering"));
+
+    await act(async () => root.render(<SkillCollaborationTools controller={{ ...controller }} t={t} />));
+    expect(control.isConnected).toBe(true);
+    expect(input.value).toBe("Engineering");
+    expect(getDirectory).toHaveBeenCalledTimes(1);
+
+    const next = { ...controller, getCollaborationDirectory: () => pending };
+    await act(async () => root.render(<SkillCollaborationTools controller={next} t={t} />));
+    expect(control.isConnected).toBe(false);
+    expect(container.textContent).not.toContain("Local owner");
+    await act(async () => resolveNext({ ...directory, actor: { id: "next-owner", displayName: "Next owner" } }));
+    expect(container.textContent).toContain("Next owner");
+  });
+
   it("creates, renames, and removes exact fenced scopes while exposing the durable actor", async () => {
     let revision = 1n;
     let scopes: readonly CollaborationScopeView[] = [];

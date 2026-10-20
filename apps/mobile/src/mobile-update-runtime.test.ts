@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const native = vi.hoisted(() => ({
+  platform: "ios",
+  googlePlay: false,
+  startInstaller: vi.fn(() => false),
   configure: vi.fn(),
   check: vi.fn(async () => ({
     isAvailable: true,
@@ -15,7 +18,11 @@ const native = vi.hoisted(() => ({
   open: vi.fn(async () => undefined)
 }));
 
-vi.mock("expo-application", () => ({ nativeApplicationVersion: "1.2.3" }));
+vi.mock("expo-application", () => ({ nativeApplicationVersion: "1.2.3", applicationId: "app.joko.mobile" }));
+vi.mock("./mobile-android-installer", () => ({
+  isMobileGooglePlayInstallation: () => native.googlePlay,
+  mobileAndroidInstaller: { start: native.startInstaller }
+}));
 vi.mock("expo-constants", () => ({
   default: {
     expoConfig: {
@@ -46,7 +53,7 @@ vi.mock("expo-updates", () => ({
   reloadAsync: native.reload
 }));
 vi.mock("react-native", () => ({
-  Platform: { OS: "ios" },
+  Platform: { get OS() { return native.platform; } },
   Linking: { canOpenURL: native.canOpen, openURL: native.open }
 }));
 
@@ -58,6 +65,9 @@ import {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.clearAllMocks();
+  native.platform = "ios";
+  native.googlePlay = false;
+  native.startInstaller.mockReturnValue(false);
 });
 
 describe("ExpoMobileUpdateRuntime", () => {
@@ -114,10 +124,35 @@ describe("ExpoMobileUpdateRuntime", () => {
     const runtime = new ExpoMobileUpdateRuntime();
     await expect(runtime.fetchRelease("https://updates.joko.app/latest", "ios", "stable", 100))
       .resolves.toBeNull();
-    await expect(runtime.openUrl("https://download.joko.app/mobile")).resolves.toBeUndefined();
+    await expect(runtime.openRelease(release("https://download.joko.app/mobile"))).resolves.toBeUndefined();
     expect(native.open).toHaveBeenCalledWith("https://download.joko.app/mobile");
-    await expect(runtime.openUrl("https://localhost/mobile")).rejects.toThrow("install target");
-    await expect(runtime.openUrl("https://download.joko.app/mobile?token=secret")).rejects.toThrow("install target");
+    await expect(runtime.openRelease(release("https://localhost/mobile"))).rejects.toThrow("install target");
+    await expect(runtime.openRelease(release("https://download.joko.app/mobile?token=secret"))).rejects.toThrow("install target");
+  });
+
+  it("routes Android APKs to the shared installer and keeps browser fallback for unavailable native support", async () => {
+    native.platform = "android";
+    native.startInstaller.mockReturnValue(true);
+    const runtime = new ExpoMobileUpdateRuntime();
+    const target = release("https://download.joko.app/mobile.apk");
+    await runtime.openRelease(target);
+    expect(native.startInstaller).toHaveBeenCalledWith({ version: target.version, installUrl: target.installUrl });
+    expect(native.open).not.toHaveBeenCalled();
+    native.startInstaller.mockReturnValue(false);
+    await runtime.openRelease(release("https://download.joko.app/mobile"));
+    expect(native.open).toHaveBeenCalledWith("https://download.joko.app/mobile");
+  });
+
+  it("keeps Google Play installations on Play even for a stale direct APK target", async () => {
+    native.platform = "android";
+    native.googlePlay = true;
+    const runtime = new ExpoMobileUpdateRuntime();
+    expect(runtime.bundleUpdatesSupported).toBe(false);
+    native.open.mockRejectedValueOnce(new Error("market unavailable"));
+    await runtime.openRelease(release("https://download.joko.app/mobile.apk"));
+    expect(native.startInstaller).not.toHaveBeenCalled();
+    expect(native.open).toHaveBeenNthCalledWith(1, "market://details?id=app.joko.mobile");
+    expect(native.open).toHaveBeenNthCalledWith(2, "https://play.google.com/store/apps/details?id=app.joko.mobile");
   });
 
   it("rejects on its own deadline even if a native fetch ignores abort", async () => {
@@ -138,3 +173,7 @@ describe("ExpoMobileUpdateRuntime", () => {
       .rejects.toThrow("mobile-release-response-too-large");
   });
 });
+
+function release(installUrl: string) {
+  return { version: "1.2.4", runtimeVersion: "runtime-new", installUrl };
+}

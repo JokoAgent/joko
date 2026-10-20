@@ -1,3 +1,4 @@
+import { Code } from "@connectrpc/connect";
 import type { SessionView, TargetView, TimelineHistoryCursorView } from "./model.js";
 
 export type SidebarGroupBy = "project" | "flat";
@@ -125,6 +126,7 @@ export function retrySessionAttentionAcknowledgement(error: unknown): boolean {
     ? String(error.code).toLocaleLowerCase()
     : "";
   return !new Set([
+    String(Code.Aborted),
     "revision_conflict",
     "generation_mismatch",
     "invalid_state_transition",

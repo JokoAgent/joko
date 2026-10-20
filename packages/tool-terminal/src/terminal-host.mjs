@@ -1,5 +1,5 @@
 import { createRequire } from "node:module";
-import { lstatSync, realpathSync } from "node:fs";
+import { accessSync, constants, lstatSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative } from "node:path";
 
 // This process is the lifetime owner of exactly one native PTY and its native workers.
@@ -111,6 +111,10 @@ process.on("message", (message) => {
       // Recheck after IPC startup, immediately before the synchronous native spawn.
       const directory = lstatSync(message.cwd);
       if (!directory.isDirectory() || directory.isSymbolicLink() || relative(message.cwd, realpathSync.native(message.cwd)) !== "") throw new Error();
+      // Unix forkpty returns before the child execs. Reject unavailable files
+      // before reporting ready; stat/access deliberately follow shell symlinks.
+      if (!statSync(message.executable).isFile()) throw new Error();
+      accessSync(message.executable, process.platform === "win32" ? constants.F_OK : constants.X_OK);
       pty = native.spawn(message.executable, message.args, {
         name: "xterm-256color", cwd: message.cwd, cols: message.cols, rows: message.rows,
         env: message.env,

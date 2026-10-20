@@ -1368,8 +1368,14 @@ async function readTextTree(root: string): Promise<string> {
   const values: string[] = [];
   for (const entry of await readdir(root, { withFileTypes: true })) {
     const path = join(root, entry.name);
-    if (entry.isDirectory()) values.push(await readTextTree(path));
-    else if (entry.isFile()) values.push(await readFile(path, "utf8"));
+    try {
+      if (entry.isDirectory()) values.push(await readTextTree(path));
+      else if (entry.isFile()) values.push(await readFile(path, "utf8"));
+    } catch (error) {
+      // Terminal status precedes the runner's owned temporary-tree cleanup.
+      // A child enumerated above may disappear before its contents are read.
+      if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
+    }
   }
   return values.join("\n");
 }

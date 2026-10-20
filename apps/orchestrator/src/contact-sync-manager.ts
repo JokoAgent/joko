@@ -125,6 +125,7 @@ export class ContactSyncManager {
   #generation = 0;
   #activeSyncs = 0;
   #automaticSyncTimer?: NodeJS.Timeout;
+  #automaticSyncDueAt?: number;
   #automaticSyncRunning = false;
   #errorCode?: ContactSyncErrorCode;
   #initialized = false;
@@ -495,14 +496,21 @@ export class ContactSyncManager {
     this.#activeSyncs = 0;
     if (this.#automaticSyncTimer !== undefined) clearTimeout(this.#automaticSyncTimer);
     this.#automaticSyncTimer = undefined;
+    this.#automaticSyncDueAt = undefined;
     this.#automaticSyncRunning = false;
   }
 
   #scheduleAutomaticSync(delayMilliseconds: number): void {
     if (this.#closed || this.#configuration?.enabled !== true || this.#transport === undefined || this.#automaticSyncRunning) return;
+    const dueAt = this.#now() + delayMilliseconds;
+    // Presence is refreshed for every beacon. It must not debounce an already
+    // scheduled grant or sync forever when heartbeats arrive more frequently.
+    if (this.#automaticSyncTimer !== undefined && this.#automaticSyncDueAt !== undefined && this.#automaticSyncDueAt <= dueAt) return;
     if (this.#automaticSyncTimer !== undefined) clearTimeout(this.#automaticSyncTimer);
+    this.#automaticSyncDueAt = dueAt;
     this.#automaticSyncTimer = setTimeout(() => {
       this.#automaticSyncTimer = undefined;
+      this.#automaticSyncDueAt = undefined;
       if (this.#closed || this.#configuration?.enabled !== true || this.#automaticSyncRunning) return;
       const generation = this.#generation;
       this.#automaticSyncRunning = true;

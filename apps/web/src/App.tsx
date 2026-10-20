@@ -289,6 +289,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   const [retryableMessageDeepLinkKey, setRetryableMessageDeepLinkKey] = useState<string>();
   const [applicationMenuNotice, setApplicationMenuNotice] = useState<(DesktopUpdateCheckNotice & { readonly id: number })>();
   const [busyAction, setBusyAction] = useState<string>();
+  const actionFlightRef = useRef(0);
   const [layoutNotice, setLayoutNotice] = useState<string>();
   const [sessionProjectOverrides, setSessionProjectOverrides] = useState<ReadonlyMap<string, SessionProjectNavigationPlacement>>(() => new Map());
   const [movingSessionProjectIds, setMovingSessionProjectIds] = useState<ReadonlySet<string>>(() => new Set());
@@ -685,9 +686,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
   }, [applicationMenuNoticeId]);
 
   const runAction = useCallback<RunAction>((key, action) => {
+    const flight = ++actionFlightRef.current;
     setActionError(undefined);
     setBusyAction(key);
-    void action().catch((error: unknown) => setActionError(messageOf(error, t("error.unexpected")))).finally(() => setBusyAction((current) => current === key ? undefined : current));
+    void action().catch((error: unknown) => {
+      if (actionFlightRef.current === flight) setActionError(messageOf(error, t("error.unexpected")));
+    }).finally(() => {
+      if (actionFlightRef.current === flight) setBusyAction(undefined);
+    });
   }, [t]);
   const runSidebarScheduleAction = useCallback(async (action: () => Promise<void>): Promise<void> => {
     setActionError(undefined);
@@ -2213,6 +2219,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
       <DesktopPageSearchBar overrides={shortcutOverrides} t={t} />
       {applicationMenuFeedback}
       {!formalFilesMode && !settingsRoute && <Sidebar
+        appShortcutOverrides={shortcutOverrides}
         groupNavigation={<><TaskSharingNavigation controller={controller} t={t} onClose={closeNavigation} /><PartnerGroupsNavigation controller={controller} t={t} onClose={closeNavigation} /></>}
         snapshot={sidebarSnapshot}
         activeSessionId={creatingNewSession ? undefined : activeSession?.id}
@@ -2280,6 +2287,11 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
         onNewTaskInTarget={(target) => controller.navigate({ kind: "newSession", targetId: target.id })}
         onNewDialogue={(backendId) => controller.navigate({ kind: "newSession", dialogueBackendId: backendId })}
         onRename={(session, name) => runAction(`rename:${session.id}`, () => controller.renameSession(session.id, name))}
+        onSuggestTitle={(session, signal) => controller.suggestSessionTitle(session.id, signal)}
+        titleSuggestionOwnerKey={JSON.stringify([
+          state.activeProfile.id, state.activeProfile.serverId, state.activeProfile.deviceId, state.activeProfile.origin,
+          state.connectionGeneration, state.snapshot.generation.toString()
+        ])}
         onToggleTaskTag={(session, tagId, attached) => runAction(
           `task-tag:${session.id}:${tagId}:${attached ? "attach" : "detach"}`,
           () => controller.setSessionTaskTags(session.id, [session.id], [tagId], attached)
@@ -2387,6 +2399,7 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
             onSelectionQuote={insertFileSelectionQuote}
             onImageToChat={activeImageAttachments ? insertFileAttachment : undefined}
             navigation={{
+              appShortcutOverrides: shortcutOverrides,
               open: navigationOpen,
               mode: navigationMode,
               width: navigationWidth,

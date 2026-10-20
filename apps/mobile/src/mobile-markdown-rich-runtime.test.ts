@@ -13,6 +13,27 @@ const colors = { surface: "#ffffff", background: "#f7f6f3", ink: "#242a2d", mute
   accent: "#ff9800", border: "#e1e2df", negative: "#cc634e" };
 
 describe("mobile rich Markdown runtime", () => {
+  it.each([false, true].flatMap(dark => (["math", "mermaid"] as const).map(kind => ({ dark, kind }))))(
+    "accepts the application theme for $kind without treating dark=$dark as a CSS color", ({ dark, kind }) => {
+      const theme = { ...colors, surface: dark ? "#24292d" : "#ffffff", ink: dark ? "#f4f4f2" : "#242a2d",
+        brandBackground: dark ? "#302920" : "#fff1db", dark };
+      const html = buildMobileMarkdownRichHtml({ instanceId: "theme-rich", kind,
+        source: kind === "math" ? "x^2" : "graph TD; A-->B", colors: theme },
+      { mermaidScript: "", katexScript: "", katexCss: "" });
+      expect(html).toContain(`background:${theme.surface};color:${theme.ink}`);
+      expect(html).toContain("connect-src 'none'");
+      expect(html).not.toContain(theme.brandBackground);
+    });
+
+  it("rejects injected declared colors and oversized rich source", () => {
+    const input = { instanceId: "theme-rich", kind: "math" as const, source: "x^2", colors };
+    const runtime = { mermaidScript: "", katexScript: "", katexCss: "" };
+    for (const key of Object.keys(colors) as (keyof typeof colors)[]) {
+      expect(() => buildMobileMarkdownRichHtml({ ...input, colors: { ...colors, [key]: "#fff;display:none" } }, runtime)).toThrow("invalid");
+    }
+    expect(() => buildMobileMarkdownRichHtml({ ...input, source: "x".repeat(100_001) }, runtime)).toThrow("invalid");
+  });
+
   it("builds pinned offline engines and executes real KaTeX with exact source fallback and a scoped status", async () => {
     const entry = resolve(root, "src", "rich-markdown-runtime.richjs");
     const source = transformer.testing.buildRichMarkdownRuntimeModule(readFileSync(entry, "utf8"), entry);

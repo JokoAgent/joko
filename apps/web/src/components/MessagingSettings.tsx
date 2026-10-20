@@ -79,7 +79,8 @@ type MessagingCreateChannel = "telegram" | "discord" | "dingtalk" | "feishu" | "
 type MessagingDialog =
   | { readonly kind: "create"; readonly channel: MessagingCreateChannel }
   | { readonly kind: "credential"; readonly connectionId: string }
-  | { readonly kind: "configuration"; readonly connectionId: string }
+  | { readonly kind: "configuration"; readonly connectionId: string; readonly baseline: MessagingConnectionView;
+      readonly readOwner: AppController["getMessagingSettings"] }
   | { readonly kind: "clear"; readonly connectionId: string }
   | { readonly kind: "wechatAuthorization"; readonly connectionId: string }
   | { readonly kind: "route"; readonly connectionId?: string };
@@ -95,6 +96,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
   readonly t: Translator;
 }): JSX.Element {
   const ownerKey = controller.state.activeProfile?.id ?? "disconnected";
+  const getMessagingSettings = controller.getMessagingSettings;
   const [settings, setSettings] = useState<MessagingSettingsView>();
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -113,7 +115,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
       if (initial) setLoading(true);
       else setRefreshing(true);
       try {
-        const next = await controller.getMessagingSettings(abort.signal);
+        const next = await getMessagingSettings(abort.signal);
         if (!abort.signal.aborted) {
           setSettings(next);
           setError(undefined);
@@ -136,7 +138,7 @@ export function MessagingSettings({ controller, snapshot, t }: {
       abort.abort();
       reloadRef.current = async () => undefined;
     };
-  }, [controller, ownerKey, t]);
+  }, [getMessagingSettings, ownerKey, t]);
 
   const replaceConnection = (connection: MessagingConnectionView): void => {
     setSettings((current) => current === undefined ? current : {
@@ -187,9 +189,12 @@ export function MessagingSettings({ controller, snapshot, t }: {
     return refreshConnection(original);
   };
 
-  const connectionForDialog = dialog !== undefined && "connectionId" in dialog
+  const liveConnectionForDialog = dialog !== undefined && "connectionId" in dialog
     ? settings?.connections.find((value) => value.id === dialog.connectionId)
     : undefined;
+  const connectionForDialog = dialog?.kind === "configuration"
+    ? dialog.readOwner === getMessagingSettings && liveConnectionForDialog !== undefined ? dialog.baseline : undefined
+    : liveConnectionForDialog;
   const globalRoute = settings?.routes.find((route) => route.connectionId === undefined);
   const telegramAvailable = settings?.channels.some((capability) =>
     capability.channel === "telegram" && capability.available) === true;
@@ -727,7 +732,8 @@ export function MessagingSettings({ controller, snapshot, t }: {
                 <Button tone="secondary" disabled={pending || !connection.credentialConfigured} onClick={() => { void testConnection(connection); }}>
                   {busy === `test:${connection.id}` ? <Spinner /> : <RefreshCw aria-hidden="true" />}{t("messaging.test")}
                 </Button>
-                {connection.channel !== "wechat" && <Button tone="secondary" disabled={pending} onClick={() => setDialog({ kind: "configuration", connectionId: connection.id })}>
+                {connection.channel !== "wechat" && <Button tone="secondary" disabled={pending} onClick={() => setDialog({ kind: "configuration", connectionId: connection.id,
+                  baseline: connection, readOwner: getMessagingSettings })}>
                   <Settings2 aria-hidden="true" />{t("messaging.configure")}
                 </Button>}
                 {connection.channel === "wechat"

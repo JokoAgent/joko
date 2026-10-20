@@ -190,10 +190,32 @@ export class PartnerRoutineManager {
   async #execute(routine: Routine, run: RoutineRun, signal: AbortSignal, canDispatch: () => boolean) {
     if (this.options.partners.getPartner(routine.partnerId).lifecycle === "paused") return { deferred: true };
     const { partner, session } = this.#owner(routine.partnerId, true);
+    const id = `partner-routine-${routine.id}`;
+    const backendGeneration = this.options.store.getBackend(session.backendId).descriptor.instanceGeneration;
+    let executionRunId: string | undefined;
     const assertCurrent = () => {
       if (!canDispatch() || signal.aborted) throw new PartnerRoutineError("changed", "Routine was changed or cancelled.");
       const current = this.#owner(partner.id, true, partner.revision).session;
-      if (current.id !== session.id || current.binding.generation !== session.binding.generation) throw new PartnerRoutineError("changed", "Canonical task changed during routine execution.");
+      const changed = () => { throw new PartnerRoutineError("changed", "Canonical task changed during routine execution."); };
+      if (current.id !== session.id || current.backendId !== session.backendId || current.targetId !== session.targetId
+        || current.binding.opaqueRef !== session.binding.opaqueRef || current.binding.nativeSessionId !== session.binding.nativeSessionId
+        || this.options.store.getBackend(session.backendId).descriptor.instanceGeneration !== backendGeneration) changed();
+      if (current.binding.generation === session.binding.generation) return;
+      // Starting this exact queued turn may resume the same native history in
+      // one newer runtime generation. A different binding or unrelated reset
+      // cannot borrow that completed Run's renewed dispatch authority.
+      if (executionRunId === undefined || current.binding.generation !== session.binding.generation + 1) changed();
+      const execution = this.options.store.findRun(executionRunId!)?.descriptor;
+      const queue = this.options.store.findQueueItemByRunId(session.id, executionRunId!);
+      const attempt = queue?.attemptId === undefined ? undefined : this.options.store.getAttempt(queue.attemptId).descriptor;
+      const occurrence = this.options.store.findScheduleRunByRunId(executionRunId!);
+      if (execution?.sessionId !== session.id || execution.source !== "schedule" || execution.state !== "completed"
+        || queue?.state !== "completed" || queue.backendInstanceGeneration !== backendGeneration
+        || attempt === undefined || attempt.id !== execution.activeAttemptId || attempt.runId !== executionRunId
+        || attempt.generation !== current.binding.generation || attempt.backendInstanceGeneration !== backendGeneration
+        || attempt.endedAt === undefined || attempt.error !== undefined
+        || occurrence?.scheduleId !== id || occurrence.sessionId !== session.id
+        || !this.options.store.listAttempts(executionRunId!).some(previous => previous.descriptor.generation === session.binding.generation)) changed();
     };
     assertCurrent();
     if (this.options.store.listRuns({ sessionId: session.id, activeOnly: true }).length > 0
@@ -217,7 +239,7 @@ export class PartnerRoutineManager {
       if (checked.decision === "block") return { error: redactSecrets(schedulePreRunFailureSummary(checked)).slice(0, 1000) };
       checkSummary = redactSecrets(checked.stdout).slice(0, 8000);
     }
-    const id = `partner-routine-${routine.id}`; const existing = this.options.store.findSchedule(id);
+    const existing = this.options.store.findSchedule(id);
     const extension = { ...defaultScheduleExtensionSnapshot(), silentWhenIdle: routine.silentWhenIdle };
     assertCurrent();
     this.options.store.upsertSchedule({ id, backendId: session.backendId, targetId: session.targetId,
@@ -237,6 +259,7 @@ export class PartnerRoutineManager {
       });
       if (dispatched.status === "skipped") return { deferred: true };
       if (dispatched.status !== "queued") return { error: "Routine could not be admitted to its canonical task.", scheduleRunId: dispatched.runId };
+      executionRunId = dispatched.runId;
       for (;;) {
         if (signal.aborted) { await this.options.scheduler.abortSchedule(id); throw new Error("Routine cancelled."); }
         const completed = this.options.store.findRun(dispatched.runId)?.descriptor;

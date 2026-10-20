@@ -787,7 +787,7 @@ export class ClaudeDurableSessionStore implements SessionStore {
             : [];
         }
         const rows = database.prepare(`
-          SELECT *
+          SELECT *, instr(CAST(project_key AS BLOB), x'00') AS project_key_nul
           FROM sessions
           WHERE workspace_authority = ? AND project_key = ?
           ORDER BY mtime DESC, session_id ASC
@@ -1393,6 +1393,7 @@ function assertSessionCounts(database: DatabaseSync, session: SessionRow): void 
   const row = database.prepare(`
     SELECT COUNT(*) AS entry_count, COALESCE(SUM(entry_bytes), 0) AS byte_count,
       COUNT(DISTINCT CASE WHEN subpath <> '' THEN subpath END) AS subkey_count,
+      COALESCE(MAX(instr(CAST(subpath AS BLOB), x'00')), 0) AS subpath_nul,
       COALESCE(MAX(ordinal) + 1, 0) AS next_ordinal
     FROM session_entries WHERE workspace_authority = ? AND session_id = ?
   `).get(session.workspaceAuthority, session.sessionId) as Record<string, unknown> | undefined;
@@ -1400,6 +1401,7 @@ function assertSessionCounts(database: DatabaseSync, session: SessionRow): void 
     || sqlInteger(row["entry_count"]) !== session.entryCount
     || sqlInteger(row["byte_count"]) !== session.byteCount
     || sqlInteger(row["subkey_count"]) !== session.subkeyCount
+    || sqlInteger(row["subpath_nul"]) !== 0
     || sqlInteger(row["next_ordinal"]) !== session.nextOrdinal) {
     throw failure("CORRUPT");
   }
@@ -1955,7 +1957,11 @@ function readTransaction<T>(database: DatabaseSync, callback: () => T): T {
 }
 
 function findOperation(database: DatabaseSync, operationId: string): OperationRow | null {
-  const row = database.prepare("SELECT * FROM operations WHERE operation_id = ?").get(operationId) as
+  const row = database.prepare(`
+    SELECT *, COALESCE(instr(CAST(source_project_key AS BLOB), x'00'), 0) AS source_project_key_nul,
+      COALESCE(instr(CAST(target_project_key AS BLOB), x'00'), 0) AS target_project_key_nul
+    FROM operations WHERE operation_id = ?
+  `).get(operationId) as
     Record<string, unknown> | undefined;
   return row === undefined ? null : decodeOperationRow(row);
 }
@@ -2000,6 +2006,9 @@ function assertOperationAccess(operation: OperationRow, access: ClaudeSessionSto
 }
 
 function decodeOperationRow(row: Record<string, unknown>): OperationRow {
+  if (sqlInteger(row["source_project_key_nul"]) !== 0 || sqlInteger(row["target_project_key_nul"]) !== 0) {
+    throw failure("CORRUPT");
+  }
   const sourceKind = requiredString(row["source_kind"]);
   const state = requiredString(row["state"]);
   const reservation = nullableString(row["reservation_state"]);
@@ -2069,7 +2078,8 @@ function decodeOperationRow(row: Record<string, unknown>): OperationRow {
 
 function findSession(database: DatabaseSync, workspaceAuthority: string, sessionId: string): SessionRow | null {
   const row = database.prepare(`
-    SELECT * FROM sessions WHERE workspace_authority = ? AND session_id = ?
+    SELECT *, instr(CAST(project_key AS BLOB), x'00') AS project_key_nul
+    FROM sessions WHERE workspace_authority = ? AND session_id = ?
   `).get(workspaceAuthority, sessionId) as Record<string, unknown> | undefined;
   return row === undefined ? null : decodeSessionRow(row);
 }
@@ -2081,6 +2091,8 @@ function requireSession(database: DatabaseSync, workspaceAuthority: string, sess
 }
 
 function decodeSessionRow(row: Record<string, unknown>): SessionRow {
+  // Check stored bytes before native TEXT decoding can hide an embedded NUL.
+  if (sqlInteger(row["project_key_nul"]) !== 0) throw failure("CORRUPT");
   const lifecycle = requiredString(row["lifecycle"]);
   const reservation = nullableString(row["reservation_state"]);
   if ((lifecycle !== "reserved" && lifecycle !== "adopted")

@@ -343,6 +343,7 @@ export class NodeDevicePeerAgentExecutor {
     this.#activeForwards.clear();
     this.#activeListeners.clear();
     this.#reverseConnections.clear();
+    await this.#recentDirectories.flush();
   }
 
   async #perform(
@@ -1451,6 +1452,10 @@ export class NodeDevicePeerRecentDirectoryStore {
     this.#path = localPath(path);
   }
 
+  flush(): Promise<void> {
+    return this.#mutations;
+  }
+
   async list(maximumEntries: number, signal: AbortSignal): Promise<{
     readonly directories: Array<{
       readonly name: string;
@@ -1702,7 +1707,9 @@ class AgentOutput {
     }
     const result = create(DevicePeerAgentResultSchema, { phase, sequence: ++this.#sequence, payload });
     const pending = this.#pending.then(() => this.#emitResult(result));
-    this.#pending = pending.then(() => undefined);
+    // Keep the rejection for callers/drain, but observe it before asynchronous resource cleanup.
+    this.#pending = pending;
+    void pending.catch(() => undefined);
     return pending;
   }
 

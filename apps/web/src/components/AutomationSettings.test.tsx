@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
+import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
 import { translate } from "../i18n.js";
 import { emptySnapshot, type AppSnapshot } from "../model.js";
 import { AutomationSettings, validateBrowserServiceSettings } from "./AutomationSettings.js";
@@ -429,6 +430,7 @@ describe("AutomationSettings", () => {
 
 function controllerFixture(): AppController {
   return {
+    state: { ready: true, connectionState: "connected", snapshot: emptySnapshot(), preferences: DEFAULT_UI_PREFERENCES },
     updateBrowserSettings: vi.fn(async () => undefined),
     showBrowserAutomation: vi.fn(async () => undefined),
     restartBrowser: vi.fn(async () => undefined),

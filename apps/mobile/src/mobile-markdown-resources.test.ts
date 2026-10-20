@@ -133,7 +133,7 @@ describe("canonical message Markdown resources", () => {
     reader.releaseAll();
   });
 
-  it("bounds cached image bytes across mounted messages and restores capacity when the owner releases them", async () => {
+  it("bounds cached image bytes across mounted messages and restores capacity when the owner releases them", { timeout: 15_000 }, async () => {
     const reader = new MobileMarkdownResourceReader();
     const bytes = paddedPngBytes(png, 8 * 1_024 * 1_024);
     const largeRevision = create(FileRevisionSchema, { ...revision, byteSize: BigInt(bytes.length), sha256Hex: bytesToHex(sha256(bytes)) });

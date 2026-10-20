@@ -10,7 +10,7 @@ import * as secureFiles from "../src/secure-files.js";
 
 const spawn = vi.hoisted(() => vi.fn());
 vi.mock("node:child_process", () => ({ spawn }));
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); spawn.mockReset(); });
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllEnvs(); spawn.mockReset(); });
 const scope = () => ({ id: randomUUID(), isCurrent: () => true });
 const input = (name = "clip's video.mp4") => ({ requestId: randomUUID(), file: { name, mediaType: "video/mp4", bytes: new Uint8Array([1, 2, 3]) } });
 const root = () => mkdtemp(join(tmpdir(), "joko-file-clipboard-"));
@@ -90,7 +90,7 @@ describe("native file clipboard ownership", () => {
     ];
     for (const entry of entries) { await mkdir(join(directory, entry.id)); await writeFile(join(directory, entry.id, entry.name), new Uint8Array([1, 2, 3])); }
     await writeFile(join(directory, "unlisted.txt"), "never discover or delete");
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }), { mode: 0o600 });
     const owner = new NativeFileClipboard({ directory, platform: "win32", now: () => now, processExists: () => false, execute: async () => ({ status: "copied", dispatched: true, closed: true }) });
     await expect(owner.copy(input(), scope())).resolves.toEqual({ status: "copied" });
     const restored = await manifest(directory);
@@ -106,7 +106,7 @@ describe("native file clipboard ownership", () => {
     const count = limit === "bytes" ? 2 : 32;
     const entries = Array.from({ length: count }, () => ({ id: randomUUID(), name: "retained.mp4", bytes: limit === "bytes" ? FILE_COPY_MAXIMUM_BYTES : 1, state: "retained", retainUntil: FILE_COPY_RETENTION_MS }));
     expect(entries.reduce((sum, entry) => sum + entry.bytes, 0)).toBeLessThanOrEqual(FILE_COPY_TOTAL_BYTES);
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries }), { mode: 0o600 });
     const owner = new NativeFileClipboard({ directory, platform: "win32", execute, now: () => 100 });
     await expect(owner.copy(input(), scope())).resolves.toEqual({ status: "failed", reason: "capacity" });
     expect((await manifest(directory)).entries).toHaveLength(count);
@@ -119,7 +119,7 @@ describe("native file clipboard ownership", () => {
     const oversized = input(); Object.defineProperty(oversized.file.bytes, "byteLength", { value: FILE_COPY_MAXIMUM_BYTES + 1 });
     expect(() => parseDesktopCopyFileRequest(oversized)).toThrow();
     const directory = await root();
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries: [{ id: "../outside", name: "file.mp4", bytes: 3, state: "prepared" }] }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries: [{ id: "../outside", name: "file.mp4", bytes: 3, state: "prepared" }] }), { mode: 0o600 });
     const execute = vi.fn(); const owner = new NativeFileClipboard({ directory, platform: "win32", execute });
     await expect(owner.copy(input(), scope())).resolves.toEqual({ status: "failed", reason: "storage" });
     const linux = new NativeFileClipboard({ directory, platform: "linux", execute });
@@ -149,14 +149,21 @@ describe("native file clipboard ownership", () => {
   });
 
   it.each(["before", "after"] as const)("does not release the OS writer on a process error %s the spawn event without confirmed close", async (phase) => {
+    const helperError = deferred<void>();
     const child = new EventEmitter() as EventEmitter & { kill(): boolean };
     Object.assign(child, { pid: 4242 });
     child.kill = vi.fn(() => { child.emit("error", new Error("Termination was not confirmed")); return false; });
-    spawn.mockImplementation(() => { queueMicrotask(() => { if (phase === "after") child.emit("spawn"); child.emit("error", new Error("Native helper process error")); }); return child; });
+    spawn.mockImplementation(() => { queueMicrotask(() => { if (phase === "after") child.emit("spawn"); child.emit("error", new Error("Native helper process error")); helperError.resolve(); }); return child; });
     const directory = await root(); let now = 1_000;
+    // The 40 ms probe targets an already owned helper, not runner disk speed
+    // while writing its private script or recording its process identity.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const owner = new NativeFileClipboard({ directory, platform: "darwin", timeoutMs: 40, now: () => now });
     const request = input(); const caller = scope();
-    await expect(owner.copy(request, caller)).resolves.toEqual({ status: "unknown" });
+    const pending = owner.copy(request, caller);
+    await helperError.promise;
+    await vi.advanceTimersByTimeAsync(40);
+    await expect(pending).resolves.toEqual({ status: "unknown" });
     await expect(owner.copy(input(), scope())).resolves.toEqual({ status: "blocked" });
     expect(spawn).toHaveBeenCalledOnce(); expect(child.kill).toHaveBeenCalledOnce();
     expect((await manifest(directory)).entries[0]?.retainUntil).toBeUndefined();
@@ -191,7 +198,7 @@ describe("native file clipboard ownership", () => {
     const directory = await root(); const id = randomUUID();
     await mkdir(join(directory, id)); await writeFile(join(directory, id, "held.mp4"), new Uint8Array([1, 2, 3]));
     const entry = { id, name: "held.mp4", bytes: 3, state: "dispatched", ...(proof === "missing" ? {} : { pid: 4242 }) };
-    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries: [entry] }));
+    await writeFile(join(directory, "files.json"), JSON.stringify({ version: 1, entries: [entry] }), { mode: 0o600 });
     const execute = vi.fn(async (): Promise<FileCopyHelperResult> => ({ status: "copied", dispatched: true, closed: true }));
     const probe = vi.fn(() => proof === "present" ? true : "unknown" as const);
     const now = FILE_COPY_RETENTION_MS * 3;

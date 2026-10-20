@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AdapterContext, AdapterEventMetadata, BlobRef, EventPayload, TargetDescriptor } from "@joko/core";
+import { NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD, type AdapterContext, type AdapterEventMetadata, type BlobRef, type EventPayload, type TargetDescriptor } from "@joko/core";
 import { describe, expect, it, vi } from "vitest";
 import type { PiRpcEvent } from "./protocol.js";
 import { JOKO_SUBAGENT_ACTIVITY_MARKER } from "./subagent-progress.js";
@@ -1487,6 +1487,9 @@ describe("PiEventTranslator", () => {
     expect(compactions[3]?.compactionId).toBe(compactions[2]?.compactionId);
     expect(compactions[5]?.compactionId).toBe(compactions[4]?.compactionId);
     expect(new Set([compactions[0]?.compactionId, compactions[2]?.compactionId, compactions[4]?.compactionId]).size).toBe(3);
+    expect(metadata.filter((_item, index) => events[index]?.type === "compaction")
+      .map((item) => item.fields[NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD] === true))
+      .toEqual([true, true, false, false, true, true]);
     expect(compactions[5]).toMatchObject({
       state: "failed",
       error: { code: "PI_COMPACTION_FAILED", message: "summary provider failed", phase: "compaction", retryable: true }
@@ -1503,6 +1506,31 @@ describe("PiEventTranslator", () => {
       "started", "no_op", "started", "aborted", "started", "failed"
     ]);
     expect(compactionMetadata[1]).not.toHaveProperty("error");
+  });
+
+  it("attaches only a current automatic compaction's exact persisted identity", async () => {
+    const events: EventPayload[] = [];
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-compaction-identity-workspace-"));
+    const artifacts = await mkdtemp(join(tmpdir(), "joko-pi-compaction-identity-artifacts-"));
+    const translator = new PiEventTranslator({
+      context: context(workspace, events, []), artifactDirectory: artifacts, wasAbortRequested: () => false
+    });
+    const receipt = (reason: string, entryId: string) => ({ method: "setStatus",
+      statusKey: "joko-compaction-identity/v1", statusText: JSON.stringify({ reason, entryId, parentEntryId: "parent-1" }) });
+    expect(translator.consumeCompactionNativeIdentity(receipt("threshold", "stale-entry"))).toBe(true);
+    await translator.translate({ type: "compaction_start", reason: "threshold" } as unknown as PiRpcEvent);
+    translator.consumeCompactionNativeIdentity(receipt("overflow", "wrong-reason"));
+    translator.consumeCompactionNativeIdentity(receipt("threshold", "persisted-entry-1"));
+    await translator.translate({ type: "compaction_end", reason: "threshold", result: {
+      summary: "summary", firstKeptEntryId: "kept-1", tokensBefore: 10_003, estimatedTokensAfter: 100
+    } } as unknown as PiRpcEvent);
+    expect(events.filter(event => event.type === "compaction").at(-1)).toMatchObject({
+      automatic: true, reason: "threshold", nativeHistory: { identity: { entryId: "persisted-entry-1", parentEntryId: "parent-1" } }
+    });
+    await translator.translate({ type: "compaction_start", reason: "threshold" } as unknown as PiRpcEvent);
+    translator.consumeCompactionNativeIdentity(receipt("threshold", "invalid\nentry"));
+    await translator.translate({ type: "compaction_end", reason: "threshold", aborted: true } as unknown as PiRpcEvent);
+    expect(events.filter(event => event.type === "compaction").at(-1)).not.toHaveProperty("nativeHistory");
   });
 
   it("fails closed when a compaction terminal has neither a result nor an exact no-op shape", async () => {

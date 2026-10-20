@@ -1,6 +1,6 @@
 import { OperationalStore } from "@joko/store";
 import { WdaClientError } from "@joko/tool-ios-simulator";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import { SimulatorOwnershipRegistry, type PublicSimulatorInstance } from "./ios-simulator-ownership.js";
 import { SimulatorScreenObservationCoordinator } from "./ios-simulator-screen-observation.js";
 
@@ -122,6 +122,21 @@ it("returns a bounded timeout when a requested UI condition does not appear", as
       mode: "stable", timedOut: true, stable: false, screenMap: { elements: expect.any(Array) }
     });
   } finally { h.store.close(); }
+});
+
+it.each([100, 101])("rejects a matching capture completed %i ms into a 100 ms wait", async (elapsedMs) => {
+  vi.useFakeTimers();
+  vi.setSystemTime(1_000);
+  const h = fixture();
+  h.setObserve(async () => {
+    vi.setSystemTime(1_000 + elapsedMs);
+    return { capturedAt: new Date().toISOString(), tree: { type: "XCUIElementTypeButton", label: "Continue" } };
+  });
+  try {
+    await expect(h.screen.wait(SCOPE, route(h.instance),
+      { kind: "element_exists", selector: { labelContains: "Continue" } }, { timeoutMs: 100 }))
+      .rejects.toMatchObject({ code: "UI_WAIT_TIMEOUT" });
+  } finally { h.store.close(); vi.useRealTimers(); }
 });
 
 it("bounds an in-flight capture by the wait deadline and distinguishes caller cancellation", async () => {

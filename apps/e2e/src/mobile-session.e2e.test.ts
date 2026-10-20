@@ -215,6 +215,33 @@ describe("native mobile device through the durable product chain", () => {
   let fixture: OrchestratorE2eFixture | undefined;
   afterEach(async () => { await fixture?.close(); fixture = undefined; });
 
+  it("reads the native header role through its authenticated collaboration owner and closes it before the host", async () => {
+    fixture = await OrchestratorE2eFixture.start({ collaborationGoals: true });
+    const paired = await fixture.pair("Native header role client");
+    const sessionId = sessionIdFrom(await submit(paired.clients.operation, paired.connectionId,
+      createSessionMutation({ backendId: PI_LIKE_PROFILE.id, targetId: fixture.targetId(), displayName: "Native header role task" })));
+    const access = await paired.clients.collaboration.listCollaborationGoals({ sessionId, includeArchived: true });
+    expect(access.access).toEqual([]);
+    const { mobileNetwork } = await vi.importActual<{
+      mobileNetwork: { readTaskHeaderRole(credential: { origin: string; authKey: string }, sessionId: string, signal: AbortSignal): Promise<string> }
+    }>("../../mobile/src/network.js");
+    await expect(mobileNetwork.readTaskHeaderRole({ origin: fixture.baseUrl, authKey: paired.authKey }, sessionId,
+      new AbortController().signal)).resolves.toBe("ordinary");
+    await expect(fixture.anonymous.collaboration.listCollaborationGoals({ sessionId, includeArchived: true }))
+      .rejects.toMatchObject({ code: Code.Unauthenticated });
+    const manager = fixture.application.collaborationGoals;
+    expect(manager).toBeDefined();
+    if (!manager) throw new Error("The native header fixture has no collaboration owner.");
+    const close = vi.spyOn(manager, "close");
+    const disposeHost = vi.spyOn(fixture.application.sessionHost, "dispose");
+    await fixture.close();
+    fixture = undefined;
+    expect(close).toHaveBeenCalledOnce();
+    expect(disposeHost).toHaveBeenCalledOnce();
+    expect(close.mock.invocationCallOrder[0]).toBeLessThan(disposeHost.mock.invocationCallOrder[0]!);
+    expect(() => manager.listGoals()).toThrow(/closed/iu);
+  });
+
   it("reads canonical mobile music and its independent cover through authenticated HTTP and retires exact preview copy leases", async () => {
     const { mobileNetwork } = await vi.importActual<{ mobileNetwork: unknown }>("../../mobile/src/network.js");
     const { MobileClient } = await vi.importActual<{ MobileClient: new (...args: unknown[]) => AudioMobileHarness }>("../../mobile/src/mobile-client.js");

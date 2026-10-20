@@ -1,0 +1,22 @@
+diff --git a/scripts/prebuild.js b/scripts/prebuild.js
+--- a/scripts/prebuild.js
++++ b/scripts/prebuild.js
+@@ -33,4 +33,18 @@ if (!fs.existsSync(PREBUILD_DIR)) {
+   process.exit(1);
+ }
+ 
++// The published macOS helpers lack executable bits. Repair only the current
++// package's regular, canonical prebuilt helper before accepting its prebuild.
++if (process.platform === 'darwin') {
++  const helper = path.join(PREBUILD_DIR, 'spawn-helper');
++  const info = fs.lstatSync(helper);
++  if (!info.isFile() || info.isSymbolicLink() || fs.realpathSync.native(helper) !== helper) {
++    throw new Error('The terminal spawn-helper is not a canonical regular file.');
++  }
++  if ((info.mode & 0o111) !== 0o111) {
++    fs.chmodSync(helper, (info.mode & 0o777) | 0o111);
++  }
++  fs.accessSync(helper, fs.constants.X_OK);
++}
++
+ process.exit(0);

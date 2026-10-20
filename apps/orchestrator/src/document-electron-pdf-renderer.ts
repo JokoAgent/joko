@@ -9,7 +9,7 @@ let renderChain: Promise<void> = Promise.resolve();
 function helperEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const allowed = ["PATH", "Path", "PATHEXT", "SystemRoot", "SYSTEMROOT", "WINDIR", "HOME", "USERPROFILE",
     "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "TMPDIR", "DISPLAY", "WAYLAND_DISPLAY",
-    "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LANG", "LC_ALL", "LC_CTYPE"];
+    "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY", "LANG", "LC_ALL", "LC_CTYPE"];
   const result: NodeJS.ProcessEnv = {};
   for (const name of allowed) if (source[name] !== undefined) result[name] = source[name];
   return result;

@@ -474,9 +474,9 @@ class Connection {
     supported_ = Atom("_NET_SUPPORTED");
     if (active_ == XCB_NONE || supporting_ == XCB_NONE || supported_ == XCB_NONE) return false;
     xcb_window_t manager = XCB_NONE;
-    xcb_window_t confirmation = XCB_NONE;
+    xcb_window_t manager_confirmation = XCB_NONE;
     if (!WindowProperty(root_, supporting_, &manager) || manager == root_ ||
-        !WindowProperty(manager, supporting_, &confirmation) || confirmation != manager) return false;
+        !WindowProperty(manager, supporting_, &manager_confirmation) || manager_confirmation != manager) return false;
     const auto property_cookie = xcb_get_property(connection_, false, root_, supported_, XCB_ATOM_ATOM, 0, 1024);
     const auto property = ReadReply<xcb_get_property_reply_t>(property_cookie.sequence);
     if (!property || property->type != XCB_ATOM_ATOM || property->format != 32 ||

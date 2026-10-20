@@ -255,6 +255,11 @@ class PeerProcessHandle extends EventEmitter implements DevicePeerProcessHandle 
       },
       final: (callback) => this.#writeInput(new Uint8Array(), true).then(() => callback(), callback)
     });
+    // Route stream failures through the process handle's error channel. A late
+    // input acknowledgement can fail even after the peer has reported its exit.
+    for (const stream of [this.stdin, this.stdout, this.stderr]) {
+      stream.on("error", (error) => this.#fail(error));
+    }
   }
 
   attach(processId: string, stream: DevicePeerStreamLease): void {
@@ -326,8 +331,9 @@ class PeerProcessHandle extends EventEmitter implements DevicePeerProcessHandle 
   #fail(error: Error): void {
     if (this.#terminal) return;
     this.#terminal = true;
-    this.stdout.destroy(error);
-    this.stderr.destroy(error);
+    this.stdin.destroy();
+    this.stdout.destroy();
+    this.stderr.destroy();
     this.#stream?.close();
     this.emit("error", error);
   }
@@ -370,6 +376,11 @@ class PeerTerminalHandle implements DevicePeerTerminalHandle {
   readonly #data = new Set<(data: string) => void>();
   readonly #exit = new Set<(event: DevicePeerTerminalExit) => void>();
   readonly #earlyEvents: DevicePeerMultiplexEvent[] = [];
+  readonly #startupOutput: string[] = [];
+  #startupOutputBytes = 0;
+  #outputAttached = false;
+  #flushingOutput = false;
+  #finalExit?: Readonly<DevicePeerTerminalExit>;
   #terminalId?: string;
   #stream?: DevicePeerStreamLease;
   #closed = false;
@@ -386,6 +397,7 @@ class PeerTerminalHandle implements DevicePeerTerminalHandle {
   }
 
   accept(event: DevicePeerMultiplexEvent): void {
+    if (this.#closed) return;
     if (this.#terminalId === undefined) {
       this.#earlyEvents.push(event);
       return;
@@ -399,6 +411,19 @@ class PeerTerminalHandle implements DevicePeerTerminalHandle {
       return;
     }
     if (event.channel === "terminal_data") {
+      if (!this.#outputAttached || this.#flushingOutput) {
+        const bytes = Buffer.byteLength(event.data);
+        if (bytes === 0) return;
+        if (this.#startupOutputBytes + bytes > MAXIMUM_TEXT_BYTES) {
+          this.#startupOutput.length = 0;
+          this.#startupOutputBytes = 0;
+          this.#finish({ exitCode: -1, failureCode: "output_limit", processExitConfirmed: false });
+          return;
+        }
+        this.#startupOutput.push(event.data);
+        this.#startupOutputBytes += bytes;
+        return;
+      }
       for (const listener of this.#data) safely(() => listener(event.data));
     } else if (event.channel === "terminal_exit") {
       this.#finish({
@@ -414,11 +439,30 @@ class PeerTerminalHandle implements DevicePeerTerminalHandle {
 
   onData(listener: (data: string) => void): { dispose(): void } {
     this.#data.add(listener);
+    // The open claim resolves before the outer runtime installs its consumer.
+    // Preserve startup protocol queries as well as visible output across that gap.
+    if (!this.#outputAttached) {
+      this.#outputAttached = true;
+      this.#flushingOutput = true;
+      try {
+        while (this.#startupOutput.length > 0) {
+          const data = this.#startupOutput.shift()!;
+          this.#startupOutputBytes -= Buffer.byteLength(data);
+          for (const consumer of [...this.#data]) {
+            if (this.#data.has(consumer)) safely(() => consumer(data));
+          }
+        }
+      } finally {
+        this.#flushingOutput = false;
+        if (this.#finalExit !== undefined) this.#notifyExit();
+      }
+    }
     return disposable(this.#data, listener);
   }
 
   onExit(listener: (event: DevicePeerTerminalExit) => void): { dispose(): void } {
     this.#exit.add(listener);
+    if (this.#finalExit !== undefined) queueMicrotask(() => this.#notifyExit());
     return disposable(this.#exit, listener);
   }
 
@@ -476,10 +520,17 @@ class PeerTerminalHandle implements DevicePeerTerminalHandle {
   #finish(event: DevicePeerTerminalExit): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#finalExit = Object.freeze(event);
     this.#stream?.close();
-    for (const listener of this.#exit) safely(() => listener(Object.freeze(event)));
+    if (!this.#flushingOutput) this.#notifyExit();
+  }
+
+  #notifyExit(): void {
+    if (this.#finalExit === undefined || this.#flushingOutput) return;
+    for (const listener of [...this.#exit]) {
+      if (this.#exit.delete(listener)) safely(() => listener(this.#finalExit!));
+    }
     this.#data.clear();
-    this.#exit.clear();
   }
 }
 

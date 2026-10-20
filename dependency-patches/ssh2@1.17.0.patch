@@ -1,0 +1,18 @@
+diff --git a/lib/keygen.js b/lib/keygen.js
+--- a/lib/keygen.js
++++ b/lib/keygen.js
+@@ -294,8 +294,6 @@
+-      let pubBin = reader.readString(Ber.BitString, true);
+-      {
+-        // Remove leading zero bytes
+-        let i = 0;
+-        for (; i < pubBin.length && pubBin[i] === 0x00; ++i);
+-        if (i > 0)
+-          pubBin = pubBin.slice(i);
+-      }
++      const publicBits = reader.readString(Ber.BitString, true);
++      // Only the BIT STRING's unused-bit octet is metadata. All 32 key
++      // octets, including a leading zero, belong to the Ed25519 identity.
++      if (publicBits.length !== 33 || publicBits[0] !== 0)
++        throw new Error('Bad ED25519 public key bit string');
++      const pubBin = publicBits.subarray(1);

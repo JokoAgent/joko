@@ -2,28 +2,48 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation scope
+        type: choice
+        default: full
+        options:
+          - full
+          - windows-native
+          - windows-runtime-diagnostics
+          - desktop-product
+          - browser-regressions
+      platform:
+        description: Platform for manual verification
+        type: choice
+        default: all
+        options:
+          - all
+          - windows
+          - linux
+          - macos
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}${{ inputs.scope == 'windows-native' && '-windows-native' || inputs.scope == 'windows-runtime-diagnostics' && '-windows-runtime-diagnostics' || inputs.scope == 'desktop-product' && format('-desktop-product-{0}', github.sha) || inputs.scope == 'browser-regressions' && format('-browser-regressions-{0}', github.sha) || inputs.scope == 'full' && github.event_name == 'workflow_dispatch' && format('-full-{0}', github.sha) || '' }}${{ github.event_name == 'workflow_dispatch' && format('-platform-{0}', inputs.platform || 'all') || '' }}
+  cancel-in-progress: false
 
 jobs:
   verify:
-    name: ${{ matrix.os }} / Node 22.19
+    if: ${{ inputs.scope != 'windows-runtime-diagnostics' }}
+    name: ${{ matrix.os }} / Node 24.16 / ${{ matrix.workload }}${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+        os: ${{ fromJSON(inputs.scope == 'windows-native' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'windows' && '["windows-latest"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'linux' && '["ubuntu-24.04"]' || github.event_name == 'workflow_dispatch' && inputs.platform == 'macos' && '["macos-15"]' || '["ubuntu-24.04","windows-latest","macos-15"]') }}
+        workload: ${{ fromJSON(inputs.scope == 'browser-regressions' && '["browser-regressions"]' || (inputs.scope == 'windows-native' || inputs.scope == 'desktop-product') && '["product"]' || '["product","e2e-1","e2e-2","e2e-3","e2e-4"]') }}
 
     steps:
       - name: Check out repository
@@ -35,45 +55,332 @@ jobs:
           version: 11.22.0
           run_install: false
 
-      - name: Install Node.js 22.19.0
+      - name: Install Node.js 24.16.0
         uses: actions/setup-node@v4
         with:
-          node-version: 22.19.0
+          node-version: 24.16.0
           cache: pnpm
 
       - name: Use the canonical temporary directory
+        id: temporary
         run: |
-          node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV, ['TMPDIR='+canonical, 'TMP='+canonical, 'TEMP='+canonical, ''].join('\n'));"
+          node -e "const fs=require('node:fs'); const os=require('node:os'); const path=require('node:path'); const canonical=fs.realpathSync.native(os.tmpdir()); fs.mkdirSync(path.join(process.env.RUNNER_TEMP,'joko-ci-logs'),{recursive:true}); fs.appendFileSync(process.env.GITHUB_ENV, ['TMPDIR='+canonical, 'TMP='+canonical, 'TEMP='+canonical, ''].join('\n')); fs.appendFileSync(process.env.GITHUB_OUTPUT,'directory='+canonical+'\n');"
 
       - name: Install Linux test dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev ripgrep xauth xvfb
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- update
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- install --no-install-recommends --yes build-essential pkg-config libxcb1-dev libxcb-res0-dev libxcb-xkb-dev libwayland-dev libwayland-bin libxkbcommon-dev libjson-c-dev libturbojpeg0-dev libpng-dev ripgrep xauth xvfb openbox x11-utils apparmor
 
       - name: Install Windows test dependencies
         if: runner.os == 'Windows'
-        run: choco install ripgrep --no-progress --yes
+        timeout-minutes: 10
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'ripgrep-15.2.0-x86_64-pc-windows-msvc.zip'
+          $installation = Join-Path $env:RUNNER_TEMP 'joko-ci-ripgrep'
+          Invoke-WebRequest -Uri 'https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip' -OutFile $archive -MaximumRetryCount 3 -RetryIntervalSec 5 -TimeoutSec 120
+          $archiveHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
+          if ($archiveHash -ne '71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5') {
+            throw 'The Windows ripgrep archive did not match its pinned release digest.'
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $installation
+          $directory = Join-Path $installation 'ripgrep-15.2.0-x86_64-pc-windows-msvc'
+          $executable = Join-Path $directory 'rg.exe'
+          $version = @(& $executable --version)
+          if ($LASTEXITCODE -ne 0 -or $version[0] -notmatch '^ripgrep 15\.2\.0(?:\s|$)') {
+            throw 'The pinned Windows ripgrep executable could not be verified.'
+          }
+          $version
+          $directory | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Install macOS test dependencies
         if: runner.os == 'macOS'
         run: brew install ripgrep
 
+      - name: Route same-runner multicast fixtures through macOS loopback
+        if: runner.os == 'macOS'
+        timeout-minutes: 1
+        run: node scripts/ci/macos-loopback-multicast.mjs configure
+
       - name: Install dependencies from lockfile
         id: dependencies
-        run: pnpm install --frozen-lockfile
+        shell: bash
+        run: pnpm install --frozen-lockfile 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/install.log"
+
+      - name: Diagnose the reproducible macOS LAN discovery failure
+        id: lan_discovery
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'macOS' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/node-sync exec vitest run src/node-sync.test.ts -t "delivers on its granted purpose" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/lan-discovery.log"
+
+      - name: Upload the immediate LAN failure diagnosis
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.lan_discovery.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-lan-discovery-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/lan-discovery.log
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Configure the installed Electron sandbox helper on Linux
+        id: electron_sandbox
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          exec > >(tee "$RUNNER_TEMP/joko-ci-logs/linux-sandbox.log") 2>&1
+          pnpm --filter @joko/desktop exec node --input-type=commonjs <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { spawnSync } = require('node:child_process');
+          // Electron may download its binary and write progress to stdout here.
+          // Keep the validated filename in memory instead of parsing that output.
+          const executable = fs.realpathSync(require('electron'));
+          const helper = path.join(path.dirname(executable), 'chrome-sandbox');
+          const root = fs.realpathSync(process.env.GITHUB_WORKSPACE);
+          const relative = path.relative(root, helper);
+          const info = fs.lstatSync(helper);
+          if (!relative || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)
+            || !info.isFile() || info.isSymbolicLink() || fs.realpathSync(helper) !== helper) {
+            throw new Error('Electron sandbox helper is outside the checked-out installation');
+          }
+          for (const args of [['chown', 'root:root', helper], ['chmod', '4755', helper]]) {
+            const result = spawnSync('sudo', args, { shell: false, stdio: 'inherit' });
+            if (result.error || result.signal || result.status !== 0) {
+              throw new Error('Electron sandbox helper permission setup failed');
+            }
+          }
+          const configured = fs.lstatSync(helper);
+          if (!configured.isFile() || configured.isSymbolicLink() || fs.realpathSync(helper) !== helper
+            || configured.dev !== info.dev || configured.ino !== info.ino
+            || configured.uid !== 0 || configured.gid !== 0 || (configured.mode & 0o7777) !== 0o4755) {
+            throw new Error('Electron sandbox helper root ownership or setuid mode was not established');
+          }
+          NODE
+
+      - name: Upload a Linux sandbox setup failure immediately
+        if: ${{ !cancelled() && steps.electron_sandbox.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-linux-sandbox-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
+          path: ${{ runner.temp }}/joko-ci-logs/linux-sandbox.log
+          if-no-files-found: error
+          retention-days: 3
 
       - name: Check build, boundaries, generated contracts, and types
+        id: source_check
         if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: pnpm check
+        shell: bash
+        run: pnpm check 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/check.log"
+        env:
+          NODE_OPTIONS: --max-old-space-size=4096
 
-      - name: Run workspace test suite, including Connect end-to-end coverage
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: pnpm test:ci
+      - name: Upload an immediately available source-check failure log
+        if: ${{ !cancelled() && steps.source_check.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-source-check-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
+          path: ${{ runner.temp }}/joko-ci-logs/check.log
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Check Windows SSH key permissions
+        id: ssh_key_permissions
+        if: ${{ matrix.workload == 'product' && (inputs.scope == 'windows-native' || inputs.scope == 'desktop-product') && !cancelled() && steps.source_check.outcome == 'success' && runner.os == 'Windows' }}
+        timeout-minutes: 5
+        shell: bash
+        run: pnpm --filter @joko/remote-ssh exec vitest run src/keys.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/ssh-key-permissions.log"
+
+      - name: Upload Windows SSH key permission failure evidence
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.ssh_key_permissions.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-ssh-key-permissions-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/ssh-key-permissions.log
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Prepare Chromium for production Web and standalone backend chains
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
+        id: browser
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            pnpm --filter @joko/e2e exec playwright-core install --with-deps chromium 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/chromium.log"
+          else
+            pnpm --filter @joko/e2e exec playwright-core install chromium 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/chromium.log"
+          fi
+          node scripts/ci/prepare-browser.mjs
+
+      - name: Configure the installed Chromium sandbox profile on Linux
+        id: chromium_sandbox
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.browser.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: node scripts/ci/configure-linux-browser-sandbox.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/linux-browser-sandbox.log"
+
+      - name: Upload an immediately available Chromium sandbox setup failure
+        if: ${{ !cancelled() && steps.chromium_sandbox.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-linux-browser-sandbox-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
+          path: ${{ runner.temp }}/joko-ci-logs/linux-browser-sandbox.log
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Run workspace package tests (Linux)
+        id: workspace_packages_linux
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm -r --workspace-concurrency=1 --no-bail --if-present --filter '!@joko/orchestrator' --filter '!@joko/e2e' test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-packages.log"
+        env:
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Run workspace package tests (Windows/macOS)
+        id: workspace_packages_desktop
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        shell: bash
+        run: pnpm -r --workspace-concurrency=1 --no-bail --if-present --filter '!@joko/orchestrator' --filter '!@joko/e2e' test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-packages.log"
+
+      - name: Upload completed workspace package test logs
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-workspace-packages-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/tests-packages.log
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Run Orchestrator tests (Linux)
+        id: workspace_orchestrator_linux
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/orchestrator test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-orchestrator.log"
+        env:
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Run Orchestrator tests (Windows/macOS)
+        id: workspace_orchestrator_desktop
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        shell: bash
+        run: pnpm --filter @joko/orchestrator test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-orchestrator.log"
+
+      - name: Upload completed Orchestrator test logs
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-workspace-orchestrator-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/tests-orchestrator.log
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Run Connect end-to-end tests and Browser chains (Linux)
+        id: workspace_e2e_linux
+        timeout-minutes: 35
+        if: ${{ startsWith(matrix.workload, 'e2e-') && !cancelled() && steps.dependencies.outcome == 'success' && runner.os == 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/4' || matrix.workload == 'e2e-2' && '2/4' || matrix.workload == 'e2e-3' && '3/4' || '4/4' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
+        env:
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Run Connect end-to-end tests (Windows/macOS)
+        id: workspace_e2e_desktop
+        timeout-minutes: 35
+        if: ${{ startsWith(matrix.workload, 'e2e-') && !cancelled() && steps.dependencies.outcome == 'success' && runner.os != 'Linux' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        shell: bash
+        run: pnpm --filter @joko/e2e test --shard=${{ matrix.workload == 'e2e-1' && '1/4' || matrix.workload == 'e2e-2' && '2/4' || matrix.workload == 'e2e-3' && '3/4' || '4/4' }} 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/tests-e2e.log"
+
+      - name: Upload completed Connect end-to-end test logs
+        if: ${{ startsWith(matrix.workload, 'e2e-') && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-workspace-e2e-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}-${{ matrix.workload }}
+          path: ${{ runner.temp }}/joko-ci-logs/tests-e2e.log
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Check history navigation and artifact fixture ownership
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: pnpm --filter @joko/web exec vitest run src/components/Timeline.viewport.test.tsx src/components/Timeline.test.ts src/components/timeline-follow-intent.test.ts src/dev/VisualHarness.artifact-storage.test.tsx 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-owners.log"
+
+      - name: Run the affected production Web chains (Linux)
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 15
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/paired-backends.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+        env:
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Run the affected production Web chains (Windows/macOS)
+        id: browser_regressions
+        if: ${{ matrix.workload == 'browser-regressions' && !cancelled() && steps.source_check.outcome == 'success' && steps.browser.outcome == 'success' && runner.os != 'Linux' }}
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            files=(src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts src/document-tools.e2e.test.ts src/paired-backends.e2e.test.ts)
+          else
+            files=(src/session-events.e2e.test.ts src/timeline-history.e2e.test.ts)
+          fi
+          echo "selected_files=${files[*]}" >> "$GITHUB_OUTPUT"
+          pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${files[@]}" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/browser-regressions.log"
+
+      - name: Upload the affected Web chain logs
+        if: ${{ matrix.workload == 'browser-regressions' && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-browser-regressions-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ci-logs/browser-regressions.log
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Diagnose the exact Windows remote broker startup regression
+        if: ${{ matrix.workload == 'product' && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.scope == 'windows-native' && runner.os == 'Windows' && steps.source_check.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: pnpm --filter @joko/orchestrator exec vitest run src/remote-pi-broker-source.test.ts -t "keeps the exact child and replay alive across manager crash, then rotates relay authority" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/remote-pi-broker-regression.log"
+
+      - name: Run the affected Windows Desktop checks
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 5
+        shell: bash
+        run: pnpm --filter @joko/desktop exec vitest run test/managed-orchestrator-real.test.ts test/runtime-staging.test.ts test/remote-desktop-native-build.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-native-regressions.log"
+
+      - name: Run the affected Windows queue checks
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/store exec vitest run src/operational-store.test.ts -t queue 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/store-queue-regressions.log"
+
+      - name: Check the Windows document worker regression
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/tool-document exec node --import ../../scripts/ci/observe-document-workers.mjs ../../node_modules/vitest/vitest.mjs run --execArgv=--import=../../scripts/ci/observe-document-workers.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/document-regressions.log"
+
+      - name: Run the affected Windows service product chains
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 7
+        shell: bash
+        run: pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/device-peer-product.e2e.test.ts src/ssh-keys.e2e.test.ts src/controlled-pi-process.e2e.test.ts src/paired-backends.e2e.test.ts src/voice-dictionary.e2e.test.ts -t "runs a durable two-Device project|uses authenticated single-use passphrase uploads|forwards the native input write failure|fences consumed native inputs with lost receipts|resumes three native tasks through service restart|converges the production three-node bridge" 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/e2e-native-regressions.log"
+
+      - name: Check the complete Windows Mobile test owner
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'windows-native' }}
+        timeout-minutes: 10
+        shell: bash
+        run: pnpm --filter @joko/mobile test 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/mobile-regressions.log"
 
       - name: Amplify the short queue soak and fault matrix
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: pnpm test:soak
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' && inputs.scope != 'desktop-product' }}
+        shell: bash
+        run: pnpm test:soak 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/soak.log"
         env:
           JOKO_E2E_SOAK_ITERATIONS: "2"
           JOKO_E2E_SOAK_DURATION_MS: "3000"
@@ -81,20 +388,328 @@ jobs:
 
       - name: Build and verify isolated Desktop Orchestrator runtime
         id: desktop_runtime
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        timeout-minutes: 15
-        run: pnpm stage:desktop:orchestrator-runtime
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.dependencies.outcome == 'success' && inputs.scope != 'windows-native' }}
+        timeout-minutes: 45
+        shell: bash
+        run: pnpm stage:desktop:orchestrator-runtime 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-runtime.log"
 
-      - name: Run Electron development-host smoke (Linux)
-        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
-        timeout-minutes: 5
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm test:desktop:host
+      - name: Check smoke evidence preservation before profile cleanup
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.source_check.outcome == 'success' && inputs.scope == 'desktop-product' }}
+        shell: bash
+        run: pnpm --filter @joko/desktop exec vitest run test/smoke-packaged-helpers.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/smoke-evidence-owner.log"
+
+      - name: Operate production Web with the isolated standalone backend and recover after restart
+        id: standalone_web
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && steps.browser.outcome == 'success' }}
+        timeout-minutes: 7
+        shell: bash
+        env:
+          JOKO_STANDALONE_WEB_CLI: "1"
+          JOKO_STANDALONE_WEB_CLI_HEADED: "1"
+          PLAYWRIGHT_LEGACY_SCREENSHOT: ${{ runner.os == 'Windows' && '1' || '' }}
+          JOKO_BROWSER_EXECUTABLE: ${{ steps.browser.outputs.executable }}
+          JOKO_MOUNTED_WEB_DIR: ${{ github.workspace }}/apps/web/dist
+          JOKO_STANDALONE_ORCHESTRATOR_ENTRY: ${{ github.workspace }}/apps/desktop/dist/orchestrator-runtime/dist/main.js
+          JOKO_STANDALONE_WEB_EVIDENCE_DIR: ${{ runner.temp }}/joko-standalone-web-evidence
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/standalone-web-cli.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/web-standalone.log"
+          else
+            pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts src/standalone-web-cli.e2e.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/web-standalone.log"
+          fi
+
+      - name: Upload a failed standalone Web chain before Desktop packaging
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.standalone_web.outcome == 'failure' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-standalone-failure-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ci-logs/web-standalone.log
+            ${{ runner.temp }}/joko-standalone-web-evidence/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Package the current platform Desktop application
+        id: desktop_package
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' }}
+        timeout-minutes: 20
+        shell: bash
+        run: pnpm --filter @joko/desktop package:dir 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-package.log"
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+      - name: Run applicable GUI regressions against the current packaged Desktop
+        id: packaged_regressions
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' }}
+        timeout-minutes: 35
+        shell: bash
+        run: |
+          packaged_executable="$(node --input-type=module <<'NODE'
+          import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
+          import { isAbsolute, relative, resolve, sep } from 'node:path';
+          const root = resolve('apps/desktop/release');
+          const candidates = process.platform === 'win32'
+            ? [resolve(root, 'win-unpacked/Joko.exe'), resolve(root, `win-${process.arch}-unpacked/Joko.exe`)]
+            : process.platform === 'linux'
+              ? [resolve(root, 'linux-unpacked/joko'), resolve(root, `linux-${process.arch}-unpacked/joko`)]
+              : readdirSync(root, { withFileTypes: true })
+                .filter(entry => entry.isDirectory() && /^mac(?:-(?:arm64|x64|universal))?$/.test(entry.name))
+                .map(entry => resolve(root, entry.name, 'Joko.app/Contents/MacOS/Joko'));
+          const matches = [...new Set(candidates)].filter(existsSync);
+          if (matches.length !== 1) throw new Error('Expected one current packaged Desktop executable.');
+          const executable = matches[0];
+          const withinRoot = relative(root, realpathSync(executable));
+          const info = lstatSync(executable);
+          if (!info.isFile() || info.isSymbolicLink() || isAbsolute(withinRoot)
+              || withinRoot === '..' || withinRoot.startsWith('..' + sep)) {
+            throw new Error('The packaged Desktop executable must remain a regular file inside its release directory.');
+          }
+          process.stdout.write(executable);
+          NODE
+          )"
+          export JOKO_PACKAGED_DESKTOP_EXECUTABLE="$packaged_executable"
+          packaged_files=(src/real-pi-compaction-packaged-desktop.e2e.test.ts)
+          if [[ "$RUNNER_OS" == 'Windows' && "$JOKO_PACKAGED_WINDOWS_PI_REGRESSIONS" != '1' ]]; then
+            packaged_files+=(src/settings-packaged-desktop.e2e.test.ts src/message-search-packaged-desktop.e2e.test.ts src/document-tools-packaged-desktop.e2e.test.ts)
+          fi
+          if [[ "$RUNNER_OS" == 'Linux' ]]; then
+            export XDG_SESSION_TYPE=x11 WAYLAND_DISPLAY='' JOKO_DESKTOP_SMOKE_NO_SANDBOX=1
+            xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bash scripts/ci/run-linux-gui.sh pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${packaged_files[@]}"
+          else
+            pnpm --filter @joko/e2e exec vitest run --config vitest.config.ts --reporter=verbose "${packaged_files[@]}"
+          fi 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/packaged-desktop-regressions.log"
+        env:
+          JOKO_DOCUMENT_VISUAL_CAPTURE_DIR: ${{ runner.temp }}/joko-web-evidence/packaged-desktop/documents
+          JOKO_PACKAGED_WINDOWS_PI_REGRESSIONS: ${{ inputs.scope == 'desktop-product' && runner.os == 'Windows' && '1' || '0' }}
+
+      - name: Upload packaged Desktop regression evidence
+        if: ${{ matrix.workload == 'product' && always() && (steps.packaged_regressions.outcome == 'success' || steps.packaged_regressions.outcome == 'failure') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaged-desktop-gui-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ci-logs/packaged-desktop-regressions.log
+            ${{ runner.temp }}/joko-web-evidence/packaged-desktop/
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Prepare the macOS cursor smoke compiler
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'macOS' }}
+        timeout-minutes: 3
+        shell: bash
+        run: /usr/bin/time -p /usr/bin/swift -e 'import CoreGraphics; import Darwin; print("CoreGraphics cursor smoke compiler ready")' 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/macos-cursor-compiler.log"
+
+      - name: Run the packaged Desktop smoke (Linux)
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 10
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bash scripts/ci/run-linux-gui.sh pnpm test:desktop:artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-smoke.log"
         env:
           JOKO_DESKTOP_SMOKE_NO_SANDBOX: "1"
+          JOKO_DESKTOP_SMOKE_KEEP_FAILED: "1"
+          JOKO_DESKTOP_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/joko-packaged-evidence
           XDG_SESSION_TYPE: x11
           WAYLAND_DISPLAY: ""
 
-      - name: Run Electron development-host smoke (Windows/macOS)
-        if: ${{ !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
+      - name: Run the packaged Desktop smoke (Windows/macOS)
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' && runner.os != 'Linux' }}
+        timeout-minutes: 10
+        shell: bash
+        run: pnpm test:desktop:artifact 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-smoke.log"
+        env:
+          JOKO_DESKTOP_SMOKE_KEEP_FAILED: "1"
+          JOKO_DESKTOP_SMOKE_EVIDENCE_DIR: ${{ runner.temp }}/joko-packaged-evidence
+
+      - name: Run the independent Desktop viewer GUI chain (Linux)
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
         timeout-minutes: 5
-        run: pnpm test:desktop:host
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bash scripts/ci/run-linux-gui.sh node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer.log"
+        env:
+          JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR: ${{ runner.temp }}/joko-viewer-evidence
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Run the independent Desktop viewer GUI chain (Windows/macOS)
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
+        timeout-minutes: 5
+        shell: bash
+        run: node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer.log"
+        env:
+          JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR: ${{ runner.temp }}/joko-viewer-evidence
+
+      - name: Verify the viewer's unbound prewarm lifecycle (Linux)
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os == 'Linux' }}
+        timeout-minutes: 5
+        shell: bash
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" bash scripts/ci/run-linux-gui.sh node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs --scope viewer-lifecycle 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer-lifecycle.log"
+        env:
+          JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR: ${{ runner.temp }}/joko-viewer-evidence
+          XDG_SESSION_TYPE: x11
+          WAYLAND_DISPLAY: ""
+
+      - name: Verify the viewer's unbound prewarm lifecycle (Windows/macOS)
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_runtime.outcome == 'success' && runner.os != 'Linux' }}
+        timeout-minutes: 5
+        shell: bash
+        run: node apps/desktop/scripts/smoke-remote-desktop-viewer.mjs --scope viewer-lifecycle 2>&1 | tee "$RUNNER_TEMP/joko-ci-logs/desktop-viewer-lifecycle.log"
+        env:
+          JOKO_REMOTE_DESKTOP_VIEWER_EVIDENCE_DIR: ${{ runner.temp }}/joko-viewer-evidence
+
+      - name: Archive the packaged application with its source identity
+        id: desktop_archive
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_package.outcome == 'success' }}
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          mkdir -p ci-artifacts
+          archive="Joko-${RUNNER_OS}-${RUNNER_ARCH}-${GITHUB_SHA}.tar.gz"
+          tar -czf "ci-artifacts/$archive" -C apps/desktop release
+          node --input-type=module - "$archive" <<'NODE'
+          import { createReadStream, writeFileSync } from 'node:fs';
+          import { createHash } from 'node:crypto';
+          const archive = process.argv[2], hash = createHash('sha256');
+          for await (const chunk of createReadStream(`ci-artifacts/${archive}`)) hash.update(chunk);
+          writeFileSync('ci-artifacts/manifest.json', JSON.stringify({ sourceCommit: process.env.GITHUB_SHA,
+            platform: process.env.RUNNER_OS, architecture: process.env.RUNNER_ARCH, archive,
+            sha256: hash.digest('hex') }, null, 2) + '\n');
+          NODE
+
+      - name: Upload the current platform application
+        if: ${{ matrix.workload == 'product' && !cancelled() && steps.desktop_archive.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ci-artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Collect bounded smoke receipts beside validation logs
+        if: ${{ matrix.workload == 'product' && always() }}
+        shell: bash
+        run: node scripts/ci/collect-desktop-diagnostics.mjs
+
+      - name: Remove only the macOS multicast route created by this job
+        if: ${{ always() && runner.os == 'macOS' }}
+        timeout-minutes: 1
+        run: node scripts/ci/macos-loopback-multicast.mjs cleanup
+
+      - name: Upload validation logs and bounded smoke failure receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-diagnostics-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
+          path: ${{ runner.temp }}/joko-ci-logs/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload bounded Desktop viewer GUI evidence
+        if: ${{ matrix.workload == 'product' && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-viewer-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-viewer-evidence/*.png
+            ${{ runner.temp }}/joko-viewer-evidence/identity.json
+            ${{ runner.temp }}/joko-viewer-evidence/result.json
+            ${{ runner.temp }}/joko-viewer-evidence/failure.json
+            ${{ runner.temp }}/joko-viewer-evidence/lifecycle/*.png
+            ${{ runner.temp }}/joko-viewer-evidence/lifecycle/identity.json
+            ${{ runner.temp }}/joko-viewer-evidence/lifecycle/result.json
+            ${{ runner.temp }}/joko-viewer-evidence/lifecycle/failure.json
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload packaged Desktop operation screenshots and receipts
+        if: ${{ matrix.workload == 'product' && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-gui-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-packaged-evidence/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload Web operation screenshots
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-gui-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}${{ matrix.workload != 'product' && format('-{0}', matrix.workload) || '' }}
+          path: ${{ runner.temp }}/joko-web-evidence/
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Upload standalone Web and backend operation evidence
+        if: ${{ matrix.workload == 'product' && always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-standalone-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-standalone-web-evidence/
+          if-no-files-found: warn
+          retention-days: 3
+
+  windows_runtime_diagnostics:
+    name: Windows compiler and PDF startup observations
+    if: ${{ inputs.scope == 'windows-runtime-diagnostics' }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+      - name: Use the canonical temporary directory for parser owners
+        run: |
+          node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync.native(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV,['TMPDIR='+canonical,'TMP='+canonical,'TEMP='+canonical,''].join('\n'));"
+      - name: Install dependencies from lockfile
+        id: dependencies
+        shell: bash
+        run: pnpm install --frozen-lockfile
+      - name: Observe the owned permission compiler with controlled startup environments
+        id: compiler
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/joko-runtime-diagnostics"
+          node scripts/ci/diagnose-windows-compiler.mjs 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/compiler.log"
+      - name: Build the document worker for source and compiled startup observations
+        run: pnpm --filter @joko/tool-document build
+      - name: Observe PDF imports and parsing within the original Worker limits
+        timeout-minutes: 2
+        shell: bash
+        run: node scripts/ci/diagnose-pdf-worker.mjs 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/pdf-worker.log"
+      - name: Verify the actual SSH key permission and creation operations
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && steps.compiler.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: pnpm --filter @joko/remote-ssh exec vitest run src/keys.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/ssh-keys.log"
+      - name: Verify the actual document owner after native startup observations
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' && steps.compiler.outcome == 'success' }}
+        timeout-minutes: 2
+        shell: bash
+        run: pnpm --filter @joko/tool-document exec vitest run 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/document.log"
+      - name: Verify native SQL deadlines, authority revocation and Review parser retirement
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          pnpm --filter @joko/contracts build
+          pnpm --filter @joko/orchestrator exec vitest run src/extension-library-sql.test.ts src/extension-library-manager.test.ts src/review-evidence-provider.test.ts 2>&1 | tee "$RUNNER_TEMP/joko-runtime-diagnostics/native-parser-owners.log"
+      - name: Upload the bounded runtime observations
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-runtime-diagnostics-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-runtime-diagnostics/
+          if-no-files-found: warn
+          retention-days: 3

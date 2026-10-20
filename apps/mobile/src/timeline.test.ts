@@ -36,6 +36,31 @@ it("shows typed objective completion while keeping the internal verdict out of v
 });
 
 describe("mobile Timeline metadata events", () => {
+  it("retains canonical attachment names for message actions in image-then-file order across completion", () => {
+    const start = create(EventSchema, { eventId: "accepted-media", identity: { sessionId: "session" },
+      cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageStarted", value: {
+        messageId: "message", role: MessageRole.USER, userInputAccepted: true, userInput: { parts: [
+          { content: { case: "file", value: { fileName: "first.txt" } } },
+          { content: { case: "image", value: { blob: { fileName: "first.png" } } } },
+          { content: { case: "text", value: "Exact **body**" } },
+          { content: { case: "file", value: { fileName: "second.txt" } } },
+          { content: { case: "image", value: { blob: { fileName: "second.png" } } } }
+        ] } } } } });
+    const end = completed([{ content: { case: "text", value: "Exact **body**" } }], MessageRole.USER);
+    end.cursor!.sequence = 2n;
+    expect(timelineRows([start, end])[0]?.copySource).toEqual({ body: "Exact **body**",
+      attachmentNames: ["first.png", "second.png", "first.txt", "second.txt"] });
+    if (start.payload?.kind.case !== "messageStarted") throw new Error("Expected accepted input.");
+    start.payload.kind.value.userInput!.parts = start.payload.kind.value.userInput!.parts.filter(part => part.content.case !== "text");
+    expect(timelineRows([start])[0]?.copySource).toMatchObject({ body: "", attachmentNames: ["first.png", "second.png", "first.txt", "second.txt"] });
+    start.payload.kind.value.automaticContinuation = true;
+    expect(timelineRows([start])[0]?.copySource).toBeUndefined();
+    const boundaryOnly = completed([
+      { content: { case: "image", value: { blob: { fileName: "visible.png" } } } },
+      { content: { case: "artifact", value: { blob: { fileName: "visible.txt" } } } }
+    ], MessageRole.USER);
+    expect(timelineRows([boundaryOnly])[0]?.copySource).toEqual({ body: "", attachmentNames: ["visible.png", "visible.txt"] });
+  });
   it("preserves the Host participant author through accepted input and completed-message replay", () => {
     const author = { shareId: "share", sessionId: "session", shareGeneration: 2n, memberId: "member", memberGeneration: 3n, displayName: "Participant" };
     const start = create(EventSchema, { eventId: "accepted", identity: { sessionId: "session" }, cursor: { generation: 1n, sequence: 1n },

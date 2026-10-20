@@ -219,6 +219,42 @@ describe("macOS native task-status host", () => {
     expect(clock.pending()).toBe(0);
   });
 
+  it.each(["navigation", "unchanged", "dispose"] as const)("settles a current aborted load through its exact owner: %s", async outcome => {
+    const clock = new FakeClock();
+    const windows: FakeWindow[] = [];
+    let rejectCurrent!: (error: Error) => void;
+    const current = new Promise<void>((_resolve, reject) => { rejectCurrent = reject; });
+    let loads = 0;
+    const host = createMacNativeTaskStatusHost({
+      supported: true,
+      now: clock.now, setTimer: clock.setTimer, clearTimer: clock.clearTimer,
+      getDisplays: () => [{ id: 1, name: "Primary", primary: true, bounds: { x: 0, y: 0, width: 1200, height: 800 } }],
+      createWindow: bounds => {
+        const window = new FakeWindow(bounds);
+        window.loadDocument = async () => { if (++loads === 2) await current; };
+        windows.push(window);
+        return window;
+      },
+      onAction: () => undefined, onNewTask: () => undefined, onOpenSettings: () => undefined,
+      onToggleSounds: () => undefined, playSound: () => undefined
+    });
+    host.setSettings({ enabled: true, display: { mode: "all" }, layout: "normal", sounds: SOUND_SETTINGS });
+    host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "owner", revision: "1", locale: "en", sessions: [] }));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "owner", revision: "2", locale: "en", sessions: [] }));
+    rejectCurrent(Object.assign(new Error("native navigation aborted"), { code: "ERR_ABORTED" }));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(windows[0]!.destroyed).toBe(false);
+    if (outcome === "navigation") windows[0]!.navigate?.("joko-task-status://toggle");
+    if (outcome === "dispose") host.dispose();
+    clock.advance(100);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(windows[0]!.destroyed).toBe(outcome !== "navigation");
+    if (outcome === "navigation") expect(windows[0]!.bounds.height).toBeGreaterThan(46);
+    host.dispose();
+    expect(clock.pending()).toBe(0);
+  });
+
   it("does not retire the current window for an earlier document load failure", async () => {
     const windows: FakeWindow[] = [];
     let rejectEarlier!: (error: Error) => void;

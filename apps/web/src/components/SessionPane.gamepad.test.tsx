@@ -32,6 +32,9 @@ const session: SessionView = { id: "task", backendId: "backend", targetId: "targ
 const backend: BackendView = { id: "backend", name: "Backend", health: "healthy", version: "1", capabilities: new Map(
   ["model.effort", "model.fast_mode", "plan_mode", "turn.abort", "session.fork", "session.clone"].map((name) => [name, { name, supported: true, options: [] }])) };
 const message: TimelineItemView = { id: "message", kind: "assistant", text: "Finished response", nativeEntryId: "native-entry", sourceEventId: "event", sequence: 1n, createdAt: 1 };
+const learningRun = { id: "learning", revision: 1n, state: "distilling" as const, sourceKind: "session" as const,
+  backendId: "backend", targetId: "target", sourceSessionId: "task", distillationSessionId: "distillation",
+  summary: "", createdAt: 1, updatedAt: 1, expiresAt: 100 };
 
 describe("session gamepad actions", () => {
   it("applies bounded reasoning and Fast changes to the current model and prevents overlapping model updates", async () => {
@@ -193,6 +196,114 @@ describe("session gamepad actions", () => {
     await act(async () => view.host.querySelector<HTMLButtonElement>('[data-testid="message-fork"]')!.click());
     expect(document.querySelector("[data-message-fork-confirm='true']")).not.toBeNull();
   });
+
+  it.each(["fork", "clone", "learn"] as const)("does not let an old %s result replace a later task navigation", async (action) => {
+    const view = await mount();
+    let complete!: () => void;
+    if (action === "fork") view.api.forkSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("forked"); }));
+    if (action === "clone") view.api.cloneSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("cloned"); }));
+    if (action === "learn") view.api.startSkillLearning.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve(learningRun); }));
+    await view.derive(action);
+    await view.render({ ...session, id: "other-task" }, backend, false, { navigationRevision: 2 });
+    await act(async () => { complete(); await Promise.all(view.pending); });
+    expect(view.api.navigate).not.toHaveBeenCalled();
+  });
+
+  it("does not save a late user-message fork prompt into a replacement connection", async () => {
+    const view = await mount();
+    const userMessage: TimelineItemView = { ...message, kind: "user", text: "Keep my source prompt", nativeEntryId: undefined, nativeParentEntryId: "parent-entry" };
+    await view.render(session, backend, false, {}, [userMessage]);
+    let complete!: () => void;
+    view.api.forkSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("forked"); }));
+    await view.derive("fork");
+    await view.render(session, backend, false, {
+      activeProfile: { id: "replacement", serverId: "replacement-server", deviceId: "device", name: "Other node", origin: "https://other.example" },
+      connectionGeneration: 2
+    }, [userMessage]);
+    await act(async () => { complete(); await Promise.all(view.pending); });
+    expect(view.api.saveDraft).not.toHaveBeenCalled();
+    expect(view.api.navigate).not.toHaveBeenCalled();
+    expect(userMessage.text).toBe("Keep my source prompt");
+  });
+
+  it.each(["fork", "clone", "learn"] as const)("keeps current %s success usable and reports its current failure", async (action) => {
+    const view = await mount();
+    await view.derive(action);
+    await view.flush();
+    expect(view.api.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: action === "fork" ? "forked" : action === "clone" ? "cloned" : "distillation" });
+    view.api.navigate.mockClear();
+    const failure = new Error("source operation failed");
+    if (action === "fork") view.api.forkSession.mockRejectedValueOnce(failure);
+    if (action === "clone") view.api.cloneSession.mockRejectedValueOnce(failure);
+    if (action === "learn") view.api.startSkillLearning.mockRejectedValueOnce(failure);
+    await view.derive(action);
+    await expect(view.flush()).rejects.toThrow("source operation failed");
+    expect(view.api.navigate).not.toHaveBeenCalled();
+  });
+
+  it.each(["fork", "clone", "learn"] as const)("discards a stale %s failure after leaving the source task", async (action) => {
+    const view = await mount();
+    let fail!: () => void;
+    if (action === "fork") view.api.forkSession.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = () => reject(new Error("old failure")); }));
+    if (action === "clone") view.api.cloneSession.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = () => reject(new Error("old failure")); }));
+    if (action === "learn") view.api.startSkillLearning.mockImplementationOnce(() => new Promise((_resolve, reject) => { fail = () => reject(new Error("old failure")); }));
+    await view.derive(action);
+    await view.render({ ...session, id: "other-task" });
+    await act(async () => { fail(); await Promise.all(view.pending); });
+    expect(view.api.navigate).not.toHaveBeenCalled();
+  });
+
+  it.each(["connection", "generation", "return", "pagehide"] as const)("retires an in-flight clone on %s even when the task ID is unchanged", async (change) => {
+    const view = await mount();
+    let complete!: () => void;
+    view.api.cloneSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("cloned"); }));
+    await view.derive("clone");
+    if (change === "connection") await view.render(session, backend, false, { connectionGeneration: 2 });
+    if (change === "generation") await view.render({ ...session, generation: 2n });
+    if (change === "return") {
+      await view.render({ ...session, id: "other-task" }, backend, false, { navigationRevision: 2 });
+      await view.render(session, backend, false, { navigationRevision: 3 });
+    }
+    if (change === "pagehide") await act(async () => window.dispatchEvent(new Event("pagehide")));
+    await act(async () => { complete(); await Promise.all(view.pending); });
+    expect(view.api.navigate).not.toHaveBeenCalled();
+  });
+
+  it.each(["fork", "clone"] as const)("allows a newer action to own navigation while an old %s completes and leaves Fork usable", async (action) => {
+    const view = await mount();
+    let complete!: () => void;
+    if (action === "fork") view.api.forkSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("old-fork"); }));
+    else view.api.cloneSession.mockImplementationOnce(() => new Promise((resolve) => { complete = () => resolve("old-clone"); }));
+    await view.derive(action);
+    await view.derive("learn");
+    await act(async () => { complete(); await Promise.all(view.pending); });
+    expect(view.api.navigate).toHaveBeenCalledExactlyOnceWith({ kind: "session", sessionId: "distillation" });
+    await view.derive("fork");
+    await view.flush();
+    expect(view.api.navigate).toHaveBeenLastCalledWith({ kind: "session", sessionId: "forked" });
+  });
+
+  it("saves the original user fork prompt before navigation and does not navigate if ownership changes during save", async () => {
+    const view = await mount();
+    const userMessage: TimelineItemView = { ...message, kind: "user", text: "Keep my source prompt", nativeEntryId: undefined, nativeParentEntryId: "parent-entry" };
+    await view.render(session, backend, false, {}, [userMessage]);
+    let completeSave!: () => void;
+    view.api.saveDraft.mockImplementationOnce(() => new Promise((resolve) => { completeSave = resolve; }));
+    await view.derive("fork");
+    expect(view.api.saveDraft).toHaveBeenCalledWith("forked", expect.objectContaining({ text: "Keep my source prompt", attachments: [], mentions: [] }));
+    expect(view.api.navigate).not.toHaveBeenCalled();
+    await view.render({ ...session, id: "other-task" });
+    await act(async () => { completeSave(); await Promise.all(view.pending); });
+    expect(view.api.navigate).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch a cancelled fork confirmation", async () => {
+    const view = await mount();
+    await act(async () => view.host.querySelector<HTMLButtonElement>('[data-testid="message-fork"]')!.click());
+    await act(async () => [...document.querySelectorAll<HTMLButtonElement>(".modal button")].find((button) => button.textContent === "common.cancel")!.click());
+    expect(view.api.forkSession).not.toHaveBeenCalled();
+    expect(view.api.navigate).not.toHaveBeenCalled();
+  });
 });
 
 async function mount(overrides: AppShortcutOverrides = {}) {
@@ -201,21 +312,33 @@ async function mount(overrides: AppShortcutOverrides = {}) {
     listPartners: vi.fn(async () => ({ partners: [], directory: { revision: 1n, activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 0, templates: [], avatarPresets: [] } })),
     pinSession: vi.fn(async () => undefined), abort: vi.fn(async () => undefined), forkSession: vi.fn<AppController["forkSession"]>(async () => "forked"),
     loadSessionTimelinePage: vi.fn<AppController["loadSessionTimelinePage"]>(async () => ({ items: [] })),
+    saveDraft: vi.fn<AppController["saveDraft"]>(async () => undefined),
+    startSkillLearning: vi.fn<AppController["startSkillLearning"]>(async () => learningRun),
     cloneSession: vi.fn<AppController["cloneSession"]>(async () => "cloned"), navigate: vi.fn(), exportSession: vi.fn(), getArtifactUrl: vi.fn(), releaseArtifactUrl: vi.fn() };
   const archive = vi.fn(); const copy = vi.fn(); const pending: Promise<unknown>[] = [];
   const host = document.body.appendChild(document.createElement("div")); const root = createRoot(host); roots.push(root);
-  const render = async (current = session, currentBackend = backend, readOnly = false) => {
-    const snapshot = { ...emptySnapshot(), revision: 1n, sessions: [current], backends: [currentBackend], models: [model], timelineBySession: new Map([[current.id, [message]]]) };
-    const controller = { ...api, state: { ready: true, connectionState: "connected", preferences: { ...DEFAULT_UI_PREFERENCES, appShortcutOverrides: overrides }, snapshot, route: { kind: "session", sessionId: current.id } } } as unknown as AppController;
-    await act(async () => root.render(<SessionPane controller={controller} session={current} backend={currentBackend} reviewReadOnly={readOnly} models={[model]} timeline={[message]}
+  const controller = { ...api } as unknown as AppController;
+  const render = async (current = session, currentBackend = backend, readOnly = false, stateOverrides: Partial<AppController["state"]> = {}, items = [message]) => {
+    const snapshot = { ...emptySnapshot(), revision: 1n, sessions: [current], backends: [currentBackend], models: [model], timelineBySession: new Map([[current.id, items]]) };
+    Object.assign(controller, { ...api, state: { ready: true, connectionState: "connected", connectionGeneration: 1, navigationRevision: 1,
+      activeProfile: { id: "profile", serverId: "server", deviceId: "device", name: "Node", origin: "https://node.example" },
+      preferences: { ...DEFAULT_UI_PREFERENCES, appShortcutOverrides: overrides }, snapshot, route: { kind: "session", sessionId: current.id }, ...stateOverrides } });
+    await act(async () => root.render(<SessionPane controller={controller} session={current} backend={currentBackend} reviewReadOnly={readOnly} models={[model]} timeline={items}
       timelineHasEarlier={false} timelineHistoryLoading={false} onLoadEarlierTimeline={async () => undefined} extensionWidgets={[]} extensionStatuses={[]}
       queue={[]} extraDirectories={[]} resources={[]} commandRefreshSignal={[]} remainingInteractions={0} navigationOpen inspectorOpen t={(key) => key}
-      runAction={(_key, action) => { pending.push(action()); }} onOpenNavigation={() => undefined} onOpenInspector={() => undefined} onRename={() => undefined} onDelete={() => undefined}
+      runAction={(_key, action) => { const result = action(); void result.catch(() => undefined); pending.push(result); }} onOpenNavigation={() => undefined} onOpenInspector={() => undefined} onRename={() => undefined} onDelete={() => undefined}
       onArchive={archive} onCopyTaskLink={copy} />));
     host.querySelector<HTMLButtonElement>("button")!.focus();
   };
   await render();
   return { api, archive, copy, render, pending, host,
+    derive: async (action: "fork" | "clone" | "learn") => {
+      await act(async () => {
+        if (action === "fork") host.querySelector<HTMLButtonElement>('[data-testid="message-fork"]')!.click();
+        else [...host.querySelectorAll<HTMLButtonElement>("[role='menuitem']")].find((candidate) => candidate.textContent?.trim() === (action === "clone" ? "session.clone" : "skills.learning.fromSession"))!.click();
+      });
+      if (action === "fork") await act(async () => document.querySelector<HTMLButtonElement>("[data-message-fork-confirm='true']")!.click());
+    },
     menuLabels: () => [...host.querySelectorAll<HTMLButtonElement>("[role='menuitem']")].map((item) => item.textContent?.trim()),
     menuButton: (label: string) => {
       const item = [...host.querySelectorAll<HTMLButtonElement>("[role='menuitem']")].find((candidate) => candidate.textContent?.trim() === label);

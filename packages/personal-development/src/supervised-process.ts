@@ -55,6 +55,7 @@ function observeCommand(child: ChildProcessWithoutNullStreams, journal: CommandJ
   return new Promise((resolve, reject) => {
     const nonce = journal.nonce;
     let proof: Proof | undefined; let retirement: Retirement | undefined;
+    let failure: { readonly stage: string; readonly systemCode: string } | undefined;
     let line = ""; let stdout = Buffer.alloc(0); let stderrTail = ""; let stdoutTail = "";
     let uncertain = false; let cancelled = false; let overflow = false; let settled = false;
     let forceDeadline: ReturnType<typeof setTimeout> | undefined;
@@ -66,7 +67,11 @@ function observeCommand(child: ChildProcessWithoutNullStreams, journal: CommandJ
         const durable = retirement && await readCommandRetirement(journal);
         if (error) reject(error);
         else if (uncertain || !retirement || !durable || durable.pid !== retirement.pid || durable.identity !== retirement.identity
-          || durable.helperPid !== child.pid || durable.exitCode !== retirement.exitCode || durable.cancelled !== retirement.cancelled || durable.forcedDescendants !== retirement.forcedDescendants) reject(new PersonalDevelopmentError("PROCESS_UNKNOWN"));
+          || durable.helperPid !== child.pid || durable.exitCode !== retirement.exitCode || durable.cancelled !== retirement.cancelled || durable.forcedDescendants !== retirement.forcedDescendants) {
+          const unknown = new PersonalDevelopmentError("PROCESS_UNKNOWN");
+          if (failure) Object.defineProperty(unknown, "cause", { value: failure });
+          reject(unknown);
+        }
         else if (overflow || retirement.forcedDescendants) reject(new PersonalDevelopmentError("COMMAND_FAILED"));
         else if (cancelled || retirement.cancelled) reject(new PersonalDevelopmentError("CANCELLED"));
         else resolve({ stdout: stdout.toString("utf8"), exitCode: retirement.exitCode });
@@ -104,7 +109,13 @@ function observeCommand(child: ChildProcessWithoutNullStreams, journal: CommandJ
         const raw = line.slice(0, end); line = line.slice(end + 1); let value: Record<string, unknown>;
         try { value = JSON.parse(raw) as Record<string, unknown>; } catch { invalid(); return; }
         if (!value || typeof value !== "object" || Array.isArray(value) || value.protocol !== 1 || value.nonce !== nonce || typeof value.event !== "string" || retirement) { invalid(); return; }
-        if (value.event === "started") {
+        if (!windows && value.event === "failed") {
+          if (!proof || failure || !exact(value, ["protocol", "nonce", "event", "stage", "systemCode"])
+            || typeof value.stage !== "string" || !["leader", "birth", "terminate", "quiescence", "drain", "receipt"].includes(value.stage)
+            || typeof value.systemCode !== "string" || !["ESRCH", "EPERM", "EACCES", "EIO", "ENOENT", "ENOSPC", "unknown"].includes(value.systemCode)) { invalid(); return; }
+          failure = { stage: String(value.stage), systemCode: String(value.systemCode) };
+          uncertain = true;
+        } else if (value.event === "started") {
           const keys = ["protocol", "nonce", "event", "pid", "identity"];
           if (proof || !exact(value, keys) || !Number.isSafeInteger(value.pid) || (value.pid as number) < 1 || typeof value.identity !== "string"
             || value.identity.length < 1 || value.identity.length > 256 || windows && !/^[0-9]{1,20}$/u.test(value.identity)) { invalid(); return; }

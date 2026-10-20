@@ -41,7 +41,7 @@ describe("mounted usage history", () => {
     });
 
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
-    const context = await browser.newContext({ viewport: { width: 1440, height: 960 } });
+    const context = await browser.newContext({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
     const first = await context.newPage();
     const firstErrors = browserErrors(first);
     const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Usage history Web" });
@@ -103,6 +103,7 @@ async function openModelReport(page: Page): Promise<void> {
   await section.getByLabel("Group by").selectOption("model");
   await section.getByLabel("Provider ID").fill("history-provider");
   await section.getByRole("button", { name: "Apply filters" }).click();
+  await section.locator(".usage-history-scope").getByText("Model", { exact: true }).waitFor({ state: "visible" });
   await section.locator(".usage-history-entries details").first().waitFor({ state: "visible" });
 }
 

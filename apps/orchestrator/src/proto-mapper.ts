@@ -5391,7 +5391,7 @@ function fromProtoScheduleExecution(value: ScheduleExecutionSnapshot | undefined
     ? undefined
     : {
         command: requiredProtoText(value.preRunHook.command, "schedule.execution.pre_run_hook.command", 32_768),
-        filePath: requiredProtoText(value.preRunHook.filePath, "schedule.execution.pre_run_hook.file_path", 4_096),
+        filePath: value.preRunHook.filePath === "" ? "" : requiredProtoText(value.preRunHook.filePath, "schedule.execution.pre_run_hook.file_path", 4_096),
         ...(value.preRunHook.timeout === undefined
           ? {}
           : { timeoutMs: fromProtoDuration(value.preRunHook.timeout, "schedule.execution.pre_run_hook.timeout") as number })

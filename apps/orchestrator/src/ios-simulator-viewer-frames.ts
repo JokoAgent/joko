@@ -254,11 +254,24 @@ export class SimulatorViewerFrameCoordinator {
             subscription.viewerOrientation = null;
             subscription.nativeRoute = "fallback_lost";
           } else {
-            const peers = [...subscriptions].filter(item => item !== subscription &&
-              !item.controller.signal.aborted && item.encoding === "jpeg");
-            const older = [...subscriptions].slice(0, [...subscriptions].indexOf(subscription));
-            if (peers.some(item => (item.state === "streaming" || older.includes(item)) &&
-                !sameMjpegProfile(item.mjpegProfile, subscription.mjpegProfile))) {
+            const hasProfileConflict = (): boolean => {
+              const ordered = [...subscriptions];
+              const older = ordered.slice(0, ordered.indexOf(subscription));
+              return ordered.some(item => item !== subscription && !item.controller.signal.aborted &&
+                item.encoding === "jpeg" && (item.state === "streaming" || older.includes(item)) &&
+                !sameMjpegProfile(item.mjpegProfile, subscription.mjpegProfile));
+            };
+            // A replacement HTTP stream can arrive before the previous
+            // connection's cancellation. Wait only for retirement; never
+            // cancel another Viewer or configure over its active profile.
+            const retirementDeadline = Date.now() + 1_000;
+            while (hasProfileConflict() && !controller.signal.aborted && Date.now() < retirementDeadline) {
+              await this.#delay(25, controller.signal);
+              check();
+              if (stale) throw stale;
+            }
+            if (controller.signal.aborted) return;
+            if (hasProfileConflict()) {
               throw new SimulatorViewerFrameError("PROFILE_CONFLICT",
                 "Another Viewer is using a different MJPEG stream profile.");
             }

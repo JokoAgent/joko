@@ -1,4 +1,5 @@
-import { createHash, randomInt } from "node:crypto";
+import { createHash } from "node:crypto";
+import { createSocket } from "node:dgram";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -10,6 +11,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { CredentialVault } from "./credential-vault.js";
 import { VoiceDictionaryPeerManager } from "./voice-dictionary-peer-manager.js";
+import { createVoiceDictionaryPeerTransport } from "./voice-dictionary-peer-transport.js";
 import { VoiceDictionarySyncRepository } from "./voice-dictionary-sync-repository.js";
 import {
   decodeVoiceDictionaryPeerMessage,
@@ -121,10 +123,13 @@ describe("Voice dictionary peer authority and exchange", () => {
     expect(() => manager.subscribe(() => undefined)).toThrow(/unavailable/u);
   });
 
-  it("coalesces concurrent durable exchanges when LAN and direct routes coexist and retains LAN sharing after clearing direct routes", { timeout: 25_000 }, async () => {
+  it("coalesces concurrent durable exchanges when LAN and direct routes coexist and retains LAN sharing after clearing direct routes", { timeout: 25_000 }, async ({ onTestFailed }) => {
     const first = await localFixture("coexisting-first");
     const second = await localFixture("coexisting-second");
     const [firstPort, secondPort] = await temporaryListenerPorts();
+    const multicastPort = await temporaryMulticastPort();
+    const startupErrors: string[] = [];
+    onTestFailed(() => console.error("LAN/direct startup diagnostics:", { multicastPort, startupErrors }));
     const encoding = new Map<string, { active: number; maximum: number; calls: number }>();
     const release = deferred<void>();
     let holdNextFirstEncode = false;
@@ -144,8 +149,14 @@ describe("Voice dictionary peer authority and exchange", () => {
         return encodeVoiceDictionaryPeerMessage(options);
       } finally { count.active -= 1; }
     } };
-    const firstManager = new VoiceDictionaryPeerManager({ ...first.options, codec, enableLan: true, debounceMilliseconds: 30 });
-    const secondManager = new VoiceDictionaryPeerManager({ ...second.options, codec, enableLan: true, debounceMilliseconds: 30 });
+    const transportFactory = (peers: VoiceDictionaryPeerStore) => (options: NodeSyncLanTransportOptions) => {
+      const transport = createVoiceDictionaryPeerTransport({ ...options, multicastInterface: "127.0.0.1", multicastPort }, peers, true);
+      return { ...transport, start: () => startObservedTransport(transport, startupErrors) };
+    };
+    const firstManager = new VoiceDictionaryPeerManager({ ...first.options, codec, enableLan: true, debounceMilliseconds: 30,
+      transportFactory: transportFactory(first.peers) });
+    const secondManager = new VoiceDictionaryPeerManager({ ...second.options, codec, enableLan: true, debounceMilliseconds: 30,
+      transportFactory: transportFactory(second.peers) });
     cleanups.push(() => firstManager.close(), () => secondManager.close(), () => release.resolve());
     await firstManager.initialize();
     await secondManager.initialize();
@@ -154,7 +165,7 @@ describe("Voice dictionary peer authority and exchange", () => {
     first.dictionary.addManualTerm(first.dictionary.snapshot().revision, "Initial shared state");
     await firstManager.setEnabled(first.dictionary.snapshot().revision, true);
     await secondManager.setEnabled(second.dictionary.snapshot().revision, true);
-    // Neither owner has an explicit peer route yet, so these candidates come from real default LAN discovery.
+    // Neither owner has an explicit peer route yet; real multicast discovery stays on this host's loopback interface.
     await waitUntil(() => firstManager.status().candidates.some((value) => value.nodeId === second.options.nodeId) &&
       secondManager.status().candidates.some((value) => value.nodeId === first.options.nodeId), 7_000);
     const firstInvitation = await firstManager.invitation();
@@ -225,10 +236,13 @@ describe("Voice dictionary peer authority and exchange", () => {
     for (const count of encoding.values()) expect(count.maximum).toBe(1);
   });
 
-  it("converges full state through two durable LAN owners, forces reconnect replies, and retains identity across restart", { timeout: 25_000 }, async () => {
-    const port = randomInt(54_000, 60_000);
+  it("converges full state through two durable LAN owners, forces reconnect replies, and retains identity across restart", { timeout: 25_000 }, async ({ onTestFailed }) => {
+    const port = await temporaryMulticastPort();
     const first = await lanFixture("first", port);
     const second = await lanFixture("second", port);
+    onTestFailed(() => console.error("LAN peer startup diagnostics:", {
+      multicastPort: port, firstErrors: first.startupErrors, secondErrors: second.startupErrors
+    }));
     first.dictionary.addManualTerm(first.dictionary.snapshot().revision, "Initial superset");
     await first.manager.setEnabled(first.dictionary.snapshot().revision, true);
     await second.manager.setEnabled(second.dictionary.snapshot().revision, true);
@@ -450,6 +464,81 @@ describe("Voice dictionary peer authority and exchange", () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it.each([0, 1, 2, 3, 4, 5])("retains a new exchange requested %i microtasks after a transfer acknowledgement", async offset => {
+    const fixture = await localFixture(`ack-followup-${offset}`), remote = generateNodeSyncIdentity();
+    const messages: VoiceDictionaryPeerMessage[] = [], requested = deferred<void>();
+    let online = false, scheduleFollowup = true, followup: Promise<void> | undefined;
+    let manager!: VoiceDictionaryPeerManager;
+    manager = new VoiceDictionaryPeerManager({ ...fixture.options, codec: { ...inProcessCodec, encode: async options => {
+      messages.push(options.message); return encodeVoiceDictionaryPeerMessage(options);
+    } }, transportFactory: () => ({ ...emptyTransport(), onlinePeerIds: () => online ? ["node-remote"] : [],
+      send: async () => {
+        if (scheduleFollowup) {
+          scheduleFollowup = false;
+          void (async () => {
+            for (let index = 0; index < offset; index++) await Promise.resolve();
+            fixture.dictionary.addManualTerm(fixture.dictionary.snapshot().revision, "After acknowledgement");
+            followup = manager.syncNow(); requested.resolve();
+          })();
+        }
+        return true;
+      } }) });
+    cleanups.push(() => manager.close()); await manager.initialize();
+    fixture.dictionary.setEnabled(fixture.dictionary.snapshot().revision, true);
+    fixture.peers.grantPeer({ expectedRevision: fixture.peers.configurationRevision(), peerId: "node-remote",
+      displayName: "Remote", publicKey: remote.publicKey, fingerprint: keyFingerprint(remote.publicKey) });
+    await manager.syncNow(); online = true;
+    await manager.syncNow(); await requested.promise; await followup;
+    expect(messages.at(-1)?.state).toEqual(fixture.dictionary.stateForSync());
+    expect(messages).toHaveLength(2);
+  });
+
+  it("keeps the mutation debounce when an older exchange finishes before that timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const fixture = await localFixture("debounce-inflight");
+      const remote = generateNodeSyncIdentity();
+      const started = deferred<void>();
+      const acknowledgement = deferred<boolean>();
+      const messages: VoiceDictionaryPeerMessage[] = [];
+      let online = false;
+      let delayFirst = true;
+      const manager = new VoiceDictionaryPeerManager({ ...fixture.options, debounceMilliseconds: 8_000,
+        codec: { ...inProcessCodec, encode: async (options) => {
+          messages.push(options.message);
+          return encodeVoiceDictionaryPeerMessage(options);
+        } },
+        transportFactory: () => ({ ...emptyTransport(), onlinePeerIds: () => online ? ["node-remote"] : [],
+          send: async () => {
+            if (!delayFirst) return true;
+            delayFirst = false;
+            started.resolve();
+            return acknowledgement.promise;
+          } })
+      });
+      cleanups.push(() => manager.close());
+      await manager.initialize();
+      fixture.dictionary.setEnabled(fixture.dictionary.snapshot().revision, true);
+      fixture.peers.grantPeer({ expectedRevision: fixture.peers.configurationRevision(), peerId: "node-remote",
+        displayName: "Remote", publicKey: remote.publicKey, fingerprint: keyFingerprint(remote.publicKey) });
+      await manager.syncNow();
+      online = true;
+      const initialExchange = manager.syncNow();
+      await started.promise;
+      fixture.dictionary.addManualTerm(fixture.dictionary.snapshot().revision, "After initial exchange");
+      await vi.advanceTimersByTimeAsync(7_000);
+      acknowledgement.resolve(true);
+      await initialExchange;
+      expect(messages).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(messages).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(messages).toHaveLength(2);
+      expect(messages[1]!.state).toEqual(fixture.dictionary.stateForSync());
+      expect(messages[1]!.requestReply).toBeUndefined();
+    } finally { vi.useRealTimers(); }
+  });
+
   it.each((["explicit", "fallback"] as const).flatMap((trigger) =>
     (["complete", "revoke", "disable", "close"] as const).map((retirement) => ({ trigger, retirement }))
   ))("attempts every peer after an earlier failure on $trigger and fences $retirement", async ({ trigger, retirement }) => {
@@ -540,6 +629,35 @@ async function localFixture(name: string) {
   return { directory, store, peers, dictionary, options: { store: peers, dictionary, vault, nodeId: `node-${name}`, displayName: `${name} computer` } };
 }
 
+async function startObservedTransport(transport: { start(): Promise<void> }, errors: string[]): Promise<void> {
+  try { await transport.start(); }
+  catch (error) {
+    const code = error instanceof Error && "code" in error ? error.code : undefined;
+    if (errors.length < 8) errors.push(typeof code === "string"
+      && ["EACCES", "EADDRINUSE", "EADDRNOTAVAIL", "ENETUNREACH"].includes(code) ? code : "unavailable");
+    throw error;
+  }
+}
+
+async function temporaryMulticastPort(): Promise<number> {
+  const socket = createSocket("udp4");
+  try {
+    // Let the OS avoid occupied and excluded UDP ports before sharing discovery.
+    return await new Promise<number>((resolve, reject) => {
+      socket.once("error", reject);
+      socket.bind(0, "0.0.0.0", () => resolve(socket.address().port));
+    });
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      try { socket.close(resolve); }
+      catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "ERR_SOCKET_DGRAM_NOT_RUNNING") resolve();
+        else reject(error);
+      }
+    });
+  }
+}
+
 async function temporaryListenerPorts(): Promise<readonly [number, number]> {
   const servers = [createServer(), createServer()];
   try {
@@ -568,6 +686,7 @@ async function lanFixture(name: string, multicastPort: number) {
   let manager: VoiceDictionaryPeerManager;
   let dictionary: VoiceDictionarySyncRepository;
   let sends = 0;
+  const startupErrors: string[] = [];
   const nodeId = `node-${name}`;
   const open = async (): Promise<void> => {
     store = new OperationalStore(join(directory, "orchestrator.db"));
@@ -576,9 +695,9 @@ async function lanFixture(name: string, multicastPort: number) {
     const vault = await CredentialVault.open(join(directory, "master.key"));
     manager = new VoiceDictionaryPeerManager({ store: peers, dictionary, vault, nodeId, displayName: `${name} computer`,
       debounceMilliseconds: 30, transportFactory: (options) => {
-        const transport = new NodeSyncLanTransport({ ...options, multicastPort, beaconIntervalMilliseconds: 150,
+        const transport = new NodeSyncLanTransport({ ...options, multicastInterface: "127.0.0.1", multicastPort, beaconIntervalMilliseconds: 150,
           endpointTtlMilliseconds: 2_000, connectTimeoutMilliseconds: 4_000 });
-        return { start: () => transport.start(), stop: () => transport.stop(), candidates: () => transport.candidates(),
+        return { start: () => startObservedTransport(transport, startupErrors), stop: () => transport.stop(), candidates: () => transport.candidates(),
           onlinePeerIds: () => transport.onlinePeerIds(), send: (peerId, frame) => { sends += 1; return transport.send(peerId, frame); } };
       }
     });
@@ -586,7 +705,7 @@ async function lanFixture(name: string, multicastPort: number) {
   };
   await open();
   cleanups.push(() => { manager.close(); peers.close(); store.close(); rmSync(directory, { recursive: true, force: true }); });
-  return { nodeId, get manager() { return manager; }, get dictionary() { return dictionary; }, get sends() { return sends; },
+  return { nodeId, startupErrors, get manager() { return manager; }, get dictionary() { return dictionary; }, get sends() { return sends; },
     restart: async () => { manager.close(); peers.close(); store.close(); await open(); } };
 }
 

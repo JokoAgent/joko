@@ -621,7 +621,26 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
         .some((event) => event.state === CompactionState.COMPLETED && event.reason === "threshold"),
       "real Pi threshold compaction projection",
       30_000
-    );
+    ).catch(async (error: unknown) => {
+      const [snapshot, state, entries] = await Promise.all([
+        paired.clients.event.getSnapshot({ scope: sessionScope }),
+        paired.clients.pi.getPiSessionState({ sessionId }),
+        paired.clients.pi.listPiEntries({ sessionId })
+      ]);
+      throw new Error(`Installed Pi threshold compaction was not projected: ${JSON.stringify({
+        events: compactionEvents(snapshot.snapshot?.timeline ?? []).map((event) => ({
+          state: event.state, reason: event.reason, automatic: event.automatic,
+        })),
+        state: {
+          streaming: state.state?.streaming, compacting: state.state?.compacting,
+          autoCompaction: state.state?.autoCompaction, messageCount: state.state?.messageCount
+        },
+        nativeCompactions: entries.entries.filter((entry) => entry.payload.case === "compaction").length,
+        providerRequests: fixture!.providerRequests.length,
+        summarizationRequests: fixture!.providerRequests.filter((request) =>
+          JSON.stringify(request.body).includes("You are a context summarization assistant")).length
+      }, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)}`, { cause: error });
+    });
     const events = compactionEvents(snapshot.snapshot?.timeline ?? [])
       .filter((event) => event.reason === "threshold");
     const eventsByCompaction = new Map<string, typeof events>();
@@ -636,11 +655,22 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
       ]);
     }
     expect(events.every((event) => event.automatic)).toBe(true);
+    expect(compactionEvents(snapshot.snapshot?.timeline ?? []).filter((event) =>
+      event.state === CompactionState.COMPLETED && event.reason === "native_history")).toHaveLength(0);
     expect(fixture.providerRequests.length).toBeGreaterThanOrEqual(2);
     const nativeEntries = await paired.clients.pi.listPiEntries({ sessionId });
     expect(nativeEntries.entries).toEqual(expect.arrayContaining([
       expect.objectContaining({ payload: expect.objectContaining({ case: "compaction" }) })
     ]));
+    const beforeGeneration = (await paired.clients.session.getSession({ sessionId })).session?.version?.generation;
+    if (beforeGeneration === undefined) throw new Error("The threshold compaction Session has no runtime generation.");
+    expect((await submit(paired.clients.operation, paired.connectionId, restartBackendMutation("pi"))).state)
+      .toBe(OperationState.SUCCEEDED);
+    await waitForRealSystem(() => paired.clients.session.getSession({ sessionId }),
+      response => (response.session?.version?.generation ?? 0n) > beforeGeneration && response.session?.state === SessionState.IDLE,
+      "threshold compaction runtime recovery", 30_000);
+    const recovered = compactionEvents((await paired.clients.event.getSnapshot({ scope: sessionScope })).snapshot?.timeline ?? []);
+    expect(recovered).toEqual(compactionEvents(snapshot.snapshot?.timeline ?? []));
   });
 
   it("runs a catalogued installed-Pi extension during automatic compaction while ordinary input stays queued", { timeout: 90_000 }, async () => {
@@ -838,12 +868,9 @@ describe("latest npm Pi through production Orchestrator and binary Connect", () 
 
     const snapshot = await paired.clients.event.getSnapshot({ scope: sessionScope });
     const events = compactionEvents(snapshot.snapshot?.timeline ?? []);
-    // Stock Pi persists the resulting native compaction entry without its
-    // trigger reason. The live Event stream above is the reason authority;
-    // a later native-history reconciliation must not invent that reason.
-    expect(events).toEqual(expect.arrayContaining([
-      expect.objectContaining({ state: CompactionState.COMPLETED, reason: "native_history" })
-    ]));
+    // The observed lifecycle retains its actual reason after native history
+    // sync. Its exact persisted receipt prevents a second unknown-trigger card.
+    expect(events).toEqual(liveOverflowEvents);
     expect(fixture.providerRequests).toHaveLength(4);
     const nativeEntries = await paired.clients.pi.listPiEntries({ sessionId });
     expect(nativeEntries.entries).toEqual(expect.arrayContaining([

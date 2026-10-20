@@ -215,6 +215,68 @@ describe("Desktop viewer connection authority", () => {
     await f.connection.stop();
   });
 
+  it.each([true, false])("keeps an in-flight screenshot when control changes to %s without changing its capture", async enabled => {
+    const frame = deferred<object>();
+    const f = fixture({
+      startRemoteDesktop: () => ({ peer: PEER, lease: { ...LEASE, controlling: !enabled } }),
+      getRemoteDesktopFrame: () => frame.promise,
+      setRemoteDesktopControl: () => ({ peer: PEER, state: { controlling: enabled, controlGeneration: 2n } })
+    });
+    await f.request("startRemoteDesktop", { displayId: "display", mode: 1 });
+    const pendingFrame = f.request("getRemoteDesktopFrame", { leaseId: "lease" });
+    await vi.waitFor(() => expect(f.calls.at(-1)?.name).toBe("getRemoteDesktopFrame"));
+    expect((await f.request("setRemoteDesktopControl", { leaseId: "lease", enabled })).ok).toBe(true);
+    frame.resolve({ peer: PEER, result: { frame: { jpeg: new Uint8Array([255, 216, 255, 217]) } } });
+    expect((await pendingFrame).ok).toBe(true);
+    expect(f.connection.lease).toMatchObject({ ...LEASE, controlling: enabled, controlGeneration: 2n });
+    await f.connection.stop();
+  });
+
+  it.each([true, false])("keeps an in-flight heartbeat when control changes to %s without changing its capture", async enabled => {
+    const heartbeat = deferred<object>();
+    const f = fixture({
+      startRemoteDesktop: () => ({ peer: PEER, lease: { ...LEASE, controlling: !enabled } }),
+      heartbeatRemoteDesktop: () => heartbeat.promise,
+      setRemoteDesktopControl: () => ({ peer: PEER, state: { controlling: enabled, controlGeneration: 2n } })
+    });
+    await f.request("startRemoteDesktop", { displayId: "display", mode: 1 });
+    const pending = f.request("heartbeatRemoteDesktop", { leaseId: "lease" });
+    await vi.waitFor(() => expect(f.calls.at(-1)?.name).toBe("heartbeatRemoteDesktop"));
+    expect((await f.request("setRemoteDesktopControl", { leaseId: "lease", enabled })).ok).toBe(true);
+    heartbeat.resolve({ peer: PEER, state: { controlling: !enabled, controlGeneration: 1n } });
+    expect((await pending).ok).toBe(true);
+    expect(f.connection.lease).toMatchObject({ ...LEASE, controlling: enabled, controlGeneration: 2n });
+    await f.connection.stop();
+  });
+
+  it.each(["owner", "document", "peer", "capture"] as const)("rejects an in-flight heartbeat after its %s authority changes", async kind => {
+    const heartbeat = deferred<object>();
+    let documentCurrent = true;
+    const f = fixture({
+      getRemoteDesktopCapabilities: () => ({ peer: PEER, capabilities: { displayModes: true, resolutionRestore: true } }),
+      startRemoteDesktop: () => ({ peer: PEER, lease: { ...LEASE, controlling: true } }),
+      heartbeatRemoteDesktop: () => heartbeat.promise,
+      setRemoteDesktopDisplayMode: () => ({ peer: PEER, result: { lease: { ...LEASE,
+        display: { ...LEASE.display, width: 900, height: 600 }, controlGeneration: 2n } } })
+    });
+    await f.request("getRemoteDesktopCapabilities");
+    await f.request("startRemoteDesktop", { displayId: "display", mode: 1 });
+    const pending = f.request("heartbeatRemoteDesktop", { leaseId: "lease" }, () => {
+      if (!documentCurrent) throw new ConnectError("Document retired.", Code.Canceled);
+    });
+    await vi.waitFor(() => expect(f.calls.at(-1)?.name).toBe("heartbeatRemoteDesktop"));
+    if (kind === "owner") f.change({ ...OWNER, connectionGeneration: 2 });
+    if (kind === "document") documentCurrent = false;
+    if (kind === "capture") expect((await f.request("setRemoteDesktopDisplayMode", {
+      leaseId: "lease", controlGeneration: 1n, modeId: "20", temporary: true
+    })).ok).toBe(true);
+    heartbeat.resolve({ peer: kind === "peer" ? { ...PEER, routeGeneration: 2n } : PEER,
+      state: { controlling: true, controlGeneration: 9n } });
+    expect((await pending).ok).toBe(false);
+    expect(f.connection.lease?.controlGeneration).toBe(kind === "capture" ? 2n : 1n);
+    f.connection.retire();
+  });
+
   it("blocks input after an uncertain temporary write and accepts explicit old STOPPED cleanup before NEW", async () => {
     const f = fixture({
       getRemoteDesktopCapabilities: () => ({ peer: PEER, capabilities: { displayModes: true, resolutionRestore: true } }),
@@ -475,7 +537,8 @@ describe("Desktop viewer connection authority", () => {
     await vi.waitFor(() => expect(f.calls.at(-1)?.name).toBe(name));
     await f.request("stopRemoteDesktop", { leaseId: "lease-1" });
     await f.request("startRemoteDesktop", { displayId: "display", mode: 1 });
-    old.resolve({ peer: PEER, state: { controlling: false, controlGeneration: 10n } }); await pending;
+    old.resolve({ peer: PEER, state: { controlling: false, controlGeneration: 10n } });
+    expect((await pending).ok).toBe(name === "stopRemoteDesktop");
     expect(f.connection.lease).toMatchObject({ leaseId: "lease-2", controlGeneration: 1n });
     f.connection.retire();
   });
