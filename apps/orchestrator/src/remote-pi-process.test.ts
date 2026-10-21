@@ -1039,7 +1039,7 @@ describe("RemotePiProcessFactory", () => {
     await secondTerminal;
   });
 
-  it("orders a verified restart when an otherwise stable absolute launch resource changes", async () => {
+  it.each(["--launch-resource", "--append-system-prompt"])("orders a verified restart when an otherwise stable absolute %s file changes", async (resourceFlag) => {
     const fixture = await mkdtemp(join(tmpdir(), "joko-remote-pi-resource-restart-"));
     temporaryDirectories.push(fixture);
     const runtimeOne = join(fixture, "runtime-one");
@@ -1096,7 +1096,7 @@ describe("RemotePiProcessFactory", () => {
     const recoveryIdentity = "b".repeat(64);
     const spec = (generation: number, control: string, resource: string): PiProcessSpec => ({
       command: process.execPath,
-      args: [cli, "--mode", "rpc", "--launch-resource", resource],
+      args: [cli, "--mode", "rpc", resourceFlag, resource],
       cwd: "/workspace",
       env: {
         JOKO_PI_TARGET_ID: "target-a",
@@ -1123,7 +1123,7 @@ describe("RemotePiProcessFactory", () => {
       authority: { compatibilityHash: initial.authority.compatibilityHash }
     });
     expect(fresh.authority).not.toHaveProperty("recovery");
-    expect(files.text(fresh.args[fresh.args.indexOf("--launch-resource") + 1]))
+    expect(files.text(fresh.args[fresh.args.indexOf(resourceFlag) + 1]))
       .toBe('{"shape":"two"}\n');
     expect(bridgeIndex).toBe(3);
     expect(requests.filter((request) => request.args[1] === "kill")).toHaveLength(1);
