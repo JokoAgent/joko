@@ -2,6 +2,7 @@ import { mobileMediaPreviewKind, type MobileMediaPreviewKind } from "./mobile-me
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import { normalizeMediaType } from "./workspace-files";
+import { richMediaNetworkUrl } from "@joko/contracts";
 
 export type MobileMediaPlayerCommand = "play" | "pause" | "reset";
 export type MobileMediaRendererState = "ready" | "playing" | "paused" | "waiting" | "ended" | "error";
@@ -55,7 +56,8 @@ export function buildMobileMediaPlayerHtml({
   uri,
   background,
   surface,
-  ink
+  ink,
+  networkSource = false
 }: {
   readonly instanceId: string;
   readonly kind: MobileMediaPreviewKind;
@@ -66,11 +68,12 @@ export function buildMobileMediaPlayerHtml({
   readonly background: string;
   readonly surface: string;
   readonly ink: string;
+  readonly networkSource?: boolean;
 }): string {
   const exactInstanceId = playerInstanceId(instanceId);
   const exactMediaType = normalizeMediaType(mediaType);
-  if (mobileMediaPreviewKind(exactMediaType) !== kind) throw new Error("The media player kind does not match its media type.");
-  if (typeof uri !== "string" || !uri.startsWith("file://") || uri.length > 4_096
+  if (!(networkSource && !exactMediaType) && mobileMediaPreviewKind(exactMediaType) !== kind) throw new Error("The media player kind does not match its media type.");
+  if (typeof uri !== "string" || (networkSource ? !richMediaNetworkUrl(uri) : !uri.startsWith("file://")) || uri.length > 4_096
     || /[\u0000-\u001f\u007f]/u.test(uri)) throw new Error("The media player URI is invalid.");
   const exactTitle = boundedText(title, 512) || mobileMessage(locale,
     kind === "video" ? "preview.videoTitle" : "preview.audioTitle");
@@ -85,7 +88,7 @@ export function buildMobileMediaPlayerHtml({
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'none'; form-action 'none'; frame-src 'none'; img-src 'none'; media-src file:; object-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; base-uri 'none'; connect-src 'none'; font-src 'none'; form-action 'none'; frame-src 'none'; img-src 'none'; media-src ${networkSource ? "https: http:" : "file:"}; object-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
   <style>
     html, body { background: ${safeBackground}; color: ${safeInk}; height: 100%; margin: 0; width: 100%; }
     body { align-items: center; display: flex; justify-content: center; overflow: hidden; }
@@ -94,7 +97,7 @@ export function buildMobileMediaPlayerHtml({
   </style>
 </head>
 <body>
-  <${tag} controls${videoAttributes} preload="metadata" aria-label="${escapeHtml(exactTitle)}"><source src="${escapeHtml(uri)}" type="${escapeHtml(exactMediaType)}" /></${tag}>
+  <${tag} controls${videoAttributes} preload="metadata" aria-label="${escapeHtml(exactTitle)}"><source src="${escapeHtml(uri)}"${exactMediaType ? ` type="${escapeHtml(exactMediaType)}"` : ""} /></${tag}>
   <script>
     (function () {
       'use strict';

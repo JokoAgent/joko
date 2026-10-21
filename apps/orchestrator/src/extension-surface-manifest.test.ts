@@ -6,6 +6,13 @@ const entries = ["extensions/review.ts", "extensions/search/index.js"];
 const files = [...entries, "ui/review/index.html", "ui/review/app.js", "ui/search.html"];
 
 describe("Extension surface manifest", () => {
+  it("admits task/text runtimes without tools and treats preferences visibility as presentation only", () => {
+    const manifest = (runtime: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], runtime }] } } });
+    const runtime = { html: "ui/review/index.html", tools: [], card: {}, tasks: { hidden: true }, text: { oneshot: true }, showTaskPreferences: false };
+    expect(parseExtensionSurfaceManifest(manifest(runtime), entries, files)[0]?.runtime).toEqual(runtime);
+    for (const invalid of [{ ...runtime, tasks: { hidden: false } }, { ...runtime, tasks: { hidden: true, allTasks: true } }, { ...runtime, text: { oneshot: false } },
+      { ...runtime, showTaskPreferences: "false" }, { html: runtime.html, tools: [], card: {} }]) expect(() => parseExtensionSurfaceManifest(manifest(invalid), entries, files)).toThrow();
+  });
   it("binds resident tools, cards, mail readers and optional continuation to inspected files", () => {
     const runtime = { html: "ui/review/index.html", tools: [{ name: "read", description: "Read mail", inputSchema: { type: "object" }, readOnly: true }], card: { externalLinks: true }, mail: true,
       mailReader: { tool: "read", hosts: ["mail.example.test"], markRead: true }, agent: true };

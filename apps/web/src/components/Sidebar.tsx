@@ -2284,7 +2284,7 @@ export function sessionsForArchiveView(sessions: readonly SessionView[], showArc
 }
 
 export function sessionsForSidebarStatus(sessions: readonly SessionView[], status: SidebarLayout["status"]): readonly SessionView[] {
-  return status === "all" ? sessions : sessions.filter((session) => session.archived === (status === "archived"));
+  return sessions.filter(session => !session.hidden && (status === "all" || session.archived === (status === "archived")));
 }
 
 interface RemoteMachineSearchFilters {

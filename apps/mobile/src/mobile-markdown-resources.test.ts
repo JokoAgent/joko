@@ -34,6 +34,26 @@ function context(entries: readonly WorkspaceEntry[] = [image, file, folder]): Mo
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("canonical message Markdown resources", () => {
+  it.each(["\n```", "\n", ""])("stages the exact completed rich media revision with ending %j and removes its private file", async ending => {
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+    const mediaRevision = create(FileRevisionSchema, { opaqueRevision: "voice-v1", sha256Hex: bytesToHex(sha256(bytes)), byteSize: 4n });
+    const entry = create(WorkspaceEntrySchema, { workspaceId: "workspace", relativePath: "voice.wav", displayName: "voice.wav", kind: FileKind.REGULAR,
+      mediaType: "audio/wav", revision: mediaRevision });
+    const mediaBlob = create(BlobRefSchema, { blobId: "voice", fileName: "voice.wav", byteSize: 4n, sha256Hex: mediaRevision.sha256Hex, mediaType: "audio/wav" });
+    const source = context([entry]);
+    vi.mocked(source.readFile).mockResolvedValue(create(FilePreviewSchema, { entry, content: { case: "blob", value: mediaBlob } }));
+    vi.mocked(source.download).mockResolvedValue({ bytes, mediaType: "audio/wav" });
+    const release = vi.fn(); source.stageMedia = vi.fn(async () => ({ uri: "file:///private/voice.wav", kind: "audio" as const, release }));
+    const text = '```joko-ui\n{"seq":1,"op":"create","id":"voice","kind":"audio","props":{"src":"voice.wav"}}' + ending;
+    const reader = new MobileMarkdownResourceReader();
+    const result = await reader.prepare("voice-lease", text, source, new AbortController().signal);
+    expect(source.revalidateSource).toHaveBeenCalledOnce();
+    expect(result.references.get(JSON.stringify(["media", "audio", "voice.wav"]))?.media).toEqual({ uri: "file:///private/voice.wav", kind: "audio", mediaType: "audio/wav" });
+    reader.release("voice-lease"); expect(release).toHaveBeenCalledOnce();
+    vi.mocked(source.download).mockResolvedValue({ bytes: new Uint8Array([9, 2, 3, 4]), mediaType: "audio/wav" });
+    const changed = await reader.prepare("changed", text, source, new AbortController().signal);
+    expect(changed.references.size).toBe(0); expect(source.stageMedia).toHaveBeenCalledOnce();
+  });
   it.each(["png", "webp"] as const)("retains original EXIF %s bytes and bounded native canvas choices", async (format) => {
     const bytes = await sharp({ create: { width: 6, height: 4, channels: 3, background: "orange" } })
       .withMetadata({ orientation: 6 }).toFormat(format).toBuffer();

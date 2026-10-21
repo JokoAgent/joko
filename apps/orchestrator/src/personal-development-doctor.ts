@@ -106,7 +106,7 @@ export class PersonalDevelopmentDoctor {
   start(input: DevelopmentDoctorStartInput): Promise<DevelopmentDoctorRun> {
     this.#assertAvailable(); personalDevelopmentIdentity(input.operationId);
     if (!input.title.trim() || input.title.length > 200 || input.request.length > 4_000 || input.mode !== "check" && input.mode !== "prepare"
-      || !["ask", "auto", "bypassPermissions"].includes(input.permissionMode)) throw new PersonalDevelopmentError("INVALID_ARGUMENT");
+      || !["ask", "acceptEdits", "auto", "bypassPermissions"].includes(input.permissionMode)) throw new PersonalDevelopmentError("INVALID_ARGUMENT");
     const runId = stableId("doctor", `${this.#ownerId}:${input.operationId}`), inputHash = operationBodyHash(input);
     const existing = this.#records().find(record => record.report.runId === runId);
     if (existing) {

@@ -15,6 +15,7 @@
 #import <unistd.h>
 
 static _Atomic(time_t) lastRequest;
+static atomic_bool awaitingFrame;
 
 // Compatibility capture for an already logged-in macOS session. The public
 // legacy symbols are unavailable at compile time in current SDKs, so resolve
@@ -176,14 +177,22 @@ int main(int argc, const char *argv[]) {
     __block size_t latestHeight = 0;
     __block BOOL requested = NO;
     atomic_store(&lastRequest, time(NULL));
+    // A slow WindowServer cursor read must never block delivery of a frame.
+    __block NSDictionary *cursor = nil;
+    __block BOOL cursorReading = NO;
+    void (^refreshCursor)(void) = ^{
+      if (!separateCursor || cursorReading) return;
+      cursorReading = YES;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        NSDictionary *value = readCursor(display);
+        dispatch_async(queue, ^{ cursor = value; cursorReading = NO; });
+      });
+    };
 
     void (^reply)(void) = ^{
       if (!requested || !latest) return;
       requested = NO;
-      __block NSDictionary *cursor = nil;
-      if (separateCursor) {
-        dispatch_sync(dispatch_get_main_queue(), ^{ cursor = readCursor(display); });
-      }
+      refreshCursor();
       NSDictionary *frame = @{
         @"jpeg": [latest base64EncodedStringWithOptions:0],
         @"width": @(latestWidth),
@@ -202,6 +211,7 @@ int main(int argc, const char *argv[]) {
         bytes += count;
         remaining -= count;
       }
+      atomic_store(&awaitingFrame, false);
     };
 
     FrameHandler receiveFrame = ^(int32_t status, uint64_t timestamp, IOSurfaceRef surface, const void *update) {
@@ -279,6 +289,7 @@ int main(int argc, const char *argv[]) {
         }, queue, receiveFrame);
       if (!stream || start(stream) != kCGErrorSuccess) return 5;
     }
+    if (overlay) dispatch_async(queue, refreshCursor);
     signal(SIGPIPE, SIG_IGN);
 
     // stdin is a private parent pipe: one byte requests the newest frame. EOF,
@@ -289,6 +300,7 @@ int main(int argc, const char *argv[]) {
       while (read(STDIN_FILENO, &byte, 1) == 1) {
         if (byte != 'f' || !ownedLoggedInSession()) _exit(2);
         atomic_store(&lastRequest, time(NULL));
+        atomic_store(&awaitingFrame, true);
         dispatch_async(queue, ^{ requested = YES; reply(); });
       }
       _exit(0);
@@ -298,7 +310,7 @@ int main(int argc, const char *argv[]) {
     dispatch_source_set_timer(watchdog, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
       NSEC_PER_SEC, 0);
     dispatch_source_set_event_handler(watchdog, ^{
-      if (time(NULL) - atomic_load(&lastRequest) > 5 || !ownedLoggedInSession()) _exit(0);
+      if (time(NULL) - atomic_load(&lastRequest) > (atomic_load(&awaitingFrame) ? 15 : 5) || !ownedLoggedInSession()) _exit(0);
     });
     dispatch_resume(watchdog);
     dispatch_main();

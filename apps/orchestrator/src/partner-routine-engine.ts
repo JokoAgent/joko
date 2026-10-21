@@ -356,6 +356,21 @@ export class RoutineEngine {
     }
   }
 
+  /** Definitions travel; machine commands, missed timer cursors and execution receipts do not become new work. */
+  async prepareHomeChange(partnerId: string, assertCurrent: () => void): Promise<void> {
+    await this.change(state => {
+      assertCurrent(); const now = this.deps.now();
+      for (const routine of state.routines.filter(item => item.partnerId === partnerId)) {
+        this.cancelQueued(state, routine.id);
+        for (const key of Object.keys(state.next)) if (key.startsWith(`${routine.id}:`)) delete state.next[key];
+        const expired = routine.triggers.length > 0 && routine.triggers.every(trigger => trigger.kind === "once" && trigger.at <= now);
+        if (routine.enabled && (routine.preRunHook !== undefined || expired)) {
+          routine.enabled = false; routine.revision++; routine.updatedAt = now;
+        }
+      }
+    });
+  }
+
   /** Called only after host-owned backing schedules have been stopped and removed. */
   async removePartner(partnerId: string): Promise<void> {
     await this.setPartnerPaused(partnerId, true);

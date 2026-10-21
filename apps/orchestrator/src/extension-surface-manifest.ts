@@ -163,10 +163,10 @@ export function parseExtensionSurfaceManifest(
 
 export function parseExtensionRuntime(value: unknown): ExtensionRuntimeDescriptor {
   const raw = requirePlainObject(value, "Extension runtime");
-  requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network"], ["html", "tools"], "Extension runtime");
+  requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network", "tasks", "text", "showTaskPreferences"], ["html", "tools"], "Extension runtime");
   const html = requirePortablePath(raw.html, "Extension runtime HTML");
   if (extname(html) !== ".html" || posix.dirname(html) === ".") throw new Error("Extension runtime HTML must be in a self-contained directory.");
-  if (!Array.isArray(raw.tools) || raw.tools.length < 1 || raw.tools.length > 64) throw new Error("Extension runtime must declare 1–64 tools.");
+  if (!Array.isArray(raw.tools) || raw.tools.length > 64 || raw.tools.length === 0 && raw.tasks === undefined && raw.text === undefined) throw new Error("Extension runtime must declare tools or an autonomous task/text capability.");
   const tools = raw.tools.map(item => {
     const tool = requirePlainObject(item, "Extension tool");
     requireExactKeys(tool, ["name", "description", "inputSchema", "readOnly"], ["name", "description", "inputSchema"], "Extension tool");
@@ -190,7 +190,23 @@ export function parseExtensionRuntime(value: unknown): ExtensionRuntimeDescripto
   const mailReader = raw.mailReader === undefined ? undefined : parseMailReader(raw.mailReader);
   if (mailReader === null || mailReader && (raw.mail !== true || !tools.some(tool => tool.name === mailReader.tool))) throw new Error("Mail reader must name a declared tool and mail capability.");
   const network = raw.network === undefined ? undefined : parseExtensionNetwork(raw.network);
-  return { html, tools, ...(card === undefined ? {} : { card }), ...(raw.mail === true ? { mail: true } : {}), ...(mailReader ? { mailReader } : {}), ...(raw.agent === true ? { agent: true } : {}), ...(network ? { network } : {}) };
+  let tasks: ExtensionRuntimeDescriptor["tasks"];
+  if (raw.tasks !== undefined) {
+    const value = requirePlainObject(raw.tasks, "Extension managed tasks");
+    requireExactKeys(value, ["hidden"], [], "Extension managed tasks");
+    if (value.hidden !== undefined && value.hidden !== true) throw new Error("Hidden tasks capability must be true when declared.");
+    tasks = value.hidden === true ? { hidden: true } : {};
+  }
+  let text: ExtensionRuntimeDescriptor["text"];
+  if (raw.text !== undefined) {
+    const value = requirePlainObject(raw.text, "Extension text inference");
+    requireExactKeys(value, ["oneshot", "model"], ["oneshot"], "Extension text inference");
+    if (value.oneshot !== true || value.model !== undefined && (typeof value.model !== "string" || !value.model.trim() || value.model.length > 128)) throw new Error("Extension text inference declaration is invalid.");
+    text = { oneshot: true, ...(typeof value.model === "string" ? { model: value.model } : {}) };
+  }
+  if (raw.showTaskPreferences !== undefined && typeof raw.showTaskPreferences !== "boolean") throw new Error("showTaskPreferences must be boolean.");
+  return { html, tools, ...(card === undefined ? {} : { card }), ...(raw.mail === true ? { mail: true } : {}), ...(mailReader ? { mailReader } : {}), ...(raw.agent === true ? { agent: true } : {}), ...(network ? { network } : {}),
+    ...(tasks ? { tasks } : {}), ...(text ? { text } : {}), ...(typeof raw.showTaskPreferences === "boolean" ? { showTaskPreferences: raw.showTaskPreferences } : {}) };
 }
 
 /** Flat event declarations are adapted from the fixed publisher protocol. */
@@ -357,4 +373,7 @@ export interface ExtensionRuntimeDescriptor {
   readonly mailReader?: MailReaderDeclaration;
   readonly agent?: true;
   readonly network?: ExtensionNetworkDeclaration;
+  readonly tasks?: { readonly hidden?: true };
+  readonly text?: { readonly oneshot: true; readonly model?: string };
+  readonly showTaskPreferences?: boolean;
 }

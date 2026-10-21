@@ -561,6 +561,7 @@ export class RemoteDesktopController {
         displays: Object.freeze(capabilities.displays.filter(display => display.id === viewer?.sourceDisplayId || display.id !== displayId)),
         automaticReconnect: true,
         connectionTakeover: true,
+        autoControl: capabilities.canControl,
         webrtcVideo: true,
         trickleIce: true,
         jpegFallback: true
@@ -577,7 +578,12 @@ export class RemoteDesktopController {
       ));
       return permissions;
     }
-    if (request.op === "start") return this.#start(authority, request);
+    if (request.op === "start") {
+      const lease = await this.#start(authority, request);
+      const active = this.#active;
+      return request.control && active?.lease === lease.lease
+        ? this.#withControl(authority, active) : lease;
+    }
     if (request.op === "systemAction"
       && !this.isControlCurrent(authority, request.lease, request.controlGeneration)) throw new Error("REMOTE_DESKTOP_SYSTEM_ACTION_EXPIRED");
     if (request.op === "privacyScreen"
@@ -660,10 +666,10 @@ export class RemoteDesktopController {
         return this.#displayModes(authority, active);
       case "viewerDisplay":
         if (!active.viewerDisplay) throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
-        return this.#changeViewerDisplay(authority, active, request.controlGeneration, request);
+        return this.#changeViewerDisplay(authority, active, request.controlGeneration, request, request.control === true);
       case "restoreViewerDisplay":
         if (!active.viewerDisplayRestore) throw new Error("REMOTE_DESKTOP_DISPLAY_RESTORE_UNAVAILABLE");
-        return this.#changeViewerDisplay(authority, active, request.controlGeneration);
+        return this.#changeViewerDisplay(authority, active, request.controlGeneration, undefined, request.control === true);
       case "resolution":
         if (this.#locking !== undefined) throw new Error("REMOTE_DESKTOP_BUSY");
         if (!active.displayModes) throw new Error("REMOTE_DESKTOP_DISPLAY_MODES_UNAVAILABLE");
@@ -672,7 +678,8 @@ export class RemoteDesktopController {
           active,
           request.controlGeneration,
           request.modeId,
-          request.temporary
+          request.temporary,
+          request.control === true
         );
       case "offer": {
         if (request.cursorOverlay && !active.cursorOverlay) {
@@ -912,6 +919,16 @@ export class RemoteDesktopController {
       controlling: active.controlling,
       controlGeneration: active.controlGeneration
     });
+  }
+
+  /** An input refusal retains the picture; revoked/replaced authority never does. */
+  async #withControl(authority: RemoteDesktopAuthority, active: ActiveRemoteDesktopLease): Promise<RemoteDesktopLease> {
+    try { await this.#control(authority, active, true); }
+    catch (error) {
+      if (this.#active !== active) throw error;
+      this.#revalidateAsyncCompletion(authority, active);
+    }
+    return leaseView(active);
   }
 
   #retireSystemActions(): void {
@@ -1154,7 +1171,8 @@ export class RemoteDesktopController {
     active: ActiveRemoteDesktopLease,
     controlGeneration: number,
     modeId: string,
-    temporary: boolean
+    temporary: boolean,
+    control = false
   ): Promise<{ readonly lease?: RemoteDesktopLease }> {
     if (!active.controlling) throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
     if (active.controlGeneration !== controlGeneration) {
@@ -1238,7 +1256,7 @@ export class RemoteDesktopController {
         active.controlling = false;
         active.controlGeneration = ++this.#controlGeneration;
         this.#dependencies.changed();
-        return Object.freeze({ lease: leaseView(active) });
+        return Object.freeze({ lease: control ? await this.#withControl(authority, active) : leaseView(active) });
       }
       if (this.#originalResolution !== undefined) {
         const original = this.#originalResolution;
@@ -1310,7 +1328,8 @@ export class RemoteDesktopController {
     authority: RemoteDesktopAuthority,
     active: ActiveRemoteDesktopLease,
     controlGeneration: number,
-    fit?: { readonly width: number; readonly height: number }
+    fit?: { readonly width: number; readonly height: number },
+    control = false
   ): Promise<{ readonly lease: RemoteDesktopLease }> {
     if (!active.controlling) throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
     if (active.controlGeneration !== controlGeneration) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
@@ -1382,7 +1401,7 @@ export class RemoteDesktopController {
       active.display = display; this.#viewerGeometryManaged = true;
       active.controlling = false; active.controlGeneration = ++this.#controlGeneration;
       this.#dependencies.changed();
-      return Object.freeze({ lease: leaseView(active) });
+      return Object.freeze({ lease: control ? await this.#withControl(authority, active) : leaseView(active) });
     });
     this.#displayWrite = write.then(() => undefined, () => undefined);
     try { return await write; }

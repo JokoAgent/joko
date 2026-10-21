@@ -30,8 +30,6 @@
     "buildResources": "../../packages/brand-assets/src"
   },
   "files": [
-    "NOTICE",
-    "LICENSE.cindy",
     "dist/**/*.js",
     "dist/**/*.cjs",
     "dist/web/**/*",

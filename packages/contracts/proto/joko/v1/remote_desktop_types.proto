@@ -68,6 +68,8 @@ message RemoteDesktopCapabilities {
   bool workspace_navigation = 28;
   bool system_menu = 29;
   bool channel_requests = 30;
+  // Grant input within the same lease/geometry request when explicitly requested.
+  bool auto_control = 31;
 }
 
 enum RemoteDesktopSystemActionKind {

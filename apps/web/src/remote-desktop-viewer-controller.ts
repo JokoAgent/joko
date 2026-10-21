@@ -264,12 +264,14 @@ export class DesktopRemoteDesktopViewerController {
       this.publish({ caps });
       const display = caps.displays.find((item) => item.displayId === displayId) ?? caps.displays[0]!;
       const started = await rpc.startRemoteDesktop({ displayId: display.displayId,
-        mode: takeover ? RemoteDesktopStartMode.TAKEOVER : resume ? RemoteDesktopStartMode.RESUME : RemoteDesktopStartMode.NEW }, this.options());
+        mode: takeover ? RemoteDesktopStartMode.TAKEOVER : resume ? RemoteDesktopStartMode.RESUME : RemoteDesktopStartMode.NEW,
+        control: caps.autoControl && caps.canControl }, this.options());
       if (!this.current(epoch)) return;
       if (started.lease === undefined || !started.lease.leaseId || started.lease.display === undefined) throw new Error("Invalid lease.");
       this.#sourceDisplayId = display.displayId;
-      this.publish({ lease: started.lease, sourceDisplayId: display.displayId, viewerDisplayFitted: started.lease.display.displayId !== display.displayId });
-      this.#initialControlPending = caps.canControl;
+      this.publish({ lease: started.lease, controlling: started.lease.controlling, sourceDisplayId: display.displayId, viewerDisplayFitted: started.lease.display.displayId !== display.displayId });
+      this.#wantedControl = caps.canControl;
+      this.#initialControlPending = caps.canControl && !started.lease.controlling;
       this.initMedia();
       await this.acquireInitialControl();
       if (this.current(epoch) && caps.displayModes) void this.loadModes();
@@ -746,18 +748,19 @@ export class DesktopRemoteDesktopViewerController {
     this.#awaitingFrame = false;
     this.publish({ settingsBusy: true, ready: false, controlling: false, media: "none", modeNotice: undefined });
     this.syncControl();
-    try { const response = await rpc.setRemoteDesktopDisplayMode({ leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, modeId, temporary }, this.options());
+    try { const response = await rpc.setRemoteDesktopDisplayMode({ leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, modeId, temporary,
+      control: this.#snapshot.caps?.autoControl === true && restoreControl }, this.options());
       if (!this.current(epoch)) return;
       if (!response.result) throw new Error("Display mode receipt missing.");
       if (temporary) {
         const next = response.result.lease;
-        if (!next || next.leaseId !== lease.leaseId || next.controlling || next.controlGeneration <= lease.controlGeneration ||
+        if (!next || next.leaseId !== lease.leaseId || next.controlling && !this.#snapshot.caps?.autoControl || next.controlGeneration <= lease.controlGeneration ||
           !next.display || (next.display.displayId !== lease.display?.displayId && next.display.displayId !== this.#sourceDisplayId) ||
           ![next.display.width, next.display.height].every(size => Number.isSafeInteger(size) && size > 0 && size <= 32_768)) throw new Error("Display mode occurrence changed.");
-        this.publish({ lease: next, controlling: false, ready: false, status: "reconnecting", modes: [],
+        this.publish({ lease: next, controlling: next.controlling, ready: false, status: "reconnecting", modes: [],
           viewerDisplayFitted: next.display.displayId !== this.#sourceDisplayId });
         this.#modePending = false; this.initMedia();
-        if (restoreControl && this.#wantedControl && document.hasFocus()) await this.control(true);
+        if (!next.controlling && restoreControl && this.#wantedControl && document.hasFocus()) await this.control(true);
         void this.loadModes();
         return;
       }
@@ -794,21 +797,21 @@ export class DesktopRemoteDesktopViewerController {
     this.#awaitingFrame = false;
     this.publish({ settingsBusy: true, ready: false, controlling: false, media: "none", modeNotice: undefined }); this.syncControl();
     try {
-      const input = { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration };
+      const input = { leaseId: lease.leaseId, controlGeneration: lease.controlGeneration, control: caps.autoControl && restoreControl };
       const response = size ? await rpc.setRemoteDesktopViewerDisplay({ ...input, ...size }, this.options())
         : await rpc.restoreRemoteDesktopViewerDisplay(input, this.options());
       if (!this.current(epoch)) return;
       const next = response.result?.lease;
-      if (!next || next.leaseId !== lease.leaseId || next.controlling || next.controlGeneration <= lease.controlGeneration ||
+      if (!next || next.leaseId !== lease.leaseId || next.controlling && !caps.autoControl || next.controlGeneration <= lease.controlGeneration ||
         !next.display || !next.display.displayId || (!size && next.display.displayId !== this.#sourceDisplayId) ||
         (size && (next.display.displayId === this.#sourceDisplayId || next.display.width !== size.width || next.display.height !== size.height ||
           this.#snapshot.viewerDisplayFitted && next.display.displayId !== lease.display?.displayId)) ||
         ![next.display.width, next.display.height].every(value => Number.isSafeInteger(value) && value > 0 && value <= (size ? 2560 : 32_768))) {
         throw new Error("Display geometry receipt changed its authority.");
       }
-      this.publish({ lease: next, controlling: false, ready: false, status: "reconnecting", modes: [], viewerDisplayFitted: !!size });
+      this.publish({ lease: next, controlling: next.controlling, ready: false, status: "reconnecting", modes: [], viewerDisplayFitted: !!size });
       this.#modePending = false; this.initMedia();
-      if (restoreControl && this.#wantedControl && document.hasFocus()) await this.control(true);
+      if (!next.controlling && restoreControl && this.#wantedControl && document.hasFocus()) await this.control(true);
       void this.loadModes();
     } catch (error) {
       if (!this.current(epoch)) return;

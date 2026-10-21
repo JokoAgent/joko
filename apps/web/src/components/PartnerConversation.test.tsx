@@ -1,12 +1,15 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { create } from "@bufbuild/protobuf";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import { emptySnapshot, type PartnerActivityView, type PartnerPrivateThreadView, type PartnerProfileView, type SessionView, type TimelineItemView } from "../model.js";
 import { PartnerConversationProvider, usePartnerConversation } from "./PartnerConversation.js";
 import { Timeline } from "./Timeline.js";
-import type { PartnerMemoryApi, PartnerConnectionsApi, ConnectionsDetail, PartnerLearningFeedbackView } from "@joko/contracts";
+import { ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
+  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema,
+  type PartnerHomeApi, type PartnerMemoryApi, type PartnerConnectionsApi, type ConnectionsDetail, type PartnerLearningFeedbackView } from "@joko/contracts";
 
 vi.mock("@tanstack/react-virtual", () => ({
   defaultRangeExtractor: () => [],
@@ -237,6 +240,10 @@ async function mount(app = controller(), active = true, streaming = false, items
 }
 function controller(overrides: Partial<AppController> = {}): AppController {
   return { state: { ready: true, connectionState: "connected", activeProfile: { id: "profile", serverId: "node", origin: "https://node.invalid" }, snapshot: emptySnapshot() },
+    partnerHomeApi: (ownerKey: string): PartnerHomeApi => ({ ownerKey,
+      list: vi.fn(async () => create(ListPartnerHomeTargetsResponseSchema)), inspect: vi.fn(async () => create(InspectPartnerHomeTargetResponseSchema)),
+      move: vi.fn(async () => create(MovePartnerHomeResponseSchema)), status: vi.fn(async () => create(GetPartnerHomeMoveResponseSchema)),
+      retry: vi.fn(async () => create(RetryPartnerHomeMoveResponseSchema)) }),
     listPartners: vi.fn(async () => ({ partners: [partner()], directory: { revision: 1n, activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 1, templates: [], avatarPresets: ["orbit"] } })),
     listPartnerSessions: vi.fn(async () => [{ partnerId: "partner", sessionId: "session", role: "canonical", available: true, deleted: false, profileVersion: 1n }]),
     getPartner: vi.fn(async () => partner()), markPartnerRead: vi.fn(async () => ({ ...partner().activity, readThroughCursor: 91n })),

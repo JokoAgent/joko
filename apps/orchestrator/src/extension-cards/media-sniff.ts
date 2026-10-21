@@ -1,4 +1,3 @@
-// Adapted from the fixed reference. See NOTICE and LICENSE.cindy.
 /**
  * media-sniff.ts — 媒体总仓支持类型的保守魔数识别。
  * ---------------------------------------------------------------------------

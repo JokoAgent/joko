@@ -2,6 +2,8 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { create } from "@bufbuild/protobuf";
 import { PartnerImportCategory, PartnerImportPreviewPageSchema, PartnerImportResultSchema, PartnerImportSourceSchema, PartnerImportStatus,
+  ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
+  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, type PartnerHomeApi,
   type PartnerImportApi, type PartnerImportResult, type PartnerMemoryApi, type MemoryCatalog, type MemoryDetail } from "@joko/contracts";
 import { act, type JSX } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -996,6 +998,10 @@ function controller(overrides: Record<string, unknown> = {}, owner = "owner-one"
       preferences: DEFAULT_UI_PREFERENCES, connectionGeneration: 1, snapshot: snapshot()
     },
     navigate: vi.fn(),
+    partnerHomeApi: (ownerKey: string): PartnerHomeApi => ({ ownerKey,
+      list: vi.fn(async () => create(ListPartnerHomeTargetsResponseSchema)), inspect: vi.fn(async () => create(InspectPartnerHomeTargetResponseSchema)),
+      move: vi.fn(async () => create(MovePartnerHomeResponseSchema)), status: vi.fn(async () => create(GetPartnerHomeMoveResponseSchema)),
+      retry: vi.fn(async () => create(RetryPartnerHomeMoveResponseSchema)) }),
     listPartners: vi.fn(async () => ({ partners: [], directory: directory() })),
     partnerGroupApi: (ownerKey: string) => ({ ownerKey, list: async () => create(ListPartnerGroupsResponseSchema, { revision: { value: 1n }, groups: [] }),
       changes: async function* (_after: bigint, signal: AbortSignal) { if (!signal.aborted) await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); } } as unknown as PartnerGroupApi),

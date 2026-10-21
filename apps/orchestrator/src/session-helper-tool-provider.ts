@@ -25,6 +25,7 @@ import type {
 import type { SessionHost } from "./session-host.js";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 import { COLLABORATION_POLICY_LOCALIZATIONS } from "./i18n/orchestration-language.js";
+import { isExtensionTaskControlled } from "./extension-tasks.js";
 
 export const SESSION_HELPER_TOOL_PROVIDER_ID = "joko_session_helper";
 export const COLLABORATION_TOOL_POLICY_ID = "joko-collaboration-tools";
@@ -502,6 +503,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     signal?.throwIfAborted();
     try {
       const caller = this.#requireCaller(context);
+      if (isExtensionTaskControlled(this.#store, caller.id)) throw new SessionHelperError("PERMISSION_DENIED", "Plugin-managed tasks cannot use account-wide task helpers.");
       if (name === LIST_TOOLS_NAME) return this.#listTools(arguments_);
       if (name !== CALL_TOOL_NAME) throw new Error("Task helper tool is not part of this runtime snapshot.");
       assertKeys(arguments_, ["name", "args"]);
@@ -1375,7 +1377,7 @@ export class SessionHelperToolBridgeProvider implements BridgeToolProvider {
     const order = historyOrder(input["order"]);
     const cursorText = optionalText(input["cursor"], "cursor", 4_096);
     const cursor = decodeOffsetCursor(cursorText, "sessions");
-    const sessions = this.#store.listSessions({ includeArchived: true, includeDeleted })
+    const sessions = this.#store.listSessions({ includeArchived: true, includeDeleted, excludeHidden: true })
       .filter((stored) => workdir === undefined || effectiveWorkdir(this.#store, stored.descriptor) === workdir)
       .filter((stored) => from === undefined || stored.descriptor.createdAt >= from)
       .filter((stored) => to === undefined || stored.descriptor.createdAt < to)

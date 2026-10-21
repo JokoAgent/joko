@@ -1,4 +1,3 @@
-// Adapted from the fixed controller loopback listener. See NOTICE / LICENSE.cindy.
 import { createServer } from "node:http";
 import type { ExtensionOAuthAuthorization } from "@joko/contracts";
 

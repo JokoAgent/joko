@@ -39,7 +39,7 @@ export function createPersonalDevelopmentDoctorConnectMethods(options: {
   return {
     startPersonalDevelopmentDoctor: (request, context) => rpc(async () => {
       options.authenticateLocal(context); context.signal.throwIfAborted();
-      if (request.mode !== "check" && request.mode !== "prepare" || !["ask", "auto", "bypassPermissions"].includes(request.permissionMode)) throw new ConnectError("Invalid diagnostics request.", Code.InvalidArgument);
+      if (request.mode !== "check" && request.mode !== "prepare" || !["ask", "acceptEdits", "auto", "bypassPermissions"].includes(request.permissionMode)) throw new ConnectError("Invalid diagnostics request.", Code.InvalidArgument);
       const report = await owner().start({ operationId: request.operationId, ...(request.sessionId ? { sessionId: request.sessionId } : {}),
         mode: request.mode, request: request.request, title: request.title, targetId: request.targetId,
         ...(request.providerId ? { providerId: request.providerId } : {}), ...(request.modelId ? { modelId: request.modelId } : {}), ...(request.effort ? { effort: request.effort } : {}),

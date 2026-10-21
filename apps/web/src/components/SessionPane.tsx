@@ -1,5 +1,6 @@
 import { useArtifactDownload } from "./use-artifact-download.js";
 import { McpAppTimelineProvider } from "./McpAppCard.js";
+import { richMediaWorkspacePath } from "@joko/contracts";
 import { ExtensionCardTimelineProvider } from "./ExtensionCard.js";
 import { ExtensionMailReaderProvider } from "./ExtensionMailReader.js";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -469,6 +470,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const canOpenWorkspaceReferences = workspace !== undefined && backend?.capabilities.get("workspace.files")?.supported === true;
   const loadTimelineWorkspaceAsset = useCallback(async (path: string) => {
     if (!canOpenWorkspaceReferences || workspace === undefined) throw new Error("Workspace file previews are unavailable.");
+    const relativePath = richMediaWorkspacePath(path, workspace.serverPath);
+    if (!relativePath) throw new Error("The media path is outside this Workspace.");
+    path = relativePath;
     const read = controller.readWorkspaceFile;
     const acquire = controller.getArtifactUrl;
     const releaseArtifact = controller.releaseArtifactUrl;
@@ -484,12 +488,12 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       const objectUrls = URL;
       url = objectUrls.createObjectURL(new Blob([preview.text], { type: "image/svg+xml" }));
       dispose = () => objectUrls.revokeObjectURL(url);
-    } else if (preview.blobId !== undefined && preview.blobId !== "" && (preview.kind === "image" || mediaType?.startsWith("image/") === true)) {
+    } else if (preview.blobId !== undefined && preview.blobId !== "" && (preview.kind === "image" || /^(?:image|audio|video)\//u.test(mediaType ?? ""))) {
       const blobId = preview.blobId;
       url = await acquire(blobId);
       dispose = () => releaseArtifact(blobId);
     } else {
-      throw new Error("The workspace target is not an image.");
+      throw new Error("The workspace target has no supported media preview.");
     }
     let released = false;
     const release = (): void => {
@@ -2008,6 +2012,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         key={timelineResourceOwnerKey}
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
         viewportOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, session.id, String(session.generation)])}
+        answerStateOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, session.id, session.createdAt])}
         sessionId={session.id}
         sessionName={session.name}
         workspaceId={canOpenWorkspaceReferences && controller.state.connectionState === "connected" ? workspace?.id : undefined}

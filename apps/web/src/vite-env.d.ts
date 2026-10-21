@@ -215,6 +215,14 @@ interface JokoDesktopNativeTaskStatusSnapshot {
   readonly revision: string;
   readonly locale: "en" | "zh-CN" | "en-XA";
   readonly sessions: readonly {
+    readonly remote?: {
+      readonly sourceId: string;
+      readonly runId: string;
+      readonly silent: boolean;
+      readonly completionNotification: "none" | "pending" | "teammate";
+      readonly observedCompletionOnly?: boolean;
+      readonly companion?: { readonly name: string; readonly glyph: string; readonly tint: string; readonly artwork?: string };
+    };
     readonly sessionId: string;
     readonly title: string;
     readonly detail: string;
@@ -238,7 +246,7 @@ interface JokoDesktopNativeTaskStatusSnapshot {
 }
 
 type JokoDesktopNativeTaskStatusAction =
-  | { readonly kind: "focus"; readonly sessionId: string }
+  | { readonly kind: "focus"; readonly sessionId: string; readonly entryToken?: string }
   | {
       readonly kind: "permission";
       readonly sessionId: string;
@@ -595,7 +603,8 @@ interface JokoDesktopApi {
   notify(value: {
     readonly title: string;
     readonly body: string;
-    readonly navigation?: { readonly kind: "session"; readonly profileId: string; readonly sessionId: string };
+    readonly navigation?: { readonly kind: "session"; readonly profileId: string; readonly sessionId: string }
+      | { readonly kind: "nativeTask"; readonly sessionId: string; readonly entryToken: string };
   }): Promise<void>;
   readonly attention: {
     mark(key: JokoDesktopAttentionKey): Promise<void>;
@@ -609,6 +618,7 @@ interface JokoDesktopApi {
     selectSoundFile(): Promise<{ readonly path: string | null; readonly name: string | null }>;
     publish(snapshot: JokoDesktopNativeTaskStatusSnapshot): Promise<void>;
     setVisibleSessions(sessionIds: readonly string[]): Promise<void>;
+    acknowledgeFocus?(sessionId: string, entryToken: string): Promise<void>;
     onAction(listener: (action: JokoDesktopNativeTaskStatusAction) => void): () => void;
     onSettingsChanged(listener: (settings: JokoDesktopNativeTaskStatusSettings) => void): () => void;
   };

@@ -1,4 +1,3 @@
-// Adapted from the fixed reference's network slot; see NOTICE / LICENSE.cindy.
 import { extensionNetworkCredentialReference, extensionNetworkUrl, extensionNetworkHostMatches, type ExtensionNetworkDeclaration, type ExtensionNetworkSecret } from "./network-manifest.js";
 import { randomUUID } from "node:crypto";
 import type { ExtensionCardMedia } from "./media.js";

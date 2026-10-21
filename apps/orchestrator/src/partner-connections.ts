@@ -63,9 +63,10 @@ export class PartnerConnectionsManager {
     const session = this.store.getSession(profile.canonicalSessionId).descriptor;
     const target = this.store.getTarget(profile.homeTargetId).descriptor;
     const link = this.profiles.getSessionLink(session.id);
-    if (session.targetId !== target.id || session.remoteWorkspace !== undefined || target.remoteWorkspace !== undefined || !target.trusted || session.deletedAt !== undefined
+    if (session.targetId !== target.id || session.remoteWorkspace?.kind === "ssh" || target.remoteWorkspace?.kind === "ssh" || !target.trusted || session.deletedAt !== undefined
       || link?.partnerId !== partnerId || link.role !== "canonical") throw new ConnectError("Partner connections owner changed.", Code.FailedPrecondition);
-    const readOnly = profile.lifecycle === "archived" || profile.pauseCleanupPending === true || this.partners.listPendingRestarts().some(item => item.partnerId === partnerId);
+    const readOnly = profile.lifecycle === "archived" || profile.pauseCleanupPending === true || this.partners.isHomeChanging(partnerId)
+      || this.partners.listPendingRestarts().some(item => item.partnerId === partnerId);
     if (writable && readOnly) throw new ConnectError("Partner connections are read-only.", Code.FailedPrecondition);
     return create(contract.PartnerConnectionsOwnerSchema, { partnerId, homeTargetId: target.id, canonicalSessionId: session.id, revision: toProtoRevision(profile.revision), readOnly });
   }
@@ -88,7 +89,7 @@ export class PartnerConnectionsManager {
       .filter(item => item.backendId === backendId || own.has(item.id))
       .filter(item => item.state !== "removed" && (item.targetId === undefined || item.targetId === target.id))
       .map(item => ({ kind: contract.PartnerConnectionKind.SKILL, id: item.id, name: redactSecrets(item.name).slice(0, 256),
-        available: !!supported && target.trusted && !target.remoteWorkspace && item.enabled && ["approved", "installed", "loaded"].includes(item.state)
+        available: !!supported && target.trusted && target.remoteWorkspace?.kind !== "ssh" && item.enabled && ["approved", "installed", "loaded"].includes(item.state)
           && !item.symbolicLinkDetected && !item.specialFileDetected, inherited: false, personal: own.has(item.id),
         identity: JSON.stringify([item.discoveredRevision, item.enabled, item.approvedAt, item.approvedByConnectionId,
           ["approved", "installed", "loaded"].includes(item.state) ? "ready" : item.state]) })) : [];
@@ -156,7 +157,7 @@ export class PartnerConnectionsManager {
       // creation, neither that binding nor its canonical link is published yet.
       if (current.homeTargetId !== homeTargetId || homeTargetId !== context.target.id && this.groupHomeTarget(context.sessionId, context.target.id) !== homeTargetId
         || current.lifecycle !== "active" || current.pauseCleanupPending
-        || target.descriptor.remoteWorkspace !== undefined || context.target.remoteWorkspace !== undefined
+        || target.descriptor.remoteWorkspace?.kind === "ssh" || context.target.remoteWorkspace?.kind === "ssh"
         || target.descriptor.backendId !== context.target.backendId && !new SessionRuntimeHandoffStore(this.store).admitsTarget({
           sessionId: context.sessionId, targetId: context.target.id, backendId: context.target.backendId, generation: context.generation,
           backendInstanceGeneration: context.backendInstanceGeneration ?? -1, workspaceRoot: context.target.workspaceRoot,

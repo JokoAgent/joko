@@ -536,7 +536,10 @@ export interface CreateScheduledSessionInput {
  * its first queued message settles. */
 export interface CreateServiceSessionInput {
   readonly operationId: string;
-  readonly serviceKind: "session_handoff" | "partner" | "collaboration" | "messaging" | "learning" | "personal_development";
+  readonly serviceKind: "session_handoff" | "partner" | "collaboration" | "messaging" | "learning" | "personal_development" | "extension";
+  /** Approved plugin ownership is adopted atomically with its normal Session. */
+  readonly hidden?: boolean;
+  readonly onExtensionAdmitted?: (store: OperationalStore, session: StoredSession) => void;
   readonly targetId: string;
   /** Private Partner primary route; the home Target keeps its workspace identity. */
   readonly runtimeBackendId?: string;
@@ -869,6 +872,9 @@ export class SessionHost {
   readonly #drainSettlements = new Map<string, Promise<void>>();
   readonly #pendingInteractions = new Map<string, PendingInteraction>();
   readonly #applicationQueueGuards = new Map<string, McpAppMessageGuard>();
+  #partnerHomeInputGuard: ((sessionId: string) => void) | undefined;
+  #extensionTaskQueueGuard?: (item: QueueItemRecord) => void;
+  #extensionNativeToolAuthorization?: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined;
   readonly #resolveMcpAppModelContext: ((sessionId: string) => Promise<McpAppModelContext>) | undefined;
   readonly #pendingDispatchAcceptances = new Map<string, PendingDispatchAcceptance>();
   readonly #partnerLearningTurns = new Map<string, PartnerLearningTurnRecord>();
@@ -958,6 +964,7 @@ export class SessionHost {
   readonly #partnerPauseFlights = new Map<string, Promise<void>>();
   readonly #partnerTargetRetired: (targetId: string) => boolean;
   readonly #resolveServiceRuntimePrompt: ((session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>) | undefined;
+  readonly #decorateRuntimePrompt: ((base: string | undefined) => string | undefined) | undefined;
   readonly #serviceRuntimePrompts = new Map<string, { readonly baseDigest: string; readonly text: string }>();
   readonly #resolveServiceRuntimeConfiguration: ((session: SessionDescriptor) => string | undefined) | undefined;
   readonly #prepareManagedProviderRuntime: ((context: AdapterContext) => Promise<void>) | undefined;
@@ -1040,6 +1047,8 @@ export class SessionHost {
       readonly partnerTargetRetired?: (targetId: string) => boolean;
       /** Private service identity resolved at native activation, never supplied through RPC or persisted in Session data. */
       readonly resolveServiceRuntimePrompt?: (session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>;
+      /** Private instructions applied equally to initial creation and later native contexts. */
+      readonly decorateRuntimePrompt?: (base: string | undefined) => string | undefined;
       /** Native resource selections are private identity, never natural-language prompt declarations. */
       readonly resolveServiceRuntimeConfiguration?: (session: SessionDescriptor) => string | undefined;
       /** Node-owned local inference readiness, after durable Queue admission and before sending. */
@@ -1122,6 +1131,7 @@ export class SessionHost {
     this.#partnerSessionPolicy = options.partnerSessionPolicy ?? (() => undefined);
     this.#partnerTargetRetired = options.partnerTargetRetired ?? (() => false);
     this.#resolveServiceRuntimePrompt = options.resolveServiceRuntimePrompt;
+    this.#decorateRuntimePrompt = options.decorateRuntimePrompt;
     this.#resolveServiceRuntimeConfiguration = options.resolveServiceRuntimeConfiguration;
     this.#prepareManagedProviderRuntime = options.prepareManagedProviderRuntime;
     this.#resolveModelWorkingContext = options.resolveModelWorkingContext;
@@ -1332,6 +1342,33 @@ export class SessionHost {
         this.recordFailure("portable_import_replacement_recovery", error);
       });
     }
+  }
+
+  captureToolWorkspace(context: { readonly sessionId: string; readonly targetId: string; readonly generation: number }) {
+    this.#assertOpen();
+    const source = this.#store.getSession(context.sessionId).descriptor;
+    const backendGeneration = this.#store.getBackend(source.backendId).descriptor.instanceGeneration;
+    const targetRevision = this.#store.getTarget(context.targetId).revision;
+    const target = this.targetForSession(this.#store.getSession(context.sessionId));
+    const identity = JSON.stringify([source.worktree, source.remoteWorkspace, target.workspaceRoot, target.remoteWorkspace]);
+    const assertCurrent = () => {
+      this.#assertOpen();
+      const stored = this.#store.getSession(context.sessionId), session = stored.descriptor;
+      const current = this.targetForSession(stored);
+      if (session.id !== context.sessionId || session.targetId !== context.targetId || session.backendId !== source.backendId
+        || session.createdAt !== source.createdAt || session.binding.generation !== context.generation || session.binding.opaqueRef !== source.binding.opaqueRef
+        || session.archived || session.deletedAt !== undefined || !current.trusted
+        || this.#store.findPendingSessionLifecycleCleanup(session.id) !== undefined
+        || this.#store.getBackend(session.backendId).descriptor.instanceGeneration !== backendGeneration
+        || this.#store.getTarget(context.targetId).revision !== targetRevision
+        || JSON.stringify([session.worktree, session.remoteWorkspace, current.workspaceRoot, current.remoteWorkspace]) !== identity
+        || session.worktree !== undefined && session.worktree.remote === undefined
+          && this.#worktrees?.activeWorkspacePath(session.id, session.worktree) !== current.workspaceRoot) {
+        throw new Error("The tool's task Workspace changed.");
+      }
+    };
+    assertCurrent();
+    return { root: target.workspaceRoot, remote: target.remoteWorkspace !== undefined, assertCurrent };
   }
 
   appDefaultModelChoices() {
@@ -1791,6 +1828,11 @@ export class SessionHost {
   async createServiceSession(input: CreateServiceSessionInput): Promise<OperationExecution<{ readonly sessionId: string }>> {
     this.#assertOpen();
     input.assertServiceScope?.();
+    if ((input.onExtensionAdmitted !== undefined || input.serviceKind === "extension")
+      && (input.serviceKind !== "extension" || !input.assertServiceScope || !input.onExtensionAdmitted)) {
+      throw new StoreError("Plugin task creation requires its exact installation owner.");
+    }
+    if (input.hidden !== undefined && (!input.assertServiceScope || !["extension", "collaboration"].includes(input.serviceKind))) throw new StoreError("Hidden service tasks require their exact installation or team owner.");
     if (input.catalogImport !== undefined && (input.serviceKind !== "partner" || input.originSessionId === undefined
       || input.originSessionGeneration === undefined || input.assertServiceScope === undefined)) throw new StoreError("A service catalog import requires its exact Partner scope.");
     validateAppendSystemPrompt(input.appendSystemPrompt);
@@ -2682,6 +2724,7 @@ export class SessionHost {
   commitQueuedInput(store: OperationalStore, input: QueuedInput): EnqueueResult {
     this.#assertOpen();
     if (store !== this.#store) throw new StoreError("Input must be committed by its owning Store.");
+    this.#partnerHomeInputGuard?.(input.sessionId);
     const acceptedPrompt = this.canonicalQueuedPrompt(input.sessionId, input.prompt);
     assertPromptInlineTextRanges(acceptedPrompt);
     this.assertInputCapabilities(input.sessionId, acceptedPrompt);
@@ -2792,6 +2835,7 @@ export class SessionHost {
         }
       },
       (store) => {
+        this.#partnerHomeInputGuard?.(input.sessionId);
         store.createRun({
           id: runId,
           sessionId: input.sessionId,
@@ -2872,6 +2916,7 @@ export class SessionHost {
     const execution = this.#store.runOperation(
       { id: input.operationId, kind: "schedule_dispatch", body },
       (store) => {
+        this.#partnerHomeInputGuard?.(sessionId);
         store.createRun({
           id: runId,
           sessionId,
@@ -3569,7 +3614,8 @@ export class SessionHost {
     }
   }
 
-  async abort(sessionId: string, runId: string): Promise<void> {
+  async abort(sessionId: string, runId: string, assertAuthority?: () => void): Promise<void> {
+    assertAuthority?.();
     this.#clearSessionRuntimeRecovery(sessionId);
     const run = this.#store.getRun(runId);
     if (run.descriptor.sessionId !== sessionId) throw new Error("Run does not belong to the task.");
@@ -3578,6 +3624,11 @@ export class SessionHost {
       ?? await this.activate(sessionId);
     const lease = this.beginActiveBackendSideEffect(sessionId, active);
     try {
+      if (assertAuthority) {
+        assertAuthority();
+        const owned = this.#store.listQueueItems({ sessionId, states: ["dispatching", "backend_accepted"], limit: 100 }).some(item => item.runId === runId);
+        if (!owned || !["running", "waiting", "retrying"].includes(this.#store.getRun(runId).descriptor.state)) throw new StoreError("The original plugin execution is no longer active.");
+      }
       await active.adapter.abort(this.contextFor(
         lease.stored,
         runId,
@@ -3958,6 +4009,35 @@ export class SessionHost {
     if ((this.#targetSessionCreationAdmissions.get(targetId) ?? 0) > 0) {
       throw new StoreError("Wait for the admitted task creation to settle before continuing Partner deletion.");
     }
+  }
+
+  /** Stops only work named by a persisted home-change receipt; it never resends input. */
+  async stopPartnerHomeSession(sessionId: string, assertCurrent: () => void): Promise<void> {
+    this.#assertOpen(); assertCurrent();
+    await this.quiesceSessionForExplicitClose(sessionId, "The Partner is changing its execution computer.", assertCurrent);
+    assertCurrent();
+  }
+
+  /** The restored visible transcript becomes native context before the new home can accept input. */
+  async rebuildPartnerHomeContext(sessionId: string, operationId: string, assertCurrent: () => void): Promise<void> {
+    this.#assertOpen(); assertCurrent();
+    let claim;
+    try { claim = this.#store.claimDeferredEffectOperation<{ readonly sessionId: string; readonly generation: number; readonly bindingIdentity: string }>({
+      id: operationId, kind: "restore_partner_home_context", body: { sessionId } }); }
+    catch (error) {
+      if (error instanceof OperationInProgressError) throw Object.assign(new StoreError("The original Partner context replacement has an unconfirmed outcome. Inspect it before retrying."), { stateMayHaveChanged: true });
+      throw error;
+    }
+    if (!claim.claimed) {
+      const binding = this.#store.getSession(sessionId).descriptor.binding;
+      if (claim.value.sessionId !== sessionId || !Number.isSafeInteger(claim.value.generation) || claim.value.generation < 1
+        || claim.value.generation > binding.generation || !/^sha256:[a-f0-9]{64}$/u.test(claim.value.bindingIdentity)
+        || claim.value.generation === binding.generation && claim.value.bindingIdentity !== operationBodyHash(binding)) throw new StoreError("The completed Partner context receipt does not match its native owner.");
+      assertCurrent(); return;
+    }
+    this.#store.armManualContextRebuild({ sessionId, operationId });
+    if (!await this.rebuildPendingContextBeforeDispatch(sessionId)) throw Object.assign(new StoreError("The new Partner home context could not be confirmed. Its original native effect will not be repeated."), { stateMayHaveChanged: true });
+    assertCurrent();
   }
 
   /** Retains native history, artifacts and independent worktrees. The Partner
@@ -6937,7 +7017,7 @@ export class SessionHost {
         : {}),
       ...(typeof value["effort"] === "string" ? { effort: value["effort"] } : {}),
       ...(typeof value["fastMode"] === "boolean" ? { fastMode: value["fastMode"] } : {}),
-      ...(permissionMode === "ask" || permissionMode === "auto" || permissionMode === "bypassPermissions"
+      ...(permissionMode === "ask" || permissionMode === "auto" || permissionMode === "acceptEdits" || permissionMode === "bypassPermissions"
         ? { permissionMode }
         : {}),
       ...(typeof value["planMode"] === "boolean" ? { planMode: value["planMode"] } : {})
@@ -10611,6 +10691,7 @@ export class SessionHost {
       const presentationCreatedAt = input.catalogImport?.createdAt ?? now;
       const presentationAt = input.catalogImport?.modifiedAt ?? now;
       const appendSystemPrompt = nativeStart.kind === "attach" ? undefined : input.appendSystemPrompt;
+      const nativeAppendSystemPrompt = this.decorateRuntimePrompt(appendSystemPrompt);
       if (input.worktree !== undefined
         && (nativeStart.kind !== "new" || nativeStart.parentNativeReference !== undefined)) {
         throw new JokoError({
@@ -10711,7 +10792,7 @@ export class SessionHost {
         runtimeTarget,
         1,
         undefined,
-        appendSystemPrompt,
+        nativeAppendSystemPrompt,
         backendInstanceGeneration,
         sessionWorktree
       ), operationId: claim.operation.id };
@@ -10793,7 +10874,7 @@ export class SessionHost {
             ...(!attaching && routedInput.effort !== undefined ? { effort: routedInput.effort } : {}),
             fastMode: attaching ? false : routedInput.fastMode,
             permissionMode: attaching ? "ask" : input.permissionMode,
-            ...(appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
+            ...(nativeAppendSystemPrompt === undefined ? {} : { appendSystemPrompt: nativeAppendSystemPrompt }),
             nativeStart
           }, context);
           createdBinding = binding;
@@ -10881,6 +10962,7 @@ export class SessionHost {
               binding,
               pinned: false,
               archived: input.catalogImport?.archived ?? false,
+              ...("serviceKind" in input && input.hidden === true ? { hidden: true } : {}),
               permissionMode: catalogBinding === undefined
                 ? attachedState?.permissionMode ?? input.permissionMode
                 : "ask",
@@ -10916,6 +10998,10 @@ export class SessionHost {
                 && nativeStart.parentNativeReference === undefined
             });
             if ("onAdmitted" in input && input.onAdmitted !== undefined) input.onAdmitted(store, created);
+            if ("serviceKind" in input && input.serviceKind === "extension") {
+              input.assertServiceScope?.();
+              input.onExtensionAdmitted?.(store, created);
+            }
             if (nativeHistory !== undefined) {
               this.appendNativeHistory(store, descriptor, adapter, nativeHistory, input.operationId);
             }
@@ -13326,6 +13412,25 @@ export class SessionHost {
         || this.#sessionRuntimeMutationMustDefer(sessionId))
       ? turnBudget.budgets : this.captureModelWorkingContexts(target.backendId);
     const context: AdapterContext = {
+      ...(this.#extensionNativeToolAuthorization === undefined ? {} : { nativeToolAuthorization: {
+        required: this.#extensionNativeToolAuthorization(sessionId)?.required === true,
+        capture: () => this.#extensionNativeToolAuthorization?.(sessionId)?.capture(),
+        assertCurrent: (expectedRevision?: string) => {
+          if (this.#disposed || this.#store.getBackend(target.backendId).descriptor.instanceGeneration !== backendInstanceGeneration
+            || this.#store.getSession(sessionId).descriptor.binding.generation !== generation
+            || runId !== undefined && !["running", "waiting", "retrying"].includes(this.#store.getRun(runId).descriptor.state)) throw new StoreError("The originating native execution is no longer current.");
+          const authority = this.#extensionNativeToolAuthorization?.(sessionId);
+          if (!authority && expectedRevision !== undefined) throw new StoreError("The original native task authority was retired.");
+          authority?.assertCurrent(expectedRevision);
+        },
+        review: async (request: import("@joko/core").NativeToolAuthorizationRequest) => {
+          try {
+            context.nativeToolAuthorization!.assertCurrent();
+            const result = await this.#extensionNativeToolAuthorization?.(sessionId)?.review(request) ?? { verdict: "default" as const };
+            context.nativeToolAuthorization!.assertCurrent(result.authorizationRevision); return result;
+          } catch { return { verdict: "block" as const, reason: "The originating native task authorization changed." }; }
+        }
+      } }),
       sessionId,
       generation,
       backendInstanceGeneration,
@@ -13855,28 +13960,50 @@ export class SessionHost {
   /** Import verification shares the target policy and ordinary authenticated interaction route. */
   async authorizeMcpAppTool(sessionId: string, serverId: string, toolName: string,
     args: Readonly<Record<string, unknown>>, signal: AbortSignal): Promise<void> {
+    await this.#authorizeMcpTool(sessionId, serverId, toolName, args, signal);
+  }
+
+  async authorizeNativeBridgeTool(sessionId: string, serverId: string, toolName: string,
+    args: Readonly<Record<string, unknown>>, signal: AbortSignal): Promise<() => void> {
+    if (!this.#extensionNativeToolAuthorization?.(sessionId)) return () => {};
+    return this.#authorizeMcpTool(sessionId, serverId, toolName, args, signal);
+  }
+
+  async #authorizeMcpTool(sessionId: string, serverId: string, toolName: string,
+    args: Readonly<Record<string, unknown>>, signal: AbortSignal): Promise<() => void> {
     signal.throwIfAborted();
     const stored = this.#store.getSession(sessionId), target = this.targetForSession(stored);
     const policy = policySnapshotFor(this.#store, target);
-    const decision = evaluateOrderedPolicyRules(policy, { subjectKind: "mcp", risk: policyRiskForToolRisk("ambiguous"), toolProviderId: serverId, toolName })
+    const ordered = evaluateOrderedPolicyRules(policy, { subjectKind: "mcp", risk: policyRiskForToolRisk("ambiguous"), toolProviderId: serverId, toolName });
+    const decision = ordered
       ?? decideToolCall({ name: `mcp__${serverId}__${toolName}`, args }, {
       mode: stored.descriptor.permissionMode, workspaceRoot: target.workspaceRoot, extraReadOnlyRoots: [],
       explicitAllowTools: new Set(), explicitDenyTools: new Set()
     });
     if (decision.action === "deny") throw new StoreError("MCP App tool was denied by target policy.");
-    if (decision.action === "allow") return;
+    const authority = this.#extensionNativeToolAuthorization?.(sessionId);
+    let revision = authority?.capture();
+    const guard = () => {
+      signal.throwIfAborted(); authority?.assertCurrent(revision);
+      const current = this.#store.getSession(sessionId);
+      if (current.descriptor.archived || current.descriptor.deletedAt !== undefined || current.descriptor.binding.generation !== stored.descriptor.binding.generation
+        || policySnapshotFor(this.#store, this.targetForSession(current)).generation !== policy.generation) throw new StoreError("MCP tool permission owner changed.");
+    };
+    guard();
+    const delegated = await authority?.review({ toolName: `mcp__${serverId}__${toolName}`, input: args, signal });
+    if (delegated?.authorizationRevision !== undefined) revision = delegated.authorizationRevision;
+    guard();
+    if (delegated?.verdict === "block") throw new StoreError(delegated.reason ?? "The delegated task denied this MCP action.");
+    if (delegated?.verdict === "allow" && ordered?.action !== "ask" || delegated?.verdict !== "ask" && delegated?.verdict !== "allow" && decision.action === "allow") return guard;
     const context = this.makeContext(sessionId, target, stored.descriptor.binding.generation, stored.descriptor.binding);
     const answer = await context.requestInteraction({ id: `mcp-app-permission-${randomUUID()}`, kind: "permission",
       title: "Allow this application tool?", toolName: `${serverId}/${toolName}`,
       summary: redactSecrets(JSON.stringify(args)).slice(0, 8000), risk: "medium", choices: ["allow_once", "deny_once"] }, { signal });
     signal.throwIfAborted();
-    const current = this.#store.getSession(sessionId);
-    if (current.descriptor.archived || current.descriptor.deletedAt !== undefined
-      || current.descriptor.binding.generation !== stored.descriptor.binding.generation
-      || policySnapshotFor(this.#store, this.targetForSession(current)).generation !== policy.generation)
-      throw new StoreError("MCP App tool permission owner changed.");
+    guard();
     if (!(answer.kind === "confirmed" && answer.confirmed || answer.kind === "selected" && answer.value === "allow_once"))
       throw new StoreError("MCP App tool was not approved.");
+    return guard;
   }
 
   async enqueueMcpAppMessage(sessionId: string, serverId: string, content: unknown[], guard: McpAppMessageGuard): Promise<void> {
@@ -13911,7 +14038,12 @@ export class SessionHost {
     });
   }
 
+  setExtensionTaskQueueGuard(guard: (item: QueueItemRecord) => void): void { this.#extensionTaskQueueGuard = guard; }
+  setExtensionNativeToolAuthorization(factory: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined): void { this.#extensionNativeToolAuthorization = factory; }
+  setPartnerHomeInputGuard(guard: (sessionId: string) => void): void { this.#partnerHomeInputGuard = guard; }
+
   async #assertApplicationQueueCurrent(item: QueueItemRecord): Promise<void> {
+    this.#extensionTaskQueueGuard?.(item);
     if (this.#store.findSetting("session", item.sessionId, `mcp_app_queue:${item.id}`) === undefined
       && this.#store.findSetting("session", item.sessionId, `extension_card_queue:${item.id}`) === undefined) return;
     const guard = this.#applicationQueueGuards.get(item.id);
@@ -13931,6 +14063,20 @@ export class SessionHost {
       if (item.attemptId !== undefined) store.finishAttempt(item.attemptId, error);
     });
     this.#applicationQueueGuards.delete(item.id);
+  }
+
+  /** Plugin permission requests use the existing owner interaction channel;
+   * declaring a task capability or hiding a task never grants Auto. */
+  async authorizeExtensionTaskWrite(sessionId: string, signal: AbortSignal, assertCurrent: () => void, mode: "acceptEdits" | "auto"): Promise<void> {
+    assertCurrent(); signal.throwIfAborted(); this.assertSessionLifecycleIdle(sessionId);
+    const stored = this.#store.getSession(sessionId), target = this.targetForSession(stored);
+    if (stored.descriptor.planMode || this.isReviewReadOnlySession(sessionId)) throw new StoreError("Exit read-only planning before requesting plugin write access.");
+    const context = this.makeContext(sessionId, target, stored.descriptor.binding.generation, stored.descriptor.binding);
+    const decision = await context.requestInteraction({ id: `extension-write-${randomUUID()}`, kind: "permission", title: mode === "auto" ? "Allow this plugin task to use automatic approval?" : "Allow this plugin task to accept file edits?",
+      toolName: "plugin_managed_task", summary: mode === "auto" ? "This changes this task and the plugin's task permission preference. Actions are reviewed against its host-registered delegated scope and current owner instructions."
+        : "This lets this unstarted task accept file edits. Commands and external actions still require confirmation. The plugin's task permission preference is updated if needed.", risk: "high", choices: ["allow_once", "deny_once"] }, { signal });
+    assertCurrent(); signal.throwIfAborted(); this.assertSessionLifecycleIdle(sessionId);
+    if (!(decision.kind === "confirmed" && decision.confirmed || decision.kind === "selected" && decision.value === "allow_once")) throw new StoreError("Plugin task write access was not approved.");
   }
 
   async authorizeImportProbe(sessionId: string, summary: string, signal: AbortSignal, assertCurrent: () => void): Promise<void> {
@@ -15280,7 +15426,11 @@ export class SessionHost {
 
   private serviceRuntimePrompt(session: SessionDescriptor): string | undefined {
     const prompt = this.#serviceRuntimePrompts.get(session.id);
-    return prompt?.baseDigest === privatePromptDigest(session.appendSystemPrompt) ? prompt.text : session.appendSystemPrompt;
+    return this.decorateRuntimePrompt(prompt?.baseDigest === privatePromptDigest(session.appendSystemPrompt) ? prompt.text : session.appendSystemPrompt);
+  }
+
+  private decorateRuntimePrompt(base: string | undefined): string | undefined {
+    return this.#decorateRuntimePrompt === undefined ? base : this.#decorateRuntimePrompt(base);
   }
 
   private async refreshServiceRuntimePrompt(sessionId: string): Promise<void> {
@@ -17070,6 +17220,7 @@ function createSessionOperationBody(input: SessionCreationInput): unknown {
       }
     } : {}),
     ...("serviceKind" in input ? { serviceKind: input.serviceKind } : {}),
+    ...("serviceKind" in input && input.hidden !== undefined ? { hidden: input.hidden === true } : {}),
     ...("originSessionId" in input && input.originSessionId !== undefined ? {
       originSessionId: input.originSessionId, originSessionGeneration: input.originSessionGeneration
     } : {}),
@@ -17267,7 +17418,7 @@ function scheduleTurnOverrides(value: unknown): TurnExecutionOverrides | undefin
   const modelId = typeof value["modelId"] === "string" ? value["modelId"] : undefined;
   const effort = typeof value["effort"] === "string" ? value["effort"] : undefined;
   const fastMode = typeof value["fastMode"] === "boolean" ? value["fastMode"] : undefined;
-  const permissionMode = value["permissionMode"] === "ask" || value["permissionMode"] === "auto" || value["permissionMode"] === "bypassPermissions"
+  const permissionMode = value["permissionMode"] === "ask" || value["permissionMode"] === "auto" || value["permissionMode"] === "acceptEdits" || value["permissionMode"] === "bypassPermissions"
     ? value["permissionMode"]
     : undefined;
   const planMode = typeof value["planMode"] === "boolean" ? value["planMode"] : undefined;

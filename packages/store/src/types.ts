@@ -46,6 +46,8 @@ export interface OperationalStoreOptions {
   readonly idFactory?: () => string;
   /** A private product owner supplies its own notification journey. */
   readonly suppressSessionNotifications?: (sessionId: string) => boolean;
+  /** Product-owned readable answer projection; stored event bytes remain unchanged. */
+  readonly assistantTextForSearch?: (source: string) => string;
 }
 
 export interface OperationalHistoryMaintenanceCandidate {
@@ -669,7 +671,7 @@ export interface CollaborationWorkerRecord {
   readonly modelId?: string;
   readonly effort?: string;
   readonly fastMode: boolean;
-  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly sessionGeneration?: number;
   readonly backendInstanceGeneration?: number;
@@ -727,7 +729,7 @@ export interface CreateCollaborationWorkerInput {
   readonly modelId?: string;
   readonly effort?: string;
   readonly fastMode: boolean;
-  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly parentWorkerId?: string;
   readonly label: string;
@@ -942,7 +944,7 @@ export interface MessagingRouteRecord {
   readonly modelId?: string;
   readonly effort?: string;
   readonly fastMode: boolean;
-  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly createdAt: UnixMillis;
   readonly updatedAt: UnixMillis;
@@ -957,7 +959,7 @@ export interface PutMessagingRouteInput {
   readonly modelId?: string;
   readonly effort?: string;
   readonly fastMode: boolean;
-  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly updatedAt?: UnixMillis;
 }
@@ -982,7 +984,7 @@ export interface MessagingConversationRecord {
   readonly modelId?: string;
   readonly effort?: string;
   readonly fastMode?: boolean;
-  readonly permissionMode?: "ask" | "auto" | "bypassPermissions";
+  readonly permissionMode?: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode?: boolean;
   readonly createdAt: UnixMillis;
   readonly updatedAt: UnixMillis;
@@ -1059,7 +1061,7 @@ export interface BindMessagingConversationInput {
   readonly sessionId: SessionId;
   readonly expectedSessionGeneration: number;
   readonly routeScopeKey: string;
-  readonly expectedPermissionMode?: "ask" | "auto" | "bypassPermissions";
+  readonly expectedPermissionMode?: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly updatedAt?: UnixMillis;
 }
 

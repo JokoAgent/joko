@@ -1678,8 +1678,8 @@ export class MobileClient {
         taskModels,
         canSwitchModel: controls?.canSwitchModel === true, canSetEffort: controls?.canSetEffort === true,
         canSetFastMode: controls?.canSetFastMode === true, canSetPlanMode: controls?.canSetPlanMode === true,
-        permissionModes: (controls?.permissionModes ?? []).filter((mode) => mode === PermissionMode.ASK || mode === PermissionMode.AUTO || mode === PermissionMode.BYPASS_PERMISSIONS)
-          .map((mode) => mode === PermissionMode.ASK ? "ask" as const : mode === PermissionMode.AUTO ? "auto" as const : "bypassPermissions" as const) };
+        permissionModes: (controls?.permissionModes ?? []).filter((mode) => mode === PermissionMode.ASK || mode === PermissionMode.ACCEPT_EDITS || mode === PermissionMode.AUTO || mode === PermissionMode.BYPASS_PERMISSIONS)
+          .map((mode) => mode === PermissionMode.ASK ? "ask" as const : mode === PermissionMode.ACCEPT_EDITS ? "acceptEdits" as const : mode === PermissionMode.AUTO ? "auto" as const : "bypassPermissions" as const) };
     };
     const listOutputs: NonNullable<MobilePartnerProfileTransport["listOutputs"]> = async (snapshot, signal) => {
       requireCurrent(signal);
@@ -2006,6 +2006,15 @@ export class MobileClient {
     const credential = context.credential;
     return new PartnerImportEditor(api, new PartnerImportReceipts(storage,
       JSON.stringify([credential.serverId, credential.profileId, credential.deviceId, new URL(credential.origin).href])));
+  }
+
+  partnerHomeApi(): import("@joko/contracts").PartnerHomeApi | undefined {
+    const context = this.#partnerPrivateContext(); if (!context || !this.network.partnerHomeApi) return undefined;
+    return this.network.partnerHomeApi(context.credential, context.authorityKey, signal => {
+      signal.throwIfAborted(); if (this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey) {
+        throw new Error("The Partner home service owner changed.");
+      }
+    });
   }
 
   partnerSkillsEditor(partner: MobilePartnerDirectoryProfile, conversationOwnerKey: string): import("@joko/contracts").PartnerSkillsEditor | undefined {
@@ -3104,6 +3113,25 @@ export class MobileClient {
             state: receipt.state }]
         : [])),
       list: (signal) => owned(signal, (current) => this.network.listExtensions(context.credential, current)),
+      getTaskPreferences: (expected, signal) => owned(signal, async current => {
+        await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
+        if (!api) throw new Error("Plugin task preferences are unavailable.");
+        const result = await api.getPreferences({ extensionId: expected.extensionId }, { signal: current }); requireCurrent(current);
+        if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin preference owner changed."); return result.preferences;
+      }),
+      setTaskPreferences: (expected, preferences, model, permissionMode, signal) => owned(signal, async current => {
+        await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
+        if (!api || preferences.extensionId !== expected.extensionId) throw new Error("Plugin task preferences are unavailable.");
+        const result = await api.updatePreferences({ extensionId: expected.extensionId, expectedRevision: preferences.revision, model, permissionMode,
+          targetId: preferences.targetId }, { signal: current }); requireCurrent(current);
+        if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin preference owner changed."); return result.preferences;
+      }),
+      retryTaskWriteAccess: (expected, taskId, signal) => owned(signal, async current => {
+        await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
+        if (!api) throw new Error("Plugin task permissions are unavailable.");
+        const result = await api.retryWriteAccess({ extensionId: expected.extensionId, taskId }, { signal: current }); requireCurrent(current);
+        if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin permission owner changed."); return result.preferences;
+      }),
       detail: (expected, signal) => owned(signal, (current) => readExactDetail(expected, current)),
       setEnabled: (expected, enabled, signal) => mutate(expected, "enabled", enabled, signal),
       setSidebarVisible: (expected, visible, signal) => mutate(expected, "sidebar", visible, signal),
@@ -3218,8 +3246,8 @@ export class MobileClient {
       capabilities: (host, signal) => checked(() => this.network.getRemoteDesktopCapabilities!(credential, route(host), signal)),
       permissions: (host, signal) => checked(() => this.network.getRemoteDesktopPermissions!(credential, route(host), signal)),
       showPermissionGuide: (host, signal) => checked(() => this.network.showRemoteDesktopPermissionGuide!(credential, route(host), signal)),
-      start: (host, displayId, mode, signal) => checked(() =>
-        this.network.startRemoteDesktop!(credential, route(host), displayId, mode, signal)),
+      start: (host, displayId, mode, signal, control) => checked(() =>
+        this.network.startRemoteDesktop!(credential, route(host), displayId, mode, signal, control)),
       heartbeat: (host, leaseId, signal) => checked(() =>
         this.network.heartbeatRemoteDesktop!(credential, route(host), leaseId, signal)),
       stop: async (host, leaseId, exit, signal) => {
@@ -3278,15 +3306,15 @@ export class MobileClient {
         this.network.getRemoteDesktopFrame!(credential, route(host), leaseId, cursorOverlay, signal)),
       listDisplayModes: (host, leaseId, signal) => checked(() =>
         this.network.listRemoteDesktopDisplayModes!(credential, route(host), leaseId, signal)),
-      setDisplayMode: (host, leaseId, controlGeneration, modeId, temporary, signal) => checked(() =>
-        this.network.setRemoteDesktopDisplayMode!(credential, route(host), leaseId, controlGeneration, modeId, temporary, signal)),
-      fitViewerDisplay: (host, leaseId, controlGeneration, width, height, signal) => checked(() => {
+      setDisplayMode: (host, leaseId, controlGeneration, modeId, temporary, signal, control) => checked(() =>
+        this.network.setRemoteDesktopDisplayMode!(credential, route(host), leaseId, controlGeneration, modeId, temporary, signal, control)),
+      fitViewerDisplay: (host, leaseId, controlGeneration, width, height, signal, control) => checked(() => {
         if (!this.network.setRemoteDesktopViewerDisplay) throw new Error("Remote Desktop viewer display is unavailable.");
-        return this.network.setRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, width, height, signal);
+        return this.network.setRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, width, height, signal, control);
       }),
-      restoreViewerDisplay: (host, leaseId, controlGeneration, signal) => checked(() => {
+      restoreViewerDisplay: (host, leaseId, controlGeneration, signal, control) => checked(() => {
         if (!this.network.restoreRemoteDesktopViewerDisplay) throw new Error("Remote Desktop viewer display restore is unavailable.");
-        return this.network.restoreRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, signal);
+        return this.network.restoreRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, signal, control);
       }),
       systemAction: (host, leaseId, controlGeneration, action, signal) => checked(() => {
         if (!this.network.performRemoteDesktopSystemAction) throw new Error("Remote Desktop system actions are unavailable.");
@@ -4816,6 +4844,12 @@ export class MobileClient {
     const joined = this.#joinedTask;
     return joined ? mobileSharedTaskDraftProfileId(joined.source.homeProfileId, joined.source.homeServerId,
       joined.source.homeOrigin, joined.source.joined.joinId) : this.#state.activeProfileId;
+  }
+
+  /** Durable presentation identity, independent of a transport or runtime occurrence. */
+  answerStateOwnerKey(): string | undefined {
+    const credential = this.#credential, session = this.#selectedSession();
+    return credential && session ? JSON.stringify([this.taskDraftProfileId(), credential.serverId, credential.origin, session.sessionId]) : undefined;
   }
 
   async openJoinedTask(joined: JoinedTaskShare): Promise<void> {
@@ -7749,6 +7783,14 @@ export class MobileClient {
     assertCurrent();
     return {
       workspaceId: files.authority.workspace.workspaceId, workdir: files.authority.workspace.serverPathDisplay, assertCurrent,
+      ...(this.mediaPreviewFiles ? { stageMedia: async (entry: WorkspaceEntry, blob: BlobRef, bytes: Uint8Array, signal: AbortSignal) => {
+        assertCurrent(signal);
+        const driver = this.mediaPreviewFiles!;
+        const staged = await driver.stage(credential.profileId, this.newId(), entry.relativePath, blob.mediaType, blob.sha256Hex, bytes, signal);
+        const release = () => { void driver.remove(staged).catch(() => undefined); };
+        try { assertCurrent(signal); } catch (error) { release(); throw error; }
+        return { uri: staged.uri, kind: staged.mediaKind, release };
+      } } : {}),
       revalidateSource: async (signal) => {
         assertCurrent(signal);
         const around = await this.network.readAround(credential, files.authority.sessionId, event.eventId, signal);

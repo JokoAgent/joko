@@ -2172,7 +2172,7 @@ export class MessagingManager {
     const session = this.#store.getSession(conversation.sessionId);
     const available = this.#store.getBackend(session.descriptor.backendId).descriptor.capabilities
       .get("permission.modes")?.options ?? [];
-    const choice = /^\/permission(?:\s+(ask|auto|bypassPermissions)(?:\s+(confirm))?)?$/iu.exec(command);
+    const choice = /^\/permission(?:\s+(ask|acceptEdits|auto|bypassPermissions)(?:\s+(confirm))?)?$/iu.exec(command);
     const picker = `Current permission: ${session.descriptor.permissionMode}. Available: ${available.join(", ") || "none"}. Use /permission <mode>; bypassPermissions requires /permission bypassPermissions confirm.`;
     if (choice === null || choice[1] === undefined) return picker;
     const mode = choice[1].toLowerCase() === "bypasspermissions"

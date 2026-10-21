@@ -369,6 +369,7 @@ export interface RunMappingContext {
 }
 
 export interface SessionMappingContext {
+  readonly taskActivity?: import("./session-task-activity.js").SessionTaskActivityProjection;
   readonly activeRun?: StoredRun;
   readonly runtimeAttached?: boolean;
   readonly usage?: UsageSnapshot;
@@ -687,6 +688,12 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
         }),
     displayName: session.title,
     taskSummary: session.summary ?? "",
+    taskActivity: context.taskActivity === undefined ? undefined : message<contract.SessionTaskActivity>("joko.v1.SessionTaskActivity", {
+      runId: context.taskActivity.runId, completedReplySummary: context.taskActivity.completedReplySummary,
+      completionNotification: context.taskActivity.completionNotification === "pending" ? contract.TaskCompletionNotification.PENDING
+        : context.taskActivity.completionNotification === "teammate" ? contract.TaskCompletionNotification.TEAMMATE : contract.TaskCompletionNotification.NONE,
+      silent: context.taskActivity.silent
+    }),
     state: sessionState(session, context.activeRun),
     nativeBinding: toProtoNativeBinding(session.backendId, session.binding, context.runtimeAttached ?? false),
     model: runtimeModel === undefined
@@ -701,6 +708,7 @@ export function toProtoSession(record: StoredSession, context: SessionMappingCon
     planMode: session.planMode,
     pinned: session.pinned,
     archived: session.archived,
+    hidden: session.hidden === true,
     context: context.usage === undefined
       ? undefined
       : toProtoContextUsage(context.usage, context.usageMeasuredAt ?? session.updatedAt),
@@ -2817,6 +2825,8 @@ export function toProtoRuntimeCommand(
   sessionId: string
 ): contract.RuntimeCommand {
   const normalizedSessionId = requireText(sessionId, "runtime_command.session_id");
+  if (item.builtinSkill && (item.builtinSkill.id !== "plugin_creator" || !/^sha256:[a-f0-9]{64}$/u.test(item.builtinSkill.revision)
+    || item.source !== "skill" || !item.loaded || !item.resourceId)) throw new ProtoMappingError("unsupported_mapping", "runtime_command.builtin_skill", "Invalid built-in Skill attestation.");
   const inputMode = item.inputMode === "text" ? contract.RuntimeCommandInputMode.TEXT
     : item.inputMode === "resource_mention" ? contract.RuntimeCommandInputMode.RESOURCE_MENTION : undefined;
   if (inputMode === undefined || (item.inputMode === "resource_mention" && (!item.loaded || !item.resourceId))) {
@@ -2833,6 +2843,7 @@ export function toProtoRuntimeCommand(
         ? contract.RuntimeCommandSource.SKILL
         : contract.RuntimeCommandSource.PROMPT,
     resourceId: item.resourceId ?? "",
+    ...(item.builtinSkill === undefined ? {} : { builtinSkill: message<contract.BuiltinSkillIdentity>("joko.v1.BuiltinSkillIdentity", item.builtinSkill) }),
     inputMode,
     loaded: item.loaded,
     sessionId: normalizedSessionId
@@ -2840,6 +2851,8 @@ export function toProtoRuntimeCommand(
 }
 
 export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRuntimeCommand {
+  if (item.builtinSkill && (item.builtinSkill.id !== "plugin_creator" || !/^sha256:[a-f0-9]{64}$/u.test(item.builtinSkill.revision)
+    || item.source !== contract.RuntimeCommandSource.SKILL || !item.loaded || !item.resourceId)) throw new ProtoMappingError("unsupported_mapping", "runtime_command.builtin_skill", "Invalid built-in Skill attestation.");
   const inputMode = item.inputMode === contract.RuntimeCommandInputMode.TEXT ? "text"
     : item.inputMode === contract.RuntimeCommandInputMode.RESOURCE_MENTION ? "resource_mention" : undefined;
   if (inputMode === undefined || (inputMode === "resource_mention" && (!item.loaded || !item.resourceId))) {
@@ -2864,6 +2877,7 @@ export function fromProtoRuntimeCommand(item: contract.RuntimeCommand): CoreRunt
     source,
     inputMode,
     ...(item.resourceId === "" ? {} : { resourceId: requireText(item.resourceId, "runtime_command.resource_id") }),
+    ...(item.builtinSkill ? { builtinSkill: { id: "plugin_creator" as const, revision: item.builtinSkill.revision } } : {}),
     loaded: item.loaded
   };
 }
@@ -4767,7 +4781,7 @@ function toProtoCapabilityOptions(capability: Capability): CapabilityOptions | u
       value: {
         $typeName: "joko.v1.PermissionCapabilityOptions",
         modes: (capability.options ?? []).flatMap((value) =>
-          value === "ask" || value === "auto" || value === "bypassPermissions"
+          value === "ask" || value === "auto" || value === "acceptEdits" || value === "bypassPermissions"
             ? [toProtoPermissionMode(value)]
             : []
         ),
@@ -4868,6 +4882,7 @@ function toProtoPermissionMode(value: CorePermissionMode): PermissionMode {
   switch (value) {
     case "ask": return PermissionMode.ASK;
     case "auto": return PermissionMode.AUTO;
+    case "acceptEdits": return PermissionMode.ACCEPT_EDITS;
     case "bypassPermissions": return PermissionMode.BYPASS_PERMISSIONS;
   }
 }
@@ -4875,6 +4890,7 @@ function toProtoPermissionMode(value: CorePermissionMode): PermissionMode {
 function fromProtoPermissionMode(value: PermissionMode): CorePermissionMode {
   switch (value) {
     case PermissionMode.AUTO: return "auto";
+    case PermissionMode.ACCEPT_EDITS: return "acceptEdits";
     case PermissionMode.BYPASS_PERMISSIONS: return "bypassPermissions";
     default: return "ask";
   }

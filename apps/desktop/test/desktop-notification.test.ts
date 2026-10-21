@@ -17,6 +17,11 @@ class FakeNotification extends EventEmitter implements NativeDesktopNotification
 }
 
 describe("Desktop notifications", () => {
+  it("carries a bounded current native entry token for remote notification focus", () => {
+    const navigation = { kind: "nativeTask", sessionId: "node/session", entryToken: "exact-source-run-phase" };
+    expect(parseDesktopNotification({ title: "Task · Computer", body: "Done", navigation }).navigation).toEqual(navigation);
+    expect(() => parseDesktopNotification({ title: "Task", body: "", navigation: { ...navigation, entryToken: "x".repeat(2049) } })).toThrow();
+  });
   it("accepts only bounded text and an exact machine-owned task route", () => {
     const parsed = parseDesktopNotification({
       title: "Joko · Task",

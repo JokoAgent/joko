@@ -186,12 +186,6 @@ async function copyCandidateApplication() {
     mode: 0o644
   });
   await copyRegularTree(join(source, "dist"), join(candidateRoot, "dist"));
-  for (const directory of ["", "mcp-apps", "extension-cards", "partner-packages"]) {
-    const notices = join(candidateRoot, "licenses", directory || "orchestrator");
-    await mkdir(notices, { recursive: true, mode: 0o755 });
-    for (const name of ["NOTICE", "LICENSE.cindy"]) await writeFile(join(notices, name),
-      await readFile(join(repositoryRoot, "apps", "orchestrator", "src", directory, name)), { flag: "wx", mode: 0o644 });
-  }
 }
 
 async function overlayWorkspacePackages() {
@@ -207,12 +201,6 @@ async function overlayWorkspacePackages() {
     }
     await rewriteRuntimePackageManifestFile(join(packageRoot, "package.json"), descriptor.name);
     if (descriptor.candidatePath !== ".") await copyRegularTree(join(sourcePackageRoot, "dist"), join(packageRoot, "dist"));
-    if (descriptor.candidatePath !== ".") for (const name of ["NOTICE", "LICENSE.cindy"]) {
-      let bytes;
-      try { bytes = await readFile(join(sourcePackageRoot, name)); }
-      catch (error) { if (error?.code === "ENOENT") continue; throw error; }
-      await writeFile(join(packageRoot, name), bytes, { flag: "wx", mode: 0o644 });
-    }
     if (descriptor.name === "@joko/contracts") {
       await copyRegularTree(join(sourcePackageRoot, "proto"), join(packageRoot, "proto"));
     }

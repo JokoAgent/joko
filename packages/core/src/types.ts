@@ -173,7 +173,7 @@ export const HOST_COMPOSED_CAPABILITIES = [
 
 export type HostComposedCapability = (typeof HOST_COMPOSED_CAPABILITIES)[number];
 
-export type PermissionMode = "ask" | "auto" | "bypassPermissions";
+export type PermissionMode = "ask" | "acceptEdits" | "auto" | "bypassPermissions";
 export type InputDisposition = "prompt" | "steer" | "follow_up";
 export type QueueState =
   | "accepted"
@@ -896,6 +896,8 @@ export interface SessionDescriptor {
   readonly binding: NativeSessionBinding;
   readonly pinned: boolean;
   readonly archived: boolean;
+  /** Host-owned plugin background visibility; execution and archival are independent. */
+  readonly hidden?: boolean;
   readonly deletedAt?: UnixMillis;
   readonly permissionMode: PermissionMode;
   readonly planMode: boolean;

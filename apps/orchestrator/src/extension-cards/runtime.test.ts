@@ -13,6 +13,7 @@ import type { BridgeToolProvider } from "../mcp-router.js";
 import { parseExtensionRuntime, type ExtensionRuntimeDescriptor } from "../extension-surface-manifest.js";
 import { ExtensionCardRuntime, validateExtensionEnvelope } from "./runtime.js";
 import { ExtensionCardsManager } from "./manager.js";
+import type { ExtensionTasks, ExtensionTaskOwner } from "../extension-tasks.js";
 
 const browserIt = process.env.JOKO_BROWSER_EXECUTABLE ? it : it.skip;
 it("bounds every plugin envelope before asynchronous admission", () => {
@@ -30,8 +31,8 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
   const id = "extension_0123456789abcdef0123456789abcdef", revision = `sha256:${"a".repeat(64)}`;
   let enabled = true, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
-  const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
-    card: { externalLinks: true }, mail: true, agent: true,
+  const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "text"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
+    card: { externalLinks: true }, mail: true, agent: true, tasks: { hidden: true }, text: { oneshot: true }, showTaskPreferences: false,
     network: { hosts: ["api.example.test"], connections: [{ key: "service", label: "Service", inject: { header: "Authorization", format: "Bearer {value}" } }], secrets: [{ key: "key", label: "Key", inject: { header: "Authorization", format: "Bearer {value}" } }] }, mailReader: { tool: "read_mail", hosts: ["mail.example.test"], markRead: true } });
   const extension = () => ({ id, revision: 1n, name: "Fixture mail", installed: true, enabled, owner: { kind: "resource", resourceId: "resource", resourceVersion: 1n, discoveredRevision: revision },
     setup: { state: "not_required" }, runtime: { ...declaration, extensionEntry: "extensions/main.js" } } as unknown as ExtensionCatalogDescriptor);
@@ -46,6 +47,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
       await writeFile(join(destination, "ui/logic/index.html"), '<!doctype html><html><head><script src="./runtime.js"></script></head><body></body></html>');
       await writeFile(join(destination, "ui/logic/runtime.js"), String.raw`
         let writes = 0, sends = 0;
+        const taskOutcomes = {}, textOutcomes = {};
         let saved = { status: 'read_back', draftId: 'draft-one', fingerprint: 'revision-1', locator: { id: 'draft-one' },
           headers: { from: 'owner@example.test', to: 'reader@example.test', cc: '', bcc: '', subject: 'Review' },
           editor: { editable: true, format: 'html', body: 'Hello', quote: '', bodyHtml: '<p style="color:red">Hello</p>', quoteHtml: '' }, attachments: [] };
@@ -75,23 +77,66 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
           const downloaded = await joko.network.fetch({ callId: message.callId, url: 'https://api.example.test/download', as: 'file', saveTo: { token: message.arguments.save_deposit.token } });
           return { ok: uploaded.ok && downloaded.ok, result: { uploaded, downloaded, argumentKeys: Object.keys(message.arguments) } };
         });
+        joko.tools.register('tasks', async message => {
+          if (message.arguments.requestKey) {
+            const requestKey = message.arguments.requestKey;
+            try {
+              const task = await joko.tasks.create({ ...(message.arguments.resident ? {} : { callId: message.callId }), requestKey, title: 'Deferred task' });
+              taskOutcomes[requestKey] = { taskId: task.taskId };
+            } catch (error) { taskOutcomes[requestKey] = { errorCode: error.code }; }
+            return { ok: true, result: taskOutcomes[requestKey] };
+          }
+          const task = await joko.tasks.create({ callId: message.callId, requestKey: 'task-one', title: 'Review', hidden: true });
+          const text = await joko.text.oneshot({ prompt: 'Return a summary', expectJson: true });
+          let failureCode;
+          try { await joko.tasks.get({ taskId: 'foreign-task' }); } catch (error) { failureCode = error.code; }
+          return { ok: true, result: { task, text, failureCode, taskMethods: Object.keys(joko.tasks), hasCredentials: 'credential' in joko } };
+        });
+        joko.tools.register('text', async message => {
+          const key = message.arguments.key;
+          const response = await joko.text.oneshot({ prompt: key, ...(message.arguments.resident ? {} : { callId: message.arguments.expired ? 'missing-call' : message.callId }) });
+          textOutcomes[key] = response;
+          return { ok: true, result: response };
+        });
         joko.tools.register('read_mail', async message => ({ ok: true, result: { accountId: 'one', messageId: 'one', from: 'Sender', to: 'Owner', cc: '', bcc: '', date: 'Today', subject: message.arguments.markRead ? 'Opened' : 'Unread', bodyHtml: '<p>Hello</p>', bodyText: 'Hello', attachments: [] } }));
         joko.onHostMessage(async message => {
           if (message.actionId === 'refresh') await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
         });
         joko.tools.register('mail', async message => ({ ok: await compose.present(message, account, structuredClone(saved)), result: { shown: true } }));
-        joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved } }));
+        joko.tools.register('inspect', async () => ({ ok: true, result: { writes, sends, saved, taskOutcomes, textOutcomes } }));
       `);
       return { discoveredRevision: revision, files: 4, bytes: 5000, entries: [] };
     }
   }) } });
   let runtime: ExtensionCardRuntime | undefined;
   const providers = new Map<string, BridgeToolProvider>(), continuation = vi.fn(async () => {});
+  const delayedTasks = new Map<string, { readonly owner: ExtensionTaskOwner; readonly release: () => void }>(), taskEffects: string[] = [];
+  const delayedText = new Map<string, { readonly owner: ExtensionTaskOwner; readonly release: () => void }>(), textEffects: string[] = [], textCalls: string[] = [];
+  const tasks: Pick<ExtensionTasks, "installation" | "request" | "drain"> = { installation: () => "durable-installation", drain: async () => {}, request: vi.fn(async (owner, input) => {
+    owner.assertCurrent(); expect(owner.installation).toBe("durable-installation");
+    if ((input as { kind: string }).kind === "get") throw Object.assign(new Error("Not owned"), { code: "TASK_NOT_FOUND" });
+    const request = input as { requestKey?: string };
+    if (request.requestKey?.startsWith("deferred-")) {
+      const key = request.requestKey;
+      await new Promise<void>(release => delayedTasks.set(key, { owner, release }));
+      owner.assertCurrent(); owner.signal.throwIfAborted(); taskEffects.push(key);
+      return { taskId: `managed-${key}`, revision: "configuration" };
+    }
+    expect(owner.sourceSessionId).toBe("task"); return { taskId: "managed-task", revision: "configuration", hidden: true, usage: 1n };
+  }) };
   const manager = new ExtensionCardsManager({ store, vault, authority: extensionId => runtime?.authority(extensionId), redact: value => value,
     dispatch: (scope, event, assertCurrent) => runtime!.dispatch(scope, event, assertCurrent) });
   const startupErrors: string[] = [];
   const registration = { id: "target", root, displayName: "Workspace", trusted: true };
   runtime = new ExtensionCardRuntime({ store, vault, cards: manager, surfaces, executablePath: process.env.JOKO_BROWSER_EXECUTABLE,
+    tasks, text: { oneshot: async (owner, input) => {
+      owner.assertCurrent(); const key = (input as { prompt: string }).prompt; textCalls.push(key);
+      if (key.startsWith("deferred-text-")) {
+        await new Promise<void>(release => delayedText.set(key, { owner, release }));
+        owner.assertCurrent(); owner.signal.throwIfAborted(); textEffects.push(key); return { ok: true, text: key };
+      }
+      return { ok: true, text: '{"summary":"Done"}' };
+    } },
     workspaces: { listRegistrations: () => [registration] },
     launch: async () => {
       const browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE, headless: true, chromiumSandbox: true });
@@ -121,6 +166,51 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   try {
     await surfaces.initialize(); await runtime.start();
     const provider = providers.get(`${id}-runtime`)!; expect(provider).toBeDefined();
+    const managed = await provider.callTool("tasks", {}, undefined, context);
+    expect(managed.structuredContent).toMatchObject({ task: { taskId: "managed-task", revision: "configuration", hidden: true, usage: "1" },
+      text: { ok: true, text: '{"summary":"Done"}' }, failureCode: "TASK_NOT_FOUND", hasCredentials: false });
+    expect((managed.structuredContent?.taskMethods as string[])).toHaveLength(17);
+    for (const reason of ["cancel", "generation", "bridge-authority", "resident"] as const) {
+      const key = `deferred-${reason}`, source = new AbortController(); let bridgeCurrent = true;
+      const failed = provider.callTool("tasks", { requestKey: key, ...(reason === "resident" ? { resident: true } : {}) }, source.signal,
+        { ...context, assertCurrent: () => { if (!bridgeCurrent) throw new Error("Original tool authority revoked"); } }).then(() => false, () => true);
+      await vi.waitFor(() => expect(delayedTasks.has(key)).toBe(true));
+      const deferred = delayedTasks.get(key)!;
+      if (reason === "generation") store.updateSession("task", { binding: { opaqueRef: "replacement-native", generation: 2 } });
+      else if (reason === "bridge-authority") bridgeCurrent = false;
+      else source.abort();
+      if (reason === "cancel") expect(deferred.owner.signal.aborted).toBe(true);
+      if (reason === "resident") { expect(deferred.owner.sourceSessionId).toBeUndefined(); expect(deferred.owner.signal.aborted).toBe(false); }
+      else expect(() => deferred.owner.assertCurrent()).toThrow();
+      deferred.release(); expect(await failed).toBe(true);
+      if (reason === "generation") context.generation = 2;
+      await vi.waitFor(async () => {
+        const inspected = await provider.callTool("inspect", {}, undefined, context);
+        expect(inspected.structuredContent).toMatchObject({ taskOutcomes: { [key]: reason === "resident" ? { taskId: `managed-${key}` } : { errorCode: "INTERNAL" } } });
+      });
+      expect(taskEffects.includes(key)).toBe(reason === "resident");
+    }
+    const beforeExpiredText = textCalls.length;
+    const expiredText = await provider.callTool("text", { key: "expired-text", expired: true }, undefined, context);
+    expect(expiredText.structuredContent).toMatchObject({ ok: false, errorCode: "SOURCE_CALL_EXPIRED" }); expect(textCalls).toHaveLength(beforeExpiredText);
+    for (const reason of ["cancel", "generation", "resident"] as const) {
+      const key = `deferred-text-${reason}`, source = new AbortController();
+      const failed = provider.callTool("text", { key, ...(reason === "resident" ? { resident: true } : {}) }, source.signal, { ...context }).then(() => false, () => true);
+      await vi.waitFor(() => expect(delayedText.has(key)).toBe(true));
+      const deferred = delayedText.get(key)!;
+      if (reason === "generation") store.updateSession("task", { binding: { opaqueRef: "next-native", generation: context.generation + 1 } });
+      else source.abort();
+      if (reason === "cancel") expect(deferred.owner.signal.aborted).toBe(true);
+      if (reason === "resident") { expect(deferred.owner.sourceSessionId).toBeUndefined(); expect(deferred.owner.signal.aborted).toBe(false); }
+      else expect(() => deferred.owner.assertCurrent()).toThrow();
+      deferred.release(); expect(await failed).toBe(true);
+      if (reason === "generation") context.generation += 1;
+      await vi.waitFor(async () => {
+        const inspected = await provider.callTool("inspect", {}, undefined, context);
+        expect(inspected.structuredContent).toMatchObject({ textOutcomes: { [key]: reason === "resident" ? { ok: true, text: key } : { ok: false, errorCode: reason === "cancel" ? "CANCELLED" : "SOURCE_CHANGED" } } });
+      });
+      expect(textEffects.includes(key)).toBe(reason === "resident");
+    }
     expect(provider.tools.find(tool => tool.name === "network")?.requiresPermission).toBe(true);
     expect(provider.tools.find(tool => tool.name === "transfer")?.inputSchema).toMatchObject({ properties: { dir: { type: "string" }, save_dir: { type: "string" } } });
     await writeFile(join(root, "selected.txt"), "selected bytes");
@@ -173,5 +263,5 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     enabled = false; changed?.([id]); expect(provider.available).toBe(false);
     expect(manager.get("task", mailId).interactive).toBe(false);
     await expect(provider.callTool("card", {}, undefined, context)).rejects.toThrow(); expect(publicCards()).toHaveLength(before);
-  } finally { await runtime.stop(); await manager.dispose(); await surfaces.close(); store.close(); await rm(root, { recursive: true, force: true }); }
+  } finally { for (const task of [...delayedTasks.values(), ...delayedText.values()]) task.release(); await runtime.stop(); await manager.dispose(); await surfaces.close(); store.close(); await rm(root, { recursive: true, force: true }); }
 }, 30_000);

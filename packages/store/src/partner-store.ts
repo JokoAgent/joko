@@ -116,7 +116,7 @@ CREATE TABLE partner_directory (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
   default_model_chain_json TEXT,
-  default_permission_mode TEXT CHECK (default_permission_mode IS NULL OR default_permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+  default_permission_mode TEXT CHECK (default_permission_mode IS NULL OR default_permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
   default_plan_mode INTEGER CHECK (default_plan_mode IS NULL OR default_plan_mode IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
@@ -144,7 +144,7 @@ CREATE TABLE partners (
   canonical_session_id TEXT UNIQUE,
   model_chain_json TEXT NOT NULL,
   task_model_json TEXT,
-  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -222,7 +222,7 @@ CREATE TABLE partner_profile_versions (
   identity_source TEXT NOT NULL,
   model_chain_json TEXT NOT NULL,
   task_model_json TEXT,
-  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -1290,6 +1290,7 @@ export class PartnerStore {
         UPDATE partner_session_links SET role = 'history' WHERE session_id = ? AND partner_id = ? AND role = 'canonical'
       `).run(expected, current.id);
       if (Number(retired.changes) !== 1) throw unavailable("The previous canonical Session link is missing.");
+      this.#database.prepare("UPDATE partner_session_links SET role = 'history' WHERE partner_id = ? AND role = 'delegation'").run(current.id);
       this.#database.prepare(`
         INSERT INTO partner_session_links(
           session_id, partner_id, role, profile_version, parent_session_id, delegation_id, created_at
@@ -1318,6 +1319,32 @@ export class PartnerStore {
       if (Number(result.changes) !== 1) throw changed(current.id);
       this.#bumpDirectory(at);
       return this.getPartner(current.id);
+    });
+  }
+
+  /** The home Owner publishes a fully prepared execution Target and historical hand-off together. */
+  moveHome(input: { readonly partnerId: string; readonly expectedRevision: bigint; readonly sourceSessionId: string;
+    readonly targetId: string; readonly sessionId: string; readonly capabilities: PartnerCapabilitiesRecord }): PartnerProfileRecord {
+    return this.#write(() => {
+      const current = this.getPartner(input.partnerId); assertRevision(current, input.expectedRevision); assertMutable(current);
+      if (current.lifecycle !== "active" || current.canonicalSessionId !== input.sourceSessionId) throw changed(current.id);
+      const targetId = entityId(input.targetId, "Partner home Target ID"), sessionId = entityId(input.sessionId, "Canonical Session ID");
+      if (targetId === current.homeTargetId || sessionId === current.canonicalSessionId) throw new PartnerStoreError("PARTNER_INVALID", "A home change requires a fresh execution owner.");
+      const capabilities = capabilitiesValue(input.capabilities), at = this.#now();
+      const version = current.profileVersion + 1;
+      const retired = this.#database.prepare("UPDATE partner_session_links SET role = 'history' WHERE session_id = ? AND partner_id = ? AND role = 'canonical'")
+        .run(current.canonicalSessionId, current.id);
+      if (Number(retired.changes) !== 1) throw unavailable("The previous canonical Session link is missing.");
+      const updated = this.#database.prepare(`UPDATE partners SET revision = ?, profile_version = ?, home_target_id = ?, canonical_session_id = ?,
+        model_chain_json = ?, task_model_json = NULL, permission_mode = ?, plan_mode = ?, uses_directory_defaults = 0,
+        initialization_state = 'ready', invitation_stage = 'ready', initialization_error_code = NULL, updated_at = ? WHERE id = ? AND revision = ?`)
+        .run(nextNumber(current.revision, "Partner revision"), version, targetId, sessionId, JSON.stringify(capabilities.modelChain),
+          capabilities.permissionMode, capabilities.planMode ? 1 : 0, at, current.id, Number(current.revision));
+      if (Number(updated.changes) !== 1) throw changed(current.id);
+      this.#database.prepare(`INSERT INTO partner_session_links(session_id, partner_id, role, profile_version, parent_session_id, delegation_id, created_at)
+        VALUES (?, ?, 'canonical', ?, NULL, NULL, ?)`).run(sessionId, current.id, version, at);
+      this.#insertVersion(current.id, version, current.identitySource, capabilities, false, at);
+      this.#bumpDirectory(at); return this.getPartner(current.id);
     });
   }
 
@@ -2247,7 +2274,7 @@ function capabilitiesValue(value: PartnerCapabilitiesRecord, allowUnconfiguredMo
     throw new PartnerStoreError("PARTNER_INVALID", "Partner capabilities are required.");
   }
   const permissionMode = value.permissionMode;
-  if (permissionMode !== "ask" && permissionMode !== "auto" && permissionMode !== "bypassPermissions") {
+  if (permissionMode !== "ask" && permissionMode !== "auto" && permissionMode !== "acceptEdits" && permissionMode !== "bypassPermissions") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner permission mode is invalid.");
   }
   if (typeof value.planMode !== "boolean") {

@@ -315,7 +315,7 @@ export class RemoteDesktopCoordinator {
   async start(
     connection: ConnectionRecord,
     identity: DevicePeerSelectionIdentity,
-    input: { readonly displayId: string; readonly mode: contract.RemoteDesktopStartMode },
+    input: { readonly displayId: string; readonly mode: contract.RemoteDesktopStartMode; readonly control?: boolean },
     signal: AbortSignal
   ): Promise<contract.RemoteDesktopLease> {
     this.#assertOpen();
@@ -349,7 +349,8 @@ export class RemoteDesktopCoordinator {
           "startRemoteDesktop",
           create(contract.DevicePeerStartRemoteDesktopActionSchema, {
             displayId: input.displayId,
-            mode: input.mode
+            mode: input.mode,
+            control: input.control === true
           }),
           "side_effect"
         ), signal, "remoteDesktopLease", "joko.v1.RemoteDesktopLease");
@@ -361,7 +362,7 @@ export class RemoteDesktopCoordinator {
       }
       validateLease(value);
       if (value.display?.displayId !== input.displayId || (resumeState?.viewerDisplayActive
-        && (value.leaseId === resumeState.leaseId || value.controlling || value.controlGeneration <= resumeState.controlGeneration))) {
+        && (value.leaseId === resumeState.leaseId || (!input.control && value.controlling) || value.controlGeneration <= resumeState.controlGeneration))) {
         void this.#bestEffortStopLease(cleanupAuthority, value.leaseId);
         throw invalidTargetResponse();
       }
@@ -760,6 +761,7 @@ export class RemoteDesktopCoordinator {
       readonly controlGeneration: bigint;
       readonly modeId: string;
       readonly temporary: boolean;
+      readonly control?: boolean;
     },
     signal: AbortSignal
   ): Promise<contract.RemoteDesktopDisplayModeResult> {
@@ -800,7 +802,7 @@ export class RemoteDesktopCoordinator {
         const displayId = value.lease.display!.displayId;
         if (value.lease.leaseId !== state.leaseId
           || (displayId !== state.captureDisplayId && (!state.viewerDisplayActive || displayId !== state.sourceDisplayId))
-          || value.lease.controlling || value.lease.controlGeneration <= input.controlGeneration) throw invalidTargetResponse();
+          || (!input.control && value.lease.controlling) || value.lease.controlGeneration <= input.controlGeneration) throw invalidTargetResponse();
         state.captureDisplayId = displayId;
         if (displayId === state.sourceDisplayId) state.viewerDisplayActive = false;
         this.#adoptControlState(state, create(contract.RemoteDesktopControlStateSchema, {
@@ -836,6 +838,7 @@ export class RemoteDesktopCoordinator {
       readonly controlGeneration: bigint;
       readonly width: number;
       readonly height: number;
+      readonly control?: boolean;
     },
     signal: AbortSignal
   ): Promise<contract.RemoteDesktopViewerDisplayResult> {
@@ -851,7 +854,7 @@ export class RemoteDesktopCoordinator {
   async restoreViewerDisplay(
     connection: ConnectionRecord,
     identity: DevicePeerSelectionIdentity,
-    input: { readonly leaseId: string; readonly controlGeneration: bigint },
+    input: { readonly leaseId: string; readonly controlGeneration: bigint; readonly control?: boolean },
     signal: AbortSignal
   ): Promise<contract.RemoteDesktopViewerDisplayResult> {
     return this.#changeViewerDisplay(connection, identity, input, signal,
@@ -862,7 +865,7 @@ export class RemoteDesktopCoordinator {
   async #changeViewerDisplay(
     connection: ConnectionRecord,
     identity: DevicePeerSelectionIdentity,
-    input: { readonly leaseId: string; readonly controlGeneration: bigint },
+    input: { readonly leaseId: string; readonly controlGeneration: bigint; readonly control?: boolean },
     signal: AbortSignal,
     command: contract.DevicePeerCommand,
     restore: boolean
@@ -883,13 +886,13 @@ export class RemoteDesktopCoordinator {
         || state.displayRevision !== revision) throw leaseFailure(contract.RemoteDesktopFailureReason.LEASE_EXPIRED);
       if (value.lease === undefined) throw invalidTargetResponse();
       validateLease(value.lease);
-      if (value.lease.leaseId !== state.leaseId || value.lease.controlling
+      if (value.lease.leaseId !== state.leaseId || (!input.control && value.lease.controlling)
         || value.lease.controlGeneration <= input.controlGeneration
         || (restore && value.lease.display!.displayId !== state.sourceDisplayId)) throw invalidTargetResponse();
       state.captureDisplayId = value.lease.display!.displayId;
       state.viewerDisplayActive = !restore;
       this.#adoptControlState(state, create(contract.RemoteDesktopControlStateSchema, {
-        controlling: false, controlGeneration: value.lease.controlGeneration
+        controlling: value.lease.controlling, controlGeneration: value.lease.controlGeneration
       }));
       state.expiresAt = this.#now() + REMOTE_DESKTOP_LEASE_MS;
       clearTimeout(state.timer); state.timer = this.#leaseTimer(state);

@@ -1,4 +1,3 @@
-// Adapted from the fixed host-owned audio slots. See public/licenses/mcp-apps/NOTICE.txt.
 // Media elements stay in the host document across inert poster replacements.
 import { registerExclusiveMediaPlayback } from "../media-playback.js";
 import type { ExtensionCardApi } from "../model.js";

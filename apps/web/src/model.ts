@@ -8,7 +8,7 @@ export type Locale = "en" | "zh-CN" | "en-XA";
 export type SystemLocale = Exclude<Locale, "en-XA">;
 export type LocalePreference = "system" | Locale;
 export type Theme = "system" | "light" | "dark";
-export type PermissionMode = "ask" | "auto" | "bypassPermissions";
+export type PermissionMode = "ask" | "acceptEdits" | "auto" | "bypassPermissions";
 export type DeliveryMode = "prompt" | "steer" | "followUp";
 
 export interface ConnectionProfile {
@@ -745,6 +745,7 @@ export interface PartnerWorkbenchTextView {
   readonly privateMessageOrigin?: { readonly messageId: string; readonly threadId: string; readonly senderPartnerId: string; readonly recipientPartnerId: string; readonly senderDisplayName: string };
 }
 export interface PartnerWorkbenchTaskView {
+  readonly readOnly?: boolean;
   readonly id: string;
   readonly kind: "session" | "external" | "item" | "automation";
   readonly project: string;
@@ -781,7 +782,8 @@ export interface PartnerWorkbenchProjectBriefView {
 export interface PartnerWorkbenchView {
   readonly owner: PartnerWorkbenchOwnerView;
   readonly revision: bigint;
-  readonly projects: readonly { readonly path: string; readonly name: string; readonly addedAt: number; readonly exists: boolean }[];
+  readonly projects: readonly { readonly path: string; readonly name: string; readonly addedAt: number; readonly exists: boolean;
+    readonly sourceComputerId?: string; readonly sourceComputerName?: string; readonly readOnly?: boolean }[];
   readonly judgments: readonly PartnerWorkbenchJudgmentView[];
   readonly projectOptions: readonly { readonly path: string; readonly name: string; readonly taskCount: number; readonly nativeCount: number; readonly automationCount: number; readonly repository: boolean; readonly granted: boolean }[];
   readonly tasks: readonly PartnerWorkbenchTaskView[];
@@ -1403,6 +1405,13 @@ export interface TaskTagDeletePreviewView {
 }
 
 export interface SessionView {
+  readonly taskActivity?: {
+    readonly runId: string;
+    readonly completedReplySummary: string;
+    readonly completionNotification: "none" | "pending" | "teammate";
+    readonly silent: boolean;
+  };
+  readonly hidden?: boolean;
   readonly id: string;
   readonly backendId: string;
   readonly targetId: string;
@@ -3699,6 +3708,7 @@ export interface RuntimeCommandView {
   readonly resourceId?: string;
   readonly inputMode: "text" | "resource_mention";
   readonly loaded: boolean;
+  readonly builtinSkill?: { readonly id: "plugin_creator"; readonly revision: string };
 }
 
 export type RuntimeToolFieldTypeView = "string" | "number" | "integer" | "boolean" | "object" | "array" | "blob" | "unknown";
@@ -5443,6 +5453,7 @@ export type NewSessionDraftSelection =
  * opaque approved-record IDs and is revalidated against the current snapshot
  * before it is shown or sent; server paths are never copied into this record. */
 export interface NewSessionLocalDraft {
+  readonly builtinSkillIntent?: "plugin_creator";
   readonly selection: NewSessionDraftSelection | { readonly kind: "unselected" };
   readonly nativeStart: { readonly kind: "fresh" } | { readonly kind: "attach"; readonly reference: string };
   readonly providerId: string;
@@ -5556,6 +5567,7 @@ export type ComposerSelectionQuoteDraft =
   | ComposerFileSelectionQuoteDraft;
 
 export interface ComposerDraft {
+  readonly builtinSkillIntent?: "plugin_creator";
   readonly text: string;
   /** Ordered rich-text source of truth for inline selected-text quote atoms. */
   readonly editorDocument?: JSONContent;
@@ -6028,6 +6040,7 @@ export interface McpAppApi {
 export type ExtensionNetworkApi = Pick<import("@connectrpc/connect").Client<typeof import("@joko/contracts").ExtensionNetworkService>, "get" | "change"> & {
   save(request: import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").ExtensionNetworkServiceBeginCredentialRequestSchema>, secret: string, signal?: AbortSignal): Promise<import("@joko/contracts").ExtensionNetworkState>;
 };
+export type ExtensionTaskApi = import("@connectrpc/connect").Client<typeof import("@joko/contracts").ExtensionTaskService>;
 export type ExtensionOAuthApi = Pick<import("@connectrpc/connect").Client<typeof import("@joko/contracts").ExtensionOAuthService>, "get" | "change"> & {
   readonly canAuthorize: boolean;
   saveClient(request: import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").ExtensionOAuthServiceBeginClientRequestSchema>, clientId: string, clientSecret: string, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionOAuthState>;
@@ -6048,6 +6061,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   extensionCardApi(): ExtensionCardApi | undefined;
   extensionNetworkApi(): ExtensionNetworkApi | undefined;
   extensionOAuthApi(): ExtensionOAuthApi | undefined;
+  extensionTaskApi?(): ExtensionTaskApi | undefined;
   getSimulatorViewerState(sessionId: string, signal?: AbortSignal): Promise<SimulatorViewerStateView>;
   controlSimulatorInstance(sessionId: string, requestId: string, input: SimulatorViewerControlView, signal?: AbortSignal): Promise<SimulatorViewerControlResultView>;
   controlSimulatorViewerInput(sessionId: string, requestId: string, route: SimulatorViewerRouteView,
@@ -6629,6 +6643,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   partnerMemoryApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerMemoryApi;
   partnerConnectionsApi(partnerId: string, ownerKey: string): import("@joko/contracts").PartnerConnectionsApi;
   partnerImportApi(ownerKey: string): import("@joko/contracts").PartnerImportApi;
+  partnerHomeApi(ownerKey: string): import("@joko/contracts").PartnerHomeApi;
   getPartner(partnerId: string, signal?: AbortSignal): Promise<PartnerProfileView>;
   readPartnerWorkingStatus(partnerId: string, status: SessionWorkingStatus, locale: "en" | "zh-CN", signal?: AbortSignal): Promise<string | undefined>;
   createPartner(expectedDirectoryRevision: bigint, draft: PartnerDraftView, requestId: string, signal?: AbortSignal): Promise<PartnerMutationView>;

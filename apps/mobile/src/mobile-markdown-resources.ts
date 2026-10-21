@@ -1,6 +1,8 @@
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
-import { FileKind, type BlobRef, type FilePreview, type WorkspaceEntry } from "@joko/contracts";
+import { FileKind, RichAnswerStream, richMarkdown, richMediaSource, splitRichAnswer, type BlobRef, type FilePreview, type WorkspaceEntry } from "@joko/contracts";
+import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
+import { mobileMediaPreviewKind, type MobileMediaPreviewKind } from "./mobile-media-preview";
 import { parseMobileMarkdown, type MobileMarkdownInline } from "./mobile-markdown";
 import { classifyChatPathLinkTarget, classifyInlineCodePathCandidate, resolveChatAbsPath, splitChatPathLineSuffix, toWorkdirRel } from "./mobile-markdown-path-candidate";
 import { canonicalWorkspacePath, normalizeMediaType, workspaceEntryRevisionKey, workspaceParentPath } from "./workspace-files";
@@ -10,7 +12,8 @@ import { assertWorkspaceFilePreview } from "./network";
 
 export interface MobileMarkdownResourceCandidate {
   readonly key: string;
-  readonly kind: "image" | "path";
+  readonly kind: "image" | "path" | "media";
+  readonly mediaKind?: MobileMediaPreviewKind;
   readonly relativePath: string;
   readonly label: string;
   readonly ambiguous: boolean;
@@ -24,6 +27,7 @@ export interface MobileMarkdownResourceReference {
   readonly relativePath: string;
   readonly image?: { readonly uri: string; readonly width: number; readonly height: number;
     readonly nativeQuarterTurn?: true };
+  readonly media?: { readonly uri: string; readonly kind: MobileMediaPreviewKind; readonly mediaType: string };
 }
 export interface MobileMarkdownResourceDescriptor {
   readonly leaseId: string;
@@ -39,6 +43,9 @@ export interface MobileMarkdownResourceContext {
   listDirectory(parent: string, signal: AbortSignal): Promise<{ readonly entries: readonly WorkspaceEntry[]; readonly revision: string }>;
   readFile(entry: WorkspaceEntry, signal: AbortSignal): Promise<FilePreview>;
   download(blob: BlobRef, signal: AbortSignal): Promise<{ readonly bytes: Uint8Array; readonly mediaType: string }>;
+  stageMedia?(entry: WorkspaceEntry, blob: BlobRef, bytes: Uint8Array, signal: AbortSignal): Promise<{
+    readonly uri: string; readonly kind: MobileMediaPreviewKind; release(): void;
+  }>;
 }
 interface Lease {
   readonly id: string;
@@ -48,6 +55,7 @@ interface Lease {
   readonly references: Map<string, MobileMarkdownResourceReference>;
   readonly entries: Map<string, WorkspaceEntry>;
   readonly pages: Map<string, MobileImageGalleryPage>;
+  readonly disposals: (() => void)[];
   pins: number;
   bytes: number;
   pixels: number;
@@ -96,9 +104,34 @@ export function collectMobileMarkdownResourceCandidates(text: string, workdir: s
         ...(classified.line ? { line: classified.line } : {}), ...(classified.column ? { column: classified.column } : {}) });
     }
   };
-  for (const block of parseMobileMarkdown(text)) {
-    if ("inlines" in block) collect(block.inlines);
-    else if (block.type === "table") { block.header.forEach(collect); block.rows.forEach((row) => row.cells.forEach(collect)); }
+  const markdown = (source: string) => {
+    for (const block of parseMobileMarkdown(source)) {
+      if ("inlines" in block) collect(block.inlines);
+      else if (block.type === "table") { block.header.forEach(collect); block.rows.forEach((row) => row.cells.forEach(collect)); }
+    }
+  };
+  for (const part of splitRichAnswer(text)) {
+    if (part.kind === "markdown") markdown(part.source);
+    else {
+      // Resource admission already requires a complete canonical message or
+      // file preview. Its final JSON line is committed even without a fence.
+      const doc = new RichAnswerStream().update(part.source, true);
+      for (const node of doc.nodes.values()) {
+        if (node.kind === "audio" || node.kind === "video") {
+          const raw = richMediaSource(node);
+          if (!raw || candidates.size >= 64) continue;
+          const before = new Set(candidates.keys());
+          collect([{ type: "image", url: raw, alt: "" }]);
+          const key = JSON.stringify(["image", raw]);
+          const candidate = candidates.get(key);
+          if (candidate) {
+            if (!before.has(key)) candidates.delete(key);
+            const mediaKey = JSON.stringify(["media", node.kind, raw]);
+            candidates.set(mediaKey, { ...candidate, key: mediaKey, kind: "media", mediaKind: node.kind });
+          }
+        } else { const source = richMarkdown(node); if (source !== null) markdown(source); }
+      }
+    }
   }
   return [...candidates.values()];
 }
@@ -125,7 +158,7 @@ export class MobileMarkdownResourceReader {
     if (!candidates.length) return { leaseId: id, references: new Map() };
     if (this.#leases.size >= 64 || this.#leases.has(id)) throw new Error("The message resource limit was reached.");
     const lease: Lease = { id, context, controller: new AbortController(), candidates,
-      references: new Map(), entries: new Map(), pages: new Map(), pins: 1, bytes: 0, pixels: 0 };
+      references: new Map(), entries: new Map(), pages: new Map(), disposals: [], pins: 1, bytes: 0, pixels: 0 };
     this.#leases.set(id, lease);
     const abort = () => lease.controller.abort();
     signal.addEventListener("abort", abort, { once: true });
@@ -149,6 +182,7 @@ export class MobileMarkdownResourceReader {
             relativePath: entry.relativePath, label: candidate.label };
           if (candidate.kind === "path") lease.references.set(candidate.key, reference);
           if (candidate.kind === "image" && entry.kind === FileKind.REGULAR) await this.#image(lease, candidate, entry);
+          if (candidate.kind === "media" && entry.kind === FileKind.REGULAR) await this.#media(lease, candidate, entry);
         } catch {
           this.#assert(lease);
         }
@@ -166,12 +200,12 @@ export class MobileMarkdownResourceReader {
   release(id: string): void {
     const lease = this.#leases.get(id); if (!lease) return;
     lease.pins -= 1;
-    if (lease.pins <= 0) { lease.controller.abort(); this.#leases.delete(id); }
+    if (lease.pins <= 0) this.#dispose(lease);
   }
-  releaseAll(): void { for (const lease of this.#leases.values()) lease.controller.abort(); this.#leases.clear(); }
+  releaseAll(): void { for (const lease of [...this.#leases.values()]) this.#dispose(lease); }
   retireStale(): void {
     for (const lease of this.#leases.values()) {
-      try { this.#assert(lease); } catch { lease.controller.abort(); this.#leases.delete(lease.id); }
+      try { this.#assert(lease); } catch { this.#dispose(lease); }
     }
   }
   imagePages(id: string): readonly MobileImageGalleryPage[] { const lease = this.#lease(id); this.#assert(lease); return [...lease.pages.values()]; }
@@ -203,6 +237,7 @@ export class MobileMarkdownResourceReader {
   }
 
   #lease(id: string): Lease { const lease = this.#leases.get(id); if (!lease) throw new Error("The message resource was released."); return lease; }
+  #dispose(lease: Lease): void { lease.controller.abort(); this.#leases.delete(lease.id); lease.disposals.splice(0).forEach(dispose => dispose()); }
   #assert(lease: Lease, signal?: AbortSignal): void {
     signal?.throwIfAborted(); lease.controller.signal.throwIfAborted();
     if (this.#leases.get(lease.id) !== lease) throw new Error("The message resource changed.");
@@ -266,6 +301,33 @@ export class MobileMarkdownResourceReader {
       else { this.#activeReads += 1; waiting.grant(); }
     }
   }
+  async #media(lease: Lease, candidate: MobileMarkdownResourceCandidate, entry: WorkspaceEntry): Promise<void> {
+    const revision = entry.revision!;
+    if (!lease.context.stageMedia || mobileMediaPreviewKind(entry.mediaType) !== candidate.mediaKind
+      || revision.byteSize < 1n || revision.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)
+      || [...this.#leases.values()].reduce((sum, item) => sum + item.bytes, 0) + Number(revision.byteSize) > MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES) return;
+    lease.bytes += Number(revision.byteSize);
+    let adopted = false;
+    try {
+      await this.#read(lease, signal => lease.context.revalidateSource(signal));
+      const preview = await this.#read(lease, signal => lease.context.readFile(entry, signal));
+      assertWorkspaceFilePreview(lease.context.workspaceId, entry.relativePath, revision, preview);
+      const blob = preview.content.case === "blob" ? preview.content.value : undefined;
+      if (preview.truncated || !blob || blob.byteSize !== revision.byteSize || blob.sha256Hex !== revision.sha256Hex
+        || normalizeMediaType(blob.mediaType) !== normalizeMediaType(entry.mediaType)) throw new Error("The answer media revision changed.");
+      const download = await this.#read(lease, signal => lease.context.download(blob, signal));
+      if (BigInt(download.bytes.byteLength) !== blob.byteSize || normalizeMediaType(download.mediaType) !== normalizeMediaType(blob.mediaType)
+        || bytesToHex(sha256(download.bytes)) !== blob.sha256Hex) throw new Error("The answer media bytes changed.");
+      const staged = await lease.context.stageMedia(entry, blob, download.bytes, lease.controller.signal);
+      try { this.#assert(lease); if (staged.kind !== candidate.mediaKind) throw new Error("The media kind changed."); }
+      catch (error) { staged.release(); throw error; }
+      lease.disposals.push(staged.release);
+      lease.references.set(candidate.key, { key: candidate.key, kind: "file", label: candidate.label, relativePath: entry.relativePath,
+        media: { uri: staged.uri, kind: staged.kind, mediaType: normalizeMediaType(blob.mediaType) } });
+      adopted = true;
+    } finally { if (!adopted) lease.bytes -= Number(revision.byteSize); }
+  }
+
   async #image(lease: Lease, candidate: MobileMarkdownResourceCandidate, entry: WorkspaceEntry): Promise<void> {
     const revision = entry.revision!;
     if (revision.byteSize < 1n || revision.byteSize > 8n * 1_024n * 1_024n) return;

@@ -121,7 +121,7 @@ class JokoMcpAppSurfaceModule : Module() {
     server.stop()
     handler.post {
       try {
-        CookieManager.getInstance().setCookie(origin, "cindy_$token=; Max-Age=0; Path=/")
+        CookieManager.getInstance().setCookie(origin, "joko_$token=; Max-Age=0; Path=/")
       } catch (_: Exception) {}
     }
   }

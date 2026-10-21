@@ -8,6 +8,7 @@ import {
   ipcMain,
   Menu,
   net,
+  nativeTheme,
   nativeImage,
   Notification,
   powerMonitor,
@@ -366,9 +367,11 @@ import {
 import {
   createDesktopRemoteDesktopMainHost,
   closeDesktopRemoteDesktopClipboardWriter,
+  refreshDesktopRemoteDesktopLocalNotices,
   readDesktopRemoteDesktopPermissions,
   showDesktopRemoteDesktopPermissionGuide
 } from "./remote-desktop-main.js";
+import { createDesktopRemoteDesktopControllerDirectory } from "./remote-desktop-controller-directory.js";
 import { desktopRemoteDesktopWindowsHost, type DesktopRemoteDesktopWindowsSupport } from "./remote-desktop-windows-host.js";
 import type { DesktopRemoteDesktopHost } from "./remote-desktop-host.js";
 import {
@@ -619,7 +622,9 @@ const desktopNotifications = new DesktopNotificationCoordinator<WebContents>({
     owner === mainWindow?.webContents && !owner.isDestroyed()
       && mainWindowDocuments.isCurrent(owner, documentOccurrence),
   activateOwner: (owner) => showCurrentMainWindowOwner(owner),
-  navigate: (navigation) => handleDesktopInboundOpenIntent(navigation)
+  navigate: (navigation) => navigation.kind === "nativeTask"
+    ? macNativeTaskStatusHost?.focusSession(navigation.sessionId, navigation.entryToken)
+    : handleDesktopInboundOpenIntent(navigation)
 });
 let inspectorWindow: BrowserWindow | undefined;
 let inspectorWindowOwner: WebContents | undefined;
@@ -841,6 +846,7 @@ const managedOrchestratorExitFence = createManagedExitFence({
 let packagedSmokeFinishing = false;
 let preferredSystemLocale: DesktopSystemLocale = "en";
 let applicationMenuLocale: DesktopLocale = "en";
+let desktopRemoteDesktopDark: boolean | undefined;
 const applicationMenuConfigurationState = createMacApplicationMenuConfigurationState({
   shortcutRecording: false,
   newSessionAccelerator: "Command+N",
@@ -7372,6 +7378,7 @@ async function desktopRemoteDesktopSnapshot(refreshWindowsSupport = false): Prom
         enabled,
         active: true,
         controlling: state.controlling,
+        overlayVisible: desktopRemoteDesktopHost?.localNoticeVisible === true,
         controllerDeviceId: state.controllerDeviceId,
         displayId: state.displayId,
         permissions,
@@ -7434,6 +7441,12 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
         settings,
         credentialsOwner: { profileId: connection.profileId, serverId: connection.serverId, deviceId: connection.deviceId },
         systemAudioMute: globalVoiceSystemAudio,
+        appearance: () => ({ dark: desktopRemoteDesktopDark ?? nativeTheme.shouldUseDarkColors, locale: applicationMenuLocale }),
+        controllerDirectory: createDesktopRemoteDesktopControllerDirectory({
+          profileId: connection.profileId, serverId: connection.serverId, deviceId: connection.deviceId, origin: connection.origin,
+          current: () => isDesktopDevicePeerAgentAuthorityCurrent(connection),
+          readAuthKey: () => readCredential(connection.profileId)
+        }),
         getMainWindow: () => mainWindow,
         changed: () => {
           if (desktopRemoteDesktopHost === remoteDesktop) {
@@ -7875,6 +7888,7 @@ function registerIpc(): void {
     setSelectionContextMenuLocale(locale);
     applicationMenuLocale = locale;
     if (localeChanged) desktopRemoteDesktopViewers.refreshLocale();
+    if (localeChanged) refreshDesktopRemoteDesktopLocalNotices();
     const overlay = globalVoiceOverlayWindow;
     if (localeChanged && overlay !== undefined && !overlay.isDestroyed() && !overlay.webContents.isDestroyed()) {
       try {
@@ -8544,6 +8558,13 @@ function registerIpc(): void {
     }
     macNativeTaskStatusHost.publish(parseDesktopNativeTaskStatusSnapshot(parameters[0]));
   });
+  ipcMain.handle(DESKTOP_CHANNELS.nativeTaskStatusAcknowledgeFocus, (event, ...parameters: unknown[]) => {
+    assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    if (parameters.length !== 3 || typeof parameters[2] !== "string"
+      || parameters[2].length > 2048) throw new TypeError("Native task focus acknowledgement requires its current owner and entry.");
+    const ids = parseDesktopNativeTaskStatusVisibleSessionIds([parameters[1]]);
+    macNativeTaskStatusHost?.acknowledgeFocus(ids[0]!, parameters[2]);
+  });
   ipcMain.handle(DESKTOP_CHANNELS.nativeTaskStatusSetVisibleSessions, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
     if (event.sender !== mainWindow?.webContents && !sessionWindows.hasContents(event.sender)) {
@@ -8961,6 +8982,12 @@ function registerIpc(): void {
     assertTrustedIpcSender(event);
     if (parameters.length !== 0) throw new TypeError("Managed Orchestrator logout completion does not accept parameters.");
     return completeCurrentManagedOrchestratorLogout();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopSetAppearance, (event, ...parameters: unknown[]) => {
+    if (parameters.length !== 2 || typeof parameters[1] !== "boolean") throw new TypeError("Remote Desktop appearance requires one Document occurrence and one boolean.");
+    assertCurrentMainApplicationDocumentSender(event, parameters[0]);
+    desktopRemoteDesktopDark = parameters[1];
+    refreshDesktopRemoteDesktopLocalNotices();
   });
   ipcMain.handle(DESKTOP_CHANNELS.remoteDesktopGetState, async (event, ...parameters: unknown[]) => {
     if ((parameters.length !== 1 && parameters.length !== 2)

@@ -573,6 +573,7 @@ export class NodeDevicePeerAgentExecutor {
           controllerDeviceId: command.controllerDeviceId,
           displayId: command.action.value.displayId,
           mode: command.action.value.mode,
+          ...(command.action.value.control ? { control: true } : {}),
           signal
         });
         validateRemoteDesktopLease(value);
@@ -780,13 +781,14 @@ export class NodeDevicePeerAgentExecutor {
           controlGeneration: request.controlGeneration,
           modeId: request.modeId,
           temporary: request.temporary,
+          ...(request.control ? { control: true } : {}),
           signal
         });
         try {
           if (request.temporary) {
             if (value.lease === undefined) throw invalidRemoteDesktopHostResult();
             validateRemoteDesktopLease(value.lease);
-            if (value.lease.leaseId !== request.leaseId || value.lease.controlling
+            if (value.lease.leaseId !== request.leaseId || (!request.control && value.lease.controlling)
               || value.lease.controlGeneration <= request.controlGeneration) throw invalidRemoteDesktopHostResult();
           } else if (value.lease !== undefined) throw invalidRemoteDesktopHostResult();
           return { case: "remoteDesktopDisplayMode", value: clone(RemoteDesktopDisplayModeResultSchema, value) };
@@ -797,7 +799,7 @@ export class NodeDevicePeerAgentExecutor {
         const request = command.action.value;
         this.#resetRemoteDesktopClipboardTransferForLease(request.leaseId);
         const common = { controllerDeviceId: command.controllerDeviceId, leaseId: request.leaseId,
-          controlGeneration: request.controlGeneration, signal };
+          controlGeneration: request.controlGeneration, ...(request.control ? { control: true } : {}), signal };
         const host = this.#requireRemoteDesktop();
         let capabilities: RemoteDesktopCapabilities | undefined;
         if (command.action.case === "setRemoteDesktopViewerDisplay") {
@@ -820,7 +822,7 @@ export class NodeDevicePeerAgentExecutor {
         try {
           if (value.lease === undefined) throw invalidRemoteDesktopHostResult();
           validateRemoteDesktopLease(value.lease);
-          if (value.lease.leaseId !== request.leaseId || value.lease.controlling
+          if (value.lease.leaseId !== request.leaseId || (!request.control && value.lease.controlling)
             || value.lease.controlGeneration <= request.controlGeneration
             || (command.action.case === "setRemoteDesktopViewerDisplay"
               && (physicalDisplayIds.has(value.lease.display!.displayId)

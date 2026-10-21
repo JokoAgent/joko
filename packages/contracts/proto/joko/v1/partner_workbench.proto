@@ -61,6 +61,9 @@ message PartnerWorkbenchProject {
   string name = 2;
   google.protobuf.Timestamp added_at = 3;
   bool exists = 4;
+  optional string source_computer_id = 5;
+  optional string source_computer_name = 6;
+  bool read_only = 7;
 }
 
 message PartnerWorkbenchJudgment {
@@ -106,6 +109,7 @@ message PartnerWorkbenchTask {
   optional google.protobuf.Timestamp next_run_at = 18;
   CodeHostPullRequestProjection pull_request = 19;
   optional PartnerWorkbenchStopReason stop_reason = 20;
+  bool read_only = 21;
 }
 
 message PartnerWorkbenchRoutine {

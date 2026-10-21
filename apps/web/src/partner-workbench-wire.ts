@@ -50,7 +50,7 @@ function task(value: contract.PartnerWorkbenchTask, mapPullRequest: PullRequestM
     ...(value.pullRequest === undefined ? {} : { pullRequest: mapPullRequest(value.pullRequest) }),
     ...(value.stopReason === undefined ? {} : { stopReason: enumKey(STOP_REASONS, value.stopReason) }),
     ...(value.routine === undefined ? {} : { routine: value.routine }),
-    ownedBackground: value.ownedBackground, unread: value.unread, ...(value.judgment === undefined ? {} : { judgment: judgment(value.judgment) }),
+    ownedBackground: value.ownedBackground, unread: value.unread, ...(value.readOnly === undefined ? {} : { readOnly: value.readOnly }), ...(value.judgment === undefined ? {} : { judgment: judgment(value.judgment) }),
     digest: { purpose: value.digest?.purpose ?? null, recent: (value.digest?.recent ?? []).map((item) => ({ role: role(item.role), text: item.text })) } };
 }
 function brief(value: contract.PartnerWorkbenchProjectBrief): PartnerWorkbenchProjectBriefView {
@@ -65,7 +65,9 @@ function brief(value: contract.PartnerWorkbenchProjectBrief): PartnerWorkbenchPr
 export function mapPartnerWorkbench(value: contract.PartnerWorkbenchSnapshot | undefined, mapPullRequest: PullRequestMapper): PartnerWorkbenchView {
   if (value?.owner === undefined || value.revision === undefined || value.revision.value < 1n) throw new Error("The workbench owner is unavailable.");
   return { owner: { partnerId: value.owner.partnerId, profileVersion: value.owner.profileVersion, sessionId: value.owner.sessionId, sessionGeneration: value.owner.sessionGeneration, targetId: value.owner.targetId }, revision: value.revision.value,
-    projects: value.projects.map((row) => ({ path: row.path, name: row.name, addedAt: time(row.addedAt), exists: row.exists })), judgments: value.judgments.map(judgment),
+    projects: value.projects.map((row) => ({ path: row.path, name: row.name, addedAt: time(row.addedAt), exists: row.exists,
+      ...(row.sourceComputerId === undefined ? {} : { sourceComputerId: row.sourceComputerId }), ...(row.sourceComputerName === undefined ? {} : { sourceComputerName: row.sourceComputerName }),
+      ...(row.readOnly === undefined ? {} : { readOnly: row.readOnly }) })), judgments: value.judgments.map(judgment),
     projectOptions: value.projectOptions.map((row) => ({ path: row.path, name: row.name, taskCount: row.taskCount, nativeCount: row.nativeCount, automationCount: row.automationCount, repository: row.repository, granted: row.granted })),
     tasks: value.tasks.map((row) => task(row, mapPullRequest)), candidates: value.candidates.map((row) => task(row, mapPullRequest)), briefs: value.briefs.map(brief), outputs: value.outputs.map(artifact), olderCount: value.olderCount, truncated: value.truncated, unavailableSources: value.unavailableSources };
 }

@@ -45,6 +45,19 @@ beforeEach(() => { Object.defineProperty(process, "platform", { ...platform, val
 afterEach(async () => { for (const media of cleanup.splice(0)) await media.retire(); Object.defineProperty(process, "platform", platform); });
 
 describe("Remote Desktop privacy capture receipt", () => {
+  it("unions overlay and privacy windows and restores each remaining owner independently", async () => {
+    const f = fixture(), owner = {};
+    await f.media.setOverlayExclusions([20]); f.media.setPrivacyExclusions(owner, [10]);
+    const combined = f.media.frame(frameRequest()); await vi.waitFor(() => expect(f.children).toHaveLength(1));
+    expect(f.args[0]).toEqual(["1", "10,20"]); f.respond(0); await combined;
+    f.media.clearPrivacyExclusions(owner);
+    const overlay = f.media.frame(frameRequest()); await vi.waitFor(() => expect(f.children).toHaveLength(2));
+    expect(f.args[1]).toEqual(["1", "20"]); f.respond(1); await overlay;
+    f.media.setPrivacyExclusions(owner, [10]); await f.media.setOverlayExclusions([]);
+    const privacy = f.media.frame(frameRequest()); await vi.waitFor(() => expect(f.children).toHaveLength(3));
+    expect(f.args[2]).toEqual(["1", "10"]); f.respond(2); await privacy;
+    expect(h.getSources).not.toHaveBeenCalled();
+  });
   it("requires a current filtered native frame for JPEG and ignores an old owner's clear", async () => {
     const f = fixture(); const owner = {};
     f.media.setPrivacyExclusions(owner, [9]);

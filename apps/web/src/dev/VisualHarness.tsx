@@ -583,6 +583,7 @@ export function VisualHarness(): JSX.Element {
         setState((current) => ({ ...current, route }));
       },
       refresh: async (): Promise<void> => { record("refresh"); },
+      extensionTaskApi: () => undefined,
       listExtensions: async (options = {}): Promise<ExtensionCatalogView> => {
         options.signal?.throwIfAborted();
         const query = options.query?.trim().toLocaleLowerCase("en-US") ?? "";

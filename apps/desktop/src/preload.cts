@@ -169,6 +169,7 @@ const DESKTOP_CHANNELS = {
   nativeTaskStatusPublish: "joko:native-task-status:publish",
   nativeTaskStatusSetVisibleSessions: "joko:native-task-status:visible-sessions:set",
   nativeTaskStatusAction: "joko:native-task-status:action",
+  nativeTaskStatusAcknowledgeFocus: "joko:native-task-status:focus:acknowledge",
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
   keepAwakeChanged: "joko:power:keep-awake:changed",
@@ -242,6 +243,7 @@ const DESKTOP_CHANNELS = {
   managedOrchestratorAdoptConnection: "joko:managed-orchestrator:adopt-connection",
   managedOrchestratorCompleteLogout: "joko:managed-orchestrator:complete-logout",
   remoteDesktopGetState: "joko:remote-desktop:get-state",
+  remoteDesktopSetAppearance: "joko:remote-desktop:set-appearance",
   remoteDesktopSetEnabled: "joko:remote-desktop:set-enabled",
   remoteDesktopConfigureWindowsSupport: "joko:remote-desktop:configure-windows-support",
   remoteDesktopDisconnect: "joko:remote-desktop:disconnect",
@@ -622,6 +624,10 @@ const desktopApi = Object.freeze({
     )
   }),
   nativeTaskStatus: Object.freeze({
+    acknowledgeFocus: (sessionId: string, token: string): Promise<void> => {
+      if (!mainDocumentOccurrence || !nativeIdentity(sessionId, 1024) || !nativeIdentity(token, 2048)) return Promise.reject(new TypeError("Invalid native task focus receipt."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.nativeTaskStatusAcknowledgeFocus, mainDocumentOccurrence, sessionId, token);
+    },
     getSettings: (): Promise<DesktopNativeTaskStatusSettings> =>
       ipcRenderer.invoke(DESKTOP_CHANNELS.nativeTaskStatusGetSettings).then(parseDesktopNativeTaskStatusSettings),
     setSettings: (settings: DesktopNativeTaskStatusSettings): Promise<DesktopNativeTaskStatusSettings> => {
@@ -1037,6 +1043,9 @@ const desktopApi = Object.freeze({
       ipcRenderer.invoke(DESKTOP_CHANNELS.managedOrchestratorCompleteLogout)
   }),
   remoteDesktop: Object.freeze({
+    setAppearance: (dark: boolean): Promise<void> => mainDocumentOccurrence === undefined || typeof dark !== "boolean"
+      ? Promise.reject(new TypeError("Remote Desktop appearance requires the current main Document and a boolean."))
+      : ipcRenderer.invoke(DESKTOP_CHANNELS.remoteDesktopSetAppearance, mainDocumentOccurrence, dark),
     getState: (refreshWindowsSupport?: boolean): Promise<DesktopRemoteDesktopSnapshot> => {
       if (refreshWindowsSupport !== undefined && typeof refreshWindowsSupport !== "boolean") {
         return Promise.reject(new TypeError("Remote Desktop support refresh must be boolean."));
@@ -1184,10 +1193,13 @@ function parseDesktopRemoteDesktopSnapshot(value: unknown): DesktopRemoteDesktop
     : ["enabled", "active", "controlling", "permissions"];
   const hasWindowsSupport = Object.hasOwn(candidate, "windowsSupport");
   if (hasWindowsSupport) keys.push("windowsSupport");
+  const hasOverlay = Object.hasOwn(candidate, "overlayVisible");
+  if (hasOverlay) keys.push("overlayVisible");
   if (!exactRemoteDesktopRecord(candidate, keys)
     || typeof candidate["enabled"] !== "boolean"
     || typeof candidate["active"] !== "boolean"
     || typeof candidate["controlling"] !== "boolean"
+    || (hasOverlay && typeof candidate["overlayVisible"] !== "boolean")
     || (hasWindowsSupport && !isRemoteDesktopWindowsSupport(candidate["windowsSupport"]))
     || (!candidate["active"] && candidate["controlling"])
     || (candidate["active"] && (!boundedRemoteDesktopIdentity(candidate["controllerDeviceId"])
@@ -1202,6 +1214,7 @@ function parseDesktopRemoteDesktopSnapshot(value: unknown): DesktopRemoteDesktop
         enabled: candidate["enabled"],
         active: true,
         controlling: candidate["controlling"],
+        ...(hasOverlay ? { overlayVisible: candidate["overlayVisible"] as boolean } : {}),
         controllerDeviceId: candidate["controllerDeviceId"] as string,
         displayId: candidate["displayId"] as string,
         permissions,
@@ -1641,9 +1654,10 @@ function parseNativeTaskStatusPermission(value: unknown): NonNullable<DesktopNat
 }
 
 function parseDesktopNativeTaskStatusAction(value: unknown): DesktopNativeTaskStatusAction | undefined {
-  if (!nativeRecord(value) || !nativeIdentity(value["sessionId"])) return undefined;
-  if (value["kind"] === "focus" && nativeKeys(value) === "kind,sessionId") {
-    return Object.freeze({ kind: "focus", sessionId: value["sessionId"] });
+  if (!nativeRecord(value) || !nativeIdentity(value["sessionId"], 1024)) return undefined;
+  if (value["kind"] === "focus" && ["kind,sessionId", "entryToken,kind,sessionId"].includes(nativeKeys(value))
+    && (value["entryToken"] === undefined || nativeIdentity(value["entryToken"], 2048))) {
+    return Object.freeze({ kind: "focus", sessionId: value["sessionId"], ...(value["entryToken"] === undefined ? {} : { entryToken: value["entryToken"] }) });
   }
   if (value["kind"] !== "permission" || nativeKeys(value) !== "decision,generation,interactionId,kind,sessionId" ||
     !nativeIdentity(value["interactionId"]) || !nativeDecimal(value["generation"]) ||
@@ -1669,8 +1683,8 @@ function nativeOnlyKeys(value: Record<string, unknown>, allowed: readonly string
   return Object.keys(value).every((key) => keys.has(key));
 }
 
-function nativeIdentity(value: unknown): value is string {
-  return typeof value === "string" && value.length >= 1 && value.length <= 256 && value.trim() === value &&
+function nativeIdentity(value: unknown, maximum = 256): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= maximum && value.trim() === value &&
     !/[\u0000-\u001f\u007f]/u.test(value);
 }
 

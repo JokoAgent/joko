@@ -6,7 +6,7 @@ import { Button, Pill } from "./ui.js";
 
 export function DesktopRemoteDesktopStatus({ t }: { readonly t: Translator }): JSX.Element | null {
   const { state, disconnect } = useDesktopRemoteDesktop();
-  if (!state.available || !state.active) return null;
+  if (!state.available || !state.active || state.overlayVisible) return null;
   return <aside className="desktop-remote-desktop-status" aria-label={t("settings.remoteDesktop.statusAria")}>
     <div role="status" aria-live="polite">
       <Pill tone={state.controlling ? "warning" : "accent"}>

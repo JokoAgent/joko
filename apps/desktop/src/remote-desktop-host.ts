@@ -197,6 +197,7 @@ export interface DesktopRemoteDesktopHostDependencies {
   createViewerDisplay?(sourceDisplayId: string, current: () => boolean, onFailure: () => void,
     signal: AbortSignal): Promise<import("@joko/device-peer").RemoteDesktopViewerDisplayHandle>;
   changed(state: DesktopRemoteDesktopState | undefined): void;
+  localNoticeVisible?(): boolean;
   retired?(): void;
   onDisplayChange?(listener: (displayId: string, geometryChanged: boolean,
     geometry?: { readonly width: number; readonly height: number; readonly metrics: readonly string[] }) => void): () => void;
@@ -531,6 +532,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     });
   }
 
+  get localNoticeVisible(): boolean { return this.#dependencies.localNoticeVisible?.() === true; }
+
   /** Main's compositor poll must not invalidate a change already owned by this lease. */
   managesDisplayGeometry(displayId: string, width: number, height: number): boolean {
     return this.#controller.changingDisplay
@@ -635,11 +638,13 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       readonly workspaceNavigation: boolean;
       readonly systemMenu: boolean;
       readonly channelRequests?: boolean;
+      readonly autoControl?: boolean;
     };
     return create(RemoteDesktopCapabilitiesSchema, {
       protocolVersion: value.version,
       enabled: value.enabled,
       canControl: value.canControl,
+      autoControl: value.autoControl === true,
       platform: value.platform,
       displays: value.displays.map((display) => create(RemoteDesktopDisplaySchema, {
         displayId: display.id,
@@ -687,10 +692,12 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   async start(request: DevicePeerRemoteDesktopHostRequest & {
     readonly displayId: string;
     readonly mode: RemoteDesktopStartMode;
+    readonly control?: boolean;
   }) {
     const value = await this.#request(request, {
       op: "start",
       displayId: request.displayId,
+      ...(request.control ? { control: true } : {}),
       ...(request.mode === RemoteDesktopStartMode.RESUME ? { resume: true } : {}),
       ...(request.mode === RemoteDesktopStartMode.TAKEOVER ? { takeover: true } : {})
     }) as {
@@ -991,6 +998,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     readonly controlGeneration: bigint;
     readonly modeId: string;
     readonly temporary: boolean;
+    readonly control?: boolean;
   }) {
     if (request.controlGeneration < 1n
       || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -1001,7 +1009,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       lease: request.leaseId,
       controlGeneration: Number(request.controlGeneration),
       modeId: request.modeId,
-      temporary: request.temporary
+      temporary: request.temporary,
+      ...(request.control ? { control: true } : {})
     }) as { readonly lease?: import("@joko/device-peer").RemoteDesktopLease };
     return create(RemoteDesktopDisplayModeResultSchema, value.lease === undefined ? {} : {
       lease: create(RemoteDesktopLeaseSchema, {
@@ -1015,20 +1024,21 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   }
 
   async setViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
-    readonly controlGeneration: bigint; readonly width: number; readonly height: number;
+    readonly controlGeneration: bigint; readonly width: number; readonly height: number; readonly control?: boolean;
   }) { return this.#viewerDisplayRequest(request, { op: "viewerDisplay", width: request.width, height: request.height }); }
 
   async restoreViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
+    readonly control?: boolean;
   }) { return this.#viewerDisplayRequest(request, { op: "restoreViewerDisplay" }); }
 
-  async #viewerDisplayRequest(request: DevicePeerRemoteDesktopLeaseRequest & { readonly controlGeneration: bigint },
+  async #viewerDisplayRequest(request: DevicePeerRemoteDesktopLeaseRequest & { readonly controlGeneration: bigint; readonly control?: boolean },
     operation: { readonly op: "viewerDisplay"; readonly width: number; readonly height: number } | { readonly op: "restoreViewerDisplay" }) {
     if (request.controlGeneration < 1n || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw failure(RemoteDesktopFailureReason.LEASE_EXPIRED, false);
     }
     const value = await this.#request(request, { ...operation, lease: request.leaseId,
-      controlGeneration: Number(request.controlGeneration) }) as { readonly lease: import("@joko/device-peer").RemoteDesktopLease };
+      controlGeneration: Number(request.controlGeneration), ...(request.control ? { control: true } : {}) }) as { readonly lease: import("@joko/device-peer").RemoteDesktopLease };
     return create(RemoteDesktopViewerDisplayResultSchema, { lease: create(RemoteDesktopLeaseSchema, {
       leaseId: value.lease.lease, display: create(RemoteDesktopDisplaySchema, { displayId: value.lease.display.id,
         name: value.lease.display.name, width: value.lease.display.width, height: value.lease.display.height }),

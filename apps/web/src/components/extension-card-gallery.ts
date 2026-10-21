@@ -1,4 +1,3 @@
-// Adapted from the fixed card gallery projection; see public/licenses/mcp-apps/NOTICE.txt.
 import type { ExtensionCard } from "@joko/contracts";
 export interface ExtensionCardGalleryImage { readonly sessionId: string; readonly cardId: string; readonly uri: string; readonly imageIndex: number }
 export function extensionCardGalleryImages(cards: readonly ExtensionCard[]): ExtensionCardGalleryImage[] {

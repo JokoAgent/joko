@@ -89,7 +89,7 @@ export interface MobileAutomationDraft {
   readonly scriptTimeoutSeconds: string;
   readonly scriptDispatchSessions: boolean;
   readonly model?: MobileModelControlSelection;
-  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly useWorktree: boolean;
   readonly worktreeSourceRef?: string;
@@ -270,6 +270,7 @@ export function mobileAutomationPermissionOptions(
 ): readonly MobileAutomationDraft["permissionMode"][] {
   return (resolveMobileNewTaskExecutionAuthority(owner, backendId)?.permissionModes ?? [])
     .flatMap((mode) => mode === PermissionMode.ASK ? ["ask" as const]
+      : mode === PermissionMode.ACCEPT_EDITS ? ["acceptEdits" as const]
       : mode === PermissionMode.AUTO ? ["auto" as const]
         : mode === PermissionMode.BYPASS_PERMISSIONS ? ["bypassPermissions" as const] : []);
 }
@@ -656,6 +657,7 @@ function dispositionFromProto(value: ScheduleGeneratedSessionDisposition): Mobil
 }
 
 function permissionFromProto(value: PermissionMode): MobileAutomationDraft["permissionMode"] | undefined {
+  if (value === PermissionMode.ACCEPT_EDITS) return "acceptEdits";
   if (value === PermissionMode.ASK) return "ask";
   if (value === PermissionMode.AUTO) return "auto";
   if (value === PermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";
@@ -663,6 +665,7 @@ function permissionFromProto(value: PermissionMode): MobileAutomationDraft["perm
 }
 
 function permissionToProto(value: MobileAutomationDraft["permissionMode"]): PermissionMode {
+  if (value === "acceptEdits") return PermissionMode.ACCEPT_EDITS;
   if (value === "ask") return PermissionMode.ASK;
   if (value === "auto") return PermissionMode.AUTO;
   if (value === "bypassPermissions") return PermissionMode.BYPASS_PERMISSIONS;

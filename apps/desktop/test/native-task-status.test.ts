@@ -16,6 +16,14 @@ import {
 } from "../src/native-task-status.js";
 
 describe("native task-status contract", () => {
+  it("accepts the complete 500 mirror but rejects overflow and remote local-permission actions", () => {
+    const base = { ownerId: "renderer", revision: "1", locale: "en", sessions: Array.from({ length: 500 }, (_, index) => session(`task-${index}`, "running", index)) };
+    expect(parseDesktopNativeTaskStatusSnapshot(base).sessions).toHaveLength(500);
+    expect(() => parseDesktopNativeTaskStatusSnapshot({ ...base, sessions: [...base.sessions, session("overflow", "running", 1)] })).toThrow();
+    expect(() => parseDesktopNativeTaskStatusSnapshot({ ...base, sessions: [{ ...session("remote", "interaction", 1),
+      remote: { sourceId: "source", runId: "run", silent: false, completionNotification: "none" },
+      permission: { interactionId: "request", generation: "1", allow: true, allowForSession: true, deny: true } }] })).toThrow("cannot carry local permission");
+  });
   it("declares support only for macOS 14 and newer Darwin hosts", () => {
     expect(isNativeTaskStatusSupported("darwin", "23.0.0")).toBe(true);
     expect(isNativeTaskStatusSupported("darwin", "22.6.0")).toBe(false);

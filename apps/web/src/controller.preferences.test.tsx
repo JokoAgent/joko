@@ -943,6 +943,7 @@ it("waits for confirmed bootstrap preferences before applying native window zoom
   const readPreferences = vi.fn(() => initialRead.promise);
   const setZoomFactor = vi.fn(async () => undefined);
   vi.stubGlobal("jokoDesktop", {
+    capabilities: [],
     window: { setZoomFactor }
   } as unknown as JokoDesktopApi);
   vi.spyOn(LocalState, "open").mockResolvedValue({
@@ -1156,6 +1157,7 @@ it("adopts durable appearance and bases zoom intent on the latest cross-controll
 
   const setZoomFactor = vi.fn(async () => undefined);
   vi.stubGlobal("jokoDesktop", {
+    capabilities: [],
     window: { setZoomFactor }
   } as unknown as JokoDesktopApi);
   stored = { ...stored, windowZoom: 1.4 };

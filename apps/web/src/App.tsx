@@ -1360,7 +1360,9 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     a.createdAt - b.createdAt
   ), [activeSession?.id, state.snapshot.interactions]);
   const activeInteractions = (state.route.kind === "session" || state.route.kind === "files") && activeSession !== undefined ? interactions.filter((interaction) => interaction.sessionId === activeSession.id) : [];
-  const backgroundInteraction = interactions.find((interaction) => interaction.sessionId.length > 0 && interaction.sessionId !== activeSession?.id);
+  const backgroundInteraction = interactions.find((interaction) => interaction.sessionId.length > 0 && interaction.sessionId !== activeSession?.id
+    && (state.snapshot.sessions.some(session => session.id === interaction.sessionId && !session.hidden)
+      || interaction.permissionSubject?.kind === "customTool" && interaction.permissionSubject.toolId === "plugin_managed_task"));
 
   const shortcutOverrides = state.preferences.appShortcutOverrides;
   const shortcutInspectorOpen = state.preferences.inspectorOpen

@@ -762,6 +762,8 @@ const mobileTaskMessageRows = [
   ["controls.enableFullAccess", "Enable full access", "启用完全访问权限", "啟用完整存取權", "フルアクセスを有効化", "전체 접근 활성화"],
   ["controls.changeError", "The task control could not be changed.", "无法更改任务控制项。", "無法變更任務控制項。", "タスクコントロールを変更できませんでした。", "작업 제어를 변경할 수 없습니다."],
   ["controls.permission.ask", "Ask before actions", "执行操作前询问", "執行操作前詢問", "操作前に確認", "동작 전에 묻기"],
+  ["controls.permission.edits", "Accept edits", "允许编辑", "允許編輯", "編集を許可", "편집 허용"],
+  ["controls.permission.editsDescription", "File edits proceed; other actions follow the selected backend's approval rules.", "文件编辑直接进行；其他操作遵循所选后端的审批规则。", "檔案編輯直接進行；其他操作遵循所選後端的核准規則。", "ファイル編集を許可し、他の操作は選択したバックエンドの承認規則に従います。", "파일 편집을 허용하며 다른 동작은 선택한 백엔드의 승인 규칙을 따릅니다."],
   ["controls.permission.askDescription", "Joko asks before actions that need approval.", "Joko 会在需要批准的操作前询问。", "Joko 會在需要核准的操作前詢問。", "承認が必要な操作の前に Joko が確認します。", "승인이 필요한 동작 전에 Joko가 묻습니다."],
   ["controls.permission.auto", "Allow safe actions", "允许安全操作", "允許安全操作", "安全な操作を許可", "안전한 동작 허용"],
   ["controls.permission.autoDescription", "The Backend may continue with its advertised safe automatic policy.", "Backend 可按其公布的安全自动策略继续。", "Backend 可依其公告的安全自動原則繼續。", "Backend は公開済みの安全な自動ポリシーで続行できます。", "Backend는 제공된 안전 자동 정책에 따라 계속할 수 있습니다."],

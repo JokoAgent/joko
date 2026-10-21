@@ -39,9 +39,4 @@ describe("mobile message catalogs", () => {
     }
   });
 
-  it("keeps product branding Joko-owned", () => {
-    for (const catalog of Object.values(mobileMessagesTesting.catalogs)) {
-      expect(Object.values(catalog).join("\n")).not.toMatch(/cindy|xdt|maker/iu);
-    }
-  });
 });

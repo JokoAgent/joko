@@ -1,5 +1,3 @@
-// Adapted from the fixed attachment snapshot and owned-media boundary.
-// See NOTICE / LICENSE.cindy. Artifacts and streamed uploads remain Joko-owned.
 import { createHash, randomUUID } from "node:crypto";
 import type { BlobRef } from "@joko/core";
 import type { OperationalStore } from "@joko/store";

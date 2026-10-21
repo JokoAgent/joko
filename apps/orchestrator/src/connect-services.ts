@@ -12,6 +12,7 @@ import { createMcpAppConnectService } from "./mcp-apps/connect-service.js";
 import { createExtensionCardConnectService } from "./extension-cards/connect-service.js";
 import { createExtensionNetworkConnectService } from "./extension-cards/network-connect-service.js";
 import { createExtensionOAuthConnectService } from "./extension-cards/oauth-connect-service.js";
+import { createExtensionTaskConnectService } from "./extension-task-connect-service.js";
 import { createMcpAppNativeService } from "./mcp-apps/native-service.js";
 import { createPersonalDevelopmentConnectService } from "./personal-development-connect-service.js";
 import { createPersonalDevelopmentNativeConnectService } from "./personal-development-native-connect-service.js";
@@ -454,6 +455,7 @@ import { PartnerMemoryManager } from "./partner-memory.js";
 import { createPartnerRoutineConnectService } from "./partner-routine-connect-service.js";
 import { createPartnerGroupConnectService } from "./partner-group-connect-service.js";
 import { createPartnerImportConnectService } from "./partner-import-connect-service.js";
+import { createPartnerHomeConnectService } from "./partner-home-connect-service.js";
 import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
 import { createCollaborationConnectService } from "./collaboration-connect-service.js";
 import { createObjectiveConnectService } from "./objective-connect-service.js";
@@ -775,6 +777,7 @@ export interface ConnectServiceSet {
   readonly extensionCards: ServiceImpl<typeof contract.ExtensionCardService>;
   readonly extensionNetwork: ServiceImpl<typeof contract.ExtensionNetworkService>;
   readonly extensionOAuth: ServiceImpl<typeof contract.ExtensionOAuthService>;
+  readonly extensionTasks: ServiceImpl<typeof contract.ExtensionTaskService>;
   readonly mcpAppsNative: ServiceImpl<typeof contract.McpAppNativeService>;
   readonly appDefaultModel: ServiceImpl<typeof contract.AppDefaultModelService>;
   readonly connection: ServiceImpl<typeof contract.ConnectionService>;
@@ -803,6 +806,7 @@ export interface ConnectServiceSet {
   readonly partnerRoutine: ServiceImpl<typeof contract.PartnerRoutineService>;
   readonly partnerGroup: ServiceImpl<typeof contract.PartnerGroupService>;
   readonly partnerImport: ServiceImpl<typeof contract.PartnerImportService>;
+  readonly partnerHome: ServiceImpl<typeof contract.PartnerHomeService>;
   readonly collaborationGoal: ServiceImpl<typeof contract.CollaborationService>;
   readonly managedModelRuntime: ServiceImpl<typeof contract.ManagedModelRuntimeService>;
   readonly tool: ServiceImpl<typeof contract.ToolService>;
@@ -1204,6 +1208,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.ExtensionCardService, withConnectErrors(services.extensionCards));
   router.service(contract.ExtensionNetworkService, withConnectErrors(services.extensionNetwork));
   router.service(contract.ExtensionOAuthService, withConnectErrors(services.extensionOAuth));
+  router.service(contract.ExtensionTaskService, withConnectErrors(services.extensionTasks));
   router.service(contract.McpAppNativeService, withConnectErrors(services.mcpAppsNative));
   router.service(contract.PersonalDevelopmentService, withConnectErrors(services.personalDevelopment));
   router.service(contract.DesktopPersonalDevelopmentHostService, withConnectErrors(services.personalDevelopmentNative));
@@ -1232,6 +1237,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.PartnerRoutineService, withConnectErrors(services.partnerRoutine));
   router.service(contract.PartnerGroupService, withConnectErrors(services.partnerGroup));
   router.service(contract.PartnerImportService, withConnectErrors(services.partnerImport));
+  router.service(contract.PartnerHomeService, withConnectErrors(services.partnerHome));
   router.service(contract.CollaborationService, withConnectErrors(services.collaborationGoal));
   router.service(contract.ManagedModelRuntimeService, withConnectErrors(services.managedModelRuntime));
   router.service(contract.ToolService, withConnectErrors(services.tool));
@@ -1529,6 +1535,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const partnerGroup = createPartnerGroupConnectService(application.partnerGroups, application.store, context => authenticate(context),
     (connectionId, callback) => application.connections.onRevoked(connectionId, callback), { workspaces: application.workspaces, artifacts: application.artifacts });
   const partnerImport = createPartnerImportConnectService(application.partnerImports, context => authenticate(context));
+  const partnerHome = createPartnerHomeConnectService(application.partnerHomes, application.partnerHomeRuntime, context => authenticate(context));
   const collaborationGoal = createCollaborationConnectService(
     application.collaborationGoals,
     (context) => authenticate(context)
@@ -2492,7 +2499,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
       let records = dependencies.store.listSessions({
         ...(request.targetId === "" ? {} : { targetId: request.targetId }),
         includeArchived: request.archived ?? true,
-        includeDeleted: false
+        includeDeleted: false,
+        excludeHidden: true
       });
       if (request.backendId !== "") records = records.filter((item) => item.descriptor.backendId === request.backendId);
       if (request.archived !== undefined) records = records.filter((item) => item.descriptor.archived === request.archived);
@@ -5500,7 +5508,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
   return { ...taskSharingServices, personalDevelopment, personalDevelopmentNative,
     extensionNetwork: createExtensionNetworkConnectService(application.extensionNetwork, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
     extensionOAuth: createExtensionOAuthConnectService(application.extensionOAuth, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
-    extensionCards: createExtensionCardConnectService(application.extensionCards, dependencies.connections), mcpApps: createMcpAppConnectService(application.mcpApps, application.mcpAppSurfaces, dependencies.connections), mcpAppsNative: createMcpAppNativeService(application.mcpApps, dependencies.connections), help: createHelpConnectService(application.helpAssistant, application.helpFeedback, dependencies.connections), appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
+    extensionTasks: createExtensionTaskConnectService(application.extensionTasks, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
+    extensionCards: createExtensionCardConnectService(application.extensionCards, dependencies.connections), mcpApps: createMcpAppConnectService(application.mcpApps, application.mcpAppSurfaces, dependencies.connections), mcpAppsNative: createMcpAppNativeService(application.mcpApps, dependencies.connections), help: createHelpConnectService(application.helpAssistant, application.helpFeedback, dependencies.connections), appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, partnerHome, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
@@ -23463,6 +23472,7 @@ function boundedPublicScheduleText(value: string, field: string, maximum: number
 }
 
 function corePermission(value: contract.PermissionMode): CorePermissionMode {
+  if (value === contract.PermissionMode.ACCEPT_EDITS) return "acceptEdits";
   if (value === contract.PermissionMode.AUTO) return "auto";
   if (value === contract.PermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";
   return "ask";
@@ -23471,6 +23481,7 @@ function corePermission(value: contract.PermissionMode): CorePermissionMode {
 function requiredCorePermission(value: contract.PermissionMode, field: string): CorePermissionMode {
   if (
     value !== contract.PermissionMode.ASK
+    && value !== contract.PermissionMode.ACCEPT_EDITS
     && value !== contract.PermissionMode.AUTO
     && value !== contract.PermissionMode.BYPASS_PERMISSIONS
   ) throw invalidArgument(`${field} is required`);
@@ -23574,6 +23585,7 @@ function piProjectionDefaults(
 }
 
 function protoPermission(value: string | undefined): contract.PermissionMode {
+  if (value === "acceptEdits") return contract.PermissionMode.ACCEPT_EDITS;
   if (value === "auto") return contract.PermissionMode.AUTO;
   if (value === "bypassPermissions") return contract.PermissionMode.BYPASS_PERMISSIONS;
   return contract.PermissionMode.ASK;

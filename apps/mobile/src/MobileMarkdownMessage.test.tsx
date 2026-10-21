@@ -10,6 +10,12 @@ const { copy, appStateListeners, pressureListeners, nativeImages } = vi.hoisted(
   nativeImages: new Map<string, { onError(): void; onLoad(event: { source: { width: number; height: number; isAnimated?: boolean } }): void }>()
 }));
 vi.mock("expo-clipboard", () => ({ setStringAsync: copy }));
+vi.mock("lucide-react-native", () => ({ Mail: () => null, CalendarDays: () => null, Folder: () => null,
+  ChartColumn: () => null, Check: () => null, Info: () => null, Clock: () => null, MapPin: () => null,
+  Coffee: () => null, Image: () => null, Users: () => null, Star: () => null }));
+vi.mock("@react-native-async-storage/async-storage", () => ({ default: { getItem: async () => null, setItem: async () => undefined } }));
+vi.mock("react-native-svg", () => ({ default: () => null, Path: () => null, Rect: () => null, Ellipse: () => null,
+  Polygon: () => null, Polyline: () => null, Line: () => null, Circle: () => null, Text: () => null }));
 vi.mock("expo-crypto", () => ({ randomUUID: () => "render-1" }));
 vi.mock("./rich-markdown-runtime.richjs", () => ({ default: { mermaidScript: "", katexScript: "", katexCss: "" } }));
 vi.mock("./use-mobile-preview-resource-lifecycle", () => ({ useMobilePreviewResourceLifecycle: () => ({ rendererMounted: false }) }));
@@ -24,7 +30,9 @@ vi.mock("expo-image", () => ({ Image: (props: { source: { uri: string }; accessi
 vi.mock("react-native-safe-area-context", () => ({ SafeAreaView: ({ children }: { children?: ReactNode }) => createElement("div", {}, children) }));
 vi.mock("react-native", () => {
   const box = ({ children, accessibilityLabel }: { children?: ReactNode; accessibilityLabel?: string }) => createElement("div", { "aria-label": accessibilityLabel }, children);
-  return { View: box, ScrollView: box, Text: ({ children, onPress, accessibilityRole, accessibilityLabel, selectable, style }: {
+  return { View: box, ScrollView: box, TextInput: ({ value, onChangeText }: { value: string; onChangeText(value: string): void }) => createElement("input", { value, onChange: (event: { target: { value: string } }) => onChangeText(event.target.value) }),
+    Switch: ({ value, onValueChange }: { value: boolean; onValueChange(value: boolean): void }) => createElement("button", { role: "switch", "aria-checked": value, onClick: () => onValueChange(!value) }),
+    Text: ({ children, onPress, accessibilityRole, accessibilityLabel, selectable, style }: {
     children?: ReactNode; onPress?: () => void; accessibilityRole?: string; accessibilityLabel?: string; selectable?: boolean; style?: unknown;
   }) => createElement("span", { onClick: onPress, role: accessibilityRole, "aria-label": accessibilityLabel,
     "data-selectable": selectable === undefined ? undefined : String(selectable),
@@ -41,6 +49,23 @@ vi.mock("react-native", () => {
 });
 
 describe("native message Markdown", () => {
+  it("mounts rich answer controls, retains local edits across streamed patches and isolates another owner", async () => {
+    const container = document.createElement("div"); const root = createRoot(container);
+    const body = '{"seq":1,"op":"create","id":"flag","kind":"check","props":{"label":"Enabled","default":false}}\n'
+      + '{"seq":2,"op":"create","id":"result","kind":"stat","props":{"label":"Result","value":{"op":"if","args":[{"ref":"flag"},"On","Off"]}}}\n';
+    const props = { text: 'Before\n```joko-ui\n' + body, streaming: true, answerStateKey: "node/task/rich-message", ownerKey: "runtime-one",
+      colors: { background: "#fff", surface: "#fff", ink: "#111", muted: "#666", border: "#ccc", accent: "#ff9800", negative: "#cc634e" }, locale: "en" as const };
+    try {
+      await act(async () => root.render(createElement(MobileMarkdownMessage, props)));
+      expect(container.textContent).toContain("Off"); expect(container.textContent).not.toContain('"op"');
+      await act(async () => container.querySelector<HTMLElement>('[role="switch"]')!.click());
+      expect(container.textContent).toContain("On");
+      await act(async () => root.render(createElement(MobileMarkdownMessage, { ...props, ownerKey: "runtime-two", text: props.text + '{"seq":3,"op":"patch","id":"flag","props":{"default":false}}\n```' })));
+      expect(container.textContent).toContain("On");
+      await act(async () => root.render(createElement(MobileMarkdownMessage, { ...props, answerStateKey: "other-node/task/rich-message" })));
+      expect(container.textContent).toContain("Off");
+    } finally { await act(async () => root.unmount()); }
+  });
   it.each([false, true])("keeps math and diagram messages mounted with the full application theme, dark=%s", async (dark) => {
     const container = document.createElement("div"); const root = createRoot(container);
     const colors = { background: "#f7f6f3", surface: dark ? "#24292d" : "#ffffff", ink: dark ? "#f4f4f2" : "#242a2d",

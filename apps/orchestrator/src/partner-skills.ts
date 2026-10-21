@@ -76,6 +76,7 @@ export class PartnerSkillsManager {
       || !target.trusted || link?.partnerId !== partnerId || link.role !== "canonical"
       || session.remoteWorkspace?.kind === "ssh" || target.remoteWorkspace?.kind === "ssh") return fail("The local skill owner is unavailable.");
     const readOnly = profile.lifecycle === "archived" || profile.pauseCleanupPending === true
+      || this.partners.isHomeChanging(partnerId)
       || this.partners.listPendingRestarts().some(item => item.partnerId === partnerId);
     if (writable && readOnly) return fail("Partner skills are read-only.");
     return create(contract.PartnerSkillsOwnerSchema, { partnerId, homeTargetId: target.id, canonicalSessionId: session.id,

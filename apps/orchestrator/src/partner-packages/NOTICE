@@ -1,7 +1,0 @@
-The native package parser, catalog contract and bundled package content are
-adapted from Cindy v0.1.112 (8bd60e8549cdcf0ada21e6f73d68dc0d0b71909d),
-apps/desktop/src/main/bot-import/nativePackage.ts, shared/botMarket.ts and
-resources/bot-packages. Copyright 2026 Cindy contributors.
-Licensed under Apache License, Version 2.0; see LICENSE.cindy.
-Joko adaptations use its service-owned import receipts, generated contracts,
-local resource authorization, profile lifecycle and Joko-owned avatar artwork.

@@ -442,5 +442,6 @@ while let line = readLine() {
   lock.lock(); lastSeen = Date()
   for event in events { apply(event) }
   lock.unlock()
+  print("ok"); fflush(stdout)
 }
 lock.lock(); releaseAll(); lock.unlock()

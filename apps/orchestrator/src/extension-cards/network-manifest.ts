@@ -1,5 +1,3 @@
-// Adapted from the fixed reference's declarative network and secret boundary.
-// See NOTICE and LICENSE.cindy in this directory.
 import { createHash } from "node:crypto";
 import { parseExtensionOAuth, type ExtensionOAuthDeclaration } from "./oauth-manifest.js";
 

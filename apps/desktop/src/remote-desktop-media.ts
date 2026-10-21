@@ -130,6 +130,9 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
   } | undefined;
   readonly #nativeCapture: DesktopRemoteDesktopNativeCapture;
   #privacy: { readonly owner: object; readonly revision: number } | undefined;
+  #privacyExcluded: readonly number[] = [];
+  #overlayExcluded: readonly number[] = [];
+  #overlayRevision = 0;
   #sourceRevision = 0;
   #inputHandler: ((leaseId: string, sequence: number, events: readonly RemoteDesktopInput[]) => void) | undefined;
   #controlHandler: ((leaseId: string, request: unknown) => Promise<unknown>) | undefined;
@@ -243,14 +246,46 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
   setPrivacyExclusions(owner: object, ids: readonly number[]): void {
     this.#assertAvailable();
     if (process.platform !== "darwin" || ids.length === 0) throw new Error("REMOTE_DESKTOP_PRIVACY_UNAVAILABLE");
-    this.#nativeCapture.setExcludedWindows(ids);
+    this.#privacyExcluded = [...ids];
+    this.#nativeCapture.setExcludedWindows([...new Set([...ids, ...this.#overlayExcluded])]);
     this.#privacy = { owner, revision: ++this.#sourceRevision };
   }
 
   clearPrivacyExclusions(owner: object): void {
     if (this.#privacy?.owner !== owner) return;
     this.#privacy = undefined;
-    this.#nativeCapture.setExcludedWindows([]);
+    this.#privacyExcluded = [];
+    this.#nativeCapture.setExcludedWindows(this.#overlayExcluded);
+    ++this.#sourceRevision;
+    if (this.#overlayExcluded.length) void this.setOverlayExclusions(this.#overlayExcluded).catch(() => undefined);
+  }
+
+  /** Local-only windows join the privacy filter; neither owner can clear the other. */
+  async setOverlayExclusions(ids: readonly number[]): Promise<void> {
+    if (process.platform !== "darwin") return;
+    if (ids.length) this.#assertAvailable();
+    const occurrence = ++this.#overlayRevision;
+    this.#overlayExcluded = [...ids];
+    this.#nativeCapture.setExcludedWindows([...new Set([...this.#privacyExcluded, ...ids])]);
+    const revision = ++this.#sourceRevision;
+    if (!ids.length) return;
+    const attempt = this.#attempt;
+    if (!attempt) return; // Every subsequent offer/relay frame now selects native filtering.
+    const deadline = Date.now() + REMOTE_DESKTOP_OFFER_BUDGET.captureReadyMs;
+    const current = (): void => {
+      if (this.#overlayRevision !== occurrence || this.#sourceRevision !== revision
+        || this.#attempt !== attempt || !attempt.current()) throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
+    };
+    current();
+    while (this.#pending && Date.now() < deadline) { await new Promise(resolve => setTimeout(resolve, 25)); current(); }
+    if (this.#pending) throw new Error("REMOTE_DESKTOP_CAPTURE_PENDING");
+    const reply = await this.#command({ op: "nativeSource", id: randomUUID(), leaseId: attempt.leaseId,
+      attemptId: attempt.attemptId, sourceRevision: revision }, REMOTE_DESKTOP_OFFER_BUDGET.captureReadyMs,
+      AbortSignal.timeout(REMOTE_DESKTOP_OFFER_BUDGET.captureReadyMs));
+    current();
+    if (reply.kind !== "nativeSource" || reply.sourceRevision !== revision || !this.#nativeCapture.privacyReady) {
+      throw new Error("REMOTE_DESKTOP_VIDEO_UNAVAILABLE");
+    }
   }
 
   async preparePrivacy(owner: object, displayId: string, current: () => boolean, signal: AbortSignal): Promise<void> {
@@ -306,25 +341,26 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     }
     assertCapturePermission();
     const privacy = this.#privacy;
-    if ((process.platform === "darwin" && (privacy !== undefined || this.#nativeOnly || cursorOverlay))
+    const sourceRevision = this.#sourceRevision;
+    if ((process.platform === "darwin" && (privacy !== undefined || this.#overlayExcluded.length > 0 || this.#nativeOnly || cursorOverlay))
       || (process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture())
       || (process.platform === "win32" && (this.#nativeOnly || await desktopRemoteDesktopWindowsHost.readSupport(signal) === "ready"))) {
       const frame = await this.#nativeCapture.frame(displayId, cursorOverlay, cursorOverlay, undefined, signal);
       throwIfAborted(signal);
-      if (this.#privacy !== privacy || !request.current()) return null;
+      if (this.#privacy !== privacy || this.#sourceRevision !== sourceRevision || !request.current()) return null;
       return encodeNativeRelayFrame(frame);
     }
     try {
       const sources = await enumerateDesktopSources(true, signal);
       const source = exactDesktopSource(sources, displayId);
       throwIfAborted(signal);
-      if (this.#privacy !== privacy || !request.current()) return null;
+      if (this.#privacy !== privacy || this.#sourceRevision !== sourceRevision || !request.current()) return null;
       return source === null ? null : encodeDesktopFrame(source.thumbnail);
     } catch (error) {
       if (process.platform !== "darwin" || !capturePermissionGranted()) throw error;
       const frame = await this.#nativeCapture.frame(displayId, cursorOverlay, cursorOverlay, undefined, signal);
       throwIfAborted(signal);
-      if (this.#privacy !== privacy || !request.current()) return null;
+      if (this.#privacy !== privacy || this.#sourceRevision !== sourceRevision || !request.current()) return null;
       return encodeNativeRelayFrame(frame);
     }
   }
@@ -361,7 +397,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     const nativeAvailable = process.platform === "darwin"
       || (process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture())
       || (process.platform === "win32" && await desktopRemoteDesktopWindowsHost.readSupport(request.signal) === "ready");
-    let nativeVideo = nativeAvailable && (process.platform === "linux" || process.platform === "win32" || this.#privacy !== undefined || this.#nativeOnly || request.cursorOverlay);
+    let nativeVideo = nativeAvailable && (process.platform === "linux" || process.platform === "win32" || this.#privacy !== undefined || this.#overlayExcluded.length > 0 || this.#nativeOnly || request.cursorOverlay);
     const nativeAudio = process.platform === "linux" && !portalCapture && nativeAvailable && settings?.audio === true;
     if (!portalCapture && (!nativeVideo || settings?.audio === true && !nativeAudio)
       && !(process.platform === "win32" && this.#nativeOnly)) {
@@ -381,7 +417,7 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
       throw new Error("REMOTE_DESKTOP_VIDEO_STOPPED");
     }
     const requestId = randomUUID();
-    nativeVideo ||= nativeAvailable && this.#privacy !== undefined;
+    nativeVideo ||= nativeAvailable && (this.#privacy !== undefined || this.#overlayExcluded.length > 0);
     this.#grant = source === null || (nativeVideo && settings?.audio !== true) ? undefined : {
       source,
       leaseId: request.leaseId,
@@ -846,12 +882,13 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     }
     if (!Number.isSafeInteger(sourceRevision) || (sourceRevision as number) < 0
       || (sourceRevision as number) > this.#sourceRevision
-      || (this.#privacy !== undefined && sourceRevision !== this.#sourceRevision)) return null;
+      || ((this.#privacy !== undefined || this.#overlayExcluded.length > 0) && sourceRevision !== this.#sourceRevision)) return null;
     const privacy = this.#privacy;
     let current = false;
     try { current = attempt.current(); } catch { /* Authority lookup failed closed. */ }
     if (!current) throw new Error("Remote Desktop native frame request is stale.");
     const generation = this.#generation;
+    const currentRevision = this.#sourceRevision;
     const frame = await this.#nativeCapture.frame(
       attempt.displayId,
       true,
@@ -860,7 +897,8 @@ export class DesktopRemoteDesktopMedia implements DesktopRemoteDesktopMediaPort 
     );
     let stillCurrent = false;
     try { stillCurrent = attempt.current(); } catch { /* Authority lookup failed closed. */ }
-    if (generation !== this.#generation || this.#attempt !== attempt || !stillCurrent || this.#privacy !== privacy) return null;
+    if (generation !== this.#generation || this.#attempt !== attempt || !stillCurrent || this.#privacy !== privacy
+      || currentRevision !== this.#sourceRevision) return null;
     return frame;
   }
 

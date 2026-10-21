@@ -1,0 +1,230 @@
+/* Answer primitives inherit the host theme and typography. No generated CSS or HTML. */
+.rich-answer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rich-gap, 16px);
+  min-width: 0;
+  container-type: inline-size;
+}
+.rich-answer p.rich-answer-text {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.rich-answer h3.rich-answer-heading {
+  margin: 0;
+  font-size: var(--rich-fontSize, var(--text-18));
+  font-weight: var(--rich-fontWeight, 500);
+  line-height: 1.5;
+}
+.rich-answer-layout {
+  display: flex;
+  gap: var(--rich-gap, 16px);
+  min-width: 0;
+}
+.rich-answer-stack,
+.rich-answer-group {
+  flex-direction: column;
+}
+.rich-answer-row {
+  flex-wrap: wrap;
+}
+.rich-answer-row > * {
+  flex: 1;
+  min-width: 0;
+}
+.rich-answer-grid {
+  display: grid;
+  grid-template-columns: var(--rich-ratio, repeat(var(--rich-columns, 2), minmax(0, 1fr)));
+}
+.rich-answer-aside {
+  grid-template-columns: var(--rich-ratio, minmax(100px, 0.7fr) minmax(0, 1.8fr));
+}
+.rich-answer-content {
+  min-width: 0;
+}
+.rich-answer-content img,
+.rich-answer-content video {
+  max-width: 100%;
+}
+.rich-answer-caption {
+  color: var(--text-soft);
+  font-size: var(--text-12);
+  font-weight: 400;
+}
+.rich-answer-stat {
+  border-top: 1px solid var(--line);
+  padding-block: 12px;
+}
+.rich-answer-stat output {
+  font-size: var(--text-24);
+  font-variant-numeric: tabular-nums;
+}
+.rich-answer-control {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.rich-answer-control-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+.rich-answer-check {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  min-height: 36px;
+}
+.rich-answer-check input {
+  accent-color: var(--text);
+}
+.rich-answer-select {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 8px 12px;
+  background: var(--surface);
+  color: var(--text);
+  min-height: 36px;
+}
+.rich-answer-select:focus-visible,
+.rich-answer-check input:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+.rich-answer-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.rich-answer-tabs [aria-selected='true'] {
+  font-weight: 600;
+}
+.rich-answer summary {
+  cursor: pointer;
+  min-height: 36px;
+}
+.rich-answer hr.rich-answer-divider {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 8px 0;
+}
+.rich-answer-chart {
+  margin: 0;
+}
+.rich-answer-chart svg {
+  display: block;
+  width: 100%;
+  max-height: 180px;
+}
+.rich-answer-chart dl {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 12px 0 0;
+}
+.rich-answer-chart dd {
+  margin: 0;
+}
+.rich-answer-track {
+  height: 8px;
+  background: var(--surface-raised);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+.rich-answer-track > div {
+  height: 100%;
+  background: var(--text-soft);
+}
+/* Two readable chart columns need more room than a phone-sized answer. */
+@container (max-width:600px) {
+  .rich-answer-row {
+    flex-direction: column;
+  }
+  .rich-answer-grid {
+    grid-template-columns: repeat(var(--rich-mobile-columns, 1), minmax(0, 1fr));
+  }
+  .rich-answer-aside {
+    grid-template-columns: var(--rich-ratio, minmax(88px, 0.7fr) minmax(0, 1.8fr));
+  }
+}
+
+.rich-answer-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--rich-gap, 16px);
+  min-width: 0;
+}
+
+.rich-answer-icon-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.rich-answer-icon-row > svg {
+  flex-shrink: 0;
+  margin-top: 4px;
+}
+.rich-answer-icon-row > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rich-answer-icon-row strong {
+  font-weight: var(--rich-fontWeight, 500);
+}
+.rich-answer-chart-guide {
+  stroke: var(--line);
+}
+.rich-answer-chart-axis {
+  fill: var(--text-soft);
+  font-size: var(--text-12);
+}
+.rich-answer-chart-value {
+  fill: var(--text);
+  font-size: var(--text-12);
+}
+/* Model styles are inherited by the text inside compound primitives. */
+.rich-answer-caption {
+  color: var(--rich-color, var(--text-soft));
+  font-size: var(--rich-fontSize, var(--text-12));
+}
+.rich-answer-stat output {
+  font-size: var(--rich-fontSize, var(--text-24));
+}
+.rich-answer-icon-row strong {
+  font-size: var(--rich-fontSize, inherit);
+}
+.rich-answer-text,
+.rich-answer-heading,
+.rich-answer-caption,
+.rich-answer-stat output {
+  line-height: var(--rich-lineHeight, 1.5);
+}
+
+/* Apply media dimensions to the image itself; limiting only its wrapper makes
+   a tall image overlap subsequent text. Host preview defaults remain fallbacks. */
+.rich-answer-media img,
+.rich-answer-media video {
+  width: var(--rich-width, auto) !important;
+  max-width: 100% !important;
+  height: var(--rich-height, auto) !important;
+  min-height: var(--rich-minHeight, 0) !important;
+  max-height: var(--rich-maxHeight, min(40vh, 420px)) !important;
+  border-radius: var(--rich-borderRadius, 16px) !important;
+  object-fit: contain;
+}
+
+.rich-answer-input { min-width: 0; width: 100%; min-height: 36px; border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; font: inherit; color: var(--text); background: var(--surface); }
+.rich-answer-range { width: 100%; min-height: 36px; accent-color: var(--text); }
+.rich-answer-input:focus-visible, .rich-answer-range:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.rich-answer__image { display: block; max-width: 100%; max-height: 540px; object-fit: contain; border-radius: 12px; }
+.rich-answer__video-site { display: grid; gap: 8px; width: 100%; }
+.rich-answer__video-site iframe, .rich-answer__video-site > button { width: 100%; aspect-ratio: 16 / 9; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.rich-answer__video-site > button { position: relative; padding: 0; color: white; background: var(--surface-raised); cursor: pointer; }
+.rich-answer__video-site > button img { width: 100%; height: 100%; object-fit: cover; }
+.rich-answer__video-site > button span { position: absolute; inset: 0; display: grid; place-content: center; background: #0005; }

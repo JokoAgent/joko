@@ -16,5 +16,5 @@ Pod::Spec.new do |s|
   s.dependency 'ExpoModulesCore'
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES' }
   s.source_files = '**/*.{h,m,mm,swift,hpp,cpp}'
-  s.resource_bundles = { 'JokoMcpAppSurfaceNotices' => ['../LICENSE', '../LICENSE.cindy', '../NOTICE'] }
+  s.resource_bundles = { 'JokoMcpAppSurfaceNotices' => ['../LICENSE'] }
 end

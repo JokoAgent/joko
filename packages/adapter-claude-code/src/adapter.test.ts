@@ -61,6 +61,47 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("observes edit mode and checks native PreToolUse authority even when file edits bypass canUseTool", async () => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk); let current = true;
+    const review = vi.fn(async () => ({ verdict: "allow" as const, authorizationRevision: "original" }));
+    const nativeToolAuthorization = { required: true, capture: () => "original", assertCurrent: () => { if (!current) throw new Error("Revoked"); }, review };
+    const binding = await adapter.createSession(createInput({ permissionMode: "acceptEdits" }), { ...contextFor().context, nativeToolAuthorization });
+    const source = { ...contextFor(binding, { operationId: "native-edit" }).context, nativeToolAuthorization };
+    try {
+      await adapter.send(textPrompt("Write the approved draft"), source);
+      const query = sdk.queries.at(-1)!, hook = query.params.options.hooks!.PreToolUse![0]!.hooks[0]!;
+      const input = { hook_event_name: "PreToolUse" as const, session_id: binding.nativeSessionId!, transcript_path: "unused", cwd: target.workspaceRoot,
+        tool_name: "Write", tool_use_id: "write-action", tool_input: { file_path: join(target.workspaceRoot, "draft.md"), content: "draft" } };
+      expect(query.params.options.permissionMode).toBe("acceptEdits");
+      await expect(hook(input, "write-action", { signal: source.signal })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "allow", updatedInput: input.tool_input } });
+      current = false;
+      await expect(hook(input, "write-action", { signal: source.signal })).resolves.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      expect(review).toHaveBeenCalledOnce();
+    } finally { await adapter.dispose(); }
+  });
+  test("uses a temporary tool-free native Query for exact-model text review and retires it", async () => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk), allowed = vi.fn();
+    try {
+      const result = adapter.inferNativeText({ system: "Review the action", user: "Exact action", providerId: "claude-code", modelId: "model-a",
+        maxTokens: 1500, backendInstanceGeneration: INSTANCE_GENERATION, signal: new AbortController().signal, timeoutMs: 10_000, assertCurrent: () => {}, assertModelAllowed: allowed });
+      await eventually(() => sdk.queries.length === 1);
+      const query = sdk.queries[0]!;
+      expect(query.params.options).toMatchObject({ model: "model-a", persistSession: false, tools: [], agents: {}, skills: [], settingSources: [], strictMcpConfig: true, mcpServers: {}, additionalDirectories: [] });
+      expect(query.params.options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]).toBe("1500");
+      query.push(resultMessage(query.params.options.sessionId!, { result: '{"verdict":"allow","reason":"In scope"}', totalCostUsd: 0 }));
+      await expect(result).resolves.toContain('"verdict":"allow"');
+      expect(allowed).toHaveBeenCalledWith("claude-code", "model-a"); expect(sdk.retiredQueries).toContain(query);
+    } finally { await adapter.dispose(); }
+  });
+  test("retires a pending native text Query when the original owner cancels", async () => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk), owner = new AbortController();
+    try {
+      const result = adapter.inferNativeText({ system: "Review", user: "Action", providerId: "claude-code", modelId: "model-a",
+        backendInstanceGeneration: INSTANCE_GENERATION, signal: owner.signal, timeoutMs: 10_000, assertCurrent: () => owner.signal.throwIfAborted(), assertModelAllowed: () => {} });
+      await eventually(() => sdk.queries.length === 1); owner.abort(); await expect(result).rejects.toThrow();
+      expect(sdk.retiredQueries).toContain(sdk.queries[0]);
+    } finally { await adapter.dispose(); }
+  });
   test("projects native system compaction and retry facts once without dispatching another input", async () => {
     const runtime = new FakeSdkRuntime({ autoAdmitTurns: true });
     const adapter = adapterFor(runtime);
@@ -2819,6 +2860,25 @@ describe("ClaudeCodeAdapter", () => {
     }
   });
 
+  test.each([true, false])("attests a built-in native Skill only with an exact launch plugin acknowledgement: %s", async (acknowledged) => {
+    const source = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-builtin-")));
+    const body = "---\nname: joko-plugin-creator\ndescription: Create plugins\n---\nFollow references/packaging.md.\n";
+    await writeFile(join(source, "SKILL.md"), body);
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+    const runtime = new FakeSdkRuntime(); runtime.queryInitialization = { ...initialization(), plugins_applied: acknowledged };
+    const adapter = adapterFor(runtime, { resolveNativeSkills: async () => [{ sourcePath: source, resource: {
+      id: "shipped-creator", kind: "skill", name: "joko-plugin-creator", source: "builtin", state: "approved", revision, resourceVersion: 1n,
+      trustedBuiltin: { id: "plugin_creator", revision } }, assertCurrent: () => undefined }], resolveTextResources: async () => [] });
+    try {
+      const binding = await adapter.createSession(createInput(), contextFor().context), active = contextFor(binding).context;
+      const commands = await adapter.getCommands(active), resources = await adapter.getResources(active);
+      if (acknowledged) {
+        expect(commands[0]).toMatchObject({ resourceId: "shipped-creator", source: "skill", loaded: true, builtinSkill: { id: "plugin_creator", revision } });
+        expect(resources[0]?.id).toBe("shipped-creator");
+      } else { expect(commands).toEqual([]); expect(resources).toEqual([]); }
+    } finally { await adapter.dispose(); await rm(source, { recursive: true, force: true }); }
+  });
+
   test("loads complete native skill plugins and retains their files until Query retirement is confirmed", async () => {
     const source = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-skill-")));
     const body = "---\nname: report\ndescription: Prepare reports\n---\n" + "Full original instructions.\n".repeat(20_000);
@@ -5060,6 +5120,7 @@ describe("ClaudeCodeAdapter", () => {
     );
     expect(permission).toMatchObject({ behavior: "allow" });
     expect(permission.behavior === "allow" ? permission.updatedPermissions : []).toEqual([
+      { type: "setMode", mode: "acceptEdits", destination: "session" },
       { type: "addRules", rules: [], behavior: "allow", destination: "session" }
     ]);
     query.push(resultMessage(binding.nativeSessionId!, { result: "done", totalCostUsd: 0 }));

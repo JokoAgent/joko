@@ -1,4 +1,5 @@
 import type { DragEvent, JSX, ReactNode } from "react";
+import { builtinSkillIntentForText } from "../builtin-skill-intent.js";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { JSONContent } from "@tiptap/core";
 import {
@@ -147,6 +148,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const [inlineMentionActivation, setInlineMentionActivation] = useState<(ComposerInlineMentionActivation & { readonly source: "typed" | "button" })>();
   const [inlineMentionActiveIndex, setInlineMentionActiveIndex] = useState(0);
   const [extraDirectoryIds, setExtraDirectoryIds] = useState<readonly string[] | undefined>();
+  const builtinSkillIntentRef = useRef<"plugin_creator" | undefined>(undefined);
   const [attachmentError, setAttachmentError] = useState<string>();
   const [deliveryMode, setDeliveryMode] = useState<DeliveryMode>("prompt");
   const [hydratedSession, setHydratedSession] = useState<string>();
@@ -630,6 +632,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
         const restoredDocument = normalizeComposerDocument(draft?.editorDocument, draft?.text ?? "");
         const restoredText = composerDocumentPlainText(restoredDocument);
         const restoredMentions = draft?.mentions ?? [];
+        builtinSkillIntentRef.current = draft?.builtinSkillIntent;
         setEditorDocument(restoredDocument);
         textRef.current = restoredText;
         setText(restoredText);
@@ -719,6 +722,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       ...(extraDirectoryIds === undefined ? {} : { extraDirectoryIds })
     };
     const restored = mergeRejectedComposerDraft(rejectedFirstInputRecovery.input, current);
+    builtinSkillIntentRef.current = restored.builtinSkillIntent;
     const pendingObjectiveDialogHandoff = objectiveDialogHandoffRef.current;
     if (pendingObjectiveDialogHandoff !== undefined
       && pendingObjectiveDialogHandoff.sessionId === session.id
@@ -890,6 +894,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     const owner = guard.capture(session.id);
     const draft = {
       text,
+      builtinSkillIntent: builtinSkillIntentForText(text, builtinSkillIntentRef.current),
       editorDocument,
       deliveryMode,
       mentions,
@@ -1893,6 +1898,8 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
     const sourceAttachments = [...attachments];
     const sourceBrowserComments = [...browserComments];
     const sourceExtraDirectoryIds = extraDirectoriesSupported ? extraDirectoryIds : undefined;
+    const sourceBuiltinSkillIntent = builtinSkillIntentForText(sourceText, builtinSkillIntentRef.current);
+    builtinSkillIntentRef.current = undefined;
     const clearedDocument = emptyComposerDocument();
     const clearedOwner = operationGuardRef.current.capture(sourceSessionId);
     setSubmissionKind("send");
@@ -1952,6 +1959,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
       const restoredBrowserComments = mergeDraftItemsById(sourceBrowserComments, current.browserComments ?? []);
       const restoredDraft = {
         text: restoredText,
+        builtinSkillIntent: sourceBuiltinSkillIntent,
         editorDocument: restoredDocument,
         deliveryMode: current.deliveryMode,
         mentions: restoredMentions,
@@ -1963,6 +1971,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           : { extraDirectoryIds: current.extraDirectoryIds ?? sourceExtraDirectoryIds })
       } satisfies ComposerDraft;
       if (ownsLiveComposer) {
+        builtinSkillIntentRef.current = sourceBuiltinSkillIntent;
         markDraftEdited(sourceSessionId);
         editorRevisionRef.current += 1;
         editorDocumentRef.current = restoredDocument;
@@ -1989,6 +1998,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
         if (sourceEpoch === undefined || sendEpochRef.current !== sourceEpoch || current.owner !== sourceSendOwner || current.readOnly || !current.connected || current.route !== sourceRoute || !current.supportedModes.includes(sourceDeliveryMode) || !attachmentsAllowed(draftMedia, current.attachmentPolicy) || !composerMentionsAllowed(sourceMentions, current.mentionPolicy, current.resources)) throw new Error(t("composer.inputUnavailable"));
         await sourceSend(sourceSessionId, {
           text: sourceText,
+          builtinSkillIntent: sourceBuiltinSkillIntent,
           editorDocument: sourceEditorDocument,
           attachments: sourceAttachments,
           browserComments: sourceBrowserComments,

@@ -18,7 +18,7 @@ import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 import * as contract from "@joko/contracts";
 
 describe("Partner gateway", () => {
-  it("strictly roundtrips all three Partner permission values for defaults create and profile writes", async () => {
+  it("strictly roundtrips Partner permission values for defaults create and profile writes", async () => {
     const requests: Array<{ method: string; input: any; signal?: AbortSignal }> = [];
     let mode = PermissionMode.ASK;
     const gateway = connectedGateway(partnerTransport(method => {
@@ -28,7 +28,7 @@ describe("Partner gateway", () => {
       return result;
     }, requests));
     await gateway.connect();
-    for (const [wire, ui] of [[PermissionMode.ASK, "ask"], [PermissionMode.AUTO, "auto"], [PermissionMode.BYPASS_PERMISSIONS, "bypassPermissions"]] as const) {
+    for (const [wire, ui] of [[PermissionMode.ASK, "ask"], [PermissionMode.ACCEPT_EDITS, "acceptEdits"], [PermissionMode.AUTO, "auto"], [PermissionMode.BYPASS_PERMISSIONS, "bypassPermissions"]] as const) {
       mode = wire;
       const caps = { ...capabilities(), permissionMode: ui };
       expect((await gateway.getPartnerDirectory()).defaultCapabilities?.permissionMode).toBe(ui);

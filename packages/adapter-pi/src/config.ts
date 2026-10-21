@@ -322,7 +322,7 @@ export async function writeRuntimeControl(path: string, control: Omit<PiRuntimeC
   if (!Number.isSafeInteger(control.policyGeneration) || control.policyGeneration < 0) {
     throw piError("PI_CONTROL_INVALID_POLICY_GENERATION", "Pi runtime policy generation must be a non-negative safe integer", "provision");
   }
-  if (!(["ask", "auto", "bypassPermissions"] as const).includes(control.permissionMode)) {
+  if (!(["ask", "acceptEdits", "auto", "bypassPermissions"] as const).includes(control.permissionMode)) {
     throw piError("PI_CONTROL_INVALID_PERMISSION", "Pi runtime control contains an invalid permission mode", "provision");
   }
   if (typeof control.planMode !== "boolean" || typeof control.fastMode !== "boolean") {
@@ -343,7 +343,9 @@ export async function writeRuntimeControl(path: string, control: Omit<PiRuntimeC
     if (seenRoots.has(key)) throw piError("PI_CONTROL_DUPLICATE_ROOT", "Pi runtime control contains a duplicate approved root", "provision");
     seenRoots.add(key);
   }
-  await atomicWriteJson(path, { ...control, writtenAt: new Date().toISOString() } satisfies PiRuntimeControl);
+  // This engine does not advertise edit-only approval. Match the native
+  // reference's strict Ask normalization instead of widening it into Auto.
+  await atomicWriteJson(path, { ...control, permissionMode: control.permissionMode === "acceptEdits" ? "ask" : control.permissionMode, writtenAt: new Date().toISOString() } satisfies PiRuntimeControl);
 }
 
 export async function writeMcpDescriptor(path: string, descriptor: PiMcpBridgeDescriptor): Promise<void> {

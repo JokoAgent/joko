@@ -14,7 +14,7 @@ test("Runtime command input modes preserve explicit text and selected Resource s
     const command = create(contract.RuntimeCommandSchema, { name: "report", resourceId: "opaque-resource", loaded: true, inputMode });
     assert.deepEqual(fromBinary(contract.RuntimeCommandSchema, toBinary(contract.RuntimeCommandSchema, command)), command);
   }
-  assert.deepEqual([...fieldNames(contract.RuntimeCommandSchema)], ["command_id", "name", "description", "source", "resource_id", "loaded", "session_id", "input_mode"]);
+  assert.deepEqual([...fieldNames(contract.RuntimeCommandSchema)], ["command_id", "name", "description", "source", "resource_id", "loaded", "session_id", "input_mode", "builtin_skill"]);
 });
 
 test("Model working context and declared metadata preserve strict optional presence and exact route CAS", () => {
@@ -539,9 +539,9 @@ test("Remote Desktop keeps public controller identity implicit and target comman
   assert.equal(contract.RemoteDesktopFailureReason.SYSTEM_ACTION_UNAVAILABLE, 46);
   assert.equal(contract.RemoteDesktopFailureReason.SYSTEM_ACTION_EXPIRED, 47);
   assert.deepEqual([...fieldNames(contract.SetRemoteDesktopViewerDisplayRequestSchema)], [
-    "peer", "lease_id", "control_generation", "width", "height"
+    "peer", "lease_id", "control_generation", "width", "height", "control"
   ]);
-  assert.deepEqual([...fieldNames(contract.RestoreRemoteDesktopViewerDisplayRequestSchema)], ["peer", "lease_id", "control_generation"]);
+  assert.deepEqual([...fieldNames(contract.RestoreRemoteDesktopViewerDisplayRequestSchema)], ["peer", "lease_id", "control_generation", "control"]);
   assert.deepEqual([...fieldNames(contract.RemoteDesktopViewerDisplayResultSchema)], ["lease"]);
   assert.equal(field(contract.DevicePeerAgentResultSchema, "remote_desktop_viewer_display").number, 58);
   assert.equal(contract.RemoteDesktopFailureReason.DISPLAY_RESTORE_UNAVAILABLE, 44);

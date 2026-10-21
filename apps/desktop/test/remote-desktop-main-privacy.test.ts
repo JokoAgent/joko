@@ -81,6 +81,7 @@ vi.mock("../src/remote-desktop-windows-host.js", () => ({ desktopRemoteDesktopWi
 } }));
 vi.mock("electron", () => ({
   app: { get isPackaged() { return h.packaged; } },
+  nativeTheme: Object.assign(new EventEmitter(), { shouldUseDarkColors: false }),
   BrowserWindow: class {}, dialog: {}, shell: {}, systemPreferences: {}, powerSaveBlocker: {},
   screen: Object.assign(new EventEmitter(), { getAllDisplays: vi.fn(() => [{ id: 1, label: "Desktop", size: { width: 1920, height: 1080 } }]) }),
   powerMonitor: Object.assign(new EventEmitter(), { getSystemIdleState: () => h.idle })
@@ -111,7 +112,7 @@ vi.mock("../src/remote-desktop-input.js", () => ({
   readDesktopRemoteDesktopSessionState: vi.fn(), setDesktopRemoteDesktopDisplayMode: vi.fn(),
   restoreDesktopRemoteDesktopDisplayMode: vi.fn()
 }));
-import { screen } from "electron";
+import { nativeTheme, screen } from "electron";
 import { createDesktopRemoteDesktopMainHost, closeDesktopRemoteDesktopClipboardWriter } from "../src/remote-desktop-main.js";
 import { restoreDesktopRemoteDesktopDisplayMode, setDesktopRemoteDesktopDisplayMode } from "../src/remote-desktop-input.js";
 import { restoreDesktopRemoteDesktopLinuxDisplayMode, setDesktopRemoteDesktopLinuxDisplayMode } from "../src/remote-desktop-linux-display.js";
@@ -121,6 +122,7 @@ import { SystemAudioMuteGuard } from "../src/system-audio-mute.js";
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const systemVersion = Object.getOwnPropertyDescriptor(process, "getSystemVersion");
 beforeEach(() => {
+  nativeTheme.removeAllListeners();
   h.host = undefined; h.privacy = undefined; h.active = true; h.os = "10.0.19041"; h.macVersion = "14.0";
   h.excluded.mockReset(); h.cleared.mockReset(); h.prepare.mockClear(); h.coverage.mockReset(); screen.removeAllListeners();
   h.linuxNative = false; h.linuxWayland = true; h.linuxSession = "unlocked"; h.linuxInput = false; h.linuxCursor = false;

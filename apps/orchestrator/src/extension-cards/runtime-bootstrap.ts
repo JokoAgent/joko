@@ -1,5 +1,4 @@
 // The isolated page receives literal JavaScript, independent of Node/TS loaders.
-// Adapted from the fixed extension host bridge; see NOTICE / LICENSE.cindy.
 export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities) => {
   const target = window;
   const transport = target.__jokoExtensionRequest.bind(window);
@@ -18,7 +17,13 @@ export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities)
       connections: key => request({ type: "connections-list", key }),
       accounts: key => request({ type: "oauth-accounts", key }),
       reportInsufficientScopes: (key, scopes) => request({ type: "oauth-insufficient-scopes", key, scopes }) }) } : {}),
-    ...(capabilities.agent ? { agent: Object.freeze({ run: payload => request({ ...payload, type: "agent-run" }) }) } : {})
+    ...(capabilities.agent ? { agent: Object.freeze({ run: payload => request({ ...payload, type: "agent-run" }) }) } : {}),
+    ...(capabilities.text ? { text: Object.freeze({ oneshot: payload => request({ ...payload, type: "text-oneshot" }) }) } : {}),
+    ...(capabilities.tasks ? { tasks: Object.freeze(Object.fromEntries(["capabilities", "models", "create", "get", "list", "setModel", "send", "getRun", "listRuns", "readMessages", "cancel", "setHidden", "requestWriteAccess", "startTeam", "getTeam", "setTeamPlan", "releaseWorker"].map(kind => [kind, async (payload = {}) => {
+      const response = await request({ ...payload, type: "tasks-request", kind });
+      if (!response.ok) throw Object.assign(new Error(response.message || "Plugin task request failed."), { code: response.errorCode });
+      return response.result;
+    }]))) } : {})
   }), writable: false, configurable: false });
   target.__jokoRuntime = {
     async tool(input) {

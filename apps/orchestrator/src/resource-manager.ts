@@ -8,6 +8,7 @@ import { CODEX_PROJECT_SKILL_ROOTS } from "@joko/adapter-codex";
 import { redactSecrets, type AdapterContext, type ApprovedSkillSeed, type RuntimeResource } from "@joko/core";
 import { SessionRuntimeHandoffStore, type OperationalStore } from "@joko/store";
 import { readSkillFile } from "./skill-file.js";
+import type { BuiltinSkillCatalog } from "./builtin-skills.js";
 import { RemoteSkillSourceOwner, remoteProjectSkillSourceIdentity, validateRemoteProjectSkillSource,
   type StoredRemoteProjectSkillSource } from "./remote-skill-source.js";
 
@@ -215,6 +216,7 @@ export interface PiResourceManagerOptions {
   /** Service-owned private source selection; never a client Target override. */
   readonly privateResourceTarget?: (owner: AdapterContext) => string | undefined;
   readonly remoteProjectSkills?: RemoteSkillSourceOwner;
+  readonly builtinSkills?: BuiltinSkillCatalog;
 }
 
 export interface DiscoverPiResourceInput {
@@ -640,6 +642,7 @@ export class PiResourceManager {
   readonly #acquisition: PiPackageAcquisition;
   readonly #privateResourceTarget: PiResourceManagerOptions["privateResourceTarget"];
   readonly #remoteProjectSkills: RemoteSkillSourceOwner | undefined;
+  readonly #builtinSkills: BuiltinSkillCatalog | undefined;
   readonly #remoteSourceGuards = new WeakMap<StoredResource, () => void>();
   readonly #records = new Map<string, StoredResource>();
   readonly #preparedMutations = new WeakMap<object, PreparedCatalogMutation<unknown>>();
@@ -647,6 +650,28 @@ export class PiResourceManager {
   readonly #retiredInstalledGenerations = new Map<string, { readonly record: StoredResource; readonly generation: string }>();
   #initialized = false;
   #tail: Promise<void> = Promise.resolve();
+  #extensionTaskRemoval?: (store: OperationalStore, resourceId: string) => void;
+  #partnerHomeDataRoot?: (targetId: string) => string | undefined;
+
+  setExtensionTaskRemoval(participant: (store: OperationalStore, resourceId: string) => void): void { this.#extensionTaskRemoval = participant; }
+  setPartnerHomeDataRoot(resolveRoot: (targetId: string) => string | undefined): void { this.#partnerHomeDataRoot = resolveRoot; }
+
+  /** Only personal Skill records follow a Partner. Host packages, plugins and credentials do not. */
+  async movePartnerSkills(input: { readonly partnerId: string; readonly sourceTargetId: string; readonly targetId: string;
+    readonly backendId: string; readonly authorityRoot: string; readonly assertCurrent: () => void }): Promise<void> {
+    await this.#mutate(async () => {
+      input.assertCurrent(); this.#assertTrustedProjectTarget(input.backendId, input.targetId, input.authorityRoot);
+      const previous = new Map<string, StoredResource>();
+      for (const [id, record] of this.#records) {
+        if (record.targetId !== input.sourceTargetId || record.kind !== "skill" || record.state === "removed"
+          || record.partnerSkill?.partnerId !== input.partnerId && record.importedSkill?.partnerId !== input.partnerId) continue;
+        previous.set(id, record);
+        this.#records.set(id, { ...record, targetId: input.targetId, backendId: input.backendId, workspaceRoot: input.authorityRoot });
+      }
+      try { input.assertCurrent(); this.#persist(); }
+      catch (error) { for (const [id, record] of previous) this.#records.set(id, record); throw error; }
+    });
+  }
 
   constructor(options: PiResourceManagerOptions) {
     if (!isAbsolute(options.managedRoot) || resolve(options.managedRoot) !== options.managedRoot) {
@@ -661,6 +686,7 @@ export class PiResourceManager {
     this.#acquisition = options.acquisition ?? new DefaultPiPackageAcquisition();
     this.#privateResourceTarget = options.privateResourceTarget;
     this.#remoteProjectSkills = options.remoteProjectSkills;
+    this.#builtinSkills = options.builtinSkills;
     if (!Number.isSafeInteger(this.#maximumFiles) || this.#maximumFiles < 1) throw new RangeError("Resource file limit is invalid.");
     if (!Number.isSafeInteger(this.#maximumBytes) || this.#maximumBytes < 1) throw new RangeError("Resource byte limit is invalid.");
   }
@@ -2563,6 +2589,9 @@ export class PiResourceManager {
       signal.throwIfAborted();
       this.#assertTargetOwner(backendId, targetId, runtimeOwner);
       const seeds: ApprovedSkillSeed[] = [];
+      if (this.#builtinSkills && this.#backendSupportsResourceKind(backendId, "skill") && allowedSkillIds === undefined) {
+        seeds.push(...await this.#builtinSkills.snapshot(() => this.#assertTargetOwner(backendId, targetId, runtimeOwner), signal));
+      }
       for (const record of this.#records.values()) {
         if (record.backendId !== backendId && !(runtimeOwner !== undefined && record.targetId === targetId
           && (record.partnerSkill !== undefined || record.importedSkill !== undefined) && allowedSkillIds?.has(record.id) === true)
@@ -4018,6 +4047,7 @@ export class PiResourceManager {
       }
     }
     const changed = prepared.entries.filter((entry) => entry.next !== entry.expected);
+    for (const entry of changed) if (entry.next.state === "removed" && entry.expected?.state !== "removed") this.#extensionTaskRemoval?.(store, entry.id);
     for (const entry of changed) this.#records.set(entry.id, entry.next);
     try {
       if (changed.length > 0) this.#persist(store);
@@ -4081,8 +4111,9 @@ export class PiResourceManager {
     if (targetId === undefined) throw new Error("Project resources require a Target.");
     const target = this.#store.getTarget(targetId);
     assertTargetNotDeleted(target.metadata);
-    if (target.descriptor.remoteWorkspace !== undefined) throw new Error("Local project sources cannot acquire a remote workspace.");
-    const targetWorkspaceRoot = normalizedAbsolute(target.descriptor.workspaceRoot, "Target workspace root");
+    const ownedRoot = this.#partnerHomeDataRoot?.(targetId);
+    if (target.descriptor.remoteWorkspace !== undefined && ownedRoot === undefined) throw new Error("Local project sources cannot acquire a remote workspace.");
+    const targetWorkspaceRoot = normalizedAbsolute(ownedRoot ?? target.descriptor.workspaceRoot, "Target workspace root");
     if (target.descriptor.backendId !== backendId || (workspaceRoot !== undefined && !samePath(targetWorkspaceRoot, workspaceRoot))) {
       throw new Error("Project resource does not match its durable Target boundary.");
     }

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { sessionTaskActivity } from "./session-task-activity.js";
 import { isPartnerRoutineSchedule } from "./partner-routine-schedule.js";
 
 import type {
@@ -188,6 +189,7 @@ export function sessionProjectionContext(
           derivationOriginAvailability: sessionDerivationOriginAvailability(store, session)
         }),
     codeHostPullRequests: readSessionCodeHostReferences(store, session.descriptor.id),
+    taskActivity: sessionTaskActivity(store, session),
     ...(contextState === undefined ? {} : { contextState })
   };
 }
@@ -279,7 +281,7 @@ export class SnapshotProjector {
   }
 
   private catalogBase(base: OperationalSnapshot): OperationalSnapshot {
-    return { ...base, sessions: base.sessions.filter(session => this.options.hideSessionFromCatalog?.(session.descriptor.id) !== true),
+    return { ...base, sessions: base.sessions.filter(session => session.descriptor.hidden !== true && this.options.hideSessionFromCatalog?.(session.descriptor.id) !== true),
       targets: base.targets.filter(target => this.options.hideTargetFromCatalog?.(target.descriptor.id) !== true) };
   }
 
@@ -290,7 +292,7 @@ export class SnapshotProjector {
       // snapshot plus entity lists not exposed by OperationalSnapshot.
       const base = this.catalogBase(store.getSnapshot(createdAt));
       const hiddenReferences = new Set([
-        ...store.listSessions({ includeArchived: true }).filter(session => this.options.hideSessionFromCatalog?.(session.descriptor.id) === true).map(session => session.descriptor.id),
+        ...store.listSessions({ includeArchived: true }).filter(session => session.descriptor.hidden === true || this.options.hideSessionFromCatalog?.(session.descriptor.id) === true).map(session => session.descriptor.id),
         ...store.listTargets().filter(target => this.options.hideTargetFromCatalog?.(target.descriptor.id) === true).map(target => target.descriptor.id)
       ]);
       const visibleSessionIds = new Set(base.sessions.map((session) => session.descriptor.id));
@@ -302,9 +304,10 @@ export class SnapshotProjector {
       const schedules = store.listSchedules().filter(schedule => !isPartnerRoutineSchedule(schedule))
         .filter((schedule) => schedule.sessionId === undefined || visibleSessionIds.has(schedule.sessionId));
       const interactions = scanStorePages((offset, limit) => store.listInteractions({ limit, offset }))
-        .filter((interaction) => visibleSessionIds.has(interaction.sessionId));
+        .filter((interaction) => visibleSessionIds.has(interaction.sessionId)
+          || interaction.payload.kind === "permission" && interaction.payload.toolName === "plugin_managed_task");
       const artifacts = scanStorePages((offset, limit) => store.listArtifacts({ limit, offset }))
-        .filter(artifact => artifact.sessionId === undefined || this.options.hideSessionFromCatalog?.(artifact.sessionId) !== true);
+        .filter(artifact => artifact.sessionId === undefined || visibleSessionIds.has(artifact.sessionId));
       const toolLeases = store.listToolLeases()
         .filter((lease) => visibleSessionIds.has(lease.sessionId));
       const operations = scanStorePages((offset, limit) => store.listOperations({ limit, offset })).filter(operation => !operationMatches(operation, hiddenReferences));
@@ -686,7 +689,12 @@ export class SnapshotProjector {
       runById
     ));
     const mappedInteractions = input.interactions.map((interaction) => {
-      const session = sessionById.get(interaction.sessionId);
+      // A host permission request remains actionable for a hidden task without
+      // inserting that task into the ordinary catalog. Its scoped task view is
+      // loaded only when the owner opens the permission banner.
+      const session = sessionById.get(interaction.sessionId)
+        ?? (interaction.payload.kind === "permission" && interaction.payload.toolName === "plugin_managed_task"
+          ? this.store.getSession(interaction.sessionId) : undefined);
       if (session === undefined) {
         throw projectionReferenceError("interaction.session_id", interaction.id, interaction.sessionId);
       }

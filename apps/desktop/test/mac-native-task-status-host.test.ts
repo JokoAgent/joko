@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { remoteEntryToken } from "@joko/contracts";
 
 import type { DesktopNativeTaskStatusAction } from "../src/channels.js";
 import {
@@ -97,6 +98,34 @@ class FakeClock {
 }
 
 describe("macOS native task-status host", () => {
+  it("keeps first remote attention passive, alerts on a real transition and clears only an unchanged committed entry", () => {
+    const sounds = vi.fn(), actions: DesktopNativeTaskStatusAction[] = [];
+    const host = createMacNativeTaskStatusHost({ supported: true,
+      getDisplays: () => [{ id: 1, name: "Primary", primary: true, bounds: { x: 0, y: 0, width: 1600, height: 900 } }],
+      createWindow: bounds => new FakeWindow(bounds), onAction: action => actions.push(action), onNewTask: () => undefined,
+      onOpenSettings: () => undefined, onToggleSounds: () => undefined, playSound: sounds });
+    host.setSettings({ enabled: true, display: { mode: "all" }, layout: "normal", sounds: SOUND_SETTINGS });
+    const remote = { sourceId: "node/epoch", runId: "run", silent: false, completionNotification: "none" as const };
+    const entry = { sessionId: "remote", title: "Task", detail: "", phase: "interaction" as const, activityLines: [], updatedAt: 1, remote };
+    const publish = (revision: number, sessions: readonly Record<string, unknown>[]) => host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "renderer", revision: String(revision), locale: "en", sessions }));
+    publish(1, [entry]); expect(host.surface()?.mode).toBe("compact"); expect(sounds).not.toHaveBeenCalled();
+    publish(2, [{ ...entry, phase: "running" }]); publish(3, [{ ...entry, phase: "error" }, { ...entry, sessionId: "other", phase: "error" }]);
+    expect(host.surface()?.mode).toBe("expanded"); expect(sounds).toHaveBeenCalledOnce();
+    const error = { ...entry, phase: "error" as const }; const token = remoteEntryToken(error);
+    host.focusSession(error.sessionId, token); expect(actions).toEqual([{ kind: "focus", sessionId: "remote", entryToken: token }]);
+    host.acknowledgeFocus("remote", "old"); expect(host.surface()?.sessions).toHaveLength(2);
+    host.acknowledgeFocus("remote", token); expect(host.surface()?.sessions.map(session => session.sessionId)).toEqual(["other"]);
+    publish(4, [{ ...error, updatedAt: 2 }, { ...entry, sessionId: "other", phase: "error" }]);
+    expect(host.surface()?.sessions.map(session => session.sessionId)).toEqual(["other"]); expect(sounds).toHaveBeenCalledOnce();
+    const { remote: _remote, ...local } = error;
+    // The same task can become the primary connection while its route commits.
+    // Preserve both prior reads and the token of a click still being committed.
+    const { remote: _otherRemote, ...localOther } = { ...entry, sessionId: "other", phase: "error" };
+    publish(5, [{ ...local, updatedAt: 2 }, localOther]);
+    expect(host.surface()?.sessions.map(session => session.sessionId)).toEqual(["other"]);
+    host.acknowledgeFocus("other", remoteEntryToken({ ...error, sessionId: "other" }));
+    expect(host.surface()?.sessions).toHaveLength(0); host.dispose();
+  });
   it("defines the ambient window as pointer-interactive but nonactivating", () => {
     expect(NATIVE_TASK_STATUS_WINDOW_INTERACTION).toMatchObject({
       resizable: true,

@@ -12,6 +12,7 @@ export interface DesktopRemoteDesktopSnapshot {
   readonly enabled: boolean;
   readonly active: boolean;
   readonly controlling: boolean;
+  readonly overlayVisible?: boolean;
   readonly controllerDeviceId?: string;
   readonly displayId?: string;
   readonly permissions: DesktopRemoteDesktopPermissions;
@@ -19,6 +20,7 @@ export interface DesktopRemoteDesktopSnapshot {
 }
 
 export interface DesktopRemoteDesktopApi {
+  setAppearance?(dark: boolean): Promise<void>;
   getState(refreshWindowsSupport?: boolean): Promise<DesktopRemoteDesktopSnapshot>;
   setEnabled(enabled: boolean): Promise<DesktopRemoteDesktopSnapshot>;
   configureWindowsSupport(enabled: boolean): Promise<DesktopRemoteDesktopSnapshot>;

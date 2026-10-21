@@ -1,0 +1,209 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { create } from "@bufbuild/protobuf";
+import { ServerInfoSchema } from "@joko/contracts";
+import { OperationalStore } from "@joko/store";
+import { DEFAULT_COLLABORATION_SETTINGS } from "@joko/runtime-governance";
+import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
+import { afterEach, expect, it, vi } from "vitest";
+import { ArtifactStore } from "./artifact-store.js";
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { SessionHost } from "./session-host.js";
+import { SnapshotProjector } from "./snapshot-projector.js";
+import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
+import { ExtensionTasks, type ExtensionTaskOwner } from "./extension-tasks.js";
+import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
+
+const cleanups: (() => Promise<void>)[] = [];
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
+async function fixture(options: { readonly edits?: boolean; readonly review?: ConstructorParameters<typeof ExtensionTasks>[0]["reviewNativeTool"] } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "joko-plugin-tasks-")), store = new OperationalStore(join(root, "store.db"));
+  const artifacts = new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] });
+  await artifacts.initialize();
+  const permissionModes = options.edits ? [...PI_LIKE_PROFILE.permissionModes, "acceptEdits" as const] : PI_LIKE_PROFILE.permissionModes;
+  const adapter = new FakeBackendAdapter({ ...PI_LIKE_PROFILE, permissionModes, capabilities: PI_LIKE_PROFILE.capabilities.map(capability => capability.key === "permission.modes"
+    ? { ...capability, options: [...permissionModes] } : capability).concat({ key: "permission.change", supported: true }) });
+  const host = new SessionHost(store, artifacts, [adapter]); await host.initialize();
+  await host.registerTarget({ id: "workspace", backendId: adapter.id, displayName: "Approved directory", workspaceRoot: root, trusted: true, managed: true });
+  let enabled = true, installed = true, installation = "installation-one", hiddenAllowed = true;
+  const extensionId = "extension_0123456789abcdef0123456789abcdef";
+  const descriptor = () => ({ id: extensionId, installed, enabled, name: "Task workflow", owner: { kind: "resource", resourceId: "resource" },
+    permissions: [], runtime: { tasks: hiddenAllowed ? { hidden: true } : {}, text: { oneshot: true } }, setup: { state: "not_required" } } as unknown as ExtensionCatalogDescriptor);
+  const model = PI_LIKE_PROFILE.models[0]!, route = { backendId: adapter.id, providerId: model.providerId, modelId: model.modelId, fastMode: false };
+  const teams = new CollaborationGoalManager({ store, sessionHost: host, readSettings: () => DEFAULT_COLLABORATION_SETTINGS,
+    assertWorkerAdmission: lead => tasks.assertTeamWorkerCurrent(lead) });
+  const tasks = new ExtensionTasks({ store, host, catalog: { get: () => descriptor() }, defaults: { current: () => ({ ...route, effort: "" }) }, rootDirectory: join(root, "tasks"), redact: value => value, teams, reviewNativeTool: options.review });
+  await teams.initialize();
+  installation = tasks.installation(extensionId, "resource");
+  host.setExtensionTaskQueueGuard(item => tasks.assertQueueCurrent(item));
+  const owner: ExtensionTaskOwner = { extensionId, resourceId: "resource", installation, signal: new AbortController().signal,
+    assertCurrent: () => { if (!enabled || !installed || installation !== owner.installation) throw new Error("Retired source"); } };
+  cleanups.push(async () => { await teams.close(); await host.dispose(); store.close(); await rm(root, { recursive: true, force: true }); });
+  const request = (value: Record<string, unknown>) => tasks.request(owner, { type: "tasks-request", ...value });
+  return { root, store, host, teams, tasks, owner, extensionId, route, request, disable: () => { enabled = false; }, uninstall: () => { installed = false; }, reinstall: () => { installed = true; enabled = true; installation = tasks.installation(extensionId, "resource"); }, removeHidden: () => { hiddenAllowed = false; } };
+}
+it("adopts hidden ordinary Sessions atomically, dispatches one durable Run, and replays original input keys", async () => {
+  const f = await fixture();
+  const observed: boolean[] = [];
+  f.store.subscribe(event => { if (event.payload.type === "session_changed" && event.sessionId) observed.push(f.store.getSession(event.sessionId).descriptor.hidden === true); });
+  const input = { kind: "create", requestKey: "create-one", title: "Grade a document", hidden: true };
+  const task = await f.request(input) as { taskId: string; revision: string; hidden: boolean };
+  expect(task.hidden).toBe(true); expect(observed.every(Boolean)).toBe(true);
+  expect(f.store.listSessions({ excludeHidden: true })).toHaveLength(0);
+  const projector = new SnapshotProjector(f.store, { server: create(ServerInfoSchema, { serverId: "node" }) });
+  expect(projector.projectOwnerSnapshot().sessions).toHaveLength(0);
+  expect(projector.projectSessionSnapshot({ sessionId: task.taskId }).sessions[0]?.hidden).toBe(true);
+  expect(await f.request({ ...input })).toMatchObject({ taskId: task.taskId });
+  await expect(f.request({ ...input, hidden: false })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+  const send = { kind: "send", taskId: task.taskId, expectedRevision: task.revision, requestKey: "send-one", text: "Return a short assessment." };
+  const run = await f.request(send) as { runId: string };
+  await vi.waitFor(() => expect(f.store.getRun(run.runId).descriptor.state).toBe("completed"));
+  expect(await f.request(send)).toMatchObject({ runId: run.runId });
+  expect(f.store.listRuns({ sessionId: task.taskId })).toHaveLength(1);
+  expect(f.store.listQueueItems({ sessionId: task.taskId })).toHaveLength(1);
+  expect(await f.request({ kind: "listRuns", taskId: task.taskId })).toMatchObject({ items: [{ runId: run.runId }], nextCursor: null });
+  expect(f.store.searchSessionMessages({ query: "assessment", scope: { owner: true } }).matches).toHaveLength(0);
+  expect(f.tasks.backgroundTasks(f.extensionId)).toHaveLength(1);
+  const messages = await f.request({ kind: "readMessages", taskId: task.taskId }) as { items: unknown[] };
+  expect(messages.items.length).toBeGreaterThan(0);
+  f.tasks.reveal(f.extensionId, task.taskId, () => {});
+  expect(f.store.searchSessionMessages({ query: "assessment", scope: { owner: true } }).matches.length).toBeGreaterThan(0);
+});
+it("approves explicit Auto through the original host interaction and refuses a changed configuration", async () => {
+  const f = await fixture(), task = await f.request({ kind: "create", requestKey: "write", title: "Approved actions", hidden: true }) as { taskId: string };
+  await expect(f.request({ kind: "requestWriteAccess", taskId: task.taskId })).rejects.toMatchObject({ code: "UNSUPPORTED_PERMISSION_MODE" });
+  const result = f.request({ kind: "requestWriteAccess", taskId: task.taskId, mode: "auto" });
+  await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: task.taskId, status: "open" })).toHaveLength(1));
+  const interaction = f.store.listInteractions({ sessionId: task.taskId, status: "open" })[0]!;
+  const owner = new SnapshotProjector(f.store, { server: create(ServerInfoSchema, { serverId: "node" }) }).projectOwnerSnapshot();
+  expect(owner.sessions).toHaveLength(0); expect(owner.interactions.some(value => value.interactionId === interaction.id)).toBe(true);
+  f.host.resolveInteraction(interaction.id, interaction.generation, { kind: "permission", decision: "allow_once" }, "approve-plugin-write");
+  await expect(result).resolves.toMatchObject({ granted: true });
+  expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("auto");
+  expect(f.tasks.preferences(f.extensionId).config.permissionMode).toBe("auto");
+
+  const other = await f.request({ kind: "create", requestKey: "changed", title: "Changed" }) as { taskId: string };
+  f.store.updateSession(other.taskId, { permissionMode: "ask" });
+  const changed = f.request({ kind: "requestWriteAccess", taskId: other.taskId, mode: "auto" });
+  await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: other.taskId, status: "open" })).toHaveLength(1));
+  const pending = f.store.listInteractions({ sessionId: other.taskId, status: "open" })[0]!;
+  f.store.updateSession(other.taskId, { planMode: true });
+  f.host.resolveInteraction(pending.id, pending.generation, { kind: "permission", decision: "allow_once" }, "approve-stale-plugin-write");
+  await expect(changed).resolves.toMatchObject({ granted: false });
+  expect(f.store.getSession(other.taskId).descriptor.permissionMode).toBe("ask");
+  f.store.updateSession(other.taskId, { planMode: false });
+  await expect(f.request({ kind: "requestWriteAccess", taskId: other.taskId, mode: "auto" })).resolves.toMatchObject({ granted: false });
+  expect(f.store.listInteractions({ sessionId: other.taskId, status: "open" })).toHaveLength(0);
+});
+it("supports an unplanned team within its approved task root and refuses an unrelated trusted target", async () => {
+  const f = await fixture(); f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, permissionMode: "auto" }, () => {});
+  const task = await f.request({ kind: "create", requestKey: "unplanned", title: "Team without registered plan" }) as { taskId: string };
+  const team = await f.request({ kind: "startTeam", taskId: task.taskId }) as ReturnType<CollaborationGoalManager["getTree"]>;
+  const input = { operationId: "outside-worker", goalId: team.goal.id, callerLeadSessionId: task.taskId, expectedGoalRevision: team.goal.revision,
+    label: "Reader", role: "Read", assignment: "Read the task directory.", route: { ...f.route, targetId: "workspace", permissionMode: "auto" as const, planMode: false } };
+  await expect(f.teams.createWorker(input)).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+  const target = f.store.getSession(task.taskId).descriptor.targetId;
+  const result = await f.teams.createWorker({ ...input, operationId: "inside-worker", route: { ...input.route, targetId: target } });
+  expect(result.worker.sessionId).toBeDefined();
+  await vi.waitFor(() => expect(f.store.listRuns({ sessionId: result.worker.sessionId! })[0]?.descriptor.state).toBe("completed"));
+});
+it("requests file edits by default only for an unstarted supported task, and lets the host explicitly retry one refusal", async () => {
+  const f = await fixture({ edits: true }), task = await f.request({ kind: "create", requestKey: "edit-task", title: "Write a draft" }) as { taskId: string };
+  const pending = f.request({ kind: "requestWriteAccess", taskId: task.taskId });
+  await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: task.taskId, status: "open" })).toHaveLength(1));
+  const interaction = f.store.listInteractions({ sessionId: task.taskId, status: "open" })[0]!;
+  expect(interaction.payload.kind === "permission" && interaction.payload.title).toContain("file edits");
+  f.host.resolveInteraction(interaction.id, interaction.generation, { kind: "permission", decision: "deny_once" }, "deny-edits");
+  await expect(pending).resolves.toMatchObject({ granted: false });
+  await expect(f.request({ kind: "requestWriteAccess", taskId: task.taskId, mode: "auto" })).resolves.toMatchObject({ granted: false });
+  expect(f.tasks.preferences(f.extensionId).writeRequests).toEqual([{ taskId: task.taskId, title: "Write a draft", mode: "acceptEdits" }]);
+  const retry = f.tasks.retryWriteAccess(f.extensionId, task.taskId, new AbortController().signal, () => {});
+  await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: task.taskId, status: "open" })).toHaveLength(1));
+  const retried = f.store.listInteractions({ sessionId: task.taskId, status: "open" })[0]!;
+  f.host.resolveInteraction(retried.id, retried.generation, { kind: "permission", decision: "allow_once" }, "retry-edits");
+  await expect(retry).resolves.toMatchObject({ granted: true });
+  expect(f.store.getSession(task.taskId).descriptor.permissionMode).toBe("acceptEdits");
+  expect(f.tasks.preferences(f.extensionId).config.permissionMode).toBe("acceptEdits");
+  expect(f.tasks.preferences(f.extensionId).writeRequests).toEqual([]);
+  const second = await f.request({ kind: "create", requestKey: "started-edit-task", title: "Started draft" }) as { taskId: string; revision: string };
+  const input = await f.request({ kind: "send", taskId: second.taskId, expectedRevision: second.revision, requestKey: "started-edit-input", text: "Read first" }) as { runId: string };
+  await vi.waitFor(() => expect(f.store.getRun(input.runId).descriptor.state).toBe("completed"));
+  f.store.updateSession(second.taskId, { permissionMode: "ask" });
+  await expect(f.request({ kind: "requestWriteAccess", taskId: second.taskId })).rejects.toMatchObject({ code: "TASK_BUSY" });
+});
+it("does not consume a task's automatic permission attempt while another host request is pending", async () => {
+  const f = await fixture(), first = await f.request({ kind: "create", requestKey: "gate-first", title: "First" }) as { taskId: string }, second = await f.request({ kind: "create", requestKey: "gate-second", title: "Second" }) as { taskId: string };
+  const request = f.request({ kind: "requestWriteAccess", taskId: first.taskId, mode: "auto" });
+  await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: first.taskId, status: "open" })).toHaveLength(1));
+  await expect(f.request({ kind: "requestWriteAccess", taskId: second.taskId, mode: "auto" })).rejects.toMatchObject({ code: "TASK_BUSY" });
+  const firstPrompt = f.store.listInteractions({ sessionId: first.taskId, status: "open" })[0]!;
+  f.host.resolveInteraction(firstPrompt.id, firstPrompt.generation, { kind: "permission", decision: "deny_once" }, "deny-first"); await request;
+  const next = f.request({ kind: "requestWriteAccess", taskId: second.taskId, mode: "auto" });
+  await vi.waitFor(() => expect(f.store.listInteractions({ sessionId: second.taskId, status: "open" })).toHaveLength(1));
+  const secondPrompt = f.store.listInteractions({ sessionId: second.taskId, status: "open" })[0]!;
+  f.host.resolveInteraction(secondPrompt.id, secondPrompt.generation, { kind: "permission", decision: "deny_once" }, "deny-second"); await next;
+});
+it("reviews safe native reads against the registered task and revalidates approval during a pending review", async () => {
+  let release!: () => void, scope: unknown;
+  const reviewer = vi.fn(async (value: unknown) => { scope = value; await new Promise<void>(resolve => { release = resolve; }); return { verdict: "allow" as const }; });
+  const f = await fixture({ review: reviewer }); f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, targetId: "workspace", permissionMode: "auto" }, () => {});
+  const task = await f.request({ kind: "create", requestKey: "native-read", title: "Review project" }) as { taskId: string };
+  await f.request({ kind: "setTeamPlan", taskId: task.taskId, plan: { concurrency: 1, task: "Review only README", items: [{ label: "Reader", workingDir: f.root, route: f.route, task: "Read README" }] } });
+  const authority = f.tasks.nativeToolAuthorization(task.taskId)!, revision = authority.capture();
+  const result = authority.review({ toolName: "Read", input: { file_path: join(f.root, "README.md") }, signal: new AbortController().signal });
+  await vi.waitFor(() => expect(reviewer).toHaveBeenCalledOnce());
+  expect(scope).toMatchObject({ role: "coordinator", task: "Review only README", userInstructions: [], route: f.route });
+  f.tasks.updatePreferences(f.extensionId, f.tasks.preferences(f.extensionId).revision, { model: f.route, targetId: "workspace", permissionMode: "ask" }, () => {});
+  release(); await expect(result).resolves.toMatchObject({ verdict: "block" });
+  expect(() => authority.assertCurrent(revision)).toThrow();
+});
+it("creates real hidden team workers only in the approved immutable plan and reveals them on uninstall", async () => {
+  const f = await fixture();
+  f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, targetId: "workspace", permissionMode: "auto" }, () => {});
+  const task = await f.request({ kind: "create", requestKey: "team", title: "Task team", hidden: true }) as { taskId: string };
+  const plan = { concurrency: 1, task: "Review the approved project", items: [{ label: "Reviewer", workingDir: f.root, route: f.route, task: "Review the project." }] };
+  await f.request({ kind: "setTeamPlan", taskId: task.taskId, plan });
+  await expect(f.request({ kind: "setTeamPlan", taskId: task.taskId, plan: { ...plan, concurrency: 2 } })).rejects.toMatchObject({ code: "IDEMPOTENCY_CONFLICT" });
+  const team = await f.request({ kind: "startTeam", taskId: task.taskId }) as ReturnType<CollaborationGoalManager["getTree"]>;
+  const target = f.store.listTargets().find(value => value.descriptor.id.startsWith("extension-team-target-"))!;
+  const input = { operationId: "create-plugin-worker", goalId: team.goal.id, callerLeadSessionId: task.taskId, expectedGoalRevision: team.goal.revision,
+    label: "Reviewer", role: "Review", assignment: "Review the project.", route: { ...f.route, targetId: target.descriptor.id, permissionMode: "auto" as const, planMode: false } };
+  await expect(f.teams.createWorker({ ...input, operationId: "invalid-label", label: "Other" })).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+  const { worker } = await f.teams.createWorker(input);
+  expect(f.store.getSession(worker.sessionId!).descriptor.hidden).toBe(true);
+  await vi.waitFor(() => expect(f.store.listRuns({ sessionId: worker.sessionId! })[0]?.descriptor.state).toBe("completed"));
+  expect(f.store.listSessions({ excludeHidden: true })).toHaveLength(0);
+  expect(f.store.listQueueItems({ sessionId: worker.sessionId! })).toHaveLength(1);
+  const current = f.store.getCollaborationWorker(worker.id);
+  expect(() => f.teams.updateWorker({ operationId: "rename-plugin-worker", workerId: worker.id, callerLeadSessionId: task.taskId, expectedRevision: current.revision, label: "Outside plan" })).toThrow();
+  f.store.upsertTarget({ ...target.descriptor, trusted: false });
+  await expect(f.teams.sendMessage({ operationId: "revoked-directory", goalId: team.goal.id, workerId: worker.id, callerLeadSessionId: task.taskId,
+    expectedWorkerRevision: f.store.getCollaborationWorker(worker.id).revision, expectedSessionGeneration: worker.sessionGeneration!, message: "Continue" })).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+  f.store.transaction(store => f.tasks.uninstall(store, "resource")); f.uninstall();
+  expect(f.store.listSessions({ excludeHidden: true })).toHaveLength(2);
+  expect(() => f.tasks.assertTeamWorkerCurrent(task.taskId)).toThrow();
+});
+it("preserves user takeover after a declaration is removed and reveals before uninstall revokes ownership", async () => {
+  const f = await fixture();
+  const task = await f.request({ kind: "create", requestKey: "one", title: "Background work", hidden: true }) as { taskId: string };
+  f.removeHidden();
+  await expect(f.request({ kind: "setHidden", taskId: task.taskId, hidden: false })).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+  expect(f.tasks.backgroundTasks(f.extensionId)).toHaveLength(1);
+  f.disable(); f.tasks.reveal(f.extensionId, task.taskId, () => {});
+  expect(f.store.getSession(task.taskId).descriptor.hidden).toBeUndefined();
+  f.store.updateSession(task.taskId, { hidden: true });
+  f.store.transaction(store => f.tasks.uninstall(store, "resource")); f.uninstall();
+  expect(f.store.listSessions({ excludeHidden: true })).toHaveLength(1);
+  f.reinstall(); await expect(f.request({ kind: "get", taskId: task.taskId })).rejects.toThrow();
+});
+it("rejects another installation, invalid model tuning, stale settings and hidden declaration escalation", async () => {
+  const f = await fixture(), prefs = f.tasks.preferences(f.extensionId);
+  const updated = f.tasks.updatePreferences(f.extensionId, prefs.revision, { model: f.route, targetId: "workspace", permissionMode: "ask" }, () => {});
+  expect(updated.config.targetId).toBe("workspace");
+  expect(() => f.tasks.updatePreferences(f.extensionId, prefs.revision, { permissionMode: "auto" }, () => {})).toThrow();
+  expect(() => f.tasks.updatePreferences(f.extensionId, updated.revision, { model: { ...f.route, fastMode: true }, permissionMode: "ask" }, () => {})).toThrow();
+  const task = await f.request({ kind: "create", requestKey: "one", title: "Own task" }) as { taskId: string };
+  await expect(f.tasks.request({ ...f.owner, installation: "another" }, { kind: "get", taskId: task.taskId })).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+  f.removeHidden(); await expect(f.request({ kind: "create", requestKey: "two", title: "Hidden task", hidden: true })).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+});

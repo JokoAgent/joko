@@ -43,6 +43,7 @@ export interface DesktopRemoteDesktopInputRuntime {
     readonly x: number;
     readonly y: number;
   };
+  cursorScreenPoint?(): { readonly x: number; readonly y: number };
   linuxSupport?(signal: AbortSignal): Promise<boolean>;
   linuxSession?(signal: AbortSignal): Promise<DesktopRemoteDesktopSessionState>;
   linuxMonitors?(signal: AbortSignal): Promise<readonly DesktopRemoteDesktopLinuxMonitor[]>;
@@ -65,7 +66,8 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
   #linuxQueueBytes = 0;
   #linuxAck: ((error?: Error) => void) | undefined;
 
-  constructor(onFailure: () => void, runtime: DesktopRemoteDesktopInputRuntime = electronInputRuntime()) {
+  constructor(onFailure: () => void, runtime: DesktopRemoteDesktopInputRuntime = electronInputRuntime(),
+    private readonly onPointer?: (points: { x: number; y: number }[]) => (() => void) | void) {
     this.#onFailure = onFailure;
     this.#runtime = runtime;
   }
@@ -151,9 +153,10 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
       if (generation !== this.#generation || this.#child !== child) {
         throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
       }
-      if (this.#runtime.platform === "linux") {
-        if (await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal) !== "unlocked"
-          || generation !== this.#generation || this.#child !== child) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+      if (this.#runtime.platform === "linux"
+        && (await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal) !== "unlocked"
+          || generation !== this.#generation || this.#child !== child)) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+      {
         let output = "";
         child.stdout.on("data", (chunk: Buffer) => {
           if (this.#child !== child) return;
@@ -165,9 +168,7 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
             this.#linuxAck();
           }
         });
-      } else child.stdout.on("data", (chunk: Buffer) => {
-        if (this.#child === child && chunk.byteLength > 0) this.#failed();
-      });
+      }
       this.#heartbeat = setInterval(() => this.#write([]), 2_000);
       this.#heartbeat.unref?.();
     } catch (error) {
@@ -194,15 +195,18 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     if (display === undefined || this.#child === undefined) {
       throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
     }
+    const points: { x: number; y: number }[] = [];
     const projected = events.map((event) => {
       if (event.kind !== "move" && event.kind !== "button") return event;
-      const point = this.#runtime.toPhysicalPoint({
+      const dip = {
         x: Math.round(display.x + event.x * (display.width - 1)),
         y: Math.round(display.y + event.y * (display.height - 1))
-      });
+      };
+      points.push(dip);
+      const point = this.#runtime.toPhysicalPoint(dip);
       return Object.freeze({ ...event, x: point.x, y: point.y });
     });
-    this.#write(projected);
+    this.#write(projected, points, events.some(event => event.kind === "scroll"));
   }
 
   stop(): void {
@@ -216,6 +220,8 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     this.#linuxMapping = undefined;
     this.#linuxLayout = "";
     this.#linuxAck?.(new Error("REMOTE_DESKTOP_LEASE_EXPIRED"));
+    this.#linuxQueueBytes = 0;
+    this.#linuxQueue = Promise.resolve();
     if (child === undefined) return;
     this.#pendingInputReleases.add(child);
     this.#stopping = new Promise<void>((resolveStopped) => {
@@ -322,48 +328,44 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     }
   }
 
-  #write(events: readonly unknown[]): void {
+  #write(events: readonly unknown[], points: { x: number; y: number }[] = [], wheel = false): void {
     const child = this.#child;
     if (child === undefined) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
     const line = `${JSON.stringify(events)}\n`;
-    if (this.#runtime.platform === "linux") {
-      const size = Buffer.byteLength(line, "utf8");
-      if (size > MAXIMUM_QUEUE_BYTES || this.#linuxQueueBytes + size > MAXIMUM_QUEUE_BYTES) {
-        this.#failed(); throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
-      }
-      this.#linuxQueueBytes += size;
-      const generation = this.#generation;
-      this.#linuxQueue = this.#linuxQueue.then(async () => {
-        if (generation !== this.#generation || this.#child !== child) return;
+    const size = Buffer.byteLength(line, "utf8");
+    if (size > MAXIMUM_QUEUE_BYTES || this.#linuxQueueBytes + size > MAXIMUM_QUEUE_BYTES || child.stdin.destroyed) {
+      this.#failed(); throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+    }
+    this.#linuxQueueBytes += size;
+    const generation = this.#generation;
+    this.#linuxQueue = this.#linuxQueue.then(async () => {
+      if (generation !== this.#generation || this.#child !== child) return;
+      if (this.#runtime.platform === "linux") {
         const signal = new AbortController().signal;
         const monitors = await (this.#runtime.linuxMonitors ?? readDesktopRemoteDesktopLinuxMonitors)(signal);
-        // The final system receipt is the lock proof; a directory await must not outlive it.
         const state = await (this.#runtime.linuxSession ?? readDesktopRemoteDesktopLinuxSessionState)(signal);
         if (generation !== this.#generation || this.#child !== child) return;
         if (state !== "unlocked" || JSON.stringify(monitors) !== this.#linuxLayout) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+      }
+      const settled = this.onPointer && (points.length || wheel)
+        ? this.onPointer(wheel ? [this.#runtime.cursorScreenPoint?.() ?? screen.getCursorScreenPoint(), ...points] : points) : undefined;
+      try {
+        // Completion owns the actual native injection, not just stdin's buffer.
         await new Promise<void>((resolveAck, rejectAck) => {
+          let done = false;
           const timer = setTimeout(() => finish(new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE")), 10_000);
           const finish = (error?: Error): void => {
+            if (done) return; done = true;
             clearTimeout(timer); if (this.#linuxAck === finish) this.#linuxAck = undefined;
             if (error === undefined) resolveAck(); else rejectAck(error);
           };
           this.#linuxAck = finish;
-          try { child.stdin.write(line); } catch { finish(new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE")); }
+          try { child.stdin.write(line, error => { if (error) finish(new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE")); }); }
+          catch { finish(new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE")); }
         });
-      }).catch(() => { if (generation === this.#generation && this.#child === child) this.#failed(); })
-        .finally(() => { this.#linuxQueueBytes -= size; });
-      return;
-    }
-    if (Buffer.byteLength(line, "utf8") > MAXIMUM_QUEUE_BYTES
-      || child.stdin.destroyed
-      || child.stdin.writableLength + Buffer.byteLength(line, "utf8") > MAXIMUM_QUEUE_BYTES) {
-      this.#failed();
-      throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
-    }
-    if (!child.stdin.write(line)) {
-      this.#failed();
-      throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
-    }
+      } finally { settled?.(); }
+    }).catch(() => { if (generation === this.#generation && this.#child === child) this.#failed(); })
+      .finally(() => { if (generation === this.#generation) this.#linuxQueueBytes -= size; });
   }
 
   #failed(): void {

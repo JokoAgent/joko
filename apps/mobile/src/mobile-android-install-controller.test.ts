@@ -128,11 +128,11 @@ describe('Android in-app installation', () => {
     controller.start(target);
     await settle();
     expect(controller.getSnapshot().phase).toBe('ready');
-    old.resolve('file:///cache/cindy-updates/old.apk');
+    old.resolve('file:///cache/joko-updates/old.apk');
     await settle();
     expect(controller.getSnapshot().phase).toBe('ready');
     expect(io.install).toHaveBeenCalledOnce();
-    expect(io.remove).toHaveBeenCalledWith('file:///cache/cindy-updates/old.apk');
+    expect(io.remove).toHaveBeenCalledWith('file:///cache/joko-updates/old.apk');
   });
 
   it('a download failure offers retry and browser fallback without unhandled rejections', async () => {

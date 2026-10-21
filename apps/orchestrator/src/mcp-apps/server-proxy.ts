@@ -1,4 +1,3 @@
-// Adapted from the fixed model facade. See NOTICE / LICENSE.cindy.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Transport, TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";

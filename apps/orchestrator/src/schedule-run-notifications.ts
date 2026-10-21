@@ -1,6 +1,7 @@
 import type { OperationalStore, ScheduleRecord } from "@joko/store";
 
 import { scheduleExtensionSnapshot } from "./schedule-extensions.js";
+import { persistSessionTaskActivity } from "./session-task-activity.js";
 
 export type ScheduleRunTerminalState = "completed" | "aborted" | "failed";
 
@@ -45,18 +46,20 @@ export class ScheduleRunNotificationController {
   } {
     const override = this.#overrides.get(runId);
     this.#overrides.delete(runId);
-    if (state !== "completed") return { suppressAttention: false, markHistoryRead: false };
-    if (override === "notify") return { suppressAttention: true, markHistoryRead: false };
-    if (override === "silent") return { suppressAttention: true, markHistoryRead: true };
+    const finish = (suppressAttention: boolean, markHistoryRead: boolean) => {
+      const run = this.#store.findRun(runId);
+      if (run) persistSessionTaskActivity(this.#store, run.descriptor.sessionId, { runId, silent: state === "completed" && markHistoryRead });
+      return { suppressAttention, markHistoryRead };
+    };
+    if (state !== "completed") return finish(false, false);
+    if (override === "notify") return finish(true, false);
+    if (override === "silent") return finish(true, true);
     const schedule = this.#findScheduleForRun(runId);
-    if (schedule === undefined) return { suppressAttention: false, markHistoryRead: false };
+    if (schedule === undefined) return finish(false, false);
     try {
-      return {
-        suppressAttention: true,
-        markHistoryRead: scheduleExtensionSnapshot(schedule.executionSnapshot).silentWhenIdle
-      };
+      return finish(true, scheduleExtensionSnapshot(schedule.executionSnapshot).silentWhenIdle);
     } catch {
-      return { suppressAttention: false, markHistoryRead: false };
+      return finish(false, false);
     }
   }
 

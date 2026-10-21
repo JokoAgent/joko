@@ -165,6 +165,12 @@ export class PartnerRoutineManager {
     for (const routine of this.engine.list(partnerId)) await this.#cleanBacking(routine.id, false);
   }
   async resumePartner(partnerId: string): Promise<void> { this.#owner(partnerId, false); await this.engine.setPartnerPaused(partnerId, false); }
+  async prepareHomeChange(partnerId: string, requestId: string, assertCurrent: () => void): Promise<void> {
+    const key = `partner-home-routines.${requestId}`;
+    if (this.options.store.findSetting("service", partnerId, key)) return;
+    assertCurrent(); await this.engine.prepareHomeChange(partnerId, assertCurrent); assertCurrent();
+    this.options.store.setSetting("service", partnerId, key, { version: 1 });
+  }
   async deletePartner(partnerId: string): Promise<void> {
     await this.suspendPartner(partnerId);
     for (const routine of this.engine.list(partnerId)) await this.#cleanBacking(routine.id, true);
@@ -194,6 +200,7 @@ export class PartnerRoutineManager {
     if (remove) this.options.store.deleteSchedule(id, this.options.store.getSchedule(id).revision);
   }
   async #execute(routine: Routine, run: RoutineRun, signal: AbortSignal, canDispatch: () => boolean) {
+    if (this.options.partners.isHomeChanging(routine.partnerId)) return { deferred: true };
     if (this.options.partners.getPartner(routine.partnerId).lifecycle === "paused") return { deferred: true };
     const { partner, session } = this.#owner(routine.partnerId, true);
     const id = `partner-routine-${routine.id}`;
@@ -236,6 +243,7 @@ export class PartnerRoutineManager {
     let checkSummary = "";
     if (routine.preRunHook) {
       const target = this.options.store.getTarget(session.targetId).descriptor;
+      if (target.remoteWorkspace !== undefined) throw new PartnerRoutineError("unavailable", "Configure this check on its execution computer before enabling it.");
       if (!target.trusted) throw new PartnerRoutineError("unavailable", "Routine checks require a trusted workspace.");
       const checked = await executeSchedulePreRunHook({ ...routine.preRunHook, cwd: target.workspaceRoot, signal,
         stdinPayload: { event: "schedule-pre-run", scheduleId: `partner-routine-${routine.id}`, scheduleName: routine.name,

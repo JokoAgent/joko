@@ -3,6 +3,16 @@ import { LocalState } from "./local-state.js";
 import type { ComposerDraft } from "./model.js";
 
 describe("durable composer draft surfaces", () => {
+  it("persists creator intent only with its exact leading invocation and keeps owners independent", async () => {
+    const database = draftDatabase(), state = local(database.value);
+    const creator: ComposerDraft = { ...draft("/joko-plugin-creator Build a timer"), builtinSkillIntent: "plugin_creator" };
+    await state.saveDraft("server", "profile", "session", creator);
+    expect(await local(database.value).readDraft("server", "profile", "session")).toMatchObject(creator);
+    expect(await state.readDraft("server", "other", "session")).toBeUndefined();
+    await state.saveDraft("server", "profile", "session", { ...creator, text: "Ordinary draft" });
+    expect((await state.readDraft("server", "profile", "session"))?.builtinSkillIntent).toBeUndefined();
+  });
+
   it("keeps application and repeated task-window slots independent across save, CAS, clear and reopen", async () => {
     const database = draftDatabase(), application = local(database.value), first = local(database.value), second = local(database.value);
     await application.saveDraft("server", "profile", "session", draft("Main"));

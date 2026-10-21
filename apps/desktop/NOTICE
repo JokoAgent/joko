@@ -1,7 +1,0 @@
-Small Remote Desktop media-channel requests and bounded native input recovery
-are adapted from Cindy v0.1.112 (8bd60e8549cdcf0ada21e6f73d68dc0d0b71909d),
-copyright 2026 Cindy contributors, under the Apache License, Version 2.0.
-Sources: main/remote-desktop/controller.ts, main/remote-desktop/index.ts,
-features/remote-desktop/captureHost.ts and packages/device-link/src/remoteDesktop.ts.
-Joko uses its existing device-peer executor authority, lease and media-attempt
-fences, generated capability negotiation and isolated capture IPC. See LICENSE.cindy.

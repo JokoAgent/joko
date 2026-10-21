@@ -46,10 +46,10 @@ import type { OrchestratorApplication } from "./application.js";
 const cleanups: Array<() => Promise<void> | void> = [];
 const PROFILE = {
   ...PI_LIKE_PROFILE,
-  permissionModes: ["ask", "auto", "bypassPermissions"],
+  permissionModes: ["ask", "acceptEdits", "auto", "bypassPermissions"],
   capabilities: [
     ...PI_LIKE_PROFILE.capabilities.map((capability) => capability.key === "permission.modes"
-      ? { key: "permission.modes", supported: true, options: ["ask", "auto", "bypassPermissions"] }
+      ? { key: "permission.modes", supported: true, options: ["ask", "acceptEdits", "auto", "bypassPermissions"] }
       : capability),
     { key: "permission.change", supported: true }
   ]
@@ -60,7 +60,7 @@ afterEach(async () => {
 });
 
 describe("PartnerService", () => {
-  it("round-trips the three exact permission modes through defaults, create and profile updates", async () => {
+  it("round-trips the exact permission modes through defaults, create and profile updates", async () => {
     const f = await createFixture(), service = createPartnerConnectService(f.manager, () => undefined);
     const defaults = await service.updatePartnerDefaults(create(contract.UpdatePartnerDefaultsRequestSchema, {
       expectedDirectoryRevision: revision(f.partnerStore.directoryState().revision),
@@ -74,7 +74,7 @@ describe("PartnerService", () => {
     }), context());
     let row = created.partner!;
     expect(row.capabilities?.permissionMode).toBe(contract.PermissionMode.BYPASS_PERMISSIONS);
-    for (const permissionMode of [contract.PermissionMode.ASK, contract.PermissionMode.AUTO, contract.PermissionMode.BYPASS_PERMISSIONS]) {
+    for (const permissionMode of [contract.PermissionMode.ASK, contract.PermissionMode.ACCEPT_EDITS, contract.PermissionMode.AUTO, contract.PermissionMode.BYPASS_PERMISSIONS]) {
       const result = await service.updatePartner(create(contract.UpdatePartnerRequestSchema, { partnerId: row.partnerId, expectedRevision: row.revision,
         patch: { usesDirectoryDefaults: false, permissionMode } }), context());
       row = result.partner!; expect(row.capabilities?.permissionMode).toBe(permissionMode);

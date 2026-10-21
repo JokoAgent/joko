@@ -114,18 +114,21 @@ export function PermissionSelector({
 }
 
 export function permissionLabel(mode: PermissionMode, t: Translator): string {
+  if (mode === "acceptEdits") return t("permission.edits");
   if (mode === "auto") return t("permission.auto");
   if (mode === "bypassPermissions") return t("permission.full");
   return t("permission.ask");
 }
 
 function permissionHelp(mode: PermissionMode, t: Translator): string {
+  if (mode === "acceptEdits") return t("permission.editsHelp");
   if (mode === "auto") return t("permission.autoHelp");
   if (mode === "bypassPermissions") return t("permission.fullHelp");
   return t("permission.askHelp");
 }
 
 function permissionIcon(mode: PermissionMode): LucideIcon {
+  if (mode === "acceptEdits") return ShieldCheck;
   if (mode === "auto") return ShieldCheck;
   if (mode === "bypassPermissions") return ShieldAlert;
   return Hand;

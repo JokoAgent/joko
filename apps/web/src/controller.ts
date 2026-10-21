@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { NativeTaskStatusLiveSource } from "./native-task-status-sources.js";
+import { nativeTaskStatusAvatar } from "./native-task-status-avatar.js";
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import type { SessionAccess, TaskSource } from "./task-sharing.js";
 import type { TaskSharingApi } from "@joko/contracts";
@@ -167,6 +169,7 @@ export interface ControllerState {
   readonly profiles: readonly ConnectionProfile[];
   readonly machineCaches: readonly MachineCacheView[];
   readonly machinePresenceByProfile: Readonly<Record<string, MachinePresenceView>>;
+  readonly nativeTaskStatusLiveSources?: readonly NativeTaskStatusLiveSource[];
   readonly partnerSources?: readonly PartnerSourceView[];
   readonly activeProfile?: ConnectionProfile;
   readonly discoveredNodes: readonly DiscoveredOrchestratorView[];
@@ -399,8 +402,11 @@ export function useAppController(): AppController {
     readonly profileKey: string;
     gateway?: OrchestratorGateway;
     connected: boolean;
+    snapshot?: AppSnapshot;
+    partners?: NativeTaskStatusLiveSource["partners"];
     failures: number;
     retryTimer?: number;
+    activityTimer?: number;
   }>());
 
   const enqueuePreferenceOperation = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
@@ -784,6 +790,7 @@ export function useAppController(): AppController {
       gatewayRef.current?.disconnect();
       for (const binding of remoteMachineGatewaysRef.current.values()) {
         if (binding.retryTimer !== undefined) window.clearTimeout(binding.retryTimer);
+        if (binding.activityTimer !== undefined) window.clearTimeout(binding.activityTimer);
         binding.gateway?.disconnect();
       }
       remoteMachineGatewaysRef.current.clear();
@@ -1823,6 +1830,15 @@ export function useAppController(): AppController {
     if (!snapshotRef.current.sessions.some((session) => session.id === sessionId)) {
       throw new Error("The task disappeared while the selected machine was connecting.");
     }
+    if (messageTarget?.partnerId !== undefined) {
+      const owner = gatewayRef.current;
+      if (!owner) throw new Error("The original Partner connection is unavailable.");
+      const partner = await owner.getPartner(messageTarget.partnerId);
+      if (!isCurrentOwner() || gatewayRef.current !== owner || activeProfileRef.current?.id !== profile.id) return;
+      if (partner.canonicalSessionId !== sessionId || !["active", "paused"].includes(partner.lifecycle)) {
+        throw new Error("The Partner canonical task changed while connecting. Refresh before opening it.");
+      }
+    }
     navigate({
       kind: "session",
       profileId,
@@ -1893,15 +1909,18 @@ export function useAppController(): AppController {
   useEffect(() => {
     if (!state.ready || localRef.current === undefined) return;
     const selected = new Set(selectedMachineProfileIds(state.preferences.machineSelection, state.profiles));
+    const nativeActivity = window.jokoDesktop?.capabilities.includes("native.taskStatus") === true;
     const desired = new Map(state.profiles
-      .filter((profile) => profile.id !== state.activeProfile?.id && selected.has(profile.id))
+      .filter((profile) => profile.id !== state.activeProfile?.id && (selected.has(profile.id) || nativeActivity))
       .map((profile) => [profile.id, profile] as const));
     for (const [profileId, binding] of remoteMachineGatewaysRef.current) {
       const profile = desired.get(profileId);
       if (profile !== undefined && binding.profileKey === remoteMachineProfileKey(profile)) continue;
       if (binding.retryTimer !== undefined) window.clearTimeout(binding.retryTimer);
+      if (binding.activityTimer !== undefined) window.clearTimeout(binding.activityTimer);
       binding.gateway?.disconnect();
       remoteMachineGatewaysRef.current.delete(profileId);
+      setState(value => ({ ...value, nativeTaskStatusLiveSources: value.nativeTaskStatusLiveSources?.filter(source => source.profile.id !== profileId) }));
     }
     for (const profile of desired.values()) {
       if (remoteMachineGatewaysRef.current.has(profile.id)) continue;
@@ -1911,8 +1930,12 @@ export function useAppController(): AppController {
         profileKey: remoteMachineProfileKey(profile),
         gateway: undefined as OrchestratorGateway | undefined,
         connected: false,
+        snapshot: undefined as AppSnapshot | undefined,
+        partners: [] as NativeTaskStatusLiveSource["partners"],
+        artworkByPartnerId: {} as Record<string, string>,
         failures: 0,
-        retryTimer: undefined as number | undefined
+        retryTimer: undefined as number | undefined,
+        activityTimer: undefined as number | undefined
       };
       remoteMachineGatewaysRef.current.set(profile.id, binding);
       const current = (): boolean => {
@@ -1923,6 +1946,59 @@ export function useAppController(): AppController {
           && registered.profileKey === binding.profileKey
           && savedProfile !== undefined
           && remoteMachineProfileKey(savedProfile) === binding.profileKey;
+      };
+      let streamEpoch = epoch;
+      const publishActivity = (): void => {
+        if (!current()) return;
+        setState(value => ({ ...value, nativeTaskStatusLiveSources: [
+          ...(value.nativeTaskStatusLiveSources ?? []).filter(source => source.profile.id !== profile.id),
+          ...(binding.connected && binding.snapshot ? [{ profile, epoch: streamEpoch, snapshot: binding.snapshot, partners: binding.partners,
+            artworkByPartnerId: binding.artworkByPartnerId }] : [])
+        ] }));
+      };
+      let partnersPending = false, partnersDirty = false, partnersReadAt = 0;
+      const artworkRequests = new Map<string, { readonly identity: string; readonly retryAt: number }>();
+      const refreshActivityArtwork = (): void => {
+        const gateway = binding.gateway;
+        if (!gateway || !current() || !binding.connected) return;
+        const wanted = binding.partners.filter(partner => typeof partner.avatar !== "string" && partner.canonicalSessionId
+          && (partner.activity.unreadReplyCount > 0 || binding.snapshot?.sessions.some(session => session.id === partner.canonicalSessionId
+            && ["running", "waiting", "retrying", "error"].includes(session.state)))).slice(0, 32);
+        const keep = new Set(wanted.map(partner => partner.id));
+        binding.artworkByPartnerId = Object.fromEntries(Object.entries(binding.artworkByPartnerId).filter(([id]) => keep.has(id)));
+        for (const [id] of artworkRequests) if (!keep.has(id)) artworkRequests.delete(id);
+        for (const partner of wanted) {
+          if (typeof partner.avatar === "string") continue;
+          const image = partner.avatar, identity = `${partner.revision}:${image.sha256}`, previous = artworkRequests.get(partner.id);
+          if (previous?.identity === identity && (binding.artworkByPartnerId[partner.id] || previous.retryAt > Date.now())) continue;
+          const { [partner.id]: _removed, ...remaining } = binding.artworkByPartnerId; binding.artworkByPartnerId = remaining;
+          const activityEpoch = streamEpoch;
+          const request = { identity, retryAt: Date.now() + 60_000 }; artworkRequests.set(partner.id, request);
+          void gateway.readPartnerAvatar(partner.id, partner.revision, image, AbortSignal.timeout(8_000)).then(nativeTaskStatusAvatar).then(artwork => {
+            if (!current() || !binding.connected || streamEpoch !== activityEpoch || binding.gateway !== gateway || artworkRequests.get(partner.id) !== request
+              || !binding.partners.some(value => value.id === partner.id && value.revision === partner.revision
+                && typeof value.avatar !== "string" && value.avatar.sha256 === image.sha256)) return;
+            binding.artworkByPartnerId = { ...binding.artworkByPartnerId, [partner.id]: artwork }; publishActivity();
+          }).catch(() => undefined);
+        }
+      };
+      const refreshActivityPartners = async (): Promise<void> => {
+        if (!nativeActivity || !current() || !binding.connected || !binding.gateway) return;
+        if (partnersPending) { partnersDirty = true; return; }
+        const delay = partnersReadAt + 1_000 - Date.now();
+        if (delay > 0) {
+          binding.activityTimer ??= window.setTimeout(() => { binding.activityTimer = undefined; void refreshActivityPartners(); }, delay);
+          return;
+        }
+        partnersReadAt = Date.now();
+        partnersPending = true;
+        const gateway = binding.gateway, activityEpoch = streamEpoch;
+        try {
+          const result = await gateway.listPartners();
+          if (!current() || !binding.connected || streamEpoch !== activityEpoch || binding.gateway !== gateway) return;
+          binding.partners = result.partners; refreshActivityArtwork(); publishActivity();
+        } catch { if (current() && streamEpoch === activityEpoch) { binding.partners = []; publishActivity(); } }
+        finally { partnersPending = false; if (partnersDirty) { partnersDirty = false; void refreshActivityPartners(); } }
       };
       const scheduleRetry = (): void => {
         if (!current() || binding.retryTimer !== undefined) return;
@@ -1945,6 +2021,7 @@ export function useAppController(): AppController {
             setState((value) => ({
               ...value,
               machineCaches: value.machineCaches.filter((cache) => cache.profileId !== profile.id),
+              nativeTaskStatusLiveSources: value.nativeTaskStatusLiveSources?.filter(source => source.profile.id !== profile.id),
               machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "identityMismatch" }
             }));
             return;
@@ -1959,6 +2036,7 @@ export function useAppController(): AppController {
             setState((value) => ({
               ...value,
               machineCaches: value.machineCaches.filter((cache) => cache.profileId !== profile.id),
+              nativeTaskStatusLiveSources: value.nativeTaskStatusLiveSources?.filter(source => source.profile.id !== profile.id),
               machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "accessDenied" }
             }));
             return;
@@ -1966,7 +2044,6 @@ export function useAppController(): AppController {
           const gateway = createOrchestratorGateway(profile, authKey, {
             onState: (connectionState) => {
               if (!current() || binding.gateway !== gateway) return;
-              binding.connected = connectionState === "connected";
               if (connectionState === "connected") {
                 binding.failures = 0;
                 setState((value) => ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "online" } }));
@@ -1984,14 +2061,25 @@ export function useAppController(): AppController {
               }));
               void local.saveMachineCache(cache).catch(() => undefined);
             },
+            onLiveSnapshot: (snapshot) => {
+              if (!current() || binding.gateway !== gateway) return;
+              if (snapshot && !binding.connected) streamEpoch = ++remoteMachineGatewayEpochRef.current;
+              binding.connected = snapshot !== undefined;
+              binding.snapshot = snapshot;
+              if (!snapshot) { binding.partners = []; binding.artworkByPartnerId = {}; artworkRequests.clear(); }
+              publishActivity();
+              if (snapshot) void refreshActivityPartners();
+            },
             onError: (error) => {
               if (!current() || binding.gateway !== gateway || !error.offline) return;
               binding.connected = false;
+              publishActivity();
               setState((value) => ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "offline" } }));
             },
             onAuthenticationInvalidated: async () => {
               if (!current() || binding.gateway !== gateway) return;
               binding.connected = false;
+              publishActivity();
               if (shouldDeleteInvalidatedConnectionCredential(profile)) await local.deleteAuthKey(profile.id);
               await local.deleteMachineCache(profile.id);
               if (!current()) return;
@@ -2010,11 +2098,11 @@ export function useAppController(): AppController {
             gateway.disconnect();
             return;
           }
-          binding.connected = true;
           binding.failures = 0;
         } catch {
           if (!current()) return;
           binding.connected = false;
+          publishActivity();
           binding.gateway?.disconnect();
           binding.gateway = undefined;
           setState((value) => ({ ...value, machinePresenceByProfile: { ...value.machinePresenceByProfile, [profile.id]: "offline" } }));
@@ -3165,10 +3253,12 @@ export function useAppController(): AppController {
     extensionCardApi: () => gateway().extensionCardApi(),
     extensionNetworkApi: () => gateway().extensionNetworkApi(),
     extensionOAuthApi: () => gateway().extensionOAuthApi(),
+    extensionTaskApi: () => gateway().extensionTaskApi?.(),
     uploadPartnerGroupFile: (file, signal) => gateway().uploadPartnerGroupFile(file, signal),
     partnerMemoryApi: (partnerId, ownerKey) => gateway().partnerMemoryApi(partnerId, ownerKey),
     partnerConnectionsApi: (partnerId, ownerKey) => gateway().partnerConnectionsApi(partnerId, ownerKey),
     partnerImportApi: ownerKey => gateway().partnerImportApi(ownerKey),
+    partnerHomeApi: ownerKey => gateway().partnerHomeApi(ownerKey),
     readPartnerWorkingStatus: (partnerId, status, locale, signal) => gateway().readPartnerWorkingStatus(partnerId, status, locale, signal),
     getPartner: (partnerId, signal) => gateway().getPartner(partnerId, signal),
     createPartner: (expectedDirectoryRevision, draft, requestId, signal) =>
@@ -4233,6 +4323,7 @@ function sameOrchestratorOrigin(left: string, right: string): boolean {
 function applyTheme(theme: Theme): void {
   document.documentElement.dataset.theme = theme;
   const dark = theme === "dark" || (theme === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+  void window.jokoDesktop?.remoteDesktop?.setAppearance?.(dark).catch(() => undefined);
   applyFavicon(dark);
   document.querySelector('meta[name="theme-color"]')?.setAttribute("content", dark ? "#0d0d0d" : "#f2f2f2");
 }

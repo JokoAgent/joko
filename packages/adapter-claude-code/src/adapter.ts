@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
+import { lstat, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, normalize, posix as remotePath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -53,6 +53,7 @@ import {
   type NativeSessionPreview,
   type NativeSessionCandidate,
   type NativeSessionState,
+  type NativeTextInferenceInput,
   type PermissionMode,
   type PromptInput,
   type ProviderAccountUsageSnapshot,
@@ -60,6 +61,7 @@ import {
   type PublicError,
   type RuntimeProcessUsageSnapshot,
   type RuntimeResource,
+  type RuntimeCommand,
   type SubagentControlInput,
   type TargetDescriptor,
   type TerminateRuntimeProcessInput,
@@ -107,6 +109,9 @@ import {
   type ClaudeSdkModelInfo,
   type ClaudeSdkPermissionMode,
   type ClaudeSdkQuery,
+  type ClaudeSdkHooks,
+  type ClaudeSdkHookInput,
+  type ClaudeSdkHookOutput,
   type ClaudeRemoteRuntimePort,
   type ClaudeSdkRuntime,
   type ClaudeSdkSessionInfo,
@@ -643,6 +648,7 @@ export interface ProviderAuthenticationRevocation {
 
 export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements ProviderAuthenticationRevocation {
   override readonly id: string;
+  readonly nativeTextInferenceCapabilities = { pluginOneshot: true, maxTokens: true } as const;
   readonly #runtime: ClaudeSdkRuntime;
   readonly #remoteRuntimes: ClaudeRemoteRuntimePort | undefined;
   readonly #resolvedTargetRuntimes = new Set<ClaudeSdkRuntime>();
@@ -675,6 +681,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   readonly #accountUsage: ClaudeAccountUsageCache;
   readonly #privateManagedWorktreePaths = new Set<string>();
   readonly #sessions = new Map<string, NativeRuntime>();
+  readonly #nativeTextFlights = new Set<AbortController>();
   readonly #workingContextRecoveries = new Map<string, { readonly runtime: NativeRuntime; readonly providerId: string; readonly modelId: string }>();
   readonly #models = new Map<string, ClaudeSdkModelInfo>();
   readonly #toolNames = new Set<string>();
@@ -922,7 +929,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         supportsLogin,
         supportsLogout,
         this.#inputResolvers,
-        this.#resolveTextResources !== undefined,
+        this.#resolveTextResources !== undefined || this.#resolveNativeSkills !== undefined,
         supportsAccountUsage
       ),
       ...(this.#managedProviders === undefined ? {} : { providerRuntimeSupport: managedProviderSupport(this.#managedProviders.support) }),
@@ -1090,6 +1097,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   }
 
   async revokeProviderAuthentication(providerId: string): Promise<void> {
+    for (const flight of this.#nativeTextFlights) flight.abort();
     if (providerId !== PROVIDER_ID) return;
     this.#accountUsage.clear();
     await this.#retireAuthorizedRuntimes();
@@ -1773,11 +1781,24 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   }
 
   override getResources(context: AdapterContext): Promise<readonly RuntimeResource[]> {
-    if (this.#resolveTextResources === undefined) return this.unsupported("runtime.resources");
+    if (this.#resolveTextResources === undefined && this.#resolveNativeSkills === undefined) return this.unsupported("runtime.resources");
     const runtime = this.#requireRuntime(context);
     if (runtime.runtimePolicy === "review_read_only") return Promise.resolve([]);
     return Promise.resolve(loadedClaudeTextResources((runtime.textResources ?? [])
       .filter(resource => !runtime.nativeSkills?.indexedResourceIds.includes(resource.id))));
+  }
+
+  override async getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]> {
+    const runtime = this.#requireRuntime(context), snapshot = runtime.nativeSkills;
+    if (runtime.remote || runtime.runtimePolicy !== "standard" || !snapshot || runtime.initialization?.plugins_applied !== true) return [];
+    await snapshot.assertFilesCurrent(context.signal);
+    this.#assertCurrent(runtime, context, runtime.binding);
+    const resources = await this.getResources(context);
+    return snapshot.skills.filter(mount => !mount.discovery && mount.seed.resource.trustedBuiltin
+      && resources.some(resource => resource.id === mount.seed.resource.id && resource.revision === mount.seed.resource.revision)).map(mount => ({
+      name: mount.seed.resource.name, description: "Create or update a Joko plugin using the shipped authoring instructions.", source: "skill" as const,
+      inputMode: "resource_mention" as const, loaded: true, resourceId: mount.seed.resource.id, builtinSkill: mount.seed.resource.trustedBuiltin!
+    }));
   }
 
   override async send(input: PromptInput, context: AdapterContext): Promise<void> {
@@ -3156,6 +3177,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         throw new Error("The product MCP call lacks an active root tool owner.");
       }
       lease.assertCurrent();
+      turn.context.nativeToolAuthorization?.assertCurrent();
     };
     assertCurrent();
     const signal = AbortSignal.any([options.signal, runtime.abortController.signal, turn!.mcpCallCancellation.signal]);
@@ -3260,7 +3282,58 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     });
   }
 
+  async inferNativeText(input: NativeTextInferenceInput): Promise<string> {
+    this.#assertUsable();
+    if (input.backendInstanceGeneration !== this.#instanceGeneration || input.providerId !== PROVIDER_ID || !input.modelId
+      || !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1000 || input.timeoutMs > 90_000
+      || input.maxTokens !== undefined && (!Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1)
+      || input.system.length > 80_000 || input.user.length > 300_000) throw new Error("Native text inference scope is invalid.");
+    const owner = new AbortController(); this.#nativeTextFlights.add(owner);
+    const signal = AbortSignal.any([owner.signal, input.signal, AbortSignal.timeout(input.timeoutMs)]);
+    const stopped = () => owner.abort(signal.reason); signal.addEventListener("abort", stopped, { once: true });
+    let directory: string | undefined, query: ClaudeSdkQuery | undefined;
+    let authorization: Awaited<ReturnType<ClaudeCodeOAuthAccount["runtimeAuthorization"]>>;
+    const current = () => { signal.throwIfAborted(); this.#assertUsable(); input.assertCurrent(); input.assertModelAllowed(PROVIDER_ID, input.modelId!);
+      if (authorization && !authorization.isCurrent()) throw new Error("Native text authorization changed."); };
+    try {
+      current(); if (!this.#lastCliVersion || !this.#models.has(input.modelId)) await this.describe(); current();
+      if (!supportsIsolatedReview(this.#lastCliVersion) || !this.#models.has(input.modelId)) throw new Error("The selected native text model is unavailable.");
+      authorization = await this.#oauthAccount?.runtimeAuthorization(); current();
+      if (this.#oauthAccount && !authorization) throw new Error("The native text account is unavailable.");
+      directory = await mkdtemp(join(tmpdir(), "joko-text-")); current();
+      const user: ClaudeSdkUserMessage = { type: "user", message: { role: "user", content: input.user }, origin: { kind: "human" }, parent_tool_use_id: null, uuid: randomUUID() };
+      query = await this.#runtime.query({ prompt: (async function* () { yield user; })(), options: {
+        abortController: owner, additionalDirectories: [], allowDangerouslySkipPermissions: false, agents: {},
+        canUseTool: async () => ({ behavior: "deny", message: "This text inference has no tools." }), cwd: directory,
+        env: { ...this.#environment, ...authorization?.environment, ...(input.maxTokens === undefined ? {} : { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(input.maxTokens) }) }, ...(authorization ? { getOAuthToken: authorization.getOAuthToken } : {}),
+        extraArgs: { "safe-mode": null, "disable-slash-commands": null, "no-chrome": null },
+        settings: { allowedMcpServers: [], autoMemoryEnabled: false, autoDreamEnabled: false, disableAllHooks: true,
+          disableBundledSkills: true, disableClaudeAiConnectors: true, disableRemoteControl: true, disableWorkflows: true, includeGitInstructions: false },
+        includePartialMessages: true, model: input.modelId, permissionMode: "default", persistSession: false, sessionId: randomUUID(),
+        ...(this.#pathToExecutable ? { pathToClaudeCodeExecutable: this.#pathToExecutable } : {}),
+        settingSources: [], skills: [], tools: [], mcpServers: {}, strictMcpConfig: true,
+        systemPrompt: { type: "preset", preset: "claude_code", append: input.system }
+      } }); current();
+      const iterator = query[Symbol.asyncIterator]();
+      for (let count = 0; count < 10_000; count++) {
+        const next = await raceAbort(iterator.next(), signal); current(); if (!next || next.done) break;
+        const frame = record(next.value);
+        if (frame?.["type"] === "result") {
+          if (frame["subtype"] !== "success" || typeof frame["result"] !== "string" || !frame["result"].trim() || frame["result"].length > 24_000) throw new Error("Native text inference produced no bounded answer.");
+          return frame["result"].trim();
+        }
+      }
+      throw new Error("Native text inference produced no answer.");
+    } finally {
+      query?.close(); owner.abort();
+      try { if (query) await this.#runtime.retireQuery(query, this.#teardownTimeoutMs); }
+      finally { authorization?.release(); this.#nativeTextFlights.delete(owner); signal.removeEventListener("abort", stopped); }
+      if (directory) await rm(directory, { recursive: true, force: true, maxRetries: 3 });
+    }
+  }
+
   override async dispose(): Promise<void> {
+    for (const flight of this.#nativeTextFlights) flight.abort();
     this.#accountUsage.clear();
     const failures: unknown[] = [];
     try { this.#managedProviders?.dispose(); }
@@ -3313,11 +3386,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   }
 
   async quiesceForReplacement(): Promise<void> {
+    for (const flight of this.#nativeTextFlights) flight.abort();
     this.#accountUsage.clear();
     await this.#oauthAccount?.quiesceForReplacement();
   }
 
   async forceDispose(): Promise<void> {
+    for (const flight of this.#nativeTextFlights) flight.abort();
     this.#accountUsage.clear();
     const failures: unknown[] = [];
     try { this.#managedProviders?.dispose(); }
@@ -3453,19 +3528,20 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const abortController = new AbortController();
     let textResources: readonly ClaudeRuntimeTextResource[] | undefined;
     let nativeSkills: NativeSkillSnapshot | undefined;
+    let builtinInitializationCurrent: (() => boolean) | undefined;
     try {
       if (launch.runtimePolicy === "standard" && !scoped.remote && this.#resolveNativeSkills !== undefined) {
         const resourceSignal = AbortSignal.any([context.signal, abortController.signal]);
         const policy = await this.#resolveNativeSkillPolicy?.(context);
         nativeSkills = await snapshotNativeSkills(await this.#resolveNativeSkills(context, resourceSignal), resourceSignal, undefined, policy);
       }
-      if (this.#resolveTextResources !== undefined) {
+      if (this.#resolveTextResources !== undefined || nativeSkills?.skills.some(mount => mount.seed.resource.trustedBuiltin)) {
         if (launch.runtimePolicy === "review_read_only") {
           textResources = Object.freeze([]);
         } else {
           const resourceSignal = AbortSignal.any([context.signal, abortController.signal]);
           const seeds = await waitFor(
-            Promise.resolve().then(() => this.#resolveTextResources!(context, resourceSignal)),
+            Promise.resolve().then(() => this.#resolveTextResources?.(context, resourceSignal) ?? []),
             this.#initializationTimeoutMs,
             resourceSignal,
             () => claudeCodeError(
@@ -3479,7 +3555,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           this.#assertUsable();
           this.#assertBackendInstance(context);
           this.#assertBindingContext(binding, context);
-          textResources = snapshotClaudeTextResources(seeds, context.generation, abortController.signal);
+          const builtinSeeds = await Promise.all((nativeSkills?.skills ?? []).filter(mount => mount.seed.resource.trustedBuiltin
+            && nativeSkills?.skillOverrides[mount.seed.resource.name] !== "off").map(async mount => ({
+            id: mount.seed.resource.id, kind: "skill" as const, name: mount.seed.resource.name, revision: mount.seed.resource.revision!, resourceVersion: mount.seed.resource.resourceVersion!,
+            content: `Skill base directory: ${JSON.stringify(mount.path)}\nResolve relative references against this exact directory.\n\n${await readFile(mount.filePath, { encoding: "utf8", signal: resourceSignal })}`,
+            assertCurrent: () => { nativeSkills!.assertCurrent(); if (builtinInitializationCurrent && !builtinInitializationCurrent()) throw new Error("The native Skill plugin was not acknowledged as loaded."); }
+          })));
+          textResources = snapshotClaudeTextResources([...seeds, ...builtinSeeds], context.generation, abortController.signal);
         }
       }
     } catch (error) {
@@ -3523,7 +3605,10 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }, async (tool, arguments_, options) => {
       if (runtime === undefined) throw new Error("The product MCP Query is not ready.");
       return this.#callProductMcp(runtime, tool, arguments_, options);
-    }, nativeSkills).catch(async (error: unknown) => { abortController.abort(); await nativeSkills?.dispose(); managedRoute?.dispose(); launch.mcpLease?.release(); throw error; });
+    }, nativeSkills, { PreToolUse: [{ hooks: [async (input, toolUseId, options) => {
+      if (!runtime) return { continue: false, stopReason: "The originating native runtime is not ready." };
+      return this.#nativeToolAuthorizationHook(runtime, input, toolUseId, options.signal);
+    }] }] }).catch(async (error: unknown) => { abortController.abort(); await nativeSkills?.dispose(); managedRoute?.dispose(); launch.mcpLease?.release(); throw error; });
     const query = startedQuery.query;
     try {
       runtime = {
@@ -3592,6 +3677,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         modelUsageObserver: new NativeModelUsageObserver()
       };
       this.#sessions.set(context.sessionId, runtime);
+      builtinInitializationCurrent = () => runtime?.initialization?.plugins_applied === true;
     } finally {
       startedQuery.releaseAuthorization();
     }
@@ -3704,7 +3790,8 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       arguments_: Readonly<Record<string, unknown>>,
       options: { readonly toolUseId: string; readonly signal: AbortSignal; readonly modelCallId?: string }
     ) => Promise<ClaudeMcpCallResult>,
-    nativeSkills: NativeSkillSnapshot | undefined
+    nativeSkills: NativeSkillSnapshot | undefined,
+    nativeToolHooks: ClaudeSdkHooks
   ): Promise<{
     readonly query: ClaudeSdkQuery;
     readonly subagentModel: string | undefined;
@@ -3800,6 +3887,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           allowDangerouslySkipPermissions: launch.runtimePolicy === "standard",
           ...(launch.runtimePolicy === "review_read_only" ? { agents: {} } : {}),
           canUseTool,
+          hooks: nativeToolHooks,
           cwd: scoped.workspaceRoot,
           ...(nativeSkills === undefined || nativeSkills.skills.length === 0 ? {} : {
             plugins: [{ type: "local" as const, path: nativeSkills.pluginRoot }]
@@ -5106,6 +5194,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             requestId: managedChildNativeIdentity(child.rawTaskId, "permission", options.requestId),
             agentID: options.agentID ?? child.rawTaskId
           }),
+          hooks: { PreToolUse: [{ hooks: [(input, toolUseId, options) => this.#nativeToolAuthorizationHook(runtime, input, toolUseId, options.signal)] }] },
           cwd,
           env: {
             ...this.#environment,
@@ -5570,6 +5659,24 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     return normalize(requested);
   }
 
+  async #nativeToolAuthorizationHook(runtime: NativeRuntime, input: ClaudeSdkHookInput, _toolUseId: string | undefined, signal: AbortSignal): Promise<ClaudeSdkHookOutput> {
+    if (input.hook_event_name !== "PreToolUse") return { continue: true };
+    const context = runtime.activeTurn?.context ?? runtime.baseContext, authority = context.nativeToolAuthorization;
+    if (!authority || runtime.runtimePolicy === "review_read_only") return { continue: true };
+    const denied = (reason: string): ClaudeSdkHookOutput => ({ continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } });
+    try {
+      signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent();
+      const toolInput = structuredClone(input.tool_input) as Record<string, unknown>;
+      const result = await authority.review({ toolName: input.tool_name, input: toolInput, signal });
+      signal.throwIfAborted(); runtime.assertRuntimeCurrent(); authority.assertCurrent(result.authorizationRevision);
+      if (JSON.stringify(input.tool_input) !== JSON.stringify(toolInput)) return denied("The native action changed while its authorization was being reviewed.");
+      if (result.verdict === "block") return denied(result.reason ?? "The current delegated task authorization denied this action.");
+      if (result.verdict === "default") return { continue: true };
+      return { continue: true, hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: result.verdict,
+        permissionDecisionReason: result.reason ?? "Host-verified delegated task scope.", ...(result.verdict === "allow" ? { updatedInput: toolInput } : {}) } };
+    } catch { return denied("The originating delegated task authority changed before native execution."); }
+  }
+
   async #canUseTool(
     runtime: NativeRuntime,
     toolName: string,
@@ -5590,10 +5697,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (runtime.runtimePolicy === "review_read_only") {
       return reviewToolDecision(runtime.target.workspaceRoot, toolName, input);
     }
+    try { turn.context.nativeToolAuthorization?.assertCurrent(); } catch { return { behavior: "deny", message: "The originating delegated task authority changed." }; }
     const requestId = this.#projection.identifier(options.requestId, "missing-request");
     let fingerprint: string;
     try {
-      fingerprint = permissionFingerprint(toolName, input, options.toolUseID);
+      fingerprint = permissionFingerprint(toolName, input, options.toolUseID) + `:${turn.context.nativeToolAuthorization?.capture() ?? ""}`;
     } catch {
       return { behavior: "deny", message: "The permission request payload exceeded safe limits." };
     }
@@ -5638,6 +5746,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   ): Promise<ClaudePermissionResult> {
     if (toolName === "AskUserQuestion") return this.#askUserQuestion(runtime, turn, input, options);
     if (toolName === "ExitPlanMode") return this.#reviewPlan(runtime, turn, input, options);
+    const authorizationRevision = turn.context.nativeToolAuthorization?.capture();
     const interaction: InteractionPayload = {
       id: interactionId(runtime, options.requestId),
       kind: "permission",
@@ -5648,6 +5757,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       choices: ["allow_once", "allow_for_session", "deny"]
     };
     const decision = await this.#requestInteraction(runtime, turn, interaction, options.signal);
+    try { turn.context.nativeToolAuthorization?.assertCurrent(authorizationRevision); } catch { return { behavior: "deny", message: "The originating delegated task authority changed while permission was pending." }; }
     if (!this.#isTurnCurrent(runtime, turn) || options.signal.aborted) {
       return { behavior: "deny", message: "The permission request expired." };
     }
@@ -7328,7 +7438,7 @@ function capabilityManifest(
   if (freshContextSupported) supported.add("session.rewind_to_start");
   if (inputResolvers.readBlob !== undefined) supported.add("input.image");
   if (inputResolvers.resolveFile !== undefined) supported.add("input.file");
-  if (textResourcesSupported) supported.add("runtime.resources");
+  if (textResourcesSupported) { supported.add("runtime.resources"); supported.add("runtime.commands"); }
   if (isolatedReviewSupported) supported.add("review.isolated");
   if (nativeTasksSupported) {
     for (const capability of [
@@ -7359,7 +7469,7 @@ function capabilityManifest(
       : key === "provider.login" && supportsLogin
       ? ["oauth_browser"]
       : key === "permission.modes"
-      ? ["ask", "auto", "bypassPermissions"]
+      ? ["ask", "acceptEdits", "auto", "bypassPermissions"]
       : key === "workspace.extra_dirs"
         ? ["read_write"]
         : key === "input.mention"
@@ -8006,6 +8116,7 @@ function canonicalPathKey(path: string): string {
 
 function toSdkPermissionMode(mode: PermissionMode): ClaudeSdkPermissionMode {
   if (mode === "ask") return "default";
+  if (mode === "acceptEdits") return "acceptEdits";
   if (mode === "auto") return "auto";
   return "bypassPermissions";
 }
@@ -8016,6 +8127,7 @@ function observePermissionMode(runtime: NativeRuntime, mode: string | undefined)
     return;
   }
   if (mode === "default") runtime.permissionMode = "ask";
+  else if (mode === "acceptEdits") runtime.permissionMode = "acceptEdits";
   else if (mode === "auto") runtime.permissionMode = "auto";
   else if (mode === "bypassPermissions") runtime.permissionMode = "bypassPermissions";
   else {
@@ -8653,7 +8765,7 @@ function safePermissionUpdates(
   for (const update of updates) {
     if (update.destination !== "session" && update.destination !== "cliArg") continue;
     if (update.type === "setMode") {
-      if (update.mode !== "default" && update.mode !== "auto" && update.mode !== "bypassPermissions") continue;
+      if (update.mode !== "default" && update.mode !== "acceptEdits" && update.mode !== "auto" && update.mode !== "bypassPermissions") continue;
       if (update.mode === "bypassPermissions" && !targetTrusted) continue;
       safe.push({ type: "setMode", mode: update.mode, destination: update.destination });
       continue;

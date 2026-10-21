@@ -1,6 +1,7 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
+import { builtinSkillIntentForText, resolveBuiltinSkillDraft } from "./builtin-skill-intent.js";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
-import { ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
+import { ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import type { McpAppApi } from "./model.js";
 import { AppDefaultModelService } from "@joko/contracts";
@@ -10,6 +11,7 @@ import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
 import { createPartnerRoutineApi, PartnerRoutineService, createPartnerImportApi, PartnerImportService } from "@joko/contracts";
+import { createPartnerHomeApi, PartnerHomeService } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService } from "@joko/contracts";
 import { createPartnerMemoryApi } from "@joko/contracts";
 import { projectPartnerLearningFeedback } from "@joko/contracts";
@@ -956,6 +958,8 @@ export type GatewayConnectionState = "disconnected" | "connecting" | "connected"
 export interface GatewayCallbacks {
   readonly onState?: (state: GatewayConnectionState, statusMessage?: string) => void;
   readonly onSnapshot?: (snapshot: AppSnapshot) => void;
+  /** Authenticated owner snapshot attached to this live stream incarnation; never a snapshot-only probe. */
+  readonly onLiveSnapshot?: (snapshot: AppSnapshot | undefined) => void;
   readonly onError?: (error: GatewayError) => void;
   /** Called once when Orchestrator rejects the saved bearer credential. */
   readonly onAuthenticationInvalidated?: (error: GatewayError) => void | Promise<void>;
@@ -1115,6 +1119,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   #snapshot: AppSnapshot | undefined;
   #rawSnapshot: Snapshot | undefined;
   #streamTask: Promise<void> | undefined;
+  #liveSnapshotConnected = false;
   #refreshPromise: Promise<void> | undefined;
   #eventRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   #eventRefreshQueued = false;
@@ -1219,7 +1224,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       if (abort.signal.aborted || this.#abort !== abort || this.#transport !== transport) return;
       this.#sharedTaskReady = true;
       this.#callbacks.onState?.("connected");
-      if (options?.snapshotOnly !== true) this.#streamTask = this.consumeEvents(abort.signal);
+      if (options?.snapshotOnly !== true) {
+        this.publishLiveSnapshot(true);
+        this.#streamTask = this.consumeEvents(abort.signal);
+      }
     } catch (error) {
       if (abort.signal.aborted || this.#abort !== abort || this.#transport !== transport) return;
       const gatewayError = normalizeError(error);
@@ -1255,6 +1263,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   disconnect(): void {
+    this.publishLiveSnapshot(false);
     this.#sharedTaskReady = false;
     this.#sharingApi = undefined;
     this.#abort?.abort();
@@ -1269,6 +1278,11 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     for (const lease of this.#artifactUrls.values()) if (lease.url !== undefined) URL.revokeObjectURL(lease.url);
     this.#artifactUrls.clear();
     this.#callbacks.onState?.("disconnected");
+  }
+
+  private publishLiveSnapshot(connected: boolean): void {
+    this.#liveSnapshotConnected = connected;
+    this.#callbacks.onLiveSnapshot?.(connected ? this.#snapshot : undefined);
   }
 
   async refresh(): Promise<void> {
@@ -1933,6 +1947,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     this.#rawSnapshot = raw;
     this.#snapshot = mapped;
     this.#callbacks.onSnapshot?.(mapped);
+    if (this.#liveSnapshotConnected) this.#callbacks.onLiveSnapshot?.(mapped);
   }
 
   private async currentDeviceNameSource(transport: Transport, signal?: AbortSignal): Promise<DeviceNameSource | undefined> {
@@ -1959,13 +1974,16 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void> {
     const scope = this.captureActionScope();
-    const edits = pendingExtensionCardFormDelivery(extensionCardFormDeliveryScope(scope.signal, sessionId));
-    if (edits && !await edits) throw new GatewayError("The card edits could not be saved. Retry the card edit before sending.");
-    scope.signal.throwIfAborted();
     const expectedGeneration = admission.expectedGeneration;
     if (expectedGeneration < 1n || expectedGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new GatewayError("Input requires the source task generation.");
     }
+    if (builtinSkillIntentForText(draft.text, draft.builtinSkillIntent)) {
+      draft = await resolveBuiltinSkillDraft(draft, sessionId, expectedGeneration, this, scope.signal);
+    }
+    const edits = pendingExtensionCardFormDelivery(extensionCardFormDeliveryScope(scope.signal, sessionId));
+    if (edits && !await edits) throw new GatewayError("The card edits could not be saved. Retry the card edit before sending.");
+    scope.signal.throwIfAborted();
     if (draft.extraDirectoryIds?.some((id) => id.length === 0) === true) {
       throw new GatewayError("Extra-directory selections must use non-empty IDs.");
     }
@@ -5115,6 +5133,19 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       }
     };
   }
+  extensionTaskApi(): import("./model.js").ExtensionTaskApi | undefined {
+    if (!this.#transport || !this.#abort || !this.#profile) return;
+    const scope = this.captureActionScope(), transport = this.#transport, lifetime = this.#abort;
+    const client = createClient(ExtensionTaskService, scope.transport);
+    const guard = () => { scope.signal.throwIfAborted(); if (this.#transport !== transport || this.#abort !== lifetime) throw new GatewayError("Plugin task settings connection changed."); };
+    return {
+      getPreferences: async (request, options) => { guard(); const result = await client.getPreferences(request, { ...options, signal: options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal }); guard(); return result; },
+      updatePreferences: async (request, options) => { guard(); const result = await client.updatePreferences(request, { ...options, signal: options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal }); guard(); return result; },
+      listBackgroundTasks: async (request, options) => { guard(); const result = await client.listBackgroundTasks(request, { ...options, signal: options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal }); guard(); return result; },
+      revealTask: async (request, options) => { guard(); const result = await client.revealTask(request, { ...options, signal: options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal }); guard(); return result; },
+      retryWriteAccess: async (request, options) => { guard(); const result = await client.retryWriteAccess(request, { ...options, signal: options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal }); guard(); return result; }
+    };
+  }
   extensionOAuthApi(): import("./model.js").ExtensionOAuthApi | undefined {
     if (!this.#transport || !this.#abort || !this.#profile) return;
     const scope = this.captureActionScope(), transport = this.#transport, lifetime = this.#abort, profile = this.#profile;
@@ -5249,6 +5280,13 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       newRequestId: () => crypto.randomUUID(), assertCurrent: () => {
         if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Import connection owner changed.");
       } });
+  }
+
+  partnerHomeApi(ownerKey: string) {
+    const transport = this.requireTransport();
+    return createPartnerHomeApi({ rpc: createClient(PartnerHomeService, transport), ownerKey, assertCurrent: () => {
+      if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Partner home connection owner changed.");
+    } });
   }
 
   async getUsageReport(query: UsageReportQueryView, signal: AbortSignal): Promise<UsageReportView> {
@@ -10160,8 +10198,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   private async consumeEvents(signal: AbortSignal): Promise<void> {
     let delay = 350;
+    let refreshLiveSnapshot = false;
     while (!signal.aborted) {
       try {
+        // A retry's optimistic connection state is not authority for the prior
+        // snapshot. Renew the owner snapshot before restoring native activity.
+        if (refreshLiveSnapshot && this.#callbacks.onLiveSnapshot) {
+          await this.refresh();
+          if (signal.aborted || this.#abort?.signal !== signal) return;
+          this.publishLiveSnapshot(true);
+          refreshLiveSnapshot = false;
+        }
         const transport = this.requireTransport();
         const client = createClient(EventService, transport);
         const cursor = this.#rawSnapshot?.resumeCursor;
@@ -10193,6 +10240,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             if (visionEffect !== undefined) this.#callbacks.onVisionBridgeUiEffect?.(visionEffect);
           }
           if (continuity === "gap" || continuity === "generationChanged" || continuity === "missingCursor" || invalidated) {
+            this.publishLiveSnapshot(false);
             if (this.#rawSnapshot !== undefined && this.#snapshot !== undefined) {
               const retired = retireTimelineHistory(this.#rawSnapshot, this.#snapshot, undefined, event.cursor?.sequence);
               this.#rawSnapshot = retired.rawSnapshot;
@@ -10200,6 +10248,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
               this.#callbacks.onSnapshot?.(retired.snapshot);
             }
             await this.flushEventRefresh(event.cursor);
+            if (signal.aborted || this.#abort?.signal !== signal) return;
+            this.publishLiveSnapshot(true);
             lastGeneration = this.#snapshot?.generation;
             lastSequence = this.#snapshot?.cursor;
           } else {
@@ -10215,25 +10265,35 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
             this.#rawSnapshot = projected.rawSnapshot;
             this.#snapshot = projected.snapshot;
             this.#callbacks.onSnapshot?.(projected.snapshot);
+            // Run/content deltas intentionally omit Session activity ownership.
+            // The native mirror needs the current durable reply and delivery
+            // arbitration before exposing a terminal edge, never a stale Run.
+            const activityRefresh = this.#callbacks.onLiveSnapshot !== undefined
+              && ["runChanged", "messageCompleted", "runDone"].includes(payloadCase(event) ?? "");
+            if (this.#liveSnapshotConnected && !activityRefresh && projected.refresh !== "authoritative") this.#callbacks.onLiveSnapshot?.(projected.snapshot);
             lastGeneration = projected.snapshot.generation;
             lastSequence = projected.snapshot.cursor;
-            if (projected.refresh === "batched") this.scheduleEventRefresh();
-            else if (projected.refresh === "authoritative") {
+            if (projected.refresh === "authoritative" || activityRefresh) {
               await this.flushEventRefresh(event.cursor);
               lastGeneration = this.#snapshot?.generation;
               lastSequence = this.#snapshot?.cursor;
-            }
+            } else if (projected.refresh === "batched") this.scheduleEventRefresh();
           }
           delay = 350;
         }
         if (!signal.aborted) throw new GatewayError("The Orchestrator event stream closed.", { offline: true });
       } catch (error) {
         if (signal.aborted) return;
+        this.publishLiveSnapshot(false);
+        refreshLiveSnapshot = true;
         let retryError = error;
         if (requiresEventSnapshotResync(error)) {
           this.#callbacks.onState?.("reconnecting", "Refreshing the event snapshot…");
           try {
             await this.refresh();
+            if (signal.aborted || this.#abort?.signal !== signal) return;
+            this.publishLiveSnapshot(true);
+            refreshLiveSnapshot = false;
             delay = 350;
             this.#callbacks.onState?.("connected");
             continue;
@@ -13453,6 +13513,14 @@ function mapSession(
       : attention?.kind === SessionAttentionKind.ERROR ? "error" as const : undefined;
   return {
     id: session.sessionId,
+    ...(session.taskActivity === undefined ? {} : { taskActivity: {
+      runId: session.taskActivity.runId,
+      completedReplySummary: session.taskActivity.completedReplySummary,
+      completionNotification: session.taskActivity.completionNotification === 2 ? "pending" as const
+        : session.taskActivity.completionNotification === 3 ? "teammate" as const : "none" as const,
+      silent: session.taskActivity.silent
+    } }),
+    ...(session.hidden ? { hidden: true } : {}),
     backendId: session.backendId,
     targetId: session.targetId,
     ...(session.projectId === undefined ? {} : { projectId: session.projectId }),
@@ -17954,6 +18022,10 @@ function extensionSetupFieldKind(value: ProtoExtensionSetupFieldKind): Extension
 }
 
 function mapRuntimeCommand(command: RuntimeCommand): RuntimeCommandView {
+  if (command.builtinSkill !== undefined && (command.builtinSkill.id !== "plugin_creator"
+    || !/^sha256:[a-f0-9]{64}$/u.test(command.builtinSkill.revision) || command.source !== 3 || !command.loaded || !command.resourceId)) {
+    throw new GatewayError("Orchestrator returned an invalid built-in Skill attestation.");
+  }
   const inputMode = command.inputMode === 1 ? "text" : command.inputMode === 2 ? "resource_mention" : undefined;
   if (inputMode === undefined || (inputMode === "resource_mention" && (!command.loaded || !command.resourceId))) {
     throw new GatewayError("Orchestrator returned an invalid runtime command input mode.");
@@ -17966,6 +18038,7 @@ function mapRuntimeCommand(command: RuntimeCommand): RuntimeCommandView {
     source: runtimeCommandSource(command.source),
     inputMode,
     ...(command.resourceId.length > 0 ? { resourceId: command.resourceId } : {}),
+    ...(command.builtinSkill === undefined ? {} : { builtinSkill: { id: "plugin_creator" as const, revision: command.builtinSkill.revision } }),
     loaded: command.loaded
   };
 }
@@ -20735,6 +20808,7 @@ function collaborationInterruptStopOutcome(
 }
 
 function collaborationPermission(value: ProtoPermissionMode): PermissionMode {
+  if (value === ProtoPermissionMode.ACCEPT_EDITS) return "acceptEdits";
   if (value === ProtoPermissionMode.ASK) return "ask";
   if (value === ProtoPermissionMode.AUTO) return "auto";
   if (value === ProtoPermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";
@@ -21071,6 +21145,7 @@ function protoPartnerPatch(value: PartnerPatchView) {
 
 function protoPartnerPermission(mode: PartnerCapabilitiesView["permissionMode"]): ProtoPermissionMode {
   switch (mode) {
+    case "acceptEdits": return ProtoPermissionMode.ACCEPT_EDITS;
     case "ask": return ProtoPermissionMode.ASK;
     case "auto": return ProtoPermissionMode.AUTO;
     case "bypassPermissions": return ProtoPermissionMode.BYPASS_PERMISSIONS;
@@ -21102,6 +21177,7 @@ function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined, all
     throw new GatewayError("Orchestrator returned an inconsistent Partner model chain.");
   }
   const permissionMode = value.permissionMode === ProtoPermissionMode.ASK ? "ask" as const
+    : value.permissionMode === ProtoPermissionMode.ACCEPT_EDITS ? "acceptEdits" as const
     : value.permissionMode === ProtoPermissionMode.AUTO ? "auto" as const
       : value.permissionMode === ProtoPermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions" as const : undefined;
   if (permissionMode === undefined) throw new GatewayError("Orchestrator returned an unsupported Partner permission mode.");
@@ -22639,7 +22715,7 @@ function sessionViewState(value: SessionState, run: RunState | undefined): Sessi
 }
 
 function protoPermission(value: PermissionMode): ProtoPermissionMode {
-  return value === "auto" ? ProtoPermissionMode.AUTO : value === "bypassPermissions" ? ProtoPermissionMode.BYPASS_PERMISSIONS : ProtoPermissionMode.ASK;
+  return value === "acceptEdits" ? ProtoPermissionMode.ACCEPT_EDITS : value === "auto" ? ProtoPermissionMode.AUTO : value === "bypassPermissions" ? ProtoPermissionMode.BYPASS_PERMISSIONS : ProtoPermissionMode.ASK;
 }
 
 function providerKind(value: ProviderKind): SettingsView["providers"][number]["kind"] {
@@ -22863,7 +22939,7 @@ function canonicalProviderEndpoint(value: string): string {
 }
 
 function uiPermission(value: ProtoPermissionMode): PermissionMode {
-  return value === ProtoPermissionMode.AUTO ? "auto" : value === ProtoPermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions" : "ask";
+  return value === ProtoPermissionMode.ACCEPT_EDITS ? "acceptEdits" : value === ProtoPermissionMode.AUTO ? "auto" : value === ProtoPermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions" : "ask";
 }
 
 function deliveryMode(value: ComposerDraft["deliveryMode"]): QueueDeliveryMode {

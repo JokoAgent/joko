@@ -124,6 +124,7 @@ export function mobileAutomationPermissionLabel(
   value: MobileAutomationDraft["permissionMode"]
 ): string {
   if (value === "ask") return mobileMessage(locale, "controls.permission.ask");
+  if (value === "acceptEdits") return mobileMessage(locale, "controls.permission.edits");
   if (value === "auto") return mobileMessage(locale, "controls.permission.auto");
   return mobileMessage(locale, "controls.permission.full");
 }

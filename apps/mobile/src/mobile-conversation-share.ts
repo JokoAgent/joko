@@ -1,4 +1,4 @@
-import type { Event } from "@joko/contracts";
+import { richAnswerText, type Event } from "@joko/contracts";
 import { mobileTimelineGalleryPages, type MobileImageGalleryPage } from "./mobile-image-gallery";
 import type { TimelineRow } from "./timeline";
 import { redactShareMessageText } from "./mobile-share-redaction";
@@ -43,12 +43,12 @@ export function projectMobileConversationShareMessage(
       const page = pages.find((image) => image.source.kind === "timeline" && image.source.contentKind === "block"
         && image.source.contentIndex === contentIndex);
       if (page) bodyParts.push({ kind: "image", key: page.pageId, label: redactShareMessageText(page.title) });
-      else if (block.content.case === "text") bodyParts.push({ kind: "text", text: redactShareMessageText(block.content.value) });
+      else if (block.content.case === "text") bodyParts.push({ kind: "text", text: redactShareMessageText(row.kind === "assistant" ? richAnswerText(block.content.value) : block.content.value) });
       else if (block.content.case === "artifact") bodyParts.push({ kind: "text", text: redactShareMessageText(block.content.value.label || block.content.value.blob?.fileName || "[Artifact]") });
       else if (block.content.case === "image") bodyParts.push({ kind: "text", text: "[Image]" });
     });
   } else {
-    bodyParts.push({ kind: "text", text: redactShareMessageText(row.sourceText ?? row.text) });
+    bodyParts.push({ kind: "text", text: redactShareMessageText(row.kind === "assistant" ? richAnswerText(row.sourceText ?? row.text) : row.sourceText ?? row.text) });
     for (const page of pages) attachments.push({ kind: "image", name: redactShareMessageText(page.title), uri: page.pageId });
     for (const artifact of row.artifacts ?? []) attachments.push({ kind: "file", name: redactShareMessageText(artifact.title) });
     const input = (acceptedInput ?? event).payload?.kind;
@@ -59,7 +59,7 @@ export function projectMobileConversationShareMessage(
       }
     }
   }
-  return { clientId: row.id, kind: row.kind as "user" | "assistant", body: redactShareMessageText(row.sourceText ?? row.text), bodyParts, attachments };
+  return { clientId: row.id, kind: row.kind as "user" | "assistant", body: redactShareMessageText(row.kind === "assistant" ? richAnswerText(row.sourceText ?? row.text) : row.sourceText ?? row.text), bodyParts, attachments };
 }
 
 export class MobileConversationShareSelection {

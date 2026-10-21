@@ -1,4 +1,3 @@
-// Adapted from the fixed declarative authorization boundary. See NOTICE / LICENSE.cindy.
 export interface ExtensionOAuthDeclaration {
   readonly authorizeUrl: string; readonly tokenUrl: string;
   readonly clientId?: string; readonly clientSecret?: string;

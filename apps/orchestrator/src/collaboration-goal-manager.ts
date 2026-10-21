@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { assertExtensionWorkerPlan, isExtensionTaskControlled } from "./extension-tasks.js";
 
 import { toPublicError, type PermissionMode, type PromptInput, type PublicError } from "@joko/core";
 import {
@@ -58,6 +59,7 @@ export class CollaborationGoalManagerError extends Error {
 }
 
 export interface CollaborationGoalManagerOptions {
+  readonly assertWorkerAdmission?: (leadSessionId: string) => void;
   readonly store: OperationalStore;
   readonly sessionHost: Pick<
     SessionHost,
@@ -83,6 +85,7 @@ interface WorkerRouteInput {
 /** Owns Goal/lead/worker lifecycle and binds every lead message to the exact
  * durable worker Queue item before Backend dispatch can begin. */
 export class CollaborationGoalManager {
+  readonly #assertWorkerAdmission: CollaborationGoalManagerOptions["assertWorkerAdmission"];
   readonly #store: OperationalStore;
   readonly #sessionHost: CollaborationGoalManagerOptions["sessionHost"];
   readonly #readSettings: () => CollaborationSettings;
@@ -95,6 +98,7 @@ export class CollaborationGoalManager {
   #closed = false;
 
   constructor(options: CollaborationGoalManagerOptions) {
+    this.#assertWorkerAdmission = options.assertWorkerAdmission;
     this.#store = options.store;
     this.#sessionHost = options.sessionHost;
     this.#readSettings = options.readSettings;
@@ -317,6 +321,8 @@ export class CollaborationGoalManager {
       }
 
       const goal = this.#store.getCollaborationGoal(input.goalId);
+      this.#assertWorkerAdmission?.(input.callerLeadSessionId);
+      assertExtensionWorkerPlan(this.#store, input.callerLeadSessionId, input);
       const target = this.#store.getTarget(input.route.targetId);
       const workerId = collaborationId("worker", this.#idFactory());
       const lease = await this.#capacity.acquire(goal.id, workerId);
@@ -327,6 +333,8 @@ export class CollaborationGoalManager {
         const claim = this.#store.claimDeferredEffectOperation<{ readonly workerId: string }>(
           { id: input.operationId, kind: "create_collaboration_worker", body },
           (store) => {
+            this.#assertWorkerAdmission?.(input.callerLeadSessionId);
+            assertExtensionWorkerPlan(store, input.callerLeadSessionId, input);
             store.reserveCollaborationWorker({
               id: workerId,
               goalId: goal.id,
@@ -381,6 +389,10 @@ export class CollaborationGoalManager {
         body: { ...input, expectedRevision: input.expectedRevision.toString(10) }
       },
       (store) => {
+        const current = store.getCollaborationWorker(input.workerId);
+        this.#assertWorkerAdmission?.(input.callerLeadSessionId);
+        assertExtensionWorkerPlan(store, input.callerLeadSessionId, { ...current, existingWorkerId: current.id,
+          label: input.label ?? current.label, assignment: input.assignment ?? current.assignment, route: current });
         const worker = store.updateCollaborationWorkerAssignment({
           workerId: input.workerId,
           callerLeadSessionId: input.callerLeadSessionId,
@@ -451,6 +463,9 @@ export class CollaborationGoalManager {
         return { tree: this.#tree(worker.goalId), worker };
       }
       const current = this.#store.getCollaborationWorker(input.workerId);
+      const assertCurrent = () => { const worker = this.#store.getCollaborationWorker(input.workerId); this.#assertWorkerAdmission?.(input.callerLeadSessionId);
+        assertExtensionWorkerPlan(this.#store, input.callerLeadSessionId, { ...worker, existingWorkerId: worker.id, route: worker }); };
+      assertCurrent();
       const currentGoal = this.#store.getCollaborationGoal(current.goalId);
       if (currentGoal.leadSessionId !== input.callerLeadSessionId) {
         throw new AuthorizationError("Only the collaboration Goal lead Session can wake a worker.");
@@ -479,6 +494,7 @@ export class CollaborationGoalManager {
         const claim = this.#store.claimDeferredEffectOperation<{ readonly workerId: string }>(
           operation,
           (store) => {
+            assertCurrent();
             const worker = store.getCollaborationWorker(input.workerId);
             assertWorkerRevision(worker, input.expectedRevision);
             const goal = store.getCollaborationGoal(worker.goalId);
@@ -516,7 +532,9 @@ export class CollaborationGoalManager {
         this.#leases.set(current.id, lease);
         const prepared = this.#store.getCollaborationWorker(current.id);
         if (prepared.sessionId === undefined) throw new StoreError("The collaboration worker has no Session.");
+        assertCurrent();
         await this.#sessionHost.resume(prepared.sessionId);
+        assertCurrent();
         const resumedSession = this.#store.getSession(prepared.sessionId);
         const resumedBackend = this.#store.getBackend(resumedSession.descriptor.backendId);
         const claimedOperation = this.#store.getOperation(input.operationId);
@@ -663,6 +681,8 @@ export class CollaborationGoalManager {
         throw new StoreError("The collaboration worker Session binding was lost before queue admission.");
       }
       const admittedWorker = worker;
+      this.#assertWorkerAdmission?.(input.callerLeadSessionId);
+      assertExtensionWorkerPlan(this.#store, input.callerLeadSessionId, { ...worker, existingWorkerId: worker.id, route: this.#store.getSession(sessionId).descriptor });
       const execution = this.#sessionHost.enqueueServiceInput({
         operationId: input.operationId,
         sessionId,
@@ -671,6 +691,8 @@ export class CollaborationGoalManager {
         originSessionId: input.callerLeadSessionId,
         taskMessageOrigin: { senderSessionId: input.callerLeadSessionId, senderSessionTitle: this.#store.getSession(input.callerLeadSessionId).descriptor.title },
         onAdmitted: (store, result) => {
+          this.#assertWorkerAdmission?.(input.callerLeadSessionId);
+          assertExtensionWorkerPlan(store, input.callerLeadSessionId, { ...admittedWorker, existingWorkerId: admittedWorker.id, route: store.getSession(sessionId).descriptor });
           const dispatch = store.createCollaborationDispatch({
             goalId: input.goalId,
             workerId: input.workerId,
@@ -835,6 +857,7 @@ export class CollaborationGoalManager {
     if (goal.status !== "active") {
       throw new StoreError("A worker can report only while its collaboration Goal is active.");
     }
+    this.#assertWorkerAdmission?.(goal.leadSessionId);
     const execution = this.#sessionHost.enqueueServiceInput({
       operationId: input.operationId,
       sessionId: goal.leadSessionId,
@@ -844,6 +867,7 @@ export class CollaborationGoalManager {
       collaborationReportOrigin: { goalId: goal.id, workerId: worker.id, leadSessionId: goal.leadSessionId,
         workerSessionId: worker.sessionId, workerLabel: worker.label, body: input.message },
       onAdmitted: (store) => {
+        this.#assertWorkerAdmission?.(goal.leadSessionId);
         const current = store.getCollaborationWorker(worker.id);
         const currentGoal = store.getCollaborationGoal(current.goalId);
         assertWorkerRevision(current, input.expectedWorkerRevision);
@@ -1043,6 +1067,10 @@ export class CollaborationGoalManager {
       const created = await this.#sessionHost.createServiceSession({
         operationId: sessionOperationId,
         serviceKind: "collaboration",
+        ...(isExtensionTaskControlled(this.#store, goal.leadSessionId) && this.#store.getSession(goal.leadSessionId).descriptor.hidden ? { hidden: true } : {}),
+        assertServiceScope: () => { this.#assertWorkerAdmission?.(goal.leadSessionId);
+          const current = this.#store.getCollaborationWorker(workerId);
+          assertExtensionWorkerPlan(this.#store, goal.leadSessionId, { ...current, existingWorkerId: current.id, route: current }); },
         targetId: worker.targetId,
         title: `${goal.title} · ${worker.label}`,
         ...(worker.providerId === undefined ? {} : { providerId: worker.providerId }),

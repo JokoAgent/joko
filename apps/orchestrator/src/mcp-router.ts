@@ -258,6 +258,7 @@ export interface BridgeToolPolicyDeclaration {
 
 /** Product scope authenticated from the durable Session binding, never from tool arguments. */
 export interface BridgeToolCallContext {
+  readonly assertCurrent?: () => void;
   readonly sessionId: string;
   readonly targetId: string;
   readonly generation: number;
@@ -566,6 +567,7 @@ export class McpRouter {
   readonly #nativeAuthProviderRoutes = new Map<string, NativeAuthProviderRouteState>();
   readonly #remoteAttestationNonces = new Map<string, number>();
   readonly #bridgeToolProviders = new Map<string, BridgeToolProvider>();
+  #nativeToolAdmission?: (sessionId: string, serverId: string, toolName: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal) => Promise<() => void>;
   readonly #targetReferences: McpRouterOptions["targetReferences"];
   readonly #isGroupSession: McpRouterOptions["isGroupSession"];
   readonly #capturePartnerLearningSave: McpRouterOptions["capturePartnerLearningSave"];
@@ -660,6 +662,8 @@ export class McpRouter {
   }
 
   /** Register an in-process Tool Provider without persisting it as MCP configuration. */
+  setNativeToolAdmission(admit: (sessionId: string, serverId: string, toolName: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal) => Promise<() => void>): void { this.#nativeToolAdmission = admit; }
+
   registerBridgeToolProvider(provider: BridgeToolProvider): () => void {
     this.#assertInitialized();
     nonBlank(provider.id, "Bridge Tool Provider ID");
@@ -1094,6 +1098,19 @@ export class McpRouter {
     return proof;
   }
 
+  /** Private model transport uses the same exact runtime capability, without obtaining an MCP tool grant. */
+  captureBridgeProductScope(input: { readonly authorization: string | undefined; readonly generation: number;
+    readonly sessionId: string; readonly targetId: string }): { readonly assertCurrent: () => void } {
+    this.#assertInitialized(); const token = bearerToken(input.authorization), grant = this.#findGrant(token);
+    const assertCurrent = () => {
+      const session = this.#store.getSession(input.sessionId).descriptor;
+      if (this.#findGrant(token) !== grant || !grant.productScope || grant.productScope.sessionId !== input.sessionId
+        || grant.productScope.targetId !== input.targetId || grant.expectedPiGeneration !== input.generation
+        || session.binding.generation !== input.generation || session.targetId !== input.targetId || session.archived || session.deletedAt !== undefined
+        || this.#store.findPendingSessionLifecycleCleanup(session.id)) throw new Error("The native runtime capability is no longer current.");
+    }; assertCurrent(); return { assertCurrent };
+  }
+
   async executeBridgeCall(input: {
     readonly authorization: string | undefined;
     readonly requestId: string;
@@ -1110,6 +1127,7 @@ export class McpRouter {
     readonly appCall?: AppModelInvocation;
   }): Promise<McpBridgeCallResult> {
     this.#assertInitialized();
+    input = { ...input, arguments: structuredClone(input.arguments ?? {}) };
     const token = bearerToken(input.authorization);
     const grant = this.#findGrant(token);
     if (!boundedBridgeRequestId(input.requestId)) throw new Error("Pi MCP bridge request identity is invalid.");
@@ -1140,6 +1158,8 @@ export class McpRouter {
     if (input.appCall && (!modelChannel || modelChannel.grant !== grant || modelChannel.runtime.serverId !== input.serverId
       || input.appCall.params.name !== input.toolName || operationBodyHash(input.appCall.params.arguments ?? {}) !== operationBodyHash(input.arguments ?? {}))) throw new Error("MCP model call escaped its original channel.");
     modelChannel?.assertCurrent();
+    const assertDelegated = await this.#nativeToolAdmission?.(input.sessionId, input.serverId, input.toolName, input.arguments ?? {}, input.signal ?? new AbortController().signal);
+    assertDelegated?.();
     let appCapture: McpAppCapture | undefined;
     let modelTask: CreateTaskResult | undefined;
     try {
@@ -1185,6 +1205,7 @@ export class McpRouter {
         const targetRevision = this.#store.getTarget(session.targetId).revision;
         const context = { sessionId: session.id, targetId: session.targetId, generation: input.generation, requestIdentity, requestBodyHash };
         const guard = (): void => {
+          assertDelegated?.();
           modelChannel?.assertCurrent();
           input.signal?.throwIfAborted();
           const current = this.#store.getSession(context.sessionId).descriptor;
@@ -1222,7 +1243,7 @@ export class McpRouter {
               const response = await client.request(request, CallToolResultSchema, requestOptions); guard();
               raw = { ...response, isError: response.isError ?? false };
             }
-          } else raw = await runtime.connection.callTool(input.toolName, input.arguments ?? {}, input.signal);
+          } else { guard(); raw = await runtime.connection.callTool(input.toolName, input.arguments ?? {}, input.signal); }
           guard();
           if (appCapture !== undefined) {
             await appCapture.complete({ ...raw, content: [...raw.content] }).catch(() => undefined);
@@ -1255,6 +1276,7 @@ export class McpRouter {
           requestBodyHash
         };
         const guard = (): void => {
+          assertDelegated?.();
           input.signal?.throwIfAborted();
           const current = this.#store.getSession(context.sessionId).descriptor;
           if (this.#findGrant(token) !== grant
@@ -1282,6 +1304,7 @@ export class McpRouter {
               requestIdentity,
               effectIdentity,
               requestBodyHash,
+              assertCurrent: guard,
               ...(partnerLearningSave === undefined ? {} : { partnerLearningSave })
             }
           );
@@ -2337,6 +2360,7 @@ export class McpRouter {
     readonly hostArtifacts: readonly BridgeToolArtifactOutput[];
   }> {
     const assertCurrent = (): void => {
+      context.assertCurrent?.();
       signal?.throwIfAborted();
       if (this.#bridgeToolProviders.get(provider.id) !== provider
         || !provider.available

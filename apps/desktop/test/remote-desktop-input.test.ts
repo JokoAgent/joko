@@ -14,6 +14,26 @@ import {
 } from "../src/remote-desktop-input.js";
 
 describe("Desktop Remote Desktop terminal lock helper", () => {
+  it("keeps each complete pointer batch hidden until its native ACK and samples wheel position when dispatched", async () => {
+    const child = inputChild(), completions: ReturnType<typeof vi.fn>[] = [], points: { x: number; y: number }[][] = [];
+    const pointer = vi.fn((batch: { x: number; y: number }[]) => { points.push(batch); const completed = vi.fn(); completions.push(completed); return completed; });
+    const runtime: DesktopRemoteDesktopInputRuntime = {
+      platform: "darwin", resolveBinary: async () => "helper", spawn: () => child as unknown as ChildProcessWithoutNullStreams,
+      display: () => ({ id: "1", name: "Display", width: 100, height: 100, x: -100, y: 20 }),
+      toPhysicalPoint: point => ({ x: point.x * 2, y: point.y * 2 }), cursorScreenPoint: () => ({ x: 17, y: 18 })
+    };
+    const input = new DesktopRemoteDesktopInput(vi.fn(), runtime, pointer);
+    const started = input.start("1", new AbortController().signal); await vi.waitFor(() => expect(child.stdin.listenerCount("error")).toBeGreaterThan(0));
+    child.stdout.write("ready\n"); await started;
+    input.send([{ kind: "button", button: 0, down: true, x: .5, y: .5 }, { kind: "move", x: .9, y: .9 }]);
+    input.send([{ kind: "scroll", dx: 0, dy: 1 }]);
+    await vi.waitFor(() => expect(pointer).toHaveBeenCalledOnce());
+    expect(points[0]).toEqual([{ x: -50, y: 70 }, { x: -11, y: 109 }]); expect(completions[0]).not.toHaveBeenCalled();
+    child.stdout.write("ok\n"); await vi.waitFor(() => expect(pointer).toHaveBeenCalledTimes(2));
+    expect(completions[0]).toHaveBeenCalledOnce(); expect(points[1]).toEqual([{ x: 17, y: 18 }]); expect(completions[1]).not.toHaveBeenCalled();
+    child.stdout.write("ok\n"); await vi.waitFor(() => expect(completions[1]).toHaveBeenCalledOnce());
+    const stopped = input.release(); child.emit("close", 0, null); await stopped;
+  });
   it.each(["win32", "linux"] as const)("keeps %s lock unavailable without preparing a helper", async (platform) => {
     const runtime = lockRuntime(platform);
     await expect(lockDesktopRemoteDesktopScreen(() => true, new AbortController().signal, runtime))
@@ -158,7 +178,9 @@ it("privacy pause drains the actual helper and drops remote input until exact Ca
   expect(first.stdin.read()?.toString()).toBe('[{"kind":"release"}]\n'); await Promise.resolve(); expect(paused).toBe(false);
   first.emit("close", 0, null); const resume = await pausing;
   const resuming = resume(); await vi.waitFor(() => expect(runtime.spawn).toHaveBeenCalledTimes(2)); second.stdout.write("ready\n"); await resuming;
-  input.send([{ kind: "key", code: "KeyJ", down: true }]); expect(second.stdin.read()?.toString()).toContain("KeyJ");
+  input.send([{ kind: "key", code: "KeyJ", down: true }]);
+  await vi.waitFor(() => expect(second.stdin.read()?.toString()).toContain("KeyJ"));
+  second.stdout.write("ok\n");
   const released = input.release(); second.emit("close", 0, null); await released;
 });
 

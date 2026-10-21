@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
+import { answerDeliveryPrompt } from "./answer-delivery-prompt.js";
+import { richAnswerText } from "@joko/contracts";
 import { lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { hostname, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -156,6 +158,9 @@ import { ExtensionCatalogManager } from "./extension-catalog.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import { ExtensionMainViewManager } from "./extension-main-view-manager.js";
 import { ExtensionPackagePublisher } from "./extension-package-publisher.js";
+import { ExtensionTasks } from "./extension-tasks.js";
+import { createExtensionTaskNativeReviewer } from "./extension-task-native-reviewer.js";
+import { ExtensionText } from "./extension-text.js";
 import { ExtensionSourceManager } from "./extension-source-manager.js";
 import { HistoryMaintenance } from "./history-maintenance.js";
 import {
@@ -217,7 +222,9 @@ import { OperationalBrowserState } from "./operational-browser-state.js";
 import { OperationalWorkspaceSnapshotRepository } from "./operational-workspace-snapshots.js";
 import { PiProviderAuthSupervisor } from "./pi-provider-auth-supervisor.js";
 import { ProviderAccountUsageProvider } from "./provider-account-usage.js";
-import { PiResourceManager } from "./resource-manager.js";
+import { PiResourceManager, inspectPiSkillPackage } from "./resource-manager.js";
+import { BuiltinSkillCatalog } from "./builtin-skills.js";
+import { PluginAuthoringTools } from "./plugin-authoring-tools.js";
 import { RemoteSkillSourceOwner } from "./remote-skill-source.js";
 import { SkillManager } from "./skill-manager.js";
 import { SkillLearningManager } from "./skill-learning-manager.js";
@@ -239,6 +246,13 @@ import { ContactManager } from "./contact-manager.js";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import { ContactToolBridgeProvider } from "./contact-tool-provider.js";
 import { PartnerManager, partnerSessionRuntimeFallback } from "./partner-manager.js";
+import { PartnerHomeOwner, PartnerHomeStorage } from "./partner-home-owner.js";
+import { PartnerHomeFiles } from "./partner-home-files.js";
+import { PartnerHomeRuntimeAdapter } from "./partner-home-runtime.js";
+import { PartnerHomeSnapshots } from "./partner-home-snapshot.js";
+import { PartnerHomeInference } from "./partner-home-inference.js";
+import { PartnerHomeProjects } from "./partner-home-projects.js";
+import { PartnerHomeWorkbench } from "./partner-home-workbench.js";
 import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
 import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
 import { PartnerRoutineStore } from "@joko/store";
@@ -499,6 +513,9 @@ export interface OrchestratorApplication {
   readonly appDefaultModels?: AppDefaultModelCoordinator;
   readonly partnerRoutines?: PartnerRoutineManager;
   readonly partnerImports?: PartnerImportManager;
+  readonly partnerHomes?: PartnerHomeOwner;
+  readonly partnerHomeRuntime?: PartnerHomeRuntimeAdapter;
+  readonly partnerHomeInference?: PartnerHomeInference;
   readonly partnerWorkingStatus?: PartnerWorkingStatusManager;
   readonly partnerWorkbenches?: PartnerWorkbenchManager;
   readonly partnerSessionTasks?: PartnerSessionTaskManager;
@@ -509,6 +526,7 @@ export interface OrchestratorApplication {
   readonly extensionCards?: ExtensionCardsManager;
   readonly extensionNetwork?: ExtensionNetworkSettings;
   readonly extensionOAuth?: ExtensionOAuthSettings;
+  readonly extensionTasks?: ExtensionTasks;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
@@ -637,7 +655,7 @@ export async function createOrchestratorApplication(
   ]);
 
   let suppressPrivateSessionNotifications: (sessionId: string) => boolean = () => false;
-  const store = new OperationalStore(config.databasePath, { suppressSessionNotifications: sessionId => suppressPrivateSessionNotifications(sessionId) });
+  const store = new OperationalStore(config.databasePath, { suppressSessionNotifications: sessionId => suppressPrivateSessionNotifications(sessionId), assistantTextForSearch: richAnswerText });
   let contactStore: ContactStore;
   try {
     contactStore = new ContactStore(join(config.dataDirectory, "contacts.db"));
@@ -656,6 +674,9 @@ export async function createOrchestratorApplication(
     throw error;
   }
   let backendInstances!: BackendInstanceRegistry;
+  const partnerHomeStorage = new PartnerHomeStorage(store);
+  let partnerHomeInference: PartnerHomeInference | undefined;
+  let partnerHomeRuntime: PartnerHomeRuntimeAdapter | undefined;
   suppressPrivateSessionNotifications = sessionId => partnerStore.getSessionLink(sessionId)?.role === "group";
   let partnerGroupStore: PartnerGroupStore;
   try { partnerGroupStore = new PartnerGroupStore(join(config.dataDirectory, "partner-groups.db")); }
@@ -663,7 +684,15 @@ export async function createOrchestratorApplication(
   let partnerGroupRuntime: PartnerGroupSessionRuntime | undefined;
   let partnerGroups: PartnerGroupManager | undefined;
   let partnerGroupWorkspaces: PartnerGroupWorkspaces | undefined;
-  const privateResourceTarget = (context: AdapterContext) => partnerGroupRuntime?.homeTarget(context.sessionId, context.target.id);
+  const privateHomeTarget = (sessionId: string, targetId: string) => {
+    const home = partnerHomeRuntime?.executionHome(targetId);
+    if (home && home.id !== targetId) {
+      try { if (store.getSession(sessionId).descriptor.targetId !== targetId) return undefined; } catch { /* Native creation precedes its product Session row. */ }
+      return home.id;
+    }
+    return partnerGroupRuntime?.homeTarget(sessionId, targetId);
+  };
+  const privateResourceTarget = (context: AdapterContext) => privateHomeTarget(context.sessionId, context.target.id);
   let voiceDictionaryPeerStore: VoiceDictionaryPeerStore;
   try {
     voiceDictionaryPeerStore = new VoiceDictionaryPeerStore(join(config.dataDirectory, "voice-dictionary-peers.db"));
@@ -850,6 +879,9 @@ export async function createOrchestratorApplication(
     })
   });
   const remoteExecution = new RemoteExecutionRouter({ hosts: remoteHosts, peers: devicePeers });
+  const partnerHomeProjects = new PartnerHomeProjects({ execution: remoteExecution, home: targetId => partnerHomeRuntime?.executionHome(targetId), codeHost: new CodeHostProjectProvider() });
+  const partnerWorkbenchStore = new PartnerWorkbenchStore(join(config.dataDirectory, "partner-homes"));
+  const partnerHomeWorkbench = new PartnerHomeWorkbench(store, partnerWorkbenchStore);
   const remotePiProcesses = new RemotePiProcessFactory({
     remoteExecution,
     store,
@@ -922,6 +954,7 @@ export async function createOrchestratorApplication(
   });
   const piResources = new PiResourceManager({
     store,
+    builtinSkills: await BuiltinSkillCatalog.load(inspectPiSkillPackage),
     managedRoot: join(config.piAgentHome, "managed-resources"),
     remoteProjectSkills: new RemoteSkillSourceOwner({ store,
       managedRoot: join(config.piAgentHome, "remote-project-skills"),
@@ -991,7 +1024,7 @@ export async function createOrchestratorApplication(
     onAppToolCall: async input => mcpApps?.capture(input),
     onAppConnectionOpen: connection => { mcpApps?.host.registerConnection(connection); },
     onAppConnectionRelease: async connection => { if (mcpApps) await mcpApps.host.releaseConnection(connection); else await connection.close(); },
-    targetReferences: (targetId, sessionId) => partnerConnections?.targetReferences(sessionId === undefined ? targetId : partnerGroupRuntime?.homeTarget(sessionId, targetId) ?? targetId),
+    targetReferences: (targetId, sessionId) => partnerConnections?.targetReferences(sessionId === undefined ? targetId : privateHomeTarget(sessionId, targetId) ?? targetId),
     isGroupSession: sessionId => partnerStore.getSessionLink(sessionId)?.role === "group",
     capturePartnerLearningSave: source => partnerLearning?.captureSave(source),
     resultArtifacts: artifacts,
@@ -1221,6 +1254,11 @@ export async function createOrchestratorApplication(
   const unregisterMakerMemoryBridge = mcpRouter.registerBridgeToolProvider(
     new MakerMemoryBridgeProvider(makerMemory)
   );
+  const unregisterPluginAuthoringTools = mcpRouter.registerBridgeToolProvider(new PluginAuthoringTools({ store, resources: piResources, artifacts,
+    workingRoot: join(config.dataDirectory, "plugin-authoring"), captureWorkspace: context => {
+      if (!sessionHostForHelperTools) throw new Error("The task Workspace authority is not ready.");
+      return sessionHostForHelperTools.captureToolWorkspace(context);
+    } }));
   const unregisterVisionBridgeTools = mcpRouter.registerBridgeToolProvider(
     new VisionBridgeToolProvider({
       vision: visionBridge,
@@ -1334,6 +1372,14 @@ export async function createOrchestratorApplication(
     recoverManagedGenerationsOnInitialize: backendInstances.adapter(piBackendId) === undefined,
     ...(config.piExecutable === undefined ? {} : { command: config.piExecutable }),
     processFactory: remotePiProcesses.create,
+    prepareRemoteHomeRuntime: input => partnerHomeInference?.prepare(input) ?? Promise.resolve(undefined),
+    validateRemoteHomeDirectories: (context, directories) => partnerHomeProjects.remote(context.target)
+      ? partnerHomeProjects.validateDirectories(context.target, directories, () => {
+        let current: import("@joko/core").SessionDescriptor | undefined;
+        try { current = store.getSession(context.sessionId).descriptor; } catch { /* A new native Session is admitted before its product row. */ }
+          if (!partnerHomeProjects.remote(context.target) || current && partnerHomeRuntime?.blocksExecution(context.sessionId)
+          || current && (current.targetId !== context.target.id || current.binding.generation > context.generation)) throw new Error("The Partner execution home changed.");
+      }) : Promise.resolve(undefined),
     remoteNavigationOwner: remotePiProcesses.navigationOwner,
     managedDurableStoreRegistry: remotePiProcesses,
     onManagedSubagentLineageRemoved: (input) => mcpRouter.revokeNativeAuthSession(input),
@@ -1711,6 +1757,7 @@ export async function createOrchestratorApplication(
   };
   let closed = false;
   let startupPartnerImports: PartnerImportManager | undefined;
+  let startupPartnerHomes: PartnerHomeOwner | undefined;
   let startupPartnerImportRuntime: PartnerImportRuntime | undefined;
   try {
   const currentPi = (): ReturnType<typeof createPiAdapter> => {
@@ -1816,9 +1863,10 @@ export async function createOrchestratorApplication(
       return task?.owned ? task : group?.owned ? group : partnerSessionRuntimeFallback(partnerStore, input);
     },
     partnerSessionRetiring: (sessionId) => partnerStore.isPartnerSessionRetiring(sessionId)
+      || (partnerHomeRuntime?.blocksExecution(sessionId) ?? partnerHomeStorage.blocksSession(sessionId))
       || partnerStore.isPartnerTargetRetiring(store.getSession(sessionId).descriptor.targetId) || partnerSessionTasks?.isRetiring(sessionId) === true
       || partnerGroupRuntime?.isRetiring(sessionId) === true,
-    partnerTargetRetired: (targetId) => partnerStore.isPartnerTargetRetired(targetId),
+    partnerTargetRetired: (targetId) => partnerStore.isPartnerTargetRetired(targetId) || partnerHomeRuntime?.blocksTarget(targetId) === true,
     partnerSessionRestarting: (sessionId) => partnerStore.isPartnerSessionRestarting(sessionId),
     partnerSessionPaused: (sessionId) => partnerStore.isPartnerSessionPaused(sessionId) || partnerSessionTasks?.isHeld(sessionId) === true || partnerGroupRuntime?.isHeld(sessionId) === true,
     partnerSessionPolicy: (sessionId) => {
@@ -1828,7 +1876,12 @@ export async function createOrchestratorApplication(
         status: profile.initializationState
       };
     },
-    resolveServiceRuntimePrompt: (session, assertCurrent) => partnerRuntimePrompt.resolve(session, assertCurrent),
+    decorateRuntimePrompt: answerDeliveryPrompt,
+    resolveServiceRuntimePrompt: async (session, assertCurrent) => {
+      const resolved = await partnerRuntimePrompt.resolve(session, assertCurrent);
+      assertCurrent();
+      return resolved ?? session.appendSystemPrompt;
+    },
     resolveServiceRuntimeConfiguration: session => {
       const connections = partnerConnections?.runtimeIdentity(session), skills = partnerSkills?.runtimeIdentity(session);
       return connections === undefined && skills === undefined ? undefined : JSON.stringify([connections ?? null, skills ?? null]);
@@ -1988,6 +2041,9 @@ export async function createOrchestratorApplication(
   const partners = new PartnerManager({
     store: partnerStore,
     operationalStore: store,
+    homeChanging: partnerId => partnerHomeStorage.changing(partnerId),
+    remoteHomeModelAvailable: (targetId, route) => partnerHomeRuntime?.executionHome(targetId) !== undefined
+      && route.backendId === piBackendId && partnerHomeInference?.available(route.backendId, route.providerId, route.modelId) === true,
     appDefaultModel: () => {
       const current = appDefaultModels?.current();
       if (!current || !sessionHost.appDefaultModelChoices().some(choice => choice.id === JSON.stringify([current.backendId, current.providerId, current.modelId]))) return undefined;
@@ -2015,15 +2071,18 @@ export async function createOrchestratorApplication(
     resumeIndependentReturns: async (partnerId) => partnerSessionTasks?.refreshPartner(partnerId)
   });
   const partnerWorkbenches = new PartnerWorkbenchManager({ partners, partnerStore, store, host: sessionHost, workspaces,
-    workbenches: new PartnerWorkbenchStore(join(config.dataDirectory, "partner-homes")), managedDataDirectory: config.dataDirectory,
+    workbenches: partnerWorkbenchStore, managedDataDirectory: config.dataDirectory,
+    remoteProjects: partnerHomeProjects, homeTransit: partnerHomeWorkbench, homeChanging: partnerId => partnerHomeStorage.changing(partnerId),
+    homeLocation: partnerId => partnerHomeRuntime ? partnerHomeStorage.current(partnerId, partnerHomeRuntime.local).location : undefined,
     briefs: new PartnerWorkbenchBriefReader(new CodeHostProjectProvider()), sessionTasks: () => partnerSessionTasks, routines: () => partnerRoutines,
     pullRequestProviders: (authorization) => composeCodeHostProviders(dependencies.codeHostProviders, authorization) });
-  partnerSessionTasks = new PartnerSessionTaskManager(store, partners, sessionHost, workspaces, config.dataDirectory);
+  partnerSessionTasks = new PartnerSessionTaskManager(store, partners, sessionHost, workspaces, config.dataDirectory, Date.now, partnerHomeProjects);
   const partnerTaskOutputs = new PartnerTaskOutputProjection(store, partnerSessionTasks, partnerStore, workspaceCapture);
   const unregisterPartnerSessionTaskTools = mcpRouter.registerBridgeToolProvider(new PartnerSessionTaskTools(partnerSessionTasks));
   const collaborationGoals = new CollaborationGoalManager({
     store,
     sessionHost,
+    assertWorkerAdmission: leadSessionId => extensionTasks.assertTeamWorkerCurrent(leadSessionId),
     readSettings: () => runtimeGovernance.collaboration()
   });
   const unregisterCollaborationGoalTools = mcpRouter.registerBridgeToolProvider(
@@ -2275,6 +2334,15 @@ export async function createOrchestratorApplication(
   startupRoutineRuntime = extensionRoutineRuntime;
   let extensionCardRuntime: ExtensionCardRuntime | undefined;
   let extensionOAuthCards: ExtensionOAuthCards | undefined;
+  let extensionText: ExtensionText | undefined;
+  const extensionTasks = new ExtensionTasks({ store, host: sessionHost, catalog: extensionCatalog,
+    defaults: { current: () => appDefaultModels?.current() }, rootDirectory: join(config.dataDirectory, "extension-tasks"), redact: value => credentials.redactText(value), teams: collaborationGoals,
+    reviewNativeTool: createExtensionTaskNativeReviewer({ store, routes: modelRoutes, redact: value => credentials.redactText(value),
+      adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter ? [adapter] : []; }) }) });
+  sessionHost.setExtensionTaskQueueGuard(item => extensionTasks.assertQueueCurrent(item));
+  sessionHost.setExtensionNativeToolAuthorization(sessionId => extensionTasks.nativeToolAuthorization(sessionId));
+  mcpRouter.setNativeToolAdmission((...args) => sessionHost.authorizeNativeBridgeTool(...args));
+  piResources.setExtensionTaskRemoval((transaction, resourceId) => extensionTasks.uninstall(transaction, resourceId));
   const extensionCardMedia = new ExtensionCardMedia({ store, vault: credentialVault, artifacts, transfers: blobTransfers });
   const extensionCards = new ExtensionCardsManager({ store, vault: credentialVault,
     media: extensionCardMedia,
@@ -2290,7 +2358,7 @@ export async function createOrchestratorApplication(
     authority: id => extensionCardRuntime?.authority(id), locale: () => persistedLocale(store),
     continueTask: (scope, text, guard) => sessionHost.enqueueExtensionCardMessage(scope.sessionId, scope.extensionId, text, guard) });
   extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store,
-    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
+    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, tasks: extensionTasks, text: { oneshot: (...args) => extensionText!.oneshot(...args) }, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
     registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
     locale: () => persistedLocale(store),
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
@@ -2308,11 +2376,14 @@ export async function createOrchestratorApplication(
   const messageSearch = new MessageSearchEmbeddingCoordinator({ store, providers });
   messageSearchForHelperTools = messageSearch;
   const auxiliaryText = new AuxiliaryTextRouting({ store, routes: modelRoutes, providers });
+  extensionText = new ExtensionText({ store, tasks: extensionTasks, catalog: extensionCatalog, routes: modelRoutes, auxiliary: auxiliaryText,
+    adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter === undefined ? [] : [adapter]; }) });
   const helpAssistant = new HelpAssistant({ store, auxiliary: auxiliaryText,
     adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter === undefined ? [] : [adapter]; }) });
   const helpFeedback = new HelpFeedbackStore(join(config.dataDirectory, "help-feedback"));
   const agentImportSources = dependencies.agentImportSources ?? { home: userInfo().homedir, environment: { ...process.env } };
   partnerImports = new PartnerImportManager({ storage: partnerImportStorage, ...agentImportSources,
+    currentCanonicalSession: partnerId => { try { const profile = partners.getPartner(partnerId); return profile.lifecycle === "deleted" ? undefined : profile.canonicalSessionId; } catch { return undefined; } },
     prepareCreation: (selection, native) => preparePartnerImportCreation(partners, selection, native),
     nativeRuntimeReady: id => { const profile = partners.getPartner(id); return profile.lifecycle === "active" && profile.initializationState === "ready" && !!profile.canonicalSessionId; },
     adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, partnerImportStorage, id, assertOwner),
@@ -2347,16 +2418,40 @@ export async function createOrchestratorApplication(
     } });
   const partnerImportRuntime = new PartnerImportRuntime({ partners, storage: partnerImportStorage, store, host: sessionHost,
     imports: partnerImports, auxiliary: auxiliaryText, routines: partnerRoutines, assertServiceOwner: assertImportService,
-    groupHomeTarget: (sessionId, targetId) => partnerGroupRuntime?.homeTarget(sessionId, targetId), isGroupSession: sessionId => partnerStore.getSessionLink(sessionId)?.role === "group" });
+    groupHomeTarget: privateHomeTarget, isGroupSession: sessionId => partnerStore.getSessionLink(sessionId)?.role === "group" });
   startupPartnerImports = partnerImports; startupPartnerImportRuntime = partnerImportRuntime;
   const unregisterPartnerImportTools = mcpRouter.registerBridgeToolProvider(partnerImportRuntime);
   partnerRoutines.setImportedRuntime(partnerImportRuntime);
   partnerConnections = new PartnerConnectionsManager(partners, partnerStore, store, partnerConnectionPreferences, mcpRouter,
     (sessionId, targetId, id) => toolPolicies.enabledForSession(sessionId, targetId, id), piResources,
     (partnerId, signal, backendId) => partnerSkills!.referenceMetadata(partnerId, signal, backendId),
-    (sessionId, targetId) => partnerGroupRuntime?.homeTarget(sessionId, targetId));
+    privateHomeTarget);
   partnerSkills = new PartnerSkillsManager(partners, partnerStore, store, piResources, skillMutations,
-    sessionId => sessionHost.requestServiceRuntimeRefresh(sessionId), (sessionId, targetId) => partnerGroupRuntime?.homeTarget(sessionId, targetId));
+    sessionId => sessionHost.requestServiceRuntimeRefresh(sessionId), privateHomeTarget);
+  partnerHomeRuntime = new PartnerHomeRuntimeAdapter({ serverId, store, profiles: partnerStore, partners, host: sessionHost,
+    workspaces, resources: piResources, homesRoot: join(config.dataDirectory, "partner-homes"), peers: devicePeers,
+    files: new PartnerHomeFiles({ serverId, peers: devicePeers, remoteExecution }), storage: partnerHomeStorage,
+    snapshots: new PartnerHomeSnapshots(join(config.dataDirectory, "partner-home-moves")), memoryPreferences: partnerMemoryPreferences,
+    workbench: partnerHomeWorkbench,
+    routines: partnerRoutines, artifacts, assertOwner: assertImportService,
+    supportsRemoteCreation: backendId => backendId === piBackendId,
+    hasRemoteModelRoute: (backendId, providerId, modelId) => partnerHomeInference?.available(backendId, providerId, modelId) === true,
+    ownedSessions: partnerId => [...partnerSessionTasks?.ownedSessions(partnerId) ?? [], ...partnerGroupRuntime?.ownedSessions(partnerId) ?? []],
+    readProfileProjection: async (partnerId, assertCurrent) => {
+      const profile = partnerStore.getPartner(partnerId), carried = store.findSetting<{ identity: string; user: string; instructions: string }>("target", profile.homeTargetId, "partner-home.profile")?.value;
+      if (carried) return carried;
+      const environment = await partnerImportStorage.environment.read(partnerId, assertCurrent); assertCurrent(); return environment?.profileProjection;
+    },
+    pauseGoal: async (sessionId, operationId) => {
+      const goal = store.findObjective(sessionId);
+      if (goal && (goal.status === "active" || goal.status === "dispatch_unknown")) await objectives!.pause({ sessionId, operationId,
+        expectedRevision: goal.revision, expectedOwnerGeneration: goal.ownerGeneration, reason: "Partner is changing execution computer by user request." });
+    }, retireWorkbench: (partnerId, targetId) => partnerWorkbenches.retirePartner(partnerId, targetId) });
+  const partnerHomes = startupPartnerHomes = new PartnerHomeOwner(partnerHomeStorage, partnerHomeRuntime);
+  partnerHomeInference = new PartnerHomeInference({ store, providers, router: mcpRouter,
+    fetch: createOutboundFetch(dependencies.resolveOutboundProxy), isHome: targetId => partnerHomeRuntime!.executionHome(targetId) !== undefined });
+  piResources.setPartnerHomeDataRoot(targetId => partnerHomeRuntime!.dataRoot(targetId));
+  sessionHost.setPartnerHomeInputGuard(sessionId => { if (partnerHomeRuntime!.blocksInput(sessionId)) throw new Error("The Partner is changing its execution computer. Refresh its current home."); });
   partnerLearning = new PartnerLearningManager({ store, profiles: partnerStore, partners, memory: makerMemory,
     skills: partnerSkills, auxiliary: auxiliaryText });
   const unregisterPartnerSkillTools = mcpRouter.registerBridgeToolProvider(new PartnerSkillsToolProvider(partnerSkills));
@@ -2956,6 +3051,7 @@ export async function createOrchestratorApplication(
     mobilePush.start();
     scheduler.start();
     await partnerRoutines.start();
+    await partnerHomes.recover();
     await partnerImports.recover();
     await extensionRoutineRuntime.start();
     await extensionCardRuntime.start();
@@ -2979,6 +3075,7 @@ export async function createOrchestratorApplication(
     await attempt(closePersonalDevelopment);
     await attempt(() => taskSharingHome.dispose());
     await attempt(() => partnerImports?.close());
+    await attempt(() => partnerHomes.close());
     await attempt(() => partnerImportRuntime.close());
     await attempt(() => deferredBackendRestarts?.dispose());
     await attempt(() => commandConcurrencyGate.close());
@@ -3045,6 +3142,7 @@ export async function createOrchestratorApplication(
     await attempt(() => unregisterSchedulerBridgeTools());
     await attempt(() => unregisterVisionBridgeTools());
     await attempt(() => unregisterMakerMemoryBridge());
+    await attempt(() => unregisterPluginAuthoringTools());
     partnerLearning.dispose();
     await attempt(() => partnerLearning?.drain());
     makerMemory.dispose();
@@ -3164,6 +3262,9 @@ export async function createOrchestratorApplication(
     appDefaultModels,
     partnerRoutines,
     partnerImports,
+    partnerHomes,
+    partnerHomeRuntime,
+    partnerHomeInference,
     partnerWorkbenches,
     partnerSessionTasks,
     partnerTaskOutputs,
@@ -3173,6 +3274,7 @@ export async function createOrchestratorApplication(
     extensionCards,
     extensionNetwork,
     extensionOAuth,
+    extensionTasks,
     extensionPackagePublisher,
     extensionSources,
     diagnosticsBundles,
@@ -3237,6 +3339,7 @@ export async function createOrchestratorApplication(
         await attempt(() => taskSharingHome.dispose());
         await attempt(() => unregisterPersonalDevelopmentTools());
         await attempt(() => partnerImports?.close());
+        await attempt(() => partnerHomes.close());
         await attempt(() => partnerSessionTasks?.close());
         await attempt(() => unregisterPartnerSessionTaskTools());
         await attempt(() => partnerImportRuntime.close());
@@ -3319,6 +3422,7 @@ export async function createOrchestratorApplication(
         await attempt(() => unregisterSchedulerBridgeTools());
         await attempt(() => unregisterVisionBridgeTools());
         await attempt(() => unregisterMakerMemoryBridge());
+        await attempt(() => unregisterPluginAuthoringTools());
         makerMemory.dispose();
         await maintenanceTail.catch(() => undefined);
         await attempt(() => messageSearch.stop());
@@ -3355,6 +3459,7 @@ export async function createOrchestratorApplication(
       try { await cleanup(); } catch (cleanupError) { cleanupErrors.push(cleanupError); }
     };
     await attempt(() => startupPartnerImports?.close());
+    await attempt(() => startupPartnerHomes?.close());
     await attempt(closePersonalDevelopment);
     await attempt(() => partnerGroups?.close());
     await attempt(() => partnerGroupWorkspaces?.dispose());

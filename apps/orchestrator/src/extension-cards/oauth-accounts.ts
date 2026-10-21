@@ -1,4 +1,3 @@
-// Adapted from the fixed account/token manager. See NOTICE / LICENSE.cindy.
 import { randomUUID } from "node:crypto";
 import type { OperationalStore } from "@joko/store";
 import type { CredentialManager } from "../credential-manager.js";

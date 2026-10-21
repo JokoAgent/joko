@@ -26,6 +26,7 @@ export function mergeRejectedComposerDraft(input: ComposerDraft, current: Compos
   ]);
   return {
     text: restoredText,
+    builtinSkillIntent: input.builtinSkillIntent,
     editorDocument: restoredDocument,
     deliveryMode: current?.deliveryMode ?? input.deliveryMode,
     mentions,

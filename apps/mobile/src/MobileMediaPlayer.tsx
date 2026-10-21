@@ -41,7 +41,8 @@ export function MobileMediaPlayer({
   style,
   surface,
   title,
-  uri
+  uri,
+  networkSource = false
 }: {
   readonly background: string;
   readonly border: string;
@@ -55,8 +56,9 @@ export function MobileMediaPlayer({
   readonly surface: string;
   readonly title: string;
   readonly uri: string;
+  readonly networkSource?: boolean;
 }) {
-  const baseUrl = uri.slice(0, uri.lastIndexOf("/") + 1);
+  const baseUrl = networkSource ? "about:blank" : uri.slice(0, uri.lastIndexOf("/") + 1);
   const webViewRef = useRef<MobileMediaWebViewHandle | null>(null);
   const mountedRef = useRef(true);
   const statusRef = useRef(onStatusChange);
@@ -166,9 +168,9 @@ export function MobileMediaPlayer({
       accessibilityState={{ busy: playerStatus?.state === "waiting" || resource.phase === "recovering",
         disabled: playerStatus?.state === "error" }}
       accessibilityValue={accessibilityValue}
-      allowFileAccess
+      allowFileAccess={!networkSource}
       allowFileAccessFromFileURLs={false}
-      allowingReadAccessToURL={baseUrl}
+      allowingReadAccessToURL={networkSource ? undefined : baseUrl}
       allowUniversalAccessFromFileURLs={false}
       allowsInlineMediaPlayback
       domStorageEnabled={false}
@@ -182,7 +184,7 @@ export function MobileMediaPlayer({
       onRenderProcessGone={() => resource.onRendererProcessLost(resource.rendererToken)}
       onShouldStartLoadWithRequest={(request: { readonly url: string }) => request.url === "about:blank"
         || request.url === baseUrl || request.url === uri}
-      originWhitelist={["about:blank", "file://*"]}
+      originWhitelist={networkSource ? ["about:blank"] : ["about:blank", "file://*"]}
       scrollEnabled={false}
       setSupportMultipleWindows={false}
       sharedCookiesEnabled={false}
@@ -196,7 +198,8 @@ export function MobileMediaPlayer({
           uri,
           background,
           surface,
-          ink
+          ink,
+          networkSource
         }),
         baseUrl
       }}

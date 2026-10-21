@@ -68,6 +68,10 @@ describe("machine federation selection", () => {
 });
 
 describe("machine federation cache", () => {
+  it("does not persist hidden tasks into another machine's ordinary task cache", () => {
+    const snapshot = { ...emptySnapshot(), sessions: [{ ...session("background", 10), hidden: true }, session("visible", 9)] };
+    expect(machineCacheFromSnapshot(profiles[1]!, snapshot, 42).sessions.map(task => task.id)).toEqual(["visible"]);
+  });
   it("creates a content-light, newest-first cache with stable ties and a 500-task bound", () => {
     const sessions = Array.from({ length: 505 }, (_, index) => session(`task-${String(index).padStart(3, "0")}`, index));
     sessions.push(session("tie-z", 1_000), session("tie-a", 1_000));

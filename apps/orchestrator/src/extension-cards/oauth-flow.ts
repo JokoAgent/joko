@@ -1,4 +1,3 @@
-// Adapted from the fixed authorization-code / refresh engine. See NOTICE / LICENSE.cindy.
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { extensionNetworkUrl } from "./network-manifest.js";

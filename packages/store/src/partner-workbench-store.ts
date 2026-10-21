@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, open, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, posix, win32 } from "node:path";
 
 import {
   PARTNER_WORKBENCH_MAX_JUDGMENTS,
@@ -107,6 +107,16 @@ export class PartnerWorkbenchStore {
     });
   }
 
+  /** Execution-home authority restores only the state previously granted on this computer. */
+  replaceHomeState(partnerId: string, expectedRevision: bigint, input: Pick<PartnerWorkbenchState, "projects" | "judgments">,
+    assertCurrent: () => void): Promise<PartnerWorkbenchState> {
+    const checked = this.validateHomeState(partnerId, input);
+    return this.#mutate(partnerId, expectedRevision, current => { assertCurrent(); return { ...current, projects: checked.projects, judgments: checked.judgments }; });
+  }
+  validateHomeState(partnerId: string, input: Pick<PartnerWorkbenchState, "projects" | "judgments">): PartnerWorkbenchState {
+    return parseState(JSON.stringify({ version: 1, partnerId, revision: 1, projects: input.projects, judgments: input.judgments }), partnerId);
+  }
+
   async #file(partnerId: string): Promise<string> {
     return join(await realpath(this.#homesRoot), partnerHomeDirectoryName(partnerId), "workbench.json");
   }
@@ -180,7 +190,8 @@ function parseJudgment(value: unknown): PartnerWorkbenchJudgment {
 
 function projectPath(value: unknown): string {
   const path = text(value, MAX_PATH);
-  if (!isAbsolute(path) || resolve(path) !== path) throw new PartnerWorkbenchStoreError("invalid", "A resolved absolute project directory is required.");
+  const paths = path.startsWith("/") ? posix : win32;
+  if (!paths.isAbsolute(path) || paths.normalize(path) !== path) throw new PartnerWorkbenchStoreError("invalid", "A resolved absolute project directory is required.");
   return path;
 }
 function timestamp(value: unknown): number {

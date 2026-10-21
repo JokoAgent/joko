@@ -163,6 +163,7 @@ export interface DevicePeerRemoteDesktopHostPort {
   start(request: DevicePeerRemoteDesktopHostRequest & {
     readonly displayId: string;
     readonly mode: RemoteDesktopStartMode;
+    readonly control?: boolean;
   }): Promise<RemoteDesktopLease>;
   heartbeat(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopControlState>;
   stop(request: DevicePeerRemoteDesktopLeaseRequest & {
@@ -213,12 +214,14 @@ export interface DevicePeerRemoteDesktopHostPort {
     readonly controlGeneration: bigint;
     readonly modeId: string;
     readonly temporary: boolean;
+    readonly control?: boolean;
   }): Promise<import("@joko/contracts").RemoteDesktopDisplayModeResult>;
   setViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
-    readonly controlGeneration: bigint; readonly width: number; readonly height: number;
+    readonly controlGeneration: bigint; readonly width: number; readonly height: number; readonly control?: boolean;
   }): Promise<import("@joko/contracts").RemoteDesktopViewerDisplayResult>;
   restoreViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
+    readonly control?: boolean;
   }): Promise<import("@joko/contracts").RemoteDesktopViewerDisplayResult>;
   /**
    * Synchronous target-side fence for control-scoped effects. This must read

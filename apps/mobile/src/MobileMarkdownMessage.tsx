@@ -7,6 +7,10 @@ import { randomUUID } from "expo-crypto";
 import { setStringAsync } from "expo-clipboard";
 import { Image as NativeImage } from "expo-image";
 import { mobileImageGalleryDimensionsMatch } from "./mobile-image-gallery";
+import { splitRichAnswer } from "@joko/contracts";
+import { MobileRichAnswer } from "./MobileRichAnswer";
+import { MobileRichAnswerMedia } from "./MobileRichAnswerMedia";
+import type { MobileMarkdownResourceDescriptor } from "./mobile-markdown-resources";
 import {
   groupMobileMarkdownSelectableBlocks, mobileMarkdownInlineImageSize, parseMobileMarkdownIncremental,
   type MobileMarkdownBlock, type MobileMarkdownInline, type MobileMarkdownParseResult
@@ -33,14 +37,30 @@ interface Props {
   readonly resourceClient?: MobileMarkdownResourceClient;
   readonly resourceOwnerKey?: string;
   readonly messageId?: string;
+  readonly answerStateKey?: string;
+  readonly streaming?: boolean;
+  readonly resourceText?: string;
   readonly onOpenImage?: (leaseId: string, key: string) => void;
   readonly onOpenPath?: (leaseId: string, key: string) => void;
 }
 
-export const MobileMarkdownMessage = memo(function MobileMarkdownMessage({ text, colors, locale, ownerKey, selectable = true,
-  resourceClient, resourceOwnerKey, messageId, onOpenImage, onOpenPath }: Props) {
+export const MobileMarkdownMessage = memo(function MobileMarkdownMessage(props: Props) {
+  const resources = useMobileMarkdownResources({ client: props.resourceClient, ownerKey: props.resourceOwnerKey,
+    messageId: props.messageId, text: props.resourceText ?? props.text });
+  const parts = useMemo(() => props.answerStateKey === undefined ? [] : splitRichAnswer(props.text), [props.answerStateKey, props.text]);
+  if (!parts.some(part => part.kind === "rich")) return <MobilePlainMarkdownMessage {...props} preparedResources={resources} />;
+  return <View style={styles.document}>{parts.map(part => part.kind === "rich"
+    ? <MobileRichAnswer key={part.key} source={part.source} complete={part.complete || !props.streaming}
+      stateKey={JSON.stringify([props.answerStateKey, part.key])} colors={props.colors} locale={props.locale}
+      renderMedia={node => <MobileRichAnswerMedia key={JSON.stringify([part.key, node.id, node.props["src"]])} node={node} colors={props.colors} locale={props.locale} resources={resources}
+        fallback={text => <MobilePlainMarkdownMessage {...props} text={text} preparedResources={resources} />} />}
+      renderMarkdown={(text, id) => <MobilePlainMarkdownMessage {...props} key={id} text={text} preparedResources={resources} />} />
+    : <MobilePlainMarkdownMessage {...props} key={part.key} text={part.source} preparedResources={resources} />)}</View>;
+});
+
+const MobilePlainMarkdownMessage = memo(function MobilePlainMarkdownMessage({ text, colors, locale, ownerKey, selectable = true,
+  preparedResources: resources, onOpenImage, onOpenPath }: Props & { readonly preparedResources?: MobileMarkdownResourceDescriptor }) {
   const previewMail = useMobileMailLink();
-  const resources = useMobileMarkdownResources({ client: resourceClient, ownerKey: resourceOwnerKey, messageId, text });
   const previous = useRef<MobileMarkdownParseResult | null>(null);
   const parsed = useMemo(() => parseMobileMarkdownIncremental(text, previous.current), [text]);
   useEffect(() => { previous.current = parsed; }, [parsed]);

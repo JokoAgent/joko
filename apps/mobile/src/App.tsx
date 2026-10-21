@@ -329,6 +329,7 @@ import { mobilePartnerWorkingStatus } from "./mobile-partner-working";
 import { mobilePartnerConversationRows, mobilePartnerTimeGroups, mobilePublicConversationInputs } from "./mobile-partner-presentation";
 import { useMobileHiddenHistory } from "./use-mobile-hidden-history";
 import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
+import { MobilePartnerHomeSheet } from "./MobilePartnerHomeSheet";
 import type { MobilePartnerProfileSnapshot, MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import { MobileConversationSearchSheet } from "./MobileConversationSearchSheet";
 import type { MobileConversationSearchHit } from "./mobile-conversation-search";
@@ -691,6 +692,7 @@ export function App() {
     background: dark ? "#15191d" : "#f7f6f3", surface: dark ? "#24292d" : "#ffffff",
     ink: dark ? "#f4f4f2" : "#242a2d", muted: dark ? "#adb6b7" : "#637073",
     border: dark ? "#394246" : "#e1e2df", accent: "#ff9800", negative: "#cc634e",
+    positive: dark ? "#69c49f" : "#197451", warning: dark ? "#f4b84f" : "#925800",
     brandBackground: dark ? "#302920" : "#fff1db", dark
   }), [dark]);
 
@@ -3478,6 +3480,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
   const [sharedBackendChoices, setSharedBackendChoices] = useState(false);
   const [partnerSettingsOwner, setPartnerSettingsOwner] = useState<string>();
+  const [partnerHome, setPartnerHome] = useState<{ readonly api: import("@joko/contracts").PartnerHomeApi; readonly partnerId: string; readonly revision: bigint }>();
   const [partnerLearningEntry, setPartnerLearningEntry] = useState<{ readonly owner: string;
     readonly destination: PartnerLearningSettingsDestination; readonly messageId: string; readonly completionEventId: string }>();
   const [partnerOutputsShell, setPartnerOutputsShell] = useState<{ readonly identity: string; readonly owner: string;
@@ -6110,12 +6113,15 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           if (part.kind === "artifact") return renderTimelineArtifact(part.artifact);
           return <MobileMarkdownMessage key={`${markdownOwnerKey}/part/${part.contentIndex}`} text={part.text}
             colors={colors} locale={locale} ownerKey={`${markdownOwnerKey}/part/${part.contentIndex}`}
+            answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id, part.contentIndex])} streaming={!item.completed}
+            resourceText={item.text}
             resourceClient={client} messageId={item.id}
             resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
             onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />;
         }) : item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
           enabled={state.status === "connected" || state.status === "offline"} />
           : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
+          answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id])} streaming={!item.completed}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
@@ -6473,7 +6479,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     </View> : <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
       {partnerRead.partner && <Action label={[partnerRead.partner.capabilities.modelChain[0]?.modelId,
         mobileMessage(locale, partnerRead.partner.capabilities.permissionMode === "ask" ? "partnerProfile.ask"
-          : partnerRead.partner.capabilities.permissionMode === "auto" ? "partnerProfile.auto" : "controls.permission.full"),
+          : partnerRead.partner.capabilities.permissionMode === "acceptEdits" ? "controls.permission.edits" : partnerRead.partner.capabilities.permissionMode === "auto" ? "partnerProfile.auto" : "controls.permission.full"),
         ...(partnerRead.partner.capabilities.planMode ? [mobileMessage(locale, "partnerProfile.plan")] : [])].filter(Boolean).join(" · ")}
         colors={colors} compact disabled={!partnerProfileTransport || state.busy || attachmentBusy || voice.busy}
         onPress={openRuntimeControls} />}
@@ -6819,6 +6825,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         return completed;
       }}
       onError={setLocalError} />
+    {partnerHome && <MobilePartnerHomeSheet key={partnerHome.api.ownerKey} api={partnerHome.api} partnerId={partnerHome.partnerId} revision={partnerHome.revision}
+      locale={locale} colors={colors} newRequestId={randomUUID} onClose={() => setPartnerHome(undefined)} onChanged={sessionId => {
+        void client.refresh().then(() => client.select(sessionId)).then(() => setPartnerHome(undefined)).catch(() => setLocalError(mobileMessage(locale, "partnerProfile.failed")));
+      }} />}
     <MobilePartnerProfileSheet visible={partnerSettingsVisible} partner={offlineOutputsShell?.partner ?? partnerRead.partner ?? client.partnerProfileContinuationPartner()}
       initialLearningDestination={partnerLearningEntry && partnerLearningEntry.owner === partnerSettingsOwner ? partnerLearningEntry.destination : undefined}
       transport={offlineOutputsShell?.transport ?? partnerProfileTransport} online={state.status === "connected"}
@@ -6826,6 +6836,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       memoryFactory={(partner, ownerKey) => client.partnerMemoryEditor(partner, ownerKey)}
       connectionsFactory={(partner, ownerKey) => client.partnerConnectionsEditor(partner, ownerKey)}
       skillsFactory={(partner, ownerKey) => client.partnerSkillsEditor(partner, ownerKey)}
+      onOpenHome={partner => { const api = client.partnerHomeApi(); if (api) setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision }); }}
       deletionTransport={client.partnerDeletionTransport()}
       restartTransport={client.partnerRestartTransport()}
       resumeFactory={partner => client.partnerResumeEditor(partner, partnerProfileTransport?.ownerKey)}

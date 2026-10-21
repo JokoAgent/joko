@@ -1,4 +1,5 @@
 import type { AttachmentDraft, BrowserCommentDraftItem, ComposerDraft, ComposerMentionDraft, ConnectionProfile, LocalePreference, MachineCacheView, NewSessionLocalDraft, PendingExtensionSuggestionView, PendingExtensionUseView, PermissionMode, Theme } from "./model.js";
+import { builtinSkillIntentForText } from "./builtin-skill-intent.js";
 import { normalizeBrowserCommentStyleChanges, normalizeBrowserCommentTarget, sanitizeBrowserCommentPageUrl } from "./browser-comment-draft.js";
 import { normalizeExtensionRecommendation, sameExtensionRecommendation } from "./extension-suggestion-handoff.js";
 import { normalizeRecentProjects, publishRecentProjectsChange, withRecentProject, withoutRecentProject, type RecentProject } from "./recent-projects.js";
@@ -590,6 +591,7 @@ export class LocalState {
     if (inlineMentionRanges === undefined) throw new Error("The task draft mention occurrences are invalid.");
     const persisted: PersistedComposerDraft = {
       text: draft.text,
+      builtinSkillIntent: builtinSkillIntentForText(draft.text, draft.builtinSkillIntent),
       deliveryMode: draft.deliveryMode,
       mentions,
       ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
@@ -642,6 +644,7 @@ export class LocalState {
     if (inlineMentionRanges === undefined) throw new Error("The task draft mention occurrences are invalid.");
     return { revision: record.revision, draft: {
       text: persisted.text,
+      builtinSkillIntent: builtinSkillIntentForText(persisted.text, persisted.builtinSkillIntent),
       deliveryMode: persisted.deliveryMode,
       mentions,
       ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
@@ -955,6 +958,7 @@ export function normalizeNewSessionLocalDraft(value: unknown): NewSessionLocalDr
     planMode: record["planMode"] === true,
     ...(worktree === undefined ? {} : { worktree }),
     text: record["text"],
+    builtinSkillIntent: builtinSkillIntentForText(record["text"], record["builtinSkillIntent"]),
     editorDocument,
     mentions,
     ...(inlineMentionRanges.length === 0 ? {} : { inlineMentionRanges }),
@@ -1178,7 +1182,7 @@ function normalizeDraftMentions(value: unknown): readonly ComposerMentionDraft[]
 }
 
 function normalizePermissionMode(value: unknown): PermissionMode {
-  return value === "auto" || value === "bypassPermissions" ? value : "ask";
+  return value === "acceptEdits" || value === "auto" || value === "bypassPermissions" ? value : "ask";
 }
 
 export function normalizeComposerMentions(value: unknown): readonly ComposerMentionDraft[] {

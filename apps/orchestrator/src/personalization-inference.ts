@@ -717,13 +717,25 @@ export function requestManagedTextInference(input: ManagedTextInferenceInput): P
   });
 }
 
+/** Plugin one-shot output is user controlled. Omitted limits remain omitted on
+ * protocols that allow it; Messages requires the model's declared output limit. */
+export function requestPluginTextInference(input: Omit<ManagedTextInferenceInput, "maxTokens"> & { readonly maxTokens?: number; readonly modelOutputLimit: number }): Promise<string> {
+  if (!input.user.trim() || input.user.length > 33_024 || input.system.length > 32_768
+    || input.maxTokens !== undefined && (!Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1)) throw new RangeError("Plugin text request is invalid.");
+  if (!Number.isSafeInteger(input.modelOutputLimit) || input.modelOutputLimit < 1) throw new RangeError("The model output limit is unavailable.");
+  return requestInference({ ...input, fetch: input.fetch ?? globalThis.fetch,
+    ...(input.maxTokens === undefined ? {} : { maxTokens: input.maxTokens }),
+    anthropicOutputLimit: input.modelOutputLimit });
+}
+
 async function requestInference(input: {
   readonly fetch: typeof globalThis.fetch;
   readonly route: ProviderInferenceRoute;
   readonly system: string;
   readonly user: string;
   readonly image?: { readonly mimeType: string; readonly base64: string };
-  readonly maxTokens: number;
+  readonly maxTokens?: number;
+  readonly anthropicOutputLimit?: number;
   readonly signal?: AbortSignal;
   readonly timeoutMs: number;
   readonly retryReasoningBudget?: boolean;
@@ -772,7 +784,7 @@ async function requestInference(input: {
     throw new InferenceFailure("INVALID_RESPONSE", { cause: error });
   }
   const output = inferenceText(parsed, input.route.api);
-  if (output.length === 0 && input.retryReasoningBudget === true) {
+  if (output.length === 0 && input.retryReasoningBudget === true && input.maxTokens !== undefined) {
     const budget = reasoningRetryBudget(parsed, input.route.api, input.maxTokens);
     if (budget !== undefined) {
       input.assertCurrent?.();
@@ -814,7 +826,7 @@ function inferenceBody(input: Parameters<typeof requestInference>[0]): unknown {
       model: input.route.modelId,
       system: input.system,
       messages: [{ role: "user", content }],
-      max_tokens: input.maxTokens
+      max_tokens: input.maxTokens ?? input.anthropicOutputLimit
     };
   }
   if (input.route.api === "openai-responses") {

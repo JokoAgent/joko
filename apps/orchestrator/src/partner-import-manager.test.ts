@@ -27,7 +27,7 @@ const backendProfile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.c
   ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true },
   { key: "runtime.resources", supported: true, options: ["skill", "prompt"] }] };
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; resourceFiles?: number; noDefaults?: boolean; observeImport?: (phase: string) => void } = {}) {
+async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; resourceFiles?: number; noDefaults?: boolean; observeImport?: (phase: string) => void; currentCanonicalSession?: () => string | undefined } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-import-owner-")); const native = join(root, ".hermes");
   await mkdir(join(native, "skills", "reports"), { recursive: true }); await mkdir(join(native, "memories")); await mkdir(join(native, "cron"));
   await writeFile(join(native, "config.yaml"), "name: Analyst\n" + (options.nativeTools ? "tools:\n  allowed: [read]\n" : "")); await writeFile(join(native, ".env"), `ACCESS_TOKEN=${secret}\n`);
@@ -55,6 +55,7 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
   if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false });
   imports = new PartnerImportManager({ storage, home: root, environment: {}, assertServiceOwner: () => {},
+    ...(options.currentCanonicalSession ? { currentCanonicalSession: options.currentCanonicalSession } : {}),
     nativeRuntimeReady: id => partners.getPartner(id).initializationState === "ready",
     prepareCreation: (selection, nativePackage) => {
     const frozen = preparePartnerImportCreation(partners, selection, nativePackage);
@@ -143,7 +144,8 @@ describe("native import service and owning effects", () => {
     expect(f.profiles.listPartners()).toHaveLength(1);
   }, 20_000);
   it("discovers bundled partners and admits one durable installation with skills, knowledge and disabled routines", async () => {
-    const f = await fixture({ resourceFiles: 20 }); const signal = new AbortController().signal;
+    let canonical: string | undefined;
+    const f = await fixture({ resourceFiles: 20, currentCanonicalSession: () => canonical }); const signal = new AbortController().signal;
     const catalog = await f.api.packages!("en", signal);
     expect(catalog).toHaveLength(10); const entry = catalog.find(row => row.packageId === "engineer-bot")!;
     expect(entry.skills).toHaveLength(2); expect(entry.knowledge).toHaveLength(1); expect(entry.routines).toHaveLength(1);
@@ -162,6 +164,11 @@ describe("native import service and owning effects", () => {
     const restored = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")));
     expect(restored.readReceipt(result.requestId)?.nativePackage?.packageHash).toBe(entry.packageHash);
     expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation?.partnerId).toBe(profile.id);
+    canonical = "new-main-canonical-session";
+    expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation?.canonicalSessionId).toBe(canonical);
+    expect((await f.api.invitePackage!(entry, "en", signal)).canonicalSessionId).toBe(canonical);
+    expect((await f.api.status(result.requestId, signal))?.canonicalSessionId).toBe(canonical);
+    expect(f.storage.readReceipt(result.requestId)?.result.canonicalSessionId).toBe(profile.canonicalSessionId);
     const deletion = await f.partners.deletePartner({ requestId: "package_install_delete_0001", partnerId: profile.id, expectedRevision: profile.revision, confirmName: profile.displayName });
     expect(deletion.phase).toBe("completed");
     expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation).toBeUndefined();

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { app } from "electron";
+import { REMOTE_DESKTOP_OFFER_BUDGET } from "@joko/device-peer";
 
 import type { DesktopRemoteDesktopVideoSettings } from "./remote-desktop-media-settings.js";
 import { verifyPackagedDesktopRemoteDesktopBinary } from "./remote-desktop-native-manifest.js";
@@ -102,6 +103,7 @@ export class DesktopRemoteDesktopNativeCapture {
     this.#pending = true;
     const generation = this.#generation;
     try {
+      const cold = this.#child === undefined;
       if (this.#child === undefined) {
         const binary = await this.#runtime.resolveBinary();
         if (generation !== this.#generation) return null;
@@ -120,6 +122,7 @@ export class DesktopRemoteDesktopNativeCapture {
         child.on("error", () => { if (this.#child === child) this.stop(); });
         child.on("exit", (code) => {
           if (this.#child !== child) return;
+          process.stderr.write("JOKO_REMOTE_DESKTOP_CAPTURE_HELPER_EXITED\n");
           this.#cancel?.(new Error(code === 3
             ? "REMOTE_DESKTOP_SCREEN_PERMISSION_REQUIRED"
             : "REMOTE_DESKTOP_VIDEO_UNAVAILABLE"));
@@ -171,7 +174,10 @@ export class DesktopRemoteDesktopNativeCapture {
             this.stop();
           }
         };
-        const timer = setTimeout(() => this.stop(), 3_000);
+        const timer = setTimeout(() => {
+          if (generation === this.#generation) process.stderr.write("JOKO_REMOTE_DESKTOP_CAPTURE_FRAME_TIMEOUT\n");
+          this.stop();
+        }, cold ? REMOTE_DESKTOP_OFFER_BUDGET.captureReadyMs : 3_000);
         timer.unref?.();
         this.#cancel = cancel;
         child.stdout.on("data", receive);

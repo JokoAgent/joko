@@ -1,4 +1,3 @@
-// Adapted from the fixed account metadata model. See NOTICE / LICENSE.cindy.
 import { createHash } from "node:crypto";
 import type { OperationalStore } from "@joko/store";
 import type { CredentialVault, EncryptedCredential } from "../credential-vault.js";

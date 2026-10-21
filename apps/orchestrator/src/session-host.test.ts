@@ -15,6 +15,7 @@ import {
 } from "@joko/adapter-codex";
 import { FakeCodexAppServer } from "@joko/adapter-codex/testing";
 import * as contract from "@joko/contracts";
+import { answerDeliveryPrompt } from "./answer-delivery-prompt.js";
 import {
   JokoError,
   type AdapterContext,
@@ -232,6 +233,29 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it("captures the tool's effective checkout and retires it when its exact worktree lease is lost", async () => {
+    let f!: Awaited<ReturnType<typeof createFixture>>, active = true;
+    const worktrees = {
+      effectiveTarget: (stored: Parameters<SessionWorktreeCoordinator["effectiveTarget"]>[0]) => ({
+        ...f.store.getTarget(stored.descriptor.targetId).descriptor,
+        workspaceRoot: stored.descriptor.worktree?.path ?? f.directory
+      }),
+      activeWorkspacePath: (_sessionId: string, binding: { path: string }) => active ? binding.path : undefined
+    } as unknown as SessionWorktreeCoordinator;
+    f = await createFixture(new FakeBackendAdapter(PI_LIKE_PROFILE), { worktrees });
+    const { sessionId } = (await f.host.createSession({ operationId: "tool-workspace-create", connection: f.connection,
+      targetId: "target-one", title: "Author plugin", fastMode: false, permissionMode: "ask", planMode: false })).value;
+    const before = f.store.getSession(sessionId), checkout = join(f.directory, "checkout");
+    const ownedId = sessionId + "-checkout";
+    f.store.createSession({ ...before.descriptor, id: ownedId, binding: { ...before.descriptor.binding, opaqueRef: "fake://tool-checkout" }, worktree: { leaseId: "lease-tool", workspaceId: "workspace-tool", path: checkout,
+      repositoryRoot: f.directory, branch: "task", sourceRef: "main", sourceCommit: "a".repeat(40), sourceStrategy: "explicit",
+      sourceRefreshed: false, state: "active", acquiredAt: 1, updatedAt: 1 } });
+    const captured = f.host.captureToolWorkspace({ sessionId: ownedId, targetId: "target-one", generation: before.descriptor.binding.generation });
+    expect(captured.root).toBe(checkout); expect(captured.remote).toBe(false); captured.assertCurrent();
+    active = false; expect(captured.assertCurrent).toThrow("Workspace changed");
+    expect(() => f.host.captureToolWorkspace({ sessionId: ownedId, targetId: "target-one", generation: before.descriptor.binding.generation + 1 })).toThrow();
+  });
+
   it("uses ordinary owner approval and exact MCP policy identity for application tools", async () => {
     const f = await createFixture();
     const { sessionId } = (await f.host.createSession({ operationId: "app-permission-create", connection: f.connection,
@@ -11781,6 +11805,8 @@ describe("SessionHost", () => {
       remoteWorkspace: { ...binding, workspaceRoot: derivedRoot }
     });
     expect(fixture.store.getSession(resumed.descriptor.id).descriptor.remoteWorkspace).toEqual(binding);
+    const toolWorkspace = fixture.host.captureToolWorkspace({ sessionId: resumed.descriptor.id, targetId: source.targetId, generation: fixture.store.getSession(resumed.descriptor.id).descriptor.binding.generation });
+    expect(toolWorkspace.root).toBe(derivedRoot); expect(toolWorkspace.remote).toBe(true); toolWorkspace.assertCurrent();
   });
 
   it("snapshots a private append prompt and safely advances a service-owned runtime identity", async () => {
@@ -11850,9 +11876,40 @@ describe("SessionHost", () => {
     expect(adapter.createInputs).toHaveLength(1);
   });
 
+  it("indexes readable answer content while preserving the canonical assistant and user source", async () => {
+    const fixture = await createFixture();
+    const created = await fixture.host.createSession({ operationId: "create-answer-search", connection: fixture.connection,
+      targetId: "target-one", title: "Answer search", fastMode: false, permissionMode: "ask", planMode: false });
+    const id = created.value.sessionId;
+    const source = '```joko-ui\n{"seq":1,"op":"create","id":"answer","kind":"text","props":{"text":"Visible result"}}\n```';
+    appendSessionEvent(fixture.store, id, "rich-assistant", 10, { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: source }] });
+    appendSessionEvent(fixture.store, id, "rich-user", 20, { type: "message_complete", role: "user", blocks: [{ kind: "text", text: source }] });
+    const results = fixture.store.searchSessionMessages({ scope: { sessionId: id }, query: "Visible result" });
+    expect(results.matches).toHaveLength(2);
+    expect(results.matches.find(match => match.role === "assistant")?.snippet).not.toContain('"op"');
+    expect(fixture.store.searchSessionMessages({ scope: { sessionId: id }, query: "joko-ui" }).matches.map(match => match.role)).toEqual(["user"]);
+    expect(fixture.store.findEvent("rich-assistant")?.payload).toMatchObject({ blocks: [{ text: source }] });
+  });
+
+  it("keeps initial private instructions current through live observation without changing the stored prompt or generation", async () => {
+    const adapter = new PersonalizationPromptFakeAdapter();
+    const fixture = await createFixture(adapter, { decorateRuntimePrompt: answerDeliveryPrompt,
+      resolveServiceRuntimePrompt: async session => session.appendSystemPrompt });
+    const created = await fixture.host.createSession({ operationId: "create-initial-private-instructions", connection: fixture.connection,
+      targetId: "target-one", title: "Private instructions", fastMode: false, permissionMode: "ask", planMode: false,
+      appendSystemPrompt: "Original owner instructions" });
+    const id = created.value.sessionId, initial = fixture.store.getSession(id).descriptor;
+    expect(adapter.createInputs.at(-1)?.appendSystemPrompt).toBe(answerDeliveryPrompt(initial.appendSystemPrompt));
+    await fixture.host.getCommands(id);
+    expect(adapter.resumeContexts).toHaveLength(0);
+    expect(fixture.store.getSession(id).descriptor.binding.generation).toBe(initial.binding.generation);
+    expect(fixture.store.getSession(id).descriptor.appendSystemPrompt).toBe("Original owner instructions");
+    expect(JSON.stringify(fixture.store.getOperation("create-initial-private-instructions").body)).not.toContain("```joko-ui");
+  });
+
   it("resolves complete service identity at native boundaries without persisting it and rejects a late owner change", async () => {
     const adapter = new PersonalizationPromptFakeAdapter();
-    let fullPrompt = "Complete private identity.\n".repeat(400);
+    let fullPrompt = answerDeliveryPrompt("Complete private identity.\n".repeat(400));
     let gate: { wait: Promise<void>; release: () => void } | undefined;
     let reached: (() => void) | undefined;
     const fixture = await createFixture(adapter, { resolveServiceRuntimePrompt: async (_session, assertCurrent) => {
@@ -11863,6 +11920,7 @@ describe("SessionHost", () => {
       targetId: "target-one", title: "Service identity", fastMode: false, permissionMode: "ask", planMode: false,
       appendSystemPrompt: "Public bounded identity" });
     const id = created.value.sessionId;
+    expect(fullPrompt).toContain("```joko-ui");
     await fixture.host.close(id); await fixture.host.resume(id);
     expect(adapter.resumeContexts.at(-1)?.appendSystemPrompt).toBe(fullPrompt);
     expect(fixture.store.getSession(id).descriptor.appendSystemPrompt).toBe("Public bounded identity");
@@ -15642,6 +15700,7 @@ async function createFixture(
     readonly modelAccessRestricted?: (backendId: string) => boolean;
     readonly sessionRuntimeFallbackEnabled?: () => boolean;
     readonly resolveServiceRuntimePrompt?: (session: SessionDescriptor, assertCurrent: () => void) => Promise<string | undefined>;
+    readonly decorateRuntimePrompt?: (base: string | undefined) => string | undefined;
     readonly resolveServiceRuntimeConfiguration?: (session: SessionDescriptor) => string | undefined;
     readonly serviceSessionRuntimeFallback?: (input: {
       readonly sessionId: string;
@@ -15676,7 +15735,7 @@ async function createFixture(
   } = {}
 ) {
   const directory = mkdtempSync(join(tmpdir(), "joko-host-"));
-  const store = new OperationalStore(join(directory, "store.db"));
+  const store = new OperationalStore(join(directory, "store.db"), { assistantTextForSearch: contract.richAnswerText });
   const repository = new OperationalArtifactRepository(store);
   const artifacts = new ArtifactStore({ rootDirectory: join(directory, "artifacts"), repository, ingestRoots: [directory] });
   await artifacts.initialize();

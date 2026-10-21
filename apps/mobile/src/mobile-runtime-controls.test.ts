@@ -136,6 +136,11 @@ describe("mobile runtime controls", () => {
       permissionModes: [PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS]
     });
     expect(assertMobilePermissionMode(controls!, PermissionMode.AUTO)).toBe(PermissionMode.AUTO);
+    expect(() => assertMobilePermissionMode(controls!, PermissionMode.ACCEPT_EDITS)).toThrow();
+    const edits = withCapabilities(detail, capabilities({ acceptEdits: true }));
+    const editsControls = resolveMobileRuntimeControls(identity, owner, edits, "session");
+    expect(editsControls?.permissionModes).toContain(PermissionMode.ACCEPT_EDITS);
+    expect(assertMobilePermissionMode(editsControls!, PermissionMode.ACCEPT_EDITS)).toBe(PermissionMode.ACCEPT_EDITS);
     expect(assertMobilePlanMode(controls!, true)).toBe(true);
 
     const malformed = withCapabilities(detail, capabilities({ duplicatePermission: true, plan: true }));
@@ -377,6 +382,7 @@ function withCapabilities(snapshot: Snapshot, values: readonly Capability[]): Sn
 }
 
 function capabilities(input: {
+  readonly acceptEdits?: boolean;
   readonly fast?: boolean;
   readonly plan?: boolean;
   readonly duplicatePermission?: boolean;
@@ -393,6 +399,7 @@ function capabilities(input: {
     permissionCapability(capabilityNames.permissionModes, [
       PermissionMode.BYPASS_PERMISSIONS,
       PermissionMode.ASK,
+      ...(input.acceptEdits ? [PermissionMode.ACCEPT_EDITS] : []),
       ...(input.duplicatePermission ? [PermissionMode.ASK] : [PermissionMode.AUTO])
     ]),
     permissionCapability(capabilityNames.permissionChange, [], true),

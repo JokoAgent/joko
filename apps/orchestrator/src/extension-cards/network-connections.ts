@@ -1,4 +1,3 @@
-// Adapted from the fixed connection manager. See NOTICE / LICENSE.cindy.
 import { createHash, randomUUID } from "node:crypto";
 import type { OperationalStore } from "@joko/store";
 import type { CredentialManager } from "../credential-manager.js";

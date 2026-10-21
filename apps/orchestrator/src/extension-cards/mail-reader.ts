@@ -1,4 +1,3 @@
-// Adapted from the fixed reference mail reader. See NOTICE / LICENSE.cindy.
 import { mailReaderMatches, parseMailMessage, type MailReaderDeclaration, type MailMessage } from "@joko/contracts";
 
 export interface ExtensionMailReader { readonly id: string; readonly reader: MailReaderDeclaration }

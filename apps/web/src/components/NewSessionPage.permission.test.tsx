@@ -46,6 +46,21 @@ afterEach(async () => {
 });
 
 describe("NewSessionPage Full Access confirmation", () => {
+  it("sends the advertised Accept edits mode unchanged without a Full Access confirmation", async () => {
+    const base = snapshot(), current = { ...base, backends: base.backends.map(backend => ({ ...backend, capabilities: new Map([
+      ...backend.capabilities, ["permission.modes", { name: "permission.modes", supported: true, options: ["ask", "acceptEdits", "auto"] }]
+    ]) })) };
+    const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft) => undefined);
+    const { container } = await renderPage(controller(current), onSubmit);
+    await act(async () => permissionTrigger(container).click());
+    const option = required([...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find(candidate => candidate.textContent?.startsWith("permission.edits")));
+    await act(async () => option.click());
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(permissionTrigger(container).textContent).toContain("permission.edits");
+    await act(async () => sendButton(container).click()); await flush();
+    expect(onSubmit.mock.calls[0]?.[0]).toMatchObject({ permissionMode: "acceptEdits" });
+  });
+
   it("keeps the prior mode on cancel and sends bypassPermissions only after explicit confirmation", async () => {
     const onSubmit = vi.fn(async (_session: DelayedNewSessionDraft, _input: ComposerDraft) => undefined);
     const { container } = await renderPage(controller(snapshot()), onSubmit);

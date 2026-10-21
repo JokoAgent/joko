@@ -14,6 +14,7 @@ import { ActorKind, JoinedTaskShareSchema, TaskShareMethod, TaskShareSnapshotSch
 import { PartnerGroupSummarySchema, PartnerGroupMemberSchema, ListPartnerGroupsResponseSchema, GetPartnerGroupResponseSchema,
   GetPartnerGroupCreationResponseSchema, RetirePartnerGroupCreationResponseSchema, PartnerGroupMemberStatus, type PartnerGroupApi } from "@joko/contracts";
 import { DevicePeerDescriptorSchema, RemoteDesktopControlStateSchema, type RemoteDesktopControlState } from "@joko/contracts";
+import { ExtensionTaskPreferencesSchema, ExtensionTaskServiceGetPreferencesResponseSchema, ExtensionTaskServiceUpdatePreferencesResponseSchema, ExtensionTaskServiceRetryWriteAccessResponseSchema } from "@joko/contracts";
 import { createPartnerConnectionsApi, GetPartnerConnectionsResponseSchema, UpdatePartnerConnectionsResponseSchema, PartnerConnectionMode } from "@joko/contracts";
 import { createPartnerSkillsApi, ListPartnerSkillsResponseSchema, ReadPartnerSkillResponseSchema, UpdatePartnerSkillResponseSchema, DeletePartnerSkillResponseSchema } from "@joko/contracts";
 import { createHash } from "node:crypto";
@@ -2383,6 +2384,28 @@ describe("Mobile Remote Desktop presentation transition authority", () => {
 });
 
 describe("mobile Extension catalog authority", () => {
+  it("preserves the exact approved task directory when resetting its model and retires old preference writes", async () => {
+    const network = fakeNetwork(), extension = mobileExtensionFixture();
+    network.getExtension = vi.fn(async () => extension);
+    const preferences = create(ExtensionTaskPreferencesSchema, { extensionId: extension.extensionId, revision: { value: 7n }, targetId: "opaque-approved-directory",
+      permissionMode: PermissionMode.AUTO, showPreferences: true, model: { backendId: "runtime", providerId: "provider", modelId: "answer" } });
+    const update = vi.fn(async (_request: unknown, _options?: unknown) => create(ExtensionTaskServiceUpdatePreferencesResponseSchema, { preferences }));
+    const retry = vi.fn(async (_request: unknown, _options?: unknown) => create(ExtensionTaskServiceRetryWriteAccessResponseSchema, { granted: true, preferences }));
+    network.extensionTaskApi = vi.fn(() => ({ getPreferences: async () => create(ExtensionTaskServiceGetPreferencesResponseSchema, { preferences }), updatePreferences: update, retryWriteAccess: retry }) as unknown as ReturnType<NonNullable<MobileNetwork["extensionTaskApi"]>>);
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const transport = app.extensionCatalogTransport()!, signal = new AbortController().signal;
+    await expect(transport.getTaskPreferences!(extension, signal)).resolves.toMatchObject({ targetId: "opaque-approved-directory" });
+    await transport.setTaskPreferences!(extension, preferences, undefined, PermissionMode.AUTO, signal);
+    expect(update.mock.calls[0]?.[0]).toMatchObject({ extensionId: extension.extensionId, expectedRevision: { value: 7n }, targetId: "opaque-approved-directory", model: undefined, permissionMode: PermissionMode.AUTO });
+    await transport.retryTaskWriteAccess!(extension, "owned-task", signal);
+    expect(retry).toHaveBeenCalledWith({ extensionId: extension.extensionId, taskId: "owned-task" }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(network.extensionTaskApi).toHaveBeenCalledWith(credential);
+    app.setForeground(false);
+    await expect(transport.setTaskPreferences!(extension, preferences, undefined, PermissionMode.ASK, signal)).rejects.toThrow(/owner changed/u);
+    await expect(transport.retryTaskWriteAccess!(extension, "owned-task", signal)).rejects.toThrow(/owner changed/u);
+    expect(retry).toHaveBeenCalledTimes(1);
+    expect(update).toHaveBeenCalledTimes(1);
+  });
   it("lists and opens only an exact current installed descriptor", async () => {
     const network = fakeNetwork();
     const extension = mobileExtensionFixture();

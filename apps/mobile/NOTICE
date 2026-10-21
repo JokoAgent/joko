@@ -1,8 +1,0 @@
-Attachment-upload leave decisions, queued-image viewing, retained history prefixes,
-and small Remote Desktop media-channel requests are adapted from Cindy v0.1.112
-(8bd60e8549cdcf0ada21e6f73d68dc0d0b71909d), copyright 2026 Cindy contributors,
-under the Apache License, Version 2.0. See LICENSE.cindy.
-Sources: useConfirmLeaveWhileUploading.ts, pendingSendImages.ts, messageGallery.ts,
-historyView.ts, RemoteDesktopScreen.tsx, viewerRuntime.js and RemoteDesktopReceiver.swift.
-Joko binds them to its generated contracts, retained drafts, Blob identities,
-node/runtime generations, native receiver and existing view lifecycle.

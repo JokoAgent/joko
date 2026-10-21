@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, PartnerLearningTurnSource, PolicySnapshot, ProviderModel, TargetDescriptor } from "@joko/core";
 import { describe, expect, it, vi } from "vitest";
-import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
+import { DefaultResourceLoader, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { appendVisionBridgeDescriptions, createPiAdapter, escapePiComposerSlashCommand, isRuntimeResourceProvenLoaded, mergeManagedResourceSnapshots, projectPiTreeNodes, resolvePiComposerSlashCommand } from "./adapter.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableStore } from "./managed-durable-store.js";
@@ -569,6 +569,32 @@ class ScriptedPiProcess extends EventEmitter {
 }
 
 describe("PiBackendAdapter", () => {
+  it.each([false, true])("uses the exact native account model without tools or durable credential files (revoked=%s)", async revoked => {
+    const home = await mkdtemp(join(tmpdir(), "joko-native-review-")); let current = true;
+    const initial = { type: "oauth" as const, access: "private-access", refresh: "private-refresh", expires: Date.now() + 60_000 };
+    const refreshed = { ...initial, access: "refreshed-access" }, persisted = vi.fn(async () => ({ catalogGeneration: 2, credentialReferenceId: "native" }));
+    const model = { provider: "openai-codex", id: "exact-native" };
+    const complete = vi.fn(async (_model: unknown, _context: unknown, _options: unknown) => {
+      if (revoked) current = false;
+      await captured!.credentials!.modify("openai-codex", async () => refreshed);
+      return { stopReason: "stop", content: [{ type: "text", text: "approved" }] };
+    });
+    let captured: Parameters<typeof ModelRuntime.create>[0];
+    const create = vi.spyOn(ModelRuntime, "create").mockImplementation(async options => { captured = options;
+      return { getModel: () => model, complete } as unknown as ModelRuntime;
+    });
+    const adapter = createPiAdapter({ agentHome: home, sessionRoot: home, catalogGeneration: 1, nativeAuthProviderIds: ["openai-codex"],
+      nativeModels: [{ providerId: "openai-codex", modelId: "exact-native", displayName: "Exact", api: "openai-responses", contextWindow: 32_000, maxOutputTokens: 1024, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
+      loadNativeAuth: () => ({ catalogGeneration: 1, credentials: { "openai-codex": initial } }), persistNativeAuth: persisted });
+    try {
+      const result = adapter.inferNativeText({ providerId: "openai-codex", modelId: "exact-native", backendInstanceGeneration: 0, system: "Review", user: "Action", timeoutMs: 10_000,
+        signal: new AbortController().signal, assertCurrent: () => { if (!current) throw new Error("Revoked"); }, assertModelAllowed: (provider, id) => { expect([provider, id]).toEqual(["openai-codex", "exact-native"]); } });
+      if (revoked) await expect(result).rejects.toThrow("Revoked"); else await expect(result).resolves.toBe("approved");
+      expect(captured).toMatchObject({ modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
+      expect(complete).toHaveBeenCalledWith(model, { systemPrompt: "Review", messages: [{ role: "user", content: [{ type: "text", text: "Action" }], timestamp: expect.any(Number) }] }, expect.objectContaining({ cacheRetention: "none", maxTokens: 512 }));
+      expect(persisted).toHaveBeenCalledTimes(revoked ? 0 : 1); await expect(access(join(home, "auth.json"))).rejects.toThrow();
+    } finally { create.mockRestore(); await adapter.dispose(); await rm(home, { recursive: true, force: true }); }
+  });
   it("recovers unknown native context from the current tree without inheriting another branch's usage", async () => {
     const directory = await mkdtemp(join(tmpdir(), "joko-pi-context-tree-"));
     const options = { treeLeafId: "current", tree: [{
@@ -669,6 +695,29 @@ describe("PiBackendAdapter", () => {
       await adapter.closeSession(binding, { ...context, binding });
     } finally { await adapter.dispose(); await rm(root, { recursive: true, force: true }); }
   });
+  it("attests a built-in Skill only from its exact observed native mount", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-pi-builtin-")), source = join(root, "source"), workspace = join(root, "workspace");
+    await mkdir(source); await mkdir(workspace);
+    const body = "---\nname: joko-plugin-creator\ndescription: Create plugins\n---\nCreate the requested plugin.\n";
+    await writeFile(join(source, "SKILL.md"), body);
+    const revision = `sha256:${createHash("sha256").update(`D\0\0F\0SKILL.md\0${Buffer.byteLength(body)}\0`).update(body).digest("hex")}`;
+    const adapter = createPiAdapter({ agentHome: join(root, "agent"), sessionRoot: join(root, "sessions"), versionProbe: async () => "pi 99.99.99-test",
+      resolveNativeSkills: async () => [{ sourcePath: source, resource: { id: "builtin-owned", name: "joko-plugin-creator", kind: "skill", source: "builtin", state: "approved", revision, resourceVersion: 1n,
+        trustedBuiltin: { id: "plugin_creator", revision } }, assertCurrent: () => undefined }],
+      processFactory: spec => { const mount = spec.args[spec.args.indexOf("--skill") + 1]!;
+        return new ScriptedPiProcess(spec, { commands: [
+          { name: "joko-plugin-creator", source: "skill", sourceInfo: { path: join(mount, "SKILL.md") } },
+          { name: "same-name-user-skill", source: "skill", sourceInfo: { path: join(source, "SKILL.md") } }
+        ] }) as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "builtin-home", backendId: "pi", displayName: "Home", workspaceRoot: workspace, managed: true, trusted: true };
+    try {
+      const context = makeContext(target, []), binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, context);
+      const commands = await adapter.getCommands({ ...context, binding });
+      expect(commands.find(command => command.resourceId === "builtin-owned")?.builtinSkill).toEqual({ id: "plugin_creator", revision });
+      expect(commands.find(command => command.name === "same-name-user-skill")?.builtinSkill).toBeUndefined();
+    } finally { await adapter.dispose(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("launches personal skill discovery through native argv and fences revoked originals before a prompt", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-pi-personal-")), source = join(root, "source"), workspace = join(root, "workspace");
     await mkdir(source); await mkdir(workspace);
@@ -2469,7 +2518,10 @@ describe("PiBackendAdapter", () => {
       managed: true,
       trusted: false
     };
-    const base = { ...makeContext(target, []), sessionId: "policy-session" };
+    let authorityCurrent = true, pause = false, release!: () => void;
+    const review = vi.fn(async () => { if (pause) await new Promise<void>(resolve => { release = resolve; }); return { verdict: "allow" as const, authorizationRevision: "original" }; });
+    const nativeToolAuthorization = { required: true, capture: () => "original", assertCurrent: () => { if (!authorityCurrent) throw new Error("Revoked"); }, review };
+    const base = { ...makeContext(target, []), sessionId: "policy-session", nativeToolAuthorization };
     const snapshot: PolicySnapshot = {
       generation: "3",
       backendId: target.backendId,
@@ -2523,6 +2575,14 @@ describe("PiBackendAdapter", () => {
         expect.objectContaining({ type: "extension_ui_response", id: "policy-current", value: "deny" }),
         expect.objectContaining({ type: "extension_ui_response", id: "policy-stale", value: "stale" })
       ]));
+      const nativeRead = { policyGeneration: 1, observation: { subjectKind: "file_read" as const, risk: "read_only" as const, toolName: "read" }, toolCall: { toolName: "read", input: { path: join(workspace, "README.md") } } };
+      processes[0]?.emitExtensionInput("native-current", encodePolicyDecisionRequest(nativeRead));
+      await waitForAdapterCondition(() => processes[0]?.commands.some(command => command.id === "native-current") === true);
+      expect(processes[0]?.commands).toContainEqual(expect.objectContaining({ id: "native-current", value: "delegated_allow" }));
+      pause = true; processes[0]?.emitExtensionInput("native-revoked", encodePolicyDecisionRequest(nativeRead));
+      await waitForAdapterCondition(() => review.mock.calls.length === 2); authorityCurrent = false; release();
+      await waitForAdapterCondition(() => processes[0]?.commands.some(command => command.id === "native-revoked") === true);
+      expect(processes[0]?.commands).toContainEqual(expect.objectContaining({ id: "native-revoked", cancelled: true }));
       await adapter.closeSession(binding, context);
     } finally {
       await adapter.dispose().catch(() => undefined);
@@ -4027,6 +4087,42 @@ describe("PiBackendAdapter", () => {
     expect(events.filter((event) => event.type === "subagent_transcript")).toHaveLength(transcriptCountAfterRebuild);
     expect(scripted.exitCode).toBe(0);
     await adapter.dispose();
+  });
+
+  it("preserves the exact Home model selection through the real remote context rebuild prepare hook", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-home-rebuild-")), workspace = await mkdtemp(join(tmpdir(), "joko-home-rebuild-workspace-"));
+    const prepared: AdapterContext[] = [], processes: ScriptedPiProcess[] = [];
+    const selection = { providerId: "local", modelId: "test-model" };
+    const durable: PiManagedDurableStore = {
+      scan: async () => ({ revision: "empty", unchanged: false, retryAfterMs: 500, runs: [] }),
+      readTail: async () => { throw new Error("No delegated run exists."); }, writeControl: async () => { throw new Error("No delegated run exists."); },
+      stopAndRemoveSession: async () => ({ terminalRunIds: [], removed: true, deletionReceipt: createHash("sha256").update("home rebuild lineage").digest("hex") }),
+      finalizeDeletion: async () => undefined, dispose: async () => undefined
+    };
+    const adapter = createPiAdapter({ agentHome, sessionRoot: agentHome, versionProbe: async () => "pi 99.99.99-home-rebuild-test",
+      providers: [{ id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true, models: [{ id: "test-model" }] }],
+      validateRemoteWorkspace: async () => undefined, includeManagedSubagentTools: () => false,
+      managedDurableStoreRegistry: { storeFor: async () => durable },
+      mcpBridge: { endpoint: "http://127.0.0.1:4318/internal/mcp", token: "private-home-runtime-capability", tools: [] },
+      prepareRemoteHomeRuntime: async input => {
+        // Match the production Home inference precondition at the real Adapter boundary.
+        expect(input.context.modelSelection).toEqual(selection);
+        expect(input.context.target.remoteWorkspace?.kind).toBe("device_peer");
+        expect(input.environment.JOKO_PI_MCP_TOKEN).toBe("private-home-runtime-capability");
+        prepared.push(input.context);
+        return { environment: Object.fromEntries(Object.entries(input.environment).filter((entry): entry is [string, string] => typeof entry[1] === "string")), discardNativeAuth: true };
+      }, processFactory: spec => { const process = new ScriptedPiProcess(spec, { synchronousExtensionCommand: "joko-rebuild-context" }); processes.push(process); return process as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "home-rebuild-target", backendId: "pi", displayName: "Partner home", workspaceRoot: workspace, managed: true, trusted: true,
+      remoteWorkspace: { kind: "device_peer", controllerDeviceId: "phone", targetDeviceId: "computer", workspaceRoot: "/home/person/.joko/partner-homes/authority/partner" } };
+    const context: AdapterContext = { ...makeContext(target, []), modelSelection: selection };
+    try {
+      const binding = await adapter.createSession({ target, providerId: selection.providerId, modelId: selection.modelId, fastMode: false, permissionMode: "ask" }, context);
+      const rebuilt = await adapter.rebuildContext({ reason: "manual_restart", handoff: "[JOKO SAFE CONTEXT HANDOFF]\nKeep the visible conversation.", messages: [] }, { ...context, binding });
+      expect(prepared.map(input => input.generation)).toEqual([1, 2]); expect(prepared[1]!.modelSelection).toEqual(selection);
+      expect(rebuilt.generation).toBe(2); expect(processes).toHaveLength(2);
+      expect(processes[1]!.contextRebuildHandoff).toContain("Keep the visible conversation.");
+      expect(processes[1]!.commands.some(command => command.type === "prompt" && String(command.message).startsWith("/joko-rebuild-context "))).toBe(true);
+    } finally { await adapter.dispose(); }
   });
 
   it("rebuilds a context handoff larger than 512 KiB and rejects capacity plus one before materialization", async () => {

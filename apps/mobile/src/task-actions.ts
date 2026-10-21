@@ -6,6 +6,7 @@ import {
   QueueItemState,
   QueueTextEditSpliceSchema,
   capabilityNames,
+  richAnswerText,
   type BackendDescriptor,
   type InputContent,
   type QueueItem,
@@ -29,7 +30,7 @@ export interface MobileMessageActionItem {
 
 export function buildMobileMessageCopyText(row: TimelineRow, locale: MobileSupportedLocale): string {
   const source = row.copySource ?? { body: row.sourceText ?? row.text, attachmentNames: [] };
-  const parts = [source.body, source.secondaryBody ?? ""];
+  const parts = [row.kind === "assistant" ? richAnswerText(source.body) : source.body, source.secondaryBody ?? ""];
   const names = source.attachmentNames.filter(Boolean);
   if (names.length) parts.push(mobileMessage(locale, "actions.messageAttachments", { names: names.join(", ") }));
   return parts.filter(part => part.trim().length > 0).join("\n\n");

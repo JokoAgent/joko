@@ -32,6 +32,22 @@ afterEach(async () => {
 });
 
 describe("Messaging settings", () => {
+  it("shows and saves an existing Accept edits route without relabeling it as Full or Ask", async () => {
+    const route: MessagingRouteView = { ...messagingRoute(), permissionMode: "acceptEdits" };
+    const settings = { ...messagingSettings([]), routes: [route] }, current = snapshot();
+    const putMessagingRoute = vi.fn(async () => route), controller = controllerFixture(settings, { putMessagingRoute });
+    const container = await renderSettings(controller, { ...current, backends: [{ id: "backend-one", name: "Engine", version: "1", health: "healthy", capabilities: new Map([
+      ["permission.modes", { name: "permission.modes", supported: true, options: ["ask", "acceptEdits", "auto"] }]
+    ]) }] });
+    expect(container.querySelector(".messaging-route-overview")?.textContent).toContain("Accept edits");
+    await act(async () => button(container, "Edit route").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const option = required(dialog.querySelector<HTMLOptionElement>('option[value="acceptEdits"]'));
+    expect(option.selected).toBe(true); expect(option.disabled).toBe(false);
+    await act(async () => button(dialog, "Save").click());
+    expect(putMessagingRoute).toHaveBeenCalledWith(expect.objectContaining({ permissionMode: "acceptEdits" }));
+  });
+
   it("keeps its polling owner through connection snapshots and projects a later connected state", async () => {
     let poll: (() => void) | undefined;
     const interval = vi.spyOn(window, "setInterval").mockImplementation((callback: TimerHandler) => {

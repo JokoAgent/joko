@@ -1,5 +1,0 @@
-This directory includes adapted MCP Apps protocol, connection, host and tests from
-Cindy Release v0.1.112 (8bd60e8549cdcf0ada21e6f73d68dc0d0b71909d).
-Copyright 2026 Cindy contributors. Licensed under Apache License, Version 2.0.
-The license text is included as LICENSE.cindy. Joko adaptations connect the
-implementation to Joko-owned task, authorization, persistence and UI boundaries.

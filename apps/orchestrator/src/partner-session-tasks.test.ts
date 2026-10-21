@@ -14,6 +14,7 @@ import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { SessionHost } from "./session-host.js";
 import { PartnerManager } from "./partner-manager.js";
 import { PartnerSessionTaskManager } from "./partner-session-tasks.js";
+import { sessionTaskActivity } from "./session-task-activity.js";
 import { PartnerSessionTaskTools } from "./partner-session-task-tools.js";
 import { ConnectionManager } from "./connection-manager.js";
 import { AppDefaultModelCoordinator } from "./app-default-model.js";
@@ -80,6 +81,7 @@ describe("Partner independent Session tasks", () => {
     const f = await fixture(), selected = await f.partners.updatePartner(f.partner.id, f.partner.revision, { taskModelOverride: f.route });
     const created = await f.tasks.start(f.parent, "task:first", { instruction: "Produce the report", title: "Report", workingDir: f.project }, () => undefined);
     const child = f.store.getSession(created.sessionId!).descriptor;
+    expect(sessionTaskActivity(f.store, f.store.getSession(child.id))?.completionNotification).toBe("pending");
     expect(child).toMatchObject({ backendId: f.secondary.id, providerId: "test", modelId: "text", effort: "medium", permissionMode: "ask", planMode: false });
     expect(f.store.listSessions()).toHaveLength(2); expect(f.store.getSession(f.parent).descriptor.backendId).toBe(f.primary.id);
     expect(f.store.listQueueItems({ sessionId: child.id })).toHaveLength(1); expect(f.partnerStore.getSessionLink(child.id)).toBeUndefined();
@@ -91,6 +93,7 @@ describe("Partner independent Session tasks", () => {
     f.store.transaction(store => store.adoptSessionArtifact({ sessionId: child.id, blob: store.getArtifact(artifact.id).blob }));
     await f.secondary.complete(child.id, "Report ready.");
     await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]).toMatchObject({ status: "completed", result: "Report ready.", deliveredExecution: 1 }));
+    expect(sessionTaskActivity(f.store, f.store.getSession(child.id))).toMatchObject({ completionNotification: "teammate", completedReplySummary: "Report ready." });
     expect(f.tasks.view(f.tasks.list(f.partner.id)[0]!)).toMatchObject({ artifacts: [{ id: artifact.id, name: "report.txt" }] });
     const returned = f.store.listQueueItems({ sessionId: f.parent }); expect(returned).toHaveLength(1); expect(returned[0]!.body.text).toContain(artifact.id);
     await f.tasks.message(f.parent, created.id, "task:followup", { mode: "queue", message: "Add a summary" }, () => undefined);
@@ -98,6 +101,17 @@ describe("Partner independent Session tasks", () => {
     expect(f.store.listSessions()).toHaveLength(2); expect(f.store.getSession(child.id).descriptor.backendId).toBe(f.secondary.id);
     expect(f.store.listQueueItems({ sessionId: child.id })).toHaveLength(2); expect(f.tasks.list(f.partner.id)[0]!.execution).toBe(2);
     expect(f.tasks.inspectRoute.bind(f.tasks, f.parent, created.id)).toThrow();
+  });
+  it("releases completion notification ownership when the original requester can no longer accept a result", async () => {
+    const f = await fixture();
+    const task = await f.tasks.start(f.parent, "task:orphaned", { instruction: "Prepare the result", workingDir: f.project }, () => undefined);
+    await vi.waitFor(() => expect(f.primary.inputs.some(input => input.context.sessionId === task.sessionId)).toBe(true));
+    const parent = f.store.getSession(f.parent);
+    f.store.updateSession(f.parent, { archived: true }, parent.revision);
+    await f.primary.complete(task.sessionId!, "Independent result");
+    await vi.waitFor(() => expect(f.tasks.list(f.partner.id)[0]?.status).toBe("completed"));
+    await vi.waitFor(() => expect(sessionTaskActivity(f.store, f.store.getSession(task.sessionId!))?.completionNotification).toBe("none"));
+    expect(f.store.listQueueItems({ sessionId: f.parent })).toEqual([]);
   });
   it("preserves the pending queue across pause/restart and resumes without replaying the original objective", async () => {
     const f = await fixture(); const created = await f.tasks.start(f.parent, "task:pause", { instruction: "Implement the change", workingDir: f.project }, () => undefined);
