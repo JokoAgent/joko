@@ -1,5 +1,5 @@
-import type { JSX } from "react";
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import type { JSX, Ref } from "react";
+import { useEffect, useId, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
 import { AlertTriangle, Clock3, GripVertical, Pause, Pencil, Play, X, Zap } from "lucide-react";
 import type { AppController } from "../controller.js";
 import type { DeliveryMode, QueueControlView, QueueItemTextEditView, QueueItemView } from "../model.js";
@@ -18,7 +18,9 @@ interface QueueEditLock {
   readonly lease: QueueLockLease;
 }
 
-export function QueueStrip({ sessionId, items, control, supportedDispositions, controller, runAction, t, expanded, onExpandedChange }: { readonly sessionId: string; readonly items: readonly QueueItemView[]; readonly control?: QueueControlView; readonly supportedDispositions: readonly DeliveryMode[]; readonly controller: AppController; readonly runAction: RunAction; readonly t: Translator; readonly expanded: boolean; readonly onExpandedChange: (expanded: boolean) => void }): JSX.Element {
+export interface QueueStripActions { steerSole(): boolean }
+
+export function QueueStrip({ sessionId, items, control, supportedDispositions, controller, runAction, t, expanded, onExpandedChange, actionsRef }: { readonly sessionId: string; readonly items: readonly QueueItemView[]; readonly control?: QueueControlView; readonly supportedDispositions: readonly DeliveryMode[]; readonly controller: AppController; readonly runAction: RunAction; readonly t: Translator; readonly expanded: boolean; readonly onExpandedChange: (expanded: boolean) => void; readonly actionsRef?: Ref<QueueStripActions> }): JSX.Element {
   const [editingId, setEditingId] = useState<string>();
   const [editingDraft, setEditingDraft] = useState<QueueItemTextEditView>(() => ({
     text: "",
@@ -320,6 +322,18 @@ export function QueueStrip({ sessionId, items, control, supportedDispositions, c
   }, [sessionId, controller.setQueueItemEditLock, controller.setQueueInteractionLock]);
   const steerSupported = supportedDispositions.includes("steer");
   const deliveryUnavailable = supportedDispositions.length === 0;
+  useImperativeHandle(actionsRef, () => ({
+    steerSole: () => {
+      const item = ordered[0];
+      if (ordered.length !== 1 || item === undefined || !ownerRef.current.active || !steerSupported
+        || item.state !== "accepted" || item.source !== "user" || item.editLocked
+        || !canEditSharedQueueItem(controller.state.sessionAccess, item)
+        || editingId !== undefined || editLockRef.current !== undefined || control?.interactionLocked
+        || pendingItemIdsRef.current.size > 0 || queueControlPendingRef.current) return false;
+      runWithEditLock(item, `steer-now:${item.id}`, (lockToken) => controller.steerQueueItemNow(item.id, lockToken));
+      return true;
+    }
+  }));
   return (
     <div ref={queueRootRef} className={cx("queue-strip", unknown && "queue-strip--warning", paused && "queue-strip--paused")} aria-label={t("context.queue")}>
       <div className="queue-strip__title">{unknown ? <AlertTriangle aria-hidden="true" /> : paused ? <Pause aria-hidden="true" /> : <Clock3 aria-hidden="true" />}<strong>{t("composer.queueCount", { count: ordered.length })}</strong>{paused && <Pill tone="warning">{t("queue.paused")}</Pill>}{interactionLocked && <Pill tone="warning">{t("queue.interactionLocked")}</Pill>}{!guest && <IconButton label={paused ? t("queue.resume") : t("queue.pause")} disabled={queueControlPending} onClick={() => {

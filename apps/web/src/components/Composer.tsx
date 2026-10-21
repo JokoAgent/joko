@@ -34,8 +34,8 @@ import { upsertComposerMention } from "../message-reference.js";
 import { normalizeSelectionQuoteDrafts } from "../selection-quote.js";
 import { randomUuid } from "../web-crypto.js";
 import { promptRecommendationStore } from "../prompt-recommendation-store.js";
-import { ComposerOperationGuard, currentComposerPlatform, getComposerSendShortcutLabel, resolveComposerAttachmentPolicy, resolveComposerEnterIntent, resolveComposerEscapeIntent, resolveComposerHistoryKey, resolveComposerPaletteKey, resolveUserShellDraft, type ComposerOwnershipToken, type ComposerSubmissionKind } from "./composer-behavior.js";
-import { QueueStrip, deliveryLabel } from "./QueueStrip.js";
+import { ComposerOperationGuard, hasComposerModifier, currentComposerPlatform, getComposerSendShortcutLabel, resolveComposerAttachmentPolicy, resolveComposerEnterIntent, resolveComposerEscapeIntent, resolveComposerHistoryKey, resolveComposerPaletteKey, resolveUserShellDraft, type ComposerOwnershipToken, type ComposerSubmissionKind } from "./composer-behavior.js";
+import { QueueStrip, deliveryLabel, type QueueStripActions } from "./QueueStrip.js";
 import { composerBuiltInCommand, composerCommandItems, detectComposerCommandActivation, filterComposerPaletteItems, replaceComposerCommandRun, runtimeCommandOwnsApplicationCommand, type ComposerCommandActivation, type ComposerPaletteItem } from "./composer-palette.js";
 import { ComposerInlineMentionPanel } from "./composer-inline-mention-panel.js";
 import { ComposerAddMenu } from "./ComposerAddMenu.js";
@@ -223,6 +223,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
   const commandActivationRef = useRef(commandActivation);
   commandActivationRef.current = commandActivation;
   const composerIsComposingRef = useRef(false);
+  const queueActionsRef = useRef<QueueStripActions>(null);
   const suppressedInlineMentionFromRef = useRef<number | undefined>(undefined);
   const suppressedCommandFromRef = useRef<number | undefined>(undefined);
   const lastComposerCaretRef = useRef<number | undefined>(undefined);
@@ -2648,7 +2649,7 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
           }
         }}
       >
-      {showQueue && <QueueStrip sessionId={session.id} items={sessionQueue} control={queueControl} supportedDispositions={supportedModes} controller={controller} runAction={runAction} t={t} expanded={queueExpanded} onExpandedChange={(expanded) => setQueueExpandedSessionId(expanded ? session.id : undefined)} />}
+      {showQueue && <QueueStrip sessionId={session.id} items={sessionQueue} control={queueControl} supportedDispositions={supportedModes} controller={controller} runAction={runAction} t={t} expanded={queueExpanded} onExpandedChange={(expanded) => setQueueExpandedSessionId(expanded ? session.id : undefined)} actionsRef={queueActionsRef} />}
       <div
         className={cx("composer", dragging && "is-dragging", effectiveBashMode && "composer--bash")}
         aria-busy={submissionKind !== undefined}
@@ -2787,6 +2788,10 @@ export function Composer({ controller, session, backend, sessionUsage, readOnly:
               }
               if (handleHistoryNavigation(event, activeDocument)) return true;
               return handleComposerKey(event, sendShortcut, turnRunning, composerPlatform, (intent) => {
+                if (hasComposerModifier(event, composerPlatform) && event.keyCode !== 229
+                  && !voiceActive && composerDocumentIsEmpty(activeDocument)
+                  && attachments.length === 0 && mentions.length === 0 && browserComments.length === 0
+                  && selectionQuotes.length === 0 && queueActionsRef.current?.steerSole()) return;
                 const mode = intent === "steer" ? "steer" : queueDeliveryMode(turnRunning, supportedModes);
                 if (mode !== undefined) sendDraft(mode);
               });
