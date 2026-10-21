@@ -29,10 +29,10 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   store.createSession({ id: "task", backendId: "runtime", targetId: "target", title: "Task", binding: { opaqueRef: "native", generation: 1 },
     pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
   const id = "extension_0123456789abcdef0123456789abcdef", revision = `sha256:${"a".repeat(64)}`;
-  let enabled = true, changed: ((ids: readonly string[]) => void) | undefined;
+  let enabled = true, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
   const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
     card: { externalLinks: true }, mail: true, agent: true,
-    network: { hosts: ["api.example.test"], secrets: [{ key: "key", label: "Key", inject: { header: "Authorization", format: "Bearer {value}" } }] }, mailReader: { tool: "read_mail", hosts: ["mail.example.test"], markRead: true } });
+    network: { hosts: ["api.example.test"], connections: [{ key: "service", label: "Service", inject: { header: "Authorization", format: "Bearer {value}" } }], secrets: [{ key: "key", label: "Key", inject: { header: "Authorization", format: "Bearer {value}" } }] }, mailReader: { tool: "read_mail", hosts: ["mail.example.test"], markRead: true } });
   const extension = () => ({ id, revision: 1n, name: "Fixture mail", installed: true, enabled, owner: { kind: "resource", resourceId: "resource", resourceVersion: 1n, discoveredRevision: revision },
     setup: { state: "not_required" }, runtime: { ...declaration, extensionEntry: "extensions/main.js" } } as unknown as ExtensionCatalogDescriptor);
   const resource = { id: "resource", kind: "package", scope: "managed", state: "installed", enabled: true, backendId: "runtime", versionNumber: 1n,
@@ -65,7 +65,11 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
           const published = await joko.card.update({ callId: message.callId, html: '<p>Approved source</p><button data-joko-action="refresh">Refresh</button>' });
           return { ok: published.ok, result: { published: published.ok, nodeVisible: typeof process !== 'undefined', agentVisible: !!joko.agent } };
         });
-        joko.tools.register('network', async message => ({ ok: true, result: await joko.network.fetch({ callId: message.callId, url: 'https://api.example.test/messages' }) }));
+        joko.tools.register('network', async message => {
+          const connections = message.arguments.connection ? await joko.network.connections('service') : undefined;
+          const response = await joko.network.fetch({ callId: message.callId, url: 'https://' + (connections ? connections.connections[0].host : 'api.example.test') + '/messages' });
+          return { ok: true, result: connections ? { connections, response } : response };
+        });
         joko.tools.register('read_mail', async message => ({ ok: true, result: { accountId: 'one', messageId: 'one', from: 'Sender', to: 'Owner', cc: '', bcc: '', date: 'Today', subject: message.arguments.markRead ? 'Opened' : 'Unread', bodyHtml: '<p>Hello</p>', bodyText: 'Hello', attachments: [] } }));
         joko.onHostMessage(async message => {
           if (message.actionId === 'refresh') await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
@@ -95,9 +99,12 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     resources: { get: () => resource }, catalog: { get: () => extension(), snapshot: () => ({ revision: 1n, entries: [extension()], recoveredFromCorruption: false }),
       onAuthorityChanged: listener => { changed = listener; return () => { changed = undefined; }; } },
     registerProvider: provider => { providers.set(provider.id, provider); return () => { providers.delete(provider.id); }; }, redact: value => value,
-    fetch: (async (_url, init) => {
-      expect(new Headers(init?.headers).get("authorization")).toBe("Bearer runtime-private-key");
-      return new Response('{"messages":1,"echo":"runtime-private-key"}', { headers: { "content-type": "application/json" } });
+    connections: { identity: () => connectionIdentity, hosts: () => ["one.example.test"], token: () => "connection-private-key",
+      list: () => [{ id: "connection-one", host: "one.example.test", label: "One", isDefault: true, configured: true, changeId: "private-change-id" }] },
+    fetch: (async (url, init) => {
+      const token = new URL(String(url)).hostname === "one.example.test" ? "connection-private-key" : "runtime-private-key";
+      expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${token}`);
+      return new Response(JSON.stringify({ messages: 1, echo: token }), { headers: { "content-type": "application/json" } });
     }) as typeof fetch, resolveCredential: () => "runtime-private-key",
     continueTask: async (_scope, _text, guard) => { await guard(); await continuation(); } });
   const context = { sessionId: "task", targetId: "target", generation: 1 };
@@ -107,6 +114,10 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     const provider = providers.get(`${id}-runtime`)!; expect(provider).toBeDefined();
     const response = await provider.callTool("network", {}, undefined, context);
     expect(response.structuredContent).toMatchObject({ ok: true, status: 200, body: '{"messages":1,"echo":"[REDACTED]"}' });
+    const connectionResponse = await provider.callTool("network", { connection: true }, undefined, context);
+    expect(connectionResponse.structuredContent).toMatchObject({ connections: { ok: true, connections: [{ id: "connection-one", host: "one.example.test", label: "One", default: true }] },
+      response: { ok: true, status: 200, body: '{"messages":1,"echo":"[REDACTED]"}' } });
+    expect(JSON.stringify(connectionResponse)).not.toContain("private-change-id");
     expect(await runtime.previewMail("task", "https://mail.example.test/message/one", false, false, new AbortController().signal, () => {})).toEqual({ supported: true });
     expect(await runtime.previewMail("task", "https://mail.example.test/message/one", true, true, new AbortController().signal, () => {})).toMatchObject({ supported: true, message: { subject: "Opened", bodyText: "Hello" } });
     const first = await provider.callTool("card", {}, undefined, context).catch(error => { throw new Error(`${String(error)}; ${startupErrors.join("; ")}`); });
@@ -141,6 +152,9 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.sends).toBe(1);
     expect(await action("send")).toBe(false);
     const before = publicCards().length;
+    connectionIdentity = "changed";
+    await expect(provider.callTool("network", {}, undefined, context)).rejects.toThrow();
+    expect(manager.get("task", mailId).interactive).toBe(false);
     enabled = false; changed?.([id]); expect(provider.available).toBe(false);
     expect(manager.get("task", mailId).interactive).toBe(false);
     await expect(provider.callTool("card", {}, undefined, context)).rejects.toThrow(); expect(publicCards()).toHaveLength(before);

@@ -679,12 +679,21 @@ export class ExtensionCatalogManager {
     };
   }
 
-  #replaceRecord(next: StoredExtensionRecord): void {
+  /** The settings owner commits metadata with the catalog fence before runtime
+   * observers may consume a new connection or credential pointer. */
+  updateNetworkConfiguration(extensionId: string, expectedRevision: bigint, effect: () => void): ExtensionCatalogDescriptor {
+    const definition = this.#requireDefinition(extensionId), current = this.#requireRecord(extensionId, expectedRevision);
+    if (!definition.installed || !definition.runtime?.network?.connections?.length) throw new Error("Extension connections are unavailable.");
+    this.#replaceRecord({ ...current, revision: increment(current.revision), updatedAt: this.#now() }, effect);
+    return this.#descriptor(definition);
+  }
+
+  #replaceRecord(next: StoredExtensionRecord, effect?: () => void): void {
     const previous = this.#records.get(next.id);
     this.#records.set(next.id, next);
     this.#catalogRevision += 1n;
     try {
-      this.#persist();
+      if (effect) this.#store.transaction(() => { effect(); this.#persist(); }); else this.#persist();
     } catch (error) {
       this.#catalogRevision -= 1n;
       if (previous === undefined) this.#records.delete(next.id);
@@ -737,7 +746,7 @@ function runtimePermissions(runtime: ExtensionRuntimeDescriptor | undefined): re
     ...(runtime.card ? [{ id: "runtime-card", label: "Interactive cards", description: "Publishes inert cards and receives explicit card actions.", required: true }] : []),
     ...(runtime.card?.externalLinks ? [{ id: "runtime-card-links", label: "External card links", description: "Opens card links after owner confirmation.", required: true }] : []),
     ...(runtime.mail ? [{ id: "runtime-mail", label: "Mail drafts", description: "Uses the host mail editor with its provider account adapters.", required: true }] : []),
-    ...(runtime.network ? [{ id: `runtime-network:${digest(runtime.network)}`, label: "Network access", description: `HTTPS requests to: ${runtime.network.hosts.join(", ")}. Protected credentials stay in the host.`, required: true }] : []),
+    ...(runtime.network ? [{ id: `runtime-network:${digest(runtime.network)}`, label: "Network access", description: `HTTPS requests to: ${[...runtime.network.hosts, ...(runtime.network.connections?.length ? ["addresses configured in connection settings"] : [])].join(", ")}. Protected credentials stay in the host.`, required: true }] : []),
     ...(runtime.agent ? [{ id: "runtime-task-continuation", label: "Task continuation", description: "May continue the original task once after an explicit card action.", required: true }] : [])
   ];
 }
@@ -749,7 +758,7 @@ function runtimeSetup(extensionId: string, runtime: ExtensionRuntimeDescriptor |
     description: secret.hint ?? `Protected ${secret.inject.header} credential for ${(secret.inject.hosts ?? network.hosts).join(", ")}.`,
     kind: "secret" as const, required: true, credentialReferenceId: extensionNetworkCredentialReference(extensionId, network, secret),
     credentialKinds: ["header_secret" as const, "api_key" as const] })),
-    { id: "permission-confirmation", label: "Allow extension network access", description: `Allow HTTPS requests to ${network.hosts.join(", ")}.`, kind: "confirmation", required: true }];
+    { id: "permission-confirmation", label: "Allow extension network access", description: `Allow HTTPS requests to ${[...network.hosts, ...(network.connections?.length ? ["addresses explicitly configured in connection settings"] : [])].join(", ")}.`, kind: "confirmation", required: true }];
 }
 
 function projectDefinitions(

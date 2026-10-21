@@ -18,6 +18,10 @@ interface Options {
   readonly resolveCredential: (reference: string) => string;
   readonly redact: (value: string) => string;
   readonly media?: ExtensionCardMedia;
+  readonly connections?: {
+    hosts(extensionId: string, declaration: NonNullable<ExtensionNetworkDeclaration["connections"]>[number]): readonly string[];
+    token(extensionId: string, declaration: NonNullable<ExtensionNetworkDeclaration["connections"]>[number], hostname: string): string | undefined;
+  };
 }
 interface Exchange { readonly source: string; readonly value: string; readonly expiresAt: number }
 
@@ -48,7 +52,9 @@ export class ExtensionNetwork {
     const current = () => { signal.throwIfAborted(); scope.assertCurrent(); };
     try {
       current();
-      let url = extensionNetworkUrl(payload.url, scope.declaration.hosts);
+      const dynamicHosts = () => (scope.declaration.connections ?? []).flatMap(declaration => [...(this.options.connections?.hosts(scope.extensionId, declaration) ?? [])]);
+      const destinations = () => [...scope.declaration.hosts, ...dynamicHosts()];
+      let url = extensionNetworkUrl(payload.url, destinations());
       const method = payload.method ?? "GET";
       if (typeof method !== "string" || !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(method)
         || scope.readOnly && !["GET", "HEAD"].includes(method)) throw new Error();
@@ -81,7 +87,8 @@ export class ExtensionNetwork {
           if (!/^[A-Za-z0-9-]{1,64}$/u.test(name) || typeof value !== "string" || value.length > 2048 || /[\r\n]/u.test(value)) throw new Error();
           const lower = name.toLowerCase();
           if (!STRIPPED.has(lower) && !lower.startsWith("sec-") && !lower.startsWith("proxy-")
-            && !scope.declaration.secrets?.some(secret => secret.inject.header.toLowerCase() === lower)) authorHeaders.set(name, value);
+            && !scope.declaration.secrets?.some(secret => secret.inject.header.toLowerCase() === lower)
+            && !scope.declaration.connections?.some(connection => connection.inject.header.toLowerCase() === lower)) authorHeaders.set(name, value);
         }
       }
       const count = this.#inflight.get(scope.authorityKey) ?? 0;
@@ -110,6 +117,7 @@ export class ExtensionNetwork {
         let response: Response | undefined;
         for (let hop = 0; hop <= 3; hop++) {
           current();
+          url = extensionNetworkUrl(url.href, destinations());
           const headers = new Headers(authorHeaders);
           if (body === undefined && currentMethod === "GET" && currentMethod !== method) { headers.delete("content-type"); headers.delete("content-encoding"); }
           for (const secret of scope.declaration.secrets ?? []) {
@@ -121,6 +129,14 @@ export class ExtensionNetwork {
             current(); secrets.add(value); usedExchange ||= secret.exchange !== undefined;
             headers.set(secret.inject.header, secret.inject.format.replace("{value}", () => value));
           }
+          // Declaration order selects one exact host owner. Each redirect reads
+          // that host's current credential; no previous hop header survives.
+          for (const connection of scope.declaration.connections ?? []) {
+            if (!this.options.connections?.hosts(scope.extensionId, connection).includes(url.hostname)) continue;
+            const value = this.options.connections.token(scope.extensionId, connection, url.hostname);
+            if (!value || /[\r\n]/u.test(value)) throw new Error();
+            secrets.add(value); headers.set(connection.inject.header, connection.inject.format.replace("{value}", () => value)); break;
+          }
           current();
           response = await this.options.fetch(url, { method: currentMethod, headers, ...(body === undefined ? {} : { body }), redirect: "manual", signal });
           lastResponse = response;
@@ -129,7 +145,7 @@ export class ExtensionNetwork {
           if (![301, 302, 303, 307, 308].includes(response.status) || !location) break;
           await response.body?.cancel();
           if (hop === 3) throw new Error();
-          const next = extensionNetworkUrl(new URL(location, url).href, scope.declaration.hosts);
+          const next = extensionNetworkUrl(new URL(location, url).href, destinations());
           if (response.status === 303 || [301, 302].includes(response.status) && currentMethod === "POST") { currentMethod = "GET"; body = undefined; }
           url = next;
         }

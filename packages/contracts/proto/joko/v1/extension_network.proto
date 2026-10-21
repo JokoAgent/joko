@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/common.proto";
+import "joko/v1/operation.proto";
+
+message ExtensionNetworkConnection {
+  string connection_id = 1;
+  string host = 2;
+  optional string label = 3;
+  bool is_default = 4;
+  bool configured = 5;
+}
+
+message ExtensionNetworkConnectionSlot {
+  string key = 1;
+  string label = 2;
+  optional string hint = 3;
+  uint32 maximum_connections = 4;
+  repeated ExtensionNetworkConnection connections = 5;
+}
+
+message ExtensionNetworkState {
+  string extension_id = 1;
+  Revision revision = 2;
+  repeated ExtensionNetworkConnectionSlot slots = 3;
+}
+
+message ExtensionNetworkServiceGetRequest {
+  string extension_id = 1;
+}
+message ExtensionNetworkServiceGetResponse {
+  ExtensionNetworkState state = 1;
+}
+
+message ExtensionNetworkServiceBeginCredentialRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string slot_key = 3;
+  string host = 4;
+  optional string label = 5;
+}
+message ExtensionNetworkServiceBeginCredentialResponse {
+  CredentialUploadTicket ticket = 1;
+}
+
+message ExtensionNetworkServiceCommitCredentialRequest {
+  string extension_id = 1;
+  string credential_upload_ticket_id = 2;
+}
+message ExtensionNetworkServiceCommitCredentialResponse {
+  ExtensionNetworkState state = 1;
+}
+
+message ExtensionNetworkServiceChangeRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string slot_key = 3;
+  oneof action {
+    string remove_connection_id = 4;
+    string default_connection_id = 5;
+  }
+}
+message ExtensionNetworkServiceChangeResponse {
+  ExtensionNetworkState state = 1;
+}
+
+service ExtensionNetworkService {
+  rpc Get(ExtensionNetworkServiceGetRequest) returns (ExtensionNetworkServiceGetResponse);
+  rpc BeginCredential(ExtensionNetworkServiceBeginCredentialRequest) returns (ExtensionNetworkServiceBeginCredentialResponse);
+  rpc CommitCredential(ExtensionNetworkServiceCommitCredentialRequest) returns (ExtensionNetworkServiceCommitCredentialResponse);
+  rpc Change(ExtensionNetworkServiceChangeRequest) returns (ExtensionNetworkServiceChangeResponse);
+}

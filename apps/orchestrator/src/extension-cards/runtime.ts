@@ -12,6 +12,7 @@ import { withExtensionCardToken } from "./service.js";
 import { MAIL_COMPOSE_RUNTIME_SOURCE } from "./mail-runtime-source.js";
 import type { CredentialVault, EncryptedCredential } from "../credential-vault.js";
 import { ExtensionNetwork } from "./network.js";
+import type { ExtensionNetworkConnections } from "./network-connections.js";
 import { createExtensionMailReader, type ExtensionMailPreview } from "./mail-reader.js";
 import type { ExtensionCardMedia } from "./media.js";
 import { EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE } from "./runtime-bootstrap.js";
@@ -35,6 +36,7 @@ interface Options {
   readonly fetch?: typeof fetch;
   readonly resolveCredential?: (reference: string) => string;
   readonly media?: ExtensionCardMedia;
+  readonly connections?: Pick<ExtensionNetworkConnections, "hosts" | "token" | "identity" | "list">;
   readonly continueTask: (scope: ExtensionCardScope, text: string, guard: (() => Promise<void>) & { readonly signal: AbortSignal }) => Promise<void>;
   readonly executablePath?: string; readonly launch?: () => Promise<Browser>;
 }
@@ -47,7 +49,8 @@ export class ExtensionCardRuntime {
   #tail = Promise.resolve(); #unsubscribe?: () => void; #timer?: NodeJS.Timeout;
   readonly #network: ExtensionNetwork | undefined;
   constructor(private readonly options: Options) {
-    if (options.fetch && options.resolveCredential) this.#network = new ExtensionNetwork({ fetch: options.fetch, resolveCredential: options.resolveCredential, redact: options.redact, ...(options.media ? { media: options.media } : {}) });
+    if (options.fetch && options.resolveCredential) this.#network = new ExtensionNetwork({ fetch: options.fetch, resolveCredential: options.resolveCredential, redact: options.redact,
+      ...(options.connections ? { connections: options.connections } : {}), ...(options.media ? { media: options.media } : {}) });
   }
   authority(id: string): ExtensionCardAuthority | undefined {
     try { return this.#capture(id); } catch { return; }
@@ -91,7 +94,7 @@ export class ExtensionCardRuntime {
       ...(resource.version === undefined ? {} : { packageVersion: resource.version }), extensionEntry,
       mainView: { html: runtime.html }, runtime: structuredClone(runtime) };
     const key = JSON.stringify({ ...surface, backendRevision: surface.backendRevision.toString(), resourceRevision: surface.resourceRevision.toString(),
-      extensionRevision: extension.revision.toString() });
+      extensionRevision: extension.revision.toString(), connections: runtime.network?.connections?.map(declaration => this.options.connections?.identity(id, declaration) ?? null) });
     return { key, name: extension.name, runtime, surface };
   }
   #assert(instance: Instance): void {
@@ -231,6 +234,12 @@ export class ExtensionCardRuntime {
     const request = payload as Record<string, unknown>, id = instance.authority.surface.extensionId;
     const current = () => { this.#assert(instance); };
     switch (request.type) {
+      case "connections-list": {
+        const declaration = instance.authority.runtime.network?.connections?.find(value => value.key === request.key);
+        if (!declaration || !this.options.connections) return { ok: false };
+        current();
+        return { ok: true, connections: this.options.connections.list(id, declaration).map(({ id, host, label, isDefault }) => ({ id, host, ...(label ? { label } : {}), default: isDefault })) };
+      }
       case "fetch-request": {
         const declaration = instance.authority.runtime.network;
         if (!declaration || !this.#network || typeof request.callId !== "string") return { ok: false };

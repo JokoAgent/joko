@@ -12,6 +12,12 @@ export interface ExtensionNetworkSecret {
 export interface ExtensionNetworkDeclaration {
   readonly hosts: readonly string[];
   readonly secrets?: readonly ExtensionNetworkSecret[];
+  readonly connections?: readonly ExtensionNetworkConnection[];
+}
+export interface ExtensionNetworkConnection {
+  readonly key: string; readonly label: string; readonly hint?: string;
+  readonly inject: { readonly header: string; readonly format: string };
+  readonly maxConnections?: number;
 }
 export function extensionNetworkHostMatches(pattern: string, hostname: string): boolean {
   return pattern.startsWith("*.") ? hostname.endsWith(pattern.slice(1)) && hostname.length > pattern.length - 1 : pattern === hostname;
@@ -32,6 +38,10 @@ function host(value: unknown): string {
     || labels.some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u.test(label))) throw new Error("Extension network host is invalid.");
   return pattern;
 }
+export function normalizeExtensionConnectionHost(value: unknown): string {
+  if (typeof value !== "string" || value.includes("*")) throw new Error("Extension connection requires a concrete host.");
+  return host(value.trim().toLowerCase());
+}
 export function extensionNetworkUrl(value: unknown, hosts: readonly string[]): URL {
   const parsed = new URL(text(value, 2048));
   if (parsed.protocol !== "https:" || parsed.port !== "" || parsed.username || parsed.password
@@ -39,11 +49,27 @@ export function extensionNetworkUrl(value: unknown, hosts: readonly string[]): U
   return parsed;
 }
 export function parseExtensionNetwork(value: unknown): ExtensionNetworkDeclaration {
-  const raw = object(value, ["hosts", "secrets"], ["hosts"]);
-  if (!Array.isArray(raw.hosts) || raw.hosts.length < 1 || raw.hosts.length > 8) throw new Error("Extension network must declare 1–8 hosts.");
-  const hosts = raw.hosts.map(host);
+  const raw = object(value, ["hosts", "secrets", "connections"], []);
+  if (raw.hosts !== undefined && (!Array.isArray(raw.hosts) || raw.hosts.length > 8)) throw new Error("Extension network may declare at most eight hosts.");
+  const hosts = ((raw.hosts ?? []) as unknown[]).map(host);
   if (new Set(hosts).size !== hosts.length) throw new Error("Extension network hosts must be unique.");
-  if (raw.secrets === undefined) return { hosts };
+  let connections: ExtensionNetworkConnection[] | undefined;
+  if (raw.connections !== undefined) {
+    if (!Array.isArray(raw.connections) || raw.connections.length < 1 || raw.connections.length > 2) throw new Error("Extension network may declare one or two connection types.");
+    connections = raw.connections.map(value => {
+      const data = object(value, ["key", "label", "hint", "inject", "maxConnections"], ["key", "label", "inject"]);
+      const key = text(data.key, 32), label = text(data.label, 64), inject = object(data.inject, ["header", "format"], ["header", "format"]);
+      const header = text(inject.header, 64), format = text(inject.format, 200);
+      if (!/^[a-z][a-z0-9_]{0,31}$/u.test(key) || ["constructor", "prototype"].includes(key)
+        || !/^[A-Za-z0-9-]{1,64}$/u.test(header) || ["host", "cookie", "set-cookie", "content-length", "connection", "transfer-encoding", "origin", "referer"].includes(header.toLowerCase())
+        || header.toLowerCase().startsWith("sec-") || header.toLowerCase().startsWith("proxy-") || format.split("{value}").length !== 2
+        || data.maxConnections !== undefined && (typeof data.maxConnections !== "number" || !Number.isInteger(data.maxConnections) || data.maxConnections < 1 || data.maxConnections > 8)) throw new Error("Extension network connection declaration is invalid.");
+      return { key, label, inject: { header, format }, ...(data.hint === undefined ? {} : { hint: text(data.hint, 200) }), ...(data.maxConnections === undefined ? {} : { maxConnections: data.maxConnections as number }) };
+    });
+    if (new Set(connections.map(value => value.key)).size !== connections.length) throw new Error("Extension network connection keys must be unique.");
+  }
+  if (hosts.length === 0 && !connections?.length) throw new Error("Extension network requires hosts or a connection declaration.");
+  if (raw.secrets === undefined) return { hosts, ...(connections ? { connections } : {}) };
   if (!Array.isArray(raw.secrets) || raw.secrets.length > 4) throw new Error("Extension network may declare at most four secrets.");
   const secrets = raw.secrets.map(value => {
     const secret = object(value, ["key", "label", "hint", "inject", "exchange"], ["key", "label", "inject"]);
@@ -73,7 +99,15 @@ export function parseExtensionNetwork(value: unknown): ExtensionNetworkDeclarati
     return { key, label, ...(secret.hint === undefined ? {} : { hint: text(secret.hint, 200) }), inject: { header, format, ...(injectionHosts ? { hosts: injectionHosts } : {}) }, ...(exchange ? { exchange } : {}) };
   });
   if (new Set(secrets.map(secret => secret.key)).size !== secrets.length || new Set(secrets.map(secret => secret.inject.header.toLowerCase())).size !== secrets.length) throw new Error("Extension network secret keys and headers must be unique.");
-  return { hosts, secrets };
+  if (connections?.some(connection => secrets.some(secret => secret.key === connection.key))) throw new Error("Extension connection and secret keys share one namespace.");
+  return { hosts, secrets, ...(connections ? { connections } : {}) };
+}
+
+export function extensionConnectionScope(extensionId: string, declaration: ExtensionNetworkConnection): string {
+  return createHash("sha256").update(JSON.stringify({ extensionId, key: declaration.key, inject: declaration.inject })).digest("hex");
+}
+export function extensionConnectionCredentialReference(extensionId: string, declaration: ExtensionNetworkConnection, id: string): string {
+  return `extension-connection:${extensionConnectionScope(extensionId, declaration)}:${id}`;
 }
 
 /** A wider destination or different injection/exchange gets a fresh reservation.

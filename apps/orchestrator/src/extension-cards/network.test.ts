@@ -18,6 +18,37 @@ it("parses exact credential destinations and makes expanded injection require a 
   ]) expect(() => parseExtensionNetwork(value)).toThrow();
 });
 
+it("uses only explicitly added connection hosts and selects fresh credentials at every redirect", async () => {
+  const declaration = parseExtensionNetwork({ connections: [{ key: "service", label: "Service", inject: { header: "X-Service-Key", format: "Bearer {value}" } }] });
+  const hosts = ["one.example.test", "two.example.test"];
+  const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(null, { status: 307, headers: { location: "https://two.example.test/resource" } })).mockResolvedValueOnce(text("one-secret two-secret"));
+  const network = new ExtensionNetwork({ fetch: fetchMock, resolveCredential: () => { throw new Error("No ambient credential"); }, redact: value => value,
+    connections: { hosts: () => hosts, token: (_id, _declaration, host) => host === hosts[0] ? "one-secret" : "two-secret" },
+  });
+  expect(await network.request(scope({ declaration }), { url: "https://one.example.test/start", headers: { "X-Service-Key": "forged", Authorization: "forged" } })).toMatchObject({ ok: true, body: "[REDACTED] [REDACTED]" });
+  expect(new Headers(fetchMock.mock.calls[0]![1]!.headers).get("x-service-key")).toBe("Bearer one-secret");
+  expect(new Headers(fetchMock.mock.calls[1]![1]!.headers).get("x-service-key")).toBe("Bearer two-secret");
+  expect(new Headers(fetchMock.mock.calls[1]![1]!.headers).has("authorization")).toBe(false);
+  expect(await network.request(scope({ declaration }), { url: "https://unlisted.example.test/" })).toMatchObject({ ok: false }); expect(fetchMock).toHaveBeenCalledTimes(2);
+  hosts.splice(0);
+  expect(await network.request(scope({ declaration }), { url: "https://one.example.test/" })).toMatchObject({ ok: false }); expect(fetchMock).toHaveBeenCalledTimes(2);
+});
+
+it("refuses missing connection tokens and author-defined connection injection scopes", async () => {
+  const entry = { key: "service", label: "Service", inject: { header: "X-Service-Key", format: "{value}" } };
+  const declaration = parseExtensionNetwork({ connections: [entry] });
+  for (const value of [
+    { connections: [{ ...entry, inject: { ...entry.inject, hosts: ["*.example.test"] } }] },
+    { connections: [entry, entry] }, { connections: [{ ...entry, maxConnections: 9 }] },
+    { hosts: ["api.example.test"], secrets: [{ ...entry }], connections: [entry] },
+  ]) expect(() => parseExtensionNetwork(value)).toThrow();
+  const fetchMock = vi.fn<typeof fetch>();
+  const network = new ExtensionNetwork({ fetch: fetchMock, resolveCredential: () => "", redact: value => value,
+    connections: { hosts: () => ["service.example.test"], token: () => undefined },
+  });
+  expect(await network.request(scope({ declaration }), { url: "https://service.example.test/" })).toMatchObject({ ok: false }); expect(fetchMock).not.toHaveBeenCalled();
+});
+
 it("revalidates every redirect, rebuilds host-only credentials and strips author and response authority", async () => {
   const fetchMock = vi.fn<typeof fetch>()
     .mockResolvedValueOnce(new Response(null, { status: 303, headers: { location: "https://static.example.test/result" } }))

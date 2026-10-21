@@ -250,6 +250,8 @@ import { PartnerImportRuntime } from "./partner-import-runtime.js";
 import { adoptPartnerImportSettings, createPartnerImportEffects, preparePartnerImportCreation } from "./partner-import-effects.js";
 import { ExtensionRoutineRuntime } from "./extension-routine-runtime.js";
 import { ExtensionCardRuntime } from "./extension-cards/runtime.js";
+import { ExtensionNetworkConnections } from "./extension-cards/network-connections.js";
+import { ExtensionNetworkSettings } from "./extension-cards/network-settings.js";
 import { ExtensionCardMedia } from "./extension-cards/media.js";
 import { ExtensionCardsManager } from "./extension-cards/manager.js";
 import { PartnerWorkingStatusManager } from "./partner-working-status.js";
@@ -501,6 +503,7 @@ export interface OrchestratorApplication {
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionCards?: ExtensionCardsManager;
+  readonly extensionNetwork?: ExtensionNetworkSettings;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
@@ -1011,6 +1014,9 @@ export async function createOrchestratorApplication(
   const extensionCatalog = new ExtensionCatalogManager({ store, credentials });
   extensionCatalog.initialize();
   extensionCatalog.reconcile(piResources.list(), mcpRouter.list(), extensionSources.snapshot().sources);
+  const extensionConnections = new ExtensionNetworkConnections({ store, credentials });
+  const extensionNetwork = new ExtensionNetworkSettings({ catalog: extensionCatalog, connections: extensionConnections, credentials });
+  await extensionNetwork.initialize();
   const extensionPackagePublisher = new ExtensionPackagePublisher({
     store,
     resources: piResources,
@@ -2268,7 +2274,7 @@ export async function createOrchestratorApplication(
     } });
   startupExtensionCards = extensionCards;
   extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store,
-    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, media: extensionCardMedia,
+    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, media: extensionCardMedia, connections: extensionConnections,
     registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
     locale: () => persistedLocale(store),
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
@@ -2945,6 +2951,7 @@ export async function createOrchestratorApplication(
     await attempt(() => skillMarket.close());
     await attempt(() => extensionCardRuntime?.stop());
     await attempt(() => extensionCards.dispose());
+    await attempt(() => extensionNetwork.dispose());
     await attempt(() => extensionRoutineRuntime.stop());
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());
@@ -3124,6 +3131,7 @@ export async function createOrchestratorApplication(
     extensionLibraries,
     extensionMainViews,
     extensionCards,
+    extensionNetwork,
     extensionPackagePublisher,
     extensionSources,
     diagnosticsBundles,
@@ -3205,6 +3213,7 @@ export async function createOrchestratorApplication(
         await attempt(() => skillMarket.close());
         await attempt(() => extensionCardRuntime?.stop());
         await attempt(() => extensionCards.dispose());
+        await attempt(() => extensionNetwork.dispose());
         await attempt(() => extensionRoutineRuntime.stop());
         await attempt(() => extensionLibraries.close());
         await attempt(() => extensionMainViews.close());
@@ -3334,6 +3343,7 @@ export async function createOrchestratorApplication(
     await attempt(() => skillMarket.close());
     await attempt(() => startupCardRuntime?.stop());
     await attempt(() => startupExtensionCards?.dispose());
+    await attempt(() => extensionNetwork.dispose());
     await attempt(() => startupRoutineRuntime?.stop());
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());

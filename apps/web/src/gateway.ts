@@ -1,6 +1,6 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
-import { ExtensionCardService } from "@joko/contracts";
+import { ExtensionCardService, ExtensionNetworkService } from "@joko/contracts";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import type { McpAppApi } from "./model.js";
 import { AppDefaultModelService } from "@joko/contracts";
@@ -5086,6 +5086,34 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }
     const client = createClient(McpAppService, transport);
     return { operate: (request, signal) => client.operate(request, { signal, timeoutMs: 120_000 }) };
+  }
+  extensionNetworkApi(): import("./model.js").ExtensionNetworkApi | undefined {
+    if (!this.#transport || !this.#abort) return;
+    const scope = this.captureActionScope(), transport = this.#transport, owner = this.#abort;
+    const client = createClient(ExtensionNetworkService, scope.transport);
+    const assertCurrent = () => {
+      scope.signal.throwIfAborted();
+      if (this.#transport !== transport || this.#abort !== owner) throw new GatewayError("Extension connection changed.");
+    };
+    return {
+      get: async (request, options) => {
+        assertCurrent(); const signal = options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal;
+        const result = await client.get(request, { ...options, signal }); assertCurrent(); signal.throwIfAborted(); return result;
+      },
+      change: async (request, options) => {
+        assertCurrent(); const signal = options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal;
+        const result = await client.change(request, { ...options, signal }); assertCurrent(); signal.throwIfAborted(); return result;
+      },
+      save: async (request, secret, signal) => {
+        assertCurrent(); const uploadScope = { ...scope, signal: signal ? AbortSignal.any([scope.signal, signal]) : scope.signal };
+        const begun = await client.beginCredential(request, { signal: uploadScope.signal }); assertCurrent();
+        const ticketId = await this.uploadCredentialTicket(secret, begun.ticket, uploadScope); assertCurrent();
+        const result = await client.commitCredential({ extensionId: request.extensionId, credentialUploadTicketId: ticketId }, { signal: uploadScope.signal });
+        assertCurrent(); uploadScope.signal.throwIfAborted();
+        if (!result.state) throw new GatewayError("Extension connection state unavailable.");
+        return result.state;
+      }
+    };
   }
   extensionCardApi(): import("./model.js").ExtensionCardApi | undefined {
     const transport = this.#transport, owner = this.#abort;
