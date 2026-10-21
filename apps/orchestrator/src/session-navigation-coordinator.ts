@@ -7,6 +7,7 @@ import { hasGeneratedLineLabel } from "./i18n/orchestration-language.js";
 
 const MATERIAL_PAGE_SIZE = 128;
 const SUMMARY_THROTTLE_MS = 20_000;
+const AUTO_TITLE_MAX_CODE_POINTS = 40;
 
 export type SessionTitleSuggestionStatus =
   | "ok"
@@ -131,11 +132,11 @@ export class SessionNavigationCoordinator {
       const result = await this.#auxiliary.run(plan, {
         system: titleSystemPrompt(locale),
         user: titleUserPrompt(material.text),
-        maxTokens: 64,
+        maxTokens: AUTO_TITLE_MAX_CODE_POINTS * 4,
         signal: ownedSignal,
         timeoutMs: 20_000,
         stillCurrent,
-        validate: (raw) => sanitizeGeneratedLine(this.#redact(raw), 20) || undefined
+        validate: (raw) => sanitizeGeneratedLine(this.#redact(raw), AUTO_TITLE_MAX_CODE_POINTS) || undefined
       });
       if (!stillCurrent()) return { title: "", status: "generation_failed" };
       return result.status === "ok" ? { title: result.text, status: "ok" }
@@ -222,11 +223,11 @@ export class SessionNavigationCoordinator {
       const result = await this.#auxiliary.run(plan, {
         system: titleSystemPrompt(locale),
         user: titleUserPrompt(safeText),
-        maxTokens: 64,
+        maxTokens: AUTO_TITLE_MAX_CODE_POINTS * 4,
         timeoutMs: 20_000,
         signal: this.#lifetime.signal,
         stillCurrent,
-        validate: (raw) => sanitizeGeneratedLine(this.#redact(raw), 20) || undefined
+        validate: (raw) => sanitizeGeneratedLine(this.#redact(raw), AUTO_TITLE_MAX_CODE_POINTS) || undefined
       });
       if (!stillCurrent()) return;
       if (result.status === "unavailable" || result.status === "exhausted") {
@@ -407,7 +408,14 @@ export class SessionNavigationCoordinator {
 }
 
 function normalizePlaceholder(value: string): string {
-  return value.replace(/\s+/gu, " ").trim().slice(0, 40).trim();
+  const normalized = value.replace(/\s+/gu, " ").trim();
+  let title = "";
+  let count = 0;
+  for (const character of normalized) {
+    title += character;
+    if (++count === AUTO_TITLE_MAX_CODE_POINTS) break;
+  }
+  return title.trimEnd();
 }
 
 function attachmentPlaceholder(prompt: PromptInput): string {
@@ -433,7 +441,7 @@ function sanitizeGeneratedLine(value: string, maximumCodePoints: number): string
 function titleSystemPrompt(locale: string): string {
   return [
     "Create a concise task title from conversation data.",
-    "Return exactly one plain-text line of at most 20 Unicode characters.",
+    `Return exactly one plain-text line of at most ${AUTO_TITLE_MAX_CODE_POINTS} Unicode characters.`,
     "Do not add quotes, markdown, role labels, metadata, or explanation.",
     localeInstruction(locale)
   ].join("\n");

@@ -8478,7 +8478,7 @@ export class OperationalStore {
           ? source === "draft" || source === "attachment"
           : source === "draft" || source === "attachment" || source === "placeholder";
       if (current.revision !== input.expectedRevision || !eligible) return undefined;
-      const title = boundedSessionNavigationText(input.title, input.source === "automatic" ? 20 : 40, "Session title");
+      const title = boundedSessionNavigationText(input.title, 40, "Session title");
       const result = this.database.prepare(`
         UPDATE product_sessions
         SET title = ?, title_source = ?, revision = ?
