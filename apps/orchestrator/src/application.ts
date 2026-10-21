@@ -113,6 +113,8 @@ import {
   ProviderCatalogManager
 } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
+import { McpAppsManager } from "./mcp-apps/manager.js";
+import { McpAppSurfaces } from "./mcp-apps/surface.js";
 import { TaskSharingHome } from "./task-sharing-home.js";
 import { ApnsMobilePushProvider } from "./apns-mobile-push-provider.js";
 import {
@@ -247,6 +249,13 @@ import { PartnerImportStorage } from "./partner-import-storage.js";
 import { PartnerImportRuntime } from "./partner-import-runtime.js";
 import { adoptPartnerImportSettings, createPartnerImportEffects, preparePartnerImportCreation } from "./partner-import-effects.js";
 import { ExtensionRoutineRuntime } from "./extension-routine-runtime.js";
+import { ExtensionCardRuntime } from "./extension-cards/runtime.js";
+import { ExtensionNetworkConnections } from "./extension-cards/network-connections.js";
+import { ExtensionNetworkSettings } from "./extension-cards/network-settings.js";
+import { ExtensionOAuthAccounts } from "./extension-cards/oauth-accounts.js";
+import { ExtensionOAuthSettings } from "./extension-cards/oauth-settings.js";
+import { ExtensionCardMedia } from "./extension-cards/media.js";
+import { ExtensionCardsManager } from "./extension-cards/manager.js";
 import { PartnerWorkingStatusManager } from "./partner-working-status.js";
 import { PartnerWorkbenchManager } from "./partner-workbench-manager.js";
 import { PartnerWorkbenchBriefReader } from "./partner-workbench-brief.js";
@@ -460,6 +469,8 @@ export interface OrchestratorApplication {
   readonly modelWorkingContext?: ModelWorkingContextCoordinator;
   readonly removeManagedModelProvider?: (providerId: string) => Promise<boolean | undefined>;
   readonly mcpRouter?: McpRouter;
+  readonly mcpApps?: McpAppsManager;
+  readonly mcpAppSurfaces?: McpAppSurfaces;
   readonly piResources?: PiResourceManager;
   readonly skills?: SkillManager;
   readonly skillLearning?: SkillLearningManager;
@@ -493,6 +504,9 @@ export interface OrchestratorApplication {
   readonly extensionCatalog?: ExtensionCatalogManager;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
+  readonly extensionCards?: ExtensionCardsManager;
+  readonly extensionNetwork?: ExtensionNetworkSettings;
+  readonly extensionOAuth?: ExtensionOAuthSettings;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
@@ -967,9 +981,14 @@ export async function createOrchestratorApplication(
   let partnerConnections: PartnerConnectionsManager | undefined;
   let partnerSkills: PartnerSkillsManager | undefined;
   let partnerLearning: PartnerLearningManager | undefined;
+  let mcpApps: McpAppsManager | undefined;
+  let mcpAppSurfaces: McpAppSurfaces | undefined;
   const mcpRouter = new McpRouter({
     store,
     credentials,
+    onAppToolCall: async input => mcpApps?.capture(input),
+    onAppConnectionOpen: connection => { mcpApps?.host.registerConnection(connection); },
+    onAppConnectionRelease: async connection => { if (mcpApps) await mcpApps.host.releaseConnection(connection); else await connection.close(); },
     targetReferences: (targetId, sessionId) => partnerConnections?.targetReferences(sessionId === undefined ? targetId : partnerGroupRuntime?.homeTarget(sessionId, targetId) ?? targetId),
     isGroupSession: sessionId => partnerStore.getSessionLink(sessionId)?.role === "group",
     capturePartnerLearningSave: source => partnerLearning?.captureSave(source),
@@ -998,6 +1017,14 @@ export async function createOrchestratorApplication(
   const extensionCatalog = new ExtensionCatalogManager({ store, credentials });
   extensionCatalog.initialize();
   extensionCatalog.reconcile(piResources.list(), mcpRouter.list(), extensionSources.snapshot().sources);
+  const extensionConnections = new ExtensionNetworkConnections({ store, credentials });
+  const extensionNetwork = new ExtensionNetworkSettings({ catalog: extensionCatalog, connections: extensionConnections, credentials });
+  await extensionNetwork.initialize();
+  const extensionOAuthAccounts = new ExtensionOAuthAccounts({ catalog: extensionCatalog, store, vault: credentialVault, credentials,
+    fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
+      environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }) });
+  await extensionOAuthAccounts.initialize();
+  const extensionOAuth = new ExtensionOAuthSettings({ accounts: extensionOAuthAccounts, credentials, catalog: extensionCatalog });
   const extensionPackagePublisher = new ExtensionPackagePublisher({
     store,
     resources: piResources,
@@ -1658,6 +1685,8 @@ export async function createOrchestratorApplication(
   let startupHistoryMaintenance: HistoryMaintenance | undefined;
   let startupCleanupHandled = false;
   let startupRoutineRuntime: ExtensionRoutineRuntime | undefined;
+  let startupCardRuntime: ExtensionCardRuntime | undefined;
+  let startupExtensionCards: ExtensionCardsManager | undefined;
   let startupBackendCleanup: Promise<readonly unknown[]> | undefined;
   const cleanupStartupBackendOwners = (): Promise<readonly unknown[]> => {
     if (startupBackendCleanup !== undefined) return startupBackendCleanup;
@@ -1745,6 +1774,8 @@ export async function createOrchestratorApplication(
     },
     registerPartnerLearningToolAuthority: authority => mcpRouter.registerPartnerLearningToolAuthority(authority),
     resolveModelWorkingContext: target => modelWorkingContext?.resolve(target),
+    resolveMcpAppModelContext: async sessionId => await mcpApps?.host.modelContext(sessionId)
+      ?? { text: "", async assertCurrent() {}, consume() {} },
     prepareManagedProviderRuntime: async context => { await managedModelRuntimeForSession?.prepareProviderRuntime(context); },
     backendDescriptors: backendInstances.descriptors(),
     backendDescriptorsAlreadyPublished: true,
@@ -1942,6 +1973,12 @@ export async function createOrchestratorApplication(
       : { retryDelayMs: dependencies.messagingRetryDelayMs })
   });
   let partnerRoutines: PartnerRoutineManager | undefined;
+  mcpApps = new McpAppsManager({ store, vault: credentialVault, config: id => mcpRouter.appServerConfig(id),
+    redact: value => credentials.redactText(value),
+    authorizeTool: (sessionId, serverId, toolName, args, signal) => sessionHost.authorizeMcpAppTool(sessionId, serverId, toolName, args, signal),
+    sendMessage: (sessionId, serverId, content, guard) => sessionHost.enqueueMcpAppMessage(sessionId, serverId, content, guard),
+    disposeDocument: viewId => mcpAppSurfaces?.remove(viewId) });
+  mcpAppSurfaces = new McpAppSurfaces(mcpApps.host, config.publicOrigin);
   partnerGroupRuntime = new PartnerGroupSessionRuntime(partnerGroupStore, partnerStore, store, sessionHost, workspaces);
   let partnerImports: PartnerImportManager | undefined;
   const assertImportService = () => { if (closed) throw new Error("Import service is closed."); };
@@ -2233,6 +2270,27 @@ export async function createOrchestratorApplication(
   const extensionRoutineRuntime = new ExtensionRoutineRuntime({ catalog: extensionCatalog, resources: piResources, store,
     surfaces: extensionMainViews, engine: partnerRoutines.engine, ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
   startupRoutineRuntime = extensionRoutineRuntime;
+  let extensionCardRuntime: ExtensionCardRuntime | undefined;
+  const extensionCardMedia = new ExtensionCardMedia({ store, vault: credentialVault, artifacts, transfers: blobTransfers });
+  const extensionCards = new ExtensionCardsManager({ store, vault: credentialVault,
+    media: extensionCardMedia,
+    authority: id => extensionCardRuntime?.authority(id), redact: value => credentials.redactText(value),
+    previewMail: async (...args) => { if (!extensionCardRuntime) throw new Error("Mail runtime unavailable."); return extensionCardRuntime.previewMail(...args); },
+    dispatch: async (scope, event, assertCurrent) => {
+      if (!extensionCardRuntime) throw new Error("Extension card runtime unavailable.");
+      await extensionCardRuntime.dispatch(scope, event, assertCurrent);
+    } });
+  startupExtensionCards = extensionCards;
+  extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store,
+    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, media: extensionCardMedia, connections: extensionConnections, oauth: extensionOAuthAccounts,
+    registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
+    locale: () => persistedLocale(store),
+    fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
+      environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }),
+    resolveCredential: reference => credentials.resolve(reference),
+    continueTask: (scope, text, guard) => sessionHost.enqueueExtensionCardMessage(scope.sessionId, scope.extensionId, text, guard),
+    ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
+  startupCardRuntime = extensionCardRuntime;
   const diagnosticsBundles = new DiagnosticsBundleService({
     store,
     artifacts,
@@ -2870,6 +2928,7 @@ export async function createOrchestratorApplication(
     await partnerRoutines.start();
     await partnerImports.recover();
     await extensionRoutineRuntime.start();
+    await extensionCardRuntime.start();
     armMaintenance();
     void runMaintenance().catch(() => {
       store.appendDiagnostic({
@@ -2898,6 +2957,11 @@ export async function createOrchestratorApplication(
     await attempt(() => skillPublication.close());
     await attempt(() => skills.close());
     await attempt(() => skillMarket.close());
+    await attempt(() => extensionCardRuntime?.stop());
+    await attempt(() => extensionCards.dispose());
+    await attempt(() => extensionOAuth.dispose());
+    await attempt(() => extensionOAuthAccounts.dispose());
+    await attempt(() => extensionNetwork.dispose());
     await attempt(() => extensionRoutineRuntime.stop());
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());
@@ -2963,6 +3027,7 @@ export async function createOrchestratorApplication(
     await attempt(() => partnerGroupWorkspaces?.dispose());
     await attempt(() => auxiliaryText.dispose());
     helpAssistant.close();
+    await attempt(async () => { await mcpApps?.dispose(); });
     await attempt(() => mcpRouter.dispose());
     await attempt(() => voiceInput.close());
     await attempt(() => sshKeys.close());
@@ -3047,6 +3112,8 @@ export async function createOrchestratorApplication(
     removeManagedModelProvider: providerId => managedModelRuntimeSystem.removeProvider(providerId),
     mcpRouter,
     piResources,
+    mcpApps,
+    mcpAppSurfaces,
     skills,
     skillLearning,
     skillMarket,
@@ -3073,6 +3140,9 @@ export async function createOrchestratorApplication(
     extensionCatalog,
     extensionLibraries,
     extensionMainViews,
+    extensionCards,
+    extensionNetwork,
+    extensionOAuth,
     extensionPackagePublisher,
     extensionSources,
     diagnosticsBundles,
@@ -3152,6 +3222,11 @@ export async function createOrchestratorApplication(
         await attempt(() => skillPublication.close());
         await attempt(() => skills.close());
         await attempt(() => skillMarket.close());
+        await attempt(() => extensionCardRuntime?.stop());
+        await attempt(() => extensionCards.dispose());
+        await attempt(() => extensionNetwork.dispose());
+        await attempt(() => extensionOAuth.dispose());
+        await attempt(() => extensionOAuthAccounts.dispose());
         await attempt(() => extensionRoutineRuntime.stop());
         await attempt(() => extensionLibraries.close());
         await attempt(() => extensionMainViews.close());
@@ -3217,6 +3292,7 @@ export async function createOrchestratorApplication(
         makerMemory.dispose();
         await maintenanceTail.catch(() => undefined);
         await attempt(() => messageSearch.stop());
+        await attempt(async () => { await mcpApps?.dispose(); });
         await attempt(() => mcpRouter.dispose());
         await attempt(() => voiceInput.close());
         sshKeys.close();
@@ -3266,6 +3342,7 @@ export async function createOrchestratorApplication(
     await attempt(() => startupSessionWorktrees?.dispose());
     await attempt(() => generationGcTail.catch(() => undefined));
     await attempt(() => providerAuth.close());
+    await attempt(async () => { await mcpApps?.dispose(); });
     await attempt(() => mcpRouter.dispose());
     await attempt(() => voiceInput.close());
     await attempt(() => remoteDesktop.close());
@@ -3277,6 +3354,11 @@ export async function createOrchestratorApplication(
     await attempt(() => skillPublication.close());
     await attempt(() => skills.close());
     await attempt(() => skillMarket.close());
+    await attempt(() => startupCardRuntime?.stop());
+    await attempt(() => startupExtensionCards?.dispose());
+    await attempt(() => extensionNetwork.dispose());
+    await attempt(() => extensionOAuth.dispose());
+    await attempt(() => extensionOAuthAccounts.dispose());
     await attempt(() => startupRoutineRuntime?.stop());
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());

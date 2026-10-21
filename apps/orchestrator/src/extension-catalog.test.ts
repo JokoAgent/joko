@@ -11,6 +11,7 @@ import { ExtensionCatalogManager } from "./extension-catalog.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
+import { extensionNetworkCredentialReference } from "./extension-cards/network-manifest.js";
 
 const NOW = 1_800_000_000_000;
 
@@ -132,6 +133,32 @@ function source(overrides: Partial<ExtensionSourceDescriptor> = {}): ExtensionSo
 }
 
 describe("ExtensionCatalogManager", () => {
+  it("uses host setup for runtime network secrets and requires fresh approval when destinations expand", async () => {
+    const { store, credentials, catalog } = await fixture();
+    try {
+      const network = { hosts: ["api.example.test"], secrets: [{ key: "key", label: "Account key", inject: { header: "Authorization", format: "Bearer {value}" } }] };
+      const runtime = { html: "ui/runtime/index.html", tools: [{ name: "lookup", description: "Lookup", inputSchema: { type: "object" }, readOnly: true }], network };
+      const original = resource(), detail = original.resourceDetails[0]!;
+      const installed = resource({ kind: "package", resourceDetails: [{ ...detail, entryPath: "extensions/main.ts", runtime }] });
+      const entry = catalog.reconcile([installed], []).entries[0]!;
+      expect(entry.setup.state).toBe("required"); expect(entry.permissions.some(permission => permission.description.includes("api.example.test"))).toBe(true);
+      const attempt = catalog.beginSetup(entry.id, entry.revision), attemptId = attempt.setup.attemptId!;
+      const field = attempt.setup.fields.find(field => field.kind === "secret")!;
+      const ticket = catalog.beginSetupCredentialUpload({ extensionId: entry.id, attemptId, fieldId: field.id, kind: "api_key", connectionId: "owner" });
+      credentials.upload(ticket.credentialUploadTicketId, "host-only-fixture-secret", "owner");
+      const committed = await catalog.commitSetupCredential({ extensionId: entry.id, attemptId, fieldId: field.id,
+        credentialUploadTicketId: ticket.credentialUploadTicketId, connectionId: "owner", expectedRevision: attempt.revision });
+      const confirmed = catalog.submitSetupInteraction({ extensionId: entry.id, attemptId, fieldId: "permission-confirmation", value: true, expectedRevision: committed.revision });
+      expect(catalog.completeSetup(entry.id, attemptId, confirmed.revision).setup.state).toBe("ready");
+      const reference = extensionNetworkCredentialReference(entry.id, network, network.secrets[0]!);
+      expect(credentials.resolve(reference)).toBe("host-only-fixture-secret"); expect(credentials.list()).toEqual([]);
+      const changedNetwork = { ...network, hosts: [...network.hosts, "uploads.example.test"] };
+      const updated = catalog.reconcile([resource({ ...installed, resourceDetails: [{ ...detail, entryPath: "extensions/main.ts", runtime: { ...runtime, network: changedNetwork } }] })], []).entries[0]!;
+      expect(updated.setup.state).toBe("required");
+      expect(credentials.find(extensionNetworkCredentialReference(entry.id, changedNetwork, changedNetwork.secrets[0]!))).toBeUndefined();
+      expect(JSON.stringify(store.listSettings(), (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("host-only-fixture-secret");
+    } finally { store.close(); }
+  });
   it("projects installed/local/market detail and exposes Use only for an exact live Resource command", async () => {
     const { store, catalog } = await fixture();
     try {

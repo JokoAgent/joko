@@ -20,6 +20,15 @@ function completed(blocks: any[], role = MessageRole.ASSISTANT) {
     } } }
   });
 }
+it("keeps extension-owned media available as artifacts without duplicating its card in the Timeline", () => {
+  const event = create(EventSchema, { eventId: "media", identity: { sessionId: "session", runId: "run" }, cursor: { generation: 1n, sequence: 1n },
+    payload: { kind: { case: "artifactProduced", value: { embeddedInExtensionCard: true, artifact: { artifactId: "media", sessionId: "session", runId: "run", title: "Audio", blob: {
+      blobId: "media", fileName: "audio.wav", mediaType: "audio/wav", byteSize: 100n, sha256Hex: "a".repeat(64)
+    } } } } } });
+  expect(timelineRows([event])).toEqual([]);
+  if (event.payload?.kind.case === "artifactProduced") event.payload.kind.value.embeddedInExtensionCard = false;
+  expect(timelineRows([event])).toHaveLength(1);
+});
 
 it("shows typed objective completion while keeping the internal verdict out of visible and quoted assistant text", () => {
   const completion = completed([{ content: { case: "text", value: 'Done.\n```json\n{"goal_status":"complete"}\n```' } }]);
@@ -36,6 +45,15 @@ it("shows typed objective completion while keeping the internal verdict out of v
 });
 
 describe("mobile Timeline metadata events", () => {
+  it("updates application history in place while rejecting a different task's card identity", () => {
+    const first = create(EventSchema, { eventId: "app-first", identity: { sessionId: "session" }, cursor: { sequence: 1n },
+      payload: { kind: { case: "mcpAppChanged", value: { card: { cardId: "card", sessionId: "session", title: "Form", pending: true } } } } });
+    const last = create(EventSchema, { eventId: "app-result", identity: { sessionId: "session" }, cursor: { sequence: 3n },
+      payload: { kind: { case: "mcpAppChanged", value: { card: { cardId: "card", sessionId: "session", title: "Form", text: "Public result" } } } } });
+    const wrong = create(EventSchema, { ...last, eventId: "wrong", identity: create(EventIdentitySchema, { sessionId: "other" }) });
+    const rows = timelineRows([first, wrong, last]);
+    expect(rows).toHaveLength(1); expect(rows[0]).toMatchObject({ id: "card", eventId: "app-first", sequence: 1n, mcpApp: { text: "Public result" } });
+  });
   it("retains canonical attachment names for message actions in image-then-file order across completion", () => {
     const start = create(EventSchema, { eventId: "accepted-media", identity: { sessionId: "session" },
       cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageStarted", value: {

@@ -33,6 +33,8 @@ export interface MobilePartnerPrivatePreviewCandidate {
 }
 
 export interface TimelineRow {
+  readonly mcpApp?: import("@joko/contracts").McpAppCard;
+  readonly extensionCard?: import("@joko/contracts").ExtensionCard;
   readonly learning?: PartnerLearningFeedbackView;
   readonly assistantBodyPresent?: boolean;
   readonly runtimeHandoff?: { readonly fromBackendId: string; readonly toBackendId: string; readonly modelId: string; readonly resumed: boolean };
@@ -115,6 +117,22 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
     const sequence = event.cursor?.sequence ?? 0n;
     if (!kind?.case) continue;
     switch (kind.case) {
+      case "extensionCardChanged": {
+        const card = kind.value.card;
+        if (!card || !card.cardId || card.sessionId !== event.identity?.sessionId) break;
+        const previous = byId.get(card.cardId);
+        byId.set(card.cardId, { id: card.cardId, label: card.extensionName, text: card.text, kind: "system", completed: true,
+          sequence: previous?.sequence ?? sequence, eventId: previous?.eventId ?? event.eventId, extensionCard: card });
+        break;
+      }
+      case "mcpAppChanged": {
+        const card = kind.value.card;
+        if (!card || !card.cardId || card.sessionId !== event.identity?.sessionId) break;
+        const previous = byId.get(card.cardId);
+        byId.set(card.cardId, { id: card.cardId, label: card.title, text: card.text, kind: "system", completed: !card.pending,
+          sequence: previous?.sequence ?? sequence, eventId: previous?.eventId ?? event.eventId, mcpApp: card });
+        break;
+      }
       case "sessionChanged":
       case "runtimeCommandsChanged":
       case "runChanged":
@@ -283,6 +301,7 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
         break;
       case "artifactProduced":
       case "imageProduced": {
+        if (kind.case === "artifactProduced" && kind.value.embeddedInExtensionCard) break;
         const media = timelineMedia([event]);
         if (media.images?.length || media.artifacts?.length) byId.set(event.eventId, {
           id: event.eventId, label: kind.case === "imageProduced" ? "Image" : "File", text: "",

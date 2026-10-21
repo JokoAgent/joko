@@ -127,6 +127,18 @@ function acceptedEvent(): PersistedEvent {
 }
 
 describe("portable Session message projection", () => {
+  it("exports only the latest public application history as inert text at its original position", () => {
+    const card = { id: "card", sessionId: "session", title: "Example application", text: "", pending: true, cancelled: false, isError: false, updatedAt: 1 };
+    const projection = projectPortableSessionMessages([
+      { emittedAt: 1, payload: { type: "mcp_app_changed", card } },
+      { emittedAt: 2, payload: { type: "message_complete", role: "assistant", blocks: [{ kind: "text", text: "After the application" }] } },
+      { emittedAt: 3, payload: { type: "mcp_app_changed", card: { ...card, pending: false, text: "Public result", updatedAt: 3 } } }
+    ]);
+    expect(projection.messages.map(message => message.blocks)).toEqual([
+      [{ kind: "text", text: "[Application history: Example application]\nPublic result" }], [{ kind: "text", text: "After the application" }]
+    ]);
+    expect(portableProjectionEventPayloads(decodePortableSessionProjection(encodePortableSessionProjection(projection))).every(event => event.payload.type === "message_complete")).toBe(true);
+  });
   it("retains source order across simultaneous messages, Artifacts and missing-media markers", () => {
     const artifact = event({ payload: { type: "artifact", artifact: sourceBlob, purpose: "preview" } });
     const message = event();

@@ -1,3 +1,4 @@
+import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
 import { projectPartnerSessionTask } from "@joko/contracts";
 import { TaskShareMethod, SetSessionRuntimeMutationSchema, type JoinedTaskShare, type TaskSharingApi } from "@joko/contracts";
@@ -56,6 +57,7 @@ import {
   type WorkspaceEntry, type WorkspaceSearchMatch
 } from "@joko/contracts";
 import { mobileVoiceCredentialBindingChanged, type MobileVoiceSettingsTransport } from "./mobile-voice-service-settings";
+import { McpAppNativeOperation, McpAppOperation, McpAppNativeServiceOperateRequestSchema, McpAppServiceOperateRequestSchema } from "@joko/contracts";
 import { mobileDeviceNameSource, validMobileDeviceName, type MobileDeviceNameSourceProvider } from "./mobile-device-name";
 import { resolveMobileMessageForkSource, type MobileMessageForkSource } from "./mobile-message-fork";
 import {
@@ -638,7 +640,8 @@ interface MobileTimelinePreviewLease {
   readonly sessionId: string;
   readonly taskAuthorityKey: string;
   readonly windowKey: string;
-  readonly artifact: MobileTimelinePreviewArtifact;
+  readonly artifact?: MobileTimelinePreviewArtifact;
+  readonly extensionCard?: { readonly id: string; readonly html: string; readonly uri: string };
   media?: MobileMediaPreviewLease;
   pdf?: MobilePdfPreviewLease;
   model?: MobileModelPreviewLease;
@@ -2060,6 +2063,69 @@ export class MobileClient {
     return this.network.partnerGroupApi(context.credential, context.authorityKey, this.newId, signal => {
       signal.throwIfAborted(); if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential) throw new Error("Partner group owner changed.");
     });
+  }
+
+  mcpAppApi(sessionId: string): import("./mobile-mcp-app-api").MobileMcpAppApi | undefined {
+    const credential = this.#credential;
+    if (!credential || this.#state.status !== "connected" || this.#state.selectedId !== sessionId || this.#state.taskSource?.kind === "joined") return undefined;
+    const source = this.network.mcpAppApi?.(credential, JSON.stringify([credential.profileId, credential.connectionId, sessionId]));
+    if (!source) return undefined;
+    const current = () => { if (this.#credential !== credential || this.#state.status !== "connected" || this.#state.selectedId !== sessionId)
+      throw new Error("The application card owner changed."); };
+    return { ownerKey: source.ownerKey, metadata: (request, signal) => {
+      // Cleanup remains attached to the original Connection after navigation.
+      if (request.operation !== McpAppOperation.CANCEL_OPEN && request.operation !== McpAppOperation.TEARDOWN) current();
+      return source.metadata({ ...request, sessionId }, signal);
+    }, native: (request, signal) => {
+      const response = request.operation === McpAppNativeOperation.MESSAGE && typeof request.messageJson === "string" && !JSON.parse(request.messageJson).method;
+      if (request.operation !== McpAppNativeOperation.POLL && !response) current();
+      const bound = create(McpAppNativeServiceOperateRequestSchema, request);
+      bound.view ??= create(McpAppServiceOperateRequestSchema); bound.view.sessionId = sessionId;
+      return source.native(bound, signal);
+    } };
+  }
+
+  extensionCardApi(sessionId: string): import("./mobile-extension-card-api").MobileExtensionCardApi | undefined {
+    const credential = this.#credential, authority = this.#taskAuthorityKey();
+    if (!credential || !authority || this.#state.status !== "connected" || this.#state.selectedId !== sessionId || this.#state.taskSource?.kind === "joined" || this.#selectedSession()?.archived) return;
+    const source = this.network.extensionCardApi?.(credential);
+    if (!source) return;
+    const current = () => { if (this.#credential !== credential || this.#taskAuthorityKey() !== authority || this.#state.status !== "connected" || this.#state.selectedId !== sessionId || this.#selectedSession()?.archived) throw new Error("Extension card owner changed."); };
+    return { formScope: source.formScope,
+      beginAttachment: async (request, options) => { current(); options?.signal?.throwIfAborted(); const value = await source.beginAttachment({ ...request, sessionId }, options); current(); return value; },
+      readMedia: async (request, options) => { current(); options?.signal?.throwIfAborted(); const value = await source.readMedia({ ...request, sessionId }, options); current(); return value; },
+      previewMedia: async (cardId, uri) => { current(); await this.#previewExtensionCardMedia(sessionId, cardId, uri, current); },
+      prepareAudio: this.mediaPreviewFiles ? async (cardId, uri, signal) => {
+        current(); signal.throwIfAborted();
+        if (!/^joko-media:\/\/blobs\/[a-f0-9]{64}\.(mp3|wav|m4a)$/u.test(uri)) throw new Error("Extension audio unavailable.");
+        const { blob } = await source.readMedia({ sessionId, cardId, uri, metadataOnly: true }, { signal });
+        current(); signal.throwIfAborted(); if (!blob) throw new Error("Extension audio unavailable.");
+        const download = await this.network.downloadBlob(credential, blob, signal); current(); signal.throwIfAborted();
+        if (normalizeMediaType(download.mediaType) !== blob.mediaType || BigInt(download.bytes.length) !== blob.byteSize || bytesToHex(sha256(download.bytes)) !== blob.sha256Hex) throw new Error("Extension audio changed.");
+        const staged = await this.mediaPreviewFiles!.stage(credential.profileId, this.newId(), blob.fileName, blob.mediaType, blob.sha256Hex, download.bytes, signal);
+        try {
+          current(); signal.throwIfAborted();
+          const checked = await source.readMedia({ sessionId, cardId, uri, metadataOnly: true }, { signal });
+          current(); signal.throwIfAborted(); if (checked.blob?.blobId !== blob.blobId || checked.blob.sha256Hex !== blob.sha256Hex) throw new Error("Extension audio changed.");
+          return { uri: staged.uri, mediaType: blob.mediaType, instanceId: this.newId(), release: () => this.mediaPreviewFiles!.remove(staged) };
+        } catch (error) { await this.mediaPreviewFiles!.remove(staged).catch(() => undefined); throw error; }
+      } : undefined,
+      uploadAttachment: async (_sessionId, cardId, file, inline, signal) => { current(); const value = await source.uploadAttachment(sessionId, cardId, file, inline, signal); current(); return value; },
+      pickAttachment: this.attachmentFiles ? async (cardId, inline, signal) => {
+        current(); const files = this.attachmentFiles!, policy = { images: true, files: !inline, maximumItems: 1, maximumBytes: 16 * 1024 * 1024,
+          imageMediaTypes: ["image/png", "image/jpeg", "image/gif", "image/webp"], fileMediaTypes: [] };
+        const staged = await files.pickAndStage(credential.profileId, [], policy, this.newId, signal);
+        try {
+          current(); signal.throwIfAborted(); const selected = staged[0]; if (!selected) return;
+          const verified = await files.verifyForUpload(credential.profileId, selected, signal); current(); signal.throwIfAborted();
+          const value = await source.uploadAttachment(sessionId, cardId, verified, inline, signal); current(); return value;
+        } finally { await Promise.all(staged.map(file => files.remove(credential.profileId, file).catch(() => undefined))); }
+      } : undefined,
+      previewMail: async (request, options) => { current(); options?.signal?.throwIfAborted(); const value = await source.previewMail({ ...request, sessionId }, options); current(); return value; },
+      get: async (request, options) => { current(); options?.signal?.throwIfAborted(); const value = await source.get({ ...request, sessionId }, options); current(); return value; },
+      dispatch: async (request, options) => { current(); options?.signal?.throwIfAborted(); const value = await source.dispatch({ ...request, sessionId }, options); current(); return value; },
+      authorizeLink: async (request, options) => { current(); options?.signal?.throwIfAborted(); const value = await source.authorizeLink({ ...request, sessionId }, options); current(); return value; }
+    };
   }
 
   partnerRoutineApi(partnerId: string, conversationOwnerKey?: string): import("@joko/contracts").PartnerRoutineApi | undefined {
@@ -6693,6 +6759,42 @@ export class MobileClient {
     if (this.#state.files.open) this.#set({ files: { ...this.#state.files, preview: undefined, previewPager: undefined } });
   }
 
+  async #previewExtensionCardMedia(sessionId: string, cardId: string, uri: string, current: () => void): Promise<void> {
+    const credential = this.#ready(), taskAuthorityKey = this.#taskAuthorityKey(), source = this.network.extensionCardApi?.(credential);
+    const card = this.#extensionCardSource(this.#state, cardId);
+    if (!source || !taskAuthorityKey || !card || !/^joko-media:\/\/blobs\/[a-f0-9]{64}\.(png|jpg|jpeg|gif|webp|glb)$/u.test(uri)) throw new Error("Extension media unavailable.");
+    this.#cancelTimelinePreviewLease(); const controller = new AbortController();
+    const lease: MobileTimelinePreviewLease = { controller, profileId: credential.profileId, sessionId, taskAuthorityKey,
+      windowKey: mobileTimelinePreviewWindowKey(this.#timelineEvents()), extensionCard: { id: cardId, html: card.html, uri } };
+    this.#timelinePreview = lease;
+    const base = { title: card.extensionName, sourceLabel: card.extensionName, revisionKey: `${cardId}:${uri}`, mediaType: "application/octet-stream", byteSize: 0n };
+    this.#set({ timelinePreview: { ...base, kind: "loading" } });
+    let model: MobileModelPreviewLease | undefined;
+    try {
+      const { blob } = await source.readMedia({ sessionId, cardId, uri, metadataOnly: true }, { signal: controller.signal }); current();
+      if (!blob || blob.byteSize > BigInt(MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES)) throw new Error("Extension media exceeds the mobile preview limit.");
+      const download = await this.network.downloadBlob(credential, blob, controller.signal); current(); controller.signal.throwIfAborted();
+      if (normalizeMediaType(download.mediaType) !== blob.mediaType || BigInt(download.bytes.length) !== blob.byteSize || bytesToHex(sha256(download.bytes)) !== blob.sha256Hex) throw new Error("Extension media changed.");
+      let preview: MobileFilePreview;
+      const metadata = { ...base, fileName: blob.fileName, mediaType: blob.mediaType, byteSize: blob.byteSize };
+      if (uri.endsWith(".glb")) {
+        if (!this.modelPreviewFiles || blob.mediaType !== "model/gltf-binary") throw new Error("3D model preview unavailable.");
+        model = await this.modelPreviewFiles.stage({ profileId: credential.profileId, leaseId: this.newId(), modelPath: blob.fileName,
+          mediaType: blob.mediaType, expectedSha256Hex: blob.sha256Hex, bytes: download.bytes, signal: controller.signal });
+        preview = { ...metadata, kind: "model", ...model };
+      } else {
+        const decoded = inspectMobileImageGalleryBytes(download.bytes, blob.mediaType);
+        preview = { ...metadata, kind: "image", dataUri: mobileImageGalleryPreviewUri(download.bytes, decoded), altText: card.extensionName, widthPixels: decoded.width, heightPixels: decoded.height };
+      }
+      const checked = await source.readMedia({ sessionId, cardId, uri, metadataOnly: true }, { signal: controller.signal }); current();
+      if (checked.blob?.blobId !== blob.blobId || checked.blob.sha256Hex !== blob.sha256Hex) throw new Error("Extension media changed.");
+      if (!this.#timelinePreviewLeaseCurrent(lease)) { if (model) await this.modelPreviewFiles?.remove(model).catch(() => undefined); return; }
+      lease.model = model; model = undefined; this.#set({ timelinePreview: preview });
+    } catch (error) {
+      if (model) await this.modelPreviewFiles?.remove(model).catch(() => undefined);
+      if (this.#timelinePreviewLeaseCurrent(lease)) this.#set({ timelinePreview: { ...base, kind: "error", reason: message(error) } });
+    }
+  }
   async previewTimelineArtifact(selected: MobileTimelineArtifact): Promise<void> {
     const credential = this.#ready();
     const taskAuthorityKey = this.#taskAuthorityKey();
@@ -7061,7 +7163,7 @@ export class MobileClient {
     assertCurrent();
     const revalidate = async (signal: AbortSignal): Promise<void> => {
       assertCurrent(signal);
-      if (timeline) {
+      if (timeline?.artifact) {
         const around = await this.network.readAround(credential, timeline.sessionId, timeline.artifact.eventId, signal);
         assertCurrent(signal);
         const current = resolveMobileTimelinePreviewArtifact(around, timeline.artifact);
@@ -9026,6 +9128,8 @@ export class MobileClient {
     const draftIdentity = { profileId: this.taskDraftProfileId()!, sessionId };
     this.composerDrafts.save(draftIdentity, sendDraft);
     await this.composerDrafts.flush(draftIdentity);
+    const cardEdits = pendingExtensionCardFormDelivery(extensionCardFormDeliveryScope(credential, sessionId));
+    if (cardEdits && !await cardEdits) throw new Error("The card edits could not be saved. Retry the card edit before sending.");
     const currentSession = this.#selectedSession();
     if (this.#taskAuthorityKey() !== authorityKey || currentSession?.sessionId !== sessionId
       || currentSession.nativeBinding?.runtimeGeneration !== generation
@@ -13809,11 +13913,21 @@ export class MobileClient {
       || state.selectedId !== lease.sessionId) return false;
     const events = mobileStateTimelineEvents(state);
     if (mobileTimelinePreviewWindowKey(events) !== lease.windowKey) return false;
+    if (lease.extensionCard) return this.#extensionCardSource(state, lease.extensionCard.id)?.html === lease.extensionCard.html;
+    if (!lease.artifact) return false;
     const source = resolveMobileTimelinePreviewArtifact(events, lease.artifact);
     return source !== undefined
       && source.event.identity?.sessionId === lease.sessionId
       && source.event.cursor?.generation === state.owner?.generation
       && sameMobileTimelinePreviewArtifact(source.artifact, lease.artifact);
+  }
+  #extensionCardSource(state: MobileState, cardId: string) {
+    for (const event of [...mobileStateTimelineEvents(state)].reverse()) {
+      const kind = event.payload?.kind;
+      if (kind?.case === "extensionCardChanged" && kind.value.card?.cardId === cardId
+        && event.identity?.sessionId === state.selectedId && event.cursor?.generation === state.owner?.generation) return kind.value.card;
+    }
+    return undefined;
   }
 
   #timelinePreviewLeaseCurrent(lease: MobileTimelinePreviewLease): boolean {

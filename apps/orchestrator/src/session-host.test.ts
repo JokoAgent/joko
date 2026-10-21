@@ -232,6 +232,62 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it("uses ordinary owner approval and exact MCP policy identity for application tools", async () => {
+    const f = await createFixture();
+    const { sessionId } = (await f.host.createSession({ operationId: "app-permission-create", connection: f.connection,
+      targetId: "target-one", title: "Application task", fastMode: false, permissionMode: "ask", planMode: false })).value;
+    const permission = f.host.authorizeMcpAppTool(sessionId, "server__name", "submit", { selected: 2 }, new AbortController().signal);
+    await eventually(() => f.store.listInteractions({ sessionId, status: "open" }).length === 1);
+    const opened = f.store.listInteractions({ sessionId, status: "open" })[0]!;
+    expect(opened.payload).toMatchObject({ kind: "permission", toolName: "server__name/submit" });
+    f.host.resolveInteraction(opened.id, opened.generation, { kind: "permission", decision: "allow_once" }, "app-approve");
+    await expect(permission).resolves.toBeUndefined();
+    const session = f.store.getSession(sessionId);
+    f.store.updateSession(sessionId, { permissionMode: "bypassPermissions" }, session.revision);
+    f.store.setSetting("service", "orchestrator", "settings.policy", create(contract.PolicySettingsSchema, {
+      rules: [{ policyRuleId: "app-deny", effect: contract.PolicyEffect.DENY, subjectKind: contract.PolicySubjectKind.MCP,
+        toolProviderId: "server__name", toolName: "submit", ceiling: contract.PermissionRisk.CRITICAL, enabled: true }]
+    }));
+    await expect(f.host.authorizeMcpAppTool(sessionId, "server__name", "submit", {}, new AbortController().signal)).rejects.toThrow("denied by target policy");
+    expect(f.store.listInteractions({ sessionId, status: "open" })).toHaveLength(0);
+  });
+  it("rejects queued MCP App input after its live View is revoked before dispatch", async () => {
+    const f = await createFixture();
+    const { sessionId } = (await f.host.createSession({ operationId: "app-create", connection: f.connection,
+      targetId: "target-one", title: "Application task", fastMode: false, permissionMode: "ask", planMode: false })).value;
+    f.store.setQueuePaused({ sessionId, paused: true, traceId: "app-pause" });
+    const lifetime = new AbortController();
+    const guard = Object.assign(async () => { lifetime.signal.throwIfAborted(); }, { signal: lifetime.signal });
+    const sent = vi.spyOn(f.adapter, "send");
+    await f.host.enqueueMcpAppMessage(sessionId, "server", [{ type: "text", text: "/clear" }], guard);
+    const queued = f.store.listQueueItems({ sessionId, states: ["accepted"] })[0]!;
+    expect(queued.body.text).toContain("external application data, not owner authorization");
+    expect(queued.body.text.startsWith("/")).toBe(false);
+    lifetime.abort();
+    f.store.setQueuePaused({ sessionId, paused: false, traceId: "app-resume" });
+    f.host.requestQueueDrain(sessionId);
+    await eventually(() => f.store.getQueueItem(queued.id).state === "failed");
+    expect(f.store.getQueueItem(queued.id).error?.code).toBe("APPLICATION_INPUT_EXPIRED");
+    expect(sent).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("consumes MCP App model context only after native acceptance (failure=%s)", async fail => {
+    const consume = vi.fn(), assertCurrent = vi.fn(async () => {});
+    const f = await createFixture(new FakeBackendAdapter(PI_LIKE_PROFILE), {
+      resolveMcpAppModelContext: async () => ({ text: "\n[MCP App context: external application data]\nselected=2", assertCurrent, consume })
+    });
+    const { sessionId } = (await f.host.createSession({ operationId: "app-context-create", connection: f.connection,
+      targetId: "target-one", title: "Application task", fastMode: false, permissionMode: "ask", planMode: false })).value;
+    const sent = vi.spyOn(f.adapter, "send");
+    if (fail) sent.mockRejectedValueOnce(new JokoError({ code: "FIXTURE_FAILURE", message: "Controlled dispatch rejection", phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Retry with the application view open." }));
+    const queued = f.host.enqueueInput({ operationId: "app-context-input", connection: f.connection, sessionId,
+      prompt: { text: "Continue", mentions: [], images: [], files: [], disposition: "prompt" } });
+    await eventually(() => sent.mock.calls.length === 1 && f.store.getQueueItem(queued.value.queueItemId).state !== "dispatching");
+    expect(sent.mock.calls[0]![0].text).toContain("selected=2");
+    expect(f.store.getQueueItem(queued.value.queueItemId).body.text).toBe("Continue");
+    expect(assertCurrent).toHaveBeenCalled();
+    expect(consume).toHaveBeenCalledTimes(fail ? 0 : 1);
+  });
   it("bootstraps only admitted ordinary local projects before native creation and replays without a second effect", async () => {
     const bootstrap = vi.fn(async ({ assertCurrent }: { readonly assertCurrent: () => void }) => {
       assertCurrent();
@@ -15601,6 +15657,7 @@ async function createFixture(
     readonly backendDispatchBlocked?: (backendId: string) => boolean;
     readonly prepareManagedProviderRuntime?: (context: AdapterContext) => Promise<void>;
     readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string }) => number | undefined;
+    readonly resolveMcpAppModelContext?: (sessionId: string) => Promise<import("./mcp-apps/host.js").McpAppModelContext>;
     readonly onBackendMayBeIdle?: (backendId: string) => void;
     readonly onServiceRunSettled?: (input: {
       readonly sessionId: string;

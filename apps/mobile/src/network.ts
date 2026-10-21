@@ -8,6 +8,9 @@ import { OperationMutationSchema } from "@joko/contracts";
 import { RemoteDesktopSystemActionKind, type RemoteDesktopSystemAction } from "@joko/contracts";
 import { CollaborationService } from "@joko/contracts";
 import { ObjectiveService } from "@joko/contracts";
+import { McpAppService, McpAppNativeService } from "@joko/contracts";
+import { ExtensionCardService, extensionCardFormDeliveryScope } from "@joko/contracts";
+import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
 import { createMobileObjectiveRpc, type MobileObjectiveRpc } from "./mobile-objective";
 import { createMobileCollaborationRpc, type MobileCollaborationRpc } from "./mobile-collaboration";
 import type { CollaborationSettings } from "@joko/contracts";
@@ -185,6 +188,8 @@ export interface MobilePushCapabilityResult {
 }
 
 export interface MobileNetwork {
+  mcpAppApi?(credential: PairedCredential, ownerKey: string): MobileMcpAppApi;
+  extensionCardApi?(credential: PairedCredential): import("./mobile-extension-card-api").MobileExtensionCardApi;
   getProviderUsage?(credential: PairedCredential, backendId: string, providerId: string,
     signal?: AbortSignal): Promise<import("@joko/contracts").ProviderAccountUsageSnapshot | undefined>;
   objectiveRpc?(credential: PairedCredential, sessionId: string, generation: bigint,
@@ -1766,6 +1771,23 @@ export const mobileNetwork: MobileNetwork = {
   partnerRoutineApi(credential, partnerId, ownerKey, newRequestId, assertCurrent) {
     return createPartnerRoutineApi({ rpc: createClient(PartnerRoutineService, transport(credential.origin, credential.authKey)),
       partnerId, ownerKey, newRequestId, assertCurrent });
+  },
+  mcpAppApi(credential, ownerKey) {
+    const current = transport(credential.origin, credential.authKey);
+    const metadata = createClient(McpAppService, current), native = createClient(McpAppNativeService, current);
+    return { ownerKey, metadata: (request, signal) => metadata.operate(request, { ...options(signal), timeoutMs: 120_000 }),
+      native: (request, signal) => native.operate(request, { ...options(signal), timeoutMs: 120_000 }) };
+  },
+  extensionCardApi(credential) {
+    const connection = transport(credential.origin, credential.authKey), client = createClient(ExtensionCardService, connection), artifacts = createClient(ArtifactService, connection);
+    return { ...client, formScope: sessionId => extensionCardFormDeliveryScope(credential, sessionId),
+      uploadAttachment: async (sessionId, cardId, source, inline, signal) => {
+        const exact = assertBlobUploadSource(source); signal.throwIfAborted();
+        if (exact.byteSize > 16 * 1024 * 1024) throw new Error("Mail attachment exceeds 16 MB.");
+        const response = await client.beginAttachment({ sessionId, cardId, inline, fileName: exact.fileName, mediaType: exact.mediaType, byteSize: BigInt(exact.byteSize), sha256Hex: exact.sha256Hex }, options(signal));
+        await uploadVerifiedBlob(credential, exact, response.upload, async (uploadId, signal) => (await artifacts.completeBlobUpload({ uploadId }, options(signal))).blob, signal);
+        return response.upload!.uploadId;
+      } };
   },
   partnerGroupApi(credential, ownerKey, newRequestId, assertCurrent) {
     return createPartnerGroupApi({ rpc: createClient(PartnerGroupService, transport(credential.origin, credential.authKey)), ownerKey, newRequestId, assertCurrent,

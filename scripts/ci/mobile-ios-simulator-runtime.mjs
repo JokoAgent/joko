@@ -14,7 +14,9 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const startupDiagnosticsOnly = process.argv.length === 3 && process.argv[2] === "--startup-diagnostics";
 const abort = new AbortController();
 const observationStartedAt = Date.now();
-const observationBudgetMs = (startupDiagnosticsOnly ? 4 : 15) * 60_000;
+// A full run includes up to ten minutes of cold boot and two five-minute
+// XCTest commands, plus app startup, frame capture and evidence export.
+const observationBudgetMs = (startupDiagnosticsOnly ? 4 : 30) * 60_000;
 const observationDeadlineAt = observationStartedAt + observationBudgetMs;
 const simulatorInstallTimeoutMs = 120_000;
 const simulatorLaunchTimeoutMs = 120_000;

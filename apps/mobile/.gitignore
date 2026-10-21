@@ -5,5 +5,8 @@ modules/joko-app-installer/android/build/
 !modules/joko-remote-presentation/android/
 !modules/joko-remote-presentation/android/**
 modules/joko-remote-presentation/android/build/
+!modules/joko-mcp-app-surface/android/
+!modules/joko-mcp-app-surface/android/**
+modules/joko-mcp-app-surface/android/build/
 /ios/
 dist/

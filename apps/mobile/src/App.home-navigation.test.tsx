@@ -148,6 +148,7 @@ beforeAll(async () => {
   }));
   vi.doMock("react-native-safe-area-context", () => ({ SafeAreaProvider: surface, SafeAreaView: surface,
     useSafeAreaInsets: () => ({ top: 0, left: 0, bottom: 0, right: 0 }) }));
+  vi.doMock("react-native-webview", () => ({ WebView: surface }));
   vi.doMock("./MobileAdaptiveWindow", () => ({ MobileAdaptiveWindowProvider: surface,
     useMobileAdaptiveWindow: () => taskWindowGeometry ?? { ...dimensions, insets: { top: 0, left: 0, bottom: 0, right: 0 },
       regularWidth: dimensions.width >= 600, regularHeight: dimensions.height >= 600,
@@ -160,7 +161,7 @@ beforeAll(async () => {
   }));
   vi.doMock("expo-status-bar", () => ({ StatusBar: () => null }));
   vi.doMock("expo-constants", () => ({ default: {} }));
-  vi.doMock("expo-crypto", () => ({ randomUUID: () => "ui-occurrence" }));
+  vi.doMock("expo-crypto", () => ({ randomUUID: () => "ui-occurrence", getRandomBytes: (count: number) => new Uint8Array(count).fill(1) }));
   vi.doMock("expo-clipboard", () => ({ setStringAsync: writeClipboard }));
   for (const name of ["expo-image-picker", "expo-image-manipulator", "expo-image", "expo-sharing", "expo-file-system",
     "expo-media-library", "expo-audio", "expo-network", "expo-secure-store", "expo-notifications", "expo-application"])

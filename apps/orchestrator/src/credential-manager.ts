@@ -269,6 +269,25 @@ export class CredentialManager {
     this.upload(credentialUploadTicketId, decoded, connectionId);
   }
 
+  /** A service-purpose input is ephemeral and cannot become a user credential. */
+  consumeServiceInput(input: { readonly credentialUploadTicketId: string; readonly connectionId: string; readonly servicePurpose: string; readonly kind: CredentialKind }): string {
+    this.#assertInitialized();
+    const ticket = this.#requireTicket(input.credentialUploadTicketId);
+    if (ticket.providerLoginInput !== undefined || ticket.sshKeyPassphrase !== undefined || ticket.credentialReferenceId !== undefined
+      || ticket.servicePurpose !== input.servicePurpose || ticket.connectionId !== input.connectionId || ticket.kind !== input.kind || !ticket.sealed) throw new Error("Service input does not match its original owner.");
+    const value = this.#vault.open(ticket.sealed, ticketReference(ticket.id));
+    ticket.consumed = true; this.#tickets.delete(ticket.id); return value;
+  }
+
+  retireServiceInput(input: { readonly credentialUploadTicketId: string; readonly connectionId: string; readonly servicePurpose: string }): boolean {
+    this.#assertInitialized();
+    const ticket = this.#tickets.get(input.credentialUploadTicketId);
+    if (!ticket) return false;
+    if (ticket.providerLoginInput !== undefined || ticket.sshKeyPassphrase !== undefined || ticket.credentialReferenceId !== undefined
+      || ticket.servicePurpose !== input.servicePurpose || ticket.connectionId !== input.connectionId) throw new Error("Service input does not match its original owner.");
+    return this.#tickets.delete(ticket.id);
+  }
+
   /** Consumes an ephemeral OAuth prompt value without creating a durable record. */
   consumeProviderLoginInput(input: {
     readonly credentialUploadTicketId: string;
@@ -516,7 +535,7 @@ export class CredentialManager {
     readonly displayName: string;
     readonly kind: CredentialKind;
     readonly providerId?: string;
-    readonly expiresAt: number;
+    readonly expiresAt?: number;
   }): Promise<boolean> {
     this.#assertInitialized();
     const reference = normalizeReference(input.credentialReferenceId);
@@ -529,7 +548,7 @@ export class CredentialManager {
       throw new Error("Managed credential value is outside the configured limit.");
     }
     const now = this.#now();
-    if (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= now) {
+    if (input.expiresAt !== undefined && (!Number.isSafeInteger(input.expiresAt) || input.expiresAt <= now)) {
       throw new Error("Managed credential expiry must be in the future.");
     }
     return this.#mutate(async () => {
@@ -544,7 +563,7 @@ export class CredentialManager {
         displayName,
         kind: input.kind,
         ...(providerId === undefined ? {} : { providerId }),
-        expiresAt: input.expiresAt,
+        ...(input.expiresAt === undefined ? {} : { expiresAt: input.expiresAt }),
         lastRefreshedAt: now,
         createdAt: current?.createdAt ?? now,
         updatedAt: now,
@@ -2720,7 +2739,7 @@ function secretFragments(secret: string): readonly string[] {
       if (typeof value === "string") {
         if (value.length >= 8 && key !== undefined && (
           parentKey === "env"
-          || /^(?:access|refresh|token|(?:access|refresh|id)[_-]?token|authorization|password|secret|api[_-]?key)$/iu.test(key)
+          || /^(?:access|refresh|token|(?:access|refresh|id)[_-]?token|authorization|password|secret|client[_-]?secret|api[_-]?key)$/iu.test(key)
         )) {
           fragments.add(value);
         }

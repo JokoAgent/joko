@@ -1533,6 +1533,8 @@ export interface ContextView {
 }
 
 export interface TimelineItemView {
+  readonly extensionCard?: import("@joko/contracts").ExtensionCard;
+  readonly mcpApp?: import("@joko/contracts").McpAppCard;
   readonly personalDevelopmentReport?: PersonalDevelopmentDoctorRun;
   readonly personalDevelopmentTask?: PersonalDevelopmentTask;
   readonly learning?: PartnerLearningFeedbackView;
@@ -6019,7 +6021,32 @@ export interface SimulatorViewerVideoPreferenceView {
   readonly clientFallbackReason?: "decode_failed";
 }
 
+export interface McpAppApi {
+  operate(request: import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").McpAppServiceOperateRequestSchema>, signal?: AbortSignal): Promise<import("@joko/contracts").McpAppServiceOperateResponse>;
+}
+
+export type ExtensionNetworkApi = Pick<import("@connectrpc/connect").Client<typeof import("@joko/contracts").ExtensionNetworkService>, "get" | "change"> & {
+  save(request: import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").ExtensionNetworkServiceBeginCredentialRequestSchema>, secret: string, signal?: AbortSignal): Promise<import("@joko/contracts").ExtensionNetworkState>;
+};
+export type ExtensionOAuthApi = Pick<import("@connectrpc/connect").Client<typeof import("@joko/contracts").ExtensionOAuthService>, "get" | "change"> & {
+  readonly canAuthorize: boolean;
+  saveClient(request: import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").ExtensionOAuthServiceBeginClientRequestSchema>, clientId: string, clientSecret: string, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionOAuthState>;
+  authorize(request: import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").ExtensionOAuthServiceStartRequestSchema>, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionOAuthState>;
+};
+
+export type ExtensionCardApi = Pick<import("@connectrpc/connect").Client<typeof import("@joko/contracts").ExtensionCardService>, "get" | "dispatch" | "authorizeLink" | "previewMail" | "beginAttachment" | "readMedia"> & {
+  formScope(sessionId: string): string;
+  uploadAttachment(sessionId: string, cardId: string, file: File, inline: boolean, signal: AbortSignal): Promise<string>;
+  loadMedia(sessionId: string, cardId: string, uri: string, signal: AbortSignal): Promise<{
+    readonly blob: import("@joko/contracts").BlobRef; readonly url: string; release(): void;
+  }>;
+};
+
 export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmentApi {
+  mcpAppApi(): McpAppApi | undefined;
+  extensionCardApi(): ExtensionCardApi | undefined;
+  extensionNetworkApi(): ExtensionNetworkApi | undefined;
+  extensionOAuthApi(): ExtensionOAuthApi | undefined;
   getSimulatorViewerState(sessionId: string, signal?: AbortSignal): Promise<SimulatorViewerStateView>;
   controlSimulatorInstance(sessionId: string, requestId: string, input: SimulatorViewerControlView, signal?: AbortSignal): Promise<SimulatorViewerControlResultView>;
   controlSimulatorViewerInput(sessionId: string, requestId: string, route: SimulatorViewerRouteView,

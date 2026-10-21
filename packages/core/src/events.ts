@@ -137,6 +137,8 @@ export interface TaskMessageOrigin {
 }
 
 export type EventPayload =
+  | { readonly type: "mcp_app_changed"; readonly card: McpAppCardProjection }
+  | { readonly type: "extension_card_changed"; readonly card: ExtensionCardProjection }
   /** Store-owned metadata for one existing assistant completion, never a new message. */
   | { readonly type: "partner_learning_changed"; readonly completionEventId: string; readonly messageId: string;
       readonly feedback: import("./partner-learning.js").PartnerLearningFeedback }
@@ -247,7 +249,7 @@ export type EventPayload =
       readonly artifact?: BlobRef;
       readonly nativeHistory?: NativeHistoryEventContext;
     }
-  | { readonly type: "artifact"; readonly artifact: BlobRef; readonly purpose: string; readonly audioMetadata?: AudioArtifactMetadata }
+  | { readonly type: "artifact"; readonly artifact: BlobRef; readonly purpose: string; readonly audioMetadata?: AudioArtifactMetadata; readonly embeddedInExtensionCard?: boolean }
   | WorkspaceDiffEventPayload
   | { readonly type: "interaction_opened"; readonly interaction: InteractionPayload }
   | { readonly type: "interaction_resolved"; readonly interactionId: InteractionId; readonly decision: string }
@@ -417,6 +419,31 @@ export type ToolResultContentPart =
   | { readonly kind: "text"; readonly text: string }
   | { readonly kind: "image"; readonly blob: BlobRef; readonly alt?: string }
   | { readonly kind: "artifact"; readonly blob: BlobRef; readonly label: string; readonly audioMetadata?: AudioArtifactMetadata };
+
+/** Public history only. App HTML, input and View-only result metadata are never events. */
+export interface McpAppCardProjection {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly title: string;
+  readonly text: string;
+  readonly pending: boolean;
+  readonly cancelled: boolean;
+  readonly isError: boolean;
+  readonly updatedAt: number;
+}
+
+/** Inert, sanitized history. Executable authority and running state stay in the host. */
+export interface ExtensionCardProjection {
+  readonly id: string;
+  readonly sessionId: string;
+  readonly extensionId: string;
+  readonly extensionName: string;
+  readonly toolUseId: string;
+  readonly html: string;
+  readonly text: string;
+  readonly height: number;
+  readonly updatedAt: number;
+}
 
 /** A redacted, durable workspace projection captured with a run. */
 export interface WorkspaceDiffEventPayload {

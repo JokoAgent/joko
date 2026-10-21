@@ -254,6 +254,8 @@ import {
 } from "./window-close-settings.js";
 import { DesktopWallpaperStore } from "./wallpaper-store.js";
 import { DESKTOP_WALLPAPER_SCHEME, createDesktopWallpaperProtocolHandler } from "./wallpaper-protocol.js";
+import { DesktopMcpAppHost, MCP_APP_SCHEME } from "./mcp-app-host.js";
+import { DesktopExtensionOAuthHost } from "./extension-oauth-host.js";
 import { registerDesktopWallpaperIpc } from "./wallpaper-ipc.js";
 import {
   createDesktopNativeTaskStatusSettingsStore,
@@ -586,6 +588,7 @@ const desktopRemoteDesktopViewers = new DesktopRemoteDesktopViewerWindows({
   credentialNative: () => new DesktopRemoteCredentialsNative(),
   onOwnerRetired: () => desktopRemoteDesktopViewerPrewarm.cancel()
 });
+const desktopMcpApps = new DesktopMcpAppHost({ assertSource: assertTrustedIpcSender, readAuthKey: readCredential, quitting: () => quitting });
 const nativeTaskStatusDevelopmentPreview = !app.isPackaged &&
   process.env["JOKO_DESKTOP_TASK_STATUS_PREVIEW"] === "1";
 const nativeTaskStatusSupported = isNativeTaskStatusAvailable({
@@ -603,6 +606,8 @@ const desktopRemoteDesktopViewerPrewarm = new DesktopRemoteDesktopViewerPrewarmS
 });
 const mainWindowContentsByWindow = new WeakMap<BrowserWindow, WebContents>();
 const mainWindowDocuments = new DesktopMainDocumentOccurrenceAuthority<WebContents>(() => randomUUID());
+const desktopExtensionOAuth = new DesktopExtensionOAuthHost({ assertSource: assertTrustedIpcSender, readAuthKey: readCredential,
+  quitting: () => quitting, isCurrentDocument: (contents, occurrence) => mainWindowDocuments.isCurrent(contents, occurrence), openExternal: url => shell.openExternal(url) });
 const desktopDeepLinkDelivery = new DesktopDeepLinkDeliveryBuffer();
 const desktopInboundOpenIntentFence = new DesktopInboundOpenIntentFence();
 const desktopTaskSharingInvitations = new DesktopTaskSharingInvitationBuffer();
@@ -932,6 +937,9 @@ protocol.registerSchemesAsPrivileged([{
 }, {
   scheme: DESKTOP_WALLPAPER_SCHEME,
   privileges: { standard: true, secure: true }
+}, {
+  scheme: MCP_APP_SCHEME,
+  privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true }
 }]);
 
 const desktopUserDataDirectory = personalVersionProfileOverride() ?? resolveDesktopUserDataDirectory({
@@ -1397,6 +1405,7 @@ function createWindow(): void {
     observePackagedSmokeRequest(details, "start");
     let protocol: string | undefined;
     try { protocol = new URL(details.url).protocol; } catch { protocol = undefined; }
+    if (protocol === `${MCP_APP_SCHEME}:`) { callback({ cancel: !desktopMcpApps.allowRequest(details) }); return; }
     if (protocol === `${DESKTOP_WALLPAPER_SCHEME}:`) {
       const contents = details.webContents ?? BrowserWindow.getAllWindows()
         .find(candidate => !candidate.isDestroyed() && candidate.webContents.id === details.webContentsId)?.webContents;
@@ -1422,7 +1431,8 @@ function createWindow(): void {
   });
   electronSession.webRequest.onHeadersReceived((details, callback) => {
     observePackagedSmokeRequest(details, "headers");
-    if (!shouldMergeDesktopFrameContentSecurityPolicy(details.resourceType, details.url)) {
+    if (details.url.startsWith(`${MCP_APP_SCHEME}:`) || desktopMcpApps.isAppFrame(details.frame ?? undefined)
+      || !shouldMergeDesktopFrameContentSecurityPolicy(details.resourceType, details.url)) {
       callback({ responseHeaders: details.responseHeaders });
       return;
     }
@@ -7786,6 +7796,8 @@ function bindDesktopPageSearchResults(contents: WebContents): Map<number, number
 }
 
 function registerIpc(): void {
+  desktopMcpApps.register();
+  desktopExtensionOAuth.register();
   desktopRemoteDesktopViewers.register();
   ipcMain.on(DESKTOP_CHANNELS.preferredSystemLocaleGet, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);

@@ -32,6 +32,7 @@ import {
 import {
   isExtensionLibraryDescriptor,
   parseExtensionRoutineEvents,
+  parseExtensionRuntime,
   isExtensionMainViewDescriptor,
   validateExtensionRecommendations,
   type ExtensionRecommendationDescriptor
@@ -5019,6 +5020,7 @@ function copyResourceDetail(detail: PiPackageResourceDetail): PiPackageResourceD
     ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
     ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
     ...(detail.routineEvents === undefined ? {} : { routineEvents: parseExtensionRoutineEvents(detail.routineEvents) }),
+    ...(detail.runtime === undefined ? {} : { runtime: parseExtensionRuntime(detail.runtime) }),
     ...(detail.recommendations === undefined ? {} : { recommendations: copyRecommendations(detail.recommendations) }),
     compatibility: detail.compatibility,
     compatibilityIssues: [...detail.compatibilityIssues],
@@ -5108,13 +5110,14 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       !detail || typeof detail !== "object" || !kinds.has(detail.kind) || !compatibility.has(detail.compatibility)
       || typeof detail.name !== "string" || detail.name.trim() === "" || detail.name.length > 256
       || Object.keys(detail).some((key) => ![
-        "kind", "name", "entryPath", "mainView", "library", "routineEvents", "recommendations", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
+        "kind", "name", "entryPath", "mainView", "library", "routineEvents", "runtime", "recommendations", "compatibility", "compatibilityIssues", "detectedApis", "adaptedApis", "unsupportedApis"
       ].includes(key))
       || detail.kind === "extension" !== (typeof detail.entryPath === "string")
       || detail.entryPath !== undefined && !isStoredPackageRelativePath(detail.entryPath)
       || detail.mainView !== undefined && (detail.kind !== "extension" || !isExtensionMainViewDescriptor(detail.mainView))
       || detail.library !== undefined && (detail.kind !== "extension" || !isExtensionLibraryDescriptor(detail.library))
       || detail.routineEvents !== undefined && detail.kind !== "extension"
+      || detail.runtime !== undefined && detail.kind !== "extension"
     ) throw new Error("Stored resource compatibility detail is malformed.");
     const compatibilityIssues = validateStringEnumList(detail.compatibilityIssues, issues, "compatibility issue");
     const detectedApis = validateStringEnumList(detail.detectedApis, apis, "detected API");
@@ -5133,6 +5136,7 @@ function validateStoredResourceDetails(value: readonly PiPackageResourceDetail[]
       ...(detail.mainView === undefined ? {} : { mainView: { ...detail.mainView } }),
       ...(detail.library === undefined ? {} : { library: { ...detail.library } }),
     ...(detail.routineEvents === undefined ? {} : { routineEvents: parseExtensionRoutineEvents(detail.routineEvents) }),
+    ...(detail.runtime === undefined ? {} : { runtime: parseExtensionRuntime(detail.runtime) }),
       ...(recommendations === undefined ? {} : { recommendations: recommendations.items }),
       compatibility: detail.compatibility,
       compatibilityIssues: compatibilityIssues as PiPackageResourceDetail["compatibilityIssues"],

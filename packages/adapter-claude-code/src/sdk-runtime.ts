@@ -4,6 +4,8 @@ import { existsSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createProductMcpModelServers, type ClaudeSdkMcpModelServer } from "./mcp-model-server.js";
+export type { ClaudeSdkMcpModelServer } from "./mcp-model-server.js";
 import { ListToolsRequestSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import type { TargetDescriptor } from "@joko/core";
@@ -247,6 +249,7 @@ export interface ClaudeSdkQueryOptions {
   readonly managedAgentTool?: ClaudeSdkManagedAgentTool;
   /** A Query-frozen, product-authorized catalog; never sourced from native settings. */
   readonly mcpTools?: readonly ClaudeSdkMcpTool[];
+  readonly mcpModels?: readonly ClaudeSdkMcpModelServer[];
   readonly includePartialMessages: true;
   readonly disallowedTools?: readonly string[];
   readonly mcpServers?: Readonly<Record<string, never>>;
@@ -797,7 +800,12 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
     const managedAgentServer = params.options.managedAgentTool === undefined
       ? undefined
       : createManagedAgentServer(loaded, params.options.managedAgentTool);
-    const productMcpServers = createProductMcpServers(params.options.mcpTools ?? []);
+    const modelIds = new Set(params.options.mcpModels?.map(model => model.serverId));
+    const productMcpServers = createProductMcpServers((params.options.mcpTools ?? []).filter(tool => !modelIds.has(tool.serverId)));
+    for (const [name, server] of Object.entries(createProductMcpModelServers(params.options.mcpModels ?? [], claudeMcpServerName))) {
+      if (name === CLAUDE_MANAGED_AGENT_SERVER || Object.hasOwn(productMcpServers, name)) throw new Error("The product MCP model identity is ambiguous.");
+      productMcpServers[name] = server;
+    }
     if (params.options.sessionStoreAccess !== undefined && this.#sessionStoreAuthority === undefined) {
       throw new Error("Claude SessionStore Query authority is unavailable.");
     }

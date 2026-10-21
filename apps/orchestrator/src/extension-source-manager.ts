@@ -10,6 +10,8 @@ import type { OperationalStore } from "@joko/store";
 import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
 import {
   isExtensionLibraryDescriptor,
+  parseExtensionRuntime,
+  type ExtensionRuntimeDescriptor,
   isExtensionMainViewDescriptor,
   validateExtensionRecommendations,
   type ExtensionLibraryDescriptor,
@@ -40,6 +42,7 @@ export interface ExtensionSourceEntryDescriptor {
   readonly bindingOrdinal: number;
   readonly mainView?: ExtensionMainViewDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
+  readonly runtime?: ExtensionRuntimeDescriptor;
   readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
   readonly name: string;
   readonly packageName: string;
@@ -771,6 +774,7 @@ async function discoverMarketplace(
           description: inspection.description,
           mainView: extension.mainView ?? null,
           library: extension.library ?? null,
+          runtime: extension.runtime ?? null,
           recommendations: extension.recommendations ?? null,
           packageContentRevision
         });
@@ -786,6 +790,7 @@ async function discoverMarketplace(
           bindingOrdinal: ordinal,
           ...(extension.mainView === undefined ? {} : { mainView: { ...extension.mainView } }),
           ...(extension.library === undefined ? {} : { library: { ...extension.library } }),
+          ...(extension.runtime === undefined ? {} : { runtime: structuredClone(extension.runtime) }),
           ...(extension.recommendations === undefined ? {} : { recommendations: copyRecommendations(extension.recommendations) }),
           name: inspection.extensions.length === 1 ? packageLabel : `${packageLabel} · ${basename(extension.relativePath)}`,
           packageName: inspection.name,
@@ -1045,6 +1050,7 @@ function copyEntry(entry: StoredExtensionSourceEntry): ExtensionSourceEntryDescr
     ...entry,
     ...(entry.mainView === undefined ? {} : { mainView: { ...entry.mainView } }),
     ...(entry.library === undefined ? {} : { library: { ...entry.library } }),
+    ...(entry.runtime === undefined ? {} : { runtime: structuredClone(entry.runtime) }),
     ...(entry.recommendations === undefined ? {} : { recommendations: copyRecommendations(entry.recommendations) })
   };
 }
@@ -1119,7 +1125,7 @@ function validateStoredSource(value: unknown): StoredExtensionSource {
 function validateStoredEntry(value: unknown): StoredExtensionSourceEntry {
   if (!plainObject(value) || !exactKeys(value, [
     "id", "revision", "contentRevision", "packageContentRevision", "resourceId", "packageRelativePath", "extensionRelativePath", "bindingName", "bindingOrdinal",
-    "mainView", "library", "recommendations", "name", "packageName", "version", "author", "description"
+    "mainView", "library", "runtime", "recommendations", "name", "packageName", "version", "author", "description"
   ]) || typeof value.id !== "string" || !ENTRY_ID.test(value.id) || typeof value.revision !== "string" || !CONTENT_REVISION.test(value.revision)
     || typeof value.contentRevision !== "string" || value.contentRevision !== value.revision
     || typeof value.packageContentRevision !== "string" || !CONTENT_REVISION.test(value.packageContentRevision)
@@ -1138,6 +1144,7 @@ function validateStoredEntry(value: unknown): StoredExtensionSourceEntry {
   if (recommendations !== undefined && !recommendations.ok) throw new Error("Stored Extension source recommendations are invalid.");
   return {
     ...value,
+    ...(value.runtime === undefined ? {} : { runtime: parseExtensionRuntime(value.runtime) }),
     ...(recommendations === undefined ? {} : { recommendations: recommendations.items })
   } as unknown as StoredExtensionSourceEntry;
 }

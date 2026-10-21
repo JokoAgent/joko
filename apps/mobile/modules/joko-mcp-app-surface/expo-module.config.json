@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["JokoMcpAppSurfaceModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.jokomcpappsurface.JokoMcpAppSurfaceModule"]
+  }
+}

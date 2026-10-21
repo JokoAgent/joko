@@ -142,9 +142,8 @@ describe("BackendInstanceRegistry", () => {
     });
     const current = adapter("backend");
     const sibling = adapter("sibling");
-    const stalledDispose = deferred<void>();
     const dispose = vi.fn()
-      .mockReturnValueOnce(stalledDispose.promise)
+      .mockRejectedValueOnce(new Error("private-candidate-dispose-secret"))
       .mockResolvedValueOnce(undefined);
     const forceDispose = vi.fn()
       .mockRejectedValueOnce(new Error("private-candidate-force-secret"));
@@ -189,7 +188,6 @@ describe("BackendInstanceRegistry", () => {
     expect(forceDispose).toHaveBeenCalledOnce();
     expect(current.dispose).not.toHaveBeenCalled();
     expect(sibling.dispose).not.toHaveBeenCalled();
-    stalledDispose.resolve(undefined);
   });
 
   it("keeps exhausted candidate cleanup ownership for an exact retry during registry disposal", async () => {
@@ -459,11 +457,10 @@ describe("BackendInstanceRegistry", () => {
       retirementRetryDelayMs: 0,
       retirementAttempts: 2
     });
-    const stalledDispose = deferred<void>();
     const retryEntered = deferred<void>();
     const releaseRetry = deferred<void>();
     const dispose = vi.fn()
-      .mockImplementationOnce(() => stalledDispose.promise)
+      .mockRejectedValueOnce(new Error("private-retirement-dispose-detail"))
       .mockImplementationOnce(async () => {
         retryEntered.resolve(undefined);
         await releaseRetry.promise;
@@ -503,7 +500,22 @@ describe("BackendInstanceRegistry", () => {
     await vi.waitFor(() => expect(registry.retiredCleanupSnapshots()).toEqual([]));
     expect(replacement.dispose).not.toHaveBeenCalled();
     expect(sibling.dispose).not.toHaveBeenCalled();
-    stalledDispose.resolve(undefined);
+  });
+
+  it("does not duplicate timed-out cleanup and accepts its late success without touching the replacement", async () => {
+    const { registry } = fixture({ retirementStepTimeoutMs: 5, retirementRetryDelayMs: 0, retirementAttempts: 2 });
+    const completed = deferred<void>(), dispose = vi.fn(() => completed.promise);
+    const previous = adapter("backend", { dispose }), replacement = adapter("backend"), sibling = adapter("sibling");
+    const candidates = [previous, replacement];
+    await registry.provision([dynamicFactory("backend", () => candidates.shift()!), factory("sibling", sibling)]);
+    await registry.replace("backend");
+    await expect(registry.disposeRetainedCleanups()).rejects.toThrow("cleanup remained unconfirmed");
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(registry.retiredCleanupSnapshots()).toHaveLength(1);
+    completed.resolve(undefined); await completed.promise;
+    await expect(registry.disposeRetainedCleanups()).resolves.toBeUndefined();
+    expect(registry.retiredCleanupSnapshots()).toEqual([]); expect(dispose).toHaveBeenCalledOnce();
+    expect(registry.adapter("backend")).toBe(replacement); expect(replacement.dispose).not.toHaveBeenCalled(); expect(sibling.dispose).not.toHaveBeenCalled();
   });
 
   it("keeps exhausted retired cleanup ownership across a failed final check and deletes it only after confirmation", async () => {

@@ -27,6 +27,7 @@ minimumReleaseAgeExclude:
   - '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.280'
 
 patchedDependencies:
+  '@modelcontextprotocol/ext-apps@1.7.5': dependency-patches/@modelcontextprotocol-ext-apps@1.7.5.patch
   expo-image-manipulator@57.0.14: dependency-patches/expo-image-manipulator@57.0.14.patch
   expo-image@57.0.3: dependency-patches/expo-image@57.0.3.patch
   node-pty@1.1.0: dependency-patches/node-pty@1.1.0.patch

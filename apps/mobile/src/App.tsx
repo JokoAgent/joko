@@ -30,6 +30,10 @@ import { mobileFilesPreviewCanSwipe, type MobileFilesPreviewPager as FilesPrevie
 import { MobileTimelineImage } from "./MobileTimelineImage";
 import { MobileUserMessageContent } from "./MobileUserMessageContent";
 import { MobileMessageRunFacts } from "./MobileMessageRunFacts";
+import { MobileMcpAppCard } from "./MobileMcpAppCard";
+import { MobileExtensionCard, MobileExtensionCardsProvider } from "./MobileExtensionCard";
+import { MobileExtensionMailReaderProvider } from "./MobileExtensionMailReader";
+import { MobileMcpAppViewsProvider } from "./MobileMcpAppViews";
 import { MobileImageGalleryPresenter } from "./mobile-image-gallery-presentation";
 import { MobileNativeIntentNotice } from "./MobileNativeIntentNotice";
 import {
@@ -938,6 +942,11 @@ export function App() {
       <MobileAdaptiveWindowProvider>
       <MobileNavigationFrame dark={dark}>
       <MobilePartnerAvatarProvider transport={client.partnerAvatarTransport()}>
+      <MobileMcpAppViewsProvider ownerKey={JSON.stringify([state.activeProfileId, state.origin, state.node?.serverId, state.status])} bind={sessionId => client.mcpAppApi(sessionId)}>
+      <MobileExtensionMailReaderProvider ownerKey={JSON.stringify([state.activeProfileId, state.origin, state.node?.serverId, state.status, state.selectedId, page, foreground])}
+        sessionId={page === "task" && foreground ? state.selectedId : undefined} bind={sessionId => client.extensionCardApi(sessionId)} colors={{ ...colors, dark }} locale={locale.effectiveLocale}>
+      <MobileExtensionCardsProvider ownerKey={JSON.stringify([state.activeProfileId, state.origin, state.node?.serverId, state.status, state.selectedId,
+        state.detail?.sessions.find(session => session.sessionId === state.selectedId)?.nativeBinding?.runtimeGeneration.toString()])} bind={sessionId => client.extensionCardApi(sessionId)}>
       <View style={[styles.root, { backgroundColor: colors.background }]}>
         {Platform.OS === "android" && <StatusBar style={dark ? "light" : "dark"} />}
         {updates.forced ? <SafeAreaView style={styles.fill} edges={["top", "left", "right", "bottom"]}>
@@ -1162,6 +1171,7 @@ export function App() {
         </>}
         <MobileAndroidUpdateSheet colors={colors} locale={locale.effectiveLocale} />
       </View>
+      </MobileExtensionCardsProvider></MobileExtensionMailReaderProvider></MobileMcpAppViewsProvider>
       </MobilePartnerAvatarProvider>
       </MobileNavigationFrame>
       </MobileAdaptiveWindowProvider>
@@ -6068,7 +6078,9 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
             const target = await collaborationApi.resolveReport(origin, signal); signal.throwIfAborted();
             if (!taskMountedRef.current || client.taskCollaborationApi()?.ownerKey !== collaborationApi.ownerKey) return;
             requestTaskHomeNavigation({ kind: "session", sessionId: target }, drawerMountedRef.current);
-          }} /> : delegatedOnly ? undefined : item.messageParts ? item.messageParts.map((part) => {
+          }} /> : delegatedOnly ? undefined : item.extensionCard ? <MobileExtensionCard card={item.extensionCard} colors={colors} locale={locale}
+            enabled={state.status === "connected" && !conversationShare.active} readOnly={state.taskSource?.kind === "joined"} /> : item.mcpApp ? <MobileMcpAppCard card={item.mcpApp} colors={colors} locale={locale}
+            enabled={state.status === "connected" && !conversationShare.active} readOnly={state.taskSource?.kind === "joined"} /> : item.messageParts ? item.messageParts.map((part) => {
           if (part.kind === "thinking") return <MobileThinkingCard key={part.thinking.key} thinking={part.thinking}
             ownerKey={blockOwnerKey} colors={colors} locale={locale} enabled={state.status === "connected" || state.status === "offline"}
             compact={compactThinking} />;

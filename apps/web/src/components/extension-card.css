@@ -1,0 +1,47 @@
+.extension-result-card { display: block; width: 100%; max-width: 560px; min-width: 0; margin: 12px 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-raised); color: var(--text); }
+.extension-result-card > header { display: flex; align-items: center; gap: 12px; min-height: 44px; padding: 8px 16px; color: var(--text-soft); font-size: var(--text-12); }
+.extension-result-card > header > strong { min-width: 0; flex: 1; overflow-wrap: anywhere; font-weight: 500; }
+.extension-result-card > header > button { flex-shrink: 0; padding: 6px 8px; border: 0; border-radius: 6px; color: var(--text-soft); background: transparent; font: inherit; cursor: pointer; }
+.extension-result-card > header > button:hover { background: var(--surface-hover); }
+.extension-card__poster, .extension-card__mail { display: block; width: 100%; min-width: 0; border: 0; background: transparent; }
+.extension-card__caption { margin: 0; padding: 8px 16px; color: var(--text-soft); font-size: var(--text-12); }
+.extension-card__failure { display: flex; align-items: center; gap: 12px; padding: 8px 16px; color: var(--red); font-size: var(--text-12); }
+.extension-card__failure > span { min-width: 0; flex: 1; }
+.extension-card__prompt { width: 100%; min-height: 120px; padding: 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); font: inherit; resize: vertical; }
+.extension-card-form { display: flex; flex-wrap: wrap; gap: 0 12px; min-width: 0; padding: 0 12px; }
+.extension-card-form input, .extension-card-form textarea { display: block; width: 100%; min-width: 0; max-width: 100%; margin: 0; padding: 8px 4px; border: 1px solid transparent; border-radius: 4px; color: var(--text); background: transparent; font: inherit; font-size: var(--text-13); line-height: 1.5; box-shadow: none; }
+.extension-card-form input:focus, .extension-card-form textarea:focus { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: 1px; }
+.extension-card-form input[type="file"][hidden] { display: none; }
+.extension-card-form textarea { resize: none; }
+.extension-card-form__field { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.extension-card-form__field > span { flex-shrink: 0; color: var(--text-soft); font-size: var(--text-12); }
+.extension-card-form__field > input, .extension-card-form__field > textarea, .extension-card-form__field > div { flex: 1; min-width: 0; }
+.extension-card-form__field.is-multiline { display: block; padding: 8px 0; border: 0; }
+.extension-card-form__field.is-grouped { flex: 1 1 220px; }
+.extension-card-form__static { padding: 8px 4px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-13); }
+.extension-card-form__collapsed { width: 100%; color: var(--text-soft); font-size: var(--text-12); }
+.extension-card-form__collapsed > summary { padding: 8px 0; cursor: pointer; }
+.extension-card-form__attachments { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; min-width: 0; padding: 8px 0; }
+.extension-card-form__attachments > button { min-height: 36px; padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); }
+.extension-card-form__attachments > button:hover { background: var(--surface-hover); }
+.extension-card-form__attachment { display: flex; align-items: center; gap: 8px; max-width: 100%; min-width: 0; padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font-size: var(--text-12); }
+.extension-card-form__attachment > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.extension-card-form__attachment > button { flex-shrink: 0; min-height: 32px; border: 0; border-radius: 4px; color: var(--text-soft); background: transparent; cursor: pointer; }
+.extension-card-recipients { position: relative; width: 100%; min-width: 0; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.extension-card-recipients__summary, .extension-card-recipients__group { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.extension-card-recipients__summary { gap: 12px; padding-right: var(--extension-card-toggle-width, 72px); overflow: hidden; }
+.extension-card-recipients__group > span { flex-shrink: 0; color: var(--text-soft); font-size: var(--text-12); }
+.extension-card-recipients__chip { display: inline-block; flex-shrink: 0; max-width: 160px; overflow: hidden; padding: 4px 8px; border: 0; border-radius: 999px; background: var(--surface-hover); color: var(--text); font: inherit; font-size: var(--text-12); text-overflow: ellipsis; white-space: nowrap; }
+.extension-card-recipients__more, .extension-card-recipients__toggle { display: inline-block; flex-shrink: 0; padding: 4px; border: 0; border-radius: 4px; background: transparent; color: var(--text-soft); font: inherit; font-size: var(--text-12); cursor: pointer; white-space: nowrap; }
+.extension-card-recipients__toggle { min-height: 32px; }
+.extension-card-recipients__summary + .extension-card-recipients__toggle { position: absolute; top: 4px; right: 0; }
+.extension-card-recipients__measure { position: absolute; visibility: hidden; pointer-events: none; top: 0; left: 0; width: max-content; }
+.extension-card-recipients__measure > div { display: flex; align-items: center; }
+.extension-card-recipients__measure > div > span:first-child { font-size: var(--text-12); }
+.extension-card__expanded { width: min(960px, 94vw); max-height: 90vh; }
+.extension-card__expanded .extension-card-form { padding: 0; }
+@media (max-width: 480px) { .extension-card__failure { align-items: flex-start; } .extension-card-form__field.is-grouped { flex-basis: 100%; } }
+.extension-card__mail-meta { padding: 0 12px; color: var(--text-soft); font-size: 12px; overflow-wrap: anywhere; }
+.extension-card__mail-thread { margin: 12px; }
+.extension-card__mail-thread > button { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; width: 100%; padding: 12px; border: 0; border-bottom: 1px solid var(--line); background: transparent; color: var(--text); text-align: left; overflow-wrap: anywhere; }
+.extension-card__mail-thread > button > span, .extension-card__mail-thread > button > small { color: var(--text-soft); }

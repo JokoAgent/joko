@@ -1,0 +1,103 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/workspace.proto";
+import "joko/v1/common.proto";
+
+// Static history only. Package authority and transient runtime state are private.
+message ExtensionCard {
+  string card_id = 1;
+  string session_id = 2;
+  string extension_id = 3;
+  string extension_name = 4;
+  string tool_use_id = 5;
+  string html = 6;
+  string text = 7;
+  uint32 height = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+message ExtensionCardServiceGetRequest {
+  string session_id = 1;
+  string card_id = 2;
+}
+message ExtensionCardServiceGetResponse {
+  ExtensionCard card = 1;
+  string animated_html = 2;
+  bool working = 3;
+  bool interactive = 4;
+  repeated string media_uris = 5;
+}
+message ExtensionCardFormValue {
+  string name = 1;
+  string value = 2;
+}
+message ExtensionCardServiceDispatchRequest {
+  string session_id = 1;
+  string card_id = 2;
+  string action_id = 3;
+  string prompt = 4;
+  repeated ExtensionCardFormValue form_values = 5;
+  bool change = 6;
+  string upload_id = 7;
+}
+message ExtensionCardServiceDispatchResponse {
+  bool accepted = 1;
+}
+message ExtensionCardServiceAuthorizeLinkRequest {
+  string session_id = 1;
+  string card_id = 2;
+  string url = 3;
+}
+message ExtensionCardServiceAuthorizeLinkResponse {
+  bool authorized = 1;
+}
+
+message ExtensionCardServicePreviewMailRequest {
+  string session_id = 1;
+  string url = 2;
+  bool read = 3;
+  bool opened = 4;
+}
+message ExtensionCardServicePreviewMailResponse {
+  bool supported = 1;
+  // Only the bounded, validated MailMessage data shape; never executable HTML.
+  string message_json = 2;
+  string error = 3;
+  string extension_id = 4;
+}
+
+message ExtensionCardServiceBeginAttachmentRequest {
+  string session_id = 1;
+  string card_id = 2;
+  string file_name = 3;
+  string media_type = 4;
+  uint64 byte_size = 5;
+  string sha256_hex = 6;
+  bool inline = 7;
+}
+message ExtensionCardServiceBeginAttachmentResponse {
+  PendingBlobUpload upload = 1;
+}
+message ExtensionCardServiceReadMediaRequest {
+  string session_id = 1;
+  string card_id = 2;
+  string extension_id = 3;
+  string uri = 4;
+  bool metadata_only = 5;
+}
+message ExtensionCardServiceReadMediaResponse {
+  string data_url = 1;
+  BlobRef blob = 2;
+}
+
+service ExtensionCardService {
+  rpc Get(ExtensionCardServiceGetRequest) returns (ExtensionCardServiceGetResponse);
+  rpc Dispatch(ExtensionCardServiceDispatchRequest) returns (ExtensionCardServiceDispatchResponse);
+  rpc AuthorizeLink(ExtensionCardServiceAuthorizeLinkRequest) returns (ExtensionCardServiceAuthorizeLinkResponse);
+  rpc PreviewMail(ExtensionCardServicePreviewMailRequest) returns (ExtensionCardServicePreviewMailResponse);
+  rpc BeginAttachment(ExtensionCardServiceBeginAttachmentRequest) returns (ExtensionCardServiceBeginAttachmentResponse);
+  rpc ReadMedia(ExtensionCardServiceReadMediaRequest) returns (ExtensionCardServiceReadMediaResponse);
+}

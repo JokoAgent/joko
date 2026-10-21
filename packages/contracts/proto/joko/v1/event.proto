@@ -6,6 +6,8 @@ import "google/protobuf/timestamp.proto";
 import "joko/v1/common.proto";
 import "joko/v1/interaction.proto";
 import "joko/v1/model.proto";
+import "joko/v1/mcp_app.proto";
+import "joko/v1/extension_card.proto";
 import "joko/v1/operation.proto";
 import "joko/v1/objective.proto";
 import "joko/v1/pi.proto";
@@ -95,7 +97,17 @@ message EventPayload {
     RuntimeHandoffEvent runtime_handoff = 76;
     AppDefaultModelRequestedEvent app_default_model_requested = 77;
     PartnerLearningChangedEvent partner_learning_changed = 78;
+    McpAppChangedEvent mcp_app_changed = 79;
+    ExtensionCardChangedEvent extension_card_changed = 80;
   }
+}
+
+message McpAppChangedEvent {
+  McpAppCard card = 1;
+}
+
+message ExtensionCardChangedEvent {
+  ExtensionCard card = 1;
 }
 
 message AppDefaultModelRequestedEvent {
@@ -506,6 +518,7 @@ message ImageProducedEvent {
 
 message ArtifactProducedEvent {
   Artifact artifact = 1;
+  bool embedded_in_extension_card = 2;
 }
 
 message WorkspaceDiffProducedEvent {

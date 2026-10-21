@@ -2948,6 +2948,22 @@ export function fromProtoEvent(event: ProtoEvent): AppendEventInput {
 function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext): ProtoEventPayload {
   const payload = event.payload;
   switch (payload.type) {
+    case "extension_card_changed":
+      return protoPayload("extensionCardChanged", message<contract.ExtensionCardChangedEvent>("joko.v1.ExtensionCardChangedEvent", {
+        card: message<contract.ExtensionCard>("joko.v1.ExtensionCard", {
+          cardId: payload.card.id, sessionId: payload.card.sessionId, extensionId: payload.card.extensionId,
+          extensionName: payload.card.extensionName, toolUseId: payload.card.toolUseId, html: payload.card.html,
+          text: payload.card.text, height: payload.card.height, updatedAt: toProtoTimestamp(payload.card.updatedAt)
+        })
+      }));
+    case "mcp_app_changed":
+      return protoPayload("mcpAppChanged", message<contract.McpAppChangedEvent>("joko.v1.McpAppChangedEvent", {
+        card: message<contract.McpAppCard>("joko.v1.McpAppCard", {
+          cardId: payload.card.id, sessionId: payload.card.sessionId, title: payload.card.title,
+          text: payload.card.text, pending: payload.card.pending, cancelled: payload.card.cancelled,
+          isError: payload.card.isError, updatedAt: toProtoTimestamp(payload.card.updatedAt)
+        })
+      }));
     case "partner_learning_changed":
       return protoPayload("partnerLearningChanged", message<contract.PartnerLearningChangedEvent>("joko.v1.PartnerLearningChangedEvent", {
         completionEventId: payload.completionEventId, messageId: payload.messageId, feedback: toProtoLearningFeedback(payload.feedback)
@@ -3133,7 +3149,7 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
         ? artifactFromBlob(payload.artifact, event, payload.purpose, payload.audioMetadata)
         : toProtoArtifactWithSourceAvailability(context.artifact, context.artifactSourceRevealAvailable === true);
       return protoPayload("artifactProduced", message<ArtifactProducedEvent>("joko.v1.ArtifactProducedEvent", {
-        artifact
+        artifact, embeddedInExtensionCard: payload.embeddedInExtensionCard === true
       }));
     }
     case "workspace_diff": {
@@ -3443,6 +3459,10 @@ function fromProtoEventPayload(
   runId: string
 ): EventPayload {
   switch (payload.kind.case) {
+    case "extensionCardChanged":
+      throw new ProtoMappingError("invalid_argument", "event.payload.extension_card_changed", "Extension cards are service-owned and cannot be imported as Session events.");
+    case "mcpAppChanged":
+      throw new ProtoMappingError("invalid_argument", "event.payload.mcp_app_changed", "MCP App cards are service-owned and cannot be imported as Session events.");
     case "partnerLearningChanged":
       throw new ProtoMappingError("invalid_argument", "event.payload.partner_learning_changed", "Learning feedback is owned by the Store and cannot be imported as a Session event.");
     case "deviceChanged":
@@ -3711,6 +3731,7 @@ function fromProtoEventPayload(
         type: "artifact",
         artifact: fromProtoBlobRef(artifact.blob),
         purpose: artifact.description || artifact.title || "artifact",
+        ...(payload.kind.value.embeddedInExtensionCard ? { embeddedInExtensionCard: true } : {}),
         ...(artifact.audioMetadata === undefined ? {} : { audioMetadata: fromProtoAudioMetadata(artifact.audioMetadata) })
       };
     }

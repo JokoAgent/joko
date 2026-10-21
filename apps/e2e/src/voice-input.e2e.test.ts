@@ -451,6 +451,7 @@ it("replays a complete long SAUC capture into a new recognition generation befor
   const newPartial = `${newStable} The new uncertain ending.`;
   const newFinal = `${newStable} The complete final ending.`;
   let fixtureFailure: unknown;
+  let finalReplies = 0;
   gateway.on("connection", (socket, request) => {
     const session: GatewaySession = { socket, request, packets: [] };
     sessions.push(session);
@@ -483,6 +484,13 @@ it("replays a complete long SAUC capture into a new recognition generation befor
             { text: newStable, start_time: 0, end_time: 100, definite: true },
             { text: " The new uncertain ending.", start_time: 100, end_time: 200, definite: false }
           ] } }));
+        } else if (packet.type === 2 && sessions[1] === session && packet.sequence !== undefined && packet.sequence < 0) {
+          if (finalReplies++ !== 0) throw new Error("SAUC received more than one end marker.");
+          // Reply at the wire end marker. Large byte assertions run after Stop
+          // so test-runner work cannot consume the provider's final-result grace.
+          void saucReplaySend(socket, saucResponse({ result: { text: newFinal,
+            utterances: [{ text: newFinal, start_time: 0, end_time: 100, definite: true }] } }, Math.abs(packet.sequence), true))
+            .catch(error => { fixtureFailure = error; socket.terminate(); });
         }
       } catch (error) { fixtureFailure = error; socket.terminate(); }
     });
@@ -599,7 +607,10 @@ it("replays a complete long SAUC capture into a new recognition generation befor
     let stopped: VoiceInputSession | undefined;
     pendingStop = clients.voiceInput.stopVoiceInput({ voiceInputId: started.voiceInputId, expectedNextChunkSequence: nextSequence },
       { signal: stopRequest.signal, timeoutMs: 180_000 })
-      .then(response => { stopped = response.session; stopSettled = true; }, error => { stopFailure = error; stopSettled = true; });
+      .then(response => {
+        if (finalReplies !== 1) fixtureFailure = new Error("Stop settled before the recovered provider's final reply.");
+        stopped = response.session; stopSettled = true;
+      }, error => { stopFailure = error; stopSettled = true; });
     await vi.waitFor(async () => expect((await clients.voiceInput.getVoiceInputSession({ voiceInputId: started.voiceInputId })).session!.state)
       .toBe(VoiceInputState.SUBMITTING), { timeout: 3_000 });
     expect(stopSettled).toBe(false);
@@ -614,9 +625,9 @@ it("replays a complete long SAUC capture into a new recognition generation befor
       expect(fixtureFailure).toBeUndefined(); expect(stopFailure).toBeUndefined();
       expect(recovered.packets.filter(packet => packet.type === 2).at(-1)?.sequence).toBeLessThan(0);
     }, { timeout: 90_000, interval: 200 });
-    expect(stopSettled).toBe(false);
+    await voiceDeadline(pendingStop, 10_000);
+    expect(stopFailure).toBeUndefined(); expect(fixtureFailure).toBeUndefined(); expect(finalReplies).toBe(1);
     const replayed = recovered.packets.filter(packet => packet.type === 2);
-    const finalPacket = replayed.at(-1)!;
     expect(Buffer.concat(replayed.map(packet => packet.data))).toEqual(Buffer.concat(captured));
     expect(replayed.filter(packet => packet.data.byteLength > 0).map(packet => packet.data)).toEqual(captured);
     const firstAudioSequence = replayed[0]!.sequence!;
@@ -624,10 +635,6 @@ it("replays a complete long SAUC capture into a new recognition generation befor
     expect(replayed.map(packet => Math.abs(packet.sequence!))).toEqual(Array.from({ length: replayed.length }, (_value, index) => firstAudioSequence + index));
     expect(replayed.filter(packet => packet.sequence! < 0)).toHaveLength(1);
     expect(replayed.slice(0, -1).every(packet => packet.sequence! > 0 && packet.data.byteLength === 6_400)).toBe(true);
-    await saucReplaySend(recovered.socket, saucResponse({ result: { text: newFinal,
-      utterances: [{ text: newFinal, start_time: 0, end_time: 100, definite: true }] } }, Math.abs(finalPacket.sequence!), true));
-    await voiceDeadline(pendingStop, 10_000);
-    expect(stopFailure).toBeUndefined(); expect(fixtureFailure).toBeUndefined();
     expect(stopped).toMatchObject({ state: VoiceInputState.DONE, outcome: VoiceInputTerminalOutcome.SUCCESS,
       nextChunkSequence: 313n, acceptedAudioBytes: totalBytes, recoveryAttempts: 1, result: { text: newFinal } });
     expect(stopped!.acceptedAudioDuration).toEqual(draining.acceptedAudioDuration);

@@ -7,15 +7,21 @@ import {
 } from "@joko/adapter-codex";
 import type { RemoteForwardingTransportPort, RemoteReverseForwardHandle } from "@joko/remote-ssh";
 import { Server as ProtocolServer } from "@modelcontextprotocol/sdk/server/index.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   isInitializeRequest,
+  CreateTaskResultSchema,
+  type CallToolRequest,
+  type CreateTaskResult,
   type CallToolResult,
   type RequestId
 } from "@modelcontextprotocol/sdk/types.js";
 import { type McpRouter, type PiMcpBridgeSnapshot } from "./mcp-router.js";
+import { createMcpModelProxy, type McpModelRequestExtra } from "./mcp-apps/server-proxy.js";
+import type { AppConnection } from "./mcp-apps/connection.js";
 
 const DEFAULT_GRANT_TTL_MS = 60_000;
 const MINIMUM_GRANT_TTL_MS = 1_000;
@@ -38,7 +44,7 @@ export interface CodexMcpBridgeManagerOptions {
 
 interface ProtocolSession {
   readonly serverId: string;
-  readonly server: ProtocolServer;
+  readonly server: ProtocolServer | McpServer;
   readonly transport: StreamableHTTPServerTransport;
 }
 
@@ -101,6 +107,7 @@ export class CodexMcpBridgeManager {
       })
     });
     const toolsByServer = groupTools(snapshot.mcpBridge.tools);
+    for (const serverId of snapshot.modelServerIds) if (!toolsByServer.has(serverId)) toolsByServer.set(serverId, []);
     if (toolsByServer.size === 0) {
       snapshot.revoke();
       let released = false;
@@ -271,14 +278,48 @@ export class CodexMcpBridgeManager {
     assertCurrent: () => void,
     sessions: Map<string, ProtocolSession>
   ): Promise<ProtocolSession> {
-    const server = new ProtocolServer(
+    const callTool = async (request: CallToolRequest, extra: McpModelRequestExtra, connection?: AppConnection): Promise<CallToolResult | CreateTaskResult> => {
+      assertCurrent();
+      if (request.params.task && !connection) throw new Error("This MCP server does not expose task delegation.");
+      const threadId = codexThreadId(request.params._meta);
+      const requestId = bridgeRequestId(extra.sessionId, extra.requestId, threadId);
+      const call = input.beginToolCall(threadId, { requestId, serverId: route.serverId, toolName: request.params.name });
+      const signal = AbortSignal.any([extra.signal, call.signal, routeAbort]);
+      try {
+        signal.throwIfAborted(); call.assertCurrent();
+        const progressToken = request.params._meta?.progressToken;
+        const result = await this.#router.executeBridgeCall({
+          authorization: `Bearer ${snapshot.mcpBridge.token}`, requestId, generation: input.generation,
+          sessionId: input.sessionId, targetId: input.targetId, serverId: route.serverId,
+          toolName: request.params.name, arguments: request.params.arguments, signal,
+          ...(connection ? { appCall: { connection, params: request.params,
+            ...(progressToken === undefined ? {} : { onprogress: (progress: import("@modelcontextprotocol/sdk/types.js").Progress) => {
+              try { assertCurrent(); call.assertCurrent(); } catch { return; }
+              void extra.sendNotification({ method: "notifications/progress", params: { ...progress, progressToken } }).catch(() => {});
+            } }) } } : {}),
+          ...(call.partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority: call.partnerLearningAuthority })
+        });
+        signal.throwIfAborted(); call.assertCurrent(); assertCurrent();
+        if (request.params.task) {
+          if (result.isError) throw new Error(result.error ?? "MCP task delegation failed.");
+          return CreateTaskResultSchema.parse(result.details?.["mcpTask"]);
+        }
+        return bridgeCallResult(result);
+      } finally { call.release(); }
+    };
+    const modelProxy = snapshot.modelServerIds.includes(route.serverId) ? createMcpModelProxy({
+      name: `joko-codex-${route.serverId}`, tools: route.tools,
+      open: peer => this.#router.createAppModelChannel(snapshot, route.serverId, peer, assertCurrent),
+      callTool, redact: value => this.#router.redactModelValue(value),
+    }) : undefined;
+    const server = modelProxy ?? new ProtocolServer(
       { name: `joko-codex-${route.serverId}`, version: "1.0.0" },
       { capabilities: { tools: {} } }
     );
     let session: ProtocolSession;
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: randomUUID,
-      enableJsonResponse: true,
+      enableJsonResponse: !modelProxy,
       onsessioninitialized: (sessionId) => { sessions.set(sessionId, session); },
       onsessionclosed: (sessionId) => { sessions.delete(sessionId); }
     });
@@ -288,7 +329,7 @@ export class CodexMcpBridgeManager {
         sessions.delete(transport.sessionId);
       }
     };
-    server.setRequestHandler(ListToolsRequestSchema, async () => {
+    if (!modelProxy) (server as ProtocolServer).setRequestHandler(ListToolsRequestSchema, async () => {
       assertCurrent();
       return {
         tools: route.tools.map((tool) => ({
@@ -299,35 +340,7 @@ export class CodexMcpBridgeManager {
         }))
       };
     });
-    server.setRequestHandler(CallToolRequestSchema, async (request, extra): Promise<CallToolResult> => {
-      assertCurrent();
-      const threadId = codexThreadId(request.params._meta);
-      const requestId = bridgeRequestId(extra.sessionId, extra.requestId, threadId);
-      const call = input.beginToolCall(threadId, { requestId, serverId: route.serverId, toolName: request.params.name });
-      const signal = AbortSignal.any([extra.signal, call.signal, routeAbort]);
-      try {
-        signal.throwIfAborted();
-        call.assertCurrent();
-        const result = await this.#router.executeBridgeCall({
-          authorization: `Bearer ${snapshot.mcpBridge.token}`,
-          requestId,
-          generation: input.generation,
-          sessionId: input.sessionId,
-          targetId: input.targetId,
-          serverId: route.serverId,
-          toolName: request.params.name,
-          arguments: request.params.arguments,
-          signal,
-          ...(call.partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority: call.partnerLearningAuthority })
-        });
-        signal.throwIfAborted();
-        call.assertCurrent();
-        assertCurrent();
-        return bridgeCallResult(result);
-      } finally {
-        call.release();
-      }
-    });
+    if (!modelProxy) (server as ProtocolServer).setRequestHandler(CallToolRequestSchema, callTool);
     try {
       await server.connect(transport);
       return session;

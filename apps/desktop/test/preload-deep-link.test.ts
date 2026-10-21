@@ -260,10 +260,11 @@ describe("main application preload deep-link occurrence fence", () => {
     expect(primary.invoke).toHaveBeenCalledWith("joko:remote-desktop-viewer:bind", "document-current", owner);
   });
 
-  it("captures the host-owned occurrence once before any other bridge query without exposing capture", () => {
+  it("classifies isolated documents before capturing the host-owned primary occurrence without exposing capture", () => {
     const loaded = loadPreload("document-current");
 
     expect(loaded.synchronousChannels).toEqual([
+      "joko:mcp-app:document",
       "joko:main-document:occurrence:get",
       "joko:files:open-with:document:capture",
       "joko:native-task-status:availability:get",
@@ -281,7 +282,7 @@ describe("main application preload deep-link occurrence fence", () => {
         return bytes;
       }
     });
-    expect(loaded.synchronousChannels[0]).toBe("joko:main-document:occurrence:get");
+    expect(loaded.synchronousChannels.slice(0, 2)).toEqual(["joko:mcp-app:document", "joko:main-document:occurrence:get"]);
   });
 
   it("drops a live delivery from a retired Document before renderer side effects", () => {
@@ -395,6 +396,7 @@ describe("application preload native gamepad Document occurrence fence", () => {
     );
 
     expect(loaded.synchronousChannels).toEqual([
+      "joko:mcp-app:document",
       "joko:main-document:occurrence:get",
       "joko:native-gamepad:document:capture",
       "joko:native-task-status:availability:get",

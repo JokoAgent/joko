@@ -516,8 +516,8 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       const converge = async (terms: readonly string[], evidence?: number) => {
         convergenceAttempt += 1;
         const convergenceStarted = connectionTiming.begin();
-        // LAN recovery may include the production 60-second failed-route
-        // cooldown, discovery and both eight-second forwarding debounces.
+        // Both routes may enter the production 60-second failed-route
+        // cooldown before recovery and both eight-second forwarding debounces.
         try { await vi.waitFor(async () => {
           const [dictionaryA, dictionaryB, dictionaryC] = await Promise.all([readA(), readB(), readC()]);
           for (const dictionary of [dictionaryA, dictionaryB, dictionaryC]) expect(dictionary.refinementTerms.slice().sort()).toEqual(terms.slice().sort());
@@ -567,7 +567,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
           }
           expect(phonePeers.latest?.configurationRevision).toBe(peersC.configurationRevision);
           expect(bridgeObservation.peers.latest?.status?.configurationRevision).toBe(peersB.configurationRevision);
-        }, { timeout: direct ? 24_000 : 90_000, interval: 100 }); }
+        }, { timeout: 90_000, interval: 100 }); }
         catch (error) {
           // Observe only counters and transport state before the original
           // failure cleans up the real nodes. Never export keys or content.

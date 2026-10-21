@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { posix, win32 } from "node:path";
 import { TextDecoder } from "node:util";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { JSONRPCMessageSchema } from "@modelcontextprotocol/sdk/types.js";
 
 import {
   CLAUDE_AGENT_SDK_VERSION,
@@ -1026,6 +1028,10 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
   readonly #output = new AsyncValueQueue<unknown>();
   readonly #callbackControllers = new Map<string, AbortController>();
   readonly #hookCallbackIds = new Set<string>();
+  readonly #mcpModels = new Map<string, {
+    readonly serverId: string; readonly channel: RemoteClaudeManagerChannel; readonly transport: Transport;
+    readonly ready: Promise<void>; readonly unblock: () => void;
+  }>();
   readonly #productMcpValidators = new Map<string, {
     readonly input: ReturnType<AjvJsonSchemaValidator["getValidator"]>;
     readonly output?: ReturnType<AjvJsonSchemaValidator["getValidator"]>;
@@ -1326,6 +1332,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
       onCallback: (frame) => this.#handleCallback(channel, frame),
       onCallbackCancel: (callbackId) => this.#cancelCallback(callbackId),
       onClosed: (error) => {
+        for (const [id, model] of this.#mcpModels) if (model.channel === channel) void this.#closeMcpModel(id, false);
         if (this.#channel !== channel) return;
         void channel.close().then(() => {
           if (this.#channel === channel) this.#channel = undefined;
@@ -1350,6 +1357,7 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
       throw runtimeFault("invalid_response", true);
     }
     this.#attachmentId = value.attachmentId;
+    for (const model of this.#mcpModels.values()) model.unblock();
   }
 
   #acceptEvent(frame: Readonly<Record<string, unknown>>): void {
@@ -1388,7 +1396,38 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
     this.#callbackControllers.set(callbackId, controller);
     if (frame.callback === "hook") this.#hookCallbackIds.add(callbackId);
     try {
-      if (frame.callback === "canUseTool") {
+      if (frame.callback === "productMcpConnect") {
+        const value = mcpModelFrame(frame.value), endpoint = this.#options.params.options.mcpModels?.find(model => model.serverId === value.serverId);
+        this.#options.assertCurrent(); controller.signal.throwIfAborted();
+        if (!endpoint || this.#closing || this.#ended || this.#mcpModels.has(value.channelId) || this.#mcpModels.size >= 256) throw runtimeFault("mcp_model_unavailable", false);
+        let unblock!: () => void;
+        const ready = new Promise<void>(resolve => { unblock = resolve; });
+        const current = () => {
+          this.#options.assertCurrent();
+          if (this.#ended || this.#closing || this.#channel !== channel || this.#mcpModels.get(value.channelId)?.transport !== transport) throw runtimeFault("mcp_model_retired", false);
+        };
+        const transport: Transport = { start: async () => {},
+          send: async message => {
+            await ready; current();
+            await channel.request("query.mcpMessage", { queryId: this.#queryId, attachmentId: this.#requireAttachment(),
+              serverId: value.serverId, channelId: value.channelId, message: JSONRPCMessageSchema.parse(message) }, { timeoutMs: REQUEST_TIMEOUT_MS });
+            current();
+          },
+          close: () => this.#closeMcpModel(value.channelId),
+        };
+        this.#mcpModels.set(value.channelId, { serverId: value.serverId, channel, transport, ready, unblock });
+        if (this.#channel === channel && this.#attachmentId !== undefined) unblock();
+        try { await endpoint.connect(transport); controller.signal.throwIfAborted(); this.#options.assertCurrent(); }
+        catch (error) { await this.#closeMcpModel(value.channelId, false); throw error; }
+        await channel.sendCallback(callbackId, true, {});
+      } else if (frame.callback === "productMcpMessage" || frame.callback === "productMcpClose") {
+        const value = mcpModelFrame(frame.value, frame.callback === "productMcpMessage"), model = this.#mcpModels.get(value.channelId);
+        this.#options.assertCurrent(); controller.signal.throwIfAborted();
+        if (!model || model.serverId !== value.serverId || model.channel !== channel || this.#closing || this.#ended) throw runtimeFault("mcp_model_retired", false);
+        if (frame.callback === "productMcpMessage") model.transport.onmessage?.(JSONRPCMessageSchema.parse(value.message));
+        else await this.#closeMcpModel(value.channelId, false);
+        await channel.sendCallback(callbackId, true, {});
+      } else if (frame.callback === "canUseTool") {
         const value = callbackRequest(frame.value);
         const result = await this.#options.params.options.canUseTool(value.toolName, value.input, {
           ...value.options,
@@ -1475,6 +1514,15 @@ class RemoteClaudeQuery implements ClaudeSdkQuery {
     for (const controller of this.#callbackControllers.values()) controller.abort();
     this.#callbackControllers.clear();
     this.#hookCallbackIds.clear();
+    for (const id of this.#mcpModels.keys()) void this.#closeMcpModel(id, false);
+  }
+
+  async #closeMcpModel(id: string, notify = true): Promise<void> {
+    const model = this.#mcpModels.get(id); if (!model) return;
+    this.#mcpModels.delete(id); model.unblock(); model.transport.onclose?.();
+    if (notify && this.#channel === model.channel && this.#attachmentId !== undefined && !this.#ended) {
+      await model.channel.request("query.mcpClose", { queryId: this.#queryId, attachmentId: this.#attachmentId, serverId: model.serverId, channelId: id }, { timeoutMs: REQUEST_TIMEOUT_MS }).catch(() => {});
+    }
   }
 }
 
@@ -1817,6 +1865,7 @@ function serializeQueryOptions(
     ...(options.hooks === undefined ? {} : { hooks: serializeHookManifest(options.hooks) }),
     ...(options.managedAgentTool === undefined ? {} : { managedAgentTool: true }),
     ...(options.mcpTools === undefined ? {} : { productMcpTools: serializeProductMcpTools(options.mcpTools) }),
+    ...(options.mcpModels === undefined ? {} : { productMcpModels: serializeMcpModels(options.mcpModels) }),
     includePartialMessages: true,
     ...(options.disallowedTools === undefined ? {} : { disallowedTools: [...options.disallowedTools] }),
     ...(options.mcpServers === undefined ? {} : { mcpServers: { ...options.mcpServers } }),
@@ -1841,6 +1890,22 @@ function serializeQueryOptions(
     ...(options.title === undefined ? {} : { title: options.title }),
     tools: Array.isArray(options.tools) ? [...options.tools] : { ...options.tools }
   };
+}
+
+function serializeMcpModels(models: NonNullable<ClaudeSdkQueryOptions["mcpModels"]>): readonly { readonly serverId: string }[] {
+  const identities = new Set<string>();
+  if (models.length > 256) throw runtimeFault("mcp_catalog_invalid", false);
+  return models.map(model => {
+    if (!trimmedString(model.serverId, 1, 512) || identities.has(model.serverId)) throw runtimeFault("mcp_catalog_invalid", false);
+    identities.add(model.serverId); return { serverId: model.serverId };
+  });
+}
+
+function mcpModelFrame(value: unknown, message = false): { readonly serverId: string; readonly channelId: string; readonly message?: unknown } {
+  if (!isRecord(value) || !trimmedString(value.serverId, 1, 512) || typeof value.channelId !== "string" || !UUID.test(value.channelId)
+    || !Object.keys(value).every(key => ["serverId", "channelId", ...(message ? ["message"] : [])].includes(key))
+    || encodedBytes(value) > MAXIMUM_MCP_PAYLOAD_BYTES || message && !JSONRPCMessageSchema.safeParse(value.message).success) throw runtimeFault("mcp_message_invalid", false);
+  return { serverId: value.serverId, channelId: value.channelId, ...(message ? { message: value.message } : {}) };
 }
 
 function serializeProductMcpTools(tools: NonNullable<ClaudeSdkQueryOptions["mcpTools"]>): readonly Readonly<Record<string, unknown>>[] {

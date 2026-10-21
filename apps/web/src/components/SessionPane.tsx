@@ -1,4 +1,7 @@
 import { useArtifactDownload } from "./use-artifact-download.js";
+import { McpAppTimelineProvider } from "./McpAppCard.js";
+import { ExtensionCardTimelineProvider } from "./ExtensionCard.js";
+import { ExtensionMailReaderProvider } from "./ExtensionMailReader.js";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
 import {
@@ -2001,7 +2004,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         openFileWithApplication: controller.openArtifactFileWithApplication,
         revealSource: controller.revealArtifactSource
       } : undefined}>
-      <PersonalDevelopmentReportActions.Provider value={personalReportActions}><Timeline
+      <ExtensionMailReaderProvider controller={controller} sessionId={session.id} disabled={session.archived} readOnly={reviewReadOnly} t={t}><ExtensionCardTimelineProvider controller={controller} readOnly={reviewReadOnly || session.archived} cards={timelineWithPersonalReports.flatMap(item => item.extensionCard ? [item.extensionCard] : [])}><McpAppTimelineProvider controller={controller}><PersonalDevelopmentReportActions.Provider value={personalReportActions}><Timeline
         key={timelineResourceOwnerKey}
         ownerKey={`${timelineResourceOwnerKey}:${session.generation}:${controller.state.connectionState}`}
         viewportOwnerKey={JSON.stringify([controller.state.activeProfile?.id, controller.state.activeProfile?.serverId, controller.state.activeProfile?.origin, session.id, String(session.generation)])}
@@ -2114,7 +2117,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
           }
         }}
       />
-      </PersonalDevelopmentReportActions.Provider></NativeFileActionsContext.Provider>
+      </PersonalDevelopmentReportActions.Provider></McpAppTimelineProvider></ExtensionCardTimelineProvider></ExtensionMailReaderProvider></NativeFileActionsContext.Provider>
       <div ref={bottomOverlayRef} className="session-bottom-overlay">
       {!reviewReadOnly && <SessionScheduleNotice
         ownerId={controller.state.activeProfile?.serverId ?? controller.state.activeProfile?.id ?? "local"}

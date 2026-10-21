@@ -179,7 +179,7 @@ const VISIBLE_EVENTS = new Set([
   "session_changed", "run_state", "queue_update", "queue_control", "text_delta", "thinking_delta", "status",
   "message_complete", "tool_start", "tool_update", "tool_result", "artifact", "interaction_opened", "interaction_resolved", "interaction_dismissed",
   "background_task", "retry", "compaction", "usage", "resource_usage", "context_cleared", "context_rebuild", "message_deleted", "session_reset", "done", "error",
-  "session_attention", "subagent_run", "subagent_transcript", "runtime_recovery", "history_pruned", "runtime_handoff"
+  "session_attention", "subagent_run", "subagent_transcript", "runtime_recovery", "history_pruned", "runtime_handoff", "mcp_app_changed", "extension_card_changed"
 ]);
 function denied(): ConnectError { return new ConnectError("The requested data is outside this shared task.", Code.PermissionDenied); }
 export function minimizeSharedTaskSession(session: contract.Session, lease: TaskShareLease): contract.Session {

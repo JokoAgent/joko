@@ -6,6 +6,19 @@ const entries = ["extensions/review.ts", "extensions/search/index.js"];
 const files = [...entries, "ui/review/index.html", "ui/review/app.js", "ui/search.html"];
 
 describe("Extension surface manifest", () => {
+  it("binds resident tools, cards, mail readers and optional continuation to inspected files", () => {
+    const runtime = { html: "ui/review/index.html", tools: [{ name: "read", description: "Read mail", inputSchema: { type: "object" }, readOnly: true }], card: { externalLinks: true }, mail: true,
+      mailReader: { tool: "read", hosts: ["mail.example.test"], markRead: true }, agent: true };
+    const manifest = (value: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [{ entry: entries[0], runtime: value }] } } });
+    expect(parseExtensionSurfaceManifest(manifest(runtime), entries, files)[0]?.runtime).toEqual(runtime);
+    for (const invalid of [{ ...runtime, html: "ui/missing.html" }, { ...runtime, tools: [...runtime.tools, ...runtime.tools] },
+      { ...runtime, mail: false }, { ...runtime, agent: false }, { ...runtime, mailReader: { tool: "undeclared", hosts: ["mail.example.test"] } },
+      { ...runtime, tools: [{ ...runtime.tools[0], inputSchema: { type: "array" } }] }, { ...runtime, privilegedNode: true }]) {
+      expect(() => parseExtensionSurfaceManifest(manifest(invalid), entries, files)).toThrow();
+    }
+    const base = parseExtensionSurfaceManifest(manifest({ html: runtime.html, tools: runtime.tools, card: {} }), entries, files)[0]?.runtime;
+    expect(base?.agent).toBeUndefined(); expect(base?.mail).toBeUndefined();
+  });
   it("admits a resident event publisher only with inspected HTML and unique bounded declarations", () => {
     const binding = { entry: entries[0], routineEvents: { html: "ui/review/index.html", events: [{ type: "changed", name: "Changed", fields: ["scope"] }] } };
     const manifest = (value: unknown) => ({ joko: { extensionSurfaces: { schemaVersion: 1, extensions: [value] } } });

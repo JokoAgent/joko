@@ -386,7 +386,10 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
         (value) => value.run?.state === RunState.SUCCEEDED, "paired native completion");
     }
     for (const [backendId, sessionId] of sessions) {
-      const events = fixture.application.store.listEvents({ sessionId });
+      // Native usage can follow the terminal run notification. Observe its
+      // persistence before checking the complete per-Session event history.
+      const events = await waitFor(async () => fixture.application.store.listEvents({ sessionId }),
+        events => events.some(event => event.payload.type === "usage"), `${backendId} persisted usage`);
       expect(events.some((event) => event.payload.type === "message_complete" && event.payload.role === "assistant")).toBe(true);
       expect(events.some((event) => event.payload.type === "usage")).toBe(true);
       expect((await paired.clients.session.getSession({ sessionId })).session?.backendId).toBe(backendId);

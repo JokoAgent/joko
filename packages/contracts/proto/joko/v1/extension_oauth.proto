@@ -1,0 +1,152 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/operation.proto";
+
+message ExtensionOAuthAccount {
+  string account_id = 1;
+  optional string label = 2;
+  google.protobuf.Timestamp created_at = 3;
+  bool is_default = 4;
+  bool expired = 5;
+  bool client_changed = 6;
+  bool scope_stale = 7;
+  repeated string missing_scopes = 8;
+}
+message ExtensionOAuthSlot {
+  string key = 1;
+  string label = 2;
+  optional string hint = 3;
+  string authorize_origin = 4;
+  string token_origin = 5;
+  repeated string scopes = 6;
+  bool client_configured = 7;
+  bool client_customized = 8;
+  repeated ExtensionOAuthAccount accounts = 9;
+}
+message ExtensionOAuthState {
+  string extension_id = 1;
+  Revision revision = 2;
+  repeated ExtensionOAuthSlot slots = 3;
+}
+enum ExtensionAuthorizationPhase {
+  EXTENSION_AUTHORIZATION_PHASE_UNSPECIFIED = 0;
+  EXTENSION_AUTHORIZATION_PHASE_PREPARING = 1;
+  EXTENSION_AUTHORIZATION_PHASE_AUTHORIZING = 2;
+  EXTENSION_AUTHORIZATION_PHASE_EXCHANGING = 3;
+  EXTENSION_AUTHORIZATION_PHASE_COMPLETE = 4;
+  EXTENSION_AUTHORIZATION_PHASE_FAILED = 5;
+}
+enum ExtensionAuthorizationFailure {
+  EXTENSION_AUTHORIZATION_FAILURE_UNSPECIFIED = 0;
+  EXTENSION_AUTHORIZATION_FAILURE_INVALID_CONFIG = 1;
+  EXTENSION_AUTHORIZATION_FAILURE_NO_CLIENT_CONFIG = 2;
+  EXTENSION_AUTHORIZATION_FAILURE_NO_ACCOUNT = 3;
+  EXTENSION_AUTHORIZATION_FAILURE_ACCOUNT_LIMIT = 4;
+  EXTENSION_AUTHORIZATION_FAILURE_AUTH_EXPIRED = 5;
+  EXTENSION_AUTHORIZATION_FAILURE_REFRESH_FAILED = 6;
+  EXTENSION_AUTHORIZATION_FAILURE_EXCHANGE_FAILED = 7;
+  EXTENSION_AUTHORIZATION_FAILURE_NETWORK = 8;
+  EXTENSION_AUTHORIZATION_FAILURE_CANCELLED = 9;
+  EXTENSION_AUTHORIZATION_FAILURE_TIMEOUT = 10;
+  EXTENSION_AUTHORIZATION_FAILURE_LISTEN_FAILED = 11;
+}
+message ExtensionOAuthAuthorization {
+  string authorize_url = 1;
+  string callback_url = 2;
+  string state = 3;
+  repeated string cors_origins = 4;
+  repeated string cors_hosts = 5;
+}
+message ExtensionOAuthFlow {
+  string flow_id = 1;
+  string extension_id = 2;
+  string slot_key = 3;
+  ExtensionAuthorizationPhase phase = 4;
+  ExtensionAuthorizationFailure failure = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  optional ExtensionOAuthAuthorization authorization = 7;
+}
+message ExtensionOAuthServiceGetRequest {
+  string extension_id = 1;
+}
+message ExtensionOAuthServiceGetResponse {
+  ExtensionOAuthState state = 1;
+}
+message ExtensionOAuthServiceBeginClientRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string slot_key = 3;
+}
+message ExtensionOAuthServiceBeginClientResponse {
+  CredentialUploadTicket ticket = 1;
+}
+message ExtensionOAuthServiceCommitClientRequest {
+  string extension_id = 1;
+  string credential_upload_ticket_id = 2;
+}
+message ExtensionOAuthServiceCommitClientResponse {
+  ExtensionOAuthState state = 1;
+}
+message ExtensionOAuthServiceChangeRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string slot_key = 3;
+  oneof action {
+    string remove_account_id = 4;
+    string default_account_id = 5;
+    bool clear_client = 6;
+  }
+}
+message ExtensionOAuthServiceChangeResponse {
+  ExtensionOAuthState state = 1;
+}
+message ExtensionOAuthServiceStartRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  string slot_key = 3;
+  // Empty means all declared scopes. A selection is a nonempty subset.
+  repeated string scopes = 4;
+}
+message ExtensionOAuthServiceStartResponse {
+  ExtensionOAuthFlow flow = 1;
+}
+message ExtensionOAuthServiceGetFlowRequest {
+  string flow_id = 1;
+}
+message ExtensionOAuthServiceGetFlowResponse {
+  ExtensionOAuthFlow flow = 1;
+}
+message ExtensionOAuthServiceBeginCallbackRequest {
+  string flow_id = 1;
+}
+message ExtensionOAuthServiceBeginCallbackResponse {
+  CredentialUploadTicket ticket = 1;
+}
+message ExtensionOAuthServiceCompleteCallbackRequest {
+  string flow_id = 1;
+  string credential_upload_ticket_id = 2;
+}
+message ExtensionOAuthServiceCompleteCallbackResponse {
+  ExtensionOAuthFlow flow = 1;
+}
+message ExtensionOAuthServiceCancelFlowRequest {
+  string flow_id = 1;
+}
+message ExtensionOAuthServiceCancelFlowResponse {
+  ExtensionOAuthFlow flow = 1;
+}
+service ExtensionOAuthService {
+  rpc Get(ExtensionOAuthServiceGetRequest) returns (ExtensionOAuthServiceGetResponse);
+  rpc BeginClient(ExtensionOAuthServiceBeginClientRequest) returns (ExtensionOAuthServiceBeginClientResponse);
+  rpc CommitClient(ExtensionOAuthServiceCommitClientRequest) returns (ExtensionOAuthServiceCommitClientResponse);
+  rpc Change(ExtensionOAuthServiceChangeRequest) returns (ExtensionOAuthServiceChangeResponse);
+  rpc Start(ExtensionOAuthServiceStartRequest) returns (ExtensionOAuthServiceStartResponse);
+  rpc GetFlow(ExtensionOAuthServiceGetFlowRequest) returns (ExtensionOAuthServiceGetFlowResponse);
+  rpc BeginCallback(ExtensionOAuthServiceBeginCallbackRequest) returns (ExtensionOAuthServiceBeginCallbackResponse);
+  rpc CompleteCallback(ExtensionOAuthServiceCompleteCallbackRequest) returns (ExtensionOAuthServiceCompleteCallbackResponse);
+  rpc CancelFlow(ExtensionOAuthServiceCancelFlowRequest) returns (ExtensionOAuthServiceCancelFlowResponse);
+}

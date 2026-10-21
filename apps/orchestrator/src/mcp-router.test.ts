@@ -105,7 +105,7 @@ class FakeMcpFactory implements McpClientFactory {
   }
 }
 
-interface FixtureOptions extends Partial<Pick<McpRouterOptions, "now" | "bridgeGrantTtlMs" | "nativeAuthLeaseTtlMs" | "nativeAuth" | "nativeAuthRecovery" | "trustedManagedRunnerScriptSha256" | "toolDiscoveryPolicy" | "targetReferences" | "capturePartnerLearningSave">> {
+interface FixtureOptions extends Partial<Pick<McpRouterOptions, "now" | "bridgeGrantTtlMs" | "nativeAuthLeaseTtlMs" | "nativeAuth" | "nativeAuthRecovery" | "trustedManagedRunnerScriptSha256" | "toolDiscoveryPolicy" | "targetReferences" | "capturePartnerLearningSave" | "onAppToolCall">> {
   readonly maximumBlobBytes?: number;
   readonly audioResultDownloader?: McpAudioResultDownloader;
 }
@@ -233,13 +233,47 @@ async function fixture(options: FixtureOptions = {}) {
       ? {} : { trustedManagedRunnerScriptSha256: options.trustedManagedRunnerScriptSha256 }),
     ...(options.toolDiscoveryPolicy === undefined ? {} : { toolDiscoveryPolicy: options.toolDiscoveryPolicy }),
     ...(options.targetReferences === undefined ? {} : { targetReferences: options.targetReferences }),
-    ...(options.capturePartnerLearningSave === undefined ? {} : { capturePartnerLearningSave: options.capturePartnerLearningSave })
+    ...(options.capturePartnerLearningSave === undefined ? {} : { capturePartnerLearningSave: options.capturePartnerLearningSave }),
+    ...(options.onAppToolCall === undefined ? {} : { onAppToolCall: options.onAppToolCall })
   });
   await router.initialize();
   return { root, store, credentials, factory, artifacts, router };
 }
 
 describe("McpRouter", () => {
+  it("keeps App-only tools out of the frozen model facade", async () => {
+    const f = await fixture();
+    try {
+      f.factory.toolMeta = { ui: { resourceUri: "ui://form", visibility: ["app"] } };
+      await f.router.upsert({ id: "form", displayName: "Form", enabled: true, transport: "streamable_http", endpoint: "https://mcp.example.test/rpc", credentialBindings: [] });
+      const snapshot = f.router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp" });
+      expect(snapshot.mcpBridge.tools).toEqual([]);
+      await expect(f.router.executeBridgeCall({ ...bridgeScope(1), authorization: `Bearer ${snapshot.mcpBridge.token}`,
+        generation: 1, serverId: "form", toolName: "echo", arguments: {} })).rejects.toThrow("MCP tool is not present");
+      expect(f.factory.calledTools).toEqual([]);
+    } finally { await f.router.dispose(); f.store.close(); await rm(f.root, { recursive: true, force: true }); }
+  });
+
+  it.each([false, true])("preserves the model outcome while keeping View metadata private (card-storage failure=%s)", async fail => {
+    const complete = vi.fn(async () => {}), cancel = vi.fn(async () => {});
+    const capture = vi.fn((input: unknown) => input);
+    const f = await fixture({ onAppToolCall: async input => { capture(input); if (fail) throw new Error("Controlled card storage failure"); return { complete, cancel }; } });
+    try {
+      f.factory.toolMeta = { ui: { resourceUri: "ui://form" } };
+      f.factory.result = { content: [{ type: "text", text: "Public result" }], isError: false, _meta: { privateView: "view-only-value" } };
+      await f.router.upsert({ id: "form", displayName: "Form", enabled: true, transport: "streamable_http", endpoint: "https://mcp.example.test/rpc", credentialBindings: [] });
+      const snapshot = f.router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp" });
+      const result = await f.router.executeBridgeCall({ ...bridgeScope(1), authorization: `Bearer ${snapshot.mcpBridge.token}`,
+        generation: 1, serverId: "form", toolName: "echo", arguments: {} });
+      expect(result.isError).toBe(false);
+      expect(JSON.stringify(result)).toContain("Public result");
+      expect(JSON.stringify(result)).not.toContain("view-only-value");
+      expect(capture).toHaveBeenCalledOnce();
+      expect(complete).toHaveBeenCalledTimes(fail ? 0 : 1);
+      if (!fail) expect(complete).toHaveBeenCalledWith(expect.objectContaining({ _meta: { privateView: "view-only-value" } }));
+      expect(cancel).not.toHaveBeenCalled();
+    } finally { await f.router.dispose(); f.store.close(); await rm(f.root, { recursive: true, force: true }); }
+  });
   it("binds private original-turn proof to authenticated request scope and never grants learning from tool arguments", async () => {
     const recorded = vi.fn(), capture = vi.fn(() => ({ recordSaved: recorded }));
     const { router, store } = await fixture({ capturePartnerLearningSave: capture });
