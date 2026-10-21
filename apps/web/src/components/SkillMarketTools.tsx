@@ -193,12 +193,14 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
   readonly onLearn?: (identity: SkillMarketEntryIdentityView) => void;
 }): JSX.Element {
   const [query, setQuery] = useState("");
+  const { listSkillMarketCatalog, getSkillMarketEntry, openSkillMarketPreview,
+    listSkillMarketPreviewFiles, readSkillMarketPreviewFile, closeSkillMarketPreview } = controller;
   const [category, setCategory] = useState("");
   const [sort, setSort] = useState<SkillMarketSortView>("trending");
   const [cursors, setCursors] = useState<readonly CatalogCursor[]>([{ token: "" }]);
   const [catalog, setCatalog] = useState<LoadState<SkillMarketCatalogPageView>>({ kind: "loading" });
   const [selected, setSelected] = useState<SkillMarketEntryIdentityView | undefined>(initialSelection);
-  const [detail, setDetail] = useState<LoadState<{ readonly entry: SkillMarketEntryView; readonly preview: SkillMarketPreviewView; readonly files: SkillMarketArchivePageView }> | undefined>();
+  const [detail, setDetail] = useState<LoadState<{ readonly entry: SkillMarketEntryView; readonly preview: SkillMarketPreviewView; readonly files: SkillMarketArchivePageView; readonly leaseSignal: AbortSignal }> | undefined>();
   const [selectedFile, setSelectedFile] = useState<string>();
   const [file, setFile] = useState<LoadState<SkillMarketPreviewFileView> | undefined>();
   const [installEntry, setInstallEntry] = useState<SkillMarketEntryView>();
@@ -225,7 +227,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
     const abort = new AbortController();
     setCatalog({ kind: "loading" });
     const timer = window.setTimeout(() => {
-      void controller.listSkillMarketCatalog({
+      void listSkillMarketCatalog({
         ...(cursor.revision === undefined ? {} : { expectedRevision: cursor.revision }),
         query,
         category,
@@ -240,14 +242,12 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
       });
     }, 80);
     return () => { window.clearTimeout(timer); abort.abort(); };
-  }, [category, controller, cursor.revision, cursor.token, query, reload, sort, t]);
+  }, [category, listSkillMarketCatalog, cursor.revision, cursor.token, query, reload, sort, t]);
 
   useEffect(() => {
     const request = ++detailRequest.current;
     const abort = new AbortController();
-    const prior = previewRef.current;
     previewRef.current = undefined;
-    if (prior !== undefined) void controller.closeSkillMarketPreview(prior.id).catch(() => undefined);
     setSelectedFile(undefined);
     setFile(undefined);
     if (selected === undefined) {
@@ -256,16 +256,28 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
     }
     setDetail({ kind: "loading" });
     let opened: SkillMarketPreviewView | undefined;
-    void controller.getSkillMarketEntry(selected, abort.signal).then(async (entry) => {
-      const preview = await controller.openSkillMarketPreview(entry.identity, abort.signal);
+    const retireOpened = (): void => {
+      const preview = opened;
+      opened = undefined;
+      if (preview === undefined) return;
+      if (previewRef.current?.id === preview.id) previewRef.current = undefined;
+      void closeSkillMarketPreview(preview.id).catch(() => undefined);
+    };
+    void getSkillMarketEntry(selected, abort.signal).then(async (entry) => {
+      if (abort.signal.aborted || request !== detailRequest.current) return;
+      const preview = await openSkillMarketPreview(entry.identity, abort.signal);
       opened = preview;
-      const files = await controller.listSkillMarketPreviewFiles(preview, "", 100, abort.signal);
       if (abort.signal.aborted || request !== detailRequest.current) {
-        void controller.closeSkillMarketPreview(preview.id).catch(() => undefined);
+        retireOpened();
+        return;
+      }
+      const files = await listSkillMarketPreviewFiles(preview, "", 100, abort.signal);
+      if (abort.signal.aborted || request !== detailRequest.current) {
+        retireOpened();
         return;
       }
       previewRef.current = preview;
-      setDetail({ kind: "ready", value: { entry, preview, files } });
+      setDetail({ kind: "ready", value: { entry, preview, files, leaseSignal: abort.signal } });
       setSelectedFile(files.files.find((entry) => entry.kind === "file" && entry.key.toLocaleLowerCase("en-US") === "skill.md")?.key
         ?? files.files.find((entry) => entry.kind === "file")?.key);
     }).catch((cause: unknown) => {
@@ -273,29 +285,34 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
     });
     return () => {
       abort.abort();
-      if (opened !== undefined) {
-        if (previewRef.current?.id === opened.id) previewRef.current = undefined;
-        void controller.closeSkillMarketPreview(opened.id).catch(() => undefined);
-      }
+      retireOpened();
     };
-  }, [controller, detailReload, selected?.contentRevision, selected?.entryRevision, selected?.sourceRevision, t]);
+  }, [getSkillMarketEntry, openSkillMarketPreview, listSkillMarketPreviewFiles, closeSkillMarketPreview,
+    detailReload, selected?.contentRevision, selected?.entryRevision, selected?.sourceRevision, t]);
 
   const readyDetail = detail?.kind === "ready" ? detail.value : undefined;
   useEffect(() => {
     const request = ++fileRequest.current;
     const abort = new AbortController();
-    if (readyDetail === undefined || selectedFile === undefined) {
+    if (readyDetail === undefined || selectedFile === undefined || previewRef.current?.id !== readyDetail.preview.id || readyDetail.leaseSignal.aborted) {
       setFile(undefined);
       return () => abort.abort();
     }
+    const leaseSignal = readyDetail.leaseSignal;
+    const retireRead = (): void => abort.abort();
+    leaseSignal.addEventListener("abort", retireRead, { once: true });
+    if (leaseSignal.aborted) retireRead();
     setFile({ kind: "loading" });
-    void controller.readSkillMarketPreviewFile(readyDetail.preview, selectedFile, abort.signal).then((value) => {
+    void readSkillMarketPreviewFile(readyDetail.preview, selectedFile, abort.signal).then((value) => {
       if (!abort.signal.aborted && request === fileRequest.current && previewRef.current?.id === readyDetail.preview.id) setFile({ kind: "ready", value });
     }).catch((cause: unknown) => {
       if (!abort.signal.aborted && request === fileRequest.current) setFile({ kind: "error", message: errorMessage(cause, t) });
     });
-    return () => abort.abort();
-  }, [controller, readyDetail?.preview.id, selectedFile, t]);
+    return () => {
+      leaseSignal.removeEventListener("abort", retireRead);
+      abort.abort();
+    };
+  }, [readSkillMarketPreviewFile, readyDetail?.preview.id, readyDetail?.leaseSignal, selectedFile, t]);
 
   useEffect(() => {
     if (mobileDetail && detail?.kind === "ready" && window.innerWidth <= 720) detailHeading.current?.focus();
@@ -316,7 +333,7 @@ export function SkillMarketCatalogTools({ controller, backends, targets, locale,
     if (readyDetail?.files.nextPageToken === undefined) return;
     const expectedPreview = readyDetail.preview;
     const token = readyDetail.files.nextPageToken;
-    void controller.listSkillMarketPreviewFiles(expectedPreview, token, 100).then((next) => {
+    void listSkillMarketPreviewFiles(expectedPreview, token, 100, readyDetail.leaseSignal).then((next) => {
       if (previewRef.current?.id !== expectedPreview.id || detail?.kind !== "ready") return;
       const keys = new Set(detail.value.files.files.map((entry) => entry.key));
       if (next.files.some((entry) => keys.has(entry.key))) return;

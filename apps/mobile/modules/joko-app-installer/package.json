@@ -1,0 +1,7 @@
+{
+  "name": "@joko/app-installer",
+  "version": "0.1.0",
+  "description": "Joko-owned Android update permission and verified APK handoff.",
+  "private": true,
+  "peerDependencies": { "expo": "*" }
+}

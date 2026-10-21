@@ -113,6 +113,22 @@ afterEach(async () => {
 });
 
 describe("Node Device peer recent project ownership", () => {
+  it("settles admitted recent-directory writes before retirement completes", async () => {
+    const root = await testRoot();
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "private", "recent.json")
+    });
+    let recorded = false;
+    const writing = executor.recordRecentDirectory(root, "Adopted project").then(() => { recorded = true; });
+    try {
+      await executor.retire();
+      expect(recorded).toBe(true);
+    } finally {
+      await writing;
+      await executor.retire();
+    }
+  });
+
   it("credentials admit authenticated controller and preserve the signal without a media lease", async () => {
     const root = await testRoot(); const fixture = remoteDesktopHost();
     const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "credentials.json"), remoteDesktop: fixture.port });
@@ -253,6 +269,42 @@ describe("Node Device peer recent project ownership", () => {
       "terminalExited"
     ]);
     await executor.retire();
+  });
+
+  it("propagates a retired Terminal route once without an unhandled output-chain rejection", async () => {
+    const root = await testRoot();
+    const terminal = new TestTerminalHandle();
+    const subscribed = vi.spyOn(terminal, "onExit");
+    const killed = vi.spyOn(terminal, "kill").mockImplementation(async () => {
+      await new Promise<void>(resolveTick => setImmediate(resolveTick));
+      terminal.finish();
+    });
+    const executor = new NodeDevicePeerAgentExecutor({
+      recentDirectoriesPath: join(root, "private", "recent.json"),
+      terminals: { open: async () => terminal }
+    });
+    const retired = new Error("Owned Terminal route retired.");
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown): void => { if (error === retired) unhandled.push(error); };
+    process.on("unhandledRejection", onUnhandled);
+    const emissions: string[] = [];
+    try {
+      const execution = executor.execute(openTerminal(root), new AbortController().signal, async result => {
+        emissions.push(result.payload.case ?? "empty");
+        if (result.payload.case === "terminalOutput") throw retired;
+      });
+      const rejected = expect(execution).rejects.toBe(retired);
+      await vi.waitFor(() => expect(subscribed).toHaveBeenCalledTimes(1));
+      terminal.emitData("owned terminal output");
+      await rejected;
+      await new Promise<void>(resolveTick => setImmediate(resolveTick));
+      expect(unhandled).toEqual([]);
+      expect(emissions).toEqual(["acknowledgement", "terminalOpened", "terminalOutput"]);
+      expect(killed).toHaveBeenCalledTimes(1);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await executor.retire();
+    }
   });
 });
 
@@ -1777,6 +1829,7 @@ class TestTerminalHandle implements DevicePeerTerminalHandle {
   }
 
   write(): Promise<void> { return Promise.resolve(); }
+  emitData(data: string): void { for (const listener of this.#data) listener(data); }
   resize(): Promise<void> { return Promise.resolve(); }
   pause(): void {}
   resume(): void {}

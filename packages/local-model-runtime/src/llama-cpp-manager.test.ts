@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createHash } from "node:crypto";
 import type { ChildProcess, spawn } from "node:child_process";
-import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -65,6 +65,33 @@ describe("managed GGUF owner", () => {
     const restarted = new LlamaCppRuntimeManager(value.options); managers.push(restarted); expect((await restarted.snapshot(owner)).models).toEqual([model]); expect(value.spawnProcess).not.toHaveBeenCalled();
     expect(value.changed).toHaveBeenCalledTimes(2); await restarted.snapshot(owner); expect(value.changed).toHaveBeenCalledTimes(2);
   });
+  it("publishes a relative runtime identity through a filesystem alias with either extractor path spelling", async () => {
+    for (const canonicalResult of [false, true]) {
+      const value = await fixture(), actual = join(value.root, "actual-data"), alias = join(value.root, "aliased-data");
+      await mkdir(actual); await symlink(actual, alias, "junction");
+      const manager = new LlamaCppRuntimeManager({ ...value.options, dataRoot: alias,
+        extractArchive: async ({ destination }) => { await mkdir(destination); const binary = join(destination, "llama-server.exe"); await writeFile(binary, "binary"); return canonicalResult ? await realpath(binary) : binary; } });
+      managers.push(manager); await manager.install(owner);
+      expect(await manager.snapshot(owner)).toMatchObject({ installed: true, running: false });
+      const record = JSON.parse(await readFile(join(actual, "llamacpp-runtime", "current.json"), "utf8")) as { binary: string };
+      expect(record.binary.split(/[\\/]/u)).not.toContain("..");
+      expect(value.spawnProcess).not.toHaveBeenCalled();
+    }
+  });
+  it("rejects extracted binaries and linked extraction roots outside the private staging directory", async () => {
+    for (const linkedDestination of [false, true]) {
+      const value = await fixture(), outside = join(value.root, "outside"); await mkdir(outside);
+      const binary = join(outside, "llama-server.exe"); await writeFile(binary, "outside binary");
+      const manager = new LlamaCppRuntimeManager({ ...value.options, extractArchive: async ({ destination }) => {
+        if (linkedDestination) await symlink(outside, destination, "junction"); else await mkdir(destination);
+        return binary;
+      } });
+      managers.push(manager);
+      await expect(manager.install(owner)).rejects.toMatchObject({ code: "ARCHIVE_REJECTED" });
+      await expect(readFile(join(value.root, "llamacpp-runtime", "current.json"))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(await readFile(binary, "utf8")).toBe("outside binary");
+    }
+  });
   it("rejects low disk space before asset transfer and never publishes partial installed models", async () => {
     const value = await fixture({ freeDiskBytes: async () => 5 }); await expect(value.manager.download(owner, selection)).rejects.toMatchObject({ code: "DISK_SPACE_LOW" });
     expect(value.fetcher).toHaveBeenCalledTimes(1); expect((await value.manager.snapshot(owner)).models).toEqual([]);
@@ -80,6 +107,12 @@ describe("managed GGUF owner", () => {
     });
     const value = await fixture({ fetchStreaming: fetcher }); const flight = value.manager.download(owner, selection); const observed = flight.catch(error => error); await firstChunk.promise;
     await vi.waitFor(async () => expect((await value.manager.snapshot(owner)).operation?.completed).toBe(4));
+    await vi.waitFor(async () => {
+      const models = join(value.root, "llamacpp-runtime", "models");
+      const staging = (await readdir(models)).find(name => name.startsWith(".download-"));
+      expect(staging).toBeDefined();
+      expect(await readFile(join(models, staging!, `${selection.file}.partial`), "utf8")).toBe("abcd");
+    });
     const operation = await pendingOperation(value.manager), target = { transferId: operation.transferId, selection };
     await value.manager.pause(owner, target); expect(firstSignal?.aborted).toBe(true); expect((await value.manager.snapshot(owner)).operation).toMatchObject({ paused: true, transferId: target.transferId });
     await expect(value.manager.cancel(owner, { ...target, transferId: "retired" })).rejects.toMatchObject({ reason: "TRANSFER_CHANGED" });

@@ -99,6 +99,7 @@ export interface WorkspaceFilesRouteProps {
 }
 
 export type WorkspaceFilesNavigationShell = Pick<SidebarFrameProps,
+  | "appShortcutOverrides"
   | "open"
   | "mode"
   | "width"

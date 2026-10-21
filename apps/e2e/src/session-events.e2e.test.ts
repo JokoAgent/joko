@@ -16,6 +16,7 @@ import {
   SessionSnapshotScopeSchema,
   SnapshotScopeSchema,
   SubmitOperationRequestSchema,
+  SubmitOperationResponseSchema,
   nativeSessionTreeRoots
 } from "@joko/contracts";
 import { PI_LIKE_PROFILE, type FakeAdapterProfile } from "@joko/testkit";
@@ -60,10 +61,13 @@ describe("session host, durable events, and reconnect semantics", () => {
   let fixture: OrchestratorE2eFixture | undefined;
   let browser: Browser | undefined;
   let releaseBrowserRequest: (() => void) | undefined;
+  let releaseEventStreams: (() => void) | undefined;
 
   afterEach(async () => {
     releaseBrowserRequest?.();
     releaseBrowserRequest = undefined;
+    releaseEventStreams?.();
+    releaseEventStreams = undefined;
     try {
       await Promise.all(browser?.contexts().map((context) => context.setOffline(false)) ?? []);
     } finally {
@@ -661,10 +665,6 @@ describe("session host, durable events, and reconnect semantics", () => {
     const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
     const pageErrors: string[] = [];
     page.on("pageerror", (error) => pageErrors.push(error.name));
-    let failedEventStreams = 0;
-    page.on("requestfailed", (request) => {
-      if (new URL(request.url()).pathname === "/joko.v1.EventService/StreamEvents") failedEventStreams += 1;
-    });
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -740,6 +740,8 @@ describe("session host, durable events, and reconnect semantics", () => {
     const releaseAcknowledgement = browserGate();
     releaseBrowserRequest = () => { forwardRequest.release(); releaseAcknowledgement.release(); };
     let heldBrowserRequest = false;
+    const localInputObservation: { inputMatches?: boolean; forwarded: boolean; responseStatus?: number;
+      operationState?: OperationState; failed?: string } = { forwarded: false };
     await page.route("**/joko.v1.OperationService/SubmitOperation", async (route) => {
       const bytes = route.request().postDataBuffer();
       if (bytes === null) throw new Error("Mounted Web sent no binary Operation request.");
@@ -749,9 +751,19 @@ describe("session host, durable events, and reconnect semantics", () => {
         return;
       }
       heldBrowserRequest = true;
+      localInputObservation.inputMatches = body.mutation.payload.value.input?.parts
+        .map(part => part.content.case === "text" ? part.content.value : "").join("") === MOUNTED_TIMELINE_LOCAL;
       requestEntered.release();
       await forwardRequest.promise;
-      const response = await route.fetch();
+      localInputObservation.forwarded = true;
+      const response = await route.fetch().catch((error: unknown) => {
+        localInputObservation.failed = error instanceof Error ? error.name : "unknown"; throw error;
+      });
+      localInputObservation.responseStatus = response.status();
+      if (response.status() === 200) {
+        localInputObservation.operationState = fromBinary(SubmitOperationResponseSchema,
+          new Uint8Array(await response.body())).operation?.state;
+      }
       await releaseAcknowledgement.promise;
       await route.fulfill({ response });
     });
@@ -783,7 +795,16 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(await acceptedLocalInput.count()).toBe(0);
     forwardRequest.release();
     const localContext = await waitFor(async () => adapter.contexts.get(MOUNTED_TIMELINE_LOCAL),
-      (value) => value !== undefined, "the durable local input before its unary acknowledgement");
+      (value) => value !== undefined, "the durable local input before its unary acknowledgement").catch(async (error: unknown) => {
+      throw new Error(`${error instanceof Error ? error.message : "Local input did not start"}. ${JSON.stringify({
+        request: localInputObservation,
+        adapter: { calls: adapter.sendCalls.length, localInputSeen: adapter.sendCalls.some(input => input.text === MOUNTED_TIMELINE_LOCAL),
+          contextCount: adapter.contexts.size },
+        queue: fixture!.application.store.listQueueItems({ sessionId }).map(item => item.state),
+        runs: fixture!.application.store.listRuns({ sessionId }).map(run => run.descriptor.state),
+        viewport: await viewportGeometry(page), pageErrors
+      })}`);
+    });
     if (localContext === undefined) throw new Error("The local input has no active Run.");
     await acceptedLocalInput.waitFor({ state: "attached" });
     expect(await unreadCount(page)).toBe(0);
@@ -804,10 +825,10 @@ describe("session host, durable events, and reconnect semantics", () => {
     expect(await unreadCount(page)).toBe(1);
 
     const anchor = await visibleTimelineAnchor(page);
-    const failuresBeforeFault = failedEventStreams;
     await page.context().setOffline(true);
-    fixture.dropPublicConnections();
-    await waitFor(async () => failedEventStreams, (value) => value > failuresBeforeFault, "the actual Connect stream network failure");
+    // The event stream may belong to the SharedWorker rather than this Page.
+    // Interrupt its real server socket and reject retries until recovery.
+    releaseEventStreams = fixture.suspendPublicEventStreams();
     await page.locator(".offline-banner:visible,.error-banner:visible").first().waitFor({ state: "visible", timeout: 20_000 });
     const remoteOperation = await send(MOUNTED_TIMELINE_REMOTE);
     const remoteContext = await waitFor(async () => adapter.contexts.get(MOUNTED_TIMELINE_REMOTE),
@@ -818,6 +839,8 @@ describe("session host, durable events, and reconnect semantics", () => {
     await waitFor(() => manager.clients.run.getRun({ runId: queueRunIdFrom(remoteOperation) }),
       (value) => value.run?.state === RunState.SUCCEEDED, "the offline remote Run to settle");
     expect(fixture.application.store.getSession(sessionId).descriptor.binding.generation).toBe(generation);
+    releaseEventStreams();
+    releaseEventStreams = undefined;
     await page.context().setOffline(false);
     await waitFor(() => page.locator(".offline-banner,.error-banner").count(), (value) => value === 0,
       "the automatic connection recovery to clear its public error state", 20_000);

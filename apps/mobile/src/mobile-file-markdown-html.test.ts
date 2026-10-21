@@ -11,6 +11,29 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), ".."); const trans
 const colors = { surface: "#fafafa", background: "#ffffff", ink: "#242a2d", muted: "#637073", accent: "#ff9800", border: "#e1e2df", negative: "#cc634e" };
 
 describe("file Markdown document", () => {
+  it.each([false, true])("accepts the full application theme without treating its dark flag as a color, dark=%s", (dark) => {
+    const theme = {
+      background: dark ? "#15191d" : "#f7f6f3", surface: dark ? "#24292d" : "#ffffff",
+      ink: dark ? "#f4f4f2" : "#242a2d", muted: dark ? "#adb6b7" : "#637073",
+      border: dark ? "#394246" : "#e1e2df", accent: "#ff9800", negative: "#cc634e",
+      brandBackground: dark ? "#302920" : "#fff1db", dark
+    };
+    const html = buildMobileFileMarkdownHtml({ text: "first\nfocus line\nlast\n", label: "README.md", colors: theme, focusLine: 2 },
+      { katexScript: "", katexCss: "", mermaidScript: "" });
+    expect(html).toContain("focus line");
+    expect(html).toContain(`background:${theme.background};color:${theme.ink}`);
+    expect(html).not.toContain(theme.brandBackground);
+  });
+
+  it("still rejects malformed document colors and oversized source", () => {
+    const input = { text: "first\nfocus line\nlast\n", label: "README.md", colors };
+    const runtime = { katexScript: "", katexCss: "", mermaidScript: "" };
+    for (const key of Object.keys(colors) as (keyof typeof colors)[]) {
+      expect(() => buildMobileFileMarkdownHtml({ ...input, colors: { ...colors, [key]: "#ffffff;display:none" } }, runtime)).toThrow("invalid colors");
+    }
+    expect(() => buildMobileFileMarkdownHtml({ ...input, text: "x".repeat(2_097_153) }, runtime)).toThrow("too large");
+  });
+
   it("retains intrinsic EXIF proportions both on first render and in-place resource adoption", () => {
     const key = '["image","portrait.png"]';
     const resources = { leaseId: "file", references: new Map([[key, { key, label: "Portrait", kind: "image" as const,

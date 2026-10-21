@@ -551,6 +551,7 @@ export interface PiSkillContentLeaseInput {
 }
 
 export interface PiSkillContentLease {
+  /** Internal Resource authority, never serialized with the content lease. */
   readonly resource: PiResourceDescriptor;
   /** Private native file location, never copied into a generated contract. */
   readonly entryFilePath: string;
@@ -836,7 +837,7 @@ export class PiResourceManager {
           throw new Error("Skill content changed after the content lease was acquired.");
         }
       };
-      return {
+      const lease: PiSkillContentLease = {
         resource,
         entryFilePath: join(root, "SKILL.md"),
         approvedRevision: record.discoveredRevision,
@@ -869,6 +870,11 @@ export class PiResourceManager {
           await releasePromise;
         }
       };
+      Object.defineProperties(lease, {
+        entryFilePath: { enumerable: false },
+        resource: { enumerable: false }
+      });
+      return lease;
     });
   }
 

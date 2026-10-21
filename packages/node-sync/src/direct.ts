@@ -55,7 +55,10 @@ interface DirectRoute {
   readonly controller: AbortController;
   nextProbeAt: number;
   authenticatedAt: number;
+  authenticationRevision: number;
+  ingressRevision: number;
   onlineUntil: number;
+  recoverAfterProbe?: boolean;
   pending?: PendingProbe;
 }
 
@@ -188,9 +191,14 @@ export class NodeSyncDirectTransport {
       if (route.pending === undefined || !await this.probe(peerId, delivery)) return false;
       if (!this.#isCurrent(route) || !callerIsCurrent(delivery) || route.onlineUntil <= Date.now()) return false;
     }
+    const authenticationRevision = route.authenticationRevision;
+    const ingressRevision = route.ingressRevision;
     const sent = await this.#tcp.send(route.endpoint, peerId, frame, this.#delivery(route, delivery));
     if (!this.#isCurrent(route) || !callerIsCurrent(delivery)) return false;
-    if (!sent) this.#failed(route, Date.now());
+    if (!sent && route.authenticationRevision === authenticationRevision) {
+      this.#failed(route, Date.now());
+      if (route.ingressRevision !== ingressRevision) this.#requestRecoveryProbe(route);
+    }
     return sent;
   }
 
@@ -198,9 +206,20 @@ export class NodeSyncDirectTransport {
     if (!callerIsCurrent(delivery)) return;
     this.#reconcile();
     const route = this.#routes.get(peerId);
-    if (route === undefined || route.endpoint.publicKey !== publicKey || !this.#isCurrent(route) || !callerIsCurrent(delivery) ||
-      route.onlineUntil > Date.now() || route.pending !== undefined) return;
+    if (route === undefined || route.endpoint.publicKey !== publicKey || !this.#isCurrent(route) || !callerIsCurrent(delivery)) return;
+    route.ingressRevision += 1;
+    if (route.pending !== undefined) {
+      route.recoverAfterProbe = true;
+      return;
+    }
+    if (route.onlineUntil > Date.now()) return;
     // A newly reachable authenticated peer may wake a failed route; only the outgoing probe establishes presence.
+    this.#requestRecoveryProbe(route);
+  }
+
+  #requestRecoveryProbe(route: DirectRoute): void {
+    if (!this.#isCurrent(route)) return;
+    if (route.pending !== undefined) { route.recoverAfterProbe = true; return; }
     route.nextProbeAt = 0;
     this.#enqueue(route);
   }
@@ -250,7 +269,8 @@ export class NodeSyncDirectTransport {
       if (self !== undefined) for (const [peerId, endpoint] of endpoints) {
         if (this.#routes.has(peerId)) continue;
         const route: DirectRoute = { endpoint, self: { ...self }, generation: this.#generation,
-          controller: new AbortController(), nextProbeAt: 0, authenticatedAt: 0, onlineUntil: 0 };
+          controller: new AbortController(), nextProbeAt: 0, authenticatedAt: 0,
+          authenticationRevision: 0, ingressRevision: 0, onlineUntil: 0 };
         this.#routes.set(peerId, route);
         added.push(route);
         changed = true;
@@ -321,6 +341,7 @@ export class NodeSyncDirectTransport {
         if (success) {
           const becameOnline = route.onlineUntil <= now;
           route.authenticatedAt = now;
+          route.authenticationRevision += 1;
           route.onlineUntil = now + this.#presenceTtl;
           route.nextProbeAt = now + this.#probeInterval;
           if (becameOnline) {
@@ -333,8 +354,16 @@ export class NodeSyncDirectTransport {
       success = false;
       if (this.#isCurrent(route) && callerIsCurrent(pending.delivery)) this.#failed(route, Date.now());
     } finally {
+      const recover = route.recoverAfterProbe === true;
+      route.recoverAfterProbe = false;
       if (route.pending === pending) route.pending = undefined;
       pending.resolve(success && this.#isCurrent(route) && callerIsCurrent(pending.delivery));
+      // An old failed probe must not hide newer authenticated reachability for
+      // the whole cooldown. A fresh outgoing proof still owns presence.
+      if (!success && recover && this.#isCurrent(route)) {
+        route.nextProbeAt = 0;
+        this.#enqueue(route);
+      }
     }
   }
 

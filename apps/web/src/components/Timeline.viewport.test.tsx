@@ -116,6 +116,50 @@ afterEach(async () => {
 });
 
 describe("Timeline viewport journeys", () => {
+  it("lands Home at the history boundary before virtual-row corrections can interrupt native keyboard scrolling", async () => {
+    const loadEarlier = vi.fn(async () => undefined);
+    await render({ hasEarlier: true, messageNavRailEnabled: false, onLoadEarlier: loadEarlier });
+    const viewport = timeline();
+    expect(viewport.scrollTop).toBeGreaterThan(0);
+    await act(async () => {
+      const intent = new KeyboardEvent("keydown", { key: "Home", bubbles: true, cancelable: true });
+      viewport.dispatchEvent(intent);
+      expect(viewport.scrollTop).toBe(0);
+      expect(intent.defaultPrevented).toBe(true);
+      viewport.dispatchEvent(new Event("scroll"));
+    });
+    expect(loadEarlier).toHaveBeenCalledTimes(1);
+    await flushFrames();
+    expect(viewport.scrollTop).toBe(0);
+  });
+
+  it("keeps virtual-row corrections from detaching a growing tail after a delayed scroll event", async () => {
+    await render({ items: Array.from({ length: 60 }, (_, index) => item(`measured-${index}`, index + 1, "user")) });
+    await flushFrames();
+    const viewport = timeline();
+    await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    const above = [...viewport.querySelectorAll<HTMLElement>(".timeline__row")]
+      .filter(row => row.getBoundingClientRect().bottom <= 0).slice(0, 2);
+    expect(above).toHaveLength(2);
+    const before = viewport.scrollTop;
+    const now = vi.spyOn(performance, "now").mockReturnValue(10_000);
+    await act(async () => {
+      for (const observer of [...observers]) {
+        const entries = above.filter(row => observer.targets.has(row)).map(target => ({
+          target, borderBoxSize: [{ blockSize: 10, inlineSize: 592 }]
+        }) as unknown as ResizeObserverEntry);
+        if (entries.length > 0) observer.callback(entries, observer);
+      }
+    });
+    expect(viewport.scrollTop).toBeLessThan(before);
+    extent += 200;
+    now.mockReturnValue(11_000);
+    await act(async () => viewport.dispatchEvent(new Event("scroll")));
+    expect(jumpLatest()).toBeNull();
+    await contentResize();
+    expect(viewport.scrollTop).toBe(extent - viewport.clientHeight);
+  });
+
   it("shows whole-Run accounting only on its current completion while keeping segment usage private to running status", async () => {
     const segmentUsage = { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0,
       totalTokens: 15, cost: 0.004, currency: "USD", generationDurationMs: 1_000, generationReliable: true };
@@ -180,6 +224,8 @@ describe("Timeline viewport journeys", () => {
     const viewport = timeline();
     const startingTop = viewport.scrollTop;
     await scrollbarPress(viewport);
+    const content = host.querySelector<HTMLElement>(".timeline__virtual")!;
+    expect(content.style.minHeight).toBe(`${extent}px`);
     const writesAfterPress = scrollWrites.length;
     extent += 400;
     await append([{ ...item("streamed-answer", 9, "assistant"), streaming: true }]);
@@ -192,6 +238,7 @@ describe("Timeline viewport journeys", () => {
     await act(async () => window.dispatchEvent(new MouseEvent("mousemove", { buttons: 1 })));
     expectUnread(0);
     await act(async () => window.dispatchEvent(new MouseEvent("mouseup", { button: 0 })));
+    expect(content.style.minHeight).toBe("");
     const detachedTop = viewport.scrollTop;
     extent += 200;
     await append([item("detached-answer", 10, "assistant")]);
@@ -207,7 +254,6 @@ describe("Timeline viewport journeys", () => {
     await act(async () => window.dispatchEvent(new MouseEvent("mouseup", { button: 0 })));
     expectUnread(0);
     await act(async () => jumpLatest()?.click());
-    const content = host.querySelector<HTMLElement>(".timeline__virtual")!;
     await act(async () => content.dispatchEvent(new MouseEvent("mousedown", { button: 0, clientX: 640, bubbles: true })));
     extent += 100;
     await append([item("content-click-answer", 11, "assistant")]);
@@ -233,6 +279,7 @@ describe("Timeline viewport journeys", () => {
     const oldOwnerFrames = [...frames.values()];
     await scrollbarPress(viewport);
     await render({ ownerKey: `${props.ownerKey}:next`, viewportOwnerKey: `${props.viewportOwnerKey}:2` });
+    expect(host.querySelector<HTMLElement>(".timeline__virtual")!.style.minHeight).toBe("");
     expect(jumpLatest()).toBeNull();
     const writesAfterOwnerChange = scrollWrites.length;
     await replayFrames(oldOwnerFrames);
@@ -246,6 +293,7 @@ describe("Timeline viewport journeys", () => {
     const hiddenFrames = [...frames.values()];
     await scrollbarPress(viewport);
     await act(async () => window.dispatchEvent(new Event("pagehide")));
+    expect(host.querySelector<HTMLElement>(".timeline__virtual")!.style.minHeight).toBe("");
     scrollWrites.length = 0;
     await replayFrames(hiddenFrames);
     await contentResize();

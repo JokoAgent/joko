@@ -778,6 +778,8 @@ import type {
   RemoteWorkspaceView,
   ScheduleView,
   ScheduleDraft,
+  ScheduleHookSourceView,
+  ScheduleHookPreparationView,
   ScheduleHistoryPageView,
   ScheduleDeletionResultView,
   ScheduleGeneratedSessionDispositionView,
@@ -3303,6 +3305,43 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async removeProjectSchedule(scheduleId: string, keepPersonalCopy: boolean): Promise<void> {
     await this.submit({ case: "removeProjectSchedule", value: { scheduleId, keepPersonalCopy } }, true);
+  }
+
+  async prepareScheduleHook(scheduleId: string | undefined, draft: ScheduleDraft, source: ScheduleHookSourceView, signal?: AbortSignal, operationId = randomUuid()): Promise<ScheduleHookPreparationView> {
+    const transport = this.requireTransport(), lifetime = this.#abort;
+    const response = await createClient(SchedulerService, transport).prepareScheduleHook({
+      operationId, context: scheduleHookContext(scheduleId, draft), currentHook: protoScheduleHook(draft.preRunHook),
+      source: source.kind === "readCurrent" ? { case: "readCurrent", value: true } : { case: source.kind, value: source.value }
+    }, { signal: signal && lifetime ? AbortSignal.any([signal, lifetime.signal]) : signal ?? lifetime?.signal });
+    signal?.throwIfAborted(); lifetime?.signal.throwIfAborted();
+    if (transport !== this.requireTransport() || !response.hook) throw new GatewayError("Schedule hook owner changed.");
+    return { hook: { command: response.hook.command, filePath: response.hook.filePath,
+      ...(response.hook.timeout ? { timeoutMs: Math.round(durationSeconds(response.hook.timeout) * 1000) } : {}) },
+      content: response.content, ...(response.test ? { test: schedulePreRunResult(response.test) } : {}) };
+  }
+
+  async testScheduleHook(scheduleId: string | undefined, draft: ScheduleDraft, signal?: AbortSignal, operationId = randomUuid()): Promise<import("./model.js").SchedulePreRunResultView> {
+    const transport = this.requireTransport(), lifetime = this.#abort;
+    const response = await createClient(SchedulerService, transport).testScheduleHook({ operationId, context: scheduleHookContext(scheduleId, draft), hook: protoScheduleHook(draft.preRunHook) },
+      { signal: signal && lifetime ? AbortSignal.any([signal, lifetime.signal]) : signal ?? lifetime?.signal });
+    signal?.throwIfAborted(); lifetime?.signal.throwIfAborted();
+    if (transport !== this.requireTransport() || !response.result) throw new GatewayError("Schedule hook owner changed.");
+    return schedulePreRunResult(response.result);
+  }
+
+  async getScheduleHookOperation(operationId: string, signal?: AbortSignal): Promise<import("./model.js").ScheduleHookOperationView> {
+    const transport = this.requireTransport(), lifetime = this.#abort;
+    const response = await createClient(SchedulerService, transport).getScheduleHookOperation({ operationId },
+      { signal: signal && lifetime ? AbortSignal.any([signal, lifetime.signal]) : signal ?? lifetime?.signal });
+    signal?.throwIfAborted(); lifetime?.signal.throwIfAborted();
+    if (transport !== this.requireTransport() || !response.operation) throw new GatewayError("Schedule hook owner changed.");
+    return { state: response.operation.state === OperationState.SUCCEEDED ? "completed" : response.operation.state === OperationState.FAILED ? "failed" : "running",
+      ...(response.operation.error?.message ? { error: response.operation.error.message } : {}),
+      ...(response.result.case === "test" && response.result.value.result ? { test: schedulePreRunResult(response.result.value.result) } : {}),
+      ...(response.result.case === "preparation" && response.result.value.hook ? { preparation: {
+        hook: { command: response.result.value.hook.command, filePath: response.result.value.hook.filePath,
+          ...(response.result.value.hook.timeout ? { timeoutMs: Math.round(durationSeconds(response.result.value.hook.timeout) * 1000) } : {}) },
+        content: response.result.value.content, ...(response.result.value.test ? { test: schedulePreRunResult(response.result.value.test) } : {}) } } : {}) };
   }
 
   async saveSchedule(scheduleId: string | undefined, draft: ScheduleDraft): Promise<void> {
@@ -14688,6 +14727,11 @@ function mapWorkspaceDiff(diff: WorkspaceDiff): WorkspaceDiffView {
     ...(diff.requestedBaseRef === undefined ? {} : { requestedBaseRef: diff.requestedBaseRef }),
     ...(diff.resolvedBaseRef === undefined ? {} : { resolvedBaseRef: diff.resolvedBaseRef }),
     ...(branchBaseWarning === undefined ? {} : { branchBaseWarning }),
+    ...(diff.pushTarget === undefined ? {} : { pushTarget: {
+      remote: diff.pushTarget.remote,
+      remoteRef: diff.pushTarget.remoteRef,
+      hasUpstream: diff.pushTarget.hasUpstream
+    } }),
     ...(diff.baseRevision === undefined ? {} : { baseRevision: diff.baseRevision }),
     ...(diff.headRevision === undefined ? {} : { headRevision: diff.headRevision }),
     ...(diff.mergeBaseRevision === undefined ? {} : { mergeBaseRevision: diff.mergeBaseRevision }),
@@ -14884,6 +14928,16 @@ function scheduleRunMoney(value: import("@joko/contracts").ScheduleRunMoney): im
     kind: value.kind,
     estimateReasons: [...value.estimateReasons]
   };
+}
+
+function scheduleHookContext(scheduleId: string | undefined, draft: ScheduleDraft): import("@joko/contracts").ScheduleHookContext {
+  return { $typeName: "joko.v1.ScheduleHookContext", targetId: draft.targetId, backendId: draft.backendId,
+    scheduleId: scheduleId ?? "", sessionId: draft.sessionMode === "bound" ? draft.sessionId : "", scheduleName: draft.name,
+    ...(draft.providerId && draft.modelId ? { model: { $typeName: "joko.v1.ModelKey", providerId: draft.providerId, modelId: draft.modelId } } : {}) };
+}
+function protoScheduleHook(hook: ScheduleView["preRunHook"]): import("@joko/contracts").SchedulePreRunHook | undefined {
+  return hook ? { $typeName: "joko.v1.SchedulePreRunHook", command: hook.command, filePath: hook.filePath,
+    ...(hook.timeoutMs === undefined ? {} : { timeout: { $typeName: "google.protobuf.Duration", ...durationFromMs(hook.timeoutMs) } }) } : undefined;
 }
 
 function schedulePreRunResult(
@@ -19705,7 +19759,7 @@ function isUncertainOperationSubmissionError(error: unknown): boolean {
   while (candidate instanceof Error && !seen.has(candidate)) {
     if (
       candidate instanceof ConnectError
-      && [Code.Unavailable, Code.DeadlineExceeded, Code.Aborted].includes(candidate.code)
+      && [Code.Unavailable, Code.DeadlineExceeded].includes(candidate.code)
     ) return true;
     seen.add(candidate);
     candidate = candidate.cause;

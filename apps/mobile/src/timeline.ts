@@ -72,6 +72,8 @@ export interface TimelineRow {
   readonly internalInput?: boolean;
   /** Original public input for copy/share; visual folding and pasted-text previews do not rewrite it. */
   readonly sourceText?: string;
+  /** Public copy projection; attachment names retain image-then-file ordering. */
+  readonly copySource?: { readonly body: string; readonly secondaryBody?: string; readonly attachmentNames: readonly string[] };
   readonly automationOrigin?: { readonly scheduleId: string; readonly scheduleName?: string; readonly runId?: string };
   readonly partnerPrivateOrigin?: PartnerPrivateMessageOrigin;
   /** A durable Run outcome, distinct from a completed message segment. */
@@ -130,6 +132,8 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
           : undefined;
         if (message.role === MessageRole.USER && message.userInputAccepted) acceptedUserInputs.add(message.messageId);
         const images = mobileTimelineGalleryPages(event).map(mobileImageGalleryPageSummary);
+        const copyBody = inputText === undefined ? undefined : message.userInput?.quotesEncoded
+          ? mobileVisibleSelectionQuoteText(inputText, []) ?? inputText : inputText;
         byId.set(message.messageId, { id: message.messageId, label: message.role === MessageRole.USER && message.sharedTaskAuthor
           && message.sharedTaskAuthor?.sessionId === event.identity?.sessionId && message.sharedTaskAuthor.displayName
           ? message.sharedTaskAuthor.displayName : roleLabel(message.role),
@@ -140,6 +144,10 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
           }),
           ...(inputText === undefined ? {} : { sourceText: message.userInput?.quotesEncoded
             ? mobileVisibleSelectionQuoteText(inputText, []) ?? inputText : inputText }),
+          ...(copyBody === undefined ? {} : { copySource: { body: copyBody, attachmentNames: [
+            ...(message.userInput?.parts.flatMap(part => part.content.case === "image" ? [part.content.value.blob?.fileName] : []) ?? []),
+            ...(message.userInput?.parts.flatMap(part => part.content.case === "file" ? [part.content.value.fileName] : []) ?? [])
+          ].filter((name): name is string => !!name) } }),
           ...(automation === undefined ? {} : { automationOrigin: automation }),
           ...(message.partnerPrivateOrigin === undefined ? {} : { partnerPrivateOrigin: message.partnerPrivateOrigin }),
           ...(collaboration === undefined ? {} : { collaboration }),
@@ -172,6 +180,13 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
         const acceptedInput = message.role === MessageRole.USER && acceptedUserInputs.has(message.messageId)
           ? previous?.text
           : undefined;
+        const copySource = previous?.copySource ?? (message.role === MessageRole.USER ? {
+          body: message.blocks.flatMap(block => block.content.case === "text" ? [block.content.value] : []).join("\n"),
+          attachmentNames: [
+            ...message.blocks.flatMap(block => block.content.case === "image" ? [block.content.value.blob?.fileName] : []),
+            ...message.blocks.flatMap(block => block.content.case === "artifact" ? [block.content.value.blob?.fileName] : [])
+          ].filter((name): name is string => !!name)
+        } : undefined);
         const quoteText = message.role === MessageRole.ASSISTANT && message.blocks.length > 0
           && message.blocks.every((block) => block.content.case === "text")
           ? mobileObjectiveDisplayText(message.blocks.map((block) => block.content.case === "text" ? block.content.value : "").join("\n"))
@@ -191,6 +206,7 @@ export function timelineRows(events: readonly Event[], sessionStreaming = false,
           ...(message.role !== MessageRole.ASSISTANT || message.learning === undefined ? {} : { learning: projectPartnerLearningFeedback(message.learning) }),
           ...(previous?.internalInput === undefined ? {} : { internalInput: previous.internalInput }),
           ...(previous?.sourceText === undefined ? {} : { sourceText: previous.sourceText }),
+          ...(copySource === undefined ? {} : { copySource }),
           ...(previous?.automationOrigin === undefined ? {} : { automationOrigin: previous.automationOrigin }),
           ...(previous?.collaboration === undefined ? {} : { collaboration: previous.collaboration }),
           ...(previous?.taskMessageOrigin === undefined ? {} : { taskMessageOrigin: previous.taskMessageOrigin }),

@@ -13,6 +13,8 @@ import { OrchestratorE2eFixture } from "./fixture.js";
 it("uses authenticated single-use passphrase uploads and current Host authority through the SSH HTTP service", async () => {
   let identityDirectory = "";
   let agentInputCount = 0;
+  let loadedPublicKey = "";
+  const secret = "temporary key passphrase";
   const fixture = await OrchestratorE2eFixture.start({ createAuxiliaryServices: async (store, dataDirectory) => {
     identityDirectory = join(dataDirectory, "node-identity");
     await mkdir(identityDirectory, { mode: 0o700 });
@@ -22,8 +24,20 @@ it("uses authenticated single-use passphrase uploads and current Host authority 
     await credentials.initialize();
     return { credentials, remoteHosts: new RemoteHostRegistry({ store, ownerId: "orchestrator-e2e" }),
       sshKeys: new SshKeyManager({ directory: identityDirectory, agentCommand: async (args, input) => {
-        if (args[0] === "-") { expect(input?.toString()).toContain("PRIVATE KEY"); agentInputCount++; return { code: 0, stdout: "" }; }
-        return { code: 1, stdout: "The agent has no identities." };
+        if (args[0] === "-L") {
+          expect(input).toBeUndefined();
+          return loadedPublicKey === "" ? { code: 1, stdout: "The agent has no identities." } : { code: 0, stdout: loadedPublicKey };
+        }
+        if (process.platform === "darwin") {
+          expect(args).toEqual(["--apple-use-keychain", "-k", join(identityDirectory, "id_joko")]);
+          expect(input?.toString()).toBe(`${secret}\n`);
+          loadedPublicKey = await readFile(join(identityDirectory, "id_joko.pub"), "utf8");
+        } else {
+          expect(args).toEqual(["-"]);
+          expect(input?.toString()).toContain("PRIVATE KEY");
+        }
+        agentInputCount++;
+        return { code: 0, stdout: "" };
       } }) };
   } });
   try {
@@ -36,7 +50,6 @@ it("uses authenticated single-use passphrase uploads and current Host authority 
     await expect(client().listSshKeys({})).rejects.toMatchObject({ code: Code.Unauthenticated });
     expect(await api.listSshKeys({})).toMatchObject({ keys: [], agentState: SshAgentState.READY });
     const ticket = (await api.beginSshKeyPassphraseUpload({ purpose: SshKeyPassphrasePurpose.GENERATE })).ticket!;
-    const secret = "temporary key passphrase";
     const upload = (authKey: string, value: string) => fetch(new URL(ticket.relativeEndpoint, fixture.baseUrl), {
       method: "PUT", headers: { authorization: `Bearer ${authKey}`, "content-type": "application/octet-stream" }, body: Buffer.from(value)
     });
@@ -88,7 +101,8 @@ it("uses authenticated single-use passphrase uploads and current Host authority 
     fixture.application.connections.revoke(first.connectionId);
     await expect(api.readSshPublicKey({ keyId: key.id, expectedFingerprint: key.sha256Fingerprint })).rejects.toMatchObject({ code: Code.Unauthenticated });
     expect(await readFile(join(identityDirectory, key.id), "utf8")).not.toContain(secret);
-    expect(JSON.stringify(fixture.application.store.listSettings())).not.toContain(secret);
+    expect(JSON.stringify(fixture.application.store.listSettings(),
+      (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)).not.toContain(secret);
   } finally { await fixture.close(); }
 }, 60_000);
 

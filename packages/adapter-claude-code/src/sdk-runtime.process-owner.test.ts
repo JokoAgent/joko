@@ -127,13 +127,27 @@ describe("Claude SDK owned custom spawn", () => {
     const result = await runtime.probe({
       cwd: process.cwd(),
       env: {},
-      pathToClaudeCodeExecutable: "D:\\custom\\claude.exe",
+      pathToClaudeCodeExecutable: process.execPath,
       settings: { apiKeyHelper: "" },
       settingSources: [],
       initializationTimeoutMs: 500
     });
     expect(result).toEqual(expect.objectContaining({ installed: true }));
     expect(result.cliVersion).toBeUndefined();
+  });
+
+  it("reports an absent configured executable without entering native SDK startup", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-claude-missing-probe-"));
+    roots.push(root);
+    const runtime = new DefaultClaudeSdkRuntime();
+    const callsBefore = sdk.startup.mock.calls.length;
+    const result = await runtime.probe({ cwd: root, env: {},
+      pathToClaudeCodeExecutable: join(root, "missing-cli"), settings: { apiKeyHelper: "" },
+      settingSources: ["user", "project", "local"], initializationTimeoutMs: 500 });
+    expect(result).toMatchObject({ installed: true, diagnostic: "The configured native CLI executable is unavailable." });
+    expect(result.initialization).toBeUndefined();
+    expect(sdk.startup.mock.calls).toHaveLength(callsBefore);
+    await runtime.closeSessionOperations();
   });
 
   it("confirms only the selected Query's exact process lease and does not retire a concurrent Query", async () => {

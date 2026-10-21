@@ -132,6 +132,20 @@ export async function sendDesktopBootstrapResponse(
   }
 }
 
+/** Exchange readiness and the parent's durable persistence commit. */
+export async function exchangeDesktopBootstrapCommit(
+  lease: Pick<ReceivedDesktopBootstrapRequest, "receiveCommit">,
+  output: Writable,
+  response: DesktopBootstrapResponse
+): Promise<DesktopBootstrapCommit> {
+  // The parent may reply before the readiness write callback completes.
+  const commit = lease.receiveCommit();
+  // Keep an early rejection handled while the response is still being written.
+  void commit.catch(() => undefined);
+  await sendDesktopBootstrapResponse(output, response);
+  return commit;
+}
+
 /** Write the final commit confirmation and close the dedicated output pipe. */
 export async function sendDesktopBootstrapCommitted(
   output: Writable,

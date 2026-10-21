@@ -1,6 +1,6 @@
 .messaging-settings {
   display: grid;
-  gap: 24px;
+  gap: var(--settings-section-gap);
   min-width: 0;
 }
 
@@ -28,6 +28,10 @@
 .messaging-empty h3 {
   margin: 0;
 }
+.messaging-settings__hero h2 { font-size: var(--text-16); font-weight: 500; line-height: 1.2; }
+.messaging-settings__hero p { font-size: var(--text-13); line-height: 1.5; }
+.messaging-section-heading h3, .messaging-route-overview h3 { margin: 0; font-size: var(--text-13); font-weight: 500; line-height: 1.4; }
+.messaging-section-heading p, .messaging-route-overview p { font-size: var(--text-12); line-height: 1.4; }
 
 .messaging-settings__hero p,
 .messaging-section-heading p,
@@ -112,9 +116,9 @@
 .messaging-route-overview,
 .messaging-connection-card,
 .messaging-empty {
-  padding: 18px;
+  padding: var(--settings-card-padding);
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 12px;
   background: var(--surface-raised);
 }
 

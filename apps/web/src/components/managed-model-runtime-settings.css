@@ -7,12 +7,12 @@
 .managed-model-runtime-card__identity p { margin-top: 3px; color: var(--text-soft); font-size: var(--text-12); }
 .managed-model-runtime-card__icon { width: 38px; height: 38px; display: grid; place-items: center; flex: 0 0 auto; border-radius: 12px; background: var(--accent-soft); color: var(--accent-strong); }
 .managed-model-runtime-card__icon svg { width: 19px; height: 19px; }
-.managed-model-runtime-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 14px 18px 0; border: 1px solid color-mix(in srgb, var(--danger) 36%, var(--line)); border-radius: 10px; padding: 8px 10px 8px 12px; background: color-mix(in srgb, var(--danger) 8%, var(--surface-raised)); color: var(--danger); font-size: var(--text-12); }
+.managed-model-runtime-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 14px 18px 0; border: 1px solid color-mix(in srgb, var(--red) 36%, var(--line)); border-radius: 10px; padding: 8px 10px 8px 12px; background: color-mix(in srgb, var(--red) 8%, var(--surface-raised)); color: var(--red); font-size: var(--text-12); }
 .managed-model-runtime-onboarding, .managed-model-runtime-start { display: grid; gap: 12px; padding: 18px; }
 .managed-model-runtime-onboarding p, .managed-model-runtime-start p { margin: 0; color: var(--text-soft); line-height: 1.5; }
 .managed-model-runtime-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .managed-model-runtime-spinner { width: 15px; height: 15px; animation: managed-model-runtime-spin .8s linear infinite; }
-.managed-model-runtime-warning { color: var(--danger) !important; }
+.managed-model-runtime-warning { color: var(--red) !important; }
 .managed-model-runtime-catalog, .managed-model-runtime-manual, .managed-model-runtime-installed { display: grid; gap: 12px; padding: 18px; border-top: 1px solid var(--line); }
 .managed-model-runtime-section-heading { display: grid; gap: 3px; }
 .managed-model-runtime-section-heading strong { font-size: var(--text-13); }
@@ -29,7 +29,7 @@
 .managed-model-runtime-model-title > strong { font-size: var(--text-14); }
 .managed-model-runtime-model-card__top span, .managed-model-runtime-model-card__top small { overflow-wrap: anywhere; color: var(--text-soft); font-size: var(--text-11); }
 .managed-model-runtime-installed-label { display: inline-flex; align-items: center; gap: 5px; color: var(--text-soft); font-size: var(--text-12); white-space: nowrap; }
-.managed-model-runtime-installed-label svg { width: 14px; height: 14px; color: var(--success); }
+.managed-model-runtime-installed-label svg { width: 14px; height: 14px; color: var(--green); }
 .managed-model-runtime-transfer-actions { display: flex; gap: 3px; }
 .managed-model-runtime-transfer-actions svg { width: 14px; height: 14px; }
 .managed-model-runtime-meter { display: grid; gap: 6px; }
@@ -37,7 +37,7 @@
 .managed-model-runtime-meter__track { height: 5px; overflow: hidden; border-radius: 999px; background: var(--surface-sunken); }
 .managed-model-runtime-meter__track > span { height: 100%; display: block; min-width: 4px; border-radius: inherit; background: var(--accent); transition: width .2s ease; }
 .managed-model-runtime-meter.is-paused .managed-model-runtime-meter__track > span { background: var(--text-faint); }
-.managed-model-runtime-meter.is-error .managed-model-runtime-meter__track > span { background: var(--danger); }
+.managed-model-runtime-meter.is-error .managed-model-runtime-meter__track > span { background: var(--red); }
 .managed-model-runtime-more { border-top: 1px solid var(--line); padding: 0 18px 18px; }
 .managed-model-runtime-more summary { display: flex; align-items: center; gap: 7px; padding: 14px 0; color: var(--text-soft); cursor: pointer; font-size: var(--text-12); font-weight: 600; }
 .managed-model-runtime-more summary span { min-width: 21px; border-radius: 999px; padding: 2px 6px; background: var(--surface-sunken); text-align: center; font-size: var(--text-10); }
@@ -51,7 +51,7 @@
 .managed-model-runtime-installed-list { display: grid; gap: 1px; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; background: var(--line); }
 .managed-model-runtime-installed-list > article { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 12px; background: var(--surface-subtle); }
 .managed-model-runtime-installed-name { min-width: 0; display: flex; align-items: center; gap: 9px; }
-.managed-model-runtime-installed-name > svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--success); }
+.managed-model-runtime-installed-name > svg { width: 16px; height: 16px; flex: 0 0 auto; color: var(--green); }
 .managed-model-runtime-installed-name span { min-width: 0; display: grid; gap: 2px; }
 .managed-model-runtime-installed-name strong, .managed-model-runtime-installed-name small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .managed-model-runtime-installed-name small { color: var(--text-soft); font-family: var(--app-font-code, monospace); font-size: var(--text-10); }
@@ -68,7 +68,7 @@
 .managed-model-runtime-context p { margin: 0; line-height: 1.5; }
 .managed-model-runtime-context__field { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .managed-model-runtime-context__field input { min-height: 44px; width: 95px; border: 1px solid var(--line); border-radius: 9px; padding: 0 10px; color: var(--text); background: var(--surface-raised); }
-.managed-model-runtime-context__field input[aria-invalid=true] { border-color: var(--danger); }
+.managed-model-runtime-context__field input[aria-invalid=true] { border-color: var(--red); }
 .managed-model-runtime-card button, .managed-model-runtime-manual input, .managed-model-runtime-search { min-height: 44px; }
 @keyframes managed-model-runtime-spin { to { transform: rotate(360deg); } }
 @media (max-width: 720px) {

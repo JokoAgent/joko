@@ -146,7 +146,7 @@ export class SimulatorScreenObservationCoordinator {
       lastScreenMap = screenMap;
       const current = fingerprint(screenMap);
       const now = Date.now();
-      if (now > deadline) return timeout();
+      if (now >= deadline) return timeout();
       if (current !== previous) { previous = current; stableSince = now; }
       const matched = condition.kind === "screen_changed" ? current !== baseline
         : condition.kind === "screen_stable" ? now - stableSince >= stableForMs

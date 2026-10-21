@@ -12,9 +12,9 @@ import { loadConfig } from "./config.js";
 import {
   DESKTOP_BOOTSTRAP_REQUEST_FD,
   DESKTOP_BOOTSTRAP_RESPONSE_FD,
+  exchangeDesktopBootstrapCommit,
   receiveDesktopBootstrapRequest,
   sendDesktopBootstrapCommitted,
-  sendDesktopBootstrapResponse,
   type ReceivedDesktopBootstrapRequest
 } from "./desktop-bootstrap-pipe.js";
 import { needsLocalPairingRecovery } from "./local-pairing-recovery.js";
@@ -119,8 +119,7 @@ async function main(): Promise<void> {
         origin: config.publicOrigin,
         issueConnection: (input) => application.connections.issueTrustedDesktopConnection(input)
       });
-      await sendDesktopBootstrapResponse(bootstrap.responsePipe, response);
-      const commit = await bootstrap.lease.receiveCommit();
+      const commit = await exchangeDesktopBootstrapCommit(bootstrap.lease, bootstrap.responsePipe, response);
       const committed = bootstrap.grant.confirmCommit(commit);
       application.connections.confirmTrustedDesktopConnection(response.connectionId, response.authKey);
       // Desktop has durably stored the normal Connection. A confirmation write

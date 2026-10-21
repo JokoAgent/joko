@@ -70,6 +70,30 @@ function fixture(platform = "win32", temporary = false, portal = false, systemAu
 async function flush(): Promise<void> { for (let i = 0; i < 16; i++) await Promise.resolve(); }
 
 describe("Desktop viewer presentation adapter", () => {
+  it("defers initial control until the shown viewer gains focus and preserves a later user release", async () => {
+    vi.mocked(document.hasFocus).mockReturnValue(false);
+    const f = fixture(); await flush(); f.post({ type: "framePresented" }); await flush();
+    expect(f.inputCalls.filter(call => call.name === "setRemoteDesktopControl")).toHaveLength(0);
+    vi.mocked(document.hasFocus).mockReturnValue(true);
+    window.dispatchEvent(new Event("focus")); await flush();
+    expect(f.controller.snapshot).toMatchObject({ ready: true, controlling: true });
+    expect(f.inputCalls.filter(call => call.name === "setRemoteDesktopControl")).toHaveLength(1);
+    await f.controller.control(false);
+    f.controller.focusLost(); window.dispatchEvent(new Event("focus")); await flush();
+    expect(f.controller.snapshot.controlling).toBe(false);
+    expect(f.inputCalls.filter(call => call.name === "setRemoteDesktopControl")).toHaveLength(2);
+  });
+
+  it("retires deferred initial control when its viewer binding becomes inactive", async () => {
+    vi.mocked(document.hasFocus).mockReturnValue(false);
+    const f = fixture(); await flush();
+    f.scope({ ...SCOPE, active: false, generation: 2 }); await flush();
+    vi.mocked(document.hasFocus).mockReturnValue(true);
+    window.dispatchEvent(new Event("focus")); await flush();
+    expect(f.inputCalls.filter(call => call.name === "setRemoteDesktopControl")).toHaveLength(0);
+    expect(f.controller.snapshot).toMatchObject({ status: "inactive", controlling: false });
+  });
+
   it("readies an exact null-target shell without constructing a client or running target effects", async () => {
     const unbound = { ...SCOPE, generation: 0, target: null, active: false };
     const f = fixture("darwin", false, false, false, Promise.resolve(unbound));

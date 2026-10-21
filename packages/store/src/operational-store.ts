@@ -22935,10 +22935,13 @@ function assertMessagingSessionMatchesRoute(
   expectedPermissionMode: MessagingRouteRecord["permissionMode"]
 ): void {
   const descriptor = session.descriptor;
+  // Unspecified model axes delegate to Backend defaults; the binding persists
+  // the Session's resolved values while every explicitly selected axis stays exact.
   if (
     descriptor.targetId !== route.targetId || descriptor.backendId !== route.backendId ||
-    descriptor.providerId !== route.providerId || descriptor.modelId !== route.modelId ||
-    descriptor.effort !== route.effort || descriptor.fastMode !== route.fastMode ||
+    (route.providerId !== undefined && descriptor.providerId !== route.providerId) ||
+    (route.modelId !== undefined && descriptor.modelId !== route.modelId) ||
+    (route.effort !== undefined && descriptor.effort !== route.effort) || descriptor.fastMode !== route.fastMode ||
     descriptor.permissionMode !== expectedPermissionMode || descriptor.planMode !== route.planMode
   ) {
     throw new StoreError("Messaging Session does not match the selected creation-time route snapshot.");

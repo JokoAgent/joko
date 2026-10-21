@@ -380,7 +380,7 @@ export function reportTemplateCss(theme: DocsTheme): string {
 html, body { margin: 0; padding: 0; }
 body {
   color: var(--body); background: var(--paper);
-  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+  font-family: "Hiragino Sans GB", "Microsoft YaHei", "PingFang SC",
     -apple-system, "Helvetica Neue", Arial, sans-serif;
   font-size: 11pt; line-height: 1.7;
   -webkit-print-color-adjust: exact; print-color-adjust: exact;

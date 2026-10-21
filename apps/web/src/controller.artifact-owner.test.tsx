@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 
 import { useAppController, type AppController } from "./controller.js";
-import { createOrchestratorGateway, probeOrchestratorOrigin, type OrchestratorGateway } from "./gateway.js";
+import { createOrchestratorGateway, discoverOrchestratorNodesAt, probeOrchestratorOrigin, type OrchestratorGateway } from "./gateway.js";
 import { DEFAULT_UI_PREFERENCES, LocalState, type UiPreferences, type UiPreferencesMutation } from "./local-state.js";
 import { emptySnapshot, type AppSnapshot, type BrowserSettingsView, type SessionView, type TimelineItemView, type ConnectionProfile } from "./model.js";
 import { registerWorkspaceHtmlPreviewSurface } from "./workspace-html-auto-reload.js";
@@ -30,6 +30,49 @@ afterEach(async () => {
   document.body.replaceChildren();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+it("retires anonymous discovery when an explicit connection begins and rejects its late completion", async () => {
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  vi.mocked(persistentWebSecretEncryptionAvailable).mockResolvedValue(false);
+  vi.spyOn(LocalState, "open").mockResolvedValue({
+    listProfiles: async () => [], listMachineCaches: async () => [],
+    readPreferences: async () => ({ ...DEFAULT_UI_PREFERENCES, machineSelection: ["unselected-profile"] }),
+    readAuthKey: async () => "test-key", saveProfile: async () => undefined, saveMachineCache: async () => undefined
+  } as unknown as LocalState);
+  const signals: AbortSignal[] = [];
+  let releaseDiscovery!: (value: Awaited<ReturnType<typeof discoverOrchestratorNodesAt>>) => void;
+  const discovery = new Promise<Awaited<ReturnType<typeof discoverOrchestratorNodesAt>>>(resolve => { releaseDiscovery = resolve; });
+  vi.mocked(discoverOrchestratorNodesAt).mockImplementation(async (_origin, signal) => {
+    if (signal !== undefined) signals.push(signal);
+    return discovery;
+  });
+  const owner = profile("discovery-owner");
+  let releaseProbe!: (value: Awaited<ReturnType<typeof probeOrchestratorOrigin>>) => void;
+  vi.mocked(probeOrchestratorOrigin).mockImplementation(() => new Promise(resolve => { releaseProbe = resolve; }));
+  vi.mocked(createOrchestratorGateway).mockImplementation((_profile, _key, callbacks) => ({
+    connect: async () => { callbacks.onState?.("connected"); callbacks.onSnapshot?.(emptySnapshot()); },
+    disconnect: vi.fn(), taskSharingApi: () => undefined
+  } as unknown as OrchestratorGateway));
+  let current!: AppController;
+  function Probe(): null { current = useAppController(); return null; }
+  root = createRoot(document.body.appendChild(document.createElement("div")));
+  await act(async () => root!.render(<Probe />));
+  expect(signals.length).toBeGreaterThan(0);
+  let connecting!: Promise<void>;
+  await act(async () => { connecting = current.connect(owner); await Promise.resolve(); });
+  try {
+    expect(signals.every(signal => signal.aborted)).toBe(true);
+    expect(current.state.discoveryState).toBe("idle");
+  } finally {
+    await act(async () => {
+      releaseDiscovery([]);
+      releaseProbe({ serverId: owner.serverId, displayName: owner.name, version: "1", apiVersion: "1", pairingEnabled: false });
+      await connecting;
+    });
+  }
+  expect(current.state.connectionState).toBe("connected");
+  expect(current.state.discoveryState).toBe("idle");
 });
 
 it("keeps resource and auxiliary operations bound to the controller snapshot's gateway", async () => {
@@ -167,11 +210,20 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
         callbacks.onState?.("connected"); callbacks.onSnapshot?.(browserSnapshot);
       },
       disconnect: () => { disposed = true; live.clear(); },
+      taskSharingApi: () => undefined,
       ...inputOperations, ...workspaceOperations, ...voiceOperations, ...queueOperations, ...remoteOperations, ...loginOperations, ...sshOperations,
       watchRemoteHosts: async function* () { if (disposed) throw new Error("Remote workspace owner disconnected"); yield []; },
       readWorkspaceFile: read, readWorkspaceHtmlSnapshot, performBrowserTakeoverAction, getArtifactUrl: get, releaseArtifactUrl: release,
       navigateSessionBranch: navigate, copyArtifactFile: download, openArtifactFile: download, openArtifactFileWithApplication: download, downloadArtifact: download, exportSession: download, exportPortableSession: download,
-      updateAuxiliaryTextSettings: save, predictNextPrompt: predict, openBrowserPage
+      updateAuxiliaryTextSettings: save, predictNextPrompt: predict, openBrowserPage,
+      getMessagingSettings: async () => {
+        if (owner!.id === first.id) await pendingFirst;
+        return { connections: [], routes: [], channels: [] };
+      },
+      getCollaborationDirectory: async () => {
+        if (owner!.id === first.id) await pendingFirst;
+        return { available: true, revision: 1n, actor: { id: owner!.id, displayName: owner!.id }, scopes: [], recoveredFromCorruption: false };
+      }
     } as unknown as OrchestratorGateway;
   });
   let current!: AppController;
@@ -188,6 +240,14 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(current.releaseArtifactUrl).toBe(firstController.releaseArtifactUrl);
   expect(current.updateAuxiliaryTextSettings).toBe(firstController.updateAuxiliaryTextSettings);
   expect(current.predictNextPrompt).toBe(firstController.predictNextPrompt);
+  expect(current.getCollaborationDirectory).toBe(firstController.getCollaborationDirectory);
+  expect(current.getMessagingSettings).toBe(firstController.getMessagingSettings);
+  for (const method of ["listSkillMarketCatalog", "getSkillMarketEntry", "openSkillMarketPreview",
+    "listSkillMarketPreviewFiles", "readSkillMarketPreviewFile", "closeSkillMarketPreview", "listSkillMarketSources",
+    "getSkillPublicationPreview", "listSkillPublicationJobs", "getSkillPublicationJob", "listSkills", "openSkill",
+    "listSkillFiles", "readSkillFile", "getSkillDiff", "listSkillRecoveries", "closeSkill"] as const) {
+    expect(current[method]).toBe(firstController[method]);
+  }
   expect(current.downloadArtifact).toBe(firstController.downloadArtifact);
   expect(current.exportSession).toBe(firstController.exportSession);
   expect(current.exportPortableSession).toBe(firstController.exportPortableSession);
@@ -232,8 +292,22 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   const oldHtml = expect(firstController.openWorkspaceHtml("shared-session", "workspace", "index.html", { action: downloadContext })).rejects.toThrow("source is no longer current");
   const oldDownload = expect(firstController.downloadArtifact("shared", "same.txt", downloadContext)).rejects.toThrow("Download owner disconnected");
   const oldAcquisition = firstController.getArtifactUrl("shared").then((url) => { firstController.releaseArtifactUrl("shared"); return url; });
+  const oldDirectory = expect(firstController.getCollaborationDirectory(new AbortController().signal))
+    .rejects.toThrow("The collaboration connection is no longer current.");
+  const oldMessaging = expect(firstController.getMessagingSettings(new AbortController().signal))
+    .rejects.toThrow("The messaging connection is no longer current.");
   await act(async () => current.connect(second));
   const secondController = current;
+  expect(secondController.getCollaborationDirectory).not.toBe(firstController.getCollaborationDirectory);
+  expect(secondController.getMessagingSettings).not.toBe(firstController.getMessagingSettings);
+  await expect(firstController.getMessagingSettings()).rejects.toThrow("The messaging connection is no longer current.");
+  await expect(secondController.getMessagingSettings()).resolves.toMatchObject({ connections: [] });
+  expect(secondController.listSkillMarketCatalog).not.toBe(firstController.listSkillMarketCatalog);
+  await expect(firstController.listSkillMarketCatalog({})).rejects.toThrow("The Skill market connection is no longer current.");
+  expect(secondController.listSkills).not.toBe(firstController.listSkills);
+  await expect(firstController.listSkills()).rejects.toThrow("The Skill connection is no longer current.");
+  await expect(secondController.getCollaborationDirectory(new AbortController().signal))
+    .resolves.toMatchObject({ actor: { id: second.id } });
   expect(secondController.getPersonalizationPrompt()).toBe("Explain tradeoffs.");
   const queueArguments: { [Method in typeof queueMethods[number]]: Parameters<AppController[Method]> } = {
     cancelQueueItem: ["shared-item"],
@@ -434,6 +508,8 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
   expect(gateways.get(second.id)!.get).toHaveBeenCalledTimes(1);
   await act(async () => finishFirst());
   await oldBrowser;
+  await oldDirectory;
+  await oldMessaging;
   await oldHtml;
   expect(htmlCalls.get(first.id)).toHaveBeenCalledOnce();
   expect(htmlCalls.get(second.id)).not.toHaveBeenCalled();
@@ -613,7 +689,7 @@ it("retains a message deep-link target while connecting its saved machine", asyn
       callbacks.onState?.("connected");
       callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
     },
-    disconnect: vi.fn()
+    disconnect: vi.fn(), taskSharingApi: () => undefined
   } as unknown as OrchestratorGateway));
 
   let current!: AppController;
@@ -706,7 +782,7 @@ it("does not let a stale cross-machine task open replace a newer navigation occu
       callbacks.onState?.("connected");
       callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
     },
-    disconnect: vi.fn()
+    disconnect: vi.fn(), taskSharingApi: () => undefined
   } as unknown as OrchestratorGateway));
 
   let current!: AppController;

@@ -368,7 +368,7 @@ describe("Orchestrator application composition", () => {
     }
   }, 20_000);
 
-  it("composes a private dictionary peer identity, preserves its sole dictionary owner across restart, and closes its transport before SQLite", async () => {
+  it("composes a private dictionary peer identity, preserves its sole dictionary owner across restart, and closes its peer manager before SQLite", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-application-dictionary-peers-"));
     const workspace = join(root, "workspace");
     const dataDirectory = join(root, "data");
@@ -378,6 +378,7 @@ describe("Orchestrator application composition", () => {
       publicOrigin: "http://127.0.0.1:4328", internalOrigin: "http://127.0.0.1:4327",
       dataDirectory, databasePath: join(dataDirectory, "orchestrator.db"),
       allowInsecureLoopback: true, allowInsecureLan: false, lanDiscoveryEnabled: false,
+      voiceDictionaryLanDiscoveryEnabled: false,
       codexExecutable: join(root, "missing-codex"), piAgentHome: join(dataDirectory, "pi"),
       workspace: { id: "workspace-dictionary-peers", root: workspace, displayName: "Dictionary", trusted: true },
       artifactDirectory: join(dataDirectory, "artifacts"), webDirectory: join(root, "no-web-build"), corsOrigins: []

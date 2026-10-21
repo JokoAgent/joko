@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -59,6 +59,7 @@ import { ControlledClaudeRuntime } from "./controlled-claude-runtime.js";
 import { ControlledPiProcessFactory } from "./controlled-pi-process.js";
 import { AuthenticationPiProcessFactory } from "./auth-pi-process.js";
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
+import { nativeRunTimeoutMs } from "./test-deadlines.js";
 import {
   createSessionMutation,
   queueRunIdFrom,
@@ -354,8 +355,9 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
     const codexSessionId = sessions.get("codex-paired")!;
     const codexThreadId = fixture.application.store.getSession(codexSessionId).descriptor.binding.nativeSessionId;
     if (codexThreadId === undefined) throw new Error("Codex task has no native thread.");
-    await waitFor(async () => codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
-      (dispatched) => dispatched, "paired Codex dispatch");
+    await withNativeDispatchFailureState(waitFor(
+      async () => codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
+      (dispatched) => dispatched, "paired Codex dispatch"), fixture, codex, codexSessionId, codexRunId);
     await waitFor(async () => claude.queries.some((query) => query.receivedInputs.length > 0),
       (dispatched) => dispatched, "paired Claude dispatch");
     const approval = codex.requestCommandApproval(codexThreadId, "turn-1");
@@ -416,6 +418,13 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
       JSON.stringify(event.payload).includes("Claude still isolated"))).toBe(false);
 
     const reviewSourceId = sessions.get("claude-paired")!;
+    // Run completion precedes the asynchronous workspace change-set capture.
+    // Review must start from that settled evidence, not race its publication.
+    await waitFor(() => paired.clients.workspace.listWorkspaceChangeSets({
+      workspaceId: "workspace-main", sessionId: reviewSourceId
+    }), (response) => response.changeSets.some((changeSet) =>
+      changeSet.runId === claudeSecondRunId && changeSet.completeBaseline),
+    "settled Claude review source change-set");
     const review = await submit(paired.clients.operation, paired.connectionId, create(OperationMutationSchema, {
       payload: { case: "startReview", value: create(StartReviewMutationSchema, {
         sourceSessionId: reviewSourceId,
@@ -424,7 +433,9 @@ it("runs Pi, Codex and Claude through one durable service without crossing Sessi
       }) }
     }));
     if (review.state !== OperationState.SUCCEEDED) {
-      throw new Error(`Paired Review failed: ${review.error?.code ?? "unknown"}: ${review.error?.message ?? "no detail"}`);
+      const failures = fixture.application.store.listReviewRunsBySource(reviewSourceId)
+        .map((run) => ({ state: run.state, failureCode: run.failureCode }));
+      throw new Error(`Paired Review failed: ${review.error?.code ?? "unknown"}: ${review.error?.message ?? "no detail"}; ${JSON.stringify(failures)}`);
     }
     if (review.result?.payload.case !== "reviewRun") throw new Error("Paired Review did not return a ReviewRun.");
     const reviewRunId = review.result.payload.value.reviewRunId;
@@ -470,7 +481,11 @@ it("resumes three native tasks through service restart and isolates one missing 
       return queueRunIdFrom(accepted);
     };
     const waitForRun = (clients: typeof paired.clients, runId: string, state: RunState) =>
-      waitFor(() => clients.run.getRun({ runId }), (value) => value.run?.state === state, `${runId} to reach ${state}`);
+      withNativeDispatchFailureState(
+        waitFor(() => clients.run.getRun({ runId }), (value) => value.run?.state === state,
+          `${runId} to reach ${state}`, nativeRunTimeoutMs),
+        fixture, undefined, fixture.application.store.getRun(runId).descriptor.sessionId, runId
+      );
 
     const firstRuns = new Map<string, string>();
     for (const backendId of ["pi", "codex-paired", "claude-paired"]) {
@@ -479,8 +494,10 @@ it("resumes three native tasks through service restart and isolates one missing 
     const codexSessionId = sessions.get("codex-paired")!;
     const firstCodexThreadId = fixture.application.store.getSession(codexSessionId).descriptor.binding.nativeSessionId;
     if (firstCodexThreadId === undefined) throw new Error("Restart fixture Codex task has no native thread.");
-    await waitFor(async () => setup.codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
-      (dispatched) => dispatched, "Codex dispatch before service restart");
+    await withNativeDispatchFailureState(waitFor(
+      async () => setup.codex.transport?.requests.some((request) => request.method === "turn/start") ?? false,
+      (dispatched) => dispatched, "Codex dispatch before service restart"),
+    fixture, setup.codex, codexSessionId, firstRuns.get("codex-paired")!);
     await waitFor(async () => setup.claude.queries.some((query) => query.receivedInputs.length === 1),
       (dispatched) => dispatched, "Claude dispatch before service restart");
     setup.claude.queries.at(-1)!.complete("Claude before restart answer");
@@ -718,11 +735,20 @@ it("replaces three native Backend instances independently and rejects a busy rep
     const waitForRun = (runId: string) => waitFor(
       () => paired.clients.run.getRun({ runId }),
       (value) => value.run?.state === RunState.SUCCEEDED,
-      `${runId} to complete`
+      `${runId} to complete`, nativeRunTimeoutMs
     );
     const codexSessionId = sessions.get("codex-paired")!;
     const codexThreadId = fixture.application.store.getSession(codexSessionId).descriptor.binding.nativeSessionId;
     if (codexThreadId === undefined) throw new Error("Replacement fixture Codex task has no native thread.");
+    const codexSideEffects = () => (setup.codex.transport?.requests ?? []).filter(request => {
+      if (request.options.mutation === true) return true;
+      if (request.method === "account/read") {
+        const params = request.params;
+        return typeof params !== "object" || params === null || Array.isArray(params)
+          || params["refreshToken"] !== false;
+      }
+      return !["account/rateLimits/read", "model/list", "thread/read", "thread/turns/list"].includes(request.method);
+    }).map(request => request.method);
 
     const initialRuns = new Map<(typeof backendIds)[number], string>();
     for (const backendId of backendIds) initialRuns.set(backendId, await send(backendId, `${backendId} before replacement`));
@@ -760,26 +786,37 @@ it("replaces three native Backend instances independently and rejects a busy rep
       fixture.application.store.getSession(sessions.get(backendId)!).descriptor.binding
     )] as const));
     const providerRequestsBeforeBusyRestart = setup.requests.length;
-    const codexRequestsBeforeBusyRestart = setup.codex.transport?.requests.length ?? 0;
+    const codexRequestsBeforeBusyRestart = codexSideEffects();
+    const accountReadsBeforeBusyRestart = setup.codex.transport?.requests
+      .filter(request => request.method === "account/read").length ?? 0;
     const claudeQueriesBeforeBusyRestart = setup.claude.queries.length;
     const lifecycleBeforeBusyRestart = setup.lifecycle.length;
     const failedRestartOperationId = randomUUID();
     const failedRestartMutation = restartBackendMutation("codex-paired");
-    const failedRestart = await submit(
-      paired.clients.operation,
-      paired.connectionId,
-      failedRestartMutation,
-      failedRestartOperationId
-    );
+    const codexAdapter = fixture.application.adapters.find(
+      adapter => adapter.id === "codex-paired"
+    ) as ReturnType<typeof createCodexAdapter>;
+    // Native observations may finish while the idle-only restart is rejected.
+    // Keep checking every mutation without treating those reads as restart effects.
+    const [failedRestart] = await Promise.all([
+      submit(paired.clients.operation, paired.connectionId, failedRestartMutation, failedRestartOperationId),
+      codexAdapter.readAccount()
+    ]);
+    expect(setup.codex.transport?.requests.filter(request => request.method === "account/read").length)
+      .toBeGreaterThan(accountReadsBeforeBusyRestart);
     expect(failedRestart.state).toBe(OperationState.FAILED);
-    expect(failedRestart.error?.message)
-      .toBe("A Backend can be replaced only after every native side effect has settled.");
+    // Dispatch can release its native call before this request arrives while the
+    // Run remains active. Both exact busy guards must leave the instance intact.
+    expect([
+      "A Backend can be replaced only after every native side effect has settled.",
+      "A Backend can be restarted only after every affected task has no active or queued work."
+    ]).toContain(failedRestart.error?.message);
     expect(fixture.application.store.getBackend("codex-paired").descriptor)
       .toEqual(backendBeforeBusyRestart);
     expect(fixture.application.store.getBackendInstanceGenerationAuthority("codex-paired"))
       .toEqual(generationAuthorityBeforeBusyRestart);
     expect(setup.requests).toHaveLength(providerRequestsBeforeBusyRestart);
-    expect(setup.codex.transport?.requests).toHaveLength(codexRequestsBeforeBusyRestart);
+    expect(codexSideEffects()).toEqual(codexRequestsBeforeBusyRestart);
     expect(setup.claude.queries).toHaveLength(claudeQueriesBeforeBusyRestart);
     expect(setup.lifecycle).toHaveLength(lifecycleBeforeBusyRestart);
     for (const backendId of backendIds) {
@@ -802,7 +839,7 @@ it("replaces three native Backend instances independently and rejects a busy rep
     )] as const));
     const tracesBeforeFailedReplay = {
       providerRequests: setup.requests.length,
-      codexRequests: setup.codex.transport?.requests.length ?? 0,
+      codexRequests: codexSideEffects(),
       claudeQueries: setup.claude.queries.length,
       lifecycle: setup.lifecycle.length
     };
@@ -825,7 +862,7 @@ it("replaces three native Backend instances independently and rejects a busy rep
         .toEqual(sessionsBeforeFailedReplay.get(backendId));
     }
     expect(setup.requests).toHaveLength(tracesBeforeFailedReplay.providerRequests);
-    expect(setup.codex.transport?.requests).toHaveLength(tracesBeforeFailedReplay.codexRequests);
+    expect(codexSideEffects()).toEqual(tracesBeforeFailedReplay.codexRequests);
     expect(setup.claude.queries).toHaveLength(tracesBeforeFailedReplay.claudeQueries);
     expect(setup.lifecycle).toHaveLength(tracesBeforeFailedReplay.lifecycle);
 
@@ -847,6 +884,7 @@ it("replaces three native Backend instances independently and rejects a busy rep
       if (adapterBefore === undefined) throw new Error(`No current ${backendId} Adapter exists before replacement.`);
       const providerRequestsBefore = setup.requests.length;
       const codexRequestsBefore = setup.codex.transport?.requests.length ?? 0;
+      const codexSideEffectsBefore = codexSideEffects();
       const codexThreadsBefore = setup.codex.transport?.requests
         .filter((request) => request.method === "thread/start").length ?? 0;
       const codexStartsBefore = setup.codex.transport?.requests.filter((request) => request.method === "turn/start").length ?? 0;
@@ -967,7 +1005,7 @@ it("replaces three native Backend instances independently and rejects a busy rep
       expect(setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0))
         .toBe(claudeInputsBefore);
       if (backendId !== "codex-paired") {
-        expect(setup.codex.transport?.requests).toHaveLength(codexRequestsBefore);
+        expect(codexSideEffects()).toEqual(codexSideEffectsBefore);
       }
       if (backendId !== "claude-paired") {
         expect(setup.claude.queries).toHaveLength(claudeQueriesBefore);
@@ -1006,7 +1044,7 @@ it("replaces three native Backend instances independently and rejects a busy rep
       const bindingAfterRestart = structuredClone(selectedSession.binding);
       const publicGenerationAfterRestart = publicSessionAfter?.version?.generation;
       const lifecycleAfterRestart = structuredClone(setup.lifecycle);
-      const codexRequestsAfterRestart = setup.codex.transport?.requests.length ?? 0;
+      const codexRequestsAfterRestart = codexSideEffects();
       const claudeQueriesAfterRestart = setup.claude.queries.length;
       const replayed = await submit(paired.clients.operation, paired.connectionId, mutation, operationId);
       expect(replayed.operationId).toBe(restarted.operationId);
@@ -1021,7 +1059,7 @@ it("replaces three native Backend instances independently and rejects a busy rep
       expect((await paired.clients.session.getSession({ sessionId: sessions.get(backendId)! })).session?.version?.generation)
         .toBe(publicGenerationAfterRestart);
       expect(setup.requests).toHaveLength(providerRequestsBefore);
-      expect(setup.codex.transport?.requests).toHaveLength(codexRequestsAfterRestart);
+      expect(codexSideEffects()).toEqual(codexRequestsAfterRestart);
       expect(setup.claude.queries).toHaveLength(claudeQueriesAfterRestart);
       expect(setup.claude.queries.reduce((count, query) => count + query.receivedInputs.length, 0))
         .toBe(claudeInputsBefore);
@@ -1074,12 +1112,14 @@ it("replaces three native Backend instances independently and rejects a busy rep
       const sessionEvents = fixture.application.store.listEvents({ sessionId });
       const allAssistantEvents = sessionEvents.filter((event) =>
         event.payload.type === "message_complete" && event.payload.role === "assistant");
-      const assistantEvents = allAssistantEvents.filter((event) => event.runId === runId);
+      const assistantEvents = allAssistantEvents.filter((event) => event.runId === runId
+        && event.metadata?.fields["nativeHydration"] !== true);
       const assistantDelta = allAssistantEvents.slice(assistantCountsBeforeFinal.get(backendId));
       const allUsageEvents = sessionEvents.filter((event) => event.payload.type === "usage");
       const usageEvents = allUsageEvents.slice(usageCountsBeforeFinal.get(backendId));
       const doneEvents = sessionEvents.filter((event) => event.payload.type === "done" && event.runId === runId);
-      expect(assistantEvents, `${backendId} run-bound final assistant`).toHaveLength(1);
+      expect(assistantEvents, `${backendId} run-bound live final assistant`).toHaveLength(1);
+      assertSingleVisibleRunAssistant(fixture, sessionId, runId, finalAnswers.get(backendId)!);
       expect(assistantDelta.length).toBeGreaterThan(0);
       expect(assistantDelta.every((event) =>
         event.backendId === backendId
@@ -1087,7 +1127,11 @@ it("replaces three native Backend instances independently and rejects a busy rep
         && event.generation === binding.generation
         && jsonWithBigints(event).includes(finalAnswers.get(backendId)!)
       )).toBe(true);
-      expect(usageEvents.length, `${backendId} final usage delta`).toBeGreaterThan(0);
+      // Session snapshots are deduplicated; native usage can also be carried by
+      // the run-bound assistant completion checked below.
+      const messageUsageEvents = assistantEvents.filter(event =>
+        event.payload.type === "message_complete" && event.payload.usage !== undefined);
+      expect(usageEvents.length + messageUsageEvents.length, `${backendId} final usage evidence`).toBeGreaterThan(0);
       for (const event of assistantEvents) {
         expect(event).toMatchObject({
           backendId,
@@ -1176,11 +1220,19 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
       expect(accepted.state).toBe(OperationState.SUCCEEDED);
       return queueRunIdFrom(accepted);
     };
-    const waitForRun = (runId: string) => waitFor(
-      () => paired.clients.run.getRun({ runId }),
-      (value) => value.run?.state === RunState.SUCCEEDED,
-      `${runId} to complete`
-    );
+    const waitForRun = async (runId: string) => {
+      const response = await waitFor(
+        () => paired.clients.run.getRun({ runId }),
+        (value) => value.run?.state === RunState.SUCCEEDED,
+        `${runId} to complete`, nativeRunTimeoutMs
+      );
+      const sessionId = response.run?.sessionId;
+      if (sessionId === undefined) throw new Error("The completed candidate probe Run has no Session.");
+      await waitFor(async () => fixture.application.store.listEvents({ sessionId }).filter(event =>
+        event.runId === runId && event.payload.type === "done" && event.payload.outcome === "completed").length,
+      count => count === 1, "the durable native completion before the candidate probe baseline");
+      return response;
+    };
 
     const baselineRuns = new Map<BackendId, string>();
     for (const backendId of backendIds) {
@@ -1265,7 +1317,8 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
         backendId,
         generation: descriptorsBefore.get(backendId)!.instanceGeneration + 1,
         factoryCalls: 1,
-        probeCalls: 1
+        probeCalls: 1,
+        processTerminationCalls: 0
       });
       const authorityAfter = fixture.application.store.getBackendInstanceGenerationAuthority(backendId);
       expect(authorityAfter).toMatchObject({
@@ -1293,8 +1346,34 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
       for (const id of backendIds) {
         expect(fixture.application.store.getBackend(id).descriptor).toEqual(descriptorsBefore.get(id));
         expect(fixture.application.store.getSession(sessions.get(id)!).descriptor).toEqual(sessionsBefore.get(id));
-        expect((await paired.clients.session.getSession({ sessionId: sessions.get(id)! })).session)
-          .toEqual(publicSessionsBefore.get(id));
+        const publicSession = (await paired.clients.session.getSession({ sessionId: sessions.get(id)! })).session;
+        try {
+          expect(publicSession).toEqual(publicSessionsBefore.get(id));
+        } catch (error) {
+          const before = publicSessionsBefore.get(id);
+          console.error("[candidate-probe-session-isolation]", jsonWithBigints({
+            candidateBackendId: backendId,
+            affectedBackendId: id,
+            attentionBefore: before?.attention?.kind,
+            attentionAfter: publicSession?.attention?.kind,
+            hadContextState: before?.contextState !== undefined,
+            hasContextState: publicSession?.contextState !== undefined,
+            events: fixture.application.store.listEvents({ sessionId: sessions.get(id)! }).slice(-12).map(event => ({
+              sequence: event.globalCursor,
+              generation: event.generation,
+              type: event.payload.type,
+              baselineRun: event.runId === baselineRuns.get(id),
+              candidateOperation: event.operationId === operationId,
+              ...(event.payload.type === "error" ? {
+                errorCode: /^[A-Z][A-Z0-9_]{0,79}$/u.test(event.payload.error.code) ? event.payload.error.code : "noncanonical",
+                errorPhase: event.payload.error.phase,
+                terminal: event.payload.terminal
+              } : {}),
+              ...(event.payload.type === "done" ? { outcome: event.payload.outcome } : {})
+            }))
+          }));
+          throw error;
+        }
         expect(fixture.application.adapters.find((candidate) => candidate.id === id))
           .toBe(retainedAdapters.get(id));
       }
@@ -1375,6 +1454,7 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
         generation: authorityBefore.highWaterGeneration + 1,
         factoryCalls: 1,
         probeCalls: 1,
+        processTerminationCalls: 0,
         disposeCalls: 1,
         forceDisposeCalls: backendId === "pi" ? 0 : 1
       });
@@ -1459,11 +1539,11 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
       const runWhileUnknown = await send(backendId, inputWhileUnknown);
       let answerWhileUnknown: string;
       if (backendId === "pi") {
-        await waitFor(
+        await withNativeDispatchFailureState(waitFor(
           async () => setup.requests.length,
           (count) => count === providerRequestsBeforeUnknownRun + 1,
           "Pi dispatch while candidate cleanup is unknown"
-        );
+        ), fixture, undefined, sessionId, runWhileUnknown);
         answerWhileUnknown = REAL_PI_RESPONSE_TEXT;
       } else if (backendId === "codex-paired") {
         await waitFor(
@@ -1501,12 +1581,14 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
       const assistantEventsWhileUnknown = eventsWhileUnknown.filter((event) =>
         event.runId === runWhileUnknown
         && event.payload.type === "message_complete"
-        && event.payload.role === "assistant");
+        && event.payload.role === "assistant"
+        && event.metadata?.fields["nativeHydration"] !== true);
       const doneEventsWhileUnknown = eventsWhileUnknown.filter((event) =>
         event.runId === runWhileUnknown && event.payload.type === "done");
       const usageDeltaWhileUnknown = eventsWhileUnknown.filter((event) => event.payload.type === "usage")
         .slice(usageEventsBeforeUnknownRun);
       expect(assistantEventsWhileUnknown).toHaveLength(1);
+      assertSingleVisibleRunAssistant(fixture, sessionId, runWhileUnknown, answerWhileUnknown);
       expect(jsonWithBigints(assistantEventsWhileUnknown)).toContain(answerWhileUnknown);
       expect(assistantEventsWhileUnknown[0]).toMatchObject({
         backendId,
@@ -1671,7 +1753,8 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
       const assistantEvents = events.filter((event) =>
         event.runId === runId
         && event.payload.type === "message_complete"
-        && event.payload.role === "assistant");
+        && event.payload.role === "assistant"
+        && event.metadata?.fields["nativeHydration"] !== true);
       const assistantDelta = events.filter((event) =>
         event.payload.type === "message_complete" && event.payload.role === "assistant")
         .slice(assistantCountsBeforeFinal.get(backendId));
@@ -1679,6 +1762,7 @@ it("isolates failed replacement probes and unconfirmed candidate cleanup across 
         .slice(usageCountsBeforeFinal.get(backendId));
       const doneEvents = events.filter((event) => event.runId === runId && event.payload.type === "done");
       expect(assistantEvents).toHaveLength(1);
+      assertSingleVisibleRunAssistant(fixture, sessionId, runId, finalAnswers.get(backendId)!);
       expect(assistantDelta.length).toBeGreaterThan(0);
       expect(jsonWithBigints(assistantEvents)).toContain(finalAnswers.get(backendId));
       for (const event of assistantEvents) {
@@ -1764,7 +1848,7 @@ it("keeps published replacements authoritative while exact old-generation cleanu
     const waitForRun = (runId: string) => waitFor(
       () => paired.clients.run.getRun({ runId }),
       (value) => value.run?.state === RunState.SUCCEEDED,
-      `${runId} to complete`
+      `${runId} to complete`, nativeRunTimeoutMs
     );
 
     const baselineRuns = new Map<BackendId, string>();
@@ -1862,10 +1946,12 @@ it("keeps published replacements authoritative while exact old-generation cleanu
       const assistantEvents = events.filter((event) =>
         event.runId === runId
         && event.payload.type === "message_complete"
-        && event.payload.role === "assistant");
+        && event.payload.role === "assistant"
+        && event.metadata?.fields["nativeHydration"] !== true);
       const doneEvents = events.filter((event) => event.runId === runId && event.payload.type === "done");
       const usageDelta = events.filter((event) => event.payload.type === "usage").slice(usageEventsBefore);
       expect(assistantEvents).toHaveLength(1);
+      assertSingleVisibleRunAssistant(fixture, sessionId, runId, answer);
       expect(jsonWithBigints(assistantEvents)).toContain(answer);
       expect(assistantEvents[0]).toMatchObject({
         backendId,
@@ -2615,13 +2701,13 @@ it("fences consumed native inputs with lost receipts without blocking sibling Ba
       "Pi sibling Provider dispatch"
     );
     const codexControlNativeId = nativeSessionId("codex-paired", "control");
-    await waitFor(
+    await withNativeDispatchFailureState(waitFor(
       async () => (setup.codex.transport?.requests ?? []).filter((request) =>
         request.method === "turn/start"
         && jsonWithBigints(request.params).includes(controlTexts.get("codex-paired")!)).length,
       (count) => count === 1,
       "Codex sibling dispatch"
-    );
+    ), setup.fixture, setup.codex, sessions.get("codex-paired")!.control, controlRuns.get("codex-paired")!);
     const claudeControlNativeId = nativeSessionId("claude-paired", "control");
     const claudeControlQuery = await waitFor(
       async () => setup.claude.queries.findLast((query) =>
@@ -3325,7 +3411,7 @@ mountedIt("keeps three native tasks distinct through mounted Web, approval and o
     if (challenge.challenge === undefined) throw new Error("Mounted pairing returned no challenge.");
 
     browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
     const errors: string[] = [];
     page.on("pageerror", (error) => errors.push(error.message));
     await page.goto(`${fixture.baseUrl}/#/tasks/${encodeURIComponent(piSessionId)}`, { waitUntil: "domcontentloaded" });
@@ -3349,7 +3435,40 @@ mountedIt("keeps three native tasks distinct through mounted Web, approval and o
 
     await sendFromWeb("Pi mounted first");
     await page.locator(".timeline").getByText("real npm Pi reached Orchestrator over binary Connect", { exact: true })
-      .first().waitFor({ state: "visible", timeout: 20_000 });
+      .first().waitFor({ state: "visible", timeout: 20_000 }).catch(async (cause: unknown) => {
+        const events = fixture.application.store.listEvents({ sessionId: piSessionId, activeNativeTimeline: true, limit: 1_000 });
+        const observation = {
+          sourceCommit: process.env.GITHUB_SHA ?? "working-tree",
+          providerRequests: setup.requests.length,
+          unexpectedRuntimeExits: setup.unexpectedPiRuntimeExits.length,
+          runs: fixture.application.store.listRuns({ sessionId: piSessionId }).map(run => run.descriptor.state),
+          queue: fixture.application.store.listQueueItems({ sessionId: piSessionId }).map(item => ({
+            state: item.state, inputMatches: item.body.text === "Pi mounted first"
+          })),
+          eventCount: events.length,
+          eventTypes: [...new Set(events.map(event => event.payload.type))],
+          durableAnswer: events.some(event => event.payload.type === "message_complete" && event.payload.role === "assistant"
+            && event.payload.blocks.some(block => block.kind === "text" && block.text === REAL_PI_RESPONSE_TEXT)),
+          pageErrorCount: errors.length,
+          renderedAnswerCount: await page.locator(".timeline").getByText(REAL_PI_RESPONSE_TEXT, { exact: true }).count(),
+          viewport: await page.locator(".timeline").evaluate(node => ({
+            scrollTop: node.scrollTop, scrollHeight: node.scrollHeight, clientHeight: node.clientHeight,
+            rows: node.querySelectorAll("[data-timeline-item-id]").length,
+            hasRunStatus: document.querySelector(".session-running-status") !== null,
+            composerEmpty: document.querySelector(".composer-rich-editor__content")?.getAttribute("data-empty")
+          })).catch(() => undefined)
+        };
+        if (process.env.RUNNER_TEMP !== undefined) {
+          try {
+            const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "paired-backends");
+            await mkdir(directory, { recursive: true });
+            await writeFile(join(directory, "pi-first-reply-failure.json"), JSON.stringify(observation, null, 2));
+            await page.screenshot({ path: join(directory, "pi-first-reply-failure.png"), fullPage: true, timeout: 5_000,
+              mask: [page.locator('.pair-form input,input[type="password"]')] });
+          } catch { console.error("Mounted native reply failure evidence was unavailable."); }
+        }
+        throw new Error(`The first mounted native reply did not become visible: ${JSON.stringify(observation)}`, { cause });
+      });
     await openTask("claude-paired");
     expect(await page.locator(".timeline").getByText("real npm Pi reached Orchestrator over binary Connect", { exact: true }).count()).toBe(0);
     await sendFromWeb("Claude mounted first");
@@ -3589,7 +3708,9 @@ async function startPairedFixture(
           ? await createAuthenticationSnapshot()
           : undefined;
         const adapter = createPiAdapter({
-          agentHome: authenticationSnapshot?.agentHome ?? join(root, "pi-agent-home"),
+          // Match production ownership: probing a candidate must not recover
+          // runtime records from the retained Backend's generation.
+          agentHome: authenticationSnapshot?.agentHome ?? join(root, "pi-agent-home", `generation-${generation}`),
           sessionRoot: join(root, "pi-sessions"),
           externalSessionRoots: [],
           providers: authenticationSnapshot?.providers ?? [provider],
@@ -3608,7 +3729,8 @@ async function startPairedFixture(
           ...(fault === undefined ? {} : {
             command: join(root, `missing-pi-candidate-${generation}`),
             environment: { JOKO_PAIRED_CANDIDATE_SECRET: fault.sentinel },
-            secretEnvironmentNames: ["JOKO_PAIRED_CANDIDATE_SECRET"]
+            secretEnvironmentNames: ["JOKO_PAIRED_CANDIDATE_SECRET"],
+            processSupervisor: probeFailures.createProcessSupervisor(fault)
           }),
           ...(options.controlPiFault === true ? {
             processFactory: piProcesses.create,
@@ -3761,6 +3883,33 @@ async function startPairedFixture(
   }
 }
 
+async function withNativeDispatchFailureState<T>(
+  pending: Promise<T>,
+  fixture: OrchestratorE2eFixture,
+  codex: FakeCodexAppServer | undefined,
+  sessionId: string,
+  runId: string
+): Promise<T> {
+  try {
+    return await pending;
+  } catch (cause) {
+    const run = fixture.application.store.getRun(runId).descriptor;
+    const session = fixture.application.store.getSession(sessionId).descriptor;
+    const queue = fixture.application.store.findQueueItemByRunId(sessionId, runId);
+    throw new Error(`Native dispatch ownership state: ${JSON.stringify({
+      backendId: session.backendId,
+      runState: run.state,
+      errorCode: run.error?.code,
+      errorPhase: run.error?.phase,
+      generation: session.binding.generation,
+      queueState: queue?.state,
+      queueClaimed: queue?.attemptId !== undefined,
+      transportRunning: codex?.transport?.running,
+      requestMethods: codex === undefined ? undefined : [...new Set(codex.transport?.requests.map((request) => request.method) ?? [])]
+    })}`, { cause });
+  }
+}
+
 async function shutdownCodexHost(host: AppServerHost): Promise<void> {
   try {
     await host.shutdown();
@@ -3789,6 +3938,20 @@ function throwCleanupErrors(errors: readonly unknown[], message: string): void {
 
 function jsonWithBigints(value: unknown): string {
   return JSON.stringify(value, (_key, entry: unknown) => typeof entry === "bigint" ? entry.toString() : entry);
+}
+
+function assertSingleVisibleRunAssistant(
+  fixture: OrchestratorE2eFixture,
+  sessionId: string,
+  runId: string,
+  answer: string
+): void {
+  // The raw event log retains live delivery and canonical native hydration.
+  // The production timeline must expose their one authoritative completion.
+  const messages = fixture.application.store.listEvents({ sessionId, activeNativeTimeline: true, limit: 1_000 })
+    .filter(event => event.runId === runId && event.payload.type === "message_complete" && event.payload.role === "assistant");
+  expect(messages, "one visible final assistant after native reconciliation").toHaveLength(1);
+  expect(jsonWithBigints(messages[0])).toContain(answer);
 }
 
 async function waitForStableNumber(
@@ -3863,6 +4026,7 @@ interface CandidateProbeFailureRecord {
   generation?: number;
   factoryCalls: number;
   probeCalls: number;
+  processTerminationCalls: number;
   disposeCalls: number;
   forceDisposeCalls: number;
   readonly cleanupRetryGate: CandidateCleanupRetryGate;
@@ -4000,6 +4164,7 @@ class CandidateProbeFailureController {
       cleanupFault,
       factoryCalls: 0,
       probeCalls: 0,
+      processTerminationCalls: 0,
       disposeCalls: 0,
       forceDisposeCalls: 0,
       cleanupRetryGate: new CandidateCleanupRetryGate()
@@ -4022,6 +4187,16 @@ class CandidateProbeFailureController {
     record.factoryCalls++;
     record.generation = generation;
     return record;
+  }
+
+  createProcessSupervisor(record: CandidateProbeFailureRecord): ReturnType<typeof createDefaultManagedProcessSupervisor> {
+    const supervisor = createDefaultManagedProcessSupervisor();
+    const terminate = supervisor.terminate.bind(supervisor);
+    supervisor.terminate = (pid, expectedIdentity, timeoutMs) => {
+      record.processTerminationCalls++;
+      return terminate(pid, expectedIdentity, timeoutMs);
+    };
+    return supervisor;
   }
 
   observeProbe<T extends BackendAdapter>(adapter: T, record: CandidateProbeFailureRecord): void {

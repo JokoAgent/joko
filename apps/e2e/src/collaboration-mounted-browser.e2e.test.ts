@@ -4,6 +4,9 @@ import {
   CollaborationWorkerStatus,
   PermissionMode
 } from "@joko/contracts";
+import { createHash } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -31,7 +34,17 @@ describe("mounted Collaboration Goal product chain", () => {
   let fixture: RealPiSystemFixture | undefined;
   let browser: Browser | undefined;
 
-  afterEach(async () => {
+  afterEach(async ({ task }) => {
+    if (task.result?.state === "fail") {
+      try {
+        const page = browser?.contexts()[0]?.pages()[0];
+        if (page !== undefined) await captureCollaboration(page, "product-chain-failed", {
+          connectionPageVisible: await page.locator(".connection-screen").isVisible(),
+          dialogs: await page.getByRole("dialog").count(),
+          locale: await page.locator("html").getAttribute("lang") ?? ""
+        });
+      } catch { console.info("Collaboration failure capture was unavailable."); }
+    }
     await browser?.close();
     browser = undefined;
     await fixture?.close({ removeRoot: true });
@@ -75,7 +88,7 @@ describe("mounted Collaboration Goal product chain", () => {
     const taskUrl = `${fixture.baseUrl}/#/tasks/${encodeURIComponent(leadSessionId)}`;
 
     browser = await chromium.launch({ executablePath, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ locale: "en-US", viewport: { width: 1440, height: 960 } });
     const browserErrors = observeBrowserErrors(page);
     await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
@@ -130,11 +143,15 @@ describe("mounted Collaboration Goal product chain", () => {
     let tree = required((await waitFor(
       () => paired.clients.collaboration.getCollaborationGoal({ goalId, viewerSessionId: leadSessionId }),
       (value) => value.tree?.workers.some((worker) => worker.label === WORKER_LABEL
-        && [CollaborationWorkerStatus.IDLE, CollaborationWorkerStatus.COMPLETED].includes(worker.status)) === true,
+        && worker.status === CollaborationWorkerStatus.COMPLETED) === true,
       "the worker created through production Web to settle",
       60_000
     )).tree, "settled mounted collaboration tree");
     const mountedWorker = required(tree.workers.find((worker) => worker.label === WORKER_LABEL), "mounted worker");
+    // The initial assignment must settle in the actual Web projection too.
+    // A backend-only read can otherwise race the next poll and submit stale CAS.
+    await panel.locator(".collaboration-panel__worker-header").getByText("Completed", { exact: true })
+      .waitFor({ state: "visible", timeout: 30_000 });
     const workerSessionId = required(mountedWorker.sessionId, "mounted worker Session");
     const queueControl = required(
       (await paired.clients.queue.getQueueControl({ sessionId: workerSessionId })).queueControl,
@@ -283,6 +300,13 @@ describe("mounted Collaboration Goal product chain", () => {
     ]));
 
     await page.goto(taskUrl, { waitUntil: "domcontentloaded" });
+    const restartedDocument = await page.reload({ waitUntil: "domcontentloaded" });
+    expect(restartedDocument?.ok()).toBe(true);
+    // Automatic entry was not enabled. Reopen the exact saved node from a
+    // fresh document before verifying the archived Goal and durable queue.
+    await page.locator(".connection-tabs > button").nth(1).click();
+    await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
+      .getByRole("button", { name: /^(?:Connect|连接)$/u }).click();
     await page.getByRole("button", { name: "打开协作面板", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
     browserErrors.splice(0);
     await page.getByRole("button", { name: "打开协作面板", exact: true }).click();
@@ -294,8 +318,24 @@ describe("mounted Collaboration Goal product chain", () => {
     ]);
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
+    await captureCollaboration(page, "restarted-goal", {
+      locale: await page.evaluate(() => document.documentElement.lang),
+      goalArchived: tree.goal?.status === CollaborationGoalStatus.ARCHIVED,
+      allWorkersReleased: tree.workers.every(worker => worker.runtimeReleased),
+      browserErrors: browserErrors.length
+    });
   });
 });
+
+async function captureCollaboration(page: Page, name: string, state: Record<string, string | number | boolean>): Promise<void> {
+  if (process.env.RUNNER_TEMP === undefined) return;
+  const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "collaboration");
+  await mkdir(directory, { recursive: true });
+  const screenshot = await page.screenshot({ path: join(directory, `${name}.png`), fullPage: true, timeout: 5_000,
+    mask: [page.getByLabel(/Pairing code|配对码|密码/iu), page.locator("input[type=password]")] });
+  await writeFile(join(directory, `${name}.json`), JSON.stringify({ sourceCommit: process.env.GITHUB_SHA,
+    ...state, screenshotSha256: createHash("sha256").update(screenshot).digest("hex") }, null, 2) + "\n");
+}
 
 function observeBrowserErrors(page: Page): string[] {
   const errors: string[] = [];

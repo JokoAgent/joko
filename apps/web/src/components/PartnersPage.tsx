@@ -463,8 +463,6 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
   inputRef.current = { directory, snapshot };
   const ownerRef = useRef(ownerKey);
   ownerRef.current = ownerKey;
-  const controllerRef = useRef(controller);
-  controllerRef.current = controller;
   useEffect(() => {
     if (!open) return;
     const ownerDocument = formRef.current?.ownerDocument;
@@ -504,7 +502,7 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
       ownerWindow.removeEventListener("pagehide", retire);
       ownerWindow.removeEventListener("pageshow", activate);
     };
-  }, [open, ownerKey, controller]);
+  }, [open, ownerKey]);
   useEffect(() => {
     if (directory.revision > formDirectory.revision) setFormDirectory(directory);
   }, [directory, formDirectory.revision]);
@@ -520,11 +518,10 @@ function PartnerInviteDialog({ open, directory, snapshot, controller, ownerKey, 
     if (flightRef.current || abort === undefined || abort.signal.aborted || !open) return undefined;
     flightRef.current = true;
     const epoch = epochRef.current;
-    const activeController = controller;
     setSubmitting(true);
     setError(undefined);
     return { signal: abort.signal, current: () => !abort.signal.aborted && epoch === epochRef.current
-      && ownerRef.current === ownerKey && controllerRef.current === activeController };
+      && ownerRef.current === ownerKey };
   };
   const finish = (action: { readonly current: () => boolean }): void => {
     if (!action.current()) return;

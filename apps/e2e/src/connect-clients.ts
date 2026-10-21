@@ -36,6 +36,8 @@ import {
   WorkspaceService as WorkspaceContractService
 } from "@joko/contracts";
 
+import { rpcTimeoutMs } from "./test-deadlines.js";
+
 export interface E2eClients {
   readonly connection: Client<typeof ConnectionService>;
   readonly collaboration: Client<typeof CollaborationService>;
@@ -79,7 +81,7 @@ export interface PairedClient {
   readonly clients: E2eClients;
 }
 
-export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 10_000): E2eClients {
+export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = rpcTimeoutMs): E2eClients {
   const interceptors: Interceptor[] = authKey === undefined ? [] : [
     (next) => (request) => {
       request.header.set("authorization", `Bearer ${authKey}`);

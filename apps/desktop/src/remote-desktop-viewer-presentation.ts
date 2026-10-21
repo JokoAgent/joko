@@ -16,6 +16,7 @@ export class DesktopRemoteDesktopViewerPresentation {
   #automaticRecoveryAttempts = 0;
   #visibilityGeneration = 0;
   #enteringNativeFullscreen = false;
+  #nativeFullscreenTarget?: boolean;
   #hiding = false;
   #openTimer?: ReturnType<typeof setTimeout>;
   #stabilityTimer?: ReturnType<typeof setTimeout>;
@@ -43,6 +44,7 @@ export class DesktopRemoteDesktopViewerPresentation {
 
   open(): void {
     if (this.#disposed || !this.deps.current()) return;
+    this.#nativeFullscreenTarget = undefined;
     this.#automaticRecoveryAttempts = 0;
     this.#clearStability(); this.#clearLeave();
     ++this.#visibilityGeneration;
@@ -76,11 +78,14 @@ export class DesktopRemoteDesktopViewerPresentation {
     const window = this.#window;
     if (!window || !this.#current(window)) return;
     this.#enteringNativeFullscreen = this.deps.platform === "darwin" && enabled;
+    this.#nativeFullscreenTarget = this.deps.platform === "darwin" && this.#visible &&
+      (window.isFullScreen() !== enabled || this.#nativeFullscreenTarget !== undefined) ? enabled : undefined;
     window.setFullScreen(enabled);
   }
 
   reload(window: BrowserWindow): void {
     if (!this.#current(window) || this.#loading) return;
+    this.#nativeFullscreenTarget = undefined;
     const reopen = this.#visible || this.#pendingOpen;
     this.#clearOpen(); this.#clearStability(); this.#clearLeave();
     ++this.#visibilityGeneration;
@@ -94,6 +99,7 @@ export class DesktopRemoteDesktopViewerPresentation {
 
   failed(window: BrowserWindow): void {
     if (!this.#current(window)) return;
+    this.#nativeFullscreenTarget = undefined;
     const reopen = this.#visible || this.#pendingOpen;
     this.#clearOpen(); this.#clearStability(); this.#clearLeave();
     ++this.#visibilityGeneration;
@@ -113,6 +119,7 @@ export class DesktopRemoteDesktopViewerPresentation {
   close(): void {
     const window = this.#window;
     if (!window || !this.#current(window)) return;
+    this.#nativeFullscreenTarget = undefined;
     this.#clearOpen(); this.#clearStability(); this.#clearLeave();
     this.#pendingOpen = false; this.#visible = false;
     const generation = ++this.#visibilityGeneration;
@@ -135,6 +142,7 @@ export class DesktopRemoteDesktopViewerPresentation {
 
   dispose(): void {
     if (this.#disposed) return;
+    this.#nativeFullscreenTarget = undefined;
     this.#clearOpen(); this.#clearStability(); this.#clearLeave();
     this.#disposed = true; ++this.#visibilityGeneration;
     this.#pendingOpen = false; this.#visible = false; this.#enteringNativeFullscreen = false;
@@ -160,12 +168,18 @@ export class DesktopRemoteDesktopViewerPresentation {
       this.#visible = true; this.deps.changed();
     };
     window.on("show", shown); window.on("restore", shown);
-    const fullscreenSettled = (): void => { if (this.#current(window)) this.#enteringNativeFullscreen = false; };
-    window.on("enter-full-screen", fullscreenSettled); window.on("leave-full-screen", fullscreenSettled);
+    const fullscreenSettled = (enabled: boolean): void => {
+      if (!this.#current(window)) return;
+      this.#enteringNativeFullscreen = false;
+      if (this.#nativeFullscreenTarget === enabled) this.#nativeFullscreenTarget = undefined;
+    };
+    window.on("enter-full-screen", () => fullscreenSettled(true));
+    window.on("leave-full-screen", () => fullscreenSettled(false));
     window.on("closed", () => {
       if (!this.owns(window)) return;
       this.#clearOpen(); this.#clearStability(); this.#clearLeave();
       this.#window = undefined; this.#ready = false; this.#visible = false; this.#pendingOpen = false;
+      this.#nativeFullscreenTarget = undefined;
       this.#enteringNativeFullscreen = false;
       this.deps.retire();
     });
@@ -173,6 +187,11 @@ export class DesktopRemoteDesktopViewerPresentation {
 
   #hidden(window: BrowserWindow): void {
     if (!this.#current(window) || this.#hiding) return;
+    // A requested macOS space transition can notify hide while this exact
+    // native window remains visible. Real hide/minimize still retires authority.
+    if (this.deps.platform === "darwin" && this.#nativeFullscreenTarget !== undefined &&
+      this.#visible && window.isVisible() && !window.isMinimized()) return;
+    this.#nativeFullscreenTarget = undefined;
     this.#clearOpen(); this.#clearStability(); this.#clearLeave();
     ++this.#visibilityGeneration;
     const wasActive = this.#visible || this.#pendingOpen;

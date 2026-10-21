@@ -11,6 +11,7 @@ import {
   clampWorkspaceFilesMenuPosition,
   splitWorkspaceSearchPreview,
   workspaceSearchErrorText,
+  type WorkspaceFilesDocumentActions,
   type WorkspaceFilesSidebarHandle
 } from "./WorkspaceFilesSidebar.js";
 import type { WorkspaceFilesEntryView } from "./workspace-tree-state.js";
@@ -144,6 +145,106 @@ describe("WorkspaceFilesSidebar directory refresh lifecycle", () => {
     expect(host.container.textContent).not.toContain("old.txt");
   });
 });
+
+describe("WorkspaceFilesSidebar file operation ownership", () => {
+  it("keeps a new folder draft independent of an earlier pending file creation", async () => {
+    let finishFile!: () => void;
+    const createFile = vi.fn(() => new Promise<void>((resolve) => { finishFile = resolve; }));
+    const createDirectory = vi.fn()
+      .mockRejectedValueOnce(new Error("Directory creation failed."))
+      .mockResolvedValueOnce(undefined);
+    const host = await mountOperationHost({
+      capabilities: { createFile: true, createDirectory: true },
+      createFile,
+      createDirectory
+    });
+
+    await host.start("New file");
+    await host.type("first.txt");
+    await host.key("Enter");
+    expect(createFile).toHaveBeenCalledExactlyOnceWith({ workspaceId: "workspace-a", parentPath: "", path: "first.txt" });
+    expect(host.input().disabled).toBe(true);
+
+    await host.start("New folder");
+    expect(host.input().value).toBe("");
+    expect(host.input().disabled).toBe(false);
+    await host.type("next-folder");
+    await act(async () => finishFile());
+    expect(host.input().value).toBe("next-folder");
+    expect(host.input().disabled).toBe(false);
+
+    await host.key("Enter");
+    expect(createDirectory).toHaveBeenCalledTimes(1);
+    expect(host.input().value).toBe("next-folder");
+    expect(host.input().disabled).toBe(false);
+    expect(host.container.textContent).toContain("The workspace action failed.");
+    await host.key("Enter");
+    expect(createDirectory).toHaveBeenCalledTimes(2);
+    expect(host.container.querySelector("[data-workspace-tree-inline] input")).toBeNull();
+  });
+
+  it("resets a reopened action and ignores the superseded request's failure", async () => {
+    let failFile!: (error: Error) => void;
+    const createFile = vi.fn(() => new Promise<void>((_resolve, reject) => { failFile = reject; }));
+    const host = await mountOperationHost({ capabilities: { createFile: true }, createFile });
+
+    await host.start("New file");
+    await host.type("earlier.txt");
+    await host.key("Enter");
+    await host.start("New file");
+    expect(host.input().value).toBe("");
+    expect(host.input().disabled).toBe(false);
+    await host.type("retained.txt");
+    await act(async () => failFile(new Error("Earlier creation failed.")));
+    expect(host.input().value).toBe("retained.txt");
+    expect(host.container.textContent).not.toContain("The workspace action failed.");
+    await host.key("Escape");
+    expect(host.container.querySelector("[data-workspace-tree-inline] input")).toBeNull();
+    expect(createFile).toHaveBeenCalledTimes(1);
+  });
+});
+
+async function mountOperationHost(documentActions: WorkspaceFilesDocumentActions) {
+  const container = document.body.appendChild(document.createElement("div"));
+  const root = createRoot(container);
+  roots.push(root);
+  const initialDirectories = new Map([["", []]]);
+  await act(async () => root.render(<WorkspaceFilesSidebar
+    workspaceId="workspace-a"
+    workspaceDisplayName="Joko"
+    documentActions={documentActions}
+    initialDirectories={initialDirectories}
+    loadDirectory={async () => []}
+    searchWorkspace={emptyWorkspaceSearch}
+    onSelectFile={() => undefined}
+    onOpenSearchMatch={() => undefined}
+    onLeaveDocumentMode={() => undefined}
+  />));
+  const input = (): HTMLInputElement => {
+    const element = container.querySelector<HTMLInputElement>("[data-workspace-tree-inline] input");
+    if (element === null) throw new Error("The file operation input is missing.");
+    return element;
+  };
+  return {
+    container,
+    input,
+    start: async (label: string) => {
+      await act(async () => container.querySelector("[role='tree']")!.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true, clientX: 40, clientY: 40 })));
+      const action = [...document.querySelectorAll<HTMLButtonElement>(".workspace-files-context-menu button")].find((button) => button.textContent === label);
+      if (action === undefined) throw new Error(`The ${label} action is missing.`);
+      await act(async () => action.click());
+    },
+    type: async (value: string) => {
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input(), value);
+        input().dispatchEvent(new Event("input", { bubbles: true }));
+      });
+    },
+    key: async (key: string) => {
+      await act(async () => input().dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })));
+    }
+  };
+}
 
 function mountDirectoryHost() {
   const container = document.createElement("div");

@@ -1,5 +1,5 @@
-import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
@@ -13,7 +13,7 @@ import {
   createInternalServer
 } from "@joko/orchestrator";
 import { PI_LIKE_PROFILE, type FakeAdapterProfile } from "@joko/testkit";
-import { _electron, type ElectronApplication, type Page } from "playwright-core";
+import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
 
 import { OrchestratorE2eFixture, waitFor } from "./fixture.js";
@@ -36,13 +36,29 @@ interface OwnedDesktopProcess {
 
 let fixture: OrchestratorE2eFixture | undefined;
 let internal: Awaited<ReturnType<typeof createInternalServer>> | undefined;
-let desktop: ElectronApplication | undefined;
+let desktop: Browser | undefined;
+let desktopProcess: ChildProcess | undefined;
+let desktopPage: Page | undefined;
 let desktopIdentity: OwnedDesktopProcess | undefined;
 let profileDirectory: string | undefined;
+let preloadLoadFailed = false;
 
-afterEach(async () => {
+afterEach(async ({ task }) => {
+  if (task.result?.state === "fail") {
+    console.error("Packaged documents: failed window routes.", JSON.stringify({
+      spawnedPid: desktopProcess?.pid,
+      mainPid: desktopIdentity?.pid,
+      exitCode: desktopProcess?.exitCode,
+      windows: desktop?.contexts().flatMap((context) => context.pages())
+        .map((page) => ({ route: new URL(page.url()).hash, closed: page.isClosed() })) ?? []
+    }));
+    const startupProgress = profileDirectory === undefined ? "" : await readFile(join(profileDirectory, "launch.progress"), "utf8").catch(() => "");
+    console.error("Packaged documents: startup stages.", startupProgress.split(/\r?\n/u)
+      .filter(Boolean).slice(0, 12).map((line) => line.split(" ", 1)[0]));
+    console.error("Packaged documents: native save stages.", await readNativeSaveStages());
+  }
   try {
-    await closeDesktop();
+    await closeDesktop(task.result?.state === "fail");
   } finally {
     await internal?.close();
     internal = undefined;
@@ -211,38 +227,97 @@ tr:nth-child(even) td { background: #fafafa; }
 
   const challenge = await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Document Desktop" });
   if (challenge.challenge === undefined) throw new Error("Desktop pairing returned no challenge.");
+  console.info("Packaged documents: generated outputs and pairing ready.");
   profileDirectory = await mkdtemp(join(tmpdir(), "joko-document-desktop-"));
-  desktop = await _electron.launch({
-    executablePath,
+  const launchDeadline = Date.now() + 60_000;
+  desktopProcess = spawn(executablePath, ["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1",
+    "--disable-gpu", "--enable-logging=stderr"], {
     env: {
       ...process.env,
       JOKO_DESKTOP_MANAGED_ORCHESTRATOR: "0",
       JOKO_DESKTOP_PACKAGED_SMOKE: "1",
       JOKO_DESKTOP_SMOKE_SCOPE: "external",
+      JOKO_DESKTOP_SMOKE_RESULT: join(profileDirectory, "launch"),
       JOKO_DESKTOP_SMOKE_USER_DATA: profileDirectory
     },
-    timeout: 60_000
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"]
   });
-  const mainPid = await desktop.evaluate(() => process.pid);
+  let devtoolsEndpoint: string | undefined;
+  let launchError: Error | undefined;
+  let stderrLine = "";
+  preloadLoadFailed = false;
+  desktopProcess.once("error", (error) => { launchError = error; });
+  desktopProcess.stdout?.resume();
+  desktopProcess.stderr?.on("data", (bytes: Buffer) => {
+    stderrLine += bytes.toString();
+    let newline: number;
+    while ((newline = stderrLine.indexOf("\n")) >= 0) {
+      const line = stderrLine.slice(0, newline).trim();
+      stderrLine = stderrLine.slice(newline + 1);
+      if (line.includes("Unable to load preload script")) preloadLoadFailed = true;
+      const match = /^DevTools listening on (ws:\/\/127\.0\.0\.1:\d+\/devtools\/browser\/[a-zA-Z0-9-]+)$/u.exec(line);
+      if (match !== null) devtoolsEndpoint = match[1];
+    }
+    stderrLine = stderrLine.slice(-8192);
+  });
+  const mainPid = desktopProcess.pid;
+  if (mainPid === undefined) throw new Error("Document Desktop returned no spawned process ID.");
   desktopIdentity = await readOwnedDesktopProcess(mainPid);
   if (desktopIdentity === undefined || resolve(desktopIdentity.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
     throw new Error("Document Desktop launched an unexpected executable.");
   }
-  const userDataPath = await desktop.evaluate(({ app }) => app.getPath("userData"));
-  const profileRelative = relative(profileDirectory, userDataPath);
+  console.info("Packaged documents: owned process confirmed.");
+  const startupPath = join(profileDirectory, "launch.startup.json");
+  let startup: { readonly pid: number; readonly executablePath: string; readonly userDataPath: string; readonly packaged: boolean } | undefined;
+  await waitFor(async () => {
+    if (launchError !== undefined) throw launchError;
+    if (desktopProcess?.exitCode !== null) throw new Error("Document Desktop exited before automation connected.");
+    startup = await readFile(startupPath, "utf8").then((value) => JSON.parse(value) as NonNullable<typeof startup>).catch(() => undefined);
+    return startup !== undefined && devtoolsEndpoint !== undefined;
+  }, Boolean, "Document Desktop owned startup receipt", Math.max(1, launchDeadline - Date.now()));
+  if (startup === undefined || devtoolsEndpoint === undefined || startup.pid !== mainPid || !startup.packaged
+    || typeof startup.userDataPath !== "string" || typeof startup.executablePath !== "string"
+    || resolve(startup.executablePath).toLowerCase() !== executablePath.toLowerCase()) {
+    throw new Error("Document Desktop returned an unexpected packaged startup identity.");
+  }
+  const profileRelative = relative(profileDirectory, startup.userDataPath);
   if (profileRelative.startsWith("..") || isAbsolute(profileRelative)) {
     throw new Error("Document Desktop did not use its isolated profile.");
   }
-  const page = await desktop.firstWindow({ timeout: 60_000 });
-  const pageErrors: string[] = [];
-  page.on("pageerror", (error) => pageErrors.push(error.message));
+  console.info("Packaged documents: isolated packaged profile confirmed.");
+  desktop = await chromium.connectOverCDP(devtoolsEndpoint, { timeout: Math.max(1, launchDeadline - Date.now()) });
+  const context = desktop.contexts()[0];
+  if (context === undefined) throw new Error("Document Desktop returned no renderer context.");
+  const errorsByPage = new Map<Page, string[]>();
+  const observePage = (candidate: Page): void => {
+    if (errorsByPage.has(candidate)) return;
+    const errors: string[] = [];
+    errorsByPage.set(candidate, errors);
+    candidate.on("pageerror", (error) => errors.push(error.message));
+  };
+  context.on("page", observePage);
+  for (const candidate of context.pages()) observePage(candidate);
+  const page = await waitFor(async () => context.pages()[0], (candidate) => candidate !== undefined,
+    "Document Desktop first window", 60_000);
+  if (page === undefined) throw new Error("Document Desktop returned no application window.");
+  desktopPage = page;
+  const pageErrors = errorsByPage.get(page)!;
+  page.setDefaultTimeout(30_000);
   await page.locator(".connection-screen").waitFor({ state: "visible", timeout: 30_000 });
+  console.info("Packaged documents: connection page visible.");
   await page.locator(".connection-tabs > button").nth(2).click();
-  await page.getByLabel("Joko node address").fill(fixture.baseUrl);
-  await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challenge.challengeId));
-  await page.getByLabel("Device name").fill("Document Desktop");
+  await page.locator('form.pair-form input[type="url"]').fill(fixture.baseUrl);
+  await page.locator('form.pair-form input[autocomplete="one-time-code"]')
+    .fill(fixture.pairingCode(challenge.challenge.challengeId));
+  await page.locator('form.pair-form input[autocomplete="off"]').fill("Document Desktop");
   await page.locator("form.pair-form button[type=submit]").click();
   await page.locator(".app").waitFor({ state: "visible", timeout: 30_000 });
+  await page.evaluate(() => { location.hash = "/settings/general"; });
+  await page.locator(".settings-page").waitFor({ state: "visible", timeout: 30_000 });
+  await page.getByRole("combobox", { name: /^(?:Language|语言)$/u }).click({ timeout: 30_000 });
+  await page.getByRole("option", { name: "English", exact: true }).click({ timeout: 30_000 });
+  console.info("Packaged documents: formal connection and locale ready.");
   const filesHash = `#/files/${encodeURIComponent(sessionId)}?file=documents%2Fchart-report.pdf`;
   await page.evaluate((hash) => { window.location.hash = hash; }, filesHash);
   await page.locator('[data-file-kind="pdf"]').waitFor({ state: "visible", timeout: 30_000 });
@@ -379,6 +454,7 @@ tr:nth-child(even) td { background: #fafafa; }
     process.stdout.write(`JOKO_VISUAL_DESKTOP=${capturePath}\n`);
   }
   expect(pageErrors).toEqual([]);
+  console.info("Packaged documents: native save stages.", await readNativeSaveStages());
   bridge.revoke();
   await closeDesktop();
 });
@@ -386,23 +462,183 @@ tr:nth-child(even) td { background: #fafafa; }
 async function expectExactNativeSave(page: Page, mainPid: number, directory: string, expectedBytes: Buffer,
   fileName = "chart-report.pdf"): Promise<void> {
   const target = join(directory, `${randomUUID()}-${fileName}`);
-  await page.locator(".workspace-file-body__download").click();
-  await chooseNativeSaveTarget(mainPid, target);
-  await waitFor(() => readFile(target).catch(() => undefined), (bytes) => bytes !== undefined,
-    "Document Desktop native PDF save", 10_000);
-  expect(await readFile(target)).toEqual(expectedBytes);
-  await waitFor(() => page.locator(".workspace-file-body__download").getAttribute("aria-busy"),
-    (busy) => busy !== "true", "Document Desktop native save acknowledgement", 10_000);
-  expect(await page.locator(".workspace-file-body__state.is-error").count()).toBe(0);
+  const targetSha256 = createHash("sha256").update(resolve(target).toLowerCase()).digest("hex");
+  console.info("Packaged documents: native save starting.", fileName, targetSha256);
+  let browserDownloads = 0;
+  const observeDownload = (): void => { browserDownloads += 1; };
+  page.on("download", observeDownload);
+  try {
+    await page.locator(".workspace-file-body__download").click();
+    await chooseNativeSaveTarget(mainPid, target);
+    await waitFor(() => readFile(target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    }), (bytes) => bytes !== undefined,
+      "Document Desktop native PDF save", 10_000);
+    expect(await readFile(target)).toEqual(expectedBytes);
+    await waitFor(() => page.locator(".workspace-file-body__download").getAttribute("aria-busy"),
+      (busy) => busy !== "true", "Document Desktop native save acknowledgement", 10_000);
+    expect(await page.locator(".workspace-file-body__state.is-error").count()).toBe(0);
+    console.info("Packaged documents: exact native save verified.", fileName, { browserDownloads });
+  } catch (error) {
+    let observationTimer: ReturnType<typeof setTimeout> | undefined;
+    const renderer = await Promise.race([
+      page.evaluate(() => ({
+        nativeSaveAvailable: typeof (window as unknown as { jokoDesktop?: { saveFile?: unknown } }).jokoDesktop?.saveFile === "function",
+        pending: document.querySelector(".workspace-file-body__download")?.getAttribute("aria-busy"),
+        alerts: document.querySelectorAll('[role="alert"]').length
+      })).catch(() => undefined),
+      new Promise<undefined>((resolveObservation) => { observationTimer = setTimeout(() => resolveObservation(undefined), 1_000); })
+    ]);
+    clearTimeout(observationTimer);
+    console.error("Packaged documents: save outcome.", { renderer, browserDownloads, preloadLoadFailed });
+    throw error;
+  } finally {
+    page.off("download", observeDownload);
+  }
+}
+
+async function readNativeSaveStages(): Promise<string[]> {
+  if (profileDirectory === undefined) return [];
+  const progress = await readFile(join(profileDirectory, "launch.progress"), "utf8").catch(() => "");
+  return progress.split(/\r?\n/u).filter((line) => line.startsWith("native_file_save_")).slice(0, 24);
 }
 
 async function chooseNativeSaveTarget(mainPid: number, target: string): Promise<void> {
   const script = String.raw`
-Add-Type -AssemblyName UIAutomationClient
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -ReferencedAssemblies UIAutomationClient,UIAutomationTypes -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Windows.Automation;
+
+public static class NativeDocumentDialog {
+  [MethodImpl(MethodImplOptions.NoInlining)]
+  public static void InitializeControlProviders() {
+    // Default Win32 provider discovery needs a managed caller type, which PowerShell's dynamic frames lack.
+    ClientSettings.RegisterClientSideProviders(new ClientSideProviderDescription[0]);
+  }
+
+  [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr handle, out uint processId);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassNameW(IntPtr handle, StringBuilder name, int count);
+  [DllImport("user32.dll")] private static extern bool IsChild(IntPtr parent, IntPtr child);
+  [DllImport("user32.dll")] private static extern bool IsWindowEnabled(IntPtr handle);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr handle);
+  [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr handle);
+  [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
+  [DllImport("user32.dll")] private static extern IntPtr GetDlgItem(IntPtr dialog, int controlId);
+  [DllImport("user32.dll", SetLastError = true)]
+  private static extern uint SendInput(uint count, Input[] inputs, int size);
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct Input {
+    public uint type;
+    public InputData data;
+  }
+
+  [StructLayout(LayoutKind.Explicit)]
+  private struct InputData {
+    [FieldOffset(0)] public KeyboardInput keyboard;
+    [FieldOffset(0)] public MouseInput mouse;
+  }
+
+  [StructLayout(LayoutKind.Sequential)]
+  private struct KeyboardInput {
+    public ushort virtualKey;
+    public ushort scanCode;
+    public uint flags;
+    public uint time;
+    public IntPtr extraInfo;
+  }
+
+  // INPUT's union must retain the native mouse layout even for keyboard-only input.
+  [StructLayout(LayoutKind.Sequential)]
+  private struct MouseInput {
+    public int x;
+    public int y;
+    public uint mouseData;
+    public uint flags;
+    public uint time;
+    public IntPtr extraInfo;
+  }
+
+  private static Input Key(ushort virtualKey, ushort scanCode, uint flags) {
+    return new Input { type = 1, data = new InputData {
+      keyboard = new KeyboardInput { virtualKey = virtualKey, scanCode = scanCode, flags = flags }
+    } };
+  }
+
+  private static void RequireOwnedControl(IntPtr handle, uint processId, string className) {
+    uint owner;
+    var actualClass = new StringBuilder(256);
+    if (handle == IntPtr.Zero || GetWindowThreadProcessId(handle, out owner) == 0 || owner != processId
+      || GetClassNameW(handle, actualClass, actualClass.Capacity) == 0
+      || actualClass.ToString() != className || !IsWindowEnabled(handle) || !IsWindowVisible(handle)) {
+      throw new InvalidOperationException("The native dialog control is not owned, visible, and enabled.");
+    }
+  }
+
+  public static void RequireFileNameEditor(IntPtr dialog, IntPtr editor, uint processId) {
+    RequireOwnedControl(dialog, processId, "#32770");
+    RequireOwnedControl(editor, processId, "Edit");
+    if (!IsChild(dialog, editor)) throw new InvalidOperationException("The filename editor is outside the owned dialog.");
+  }
+
+  public static void TypeFileName(IntPtr dialog, IntPtr editor, uint processId, string target) {
+    RequireFileNameEditor(dialog, editor, processId);
+    SetForegroundWindow(dialog);
+    var control = AutomationElement.FromHandle(editor);
+    control.SetFocus();
+    if (GetForegroundWindow() != dialog || !control.Current.HasKeyboardFocus) {
+      throw new InvalidOperationException("The owned filename editor does not have foreground keyboard focus.");
+    }
+    foreach (var modifier in new int[] { 0x10, 0x11, 0x12 }) {
+      if (GetAsyncKeyState(modifier) < 0) throw new InvalidOperationException("A keyboard modifier is already held.");
+    }
+    var inputs = new List<Input> {
+      Key(0x11, 0, 0), Key(0x41, 0, 0), Key(0x41, 0, 2), Key(0x11, 0, 2)
+    };
+    foreach (var character in target) {
+      inputs.Add(Key(0, character, 4));
+      inputs.Add(Key(0, character, 6));
+    }
+    var size = Marshal.SizeOf(typeof(Input));
+    var delivered = SendInput((uint)inputs.Count, inputs.ToArray(), size);
+    if (delivered != inputs.Count) {
+      SendInput(1, new Input[] { Key(0x11, 0, 2) }, size);
+      throw new InvalidOperationException("The native filename keyboard input was not fully delivered.");
+    }
+  }
+
+  public static IntPtr RequireSaveButton(IntPtr dialog, uint processId) {
+    RequireOwnedControl(dialog, processId, "#32770");
+    var button = GetDlgItem(dialog, 1);
+    RequireOwnedControl(button, processId, "Button");
+    if (!IsChild(dialog, button)) throw new InvalidOperationException("The save button is outside the owned dialog.");
+    return button;
+  }
+
+  public static string DescribeSave(IntPtr dialog) {
+    var button = GetDlgItem(dialog, 1);
+    return "dialogVisible=" + IsWindowVisible(dialog) + ";dialogEnabled=" + IsWindowEnabled(dialog)
+      + ";dialogForeground=" + (GetForegroundWindow() == dialog)
+      + ";saveButtonEnabled=" + IsWindowEnabled(button);
+  }
+}
+'@
+[NativeDocumentDialog]::InitializeControlProviders()
 $mainPid = [int]$env:JOKO_E2E_MAIN_PID
 $target = $env:JOKO_E2E_SAVE_TARGET
 $deadline = [DateTime]::UtcNow.AddSeconds(25)
+[pscustomobject]@{
+  runtime = [System.Environment]::Version.ToString()
+  automation = [System.Windows.Automation.AutomationElement].Assembly.GetName().Version.ToString()
+} | ConvertTo-Json -Compress
 $dialog = $null
 do {
   $windows = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
@@ -412,7 +648,7 @@ do {
       [System.Windows.Automation.ControlType]::Window)))
   foreach ($window in $windows) {
     if ($window.Current.ProcessId -ne $mainPid) { continue }
-    $dialog = $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+    $dialog = $window.FindFirst([System.Windows.Automation.TreeScope]::Subtree,
       (New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ClassNameProperty, '#32770')))
     if ($null -ne $dialog) { break }
@@ -421,54 +657,120 @@ do {
   Start-Sleep -Milliseconds 100
 } while ([DateTime]::UtcNow -lt $deadline)
 if ($null -eq $dialog) { throw 'The owned native save dialog did not appear.' }
-$fileNameHost = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-  (New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'FileNameControlHost')))
-if ($null -eq $fileNameHost) { throw 'The native file name control is unavailable.' }
-$fileNameEdit = $fileNameHost.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
-  (New-Object System.Windows.Automation.PropertyCondition(
-    [System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1001')))
-if ($null -eq $fileNameEdit) { throw 'The native file name editor is unavailable.' }
+$ownedDialogHandle = [IntPtr]$dialog.Current.NativeWindowHandle
 $fileNameSet = $false
+$lastFileNameError = $null
 do {
   try {
-    $fileNameEdit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($target)
-    $fileNameSet = $true
-  } catch { Start-Sleep -Milliseconds 100 }
+    $fileNameHost = $dialog.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+      (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'FileNameControlHost')))
+    if ($null -eq $fileNameHost) { throw 'The native file name control is unavailable.' }
+    $fileNameEditors = $fileNameHost.FindAll([System.Windows.Automation.TreeScope]::Subtree,
+      (New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ClassNameProperty, 'Edit')))
+    if ($fileNameEditors.Count -ne 1) {
+      throw "Expected one owned native file name editor; found $($fileNameEditors.Count)."
+    }
+    $fileNameEdit = $fileNameEditors[0]
+    [NativeDocumentDialog]::RequireFileNameEditor($ownedDialogHandle,
+      [IntPtr]$fileNameEdit.Current.NativeWindowHandle, $mainPid)
+    $value = [System.Windows.Automation.ValuePattern]$fileNameEdit.GetCurrentPattern(
+      [System.Windows.Automation.ValuePattern]::Pattern)
+    # Actual key input commits the Shell dialog's filename, not only its edit control's text.
+    [NativeDocumentDialog]::TypeFileName($ownedDialogHandle,
+      [IntPtr]$fileNameEdit.Current.NativeWindowHandle, $mainPid, $target)
+    do {
+      if ($value.Current.Value -ceq $target) { $fileNameSet = $true; break }
+      Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if (-not $fileNameSet) { throw 'The native file name value did not match after keyboard input.' }
+    [pscustomobject]@{
+      automationId = $fileNameEdit.Current.AutomationId
+      className = $fileNameEdit.Current.ClassName
+      controlType = $fileNameEdit.Current.ControlType.ProgrammaticName
+      valuePattern = $true
+      keyboardInput = $true
+    } | ConvertTo-Json -Compress
+  } catch {
+    $lastFileNameError = $_.Exception.GetBaseException().Message
+    Start-Sleep -Milliseconds 100
+  }
 } while (-not $fileNameSet -and [DateTime]::UtcNow -lt $deadline)
-if (-not $fileNameSet) { throw 'The native file name editor did not become writable.' }
-$saveButton = $null
+if (-not $fileNameSet) {
+  $controlState = 'unavailable'
+  try {
+    if ($null -ne $fileNameHost) {
+      $controls = @($fileNameHost.FindAll([System.Windows.Automation.TreeScope]::Subtree,
+        [System.Windows.Automation.Condition]::TrueCondition) | Select-Object -First 12 | ForEach-Object {
+          [pscustomobject]@{
+            automationId = $_.Current.AutomationId
+            className = $_.Current.ClassName
+            controlType = $_.Current.ControlType.ProgrammaticName
+            enabled = $_.Current.IsEnabled
+          }
+        })
+      $controlState = ConvertTo-Json -InputObject $controls -Compress
+    }
+  } catch { }
+  throw "The native file name editor did not become writable: $lastFileNameError; controls=$controlState."
+}
+$saveInvoked = $false
+$lastSaveError = $null
 do {
-  $saveButton = $dialog.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-    (New-Object System.Windows.Automation.PropertyCondition(
-      [System.Windows.Automation.AutomationElement]::AutomationIdProperty, '1'))) |
-    Where-Object { $_.Current.ClassName -eq 'Button' } | Select-Object -Last 1
-  if ($null -ne $saveButton) { break }
+  try {
+    $buttonHandle = [NativeDocumentDialog]::RequireSaveButton($ownedDialogHandle, $mainPid)
+    $saveButton = [System.Windows.Automation.AutomationElement]::FromHandle($buttonHandle)
+    $invoke = [System.Windows.Automation.InvokePattern]$saveButton.GetCurrentPattern(
+      [System.Windows.Automation.InvokePattern]::Pattern)
+    $invoke.Invoke()
+    $saveInvoked = $true
+  } catch {
+    $lastSaveError = $_.Exception.GetBaseException().Message
+    Start-Sleep -Milliseconds 100
+  }
+} while (-not $saveInvoked -and [DateTime]::UtcNow -lt $deadline)
+if (-not $saveInvoked) { throw "The native save action did not become invokable: $lastSaveError." }
+$dialogClosed = $false
+do {
+  if (-not [NativeDocumentDialog]::IsWindowVisible($ownedDialogHandle)) {
+    $dialogClosed = $true
+    break
+  }
   Start-Sleep -Milliseconds 100
 } while ([DateTime]::UtcNow -lt $deadline)
-if ($null -eq $saveButton) { throw 'The native save action is unavailable.' }
-$saveInvoked = $false
-do {
-  try {
-    $saveButton.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-    $saveInvoked = $true
-  } catch { Start-Sleep -Milliseconds 100 }
-} while (-not $saveInvoked -and [DateTime]::UtcNow -lt $deadline)
-if (-not $saveInvoked) { throw 'The native save action did not become invokable.' }
+if (-not $dialogClosed) {
+  $saveState = [NativeDocumentDialog]::DescribeSave($ownedDialogHandle)
+  throw "The owned native save dialog did not close after its Save command: $saveState."
+}
+'Native Save InvokePattern dismissed the owned dialog.'
 `;
+  const systemRoot = process.env.SystemRoot;
+  if (systemRoot === undefined) throw new Error("The Windows system directory is unavailable.");
+  // Use Windows' matching .NET Framework UIA client and Win32 control providers.
+  const automationHost = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   await new Promise<void>((resolveSave, rejectSave) => {
-    execFile("pwsh.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    execFile(automationHost, ["-NoProfile", "-NonInteractive", "-STA", "-Command", script], {
       windowsHide: true,
       timeout: 30_000,
       env: { ...process.env, JOKO_E2E_MAIN_PID: String(mainPid), JOKO_E2E_SAVE_TARGET: target }
-    }, (error, _stdout, stderr) => error
-      ? rejectSave(new Error(`Native save selection failed: ${stderr.trim()}`, { cause: error }))
-      : resolveSave());
+    }, (error, stdout, stderr) => {
+      if (error !== null) {
+        rejectSave(new Error(`Native save selection failed: ${stderr.trim()}`, { cause: error }));
+        return;
+      }
+      console.info("Packaged documents: native file name editor.", stdout.trim());
+      resolveSave();
+    });
   });
 }
 
-async function closeDesktop(): Promise<void> {
-  if (desktopIdentity === undefined) return;
+async function closeDesktop(afterFailure = false): Promise<void> {
+  if (desktopIdentity === undefined) {
+    if (afterFailure && desktopProcess?.exitCode === null) desktopProcess.kill();
+    await desktop?.close().catch(() => undefined);
+    return;
+  }
   const original = desktopIdentity;
   const current = await readOwnedDesktopProcess(original.pid);
   if (current !== undefined && (current.executablePath.toLowerCase() !== original.executablePath.toLowerCase()
@@ -476,10 +778,28 @@ async function closeDesktop(): Promise<void> {
     throw new Error("Document Desktop cleanup refused a changed process identity.");
   }
   if (current !== undefined) {
-    await desktop?.evaluate(({ app }) => { setTimeout(() => app.quit(), 50); return true; }).catch(() => undefined);
+    if (afterFailure) {
+      await new Promise<void>((resolveKill, rejectKill) => {
+        execFile("taskkill.exe", ["/PID", String(original.pid), "/T", "/F"],
+          { windowsHide: true, timeout: 10_000 }, (error) => error ? rejectKill(error) : resolveKill());
+      });
+    } else {
+      await desktopPage?.evaluate(async () => {
+        const api = (window as unknown as { jokoDesktop: {
+          mainWindowClose: { get(): Promise<{ revision: number }>; set(change: { behavior: "quit"; expectedRevision: number }): Promise<unknown> };
+          window: { close(): Promise<void> };
+        } }).jokoDesktop;
+        const current = await api.mainWindowClose.get();
+        await api.mainWindowClose.set({ behavior: "quit", expectedRevision: current.revision });
+        setTimeout(() => { void api.window.close(); }, 50);
+        return true;
+      }).catch(() => undefined);
+    }
     try {
-      await waitFor(() => readOwnedDesktopProcess(original.pid), (candidate) => candidate === undefined,
+      const exited = await waitFor(async () => ({ process: await readOwnedDesktopProcess(original.pid), exitCode: desktopProcess?.exitCode }),
+        (candidate) => candidate.process === undefined && candidate.exitCode !== null,
         "Document Desktop complete exit", 30_000);
+      if (!afterFailure && exited.exitCode !== 0) throw new Error("Document Desktop returned a nonzero normal exit code.");
     } catch (error) {
       const stillOwned = await readOwnedDesktopProcess(original.pid);
       if (stillOwned !== undefined && stillOwned.executablePath.toLowerCase() === original.executablePath.toLowerCase()
@@ -492,8 +812,11 @@ async function closeDesktop(): Promise<void> {
       throw new Error("Document Desktop did not complete its normal exit.", { cause: error });
     }
   }
+  await desktop?.close().catch(() => undefined);
   desktopIdentity = undefined;
   desktop = undefined;
+  desktopPage = undefined;
+  desktopProcess = undefined;
 }
 
 async function readOwnedDesktopProcess(pid: number): Promise<OwnedDesktopProcess | undefined> {

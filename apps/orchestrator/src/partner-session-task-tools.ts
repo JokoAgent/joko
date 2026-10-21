@@ -26,7 +26,8 @@ export class PartnerSessionTaskTools implements BridgeToolProvider {
       task_id: id, message: text, mode: { type: "string", enum: ["queue", "steer", "resume", "edit", "withdraw"] }, queued_message_id: id,
       interaction_id: id, interaction_generation: { type: "integer", minimum: 1 }, decision: { type: "string" },
       answers: { type: "array", maxItems: 32, items: object({ field_id: id, value: object({ kind: { type: "string", enum: ["text", "choice", "other", "choices", "boolean"] },
-        value: {}, values: { type: "array", maxItems: 64, items: { type: "string", maxLength: 4_000 } }, other_text: { type: "string", maxLength: 4_000 } }, ["kind"]) }, ["field_id", "value"]) },
+        value: { anyOf: [{ type: "string", minLength: 1, maxLength: 4_000 }, { type: "boolean" }] },
+        values: { type: "array", maxItems: 64, items: { type: "string", maxLength: 4_000 } }, other_text: { type: "string", maxLength: 4_000 } }, ["kind"]) }, ["field_id", "value"]) },
       idempotency_key: { type: "string", minLength: 1, maxLength: 128 }
     }, ["task_id"], true),
     tool("stop_session_task", "cancel terminates this execution and its pending input. request-stop requests an interrupt of the current turn only. pause holds input on the same task until a deliberate resume. pausing/cancelling is not proof the runtime stopped.", { task_id: id, mode: { type: "string", enum: ["cancel", "request-stop", "pause"] } }, ["task_id"], true),

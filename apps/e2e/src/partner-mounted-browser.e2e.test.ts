@@ -1,4 +1,7 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
+import { createHash } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { Code } from "@connectrpc/connect";
 import {
   CreatePartnerRequestSchema,
@@ -42,7 +45,26 @@ describe("mounted Partner collaboration product chain", () => {
   let fixture: RealPiSystemFixture | undefined;
   let browser: Browser | undefined;
 
-  afterEach(async () => {
+  afterEach(async ({ task }) => {
+    if (task.result?.state === "fail" && process.env.RUNNER_TEMP !== undefined) {
+      try {
+        const page = browser?.contexts()[0]?.pages()[0];
+        if (page !== undefined) {
+          const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "partners");
+          await mkdir(directory, { recursive: true });
+          await writeFile(join(directory, "product-chain-failed.json"), JSON.stringify({
+            sourceCommit: process.env.GITHUB_SHA,
+            connectionPageVisible: await page.locator(".connection-screen").isVisible(),
+            dialogs: await page.getByRole("dialog").count(),
+            alerts: await page.getByRole("alert").allTextContents(),
+            workspaceStates: await page.locator(".partner-workspace-state").allTextContents(),
+            pageText: (await page.locator("body").innerText({ timeout: 5_000 })).slice(-6_000)
+          }, null, 2));
+          await page.screenshot({ path: join(directory, "product-chain-failed.png"),
+            mask: [page.locator("input,textarea")], fullPage: true, timeout: 5_000 });
+        }
+      } catch { console.error("Partner product-chain failure evidence was unavailable."); }
+    }
     await browser?.close();
     browser = undefined;
     await fixture?.close({ removeRoot: true });
@@ -182,7 +204,7 @@ describe("mounted Partner collaboration product chain", () => {
     const pairingCode = fixture.pairingCode(challenge.challenge.challengeId);
 
     browser = await chromium.launch({ executablePath, headless: true });
-    const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
+    const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: "en-US" });
     const browserErrors = observeBrowserErrors(page);
     await page.goto(`${fixture.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
@@ -264,8 +286,26 @@ describe("mounted Partner collaboration product chain", () => {
     await page.goto(`${fixture.baseUrl}/#/partners`);
     const firstCard = page.locator(partnerCard(first.partnerId));
     await firstCard.waitFor({ state: "visible", timeout: 30_000 });
-    await firstCard.getByRole("button", { name: "Open task" }).dispatchEvent("click");
-    await page.waitForURL((url) => url.hash.includes(encodeURIComponent(first.canonicalSessionId)), { timeout: 30_000 });
+    await firstCard.getByRole("button", { name: "Open task" }).click();
+    await page.waitForURL((url) => url.hash.includes(encodeURIComponent(first.canonicalSessionId)), { timeout: 30_000 }).catch(async (cause: unknown) => {
+      let observation: Record<string, unknown> = { available: false };
+      try {
+        observation = {
+          available: true, documentVisibility: await page.evaluate(() => document.visibilityState),
+          pages: browser!.contexts().reduce((count, context) => count + context.pages().length, 0),
+          alerts: await page.locator('[role="alert"]').count(), dialogs: await page.getByRole("dialog").count(),
+          targetHashMatched: new URL(page.url()).hash.includes(encodeURIComponent(first.canonicalSessionId))
+        };
+        if (process.env.RUNNER_TEMP !== undefined) {
+          const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "partners");
+          await mkdir(directory, { recursive: true });
+          await page.screenshot({ path: join(directory, "open-task-failed.png"), fullPage: true, timeout: 5_000,
+            mask: [page.locator("input, textarea")] });
+          await writeFile(join(directory, "open-task-failed.json"), JSON.stringify({ sourceCommit: process.env.GITHUB_SHA, ...observation }, null, 2) + "\n");
+        }
+      } catch { /* Preserve the original navigation failure when its observation is unavailable. */ }
+      throw new Error(`The Partner task navigation did not complete: ${JSON.stringify(observation)}`, { cause });
+    });
     const completedCard = page.getByLabel(`Delegated work: ${COMPLETE_TITLE}`);
     try {
       await completedCard.waitFor({ state: "visible", timeout: 10_000 });
@@ -325,7 +365,14 @@ describe("mounted Partner collaboration product chain", () => {
     ]);
     expect(restartedThread.readState?.throughSequence).toBe(1n);
 
-    await page.goto(`${fixture.baseUrl}/#/partners/${encodeURIComponent(first.partnerId)}`, { waitUntil: "domcontentloaded" });
+    expect(new URL(page.url()).hash).toBe(`#/partners/${encodeURIComponent(first.partnerId)}`);
+    const restartedDocument = await page.reload({ waitUntil: "domcontentloaded" });
+    expect(restartedDocument?.ok()).toBe(true);
+    // Automatic entry was not enabled. Reopen this exact saved node through
+    // the real connection control before checking its durable workspace.
+    await page.getByRole("button", { name: "Saved nodes", exact: true }).click();
+    await page.locator(".connection-card .profile-card").filter({ hasText: fixture.baseUrl })
+      .getByRole("button", { name: "Connect", exact: true }).click();
     const restartedWorkspace = page.getByRole("dialog", { name: "Aster workspace" });
     await restartedWorkspace.getByText(ARTIFACT_FILE, { exact: true }).waitFor({ state: "visible", timeout: 30_000 });
     await restartedWorkspace.getByText(COMPLETE_TITLE, { exact: true }).waitFor({ state: "visible" });
@@ -335,6 +382,19 @@ describe("mounted Partner collaboration product chain", () => {
     await restartedWorkspace.getByText(ARTIFACT_FILE, { exact: true }).waitFor({ state: "visible" });
     expect(await overflow(page)).toBeLessThanOrEqual(1);
     expect(browserErrors).toEqual([]);
+    if (process.env.RUNNER_TEMP !== undefined) {
+      const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "partners");
+      await mkdir(directory, { recursive: true });
+      await restartedWorkspace.getByText(ARTIFACT_FILE, { exact: true }).scrollIntoViewIfNeeded({ timeout: 5_000 });
+      const screenshot = await page.screenshot({ path: join(directory, "restarted-workspace.png"),
+        mask: [restartedWorkspace.locator("input,textarea")], fullPage: true, timeout: 5_000 });
+      await writeFile(join(directory, "restarted-workspace.json"), JSON.stringify({
+        sourceCommit: process.env.GITHUB_SHA ?? "working-tree",
+        navigationType: await page.evaluate(() => (performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined)?.type),
+        artifactVisible: await restartedWorkspace.getByText(ARTIFACT_FILE, { exact: true }).isVisible(),
+        screenshotSha256: createHash("sha256").update(screenshot).digest("hex"), pageErrors: browserErrors.length
+      }, null, 2));
+    }
   }, 180_000);
 });
 

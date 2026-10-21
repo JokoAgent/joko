@@ -22,6 +22,7 @@ import {
   FileChangeKind,
   ErrorSeverity,
   GitFileStatus,
+  GitSafetyMode,
   InteractionKind,
   InteractionState,
   InstallationState,
@@ -2665,7 +2666,7 @@ describe("provider and model projection", () => {
     auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
     agentResource: {},
     collaboration: {},
-    gitSafety: {},
+    gitSafety: { mode: GitSafetyMode.EXISTING_GIT },
     modelFavorites: { revision: { value: 0n } }
   } as const;
 

@@ -356,6 +356,7 @@ export class RemotePiProcessFactory implements PiManagedDurableStoreRegistry {
 
   async #navigationPath(operationId: string): Promise<string> {
     exactBoundedText(operationId, 512, "navigation operation identity");
+    await this.#authorityStore.ensureReady();
     await mkdir(this.#navigationRoot, { recursive: true, mode: 0o700 });
     const info = await lstat(this.#navigationRoot);
     if (!info.isDirectory() || info.isSymbolicLink() || !sameLocalPath(await realpath(this.#navigationRoot), this.#navigationRoot)
@@ -1677,7 +1678,7 @@ async function readBoundedRemoteControlOutput(
 
 class RemotePiAuthorityStore {
   readonly #root: string;
-  readonly #ready: Promise<void>;
+  #ready: Promise<void> | undefined;
   readonly #tails = new Map<string, Promise<void>>();
 
   constructor(root: string) {
@@ -1686,7 +1687,6 @@ class RemotePiAuthorityStore {
       throw new Error("Remote Pi authority root must be a normalized absolute path.");
     }
     this.#root = normalized;
-    this.#ready = this.#initialize();
   }
 
   async read(identity: string, scope: RemoteAuthorityScope): Promise<RemoteAuthorityRecord | undefined> {
@@ -1752,7 +1752,7 @@ class RemotePiAuthorityStore {
   }
 
   async #removeUnlocked(identity: string): Promise<void> {
-    await this.#ready;
+    await this.ensureReady();
     const path = this.#path(identity);
     const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
@@ -1761,6 +1761,12 @@ class RemotePiAuthorityStore {
     if (info === undefined) return;
     await this.#assertSafeFile(path, info);
     await rm(path, { force: false });
+  }
+
+  ensureReady(): Promise<void> {
+    // The first actual access owns initialization and its failure. Validation
+    // that rejects an unused factory must not leave background filesystem work.
+    return this.#ready ??= this.#initialize();
   }
 
   async #initialize(): Promise<void> {
@@ -1780,7 +1786,7 @@ class RemotePiAuthorityStore {
   }
 
   async #readUnlocked(identity: string): Promise<RemoteAuthorityRecord | undefined> {
-    await this.#ready;
+    await this.ensureReady();
     const path = this.#path(identity);
     const info = await lstat(path).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return undefined;
@@ -1824,7 +1830,7 @@ class RemotePiAuthorityStore {
   }
 
   async #writeUnlocked(identity: string, record: RemoteAuthorityRecord): Promise<void> {
-    await this.#ready;
+    await this.ensureReady();
     const normalized = parseRemoteAuthorityRecord(JSON.stringify(record), identity);
     const path = this.#path(identity);
     const existing = await lstat(path).catch((error: NodeJS.ErrnoException) => {

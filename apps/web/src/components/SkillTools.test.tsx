@@ -98,8 +98,11 @@ describe("SkillTools", () => {
   });
 
   it("shows loading, catalog failure, empty, and independently retryable recovery states", async () => {
+    let rejectCatalog!: (error: Error) => void;
+    let resolveCatalogStarted!: () => void;
+    const catalogStarted = new Promise<void>((resolve) => { resolveCatalogStarted = resolve; });
     const listSkills = vi.fn()
-      .mockRejectedValueOnce(new Error("Catalog unavailable."))
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectCatalog = reject; resolveCatalogStarted(); }))
       .mockResolvedValue({ revision: 2n, skills: [] });
     const listSkillRecoveries = vi.fn()
       .mockResolvedValueOnce([])
@@ -109,6 +112,8 @@ describe("SkillTools", () => {
     const container = await renderSkills(controller);
 
     expect(container.textContent).toContain("Loading Skills");
+    await act(async () => { await catalogStarted; });
+    await act(async () => rejectCatalog(new Error("Catalog unavailable.")));
     await settle();
     expect(container.textContent).toContain("Catalog unavailable.");
 
@@ -282,6 +287,11 @@ describe("SkillTools", () => {
     let started = false;
     const getSkillMarketEntry = vi.fn(async () => marketEntryFixture());
     const controller = skillController({
+      listSkills: vi.fn(async () => ({
+        revision: started ? 2n : 1n,
+        skills: [{ ...globalSkill(), revision: started ? 2n : 1n }]
+      })),
+      openSkill: vi.fn(async () => sessionFor({ ...globalSkill(), revision: started ? 2n : 1n })),
       listSkillMarketSources: vi.fn(async () => ({ revision: 4n, sources: [marketSourceFixture()], recoveredFromCorruption: false })),
       getSkillPublicationPreview: vi.fn(async () => preview),
       listSkillPublicationJobs: vi.fn(async () => ({ items: started ? [published] : [], recoveredFromCorruption: false })),
@@ -328,9 +338,25 @@ describe("SkillTools", () => {
     const dialog = required(document.body.querySelector<HTMLElement>('[role="dialog"]'));
     await act(async () => buttonWithText(dialog, "Review publication target").click());
     await settle();
+    await act(async () => roots.at(-1)!.render(<SkillTools controller={{ ...controller }} backends={backends} targets={targets} locale="en" t={skillTranslator} />));
+    await settle();
+    expect(document.body.querySelector('[role="dialog"]')).toBe(dialog);
+    expect(controller.openSkill).toHaveBeenCalledTimes(1);
+    expect(controller.closeSkill).not.toHaveBeenCalled();
     await act(async () => buttonWithText(dialog, "Publish Skill").click());
     await settle();
-    await act(async () => buttonWithText(dialog, "Open in Skill market").click());
+    expect(document.body.querySelector('[role="dialog"]')).toBe(dialog);
+    expect(dialog.textContent).toContain("Version 1.0.0 is published");
+    expect(controller.listSkills).toHaveBeenCalledTimes(1);
+    await act(async () => dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    await settle();
+    expect(controller.listSkills).toHaveBeenCalledTimes(2);
+    expect(controller.openSkill).toHaveBeenLastCalledWith("resource-global", 2n, expect.any(AbortSignal));
+    await act(async () => buttonWithText(container, "Publish").click());
+    await settle();
+    const reopened = required(document.body.querySelector<HTMLElement>('[role="dialog"]'));
+    expect(reopened.textContent).toContain("Version 1.0.0 is published");
+    await act(async () => buttonWithText(reopened, "Open in Skill market").click());
     await settle(140);
 
     const identity = marketEntryFixture().identity;

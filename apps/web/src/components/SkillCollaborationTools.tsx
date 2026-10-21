@@ -31,19 +31,20 @@ export function SkillCollaborationTools({ controller, t }: {
   const [mutationError, setMutationError] = useState<string>();
   const request = useRef(0);
   const generation = useRef(0);
+  const getCollaborationDirectory = controller.getCollaborationDirectory;
 
   useEffect(() => () => { generation.current += 1; }, []);
   useEffect(() => {
     const current = ++request.current;
     const abort = new AbortController();
     setState({ kind: "loading" });
-    void controller.getCollaborationDirectory(abort.signal).then((value) => {
+    void getCollaborationDirectory(abort.signal).then((value) => {
       if (!abort.signal.aborted && current === request.current) setState({ kind: "ready", value });
     }).catch((cause: unknown) => {
       if (!abort.signal.aborted && current === request.current) setState({ kind: "error", message: errorMessage(cause, t) });
     });
     return () => abort.abort();
-  }, [controller, reload, t]);
+  }, [getCollaborationDirectory, reload, t]);
 
   const directory = state.kind === "ready" ? state.value : undefined;
   const validName = (value: string): boolean => value === value.trim() && value.length > 0 && value.length <= 128

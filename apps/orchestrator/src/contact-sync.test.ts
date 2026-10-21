@@ -5,15 +5,16 @@ import { join } from "node:path";
 
 import {
   ContactStore,
+  contactSyncPublicKeyFingerprint,
   captureContactSnapshot,
   createEmptyContactSnapshot,
   createEmptyContactSyncState,
   type ContactDataSnapshot
 } from "@joko/store";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ContactSyncWorkerCodec } from "./contact-sync-codec.js";
-import { generateNodeSyncIdentity, NodeSyncLanTransport, type NodeSyncCipherChunkFrame } from "@joko/node-sync";
+import { generateNodeSyncIdentity, NodeSyncLanTransport, type NodeSyncCipherChunkFrame, type NodeSyncLanTransportOptions } from "@joko/node-sync";
 import { ContactSyncManager } from "./contact-sync-manager.js";
 import {
   ContactSyncWireDecoder,
@@ -176,10 +177,64 @@ describe("Contacts sync node lifecycle", () => {
     expect(starts).toBe(2);
   });
 
-  it("discovers explicit candidates, converges two real LAN nodes, and revokes delivery", { timeout: 25_000 }, async () => {
+  it("does not postpone a granted peer's scheduled sync on each more frequent LAN beacon", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "joko-contact-sync-beacons-"));
+    const store = new ContactStore(join(directory, "contacts.db"));
+    const vault = await CredentialVault.open(join(directory, "master.key"));
+    const identity = generateNodeSyncIdentity();
+    const candidate = { nodeId: "node-peer", displayName: "Peer", publicKey: identity.publicKey,
+      fingerprint: contactSyncPublicKeyFingerprint(identity.publicKey), address: "127.0.0.1", port: 4318, seenAt: Date.now() };
+    let transportOptions: NodeSyncLanTransportOptions | undefined;
+    const send = vi.fn(async (_peerId: string, _frame: NodeSyncCipherChunkFrame) => true);
+    const manager = new ContactSyncManager({ store, vault, nodeId: "node-beacons", displayName: "Beacon receiver",
+      codec: inProcessContactSyncCodec, now: () => Date.now(), transportFactory: (options) => {
+        transportOptions = options;
+        return { start: async () => undefined, stop: () => undefined, send, candidates: () => [candidate], onlinePeerIds: () => [candidate.nodeId] };
+      } });
+    await manager.initialize();
+    cleanups.push(() => { manager.close(); store.close(); rmSync(directory, { recursive: true, force: true }); });
+    vi.useFakeTimers();
+    try {
+      await manager.setEnabled(manager.status().configurationRevision, true);
+      await manager.grantCandidate(candidate.nodeId, candidate.fingerprint);
+      await vi.advanceTimersByTimeAsync(50);
+      for (let beacon = 0; beacon < 8; beacon++) {
+        // NodeSyncLanTransport reports both callbacks for every 150 ms beacon.
+        transportOptions!.onCandidate(candidate);
+        transportOptions!.onPresenceChanged?.();
+        await vi.advanceTimersByTimeAsync(150);
+      }
+      expect(send).toHaveBeenCalled();
+      expect(send.mock.calls.every(call => call[0] === candidate.nodeId)).toBe(true);
+      expect(manager.status().peers).toHaveLength(1);
+    } finally { manager.close(); vi.useRealTimers(); }
+  });
+
+  it("discovers explicit candidates, converges two real LAN nodes, and revokes delivery", { timeout: 25_000 }, async ({ signal, onTestFailed, onTestFinished }) => {
+    type Phase = "fixture" | "enable-first" | "enable-second" | "discovery" | "grant" | "convergence" | "settlement" | "revoke" | "revoked-delivery" | "complete";
+    const startedAt = performance.now();
+    let phase: Phase = "fixture";
+    const observed = { firstEnabled: false, secondEnabled: false, firstSeesSecond: false, secondSeesFirst: false };
+    let transportSnapshot: (() => unknown) | undefined;
+    const snapshot = () => ({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), ...observed,
+      transports: transportSnapshot?.() });
+    let abortedSnapshot: ReturnType<typeof snapshot> | undefined;
+    const captureAbort = () => { abortedSnapshot ??= snapshot(); };
+    signal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => signal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => {
+      try { console.error("[contact-sync-boundary]", JSON.stringify(abortedSnapshot ?? snapshot())); }
+      catch { /* Observations must preserve the original failure. */ }
+    });
     const port = randomInt(54_000, 60_000);
     const first = await managerFixture("first", port);
     const second = await managerFixture("second", port);
+    transportSnapshot = () => [first, second].map(({ manager, diagnostics }) => {
+      const status = manager.status();
+      return { phase: status.phase, errorCode: status.errorCode, candidates: status.candidates.length,
+        peers: status.peers.length, onlinePeers: status.onlinePeerCount, diagnostics,
+        multicastInterface: process.platform === "win32" ? "os-default" : "loopback" };
+    });
     const created = first.store.createContact({
       expectedDirectoryRevision: first.store.directoryState().revision,
       kind: "person",
@@ -188,31 +243,45 @@ describe("Contacts sync node lifecycle", () => {
       identities: [{ platform: "email", value: "lin@example.com" }]
     }).contact!;
 
+    phase = "enable-first";
     await first.manager.setEnabled(first.manager.status().configurationRevision, true);
+    observed.firstEnabled = first.manager.status().enabled;
+    phase = "enable-second";
     await second.manager.setEnabled(second.manager.status().configurationRevision, true);
-    await waitUntil(() => first.manager.status().candidates.some((candidate) => candidate.nodeId === "node-second") &&
-      second.manager.status().candidates.some((candidate) => candidate.nodeId === "node-first"));
+    observed.secondEnabled = second.manager.status().enabled;
+    phase = "discovery";
+    await waitUntil(() => {
+      observed.firstSeesSecond = first.manager.status().candidates.some((candidate) => candidate.nodeId === "node-second");
+      observed.secondSeesFirst = second.manager.status().candidates.some((candidate) => candidate.nodeId === "node-first");
+      return observed.firstSeesSecond && observed.secondSeesFirst;
+    });
 
+    phase = "grant";
     const firstCandidate = first.manager.status().candidates.find((candidate) => candidate.nodeId === "node-second")!;
     const secondCandidate = second.manager.status().candidates.find((candidate) => candidate.nodeId === "node-first")!;
     expect(firstCandidate.granted).toBe(false);
     await first.manager.grantCandidate(firstCandidate.nodeId, firstCandidate.fingerprint);
     await second.manager.grantCandidate(secondCandidate.nodeId, secondCandidate.fingerprint);
+    phase = "convergence";
     await waitUntil(() => second.store.allContacts().some((contact) => contact.id === created.id), 10_000);
     expect(second.store.getContact(created.id)).toMatchObject({
       displayName: "Lin Xiao",
       summary: "Local before pairing",
       identityCount: 1
     });
+    phase = "settlement";
     await waitUntil(() => first.manager.status().phase === "up_to_date" || second.manager.status().phase === "up_to_date");
 
+    phase = "revoke";
     const granted = first.manager.status().peers.find((peer) => peer.peerId === "node-second")!;
     first.manager.revokePeer(granted.peerId, granted.revision);
     const remote = second.store.getContact(created.id);
     second.store.updateContact(remote.id, remote.revision, { summary: "Must not cross a revoked grant" });
+    phase = "revoked-delivery";
     await expect(second.manager.syncNow("node-first")).rejects.toThrow(/could not be reached|reachable/iu);
     expect(first.store.getContact(created.id).summary).toBe("Local before pairing");
     expect(first.manager.status().peers).toEqual([]);
+    phase = "complete";
   });
 });
 
@@ -270,10 +339,16 @@ function multiChunkState() {
 async function managerFixture(name: string, multicastPort: number): Promise<{
   readonly manager: ContactSyncManager;
   readonly store: ContactStore;
+  readonly diagnostics: readonly { readonly level: string; readonly code?: string }[];
 }> {
   const directory = mkdtempSync(join(tmpdir(), `joko-contact-sync-manager-${name}-`));
   const store = new ContactStore(join(directory, "contacts.db"));
   const vault = await CredentialVault.open(join(directory, "master.key"));
+  const diagnostics: { level: string; code?: string }[] = [];
+  const record = (level: string, metadata?: Readonly<Record<string, unknown>>) => {
+    if (diagnostics.length === 20) diagnostics.shift();
+    diagnostics.push({ level, ...(typeof metadata?.code === "string" ? { code: metadata.code.slice(0, 48) } : {}) });
+  };
   const manager = new ContactSyncManager({
     store,
     vault,
@@ -282,11 +357,15 @@ async function managerFixture(name: string, multicastPort: number): Promise<{
     codec: inProcessContactSyncCodec,
     transportFactory: (options) => new NodeSyncLanTransport({
       ...options,
+      // Windows uses the same OS-selected interface as the production LAN chain;
+      // the Unix same-host fixtures use their configured loopback route.
+      ...(process.platform === "win32" ? {} : { multicastInterface: "127.0.0.1" }),
       multicastPort,
       beaconIntervalMilliseconds: 150,
       endpointTtlMilliseconds: 2_000,
       connectTimeoutMilliseconds: 800,
-      multicastLoopback: true
+      multicastLoopback: true,
+      logger: { debug: (_message, metadata) => record("debug", metadata), warn: (_message, metadata) => record("warn", metadata) }
     })
   });
   await manager.initialize();
@@ -295,7 +374,7 @@ async function managerFixture(name: string, multicastPort: number): Promise<{
     store.close();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { manager, store };
+  return { manager, store, diagnostics };
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMilliseconds = 5_000): Promise<void> {

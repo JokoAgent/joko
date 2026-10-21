@@ -55,6 +55,7 @@ async function mount(drift = false, initializationState?: "pending" | "error") {
     const snapshot = preparing ? { ...ownerSnapshot(value), sessions: [] } : ownerSnapshot(value);
     const currentProfile = (): PartnerProfileView => preparing ? { ...partner(value), initializationState, invitationStage: initializationState === "error" ? "failed" : "session", canonicalSessionId: undefined } : partner(value);
     return { connect: async () => { callbacks.onSnapshot?.(snapshot); callbacks.onState?.("connected"); }, disconnect: () => undefined,
+      taskSharingApi: () => undefined,
       refresh: async () => callbacks.onSnapshot?.(snapshot), listPartners: async () => ({ partners: [currentProfile()], directory: { revision: 1n, templates: [], avatarPresets: ["orbit"], activeCount: 1, archivedCount: 0, errorCount: 0, updatedAt: 1 } }),
       getPartner: async () => { reads.push((active ? "active:" : "source:") + value.serverId); return { ...currentProfile(), ...(drift && active && value.id === second.id ? preparing ? { homeTargetId: "changed-home" } : { canonicalSessionId: "changed" } : {}) }; },
       listPartnerSessions: async () => { linkReads(); return [{ partnerId: "same-partner", sessionId: "session-" + value.serverId, role: "canonical", profileVersion: 1n, available: true, readOnly: false, archived: false, deleted: false, displayName: "Task", createdAt: 1 }]; }

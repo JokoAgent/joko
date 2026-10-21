@@ -971,6 +971,9 @@ export function useAppController(): AppController {
 
   const beginGatewayTransition = useCallback((): number => {
     explicitDisconnectRef.current = false;
+    discoveryGenerationRef.current += 1;
+    discoveryAbortRef.current?.abort();
+    discoveryAbortRef.current = undefined;
     const generation = ++gatewayGenerationRef.current;
     const previous = gatewayRef.current;
     gatewayRef.current = undefined;
@@ -980,6 +983,8 @@ export function useAppController(): AppController {
     document.title = "Joko";
     setState((current) => ({
       ...clearTransientExtensionUiState(current),
+      discoveryState: "idle",
+      discoveryError: undefined,
       connectionGeneration: generation
     }));
     return generation;
@@ -2399,6 +2404,53 @@ export function useAppController(): AppController {
       uninstallRemoteBackendRuntime: async (...args: Parameters<OperationApi["uninstallRemoteBackendRuntime"]>) => original().uninstallRemoteBackendRuntime(...args)
     };
   }, [artifactGateway]);
+  const skillReadApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined) throw new Error("Connect to Joko before reading Skills.");
+      return artifactGateway;
+    };
+    const current = (): OrchestratorGateway => {
+      const source = original();
+      if (gatewayRef.current !== source || gatewayGenerationRef.current !== linkGatewayGeneration
+        || connectionStateRef.current !== "connected") throw new Error("The Skill connection is no longer current.");
+      return source;
+    };
+    return {
+      listSkills: async (...args: Parameters<OperationApi["listSkills"]>) => current().listSkills(...args),
+      openSkill: async (...args: Parameters<OperationApi["openSkill"]>) => current().openSkill(...args),
+      listSkillFiles: async (...args: Parameters<OperationApi["listSkillFiles"]>) => current().listSkillFiles(...args),
+      readSkillFile: async (...args: Parameters<OperationApi["readSkillFile"]>) => current().readSkillFile(...args),
+      getSkillDiff: async (...args: Parameters<OperationApi["getSkillDiff"]>) => current().getSkillDiff(...args),
+      listSkillRecoveries: async (...args: Parameters<OperationApi["listSkillRecoveries"]>) => current().listSkillRecoveries(...args),
+      closeSkill: async (...args: Parameters<OperationApi["closeSkill"]>) => original().closeSkill(...args)
+    };
+  }, [artifactGateway, linkGatewayGeneration]);
+  const skillMarketReadApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined) throw new Error("Connect to Joko before reading the Skill market.");
+      return artifactGateway;
+    };
+    const current = (): OrchestratorGateway => {
+      const source = original();
+      if (gatewayRef.current !== source || gatewayGenerationRef.current !== linkGatewayGeneration
+        || connectionStateRef.current !== "connected") {
+        throw new Error("The Skill market connection is no longer current.");
+      }
+      return source;
+    };
+    return {
+      listSkillMarketSources: async (...args: Parameters<OperationApi["listSkillMarketSources"]>) => current().listSkillMarketSources(...args),
+      getSkillPublicationPreview: async (...args: Parameters<OperationApi["getSkillPublicationPreview"]>) => current().getSkillPublicationPreview(...args),
+      listSkillPublicationJobs: async (...args: Parameters<OperationApi["listSkillPublicationJobs"]>) => current().listSkillPublicationJobs(...args),
+      getSkillPublicationJob: async (...args: Parameters<OperationApi["getSkillPublicationJob"]>) => current().getSkillPublicationJob(...args),
+      listSkillMarketCatalog: async (...args: Parameters<OperationApi["listSkillMarketCatalog"]>) => current().listSkillMarketCatalog(...args),
+      getSkillMarketEntry: async (...args: Parameters<OperationApi["getSkillMarketEntry"]>) => current().getSkillMarketEntry(...args),
+      openSkillMarketPreview: async (...args: Parameters<OperationApi["openSkillMarketPreview"]>) => current().openSkillMarketPreview(...args),
+      listSkillMarketPreviewFiles: async (...args: Parameters<OperationApi["listSkillMarketPreviewFiles"]>) => current().listSkillMarketPreviewFiles(...args),
+      readSkillMarketPreviewFile: async (...args: Parameters<OperationApi["readSkillMarketPreviewFile"]>) => current().readSkillMarketPreviewFile(...args),
+      closeSkillMarketPreview: async (...args: Parameters<OperationApi["closeSkillMarketPreview"]>) => original().closeSkillMarketPreview(...args)
+    };
+  }, [artifactGateway, linkGatewayGeneration]);
   const mcpApi = useMemo(() => {
     const original = (): OrchestratorGateway => {
       if (artifactGateway === undefined) throw new Error("Connect to Joko before configuring tools.");
@@ -2603,6 +2655,34 @@ export function useAppController(): AppController {
       throw new Error("The Provider configuration connection is no longer current.");
     }
     return artifactGateway.saveProvider(draft, signal);
+  }, [artifactGateway, linkGatewayGeneration]);
+  const getCollaborationDirectory = useCallback<AppController["getCollaborationDirectory"]>(async (signal) => {
+    signal?.throwIfAborted();
+    if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+      || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+      throw new Error("The collaboration connection is no longer current.");
+    }
+    const directory = await artifactGateway.getCollaborationDirectory(signal);
+    signal?.throwIfAborted();
+    if (gatewayRef.current !== artifactGateway || gatewayGenerationRef.current !== linkGatewayGeneration
+      || connectionStateRef.current !== "connected") {
+      throw new Error("The collaboration connection is no longer current.");
+    }
+    return directory;
+  }, [artifactGateway, linkGatewayGeneration]);
+  const getMessagingSettings = useCallback<AppController["getMessagingSettings"]>(async (signal) => {
+    signal?.throwIfAborted();
+    const assertCurrent = () => {
+      if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+        || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+        throw new Error("The messaging connection is no longer current.");
+      }
+      return artifactGateway;
+    };
+    const settings = await assertCurrent().getMessagingSettings(signal);
+    signal?.throwIfAborted();
+    assertCurrent();
+    return settings;
   }, [artifactGateway, linkGatewayGeneration]);
   const predictNextPrompt = useCallback<AppController["predictNextPrompt"]>(async (sessionId, expectedLastActivityAt, expectedGeneration, signal) => {
     signal.throwIfAborted();
@@ -2840,6 +2920,9 @@ export function useAppController(): AppController {
     cloneProjectScheduleToUser: (scheduleId, displayName) => gateway().cloneProjectScheduleToUser(scheduleId, displayName),
     removeProjectSchedule: (scheduleId, keepPersonalCopy) => gateway().removeProjectSchedule(scheduleId, keepPersonalCopy),
     saveSchedule: (scheduleId, draft) => gateway().saveSchedule(scheduleId, draft),
+    prepareScheduleHook: (scheduleId, draft, source, signal, operationId) => gateway().prepareScheduleHook(scheduleId, draft, source, signal, operationId),
+    testScheduleHook: (scheduleId, draft, signal, operationId) => gateway().testScheduleHook(scheduleId, draft, signal, operationId),
+    getScheduleHookOperation: (operationId, signal) => gateway().getScheduleHookOperation(operationId, signal),
     listScheduleRunHistory: (scheduleId, pageToken, pageSize) => gateway().listScheduleRunHistory(scheduleId, pageToken, pageSize),
     getSchedulerRuntime: (signal) => gateway().getSchedulerRuntime(signal),
     ...queueApi,
@@ -2874,7 +2957,7 @@ export function useAppController(): AppController {
     addResource: (draft) => gateway().addResource(draft),
     setResourceEnabled: (resourceId, enabled) => gateway().setResourceEnabled(resourceId, enabled),
     removeResource: (resourceId) => gateway().removeResource(resourceId),
-    listSkills: (options) => gateway().listSkills(options),
+    ...skillReadApi,
     listSkillLearningRuns: (signal) => gateway().listSkillLearningRuns(signal),
     getSkillLearningRun: (runId, signal) => gateway().getSkillLearningRun(runId, signal),
     applySkillLearning: (run, confirmReplace, signal) => gateway().applySkillLearning(run, confirmReplace, signal),
@@ -2882,33 +2965,20 @@ export function useAppController(): AppController {
     cancelSkillLearning: (run, signal) => gateway().cancelSkillLearning(run, signal),
     getSkillResourceUsageReport: (resourceId, timeZone, signal) =>
       gateway().getSkillResourceUsageReport(resourceId, timeZone, signal),
-    openSkill: (skillId, expectedRevision, signal) => gateway().openSkill(skillId, expectedRevision, signal),
-    listSkillFiles: (sessionId, parentKey, signal) => gateway().listSkillFiles(sessionId, parentKey, signal),
-    readSkillFile: (sessionId, key, signal) => gateway().readSkillFile(sessionId, key, signal),
-    getSkillDiff: (sessionId, signal) => gateway().getSkillDiff(sessionId, signal),
     prepareSkillFileEdit: (sessionId, key, expectedFileRevision, content, signal) =>
       gateway().prepareSkillFileEdit(sessionId, key, expectedFileRevision, content, signal),
     prepareSkillRename: (sessionId, name, signal) => gateway().prepareSkillRename(sessionId, name, signal),
     applySkillDraft: (draft, signal) => gateway().applySkillDraft(draft, signal),
     setSkillEnabled: (skill, enabled, signal) => gateway().setSkillEnabled(skill, enabled, signal),
     deleteSkill: (session, confirmation, signal) => gateway().deleteSkill(session, confirmation, signal),
-    listSkillRecoveries: (signal) => gateway().listSkillRecoveries(signal),
-    closeSkill: (sessionId, signal) => gateway().closeSkill(sessionId, signal),
     getSkillMarketGitPreflight: (signal) => gateway().getSkillMarketGitPreflight(signal),
-    listSkillMarketSources: (signal) => gateway().listSkillMarketSources(signal),
     addSkillMarketSource: (source, expectedCatalogRevision, signal) =>
       gateway().addSkillMarketSource(source, expectedCatalogRevision, signal),
     refreshSkillMarketSource: (sourceId, expectedRevision, signal) =>
       gateway().refreshSkillMarketSource(sourceId, expectedRevision, signal),
     removeSkillMarketSource: (sourceId, expectedRevision, signal) =>
       gateway().removeSkillMarketSource(sourceId, expectedRevision, signal),
-    listSkillMarketCatalog: (options) => gateway().listSkillMarketCatalog(options),
-    getSkillMarketEntry: (identity, signal) => gateway().getSkillMarketEntry(identity, signal),
-    openSkillMarketPreview: (identity, signal) => gateway().openSkillMarketPreview(identity, signal),
-    listSkillMarketPreviewFiles: (preview, pageToken, pageSize, signal) =>
-      gateway().listSkillMarketPreviewFiles(preview, pageToken, pageSize, signal),
-    readSkillMarketPreviewFile: (preview, key, signal) => gateway().readSkillMarketPreviewFile(preview, key, signal),
-    closeSkillMarketPreview: (previewId, signal) => gateway().closeSkillMarketPreview(previewId, signal),
+    ...skillMarketReadApi,
     createSkillMarketInstallPlan: (identity, target, signal) =>
       gateway().createSkillMarketInstallPlan(identity, target, signal),
     getSkillMarketInstallPlan: (planId, signal) => gateway().getSkillMarketInstallPlan(planId, signal),
@@ -2924,11 +2994,7 @@ export function useAppController(): AppController {
     enqueueSkillMarketSync: (policy, signal) => gateway().enqueueSkillMarketSync(policy, signal),
     cancelSkillMarketSync: (job, signal) => gateway().cancelSkillMarketSync(job, signal),
     retrySkillMarketSync: (job, signal) => gateway().retrySkillMarketSync(job, signal),
-    getSkillPublicationPreview: (resourceId, expectedResourceRevision, sourceId, expectedSourceRevision, slug, signal) =>
-      gateway().getSkillPublicationPreview(resourceId, expectedResourceRevision, sourceId, expectedSourceRevision, slug, signal),
-    listSkillPublicationJobs: (resourceId, signal) => gateway().listSkillPublicationJobs(resourceId, signal),
-    getSkillPublicationJob: (jobId, signal) => gateway().getSkillPublicationJob(jobId, signal),
-    getCollaborationDirectory: (signal) => gateway().getCollaborationDirectory(signal),
+    getCollaborationDirectory,
     createCollaborationScope: (kind, name, expectedCatalogRevision, signal) =>
       gateway().createCollaborationScope(kind, name, expectedCatalogRevision, signal),
     updateCollaborationScope: (scope, name, signal) => gateway().updateCollaborationScope(scope, name, signal),
@@ -3220,7 +3286,7 @@ export function useAppController(): AppController {
     revokeContactSyncPeer: (peerId, expectedRevision, signal) =>
       gateway().revokeContactSyncPeer(peerId, expectedRevision, signal),
     syncContactsNow: (peerId, signal) => gateway().syncContactsNow(peerId, signal),
-    getMessagingSettings: (signal) => gateway().getMessagingSettings(signal),
+    getMessagingSettings,
     createTelegramMessagingConnection: (ownerProviderUserId, configuration, signal) =>
       gateway().createTelegramMessagingConnection(ownerProviderUserId, configuration, signal),
     createDiscordMessagingConnection: (ownerProviderUserId, configuration, signal) =>
@@ -3400,7 +3466,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-  }), [deviceNameApi, saveProvider, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+  }), [skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, simulatorViewerApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {

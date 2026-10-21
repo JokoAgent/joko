@@ -49,7 +49,7 @@ public final class JokoLanDiscoveryModule: Module {
       throw LanDiscoveryException("LAN discovery address is not multicast.")
     }
 
-    let descriptor = Darwin.socket(AF_INET, Int32(SOCK_DGRAM.rawValue), IPPROTO_UDP)
+    let descriptor = Darwin.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
     guard descriptor >= 0 else { throw LanDiscoveryException("LAN discovery socket could not be created.") }
     defer { Darwin.close(descriptor) }
     var ttl: UInt8 = 1

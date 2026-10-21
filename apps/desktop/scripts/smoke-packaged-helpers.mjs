@@ -21,6 +21,14 @@ export async function finalizeSmokeRun(options) {
     failure = normalizeError(error);
   }
 
+  try {
+    await options.preserveEvidence?.({ passed: failure === undefined, payload });
+  } catch (error) {
+    const evidenceError = normalizeError(error);
+    failure = failure === undefined ? evidenceError
+      : new AggregateError([failure, evidenceError], "Packaged desktop smoke failed and its evidence could not be preserved.");
+  }
+
   const retainFailure = failure !== undefined && options.retainFailure === true;
   if (retainFailure) {
     options.reportRetained();

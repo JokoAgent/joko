@@ -112,6 +112,8 @@ describe("the single connection page and host capabilities", () => {
     await host.render();
     expect(host.container.querySelectorAll("form")).toHaveLength(1);
     const origin = element<HTMLInputElement>(host.container, 'input[type="url"]');
+    expect(origin.getAttribute("aria-label")).toBe("connection.origin");
+    expect(document.getElementById(origin.getAttribute("aria-describedby")!)?.textContent).toBe("connection.secureHint");
     await input(origin, node.origin);
     await click(button(host.container, "Inspect identity"));
     expect(origin.disabled).toBe(true);

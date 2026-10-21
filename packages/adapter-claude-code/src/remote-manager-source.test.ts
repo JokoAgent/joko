@@ -12,7 +12,10 @@ import { loadClaudeRemoteManagerSource } from "./remote-manager-source.js";
 const execute = promisify(execFile);
 
 describe("remote Claude manager bundle", () => {
-  it("loads deterministic source and built inputs into equivalent bounded executable modules", async () => {
+  // This compiles both forms, starts real native children (10s each), and
+  // exercises durable stores. Windows needs an aggregate bound for that chain.
+  it("loads deterministic source and built inputs into equivalent bounded executable modules",
+    { timeout: process.platform === "win32" ? 30_000 : 5_000 }, async () => {
     const packageSource = dirname(fileURLToPath(import.meta.url));
     const root = await mkdtemp(join(packageSource, ".manager-bundle-test-"));
     try {

@@ -11,6 +11,7 @@ import {
 } from "./MobileUpdateSurface";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import type { MobileUpdateControllerState } from "./mobile-update-controller";
+import { mobileMessage } from "./mobile-messages";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -132,7 +133,7 @@ describe("MobileUpdateSurface", () => {
     expect(actions.onDismissPrompt).toHaveBeenCalledOnce();
     actions.onDismissPrompt.mockClear();
     act(() => button(container, "Later").click());
-    await act(async () => button(container, "Open install page").click());
+    await act(async () => button(container, mobileMessage("en", "updates.prompt.install")).click());
     expect(actions.onDismissPrompt).toHaveBeenCalledOnce();
     expect(actions.onOpenUpdate).toHaveBeenCalledWith(target);
   });
@@ -149,7 +150,7 @@ describe("MobileUpdateSurface", () => {
     expect(native.hardwareBack?.()).toBe(true);
     expect(container.textContent).toContain("remain protected");
     await act(async () => button(container, "Check again").click());
-    await act(async () => button(container, "Open install page").click());
+    await act(async () => button(container, mobileMessage("en", "updates.prompt.install")).click());
     expect(actions.onRecheckForced).toHaveBeenCalledOnce();
     expect(actions.onOpenUpdate).toHaveBeenCalledWith(target);
   });

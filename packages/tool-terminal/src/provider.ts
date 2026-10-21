@@ -37,7 +37,7 @@ export const TERMINAL_LIMITS = Object.freeze({
   maximumOutputFrames: 1024,
   maximumStreamsPerTerminal: 8,
   maximumSnapshotBytes: 8 * 1024 * 1024,
-  scrollbackLines: 1000
+  scrollbackLines: 5_000
 });
 const MAXIMUM_PENDING_OUTPUT_BYTES = 1024 * 1024;
 const PAUSE_OUTPUT_BYTES = 128 * 1024;

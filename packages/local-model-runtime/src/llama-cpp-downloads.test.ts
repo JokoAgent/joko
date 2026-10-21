@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { LocalRuntimeError } from "./errors.js";
 import { allowedDownloadUrl, downloadLlamaCppAsset, llamaCppPlatform, pickLlamaCppRelease, resolveHfRepository, resolveLlamaCppRelease, selectGgufShards } from "./llama-cpp-downloads.js";
 
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
@@ -61,6 +62,13 @@ describe("verified GGUF assets", () => {
     }
     const fetcher = vi.fn(async () => new Response(null, { status: 302, headers: { location: "http://huggingface.co/weights" } }));
     await expect(downloadLlamaCppAsset(asset(), await destination(), "hf", signal(), () => undefined, false, fetcher)).rejects.toThrow("DOWNLOAD_BLOCKED"); expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+  it("rejects with the original retired-owner error from progress and removes unverified bytes", async () => {
+    const file = await destination(), retired = new LocalRuntimeError("OWNER_CHANGED", "The runtime owner changed during the operation.");
+    const fetcher = vi.fn(async () => new Response("abcdefgh"));
+    await expect(downloadLlamaCppAsset(asset(), file, "hf", signal(), () => { throw retired; }, false, fetcher)).rejects.toBe(retired);
+    await expect(readFile(file)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(`${file}.partial`)).rejects.toMatchObject({ code: "ENOENT" });
   });
   it("keeps the winning idle timeout instead of reporting cancellation", async () => {
     const fetcher = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => new Response(new ReadableStream({ start(controller) { init?.signal?.addEventListener("abort", () => controller.error(init.signal!.reason), { once: true }); } })));

@@ -219,6 +219,7 @@ import {
 } from "./dedicated-hardware-main-controller.js";
 import { dedicatedHardwareSdkStagingDirectory } from "./dedicated-hardware-sdk.js";
 import { resolveDedicatedHardwareRuntime } from "./dedicated-hardware-runtime.js";
+import { createDedicatedHardwarePermissionRecovery } from "./dedicated-hardware/permission-recovery.js";
 import {
   DEDICATED_HARDWARE_MODEL_IDS,
   createDedicatedHardwareHostClient,
@@ -276,7 +277,8 @@ import {
   NATIVE_TASK_STATUS_WINDOW_INTERACTION,
   type MacNativeTaskStatusHost,
   type NativeTaskStatusWindow,
-  type NativeTaskStatusWindowBounds
+  type NativeTaskStatusWindowBounds,
+  type NativeTaskStatusWindowRetirementReason
 } from "./mac-native-task-status-host.js";
 import {
   isAllowedDesktopClipboardWriteRequest,
@@ -308,6 +310,11 @@ import {
 import {
   ExternalTextInsertionCoordinator
 } from "./external-text-insertion.js";
+import {
+  MacShortcutVoicePasteTarget,
+  captureShortcutVoiceDocumentTarget,
+  type ShortcutVoiceDocumentTarget
+} from "./global-voice-paste-target.js";
 import {
   createSystemAudioMuteBackend,
   SystemAudioMuteGuard
@@ -507,6 +514,21 @@ const packagedSmokePublicHttpOrigin = process.env["JOKO_DESKTOP_SMOKE_PUBLIC_HTT
 const packagedSmokeProviderOrigin = process.env["JOKO_DESKTOP_SMOKE_PROVIDER_ORIGIN"];
 const packagedSmokeClipboardNonce = process.env["JOKO_DESKTOP_SMOKE_CLIPBOARD_NONCE"];
 const packagedSmokeResultPath = process.env["JOKO_DESKTOP_SMOKE_RESULT"];
+interface PackagedSmokeNativeTaskStatusLifecycleReceipt {
+  readonly event: "created" | "bounds-requested" | "load-started" | "load-completed" | "load-failed" |
+    "show-inactive" | "destroy-requested" | "renderer-gone" | "closed" | "navigation-prevented";
+  readonly elapsedMs: number;
+  readonly load?: number;
+  readonly current?: boolean;
+  readonly width?: number;
+  readonly height?: number;
+  readonly reason?: NativeTaskStatusWindowRetirementReason | "unspecified" | "other" |
+    "ERR_ABORTED" | "ERR_INVALID_URL" | "ERR_FAILED" | "ERR_ACCESS_DENIED" |
+    "clean-exit" | "abnormal-exit" | "killed" | "crashed" | "oom" | "launch-failed" |
+    "integrity-failure" | "memory-eviction";
+  readonly exitCode?: number;
+}
+const packagedSmokeNativeTaskStatusLifecycle = new WeakMap<BrowserWindow, PackagedSmokeNativeTaskStatusLifecycleReceipt[]>();
 const packagedSmokeUserData = process.env["JOKO_DESKTOP_SMOKE_USER_DATA"];
 const packagedSmokeRequests = new Map<number, {
   readonly method: string; readonly path: string; readonly contents: number;
@@ -647,6 +669,15 @@ const globalVoiceInputLease = new SourceAwareVoiceLease<GlobalVoiceInputSource>(
   }
 });
 const externalTextInsertionCoordinator = new ExternalTextInsertionCoordinator();
+let desktopSystemFrontmostInput: ReturnType<typeof createPlatformSystemFrontmostInput> | undefined;
+const macShortcutVoicePasteTarget = new MacShortcutVoicePasteTarget(
+  () => {
+    if (process.platform !== "darwin") return undefined;
+    const input = getDesktopSystemFrontmostInput();
+    return input.status === "available" ? input.runner : undefined;
+  },
+  captureMacShortcutApplicationTarget
+);
 const GLOBAL_VOICE_APPLICATION_SHORTCUT_RECORDING_SUSPENSION = "application-shortcut-recording";
 const GLOBAL_VOICE_NATIVE_CAPTURE_SUSPENSION = "native-shortcut-capture";
 const globalVoiceNativeShortcut = new NativeVoiceShortcutListener({
@@ -731,6 +762,21 @@ let dedicatedHardwareSystemVoiceController: SystemFrontmostVoiceController | und
 const dedicatedHardwareTaskFocusFence = new DedicatedHardwareTaskFocusFence<WebContents>();
 const dedicatedHardwareWindowLifecycles = new WeakMap<WebContents, { readonly retire: () => void }>();
 let dedicatedHardwarePowerLifecycleInstalled = false;
+const dedicatedHardwarePermissionRecovery = createDedicatedHardwarePermissionRecovery({
+  platform: process.platform,
+  openSettings: async () => {
+    await shell.openExternal("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent");
+    return true;
+  },
+  retry: () => {
+    const controller = dedicatedHardwareController;
+    if (controller === undefined) return;
+    const state = controller.snapshot();
+    const model = DEDICATED_HARDWARE_MODEL_IDS.find((candidate) =>
+      state.models[candidate].settings.enabled && state.models[candidate].reason === "permission-required");
+    if (model !== undefined) controller.probe(model);
+  }
+});
 let nativeGamepadRuntime: NativeGamepadRuntime<NativeGamepadClientOwner> | undefined;
 const nativeGamepadDocuments = new DesktopNativeGamepadDocumentAuthority<WebContents>(
   () => randomUUID(),
@@ -968,6 +1014,7 @@ if (!app.requestSingleInstanceLock()) {
     macNativeTaskStatusHost?.setApplicationFocused(true);
     providerModelRefreshHostLifecycle.syncApplicationFocused(isProviderModelApplicationForeground());
     void globalVoiceShortcutRecovery.request();
+    dedicatedHardwarePermissionRecovery.applicationFocused();
   });
   app.on("browser-window-blur", () => {
     setImmediate(() => {
@@ -1074,10 +1121,17 @@ if (!app.requestSingleInstanceLock()) {
     applicationMenuLocale = preferredSystemLocale;
     installDesktopApplicationMenu();
     createWindow();
+    recordPackagedSmokeProgress("main_window_created");
+    if (externalPackagedE2e && packagedSmokeResultPath !== undefined) {
+      writeFileSync(`${packagedSmokeResultPath}.startup.json`, JSON.stringify({
+        pid: process.pid, executablePath: process.execPath,
+        userDataPath: app.getPath("userData"), packaged: app.isPackaged
+      }), { flag: "wx", mode: 0o600 });
+    }
     initializeDesktopDevicePeerAgentLifecycle();
     void beginDesktopUpdateStartup();
     if (!packagedSmoke) ensureTray();
-  }, (error: unknown) => {
+  }).catch((error: unknown) => {
     const message = safeSmokeError(error);
     recordPackagedSmokeProgress(`app_ready_failed ${message}`);
     process.stderr.write(`JOKO_DESKTOP_APP_READY_FAILED ${message}\n`);
@@ -1726,9 +1780,26 @@ async function verifyPackagedSmokeNativeTaskStatus(owner: BrowserWindow): Promis
   while (Date.now() < expansionDeadline && !ambient.isDestroyed() && ambient.getBounds().height <= compactHeight) {
     await waitForPackagedSmokePoll();
   }
-  if (ambient.isDestroyed() || ambient.getBounds().height <= compactHeight ||
-    BrowserWindow.getFocusedWindow() !== focusedBefore) {
-    throw new Error("Native Task Status did not expand without changing application focus.");
+  const destroyed = ambient.isDestroyed();
+  const expandedHeight = destroyed ? null : ambient.getBounds().height;
+  const focusedAfter = BrowserWindow.getFocusedWindow();
+  if (expandedHeight === null || expandedHeight <= compactHeight || focusedAfter !== focusedBefore) {
+    const observation = {
+      destroyed, compactHeight, expandedHeight, focusChanged: focusedAfter !== focusedBefore,
+      before: focusedBefore === null ? "none" : focusedBefore === owner ? "owner" : focusedBefore === ambient ? "ambient" : "other",
+      after: focusedAfter === null ? "none" : focusedAfter === owner ? "owner" : focusedAfter === ambient ? "ambient" : "other",
+      pointerInside: !destroyed && pointIsInsideRectangle(screen.getCursorScreenPoint(), ambient.getBounds()),
+      surfaceMode: macNativeTaskStatusHost?.surface()?.mode,
+      lifecycle: packagedSmokeNativeTaskStatusLifecycle.get(ambient) ?? []
+    };
+    process.stdout.write(`JOKO_DESKTOP_SMOKE_TASK_STATUS_EXPANSION ${JSON.stringify(observation)}\n`);
+    if (!destroyed && !ambient.webContents.isDestroyed() && packagedSmokeResultPath !== undefined) {
+      try {
+        const image = await waitForPackagedSmokeDeadline(ambient.webContents.capturePage(), 2_000, "Task Status failure capture");
+        if (!image.isEmpty()) writeFileSync(`${packagedSmokeResultPath}.native-task-status.png`, image.toPNG(), { flag: "wx", mode: 0o600 });
+      } catch { /* The original expansion/focus failure remains authoritative. */ }
+    }
+    throw new Error(`Native Task Status did not expand without changing application focus (${JSON.stringify(observation)}).`);
   }
   await owner.webContents.executeJavaScript(`(async () => {
     const bridge = window.jokoDesktop.nativeTaskStatus;
@@ -3508,12 +3579,40 @@ async function verifyPackagedSmokeTaskWindowDrag(
     ...applicationWindows(),
     ...(inspectorWindow === undefined || inspectorWindow.isDestroyed() ? [] : [inspectorWindow])
   ])].map((window) => ({ window, visible: window.isVisible(), bounds: window.getBounds() }));
+  const originalCursor = screen.getCursorScreenPoint();
+  let cursorMoved = false;
+  let dragFailure: unknown;
   try {
-    const cursor = screen.getCursorScreenPoint();
-    owner.setBounds(screen.getDisplayNearestPoint(cursor).bounds, false);
+    const display = screen.getDisplayNearestPoint(originalCursor);
+    const requestedBounds = process.platform === "darwin" ? display.workArea : display.bounds;
+    owner.setBounds(requestedBounds, false);
     owner.showInactive();
-    if (!owner.isVisible() || owner.isMinimized() || !pointIsInsideRectangle(cursor, owner.getBounds())) {
-      throw new Error("Packaged smoke could not place a visible owner around the system cursor.");
+    process.stdout.write(`JOKO_DESKTOP_SMOKE_DRAG_GEOMETRY ${JSON.stringify({ phase: "preparation",
+      cursor: screen.getCursorScreenPoint(), originalCursor, requestedBounds, realizedBounds: owner.getBounds(),
+      workArea: display.workArea, visible: owner.isVisible(), minimized: owner.isMinimized() })}\n`);
+    // macOS clamps ordinary windows below its menu bar. A pointer in that bar
+    // cannot be enclosed by requesting the complete display rectangle.
+    if (process.platform === "darwin" && owner.isVisible() && !owner.isMinimized()
+      && !pointIsInsideRectangle(screen.getCursorScreenPoint(), owner.getBounds())) {
+      const bounds = owner.getBounds();
+      const left = Math.max(bounds.x, display.workArea.x);
+      const top = Math.max(bounds.y, display.workArea.y);
+      const right = Math.min(bounds.x + bounds.width, display.workArea.x + display.workArea.width);
+      const bottom = Math.min(bounds.y + bounds.height, display.workArea.y + display.workArea.height);
+      const point = { x: Math.floor((left + right) / 2), y: Math.floor((top + bottom) / 2) };
+      if (right <= left || bottom <= top || !pointIsInsideRectangle(point, bounds)
+        || !pointIsInsideRectangle(point, display.workArea)) {
+        throw new Error(`Packaged smoke has no owned cursor target: ${JSON.stringify({ bounds, workArea: display.workArea })}.`);
+      }
+      cursorMoved = true;
+      await movePackagedSmokeMacCursor(point);
+    }
+    const cursor = screen.getCursorScreenPoint();
+    const observation = { cursor, originalCursor, requestedBounds, realizedBounds: owner.getBounds(),
+      workArea: display.workArea, visible: owner.isVisible(), minimized: owner.isMinimized(), cursorMoved };
+    process.stdout.write(`JOKO_DESKTOP_SMOKE_DRAG_GEOMETRY ${JSON.stringify(observation)}\n`);
+    if (!observation.visible || observation.minimized || !pointIsInsideRectangle(cursor, observation.realizedBounds)) {
+      throw new Error(`Packaged smoke could not place a visible owner around the system cursor: ${JSON.stringify(observation)}.`);
     }
     const inside = await runPackagedSmokeTaskDragGesture(owner, task, profileId, "smoke_inside_0002", false);
     if (!inside.started || inside.ended || inside.opened || inside.replayedOpened) {
@@ -3550,6 +3649,9 @@ async function verifyPackagedSmokeTaskWindowDrag(
     }
     recordPackagedSmokeProgress("task_drag_outside_opened");
     return taskWindow;
+  } catch (error: unknown) {
+    dragFailure = error;
+    throw error;
   } finally {
     for (const entry of savedWindows) {
       if (entry.window.isDestroyed()) continue;
@@ -3557,7 +3659,43 @@ async function verifyPackagedSmokeTaskWindowDrag(
       if (entry.visible) entry.window.showInactive();
       else entry.window.hide();
     }
+    if (cursorMoved) {
+      try {
+        await movePackagedSmokeMacCursor(originalCursor);
+        const restored = screen.getCursorScreenPoint();
+        if (restored.x !== originalCursor.x || restored.y !== originalCursor.y) {
+          throw new Error(`Packaged smoke cursor restoration did not settle: ${JSON.stringify({ originalCursor, restored })}.`);
+        }
+      } catch (error: unknown) {
+        if (dragFailure === undefined) throw error;
+        process.stderr.write("JOKO_DESKTOP_SMOKE_CURSOR_RESTORE_FAILED\n");
+      }
+    }
   }
+}
+
+async function movePackagedSmokeMacCursor(point: { readonly x: number; readonly y: number }): Promise<void> {
+  if (!packagedSmoke || process.platform !== "darwin" || !Number.isSafeInteger(point.x) || !Number.isSafeInteger(point.y)) {
+    throw new Error("Packaged smoke cursor preparation requires an exact macOS screen point.");
+  }
+  // CoreGraphics changes the actual global cursor without posting an input
+  // event. The caller still samples Electron's real cursor and runs every
+  // production drag/drop ownership check.
+  const source = [
+    "import CoreGraphics",
+    "import Darwin",
+    `if CGWarpMouseCursorPosition(CGPoint(x: ${point.x}, y: ${point.y})) != .success { exit(1) }`
+  ].join("\n");
+  await new Promise<void>((resolveMove, rejectMove) => {
+    execFile("/usr/bin/swift", ["-e", source], {
+      timeout: 10_000, killSignal: "SIGKILL", maxBuffer: 8 * 1024, windowsHide: true
+    }, (error) => {
+      if (error === null) resolveMove();
+      else rejectMove(new Error(`Packaged smoke could not move the actual macOS system cursor: ${JSON.stringify({
+        code: error.code, signal: error.signal, killed: error.killed
+      })}.`));
+    });
+  });
 }
 
 async function runPackagedSmokeTaskDragGesture(
@@ -3785,20 +3923,63 @@ async function verifyPackagedSmokeNewTaskDraftCrash(window: BrowserWindow): Prom
   await waitForPackagedSmokeDeadline(lost, 10_000, "new-task renderer crash");
   await waitForPackagedSmokeOwnerDocument(window, "new-task crash reload", () => window.reload());
   const restoreDeadline = Date.now() + 20_000;
+  let reconnectRequested = false;
+  let lastObservation: Readonly<Record<string, boolean>> = { observed: false };
+  const captureRecovery = async (): Promise<void> => {
+    if (packagedSmokeResultPath === undefined) return;
+    try {
+      const image = await waitForPackagedSmokeDeadline((async () => {
+        // The restored DOM can precede its compositor frame after a renderer
+        // crash. Keep paint and capture inside the original evidence deadline.
+        await contents.executeJavaScript("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))", true);
+        return contents.capturePage();
+      })(), 2_000, "new-task draft recovery capture");
+      if (!image.isEmpty()) writeFileSync(`${packagedSmokeResultPath}.new-task-draft-recovery.png`, image.toPNG(), { flag: "wx", mode: 0o600 });
+    } catch { /* The original recovery result remains authoritative. */ }
+  };
   while (Date.now() < restoreDeadline) {
-    const restored = await window.webContents.executeJavaScript([
-      "(() => {",
+    const observation = await window.webContents.executeJavaScript([
+      "(async () => {",
       "  const editor = document.querySelector('.new-task-page .composer-rich-editor__content');",
-      `  return editor?.textContent === ${JSON.stringify(draftText)};`,
+      "  const connectionScreen = Boolean(document.querySelector('.connection-screen'));",
+      "  let reconnected = false;",
+      // Linux runners may correctly have no secure persistent credential
+      // storage. A new-task route has no explicit Profile, so a fresh renderer
+      // then requires the same normal local-connect action as initial startup.
+      `  if (connectionScreen && ${JSON.stringify(!reconnectRequested)}) {`,
+      "    const connect = document.querySelector('button[data-managed-local-connect]');",
+      "    if (connect instanceof HTMLButtonElement && !connect.disabled) {",
+      "      const current = await window.jokoDesktop.managedOrchestrator.getConnection();",
+      `      if (current?.serverId !== ${JSON.stringify(serverId)} || current?.profileId !== ${JSON.stringify(profileId)}) {`,
+      "        throw new Error('New-task recovery crossed its managed connection owner.');",
+      "      }",
+      "      connect.click();",
+      "      reconnected = true;",
+      "    }",
+      "  }",
+      `  return { restored: editor?.textContent === ${JSON.stringify(draftText)}, reconnected, connectionScreen,`,
+      "    newTaskRoute: location.hash.startsWith('#/tasks/new'), editorPresent: Boolean(editor),",
+      "    editorEditable: editor?.getAttribute('contenteditable') === 'true' };",
       "})()"
     ].join("\n"), true) as unknown;
-    if (restored === true) {
+    if (typeof observation !== "object" || observation === null || Array.isArray(observation)) {
+      throw new Error("Packaged smoke new-task recovery returned an invalid observation.");
+    }
+    const result = observation as Readonly<Record<string, boolean>>;
+    lastObservation = result;
+    if (result["reconnected"] === true) {
+      reconnectRequested = true;
+      recordPackagedSmokeProgress("new_task_draft_reconnected_after_renderer_crash");
+    }
+    if (result["restored"] === true) {
+      await captureRecovery();
       recordPackagedSmokeProgress("new_task_draft_recovered_after_renderer_crash");
       return;
     }
     await waitForPackagedSmokePoll();
   }
-  throw new Error("Packaged smoke new-task draft was not restored after the renderer crash.");
+  await captureRecovery();
+  throw new Error(`Packaged smoke new-task draft was not restored after the renderer crash: ${JSON.stringify(lastObservation)}.`);
 }
 
 async function waitForPackagedSmokeTaskPresentation(
@@ -3948,7 +4129,7 @@ function finishPackagedSmoke(result: string, exitCode: number): void {
 }
 
 function recordPackagedSmokeProgress(step: string): void {
-  if (!packagedSmoke || packagedSmokeResultPath === undefined) return;
+  if (!packagedSmokeRequested || packagedSmokeResultPath === undefined) return;
   try {
     appendFileSync(`${packagedSmokeResultPath}.progress`, `${step}\n`, { encoding: "utf8", mode: 0o600 });
   } catch {
@@ -4172,6 +4353,31 @@ function globalVoiceAdmissionUnavailable(): boolean {
   return quitting || globalVoiceExitAdmissionClosed || managedOrchestratorExitFence.shutdownStarted;
 }
 
+function captureMacShortcutApplicationTarget(): ShortcutVoiceDocumentTarget | undefined {
+  if (process.platform !== "darwin") return undefined;
+  const window = BrowserWindow.getFocusedWindow();
+  if (window === null || window.isDestroyed() || !window.isFocused()) return undefined;
+  const contents = window.webContents;
+  if (!isTrustedClipboardWriteContents(contents)) return undefined;
+  const occurrence = nativeGamepadDocuments.currentFor(contents);
+  if (occurrence === undefined) return undefined;
+  const isCurrentDocument = (): boolean => !window.isDestroyed() && window.webContents === contents
+    && !contents.isDestroyed() && !contents.isCrashed() && !contents.isLoadingMainFrame()
+    && trustedApplicationWindowForContents(contents) === window && isTrustedClipboardWriteContents(contents)
+    && nativeGamepadDocuments.isCurrent(contents, occurrence);
+  if (!isCurrentDocument()) return undefined;
+  return captureShortcutVoiceDocumentTarget({
+    contents,
+    isCurrentDocument,
+    focus: () => {
+      if (window.isMinimized()) window.restore();
+      window.show();
+      window.focus();
+      contents.focus();
+    }
+  });
+}
+
 async function cancelGlobalVoiceForExit(): Promise<void> {
   const recording = globalVoiceInputLease.snapshot();
   if (recording.state === "idle") {
@@ -4197,6 +4403,8 @@ function startGlobalVoiceInputLease(
   globalVoiceRetry = undefined;
   globalVoiceCancellingGeneration = undefined;
   globalVoiceCommitFence = { generation, state: "open" };
+  macShortcutVoicePasteTarget.retire();
+  if (process.platform === "darwin" && source === "shortcut") macShortcutVoicePasteTarget.capture(generation);
   beginGlobalVoiceSystemAudio();
   setGlobalVoiceStatus({ state: "starting", generation: generationValue });
   try {
@@ -4237,6 +4445,7 @@ function stopGlobalVoiceInputLease(
     globalVoiceStopWaiters.set(generation, { resolve, reject, timeout });
   });
   if (reason === "cancel") {
+    macShortcutVoicePasteTarget.retire(generation);
     globalVoiceCancellingGeneration = generation;
     if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
     if (!sendGlobalVoiceCommand({
@@ -4537,6 +4746,7 @@ function failGlobalVoiceGeneration(
     || (globalVoiceActiveGeneration !== undefined && globalVoiceActiveGeneration !== generation)) return false;
   const generationValue = globalVoiceGenerationValue(generation);
   globalVoiceActiveGeneration = undefined;
+  macShortcutVoicePasteTarget.retire(generation);
   if (globalVoiceCancellingGeneration === generation) globalVoiceCancellingGeneration = undefined;
   globalVoiceStartModes.delete(generation);
   if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
@@ -4553,6 +4763,7 @@ function markGlobalVoiceStopUncertain(generation: number): boolean {
   const recording = globalVoiceInputLease.snapshot();
   if (recording.state === "idle" || recording.generation !== generation) return false;
   globalVoiceActiveGeneration = undefined;
+  macShortcutVoicePasteTarget.retire(generation);
   globalVoiceRetry = undefined;
   globalVoiceStartModes.delete(generation);
   if (globalVoiceCommitFence?.generation === generation) globalVoiceCommitFence.state = "consumed";
@@ -4575,6 +4786,7 @@ function resetGlobalVoicePresentation(expectedGeneration?: number): boolean {
   if (expectedGeneration !== undefined && generation === undefined) return false;
 
   if (generation === undefined) {
+    macShortcutVoicePasteTarget.retire();
     globalVoiceActiveGeneration = undefined;
     globalVoiceRetry = undefined;
     globalVoiceCommitFence = undefined;
@@ -4585,6 +4797,7 @@ function resetGlobalVoicePresentation(expectedGeneration?: number): boolean {
     dedicatedHardwareSystemVoiceController?.retire();
     setGlobalVoiceStatus({ state: "idle", generation: "0" });
   } else {
+    macShortcutVoicePasteTarget.retire(generation);
     const generationValue = globalVoiceGenerationValue(generation);
     if (globalVoiceActiveGeneration === generation) globalVoiceActiveGeneration = undefined;
     if (globalVoiceRetry?.failedGeneration === generation) globalVoiceRetry = undefined;
@@ -6497,6 +6710,19 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
       safeDialogs: true
     }
   });
+  const createdAt = Date.now();
+  const lifecycle: PackagedSmokeNativeTaskStatusLifecycleReceipt[] = [];
+  let loads = 0;
+  if (packagedSmoke) packagedSmokeNativeTaskStatusLifecycle.set(window, lifecycle);
+  const record = (
+    event: PackagedSmokeNativeTaskStatusLifecycleReceipt["event"],
+    detail: Omit<PackagedSmokeNativeTaskStatusLifecycleReceipt, "event" | "elapsedMs"> = {}
+  ): void => {
+    if (!packagedSmoke) return;
+    lifecycle.push({ event, elapsedMs: Math.max(0, Date.now() - createdAt), ...detail });
+    if (lifecycle.length > 32) lifecycle.shift();
+  };
+  record("created", { width: bounds.width, height: bounds.height });
   if (process.platform === "darwin") {
     window.setAlwaysOnTop(true, "screen-saver", 1);
     window.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
@@ -6504,18 +6730,40 @@ function createNativeTaskStatusWindow(bounds: NativeTaskStatusWindowBounds): Nat
   } else {
     window.setAlwaysOnTop(true, "pop-up-menu");
   }
-  window.webContents.on("render-process-gone", () => {
+  window.on("closed", () => record("closed"));
+  window.webContents.on("render-process-gone", (_event, details) => {
+    const reason = (["clean-exit", "abnormal-exit", "killed", "crashed", "oom", "launch-failed",
+      "integrity-failure", "memory-eviction"] as const).find((candidate) => candidate === details.reason) ?? "other";
+    record("renderer-gone", { reason, ...(Number.isSafeInteger(details.exitCode) ? { exitCode: details.exitCode } : {}) });
     if (!window.isDestroyed()) window.destroy();
   });
   return Object.freeze({
     isDestroyed: () => window.isDestroyed(),
-    setBounds: (next: NativeTaskStatusWindowBounds) => window.setBounds(next, false),
-    loadDocument: (dataUrl: string) => window.loadURL(dataUrl),
-    showInactive: () => window.showInactive(),
-    destroy: () => window.destroy(),
+    setBounds: (next: NativeTaskStatusWindowBounds) => {
+      record("bounds-requested", { width: next.width, height: next.height });
+      window.setBounds(next, false);
+    },
+    loadDocument: (dataUrl: string) => {
+      const load = ++loads;
+      record("load-started", { load });
+      const loading = window.loadURL(dataUrl);
+      void loading.then(() => record("load-completed", { load, current: load === loads }), (error: unknown) => {
+        const code = error !== null && typeof error === "object" && "code" in error ? error.code : undefined;
+        const reason = (["ERR_ABORTED", "ERR_INVALID_URL", "ERR_FAILED", "ERR_ACCESS_DENIED"] as const)
+          .find((candidate) => candidate === code) ?? "other";
+        record("load-failed", { load, current: load === loads, reason });
+      });
+      return loading;
+    },
+    showInactive: () => { record("show-inactive"); window.showInactive(); },
+    destroy: (reason?: NativeTaskStatusWindowRetirementReason) => {
+      record("destroy-requested", { reason: reason ?? "unspecified" });
+      window.destroy();
+    },
     onClosed: (listener: () => void) => window.on("closed", listener),
     onWillNavigate: (listener: (url: string) => void) => window.webContents.on("will-navigate", (event, url) => {
       event.preventDefault();
+      record("navigation-prevented");
       listener(url);
     }),
     onBoundsChanged: (listener: (next: NativeTaskStatusWindowBounds) => void) => {
@@ -8162,7 +8410,9 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareGetState, (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event);
     if (parameters.length !== 0) throw new TypeError("Dedicated hardware state does not accept parameters.");
-    return requireDedicatedHardwareController().snapshot();
+    const controller = requireDedicatedHardwareController();
+    controller.poll();
+    return controller.snapshot();
   });
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareSetSettings, async (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event, { focused: true });
@@ -8227,7 +8477,7 @@ function registerIpc(): void {
   ipcMain.handle(DESKTOP_CHANNELS.dedicatedHardwareOpenInputSettings, (event, ...parameters: unknown[]) => {
     assertDedicatedHardwareSender(event, { focused: true });
     if (parameters.length !== 0) throw new TypeError("Dedicated hardware input settings do not accept parameters.");
-    return openGlobalVoiceInputMonitoringSettings();
+    return dedicatedHardwarePermissionRecovery.openSettings();
   });
   ipcMain.on(DESKTOP_CHANNELS.nativeTaskStatusGetAvailability, (event) => {
     event.returnValue = nativeTaskStatusSupported;
@@ -8382,8 +8632,10 @@ function registerIpc(): void {
       || fence.state !== "open") return false;
     fence.state = "pending";
     const hardwareVoice = recording.source === "hardware";
+    const macShortcutVoice = process.platform === "darwin" && recording.source === "shortcut";
     const systemVoice = dedicatedHardwareSystemVoiceController;
-    if (hardwareVoice && (systemVoice === undefined || !systemVoice.hasTargetForActiveRecording())) {
+    if ((hardwareVoice && (systemVoice === undefined || !systemVoice.hasTargetForActiveRecording()))
+      || (macShortcutVoice && !macShortcutVoicePasteTarget.hasTarget(generation))) {
       fence.state = "consumed";
       failGlobalVoiceGeneration(generation, "insertion");
       return false;
@@ -8399,7 +8651,10 @@ function registerIpc(): void {
           clipboard,
           paste: () => systemVoice!.postPasteForActiveRecording()
         })
-        : await externalTextInsertionCoordinator.insertForeground(request.text, {
+        : macShortcutVoice ? await externalTextInsertionCoordinator.insertCaptured(request.text, {
+          clipboard,
+          paste: () => macShortcutVoicePasteTarget.paste(generation)
+        }) : await externalTextInsertionCoordinator.insertForeground(request.text, {
           clipboard,
           platform: process.platform,
           runCommand: runBoundedHostCommand
@@ -8541,12 +8796,35 @@ function registerIpc(): void {
       defaultPath: request.name,
       ...(extension === undefined ? {} : { filters: [{ name: "Joko file", extensions: [extension] }] })
     };
-    const selection = owner === undefined
-      ? await dialog.showSaveDialog(options)
-      : await dialog.showSaveDialog(owner, options);
-    if (selection.canceled || selection.filePath === undefined) return false;
-    await atomicWriteUserSelectedFile(selection.filePath, request.bytes, MAXIMUM_NATIVE_FILE_BYTES);
-    return true;
+    if (externalPackagedE2e) recordPackagedSmokeProgress("native_file_save_entered");
+    try {
+      const selection = owner === undefined
+        ? await dialog.showSaveDialog(options)
+        : await dialog.showSaveDialog(owner, options);
+      if (externalPackagedE2e) {
+        const path = selection.filePath;
+        const normalized = path === undefined ? undefined : resolve(path);
+        recordPackagedSmokeProgress(`native_file_save_selection ${JSON.stringify({
+          canceled: selection.canceled, hasFilePath: path !== undefined,
+          normalizedAbsolute: path !== undefined && isAbsolute(path) && normalized === path,
+          selectedDefaultName: path !== undefined && basename(path) === request.name,
+          selectedPathSha256: normalized === undefined ? undefined : createHash("sha256")
+            .update(process.platform === "win32" ? normalized.toLowerCase() : normalized).digest("hex")
+        })}`);
+      }
+      if (selection.canceled || selection.filePath === undefined) return false;
+      await atomicWriteUserSelectedFile(selection.filePath, request.bytes, MAXIMUM_NATIVE_FILE_BYTES);
+      if (externalPackagedE2e) recordPackagedSmokeProgress("native_file_save_completed");
+      return true;
+    } catch (error) {
+      if (externalPackagedE2e) {
+        const code = typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+        recordPackagedSmokeProgress(`native_file_save_failed ${JSON.stringify({
+          code: typeof code === "string" && /^[A-Z_]{1,64}$/u.test(code) ? code : "unclassified"
+        })}`);
+      }
+      throw error;
+    }
   });
   ipcMain.handle(DESKTOP_CHANNELS.copyFile, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
@@ -9148,17 +9426,24 @@ async function initializeManagedOrchestrator(controlledStopConfirmed = false): P
   const deviceId = previous?.deviceId ?? await loadOrCreateManagedOrchestratorDeviceId(deviceIdPath);
   let runtime: ManagedOrchestratorRuntime | undefined;
   let authKey: string | undefined;
+  let startupPhase: "launch-runtime" | "capture-runtime-birth" | "move-authorization" | "persist-authorization"
+    | "persist-connection" | "commit-bootstrap" = "launch-runtime";
   try {
     runtime = await launchManagedOrchestratorBootstrap(previous, deviceId);
+    startupPhase = "capture-runtime-birth";
     writePackagedSmokeManagedRuntimeProcess(runtime);
+    startupPhase = "move-authorization";
     authKey = runtime.takeAuthKey();
+    startupPhase = "persist-authorization";
     await storeCredential(runtime.connection.profileId, authKey);
     try {
+      startupPhase = "persist-connection";
       await writeManagedOrchestratorConnection(join(hostDirectory, "connection.json"), runtime.connection);
     } catch (error) {
       await deleteCredential(runtime.connection.profileId).catch(() => undefined);
       throw error;
     }
+    startupPhase = "commit-bootstrap";
     await runtime.commit();
     managedOrchestratorConnection = runtime.connection;
     managedOrchestratorRecoveryTarget = undefined;
@@ -9171,6 +9456,18 @@ async function initializeManagedOrchestrator(controlledStopConfirmed = false): P
       });
     }
   } catch (error) {
+    if (packagedSmoke) {
+      // Observe fixed startup phases without copying exception text, subprocess
+      // output, paths or any authorization material into GUI evidence.
+      const failure = error as { readonly code?: unknown; readonly status?: unknown; readonly signal?: unknown; readonly killed?: unknown } | undefined;
+      const codes = ["ENOENT", "EACCES", "EPERM", "ETIMEDOUT", "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"];
+      const signals = ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV"];
+      process.stderr.write(`JOKO_DESKTOP_MANAGED_SMOKE_FAILURE ${JSON.stringify({ phase: startupPhase,
+        code: typeof failure?.code === "string" && codes.includes(failure.code) ? failure.code : null,
+        exitCode: typeof failure?.status === "number" && Number.isSafeInteger(failure.status) ? failure.status : null,
+        signal: typeof failure?.signal === "string" && signals.includes(failure.signal) ? failure.signal : null,
+        killed: failure?.killed === true })}\n`);
+    }
     managedOrchestratorConnection = undefined;
     if (runtime !== undefined) await runtime.stop().catch(() => undefined);
     throw error;
@@ -9394,10 +9691,8 @@ function initializeNativeGamepad(): void {
   });
 }
 
-async function initializeDedicatedHardwareInput(): Promise<void> {
-  dedicatedHardwareTaskFocusFence.clear();
-  dedicatedHardwareSystemVoiceController?.retire();
-  dedicatedHardwareSystemVoiceController = undefined;
+function getDesktopSystemFrontmostInput(): ReturnType<typeof createPlatformSystemFrontmostInput> {
+  if (desktopSystemFrontmostInput?.status === "available") return desktopSystemFrontmostInput;
   const nativeHelper = loadNativeSystemFrontmostInput({
     directory: app.isPackaged
       ? resolve(process.resourcesPath, "native-system-frontmost-input")
@@ -9405,7 +9700,7 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
     platform: process.platform,
     architecture: process.arch
   });
-  const systemFrontmost = createPlatformSystemFrontmostInput({
+  desktopSystemFrontmostInput = createPlatformSystemFrontmostInput({
     platform: process.platform,
     linuxSession: {
       sessionType: process.env.XDG_SESSION_TYPE,
@@ -9416,6 +9711,14 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
       : process.platform === "darwin" ? { macHelper: nativeHelper }
       : process.platform === "linux" ? { linuxHelper: nativeHelper } : {})
   });
+  return desktopSystemFrontmostInput;
+}
+
+async function initializeDedicatedHardwareInput(): Promise<void> {
+  dedicatedHardwareTaskFocusFence.clear();
+  dedicatedHardwareSystemVoiceController?.retire();
+  dedicatedHardwareSystemVoiceController = undefined;
+  const systemFrontmost = getDesktopSystemFrontmostInput();
   if (packagedSmoke && (process.platform === "win32" || process.platform === "darwin" || process.platform === "linux")) {
     if (systemFrontmost.status !== "available") throw new Error("Native foreground sampler was not admitted by Main.");
     process.stdout.write("JOKO_DESKTOP_FRONTMOST_INPUT_READY\n");
@@ -9537,6 +9840,7 @@ async function initializeDedicatedHardwareInput(): Promise<void> {
     dedicatedHardwarePowerLifecycleInstalled = true;
     powerMonitor.on("suspend", suspendDedicatedHardwareInput);
     powerMonitor.on("lock-screen", suspendDedicatedHardwareInput);
+    powerMonitor.on("unlock-screen", dedicatedHardwarePermissionRecovery.screenUnlocked);
   }
 }
 

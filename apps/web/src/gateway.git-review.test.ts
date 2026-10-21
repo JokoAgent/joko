@@ -42,6 +42,7 @@ describe("exact Git Review gateway", () => {
           repositoryRevision: "repo-1",
           mergeBaseRevision: "merge-1",
           headRevision: "h".repeat(40),
+          pushTarget: { remote: "team/upstream", remoteRef: "refs/heads/published/topic", hasUpstream: true },
           files: [{ relativePath: "docs/readme.md", source: GitDiffSource.BRANCH, binary: false }]
         } }));
       }
@@ -96,6 +97,7 @@ describe("exact Git Review gateway", () => {
       repositoryRevision: "repo-1",
       mergeBaseRevision: "merge-1"
     });
+    expect(diff.pushTarget).toEqual({ remote: "team/upstream", remoteRef: "refs/heads/published/topic", hasUpstream: true });
     const file = diff.files[0]!;
     await expect(gateway.readWorkspaceDiffFile("workspace-1", file, diff)).resolves.toMatchObject({ text: "# Review\n" });
     await expect(gateway.readWorkspaceDiffImage("workspace-1", { ...file, path: "image.png", binary: true }, diff)).resolves.toMatchObject({

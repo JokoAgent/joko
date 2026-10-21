@@ -57,7 +57,7 @@ import {
   X
 } from "lucide-react";
 import type { AppRoute } from "../controller.js";
-import type { AppSnapshot, ConnectionProfile, ExtensionCatalogEntryView, FederatedSessionMessageSearchMatchView, MachineCacheView, MachinePresenceView, MachineSessionCacheView, ScheduleView, SessionMessageSearchFiltersView, SessionMessageSearchMatchView, SessionView, TargetView } from "../model.js";
+import type { AppSnapshot, ConnectionProfile, ExtensionCatalogEntryView, FederatedSessionMessageSearchMatchView, MachineCacheView, MachinePresenceView, MachineSessionCacheView, ScheduleView, SessionMessageSearchFiltersView, SessionMessageSearchMatchView, SessionTitleSuggestionView, SessionView, TargetView } from "../model.js";
 import { selectedRemoteMachineCaches, type MachineSelection } from "../machine-federation.js";
 import type { NavigationMode } from "../navigation-layout.js";
 import {
@@ -125,7 +125,7 @@ import {
   type ConversationSearchStatusFilter
 } from "./conversation-search.js";
 import type { Translator } from "./types.js";
-import { SidebarFrame } from "./SidebarFrame.js";
+import { SidebarFrame, type SidebarFrameProps } from "./SidebarFrame.js";
 import { sidebarSessionInfoPieces } from "./sidebar-session-info.js";
 import { SortableList } from "./SortableList.js";
 import { Button, IconButton, Modal, TipSummary, cx, formatRelativeTime, CheckboxControl, SelectControl } from "./ui.js";
@@ -279,6 +279,7 @@ const SIDEBAR_SESSION_INFO_OPTIONS = [
   { value: "cost", label: "nav.sessionInfoCost", Icon: Wallet }
 ] as const;
 export interface SidebarProps {
+  readonly appShortcutOverrides?: SidebarFrameProps["appShortcutOverrides"];
   readonly groupNavigation?: ReactNode;
   readonly snapshot: AppSnapshot;
   readonly activeSessionId?: string;
@@ -299,6 +300,8 @@ export interface SidebarProps {
   readonly onNewTaskInTarget?: (target: TargetView) => void;
   readonly onNewDialogue?: (backendId: string) => void;
   readonly onRename: (session: SessionView, name: string) => void;
+  readonly onSuggestTitle?: (session: SessionView, signal: AbortSignal) => Promise<SessionTitleSuggestionView>;
+  readonly titleSuggestionOwnerKey?: string;
   readonly onToggleTaskTag?: (session: SessionView, tagId: string, attached: boolean) => void;
   readonly onManageTaskTags?: (session: SessionView) => void;
   readonly onPin: (session: SessionView) => void;
@@ -1611,6 +1614,7 @@ export function Sidebar(props: SidebarProps): JSX.Element {
 
   return <><SidebarFrame
     server={snapshot.server}
+    appShortcutOverrides={props.appShortcutOverrides}
     probeRuntimeActivity={props.probeRuntimeActivity}
     open={props.open}
     mode={props.mode}
@@ -2658,6 +2662,15 @@ function sessionCallbacks(
       props.onClose();
     },
     onRename: props.onRename,
+    onSuggestTitle: props.onSuggestTitle,
+    canSuggestTitle: (session) => props.onSuggestTitle !== undefined && props.snapshot.backends
+      .find((backend) => backend.id === session.backendId)?.capabilities.get("session.ai_rename")?.supported === true,
+    titleSuggestionOwnerKey: JSON.stringify([
+      props.titleSuggestionOwnerKey ?? props.sidebarOwnerId,
+      props.machineControl?.activeProfile.id,
+      props.snapshot.generation.toString(),
+      props.activeSessionId
+    ]),
     taskTags: props.snapshot.taskTags,
     onToggleTaskTag: props.onToggleTaskTag ?? (() => undefined),
     onManageTaskTags: props.onManageTaskTags ?? (() => undefined),
@@ -2682,6 +2695,9 @@ interface SessionSectionCallbacks {
   readonly onSelect: (session: SessionView, modifiers?: SessionSelectionModifiers) => void;
   readonly onBrowseFiles: (session: SessionView) => void;
   readonly onRename: (session: SessionView, name: string) => void;
+  readonly onSuggestTitle?: (session: SessionView, signal: AbortSignal) => Promise<SessionTitleSuggestionView>;
+  readonly canSuggestTitle: (session: SessionView) => boolean;
+  readonly titleSuggestionOwnerKey: string;
   readonly taskTags: AppSnapshot["taskTags"];
   readonly onToggleTaskTag: (session: SessionView, tagId: string, attached: boolean) => void;
   readonly onManageTaskTags: (session: SessionView) => void;
@@ -4265,7 +4281,7 @@ function SessionSection({ title, sessions, targets, activeSessionId, locale, col
   );
 }
 
-function SessionRow({ session, active, locale, targetName, match, t, priorityContext, sessionInfoFields, sessionProfileId, projectNameFor, environmentNameFor, onSelect, onRename, taskTags, onToggleTaskTag, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, canExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, movingSessionProjectIds, onMoveSessionProject, selectedSessionIds }: { readonly session: SessionView; readonly active: boolean; readonly locale: string; readonly targetName?: string; readonly match?: SidebarFuzzyMatch; readonly t: Translator } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps): JSX.Element {
+function SessionRow({ session, active, locale, targetName, match, t, priorityContext, sessionInfoFields, sessionProfileId, projectNameFor, environmentNameFor, onSelect, onRename, onSuggestTitle, canSuggestTitle, titleSuggestionOwnerKey, taskTags, onToggleTaskTag, onManageTaskTags, onPin, onArchive, onPrefetchRemoval, onDelete, onCopyTaskLink, onExportPortableSession, canExportPortableSession, onSplitSession, onOpenSessionWindow, projectMenuTargets, movingSessionProjectIds, onMoveSessionProject, selectedSessionIds }: { readonly session: SessionView; readonly active: boolean; readonly locale: string; readonly targetName?: string; readonly match?: SidebarFuzzyMatch; readonly t: Translator } & SessionSectionCallbacks & SessionPriorityProps & SessionDisplayProps): JSX.Element {
   const indicator = sidebarSessionIndicatorState(session, priorityContext);
   const stateLabel = indicator === undefined
     ? sessionStateLabel(session.state, t)
@@ -4278,12 +4294,42 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
   const rowRef = useRef<HTMLLIElement>(null);
   const mainButtonRef = useRef<HTMLButtonElement>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
+  const renameContainerRef = useRef<HTMLDivElement>(null);
   const renameCommittedRef = useRef(false);
+  const titleRequestRef = useRef(0);
+  const titleAbortRef = useRef<AbortController | undefined>(undefined);
+  const selectGeneratedTitleRef = useRef(false);
+  const renameOwnerKey = JSON.stringify([titleSuggestionOwnerKey, session.id]);
+  const renameOwnerRef = useRef(renameOwnerKey);
+  renameOwnerRef.current = renameOwnerKey;
   const restoreRowFocusRef = useRef(false);
   const contextRequestSequenceRef = useRef(0);
   const [contextMenuRequest, setContextMenuRequest] = useState<SessionMenuContextRequest>();
-  const [editing, setEditing] = useState(false);
+  const [editingOwner, setEditingOwner] = useState<string>();
+  const editing = editingOwner === renameOwnerKey;
   const [editValue, setEditValue] = useState(session.name);
+  const [generatingTitle, setGeneratingTitle] = useState(false);
+  const [titleNotice, setTitleNotice] = useState<string>();
+  const supportsTitleSuggestion = canSuggestTitle(session);
+  const invalidateTitleRequest = useCallback((): void => {
+    titleRequestRef.current += 1;
+    titleAbortRef.current?.abort();
+    titleAbortRef.current = undefined;
+    selectGeneratedTitleRef.current = false;
+    setGeneratingTitle(false);
+  }, []);
+  useEffect(() => {
+    invalidateTitleRequest();
+    setEditingOwner(undefined);
+    setTitleNotice(undefined);
+  }, [invalidateTitleRequest, renameOwnerKey]);
+  useEffect(() => {
+    if (!supportsTitleSuggestion) invalidateTitleRequest();
+  }, [invalidateTitleRequest, supportsTitleSuggestion]);
+  useEffect(() => () => {
+    titleRequestRef.current += 1;
+    titleAbortRef.current?.abort();
+  }, []);
   useEffect(() => {
     if (!active) return;
     const row = rowRef.current;
@@ -4301,6 +4347,12 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
     restoreRowFocusRef.current = false;
     mainButtonRef.current?.focus({ preventScroll: true });
   }, [editing]);
+  useLayoutEffect(() => {
+    if (!editing || !selectGeneratedTitleRef.current) return;
+    selectGeneratedTitleRef.current = false;
+    renameInputRef.current?.focus({ preventScroll: true });
+    renameInputRef.current?.select();
+  }, [editValue, editing, generatingTitle]);
   useEffect(() => () => cancelSessionWindowDragPreviewForSession(session.id), [session.id]);
   const activate = (event: ReactMouseEvent<HTMLButtonElement>): void => {
     if (editing || event.detail > 1) return;
@@ -4309,24 +4361,72 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
   };
   const beginRename = (): void => {
     if (editing) return;
+    invalidateTitleRequest();
+    setTitleNotice(undefined);
     renameCommittedRef.current = false;
     restoreRowFocusRef.current = false;
     setContextMenuRequest(undefined);
     setEditValue(session.name);
-    setEditing(true);
+    setEditingOwner(renameOwnerKey);
   };
   const commitRename = (restoreFocus: boolean): void => {
-    if (renameCommittedRef.current) return;
+    if (renameCommittedRef.current || editingOwner !== renameOwnerRef.current) return;
     renameCommittedRef.current = true;
+    invalidateTitleRequest();
     restoreRowFocusRef.current = restoreFocus;
-    setEditing(false);
+    setEditingOwner(undefined);
     const name = editValue.trim();
     if (name !== "" && name !== session.name) onRename(session, name);
   };
   const cancelRename = (): void => {
     renameCommittedRef.current = true;
+    invalidateTitleRequest();
     restoreRowFocusRef.current = true;
-    setEditing(false);
+    setEditingOwner(undefined);
+  };
+  const commitRenameRef = useRef(commitRename);
+  commitRenameRef.current = commitRename;
+  useEffect(() => {
+    if (!editing) return;
+    const ownerDocument = renameContainerRef.current?.ownerDocument;
+    if (ownerDocument === undefined) return;
+    const commitOutside = (event: globalThis.PointerEvent): void => {
+      if (renameContainerRef.current?.contains(event.target as Node)) return;
+      commitRenameRef.current(false);
+    };
+    ownerDocument.addEventListener("pointerdown", commitOutside, true);
+    return () => ownerDocument.removeEventListener("pointerdown", commitOutside, true);
+  }, [editing]);
+  const suggestTitle = async (): Promise<void> => {
+    if (!editing || renameOwnerRef.current !== renameOwnerKey || onSuggestTitle === undefined || !supportsTitleSuggestion || titleAbortRef.current !== undefined) return;
+    const abort = new AbortController();
+    titleAbortRef.current = abort;
+    const request = ++titleRequestRef.current;
+    const owner = renameOwnerKey;
+    const isCurrent = (): boolean => !abort.signal.aborted && titleRequestRef.current === request && renameOwnerRef.current === owner;
+    setGeneratingTitle(true);
+    setTitleNotice(undefined);
+    try {
+      const result = await onSuggestTitle(session, abort.signal);
+      if (!isCurrent()) return;
+      if (result.status === "ok" && result.title.trim() !== "") {
+        selectGeneratedTitleRef.current = true;
+        setEditValue(result.title.trim());
+      } else {
+        setTitleNotice(t(result.status === "no_material"
+          ? "session.generateTitleNoMaterial"
+          : result.status === "provider_unavailable"
+            ? "session.generateTitleUnavailable"
+            : "session.generateTitleFailed"));
+      }
+    } catch {
+      if (isCurrent()) setTitleNotice(t("session.generateTitleFailed"));
+    } finally {
+      if (isCurrent()) {
+        titleAbortRef.current = undefined;
+        setGeneratingTitle(false);
+      }
+    }
   };
   const renameFromDoubleClick = (event: ReactMouseEvent<HTMLButtonElement>): void => {
     event.preventDefault();
@@ -4336,7 +4436,7 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
   return (
     <li
       ref={rowRef}
-      className={cx("session-row", active && "is-active", selected && "is-selected")}
+      className={cx("session-row", active && "is-active", selected && "is-selected", editing && titleNotice !== undefined && "has-rename-notice")}
       data-sidebar-session-row="true"
       onContextMenu={(event) => {
         if (editing) {
@@ -4349,23 +4449,37 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
       }}
     >
       {editing ? <div
+        ref={renameContainerRef}
         className="session-row__main session-row__main--editing"
         data-session-id={session.id}
         aria-current={active ? "page" : undefined}
+        onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget)) commitRename(false);
+        }}
+        onKeyDown={(event) => {
+          if (event.key !== "Escape") return;
+          event.preventDefault();
+          event.stopPropagation();
+          cancelRename();
+        }}
       >
         <MessageSquare className="session-row__agent" aria-hidden="true" />
+        <span className="session-row__rename-field">
         <input
           ref={renameInputRef}
           className="session-row__rename-input"
           aria-label={t("session.rename")}
           value={editValue}
           maxLength={120}
-          onChange={(event) => setEditValue(event.target.value)}
-          onBlur={() => commitRename(false)}
+          onChange={(event) => {
+            invalidateTitleRequest();
+            setTitleNotice(undefined);
+            setEditValue(event.target.value);
+          }}
           onClick={(event) => event.stopPropagation()}
           onDoubleClick={(event) => event.stopPropagation()}
           onKeyDown={(event) => {
-            if (event.key === "Enter") {
+            if (event.key === "Enter" && !event.nativeEvent.isComposing) {
               event.preventDefault();
               event.stopPropagation();
               commitRename(true);
@@ -4377,6 +4491,20 @@ function SessionRow({ session, active, locale, targetName, match, t, priorityCon
             cancelRename();
           }}
         />
+        {supportsTitleSuggestion && <button
+          type="button"
+          className="session-row__rename-magic"
+          aria-label={t("session.generateTitle")}
+          aria-disabled={generatingTitle}
+          aria-busy={generatingTitle}
+          title={t(generatingTitle ? "session.generatingTitle" : "session.generateTitle")}
+          onMouseDown={(event) => { event.preventDefault(); event.stopPropagation(); }}
+          onPointerDown={(event) => event.stopPropagation()}
+          onDoubleClick={(event) => event.stopPropagation()}
+          onClick={(event) => { event.stopPropagation(); void suggestTitle(); }}
+        >{generatingTitle ? <LoaderCircle className="is-spinning" aria-hidden="true" /> : <Sparkles aria-hidden="true" />}</button>}
+        </span>
+        {titleNotice !== undefined && <span className="session-row__rename-notice" role="alert">{titleNotice}</span>}
       </div> : <SidebarHoverCard<HTMLButtonElement>
         label={t("session.details", { name: session.name })}
         className="sidebar-hover-card--task"

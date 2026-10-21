@@ -1,6 +1,24 @@
-import { parentPort, workerData } from "node:worker_threads";
+import { Worker } from "node:worker_threads";
 import "pdfjs-dist/legacy/build/pdf.worker.mjs";
 import * as pdfjs from "pdfjs-dist/legacy/build/pdf.mjs";
+
+const parentPid = Number(process.env["JOKO_PARENT_PROCESS_ID"]);
+if (!process.send || !Number.isSafeInteger(parentPid) || parentPid <= 1 || process.ppid !== parentPid) throw new Error("PDF parser owner process is unavailable.");
+// Only this small pure-JS watchdog uses a thread. PDF/native modules run on the
+// process main thread; its blocked parser cannot prevent orphan retirement.
+const parentWatchdog = new Worker(`
+  const { workerData } = require('node:worker_threads');
+  const check = () => {
+    try {
+      if (process.ppid !== workerData.parentPid) throw new Error('Owner changed');
+      process.kill(workerData.parentPid, 0);
+    } catch { process.kill(process.pid, 'SIGKILL'); }
+  };
+  check(); setInterval(check, 250);
+`, { eval: true, execArgv: [], env: {}, workerData: { parentPid },
+  resourceLimits: { maxOldGenerationSizeMb: 8, maxYoungGenerationSizeMb: 1 } });
+parentWatchdog.on("error", () => process.kill(process.pid, "SIGKILL"));
+parentWatchdog.unref();
 
 interface WorkerRequest {
   readonly kind: "inspect";
@@ -15,6 +33,8 @@ interface TextWorkerRequest {
   readonly maxPages: number;
   readonly maxChars: number;
 }
+
+export type PdfParserRequest = WorkerRequest | TextWorkerRequest;
 
 export interface PdfTextWorkerResult {
   readonly sections: readonly string[];
@@ -163,13 +183,19 @@ async function extractText(request: TextWorkerRequest): Promise<PdfTextWorkerRes
   }
 }
 
-const port = parentPort;
-if (port) {
-  const request = workerData as WorkerRequest | TextWorkerRequest;
+// The native PDF library lives only in a dedicated Node process's main thread.
+// A Windows native teardown fault cannot terminate the caller's host process.
+if (process.send) process.once("message", (request: PdfParserRequest) => {
+  if (!(request?.data instanceof Uint8Array) || request.data.byteLength === 0 || request.data.byteLength > 64 * 1024 * 1024
+    || !Number.isInteger(request.maxPages) || request.maxPages < 1 || request.maxPages > (request.kind === "extract_text" ? 40 : 50)
+    || (request.kind === "extract_text" && (request.data.byteLength > 20 * 1024 * 1024
+      || !Number.isInteger(request.maxChars) || request.maxChars < 1 || request.maxChars > 48_000))) {
+    process.send?.({ ok: false }, () => process.disconnect?.()); return;
+  }
   const job = request.kind === "inspect" ? inspect(request)
     : request.kind === "extract_text" ? extractText(request) : Promise.reject(new Error("Unknown PDF worker request."));
   void job.then(
-    result => port.postMessage({ ok: true, result }),
-    () => port.postMessage({ ok: false })
+    result => process.send?.({ ok: true, result }, () => process.disconnect?.()),
+    () => process.send?.({ ok: false }, () => process.disconnect?.())
   );
-}
+});

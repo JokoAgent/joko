@@ -5,7 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { DEFAULT_UI_PREFERENCES } from "../local-state.js";
-import { emptySnapshot, type ExtensionCatalogEntryView, type ScheduleView, type SessionView } from "../model.js";
+import { emptySnapshot, type ExtensionCatalogEntryView, type ScheduleView, type SessionTitleSuggestionView, type SessionView } from "../model.js";
 import { DEFAULT_SIDEBAR_OWNER_LAYOUT, SIDEBAR_DIALOGUE_FILTER_ID, type SidebarDisplayPreferences } from "../sidebar-layout.js";
 import { Sidebar, type SidebarProps, visibleSidebarSessionIds } from "./Sidebar.js";
 import { SIDEBAR_HOVER_CARD_CLOSE_DELAY_MS, SIDEBAR_HOVER_CARD_OPEN_DELAY_MS } from "./SidebarHoverCard.js";
@@ -941,6 +941,12 @@ describe("Sidebar organizer display controls", () => {
     if (doubleClickRenameInput === null) throw new Error("Inline rename input was not rendered after double-click.");
     await act(async () => {
       setNativeValue(doubleClickRenameInput, "Alpha renamed");
+      doubleClickRenameInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true, isComposing: true }));
+    });
+    expect(onRename).not.toHaveBeenCalled();
+    expect(doubleClickRenameInput.isConnected).toBe(true);
+    expect(doubleClickRenameInput.value).toBe("Alpha renamed");
+    await act(async () => {
       doubleClickRenameInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
       doubleClickRenameInput.blur();
     });
@@ -980,6 +986,131 @@ describe("Sidebar organizer display controls", () => {
     if (quickArchive === null || quickArchive === undefined) throw new Error("Quick archive action was not rendered.");
     await act(async () => quickArchive.click());
     expect(onArchive).toHaveBeenCalledWith(sessions[0]);
+  });
+
+  it("fills an inline AI title draft without submitting and keeps its generation button keyboard accessible", async () => {
+    const result = deferredTitle();
+    const onRename = vi.fn();
+    const onSuggestTitle = vi.fn<NonNullable<SidebarProps["onSuggestTitle"]>>(() => result.promise);
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: titleSuggestionSnapshot(),
+      onRename,
+      onSuggestTitle
+    });
+    const input = await beginTitleRename(rendered.container);
+    await act(async () => setNativeValue(input, "Manual draft"));
+    const magic = required(rendered.container.querySelector<HTMLButtonElement>(".session-row__rename-magic"));
+    await act(async () => magic.focus());
+    expect(input.isConnected).toBe(true);
+    expect(onRename).not.toHaveBeenCalled();
+    await act(async () => magic.click());
+    expect(magic.disabled).toBe(false);
+    expect(magic.getAttribute("aria-disabled")).toBe("true");
+    expect(document.activeElement).toBe(magic);
+    await act(async () => magic.click());
+    expect(onSuggestTitle).toHaveBeenCalledOnce();
+    expect(onSuggestTitle.mock.calls[0]?.[0].id).toBe("session");
+    await act(async () => result.resolve({ title: "Generated title", status: "ok" }));
+    expect(input.value).toBe("Generated title");
+    expect(document.activeElement).toBe(input);
+    expect(input.selectionStart).toBe(0);
+    expect(input.selectionEnd).toBe("Generated title".length);
+    expect(onRename).not.toHaveBeenCalled();
+    await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, isComposing: true })));
+    expect(onRename).not.toHaveBeenCalled();
+    await act(async () => {
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      input.blur();
+    });
+    expect(onRename).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: "session" }), "Generated title");
+  });
+
+  it("preserves an inline AI title draft through failures until an explicit retry", async () => {
+    const onSuggestTitle = vi.fn<NonNullable<SidebarProps["onSuggestTitle"]>>()
+      .mockResolvedValueOnce({ title: "", status: "no_material" })
+      .mockRejectedValueOnce(new Error("Connection failed."))
+      .mockResolvedValueOnce({ title: "Retried title", status: "ok" });
+    const onRename = vi.fn();
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: titleSuggestionSnapshot(), onRename, onSuggestTitle
+    });
+    const input = await beginTitleRename(rendered.container);
+    await act(async () => setNativeValue(input, "Keep my title"));
+    const magic = required(rendered.container.querySelector<HTMLButtonElement>(".session-row__rename-magic"));
+    await act(async () => magic.click());
+    expect(input.value).toBe("Keep my title");
+    expect(rendered.container.querySelector(".session-row__rename-notice")?.textContent).toBe("session.generateTitleNoMaterial");
+    await act(async () => magic.click());
+    expect(input.value).toBe("Keep my title");
+    expect(rendered.container.querySelector(".session-row__rename-notice")?.textContent).toBe("session.generateTitleFailed");
+    expect(onSuggestTitle).toHaveBeenCalledTimes(2);
+    await act(async () => magic.click());
+    expect(onSuggestTitle).toHaveBeenCalledTimes(3);
+    expect(input.value).toBe("Retried title");
+    expect(rendered.container.querySelector(".session-row__rename-notice")).toBeNull();
+    expect(onRename).not.toHaveBeenCalled();
+    await act(async () => input.blur());
+    expect(onRename).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: "session" }), "Retried title");
+  });
+
+  it("discards inline AI title results after manual edits, Escape, task changes, and node changes", async () => {
+    const pending: Array<ReturnType<typeof deferredTitle>> = [];
+    const signals: AbortSignal[] = [];
+    const onSuggestTitle = vi.fn((_session: SessionView, signal: AbortSignal) => {
+      const result = deferredTitle();
+      pending.push(result);
+      signals.push(signal);
+      return result.promise;
+    });
+    const onRename = vi.fn();
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), {
+      snapshot: titleSuggestionSnapshot(), activeSessionId: "session", onRename, onSuggestTitle
+    });
+    let input = await beginTitleRename(rendered.container);
+    const generate = async (): Promise<HTMLButtonElement> => {
+      const magic = required(rendered.container.querySelector<HTMLButtonElement>(".session-row__rename-magic"));
+      await act(async () => magic.click());
+      return magic;
+    };
+    await generate();
+    await act(async () => setNativeValue(input, "Manual replacement"));
+    expect(signals[0]?.aborted).toBe(true);
+    await act(async () => pending[0]!.resolve({ title: "Superseded", status: "ok" }));
+    expect(input.value).toBe("Manual replacement");
+    const magic = await generate();
+    await act(async () => {
+      magic.focus();
+      magic.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    expect(signals[1]?.aborted).toBe(true);
+    expect(rendered.container.querySelector(".session-row__rename-input")).toBeNull();
+    input = await beginTitleRename(rendered.container);
+    await act(async () => pending[1]!.resolve({ title: "Cancelled", status: "ok" }));
+    expect(input.value).toBe(session().name);
+
+    await generate();
+    await rendered.rerenderActiveSessionId("another-task");
+    expect(signals[2]?.aborted).toBe(true);
+    expect(rendered.container.querySelector(".session-row__rename-input")).toBeNull();
+    await act(async () => pending[2]!.resolve({ title: "Old task", status: "ok" }));
+    input = await beginTitleRename(rendered.container);
+    expect(input.value).toBe(session().name);
+    await generate();
+    await rendered.rerenderOwnerId("other-node");
+    expect(signals[3]?.aborted).toBe(true);
+    expect(rendered.container.querySelector(".session-row__rename-input")).toBeNull();
+    await act(async () => pending[3]!.resolve({ title: "Old node", status: "ok" }));
+    input = await beginTitleRename(rendered.container);
+    expect(input.value).toBe(session().name);
+    expect(onRename).not.toHaveBeenCalled();
+  });
+
+  it("does not offer inline AI title generation without its declared capability", async () => {
+    const onSuggestTitle = vi.fn();
+    const rendered = await renderSidebar(DEFAULT_UI_PREFERENCES.sidebarDisplayPreferences, vi.fn(), { onSuggestTitle });
+    await beginTitleRename(rendered.container);
+    expect(rendered.container.querySelector(".session-row__rename-magic")).toBeNull();
+    expect(onSuggestTitle).not.toHaveBeenCalled();
   });
 
   it("retires hidden and foreign-owner selections before bulk actions", async () => {
@@ -1397,6 +1528,7 @@ interface SidebarRenderOptions {
   readonly onNewDialogue?: SidebarProps["onNewDialogue"];
   readonly onClose?: SidebarProps["onClose"];
   readonly onRename?: SidebarProps["onRename"];
+  readonly onSuggestTitle?: SidebarProps["onSuggestTitle"];
   readonly onPinTarget?: SidebarProps["onPinTarget"];
   readonly onRenameTarget?: SidebarProps["onRenameTarget"];
   readonly onRemoveTarget?: SidebarProps["onRemoveTarget"];
@@ -1499,6 +1631,7 @@ async function renderSidebar(
       onNewTaskInTarget={options.onNewTaskInTarget}
       onNewDialogue={options.onNewDialogue}
       onRename={options.onRename ?? noop}
+      onSuggestTitle={options.onSuggestTitle}
       onPin={noop}
       onPinTarget={options.onPinTarget ?? noop}
       onRenameTarget={options.onRenameTarget}
@@ -1629,6 +1762,32 @@ function setNativeValue(input: HTMLInputElement, value: string): void {
   if (setter === undefined) throw new Error("The native input value setter is unavailable.");
   setter.call(input, value);
   input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+async function beginTitleRename(container: HTMLElement): Promise<HTMLInputElement> {
+  const row = required(container.querySelector<HTMLButtonElement>("button[data-session-id='session']"));
+  await act(async () => row.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, detail: 2 })));
+  return required(container.querySelector<HTMLInputElement>(".session-row__rename-input"));
+}
+
+function titleSuggestionSnapshot(): SidebarProps["snapshot"] {
+  return {
+    ...emptySnapshot(),
+    revision: 1n,
+    server: { name: "Orchestrator", version: "test", health: "healthy" },
+    backends: [{
+      id: "backend", name: "Backend", version: "1", health: "healthy",
+      capabilities: new Map([["session.ai_rename", { name: "session.ai_rename", supported: true, options: [] }]])
+    }],
+    targets: [{ id: "target", backendId: "backend", name: "Project", workspaceId: "workspace", revision: 1n, workspaceName: "Project", trusted: true, pinned: false, archived: false }],
+    sessions: [session()]
+  };
+}
+
+function deferredTitle(): { readonly promise: Promise<SessionTitleSuggestionView>; readonly resolve: (value: SessionTitleSuggestionView) => void } {
+  let resolve!: (value: SessionTitleSuggestionView) => void;
+  const promise = new Promise<SessionTitleSuggestionView>((accept) => { resolve = accept; });
+  return { promise, resolve };
 }
 
 function mockRect(element: Element, left: number, top: number, width: number, height: number): void {

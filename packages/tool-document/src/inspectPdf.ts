@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
 import { extname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-import { Worker } from "node:worker_threads";
 import { z } from "zod";
 import { readDocumentInput } from "./input.js";
+import { createPdfParserProcess } from "./pdf-process.js";
 import type { PdfPageInspection, PdfWorkerResult } from "./inspectPdf-worker.js";
 
 const MAX_INPUT_BYTES = 64 * 1024 * 1024;
@@ -65,36 +64,39 @@ type WorkerMessage = { readonly ok: true; readonly result: PdfWorkerResult } | {
 
 async function inspectInWorker(data: Buffer, pages: readonly number[], maxPages: number, signal: AbortSignal | undefined): Promise<PdfWorkerResult> {
   signal?.throwIfAborted();
-  const sourceMode = fileURLToPath(import.meta.url).endsWith(".ts");
-  const workerFile = fileURLToPath(new URL(sourceMode ? "./inspectPdf-worker.ts" : "./inspectPdf-worker.js", import.meta.url));
-  const execArgv = sourceMode ? ["--import", import.meta.resolve("tsx")] : [];
   return await new Promise<PdfWorkerResult>((resolveResult, reject) => {
-    const worker = new Worker(workerFile, {
-      workerData: { kind: "inspect", data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), pages, maxPages },
-      transferList: [data.buffer as ArrayBuffer],
-      resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 16 },
-      execArgv
-    });
-    let settled = false;
+    const worker = createPdfParserProcess({ kind: "inspect", data: new Uint8Array(data.buffer, data.byteOffset, data.byteLength), pages, maxPages });
+    let settled = false, result: PdfWorkerResult | undefined, failure: Error | undefined, retiring = false;
     const finish = (result?: PdfWorkerResult, error?: Error): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      void worker.terminate();
       if (error) reject(error);
       else resolveResult(result!);
     };
-    const abort = (): void => finish(undefined, new PdfInspectError("INSPECT_FAILED", "PDF inspection was cancelled."));
-    const timer = setTimeout(() => finish(undefined, new PdfInspectError("INSPECT_TIMEOUT", "PDF inspection timed out.")), TIMEOUT_MS);
+    const retire = (): void => {
+      if (retiring) return;
+      retiring = true;
+      void worker.terminate().then(code => finish(result, code < 0
+        ? new PdfInspectError("INSPECT_FAILED", "PDF parser did not exit cleanly.") : failure),
+      () => finish(undefined, new PdfInspectError("INSPECT_FAILED", "PDF parser exit could not be confirmed.")));
+    };
+    const abort = (): void => { failure = new PdfInspectError("INSPECT_FAILED", "PDF inspection was cancelled."); retire(); };
+    const timer = setTimeout(() => {
+      failure = new PdfInspectError("INSPECT_TIMEOUT", "PDF inspection timed out."); retire(); finish(undefined, failure);
+    }, TIMEOUT_MS);
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) { abort(); return; }
-    worker.once("message", (message: WorkerMessage) => {
-      if (message?.ok === true) finish(message.result);
-      else finish(undefined, new PdfInspectError("INSPECT_FAILED", "PDF could not be inspected."));
+    worker.once("message", value => {
+      const message = value as WorkerMessage;
+      if (message?.ok === true) result = message.result;
+      else failure = new PdfInspectError("INSPECT_FAILED", "PDF could not be inspected.");
+      retire();
     });
-    worker.once("error", () => finish(undefined, new PdfInspectError("INSPECT_FAILED", "PDF parser failed.")));
-    worker.once("exit", () => finish(undefined, new PdfInspectError("INSPECT_FAILED", "PDF parser exited without a result.")));
+    worker.once("error", () => { failure = new PdfInspectError("INSPECT_FAILED", "PDF parser failed."); retire(); });
+    worker.once("exit", code => finish(result, failure ?? (code < 0 || result === undefined
+      ? new PdfInspectError("INSPECT_FAILED", "PDF parser exited without a confirmed result.") : undefined)));
   });
 }
 

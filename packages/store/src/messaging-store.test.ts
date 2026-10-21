@@ -109,6 +109,9 @@ describe("OperationalStore messaging", () => {
       backendId: "backend-1",
       targetId: "target-1",
       title: "Telegram group",
+      providerId: "resolved-provider",
+      modelId: "resolved-model",
+      effort: "off",
       binding: { opaqueRef: "service/messaging/conversation-1", generation: 0 },
       pinned: false,
       archived: false,
@@ -132,12 +135,18 @@ describe("OperationalStore messaging", () => {
       sessionId: "messaging-session-1",
       targetId: "target-1",
       backendId: "backend-1",
-      permissionMode: "ask"
+      permissionMode: "ask",
+      providerId: "resolved-provider",
+      modelId: "resolved-model",
+      effort: "off"
     });
 
     const changedRoute = fixture.store.putMessagingRoute({
       expectedRevision: route.revision,
       targetId: "target-1",
+      providerId: "later-provider",
+      modelId: "later-model",
+      effort: "high",
       fastMode: true,
       permissionMode: "auto",
       planMode: true,
@@ -145,6 +154,9 @@ describe("OperationalStore messaging", () => {
     });
     expect(changedRoute).toMatchObject({ fastMode: true, permissionMode: "auto", planMode: true });
     expect(fixture.store.getMessagingConversation(bound.id)).toMatchObject({
+      providerId: "resolved-provider",
+      modelId: "resolved-model",
+      effort: "off",
       fastMode: false,
       permissionMode: "ask",
       planMode: false
@@ -197,6 +209,28 @@ describe("OperationalStore messaging", () => {
       ownerProviderUserId: "84"
     });
     expect(cleared.credentialReferenceId).toBeUndefined();
+  });
+
+  it.each([
+    { providerId: "other-provider", modelId: "pinned-model", effort: "off" },
+    { providerId: "pinned-provider", modelId: "other-model", effort: "off" },
+    { providerId: "pinned-provider", modelId: "pinned-model", effort: "high" }
+  ])("rejects a mismatch on an explicitly selected route axis: $providerId / $modelId / $effort", selection => {
+    const { store } = createFixture();
+    const created = store.createMessagingConnection({ id: "pinned-connection", channel: "telegram", ownerProviderUserId: "42", configuration: {} });
+    const connection = store.replaceMessagingCredential({ connectionId: created.id, expectedRevision: created.revision,
+      expectedGeneration: created.generation, credentialReferenceId: "private-credential-ref", credentialGeneration: "1".repeat(64), enable: true });
+    const route = store.putMessagingRoute({ targetId: "target-1", providerId: "pinned-provider", modelId: "pinned-model",
+      effort: "off", fastMode: false, permissionMode: "ask", planMode: false });
+    const conversation = store.ensureMessagingConversation({ connectionId: connection.id, expectedChannelGeneration: connection.generation,
+      providerConversationId: "42", conversationKind: "direct" });
+    store.createSession({ id: "pinned-session", backendId: "backend-1", targetId: "target-1", title: "Pinned route", ...selection,
+      binding: { opaqueRef: "service/messaging/pinned", generation: 0 }, pinned: false, archived: false,
+      permissionMode: "ask", planMode: false, fastMode: false, createdAt: 14, updatedAt: 14 });
+    expect(() => store.bindMessagingConversation({ conversationId: conversation.id, expectedRevision: conversation.revision,
+      expectedChannelGeneration: connection.generation, sessionId: "pinned-session", expectedSessionGeneration: 0,
+      routeScopeKey: route.scopeKey })).toThrow("Messaging Session does not match the selected creation-time route snapshot.");
+    expect(store.getMessagingConversation(conversation.id).status).toBe("observed");
   });
 
   it("binds a Session with an explicitly validated channel-specific permission mode", () => {

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
 import * as net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -146,13 +146,8 @@ describe("remote Claude manager protocol", () => {
     });
     const sdk = new FakeSdk();
     const managerState = createManagerState(sdk as never);
-    const socketPath = managerSocketPath();
     const server = net.createServer((socket) => new ManagerConnection(socket, managerState));
-    await listen(server, socketPath);
-    cleanups.push(async () => {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      if (process.platform !== "win32") await rm(socketPath, { force: true });
-    });
+    const socketPath = await listen(server);
     const connection = await FrameClient.connect(socketPath);
     cleanups.push(() => connection.close());
     const productTool = {
@@ -219,13 +214,8 @@ describe("remote Claude manager protocol", () => {
 
     const sdk = new FakeSdk();
     const managerState = createManagerState(sdk as never);
-    const socketPath = managerSocketPath();
     const server = net.createServer((socket) => new ManagerConnection(socket, managerState));
-    await listen(server, socketPath);
-    cleanups.push(async () => {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      if (process.platform !== "win32") await rm(socketPath, { force: true });
-    });
+    const socketPath = await listen(server);
 
     const first = await FrameClient.connect(socketPath);
     cleanups.push(() => first.close());
@@ -412,13 +402,8 @@ describe("remote Claude manager protocol", () => {
       sessionStoreModule,
       sessionStoreRootDirectory: storeRoot
     });
-    const socketPath = managerSocketPath();
     const server = net.createServer((socket) => new ManagerConnection(socket, managerState));
-    await listen(server, socketPath);
-    cleanups.push(async () => {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      if (process.platform !== "win32") await rm(socketPath, { force: true });
-    });
+    const socketPath = await listen(server);
     const connection = await FrameClient.connect(socketPath);
     cleanups.push(() => connection.close());
 
@@ -540,13 +525,10 @@ async function freshManagerFixture(module: typeof freshContextModule = freshCont
   const stateOptions = { freshContextModule: module, freshContextRootDirectory: join(root, "fresh-owner"),
     sessionStoreRootDirectory: join(root, "sdk-store") };
   const managerState = createManagerState(sdk as never, stateOptions);
-  const socketPath = managerSocketPath();
   const server = net.createServer((socket) => new ManagerConnection(socket, managerState));
-  await listen(server, socketPath);
+  const socketPath = await listen(server);
   cleanups.push(async () => {
     for (const query of sdk.queries) query.close();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    if (process.platform !== "win32") await rm(socketPath, { force: true });
   });
   const connection = await FrameClient.connect(socketPath);
   cleanups.push(() => connection.close());
@@ -956,16 +938,35 @@ function userMessage(
   };
 }
 
-function managerSocketPath(): string {
-  const id = `joko-remote-claude-${process.pid}-${randomUUID()}`;
-  return process.platform === "win32" ? `\\\\.\\pipe\\${id}` : join(tmpdir(), `${id}.sock`);
-}
-
-async function listen(server: net.Server, path: string): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(path, resolve);
-  });
+async function listen(server: net.Server): Promise<string> {
+  let directory: string | undefined;
+  const close = async (): Promise<void> => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (directory !== undefined) await rm(directory, { recursive: true, force: true });
+  };
+  try {
+    let path: string;
+    if (process.platform === "win32") {
+      path = `\\\\.\\pipe\\joko-remote-claude-${process.pid}-${randomUUID()}`;
+    } else {
+      // Darwin permits at most 103 pathname bytes. Its canonical temporary
+      // directory is already long, so randomize a private directory, not a leaf.
+      directory = await mkdtemp(join(tmpdir(), "jcm-"));
+      await chmod(directory, 0o700);
+      path = join(await realpath(directory), "s");
+      if (Buffer.byteLength(path) > 103) throw new Error("The private manager socket pathname exceeds the Unix bound.");
+    }
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(path, resolve);
+    });
+    // The server must actually close before its own private directory is removed.
+    cleanups.push(close);
+    return path;
+  } catch (error) {
+    await close();
+    throw error;
+  }
 }
 
 async function waitUntil(predicate: () => boolean): Promise<void> {

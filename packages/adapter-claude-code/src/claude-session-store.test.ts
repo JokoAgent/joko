@@ -279,7 +279,7 @@ describe("ClaudeDurableSessionStore", () => {
       expectedGeneration: 2
     })).toThrowError(expect.objectContaining({ code: "CONFLICT" }));
     newStore.close();
-  });
+  }, process.platform === "win32" ? 30_000 : 5_000);
 
   it("claims adopted sessions by Store-discovered generation and rejects future or corrupt state", async () => {
     const fixture = await createFixture();
@@ -359,7 +359,20 @@ describe("ClaudeDurableSessionStore", () => {
     })).toThrowError(expect.objectContaining({ code: "CORRUPT" }));
   });
 
-  it("recovers old-generation operations and explicitly cleans every durable state", async () => {
+  it("recovers old-generation operations and explicitly cleans every durable state", async ({ signal, onTestFailed, onTestFinished }) => {
+    const startedAt = performance.now();
+    let phase = "fixture";
+    let stateIndex = -1;
+    const completedStates: Array<{ stateIndex: number; phase: string; elapsedMs: number }> = [];
+    const snapshot = () => ({ phase, stateIndex, elapsedMs: Math.round(performance.now() - startedAt), completedStates: [...completedStates] });
+    let aborted: ReturnType<typeof snapshot> | undefined;
+    const captureAbort = () => { aborted ??= snapshot(); };
+    signal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => signal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => {
+      try { console.error("[durable-store-boundary]", JSON.stringify(aborted ?? snapshot())); }
+      catch { /* Diagnostic failure must not replace the original assertion. */ }
+    });
     const fixture = await createFixture();
     const states = [
       "importing",
@@ -376,6 +389,8 @@ describe("ClaudeDurableSessionStore", () => {
     }> = [];
 
     for (const [index, state] of states.entries()) {
+      stateIndex = index;
+      phase = "prepare-state";
       const access = prepareClaudeSessionStoreImport(fixture.authority, {
         operationId: randomUUID(),
         sourceWorkspaceAuthority: `workspace.recover-source-${index}`,
@@ -387,18 +402,22 @@ describe("ClaudeDurableSessionStore", () => {
           ? async () => { throw new Error("registration unavailable"); }
           : async () => undefined
       });
+      phase = "append-source";
       await store.append(
         { projectKey: `recover-source-${index}`, sessionId: access.source.sessionId },
         [{ type: "user", uuid: randomUUID(), marker: state }]
       );
       if (state !== "importing") {
+        phase = "seal";
         sealClaudeSessionStoreImport(fixture.authority, access);
       }
       if (!["importing", "ready"].includes(state)) {
+        phase = "load-alias";
         await store.load({ projectKey: `recover-target-${index}`, sessionId: access.source.sessionId });
       }
       let childSessionId: string | undefined;
       if (["child_pending", "child_reserved", "adopted"].includes(state)) {
+        phase = "reserve-child";
         childSessionId = randomUUID();
         const append = store.append(
           { projectKey: `recover-target-${index}`, sessionId: childSessionId },
@@ -410,13 +429,16 @@ describe("ClaudeDurableSessionStore", () => {
           await append;
         }
         if (state === "adopted") {
+          phase = "adopt-child";
           adoptClaudeSessionStoreChild(fixture.authority, access, childSessionId);
         }
       }
       store.close();
       operations.push({ access, state, ...(childSessionId === undefined ? {} : { childSessionId }) });
+      completedStates.push({ stateIndex, phase: "prepared", elapsedMs: Math.round(performance.now() - startedAt) });
     }
 
+    phase = "durable-source";
     const durableSource = await createAdoptedChild(
       fixture,
       "workspace.recover-durable-source",
@@ -432,6 +454,7 @@ describe("ClaudeDurableSessionStore", () => {
       state: "durable_ready"
     });
 
+    phase = "recover-authority";
     const nextAuthority = createClaudeSessionStoreAuthority({
       rootDirectory: fixture.root,
       namespace: "test-owner",
@@ -447,7 +470,9 @@ describe("ClaudeDurableSessionStore", () => {
       targetWorkspaceAuthority: first.access.target.workspaceAuthority
     })).toThrowError(expect.objectContaining({ code: "NOT_FOUND" }));
 
-    for (const operation of operations) {
+    for (const [index, operation] of operations.entries()) {
+      stateIndex = index;
+      phase = "recover-state";
       if (operation.childSessionId !== undefined) {
         expect(() => recoverClaudeSessionStoreOperation(nextAuthority, {
           operationId: operation.access.operationId,
@@ -471,6 +496,7 @@ describe("ClaudeDurableSessionStore", () => {
       expect(readClaudeSessionStoreOperation(nextAuthority, recovered).state).toBe(
         operation.state === "durable_ready" ? "ready" : operation.state
       );
+      phase = "cleanup-state";
       const cleaned = cleanupClaudeSessionStoreOperation(nextAuthority, recovered,
         operation.childSessionId === undefined ? {} : { expectedChildSessionId: operation.childSessionId });
       expect(cleaned.state).toBe("cleaned");
@@ -478,13 +504,16 @@ describe("ClaudeDurableSessionStore", () => {
         operation.childSessionId === undefined ? {} : { expectedChildSessionId: operation.childSessionId }))
         .toEqual(cleaned);
       expect(await operationStagingCount(fixture.root, operation.access.operationId)).toBe(0);
+      completedStates.push({ stateIndex, phase: "cleaned", elapsedMs: Math.round(performance.now() - startedAt) });
     }
 
+    phase = "generation-fence";
     expect(() => recoverClaudeSessionStoreOperation(fixture.authority, {
       operationId: first.access.operationId,
       targetWorkspaceAuthority: first.access.target.workspaceAuthority
     })).toThrowError(expect.objectContaining({ code: "CONFLICT" }));
     const adoptedOperation = operations.find((operation) => operation.state === "adopted")!;
+    phase = "adopted-reopen";
     const adoptedStore = createClaudeDurableSessionStore(nextAuthority, createClaudeSessionStoreSessionAccess({
       generation: 2,
       workspaceAuthority: adoptedOperation.access.target.workspaceAuthority,
@@ -494,11 +523,13 @@ describe("ClaudeDurableSessionStore", () => {
       projectKey: `recover-target-${states.indexOf("adopted")}`,
       sessionId: adoptedOperation.childSessionId!
     })).toHaveLength(1);
+    phase = "adopted-delete";
     await adoptedStore.delete({
       projectKey: `recover-target-${states.indexOf("adopted")}`,
       sessionId: adoptedOperation.childSessionId!
     });
     adoptedStore.close();
+    phase = "final-generation";
     const finalAuthority = createClaudeSessionStoreAuthority({
       rootDirectory: fixture.root,
       namespace: "test-owner",
@@ -519,7 +550,10 @@ describe("ClaudeDurableSessionStore", () => {
     `).get() as Record<string, unknown> | undefined;
     database.close();
     expect(Number(remaining?.["count"] ?? -1)).toBe(0);
-  });
+    phase = "complete";
+  // Seven real durable states each flush and reopen their filesystem/database
+  // boundaries; the Windows aggregate can exceed Vitest's five-second default.
+  }, process.platform === "win32" ? 30_000 : 5_000);
 
   it("fails closed when operation and reserved-child receipt states disagree", async () => {
     const fixture = await createFixture();
@@ -1026,6 +1060,18 @@ describe("ClaudeDurableSessionStore", () => {
     }));
     await expect(listingStore.listSessions("project-bad-listing")).rejects.toMatchObject({ code: "CORRUPT" });
     listingStore.close();
+  });
+
+  it.each(["source_project_key", "target_project_key"] as const)("rejects a NUL-bearing persisted operation %s as CORRUPT", async (column) => {
+    const fixture = await createFixture();
+    const child = await createAdoptedChild(fixture, "workspace.operation-nul", "project-operation-nul");
+    const database = new DatabaseSync(await onlyDatabasePath(fixture.root));
+    database.prepare(`UPDATE operations SET ${column} = ? WHERE operation_id = ?`)
+      .run("bad\u0000project", child.operation.operationId);
+    database.close();
+    expect(() => readClaudeSessionStoreOperation(fixture.authority, child.operation)).toThrowError(
+      expect.objectContaining({ code: "CORRUPT" })
+    );
   });
 
   it("rejects a reopened database with foreign-key violations", async () => {

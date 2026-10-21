@@ -419,6 +419,12 @@ describe("dedicated hardware utility host client", () => {
     hosts[0]!.ready();
     expect(client.probe("codex-micro")).toBe(true);
     expect(hosts[0]!.sent.filter((request) => request.kind === "probe")).toHaveLength(1);
+    expect(client.probe("codex-micro")).toBe(true);
+    expect(hosts[0]!.sent.filter((request) => request.kind === "probe")).toHaveLength(1);
+    const probe = hosts[0]!.sent.find((request) => request.kind === "probe")!;
+    hosts[0]!.message({ version: 1, generation: probe.generation, requestId: probe.requestId, kind: "ack" });
+    expect(client.probe("codex-micro")).toBe(true);
+    expect(hosts[0]!.sent.filter((request) => request.kind === "probe")).toHaveLength(2);
     hosts[0]!.exit();
     await vi.advanceTimersByTimeAsync(500);
     await settle();

@@ -2,12 +2,14 @@ import * as Application from "expo-application";
 import Constants from "expo-constants";
 import * as Updates from "expo-updates";
 import { Linking, Platform } from "react-native";
+import { isMobileGooglePlayInstallation, mobileAndroidInstaller } from "./mobile-android-installer";
 import {
   mobileUpdateChannelHeaders,
   mobileUpdateManifestId,
   parseMobileUpdateConfiguration,
   type MobileUpdateConfiguration,
   type MobileUpdatePlatform,
+  type MobileUpdateRelease,
   type MobileUpdateRuntime,
   type MobileUpdateRuntimeInfo
 } from "./mobile-update";
@@ -42,6 +44,7 @@ export function createMobileUpdateRuntimeEnvironment(): MobileUpdateRuntimeEnvir
 
 export class ExpoMobileUpdateRuntime implements MobileUpdateRuntime {
   readonly info: MobileUpdateRuntimeInfo;
+  readonly bundleUpdatesSupported = !isMobileGooglePlayInstallation();
 
   constructor() {
     this.info = Object.freeze({
@@ -129,12 +132,23 @@ export class ExpoMobileUpdateRuntime implements MobileUpdateRuntime {
     }
   }
 
-  async openUrl(url: string): Promise<void> {
-    const target = new URL(url);
+  async openRelease(release: MobileUpdateRelease): Promise<void> {
+    if (Platform.OS === "android" && isMobileGooglePlayInstallation()) {
+      const packageName = Application.applicationId;
+      if (!packageName) throw new Error("The installed Joko package identity is unavailable.");
+      const id = encodeURIComponent(packageName);
+      try { await Linking.openURL(`market://details?id=${id}`); }
+      catch { await Linking.openURL(`https://play.google.com/store/apps/details?id=${id}`); }
+      return;
+    }
+    const target = new URL(release.installUrl);
     if (target.protocol !== "https:" || !publicDnsHostname(target.hostname) || target.username || target.password
       || target.search || target.hash) {
       throw new Error("The Joko mobile install target is invalid.");
     }
+    if (Platform.OS === "android" && mobileAndroidInstaller.start({
+      version: release.version, installUrl: target.href
+    })) return;
     if (!await Linking.canOpenURL(target.href)) {
       throw new Error("This device cannot open the Joko mobile install target.");
     }

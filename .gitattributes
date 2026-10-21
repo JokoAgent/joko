@@ -2,3 +2,4 @@
 * text=auto
 /packages/contracts/src/gen/**/*.ts whitespace=-blank-at-eof
 /apps/desktop/resources/ios-simulator/LICENSE.appium-webdriveragent text eol=lf
+/apps/desktop/native/remote-desktop/linux-credentials/main.py text eol=lf

@@ -92,6 +92,7 @@ export function combineLastTurnDiff(
     truncated: unstaged.truncated || staged.truncated,
     repositoryRevision: unstaged.repositoryRevision,
     source: "lastTurn",
+    ...(unstaged.pushTarget === undefined ? {} : { pushTarget: unstaged.pushTarget }),
     ...(unstaged.headRevision === undefined ? {} : { headRevision: unstaged.headRevision })
   };
 }

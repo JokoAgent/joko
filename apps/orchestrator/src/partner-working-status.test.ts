@@ -23,7 +23,9 @@ describe("Partner public working facts and captions", () => {
   it("replays the whole persisted current turn, exposes authenticated facts, and never puts targets or output into captions", async () => {
     const f = await fixture();
     f.tool();
-    for (let i = 0; i < 1002; i++) f.append({ type: "status", key: `tick-${i}`, text: "Private status" });
+    f.store.transaction(() => {
+      for (let i = 0; i < 1002; i++) f.append({ type: "status", key: `tick-${i}`, text: "Private status" });
+    });
     expect(f.working.status(f.partner.id)).toMatchObject({ phase: "testing", runId: "run", attemptId: "attempt" });
     const service = createPartnerConnectService(f.partners, () => ({}), undefined, f.working);
     const ctx = { signal: new AbortController().signal } as HandlerContext;

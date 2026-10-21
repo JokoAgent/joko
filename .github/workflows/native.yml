@@ -1,0 +1,199 @@
+name: Native protocol and build-policy checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  linux-native:
+    name: Linux protocol, display rollback, and sanitized C++ fragments
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONNOUSERSITE: "1"
+      CXX: g++
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+
+      - name: Prepare isolated logs and canonical temporary directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/joko-native-logs"
+          node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV,['TMPDIR='+canonical,'TMP='+canonical,'TEMP='+canonical,''].join('\n'));"
+
+      - name: Install compiler and Python tools
+        run: |
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- update 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/apt-update.log"
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- install --no-install-recommends --yes build-essential python3 python3-pip 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/apt-install.log"
+
+      - name: Install locked JavaScript dependencies without product build hooks
+        id: dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/pnpm-install.log"
+
+      - name: Install the existing Python credential protocol requirements
+        id: python
+        run: |
+          python3 -m pip install --disable-pip-version-check \
+            --target "$RUNNER_TEMP/joko-native-python" \
+            -r apps/desktop/native/remote-desktop/linux-credentials/requirements.txt \
+            2>&1 | tee "$RUNNER_TEMP/joko-native-logs/python-install.log"
+
+      - name: Resolve locked JOSE through its public package entry
+        id: jose
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs';
+          import { createRequire } from 'node:module';
+          import { resolve } from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const owner = createRequire(resolve('apps/orchestrator/package.json'));
+          const sdk = createRequire(owner.resolve('@modelcontextprotocol/sdk/client'));
+          const entry = pathToFileURL(sdk.resolve('jose')).href;
+          const jose = await import(entry);
+          if (typeof jose.CompactSign !== 'function' || typeof jose.compactDecrypt !== 'function') {
+            throw new Error('The locked JOSE public entry is unavailable.');
+          }
+          appendFileSync(process.env.GITHUB_ENV, `JOKO_NATIVE_JOSE_ENTRY=${entry}\n`);
+          NODE
+
+      - name: Execute Linux display ownership and rollback checks
+        id: display
+        if: ${{ !cancelled() && steps.python.outcome == 'success' }}
+        run: python3 -I -B apps/desktop/native/remote-desktop/linux-viewer-display.test.py 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/display.log"
+
+      - name: Execute credential, PAM fixture, and independent JOSE protocol checks
+        id: credentials
+        if: ${{ !cancelled() && steps.python.outcome == 'success' && steps.jose.outcome == 'success' }}
+        # The existing interop entry first runs the Python unit suite, including fake
+        # Secret Service/PAM/locker paths; do not execute that suite a second time.
+        run: |
+          node apps/desktop/native/remote-desktop/tests/linux-credentials-interop.test.mjs \
+            "$(command -v python3)" "$JOKO_NATIVE_JOSE_ENTRY" "$RUNNER_TEMP/joko-native-python" \
+            2>&1 | tee "$RUNNER_TEMP/joko-native-logs/credentials-interop.log"
+
+      - name: Execute actual C++ privacy fragments with ASan and UBSan
+        id: fragments
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: node --test --test-reporter=spec apps/desktop/native/remote-desktop/hyprland-privacy/test.mjs 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/privacy-fragments.log"
+
+      - name: Record native check scope and retain short logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/joko-native-artifacts"
+          for log in "$RUNNER_TEMP/joko-native-logs/"*.log; do
+            [ -f "$log" ] || continue
+            tail -n 200 "$log" > "$RUNNER_TEMP/joko-native-artifacts/$(basename "$log")"
+          done
+          printf '%s\n' \
+            'Linux native protocol checks on Ubuntu 24.04:' \
+            '- Display ownership/rollback: ${{ steps.display.outcome }}' \
+            '- Python credential/PAM fixtures and independent JOSE interop: ${{ steps.credentials.outcome }}' \
+            '- Actual C++ privacy rendering/gate fragments with ASan/UBSan: ${{ steps.fragments.outcome }}' \
+            '' \
+            'Scope: isolated protocol identities and controlled Secret Service/PAM/locker fixtures; no compositor connection, real credentials, unlock, GUI, capture, physical device, or installed Hyprland plugin was exercised.' \
+            'Only the last 200 lines of each log are retained. Full product builds, Desktop/viewer/browser chains and Swift receiver checks belong to the other workflows.' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload short Linux native logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-linux-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-native-artifacts
+          if-no-files-found: warn
+          retention-days: 3
+
+  macos-policies:
+    name: macOS signing transaction and SimulatorKit build-policy fixtures
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+
+      - name: Prepare isolated logs and canonical temporary directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/joko-native-logs"
+          node -e "const fs=require('node:fs'); const os=require('node:os'); const canonical=fs.realpathSync(os.tmpdir()); fs.appendFileSync(process.env.GITHUB_ENV,['TMPDIR='+canonical,'TMP='+canonical,'TEMP='+canonical,''].join('\n'));"
+
+      - name: Install locked JavaScript dependencies without product build hooks
+        id: dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/pnpm-install.log"
+
+      - name: Execute the existing macOS native signing transaction fixtures
+        id: signing
+        run: node --test --test-reporter=spec apps/desktop/scripts/sign-mac-native-credentials.test.mjs 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/signing-transaction.log"
+
+      - name: Execute the existing SimulatorKit architecture build-policy checks
+        id: simulator
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
+        run: node --test --test-reporter=spec apps/desktop/scripts/native-simulator-hid-build-policy.test.mjs 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/simulator-build-policy.log"
+
+      - name: Record macOS check scope and retain short logs
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/joko-native-artifacts"
+          for log in "$RUNNER_TEMP/joko-native-logs/"*.log; do
+            [ -f "$log" ] || continue
+            tail -n 200 "$log" > "$RUNNER_TEMP/joko-native-artifacts/$(basename "$log")"
+          done
+          printf '%s\n' \
+            'macOS source checks on macos-15:' \
+            '- Native signing transaction fixtures: ${{ steps.signing.outcome }}' \
+            '- SimulatorKit architecture build-policy checks: ${{ steps.simulator.outcome }}' \
+            '' \
+            'Scope: existing Node test files outside the Vitest include patterns. Signing uses controlled fixtures; no real signing identity, notarization, simulator session, GUI, Accessibility/Input Monitoring/Screen Recording grant, or physical device was exercised.' \
+            'Only the last 200 lines of each log are retained. Swift receiver execution is covered by the Mobile workflow and is not repeated here.' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload short macOS policy logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-macos-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-native-artifacts
+          if-no-files-found: warn
+          retention-days: 3

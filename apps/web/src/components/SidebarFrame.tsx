@@ -17,6 +17,12 @@ import {
   X
 } from "lucide-react";
 
+import {
+  currentAppShortcutPlatform,
+  effectiveAppShortcutCombos,
+  formatAppShortcutCombo,
+  type AppShortcutOverrides
+} from "../app-shortcuts.js";
 import type { AppSnapshot } from "../model.js";
 import type { NavigationMode } from "../navigation-layout.js";
 import { DesktopUpdateBanner, DesktopUpdateRestoreButton } from "./DesktopUpdateBanner.js";
@@ -39,6 +45,7 @@ export interface SidebarFrameProps {
   readonly width: number;
   readonly probeRuntimeActivity: () => Promise<boolean>;
   readonly t: Translator;
+  readonly appShortcutOverrides?: AppShortcutOverrides;
   readonly expandedBody: ReactNode;
   readonly railBody: ReactNode;
   readonly className?: string;
@@ -62,6 +69,8 @@ export interface SidebarFrameProps {
 }
 
 export function SidebarFrame(props: SidebarFrameProps): JSX.Element {
+  const shortcutPlatform = currentAppShortcutPlatform();
+  const newTaskCombo = effectiveAppShortcutCombos("new-maker", props.appShortcutOverrides, shortcutPlatform)[0];
   const rootRef = useRef<HTMLElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const drawerRestoreFocusRef = useRef(props.drawerRestoreFocus);
@@ -208,7 +217,7 @@ export function SidebarFrame(props: SidebarFrameProps): JSX.Element {
           <IconButton className="sidebar__mobile-close" label={props.t("a11y.closeNavigation")} onClick={props.onCloseDrawer}><X aria-hidden="true" /></IconButton>
           <IconButton className="sidebar__collapse" label={props.t("a11y.collapseNavigation")} onClick={props.onCollapse}><PanelLeftClose aria-hidden="true" /></IconButton>
         </div>
-        <Button tone="primary" className="new-task-button" onClick={props.onNewTask}><CirclePlus aria-hidden="true" />{props.t("nav.newTask")}<kbd>⌘N</kbd></Button>
+        <Button tone="primary" className="new-task-button" onClick={props.onNewTask}><CirclePlus aria-hidden="true" />{props.t("nav.newTask")}{newTaskCombo !== undefined && <kbd>{formatAppShortcutCombo(newTaskCombo, shortcutPlatform)}</kbd>}</Button>
       </div>
     </header>
 

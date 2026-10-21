@@ -1,6 +1,6 @@
 import { createHash, X509Certificate } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 export const ANDROID_ARTIFACT_KINDS = Object.freeze(["apk", "aab"]);
@@ -13,6 +13,42 @@ export function platformCommand(command, args, platform = process.platform) {
   return platform === "win32" && command.toLowerCase().endsWith(".bat")
     ? { command: "cmd.exe", args: ["/d", "/s", "/c", command, ...args] }
     : { command, args };
+}
+
+export function locateAndroidTool(name) {
+  const executables = androidToolExecutableNames(name);
+  const sdk = process.env.ANDROID_HOME || process.env.ANDROID_SDK_ROOT;
+  if (sdk) {
+    const root = join(sdk, "build-tools");
+    if (existsSync(root)) {
+      for (const version of readdirSync(root).sort((left, right) => right.localeCompare(left, undefined, { numeric: true }))) {
+        for (const executable of executables) {
+          const candidate = join(root, version, executable);
+          if (existsSync(candidate)) return candidate;
+        }
+      }
+    }
+  }
+  for (const executable of executables) {
+    const invocation = platformCommand(executable, ["version"]);
+    const probe = spawnSync(invocation.command, invocation.args, { encoding: "utf8" });
+    if (probe.status === 0) return executable;
+  }
+  throw new Error(`${name} was not found in the Android SDK build-tools directory.`);
+}
+
+export function captureAndroidArtifactCommand(command, args, options = {}) {
+  const invocation = platformCommand(command, args);
+  const result = spawnSync(invocation.command, invocation.args, { maxBuffer: 32 * 1024 * 1024, ...options, encoding: "buffer" });
+  if (result.error?.code === "ENOENT") throw new Error(`${invocation.command} is not installed or not on PATH.`);
+  if (result.error) throw new Error(`${invocation.command} could not start (${result.error.code ?? "unknown error"}).`);
+  if (result.status !== 0) throw new Error(`${command} failed while validating the Android artifact.`);
+  return {
+    stdout: result.stdout?.toString("utf8") ?? "",
+    stderr: result.stderr?.toString("utf8") ?? "",
+    stdoutBytes: result.stdout?.length ?? 0,
+    stderrBytes: result.stderr?.length ?? 0
+  };
 }
 
 export function buildJarsignerVerificationArgs(artifactPath, keystorePath) {
@@ -138,6 +174,89 @@ export function normalizeCertificateSha256(raw, label = "signing certificate SHA
   const normalized = String(raw ?? "").trim().replace(/^sha-?256\s*:/iu, "").replace(/[\s:]/gu, "").toLowerCase();
   if (!/^[0-9a-f]{64}$/u.test(normalized)) throw new Error(`${label} must be 64 hexadecimal characters.`);
   return normalized;
+}
+
+function apkSignerDigestRecords(output) {
+  return String(output ?? "").split(/\r?\n/u)
+    .filter((line) => /^(?:Signer\b|V[0-9]+(?:\.[0-9]+)?\b).* certificate SHA-256 digest:/iu.test(line))
+    .map((line) => {
+      // SDK 37 emits the observed range-free "V2 Signer:" and "V3.0 Signer:" labels.
+      // Range and ordinary labels retain their own strict forms below.
+      const match = /^(.*?) certificate SHA-256 digest:[ \t]*(.*)$/iu.exec(line);
+      const label = match?.[1];
+      const numbered = /^Signer #([1-9][0-9]{0,9}):?$/iu.exec(label ?? "");
+      const range = /^(?:Signer|V3\.[01] Signer:) \(minSdkVersion=([1-9][0-9]{0,9})(?: \(dev release=true\))?, maxSdkVersion=([1-9][0-9]{0,9})\)$/iu.exec(label ?? "");
+      const valid = label === "Signer:" || label === "V2 Signer:" || label === "V3.0 Signer:"
+        || (numbered !== null && Number(numbered[1]) <= 2_147_483_647)
+        || (range !== null && Number(range[1]) <= Number(range[2]) && Number(range[2]) <= 2_147_483_647);
+      return { label: valid ? label.replace(/^Signer /iu, "") : undefined, value: match?.[2] };
+    });
+}
+
+export function apkSignerCertificateSha256(output, expectedCertificateSha256) {
+  const records = apkSignerDigestRecords(output);
+  if (records.length === 0) throw new Error("apksigner did not return the APK signing certificate.");
+  const certificates = new Set(records.map((record) => {
+    if (record.label === undefined) throw new Error("apksigner returned an unsupported APK signer certificate label.");
+    return normalizeCertificateSha256(record.value, "APK signing certificate");
+  }));
+  if (certificates.size !== 1) throw new Error("APK contains different signing certificates across its signers or SDK ranges.");
+  const certificate = [...certificates][0];
+  if (certificate !== normalizeCertificateSha256(expectedCertificateSha256, "Pinned APK signing certificate")) {
+    throw new Error("APK signing certificate does not match the pinned release identity.");
+  }
+  return certificate;
+}
+
+function apkSignerStreamMetadata(output, byteLength) {
+  const lines = output.split(/\r\n|\n|\r/u);
+  return {
+    bytes: byteLength,
+    characters: output.length,
+    newlines: (output.match(/\n/gu) ?? []).length,
+    carriageReturns: (output.match(/\r/gu) ?? []).length,
+    nuls: (output.match(/\0/gu) ?? []).length,
+    hasLiteralNewlineEscapes: output.includes("\\n"),
+    hasVerifies: lines.includes("Verifies"),
+    hasDoesNotVerify: lines.includes("DOES NOT VERIFY"),
+    hasSignerWord: /\bSigner\b/iu.test(output),
+    hasCertificateWord: /\bcertificate\b/iu.test(output),
+    hasSha256Word: /\bSHA-?256\b/iu.test(output),
+    hasPemBoundary: lines.includes("-----BEGIN CERTIFICATE-----"),
+    hasUsage: lines.some(line => /^(?:USAGE|Usage):/u.test(line)),
+    hasJavaOptionNotice: lines.some(line => /^Picked up (?:JAVA_TOOL_OPTIONS|JDK_JAVA_OPTIONS):/u.test(line)),
+    signerCounts: lines.map(line => /^Number of signers: ([0-9]{1,10})$/u.exec(line)?.[1])
+      .filter(value => value !== undefined).slice(0, 16).map(Number)
+  };
+}
+
+export function apkSignerCertificateDiagnostics(capture, toolVersion) {
+  const output = `${capture.stdout}\n${capture.stderr}`;
+  const records = apkSignerDigestRecords(output);
+  const publicCertificateLines = ["stdout", "stderr"].flatMap(stream => capture[stream].split(/\r?\n/u)
+    .flatMap(line => {
+      const match = /^((?:Signer\b|V[0-9]+(?:\.[0-9]+)?\b)[A-Za-z0-9#:.(),= -]{0,150}) certificate SHA-256 digest:[ \t]*([0-9A-Fa-f]{64})[ \t]*$/u.exec(line);
+      return match === null || match[1].length > 160 ? [] : [{ stream, label: match[1], sha256: match[2].toLowerCase() }];
+    })).slice(0, 16);
+  return {
+    phase: "apk-signer-certificate-read",
+    tool: "apksigner",
+    toolVersion: /^[0-9]+(?:\.[0-9]+){0,5}$/u.test(String(toolVersion).trim()) ? String(toolVersion).trim() : "unavailable",
+    exitCode: 0,
+    hasOutput: String(output ?? "").trim().length > 0,
+    publicCertificateLines,
+    streams: {
+      stdout: apkSignerStreamMetadata(capture.stdout, capture.stdoutBytes),
+      stderr: apkSignerStreamMetadata(capture.stderr, capture.stderrBytes)
+    },
+    signerDigestLineCount: records.length,
+    signerDigests: records.slice(0, 16).map((record) => {
+      let sha256;
+      try { sha256 = normalizeCertificateSha256(record.value, "APK signing certificate"); }
+      catch { /* Malformed command output is not suitable for diagnostics. */ }
+      return { signer: record.label ?? "unsupported", ...(sha256 === undefined ? { validDigest: false } : { sha256 }) };
+    })
+  };
 }
 
 export function certificateSha256FromPem(raw, label = "signing certificate") {

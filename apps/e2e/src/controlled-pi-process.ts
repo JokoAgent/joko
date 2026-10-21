@@ -130,6 +130,7 @@ export class ControlledPiProcess implements PiProcessHandle {
     this.serviceRecovery = native.serviceRecovery;
 
     this.stdin.on("data", (chunk: Buffer | string) => this.#inspectInput(chunk));
+    native.stdin.on("error", (error) => this.stdin.destroy(error));
     this.stdin.pipe(native.stdin);
     native.stdout.on("data", (chunk: Buffer | string) => this.#forwardOutput(chunk));
     native.stdout.once("end", () => {

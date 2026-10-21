@@ -1,5 +1,6 @@
 import { clone, create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { CollaborationGoalTreeSchema, CollaborationGoalStatus, CollaborationSessionRole, CollaborationWorkerStatus } from "@joko/contracts";
+import { SuggestSessionTitleResponseSchema, SessionTitleSuggestionStatus } from "@joko/contracts";
 import type { MobileCollaborationRpc } from "./mobile-collaboration";
 import { BackgroundTaskSchema, SubagentRunSchema, SubagentRunDetailSchema, SubagentTranscriptEntrySchema } from "@joko/contracts";
 import { createPartnerRoutineApi, newRoutineDefinition, ListPartnerRoutinesResponseSchema, PartnerRoutineSchema,
@@ -1020,6 +1021,7 @@ function fakeNetwork(): MobileNetwork {
     unregisterMobilePush: vi.fn(async () => undefined),
     readSession: vi.fn(async () => snapshot),
     readTaskHeaderRole: vi.fn(async () => "ordinary" as const),
+    suggestSessionTitle: vi.fn(async () => create(SuggestSessionTitleResponseSchema, { title: "Suggested title", status: SessionTitleSuggestionStatus.OK })),
     listBackgroundTasks: vi.fn(async () => ({ tasks: [], nextPageToken: "" })),
     listSubagentRuns: vi.fn(async () => ({ runs: [], nextPageToken: "" })),
     getSubagentRun: vi.fn(async () => { throw new Error("No delegated run fixture was configured."); }),
@@ -1729,10 +1731,11 @@ function committedAttachment(attachment: MobileLocalComposerAttachment) {
 describe("mobile current task delegated reads", () => {
   function delegatedNetwork() {
     const network = fakeNetwork();
-    const owner = create(SnapshotSchema, { ...snapshot, scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema) } }),
-      backends: [create(BackendDescriptorSchema, { ...snapshot.backends[0]!, capabilities: create(CapabilityManifestSchema, { capabilities: [capabilityNames.backgroundTasks, capabilityNames.subagentsList,
+    const base = clone(SnapshotSchema, snapshot);
+    const owner = create(SnapshotSchema, { ...base, scope: create(SnapshotScopeSchema, { kind: { case: "owner", value: create(OwnerSnapshotScopeSchema) } }),
+      backends: [create(BackendDescriptorSchema, { ...base.backends[0]!, capabilities: create(CapabilityManifestSchema, { capabilities: [capabilityNames.backgroundTasks, capabilityNames.subagentsList,
         capabilityNames.subagentsDetail, capabilityNames.subagentsTranscript].map((name) => create(CapabilitySchema, { name, support: CapabilitySupport.SUPPORTED })) }) })] });
-    const detail = create(SnapshotSchema, { ...owner, scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "session" }) } }) });
+    const detail = create(SnapshotSchema, { ...clone(SnapshotSchema, owner), scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "session" }) } }) });
     network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner }));
     network.readSession = vi.fn(async () => detail);
     return { network, owner, detail };
@@ -1765,6 +1768,35 @@ describe("mobile current task delegated reads", () => {
     const background = app.readTaskHeaderRole(app.taskHeaderSourceKey()!, new AbortController().signal);
     app.setForeground(false); expect(active.aborted).toBe(true); expect(app.taskHeaderSourceKey()).toBeUndefined();
     finish("worker"); await expect(background).rejects.toThrow("source changed");
+  });
+
+  it("suggests a title through the current owned task without saving and rejects worker or foreign sources before dispatch", async () => {
+    const { network } = delegatedNetwork();
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const source = app.taskHeaderSourceKey()!, signal = new AbortController().signal;
+    expect(await app.suggestTaskTitle(source, signal)).toMatchObject({ title: "Suggested title", status: SessionTitleSuggestionStatus.OK });
+    expect(network.suggestSessionTitle).toHaveBeenCalledExactlyOnceWith(credential, "session", expect.any(AbortSignal));
+    expect(network.submit).not.toHaveBeenCalled();
+    await expect(app.suggestTaskTitle("foreign", signal)).rejects.toThrow("owned task");
+    vi.mocked(network.readTaskHeaderRole).mockResolvedValueOnce("worker");
+    await expect(app.suggestTaskTitle(source, signal)).rejects.toThrow("Worker titles");
+    expect(network.suggestSessionTitle).toHaveBeenCalledOnce();
+  });
+
+  it.each(["runtime", "cancel", "background"] as const)("rejects a late title suggestion after %s retirement", async kind => {
+    const { network, owner, detail } = delegatedNetwork();
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    let finish!: (value: import("@joko/contracts").SuggestSessionTitleResponse) => void;
+    vi.mocked(network.suggestSessionTitle).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const caller = new AbortController();
+    const pending = app.suggestTaskTitle(app.taskHeaderSourceKey()!, caller.signal);
+    const rejected = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(network.suggestSessionTitle).toHaveBeenCalledOnce());
+    if (kind === "runtime") { owner.sessions[0]!.nativeBinding!.runtimeGeneration = 2n; detail.sessions[0]!.nativeBinding!.runtimeGeneration = 2n; }
+    else if (kind === "cancel") caller.abort();
+    else app.setForeground(false);
+    finish(create(SuggestSessionTitleResponseSchema, { title: "Retired title", status: SessionTitleSuggestionStatus.OK }));
+    await rejected; expect(network.submit).not.toHaveBeenCalled();
   });
 
   it("reads typed Session scoped background/run/detail/child pages only through the current authenticated owner", async () => {
@@ -6867,7 +6899,7 @@ describe("native mobile connection and operation ownership", () => {
     ];
     expect(timelineRows([...events, events[2]!])).toMatchObject([
       { id: "message", label: "Assistant", text: "final" },
-      { id: "status", label: "Activity", text: "run Aborted" }
+      { id: "status", label: "Run", text: "Run stopped" }
     ]);
   });
 

@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { resolve } from "node:path";
 import type { UtilityProcess } from "electron";
 import { describe, expect, it, vi } from "vitest";
 
@@ -42,19 +43,20 @@ describe("Electron dedicated hardware utility factory", () => {
   it("uses isolated stdio, forwards structured messages, and reports the exact process exit", async () => {
     const child = new FakeUtilityProcess();
     const fork = vi.fn(() => child as unknown as UtilityProcess);
+    const cwd = resolve("."), entryPath = resolve("dist/dedicated-hardware/utility-entry.js");
     const factory = createElectronDedicatedHardwareUtilityFactory({
-      entryPath: "D:\\joko\\apps\\desktop\\dist\\dedicated-hardware\\utility-entry.js",
-      cwd: "D:\\joko",
+      entryPath,
+      cwd,
       fork
     });
     const onMessage = vi.fn();
     const onExit = vi.fn();
     const spawning = factory.spawn({ generation: 1, onMessage, onExit });
     expect(fork).toHaveBeenCalledWith(
-      "D:\\joko\\apps\\desktop\\dist\\dedicated-hardware\\utility-entry.js",
+      entryPath,
       [],
       expect.objectContaining({
-        cwd: "D:\\joko",
+        cwd,
         stdio: "ignore",
         execArgv: [],
         serviceName: "Joko hardware input",
@@ -78,7 +80,7 @@ describe("Electron dedicated hardware utility factory", () => {
     expect(() => createElectronDedicatedHardwareUtilityFactory({ entryPath: "relative.js" })).toThrow(TypeError);
     const child = new FakeUtilityProcess();
     const factory = createElectronDedicatedHardwareUtilityFactory({
-      entryPath: "D:\\joko\\utility-entry.js",
+      entryPath: resolve("utility-entry.js"),
       fork: vi.fn(() => child as unknown as UtilityProcess)
     });
     const spawning = factory.spawn({ generation: 1, onMessage: vi.fn(), onExit: vi.fn() });

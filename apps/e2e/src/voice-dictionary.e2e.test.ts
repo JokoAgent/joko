@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 
 import { create } from "@bufbuild/protobuf";
 import { Code } from "@connectrpc/connect";
@@ -189,16 +190,31 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     }))).rejects.toMatchObject({ code: Code.Unavailable });
     expect((await mobileNetwork.getVoiceInputDictionary(credential)).dictionary.entries.map((entry: { text: string }) => entry.text)).toEqual(["PhoneTerm"]);
     const grantedB = await mobileNetwork.grantVoiceInputDictionaryPeer(credential, b.configurationRevision, a.nodeId, a.fingerprint);
-    await vi.waitFor(async () => {
-      expect(firstContent.error).toBeUndefined(); expect(phoneContent.error).toBeUndefined();
-      expect(firstSharing.error).toBeUndefined(); expect(phoneSharing.error).toBeUndefined();
-      const current = (await first.getVoiceInputDictionary(dictionaryRequest)).dictionary!;
-      expect(firstContent.latest?.dictionary?.revision).toBe(current.revision);
-      expect(firstContent.latest?.dictionary?.refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
-      expect(phoneContent.latest?.refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
-      expect(firstSharing.latest?.status?.configurationRevision).toBe(grantedA.configurationRevision);
-      expect(phoneSharing.latest?.configurationRevision).toBe(grantedB.configurationRevision);
-    }, { timeout: 8_000, interval: 100 });
+    try {
+      await vi.waitFor(async () => {
+        expect(firstContent.error).toBeUndefined(); expect(phoneContent.error).toBeUndefined();
+        expect(firstSharing.error).toBeUndefined(); expect(phoneSharing.error).toBeUndefined();
+        const current = (await first.getVoiceInputDictionary(dictionaryRequest)).dictionary!;
+        expect(firstContent.latest?.dictionary?.revision).toBe(current.revision);
+        expect(firstContent.latest?.dictionary?.refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
+        expect(phoneContent.latest?.refinementTerms.slice().sort()).toEqual(["OfficeTerm", "PhoneTerm"]);
+        expect(firstSharing.latest?.status?.configurationRevision).toBe(grantedA.configurationRevision);
+        expect(phoneSharing.latest?.configurationRevision).toBe(grantedB.configurationRevision);
+      }, { timeout: 8_000, interval: 100 });
+    } catch (error) {
+      const state = (node: OrchestratorE2eFixture) => {
+        const status = node.application.voiceDictionaryPeers!.status();
+        const dictionary = node.application.voiceDictionary!.snapshot();
+        return { phase: status.phase, errorCode: status.errorCode, enabled: status.enabled,
+          configurationRevision: status.configurationRevision.toString(), candidates: status.candidates.length,
+          peers: status.peers.map(peer => ({ online: peer.online, synchronized: peer.lastSyncAt !== undefined })),
+          dictionaryRevision: dictionary.revision, termCount: dictionary.refinementTerms.length };
+      };
+      console.error("Bilateral dictionary completion state", JSON.stringify({ first: state(fixture), phone: state(peerFixture),
+        firstProjectedTerms: firstContent.latest?.dictionary?.refinementTerms.length,
+        phoneProjectedTerms: phoneContent.latest?.refinementTerms.length }));
+      throw error;
+    }
     await expect(mobileNetwork.syncVoiceInputDictionaryNow(credential, b.configurationRevision, undefined)).rejects.toMatchObject({ code: Code.Aborted });
     await expect(mobileNetwork.syncVoiceInputDictionaryNow(credential, grantedB.configurationRevision, undefined)).resolves.toMatchObject({
       fingerprint: b.fingerprint, peers: [{ fingerprint: a.fingerprint }]
@@ -246,13 +262,22 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     peerFixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "readonly-node-b", keepRoot: true });
     const originalFetch = globalThis.fetch;
     const streamSignals: Array<{ method: string; signal: AbortSignal }> = [];
+    const readonlyRequests = new Map<string, { started: number; headersReceived: number; failed: number }>();
     const fetchProbe = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const url = input instanceof Request ? input.url : String(input);
       const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
       if (signal && (url.endsWith("/StreamEvents") || url.endsWith("/WatchVoiceInputDictionaryReadOnly"))) {
         streamSignals.push({ method: new URL(url).pathname.split("/").at(-1)!, signal });
       }
-      return originalFetch(input, init);
+      const phase = ["GetServerInfo", "GetSnapshot", "GetVoiceInputDictionaryReadOnly", "WatchVoiceInputDictionaryReadOnly"]
+        .find((method) => url.endsWith(`/${method}`));
+      const progress = phase === undefined ? undefined : readonlyRequests.get(phase) ?? { started: 0, headersReceived: 0, failed: 0 };
+      if (phase !== undefined && progress) { readonlyRequests.set(phase, progress); progress.started += 1; }
+      try {
+        const response = await originalFetch(input, init);
+        if (progress) progress.headersReceived += 1;
+        return response;
+      } catch (error) { if (progress) progress.failed += 1; throw error; }
     });
     streamCleanups.push(async () => { fetchProbe.mockRestore(); });
     await expect(fixture.anonymous.voiceInput.getVoiceInputDictionaryReadOnly({})).rejects.toMatchObject({ code: Code.Unauthenticated });
@@ -303,11 +328,24 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       streamCleanups.push(async () => { controller.setVisible(false); unsubscribe(); app.dispose(); });
       return { cache, app, controller, stop: () => { controller.setVisible(false); unsubscribe(); app.dispose(); } };
     };
+    readonlyRequests.clear();
     let phone = createPhone(); await phone.app.start(); phone.controller.setVisible(true);
-    await vi.waitFor(() => {
-      expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]);
-      expect(phone.controller.state.selected?.snapshot.entries.map((entry: { text: string }) => entry.text).sort()).toEqual(["DeleteMe", "OfficeTerm", "PhoneTerm"]);
-    });
+    try {
+      // Both authenticated hosts start independent real HTTP read/watch
+      // projections. Vitest's one-second default is not their network budget.
+      await vi.waitFor(() => {
+        expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]);
+        expect(phone.controller.state.selected?.snapshot.entries.map((entry: { text: string }) => entry.text).sort()).toEqual(["DeleteMe", "OfficeTerm", "PhoneTerm"]);
+      }, { timeout: 5_000 });
+    } catch (error) {
+      // Fixed phases and state only: no origins, profile IDs, keys or payloads.
+      console.error("Readonly dictionary initial projection diagnostic", JSON.stringify({
+        visible: phone.controller.state.visible, refreshing: phone.controller.state.refreshing,
+        hosts: phone.controller.state.hosts.map((host: { status: string; cacheError: boolean }) => ({ status: host.status, cacheError: host.cacheError })),
+        requests: [...readonlyRequests].map(([phase, progress]) => ({ phase, ...progress }))
+      }));
+      throw error;
+    }
     expect(phone.app.state.activeProfileId).toBe(a.profileId);
     const grantedB = await mobileNetwork.getVoiceInputDictionaryPeerStatus(b);
     await mobileNetwork.revokeVoiceInputDictionaryPeer(b, a.serverId, grantedB.peers[0]!.revision);
@@ -339,7 +377,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     peerFixture = await OrchestratorE2eFixture.start({ rootDirectory: rootB, dictionaryPeerNodeId: "readonly-node-b", publicPort: portB });
     expect((await mobileNetwork.getVoiceInputDictionaryReadOnly(a))).toEqual(disabledSnapshot);
     phone.controller.setVisible(false); await phone.app.connectSaved(a.profileId); phone.controller.setVisible(true);
-    await vi.waitFor(() => expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]));
+    await vi.waitFor(() => expect(phone.controller.state.hosts.map((host: { status: string }) => host.status)).toEqual(["ready", "ready"]), { timeout: 5_000 });
     const enabled = await mobileNetwork.setVoiceInputDictionarySyncEnabled(a, disabled.revision, true);
     await vi.waitFor(() => expect(phone.controller.state.selected?.snapshot).toMatchObject({ revision: enabled.revision, syncEnabled: true,
       entries: expect.arrayContaining([{ text: "OfficeTerm", frequency: 1, aliases: [] }, { text: "PhoneTerm", frequency: 1, aliases: [] }]) }));
@@ -357,8 +395,12 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
     const observations: ReturnType<typeof observeProductionDictionary>[] = [];
     const phoneAbort = new AbortController();
     const phoneStreams: Promise<void>[] = [];
+    const connectionTiming = observeDictionaryConnectionTiming();
+    const journeyStarted = connectionTiming.begin();
+    streamCleanups.push(async () => connectionTiming.stop());
     let journeyFailed = false;
     let journeyError: unknown;
+    let journeyStage = "journey";
     const start = async (name: string) => {
       const node = await ProductionDictionaryNode.start(join(root, name), { directOnly: direct });
       running.add(node);
@@ -470,8 +512,13 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       await grant(apiB, identityC.nodeId, identityC.fingerprint);
       await grantC();
 
+      let convergenceAttempt = 0;
       const converge = async (terms: readonly string[], evidence?: number) => {
-        await vi.waitFor(async () => {
+        convergenceAttempt += 1;
+        const convergenceStarted = connectionTiming.begin();
+        // LAN recovery may include the production 60-second failed-route
+        // cooldown, discovery and both eight-second forwarding debounces.
+        try { await vi.waitFor(async () => {
           const [dictionaryA, dictionaryB, dictionaryC] = await Promise.all([readA(), readB(), readC()]);
           for (const dictionary of [dictionaryA, dictionaryB, dictionaryC]) expect(dictionary.refinementTerms.slice().sort()).toEqual(terms.slice().sort());
           expect(a.application.voiceDictionary!.stateForSync()).toEqual(b.application.voiceDictionary!.stateForSync());
@@ -520,7 +567,26 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
           }
           expect(phonePeers.latest?.configurationRevision).toBe(peersC.configurationRevision);
           expect(bridgeObservation.peers.latest?.status?.configurationRevision).toBe(peersB.configurationRevision);
-        }, { timeout: 24_000, interval: 100 });
+        }, { timeout: direct ? 24_000 : 90_000, interval: 100 }); }
+        catch (error) {
+          // Observe only counters and transport state before the original
+          // failure cleans up the real nodes. Never export keys or content.
+          try {
+            console.error("[dictionary-bridge-convergence]", JSON.stringify({ direct, convergenceAttempt,
+              timing: connectionTiming.summary(convergenceStarted),
+              expectedTerms: terms.length, nodes: [a, b, c].map(node => {
+                const dictionary = node.application.voiceDictionary!.snapshot();
+                const status = node.application.voiceDictionaryPeers!.status();
+                return { revision: String(dictionary.revision), terms: dictionary.refinementTerms.length,
+                  matchingTerms: dictionary.refinementTerms.filter(term => terms.includes(term)).length,
+                  available: status.available, enabled: status.enabled, phase: status.phase, errorCode: status.errorCode,
+                  peers: status.peers.map(peer => ({ online: peer.online, hasRoute: peer.route !== undefined,
+                    candidateVisible: status.candidates.some(candidate => candidate.nodeId === peer.peerId),
+                    sinceLastSyncMs: peer.lastSyncAt === undefined ? undefined : Math.max(0, Date.now() - peer.lastSyncAt) })) };
+              }) }));
+          } catch { /* Preserve the original convergence failure. */ }
+          throw error;
+        }
       };
       await converge(["DeleteMe", "Editable", "OfficeTerm", "PhoneTerm"]);
       const autoForwarded = (await apiA.addVoiceInputDictionaryTerms({ expectedRevision: (await readA()).revision, terms: ["Across bridge"] })).dictionary!;
@@ -647,17 +713,32 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
       }
       const stable = await Promise.all([readA(), readB(), readC()]);
       for (let replay = 0; replay < 2; replay += 1) {
+        journeyStage = `replay-${replay + 1}-bridge`;
         await apiB.syncVoiceInputDictionaryNow({ expectedConfigurationRevision: finalAuthorityB.configurationRevision });
         const currentC = await mobileNetwork.getVoiceInputDictionaryPeerStatus(credentialC);
+        journeyStage = `replay-${replay + 1}-phone`;
         await mobileNetwork.syncVoiceInputDictionaryNow(credentialC, currentC.configurationRevision);
       }
+      journeyStage = "replay-convergence";
       await converge(finalTerms, 2);
       expect((await readA()).revision).toBe(stable[0].revision); expect((await readB()).revision).toBe(stable[1].revision);
       expect((await readC()).revision).toBe(stable[2].revision);
     } catch (error) {
       journeyFailed = true; journeyError = error;
+      try {
+        console.info("Dictionary product failure:", JSON.stringify({ direct, stage: journeyStage,
+          elapsedMs: Math.round(performance.now() - journeyStarted), timing: connectionTiming.summary(journeyStarted),
+          nodes: [...running].map(node => {
+            const status = node.application.voiceDictionaryPeers!.status();
+            return { configurationRevision: String(status.configurationRevision), available: status.available,
+              enabled: status.enabled, phase: status.phase, errorCode: status.errorCode,
+              peers: status.peers.map(peer => ({ online: peer.online, hasRoute: peer.route !== undefined,
+                sinceLastSyncMs: peer.lastSyncAt === undefined ? undefined : Math.max(0, Date.now() - peer.lastSyncAt) })) };
+          }) }));
+      } catch { /* Preserve the original product failure. */ }
       throw error;
     } finally {
+      connectionTiming.stop();
       phoneAbort.abort();
       const streams = await Promise.allSettled([dictionaryDeadline(Promise.all(phoneStreams), 5_000), ...observations.map((observation) => observation.close())]);
       const closed = await Promise.allSettled([...running].map((node) => node.close()));
@@ -669,7 +750,7 @@ describe("durable voice dictionary through authenticated generated RPCs", () => 
         throw new AggregateError(failures, "Production dictionary cleanup failed.");
       }
     }
-  }, 150_000);
+  }, 300_000);
 
   it("drains both idle dictionary projections immediately on public server shutdown", async () => {
     fixture = await OrchestratorE2eFixture.start({ dictionaryPeerNodeId: "e2e-dictionary-shutdown", keepRoot: true });
@@ -728,6 +809,56 @@ async function dictionaryDeadline<T>(operation: Promise<T>, milliseconds: number
 }
 
 /** Starts the actual application composition; dictionary timing, codec and transport are never substituted. */
+function observeDictionaryConnectionTiming() {
+  const loop = monitorEventLoopDelay({ resolution: 20 }); loop.enable();
+  const connections: Array<{ completedAt: number; connected: boolean; connectMs?: number; elapsedMs: number;
+    bytesRead: number; bytesWritten: number; hadError: boolean; errorCode?: string }> = [];
+  const cleanups = new Set<() => void>();
+  const socketErrors = new Map<string, number>();
+  let totalConnections = 0, maximumObservedConnections = 0;
+  const original = net.createConnection;
+  let active = true;
+  // Observe the original sockets; retain no endpoints, frames or credentials,
+  // and do not add an error listener or change any timer/result/promise.
+  const spy = vi.spyOn(net, "createConnection").mockImplementation((...args: unknown[]) => {
+    const socket = Reflect.apply(original, net, args) as net.Socket;
+    if (active) totalConnections++;
+    if (!active || cleanups.size >= 128) return socket;
+    const started = performance.now(); let connectMs: number | undefined;
+    const connected = () => { connectMs = Math.round(performance.now() - started); };
+    const closed = (hadError: boolean) => {
+      const completedAt = performance.now(), elapsedMs = Math.round(completedAt - started);
+      const errorCode = socket.errored && "code" in socket.errored && typeof socket.errored.code === "string"
+        && /^[A-Z][A-Z0-9_]{0,39}$/u.test(socket.errored.code) ? socket.errored.code : undefined;
+      if (errorCode !== undefined && (socketErrors.has(errorCode) || socketErrors.size < 16)) {
+        socketErrors.set(errorCode, (socketErrors.get(errorCode) ?? 0) + 1);
+      }
+      if (elapsedMs >= 500 || hadError) {
+        connections.push({ completedAt, connected: connectMs !== undefined,
+          ...(connectMs === undefined ? {} : { connectMs }), elapsedMs,
+          bytesRead: socket.bytesRead, bytesWritten: socket.bytesWritten, hadError,
+          ...(errorCode === undefined ? {} : { errorCode }) });
+        if (connections.length > 64) connections.shift();
+      }
+      cleanup();
+    };
+    const cleanup = () => {
+      socket.removeListener("connect", connected); socket.removeListener("close", closed); cleanups.delete(cleanup);
+    };
+    cleanups.add(cleanup); socket.once("connect", connected); socket.once("close", closed);
+    maximumObservedConnections = Math.max(maximumObservedConnections, cleanups.size);
+    return socket;
+  });
+  return {
+    begin() { loop.reset(); return performance.now(); },
+    summary(since: number) { return { maximumEventLoopDelayMs: Math.round(loop.max / 1e6),
+      totalConnections, maximumObservedConnections, socketErrors: Object.fromEntries(socketErrors),
+      slowConnections: connections.filter(item => item.completedAt >= since).slice(-16)
+        .map(({ completedAt: _completedAt, ...item }) => item) }; },
+    stop() { if (!active) return; active = false; spy.mockRestore(); loop.disable(); for (const cleanup of [...cleanups]) cleanup(); }
+  };
+}
+
 class ProductionDictionaryNode {
   readonly application: OrchestratorApplication;
   readonly baseUrl: string;

@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -719,6 +720,13 @@ export class DefaultClaudeSdkRuntime implements ClaudeSdkRuntime {
       };
     }
 
+    // An explicit executable can disappear during uninstall or a failed install.
+    // Keep that known absence out of the SDK's native startup transport.
+    if (input.pathToClaudeCodeExecutable !== undefined && isAbsolute(input.pathToClaudeCodeExecutable)
+      && !existsSync(input.pathToClaudeCodeExecutable)) {
+      return { installed: true, packageVersion: this.packageVersion,
+        diagnostic: "The configured native CLI executable is unavailable." };
+    }
     const abortController = new AbortController();
     const timer = setTimeout(() => abortController.abort(), input.initializationTimeoutMs);
     let warmQuery: NativeWarmQuery | undefined;

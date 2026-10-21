@@ -293,6 +293,7 @@ describe("Desktop Device peer agent", () => {
     terminal.emitData("terminal-output");
     terminal.emitExit({ exitCode: 0, processExitConfirmed: true });
     await pending;
+    await drainRecentDirectories(executor);
 
     expect(terminal.write).toHaveBeenCalledWith("typed");
     expect(writeResults.at(-1)?.payload.case).toBe("acknowledgement");
@@ -451,7 +452,18 @@ async function execute(
 ): Promise<DevicePeerAgentResult[]> {
   const results: DevicePeerAgentResult[] = [];
   await executor.execute(command, new AbortController().signal, (result) => { results.push(result); });
+  if (command.action.case === "startProcess") await drainRecentDirectories(executor);
   return results;
+}
+
+async function drainRecentDirectories(executor: DesktopDevicePeerAgentExecutor): Promise<void> {
+  // Process/terminal completion deliberately does not await convenience history.
+  // Its existing read owner drains queued mutations before fixture removal.
+  await executor.execute(create(DevicePeerCommandSchema, {
+    capability: DevicePeerCapabilityKind.FILES,
+    effect: DevicePeerEffectKind.READ_ONLY,
+    action: { case: "listRecentDirectories", value: { maximumEntries: 1 } }
+  }), new AbortController().signal, () => undefined);
 }
 
 function recentAvailability(results: readonly DevicePeerAgentResult[]): DevicePeerDirectoryAvailability | undefined {

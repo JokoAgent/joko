@@ -1,8 +1,7 @@
 .vision-bridge {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding-bottom: 18px;
+  gap: var(--settings-card-gap);
 }
 
 .vision-bridge__heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }

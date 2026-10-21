@@ -89,8 +89,9 @@ async function fixture(label: string, git?: ExtensionSourceGitExecutor, inspectP
 
 describe("ExtensionSourceManager", () => {
   it("normalizes only credential-free current-v1 local and Git source shapes", () => {
-    expect(normalizeExtensionSourceInput({ kind: "local", path: "~/catalog" }, "D:\\owner"))
-      .toEqual({ kind: "local", path: join("D:\\owner", "catalog") });
+    const home = join(tmpdir(), "joko-source-owner");
+    expect(normalizeExtensionSourceInput({ kind: "local", path: "~/catalog" }, home))
+      .toEqual({ kind: "local", path: join(home, "catalog") });
     expect(normalizeExtensionSourceInput({ kind: "git", repositoryUrl: "example/extensions", ref: "v1", sparsePaths: [".agents/plugins", "packages/review"] }))
       .toEqual({
         kind: "git",

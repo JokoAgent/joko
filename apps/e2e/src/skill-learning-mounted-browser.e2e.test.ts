@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, describe, expect, it } from "vitest";
@@ -42,7 +43,7 @@ describe("mounted Skill learning review", () => {
     const code = fixture.pairingCode(challenge.challenge.challengeId);
     browser = await chromium.launch({ executablePath: executable!, headless: true });
     const page = await browser.newPage({ viewport: { width: 1440, height: 960 } });
-    const errors = observeErrors(page);
+    const { errors, networkFailures } = observeErrors(page);
     await page.goto(`${fixture.baseUrl}/#/tools`, { waitUntil: "domcontentloaded" });
     await page.locator(".connection-tabs > button").nth(2).click();
     await page.getByLabel("Joko node address").fill(fixture.baseUrl);
@@ -71,15 +72,34 @@ describe("mounted Skill learning review", () => {
     expect(fixture.application.piResources?.list({ kind: "skill" }).some((item) =>
       item.name === "mounted-learning" && item.sourceKind === "learned" && item.state === "installed")).toBe(true);
     expect(await overflow(page)).toBeLessThanOrEqual(1);
-    expect(errors).toEqual([]);
+    if (errors.length > 0 && process.env.RUNNER_TEMP !== undefined) {
+      try {
+        const directory = join(process.env.RUNNER_TEMP, "joko-web-evidence", "skill-learning");
+        await mkdir(directory, { recursive: true });
+        await writeFile(join(directory, "browser-failure.json"), JSON.stringify({
+          sourceCommit: process.env.GITHUB_SHA, errors, networkFailures: networkFailures.slice(-25)
+        }, null, 2));
+        await page.screenshot({ path: join(directory, "browser-failure.png"),
+          mask: [page.locator("input,textarea")], fullPage: true, timeout: 5_000 });
+      } catch { console.error("Skill learning failure evidence was unavailable."); }
+    }
+    expect(errors, JSON.stringify({ networkFailures: networkFailures.slice(-25) })).toEqual([]);
   });
 });
 
-function observeErrors(page: Page): string[] {
+function observeErrors(page: Page): { errors: string[]; networkFailures: { location: string; method: string; error: string }[] } {
   const errors: string[] = [];
+  const networkFailures: { location: string; method: string; error: string }[] = [];
+  const location = (value: string) => {
+    try { const url = new URL(value); return `${url.origin}${url.pathname}`; } catch { return "unavailable"; }
+  };
   page.on("pageerror", (error) => errors.push(`pageerror:${error.message}`));
-  page.on("console", (message) => { if (message.type() === "error") errors.push(`console:${message.text()}`); });
-  return errors;
+  page.on("console", (message) => { if (message.type() === "error") errors.push(`console:${message.text()}:${location(message.location().url)}`); });
+  page.on("requestfailed", request => {
+    if (networkFailures.length === 25) networkFailures.shift();
+    networkFailures.push({ location: location(request.url()), method: request.method(), error: request.failure()?.errorText ?? "unavailable" });
+  });
+  return { errors, networkFailures };
 }
 
 async function overflow(page: Page): Promise<number> {

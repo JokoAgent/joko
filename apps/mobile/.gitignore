@@ -1,4 +1,7 @@
 android/
+!modules/joko-app-installer/android/
+!modules/joko-app-installer/android/**
+modules/joko-app-installer/android/build/
 !modules/joko-remote-presentation/android/
 !modules/joko-remote-presentation/android/**
 modules/joko-remote-presentation/android/build/

@@ -16,6 +16,7 @@ import {
   type WeChatAuthorizationAttemptView
 } from "../model.js";
 import { MessagingSettings } from "./MessagingSettings.js";
+import type { Translator } from "./types.js";
 
 const roots: Root[] = [];
 
@@ -31,6 +32,38 @@ afterEach(async () => {
 });
 
 describe("Messaging settings", () => {
+  it("keeps its polling owner through connection snapshots and projects a later connected state", async () => {
+    let poll: (() => void) | undefined;
+    const interval = vi.spyOn(window, "setInterval").mockImplementation((callback: TimerHandler) => {
+      poll = callback as () => void;
+      return 19 as unknown as ReturnType<typeof window.setInterval>;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => undefined);
+    const get = vi.fn(async (_signal?: AbortSignal) => messagingSettings([discordConnection({ runtimeStatus: "connecting" })]));
+    const controller = controllerFixture(messagingSettings([]), { getMessagingSettings: get });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    roots.push(root);
+    const t: Translator = (key, values) => translate("en", key, values);
+    const render = (current: AppController) => root.render(<MessagingSettings controller={current} snapshot={snapshot()} t={t} />);
+    await act(async () => render(controller));
+    const signal = get.mock.calls[0]?.[0] as AbortSignal | undefined;
+    await act(async () => render({ ...controller, state: { ...controller.state } }));
+    expect(interval).toHaveBeenCalledTimes(1);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(signal?.aborted).toBe(false);
+    get.mockResolvedValue(messagingSettings([discordConnection({ runtimeStatus: "connected" })]));
+    await act(async () => poll?.());
+    expect(container.textContent).toContain("Connected");
+    expect(get).toHaveBeenCalledTimes(2);
+    const next = vi.fn(async () => messagingSettings([]));
+    await act(async () => render({ ...controller, getMessagingSettings: next }));
+    expect(signal?.aborted).toBe(true);
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(container.querySelectorAll(".messaging-connection-card")).toHaveLength(0);
+  });
+
   it("renders the complete capability and runtime state, reports test failures, and saves a new-only route", async () => {
     const connection = telegramConnection({
       runtimeStatus: "conflict",
@@ -514,6 +547,59 @@ describe("Messaging settings", () => {
     expect(update).not.toHaveBeenCalled();
     expect(container.textContent).toContain("The Messaging connection changed");
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+  });
+
+  it.each([false, true])("retains a behavior draft across polling and preserves its write baseline (configuration changed: %s)", async (configurationChanged) => {
+    let poll: (() => void) | undefined;
+    vi.spyOn(window, "setInterval").mockImplementation(callback => {
+      poll = callback as () => void;
+      return 23 as unknown as ReturnType<typeof window.setInterval>;
+    });
+    vi.spyOn(window, "clearInterval").mockImplementation(() => undefined);
+    const original = discordConnection();
+    let current = messagingSettings([original]);
+    const get = vi.fn(async () => current);
+    const update = vi.fn<AppController["updateDiscordMessagingConfiguration"]>(async (_id, _revision, _generation, ownerProviderUserId, configuration) =>
+      discordConnection({ ownerProviderUserId, discordConfiguration: configuration }));
+    const controller = controllerFixture(current, { getMessagingSettings: get, updateDiscordMessagingConfiguration: update });
+    const container = await renderSettings(controller, snapshot());
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    const lifecycle = required(dialog.querySelector<HTMLInputElement>('input[type="checkbox"]'));
+    const owner = required(dialog.querySelector<HTMLInputElement>('input[inputmode="numeric"]'));
+    await act(async () => lifecycle.click());
+    await change(owner, "876543210987654321");
+
+    current = messagingSettings([discordConnection({ revision: 9n, runtimeStatus: "connecting",
+      ...(configurationChanged ? { discordConfiguration: { ...original.discordConfiguration!, replyQuoteGroup: "all" } } : {}) })]);
+    await act(async () => poll?.());
+    expect(lifecycle.checked).toBe(false);
+    expect(owner.value).toBe("876543210987654321");
+    await act(async () => button(dialog, "Save").click());
+    if (configurationChanged) {
+      expect(update).not.toHaveBeenCalled();
+      expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+      expect(container.querySelector('[role="alert"]')).not.toBeNull();
+      expect(lifecycle.checked).toBe(false);
+    } else {
+      expect(update).toHaveBeenCalledExactlyOnceWith("discord-one", 9n, 4n, "876543210987654321",
+        { ...original.discordConfiguration!, lifecycleAnnouncements: false });
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+    }
+  });
+
+  it("retires a behavior draft when its connection owner is replaced despite reusing a connection id", async () => {
+    const original = messagingSettings([discordConnection()]);
+    const controller = controllerFixture(original);
+    const container = await renderSettings(controller, snapshot());
+    await act(async () => button(container, "Configure").click());
+    const dialog = required(document.querySelector<HTMLElement>('[role="dialog"]'));
+    await change(required(dialog.querySelector<HTMLInputElement>('input[inputmode="numeric"]')), "876543210987654321");
+    const next = { ...controller, getMessagingSettings: vi.fn(async () => original) };
+    await act(async () => roots.at(-1)!.render(<MessagingSettings controller={next} snapshot={snapshot()}
+      t={(key, values) => translate("en", key, values)} />));
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(next.updateDiscordMessagingConfiguration).not.toHaveBeenCalled();
   });
 
   it("saves Discord lifecycle, reply, reaction, and approved server-channel policy together", async () => {

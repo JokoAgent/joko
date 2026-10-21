@@ -135,6 +135,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
   readonly t: Translator;
   readonly onOpenPublished: (result: SkillPublicationResultView) => void;
 }): JSX.Element {
+  const { listSkills, listSkillRecoveries, openSkill, closeSkill, readSkillFile } = controller;
   const [query, setQuery] = useState("");
   const [scope, setScope] = useState<"all" | SkillScopeView>("all");
   const [catalog, setCatalog] = useState<LoadState<readonly SkillDescriptorView[]>>({ kind: "loading" });
@@ -152,6 +153,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
   const [renameValue, setRenameValue] = useState("");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
+  const publicationCatalogDirty = useRef(false);
   const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const [recoveries, setRecoveries] = useState<readonly SkillRecoveryView[]>([]);
   const [recoveryError, setRecoveryError] = useState<string>();
@@ -177,7 +179,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
     const timer = window.setTimeout(() => {
       setCatalog((current) => current.kind === "ready" ? current : { kind: "loading" });
       setRecoveryError(undefined);
-      void controller.listSkills({ signal: abort.signal }).then((next) => {
+      void listSkills({ signal: abort.signal }).then((next) => {
         if (abort.signal.aborted || catalogRequest.current !== request) return;
         setCatalogRevision(next.revision);
         setCatalog({ kind: "ready", value: next.skills });
@@ -190,7 +192,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
           ? current
           : { kind: "error", message: errorMessage(error, t) });
       });
-      void controller.listSkillRecoveries(abort.signal).then((nextRecoveries) => {
+      void listSkillRecoveries(abort.signal).then((nextRecoveries) => {
         if (abort.signal.aborted || catalogRequest.current !== request) return;
         setRecoveries(nextRecoveries);
       }).catch((error: unknown) => {
@@ -202,7 +204,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
       window.clearTimeout(timer);
       abort.abort();
     };
-  }, [controller, refreshSequence, t]);
+  }, [listSkills, listSkillRecoveries, refreshSequence, t]);
 
   const allSkills = catalog.kind === "ready" ? catalog.value : [];
   const normalizedQuery = query.trim().toLocaleLowerCase("en-US");
@@ -225,7 +227,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
     const abort = new AbortController();
     const prior = sessionRef.current;
     sessionRef.current = undefined;
-    if (prior !== undefined) void controller.closeSkill(prior.id).catch(() => undefined);
+    if (prior !== undefined) void closeSkill(prior.id).catch(() => undefined);
     setSelectedFileKey(undefined);
     setFileState(undefined);
     setEditing(false);
@@ -233,6 +235,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
     setActionError(undefined);
     setPreview(undefined);
     setPublishOpen(false);
+    publicationCatalogDirty.current = false;
     if (selected === undefined) {
       setSessionState(undefined);
       return () => abort.abort();
@@ -243,10 +246,10 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
     }
     setSessionState({ kind: "loading" });
     let opened: SkillSessionView | undefined;
-    void controller.openSkill(selected.id, selected.revision, abort.signal).then((value) => {
+    void openSkill(selected.id, selected.revision, abort.signal).then((value) => {
       opened = value;
       if (abort.signal.aborted || detailRequest.current !== request) {
-        void controller.closeSkill(value.id).catch(() => undefined);
+        void closeSkill(value.id).catch(() => undefined);
         return;
       }
       sessionRef.current = value;
@@ -262,10 +265,10 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
       abort.abort();
       if (opened !== undefined) {
         if (sessionRef.current?.id === opened.id) sessionRef.current = undefined;
-        void controller.closeSkill(opened.id).catch(() => undefined);
+        void closeSkill(opened.id).catch(() => undefined);
       }
     };
-  }, [controller, selected?.id, selected?.revision, selected?.contentAvailable, selectedResource?.id, t]);
+  }, [openSkill, closeSkill, selected?.id, selected?.revision, selected?.contentAvailable, selectedResource?.id, t]);
 
   const session = sessionState?.kind === "ready" ? sessionState.value : undefined;
 
@@ -280,7 +283,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
       return () => abort.abort();
     }
     setFileState({ kind: "loading" });
-    void controller.readSkillFile(session.id, selectedFileKey, abort.signal).then((file) => {
+    void readSkillFile(session.id, selectedFileKey, abort.signal).then((file) => {
       if (abort.signal.aborted || fileRequest.current !== request || sessionRef.current?.id !== session.id) return;
       setFileState({ kind: "ready", value: file });
       setEditorText(file.content);
@@ -289,7 +292,7 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
       setFileState({ kind: "error", message: errorMessage(error, t) });
     });
     return () => abort.abort();
-  }, [controller, fileRefreshSequence, selectedFileKey, session?.id, t]);
+  }, [readSkillFile, fileRefreshSequence, selectedFileKey, session?.id, t]);
 
   useEffect(() => {
     if (mobileDetail && session !== undefined && window.innerWidth <= 720) {
@@ -500,8 +503,14 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
       session={session}
       locale={locale}
       t={t}
-      onClose={() => setPublishOpen(false)}
-      onPublished={loadCatalog}
+      onClose={() => {
+        setPublishOpen(false);
+        if (publicationCatalogDirty.current) {
+          publicationCatalogDirty.current = false;
+          loadCatalog();
+        }
+      }}
+      onPublished={() => { publicationCatalogDirty.current = true; }}
       onOpenPublished={onOpenPublished}
     />}
 

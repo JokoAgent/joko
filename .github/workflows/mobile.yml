@@ -1,0 +1,457 @@
+name: Mobile native builds and GUI checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '*'
+      - '.github/workflows/mobile.yml'
+      - 'apps/mobile/**'
+      - 'apps/e2e/**'
+      - 'apps/orchestrator/**'
+      - 'packages/**'
+      - 'scripts/**'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: Validation scope
+        type: choice
+        default: full
+        options:
+          - full
+          - android-signer-diagnostics
+          - ios-startup-diagnostics
+      platform:
+        description: Platform for manual full validation
+        type: choice
+        default: all
+        options:
+          - all
+          - android
+          - ios
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mobile-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.scope == 'full' && format('{0}-{1}', github.sha, inputs.platform || 'all') || github.ref }}${{ inputs.scope == 'android-signer-diagnostics' && '-android-signer-diagnostics' || inputs.scope == 'ios-startup-diagnostics' && '-ios-startup-diagnostics' || '' }}
+  # Native builds finish while subsequent pushes replace only the pending run.
+  cancel-in-progress: false
+
+jobs:
+  hermes:
+    if: ${{ inputs.scope != 'android-signer-diagnostics' && inputs.scope != 'ios-startup-diagnostics' }}
+    name: Android and iOS JS/Hermes exports
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared Mobile inputs
+        run: |
+          pnpm --filter @joko/contracts build
+          pnpm --filter @joko/remote-desktop-sync build
+
+      - name: Export Android JS/Hermes
+        run: pnpm --filter @joko/mobile exec expo export --platform android --max-workers 2 --output-dir dist/android
+
+      - name: Export iOS JS/Hermes
+        run: pnpm --filter @joko/mobile exec expo export --platform ios --max-workers 2 --output-dir dist/ios
+
+      - name: Record JS export scope
+        run: printf '%s\n' 'Android and iOS JS/Hermes exports only; these are not APK/IPA, signed releases, or device test results.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload JS/Hermes exports
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-js-hermes-${{ github.sha }}
+          path: |
+            apps/mobile/dist/android
+            apps/mobile/dist/ios
+          if-no-files-found: error
+          retention-days: 3
+
+  android-native:
+    if: ${{ inputs.scope != 'android-signer-diagnostics' && inputs.scope != 'ios-startup-diagnostics' && (github.event_name != 'workflow_dispatch' || inputs.platform != 'ios') }}
+    name: Android x86_64 test-signed APK and native GUI
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # A reserved example domain enables the build-time installer permission branch.
+      # The GUI emulator has unavailable test DNS; no update service is supplied.
+      JOKO_MOBILE_UPDATE_FEED_URL: https://example.com/joko-ci-releases
+      JOKO_ANDROID_TEST_AVD: joko-ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK, NDK and CMake
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platform-tools platforms;android-36 build-tools;36.0.0 ndk;27.1.12297006 cmake;3.30.5
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare the fixture's Workspace file index
+        run: |
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- update
+          sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- install --no-install-recommends --yes ripgrep
+          rg --version
+
+      - name: Build shared Mobile and native E2E inputs
+        run: pnpm --filter @joko/e2e... --filter @joko/remote-desktop-sync --if-present build
+
+      - name: Build a real APK with an ephemeral CI test signer
+        id: native-artifact
+        timeout-minutes: 30
+        run: node scripts/ci/android-native.mjs build
+
+      - name: Verify the actual APK installer permission
+        env:
+          JOKO_ANDROID_TEST_APK: ${{ steps.native-artifact.outputs.apk-path }}
+        run: |
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump permissions "$JOKO_ANDROID_TEST_APK" > "$(dirname "$JOKO_ANDROID_TEST_APK")/android-permissions.txt"
+          node -e "const fs=require('node:fs'); const path=require('node:path'); const text=fs.readFileSync(path.join(path.dirname(process.env.JOKO_ANDROID_TEST_APK), 'android-permissions.txt'), 'utf8'); if (!text.includes('android.permission.REQUEST_INSTALL_PACKAGES')) throw new Error('The actual APK is missing its configured package-installer permission.');"
+
+      - name: Enable the hosted runner's KVM device
+        run: |
+          test -c /dev/kvm
+          sudo chmod 666 /dev/kvm
+
+      - name: Exercise native pairing, input, resources and recovery on the isolated AVD
+        uses: ReactiveCircus/android-emulator-runner@v2
+        env:
+          JOKO_ANDROID_TEST_APK: ${{ steps.native-artifact.outputs.apk-path }}
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          avd-name: ${{ env.JOKO_ANDROID_TEST_AVD }}
+          emulator-port: 5554
+          emulator-boot-timeout: 600
+          disable-animations: true
+          disable-spellchecker: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -dns-server 127.0.0.1 -accel on
+          script: node scripts/ci/android-native.mjs test
+
+      - name: Upload the test-signed APK, original manifest and native GUI evidence
+        if: always() && steps.native-artifact.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-android-x86_64-ci-test-${{ github.sha }}
+          path: ${{ steps.native-artifact.outputs.artifact-directory }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  android_signer_diagnostics:
+    name: Android SDK signing and certificate-output observations
+    if: ${{ inputs.scope == 'android-signer-diagnostics' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+      - name: Set up the matched JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Prepare the matched Android platform and build tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: platforms;android-36 build-tools;36.0.0
+      - name: Observe actual SDK signing with a temporary no-code APK
+        timeout-minutes: 2
+        run: node scripts/ci/diagnose-android-signer.mjs
+      - name: Upload only the bounded public signer observations
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-signer-diagnostics-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-android-signer-diagnostic.json
+          if-no-files-found: warn
+          retention-days: 3
+
+  ios-startup-diagnostics:
+    if: ${{ inputs.scope == 'ios-startup-diagnostics' }}
+    name: Owned iOS Simulator startup command probe (no application)
+    runs-on: macos-latest
+    timeout-minutes: 8
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+      - name: Prepare the selected Simulator service
+        timeout-minutes: 3
+        run: |
+          node --input-type=module -e "import {execFileSync} from 'node:child_process'; const started=performance.now(); execFileSync('xcrun',['simctl','list','runtimes','--json'],{timeout:120000,stdio:'ignore'}); console.log(JSON.stringify({simulatorServiceReady:true,elapsedMs:Math.round(performance.now()-started)}));"
+      - name: Observe owned Simulator boot, appearance and framebuffer
+        timeout-minutes: 7
+        run: node scripts/ci/mobile-ios-simulator-runtime.mjs --startup-diagnostics
+        env:
+          JOKO_IOS_RUNTIME_EVIDENCE_DIR: ${{ runner.temp }}/joko-ios-startup-diagnostics
+      - name: Upload only the Simulator command probe evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-startup-diagnostics-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/*.png
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/identity.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/result.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/failure.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/runtime-failure-diagnostics.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/runtime-host-resources.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/cleanup.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/startup-command-receipts.json
+            ${{ runner.temp }}/joko-ios-startup-diagnostics/startup-state.json
+          if-no-files-found: warn
+          retention-days: 3
+
+  ios-simulator:
+    if: ${{ inputs.scope != 'android-signer-diagnostics' && inputs.scope != 'ios-startup-diagnostics' && (github.event_name != 'workflow_dispatch' || inputs.platform != 'android') }}
+    name: iOS Simulator Debug build and Swift checks
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+
+      - name: Verify the runner's Xcode and CocoaPods
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          pod --version
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared Mobile inputs
+        run: |
+          pnpm --filter @joko/contracts build
+          pnpm --filter @joko/remote-desktop-sync build
+
+      - name: Check the Swift receiver and clipboard state machines
+        run: node apps/mobile/scripts/test-remote-desktop-native.mjs
+
+      - name: Check isolated XCTest project generation and build
+        run: |
+          ruby scripts/ci/ios-prepare-ui-tests.test.rb
+          ruby scripts/ci/ios-prepare-ui-tests.rb \
+            "$RUNNER_TEMP/JokoCIUITests.xcodeproj" \
+            scripts/ci/ios-connection-ui-tests.swift 12345 12346 16.4
+          xcodebuild -quiet \
+            -project "$RUNNER_TEMP/JokoCIUITests.xcodeproj" \
+            -scheme JokoCIUITests -configuration Debug -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/joko-ios-ui-build" \
+            build-for-testing
+
+      - name: Generate the current iOS project
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --platform ios --clean --no-install
+
+      - name: Install the generated iOS Pods
+        working-directory: apps/mobile
+        run: pod install --project-directory=ios
+
+      - name: Compile the generated iOS Simulator Debug app
+        working-directory: apps/mobile
+        run: |
+          xcodebuild \
+            -workspace ios/Joko.xcworkspace \
+            -scheme Joko \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/joko-ios-simulator" \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="-" \
+            DEVELOPMENT_TEAM="" \
+            build
+
+      - name: Verify the Simulator application's local signature
+        run: codesign --verify --deep --strict "$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator/Joko.app"
+
+      - name: Archive the compiled Simulator app
+        id: ios-archive
+        run: tar -C "$RUNNER_TEMP/joko-ios-simulator/Build/Products/Debug-iphonesimulator" -czf "$RUNNER_TEMP/joko-ios-simulator-debug.tar.gz" Joko.app
+
+      - name: Upload iOS Simulator Debug app
+        if: ${{ !cancelled() && steps.ios-archive.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-ios-simulator-debug-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ios-simulator-debug.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  ios-gui:
+    needs: ios-simulator
+    name: iOS Simulator startup and native GUI on a fresh runner
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install pnpm 11.22.0
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Install Node.js 24.16.0
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.16.0
+          cache: pnpm
+
+      - name: Verify the GUI runner's Xcode
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-version
+          uname -m
+          sysctl -n hw.memsize
+          sysctl -n hw.logicalcpu
+
+      - name: Check bounded runtime failure diagnostics
+        run: node --test scripts/ci/mobile-ios-runtime-diagnostics.test.mjs
+
+      - name: Prepare the selected Simulator service
+        timeout-minutes: 3
+        run: |
+          node --input-type=module -e "import {execFileSync} from 'node:child_process'; const started=performance.now(); execFileSync('xcrun',['simctl','list','runtimes','--json'],{timeout:120000,stdio:'ignore'}); console.log(JSON.stringify({simulatorServiceReady:true,elapsedMs:Math.round(performance.now()-started)}));"
+
+      - name: Install dependencies from lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared Mobile inputs
+        run: |
+          pnpm --filter @joko/contracts build
+          pnpm --filter @joko/remote-desktop-sync build
+
+      - name: Download this run's compiled Simulator app
+        uses: actions/download-artifact@v4
+        with:
+          name: mobile-ios-simulator-debug-${{ github.sha }}
+          path: ${{ runner.temp }}/joko-ios-artifact
+
+      - name: Extract the compiled Simulator app
+        run: |
+          mkdir -p "$RUNNER_TEMP/joko-ios-simulator-app"
+          tar -xzf "$RUNNER_TEMP/joko-ios-artifact/joko-ios-simulator-debug.tar.gz" -C "$RUNNER_TEMP/joko-ios-simulator-app"
+
+      - name: Observe the actual iOS app startup, termination and reopen
+        timeout-minutes: 18
+        run: node scripts/ci/mobile-ios-simulator-runtime.mjs
+        env:
+          JOKO_IOS_SIMULATOR_APP_PATH: ${{ runner.temp }}/joko-ios-simulator-app/Joko.app
+          JOKO_IOS_RUNTIME_EVIDENCE_DIR: ${{ runner.temp }}/joko-ios-runtime-evidence
+
+      - name: Upload bounded iOS Simulator startup evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-ios-simulator-runtime-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/joko-ios-runtime-evidence/*.png
+            ${{ runner.temp }}/joko-ios-runtime-evidence/identity.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/result.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/failure.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/runtime-failure-diagnostics.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/runtime-host-resources.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/installation-state.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/cleanup.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/*-screen.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/*-capture.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/metro.log
+            ${{ runner.temp }}/joko-ios-runtime-evidence/metro-status.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/startup-command-receipts.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/startup-state.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-build.log
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-test.log
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-*-receipt.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-summary.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-steps.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-local-probe.json
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-setup-pre-input-hierarchy.txt
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-address-pre-input-hierarchy.txt
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-screenshots/**/*.png
+            ${{ runner.temp }}/joko-ios-runtime-evidence/gui-screenshots/**/*.json
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Record iOS GUI scope
+        run: printf '%s\n' 'Simulator app startup/terminate/reopen and XCUITest connection-page tap/type/error/cancel/theme operations passed with exact app identity, XCTest receipts and named screenshots. No paired task execution, signed IPA, physical device, APNs or account integration was verified.' >> "$GITHUB_STEP_SUMMARY"

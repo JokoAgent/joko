@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ConfigContext } from "expo/config";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import mobileExpoConfig, {
   JOKO_MOBILE_BETA_ENV,
   JOKO_MOBILE_OTA_ENV,
@@ -11,6 +11,26 @@ import mobileExpoConfig, {
 } from "../app.config";
 
 describe("mobile update build configuration", () => {
+  afterEach(() => vi.unstubAllEnvs());
+
+  it("retains iOS view controller status-bar ownership through the resolved Expo configuration", () => {
+    const directory = dirname(fileURLToPath(import.meta.url));
+    const { expo } = JSON.parse(readFileSync(resolve(directory, "../app.json"), "utf8")) as { expo: ConfigContext["config"] };
+    const config = mobileExpoConfig({ config: expo } as ConfigContext);
+    expect(config.ios?.infoPlist?.UIViewControllerBasedStatusBarAppearance).toBe(true);
+  });
+
+  it("declares Android package installation only for builds with the full-package feed", () => {
+    const context = { config: { name: "Joko", slug: "joko", android: {
+      permissions: ["android.permission.INTERNET"]
+    } } } as unknown as ConfigContext;
+    vi.stubEnv(JOKO_MOBILE_UPDATE_FEED_ENV, "");
+    expect(mobileExpoConfig(context).android?.permissions).toEqual(["android.permission.INTERNET"]);
+    vi.stubEnv(JOKO_MOBILE_UPDATE_FEED_ENV, "https://updates.joko.app/latest");
+    expect(mobileExpoConfig(context).android?.permissions).toEqual([
+      "android.permission.INTERNET", "android.permission.REQUEST_INSTALL_PACKAGES"
+    ]);
+  });
   it("accepts only the closed Joko HTTPS authority and device-local beta flag", () => {
     expect(resolveMobileUpdateBuildConfiguration({
       [JOKO_MOBILE_UPDATE_FEED_ENV]: "https://updates.joko.app/releases",

@@ -1,5 +1,6 @@
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { chmod, mkdtemp, realpath, rm } from "node:fs/promises";
 import { createServer as createTcpServer, connect as connectTcp, type AddressInfo, type Server as TcpServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -38,10 +39,12 @@ interface TestSshServer {
 
 const servers: TestSshServer[] = [];
 const tcpServers: TcpServer[] = [];
+const agentDirectories: string[] = [];
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => server.close()));
   await Promise.all(tcpServers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  for (const directory of agentDirectories.splice(0)) await rm(directory, { recursive: true, force: true });
 });
 
 describe("Ssh2ResolvedAgentAuthConnector", () => {
@@ -133,9 +136,16 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
   });
 
   it("authenticates through a real service-owned SSH agent endpoint", async () => {
-    const endpoint = process.platform === "win32"
-      ? `\\\\.\\pipe\\joko-ssh-agent-${randomUUID()}`
-      : join(tmpdir(), `joko-ssh-agent-${randomUUID()}.sock`);
+    let endpoint: string;
+    if (process.platform === "win32") {
+      endpoint = `\\\\.\\pipe\\joko-ssh-agent-${randomUUID()}`;
+    } else {
+      const directory = await mkdtemp(join(tmpdir(), "jsa-"));
+      agentDirectories.push(directory);
+      await chmod(directory, 0o700);
+      endpoint = join(await realpath(directory), "s");
+      if (Buffer.byteLength(endpoint) > 103) throw new Error("The private agent socket pathname exceeds the Unix bound.");
+    }
     const otherKey = parsedPrivateKey(otherPrivateKey);
     const offered = [otherKey, allowedUserKey];
     const signed: Buffer[] = [];

@@ -354,6 +354,13 @@ export interface WorkspaceGitDiff {
     readonly requestedBaseRef: string;
     readonly resolvedBaseRef: string;
   };
+  readonly pushTarget?: WorkspaceGitPushTarget;
+}
+
+export interface WorkspaceGitPushTarget {
+  readonly remote: string;
+  readonly remoteRef: string;
+  readonly hasUpstream: boolean;
 }
 
 interface WorkspaceGitResolvedBranchBase {
@@ -1363,7 +1370,8 @@ export class WorkspaceService {
     await this.#gitMutationTail;
     const current = await this.#readGitReviewDiff(workspaceId, input);
     this.#assertReviewFence(current, input.expectedRepositoryRevision, input.expectedMergeBaseRevision, false);
-    return current;
+    const pushTarget = await this.#readDefaultGitPushTarget(this.requireWorkspace(workspaceId));
+    return { ...current, ...(pushTarget === undefined ? {} : { pushTarget }) };
   }
 
   async readGitDiffFile(
@@ -1694,7 +1702,7 @@ export class WorkspaceService {
       }
       const before = await this.#readGitDiff(workspaceId, [], {});
       const headRevision = await this.#requireHeadRevision(workspace);
-      await this.#requireCurrentBranch(workspace);
+      const branch = await this.#requireCurrentBranch(workspace);
       if (before.repositoryRevision !== input.expectedRepositoryRevision || headRevision !== input.expectedHeadRevision) {
         throw new WorkspaceGitReviewError("Workspace branch is stale; refresh Review and retry.", "stale");
       }
@@ -1738,7 +1746,7 @@ export class WorkspaceService {
         }
         const pushed = await runProcess(
           this.#gitExecutable,
-          ["push", "--porcelain", remote, `HEAD:${remoteRef}`],
+          ["push", "--porcelain", ...(await this.#readConfiguredGitUpstream(workspace, branch) === undefined ? ["--set-upstream"] : []), remote, `HEAD:${remoteRef}`],
           workspace.root,
           120_000,
           4 * 1024 * 1024,
@@ -2009,6 +2017,43 @@ export class WorkspaceService {
       throw new WorkspaceGitReviewError("Review push requires a current local branch.", "unsupported");
     }
     return branch;
+  }
+
+  async #readGitConfigValue(workspace: WorkspaceRegistration, key: string): Promise<string | undefined> {
+    const result = await runProcess(this.#gitExecutable, ["config", "--get", key], workspace.root, 10_000, 1024 * 1024, new Set([0, 1]));
+    return result.exitCode === 0 && result.stdout.trim() !== "" ? result.stdout.trim() : undefined;
+  }
+
+  async #readConfiguredGitUpstream(workspace: WorkspaceRegistration, branch: string): Promise<{ readonly remote: string; readonly remoteRef: string } | undefined> {
+    const [remote, mergeRef] = await Promise.all([
+      this.#readGitConfigValue(workspace, `branch.${branch}.remote`),
+      this.#readGitConfigValue(workspace, `branch.${branch}.merge`)
+    ]);
+    if (remote === undefined || mergeRef === undefined) return undefined;
+    return { remote, remoteRef: mergeRef.startsWith("refs/heads/") ? mergeRef : `refs/heads/${mergeRef}` };
+  }
+
+  async #readDefaultGitPushTarget(workspace: WorkspaceRegistration): Promise<WorkspaceGitPushTarget | undefined> {
+    const branchResult = await runProcess(this.#gitExecutable, ["symbolic-ref", "--quiet", "--short", "HEAD"], workspace.root, 10_000, 1024 * 1024, new Set([0, 1, 128]));
+    const branch = branchResult.stdout.trim();
+    if (branchResult.exitCode !== 0 || branch === "") return undefined;
+    const [upstream, branchPushRemote, defaultRemote, remotesResult] = await Promise.all([
+      this.#readConfiguredGitUpstream(workspace, branch),
+      this.#readGitConfigValue(workspace, `branch.${branch}.pushRemote`),
+      this.#readGitConfigValue(workspace, "remote.pushDefault"),
+      runProcess(this.#gitExecutable, ["remote"], workspace.root, 10_000, 1024 * 1024)
+    ]);
+    const remote = upstream?.remote ?? branchPushRemote ?? defaultRemote ?? "origin";
+    const remotes = remotesResult.stdout.split(/\r?\n/u).map((value) => value.trim());
+    if (remote === "." || !remotes.includes(remote)) return undefined;
+    try {
+      validateGitRemoteName(remote);
+      const remoteRef = await this.#validateGitRemoteRef(workspace, upstream?.remoteRef ?? `refs/heads/${branch}`);
+      return { remote, remoteRef, hasUpstream: upstream !== undefined };
+    } catch (error) {
+      if (error instanceof WorkspaceGitReviewError && error.kind === "invalid") return undefined;
+      throw error;
+    }
   }
 
   async #readIndexBlobOid(workspace: WorkspaceRegistration, path: string): Promise<string | undefined> {
@@ -4051,7 +4096,8 @@ function validateGitRemoteName(value: string): string {
     value === "." ||
     value === ".." ||
     value.length > 200 ||
-    !/^[a-z0-9][a-z0-9._-]*$/iu.test(value)
+    !/^[a-z0-9][a-z0-9._/-]*$/iu.test(value) ||
+    value.split("/").some((part) => part === "" || part === "." || part === "..")
   ) {
     throw new WorkspaceGitReviewError("A configured remote name is required.", "invalid");
   }

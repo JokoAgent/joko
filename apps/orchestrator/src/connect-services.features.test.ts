@@ -4560,7 +4560,8 @@ describe("Connect typed feature boundaries", () => {
         managed: targetManaged,
         trusted: true
       } }),
-      upsertSchedule: (input: unknown) => { captured = input; return input; }
+      upsertSchedule: (input: unknown) => { captured = input; return input; },
+      getSchedule: () => ({ ...captured, revision: 1n })
     };
     const services = createConnectServices(stubApplication({
       store,
@@ -4845,6 +4846,19 @@ describe("Connect typed feature boundaries", () => {
         })
       }))
     })).rejects.toMatchObject({ code: Code.InvalidArgument });
+
+    const manualGate = create(contract.ScheduleInputSchema, {
+      ...schedule([]), execution: create(contract.ScheduleExecutionSnapshotSchema, { executionMode: contract.ScheduleExecutionMode.AGENT,
+        preRunHook: { command: "node checks/ready.mjs", filePath: "", timeout: { seconds: 10n } } })
+    });
+    await invoke(services.operation.submitOperation, { operationId: "operation-schedule-manual-hook", connectionId: connection.id, mutation: mutation(manualGate) });
+    expect(captured.executionSnapshot.scheduler.preRunHook).toEqual({ command: "node checks/ready.mjs", filePath: "", timeoutMs: 10_000 });
+    const savedId = captured.id;
+    await invoke(services.operation.submitOperation, { operationId: "operation-schedule-remove-hook", connectionId: connection.id,
+      mutation: create(contract.OperationMutationSchema, { preconditions: [], payload: { case: "updateSchedule", value: {
+        scheduleId: savedId, schedule: create(contract.ScheduleInputSchema, { ...manualGate, execution: create(contract.ScheduleExecutionSnapshotSchema, { executionMode: contract.ScheduleExecutionMode.AGENT }) })
+      } } }) });
+    expect(captured.executionSnapshot.scheduler.preRunHook).toBeUndefined();
   });
 
   it("commits Pi settings before refreshing, hot-applies active runtimes, and never activates idle sessions", async () => {

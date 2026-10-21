@@ -243,6 +243,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [messageActionResetSignal, setMessageActionResetSignal] = useState(0);
   const [messageFork, setMessageFork] = useState<ActiveMessageFork>();
   const [forkingMessageId, setForkingMessageId] = useState<string>();
+  const messageForkActionRef = useRef<object | undefined>(undefined);
   const [backgroundStopping, setBackgroundStopping] = useState(false);
   const [backgroundStopError, setBackgroundStopError] = useState<string>();
   const [collaborationOpen, setCollaborationOpen] = useState(false);
@@ -313,6 +314,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     readonly epoch: number;
   }>();
   const rewindEpochRef = useRef(0);
+  const derivedTaskActionRef = useRef<object | undefined>(undefined);
   const rewindDocumentRef = useRef<{ document: Document; remove: () => void } | undefined>(undefined);
   useLayoutEffect(() => {
     const document = paneRef.current?.ownerDocument;
@@ -366,6 +368,40 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     conversationCopyFlightRef.current = undefined;
     rewindDocumentRef.current?.remove();
   }, []);
+  const beginDerivedTaskAction = () => {
+    const occurrence = {};
+    derivedTaskActionRef.current = occurrence;
+    const sourceState = controllerRef.current.state;
+    const sourceProfileId = sourceState.activeProfile?.id;
+    const sourceServerId = sourceState.activeProfile?.serverId;
+    const sourceOrigin = sourceState.activeProfile?.origin;
+    const sourceConnectionGeneration = sourceState.connectionGeneration;
+    const sourceSnapshotGeneration = sourceState.snapshot.generation;
+    const sourceNavigationRevision = sourceState.navigationRevision;
+    const sourceSessionId = session.id;
+    const sourceSessionGeneration = session.generation;
+    const sourceEpoch = rewindEpochRef.current;
+    const sourceResourceOwner = timelineResourceOwnerRef.current;
+    return {
+      isCurrent: () => {
+        const current = controllerRef.current.state;
+        return derivedTaskActionRef.current === occurrence
+          && rewindEpochRef.current === sourceEpoch
+          && sourceResourceOwner !== undefined
+          && timelineResourceOwnerRef.current === sourceResourceOwner
+          && current.connectionState === "connected"
+          && current.connectionGeneration === sourceConnectionGeneration
+          && current.activeProfile?.id === sourceProfileId
+          && current.activeProfile?.serverId === sourceServerId
+          && current.activeProfile?.origin === sourceOrigin
+          && current.snapshot.generation === sourceSnapshotGeneration
+          && current.navigationRevision === sourceNavigationRevision
+          && activeSessionIdRef.current === sourceSessionId
+          && current.snapshot.sessions.find((candidate) => candidate.id === sourceSessionId)?.generation === sourceSessionGeneration
+          && sessionRouteIsCurrent(current.route, sourceSessionId);
+      }
+    };
+  };
   const bottomOverlayRef = useRef<HTMLDivElement>(null);
   const composerMessageMentionInsertionIdRef = useRef(0);
   const composerSelectionQuoteInsertionIdRef = useRef(0);
@@ -1345,15 +1381,22 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     const sourceSessionId = pending.sessionId;
     const sourceSessionName = latestSession?.name ?? session.name;
     const sourceEventId = latestItem.sourceEventId;
+    const actionOwner = beginDerivedTaskAction();
+    const forkSession = controllerRef.current.forkSession;
+    const saveDraft = controllerRef.current.saveDraft;
+    const navigate = controllerRef.current.navigate;
+    const forkOccurrence = {};
+    messageForkActionRef.current = forkOccurrence;
     setForkingMessageId(pending.messageId);
     runAction(`fork-message:${pending.messageId}`, async () => {
       try {
-        const forkedSessionId = await controllerRef.current.forkSession(
+        const forkedSessionId = await forkSession(
           sourceSessionId,
           latestTarget.entryId,
           t("session.branchSuffix", { name: sourceSessionName }),
           { messageId: latestItem.messageId ?? latestItem.id, eventId: sourceEventId }
         );
+        if (!actionOwner.isCurrent()) return;
         if (latestTarget.composerText !== undefined) {
           const editorDocument = composerDocumentFromMessage(latestTarget.composerText, latestItem.quotesEncoded === true, {
                sessionId: sourceSessionId,
@@ -1361,7 +1404,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
                role: "user",
                ...(latestItem.sourceEventId === undefined ? {} : { sourceEventId: latestItem.sourceEventId })
             }, "edit", latestItem.pastedTextRanges);
-          await controllerRef.current.saveDraft(forkedSessionId, {
+          await saveDraft(forkedSessionId, {
             text: composerDocumentPlainText(editorDocument),
             editorDocument,
             attachments: [],
@@ -1369,9 +1412,14 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
             deliveryMode: "prompt"
           });
         }
-        controllerRef.current.navigate({ kind: "session", sessionId: forkedSessionId });
+        if (actionOwner.isCurrent()) navigate({ kind: "session", sessionId: forkedSessionId });
+      } catch (error) {
+        if (actionOwner.isCurrent()) throw error;
       } finally {
-        setForkingMessageId((current) => current === pending.messageId ? undefined : current);
+        if (messageForkActionRef.current === forkOccurrence) {
+          messageForkActionRef.current = undefined;
+          setForkingMessageId((current) => current === pending.messageId ? undefined : current);
+        }
       }
     });
   };
@@ -1876,28 +1924,44 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
             exportHtmlPending={exportDownload.pending}
             onExportHtml={canExport ? (ownerDocument) => exportDownload.run(ownerDocument, (context) => controller.exportSession(session.id, context)) : undefined}
             onClone={canClone ? () => runAction(`clone:${session.id}`, async () => {
-              const sourceMessage = latestDerivationSourceMessage(
-                controller.state.snapshot.timelineBySession.get(session.id) ?? visibleTimeline
-              );
-              const sessionId = await controller.cloneSession(
-                session.id,
-                t("session.cloneSuffix", { name: session.name }),
-                sourceMessage
-              );
-              controller.navigate({ kind: "session", sessionId });
+              const actionOwner = beginDerivedTaskAction();
+              const cloneSession = controller.cloneSession;
+              const navigate = controller.navigate;
+              try {
+                const sourceMessage = latestDerivationSourceMessage(
+                  controller.state.snapshot.timelineBySession.get(session.id) ?? visibleTimeline
+                );
+                const sessionId = await cloneSession(
+                  session.id,
+                  t("session.cloneSuffix", { name: session.name }),
+                  sourceMessage
+                );
+                if (actionOwner.isCurrent()) navigate({ kind: "session", sessionId });
+              } catch (error) {
+                if (actionOwner.isCurrent()) throw error;
+              }
             }) : undefined}
             onLearnFromSession={!reviewReadOnly && controller.state.connectionState === "connected" ? () => runAction(`learn:${session.id}`, async () => {
-              const run = requireStartedSkillLearningRun(await controller.startSkillLearning({
-                requestId: randomUuid(),
-                targetId: session.targetId,
-                sourceSessionId: session.id,
-                instruction: ""
-              }), {
-                backendId: session.backendId,
-                targetId: session.targetId,
-                source: { kind: "session", sessionId: session.id }
-              });
-              controller.navigate({ kind: "session", sessionId: run.distillationSessionId });
+              const actionOwner = beginDerivedTaskAction();
+              const startSkillLearning = controller.startSkillLearning;
+              const navigate = controller.navigate;
+              try {
+                const result = await startSkillLearning({
+                  requestId: randomUuid(),
+                  targetId: session.targetId,
+                  sourceSessionId: session.id,
+                  instruction: ""
+                });
+                if (!actionOwner.isCurrent()) return;
+                const run = requireStartedSkillLearningRun(result, {
+                  backendId: session.backendId,
+                  targetId: session.targetId,
+                  source: { kind: "session", sessionId: session.id }
+                });
+                if (actionOwner.isCurrent()) navigate({ kind: "session", sessionId: run.distillationSessionId });
+              } catch (error) {
+                if (actionOwner.isCurrent()) throw error;
+              }
             }) : undefined}
             onSplitSession={onSplitSession}
             onOpenSessionWindow={onOpenSessionWindow}

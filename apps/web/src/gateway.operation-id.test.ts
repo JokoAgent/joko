@@ -3,6 +3,7 @@ import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
   EntityKind,
   GetSnapshotResponseSchema,
+  GitSafetyMode,
   ListManagedModelRuntimesResponseSchema,
   OperationState,
   PrepareTargetWorkspaceResponseSchema,
@@ -28,7 +29,7 @@ describe("operation ID lifecycle", () => {
   it("maps language tools off by default and preserves an explicit owner opt-in", () => {
     expect(mapSnapshot(create(SnapshotSchema, {})).settings.languageTools).toEqual({ enabled: false });
     expect(mapSnapshot(create(SnapshotSchema, {
-      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, modelFavorites: { revision: { value: 0n } }, agentResource: {}, collaboration: {}, gitSafety: {}, languageTools: { enabled: true } }
+      settings: { auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" }, modelFavorites: { revision: { value: 0n } }, agentResource: {}, collaboration: {}, gitSafety: { mode: GitSafetyMode.EXISTING_GIT }, languageTools: { enabled: true } }
     })).settings.languageTools).toEqual({ enabled: true });
   });
 
@@ -144,6 +145,29 @@ describe("operation ID lifecycle", () => {
     expect(operationIds[1]).toBe(operationIds[0]);
     expect(operationIds[2]).not.toBe(operationIds[1]);
     gateway.disconnect();
+  });
+
+  it("does not replay a viewed acknowledgement after an exact cursor conflict", async () => {
+    const operationIds: string[] = [];
+    const conflict = new ConnectError("The attention projection changed.", Code.Aborted);
+    const gateway = createOrchestratorGateway(
+      { id: "connection-1", deviceId: "device-test", name: "Desktop", origin: "https://orchestrator.example", serverId: "server-test" },
+      "secret",
+      {},
+      () => operationTransport(async (_method, input) => {
+        operationIds.push(input.operationId);
+        throw conflict;
+      })
+    );
+    await gateway.connect();
+    try {
+      await expect(gateway.acknowledgeSessionAttention("session-1", {
+        opaqueToken: "viewed-159", sequence: 159n, generation: 2n
+      })).rejects.toBe(conflict);
+      expect(operationIds).toHaveLength(1);
+    } finally {
+      gateway.disconnect();
+    }
   });
 
   it("refreshes a committed managed Target past a stale in-flight snapshot before creating its task", async () => {
@@ -342,7 +366,7 @@ describe("operation ID lifecycle", () => {
             }
           }]
         },
-        agentResource: {}, collaboration: {}, gitSafety: {}
+        agentResource: {}, collaboration: {}, gitSafety: { mode: GitSafetyMode.EXISTING_GIT }
       }
     }));
     expect(mapped.settings.modelFavorites).toEqual({
@@ -397,7 +421,7 @@ describe("operation ID lifecycle", () => {
       settings: {
         auxiliaryText: { revision: { value: 0n }, runtimeRevision: "fixture:0" },
         modelFavorites: { revision: { value: 0n } },
-        agentResource: {}, collaboration: {}, gitSafety: {},
+        agentResource: {}, collaboration: {}, gitSafety: { mode: GitSafetyMode.EXISTING_GIT },
         subagentModels: [{
           backendId: "codex",
           defaultModelSupported: false,

@@ -1070,8 +1070,8 @@ export class PiBackendAdapter implements
         ? Promise.resolve({})
         : this.getSessionStats(context),
       profile.runtimePolicy === "review_read_only" || !treeSupported
-        ? Promise.resolve({ roots: [] } as SessionTree)
-        : this.getTree(context)
+        ? Promise.resolve({ tree: { roots: [] } as SessionTree, contextTokens: undefined })
+        : this.#inspectTree(context)
     ]);
     runtime.control = await readControl(runtime.controlPath, runtime.control.generation);
     this.#syncManagedSubagentObserver(runtime);
@@ -1091,8 +1091,8 @@ export class PiBackendAdapter implements
       runtime.control.fastMode,
       runtime.control.planMode,
       runtime.autoRetry,
-      tree.leafId,
-      usageFromStats(stats)
+      tree.tree.leafId,
+      usageFromStats(stats, tree.contextTokens, state.model?.contextWindow)
     );
   }
 
@@ -2541,6 +2541,10 @@ export class PiBackendAdapter implements
   }
 
   async getTree(context: AdapterContext): Promise<SessionTree> {
+    return (await this.#inspectTree(context)).tree;
+  }
+
+  async #inspectTree(context: AdapterContext): Promise<{ readonly tree: SessionTree; readonly contextTokens?: number }> {
     this.#assertReviewOperationAllowed(context, "read native history tree");
     const runtime = this.#runtime(context);
     const response = await runtime.transport.request(
@@ -2550,9 +2554,10 @@ export class PiBackendAdapter implements
     const data = responseData(response);
     if (!isRecord(data) || !Array.isArray(data.tree)) throw piError("PI_TREE_INVALID_RESPONSE", "Pi get_tree returned an invalid tree", "dispatch");
     const roots = projectPiTreeNodes(data.tree, runtime.redactValues);
+    const leafId = typeof data.leafId === "string" ? data.leafId : undefined;
     return {
-      roots,
-      leafId: typeof data.leafId === "string" ? data.leafId : undefined
+      tree: { roots, leafId },
+      contextTokens: contextTokensFromTree(data.tree, leafId)
     };
   }
 
@@ -5258,6 +5263,7 @@ export class PiBackendAdapter implements
               })
             );
           } else if (isExtensionUiRequest(event)) {
+            if (runtime.translator.consumeCompactionNativeIdentity(rawEvent)) return;
             if (learningReply) return;
             if (learningRequest !== undefined) {
               if (learningRequest.id !== "" && !runtime.transport.closed) {
@@ -6978,7 +6984,39 @@ function nativeState(
   };
 }
 
-function usageFromStats(stats: Record<string, unknown>): UsageSnapshot | undefined {
+function contextTokensFromTree(values: readonly unknown[], leafId: string | undefined): number | undefined {
+  if (leafId === undefined) return values.length === 0 ? 0 : undefined;
+  const entries = new Map<string, Record<string, unknown>>();
+  const pending = [...values];
+  while (pending.length > 0) {
+    const node = pending.pop();
+    if (!isRecord(node)) continue;
+    if (isRecord(node.entry) && typeof node.entry.id === "string") entries.set(node.entry.id, node.entry);
+    if (Array.isArray(node.children)) for (const child of node.children) pending.push(child);
+  }
+  const visited = new Set<string>();
+  let id: string | undefined = leafId;
+  while (id !== undefined && !visited.has(id)) {
+    visited.add(id);
+    const entry = entries.get(id);
+    if (entry === undefined) return undefined;
+    const message = isRecord(entry.message) ? entry.message : undefined;
+    if (entry.type === "message" && message?.role === "assistant" && isRecord(message.usage)) {
+      // Context is the last assistant request on this lineage, not accumulated
+      // output or a sibling branch. Native statistics remain authoritative.
+      return [message.usage.input, message.usage.cacheRead, message.usage.cacheWrite]
+        .reduce<number>((total, value) => total + (finiteNonNegativePiNumber(value) ? value : 0), 0);
+    }
+    id = typeof entry.parentId === "string" ? entry.parentId : undefined;
+  }
+  return id === undefined ? 0 : undefined;
+}
+
+function usageFromStats(
+  stats: Record<string, unknown>,
+  treeContextTokens?: number,
+  modelContextWindow?: number
+): UsageSnapshot | undefined {
   if (!isRecord(stats.tokens)) return undefined;
   const inputTokens = numeric(stats.tokens.input);
   const outputTokens = numeric(stats.tokens.output);
@@ -6992,8 +7030,9 @@ function usageFromStats(stats: Record<string, unknown>): UsageSnapshot | undefin
     cacheReadTokens,
     cacheWriteTokens,
     totalTokens,
-    contextTokens: context ? optionalNumeric(context.tokens) : undefined,
-    contextWindow: context ? optionalNumeric(context.contextWindow) : undefined,
+    contextTokens: finiteNonNegativePiNumber(context?.tokens) ? context.tokens : treeContextTokens,
+    contextWindow: finiteNonNegativePiNumber(context?.contextWindow) && context.contextWindow > 0
+      ? context.contextWindow : modelContextWindow,
     cost: numeric(stats.cost)
   };
 }

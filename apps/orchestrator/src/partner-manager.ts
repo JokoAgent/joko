@@ -1264,13 +1264,13 @@ export class PartnerManager {
     }
   }
 
-  #canonicalSession(profile: PartnerProfileRecord): { readonly sessionId: string; readonly replace: boolean } | undefined {
+  #canonicalSession(profile: PartnerProfileRecord): { readonly sessionId: string; readonly replace: boolean; readonly missing?: true } | undefined {
     if (profile.canonicalSessionId === undefined) return undefined;
     let session;
     try {
       session = this.#operationalStore.getSession(profile.canonicalSessionId).descriptor;
     } catch (error) {
-      if (error instanceof NotFoundError) return { sessionId: profile.canonicalSessionId, replace: true };
+      if (error instanceof NotFoundError) return { sessionId: profile.canonicalSessionId, replace: true, missing: true };
       throw error;
     }
     if (session.targetId !== profile.homeTargetId) {
@@ -1390,7 +1390,13 @@ export class PartnerManager {
   }
 
   #target(profile: PartnerProfileRecord, backendId: string, homePath: string): TargetDescriptor {
-    if (profile.canonicalSessionId !== undefined) backendId = this.#operationalStore.getTarget(profile.homeTargetId).descriptor.backendId;
+    if (profile.canonicalSessionId !== undefined) {
+      try { backendId = this.#operationalStore.getTarget(profile.homeTargetId).descriptor.backendId; }
+      catch (error) {
+        // A retained profile can recreate a missing home Target only when its old Session is also absent.
+        if (!(error instanceof NotFoundError) || this.#canonicalSession(profile)?.missing !== true) throw error;
+      }
+    }
     return {
       id: profile.homeTargetId,
       backendId,

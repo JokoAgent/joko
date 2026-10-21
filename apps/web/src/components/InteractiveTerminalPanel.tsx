@@ -70,7 +70,7 @@ export function InteractiveTerminalPanel({ controller, sessionId, terminalId, ac
     const displayAbort = new AbortController();
     displayAbortRef.current = displayAbort;
     overridesRef.current = "";
-    const terminal = new Terminal({ cursorBlink: true, scrollback: 1_000, disableStdin: true, theme: readTerminalAppearance(slot).theme, linkHandler: { activate: (_event, uri) => { void latest.current.controller.openHttpLink(uri, { forceExternal: true }).catch(() => undefined); } } });
+    const terminal = new Terminal({ cursorBlink: true, scrollback: 5_000, disableStdin: true, theme: readTerminalAppearance(slot).theme, linkHandler: { activate: (_event, uri) => { void latest.current.controller.openHttpLink(uri, { forceExternal: true }).catch(() => undefined); } } });
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.loadAddon(new WebLinksAddon((_event, uri) => { void latest.current.controller.openHttpLink(uri, { forceExternal: true }).catch(() => undefined); }));

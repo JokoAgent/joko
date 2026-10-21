@@ -1,15 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Code } from "@connectrpc/connect";
-import { CapabilitySupport, SimulatorViewerAction } from "@joko/contracts";
+import { fromBinary } from "@bufbuild/protobuf";
+import { CapabilitySupport, SimulatorViewerAction, WatchSimulatorFramesRequestSchema } from "@joko/contracts";
 import { createOrchestratorApplication, createPublicServer,
   type OrchestratorConfig } from "@joko/orchestrator";
 import { chromium, type Browser } from "playwright-core";
 import { expect, it, vi } from "vitest";
 import { createE2eClients } from "./connect-clients.js";
+import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
 
 it("serves authenticated task-owned Simulator inventory and durable exact deletion over public Connect", { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "joko-simulator-viewer-e2e-"));
@@ -135,8 +137,10 @@ function deferredSignal(): { readonly promise: Promise<void>; resolve(): void } 
   return { promise: new Promise<void>(next => { resolve = next; }), resolve };
 }
 
-mountedIt("shows the production Simulator task grid and confirms deletion in the mounted Web inspector",
-  { timeout: 120_000 }, async () => {
+mountedIt.for(["native-h264", "wda-mjpeg"] as const)("shows the production Simulator task grid and confirms deletion in the mounted Web inspector using %s",
+  { timeout: 120_000 }, async (videoMode, context) => {
+  const nativeVideo = videoMode === "native-h264";
+  let sessionId = "";
   const root = await mkdtemp(join(tmpdir(), "joko-simulator-viewer-web-"));
   const workspace = join(root, "workspace");
   const dataDirectory = join(root, "data");
@@ -214,7 +218,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       shutdownExact: async value => { expect(value).toBe(udid); booted = false; },
       takeScreenshot: async value => {
         expect(value).toBe(udid);
-        screenshots.push(application.store.listOperations({ sessionId: "viewer-web-task",
+        screenshots.push(application.store.listOperations({ sessionId: sessionId,
           status: "started" }).some(operation => operation.kind === "ios_simulator_screenshot"));
         if (!png) throw new Error("Fixture screenshot is unavailable.");
         return png;
@@ -234,7 +238,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         const record = (phase: string, sequence: number,
           next: { readonly x: number; readonly y: number }): void => {
           liveTouches.push({ gestureId, phase, sequence, x: next.x, y: next.y,
-            claimed: application.store.listOperations({ sessionId: "viewer-web-task",
+            claimed: application.store.listOperations({ sessionId: sessionId,
               status: "started" }).some(operation => operation.kind === "ios_simulator_input") });
         };
         record("begin", 0, point);
@@ -244,8 +248,9 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
           forceRelease: () => {} };
       }
     }, nativeH264Runtime: {
-      probe: async () => h264 !== undefined,
+      probe: async () => nativeVideo && h264 !== undefined,
       stream: async function* (_identity, profile, signal) {
+        expect(nativeVideo).toBe(true);
         nativeProfiles.push({ framesPerSecond: profile.framesPerSecond,
           scalingPercent: profile.scalingPercent });
         let sequence = 0;
@@ -300,13 +305,13 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         if (request.url === "/session/SESSION-1/appium/settings") viewerProfiles.push(body);
         else if (request.url === "/session/SESSION-1/wda/keys" ||
           request.url === "/session/SESSION-1/actions") viewerInputs.push({ url: request.url!, body,
-          claimed: application.store.listOperations({ sessionId: "viewer-web-task", status: "started" })
+          claimed: application.store.listOperations({ sessionId: sessionId, status: "started" })
             .some(operation => operation.kind === "ios_simulator_input") });
         else {
           const kind = request.url === "/session/SESSION-1/wda/pressButton"
             ? "ios_simulator_input" : "ios_simulator_state_control";
           deviceCommands.push({ url: request.url!, body,
-            claimed: application.store.listOperations({ sessionId: "viewer-web-task",
+            claimed: application.store.listOperations({ sessionId: sessionId,
               status: "started" }).some(operation => operation.kind === kind) });
           if (request.url === "/session/SESSION-1/orientation") orientation = body.orientation;
         }
@@ -337,11 +342,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
     }
     wdaPort = wdaAddress.port;
     const target = application.store.getTarget("workspace").descriptor;
-    application.store.createSession({ id: "viewer-web-task", backendId: target.backendId,
-      targetId: target.id, title: "Viewer Web task",
-      binding: { opaqueRef: "viewer-web-native", generation: 1 }, pinned: false,
-      archived: false, permissionMode: "ask", planMode: false, fastMode: false,
-      createdAt: Date.now(), updatedAt: Date.now() });
+
     const codes = new Map<string, string>();
     const removePairingListener = application.connections.onPairingIssued(challenge => {
       codes.set(challenge.id, challenge.code);
@@ -351,12 +352,52 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       server = await createPublicServer(application);
       server.log.level = "silent";
       const baseUrl = await server.listen({ host: "127.0.0.1", port: 0 });
+      const setupChallenge = application.connections.issuePairing("Viewer setup");
+      const setupConnection = application.connections.completePairing({ challengeId: setupChallenge.id,
+        code: setupChallenge.code, connectionName: "Viewer setup" });
+      const setupClients = createE2eClients(baseUrl, setupConnection.authKey);
+      if (application.providers === undefined || application.refreshPiGeneration === undefined) {
+        throw new Error("The Viewer fixture has no managed Provider owner.");
+      }
+      await application.providers.upsert({
+        backendId: "pi", credentialOrigin: "", provider: {
+          id: "viewer-local", baseUrl: `${baseUrl}/unused-inference/v1`, api: "openai-completions", keyless: true,
+          models: [{ id: "viewer-local-model", name: "Viewer fixture model", contextWindow: 16_384, maxTokens: 1_024 }]
+        }, displayName: "Viewer local Provider", kind: "local_keyless", credentialBindings: {}, enabled: true,
+        supportsLogin: false, supportsLogout: false, supportsRefresh: false
+      });
+      await application.refreshPiGeneration();
+      sessionId = sessionIdFrom(await submit(setupClients.operation, setupConnection.connection.id,
+        createSessionMutation({ backendId: target.backendId, targetId: target.id,
+          providerId: "viewer-local", modelId: "viewer-local-model", displayName: "Viewer Web task" })));
       const anonymous = createE2eClients(baseUrl);
       const challenge = await anonymous.connection.beginPairing({ deviceDisplayName: "Viewer Web" });
       const code = codes.get(challenge.challenge!.challengeId);
       if (!code) throw new Error("Viewer Web pairing code was not observed.");
       browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE!, headless: true });
-      const page = await browser.newPage({ viewport: { width: 1160, height: 850 } });
+      const page = await browser.newPage({ viewport: { width: 1160, height: 850 }, locale: "en-US" });
+      const requestedProfiles: Array<{ native: boolean; fps: number; quality: number; scaling: number }> = [];
+      page.on("request", request => {
+        if (!new URL(request.url()).pathname.endsWith("/WatchSimulatorFrames")) return;
+        const bytes = request.postDataBuffer();
+        if (bytes === null || requestedProfiles.length >= 12) return;
+        try {
+          const body = bytes.length >= 5 && bytes[0] === 0 && bytes.readUInt32BE(1) === bytes.length - 5
+            ? bytes.subarray(5) : bytes;
+          const value = fromBinary(WatchSimulatorFramesRequestSchema, body);
+          requestedProfiles.push({ native: value.preferNativeH264, fps: value.mjpegFramesPerSecond,
+            quality: value.jpegQuality, scaling: value.mjpegScalingPercent });
+        } catch { console.warn("Viewer stream request diagnostics could not decode its body."); }
+      });
+      const evidenceDirectory = process.env.RUNNER_TEMP === undefined ? undefined
+        : join(process.env.RUNNER_TEMP, "joko-web-evidence", "simulator-viewer", videoMode);
+      const captures: Array<{ file: string; sha256: string }> = [];
+      const capture = async (file: string): Promise<void> => {
+        if (evidenceDirectory === undefined) return;
+        await mkdir(evidenceDirectory, { recursive: true });
+        const bytes = await page.screenshot({ path: join(evidenceDirectory, file), fullPage: true, animations: "disabled" });
+        captures.push({ file, sha256: createHash("sha256").update(bytes).digest("hex") });
+      };
       await page.context().grantPermissions(["clipboard-read", "clipboard-write"],
         { origin: new URL(baseUrl).origin });
       const dataUrls = await page.evaluate(() => {
@@ -373,7 +414,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       png = Buffer.from(dataUrls.png.split(",")[1] ?? "", "base64");
       expect(jpeg.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xd8]));
       expect(png.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
-      await page.goto(`${baseUrl}/#/tasks/viewer-web-task`, { waitUntil: "domcontentloaded" });
+      await page.goto(`${baseUrl}/#/tasks/${encodeURIComponent(sessionId)}`, { waitUntil: "domcontentloaded" });
       // A 64×64 solid frame encoded as Annex-B Main-profile H.264 by libx264.
       h264 = new Uint8Array(Buffer.from("AAAAAWdNQArcQmwEQAAAAwBAAAADAIPEieAAAAABaO4PLIAAAAFliIQEv/7oyfzLHD3dQ0paXYOlpxzCPR0j/rkHZkvIIcFZB4uJwQ==", "base64"));
       expect(h264.subarray(0, 4)).toEqual(new Uint8Array([0, 0, 0, 1]));
@@ -381,14 +422,20 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         (await VideoDecoder.isConfigSupported({ codec: "avc1.4d400a", codedWidth: 64,
           codedHeight: 64, optimizeForLatency: true,
           hardwareAcceleration: "prefer-hardware" })).supported);
-      expect(decoderSupported).toBe(true);
+      if (nativeVideo) {
+        if (!decoderSupported && process.env.GITHUB_ACTIONS === "true") {
+          console.info("Native H.264 GUI was not executed: this hosted browser lacks the required prefer-hardware decoder. The separate WDA MJPEG GUI chain remains mandatory.");
+          context.skip();
+        }
+        expect(decoderSupported).toBe(true);
+      }
       await page.locator(".connection-tabs > button").nth(2).click();
       await page.getByLabel("Joko node address").fill(baseUrl);
       await page.getByLabel("Pairing code").fill(code);
       await page.getByLabel("Device name").fill("Viewer Web");
       await page.locator("form.pair-form button[type=submit]").click();
       await page.locator("aside.inspector").waitFor({ state: "attached", timeout: 30_000 });
-      const current = application.store.getSession("viewer-web-task").descriptor;
+      const current = application.store.getSession(sessionId).descriptor;
       application.simulatorViewer!.ownership.bindCreatedDevice(
         { sessionId: current.id, targetId: current.targetId,
           generation: current.binding.generation }, device, device.name);
@@ -434,34 +481,47 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         expect(metrics.frameHeight).toBeCloseTo(metrics.height, 0);
         return metrics.width;
       };
-      await panel.getByRole("article", { name: "Joko iPhone" }).waitFor({ state: "visible" });
+      try {
+        await panel.getByRole("article", { name: "Joko iPhone" }).waitFor({ state: "visible" });
+      } catch (error) {
+        throw new Error(`Simulator inventory was unavailable: ${(await panel.innerText()).slice(0, 4_000)}`, { cause: error });
+      }
       await panel.getByText("paused").first().waitFor();
       await panel.getByRole("button", { name: "Start", exact: true }).click();
-      await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
-      await page.waitForFunction(() => {
-        const canvas = document.querySelector<HTMLCanvasElement>(".simulator-viewer__screen canvas");
-        return canvas?.width === 64 && canvas.height === 64 &&
-          (canvas.getContext("2d")?.getImageData(1, 1, 1, 1).data[3] ?? 0) > 0;
-      });
-      stopNative = true;
+      if (nativeVideo) {
+        await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
+        await page.waitForFunction(() => {
+          const canvas = document.querySelector<HTMLCanvasElement>(".simulator-viewer__screen canvas");
+          return canvas?.width === 64 && canvas.height === 64 &&
+            (canvas.getContext("2d")?.getImageData(1, 1, 1, 1).data[3] ?? 0) > 0;
+        });
+        await capture("01-native-decoded.png");
+        stopNative = true;
+      }
       await panel.locator(".simulator-viewer__screen img").waitFor({ state: "visible" });
       await page.waitForFunction(() => {
         const image = document.querySelector<HTMLImageElement>(".simulator-viewer__screen img");
         return image?.complete && image.naturalWidth === 16 && image.naturalHeight === 12;
       });
+      await capture("02-mjpeg-decoded.png");
       await vi.waitFor(() => expect(viewerProfiles).toContainEqual({ settings: {
         mjpegServerFramerate: 10, mjpegServerScreenshotQuality: 45, mjpegScalingFactor: 70
       } }), { timeout: 5_000 });
       await panel.getByLabel("Video quality").selectOption("high");
-      await vi.waitFor(() => expect(viewerProfiles).toContainEqual({ settings: {
-        mjpegServerFramerate: 20, mjpegServerScreenshotQuality: 70, mjpegScalingFactor: 100
-      } }), { timeout: 5_000 });
+      try {
+        await vi.waitFor(() => expect(viewerProfiles).toContainEqual({ settings: {
+          mjpegServerFramerate: 20, mjpegServerScreenshotQuality: 70, mjpegScalingFactor: 100
+        } }), { timeout: 5_000 });
+      } catch (error) {
+        throw new Error(`Viewer quality was not applied: ${JSON.stringify({ requestedProfiles,
+          appliedProfiles: viewerProfiles, panel: (await panel.innerText()).slice(0, 4_000) })}`, { cause: error });
+      }
       await panel.getByLabel("Video quality").selectOption("balanced");
       await vi.waitFor(() => expect(viewerProfiles.at(-1)).toEqual({ settings: {
         mjpegServerFramerate: 10, mjpegServerScreenshotQuality: 45, mjpegScalingFactor: 70
       } }), { timeout: 5_000 });
 
-      const task = application.store.getSession("viewer-web-task").descriptor;
+      const task = application.store.getSession(sessionId).descriptor;
       const instance = application.simulatorViewer!.ownership.listForTask({
         sessionId: task.id, targetId: task.targetId, generation: task.binding.generation
       })[0];
@@ -525,7 +585,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await textInput.press("Enter");
       await vi.waitFor(() => expect(viewerInputs).toHaveLength(1), { timeout: 5_000 });
       expect(viewerInputs[0]).toMatchObject({ url: "/session/SESSION-1/wda/keys", claimed: true });
-      expect(await textInput.inputValue()).toBe("");
+      await vi.waitFor(async () => expect(await textInput.inputValue()).toBe(""), { timeout: 5_000 });
 
       const interactiveFrame = panel.locator(".simulator-viewer__screen img");
       const interactionProfilesStart = viewerProfiles.length;
@@ -558,7 +618,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       expect(new Set(drag.map(touch => touch.gestureId)).size).toBe(1);
       expect(drag.every(touch => touch.claimed)).toBe(true);
       expect(viewerInputs).toHaveLength(1);
-      const inputOperations = application.store.listOperations({ sessionId: "viewer-web-task",
+      const inputOperations = application.store.listOperations({ sessionId: sessionId,
         status: "completed" }).filter(operation => operation.kind === "ios_simulator_input");
       expect(inputOperations).toHaveLength(4);
       expect(JSON.stringify(inputOperations.map(operation => ({ body: operation.body,
@@ -586,10 +646,10 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await expectFittedFrame(852, 393);
       await panel.getByRole("button", { name: "Lock screen", exact: true }).click();
       await panel.getByRole("button", { name: "Unlock screen", exact: true }).click();
-      expect(deviceCommands.map(item => item.url)).toEqual([
+      await vi.waitFor(() => expect(deviceCommands.map(item => item.url)).toEqual([
         "/session/SESSION-1/wda/pressButton", "/session/SESSION-1/orientation",
         "/session/SESSION-1/wda/lock", "/session/SESSION-1/wda/unlock"
-      ]);
+      ]), { timeout: 5_000 });
       expect(deviceCommands.every(item => item.claimed)).toBe(true);
       await panel.getByRole("button", { name: "Copy screenshot" }).click();
       await panel.getByText("Screenshot copied to clipboard.").waitFor();
@@ -599,24 +659,30 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
         const blob = await item!.getType("image/png");
         return { type: blob.type, signature: [...new Uint8Array(await blob.slice(0, 8).arrayBuffer())] };
       })).toEqual({ type: "image/png", signature: [137, 80, 78, 71, 13, 10, 26, 10] });
-      await panel.getByText("Native video stopped; showing WDA video.").waitFor();
-      stopNative = false;
-      await panel.getByRole("button", { name: "Retry native video" }).click();
-      await panel.getByText("Native video is restored.").waitFor();
-      await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
-      await page.waitForFunction(() => {
-        const canvas = document.querySelector<HTMLCanvasElement>(".simulator-viewer__screen canvas");
-        return canvas?.width === 64 && canvas.height === 64 &&
-          (canvas.getContext("2d")?.getImageData(1, 1, 1, 1).data[3] ?? 0) > 0;
-      });
-      const nativeInteractionStart = nativeProfiles.length;
-      await panel.locator(".simulator-viewer__screen canvas").click({ position: { x: 8, y: 6 } });
-      await vi.waitFor(() => expect(nativeProfiles.slice(nativeInteractionStart)).toEqual([
-        { framesPerSecond: 30, scalingPercent: 100 },
-        { framesPerSecond: 20, scalingPercent: 70 }
-      ]), { timeout: 5_000 });
+      await capture("03-landscape-controls.png");
+      if (nativeVideo) {
+        await panel.getByText("Native video stopped; showing WDA video.").waitFor();
+        stopNative = false;
+        await panel.getByRole("button", { name: "Retry native video" }).click();
+        await panel.getByText("Native video is restored.").waitFor();
+        await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
+        await page.waitForFunction(() => {
+          const canvas = document.querySelector<HTMLCanvasElement>(".simulator-viewer__screen canvas");
+          return canvas?.width === 64 && canvas.height === 64 &&
+            (canvas.getContext("2d")?.getImageData(1, 1, 1, 1).data[3] ?? 0) > 0;
+        });
+        const nativeInteractionStart = nativeProfiles.length;
+        await panel.locator(".simulator-viewer__screen canvas").click({ position: { x: 8, y: 6 } });
+        await vi.waitFor(() => expect(nativeProfiles.slice(nativeInteractionStart)).toEqual([
+          { framesPerSecond: 30, scalingPercent: 100 },
+          { framesPerSecond: 20, scalingPercent: 70 }
+        ]), { timeout: 5_000 });
+      } else {
+        expect(nativeProfiles).toEqual([]);
+      }
       await page.setViewportSize({ width: 390, height: 844 });
-      await panel.locator(".simulator-viewer__screen canvas").waitFor({ state: "visible" });
+      await panel.locator(nativeVideo ? ".simulator-viewer__screen canvas" : ".simulator-viewer__screen img")
+        .waitFor({ state: "visible" });
       await expectFittedFrame(852, 393);
       await panel.getByRole("button", { name: "Copy screenshot" }).waitFor({ state: "visible" });
       const deleteButton = panel.getByRole("button", { name: "Delete", exact: true });
@@ -624,6 +690,7 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await page.keyboard.press("Enter");
       const dialog = page.getByRole("alertdialog", { name: "Delete this Simulator?" });
       await dialog.waitFor({ state: "visible" });
+      await capture("04-delete-confirmation.png");
       expect(deletes).toBe(0);
       await page.keyboard.press("Escape");
       await dialog.waitFor({ state: "hidden" });
@@ -633,8 +700,14 @@ mountedIt("shows the production Simulator task grid and confirms deletion in the
       await panel.getByText("No Simulator is attached to this task.").waitFor({ state: "visible" });
       expect(deletes).toBe(1);
       expect(application.simulatorViewer!.ownership.listForTask(
-        { sessionId: "viewer-web-task", targetId: target.id,
-          generation: application.store.getSession("viewer-web-task").descriptor.binding.generation })).toEqual([]);
+        { sessionId: sessionId, targetId: target.id,
+          generation: application.store.getSession(sessionId).descriptor.binding.generation })).toEqual([]);
+      await capture("05-deleted.png");
+      if (evidenceDirectory !== undefined) await writeFile(join(evidenceDirectory, "manifest.json"), JSON.stringify({
+        sourceCommit: process.env.GITHUB_SHA ?? null, videoMode,
+        requiredHardwareH264Supported: decoderSupported, completed: true, captures,
+        limits: ["Controlled Simulator/WDA/native transport; production browser rendering and input. No physical iOS device was exercised."]
+      }, null, 2) + "\n");
     } finally { removePairingListener(); }
   } finally {
     await browser?.close();

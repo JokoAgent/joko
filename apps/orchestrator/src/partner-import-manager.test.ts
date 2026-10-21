@@ -27,7 +27,7 @@ const backendProfile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.c
   ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true },
   { key: "runtime.resources", supported: true, options: ["skill", "prompt"] }] };
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean } = {}) {
+async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; observeImport?: (phase: string) => void } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-import-owner-")); const native = join(root, ".hermes");
   await mkdir(join(native, "skills", "reports"), { recursive: true }); await mkdir(join(native, "memories")); await mkdir(join(native, "cron"));
   await writeFile(join(native, "config.yaml"), "name: Analyst\n" + (options.nativeTools ? "tools:\n  allowed: [read]\n" : "")); await writeFile(join(native, ".env"), `ACCESS_TOKEN=${secret}\n`);
@@ -60,9 +60,29 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     return frozen;
   },
     adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, storage, id, assertOwner),
-    runPass: (id, action) => partners.runImportManagement(id, action), effects: context => createPartnerImportEffects({ partners, routines, storage, store, memory, resources, artifacts,
+    runPass: (id, action) => partners.runImportManagement(id, options.observeImport ? observedImportEffect("pass", action, options.observeImport) : action), effects: context => {
+      options.observeImport?.("effects-start");
+      const pendingEffects = createPartnerImportEffects({ partners, routines, storage, store, memory, resources, artifacts,
       verification: { readEnvironment: (id, owner) => storage.environment.read(id, owner), canonicalSessionId: async id => partners.getPartner(id).canonicalSessionId!,
-        plan: async () => undefined, authorize: async () => { throw new Error("No external probe is authorized by this fixture"); }, verifyDelivery: async () => { throw new Error("No channel is authorized by this fixture"); } }, home: root, environment: {} }, context) });
+        plan: async () => undefined, authorize: async () => { throw new Error("No external probe is authorized by this fixture"); }, verifyDelivery: async () => { throw new Error("No channel is authorized by this fixture"); } }, home: root, environment: {} }, context);
+      if (!options.observeImport) return pendingEffects;
+      const observe = options.observeImport;
+      return pendingEffects.then(effects => {
+        observe("effects-ready");
+        return { ...effects,
+        validateItems: observedImportEffect("validate", effects.validateItems, observe),
+        createPartner: observedImportEffect("create-partner", effects.createPartner, observe),
+        importItem: observedImportEffect("import-item", effects.importItem, observe),
+        saveEnvironment: observedImportEffect("save-environment", effects.saveEnvironment, observe),
+        createConversation: observedImportEffect("create-conversation", effects.createConversation, observe),
+        createRoutine: observedImportEffect("create-routine", effects.createRoutine, observe),
+        verifyAutomation: observedImportEffect("verify-automation", effects.verifyAutomation, observe),
+        pauseSource: observedImportEffect("pause-source", effects.pauseSource, observe),
+        resumeSource: observedImportEffect("resume-source", effects.resumeSource, observe),
+        enableRoutine: observedImportEffect("enable-routine", effects.enableRoutine, observe)
+        };
+      });
+    } });
   let authenticated = "device-a";
   const context = (): HandlerContext => ({ signal: new AbortController().signal } as HandlerContext);
   const service = createPartnerImportConnectService(imports, () => { if (!authenticated) throw new ConnectError("Revoked", Code.Unauthenticated); return { id: authenticated }; });
@@ -73,53 +93,125 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
   return { root, native, store, profiles, artifacts, host, storage, resources, memory, partners, routines, imports, service, api, context, manifest,
     authenticate: (value: string) => { authenticated = value; } };
 }
+
+function observedImportEffect<Args extends unknown[], Result>(phase: string, action: (...args: Args) => Promise<Result>, observe: (phase: string) => void) {
+  return (...args: Args): Promise<Result> => {
+    observe(`${phase}-start`);
+    const result = action(...args);
+    // Observe the existing promise; return it unchanged so the fixture does not
+    // replace the import's value, rejection or await boundary.
+    void result.then(() => observe(`${phase}-complete`), () => observe(`${phase}-failed`));
+    return result;
+  };
+}
 describe("native import service and owning effects", () => {
-  it("saves the complete five-category selection through the generated boundary and retains usable full originals after cold recovery", async () => {
-    const f = await fixture({ changeDefaults: true }); const signal = new AbortController().signal;
-    const sources = await f.api.sources(signal); const preview = await f.api.preview(sources[0]!.id, signal);
+  it("saves the complete five-category selection through the generated boundary and retains usable full originals after cold recovery", async ({ signal: testSignal, onTestFailed, onTestFinished }) => {
+    type Phase = "fixture" | "sources" | "preview" | "start" | "completion" | "environment"
+      | "published-tree" | "resources" | "resource-recovery" | "receipt-recovery" | "persistence" | "idempotency" | "complete";
+    const startedAt = performance.now();
+    let phase: Phase = "fixture";
+    const completedPhases: Array<{ phase: Phase; elapsedMs: number }> = [];
+    let importPhase = "not-started";
+    let effectStarted = 0;
+    let effectCompleted = 0;
+    let effectFailed = 0;
+    const effectCounts: Record<string, number> = {};
+    const observeImport = (next: string) => {
+      importPhase = next;
+      effectCounts[next] = (effectCounts[next] ?? 0) + 1;
+      if (next.endsWith("-start")) effectStarted += 1;
+      else if (next.endsWith("-complete")) effectCompleted += 1;
+      else if (next.endsWith("-failed")) effectFailed += 1;
+    };
+    const snapshot = () => ({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)), completedPhases: [...completedPhases],
+      importPhase, effectStarted, effectCompleted, effectFailed, effectCounts: { ...effectCounts } });
+    let abortedSnapshot: ReturnType<typeof snapshot> | undefined;
+    const captureAbort = () => { abortedSnapshot ??= snapshot(); };
+    const advance = (next: Phase) => {
+      completedPhases.push({ phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)) });
+      phase = next;
+    };
+    testSignal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => testSignal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => {
+      try {
+        console.error("[partner-import-boundary]", JSON.stringify({ boundary: abortedSnapshot ? "test-abort" : "failure", ...(abortedSnapshot ?? snapshot()) }));
+      } catch { /* The observation must not replace the original test failure. */ }
+    });
+    const f = await fixture({ changeDefaults: true, observeImport }); const signal = new AbortController().signal;
+    advance("sources");
+    const sources = await f.api.sources(signal);
+    advance("preview");
+    const preview = await f.api.preview(sources[0]!.id, signal);
     expect(preview.entries.length).toBeGreaterThan(20); expect(new Set(preview.entries.map(entry => entry.category)).size).toBe(5);
     expect(JSON.stringify(preview)).not.toContain(secret);
     const selection = { previewId: preview.id, requestId: "owner_import_request_0001", name: "Imported analyst", entryIds: preview.entries.map(entry => entry.id), takeover: true, deferSetup: true };
-    await f.api.start(selection, signal); const saved = await f.imports.waitForRequest(selection.requestId);
+    advance("start");
+    await f.api.start(selection, signal);
+    advance("completion");
+    const saved = await f.imports.waitForRequest(selection.requestId);
     expect(saved, JSON.stringify({ checks: saved.checks, receipt: f.storage.readReceipt(selection.requestId)?.routines,
       profiles: f.partners.listPartners().map(p => ({ initialization: p.initializationState, failure: p.initializationErrorCode })) })).toMatchObject({ saved: true, status: "complete" }); expect(saved.savedEntryIds).toHaveLength(selection.entryIds.length);
     const profile = f.partners.getPartner(saved.partnerId); expect(profile.initializationState).toBe("ready"); expect(profile.canonicalSessionId).toBe(saved.canonicalSessionId);
     expect(profile.capabilities.permissionMode).toBe("ask"); expect(f.profiles.directoryState().defaultCapabilities?.permissionMode).toBe("auto");
+    advance("environment");
     const environment = await f.storage.environment.read(profile.id, () => {});
     expect(environment?.env.ACCESS_TOKEN).toBe(secret); expect(environment?.pendingImport).toBeUndefined();
     expect(environment?.profileProjection.identity.length).toBeGreaterThan(8000); expect(profile.identitySource.length).toBeLessThanOrEqual(8000);
     expect(environment?.documents[preview.entries.find(entry => entry.name === "notes-0.md")!.id]).toContain("Retained original.");
+    advance("published-tree");
     const published = await readImportTree(f.store.getTarget(profile.homeTargetId).descriptor.workspaceRoot, () => true, createImportBudget());
     expect(published.some(file => file.name.includes("imported-memory/") && file.bytes[0] === 137)).toBe(true);
     expect(published.every(file => !file.bytes.includes(Buffer.from(secret)))).toBe(true);
+    advance("resources");
     const resource = f.resources.list({ targetId: profile.homeTargetId, kind: "skill" })[0]!; expect(resource.enabled).toBe(true);
     const text = await f.resources.runtimeTextSnapshot(profile.capabilities.modelChain[0]!.backendId, profile.homeTargetId, signal);
     expect(text[0]!.content.length).toBeGreaterThan(256 * 1024); expect(text[0]!.content).not.toContain(secret);
+    advance("resource-recovery");
     const restoredResources = new PiResourceManager({ store: f.store, managedRoot: join(f.root, "resources"), maximumFiles: 2 }); await restoredResources.initialize();
     expect((await restoredResources.runtimeTextSnapshot(profile.capabilities.modelChain[0]!.backendId, profile.homeTargetId, signal))[0]!.content).toBe(text[0]!.content);
     const routine = f.routines.list(profile.id)[0]!; expect(routine.enabled).toBe(false); expect(environment?.automations[routine.id]?.handover).toBe("ready");
+    advance("receipt-recovery");
     const receipts = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")));
     expect(receipts.readReceipt(selection.requestId)?.result).toEqual(saved);
     expect((await receipts.environment.read(profile.id, () => {}))?.skillFiles).toEqual(environment?.skillFiles);
+    advance("persistence");
     expect(JSON.stringify(f.store.listEvents({ sessionId: profile.canonicalSessionId! }), (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain(secret);
     expect((await readFile(join(f.root, "operational.db"))).includes(Buffer.from(secret))).toBe(false);
+    advance("idempotency");
     expect((await f.api.start(selection, signal)).partnerId).toBe(profile.id); expect(f.profiles.listPartners()).toHaveLength(1);
     await expect(f.api.start({ ...selection, name: "Another intent" }, signal)).rejects.toMatchObject({ code: Code.AlreadyExists });
+    advance("complete");
   }, 20_000);
-  it("fences preview theft/revocation and serializes import deletion without recreating private data", async () => {
-    const f = await fixture(); const signal = new AbortController().signal; const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
+  it("fences preview theft/revocation and serializes import deletion without recreating private data", async ({ signal: testSignal, onTestFailed, onTestFinished }) => {
+    const started = performance.now(); let phase = "fixture";
+    const effects: Array<{ phase: string; elapsedMs: number }> = [];
+    const observation = () => ({ phase, elapsedMs: Math.round(performance.now() - started), effects: effects.slice(-24) });
+    let aborted: ReturnType<typeof observation> | undefined;
+    const captureAbort = () => { aborted ??= observation(); };
+    testSignal.addEventListener("abort", captureAbort, { once: true });
+    onTestFinished(() => testSignal.removeEventListener("abort", captureAbort));
+    onTestFailed(() => { console.error("[import-deletion-boundary]", JSON.stringify(aborted ?? observation())); });
+    const f = await fixture({ observeImport: value => { effects.push({ phase: value, elapsedMs: Math.round(performance.now() - started) }); } });
+    const signal = new AbortController().signal; phase = "preview";
+    const preview = await f.api.preview((await f.api.sources(signal))[0]!.id, signal);
     const selection = { previewId: preview.id, requestId: "owner_import_request_0002", name: "Owned import", entryIds: preview.entries.filter(entry => entry.category !== PartnerImportCategory.AUTOMATIONS).map(entry => entry.id), takeover: false, deferSetup: true };
     f.authenticate("device-b"); await expect(f.service.startPartnerImport(create(StartPartnerImportRequestSchema, { controllerId: "sheet", selection }), f.context())).rejects.toMatchObject({ code: Code.FailedPrecondition });
     f.authenticate(""); await expect(f.service.getPartnerImportStatus(create(GetPartnerImportStatusRequestSchema, { requestId: selection.requestId }), f.context())).rejects.toMatchObject({ code: Code.Unauthenticated });
-    f.authenticate("device-a"); await f.api.start(selection, signal); const saved = await f.imports.waitForRequest(selection.requestId);
+    f.authenticate("device-a"); phase = "start"; await f.api.start(selection, signal);
+    phase = "completion"; const saved = await f.imports.waitForRequest(selection.requestId);
     expect(saved.saved).toBe(true); expect(saved.status).toBe("complete");
+    phase = "private-environment";
     const partner = f.partners.getPartner(saved.partnerId); expect(await f.storage.environment.read(partner.id, () => {})).toBeDefined();
+    phase = "delete";
     const deletion = await f.partners.deletePartner({ requestId: "owner_import_delete_0002", partnerId: partner.id, expectedRevision: partner.revision, confirmName: partner.displayName });
     expect(deletion.phase).toBe("completed");
     expect(f.storage.readReceipt(selection.requestId)?.cancelled).toBe(true);
+    phase = "retired-storage";
     await expect(f.storage.environment.read(partner.id, () => {})).rejects.toMatchObject({ code: "IMPORT_OWNER_RETIRED" });
-    expect((await f.api.retry(selection.requestId, true, signal)).status).toBe(PartnerImportStatus.NEEDS_ATTENTION);
+    phase = "retry"; expect((await f.api.retry(selection.requestId, true, signal)).status).toBe(PartnerImportStatus.NEEDS_ATTENTION);
     expect(() => f.partners.getPartner(partner.id)).toThrowError("The partner profile was not found."); expect(f.profiles.listPartners()).toHaveLength(0);
+    phase = "complete";
   }, 20_000);
   it("adopts an explicit current model and policy mapping under the same saved intent while refusing identity edits", async () => {
     const f = await fixture({ nativeTools: true }); const signal = new AbortController().signal;

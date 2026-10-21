@@ -1,17 +1,75 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { capabilityNames, RunState } from "@joko/contracts";
 import type { AdapterContext, PromptInput, SessionTree } from "@joko/core";
 import { PI_LIKE_PROFILE } from "@joko/testkit";
 import { parseAndroidUiNodes, type AndroidUiNode } from "@joko/tool-android";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { InstrumentedFakeAdapter, OrchestratorE2eFixture, waitFor } from "./fixture.js";
 import { createSessionMutation, sessionIdFrom, submit } from "./operations.js";
+
+const evidenceSteps = {
+  "validate-emulator": { action: "validation", assertions: ["owned-avd-name", "emulator-property", "boot-completed"] },
+  "validate-apk": { action: "validation", assertions: ["android-manifest", "clean-manifest-source", "application-package", "apk-manifest-sha256"] },
+  "install-apk": { action: "installation", assertions: ["fresh-application-data", "installed-apk-sha256"] },
+  "prepare-fixture": { action: "fixture-setup", assertions: ["local-orchestrator-ready", "fixture-task-created", "port-reverse-ready"] },
+  "pair-application": { action: "pairing", assertions: ["application-started", "pairing-request-issued"] },
+  "open-task-header": { action: "navigation", assertions: ["task-title-visible", "title-between-header-controls", "header-actions-within-viewport"] },
+  "task-actions-menu": { action: "menu", assertions: ["complete-task-actions", "actions-within-viewport"] },
+  "send-native-input": { action: "text-entry", assertions: ["one-completed-run", "exact-fixture-dispatch", "one-active-mobile-connection", "persisted-timeline", "owner-generation-consistent"] },
+  "open-image-gallery": { action: "resource-navigation", assertions: ["gallery-visible", "image-decoded", "gallery-retained-across-observations"] },
+  "zoom-image-gallery": { action: "gesture", assertions: ["double-tap-zoom", "zoomed-tap-keeps-gallery-open"] },
+  "short-image-drag": { action: "gesture", assertions: ["zoom-reset", "short-drag-keeps-gallery-open"] },
+  "tap-dismiss-image": { action: "gesture", assertions: ["tap-restores-task", "reopened-image-decoded"] },
+  "vertical-dismiss-image": { action: "gesture", assertions: ["gesture-canvas-sized", "vertical-dismiss-restores-task"] },
+  "close-image-gallery": { action: "resource-navigation", assertions: ["reopened-image-decoded", "close-restores-task"] },
+  "open-canonical-file": { action: "resource-navigation", assertions: ["canonical-file-contents", "canonical-line-focus"] },
+  "copy-file-source": { action: "clipboard", assertions: ["copy-source-completed"] },
+  "force-stop-and-reconnect": { action: "lifecycle", assertions: ["application-process-stopped", "application-restarted", "restored-task-title", "persisted-task-input"] },
+  "restore-canonical-file": { action: "lifecycle", assertions: ["restored-file-contents", "no-duplicate-dispatch", "one-persisted-run", "one-mobile-connection", "no-application-crash", "run-succeeded"] }
+} as const;
+type EvidenceStepName = keyof typeof evidenceSteps;
+type EvidenceAction = "tap" | "text-entry" | "launch" | "double-tap" | "swipe" | "force-stop" | "install";
+type EvidenceScreenshot = "header" | "actions" | "timeline" | "gallery" | "gallery-zoomed" | "gallery-drag-reset"
+  | "gallery-dismissed" | "resource-links" | "file-opened" | "file" | "restored"
+  | "gallery-error" | "restored-error" | "file-error" | "resource-candidate" | "resource-error"
+  | "connection-add" | "connection-error" | "actions-scrolled";
+type EvidenceResult = "running" | "passed" | "failed";
+type EvidenceStep = {
+  name: EvidenceStepName;
+  action: string;
+  startedAfterMs: number;
+  elapsedMs: number;
+  result: EvidenceResult;
+  assertions: { name: string; passed: true }[];
+  actions: { type: EvidenceAction; startedAfterMs: number; elapsedMs: number; result: EvidenceResult }[];
+  screenshots: { file: string; sha256: string; capturedAfterMs: number }[];
+};
+type AndroidEvidence = {
+  schemaVersion: 1;
+  platform: "android";
+  scope: "native-pairing-input-canonical-resources-and-process-reopen";
+  backend: "local-instrumented-orchestrator-fixture";
+  result: EvidenceResult;
+  scenarioResult: EvidenceResult;
+  cleanupResult: EvidenceResult;
+  elapsedMs: number;
+  fixtureReadiness?: Partial<Record<"workspace-directory" | "workspace-index" | "session-artifacts", {
+    passed: boolean; count?: number;
+  }>>;
+  target?: { serial: string; avd: string };
+  artifact?: {
+    kind: "apk"; package: string; sha256: string; manifestSha256: string;
+    source: { commit: string; tree: "clean"; productionGate: "passed" | "bypassed" | "unavailable" };
+    installedSha256?: string;
+  };
+  steps: EvidenceStep[];
+};
 
 const serial = process.env.JOKO_ANDROID_TEST_SERIAL?.trim();
 const avd = process.env.JOKO_ANDROID_TEST_AVD?.trim();
@@ -48,19 +106,34 @@ class AndroidResourceAdapter extends InstrumentedFakeAdapter {
 let fixture: OrchestratorE2eFixture | undefined;
 let ownedAvd = false;
 let reversedPort: string | undefined;
+let evidence: AndroidEvidence | undefined;
+let evidenceStarted = 0;
+let activeStep: EvidenceStep | undefined;
 
 afterEach(async () => {
+  let cleanupPassed = false;
   try {
-    if (ownedAvd) {
-      await adb("shell", "am", "force-stop", packageName);
-      expect((await adb("shell", "pm", "clear", packageName)).trim()).toBe("Success");
-      if (reversedPort !== undefined) await adb("reverse", "--remove", reversedPort);
+    try {
+      if (ownedAvd) {
+        await adb("shell", "am", "force-stop", packageName);
+        expect((await adb("shell", "pm", "clear", packageName)).trim()).toBe("Success");
+        if (reversedPort !== undefined) await adb("reverse", "--remove", reversedPort);
+      }
+    } finally {
+      ownedAvd = false;
+      reversedPort = undefined;
+      await fixture?.close();
+      fixture = undefined;
     }
+    cleanupPassed = true;
   } finally {
-    ownedAvd = false;
-    reversedPort = undefined;
-    await fixture?.close();
-    fixture = undefined;
+    if (evidence !== undefined) {
+      evidence.cleanupResult = cleanupPassed ? "passed" : "failed";
+      evidence.result = cleanupPassed && evidence.scenarioResult === "passed" ? "passed" : "failed";
+      await persistEvidence();
+      evidence = undefined;
+      activeStep = undefined;
+    }
   }
 }, 90_000);
 
@@ -71,14 +144,39 @@ nativeIt("pairs, sends through native rich input, opens canonical resources, and
     || !adbExecutable || !isAbsolute(adbExecutable) || !apkPath || !isAbsolute(apkPath)) {
     throw new Error("Native Android evidence requires an explicit isolated Joko AVD and absolute tool/artifact paths.");
   }
-  expect((await adb("emu", "avd", "name")).split(/\r?\n/u)[0]?.trim()).toBe(avd);
+  evidenceStarted = performance.now();
+  evidence = { schemaVersion: 1, platform: "android", scope: "native-pairing-input-canonical-resources-and-process-reopen",
+    backend: "local-instrumented-orchestrator-fixture", result: "running", scenarioResult: "running",
+    cleanupResult: "running", elapsedMs: 0, steps: [] };
+  await persistEvidence();
+  try {
+    await runNativeScenario();
+    evidence.scenarioResult = "passed";
+  } catch (error) {
+    evidence.scenarioResult = "failed";
+    if (activeStep !== undefined) {
+      activeStep.result = "failed";
+      activeStep.elapsedMs = elapsed() - activeStep.startedAfterMs;
+    }
+    throw error;
+  } finally { await persistEvidence(); }
+});
+
+async function runNativeScenario(): Promise<void> {
+  await beginStep("validate-emulator");
+  const actualAvd = (await adb("emu", "avd", "name")).split(/\r?\n/u)[0]?.trim();
+  expect(actualAvd).toBe(avd);
   expect((await adb("shell", "getprop", "ro.kernel.qemu")).trim()).toBe("1");
   expect((await adb("shell", "getprop", "sys.boot_completed")).trim()).toBe("1");
   ownedAvd = true;
+  evidence!.target = { serial: serial!, avd: actualAvd! };
+  await completeStep();
 
-  const apk = resolve(apkPath);
-  const manifest = JSON.parse(await readFile(join(dirname(apk), "joko-mobile-artifact.json"), "utf8")) as {
-    platform: string; source: { commit: string; tree: string };
+  await beginStep("validate-apk");
+  const apk = resolve(apkPath!);
+  const manifestPath = join(dirname(apk), "joko-mobile-artifact.json");
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    platform: string; source: { commit: string; tree: string; productionGate?: string };
     application: { package: string }; artifacts: { kind: string; fileName: string; sha256: string }[];
   };
   expect(manifest.platform).toBe("android");
@@ -87,20 +185,32 @@ nativeIt("pairs, sends through native rich input, opens canonical resources, and
   const artifact = manifest.artifacts.find((entry) => entry.kind === "apk" && entry.fileName === basename(apk));
   if (artifact === undefined) throw new Error("The APK is absent from its native artifact manifest.");
   expect(await digest(apk)).toBe(artifact.sha256);
+  evidence!.artifact = { kind: "apk", package: packageName, sha256: artifact.sha256,
+    manifestSha256: await digest(manifestPath), source: {
+      commit: /^[0-9a-f]{40}$/u.test(manifest.source.commit) ? manifest.source.commit : "unavailable",
+      tree: "clean", productionGate: manifest.source.productionGate === "passed" || manifest.source.productionGate === "bypassed"
+        ? manifest.source.productionGate : "unavailable"
+    } };
+  await completeStep();
+  await beginStep("install-apk");
   const installedPackages = (await adb("shell", "pm", "list", "packages", packageName)).trim().split(/\r?\n/u);
   if (installedPackages.includes("package:" + packageName)) expect((await adb("uninstall", packageName)).trim()).toBe("Success");
-  await adb("install", "-r", "--no-streaming", apk);
+  await interaction("install", () => adb("install", "-r", "--no-streaming", apk));
   expect((await adb("shell", "pm", "clear", packageName)).trim()).toBe("Success");
   const installedPath = (await adb("shell", "pm", "path", packageName)).trim().replace(/^package:/u, "");
   if (!/^\/data\/app\/[^\s]+\/base\.apk$/u.test(installedPath)) throw new Error("Unexpected installed Android artifact path.");
-  expect((await adb("shell", "sha256sum", installedPath)).split(/\s/u)[0]).toBe(artifact.sha256);
+  const installedSha256 = (await adb("shell", "sha256sum", installedPath)).split(/\s/u)[0];
+  expect(installedSha256).toBe(artifact.sha256);
+  evidence!.artifact!.installedSha256 = installedSha256!;
   await adb("logcat", "-c");
+  await completeStep();
 
+  await beginStep("prepare-fixture");
   const profile = { ...PI_LIKE_PROFILE, capabilities: [
     ...PI_LIKE_PROFILE.capabilities,
     { key: capabilityNames.workspaceFiles, supported: true as const }
   ] };
-  fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: (entry) => new AndroidResourceAdapter(entry) });
+  fixture = await OrchestratorE2eFixture.start({ profiles: [profile], createAdapter: (entry) => new AndroidResourceAdapter(entry), collaborationGoals: true });
   const current = fixture;
   await mkdir(join(current.workspaceDirectory, "images"));
   await writeFile(join(current.workspaceDirectory, "images", "pixel.png"), Buffer.from(
@@ -109,14 +219,50 @@ nativeIt("pairs, sends through native rich input, opens canonical resources, and
   const manager = await current.pair("Android fixture manager");
   const sessionId = sessionIdFrom(await submit(manager.clients.operation, manager.connectionId,
     createSessionMutation({ backendId: profile.id, targetId: current.targetId(profile.id), displayName: taskName })));
+  const { mobileNetwork } = await vi.importActual<{ mobileNetwork: {
+    listWorkspaceDirectory(credential: { origin: string; authKey: string }, workspaceId: string, parent: string): Promise<{ entries: readonly unknown[] }>;
+    listWorkspaceFileIndex(credential: { origin: string; authKey: string }, workspaceId: string): Promise<{ paths: readonly string[] }>;
+    listSessionArtifacts(credential: { origin: string; authKey: string }, sessionId: string): Promise<{ artifacts: readonly unknown[] }>;
+  } }>("../../mobile/src/network.js");
+  const fixtureCredential = { origin: current.baseUrl, authKey: manager.authKey };
+  for (const [phase, read] of [
+    ["workspace-directory", async () => (await mobileNetwork.listWorkspaceDirectory(fixtureCredential, "workspace-main", "")).entries.length],
+    ["workspace-index", async () => (await mobileNetwork.listWorkspaceFileIndex(fixtureCredential, "workspace-main")).paths.length],
+    ["session-artifacts", async () => (await mobileNetwork.listSessionArtifacts(fixtureCredential, sessionId)).artifacts.length]
+  ] as const) {
+    let count: number;
+    try { count = await read(); }
+    catch {
+      evidence!.fixtureReadiness = { ...evidence!.fixtureReadiness, [phase]: { passed: false } };
+      await persistEvidence();
+      console.info(JSON.stringify({ phase: `android-fixture-${phase}`, passed: false }));
+      throw new Error(`The authenticated native fixture ${phase} read failed.`);
+    }
+    evidence!.fixtureReadiness = { ...evidence!.fixtureReadiness, [phase]: { passed: true, count } };
+    await persistEvidence();
+    console.info(JSON.stringify({ phase: `android-fixture-${phase}`, passed: true, count }));
+  }
   reversedPort = "tcp:" + new URL(current.baseUrl).port;
   await adb("reverse", reversedPort, reversedPort);
+  await completeStep();
 
+  await beginStep("pair-application");
   let mobileChallengeId: string | undefined;
   const removeListener = current.application.connections.onPairingIssued((challenge) => { mobileChallengeId = challenge.id; });
   try {
     await launch();
-    await tap("Add");
+    try {
+      await tap("Add Joko node");
+    } catch (error) {
+      // This first surface has no entered node address or pairing credential.
+      await screenshot("connection-error").catch(() => undefined);
+      throw error;
+    }
+    await waitFor(nodes, (items) => items.some((node) => node.enabled
+      && (node.text === "Joko node address" || node.contentDescription === "Joko node address"))
+      && items.some((node) => node.enabled && node.className === "android.widget.EditText"
+        && node.bounds.x2 > node.bounds.x1 && node.bounds.y2 > node.bounds.y1), "empty native node address field", 25_000);
+    await screenshot("connection-add");
     await fill("Joko node address", current.baseUrl);
     await tap("Check node identity");
     await tap("Request pairing", true);
@@ -124,31 +270,28 @@ nativeIt("pairs, sends through native rich input, opens canonical resources, and
     await fill("Pairing code", current.pairingCode(mobileChallengeId!), true);
     await tap("Pair this device", true);
   } finally { removeListener(); }
+  await completeStep();
 
+  await beginStep("open-task-header");
   await tap("Open task " + taskName);
   const screen = (await adb("shell", "wm", "size")).match(/(?:Physical|Override) size: (\d+)x(\d+)/gu)?.at(-1)
     ?.match(/(\d+)x(\d+)/u);
   if (!screen) throw new Error("The isolated native viewport was unavailable.");
   const screenWidth = Number(screen[1]);
-  const title = await waitNode((node) => node.text === taskName, "visible native task title");
-  expect(title.bounds.x2 - title.bounds.x1).toBeGreaterThan(screenWidth / 2);
-  for (const label of ["Back to Tasks", "Task actions"]) {
-    const button = await waitNode((node) => node.contentDescription === label, label);
-    expect(button.bounds.x1).toBeGreaterThanOrEqual(0);
-    expect(button.bounds.x2).toBeLessThanOrEqual(screenWidth);
-  }
+  const headerLabels = ["Back to Tasks", "Remote Desktop", "Files", "Task actions"];
+  const headerNodes = await waitFor(nodes, (items) => items.some((node) => node.text === taskName)
+    && headerLabels.every((label) => items.some((node) => node.contentDescription === label)), "visible native task header", 25_000);
   await screenshot("header");
+  const title = headerNodes.find((node) => node.text === taskName)!;
+  const headerControls = headerLabels.map((label) => headerNodes.find((node) => node.contentDescription === label)!);
+  assertTaskHeaderBounds(title, headerControls, screenWidth);
+  await completeStep();
+  await beginStep("task-actions-menu");
   await tap("Task actions");
-  const requiredActions = ["Branches", "Controls", "Copy task link", "Files", "Refresh"];
-  const actionNodes = await waitFor(nodes, (items) => requiredActions.every((label) => items.some((node) => node.contentDescription === label))
-    && items.some((node) => node.contentDescription?.startsWith("Context") === true), "the complete native task actions", 25_000);
-  await screenshot("actions");
-  for (const label of requiredActions) {
-    const item = actionNodes.find((node) => node.contentDescription === label)!;
-    expect(item.bounds.x1).toBeGreaterThanOrEqual(0);
-    expect(item.bounds.x2).toBeLessThanOrEqual(screenWidth);
-  }
+  await inspectTaskActions(screenWidth);
   await tap("Cancel");
+  await completeStep();
+  await beginStep("send-native-input");
   await fill("Task message", prompt);
   await tap("Send");
   await waitFor(async () => current.application.store.listRuns({ sessionId }),
@@ -172,6 +315,8 @@ nativeIt("pairs, sends through native rich input, opens canonical resources, and
     && event.payload.kind.value.blocks.some((block) => block.content.case === "text" && block.content.value === answer))).toBe(true);
 
   await screenshot("timeline");
+  await completeStep();
+  await beginStep("open-image-gallery");
   await tap("Workspace image", true);
   await waitNode((node) => node.text === "pixel.png" || node.contentDescription?.includes("pixel.png") === true, "native image gallery");
   await waitNode((node) => node.contentDescription === "Copy image" && node.enabled, "native gallery decode readiness");
@@ -181,60 +326,78 @@ nativeIt("pairs, sends through native rich input, opens canonical resources, and
     && items.some((node) => node.contentDescription === "Copy image" && node.enabled),
   "native gallery retained across scheduled observations", 22_000);
   await screenshot("gallery");
+  await completeStep();
+  await beginStep("zoom-image-gallery");
   const densityMatch = (await adb("shell", "wm", "density")).match(/(?:Physical|Override) density: (\d+)/gu)?.at(-1)?.match(/(\d+)/u);
   if (!densityMatch) throw new Error("The isolated native display density was unavailable.");
   const pixelsPerPoint = Number(densityMatch[1]) / 160;
   const canvas = await waitNode((node) => node.contentDescription === "Image preview pixel.png", "native gallery gesture canvas");
   const x = Math.round((canvas.bounds.x1 + canvas.bounds.x2) / 2);
   const y = Math.round((canvas.bounds.y1 + canvas.bounds.y2) / 2);
-  await adb("shell", `input tap ${x} ${y}; input tap ${x} ${y}`);
+  await interaction("double-tap", () => adb("shell", `input tap ${x} ${y}; input tap ${x} ${y}`));
   await waitNode((node) => node.text?.includes("2.5") === true, "native double-tap zoom");
-  await adb("shell", "input", "tap", String(x), String(y));
+  await interaction("tap", () => adb("shell", "input", "tap", String(x), String(y)));
   const zoomTapAt = Date.now();
   await waitFor(nodes, (items) => Date.now() - zoomTapAt >= 400
     && items.some((node) => node.text?.includes("2.5") === true)
     && items.some((node) => node.contentDescription === "Copy image" && node.enabled), "zoomed tap keeps the gallery open", 5_000);
   await screenshot("gallery-zoomed");
+  await completeStep();
+  await beginStep("short-image-drag");
   await tap("Reset");
   await waitNode((node) => node.text?.includes("1.0") === true, "native gallery zoom reset");
-  await adb("shell", "input", "swipe", String(x), String(y), String(x), String(y + Math.round(90 * pixelsPerPoint)), "900");
+  await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(y), String(x), String(y + Math.round(90 * pixelsPerPoint)), "900"));
   const shortDragAt = Date.now();
   await waitFor(nodes, (items) => Date.now() - shortDragAt >= 1_000
     && items.some((node) => node.contentDescription === "Copy image" && node.enabled), "short native vertical drag returns to the gallery", 5_000);
   await screenshot("gallery-drag-reset");
-  await adb("shell", "input", "tap", String(x), String(y));
+  await completeStep();
+  await beginStep("tap-dismiss-image");
+  await interaction("tap", () => adb("shell", "input", "tap", String(x), String(y)));
   await waitNode((node) => node.text === taskName, "task restored after a native gallery tap");
   await tap("Workspace image", true);
   await waitNode((node) => node.contentDescription === "Copy image" && node.enabled, "reopened native gallery decode readiness");
+  await completeStep();
+  await beginStep("vertical-dismiss-image");
   const verticalCanvas = await waitNode((node) => node.contentDescription === "Image preview pixel.png", "reopened native gesture canvas");
   const distance = Math.round(160 * pixelsPerPoint);
   expect(verticalCanvas.bounds.y2 - verticalCanvas.bounds.y1).toBeGreaterThan(distance + 20);
   const startY = Math.round(Math.min((verticalCanvas.bounds.y1 + verticalCanvas.bounds.y2) / 2, verticalCanvas.bounds.y2 - distance - 10));
-  await adb("shell", "input", "swipe", String(x), String(startY), String(x), String(startY + distance), "600");
+  await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(startY), String(x), String(startY + distance), "600"));
   await waitNode((node) => node.text === taskName, "task restored after a native vertical dismissal");
   await screenshot("gallery-dismissed");
+  await completeStep();
+  await beginStep("close-image-gallery");
   await tap("Workspace image", true);
   await waitNode((node) => node.contentDescription === "Copy image" && node.enabled, "gallery restored before explicit native close");
   await tap("Close");
   await waitNode((node) => node.text === taskName, "task restored after closing the gallery");
   await screenshot("resource-links");
+  await completeStep();
+  await beginStep("open-canonical-file");
   await tap("README.md:2:4", true, true);
   await waitNode((node) => node.text?.includes("focus line") === true, "canonical file contents");
   await screenshot("file-opened");
   await waitNode((node) => node.text === "Line 2" || node.contentDescription === "Line 2", "canonical file line focus");
+  await completeStep();
+  await beginStep("copy-file-source");
   await tap("Source");
   await tap("Copy source");
   await waitNode((node) => node.text === "Copied.", "native file source copy completion");
   await screenshot("file");
+  await completeStep();
 
-  await adb("shell", "am", "force-stop", packageName);
+  await beginStep("force-stop-and-reconnect");
+  await interaction("force-stop", () => adb("shell", "am", "force-stop", packageName));
   expect((await adb("shell", "pidof", packageName)).trim()).toBe("");
   await launch();
-  await tap("Saved (1)");
+  await tap("Saved nodes");
   await tap("Connect", true);
   await tap("Open task " + taskName);
   await waitNode((node) => node.text === taskName, "restored native task title");
   await scrollToNode((node) => node.text?.includes(prompt) === true, "persisted native task input");
+  await completeStep();
+  await beginStep("restore-canonical-file");
   await tap("README.md:2:4", true, true);
   await waitNode((node) => node.text?.includes("focus line") === true, "restored canonical file contents");
   await screenshot("restored");
@@ -244,7 +407,53 @@ nativeIt("pairs, sends through native rich input, opens canonical resources, and
   expect(await adb("logcat", "-b", "crash", "-d", "-v", "brief")).not.toMatch(/app\.joko\.mobile|ReactNativeJS|Hermes/u);
   const run = current.application.store.listRuns({ sessionId })[0]!;
   expect((await manager.clients.run.getRun({ runId: run.descriptor.id })).run?.state).toBe(RunState.SUCCEEDED);
-});
+  await completeStep();
+}
+
+function elapsed(): number { return Math.round(performance.now() - evidenceStarted); }
+
+async function persistEvidence(): Promise<void> {
+  if (evidence === undefined) return;
+  evidence.elapsedMs = elapsed();
+  const directory = join(dirname(apkPath!), "ui-evidence");
+  await mkdir(directory, { recursive: true });
+  const target = join(directory, "android-operations.json");
+  await writeFile(target + ".tmp", JSON.stringify(evidence, null, 2) + "\n");
+  await rename(target + ".tmp", target);
+}
+
+async function beginStep(name: EvidenceStepName): Promise<void> {
+  const definition = evidenceSteps[name];
+  activeStep = { name, action: definition.action, startedAfterMs: elapsed(), elapsedMs: 0,
+    result: "running", assertions: [], actions: [], screenshots: [] };
+  evidence!.steps.push(activeStep);
+  await persistEvidence();
+}
+
+async function completeStep(): Promise<void> {
+  activeStep!.result = "passed";
+  activeStep!.elapsedMs = elapsed() - activeStep!.startedAfterMs;
+  activeStep!.assertions = evidenceSteps[activeStep!.name].assertions.map(name => ({ name, passed: true }));
+  await persistEvidence();
+  activeStep = undefined;
+}
+
+async function interaction<T>(type: EvidenceAction, operation: () => Promise<T>): Promise<T> {
+  const action: EvidenceStep["actions"][number] = { type, startedAfterMs: elapsed(), elapsedMs: 0, result: "running" };
+  activeStep?.actions.push(action);
+  await persistEvidence();
+  try {
+    const result = await operation();
+    action.result = "passed";
+    return result;
+  } catch (error) {
+    action.result = "failed";
+    throw error;
+  } finally {
+    action.elapsedMs = elapsed() - action.startedAfterMs;
+    await persistEvidence();
+  }
+}
 
 async function adb(...args: string[]): Promise<string> {
   return new Promise((accept, reject) => {
@@ -256,6 +465,65 @@ async function adb(...args: string[]): Promise<string> {
         } else accept(stdout);
       });
   });
+}
+
+function assertTaskHeaderBounds(title: AndroidUiNode, controls: readonly AndroidUiNode[], screenWidth: number): void {
+  // Android's Text node reports its rendered text bounds, not the flex title
+  // slot. Check the real slot between the current leading/trailing controls.
+  expect(title.text).toBe(taskName);
+  expect(title.bounds.x2).toBeGreaterThan(title.bounds.x1);
+  expect(title.bounds.y2).toBeGreaterThan(title.bounds.y1);
+  const leading = controls.find((node) => node.contentDescription === "Back to Tasks")!;
+  const trailing = controls.filter((node) => node !== leading);
+  expect(title.bounds.x1).toBeGreaterThanOrEqual(leading.bounds.x2);
+  expect(title.bounds.x2).toBeLessThanOrEqual(Math.min(...trailing.map((node) => node.bounds.x1)));
+  expect(title.bounds.y1).toBeGreaterThanOrEqual(Math.min(...controls.map((node) => node.bounds.y1)));
+  expect(title.bounds.y2).toBeLessThanOrEqual(Math.max(...controls.map((node) => node.bounds.y2)));
+  for (const button of controls) {
+    expect(button.bounds.x1).toBeGreaterThanOrEqual(0);
+    expect(button.bounds.x2).toBeLessThanOrEqual(screenWidth);
+    expect(button.bounds.x2).toBeGreaterThan(button.bounds.x1);
+    expect(button.bounds.y2).toBeGreaterThan(button.bounds.y1);
+  }
+}
+
+async function inspectTaskActions(screenWidth: number): Promise<void> {
+  const required = ["Branches", "Controls", "Copy task link", "Files", "Refresh", "Context"];
+  const observed = new Set<string>();
+  let previousViewport: string | undefined;
+  let swipes = 0;
+  await waitFor(async () => {
+    const items = await nodes();
+    const viewport = items.filter((node) => node.scrollable && node.enabled
+      && node.bounds.x2 > node.bounds.x1 && node.bounds.y2 > node.bounds.y1)
+      .sort((left, right) => (right.bounds.x2 - right.bounds.x1) * (right.bounds.y2 - right.bounds.y1)
+        - (left.bounds.x2 - left.bounds.x1) * (left.bounds.y2 - left.bounds.y1))[0];
+    if (!viewport) return false;
+    const visible = items.filter((node) => node.contentDescription && node.bounds.x2 > node.bounds.x1 && node.bounds.y2 > node.bounds.y1
+      && node.bounds.x1 >= viewport.bounds.x1 && node.bounds.x2 <= viewport.bounds.x2
+      && node.bounds.y1 >= viewport.bounds.y1 && node.bounds.y2 <= viewport.bounds.y2);
+    for (const label of required) {
+      const item = visible.find((node) => label === "Context" ? node.contentDescription?.startsWith("Context") : node.contentDescription === label);
+      if (!item) continue;
+      expect(item.bounds.x1).toBeGreaterThanOrEqual(0);
+      expect(item.bounds.x2).toBeLessThanOrEqual(screenWidth);
+      observed.add(label);
+    }
+    if (required.every((label) => observed.has(label))) {
+      await screenshot(swipes === 0 ? "actions" : "actions-scrolled");
+      return true;
+    }
+    if (swipes === 0) await screenshot("actions");
+    const signature = JSON.stringify(visible.map((node) => [node.contentDescription, node.bounds]));
+    if (signature === previousViewport || swipes >= 7) throw new Error("The native task menu stopped before all required actions became visible.");
+    previousViewport = signature;
+    const x = Math.round((viewport.bounds.x1 + viewport.bounds.x2) / 2);
+    const inset = Math.max(1, Math.round((viewport.bounds.y2 - viewport.bounds.y1) * 0.15));
+    await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(viewport.bounds.y2 - inset),
+      String(x), String(viewport.bounds.y1 + inset), "300"));
+    swipes += 1;
+    return false;
+  }, (complete) => complete, "the complete visible native task actions", 25_000);
 }
 
 async function nodes(): Promise<readonly AndroidUiNode[]> {
@@ -285,12 +553,16 @@ async function scrollToNode(predicate: (node: AndroidUiNode) => boolean, label: 
   for (let attempt = 0; attempt < 7; attempt += 1) {
     const node = (await nodes()).find(predicate);
     if (node) return node;
-    await adb("shell", "input", "swipe", "540", "1850", "540", "800", "300");
+    await interaction("swipe", () => adb("shell", "input", "swipe", "540", "1850", "540", "800", "300"));
   }
   return waitNode(predicate, label);
 }
 
 async function tap(label: string, scroll = false, leadingText = false): Promise<void> {
+  await interaction("tap", () => tapSurface(label, scroll, leadingText));
+}
+
+async function tapSurface(label: string, scroll: boolean, leadingText: boolean): Promise<void> {
   const observedResources: string[] = [];
   for (let attempt = 0; attempt < (scroll ? 14 : 1); attempt += 1) {
     const candidates = await nodes();
@@ -327,8 +599,8 @@ async function tap(label: string, scroll = false, leadingText = false): Promise<
       const inset = Math.max(1, Math.round((viewport.bounds.y2 - viewport.bounds.y1) * 0.15));
       const top = viewport.bounds.y1 + inset;
       const bottom = viewport.bounds.y2 - inset;
-      await adb("shell", "input", "swipe", String(x), String(attempt < 7 ? bottom : top), String(x),
-        String(attempt < 7 ? top : bottom), "300");
+      await interaction("swipe", () => adb("shell", "input", "swipe", String(x), String(attempt < 7 ? bottom : top), String(x),
+        String(attempt < 7 ? top : bottom), "300"));
     }
   }
   let node: AndroidUiNode;
@@ -352,15 +624,19 @@ async function tapNode(node: AndroidUiNode, leadingText = false): Promise<void> 
 }
 
 async function fill(label: string, value: string, scroll = false): Promise<void> {
-  if (!/^[A-Za-z0-9 .,:/_+-]+$/u.test(value)) throw new Error("Native fixture input must be bounded shell-safe ASCII.");
-  await tap(label, scroll);
-  await adb("shell", "input", "keyevent", "--longpress", "KEYCODE_MOVE_END");
-  await adb("shell", "input", "text", value.replaceAll(" ", "%s"));
-  await adb("shell", "input", "keyevent", "KEYCODE_BACK");
+  await interaction("text-entry", async () => {
+    if (!/^[A-Za-z0-9 .,:/_+-]+$/u.test(value)) throw new Error("Native fixture input must be bounded shell-safe ASCII.");
+    await tap(label, scroll);
+    await adb("shell", "input", "keyevent", "--longpress", "KEYCODE_MOVE_END");
+    await adb("shell", "input", "text", value.replaceAll(" ", "%s"));
+    await adb("shell", "input", "keyevent", "KEYCODE_BACK");
+  });
 }
 
 async function launch(): Promise<void> {
-  expect(await adb("shell", "am", "start", "-W", "-n", packageName + "/.MainActivity")).toContain("Status: ok");
+  await interaction("launch", async () => {
+    expect(await adb("shell", "am", "start", "-W", "-n", packageName + "/.MainActivity")).toContain("Status: ok");
+  });
 }
 
 async function digest(path: string): Promise<string> {
@@ -369,11 +645,15 @@ async function digest(path: string): Promise<string> {
   return hash.digest("hex");
 }
 
-async function screenshot(name: string): Promise<void> {
+async function screenshot(name: EvidenceScreenshot): Promise<void> {
   const directory = join(dirname(apkPath!), "ui-evidence");
   await mkdir(directory, { recursive: true });
   const remote = "/sdcard/joko-native-" + name + ".png";
   await adb("shell", "screencap", "-p", remote);
-  await adb("pull", remote, join(directory, name + ".png"));
+  const file = name + ".png";
+  const local = join(directory, file);
+  await adb("pull", remote, local);
   await adb("shell", "rm", remote);
+  activeStep?.screenshots.push({ file, sha256: await digest(local), capturedAfterMs: elapsed() });
+  await persistEvidence();
 }

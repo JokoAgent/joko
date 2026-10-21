@@ -123,6 +123,7 @@ export function createDedicatedHardwareHostClient(options: {
     requestId?: string;
   } | undefined;
   let keymapInspectionTimer: unknown;
+  const pendingProbes = new Map<DedicatedHardwareModelId, string>();
 
   const publish = (model: DedicatedHardwareModelId, next: DedicatedHardwareConnectionSnapshot): void => {
     const prior = states.get(model);
@@ -164,6 +165,7 @@ export function createDedicatedHardwareHostClient(options: {
     clearTimer("handshake");
     clearTimer("stable");
     clearTimer("graceful");
+    pendingProbes.clear();
   };
 
   const nextRequestId = (): string => {
@@ -462,6 +464,12 @@ export function createDedicatedHardwareHostClient(options: {
       return;
     }
     if (message.kind === "ack") {
+      for (const [model, requestId] of pendingProbes) {
+        if (requestId === message.requestId) {
+          pendingProbes.delete(model);
+          return;
+        }
+      }
       for (const model of DEDICATED_HARDWARE_MODEL_IDS) {
         if (lightingPending.get(model) !== message.requestId) continue;
         lightingPending.delete(model);
@@ -600,7 +608,12 @@ export function createDedicatedHardwareHostClient(options: {
     probe: (model) => {
       assertModel(model);
       if (!ready || plannedExit !== undefined || desired.get(model)?.settings.enabled !== true) return false;
-      return send({ version: 1, generation, requestId: nextRequestId(), kind: "probe", model });
+      if (pendingProbes.has(model)) return true;
+      const requestId = nextRequestId();
+      pendingProbes.set(model, requestId);
+      if (send({ version: 1, generation, requestId, kind: "probe", model })) return true;
+      pendingProbes.delete(model);
+      return false;
     },
     inspectCreatorKeymapRecovery: () => {
       if (permanentlyStopped) {

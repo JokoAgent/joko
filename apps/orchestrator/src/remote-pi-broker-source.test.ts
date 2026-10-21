@@ -36,10 +36,13 @@ interface BrokerFrame {
 class FrameReader {
   readonly #iterator: AsyncIterator<Buffer | string>;
   #pending = Buffer.alloc(0);
+  #receivedBytes = 0;
 
   constructor(stream: Readable) {
     this.#iterator = stream[Symbol.asyncIterator]() as AsyncIterator<Buffer | string>;
   }
+
+  get receivedBytes(): number { return this.#receivedBytes; }
 
   async next(): Promise<BrokerFrame> {
     while (this.#pending.byteLength < 5) await this.#read();
@@ -53,10 +56,9 @@ class FrameReader {
   async #read(): Promise<void> {
     const next = await this.#iterator.next();
     if (next.done) throw new Error("Broker frame stream ended unexpectedly.");
-    this.#pending = Buffer.concat([
-      this.#pending,
-      typeof next.value === "string" ? Buffer.from(next.value) : next.value
-    ]);
+    const chunk = typeof next.value === "string" ? Buffer.from(next.value) : next.value;
+    this.#receivedBytes += chunk.byteLength;
+    this.#pending = Buffer.concat([this.#pending, chunk]);
   }
 }
 
@@ -520,13 +522,15 @@ function nonManagedBootstrap(
 async function startBridge(
   fixture: BrokerFixture,
   value: BrokerBootstrap,
-  commitAuthority = true
+  commitAuthority = true,
+  observeStartup = false
 ): Promise<{
   readonly process: ChildProcessWithoutNullStreams;
   readonly reader: FrameReader;
   readonly authority: AuthorityEnvelope;
   readonly state: AuthorityState;
 }> {
+  const startedAt = performance.now();
   const child = spawn(process.execPath, [
     fixture.sourcePath,
     "bridge",
@@ -539,14 +543,20 @@ async function startBridge(
     stdio: ["pipe", "pipe", "pipe"]
   });
   let diagnostics = "";
+  let stderrBytes = 0;
   child.stderr.on("data", (chunk: Buffer) => {
+    stderrBytes += chunk.byteLength;
     if (diagnostics.length < 16_384) diagnostics += chunk.toString("utf8");
   });
   child.stdin.write(`${JSON.stringify(value)}\n`);
   const reader = new FrameReader(child.stdout);
-  const control = await nextFrameOfType(reader, FRAME_AUTHORITY).catch((error: unknown) => {
+  const startupProgress = observeStartup && process.platform === "win32"
+    ? observeBridgeStartupProgress(fixture, startedAt) : undefined;
+  const control = await nextFrameOfType(reader, FRAME_AUTHORITY).catch(async (error: unknown) => {
+    startupProgress?.stop();
+    await reportBridgeStartupBoundary(fixture, child, reader, "authority-frame", startedAt, stderrBytes, startupProgress?.snapshot());
     throw new Error(`${error instanceof Error ? error.message : "Broker startup failed."}${diagnostics === "" ? "" : `\n${diagnostics}`}`);
-  });
+  }).finally(() => startupProgress?.stop());
   const declaredEnvironment = value["env"] as Record<string, string> | undefined;
   const currentBearer = declaredEnvironment?.["JOKO_PI_MCP_TOKEN"];
   if (currentBearer !== undefined) expect(control.content.toString("utf8")).not.toContain(currentBearer);
@@ -569,7 +579,8 @@ async function startBridge(
       authorityDigest: parsed.state.authorityDigest,
       attestation: parsed.authority.attestation
     }))));
-    const committedFrame = await nextFrameOfType(reader, FRAME_AUTHORITY_COMMIT_ACK).catch((error: unknown) => {
+    const committedFrame = await nextFrameOfType(reader, FRAME_AUTHORITY_COMMIT_ACK).catch(async (error: unknown) => {
+      await reportBridgeStartupBoundary(fixture, child, reader, "commit-ack", startedAt, stderrBytes, startupProgress?.snapshot());
       throw new Error(`${error instanceof Error ? error.message : "Broker commit failed."}${diagnostics === "" ? "" : `\n${diagnostics}`}`);
     });
     const committed = JSON.parse(committedFrame.content.toString("utf8")) as {
@@ -584,6 +595,132 @@ async function startBridge(
     });
   }
   return { process: child, reader, authority: parsed.authority, state: parsed.state };
+}
+
+interface BridgeStartupProgress {
+  readonly samples: number;
+  readonly observationErrors: number;
+  readonly sessionRootSeen: boolean;
+  readonly bootstrapSeenAtMs: number | null;
+  readonly ownerFingerprintSeenAtMs: number | null;
+  readonly childFingerprintSeenAtMs: number | null;
+  readonly ownerMetadataSeenAtMs: number | null;
+}
+
+function observeBridgeStartupProgress(fixture: BrokerFixture, startedAt: number): {
+  readonly snapshot: () => BridgeStartupProgress;
+  readonly stop: () => void;
+} {
+  const sessionRoot = join(fixture.managedRoot, "sessions", fixture.identity);
+  let active = true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const progress = {
+    samples: 0,
+    observationErrors: 0,
+    sessionRootSeen: false,
+    bootstrapSeenAtMs: null as number | null,
+    ownerFingerprintSeenAtMs: null as number | null,
+    childFingerprintSeenAtMs: null as number | null,
+    ownerMetadataSeenAtMs: null as number | null
+  };
+  const observe = async (): Promise<void> => {
+    try {
+      const [directory, bootstrap, metadata] = await Promise.all([
+        lstat(sessionRoot).catch(() => undefined),
+        (async () => {
+          const file = join(sessionRoot, "bootstrap.json");
+          const info = await lstat(file).catch(() => undefined);
+          if (info === undefined) return undefined;
+          if (!info.isFile() || info.isSymbolicLink() || info.size > 16 * 1024) throw new Error("Invalid fixture marker.");
+          const handle = await open(file, "r");
+          try {
+            const current = await handle.stat();
+            if (!current.isFile() || current.size > 16 * 1024) throw new Error("Invalid fixture marker.");
+            const buffer = Buffer.alloc(16 * 1024 + 1);
+            const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
+            if (bytesRead > 16 * 1024) throw new Error("Invalid fixture marker.");
+            return JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")) as { readonly owner?: unknown; readonly child?: unknown };
+          } finally {
+            await handle.close();
+          }
+        })(),
+        lstat(join(sessionRoot, "owner.json")).catch(() => undefined)
+      ]);
+      if (!active) return;
+      progress.samples += 1;
+      const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
+      if (directory?.isDirectory() && !directory.isSymbolicLink()) progress.sessionRootSeen = true;
+      if (bootstrap !== undefined) {
+        progress.bootstrapSeenAtMs ??= elapsedMs;
+        if (bootstrap.owner !== undefined) progress.ownerFingerprintSeenAtMs ??= elapsedMs;
+        if (bootstrap.child !== undefined) progress.childFingerprintSeenAtMs ??= elapsedMs;
+      }
+      if (metadata?.isFile() && !metadata.isSymbolicLink()) progress.ownerMetadataSeenAtMs ??= elapsedMs;
+    } catch {
+      if (active) progress.observationErrors += 1;
+    } finally {
+      // Observe owned fixture metadata only; never keep startup alive or change its deadline.
+      if (active && performance.now() - startedAt < 15_000) {
+        timer = setTimeout(() => { void observe(); }, 50);
+        timer.unref?.();
+      }
+    }
+  };
+  void observe();
+  return {
+    snapshot: () => ({ ...progress }),
+    stop: () => {
+      active = false;
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  };
+}
+
+async function reportBridgeStartupBoundary(
+  fixture: BrokerFixture,
+  child: ChildProcess,
+  reader: FrameReader,
+  phase: "authority-frame" | "commit-ack",
+  startedAt: number,
+  stderrBytes: number,
+  progress?: BridgeStartupProgress
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const sessionRoot = join(fixture.managedRoot, "sessions", fixture.identity);
+    const markers = [
+      ["startLockOwner", join(fixture.managedRoot, "start.lock", "owner.json")],
+      ["daemonLockOwner", join(fixture.managedRoot, "daemon.lock", "owner.json")],
+      ["daemonMetadata", join(fixture.managedRoot, "broker.json")],
+      ["sessionBootstrap", join(sessionRoot, "bootstrap.json")],
+      ["sessionOwner", join(sessionRoot, "owner.json")],
+      ["sessionReaped", join(sessionRoot, "reaped.json")],
+      ["sessionTombstone", join(fixture.managedRoot, "sessions", `${fixture.identity}.tombstone.json`)]
+    ] as const;
+    const observations = await Promise.race([
+      Promise.all(markers.map(async ([name, path]) => {
+        const present = await lstat(path).then(info => info.isFile() && !info.isSymbolicLink(),
+          (error: unknown) => (error as NodeJS.ErrnoException).code === "ENOENT" ? false : null);
+        return [name, present] as const;
+      })),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("Fixture observation deadline.")), 250);
+      })
+    ]);
+    const signal = child.signalCode === null ? null
+      : ["SIGTERM", "SIGKILL", "SIGABRT", "SIGSEGV", "SIGINT"].includes(child.signalCode) ? child.signalCode : "other";
+    console.error("[remote-pi-broker-startup-boundary]", JSON.stringify({
+      phase, elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      exitCode: child.exitCode, signal, stdoutBytes: reader.receivedBytes, stderrBytes,
+      markers: Object.fromEntries(observations), progress
+    }));
+  } catch {
+    try {
+      console.error("[remote-pi-broker-startup-boundary]", JSON.stringify({ phase, receiptUnavailable: true }));
+    } catch { /* Observations must not replace the original protocol failure. */ }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 async function startRejectedBridge(
@@ -1018,6 +1155,48 @@ describe("remote Pi broker source", () => {
     expect(expected).not.toContain("opaque-runtime-value");
   });
 
+  it.runIf(process.platform === "win32")("queries exact Windows identities without module auto-loading", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-broker-query-"));
+    const sourcePath = join(root, "query.mjs");
+    const prelude = "'$ErrorActionPreference = \"Stop\"',";
+    const harness = REMOTE_PI_BROKER_SOURCE
+      .replace(prelude, `${prelude}\n    '$PSModuleAutoLoadingPreference = "None"',`)
+      .replace("main().catch(() => process.exit(1));", String.raw`
+windowsProcessFingerprint(process.pid).then(async (value) => {
+  if (value === undefined) return process.stdout.write(JSON.stringify({ found: false }));
+  const expectedExecutable = await realpath(process.execPath);
+  process.stdout.write(JSON.stringify({
+    found: true,
+    executableMatches: sameNativePath(value.executable, expectedExecutable),
+    exactArguments: exactProcessArguments(value.args, [process.execPath, process.argv[1]]),
+    startIdentity: /^[0-9]+$/.test(value.startTicks),
+    commandHashMatches: value.commandHash === digestBytes(Buffer.from(value.args.join("\0") + "\0")),
+    executableHashMatches: value.executableHash === digestBytes(Buffer.from(value.executable))
+  }));
+}).catch(() => process.exit(1));
+`);
+    expect(harness).not.toBe(REMOTE_PI_BROKER_SOURCE);
+    await writeFile(sourcePath, harness, { mode: 0o600 });
+    try {
+      const environment: Record<string, string> = { JOKO_REMOTE_BROKER_SOURCE_HASH: REMOTE_PI_BROKER_SOURCE_SHA256 };
+      for (const name of ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LC_ALL", "TMPDIR", "TMP", "TEMP", "SystemRoot", "WINDIR"]) {
+        const value = process.env[name];
+        if (value !== undefined) environment[name] = value;
+      }
+      const result = spawnSync(process.execPath, [sourcePath], {
+        env: environment, encoding: "utf8", windowsHide: true, timeout: 8_000
+      });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual({
+        found: true, executableMatches: true, exactArguments: true,
+        startIdentity: true, commandHashMatches: true, executableHashMatches: true
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   it.runIf(process.platform === "linux")(
     "rejects a regular file changed or replaced while its bytes are being read",
     async () => {
@@ -1080,7 +1259,7 @@ describe("remote Pi broker source", () => {
       let finalAuthority: AuthorityEnvelope | undefined;
       try {
         const firstBootstrap = bootstrap(fixture, 1, currentBearerOne, firstUpstream.port);
-        firstBridge = await startBridge(fixture, firstBootstrap);
+        firstBridge = await startBridge(fixture, firstBootstrap, true, true);
         firstBridge.process.stdin.write(sequencedFrame(FRAME_STDIN, 1, Buffer.from("call\n")));
         const firstOutput = sequenced(await nextFrameOfType(firstBridge.reader, FRAME_STDOUT));
         expect(firstOutput.content.toString("utf8")).toContain("response:");
@@ -1116,7 +1295,7 @@ describe("remote Pi broker source", () => {
           firstBridge.authority,
           prefixOutput.sequence
         );
-        secondBridge = await startBridge(fixture, secondBootstrap);
+        secondBridge = await startBridge(fixture, secondBootstrap, true, true);
         finalAuthority = secondBridge.authority;
         expect(secondBridge.authority.epoch).toBe(firstBridge.authority.epoch + 1);
         expect(secondBridge.authority.childProcessLaunchHash).toBe(firstBridge.authority.childProcessLaunchHash);

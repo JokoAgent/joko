@@ -1,8 +1,9 @@
 import { mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fork } from "node:child_process";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ExtensionLibrarySqlService,
@@ -161,8 +162,9 @@ describe("ExtensionLibrarySqlService", () => {
     const heartbeat = new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 25));
     const runaway = service.execute(opened.handleId, `
       WITH RECURSIVE counter(value) AS (
-        VALUES(0) UNION ALL SELECT value + 1 FROM counter WHERE value < 10000000
-      ) SELECT sum(value) AS total FROM counter
+        -- Keep this query running on every CPU until the real owner deadline.
+        VALUES(0) UNION ALL SELECT value + 1 FROM counter
+      ) SELECT count(*) AS total FROM counter
     `);
 
     await expect(heartbeat).resolves.toBe(true);
@@ -171,5 +173,72 @@ describe("ExtensionLibrarySqlService", () => {
       .rejects.toMatchObject({ code: "UNAVAILABLE" });
     await expect(service.open({ path: "bounded-worker.sqlite", readonly: true }))
       .rejects.toMatchObject({ code: "UNAVAILABLE" });
+    await service.closeAll();
   });
+
+  it("retires a native query process when its owning host dies without running IPC disconnect", async () => {
+    const { root, service } = await fixture();
+    const directory = await mkdtemp(join(tmpdir(), "joko-library-parent-exit-"));
+    cleanups.push(() => rm(directory, { recursive: true, force: true }));
+    const script = join(directory, "owner.mjs");
+    await writeFile(script, `
+      import { fork } from 'node:child_process';
+      const parser = fork(new URL(${JSON.stringify(new URL("./extension-library-sql-worker.ts", import.meta.url).href)}), [], {
+        execArgv: ['--max-old-space-size=256', '--import', ${JSON.stringify(import.meta.resolve("tsx"))}], serialization: 'advanced',
+        stdio: ['ignore', 'ignore', 'ignore', 'ipc'], windowsHide: true,
+        env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR,
+          TEMP: process.env.TEMP, TMP: process.env.TMP, JOKO_PARENT_PROCESS_ID: String(process.pid),
+          ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }
+      });
+      let settled = false;
+      parser.on('message', value => {
+        if (value.kind === 'mutation_fence') { parser.send({ kind: 'mutation_fence', id: value.id, allowed: true }); return; }
+        if (value.id === 1 && value.ok) {
+          parser.send({ id: 2, operation: 'execute', handleId: value.value.handleId,
+            sql: 'WITH RECURSIVE counter(value) AS (VALUES(0) UNION ALL SELECT value + 1 FROM counter) SELECT count(*) AS total FROM counter', parameters: [] });
+          setTimeout(() => process.send?.({ kind: 'native-query-pending', parserPid: parser.pid, settled }), 250);
+        } else if (value.id === 2) settled = true;
+        else process.send?.({ kind: 'startup-error', code: value.error?.code });
+      });
+      parser.once('error', error => process.send?.({ kind: 'startup-error', code: error.code }));
+      parser.once('exit', () => process.send?.({ kind: 'startup-error', code: 'child-exited' }));
+      parser.send({ kind: 'startup', root: ${JSON.stringify(root)}, extensionId: ${JSON.stringify(EXTENSION_ID)}, limits: ${JSON.stringify(service.limits)} });
+      parser.send({ id: 1, operation: 'open', input: { path: 'running.sqlite', create: true } });
+    `);
+    const host = fork(script, [], { execArgv: [], serialization: "advanced", stdio: ["ignore", "ignore", "ignore", "ipc"],
+      env: { PATH: process.env["PATH"], SystemRoot: process.env["SystemRoot"], WINDIR: process.env["WINDIR"],
+        TEMP: process.env["TEMP"], TMP: process.env["TMP"], ...(process.versions["electron"] ? { ELECTRON_RUN_AS_NODE: "1" } : {}) } });
+    let parserPid: number | undefined;
+    const exists = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; } };
+    try {
+      const ready = await new Promise<{ parserPid: number; settled: boolean }>((accept, reject) => {
+        const timer = setTimeout(() => reject(new Error("The isolated native-query host did not start.")), 15_000);
+        host.once("error", error => { clearTimeout(timer); reject(error); });
+        host.once("exit", () => { clearTimeout(timer); reject(new Error("The native-query host exited before readiness.")); });
+        host.once("message", value => {
+          clearTimeout(timer);
+          if (typeof value === "object" && value !== null && "kind" in value && value.kind === "startup-error") {
+            reject(new Error(`Isolated fixture startup failed: ${JSON.stringify(value)}`)); return;
+          }
+          accept(value as { parserPid: number; settled: boolean });
+        });
+      });
+      const candidatePid = ready.parserPid;
+      expect(Number.isSafeInteger(candidatePid) && candidatePid > 1 && candidatePid !== process.pid && candidatePid !== host.pid).toBe(true);
+      parserPid = candidatePid;
+      expect(ready.settled).toBe(false);
+      expect(exists(parserPid)).toBe(true);
+      const hostClosed = new Promise<void>((accept) => host.once("close", () => accept()));
+      expect(host.kill("SIGKILL")).toBe(true);
+      await hostClosed;
+      await vi.waitFor(() => expect(exists(parserPid!)).toBe(false), { timeout: 5_000, interval: 25 });
+    } finally {
+      if (host.exitCode === null && host.signalCode === null) host.kill("SIGKILL");
+      if (parserPid !== undefined && exists(parserPid)) {
+        // This PID came from the exact fork receipt above, never a process scan.
+        process.kill(parserPid, "SIGKILL");
+        await vi.waitFor(() => expect(exists(parserPid!)).toBe(false), { timeout: 2_000, interval: 25 });
+      }
+    }
+  }, 25_000);
 });

@@ -52,6 +52,7 @@ interface SmokePackagedHelpers {
   readonly filesHaveEqualContents: (left: string, right: string) => boolean;
   readonly finalizeSmokeRun: (options: {
     readonly runJourney: () => Promise<unknown>;
+    readonly preserveEvidence?: (result: { readonly passed: boolean; readonly payload: unknown }) => Promise<void> | void;
     readonly cleanupTemporaryDirectory: () => Promise<void> | void;
     readonly retainFailure: boolean;
     readonly reportRetained: () => void;
@@ -107,6 +108,9 @@ describe("packaged Desktop smoke helpers", () => {
         order.push("journey");
         return { event: "ok" };
       },
+      preserveEvidence: ({ passed, payload }) => {
+        expect(passed).toBe(true); expect(payload).toEqual({ event: "ok" }); order.push("evidence");
+      },
       cleanupTemporaryDirectory: () => { order.push("cleanup"); },
       retainFailure: false,
       reportRetained: vi.fn(),
@@ -114,7 +118,7 @@ describe("packaged Desktop smoke helpers", () => {
     });
 
     expect(result).toEqual({ event: "ok" });
-    expect(order).toEqual(["journey", "cleanup", "success"]);
+    expect(order).toEqual(["journey", "evidence", "cleanup", "success"]);
 
     const emitSuccess = vi.fn();
     await expect(helpers.finalizeSmokeRun({

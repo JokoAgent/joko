@@ -10,6 +10,11 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["task.renameSuggest", "Suggest title", "AI 起名", "AI 命名", "タイトルを提案", "제목 제안"],
+  ["task.renameSuggesting", "Suggesting title…", "正在生成标题…", "正在產生標題…", "タイトルを提案中…", "제목 제안 중…"],
+  ["task.renameNoMaterial", "There is not enough conversation to suggest a title. You can enter one.", "对话内容不足，可手动输入标题。", "對話內容不足，可手動輸入標題。", "会話の内容が不足しています。タイトルを入力できます。", "대화 내용이 부족합니다. 제목을 직접 입력할 수 있습니다."],
+  ["task.renameProviderUnavailable", "Title generation is unavailable. You can enter a title or retry.", "暂时无法生成标题，可手动输入或重试。", "暫時無法產生標題，可手動輸入或重試。", "タイトルの生成を利用できません。入力するか再試行してください。", "제목 생성을 사용할 수 없습니다. 직접 입력하거나 다시 시도하세요."],
+  ["task.renameFailed", "A title could not be suggested. Your draft is retained; you can retry.", "标题生成失败，已保留草稿，可重试。", "標題產生失敗，已保留草稿，可重試。", "タイトルを提案できませんでした。下書きは保持されています。再試行できます。", "제목을 제안하지 못했습니다. 초안은 유지되며 다시 시도할 수 있습니다."],
   ["task.modelSubstitution", "This turn used {actual} instead of the selected model {selected}.", "本轮使用了 {actual}，所选模型为 {selected}。", "此回合使用了 {actual}，選取的模型為 {selected}。", "このターンは選択した {selected} ではなく {actual} を使用しました。", "이 차례에는 선택한 {selected} 대신 {actual}을 사용했습니다."],
   ["task.messageTokens", "{tokens} tokens", "{tokens} tokens", "{tokens} tokens", "{tokens} トークン", "{tokens} 토큰"],
   ["task.messageCost", "Cost this turn: {cost}", "本轮费用：{cost}", "此回合費用：{cost}", "このターンの費用: {cost}", "이 차례 비용: {cost}"],
@@ -29,6 +34,7 @@ const mobileTaskMessageRows = [
   ["actions.copyMessage", "Copy message", "复制消息", "複製訊息", "メッセージをコピー", "메시지 복사"],
   ["actions.copyingMessage", "Copying message…", "正在复制消息…", "正在複製訊息…", "メッセージをコピー中…", "메시지 복사 중…"],
   ["actions.messageCopied", "Message copied", "已复制消息", "已複製訊息", "メッセージをコピーしました", "메시지를 복사했습니다"],
+  ["actions.messageAttachments", "Attachments: {names}", "附件：{names}", "附件：{names}", "添付ファイル: {names}", "첨부 파일: {names}"],
   ["actions.copyMessageFailed", "The message could not be copied. Try again.", "消息复制失败，请重试。", "訊息複製失敗，請重試。", "メッセージをコピーできませんでした。再試行してください。", "메시지를 복사하지 못했습니다. 다시 시도하세요."],
   ["actions.copyMessageUnknown", "The clipboard result is unconfirmed. Check it before copying again.", "剪贴板结果尚未确认，再次复制前请先检查。", "剪貼簿結果尚未確認，再次複製前請先檢查。", "クリップボードの結果は未確認です。再度コピーする前に確認してください。", "클립보드 결과가 확인되지 않았습니다. 다시 복사하기 전에 확인하세요."],
   ["task.messageSource", "From another task", "来自其他任务", "來自其他任務", "別のタスクから", "다른 작업에서 보냄"],
@@ -395,6 +401,7 @@ const mobileTaskMessageRows = [
   ["task.error.quoteComposerChanged", "The task composer changed while the quote was being selected. Select it again.", "选择引文时任务编辑器发生了变化。请重新选择。", "選取引文時任務編輯器發生了變更。請重新選取。", "引用の選択中にタスク入力欄が変更されました。もう一度選択してください。", "인용을 선택하는 동안 작업 작성기가 변경되었습니다. 다시 선택하세요."],
   ["task.error.quoteUnavailable", "Only a current completed assistant text message can be quoted.", "只能引用当前已完成的助手文本消息。", "只能引用目前已完成的助理文字訊息。", "現在の完了済みアシスタントテキストメッセージだけを引用できます。", "현재 완료된 어시스턴트 텍스트 메시지만 인용할 수 있습니다."],
   ["task.error.messageNotDeletable", "This message is no longer deletable in the current idle task.", "当前空闲任务中已无法删除此消息。", "目前閒置任務中已無法刪除此訊息。", "現在のアイドル状態のタスクでは、このメッセージを削除できません。", "현재 유휴 작업에서 이 메시지를 더 이상 삭제할 수 없습니다."],
+  ["task.error.messageReferenceFailed", "The message could not be added to this draft. Open its actions and try again.", "无法将消息添加到当前草稿，请重新打开消息操作后重试。", "無法將訊息加入目前草稿，請重新開啟訊息操作後再試。", "メッセージをこの下書きに追加できませんでした。操作メニューを開いて再試行してください。", "메시지를 이 초안에 추가하지 못했습니다. 메시지 작업을 열고 다시 시도하세요."],
   ["task.error.commandOwnerChanged", "The task draft or command owner changed. Type the slash command again.", "任务草稿或命令所有者已变化。请重新输入斜杠命令。", "任務草稿或命令擁有者已變更。請重新輸入斜線命令。", "タスク下書きまたはコマンド所有者が変更されました。スラッシュコマンドを再入力してください。", "작업 초안 또는 명령 소유자가 변경되었습니다. 슬래시 명령을 다시 입력하세요."],
   ["task.error.commandInsertChanged", "The task draft changed before the runtime command could be inserted.", "插入运行时命令前任务草稿发生了变化。", "插入執行階段命令前任務草稿發生了變更。", "ランタイムコマンドを挿入する前にタスク下書きが変更されました。", "런타임 명령을 삽입하기 전에 작업 초안이 변경되었습니다."],
   ["task.error.commandInvalid", "This app command is unavailable here or its syntax is invalid. The draft was retained.", "此应用命令在这里不可用或语法无效。草稿已保留。", "此應用程式命令在此處無法使用或語法無效。草稿已保留。", "このアプリコマンドはここでは利用できないか、構文が無効です。下書きは保持されました。", "이 앱 명령은 여기서 사용할 수 없거나 구문이 잘못되었습니다. 초안은 보관되었습니다."],

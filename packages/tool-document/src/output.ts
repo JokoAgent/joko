@@ -116,9 +116,21 @@ async function invokeWriter(request: WriterRequest, signal: AbortSignal | undefi
       finished = true;
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
-      child.kill();
-      if (error !== undefined) reject(error);
-      else resolveResult(result!);
+      const settle = (): void => {
+        if (error !== undefined) reject(error);
+        else resolveResult(result!);
+      };
+      if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+        settle();
+        return;
+      }
+      // The writer's cwd retains the task directory until OS exit, including
+      // after kill() succeeds. Do not return while that owner still holds it.
+      const retirementDeadline = setTimeout(() => reject(new DocumentOutputError(
+        "OUTPUT_FAILED", "Document writer exit could not be confirmed."
+      )), 1_000);
+      child.once("exit", () => { clearTimeout(retirementDeadline); settle(); });
+      try { child.kill("SIGKILL"); } catch { /* An actual exit receipt is still required. */ }
     };
     const abort = (): void => finish(undefined, new DocumentOutputError("OUTPUT_FAILED", "Document output was cancelled."));
     const timer = setTimeout(() => finish(undefined, new DocumentOutputError("OUTPUT_FAILED", "Document output timed out.")), WRITE_TIMEOUT_MS);

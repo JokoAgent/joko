@@ -12,6 +12,7 @@ import {
   BackendInstanceRegistry,
   BlobTransferCoordinator,
   ConnectionManager,
+  CollaborationGoalManager,
   ContactManager,
   DevicePeerOwner,
   LanDiscoveryService,
@@ -27,7 +28,10 @@ import {
   ReviewCoordinator,
   RemoteExecutionRouter,
   RemoteWorkspaceService,
+  RuntimeGovernanceSettingsRepository,
   ScheduleCoordinator,
+  ScheduleHookScriptInstaller,
+  createScheduleHookScriptGenerator,
   SessionHost,
   availableBackendProviderIds,
   withSessionReferenceCapability,
@@ -51,6 +55,7 @@ import {
 } from "@joko/testkit";
 
 import { createE2eClients, type E2eClients, type PairedClient } from "./connect-clients.js";
+import { conditionTimeoutMs } from "./test-deadlines.js";
 
 export type { E2eClients, PairedClient } from "./connect-clients.js";
 
@@ -62,6 +67,7 @@ type FixtureAuxiliaryServices = Pick<OrchestratorApplication,
 
 export interface FixtureOptions {
   readonly taskSharing?: boolean;
+  readonly collaborationGoals?: boolean;
   readonly serverId?: string;
   readonly rootDirectory?: string;
   readonly webDirectory?: string;
@@ -351,6 +357,12 @@ export class OrchestratorE2eFixture {
     await historyMaintenance.initialize();
     const scheduler = new ScheduleCoordinator(store, sessionHost, { tickMs: 25 });
     scheduler.start();
+    const scheduleHookScripts = new ScheduleHookScriptInstaller(auxiliaryServices?.providers === undefined ? {} : {
+      generate: createScheduleHookScriptGenerator(auxiliaryServices.providers, {
+        store,
+        adapters: () => backendInstances.availableAdapters()
+      })
+    });
 
     const config: OrchestratorConfig = {
       host: "127.0.0.1",
@@ -441,6 +453,11 @@ export class OrchestratorE2eFixture {
       workspaceService: workspaces,
       homesRoot: join(dataDirectory, "partner-homes")
     });
+    const runtimeGovernance = options.collaborationGoals ? new RuntimeGovernanceSettingsRepository({ store }) : undefined;
+    const collaborationGoals = runtimeGovernance === undefined ? undefined : new CollaborationGoalManager({
+      store, sessionHost, readSettings: () => runtimeGovernance.collaboration()
+    });
+    await collaborationGoals?.initialize();
     const taskSharingHome = options.taskSharing ? new TaskSharingHome({ directory: join(dataDirectory, "task-sharing-home"),
       serverId, vault: await CredentialVault.open(join(dataDirectory, "credentials", "master.key")) }) : undefined;
     await taskSharingHome?.initialize();
@@ -465,6 +482,7 @@ export class OrchestratorE2eFixture {
       objectives,
       reviewCoordinator,
       scheduler,
+      scheduleHookScripts,
       get adapters() {
         return backendInstances.availableAdapters();
       },
@@ -477,6 +495,7 @@ export class OrchestratorE2eFixture {
       browserActivity: [],
       contacts,
       partners,
+      ...(collaborationGoals === undefined ? {} : { collaborationGoals }),
       ...(taskSharingHome === undefined ? {} : { taskSharingHome }),
       registerServiceCleanup(cleanup) { serviceCleanups.add(cleanup); return () => serviceCleanups.delete(cleanup); },
       ...(options.terminals === undefined ? {} : { terminals: options.terminals }),
@@ -490,6 +509,7 @@ export class OrchestratorE2eFixture {
         };
         for (const cleanup of serviceCleanups) await attempt(cleanup);
         await attempt(() => taskSharingHome?.dispose());
+        await attempt(() => collaborationGoals?.close());
         await attempt(() => scheduler.stop());
         await attempt(() => auxiliaryServices?.sessionNavigation?.dispose());
         await attempt(() => auxiliaryServices?.auxiliaryText?.dispose());
@@ -618,7 +638,7 @@ export async function waitFor<T>(
   read: () => Promise<T>,
   predicate: (value: T) => boolean,
   label: string,
-  timeoutMs = 5_000
+  timeoutMs = conditionTimeoutMs
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   let last: T;

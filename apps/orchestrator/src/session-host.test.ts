@@ -4673,44 +4673,79 @@ describe("SessionHost", () => {
   });
 
   it("accounts cumulative delegated-run usage independently without inflating parent context", async () => {
-    const fixture = await createFixture(new DelegatedUsageFakeAdapter());
-    const sessionId = (await fixture.host.createSession({
-      operationId: "create-delegated-usage",
-      connection: fixture.connection,
-      targetId: "target-one",
-      title: "Delegated usage",
-      providerId: "test",
-      modelId: "text",
-      fastMode: false,
-      permissionMode: "ask",
-      planMode: false
-    })).value.sessionId;
-    const queued = fixture.host.enqueueInput({
-      operationId: "send-delegated-usage",
-      connection: fixture.connection,
-      sessionId,
-      prompt: { text: "delegate", images: [], files: [], mentions: [], disposition: "prompt" }
-    });
-    await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
+    let phase = "create-fixture";
+    let inspectBoundary: () => Record<string, unknown> = () => ({});
+    try {
+      const fixture = await createFixture(new DelegatedUsageFakeAdapter());
+      let sessionId: string | undefined;
+      let runId: string | undefined;
+      inspectBoundary = () => {
+        const run = runId === undefined ? undefined : fixture.store.getRun(runId).descriptor;
+        const usage = sessionId === undefined ? undefined : materializedSessionRuntimeState(
+          fixture.store.findSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY)?.value
+        )?.usage;
+        const ledger = fixture.store.summarizeUsageLedger({ ownerId: "orchestrator" });
+        return {
+          runState: run?.state ?? "not-created",
+          parentTotalTokens: usage?.totalTokens ?? null,
+          parentContextTokens: usage?.contextTokens ?? null,
+          runTotalTokens: run?.usage?.totalTokens ?? null,
+          ledgerTotalTokens: ledger.totalTokens,
+          ledgerCostMicros: ledger.costMicros,
+          ledgerRows: fixture.store.listUsageLedger({ ownerId: "orchestrator" }).length
+        };
+      };
+      phase = "create-session";
+      sessionId = (await fixture.host.createSession({
+        operationId: "create-delegated-usage",
+        connection: fixture.connection,
+        targetId: "target-one",
+        title: "Delegated usage",
+        providerId: "test",
+        modelId: "text",
+        fastMode: false,
+        permissionMode: "ask",
+        planMode: false
+      })).value.sessionId;
+      phase = "enqueue-input";
+      const queued = fixture.host.enqueueInput({
+        operationId: "send-delegated-usage",
+        connection: fixture.connection,
+        sessionId,
+        prompt: { text: "delegate", images: [], files: [], mentions: [], disposition: "prompt" }
+      });
+      runId = queued.value.runId;
+      phase = "await-completed-run";
+      await eventually(() => fixture.store.getRun(queued.value.runId).descriptor.state === "completed");
 
-    const runtimeUsage = materializedSessionRuntimeState(
-      fixture.store.getSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY).value
-    )?.usage;
-    expect(runtimeUsage).toMatchObject({ totalTokens: 20, contextTokens: 20, contextWindow: 32_000 });
-    const ledger = fixture.store.listUsageLedger({ ownerId: "orchestrator" });
-    expect(ledger.find((row) => row.providerId === "test" && row.modelId === "text"))
-      .toMatchObject({ totalTokens: 20, costMicros: 1_000 });
-    expect(ledger.find((row) => row.providerId === "vision" && row.modelId === "multimodal"))
-      .toMatchObject({ inputTokens: 20, outputTokens: 10, totalTokens: 30, costMicros: 5_000 });
-    expect(fixture.store.summarizeUsageLedger({ ownerId: "orchestrator" }))
-      .toMatchObject({ inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000 });
-    const completion = fixture.store.listEvents({ sessionId }).find(event => event.runId === queued.value.runId
-      && event.payload.type === "message_complete" && event.payload.role === "assistant");
-    expect(completion).toBeDefined();
-    expect(fixture.store.getRun(queued.value.runId).descriptor.usage).toMatchObject({
-      inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000, currencyCode: "USD",
-      completionEventId: completion!.id, messageId: completion!.id
-    });
+      phase = "assert-runtime-and-ledger";
+      const runtimeUsage = materializedSessionRuntimeState(
+        fixture.store.getSetting("session", sessionId, SESSION_RUNTIME_STATE_SETTING_KEY).value
+      )?.usage;
+      expect(runtimeUsage).toMatchObject({ totalTokens: 20, contextTokens: 20, contextWindow: 32_000 });
+      const ledger = fixture.store.listUsageLedger({ ownerId: "orchestrator" });
+      expect(ledger.find((row) => row.providerId === "test" && row.modelId === "text"))
+        .toMatchObject({ totalTokens: 20, costMicros: 1_000 });
+      expect(ledger.find((row) => row.providerId === "vision" && row.modelId === "multimodal"))
+        .toMatchObject({ inputTokens: 20, outputTokens: 10, totalTokens: 30, costMicros: 5_000 });
+      expect(fixture.store.summarizeUsageLedger({ ownerId: "orchestrator" }))
+        .toMatchObject({ inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000 });
+      const completion = fixture.store.listEvents({ sessionId }).find(event => event.runId === queued.value.runId
+        && event.payload.type === "message_complete" && event.payload.role === "assistant");
+      expect(completion).toBeDefined();
+      phase = "assert-run-completion-usage";
+      expect(fixture.store.getRun(queued.value.runId).descriptor.usage).toMatchObject({
+        inputTokens: 32, outputTokens: 18, totalTokens: 50, costMicros: 6_000, currencyCode: "USD",
+        completionEventId: completion!.id, messageId: completion!.id
+      });
+    } catch (error) {
+      try {
+        console.error("[delegated-usage-boundary]", JSON.stringify({ phase, ...inspectBoundary() }));
+      } catch {
+        console.error("[delegated-usage-boundary]", JSON.stringify({ phase, diagnosticsUnavailable: true }));
+      }
+      throw error;
+    }
   });
 
   it("records a terminal Provider limit for the effective turn model and clears it after live usage succeeds", async () => {
@@ -5423,6 +5458,58 @@ describe("SessionHost", () => {
     expect(adapter.sendCalls).toBe(1); expect(fenced).toHaveBeenCalledTimes(mode === "fenced" ? 1 : 0);
   });
 
+  it.each(["accepted", "rejected"] as const)("preserves cancellation when an in-flight dispatch is later %s", async (outcome) => {
+    const adapter = new FakeBackendAdapter(PI_LIKE_PROFILE);
+    const gate = new AsyncGate();
+    vi.spyOn(adapter, "send").mockImplementationOnce(async () => {
+      gate.enter();
+      await gate.wait;
+      if (outcome === "rejected") throw new Error("Dispatch interrupted after cancellation");
+    });
+    const idle = vi.fn();
+    const fixture = await createFixture(adapter, { onBackendMayBeIdle: idle });
+    const sessionId = (await fixture.host.createSession({
+      operationId: `create-cancelled-dispatch-${outcome}`,
+      connection: fixture.connection,
+      targetId: "target-one",
+      title: "Cancelled dispatch",
+      fastMode: false,
+      permissionMode: "ask",
+      planMode: false
+    })).value.sessionId;
+    const queued = fixture.host.enqueueInput({
+      operationId: `cancelled-dispatch-${outcome}`,
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "cancel while dispatching", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    await gate.entered;
+    const cancelled = fixture.store.cancelQueueItem({
+      queueItemId: queued.value.queueItemId,
+      traceId: "test:cancel-in-flight-dispatch"
+    });
+    const aborted = fixture.store.getRun(queued.value.runId);
+    const transition = vi.spyOn(fixture.store, "updateQueueState");
+    const next = fixture.host.enqueueInput({
+      operationId: `after-cancelled-dispatch-${outcome}`,
+      connection: fixture.connection,
+      sessionId,
+      prompt: { text: "continue with the next input", images: [], files: [], mentions: [], disposition: "prompt" }
+    });
+    idle.mockClear();
+    gate.release();
+    await vi.waitFor(() => expect(idle).toHaveBeenCalled());
+
+    expect(fixture.store.getQueueItem(queued.value.queueItemId)).toEqual(cancelled);
+    expect(fixture.store.getRun(queued.value.runId)).toEqual(aborted);
+    expect(transition.mock.calls.filter(([input]) => input.queueItemId === cancelled.id)).toEqual([]);
+    expect(fixture.store.getAttempt(queued.value.attemptId).descriptor).toMatchObject({
+      endedAt: expect.any(Number)
+    });
+    expect(fixture.store.getAttempt(queued.value.attemptId).descriptor.error).toBeUndefined();
+    await eventually(() => fixture.store.getRun(next.value.runId).descriptor.state === "completed");
+  });
+
   it("records a definite managed runtime preparation failure without dispatching Backend input", async () => {
     const adapter = new SendCountingFakeAdapter();
     const fixture = await createFixture(adapter, { prepareManagedProviderRuntime: async () => { throw new Error("Local runtime unavailable"); } });
@@ -5724,8 +5811,22 @@ describe("SessionHost", () => {
 
     fixture.store.setQueuePaused({ sessionId, paused: false, traceId: "test:provider-auth:resume" });
     fixture.host.requestQueueDrain(sessionId);
+    const dispatchStartedAt = performance.now();
     await eventually(() => [siblingRoute, siblingServiceRoute].every((execution) =>
-      fixture.store.getRun(execution.value.runId).descriptor.state === "completed"));
+      fixture.store.getRun(execution.value.runId).descriptor.state === "completed")).catch((error: unknown) => {
+      console.error("[provider-sibling-dispatch-boundary]", JSON.stringify({
+        elapsedMs: Math.round(performance.now() - dispatchStartedAt),
+        sendCalls: adapter.sendCalls,
+        queuePaused: fixture.store.getQueueControl(sessionId).paused,
+        runtimeClosed: onSessionRuntimeClosed.mock.calls.length,
+        executions: [revoked, siblingRoute, siblingServiceRoute].map((execution) => {
+          const queue = fixture.store.getQueueItem(execution.value.queueItemId);
+          const run = fixture.store.getRun(execution.value.runId).descriptor;
+          return { queue: queue.state, run: run.state, queueError: queue.error?.code, runError: run.error?.code };
+        })
+      }));
+      throw error;
+    });
     expect(adapter.sendCalls).toBe(2);
     expect(onSessionRuntimeClosed).not.toHaveBeenCalled();
 
@@ -6982,6 +7083,42 @@ describe("SessionHost", () => {
     await adapter.settle(sessionId);
   });
 
+  it("retires an idle inspection that overlaps a durable compaction start", async () => {
+    const adapter = new CompactionQueueFakeAdapter();
+    const fixture = await createFixture(adapter);
+    const sessionId = (await fixture.host.createSession({
+      operationId: "create-compaction-observation-race", connection: fixture.connection,
+      targetId: "target-one", title: "Compaction observation race", fastMode: false,
+      permissionMode: "ask", planMode: false
+    })).value.sessionId;
+    const gate = new AsyncGate();
+    const inspect = adapter.inspectSession.bind(adapter);
+    vi.spyOn(adapter, "inspectSession").mockImplementationOnce(async (binding, context) => {
+      const state = await inspect(binding, context);
+      gate.enter();
+      await gate.wait;
+      return state;
+    });
+    const pending = fixture.host.inspect(sessionId);
+    await gate.entered;
+    await adapter.beginNativeCompaction(sessionId);
+    gate.release();
+    await pending;
+    const stored = fixture.store.getSession(sessionId);
+    const observed = materializedNativeStateObservation(fixture.store.getSetting(
+      "session", sessionId, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY
+    ).value)!;
+    expect(nativeStateObservationIsCurrent(observed,
+      stored.descriptor.binding.generation, stored.descriptor.binding.opaqueRef)).toBe(false);
+    await adapter.finishNativeCompaction(sessionId);
+    await fixture.host.inspect(sessionId);
+    const settled = materializedNativeStateObservation(fixture.store.getSetting(
+      "session", sessionId, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY
+    ).value)!;
+    expect(settled.staleAt).toBeUndefined();
+    expect(settled.state.compacting).toBe(false);
+  });
+
   it("holds steer and follow-up together during native compaction and flushes each exactly once", async () => {
     const adapter = new CompactionQueueFakeAdapter();
     const fixture = await createFixture(adapter);
@@ -7027,6 +7164,13 @@ describe("SessionHost", () => {
     // and promote the steer while exact terminal metadata is still pending.
     adapter.endNativeCompactionState(sessionId);
     fixture.host.requestQueueDrain(sessionId);
+    await fixture.host.inspect(sessionId);
+    const stored = fixture.store.getSession(sessionId);
+    const observation = materializedNativeStateObservation(fixture.store.getSetting(
+      "session", sessionId, SESSION_NATIVE_STATE_OBSERVATION_SETTING_KEY
+    ).value)!;
+    expect(nativeStateObservationIsCurrent(observation,
+      stored.descriptor.binding.generation, stored.descriptor.binding.opaqueRef)).toBe(false);
     await nextTurn();
     expect(fixture.store.getQueueItem(steer.value.queueItemId)).toMatchObject({
       state: "accepted",
@@ -14736,7 +14880,22 @@ describe("SessionHost", () => {
       sessionId,
       prompt: { text: "new explicit input", images: [], files: [], mentions: [], disposition: "prompt" }
     });
-    await eventually(() => fixture.store.getQueueItem(next.value.queueItemId).state === "completed");
+    await eventually(() => fixture.store.getQueueItem(next.value.queueItemId).state === "completed").catch((error: unknown) => {
+      const pending = fixture.store.findPendingContextRebuild(sessionId);
+      console.error("[prompt-timeout-rebuild-boundary]", JSON.stringify({
+        generation: fixture.store.getSession(sessionId).descriptor.binding.generation,
+        adapterSteps: adapter.sequence.map((step) => step === "rebuild" ? "rebuild" : "send"),
+        rebuildCalls: adapter.rebuildInputs.length,
+        pending: pending === undefined ? null : { state: pending.state, reason: pending.reason },
+        executions: [timedOut, next].map((execution) => {
+          const queue = fixture.store.getQueueItem(execution.value.queueItemId);
+          const run = fixture.store.getRun(execution.value.runId).descriptor;
+          return { queue: queue.state, run: run.state, queueError: queue.error?.code, runError: run.error?.code };
+        }),
+        diagnostics: fixture.store.listDiagnostics({ limit: 5 }).map(({ code, component }) => ({ code, component }))
+      }));
+      throw error;
+    });
     expect(fixture.store.getQueueItem(timedOut.value.queueItemId)).toMatchObject({
       state: "failed",
       error: { code: "NATIVE_CONTEXT_REPLACED", stateMayHaveChanged: true }
@@ -17811,7 +17970,10 @@ class ExtraDirectoryContextFakeAdapter extends FakeBackendAdapter {
   }
 }
 
-async function eventually(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+// Hosted Windows dispatch also activates native state and performs private file IO.
+async function eventually(predicate: () => boolean,
+  timeoutMs = process.platform === "win32" && process.env.GITHUB_ACTIONS === "true" ? 5_000 : 2_000
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;

@@ -41,6 +41,22 @@ vi.mock("react-native", () => {
 });
 
 describe("native message Markdown", () => {
+  it.each([false, true])("keeps math and diagram messages mounted with the full application theme, dark=%s", async (dark) => {
+    const container = document.createElement("div"); const root = createRoot(container);
+    const colors = { background: "#f7f6f3", surface: dark ? "#24292d" : "#ffffff", ink: dark ? "#f4f4f2" : "#242a2d",
+      muted: "#637073", border: "#e1e2df", accent: "#ff9800", negative: "#cc634e", brandBackground: "#fff1db", dark };
+    try {
+      await act(async () => root.render(createElement(MobileMarkdownMessage, {
+        text: "Before\n\n$$\nx^2\n$$\n\n```mermaid\ngraph TD; A-->B\n```\n\nAfter",
+        colors, locale: "en", ownerKey: "theme-message"
+      })));
+      expect(container.textContent).toContain("Before");
+      expect(container.textContent).toContain("x^2");
+      expect(container.textContent).toContain("graph TD; A-->B");
+      expect(container.textContent).toContain("After");
+    } finally { await act(async () => root.unmount()); }
+  });
+
   it("mounts authorized resources, restores interrupted authority, and retires decode, background, pressure and late resources", async () => {
     const container = document.createElement("div"); const root = createRoot(container);
     const imageKey = JSON.stringify(["image", "images/a.png"]); const pathKey = JSON.stringify(["code", "README.md:7"]);

@@ -67,7 +67,9 @@ describe("production Skill management chain", () => {
       }
     });
     expect(session).not.toHaveProperty("files");
-    expect(privateJson({ installed, session })).not.toContain(fixture.rootDirectory);
+    // Inspect the public RPC values, excluding the fixture's local source path.
+    const privateRoot = privateJson(fixture.rootDirectory).slice(1, -1);
+    expect(privateJson({ installed: installed.skill, session })).not.toContain(privateRoot);
 
     const rootFiles = await paired.clients.skill.listSkillFiles({
       sessionId: session.sessionId,
@@ -197,7 +199,7 @@ describe("production Skill management chain", () => {
       status: SkillRecoveryStatus.READY,
       files: 2n
     }]);
-    expect(privateJson(recoveries)).not.toContain(fixture.rootDirectory);
+    expect(privateJson(recoveries)).not.toContain(privateRoot);
 
     await fixture.close({ removeRoot: false });
     fixture = undefined;
