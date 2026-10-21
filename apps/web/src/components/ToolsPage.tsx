@@ -62,6 +62,7 @@ import { moveTablistSelection } from "./tablist-navigation.js";
 import { extensionMainViewReady } from "./ExtensionMainViewPage.js";
 import { ExtensionLibrarySection } from "./ExtensionLibrarySection.js";
 import { ExtensionNetworkSection } from "./ExtensionNetworkSection.js";
+import { ExtensionOAuthSection } from "./ExtensionOAuthSection.js";
 import { openExtensionWindowFallback } from "../extension-window-navigation.js";
 import { SkillTools } from "./SkillTools.js";
 import { useExtensionSuggestionContinuation, type ExtensionSuggestionContinuationState } from "./use-extension-suggestion-continuation.js";
@@ -1422,6 +1423,7 @@ function ExtensionDetail({ controller, extension, locale, busy, t, onEnabledChan
     {extension.mainView !== undefined && <section className="extension-main-view-actions"><LayoutDashboard aria-hidden="true" /><div><strong>{extension.mainView.title ?? t("extensions.mainView.title")}</strong><p>{extensionMainViewReady(extension) ? t("extensions.mainView.readyBody") : t("extensions.mainView.notReadyBody")}</p></div><Button tone="primary" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenMainView}>{t("extensions.mainView.open")}</Button><Button tone="ghost" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenWindow}><ExternalLink aria-hidden="true" />{t("extensions.mainView.openWindow")}</Button></section>}
     {extension.library !== undefined && <ExtensionLibrarySection controller={controller} extension={extension} locale={locale} disabled={busy} t={t} />}
     {extension.owner.kind === "resource" && extension.installed && <ExtensionNetworkSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}
+    {extension.owner.kind === "resource" && extension.installed && <ExtensionOAuthSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}
     {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div><Button tone="primary" disabled={busy} onClick={onPackage}><Download aria-hidden="true" />{t("extensions.package.install")}</Button></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
       <label><span><strong>{t("extensions.enabled")}</strong><small>{t("extensions.enabledBody")}</small></span><CheckboxControl checked={extension.enabled} disabled={busy} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
       {extension.sidebarSupported && <label><span><strong>{t("extensions.showSidebar")}</strong><small>{t("extensions.showSidebarBody")}</small></span><CheckboxControl checked={extension.sidebarVisible} disabled={busy} onChange={(event) => onSidebarChange(event.target.checked)} /></label>}

@@ -469,6 +469,7 @@ export function VisualHarness(): JSX.Element {
       mcpAppApi: () => undefined,
       extensionCardApi: () => undefined,
       extensionNetworkApi: () => undefined,
+      extensionOAuthApi: () => undefined,
       listNativeCatalogAdoptions: async (): ReturnType<AppController["listNativeCatalogAdoptions"]> => [],
       listSkills: async (): ReturnType<AppController["listSkills"]> => ({ revision: 1n, skills: [] }),
       listSkillRecoveries: async (): ReturnType<AppController["listSkillRecoveries"]> => [],

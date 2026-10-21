@@ -11,6 +11,7 @@ import { createHelpConnectService } from "./help-connect-service.js";
 import { createMcpAppConnectService } from "./mcp-apps/connect-service.js";
 import { createExtensionCardConnectService } from "./extension-cards/connect-service.js";
 import { createExtensionNetworkConnectService } from "./extension-cards/network-connect-service.js";
+import { createExtensionOAuthConnectService } from "./extension-cards/oauth-connect-service.js";
 import { createMcpAppNativeService } from "./mcp-apps/native-service.js";
 import { createPersonalDevelopmentConnectService } from "./personal-development-connect-service.js";
 import { createPersonalDevelopmentNativeConnectService } from "./personal-development-native-connect-service.js";
@@ -773,6 +774,7 @@ export interface ConnectServiceSet {
   readonly mcpApps: ServiceImpl<typeof contract.McpAppService>;
   readonly extensionCards: ServiceImpl<typeof contract.ExtensionCardService>;
   readonly extensionNetwork: ServiceImpl<typeof contract.ExtensionNetworkService>;
+  readonly extensionOAuth: ServiceImpl<typeof contract.ExtensionOAuthService>;
   readonly mcpAppsNative: ServiceImpl<typeof contract.McpAppNativeService>;
   readonly appDefaultModel: ServiceImpl<typeof contract.AppDefaultModelService>;
   readonly connection: ServiceImpl<typeof contract.ConnectionService>;
@@ -1201,6 +1203,7 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.McpAppService, withConnectErrors(services.mcpApps));
   router.service(contract.ExtensionCardService, withConnectErrors(services.extensionCards));
   router.service(contract.ExtensionNetworkService, withConnectErrors(services.extensionNetwork));
+  router.service(contract.ExtensionOAuthService, withConnectErrors(services.extensionOAuth));
   router.service(contract.McpAppNativeService, withConnectErrors(services.mcpAppsNative));
   router.service(contract.PersonalDevelopmentService, withConnectErrors(services.personalDevelopment));
   router.service(contract.DesktopPersonalDevelopmentHostService, withConnectErrors(services.personalDevelopmentNative));
@@ -5496,6 +5499,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const personalDevelopmentNative = createPersonalDevelopmentNativeConnectService(application.personalDevelopmentNativeBroker, dependencies.connections);
   return { ...taskSharingServices, personalDevelopment, personalDevelopmentNative,
     extensionNetwork: createExtensionNetworkConnectService(application.extensionNetwork, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
+    extensionOAuth: createExtensionOAuthConnectService(application.extensionOAuth, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
     extensionCards: createExtensionCardConnectService(application.extensionCards, dependencies.connections), mcpApps: createMcpAppConnectService(application.mcpApps, application.mcpAppSurfaces, dependencies.connections), mcpAppsNative: createMcpAppNativeService(application.mcpApps, dependencies.connections), help: createHelpConnectService(application.helpAssistant, application.helpFeedback, dependencies.connections), appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
 }
 

@@ -721,6 +721,7 @@ async function renderExtensions(input: {
       snapshot
     },
     extensionNetworkApi: () => ({ get: async (request: { extensionId: string }) => ({ state: { extensionId: request.extensionId, revision: { value: input.extension.revision }, slots: [] } }) }),
+    extensionOAuthApi: () => undefined,
     ...input.controller
   } as unknown as AppController;
   const render = async (nextController: AppController, nextSnapshot = snapshot): Promise<void> => {

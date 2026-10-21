@@ -28,6 +28,7 @@ export * from "./gen/joko/v1/model_pb.js";
 export * from "./gen/joko/v1/mcp_app_pb.js";
 export * from "./gen/joko/v1/extension_card_pb.js";
 export * from "./gen/joko/v1/extension_network_pb.js";
+export * from "./gen/joko/v1/extension_oauth_pb.js";
 export * from "./mcp-app-surface.js";
 export * from "./extension-card-form.js";
 export * from "./mail-text-edit.js";

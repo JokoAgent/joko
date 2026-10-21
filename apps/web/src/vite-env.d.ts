@@ -472,6 +472,10 @@ type DesktopRuntimeProcessMonitorResponse = {
 };
 
 interface JokoDesktopApi {
+  readonly extensionOAuth?: {
+    authorize(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, bytes: Uint8Array): Promise<Uint8Array>;
+    cancel(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, flowId: string): Promise<void>;
+  };
   readonly mcpApps?: { operate(owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, bytes: Uint8Array): Promise<Uint8Array> };
   readonly platform: string;
   /** OS-preferred locale captured by the trusted Desktop preload for this app start. */

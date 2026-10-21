@@ -343,6 +343,16 @@ const desktopCapabilities = Object.freeze([
 ] as const);
 
 const desktopApi = Object.freeze({
+  ...(mainDocumentOccurrence === undefined ? {} : { extensionOAuth: Object.freeze({
+    authorize: (owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, bytes: Uint8Array): Promise<Uint8Array> => {
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength > 2_048) return Promise.reject(new Error("Invalid plugin authorization request."));
+      return ipcRenderer.invoke("joko:extension-oauth:authorize", mainDocumentOccurrence, owner, new Uint8Array(bytes)).then((result: unknown) => {
+        if (!(result instanceof Uint8Array) || result.byteLength > 96 * 1024) throw new Error("Invalid plugin authorization response."); return new Uint8Array(result);
+      });
+    },
+    cancel: (owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, flowId: string): Promise<void> =>
+      ipcRenderer.invoke("joko:extension-oauth:cancel", mainDocumentOccurrence, owner, flowId).then(() => undefined)
+  }) }),
   ...(mcpAppDocument === undefined ? {} : { mcpApps: Object.freeze({
     operate: (owner: { readonly profileId: string; readonly serverId: string; readonly origin: string }, bytes: Uint8Array): Promise<Uint8Array> => {
       if (!(bytes instanceof Uint8Array) || bytes.byteLength > 96 * 1024) return Promise.reject(new Error("Invalid application request."));

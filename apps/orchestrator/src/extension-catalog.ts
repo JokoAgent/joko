@@ -683,7 +683,7 @@ export class ExtensionCatalogManager {
    * observers may consume a new connection or credential pointer. */
   updateNetworkConfiguration(extensionId: string, expectedRevision: bigint, effect: () => void): ExtensionCatalogDescriptor {
     const definition = this.#requireDefinition(extensionId), current = this.#requireRecord(extensionId, expectedRevision);
-    if (!definition.installed || !definition.runtime?.network?.connections?.length) throw new Error("Extension connections are unavailable.");
+    if (!definition.installed || !definition.runtime?.network || !definition.runtime.network.connections?.length && !definition.runtime.network.secrets?.some(secret => secret.source === "oauth")) throw new Error("Extension network settings are unavailable.");
     this.#replaceRecord({ ...current, revision: increment(current.revision), updatedAt: this.#now() }, effect);
     return this.#descriptor(definition);
   }
@@ -754,7 +754,7 @@ function runtimePermissions(runtime: ExtensionRuntimeDescriptor | undefined): re
 function runtimeSetup(extensionId: string, runtime: ExtensionRuntimeDescriptor | undefined): readonly SetupRequirement[] {
   const network = runtime?.network;
   if (!network) return [];
-  return [...(network.secrets ?? []).map(secret => ({ id: `network-secret:${secret.key}`, label: secret.label,
+  return [...(network.secrets ?? []).filter(secret => secret.source !== "oauth").map(secret => ({ id: `network-secret:${secret.key}`, label: secret.label,
     description: secret.hint ?? `Protected ${secret.inject.header} credential for ${(secret.inject.hosts ?? network.hosts).join(", ")}.`,
     kind: "secret" as const, required: true, credentialReferenceId: extensionNetworkCredentialReference(extensionId, network, secret),
     credentialKinds: ["header_secret" as const, "api_key" as const] })),

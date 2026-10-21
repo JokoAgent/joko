@@ -1,11 +1,14 @@
 // Adapted from the fixed reference's declarative network and secret boundary.
 // See NOTICE and LICENSE.cindy in this directory.
 import { createHash } from "node:crypto";
+import { parseExtensionOAuth, type ExtensionOAuthDeclaration } from "./oauth-manifest.js";
 
 export interface ExtensionNetworkSecret {
   readonly key: string;
   readonly label: string;
   readonly hint?: string;
+  readonly source?: "oauth";
+  readonly oauth?: ExtensionOAuthDeclaration;
   readonly inject: { readonly hosts?: readonly string[]; readonly header: string; readonly format: string };
   readonly exchange?: { readonly url: string; readonly bodyFormat: string; readonly contentType?: "application/json" | "application/x-www-form-urlencoded"; readonly tokenPath: string; readonly ttlSeconds?: number };
 }
@@ -72,7 +75,7 @@ export function parseExtensionNetwork(value: unknown): ExtensionNetworkDeclarati
   if (raw.secrets === undefined) return { hosts, ...(connections ? { connections } : {}) };
   if (!Array.isArray(raw.secrets) || raw.secrets.length > 4) throw new Error("Extension network may declare at most four secrets.");
   const secrets = raw.secrets.map(value => {
-    const secret = object(value, ["key", "label", "hint", "inject", "exchange"], ["key", "label", "inject"]);
+    const secret = object(value, ["key", "label", "hint", "inject", "exchange", "source", "oauth"], ["key", "label", "inject"]);
     const key = text(secret.key, 32), label = text(secret.label, 80);
     if (!/^[a-z][a-z0-9_]{0,31}$/u.test(key)) throw new Error("Extension network secret key is invalid.");
     const inject = object(secret.inject, ["hosts", "header", "format"], ["header", "format"]);
@@ -96,7 +99,11 @@ export function parseExtensionNetwork(value: unknown): ExtensionNetworkDeclarati
       exchange = { url, bodyFormat, tokenPath, ...(data.contentType === undefined ? {} : { contentType: data.contentType as "application/json" | "application/x-www-form-urlencoded" }),
         ...(data.ttlSeconds === undefined ? {} : { ttlSeconds: data.ttlSeconds as number }) };
     }
-    return { key, label, ...(secret.hint === undefined ? {} : { hint: text(secret.hint, 200) }), inject: { header, format, ...(injectionHosts ? { hosts: injectionHosts } : {}) }, ...(exchange ? { exchange } : {}) };
+    if (secret.source !== undefined && secret.source !== "user" && secret.source !== "oauth" || secret.source === "oauth" && (secret.oauth === undefined || exchange !== undefined)
+      || secret.source !== "oauth" && secret.oauth !== undefined) throw new Error("Extension network credential source is invalid.");
+    const oauth = secret.source === "oauth" ? parseExtensionOAuth(secret.oauth, value => extensionNetworkUrl(value, hosts).href) : undefined;
+    return { key, label, ...(secret.hint === undefined ? {} : { hint: text(secret.hint, 200) }), inject: { header, format, ...(injectionHosts ? { hosts: injectionHosts } : {}) },
+      ...(exchange ? { exchange } : {}), ...(oauth ? { source: "oauth" as const, oauth } : {}) };
   });
   if (new Set(secrets.map(secret => secret.key)).size !== secrets.length || new Set(secrets.map(secret => secret.inject.header.toLowerCase())).size !== secrets.length) throw new Error("Extension network secret keys and headers must be unique.");
   if (connections?.some(connection => secrets.some(secret => secret.key === connection.key))) throw new Error("Extension connection and secret keys share one namespace.");

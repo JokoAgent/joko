@@ -1,6 +1,6 @@
 import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
 import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
-import { ExtensionCardService, ExtensionNetworkService } from "@joko/contracts";
+import { ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import type { McpAppApi } from "./model.js";
 import { AppDefaultModelService } from "@joko/contracts";
@@ -5112,6 +5112,57 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         assertCurrent(); uploadScope.signal.throwIfAborted();
         if (!result.state) throw new GatewayError("Extension connection state unavailable.");
         return result.state;
+      }
+    };
+  }
+  extensionOAuthApi(): import("./model.js").ExtensionOAuthApi | undefined {
+    if (!this.#transport || !this.#abort || !this.#profile) return;
+    const scope = this.captureActionScope(), transport = this.#transport, lifetime = this.#abort, profile = this.#profile;
+    const client = createClient(ExtensionOAuthService, scope.transport), native = typeof window === "undefined" ? undefined : window.jokoDesktop?.extensionOAuth;
+    const owner = { profileId: profile.id, serverId: profile.serverId, origin: profile.origin };
+    const assertCurrent = () => {
+      scope.signal.throwIfAborted();
+      if (this.#transport !== transport || this.#abort !== lifetime || this.#profile !== profile) throw new GatewayError("Plugin authorization connection changed.");
+    };
+    return {
+      canAuthorize: native !== undefined,
+      get: async (request, options) => {
+        assertCurrent(); const signal = options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal;
+        const result = await client.get(request, { ...options, signal }); assertCurrent(); signal.throwIfAborted(); return result;
+      },
+      change: async (request, options) => {
+        assertCurrent(); const signal = options?.signal ? AbortSignal.any([scope.signal, options.signal]) : scope.signal;
+        const result = await client.change(request, { ...options, signal }); assertCurrent(); signal.throwIfAborted(); return result;
+      },
+      saveClient: async (request, clientId, clientSecret, signal) => {
+        assertCurrent(); const combined = AbortSignal.any([scope.signal, signal]), inputScope = { ...scope, signal: combined };
+        const begun = await client.beginClient(request, { signal: combined }); assertCurrent();
+        const ticketId = await this.uploadCredentialTicket(JSON.stringify({ clientId, ...(clientSecret ? { clientSecret } : {}) }), begun.ticket, inputScope); assertCurrent();
+        const result = await client.commitClient({ extensionId: request.extensionId, credentialUploadTicketId: ticketId }, { signal: combined }); assertCurrent(); combined.throwIfAborted();
+        if (!result.state) throw new GatewayError("Plugin authorization state is unavailable."); return result.state;
+      },
+      authorize: async (request, signal) => {
+        assertCurrent(); if (!native) throw new GatewayError("Open Joko Desktop to connect an account.");
+        const combined = AbortSignal.any([scope.signal, signal]); combined.throwIfAborted();
+        const { flow } = await client.start(request, { signal: combined });
+        if (!flow) throw new GatewayError("Plugin authorization flow is unavailable.");
+        let cancelling = false;
+        const cancel = () => {
+          if (cancelling) return; cancelling = true;
+          void native.cancel(owner, flow.flowId).catch(() => undefined);
+          void client.cancelFlow({ flowId: flow.flowId }, { timeoutMs: 5_000 }).catch(() => undefined);
+        };
+        combined.addEventListener("abort", cancel, { once: true }); let complete = false;
+        try {
+          assertCurrent(); combined.throwIfAborted();
+          const result = fromBinary(ExtensionOAuthServiceGetFlowResponseSchema, await native.authorize(owner,
+            toBinary(ExtensionOAuthServiceGetFlowRequestSchema, create(ExtensionOAuthServiceGetFlowRequestSchema, { flowId: flow.flowId }))));
+          assertCurrent(); combined.throwIfAborted();
+          if (result.flow?.flowId !== flow.flowId || result.flow.phase !== ExtensionAuthorizationPhase.COMPLETE) throw new GatewayError("Plugin authorization did not complete.");
+          complete = true;
+          const latest = await client.get({ extensionId: request.extensionId }, { signal: combined }); assertCurrent(); combined.throwIfAborted();
+          if (!latest.state) throw new GatewayError("Plugin authorization state is unavailable."); return latest.state;
+        } finally { combined.removeEventListener("abort", cancel); if (!complete) cancel(); }
       }
     };
   }

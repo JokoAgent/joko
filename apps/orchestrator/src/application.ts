@@ -252,6 +252,8 @@ import { ExtensionRoutineRuntime } from "./extension-routine-runtime.js";
 import { ExtensionCardRuntime } from "./extension-cards/runtime.js";
 import { ExtensionNetworkConnections } from "./extension-cards/network-connections.js";
 import { ExtensionNetworkSettings } from "./extension-cards/network-settings.js";
+import { ExtensionOAuthAccounts } from "./extension-cards/oauth-accounts.js";
+import { ExtensionOAuthSettings } from "./extension-cards/oauth-settings.js";
 import { ExtensionCardMedia } from "./extension-cards/media.js";
 import { ExtensionCardsManager } from "./extension-cards/manager.js";
 import { PartnerWorkingStatusManager } from "./partner-working-status.js";
@@ -504,6 +506,7 @@ export interface OrchestratorApplication {
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionCards?: ExtensionCardsManager;
   readonly extensionNetwork?: ExtensionNetworkSettings;
+  readonly extensionOAuth?: ExtensionOAuthSettings;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
   readonly extensionSources?: ExtensionSourceManager;
   readonly diagnosticsBundles?: DiagnosticsBundleService;
@@ -1017,6 +1020,11 @@ export async function createOrchestratorApplication(
   const extensionConnections = new ExtensionNetworkConnections({ store, credentials });
   const extensionNetwork = new ExtensionNetworkSettings({ catalog: extensionCatalog, connections: extensionConnections, credentials });
   await extensionNetwork.initialize();
+  const extensionOAuthAccounts = new ExtensionOAuthAccounts({ catalog: extensionCatalog, store, vault: credentialVault, credentials,
+    fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
+      environmentProxyForTarget: target => environmentProxyForTarget(target, process.env) }) });
+  await extensionOAuthAccounts.initialize();
+  const extensionOAuth = new ExtensionOAuthSettings({ accounts: extensionOAuthAccounts, credentials, catalog: extensionCatalog });
   const extensionPackagePublisher = new ExtensionPackagePublisher({
     store,
     resources: piResources,
@@ -2274,7 +2282,7 @@ export async function createOrchestratorApplication(
     } });
   startupExtensionCards = extensionCards;
   extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store,
-    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, media: extensionCardMedia, connections: extensionConnections,
+    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, media: extensionCardMedia, connections: extensionConnections, oauth: extensionOAuthAccounts,
     registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
     locale: () => persistedLocale(store),
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
@@ -2951,6 +2959,8 @@ export async function createOrchestratorApplication(
     await attempt(() => skillMarket.close());
     await attempt(() => extensionCardRuntime?.stop());
     await attempt(() => extensionCards.dispose());
+    await attempt(() => extensionOAuth.dispose());
+    await attempt(() => extensionOAuthAccounts.dispose());
     await attempt(() => extensionNetwork.dispose());
     await attempt(() => extensionRoutineRuntime.stop());
     await attempt(() => extensionLibraries.close());
@@ -3132,6 +3142,7 @@ export async function createOrchestratorApplication(
     extensionMainViews,
     extensionCards,
     extensionNetwork,
+    extensionOAuth,
     extensionPackagePublisher,
     extensionSources,
     diagnosticsBundles,
@@ -3214,6 +3225,8 @@ export async function createOrchestratorApplication(
         await attempt(() => extensionCardRuntime?.stop());
         await attempt(() => extensionCards.dispose());
         await attempt(() => extensionNetwork.dispose());
+        await attempt(() => extensionOAuth.dispose());
+        await attempt(() => extensionOAuthAccounts.dispose());
         await attempt(() => extensionRoutineRuntime.stop());
         await attempt(() => extensionLibraries.close());
         await attempt(() => extensionMainViews.close());
@@ -3344,6 +3357,8 @@ export async function createOrchestratorApplication(
     await attempt(() => startupCardRuntime?.stop());
     await attempt(() => startupExtensionCards?.dispose());
     await attempt(() => extensionNetwork.dispose());
+    await attempt(() => extensionOAuth.dispose());
+    await attempt(() => extensionOAuthAccounts.dispose());
     await attempt(() => startupRoutineRuntime?.stop());
     await attempt(() => extensionLibraries.close());
     await attempt(() => extensionMainViews.close());

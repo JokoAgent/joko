@@ -15,7 +15,9 @@ export const EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE = String.raw`(capabilities)
     tools: Object.freeze({ register: (name, handler) => { if (typeof name !== "string" || typeof handler !== "function" || handlers.has(name) || handlers.size >= 64) throw new Error("Invalid tool handler."); handlers.set(name, handler); } }),
     card: Object.freeze({ update: payload => request({ ...payload, type: "card-update", version: 1 }) }),
     ...(capabilities.network ? { network: Object.freeze({ fetch: payload => request({ ...payload, type: "fetch-request" }),
-      connections: key => request({ type: "connections-list", key }) }) } : {}),
+      connections: key => request({ type: "connections-list", key }),
+      accounts: key => request({ type: "oauth-accounts", key }),
+      reportInsufficientScopes: (key, scopes) => request({ type: "oauth-insufficient-scopes", key, scopes }) }) } : {}),
     ...(capabilities.agent ? { agent: Object.freeze({ run: payload => request({ ...payload, type: "agent-run" }) }) } : {})
   }), writable: false, configurable: false });
   target.__jokoRuntime = {

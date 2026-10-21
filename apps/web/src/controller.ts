@@ -3164,6 +3164,7 @@ export function useAppController(): AppController {
     mcpAppApi: () => gateway().mcpAppApi(),
     extensionCardApi: () => gateway().extensionCardApi(),
     extensionNetworkApi: () => gateway().extensionNetworkApi(),
+    extensionOAuthApi: () => gateway().extensionOAuthApi(),
     uploadPartnerGroupFile: (file, signal) => gateway().uploadPartnerGroupFile(file, signal),
     partnerMemoryApi: (partnerId, ownerKey) => gateway().partnerMemoryApi(partnerId, ownerKey),
     partnerConnectionsApi: (partnerId, ownerKey) => gateway().partnerConnectionsApi(partnerId, ownerKey),

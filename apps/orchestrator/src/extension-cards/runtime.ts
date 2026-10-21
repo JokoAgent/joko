@@ -13,6 +13,7 @@ import { MAIL_COMPOSE_RUNTIME_SOURCE } from "./mail-runtime-source.js";
 import type { CredentialVault, EncryptedCredential } from "../credential-vault.js";
 import { ExtensionNetwork } from "./network.js";
 import type { ExtensionNetworkConnections } from "./network-connections.js";
+import type { ExtensionOAuthAccounts } from "./oauth-accounts.js";
 import { createExtensionMailReader, type ExtensionMailPreview } from "./mail-reader.js";
 import type { ExtensionCardMedia } from "./media.js";
 import { EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE } from "./runtime-bootstrap.js";
@@ -37,6 +38,7 @@ interface Options {
   readonly resolveCredential?: (reference: string) => string;
   readonly media?: ExtensionCardMedia;
   readonly connections?: Pick<ExtensionNetworkConnections, "hosts" | "token" | "identity" | "list">;
+  readonly oauth?: Pick<ExtensionOAuthAccounts, "fresh" | "invalidate" | "identity" | "get" | "capture" | "reportInsufficientScopes">;
   readonly continueTask: (scope: ExtensionCardScope, text: string, guard: (() => Promise<void>) & { readonly signal: AbortSignal }) => Promise<void>;
   readonly executablePath?: string; readonly launch?: () => Promise<Browser>;
 }
@@ -50,7 +52,7 @@ export class ExtensionCardRuntime {
   readonly #network: ExtensionNetwork | undefined;
   constructor(private readonly options: Options) {
     if (options.fetch && options.resolveCredential) this.#network = new ExtensionNetwork({ fetch: options.fetch, resolveCredential: options.resolveCredential, redact: options.redact,
-      ...(options.connections ? { connections: options.connections } : {}), ...(options.media ? { media: options.media } : {}) });
+      ...(options.connections ? { connections: options.connections } : {}), ...(options.oauth ? { oauth: options.oauth } : {}), ...(options.media ? { media: options.media } : {}) });
   }
   authority(id: string): ExtensionCardAuthority | undefined {
     try { return this.#capture(id); } catch { return; }
@@ -94,7 +96,8 @@ export class ExtensionCardRuntime {
       ...(resource.version === undefined ? {} : { packageVersion: resource.version }), extensionEntry,
       mainView: { html: runtime.html }, runtime: structuredClone(runtime) };
     const key = JSON.stringify({ ...surface, backendRevision: surface.backendRevision.toString(), resourceRevision: surface.resourceRevision.toString(),
-      extensionRevision: extension.revision.toString(), connections: runtime.network?.connections?.map(declaration => this.options.connections?.identity(id, declaration) ?? null) });
+      extensionRevision: extension.revision.toString(), connections: runtime.network?.connections?.map(declaration => this.options.connections?.identity(id, declaration) ?? null),
+      oauth: runtime.network?.secrets?.filter(secret => secret.source === "oauth").map(secret => this.options.oauth?.identity(id, secret.key) ?? null) });
     return { key, name: extension.name, runtime, surface };
   }
   #assert(instance: Instance): void {
@@ -234,6 +237,19 @@ export class ExtensionCardRuntime {
     const request = payload as Record<string, unknown>, id = instance.authority.surface.extensionId;
     const current = () => { this.#assert(instance); };
     switch (request.type) {
+      case "oauth-accounts": {
+        const declaration = instance.authority.runtime.network?.secrets?.find(value => value.key === request.key && value.source === "oauth");
+        if (!declaration || !this.options.oauth) return { ok: false };
+        current(); const slot = this.options.oauth.get(id).slots.find(slot => slot.key === declaration.key);
+        return { ok: true, accounts: slot?.accounts ?? [] };
+      }
+      case "oauth-insufficient-scopes": {
+        const declaration = instance.authority.runtime.network?.secrets?.find(value => value.key === request.key && value.source === "oauth");
+        if (!declaration || !this.options.oauth || !Array.isArray(request.scopes) || !request.scopes.length || request.scopes.length > 320
+          || request.scopes.some(scope => typeof scope !== "string" || !declaration.oauth?.scopes.includes(scope))) return { ok: false };
+        current(); const capture = this.options.oauth.capture(id, declaration.key, this.options.catalog.get(id).revision);
+        const stored = await this.options.oauth.reportInsufficientScopes(capture, request.scopes as string[]); current(); return { ok: stored };
+      }
       case "connections-list": {
         const declaration = instance.authority.runtime.network?.connections?.find(value => value.key === request.key);
         if (!declaration || !this.options.connections) return { ok: false };

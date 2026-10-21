@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { ExtensionCardMedia } from "./media.js";
 import type { ExtensionCardScope } from "./service.js";
 import { sniffMediaMime } from "./media-sniff.js";
+import type { ExtensionOAuthAccounts } from "./oauth-accounts.js";
 
 const STRIPPED = new Set(["host", "connection", "content-length", "transfer-encoding", "upgrade", "cookie", "set-cookie", "origin", "referer", "authorization"]);
 const RESPONSE_HEADERS = ["content-type", "content-length", "cache-control", "etag", "last-modified", "retry-after", "mcp-session-id"];
@@ -18,6 +19,7 @@ interface Options {
   readonly resolveCredential: (reference: string) => string;
   readonly redact: (value: string) => string;
   readonly media?: ExtensionCardMedia;
+  readonly oauth?: Pick<ExtensionOAuthAccounts, "fresh" | "invalidate">;
   readonly connections?: {
     hosts(extensionId: string, declaration: NonNullable<ExtensionNetworkDeclaration["connections"]>[number]): readonly string[];
     token(extensionId: string, declaration: NonNullable<ExtensionNetworkDeclaration["connections"]>[number], hostname: string): string | undefined;
@@ -56,6 +58,8 @@ export class ExtensionNetwork {
       const destinations = () => [...scope.declaration.hosts, ...dynamicHosts()];
       let url = extensionNetworkUrl(payload.url, destinations());
       const method = payload.method ?? "GET";
+      const authAccount = payload.authAccount;
+      if (authAccount !== undefined && (typeof authAccount !== "string" || !authAccount.length || authAccount.length > 64)) throw new Error();
       if (typeof method !== "string" || !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(method)
         || scope.readOnly && !["GET", "HEAD"].includes(method)) throw new Error();
       const asMedia = payload.as === "media";
@@ -113,6 +117,7 @@ export class ExtensionNetwork {
       const originalUrl = url;
       for (let attempt = 0; attempt < 2; attempt++) {
         let currentMethod: string = method, body: string | ArrayBuffer | undefined = preparedBody, usedExchange = false;
+        const usedOAuth = new Map<string, string>();
         url = originalUrl;
         let response: Response | undefined;
         for (let hop = 0; hop <= 3; hop++) {
@@ -122,7 +127,13 @@ export class ExtensionNetwork {
           if (body === undefined && currentMethod === "GET" && currentMethod !== method) { headers.delete("content-type"); headers.delete("content-encoding"); }
           for (const secret of scope.declaration.secrets ?? []) {
             if (!(secret.inject.hosts ?? scope.declaration.hosts).some(pattern => extensionNetworkHostMatches(pattern, url.hostname))) continue;
-            const raw = this.options.resolveCredential(extensionNetworkCredentialReference(scope.extensionId, scope.declaration, secret));
+            let raw: string;
+            if (secret.source === "oauth") {
+              if (!secret.oauth || !this.options.oauth) throw new Error();
+              const token = await this.options.oauth.fresh(scope.extensionId, secret.key, secret.oauth, authAccount); current();
+              if (!token.ok) return { ok: false, error: token.error, message: "Check the connected account in plugin settings." };
+              raw = token.accessToken; usedOAuth.set(secret.key, token.accountId);
+            } else raw = this.options.resolveCredential(extensionNetworkCredentialReference(scope.extensionId, scope.declaration, secret));
             if (!raw || /[\r\n]/u.test(raw)) throw new Error();
             secrets.add(raw);
             const value = secret.exchange ? await this.#exchange(scope, secret, raw, signal, secrets) : raw;
@@ -150,8 +161,9 @@ export class ExtensionNetwork {
           url = next;
         }
         if (!response) throw new Error();
-        if (response.status === 401 && usedExchange && attempt === 0) {
+        if (response.status === 401 && (usedExchange || usedOAuth.size > 0) && attempt === 0) {
           await response.body?.cancel();
+          for (const [key, id] of usedOAuth) this.options.oauth?.invalidate(scope.extensionId, key, id);
           this.retire(scope.authorityKey); continue;
         }
         const contentType = (response.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();

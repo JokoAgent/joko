@@ -255,6 +255,7 @@ import {
 import { DesktopWallpaperStore } from "./wallpaper-store.js";
 import { DESKTOP_WALLPAPER_SCHEME, createDesktopWallpaperProtocolHandler } from "./wallpaper-protocol.js";
 import { DesktopMcpAppHost, MCP_APP_SCHEME } from "./mcp-app-host.js";
+import { DesktopExtensionOAuthHost } from "./extension-oauth-host.js";
 import { registerDesktopWallpaperIpc } from "./wallpaper-ipc.js";
 import {
   createDesktopNativeTaskStatusSettingsStore,
@@ -605,6 +606,8 @@ const desktopRemoteDesktopViewerPrewarm = new DesktopRemoteDesktopViewerPrewarmS
 });
 const mainWindowContentsByWindow = new WeakMap<BrowserWindow, WebContents>();
 const mainWindowDocuments = new DesktopMainDocumentOccurrenceAuthority<WebContents>(() => randomUUID());
+const desktopExtensionOAuth = new DesktopExtensionOAuthHost({ assertSource: assertTrustedIpcSender, readAuthKey: readCredential,
+  quitting: () => quitting, isCurrentDocument: (contents, occurrence) => mainWindowDocuments.isCurrent(contents, occurrence), openExternal: url => shell.openExternal(url) });
 const desktopDeepLinkDelivery = new DesktopDeepLinkDeliveryBuffer();
 const desktopInboundOpenIntentFence = new DesktopInboundOpenIntentFence();
 const desktopTaskSharingInvitations = new DesktopTaskSharingInvitationBuffer();
@@ -7794,6 +7797,7 @@ function bindDesktopPageSearchResults(contents: WebContents): Map<number, number
 
 function registerIpc(): void {
   desktopMcpApps.register();
+  desktopExtensionOAuth.register();
   desktopRemoteDesktopViewers.register();
   ipcMain.on(DESKTOP_CHANNELS.preferredSystemLocaleGet, (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);

@@ -73,6 +73,7 @@ describe("Connect service composition", () => {
       contract.McpAppService,
       contract.ExtensionCardService,
       contract.ExtensionNetworkService,
+      contract.ExtensionOAuthService,
       contract.McpAppNativeService,
       contract.PersonalDevelopmentService,
       contract.DesktopPersonalDevelopmentHostService,
