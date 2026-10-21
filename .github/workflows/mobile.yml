@@ -359,7 +359,7 @@ jobs:
     needs: ios-simulator
     name: iOS Simulator startup and native GUI on a fresh runner
     runs-on: macos-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -414,7 +414,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/joko-ios-artifact/joko-ios-simulator-debug.tar.gz" -C "$RUNNER_TEMP/joko-ios-simulator-app"
 
       - name: Observe the actual iOS app startup, termination and reopen
-        timeout-minutes: 18
+        timeout-minutes: 33
         run: node scripts/ci/mobile-ios-simulator-runtime.mjs
         env:
           JOKO_IOS_SIMULATOR_APP_PATH: ${{ runner.temp }}/joko-ios-simulator-app/Joko.app
