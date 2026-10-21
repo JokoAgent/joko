@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import type { AdapterContext, BlobRef, EventPayload, NativeSessionBinding, PartnerLearningTurnSource, PolicySnapshot, ProviderModel, TargetDescriptor } from "@joko/core";
 import { describe, expect, it, vi } from "vitest";
+import { DefaultResourceLoader } from "@earendil-works/pi-coding-agent";
 import { appendVisionBridgeDescriptions, createPiAdapter, escapePiComposerSlashCommand, isRuntimeResourceProvenLoaded, mergeManagedResourceSnapshots, projectPiTreeNodes, resolvePiComposerSlashCommand } from "./adapter.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import type { PiManagedDurableStore } from "./managed-durable-store.js";
@@ -1343,10 +1344,21 @@ describe("PiBackendAdapter", () => {
       appendSystemPrompt: prompt
     }, initialContext);
     await first.closeSession(binding, { ...initialContext, binding });
-    const updatedPrompt = `${prompt}\n${"Complete service identity.\n".repeat(400)}IDENTITY_END_MARKER`;
+    const updatedPrompt = `${prompt}\n${"完整的任务身份与工具说明。\n".repeat(4000)}IDENTITY_END_MARKER`;
     const updatedContext = { ...initialContext, binding, generation: binding.generation + 1, appendSystemPrompt: updatedPrompt };
     await first.resumeSession(binding, updatedContext);
-    expect(optionalArgument(specs.at(-1)!.args, "--append-system-prompt")).toContain(updatedPrompt);
+    const promptPath = optionalArgument(specs.at(-1)!.args, "--append-system-prompt")!;
+    expect(promptPath).toContain("append-system-prompt.md");
+    expect(await readFile(promptPath, "utf8")).toContain(updatedPrompt);
+    const loader = new DefaultResourceLoader({
+      cwd: workspace, agentDir: join(agentHome, "prompt-loader"), appendSystemPrompt: [promptPath],
+      noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true
+    });
+    await loader.reload();
+    expect(loader.getAppendSystemPrompt()).toContain(await readFile(promptPath, "utf8"));
+    expect(specs.at(-1)!.args.join(" ")).not.toContain("IDENTITY_END_MARKER");
+    expect(specs.at(-1)!.args.join(" ").length).toBeLessThan(30_000);
+    expect(specs.at(-1)!.env["JOKO_PI_APPEND_SYSTEM_PROMPT_HASH"]).not.toBe(specs[0]!.env["JOKO_PI_APPEND_SYSTEM_PROMPT_HASH"]);
     await first.closeSession(binding, updatedContext);
     await first.dispose();
 
@@ -1359,11 +1371,12 @@ describe("PiBackendAdapter", () => {
     };
     try {
       await restarted.resumeSession(binding, resumeContext);
-      const restoredPrompt = optionalArgument(specs.at(-1)!.args, "--append-system-prompt");
+      const restoredPrompt = await readFile(optionalArgument(specs.at(-1)!.args, "--append-system-prompt")!, "utf8");
       expect(restoredPrompt).toContain(updatedPrompt);
       expect(restoredPrompt).toContain(memoryPrompt);
       expect(restoredPrompt).toContain("Use the dedicated grep tool for content search");
       expect(restoredPrompt).toContain("After locating a target, read only the relevant range when practical");
+      expect(specs.at(-1)!.env["JOKO_PI_APPEND_SYSTEM_PROMPT_HASH"]).toBe(createHash("sha256").update(restoredPrompt).digest("hex"));
     } finally {
       await restarted.dispose();
     }

@@ -4814,7 +4814,14 @@ export class PiBackendAdapter implements
       ? undefined
       : options.resolveMakerMemoryPrompt?.(context);
     const appendPrompt = [DEFAULT_APPEND_SYSTEM_PROMPT, options.appendSystemPrompt, makerMemoryPrompt, context.appendSystemPrompt ?? profile.appendSystemPrompt].filter(Boolean).join("\n\n");
-    if (appendPrompt) args.push("--append-system-prompt", appendPrompt);
+    if (appendPrompt) {
+      // The native CLI accepts a file here. Keep long instructions out of the
+      // operating system command line and bind the private file to this runtime.
+      const appendPromptPath = join(runtimeDirectory, "append-system-prompt.md");
+      await atomicWriteFile(appendPromptPath, appendPrompt);
+      await chmod(appendPromptPath, 0o600);
+      args.push("--append-system-prompt", appendPromptPath);
+    }
 
     const baseEnvironment = this.#baseEnvironment();
     const providerEnvironment = scopedManagedProviderEnvironment(options, catalog, profile.providerId);
@@ -4850,6 +4857,7 @@ export class PiBackendAdapter implements
       JOKO_PI_TARGET_ID: context.target.id,
       JOKO_PI_GENERATION: String(context.generation),
       JOKO_PI_SPAWN_IDENTITY: spawnIdentity,
+      JOKO_PI_APPEND_SYSTEM_PROMPT_HASH: createHash("sha256").update(appendPrompt).digest("hex"),
       JOKO_PI_RESET_RECEIPT_ROOT: resetContextReceiptRoot,
       ...(context.target.remoteWorkspace === undefined ? {} : {
         JOKO_PI_REMOTE_RECOVERY_IDENTITY: stableRemoteRecoveryIdentity(
