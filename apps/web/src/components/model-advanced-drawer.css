@@ -8,7 +8,7 @@
 .model-advanced-section:last-child { border-bottom: 0; }
 .model-advanced-section h3 { font-size: 14px; margin: 0 0 8px; }
 .model-advanced-section p { color: var(--text-soft); font-size: 12px; line-height: 1.6; margin: 8px 0; }
-.model-advanced-section .danger-text { color: var(--danger); }
+.model-advanced-section .danger-text { color: var(--red); }
 .model-advanced-section__hint { color: var(--text-faint); }
 .model-advanced-fact { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; font-size: 12px; padding: 6px 0; }
 .model-advanced-fact > span { color: var(--text-soft); }

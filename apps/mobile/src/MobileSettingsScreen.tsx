@@ -138,6 +138,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   const [renameUnknown, setRenameUnknown] = useState<"rename" | "reset">();
   const [localError, setLocalError] = useState("");
   const [notice, setNotice] = useState("");
+  const [developerOpen, setDeveloperOpen] = useState(false);
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState(false);
   const [voiceOpen, setVoiceOpen] = useState(false);
   const voiceServiceDraft = useRef<MobileVoiceServiceDraft | undefined>(undefined);
@@ -212,13 +213,14 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
   };
 
   useEffect(() => {
-    if (!editor) return;
+    if (!editor && !developerOpen) return;
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
-      requestCloseEditor();
+      if (editor) requestCloseEditor();
+      else setDeveloperOpen(false);
       return true;
     });
     return () => subscription.remove();
-  }, [editor, savingName, locale.effectiveLocale]);
+  }, [editor, developerOpen, savingName, locale.effectiveLocale]);
 
   const saveName = async (): Promise<void> => {
     if (!editor || !current || editor.ownerKey !== current.ownerKey || !canRename) return;
@@ -360,13 +362,12 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
     </ScrollView>;
   }
 
-  return <ScrollView contentContainerStyle={[styles.screen, { backgroundColor: colors.background }]}>
-    {props.onTaskSharing && <Pressable accessibilityRole="button" onPress={props.onTaskSharing} style={{ paddingVertical: 16 }}>
-      <Text style={{ color: colors.accent }}>{locale.effectiveLocale.startsWith("zh") ? "共享任务" : locale.effectiveLocale === "ja" ? "共有タスク" : locale.effectiveLocale === "ko" ? "공유 작업" : "Shared tasks"}</Text>
-    </Pressable>}
-    <BackButton label="Joko" language={locale.effectiveLocale} onPress={onBack} colors={colors} />
-    <Text style={[styles.title, { color: colors.ink }]}>{t("settings.title")}</Text>
-
+  return <ScrollView key={developerOpen ? "developer" : "settings"}
+    contentContainerStyle={[styles.screen, { backgroundColor: colors.background }]}>
+    <BackButton label={developerOpen ? t("settings.title") : "Joko"} language={locale.effectiveLocale}
+      onPress={developerOpen ? () => setDeveloperOpen(false) : onBack} colors={colors} />
+    <Text style={[styles.title, { color: colors.ink }]}>{t(developerOpen ? "settings.developer.title" : "settings.title")}</Text>
+    {!developerOpen && <>
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.appearance")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
       {(["system", "light", "dark"] as const).map((preference) => <ThemeChoice key={preference}
@@ -390,6 +391,12 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
       colors={colors} onPress={() => { setLocalError(""); setNotice(""); setVoiceOpen(true); }} />
     <NavigationRow label={t("settings.voiceReadonly.title")} description={t("settings.voiceReadonly.navigation")}
       colors={colors} onPress={() => { setLocalError(""); setNotice(""); setReadOnlyOpen(true); }} />
+
+    {props.onTaskSharing && <>
+      <Text style={[styles.section, { color: colors.muted }]}>{t("settings.sharing.title")}</Text>
+      <NavigationRow label={t("settings.sharing.title")} description={t("settings.sharing.description")}
+        colors={colors} onPress={props.onTaskSharing} />
+    </>}
 
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.currentNode")}</Text>
     <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
@@ -484,7 +491,11 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
       <InformationRow label={t("common.node")} value={state.node?.version || t("common.unknown")} colors={colors} />
       <InformationRow label={t("common.api")} value={state.node?.apiVersion || t("common.unknown")} colors={colors} />
     </View>
-
+    <NavigationRow label={t("settings.developer.title")} description={t("settings.developer.description")}
+      colors={colors} onPress={() => { setLocalError(""); setNotice(""); setDeveloperOpen(true); }} />
+    </>}
+    {developerOpen && <>
+    <Text style={[styles.caption, { color: colors.muted }]}>{t("settings.developer.description")}</Text>
     <Text style={[styles.section, { color: colors.muted }]}>{t("settings.diagnostics")}</Text>
     <Pressable accessibilityRole="button" accessibilityLabel={t("settings.diagnostics.local")}
       accessibilityState={{ expanded: diagnosticsExpanded }}
@@ -543,6 +554,7 @@ export function MobileSettingsScreen(props: MobileSettingsScreenProps) {
       </View>
       {diagnostics.error && <ErrorNotice colors={colors} text={t("settings.diagnostics.error")} />}
     </View>}
+    </>}
     {notice && <Text accessibilityLiveRegion="polite" style={[styles.noticeText, { color: colors.ink,
       backgroundColor: colors.brandBackground, borderColor: colors.accent }]}>{notice}</Text>}
     {(localError || state.error) && <ErrorNotice colors={colors} text={localError || state.error || ""} />}
@@ -711,7 +723,7 @@ function errorText(error: unknown, language: MobileSupportedLocale): string {
 }
 
 const styles = StyleSheet.create({
-  screen: { flexGrow: 1, padding: 20, gap: 14, paddingBottom: 36 },
+  screen: { flexGrow: 1, padding: 20, gap: 12, paddingBottom: 36 },
   fill: { flex: 1 },
   title: { fontSize: 26, fontWeight: "700" },
   description: { fontSize: 15, lineHeight: 22 },
@@ -722,8 +734,8 @@ const styles = StyleSheet.create({
   choice: { minHeight: 54, flexDirection: "row", alignItems: "center", gap: 12 },
   radio: { width: 24, height: 24, borderWidth: 2, borderRadius: 12, alignItems: "center", justifyContent: "center" },
   radioDot: { width: 12, height: 12, borderRadius: 6 },
-  navigationRow: { minHeight: 68, borderWidth: 1, borderRadius: 14, paddingHorizontal: 14,
-    paddingVertical: 10, flexDirection: "row", alignItems: "center", gap: 10 },
+  navigationRow: { minHeight: 72, borderWidth: 1, borderRadius: 14, paddingHorizontal: 16,
+    paddingVertical: 16, flexDirection: "row", alignItems: "center", gap: 12 },
   chevron: { fontSize: 28 },
   infoRow: { minHeight: 38, flexDirection: "row", alignItems: "flex-start", gap: 12, paddingVertical: 4 },
   infoLabel: { width: 96, fontSize: 13, lineHeight: 20, fontWeight: "600" },

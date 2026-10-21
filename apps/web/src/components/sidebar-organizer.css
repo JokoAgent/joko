@@ -610,7 +610,7 @@
 
 .schedule-delete-dialog__option.is-danger.is-selected strong,
 .schedule-delete-dialog__option.is-danger.is-selected .schedule-delete-dialog__option-icon {
-  color: var(--danger);
+  color: var(--red);
 }
 
 .sidebar-view--card .schedule-session-group__row {

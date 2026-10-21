@@ -505,9 +505,11 @@ describe("MobileSettingsScreen", () => {
     expect(button(mounted.container, "Rename this phone").disabled).toBe(true);
   });
 
-  it("keeps privacy-bounded local diagnostics folded and confirms toggle, export, and clear actions", async () => {
+  it("keeps diagnostics in Developer and confirms toggle, export, clear, and secondary-page back actions", async () => {
     const mounted = mount();
     expect(mounted.container.textContent).not.toContain("Message text, files, paths");
+    expect(mounted.container.querySelector('[aria-label="Local diagnostics"]')).toBeNull();
+    act(() => button(mounted.container, "Developer").click());
 
     act(() => button(mounted.container, "Local diagnostics").click());
     expect(mounted.container.textContent).toContain("Message text, files, paths, IDs, credentials, raw errors, audio, and transcripts are never included.");
@@ -529,6 +531,12 @@ describe("MobileSettingsScreen", () => {
     expect(mounted.onDiagnosticsClear).toHaveBeenCalledOnce();
     expect(mounted.container.textContent).toContain("Local diagnostics cleared.");
     expect(mounted.container.textContent).not.toContain("Upload diagnostics");
+    act(() => button(mounted.container, "Back to Settings").click());
+    expect(mounted.container.querySelector('[aria-label="Local diagnostics"]')).toBeNull();
+    expect(button(mounted.container, "Developer")).toBeDefined();
+    act(() => button(mounted.container, "Developer").click());
+    act(() => expect(native.hardwareBack?.()).toBe(true));
+    expect(mounted.container.querySelector('[aria-label="Local diagnostics"]')).toBeNull();
   });
 
   it("protects a dirty rename draft and blocks closing or duplicate saves while one request is in flight", async () => {

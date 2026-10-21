@@ -4,7 +4,7 @@ import { create } from "@bufbuild/protobuf";
 import { ListPartnerGroupsResponseSchema, type PartnerGroupApi } from "@joko/contracts";
 import { visualSamples } from "../i18n/visual-samples.js";
 import { AppWithController } from "../App.js";
-import { automaticConnectionTargetForProfile, resolveLinkOpenPreference } from "../controller.js";
+import { automaticConnectionTargetForProfile, resolveLinkOpenPreference, routeFromHash } from "../controller.js";
 import type { AppController, AppRoute, ControllerState } from "../controller.js";
 import {
   DEFAULT_UI_PREFERENCES,
@@ -466,6 +466,18 @@ export function VisualHarness(): JSX.Element {
     const implemented = {
       state,
       taskSharing: undefined,
+      listNativeCatalogAdoptions: async (): ReturnType<AppController["listNativeCatalogAdoptions"]> => [],
+      listSkills: async (): ReturnType<AppController["listSkills"]> => ({ revision: 1n, skills: [] }),
+      listSkillRecoveries: async (): ReturnType<AppController["listSkillRecoveries"]> => [],
+      getContactDirectory: async (): ReturnType<AppController["getContactDirectory"]> => ({
+        format: 1, revision: 1n, enabled: true, people: 0, organizations: 0, pending: 0, groups: 0
+      }),
+      listContactGroups: async (): ReturnType<AppController["listContactGroups"]> => [],
+      listContacts: async (): ReturnType<AppController["listContacts"]> => ({ contacts: [], total: 0 }),
+      getContactSyncStatus: async (): ReturnType<AppController["getContactSyncStatus"]> => ({
+        available: false, configurationRevision: 1n, nodeId: "visual-node", fingerprint: "visual-fingerprint",
+        enabled: false, phase: "off", onlinePeerCount: 0, peers: [], candidates: []
+      }),
       partnerGroupApi: () => partnerGroups,
       listPartners: async (_lifecycle: Parameters<AppController["listPartners"]>[0], signal?: AbortSignal): ReturnType<AppController["listPartners"]> => {
         signal?.throwIfAborted();
@@ -3415,6 +3427,7 @@ function visualToolPolicySnapshotObservation(snapshot: AppSnapshot) {
 }
 
 interface HarnessParameters {
+  readonly locale: "en" | "zh-CN";
   readonly scenario: "session" | "interaction" | "maintenance" | "artifact-storage" | "tool-policy" | "question" | "long-question" | "files" | "audio" | "review" | "personalization" | "providers" | "voice" | "automation" | "scheduler" | "connection" | "connections" | "browser" | "extensions" | "background" | "subagents" | "usage";
   readonly usageState: "ready" | "empty" | "error";
   readonly theme: Theme;
@@ -3441,6 +3454,7 @@ function harnessParameters(): HarnessParameters {
   const themeValue = query.get("theme");
   const updateValue = query.get("computerUpdate");
   return {
+    locale: query.get("locale") === "zh-CN" ? "zh-CN" : "en",
     scenario: scenarioValue === "interaction"
       || scenarioValue === "maintenance"
       || scenarioValue === "artifact-storage"
@@ -3494,6 +3508,8 @@ function harnessParameters(): HarnessParameters {
 }
 
 function initialControllerState(parameters: HarnessParameters, files: VisualWorkspaceFiles): ControllerState {
+  const requestedRoute = /^#\/(?:projects|partners|tools|tasks\/new)(?:[/?]|$)/u.test(window.location.hash)
+    ? routeFromHash(window.location.hash) : undefined;
   const activeProfile = {
     id: "visual-profile",
     deviceId: "visual-desktop",
@@ -3548,7 +3564,7 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
       : undefined,
     automaticConnectionAvailable: true,
     snapshot: visualSnapshot(parameters, files),
-    route: parameters.scenario === "files"
+    route: requestedRoute ?? (parameters.scenario === "files"
       ? { kind: "files", sessionId: "session-1", file: "src/App.tsx" }
       : parameters.scenario === "personalization" || parameters.scenario === "providers" || parameters.scenario === "voice" || parameters.scenario === "connections" || parameters.scenario === "maintenance" || parameters.scenario === "artifact-storage" || parameters.scenario === "tool-policy"
         ? { kind: "settings" }
@@ -3562,10 +3578,10 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
             ? parameters.extensionMainView
               ? { kind: "extensionMainView", extensionId: "extension_0123456789abcdef0123456789abcdef" }
               : { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef" }
-          : { kind: "session", sessionId: "session-1" },
+          : { kind: "session", sessionId: "session-1" }),
     preferences: {
       ...DEFAULT_UI_PREFERENCES,
-      locale: "en",
+      locale: parameters.locale,
       theme: parameters.theme,
       inspectorOpen: parameters.scenario === "subagents",
       navigationOpen: true,
@@ -3578,7 +3594,7 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
       messageSearchSort: "relevance"
     },
     systemLocale: "en",
-    effectiveLocale: "en",
+    effectiveLocale: parameters.locale,
     error: connectionScenario ? "The saved node rejected this connection. Pair again to restore access." : undefined,
     extensionNotifications: []
   };

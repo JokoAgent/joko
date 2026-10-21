@@ -1,7 +1,7 @@
 .contacts-settings { min-height: min(760px, calc(100vh - 76px)); display: flex; flex-direction: column; gap: 12px; }
 .contacts-settings__heading { flex: 0 0 auto; display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
 .contacts-settings__heading h2, .contacts-settings__heading p { margin: 0; }
-.contacts-settings__heading h2 { font-size: var(--text-16); font-weight: 550; }
+.contacts-settings__heading h2 { font-size: var(--text-16); font-weight: 500; line-height: 1.2; }
 .contacts-settings__heading p { margin-top: 4px; color: var(--text-soft); font-size: var(--text-13); line-height: 1.45; }
 .contacts-settings__header-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .contacts-settings__header-actions .button { gap: 6px; }

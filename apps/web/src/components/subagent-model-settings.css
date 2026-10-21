@@ -1,8 +1,11 @@
-.subagent-model-card { padding: 16px; }
-.subagent-model-card > .personalization-section { gap: 10px; }
-.subagent-model-card .setting-row { min-height: 52px; padding: 0; }
+.subagent-model-card { padding: 0 var(--settings-card-padding); }
+.subagent-model-card > .personalization-section { gap: 0; }
+.subagent-model-card > .personalization-section + .personalization-section { border-top: 1px solid var(--line); }
+.subagent-model-card > p { padding-block: var(--settings-card-padding); }
+.subagent-model-card .personalization-section > p,
+.subagent-smart-routing > p { padding-bottom: var(--settings-card-padding); }
 .subagent-model-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
 .subagent-model-actions .model-picker-trigger { max-width: 100%; }
-.subagent-smart-routing { display: grid; gap: 8px; border-top: 1px solid var(--border-soft); padding-top: 10px; }
+.subagent-smart-routing { display: grid; border-top: 1px solid var(--line); }
 .subagent-model-section > p,
 .subagent-model-card p { margin: 0; color: var(--text-soft); font-size: var(--text-12); line-height: 1.5; overflow-wrap: anywhere; }

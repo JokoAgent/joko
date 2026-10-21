@@ -13,7 +13,7 @@
   overflow-wrap: anywhere;
 }
 
-.native-file-actions [role="alert"] { color: var(--danger); }
+.native-file-actions [role="alert"] { color: var(--red); }
 
 .native-file-actions .message-action-menu__panel {
   min-width: 184px;

@@ -1,4 +1,5 @@
 .task-sharing-settings { display: grid; gap: 16px; min-width: 0; }
+.task-sharing-settings > .settings-heading { margin-bottom: 0; }
 .task-sharing-settings form { display: grid; gap: 12px; }
 .task-sharing-settings label { display: grid; gap: 6px; }
 .task-sharing-settings textarea { min-height: 90px; resize: vertical; width: 100%; }

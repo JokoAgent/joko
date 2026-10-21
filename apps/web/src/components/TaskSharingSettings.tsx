@@ -93,9 +93,10 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
       <strong>{member.displayName}</strong><Button disabled={busy || !!unknown} onClick={() => setConfirmation({ kind: "remove", share, member })}>{t("taskSharing.remove")}</Button>
     </div>)}
   </article>;
-  if (!api) return <p role="status">{t("taskSharing.unavailable")}</p>;
+  const heading = <header className="settings-heading"><h2>{t("taskSharing.title")}</h2><p>{t("taskSharing.body")}</p></header>;
+  if (!api) return <section className="task-sharing-settings">{heading}<p role="status">{t("taskSharing.unavailable")}</p></section>;
   return <section className="task-sharing-settings" data-task-sharing-management data-state={error ? "error" : busy || !directory.value ? "loading" : "ready"} aria-label={t("taskSharing.title")}>
-    <h2>{t("taskSharing.title")}</h2><p>{t("taskSharing.body")}</p>
+    {heading}
     {directory.error && <ErrorBanner message={directory.error} retryLabel={t("common.retry")} onRetry={() => { void directory.refresh(); }} />}
     {error && <ErrorBanner message={error} />}{notice && <p role="status">{notice}</p>}
     {unknown && <div role="status" className="settings-card"><p>{t("taskSharing.unknown")}</p><Button disabled={busy} onClick={() => {

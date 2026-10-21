@@ -4,7 +4,6 @@ import {
   Bot,
   CheckCircle2,
   KeyRound,
-  MessageCircleMore,
   Plus,
   RefreshCw,
   Route,
@@ -559,7 +558,6 @@ export function MessagingSettings({ controller, snapshot, t }: {
 
     <header className="messaging-settings__hero">
       <div>
-        <span className="messaging-settings__eyebrow"><MessageCircleMore aria-hidden="true" />{t("messaging.channels")}</span>
         <h2>{t("settings.messaging")}</h2>
         <p>{t("settings.messagingBody")}</p>
       </div>

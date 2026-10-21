@@ -113,6 +113,7 @@ import { PersonalDevelopmentSettings } from "./PersonalDevelopmentSettings.js";
 import { buildSettingsSearchDocuments, settingsSearchEntryFromHash, settingsSearchHash, type SettingsSearchEntry } from "./settings-search.js";
 import { useSettingsSearchTarget } from "./use-settings-search-target.js";
 import { TaskSharingSettings } from "./TaskSharingSettings.js";
+import { desktopRemoteDesktopApi } from "../desktop-remote-desktop.js";
 
 export const SETTINGS_NAV_SECTION_IDS = [
   "general",
@@ -342,7 +343,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
             {section === "shortcuts" && <SettingsPageSection id="shortcuts"><AppShortcutsSettings controller={controller} overrides={controller.state.preferences.appShortcutOverrides} t={t} /><DedicatedHardwareSettings t={t} bridge={dedicatedHardwareBridge} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /><GamepadSettings t={t} listSkills={controller.listSkills} serverId={controller.state.activeProfile?.serverId} connected={controller.state.connectionState === "connected"} /></SettingsPageSection>}
             {section === "voice" && <SettingsPageSection id="voice"><VoiceInputSettings controller={controller} t={t} /></SettingsPageSection>}
             {section === "taskStatus" && <SettingsPageSection id="taskStatus"><SettingsHeading title={t("settings.nativeTaskStatus.title")} body={t("settings.nativeTaskStatus.body")} /><NativeTaskStatusSettings t={t} showHeading={false} /></SettingsPageSection>}
-            {section === "connections" && <><SettingsHeading title={t("settings.connections")} body={t("settings.connectionsBody")} /><SettingsPageSection id="remoteDesktop"><SettingsSectionHeading title={t("settings.remoteDesktop.title")} body={t("settings.remoteDesktop.body")} /><DesktopRemoteDesktopSettings t={t} /></SettingsPageSection><SettingsPageSection id="connections"><ConnectionSettings controller={controller} snapshot={snapshot} locale={locale} t={t} runAction={runAction} showHeading={false} /></SettingsPageSection><SettingsPageSection id="remoteHosts"><RemoteHostsSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} t={t} /></SettingsPageSection><SshKeySettings controller={controller} t={t} /></>}
+            {section === "connections" && <><SettingsHeading title={t("settings.connections")} body={t("settings.connectionsBody")} />{desktopRemoteDesktopApi() !== undefined && <SettingsPageSection id="remoteDesktop"><SettingsSectionHeading title={t("settings.remoteDesktop.title")} body={t("settings.remoteDesktop.body")} /><DesktopRemoteDesktopSettings t={t} /></SettingsPageSection>}<SettingsPageSection id="connections"><ConnectionSettings controller={controller} snapshot={snapshot} locale={locale} t={t} runAction={runAction} showHeading={false} /></SettingsPageSection><SettingsPageSection id="remoteHosts"><RemoteHostsSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} t={t} /></SettingsPageSection><div className="settings-page-section"><SshKeySettings controller={controller} t={t} /></div></>}
             {section === "providers" && <SettingsPageSection id="providers"><ProviderSettings key={searchEntry === undefined ? subsection : `${searchEntry.id}:${searchActivation}`} controller={controller} snapshot={snapshot} runAction={runAction} onSuccess={showSuccess} initialView={searchEntry?.providerView ?? (subsection === "credentials" ? "credentials" : undefined)} t={t} /></SettingsPageSection>}
             {section === "tools" && <><SettingsHeading title={t("settings.toolPolicies.nav")} body={t("settings.toolsBody")} /><SettingsPageSection id="tools"><SettingsSectionHeading title={t("settings.toolPolicies.title")} body={t("settings.toolPolicies.body")} /><ToolPolicySettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="mcp"><McpSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
             {section === "automation" && <SettingsPageSection id="automation"><AutomationSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} onSuccess={showSuccess} t={t} /></SettingsPageSection>}
@@ -3028,7 +3029,6 @@ export function PersonalizationSettings({ controller, snapshot, runAction, onSuc
   const promptCanSave = promptDraft !== savedPrompt && !promptOverLimit && !promptPending;
   return (
     <div className="personalization-settings">
-      <TerminalShellSettings controller={controller} t={t} />
       <section className="personalization-section" aria-labelledby="personalization-prompt-heading">
         <div className="personalization-section__heading personalization-section__heading--actions"><h2 id="personalization-prompt-heading">{t("settings.personalization")}</h2><DefaultOverrideControls customized={savedPrompt.length > 0} disabled={promptPending} t={t} onReset={resetPrompt} /></div>
         <div className="personalization-card personalization-prompt-card">
@@ -3053,6 +3053,7 @@ export function PersonalizationSettings({ controller, snapshot, runAction, onSuc
         </div>
       </section>
 
+      <TerminalShellSettings controller={controller} t={t} />
       <PersonalizationMemorySettings controller={controller} snapshot={snapshot} runAction={runAction} onSuccess={onSuccess} t={t} />
 
       <VisionBridgeSection controller={controller} snapshot={snapshot} runAction={runAction} t={t} />

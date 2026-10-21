@@ -28,14 +28,18 @@ export function TerminalShellSettings({ controller, t }: { readonly controller: 
     catch (failure) { setError(failure instanceof Error ? failure.message : String(failure)); }
   };
   const automatic = capabilities?.shells.find((shell) => shell.id === capabilities.defaultShellId)?.label ?? t("terminal.automatic");
-  return <section className="settings-card" aria-label={t("terminal.defaultShell")}>
-    <header><h3>{t("terminal.defaultShell")}</h3><Button disabled={preference === "auto"} onClick={() => save("auto")}>{t("terminal.resetDefault")}</Button></header>
-    <p className="muted">{t("terminal.defaultShellBody")}</p>
+  return <section className="settings-card terminal-shell-settings" aria-label={t("terminal.defaultShell")}>
+    <div className="setting-row">
+    <div><strong>{t("terminal.defaultShell")}</strong><span>{t("terminal.defaultShellBody")}</span></div>
+    <div className="terminal-shell-settings__controls">
+    <Button tone="ghost" disabled={preference === "auto"} onClick={() => save("auto")}>{t("terminal.resetDefault")}</Button>
     <SelectControl aria-label={t("terminal.defaultShell")} value={preference} disabled={!connected || capabilities?.support !== "supported"} onChange={(event) => save(event.currentTarget.value)}>
       <option value="auto">{t("terminal.autoShell", { shell: automatic })}</option>
       {capabilities?.shells.map((shell) => <option key={shell.id} value={shell.id}>{shell.label}</option>)}
       {preference !== "auto" && !capabilities?.shells.some((shell) => shell.id === preference) && <option value={preference} disabled>{t("terminal.unavailableShell", { shell: preference })}</option>}
     </SelectControl>
+    </div>
+    </div>
     {error !== undefined && <p role="alert" className="inline-error">{error}</p>}
     {capabilities !== undefined && capabilities.support !== "supported" && <p role="status">{capabilities.reason ?? t("terminal.unavailable")}</p>}
   </section>;
