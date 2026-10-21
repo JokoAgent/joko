@@ -3,7 +3,7 @@
 import type { Editor } from "@tiptap/core";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { resetWorktreeRemovalPreflightCache } from "../worktree-removal-preflight.js";
 import { VisualHarness } from "./VisualHarness.js";
@@ -208,6 +208,33 @@ describe("Session visual harness", () => {
     expect(document.documentElement.dataset.harnessLastAction)
       .toBe('send:session-1:prompt:artifacts:["visual-artifact-one","visual-artifact-two"]');
     expect(editor().textContent?.trim()).toBe("");
+  }, 10_000);
+
+  it.each(["enter", "modifier-enter"])("steers the sole queued input from an empty composer with the %s send preference", async (shortcut) => {
+    window.history.replaceState(null, "", `/__visual-harness__?scenario=session&running=1&queue=1&interaction=0&shortcut=${shortcut}`);
+    const container = document.body.appendChild(document.createElement("div"));
+    await renderHarness(container);
+    const editor = required(container.querySelector<HTMLElement>(".composer-rich-editor__content"));
+    const actions: string[] = [];
+    const observer = new MutationObserver((records) => {
+      for (const record of records) if (record.oldValue !== null) actions.push(record.oldValue);
+    });
+    observer.observe(document.documentElement, { attributes: true, attributeOldValue: true, attributeFilter: ["data-harness-last-action"] });
+    onTestFinished(() => observer.disconnect());
+    for (const options of [{ isComposing: true }, { repeat: true }, { keyCode: 229 }, { shiftKey: true }, { altKey: true }]) {
+      await act(async () => editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true, ...options })));
+      expect(actions).not.toContain("queue-steer:visual-queue");
+    }
+    await act(async () => editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true })));
+    expect(actions).toContain("queue-steer:visual-queue");
+    expect(actions).toContain("queue-edit-lock:visual-queue:true");
+    expect(document.documentElement.dataset.harnessLastAction).toBe("queue-edit-lock:visual-queue:false");
+    actions.length = 0;
+    const input = (editor as HTMLElement & { editor: Editor }).editor;
+    await act(async () => input.commands.setContent("Send the current draft"));
+    await act(async () => editor.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", ctrlKey: true, bubbles: true, cancelable: true })));
+    expect(actions).not.toContain("queue-steer:visual-queue");
+    expect(container.querySelector(".queue-strip__text")?.textContent).toBe("Queued visual follow-up");
   }, 10_000);
 
   it("saves and cancels queue edits from the keyboard without consuming composition or steering an edited row", async ({ onTestFinished }) => {

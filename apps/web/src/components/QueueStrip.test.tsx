@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
-import { act } from "react";
+import { act, createRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController, ControllerState } from "../controller.js";
 import type { QueueItemView } from "../model.js";
 import { SELECTION_QUOTE_BLOCK_MARKER_LINE } from "../selection-quote.js";
-import { QueueStrip } from "./QueueStrip.js";
+import { QueueStrip, type QueueStripActions } from "./QueueStrip.js";
 import type { RunAction } from "./types.js";
 
 let root: Root | undefined;
@@ -31,17 +31,45 @@ const api = () => ({
 });
 async function fixture() {
   const controller = api();
+  const actions = createRef<QueueStripActions>();
   const failures: unknown[] = [];
   const runAction: RunAction = (_key, action) => { void action().catch((error: unknown) => failures.push(error)); };
   const host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
   const render = async (items = initial, owner = controller) => act(async () => root!.render(<QueueStrip sessionId="task" items={items}
     controller={owner as unknown as AppController} supportedDispositions={["followUp", "steer"]} runAction={runAction} t={(key) => key}
-    expanded={false} onExpandedChange={vi.fn()} />));
+    expanded={false} onExpandedChange={vi.fn()} actionsRef={actions} />));
   await render();
   const row = (id = "first") => host.querySelector<HTMLElement>(`[data-queue-item-id="${id}"]`)!;
   const button = (label: string, id = "first") => [...row(id).querySelectorAll<HTMLButtonElement>("button")].find((value) => value.getAttribute("aria-label") === label || value.textContent === label)!;
-  return { host, controller, failures, render, row, button };
+  return { host, controller, failures, render, row, button, actions };
 }
+it("steers a sole eligible input with the row lock and declines ambiguous, foreign, edited, or pending input", async () => {
+  const f = await fixture();
+  expect(f.actions.current?.steerSole()).toBe(false);
+  for (const entry of [
+    { ...initial[0]!, editLocked: true },
+    { ...initial[0]!, state: "dispatchUnknown" as const },
+    { ...initial[0]!, source: "schedule" as const }
+  ]) {
+    await f.render([entry]);
+    expect(f.actions.current?.steerSole()).toBe(false);
+  }
+  await f.render([initial[0]!], { ...f.controller, state: { sessionAccess: {
+    role: "guest", memberId: "other", editableQueueItemIds: new Set<string>()
+  } } } as typeof f.controller);
+  expect(f.actions.current?.steerSole()).toBe(false);
+  await f.render([initial[0]!]);
+  await act(async () => f.button("queue.edit").click());
+  expect(f.actions.current?.steerSole()).toBe(false);
+  await act(async () => f.button("common.cancel").click());
+  await act(async () => {
+    expect(f.actions.current?.steerSole()).toBe(true);
+    expect(f.actions.current?.steerSole()).toBe(false);
+  });
+  const token = f.controller.steerQueueItemNow.mock.calls[0]![1];
+  expect(f.controller.steerQueueItemNow).toHaveBeenCalledExactlyOnceWith("first", token);
+  expect(f.controller.setQueueItemEditLock).toHaveBeenLastCalledWith("first", token, false);
+});
 async function change(textarea: HTMLTextAreaElement, text: string) {
   await act(async () => { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea, text); textarea.dispatchEvent(new Event("input", { bubbles: true })); });
 }

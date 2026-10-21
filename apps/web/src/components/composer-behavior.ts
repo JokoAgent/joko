@@ -103,7 +103,7 @@ export function resolveComposerEnterIntent(
   if (event.key !== "Enter" || event.shiftKey || event.altKey) return null;
   if (event.isComposing) return "native";
 
-  const hasModifier = event.ctrlKey || (isMacPlatform(options.platform) && event.metaKey);
+  const hasModifier = hasComposerModifier(event, options.platform);
   if (event.repeat) {
     const isSendShortcut = preference === "enter" || hasModifier;
     return isSendShortcut ? "ignore" : "native";
@@ -116,6 +116,10 @@ export function resolveComposerEnterIntent(
 export function getComposerSendShortcutLabel(preference: ComposerSendShortcutPreference, platform?: string): string {
   if (preference === "enter") return "Enter";
   return isMacPlatform(platform) ? "⌘+Enter" : "Ctrl+Enter";
+}
+
+export function hasComposerModifier(event: { readonly ctrlKey?: boolean; readonly metaKey?: boolean }, platform?: string): boolean {
+  return event.ctrlKey === true || (isMacPlatform(platform) && event.metaKey === true);
 }
 
 export function currentComposerPlatform(): string | undefined {
