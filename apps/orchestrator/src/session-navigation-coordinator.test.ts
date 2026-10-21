@@ -13,6 +13,37 @@ afterEach(() => {
 });
 
 describe("SessionNavigationCoordinator", () => {
+  it.each([
+    { title: "完整保留中文标题".repeat(5), valid: true },
+    { title: "🧭".repeat(40), valid: true },
+    { title: "🧭".repeat(41), valid: false }
+  ])("uses one 40-code-point limit for generated titles: $valid / $title", async ({ title, valid }) => {
+    const store = fixtureStore();
+    appendMessage(store, "title-material", "user", "Repair the release workflow", 10);
+    const infer = vi.fn(async (_input: Parameters<typeof requestManagedTextInference>[0]) => title);
+    const coordinator = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryRouting(store, infer) });
+    try {
+      await expect(coordinator.suggestTitle("session-a", "zh-CN")).resolves.toEqual(valid
+        ? { title, status: "ok" } : { title: "", status: "generation_failed" });
+      expect(infer.mock.calls[0]?.[0]).toMatchObject({ maxTokens: 160 });
+      expect(infer.mock.calls[0]?.[0].system).toContain("at most 40 Unicode characters");
+      coordinator.observeAcceptedPrompt("session-a", prompt("Repair the release workflow"));
+      if (valid) await vi.waitFor(() => expect(store.getSession("session-a").descriptor.title).toBe(title));
+    } finally { coordinator.dispose(); }
+  });
+
+  it("bounds placeholder titles by Unicode code points without splitting supplementary characters", async () => {
+    const store = fixtureStore();
+    const generated = deferred<string>();
+    const coordinator = new SessionNavigationCoordinator({ store, auxiliary: auxiliaryRouting(store, vi.fn(() => generated.promise)) });
+    try {
+      coordinator.observeAcceptedPrompt("session-a", prompt(`${"🧭".repeat(41)} trailing text`));
+      await vi.waitFor(() => expect(store.getSession("session-a").descriptor.title).toBe("🧭".repeat(40)));
+      generated.resolve("Updated title");
+      await vi.waitFor(() => expect(store.getSession("session-a").descriptor.title).toBe("Updated title"));
+    } finally { coordinator.dispose(); }
+  });
+
   it("publishes the placeholder durably and never overwrites a concurrent manual rename", async () => {
     const store = fixtureStore();
     const generated = deferred<string>();
