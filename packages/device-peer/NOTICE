@@ -1,0 +1,5 @@
+Bounded Remote Desktop native-input recovery is adapted from Cindy v0.1.112
+(8bd60e8549cdcf0ada21e6f73d68dc0d0b71909d), copyright 2026 Cindy contributors,
+under the Apache License, Version 2.0. Source: main/remote-desktop/controller.ts.
+Joko retains executor lifecycle, control-generation and native-authentication
+authority while recovering its input helper. See LICENSE.cindy.

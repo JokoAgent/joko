@@ -5171,8 +5171,10 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     if (!transport || !owner) return;
     const client = createClient(ExtensionCardService, transport);
     const uploadScope = this.captureActionScope();
+    const native = typeof window === "undefined" ? undefined : window.jokoDesktop?.extensionOAuth, profile = this.#profile;
     const assertCurrent = () => { owner.signal.throwIfAborted(); if (this.#transport !== transport || this.#abort !== owner) throw new GatewayError("Extension connection changed."); };
     return {
+      canAuthorizeAccount: native !== undefined,
       formScope: sessionId => extensionCardFormDeliveryScope(owner.signal, sessionId),
         loadMedia: async (sessionId, cardId, uri, signal) => {
           assertCurrent(); const combined = AbortSignal.any([signal, owner.signal]); combined.throwIfAborted();
@@ -5212,8 +5214,27 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; },
       get: async (request, options) => { assertCurrent(); const result = await client.get(request, { ...options,
         signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; },
-      dispatch: async (request, options) => { assertCurrent(); const result = await client.dispatch(request, { ...options,
-        signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; },
+      dispatch: async (request, options) => {
+        assertCurrent(); const signal = options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal;
+        const result = await client.dispatch(request, { ...options, signal }); assertCurrent(); signal.throwIfAborted();
+        if (result.authorizationFlowId) {
+          const flowId = result.authorizationFlowId, oauth = createClient(ExtensionOAuthService, transport);
+          if (!native || !profile) { await oauth.cancelFlow({ flowId }).catch(() => undefined); throw new GatewayError("Open Joko Desktop to connect an account."); }
+          const controllerOwner = { profileId: profile.id, serverId: profile.serverId, origin: profile.origin };
+          let cancelled = false, completed = false;
+          const cancel = () => { if (cancelled) return; cancelled = true; void native.cancel(controllerOwner, flowId).catch(() => undefined); void oauth.cancelFlow({ flowId }, { timeoutMs: 5_000 }).catch(() => undefined); };
+          signal.addEventListener("abort", cancel, { once: true });
+          try {
+            assertCurrent(); signal.throwIfAborted();
+            const response = fromBinary(ExtensionOAuthServiceGetFlowResponseSchema, await native.authorize(controllerOwner,
+              toBinary(ExtensionOAuthServiceGetFlowRequestSchema, create(ExtensionOAuthServiceGetFlowRequestSchema, { flowId }))));
+            assertCurrent(); signal.throwIfAborted();
+            if (response.flow?.flowId !== flowId || response.flow.phase !== ExtensionAuthorizationPhase.COMPLETE) throw new GatewayError("Plugin authorization did not complete.");
+            completed = true;
+          } finally { signal.removeEventListener("abort", cancel); if (!completed) cancel(); }
+        }
+        return result;
+      },
       authorizeLink: async (request, options) => { assertCurrent(); const result = await client.authorizeLink(request, { ...options,
         signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; }
     };
@@ -21071,8 +21092,8 @@ function mapPartnerRoute(route: ProtoPartnerCapabilities["modelChain"][number]):
     };
 }
 
-function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined): PartnerCapabilitiesView {
-  if (value === undefined || value.modelChain.length < 1 || value.modelChain.length > 5) {
+function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined, allowUnconfiguredModel = false): PartnerCapabilitiesView {
+  if (value === undefined || value.modelChain.length < (allowUnconfiguredModel ? 0 : 1) || value.modelChain.length > 5) {
     throw new GatewayError("Orchestrator returned an invalid Partner model chain.");
   }
   const routes = value.modelChain.map(mapPartnerRoute);
@@ -21128,7 +21149,7 @@ function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfi
     ...(initializationErrorCode === undefined ? {} : { initializationErrorCode }),
     homeTargetId: value.homeTargetId,
     ...(value.canonicalSessionId === undefined ? {} : { canonicalSessionId: value.canonicalSessionId }),
-    capabilities: mapPartnerCapabilities(value.capabilities),
+    capabilities: mapPartnerCapabilities(value.capabilities, value.canonicalSessionId === undefined && initializationState !== "ready"),
     ...(value.taskModelOverride === undefined ? {} : { taskModelOverride: mapPartnerRoute(value.taskModelOverride) }),
     usesDirectoryDefaults: value.usesDirectoryDefaults,
     createdAt: requiredContactTimestamp(value.createdAt, "Partner creation"),

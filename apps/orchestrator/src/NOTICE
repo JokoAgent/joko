@@ -1,0 +1,7 @@
+The empty-output reasoning-budget recovery in personalization-inference.ts
+adapts apps/desktop/src/main/utility-model/oneShotCandidates.ts from Cindy
+(https://github.com/makecindy/cindy), release v0.1.112, commit
+8bd60e8549cdcf0ada21e6f73d68dc0d0b71909d (change ab482e6d3), Apache-2.0.
+Joko retains the original inference deadline and revalidates the request owner
+before one bounded retry on the same provider and model route.
+See LICENSE.cindy for the applicable license text.

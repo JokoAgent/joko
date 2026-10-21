@@ -184,6 +184,31 @@ describe("macOS native task-status host", () => {
     expect(html).toContain("Content-Security-Policy");
   });
 
+  it("shows disjoint attention and running counts without clipping multi-digit badges", () => {
+    const sessions = Array.from({ length: 25 }, (_, index) => ({
+      sessionId: `task-${index}`, title: `Task ${index}`, detail: "", activityLines: [], updatedAt: index,
+      phase: index < 12 ? "running" : index < 23 ? "interaction" : index === 23 ? "completed" : "error"
+    }));
+    const render = (items: typeof sessions, locale: "en" | "zh-CN" = "en") => renderNativeTaskStatusDocument({
+      ...projectDesktopNativeTaskStatusSurface(parseDesktopNativeTaskStatusSnapshot({
+        ownerId: "owner", revision: "1", locale, sessions: items
+      })), mode: "compact"
+    }, { enabled: true, display: { mode: "all" }, layout: "compact", sounds: SOUND_SETTINGS }, locale);
+    const both = render(sessions);
+    expect(both).toContain('aria-label="Needs attention: 13; Running: 12"');
+    expect(both).toContain('class="count__attention" aria-hidden="true">13</span>');
+    expect(both).toContain('class="count__running" aria-hidden="true">12</span>');
+    expect(both).toContain("flex-shrink:0");
+    expect(both).toContain("white-space:nowrap");
+    const running = render(sessions.slice(0, 1));
+    expect(running).toContain('aria-label="Running: 1"');
+    expect(running).not.toContain('class="count__attention"');
+    const attention = render(sessions.slice(12), "zh-CN");
+    expect(attention).toContain('aria-label="需要关注: 13"');
+    expect(attention).not.toContain('class="count__running"');
+    expect(render([])).not.toContain('class="count"');
+  });
+
   it("restores an unexpectedly closed ambient window with bounded retry and stops after opt-out", () => {
     const clock = new FakeClock();
     const windows: FakeWindow[] = [];

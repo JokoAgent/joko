@@ -31,6 +31,32 @@ afterEach(async () => {
 });
 
 describe("managed detached subagent runner", () => {
+  it("records an oversized command as a readable failure before starting the child", { timeout: 20_000 }, async () => {
+    const fixture = await createRunnerFixture({ settleDelayMs: 10 });
+    const config = JSON.parse(await readFile(fixture.configPath, "utf8"));
+    config.child.args.push(...Array.from({ length: 9 }, () => "x".repeat(16_000)));
+    await writeFile(fixture.configPath, JSON.stringify(config), { mode: 0o600 });
+    await runFixtureRunner(fixture);
+    const status = await waitForTerminalStatus(fixture.statusPath, 5_000);
+    expect(status).toMatchObject({ state: "failed", toolUses: 0 });
+    expect(String(status.summary)).toContain("platform spawn budget");
+    expect(await readdir(join(fixture.runDirectory, "sessions"))).toEqual([]);
+    expect(JSON.stringify(status)).not.toContain("x".repeat(1_000));
+  });
+
+  it.each([[6_000, "completed"], [12_000, "failed"]] as const)(
+    "measures Unicode arguments using the platform spawn units (%s characters per argument)", { timeout: 20_000 }, async (length, state) => {
+      const fixture = await createRunnerFixture({ settleDelayMs: 10 });
+      const config = JSON.parse(await readFile(fixture.configPath, "utf8"));
+      config.child.args.push(...Array.from({ length: 4 }, () => "字".repeat(length)));
+      await writeFile(fixture.configPath, JSON.stringify(config), { mode: 0o600 });
+      await runFixtureRunner(fixture);
+      const status = await waitForTerminalStatus(fixture.statusPath, 5_000);
+      expect(status).toMatchObject({ state });
+      if (state === "failed") expect(String(status.summary)).toContain("platform spawn budget");
+    }
+  );
+
   it("is valid dependency-free CommonJS", async () => {
     const directory = await temporaryDirectory();
     const runnerPath = join(directory, MANAGED_SUBAGENT_RUNNER_FILE_NAME);

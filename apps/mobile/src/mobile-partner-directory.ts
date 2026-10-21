@@ -240,7 +240,7 @@ export function projectMobilePartnerProfile(value: PartnerProfile): MobilePartne
     ...(initializationErrorCode === undefined ? {} : { initializationErrorCode }),
     homeTargetId: id(value.homeTargetId, "Partner home target ID"),
     ...(canonicalSessionId === undefined ? {} : { canonicalSessionId }),
-    capabilities: projectMobilePartnerCapabilities(value.capabilities),
+    capabilities: projectMobilePartnerCapabilities(value.capabilities, canonicalSessionId === undefined && initializationState !== "ready"),
     ...(value.taskModelOverride === undefined ? {} : { taskModelOverride: projectMobilePartnerModelRoute(value.taskModelOverride) }),
     usesDirectoryDefaults: value.usesDirectoryDefaults,
     createdAt: timestamp(value.createdAt, "Partner creation time"),
@@ -273,8 +273,8 @@ function projectMobilePartnerModelRoute(route: NonNullable<PartnerCapabilities>[
   };
 }
 
-export function projectMobilePartnerCapabilities(value: PartnerCapabilities | undefined): MobilePartnerCapabilities {
-  if (!value || value.modelChain.length < 1 || value.modelChain.length > 5) {
+export function projectMobilePartnerCapabilities(value: PartnerCapabilities | undefined, allowUnconfiguredModel = false): MobilePartnerCapabilities {
+  if (!value || value.modelChain.length < (allowUnconfiguredModel ? 0 : 1) || value.modelChain.length > 5) {
     throw new Error("The Joko node returned an invalid Partner model chain.");
   }
   const modelChain = value.modelChain.map(projectMobilePartnerModelRoute);

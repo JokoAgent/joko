@@ -29,6 +29,7 @@ const CONTROL_POLL_MS = 200;
 const RPC_TIMEOUT_MS = 5000;
 const EXIT_GRACE_MS = 2000;
 const MAX_CHILD_SLOTS = 4;
+const SPAWN_ARGV_BUDGET = process.platform === "win32" ? 30000 : 128000;
 const CREDENTIAL_NAMES_ENV = "JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES";
 const SECRET_NAMES_ENV = "JOKO_PI_SECRET_ENV_NAMES";
 const MCP_TOKEN_ENV = "JOKO_PI_MCP_TOKEN";
@@ -1164,6 +1165,11 @@ async function main() {
   let childSlot;
   try {
     flushStatus();
+    const launch = config.child;
+    const argvUnits = [launch.command].concat(launch.args).reduce(function (total, argument) {
+      return total + (process.platform === "win32" ? argument.length : Buffer.byteLength(argument, "utf8")) + 3;
+    }, 0);
+    if (argvUnits > SPAWN_ARGV_BUDGET) throw new Error("Subagent command line exceeds the platform spawn budget (" + argvUnits + " > " + SPAWN_ARGV_BUDGET + ").");
     const slotDeadline = startedAt + config.timeoutMs;
     while (!childSlot && !abortReason) {
       childSlot = tryAcquireChildSlot(config.slotRoot, config, runnerInstanceId);
@@ -1185,7 +1191,6 @@ async function main() {
       nativeLeaseAcquired = true;
       nativeLeaseInstalled = installNativeAuth(config, nativeLease, acquired.credential, nativeCredentialRedactionValues);
     }
-    const launch = config.child;
     child = spawn(launch.command, launch.args, {
       cwd: config.workspaceRoot,
       env: childEnv,

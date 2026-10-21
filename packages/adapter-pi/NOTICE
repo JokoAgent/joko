@@ -5,3 +5,9 @@ Original contribution by Yunjin Zhang; licensed under Apache License 2.0.
 Joko modifications bind private prompt files and their content digest to the
 existing runtime generation, remote staging, and process recovery lifecycle.
 See LICENSE.cindy for the applicable license.
+
+The platform command-line budget guard in the managed subagent sources adapts
+the same release's cindy-subagent-runner-source.ts (change c69e8b918).
+Windows measures UTF-16 characters; POSIX measures UTF-8 bytes. Joko applies
+the guard to foreground and detached children and records failures through
+the existing task lifecycle without exposing argument content.

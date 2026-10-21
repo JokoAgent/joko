@@ -117,7 +117,8 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
               <Text style={[styles.label, { color: colors.ink }]}>{partnerTaskModelMessages(locale).title}</Text>
               {(() => {
                 const m = partnerTaskModelMessages(locale), taskCapabilities = effective ?? draft.capabilities;
-                const route = draft.taskModelOverride ?? taskCapabilities.modelChain[0]!;
+                const route = draft.taskModelOverride ?? taskCapabilities.modelChain[0];
+                if (!route) return null;
                 const models = (snapshot.taskModels ?? []).filter(model => model.permissionModes.includes(taskCapabilities.permissionMode)
                   && (!taskCapabilities.planMode || model.canSetPlanMode));
                 const model = models.find(candidate => candidate.backendId === route.backendId && candidate.providerId === route.providerId && candidate.modelId === route.modelId);

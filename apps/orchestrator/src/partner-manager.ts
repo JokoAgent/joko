@@ -157,6 +157,7 @@ export interface PartnerManagerOptions {
   readonly pauseGoal?: (sessionId: string, operationId: string) => Promise<void>;
   readonly onRoutineLifecycle?: (partnerId: string, state: PartnerLifecycle) => Promise<void>;
   readonly prepareImportDeletion?: (partnerId: string) => Promise<void>;
+  readonly onReady?: (partnerId: string) => Promise<void>;
   /** Test seam for a recoverable, optional-artwork preparation failure. */
   readonly prepareAvatar?: (input: {
     readonly partner: PartnerProfileRecord;
@@ -202,6 +203,7 @@ export interface PartnerDelegationView {
 export class PartnerManager {
   readonly #importScope = new AsyncLocalStorage<{ key: string; active: boolean }>();
   readonly #prepareImportDeletion: PartnerManagerOptions["prepareImportDeletion"];
+  readonly #optionsOnReady: PartnerManagerOptions["onReady"];
   readonly #store: PartnerStore;
   readonly #operationalStore: OperationalStore;
   readonly #sessionHost: PartnerManagerOptions["sessionHost"];
@@ -232,6 +234,7 @@ export class PartnerManager {
     this.#pauseGoal = options.pauseGoal;
     this.#routineLifecycle = options.onRoutineLifecycle;
     this.#prepareImportDeletion = options.prepareImportDeletion;
+    this.#optionsOnReady = options.onReady;
     this.#prepareAvatar = options.prepareAvatar ?? (async ({ partner, homePath }) => {
       const file = typeof partner.avatar === "string" ? "AVATAR.svg"
         : partner.avatar.mimeType === "image/jpeg" ? "AVATAR.jpg"
@@ -576,6 +579,17 @@ export class PartnerManager {
     return this.#createPartner(input, true);
   }
 
+  /** Trusted package installation may write its managed Home before a model or canonical task exists. */
+  async prepareImportedHome(partnerId: string): Promise<string> {
+    const scope = this.#importScope.getStore();
+    if (!scope?.active || scope.key !== partnerId) throw new PartnerStoreError("PARTNER_INVALID", "Package installation requires its active management owner.");
+    const profile = this.#store.getPartner(partnerId);
+    if (profile.lifecycle !== "active") throw new PartnerStoreError("PARTNER_CHANGED", "The package Partner is unavailable.");
+    const home = await this.#writeHome(profile);
+    await this.#prepareAvatar({ partner: profile, homePath: home });
+    return home;
+  }
+
   async #createPartner(input: CreatePartnerInput, acceptedImport: boolean, assertCurrent?: () => void): Promise<PartnerProfileRecord> {
     if (!PARTNER_TEMPLATES.some((template) => template.templateId === input.templateId)) {
       throw new PartnerManagerError("PARTNER_TEMPLATE_INVALID", "The selected partner template is unavailable.");
@@ -612,7 +626,7 @@ export class PartnerManager {
       if (capabilities === undefined) {
         throw new PartnerManagerError("PARTNER_MODEL_UNAVAILABLE", "Partner directory defaults are not configured.");
       }
-      this.#validateCapabilities(capabilities);
+      if (!(capabilities.modelChain.length === 0 && patch.capabilities === undefined && current.canonicalSessionId === undefined)) this.#validateCapabilities(capabilities);
       if (capabilities.permissionMode === "bypassPermissions" && current.canonicalSessionId !== undefined) {
         this.#assertFullAccessTarget(current);
       }
@@ -1254,7 +1268,13 @@ export class PartnerManager {
             });
       }
       current = this.#store.getPartner(current.id);
-      return this.#store.markReady(current.id, current.revision);
+      const ready = this.#store.markReady(current.id, current.revision);
+      if (this.#optionsOnReady) {
+        const scope = { key: current.id, active: true };
+        try { await this.#importScope.run(scope, () => this.#optionsOnReady!(ready.id)); }
+        finally { scope.active = false; }
+      }
+      return this.#store.getPartner(ready.id);
     } catch (error) {
       const code: PartnerInitializationErrorCode = error instanceof PartnerStoreError
         && (error.code === "PARTNER_CHANGED" || error.code === "PARTNER_SESSION_CONFLICT")

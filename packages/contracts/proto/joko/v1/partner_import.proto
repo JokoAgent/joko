@@ -6,6 +6,7 @@ enum PartnerImportSourceKind {
   PARTNER_IMPORT_SOURCE_KIND_UNSPECIFIED = 0;
   PARTNER_IMPORT_SOURCE_KIND_HERMES = 1;
   PARTNER_IMPORT_SOURCE_KIND_OPENCLAW = 2;
+  PARTNER_IMPORT_SOURCE_KIND_PACKAGE = 3;
 }
 enum PartnerImportCategory {
   PARTNER_IMPORT_CATEGORY_UNSPECIFIED = 0;
@@ -96,7 +97,39 @@ message GetPartnerImportStatusResponse { PartnerImportResult result = 1; }
 message RetryPartnerImportRequest { string request_id = 1; bool resume_setup = 2; }
 message RetryPartnerImportResponse { PartnerImportResult result = 1; }
 
+message PartnerPackageModule { string name = 1; string description = 2; }
+message PartnerPackageTool { string id = 1; string purpose = 2; }
+message PartnerPackageCapability { string icon = 1; string label = 2; }
+message PartnerPackageEntry {
+  string package_id = 1;
+  string package_version = 2;
+  string package_hash = 3;
+  string name = 4;
+  string description = 5;
+  string avatar = 6;
+  string bubble = 7;
+  repeated PartnerPackageCapability capabilities = 8;
+  repeated PartnerPackageModule skills = 9;
+  repeated PartnerPackageModule knowledge = 10;
+  repeated string remembers = 11;
+  repeated PartnerPackageTool tools = 12;
+  repeated PartnerPackageModule routines = 13;
+  PartnerImportResult installation = 14;
+}
+message ListPartnerPackagesRequest { string locale = 1; }
+message ListPartnerPackagesResponse { repeated PartnerPackageEntry entries = 1; }
+message InvitePartnerPackageRequest {
+  string package_id = 1;
+  string package_version = 2;
+  string package_hash = 3;
+  string locale = 4;
+  string controller_id = 5;
+}
+message InvitePartnerPackageResponse { PartnerImportResult result = 1; }
+
 service PartnerImportService {
+  rpc ListPartnerPackages(ListPartnerPackagesRequest) returns (ListPartnerPackagesResponse);
+  rpc InvitePartnerPackage(InvitePartnerPackageRequest) returns (InvitePartnerPackageResponse);
   rpc ListPartnerImportSources(ListPartnerImportSourcesRequest) returns (ListPartnerImportSourcesResponse);
   rpc PreviewPartnerImport(PreviewPartnerImportRequest) returns (PreviewPartnerImportResponse);
   rpc ReadPartnerImportPreview(ReadPartnerImportPreviewRequest) returns (ReadPartnerImportPreviewResponse);

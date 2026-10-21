@@ -38,7 +38,7 @@ import { mobileRemoteDesktopShortcuts } from "./remote-desktop-keyboard";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { MobileNativeRemoteDesktopView } from "./MobileNativeRemoteDesktopView";
 import { dispatchMobileRemoteDesktopNativeCommand, parseMobileRemoteDesktopNativeCommand,
-  sendMobileRemoteDesktopNativeInput, type MobileRemoteDesktopNativeHandle } from "./remote-desktop-native-bridge";
+  sendMobileRemoteDesktopNativeInput, sendMobileRemoteDesktopNativeRequest, type MobileRemoteDesktopNativeHandle } from "./remote-desktop-native-bridge";
 import { MobileRemoteDesktopPipPreferenceStore } from "./mobile-remote-desktop-pip-preference";
 import { MobileRemoteDesktopNativeTools, MobileRemoteDesktopNetworkStatus } from "./MobileRemoteDesktopNativeTools";
 import type { MobileAppLifecycleTransition } from "./mobile-app-lifecycle";
@@ -140,6 +140,10 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
     sendInput: async (batch: Parameters<MobileRemoteDesktopNativeHandle["sendInput"]>[0]) => {
       const handle = nativeView.current;
       return handle ? sendMobileRemoteDesktopNativeInput(handle, batch) : false;
+    },
+    sendRequest: async (request: Parameters<NonNullable<MobileRemoteDesktopNativeHandle["sendRequest"]>>[0]) => {
+      const handle = nativeView.current;
+      return handle ? sendMobileRemoteDesktopNativeRequest(handle, request) : false;
     },
     requiresPlaybackSession: Platform.OS === "ios",
     playback: async (enabled: boolean) => {

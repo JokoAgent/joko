@@ -67,6 +67,7 @@ message RemoteDesktopCapabilities {
   bool viewer_display_restore = 27;
   bool workspace_navigation = 28;
   bool system_menu = 29;
+  bool channel_requests = 30;
 }
 
 enum RemoteDesktopSystemActionKind {

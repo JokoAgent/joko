@@ -10,11 +10,13 @@ import { MailCardService } from "./mail-cards.js";
 import { EXTENSION_CARD_ACTION_ID_RE, EXTENSION_CARD_ACTION_PROMPT_MAX_LEN, extensionCardRootCallId, isExtensionCardLinkAllowed } from "./protocol.js";
 import type { ExtensionMailPreview } from "./mail-reader.js";
 import { extensionCardMediaUris, type ExtensionCardMedia, type ExtensionMailAttachment, type ExtensionMailUploadMetadata } from "./media.js";
+import type { ExtensionOAuthCards } from "./oauth-cards.js";
 
 export interface ExtensionCardAuthority {
   readonly key: string;
   readonly name: string;
   readonly runtime: ExtensionRuntimeDescriptor;
+  readonly installationKey?: string;
 }
 export interface ExtensionCardAction {
   readonly type: "event";
@@ -37,6 +39,7 @@ interface Options {
   readonly dispatch: (scope: ExtensionCardScope, event: ExtensionCardAction, assertCurrent: () => void) => Promise<void>;
   readonly previewMail?: (sessionId: string, url: string, read: boolean, opened: boolean, signal: AbortSignal, assertCurrent: () => void) => Promise<ExtensionMailPreview>;
   readonly media?: ExtensionCardMedia;
+  readonly oauthCards?: () => ExtensionOAuthCards | undefined;
 }
 const SETTING_OWNER = "extension-card-records";
 
@@ -53,7 +56,7 @@ export class ExtensionCardsManager {
         try {
           this.assertScope(scope);
           const source = options.authority(scope.extensionId);
-          return source?.key === scope.authorityKey && (hostMail ? source.runtime.mail === true : source.runtime.card !== undefined);
+          return source?.key === scope.authorityKey && (hostMail ? source.runtime.mail === true || source.runtime.network?.secrets?.some(secret => secret.source === "oauth") === true : source.runtime.card !== undefined);
         } catch { return false; }
       },
       persist: async row => { this.#write(row); },
@@ -87,11 +90,19 @@ export class ExtensionCardsManager {
     this.cards.registerCall(callId, scope);
     return callId;
   }
-  get(sessionId: string, cardId: string): { card: ExtensionCardProjection; animatedHtml: string; working: boolean; interactive: boolean; mediaUris: string[] } {
+  matchesOccurrence(sessionId: string, cardId: string, html: string): boolean { return this.#read(sessionId, cardId).row.html === html; }
+  async publishHostAuthorization(callId: string, scope: ExtensionCardScope, html: string, current: () => void): Promise<void> {
+    current(); this.assertAuthority(scope);
+    const result = await this.cards.publishHostAuthorization(scope.extensionId, scope.authorityKey, callId, html, current);
+    if (!result.accepted) throw new Error("Plugin authorization card could not be published.");
+  }
+  oauthCards() { return this.options.oauthCards?.(); }
+  get(sessionId: string, cardId: string): { card: ExtensionCardProjection; animatedHtml: string; working: boolean; interactive: boolean; mediaUris: string[]; hostAuthorization: boolean; authorizationPhase?: import("@joko/contracts").ExtensionAuthorizationPhase; authorizationClientConfigured: boolean } {
     const saved = this.#read(sessionId, cardId), source = this.options.authority(saved.row.extensionId);
-    const interactive = source?.key === saved.row.authorityKey && this.options.store.findSessionRuntimePolicy(sessionId)?.policy !== "review_read_only";
+    const hostAuthorization = isHostAuthorization(saved.row.html), authorization = hostAuthorization ? this.oauthCards()?.view(cardId) : undefined;
+    const interactive = (hostAuthorization ? authorization?.interactive === true : source?.key === saved.row.authorityKey) && this.options.store.findSessionRuntimePolicy(sessionId)?.policy !== "review_read_only";
     const transient = interactive ? this.#transient.get(cardId) : undefined;
-    return { card: this.#projection(saved.row, source?.name), mediaUris: extensionCardMediaUris(saved.row.html),
+    return { card: this.#projection(saved.row, source?.name), mediaUris: extensionCardMediaUris(saved.row.html), hostAuthorization, authorizationClientConfigured: authorization?.clientConfigured === true, ...(authorization ? { authorizationPhase: authorization.phase } : {}),
       animatedHtml: transient?.updatedAt === saved.row.updatedAt ? transient.animatedHtml ?? "" : "",
       working: transient?.updatedAt === saved.row.updatedAt && this.cards.callInfoOf(cardId) !== null
         && (transient.state === "working" || this.cards.inFlightCallInfoOf(cardId) !== null), interactive };
@@ -154,6 +165,8 @@ export class ExtensionCardsManager {
     assertCaller();
     if (!EXTENSION_CARD_ACTION_ID_RE.test(input.actionId) || input.prompt.length > EXTENSION_CARD_ACTION_PROMPT_MAX_LEN || input.prompt.includes("\0")) return false;
     const saved = this.#read(input.sessionId, input.cardId), scope = saved.row;
+    // A closed/restarted host setup card never becomes an author event.
+    if (isHostAuthorization(scope.html)) return false;
     if (this.options.store.findSessionRuntimePolicy(scope.sessionId)?.policy === "review_read_only") return false;
     this.assertAuthority(scope);
     const form = readExtensionCardForm(scope.html);
@@ -215,7 +228,7 @@ export class ExtensionCardsManager {
     this.cards.revoke(extensionId);
     for (const [id, card] of this.#transient) if (card.extensionId === extensionId) this.#transient.delete(id);
   }
-  async dispose(): Promise<void> { this.#closed = true; await this.cards.flushWrites(); this.#transient.clear(); }
+  async dispose(): Promise<void> { this.oauthCards()?.dispose(); this.#closed = true; await this.cards.flushWrites(); this.#transient.clear(); }
   #readAny(cardId: string): SavedCard | undefined {
     if (!/^[A-Za-z0-9][A-Za-z0-9:_-]{0,127}$/u.test(cardId)) throw new Error("Extension card unavailable.");
     const sealed = this.options.store.findSetting<EncryptedCredential>("service", SETTING_OWNER, cardId)?.value;
@@ -263,6 +276,7 @@ export class ExtensionCardsManager {
 function elements(node: DefaultTreeAdapterTypes.Node): DefaultTreeAdapterTypes.Element[] {
   return [...("tagName" in node ? [node] : []), ...("childNodes" in node ? node.childNodes.flatMap(elements) : [])];
 }
+function isHostAuthorization(html: string): boolean { return elements(parseFragment(html)).some(element => element.attrs.some(attribute => attribute.name === "data-joko-host-authorization" && attribute.value === "true")); }
 function cardDeclarations(html: string): { actions: Set<string>; changes: Set<string>; prompts: Set<string>; links: Set<string> } {
   const result = { actions: new Set<string>(), changes: new Set<string>(), prompts: new Set<string>(), links: new Set<string>() };
   for (const element of elements(parseFragment(html))) {

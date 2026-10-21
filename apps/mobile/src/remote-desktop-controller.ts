@@ -3,6 +3,9 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { parseMobileRemoteDesktopNativeEvent, parseMobileRemoteDesktopNativeInputBatch, parseMobileRemoteDesktopNativeViewport,
   type MobileRemoteDesktopNativeInputBatch, type MobileRemoteDesktopNativeCommand } from "./remote-desktop-native-bridge";
 import { RTC_NETWORK } from "./remote-desktop-viewer";
+import { RemoteDesktopChannelClient, RemoteDesktopControlStateSchema, RemoteDesktopHostMuteResultSchema, RemoteDesktopPrivacyScreenResultSchema,
+  RemoteDesktopClipboardSyncResultSchema, RemoteDesktopClipboardVersionResultSchema, RemoteDesktopDisplayModeSchema,
+  parseRemoteDesktopChannelReply, isRemoteDesktopChannelId, type RemoteDesktopChannelRequest } from "@joko/contracts";
 import { mobileRemoteDesktopModifiers, mobileRemoteDesktopShortcuts, type MobileRemoteDesktopKeyboardPage,
   type MobileRemoteDesktopKeyCode } from "./remote-desktop-keyboard";
 import {
@@ -117,6 +120,7 @@ export type MobileRemoteDesktopNotice =
   | "no-hosts" | "unavailable" | "screen-permission" | "screen-permission-guide"
   | "authority-changed" | "compatibility" | "input-overflow" | "view-only"
   | "accessibility-permission" | "input-busy" | "input-unavailable"
+  | "input-recovering"
   | "busy" | "stopped" | "viewer-restarted" | "audio-unavailable"
   | "video-settings-failed" | "pip-unavailable" | "capture-pending" | "generic-error";
 
@@ -201,6 +205,7 @@ export interface MobileRemoteDesktopSnapshot {
 export interface MobileRemoteDesktopPresentation {
   readonly nativeVideo?: boolean;
   sendInput?(batch: MobileRemoteDesktopNativeInputBatch): Promise<boolean>;
+  sendRequest?(request: { readonly epoch: string; readonly attemptId: string; readonly message: RemoteDesktopChannelRequest }): Promise<boolean>;
   readonly nativePictureInPicture: boolean;
   readonly requiresPlaybackSession: boolean;
   playback(enabled: boolean): Promise<void>;
@@ -564,9 +569,13 @@ export class MobileRemoteDesktopController {
   #clipboardSyncScope?: ClipboardSyncScope;
   #clipboardSyncTail: Promise<void> = Promise.resolve();
   readonly #credentials?: MobileRemoteDesktopCredentials;
+  readonly #channel = new RemoteDesktopChannelClient();
+  #controlRecoveryWanted = false;
+  #controlRequest?: object;
+  readonly transport: MobileRemoteDesktopTransport;
 
   constructor(
-    readonly transport: MobileRemoteDesktopTransport,
+    transport: MobileRemoteDesktopTransport,
     private readonly preferredDeviceId?: string,
     private readonly clipboard?: MobileRemoteClipboardSystem,
     private readonly presentation?: MobileRemoteDesktopPresentation,
@@ -577,8 +586,64 @@ export class MobileRemoteDesktopController {
     private readonly credentialEnvironment?: { readonly native: MobileRemoteDesktopCredentialsNative;
       readonly locale: () => string; readonly theme: () => "light" | "dark" }
   ) {
+    const channelTransport: Pick<MobileRemoteDesktopTransport, "control" | "presentation" | "setHostMute" | "setPrivacyScreen" | "systemAction" | "listDisplayModes" | "setClipboardSync" | "clipboardVersion"> = {
+      control: (host, lease, enabled, signal) => this.#smallRequest(host, { op: "control", lease, enabled }, signal,
+        () => transport.control(host, lease, enabled, signal), channelControlState),
+      presentation: (host, lease, enabled, signal) => this.#smallRequest(host, { op: "presentation", lease, enabled }, signal,
+        () => transport.presentation(host, lease, enabled, signal), channelControlState),
+      setHostMute: (host, lease, controlGeneration, enabled, signal) => this.#smallRequest(host, { op: "hostMute", lease, controlGeneration: Number(controlGeneration), enabled }, signal,
+        () => transport.setHostMute(host, lease, controlGeneration, enabled, signal), result => create(RemoteDesktopHostMuteResultSchema, { enabled: channelEnabled(result) })),
+      setPrivacyScreen: (host, lease, controlGeneration, enabled, lockOnExit, signal) => this.#smallRequest(host, { op: "privacyScreen", lease, controlGeneration: Number(controlGeneration), enabled, lockOnExit }, signal,
+        () => transport.setPrivacyScreen(host, lease, controlGeneration, enabled, lockOnExit, signal), result => create(RemoteDesktopPrivacyScreenResultSchema, { enabled: channelEnabled(result) })),
+      systemAction: (host, lease, controlGeneration, action, signal) => this.#smallRequest(host, { op: "systemAction", lease, controlGeneration: Number(controlGeneration), action }, signal,
+        () => transport.systemAction(host, lease, controlGeneration, action, signal), result => {
+          if (!isRecord(result) || result.action !== action) throw new Error("REMOTE_DESKTOP_REQUEST_FAILED"); return action;
+        }),
+      listDisplayModes: (host, lease, signal) => this.#smallRequest(host, { op: "displayModes", lease }, signal,
+        () => transport.listDisplayModes(host, lease, signal), result => {
+          if (!isRecord(result) || !Array.isArray(result.modes) || result.modes.length > 256) throw new Error("REMOTE_DESKTOP_REQUEST_FAILED");
+          return result.modes.map(mode => {
+            if (!isRecord(mode) || typeof mode.id !== "string" || !Number.isSafeInteger(mode.width) || !Number.isSafeInteger(mode.height)
+              || typeof mode.current !== "boolean" || typeof mode.native !== "boolean") throw new Error("REMOTE_DESKTOP_REQUEST_FAILED");
+            return create(RemoteDesktopDisplayModeSchema, { modeId: mode.id, width: mode.width as number, height: mode.height as number,
+              current: mode.current, native: mode.native });
+          });
+        }),
+      setClipboardSync: (host, request, signal) => this.#smallRequest(host, { op: "clipboardSync", lease: request.leaseId,
+        controlGeneration: Number(request.controlGeneration), enabled: request.enabled }, signal, () => transport.setClipboardSync(host, request, signal), result => {
+          if (!isRecord(result)) throw new Error("REMOTE_DESKTOP_REQUEST_FAILED");
+          return create(RemoteDesktopClipboardSyncResultSchema, { enabled: channelEnabled(result), syncGeneration: channelGeneration(result.syncGeneration) });
+        }),
+      clipboardVersion: (host, request, signal) => this.#smallRequest(host, { op: "clipboardVersion", lease: request.leaseId,
+        controlGeneration: Number(request.controlGeneration), syncGeneration: Number(request.syncGeneration) }, signal, () => transport.clipboardVersion(host, request, signal), result => {
+          if (!isRecord(result) || typeof result.version !== "string" || result.version.length > 512) throw new Error("REMOTE_DESKTOP_REQUEST_FAILED");
+          return create(RemoteDesktopClipboardVersionResultSchema, { version: result.version });
+        })
+    };
+    this.transport = Object.assign(Object.create(transport) as MobileRemoteDesktopTransport, channelTransport);
     if (credentialEnvironment) this.#credentials = new MobileRemoteDesktopCredentials(credentialEnvironment.native,
       (credentials) => { if (!this.#disposed) this.#set({ ...this.#snapshot, credentials }); });
+  }
+
+  async #smallRequest<T>(host: DevicePeerDescriptor, request: RemoteDesktopChannelRequest["request"], signal: AbortSignal | undefined, fallback: () => Promise<T>, decode: (result: unknown) => T): Promise<T> {
+    signal?.throwIfAborted();
+    const epoch = this.#viewerEpoch, attemptId = this.#mediaAttempt?.attemptId;
+    if (!this.#snapshot.capabilities?.channelRequests || this.#snapshot.media !== "webrtc" || !epoch || !attemptId
+      || request.lease !== this.#lease?.leaseId || peerKey(host) !== peerKey(this.#snapshot.host)
+      || !this.#foreground || !this.#online || !this.transport.isCurrent()) return fallback();
+    const result = await this.#channel.request(request, message => {
+      signal?.throwIfAborted();
+      if (epoch !== this.#viewerEpoch || !this.#mediaAttemptCurrent(attemptId)) return false;
+      if (this.presentation?.nativeVideo) return this.presentation.sendRequest?.({ epoch, attemptId, message }) ?? false;
+      this.#emit({ type: "channelRequest", epoch, attemptId, message });
+    });
+    if (!result.available) return fallback();
+    signal?.throwIfAborted();
+    if (epoch !== this.#viewerEpoch || !this.#mediaAttemptCurrent(attemptId) || request.lease !== this.#lease?.leaseId
+      || peerKey(host) !== peerKey(this.#snapshot.host)) {
+      throw new Error("REMOTE_DESKTOP_REQUEST_RESULT_UNKNOWN");
+    }
+    return decode(result.result);
   }
 
   private bindCredentials(): void {
@@ -931,15 +996,18 @@ export class MobileRemoteDesktopController {
   }
 
   async setControl(enabled: boolean): Promise<void> {
+    this.#controlRecoveryWanted = enabled;
     const host = this.#snapshot.host;
     const lease = this.#lease;
     if (this.#displayModeOperation && !enabled) { this.#set({ ...this.#snapshot, wantedControl: false }); return; }
     if (!host || !lease || this.#displaySwitch || this.#displayModeOperation || !this.#ready(this.#generation)) return;
+    if (this.#controlRequest) return;
     if (enabled && !this.#snapshot.capabilities?.canControl) {
       this.#releaseControl("view-only");
       return;
     }
     const generation = this.#generation;
+    const operation = {}; this.#controlRequest = operation;
     this.#set({ ...this.#snapshot, wantedControl: enabled });
     try {
       const state = await this.transport.control(host, lease.leaseId, enabled, this.#request.signal);
@@ -953,7 +1021,22 @@ export class MobileRemoteDesktopController {
       else if (this.#snapshot.capabilities?.displayModes) void this.#loadDisplayModes(false);
     } catch (error) {
       if (this.#ready(generation)) this.#handleFailure(error, "control");
+    } finally {
+      if (this.#controlRequest === operation) {
+        this.#controlRequest = undefined;
+        if (this.#ready(generation) && this.#lease?.leaseId === lease.leaseId && this.#controlRecoveryWanted !== enabled) {
+          void this.setControl(this.#controlRecoveryWanted);
+        }
+      }
     }
+  }
+
+  #restoreForegroundControl(): void {
+    if (!this.#controlRecoveryWanted || this.#controlRequest || this.#snapshot.controlling || !this.#snapshot.capabilities?.canControl
+      || !this.#foreground || !this.#interactive || !this.#routeFocused || this.#presentationState !== "idle"
+      || this.#displayModeOperation || this.#displaySwitch || !this.#ready(this.#generation)) return;
+    this.#set({ ...this.#snapshot, notice: "input-recovering" });
+    void this.setControl(true);
   }
 
   async loadDisplayModes(): Promise<void> {
@@ -1901,7 +1984,11 @@ export class MobileRemoteDesktopController {
     const message = parseMobileRemoteDesktopNativeEvent(raw);
     if (!message || !this.presentation?.nativeVideo || this.#disposed || message.epoch !== this.#viewerEpoch || !this.#lease
       || !this.transport.canStop() || !this.#online) return;
+    if (message.type === "channelReply") {
+      if (this.#mediaAttemptCurrent(message.attemptId)) this.#channel.receive(message.reply); return;
+    }
     if (message.type === "iceConfig") {
+      if (this.#mediaAttempt?.attemptId !== message.attemptId) this.#channel.retire();
       if (!this.#ready(this.#generation) || !this.#interactive) return;
       if (this.#presentationState !== "idle") this.#resetPresentation();
       this.#nativeFrameReady = false; this.#viewerPipSupported = false;
@@ -1999,6 +2086,12 @@ export class MobileRemoteDesktopController {
       return;
     }
     if (message.epoch !== this.#viewerEpoch) return;
+    if (message.type === "channelReply") {
+      if (this.#mediaAttemptCurrent(message.attemptId)) this.#channel.receive(message.reply); return;
+    }
+    if (message.type === "channelUnavailable") {
+      if (this.#mediaAttemptCurrent(message.attemptId)) this.#channel.unavailable(message.id); return;
+    }
     if (message.type === "pipCapability") {
       this.#viewerPipSupported = message.supported;
       this.#refreshPipAvailability();
@@ -2027,12 +2120,14 @@ export class MobileRemoteDesktopController {
       return;
     }
     if (message.type === "reconnecting") {
+      this.#channel.retire();
       if (!this.#mediaAttemptCurrent(message.attemptId)) return;
       this.#startFrameLoop();
       this.#set({ ...this.#snapshot, status: "reconnecting", media: "jpeg" });
       return;
     }
     if (message.type === "fallback") {
+      this.#channel.retire();
       if (message.attemptId !== null && !this.#mediaAttemptCurrent(message.attemptId)) return;
       if (message.attemptId === null && this.#snapshot.capabilities?.webrtcVideo !== false) return;
       if (message.capturePending) {
@@ -2078,6 +2173,7 @@ export class MobileRemoteDesktopController {
       return;
     }
     if (message.type === "iceConfig") {
+      if (this.#mediaAttempt?.attemptId !== message.attemptId) this.#channel.retire();
       this.#mediaAttempt = Object.freeze({ epoch: message.epoch, attemptId: message.attemptId });
       void this.#iceConfiguration(message.attemptId);
     }
@@ -2492,6 +2588,7 @@ export class MobileRemoteDesktopController {
         throw new Error("Invalid Remote Desktop control generation.");
       }
       this.#lease = lease;
+      this.#controlRecoveryWanted = lease.controlling;
       this.#controlGeneration = lease.controlGeneration;
       this.#resumeEligible = true;
       const displayModeReconnect = this.#displayModeReconnect;
@@ -2576,6 +2673,7 @@ export class MobileRemoteDesktopController {
         if (!state.controlling) this.#emit({ type: "releaseInput" });
       }
       this.#syncHostMute();
+      if (!state.controlling) this.#restoreForegroundControl();
     } catch (error) {
       if (this.#ready(generation) && !this.#displayModeOperation) this.#handleFailure(error, "heartbeat");
     } finally {
@@ -3002,6 +3100,7 @@ export class MobileRemoteDesktopController {
         || failure?.reason === RemoteDesktopFailureReason.VIEW_ONLY
         || failure?.reason === RemoteDesktopFailureReason.ACCESSIBILITY_PERMISSION_REQUIRED) {
         this.#releaseControl(controlFailureNotice(failure.reason));
+        if (operation === "input") this.#restoreForegroundControl();
         return;
       }
       if (failure?.reason !== RemoteDesktopFailureReason.AUTHORITY_CHANGED
@@ -3159,6 +3258,7 @@ export class MobileRemoteDesktopController {
   }
 
   #endLease(stop: boolean): void {
+    this.#controlRecoveryWanted = false; this.#controlRequest = undefined;
     const host = this.#snapshot.host;
     const lease = this.#lease;
     this.#retireRequest();
@@ -3232,6 +3332,7 @@ export class MobileRemoteDesktopController {
   }
 
   #retireViewerEpoch(): void {
+    this.#channel.retire();
     this.#retireTouchpad(); this.#viewportConfigurationKey = undefined;
     this.#retireMouseControls(); this.#mouseConfigurationKey = undefined;
     this.#retireKeyboardTools(true);
@@ -3843,6 +3944,8 @@ function mobileClipboardSyncError(error: unknown): ClipboardSyncError {
 }
 
 type ViewerMessage =
+  | { readonly type: "channelReply"; readonly epoch: string; readonly attemptId: string; readonly reply: NonNullable<ReturnType<typeof parseRemoteDesktopChannelReply>> }
+  | { readonly type: "channelUnavailable"; readonly epoch: string; readonly attemptId: string; readonly id: string }
   | { readonly type: "ready" }
   | { readonly type: "pipCapability"; readonly epoch: string; readonly supported: boolean }
   | { readonly type: "presentation"; readonly epoch: string; readonly active: boolean }
@@ -3856,6 +3959,19 @@ type ViewerMessage =
   | { readonly type: "ice"; readonly epoch: string; readonly attemptId: string; readonly candidates: readonly RemoteDesktopIceCandidate[];
       readonly after: number; readonly exchangeId: number }
   | { readonly type: "input"; readonly epoch: string; readonly sequence: number; readonly events: unknown };
+
+function channelGeneration(value: unknown): bigint {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) throw new Error("REMOTE_DESKTOP_REQUEST_FAILED");
+  return BigInt(value as number);
+}
+function channelEnabled(value: unknown): boolean {
+  if (!isRecord(value) || typeof value.enabled !== "boolean") throw new Error("REMOTE_DESKTOP_REQUEST_FAILED");
+  return value.enabled;
+}
+function channelControlState(value: unknown): RemoteDesktopControlState {
+  if (!isRecord(value) || typeof value.controlling !== "boolean") throw new Error("REMOTE_DESKTOP_REQUEST_FAILED");
+  return create(RemoteDesktopControlStateSchema, { controlling: value.controlling, controlGeneration: channelGeneration(value.controlGeneration) });
+}
 
 function parseViewerMessage(raw: unknown): ViewerMessage | undefined {
   let value: unknown = raw;
@@ -3885,6 +4001,11 @@ function parseViewerMessage(raw: unknown): ViewerMessage | undefined {
     return { type: "fallback", epoch: value.epoch, attemptId: null };
   }
   if (typeof value.attemptId !== "string" || !ATTEMPT.test(value.attemptId)) return undefined;
+  if (value.type === "channelReply") {
+    const reply = parseRemoteDesktopChannelReply(value.reply);
+    if (reply) return { type: "channelReply", epoch: value.epoch, attemptId: value.attemptId, reply };
+  }
+  if (value.type === "channelUnavailable" && isRemoteDesktopChannelId(value.id)) return { type: "channelUnavailable", epoch: value.epoch, attemptId: value.attemptId, id: value.id };
   if (value.type === "streaming" || value.type === "reconnecting" || value.type === "fallback") {
     return { type: value.type, epoch: value.epoch, attemptId: value.attemptId,
       ...(value.type === "fallback" && value.reason === "capture-pending" ? { capturePending: true } : {}) };

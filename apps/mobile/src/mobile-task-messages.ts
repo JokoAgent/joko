@@ -10,6 +10,10 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["newTask.leaveUploadTitle", "Leave while uploading?", "附件正在上传，要离开吗？", "附件正在上傳，要離開嗎？", "アップロード中に移動しますか？", "업로드 중에 나가시겠어요?"],
+  ["newTask.leaveUploadBody", "Leaving cancels this message. Its input is kept in the created task draft.", "离开会取消发送这条消息，输入会保留在已创建任务的草稿中。", "離開會取消傳送這則訊息，輸入會保留在已建立工作的草稿中。", "移動すると送信を中止します。入力は作成されたタスクの下書きに残ります。", "나가면 메시지 전송을 취소합니다. 입력은 생성된 작업의 초안에 보관됩니다."],
+  ["newTask.leaveUploadStay", "Keep waiting", "继续等待", "繼續等待", "待機を続ける", "계속 기다리기"],
+  ["newTask.leaveUploadDiscard", "Cancel send and leave", "取消发送并离开", "取消傳送並離開", "送信を中止して移動", "전송 취소 후 나가기"],
   ["task.renameSuggest", "Suggest title", "AI 起名", "AI 命名", "タイトルを提案", "제목 제안"],
   ["task.renameSuggesting", "Suggesting title…", "正在生成标题…", "正在產生標題…", "タイトルを提案中…", "제목 제안 중…"],
   ["task.renameNoMaterial", "There is not enough conversation to suggest a title. You can enter one.", "对话内容不足，可手动输入标题。", "對話內容不足，可手動輸入標題。", "会話の内容が不足しています。タイトルを入力できます。", "대화 내용이 부족합니다. 제목을 직접 입력할 수 있습니다."],

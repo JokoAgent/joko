@@ -17,6 +17,7 @@ function definition(job: Record<string, unknown>): string {
 /** Resolve executable/interpreter only from the host, before adding source env. */
 export async function resolveSourceCli(source: ImportSource, home: string, host: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = process.platform): Promise<{ executable: string; interpreter?: string }> {
+  if (source.kind === 'package') throw new AgentImportError('SOURCE_COMMAND_UNAVAILABLE');
   const name = source.kind === 'hermes' ? 'hermes' : 'openclaw';
   const paths = platform === 'win32' ? path.win32 : path.posix;
   const env = importedProcessEnvironment({}, host, platform);

@@ -132,6 +132,7 @@ export interface RemoteDesktopCapabilities {
   readonly viewerDisplayRestore: boolean;
   readonly workspaceNavigation: boolean;
   readonly systemMenu: boolean;
+  readonly channelRequests?: boolean;
 }
 
 export interface RemoteDesktopVideoSettings {
@@ -256,6 +257,7 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     || typeof value.viewerDisplayRestore !== "boolean"
     || typeof value.workspaceNavigation !== "boolean"
     || typeof value.systemMenu !== "boolean"
+    || (value.channelRequests !== undefined && typeof value.channelRequests !== "boolean")
     || (value.platform !== "darwin" && value.platform !== "win32" && value.platform !== "linux")
     || !Array.isArray(value.displays)
     || value.displays.length > REMOTE_DESKTOP_MAX_DISPLAYS
@@ -303,6 +305,7 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     viewerDisplayRestore: value.viewerDisplayRestore,
     workspaceNavigation: value.workspaceNavigation,
     systemMenu: value.systemMenu,
+    ...(value.channelRequests === undefined ? {} : { channelRequests: value.channelRequests === true }),
     platform: value.platform,
     displays: Object.freeze(displays),
     permissions: parseRemoteDesktopPermissions(value.permissions)

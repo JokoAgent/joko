@@ -1,7 +1,7 @@
 import path from "node:path";
 import { createImportBudget, MAX_FILE_BYTES, MAX_SNAPSHOT_BYTES, reserveSnapshotItems } from "./files.js";
 import { decodeEnvironment, encodeEnvironment } from "./environmentJson.js";
-import { AgentImportError, type ImportItem, type ImportSnapshot } from "./types.js";
+import { AgentImportError, validateNativePartnerPackage, type ImportItem, type ImportSnapshot } from "./types.js";
 
 /** Binary fields have one current encoding, bounded before Buffer allocation. */
 export async function serializeImportSnapshotAsync(snapshot: ImportSnapshot, assertOwner: () => void): Promise<string> {
@@ -27,12 +27,16 @@ function nativePath(value: unknown): value is string { return typeof value === "
 export async function deserializeImportSnapshotAsync(text: string, assertOwner: () => void): Promise<ImportSnapshot> {
   assertOwner(); if (Buffer.byteLength(text) > 2 * MAX_SNAPSHOT_BYTES) fail();
   let value: unknown; try { value = await decodeEnvironment<unknown>(text, assertOwner); } catch { assertOwner(); fail(); }
-  if (!record(value) || !fields(value, ["version", "source", "items", "fingerprint"], ["avatarImageBase64", "publicationRedactions"])
+  if (!record(value) || !fields(value, ["version", "source", "items", "fingerprint"], ["avatarImageBase64", "publicationRedactions", "nativePackage"])
     || value.version !== 1 || !Array.isArray(value.items) || typeof value.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(value.fingerprint)
     || !record(value.source) || !fields(value.source, ["kind", "agentId", "name", "root", "workspace", "configFile"])
-    || !["hermes", "openclaw"].includes(String(value.source.kind)) || typeof value.source.agentId !== "string" || typeof value.source.name !== "string"
+    || !["hermes", "openclaw", "package"].includes(String(value.source.kind)) || typeof value.source.agentId !== "string" || typeof value.source.name !== "string"
     || !nativePath(value.source.root) || !nativePath(value.source.workspace) || !nativePath(value.source.configFile)) fail();
   const budget = createImportBudget(MAX_SNAPSHOT_BYTES, assertOwner);
+  if (value.nativePackage !== undefined) {
+    validateNativePartnerPackage(value.nativePackage);
+    if (value.source.kind !== "package" || value.source.agentId !== value.nativePackage.packageId || value.fingerprint !== value.nativePackage.packageHash) fail();
+  } else if (value.source.kind === "package") fail();
   const bytes = (input: unknown): Buffer => {
     if (!record(input) || !fields(input, ["encoding", "data"]) || input.encoding !== "base64" || typeof input.data !== "string"
       || input.data.length > 4 * Math.ceil(MAX_FILE_BYTES / 3) || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(input.data)) fail();

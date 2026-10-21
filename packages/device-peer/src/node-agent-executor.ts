@@ -434,6 +434,7 @@ export class NodeDevicePeerAgentExecutor {
           ...(command.action.value.mode === undefined ? {} : { mode: command.action.value.mode }),
           createParents: command.action.value.createParents,
           atomic: command.action.value.atomic,
+          createOnly: command.action.value.createOnly,
           signal
         });
         return mutationResult();
@@ -1607,6 +1608,25 @@ export class LocalDevicePeerFileTransport implements DevicePeerFileTransportPort
     if (request.createParents) await this.mkdir(dirname(path), { recursive: true, mode: 0o700, signal: request.signal });
     await canonicalDirectory(dirname(path));
     request.signal?.throwIfAborted();
+    if (request.createOnly) {
+      const parent = dirname(path), handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), mode);
+      const opened = await handle.stat(); let accepted = false;
+      try {
+        const validate = async () => {
+          request.signal?.throwIfAborted(); await canonicalDirectory(parent);
+          const current = await lstat(path);
+          if (!opened.isFile() || !sameFileIdentity(opened, current) || current.isSymbolicLink() || !samePath(await realpath(path), path)) throw agentError(DevicePeerFailureCode.CONFLICT, false);
+        };
+        await validate(); await handle.writeFile(content); await validate(); await handle.close(); accepted = true;
+        return;
+      } finally {
+        if (!accepted) {
+          await handle.truncate(0).catch(() => undefined); await handle.close().catch(() => undefined);
+          const current = await lstat(path).catch(missingAsUndefined);
+          if (current && sameFileIdentity(opened, current)) await unlink(path).catch(ignoreMissing);
+        }
+      }
+    }
     const existing = await lstat(path).catch(missingAsUndefined);
     if (existing?.isSymbolicLink() || (existing !== undefined && !existing.isFile())) {
       throw agentError(DevicePeerFailureCode.CONFLICT, false);

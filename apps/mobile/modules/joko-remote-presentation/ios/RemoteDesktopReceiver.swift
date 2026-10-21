@@ -253,6 +253,15 @@ final class RemoteDesktopReceiver: NSObject, RTCPeerConnectionDelegate, RTCDataC
     lastSequence = sequence
     return true
   }
+  func sendRequest(_ message: [String: Any]) -> Bool {
+    guard !stopped, message["epoch"] as? String == epoch, message["attemptId"] as? String == attempt,
+          UIApplication.shared.applicationState == .active, peer?.connectionState == .connected,
+          let channel, channel.readyState == .open, channel.bufferedAmount < 65_536,
+          let request = message["message"] as? [String: Any], request["type"] as? String == "request",
+          let id = request["id"] as? String, id.range(of: "^[A-Za-z0-9_-]{1,64}$", options: .regularExpression) != nil,
+          let data = try? JSONSerialization.data(withJSONObject: request), data.count <= 32_768 else { return false }
+    return channel.sendData(RTCDataBuffer(data: data, isBinary: false))
+  }
 
   func revokeInput() { inputGrant = nil }
 
@@ -409,7 +418,9 @@ final class RemoteDesktopReceiver: NSObject, RTCPeerConnectionDelegate, RTCDataC
     DispatchQueue.main.async { [weak self] in
       guard let self, !self.stopped, self.channel === dataChannel,
             let message = try? JSONSerialization.jsonObject(with: buffer.data) as? [String: Any] else { return }
-      if message["type"] as? String == "viewPing", Set(message.keys) == ["type", "challenge"],
+      if message["type"] as? String == "reply" {
+        self.post("channelReply", ["reply": message])
+      } else if message["type"] as? String == "viewPing", Set(message.keys) == ["type", "challenge"],
          let challenge = RemoteDesktopBridgeNumber.uuid(message["challenge"]),
          !self.answeredViewChallenges.contains(challenge),
          dataChannel.readyState == .open {

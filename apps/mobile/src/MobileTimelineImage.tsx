@@ -8,9 +8,10 @@ import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 
 interface Props {
-  readonly client: Pick<MobileClient, "prepareTimelineImagePreview" | "confirmTimelineImagePreview" | "releaseTimelineImagePreview">;
+  readonly client: Pick<MobileClient, "prepareTimelineImagePreview" | "prepareQueueImagePreview" | "confirmTimelineImagePreview" | "releaseTimelineImagePreview">;
   readonly page: MobileImageGalleryPageSummary;
   readonly eventId: string;
+  readonly queueItemId?: string;
   readonly ownerKey?: string;
   readonly eligible: boolean;
   readonly viewportPulse: number;
@@ -69,7 +70,9 @@ export function MobileTimelineImage(props: Props) {
     if (!visible || !foreground || !eligible || !ownerKey) { setPhase("idle"); return; }
     const active: NonNullable<typeof activeRef.current> = { controller: new AbortController() };
     activeRef.current = active; setPhase("loading");
-    void client.prepareTimelineImagePreview(eventId, page.pageId, active.controller.signal).then((image) => {
+    const read = props.queueItemId ? client.prepareQueueImagePreview(props.queueItemId, page.pageId, active.controller.signal)
+      : client.prepareTimelineImagePreview(eventId, page.pageId, active.controller.signal);
+    void read.then((image) => {
       if (active.controller.signal.aborted || activeRef.current !== active) { client.releaseTimelineImagePreview(image.leaseId); return; }
       active.preview = image; setPreview(image);
     }, () => { if (!active.controller.signal.aborted && activeRef.current === active) setPhase("error"); });
@@ -77,7 +80,7 @@ export function MobileTimelineImage(props: Props) {
       active.controller.abort(); if (active.preview) client.releaseTimelineImagePreview(active.preview.leaseId);
       if (activeRef.current === active) activeRef.current = undefined;
     };
-  }, [sourceKey, visible, foreground, eligible, ownerKey, attempt, client, eventId, page.pageId]);
+  }, [sourceKey, visible, foreground, eligible, ownerKey, attempt, client, eventId, page.pageId, props.queueItemId]);
 
   const current = stateSource === sourceKey ? preview : undefined;
   const currentPhase = stateSource === sourceKey ? phase : "idle";

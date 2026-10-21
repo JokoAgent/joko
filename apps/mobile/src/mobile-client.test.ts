@@ -3525,6 +3525,30 @@ describe("mobile Partner private authority", () => {
     activeCount: partner.lifecycle === "active" ? 1 : 0, archivedCount: partner.lifecycle === "archived" ? 1 : 0,
     errorCount: partner.initializationState === "error" ? 1 : 0, updatedAt: 2_000 }, partners: [partner] });
 
+  it("selects a real model for a saved package through its current initialization owner and rejects stale choices", async () => {
+    const network = fakeNetwork(); let current = { ...initializationFailed, initializationErrorCode: "modelUnavailable" as const,
+      capabilities: { ...profilePartner.capabilities, modelChain: [] } } as typeof profilePartner;
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: runtimeControlProjection() }));
+    network.listPartnerCatalog = vi.fn(async () => initializationCatalog(current));
+    network.retryPartnerInitialization = vi.fn();
+    network.updatePartnerProfile = vi.fn(async (_credential, id, revision, draft) => {
+      expect(id).toBe(current.partnerId); expect(revision).toBe(current.revision);
+      current = { ...profilePartner, revision: current.revision + 2n, capabilities: draft.capabilities }; return current;
+    });
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    const active = app.partnerInitializationTransport()!;
+    const installed = await active.load(current.partnerId, new AbortController().signal);
+    const choices = active.models!(installed); expect(choices).toHaveLength(2);
+    expect(choices[0]!.route).toMatchObject({ backendId: "backend", providerId: "alpha", modelId: "a" });
+    await expect(active.configure!(installed, { ...choices[0]!, route: { ...choices[0]!.route, modelId: "fake" } }, new AbortController().signal)).rejects.toThrow(/available model/u);
+    expect(network.updatePartnerProfile).not.toHaveBeenCalled();
+    const confirmed = await active.configure!(installed, choices[0]!, new AbortController().signal);
+    expect(confirmed.capabilities.modelChain).toEqual([choices[0]!.route]);
+    expect(network.updatePartnerProfile).toHaveBeenCalledOnce(); expect(network.retryPartnerInitialization).not.toHaveBeenCalled();
+    await expect(active.configure!(installed, choices[0]!, new AbortController().signal)).rejects.toThrow(/changed/u);
+    expect(network.updatePartnerProfile).toHaveBeenCalledOnce();
+  });
+
   it("recovers the same failed Partner and observes its new task before canonical navigation without marking it read", async () => {
     const network = fakeNetwork(); let current = initializationFailed;
     const emptyOwner = create(SnapshotSchema, { ...runtimeControlProjection(), sessions: [] });
@@ -6250,6 +6274,37 @@ describe("native mobile connection and operation ownership", () => {
       .toBeLessThan(vi.mocked(network.submit).mock.invocationCallOrder[1]!);
     expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
     expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })).toBeNull();
+  });
+
+  it.each([false, true])("waits for an upload leave decision before the first message dispatch (discard=%s)", async discard => {
+    const network = projectedNetwork(attachmentSnapshot), drafts = memoryDraftStores(), fixture = attachmentFileFixture();
+    const input = localAttachmentDraft(); let settle!: (discard: boolean) => void;
+    const decision = new Promise<boolean>(resolve => { settle = resolve; });
+    const waiting = vi.fn(() => decision), uploading = vi.fn();
+    vi.mocked(network.uploadBlob).mockImplementation(async (_credential, source) =>
+      committedAttachment(input.attachments.find(candidate => candidate.fileName === source.fileName)! as MobileLocalComposerAttachment));
+    vi.mocked(network.submit).mockImplementation(async (_credential, operationId, mutation) => create(OperationSchema, {
+      operationId, connectionId: credential.connectionId, state: OperationState.SUCCEEDED,
+      result: { payload: mutation.payload.case === "createSession"
+        ? { case: "session", value: attachmentSnapshot.sessions[0]! }
+        : { case: "queueItem", value: create(QueueItemSchema, { queueItemId: "first-input", backendId: "backend", targetId: "target", sessionId: "session", state: QueueItemState.ACCEPTED }) } }
+    }));
+    let id = 0;
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, () => `leave-upload-${++id}`, undefined, drafts, fixture.files);
+    await app.start();
+    const result = app.create("target", "Attachments", input, undefined, undefined, {
+      signal: new AbortController().signal, waitForLeaveDecision: waiting, onUploadingChange: uploading
+    });
+    const caught = result.catch(error => error as Error);
+    await vi.waitFor(() => expect(waiting).toHaveBeenCalledOnce());
+    expect(uploading).toHaveBeenCalledWith(true); expect(network.submit).toHaveBeenCalledOnce();
+    settle(discard);
+    if (discard) {
+      expect(await caught).toBeInstanceOf(Error); expect(network.submit).toHaveBeenCalledOnce();
+      expect(drafts.newTask.readSync({ profileId: credential.profileId })).toBeNull();
+      expect(drafts.composer.readSync({ profileId: credential.profileId, sessionId: "session" })?.attachments).toHaveLength(2);
+    } else { expect(await result).toMatchObject({ sent: true }); expect(network.submit).toHaveBeenCalledTimes(2); }
+    expect(uploading).toHaveBeenLastCalledWith(false);
   });
 
   it("keeps file input but fails image input closed when the exact receiving model is text-only", async () => {
@@ -12739,6 +12794,33 @@ describe("native current-task Files ownership", () => {
     await expect(app.shareImageGalleryPageOriginal(descriptor.leaseId, page.leaseId)).rejects.toThrow(/image changed/u);
     expect(perform).toHaveBeenCalledOnce(); expect(network.authorizeBlobDownload).toHaveBeenCalledOnce();
     expect(await drafts.composer.read(identity)).toEqual(plainTextMobileComposerDraft("Read only"));
+  });
+
+  it("previews pending queue images and retires original actions when their queue occurrence changes", async () => {
+    const bytes = galleryPngBytes(3, 2);
+    const snapshot = clone(SnapshotSchema, handoffSnapshot);
+    snapshot.queueItems = [create(QueueItemSchema, { queueItemId: "pending-images", sessionId: "session", backendId: "backend", targetId: "target",
+      state: QueueItemState.ACCEPTED, input: { parts: [{ content: { case: "text", value: "Explain these" } },
+        ...["one", "two"].map(name => ({ content: { case: "image" as const, value: { altText: `${name}.png`, widthPixels: 3, heightPixels: 2,
+          blob: { blobId: `pending-${name}`, fileName: `${name}.png`, mediaType: "image/png", byteSize: BigInt(bytes.byteLength), sha256Hex: sha256Hex(bytes) } } } }))] } })];
+    const network = projectedNetwork(snapshot); vi.mocked(network.downloadBlob).mockResolvedValue({ bytes, mediaType: "image/png" });
+    vi.mocked(network.readSession).mockImplementation(async () => create(SnapshotSchema, { ...snapshot,
+      scope: create(SnapshotScopeSchema, { kind: { case: "session", value: create(SessionSnapshotScopeSchema, { sessionId: "session", recentTimelineItems: 100 }) } }) }));
+    const app = client(network, memoryStorage(credential).storage, undefined, undefined, fixedIds("queue-gallery", "queue-original"), undefined, memoryDraftStores(),
+      undefined, undefined, undefined, undefined, { perform: vi.fn(async () => undefined) });
+    await app.start();
+    const images = app.taskQueueImagePages("pending-images"); expect(images.map(page => page.title)).toEqual(["one.png", "two.png"]);
+    const preview = await app.prepareQueueImagePreview("pending-images", images[0]!.pageId, new AbortController().signal);
+    expect(preview).toMatchObject({ width: 3, height: 2 }); app.releaseTimelineImagePreview(preview.leaseId);
+    const gallery = await app.openQueueImageGallery("pending-images", images[1]!.pageId);
+    expect(gallery).toMatchObject({ initialIndex: 1, pages: [{ title: "one.png" }, { title: "two.png" }] });
+    const original = await app.loadImageGalleryPage(gallery.leaseId, 1);
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, original.leaseId, original.pageId, { width: 3, height: 2, mediaType: "image/png", isAnimated: false });
+    expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(true);
+    snapshot.queueItems[0]!.state = QueueItemState.DISPATCHING;
+    await expect(app.shareImageGalleryPageOriginal(gallery.leaseId, original.leaseId)).rejects.toThrow(/pending image/u);
+    await expect(app.prepareQueueImagePreview("pending-images", images[0]!.pageId, new AbortController().signal)).rejects.toThrow(/pending image/u);
+    expect(network.submit).not.toHaveBeenCalled();
   });
 
   it("prepares canonical inline images independently of Gallery and reauthorizes their cached source", async () => {

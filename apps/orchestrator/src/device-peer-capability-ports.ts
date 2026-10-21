@@ -150,7 +150,8 @@ class PeerFiles implements DevicePeerFileTransportPort {
         content: new Uint8Array(request.content),
         ...(request.mode === undefined ? {} : { mode: boundedInteger(request.mode, 0, 0o7777, "file mode") }),
         createParents: request.createParents === true,
-        atomic: request.atomic === true
+        atomic: request.atomic === true,
+        createOnly: request.createOnly === true
       })
     ), request.signal, "fileMutation");
   }

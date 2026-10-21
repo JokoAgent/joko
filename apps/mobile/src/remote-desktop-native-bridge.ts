@@ -1,4 +1,5 @@
 import { MOBILE_REMOTE_DESKTOP_KEY_CODES, RTC_NETWORK } from "./remote-desktop-viewer";
+import { parseRemoteDesktopChannelReply, parseRemoteDesktopChannelRequest, type RemoteDesktopChannelRequest, type RemoteDesktopChannelReply } from "@joko/contracts";
 
 export interface MobileRemoteDesktopNativeScope {
   readonly epoch: string;
@@ -85,6 +86,7 @@ export type MobileRemoteDesktopNativeFallbackReason =
   | "answer-timeout" | "connect-timeout" | "host" | "background" | "capture-pending";
 
 export type MobileRemoteDesktopNativeEvent = MobileRemoteDesktopNativeScope & (
+  | { readonly type: "channelReply"; readonly reply: RemoteDesktopChannelReply }
   | { readonly type: "iceConfig" | "videoFrameReady" | "streaming" | "reconnecting" | "presentationStarting" }
   | { readonly type: "offer"; readonly sdp: string }
   | { readonly type: "ice"; readonly candidates: readonly MobileRemoteDesktopNativeIceCandidate[];
@@ -102,6 +104,7 @@ export type MobileRemoteDesktopNativeEvent = MobileRemoteDesktopNativeScope & (
 export interface MobileRemoteDesktopNativeHandle {
   receive(command: MobileRemoteDesktopNativeCommand): Promise<void>;
   sendInput(batch: MobileRemoteDesktopNativeInputBatch): Promise<boolean>;
+  sendRequest?(request: MobileRemoteDesktopNativeScope & { readonly message: RemoteDesktopChannelRequest }): Promise<boolean>;
 }
 
 const ATTEMPT = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -338,6 +341,10 @@ export function parseMobileRemoteDesktopNativeEvent(raw: unknown): MobileRemoteD
   try { value = JSON.parse(raw); } catch { return undefined; }
   if (!record(value) || typeof value.type !== "string" || !scope(value)) return undefined;
   const owned = { epoch: value.epoch, attemptId: value.attemptId };
+  if (value.type === "channelReply" && keys(value, ["type", "epoch", "attemptId", "reply"])) {
+    const reply = parseRemoteDesktopChannelReply(value.reply);
+    if (reply) return { ...owned, type: "channelReply", reply };
+  }
   if (["iceConfig", "videoFrameReady", "streaming", "reconnecting", "presentationStarting"].includes(value.type)
     && keys(value, ["type", "epoch", "attemptId"])) {
     return Object.freeze({ ...owned, type: value.type as "iceConfig" | "videoFrameReady" | "streaming" | "reconnecting" | "presentationStarting" });
@@ -420,5 +427,15 @@ export async function sendMobileRemoteDesktopNativeInput(
   try { sent = await handle.sendInput(batch); }
   catch { throw new MobileRemoteDesktopNativeBridgeError("input-failed", batch.epoch, batch.attemptId); }
   if (typeof sent !== "boolean") throw new MobileRemoteDesktopNativeBridgeError("input-failed", batch.epoch, batch.attemptId);
+  return sent;
+}
+
+export async function sendMobileRemoteDesktopNativeRequest(handle: MobileRemoteDesktopNativeHandle, raw: unknown): Promise<boolean> {
+  if (!record(raw) || !scope(raw) || !keys(raw, ["epoch", "attemptId", "message"]) || !parseRemoteDesktopChannelRequest(raw.message)) {
+    throw new MobileRemoteDesktopNativeBridgeError("invalid-input");
+  }
+  if (!handle.sendRequest) return false;
+  const sent = await handle.sendRequest({ epoch: raw.epoch, attemptId: raw.attemptId, message: raw.message as RemoteDesktopChannelRequest });
+  if (typeof sent !== "boolean") throw new MobileRemoteDesktopNativeBridgeError("input-failed", raw.epoch, raw.attemptId);
   return sent;
 }

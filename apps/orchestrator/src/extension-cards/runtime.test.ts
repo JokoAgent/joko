@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it, vi } from "vitest";
@@ -30,7 +30,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
   const id = "extension_0123456789abcdef0123456789abcdef", revision = `sha256:${"a".repeat(64)}`;
   let enabled = true, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
-  const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
+  const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
     card: { externalLinks: true }, mail: true, agent: true,
     network: { hosts: ["api.example.test"], connections: [{ key: "service", label: "Service", inject: { header: "Authorization", format: "Bearer {value}" } }], secrets: [{ key: "key", label: "Key", inject: { header: "Authorization", format: "Bearer {value}" } }] }, mailReader: { tool: "read_mail", hosts: ["mail.example.test"], markRead: true } });
   const extension = () => ({ id, revision: 1n, name: "Fixture mail", installed: true, enabled, owner: { kind: "resource", resourceId: "resource", resourceVersion: 1n, discoveredRevision: revision },
@@ -70,6 +70,11 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
           const response = await joko.network.fetch({ callId: message.callId, url: 'https://' + (connections ? connections.connections[0].host : 'api.example.test') + '/messages' });
           return { ok: true, result: connections ? { connections, response } : response };
         });
+        joko.tools.register('transfer', async message => {
+          const uploaded = await joko.network.fetch({ callId: message.callId, url: 'https://api.example.test/upload', method: 'POST', uploadDir: { token: message.arguments.dir_deposit.token, fileField: 'attachment' } });
+          const downloaded = await joko.network.fetch({ callId: message.callId, url: 'https://api.example.test/download', as: 'file', saveTo: { token: message.arguments.save_deposit.token } });
+          return { ok: uploaded.ok && downloaded.ok, result: { uploaded, downloaded, argumentKeys: Object.keys(message.arguments) } };
+        });
         joko.tools.register('read_mail', async message => ({ ok: true, result: { accountId: 'one', messageId: 'one', from: 'Sender', to: 'Owner', cc: '', bcc: '', date: 'Today', subject: message.arguments.markRead ? 'Opened' : 'Unread', bodyHtml: '<p>Hello</p>', bodyText: 'Hello', attachments: [] } }));
         joko.onHostMessage(async message => {
           if (message.actionId === 'refresh') await joko.card.update({ callId: message.callId, html: '<p>Refreshed</p>' });
@@ -85,7 +90,9 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const manager = new ExtensionCardsManager({ store, vault, authority: extensionId => runtime?.authority(extensionId), redact: value => value,
     dispatch: (scope, event, assertCurrent) => runtime!.dispatch(scope, event, assertCurrent) });
   const startupErrors: string[] = [];
+  const registration = { id: "target", root, displayName: "Workspace", trusted: true };
   runtime = new ExtensionCardRuntime({ store, vault, cards: manager, surfaces, executablePath: process.env.JOKO_BROWSER_EXECUTABLE,
+    workspaces: { listRegistrations: () => [registration] },
     launch: async () => {
       const browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE, headless: true, chromiumSandbox: true });
       const open = browser.newContext.bind(browser);
@@ -104,6 +111,8 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     fetch: (async (url, init) => {
       const token = new URL(String(url)).hostname === "one.example.test" ? "connection-private-key" : "runtime-private-key";
       expect(new Headers(init?.headers).get("authorization")).toBe(`Bearer ${token}`);
+      if (new URL(String(url)).pathname === "/upload") expect(Buffer.from(init?.body as ArrayBuffer).toString()).toContain("selected bytes");
+      if (new URL(String(url)).pathname === "/download") return new Response(new Uint8Array([0, 1, 2]), { headers: { "content-type": "application/zip", "content-disposition": 'attachment; filename="result.zip"' } });
       return new Response(JSON.stringify({ messages: 1, echo: token }), { headers: { "content-type": "application/json" } });
     }) as typeof fetch, resolveCredential: () => "runtime-private-key",
     continueTask: async (_scope, _text, guard) => { await guard(); await continuation(); } });
@@ -112,6 +121,12 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   try {
     await surfaces.initialize(); await runtime.start();
     const provider = providers.get(`${id}-runtime`)!; expect(provider).toBeDefined();
+    expect(provider.tools.find(tool => tool.name === "network")?.requiresPermission).toBe(true);
+    expect(provider.tools.find(tool => tool.name === "transfer")?.inputSchema).toMatchObject({ properties: { dir: { type: "string" }, save_dir: { type: "string" } } });
+    await writeFile(join(root, "selected.txt"), "selected bytes");
+    const transferred = await provider.callTool("transfer", { dir: join(root, "selected.txt"), save_dir: root }, undefined, context);
+    expect(transferred.structuredContent).toMatchObject({ uploaded: { ok: true }, downloaded: { ok: true, file: { file_name: "result.zip", bytes: 3 } }, argumentKeys: ["dir_deposit", "save_deposit"] });
+    expect(await readFile(join(root, "result.zip"))).toEqual(Buffer.from([0, 1, 2]));
     const response = await provider.callTool("network", {}, undefined, context);
     expect(response.structuredContent).toMatchObject({ ok: true, status: 200, body: '{"messages":1,"echo":"[REDACTED]"}' });
     const connectionResponse = await provider.callTool("network", { connection: true }, undefined, context);

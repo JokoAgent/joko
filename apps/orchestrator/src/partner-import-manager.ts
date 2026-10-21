@@ -12,6 +12,8 @@ import {
 import { parseRoutineInput } from "./partner-routine-definition.js";
 import { readOpenClawCronDatabase } from "@joko/agent-import";
 import type { PartnerImportStorage } from "./partner-import-storage.js";
+import { PARTNER_PACKAGE_IDS, applyNativeLocale, readNativePartnerPackage } from "./partner-package-reader.js";
+import { localizedPartnerPackageEntry, type PartnerPackageEntry, type PartnerPackageIdentity } from "./partner-package-types.js";
 
 /** Controller identity is authenticated by the service, independent of model-supplied arguments. */
 export interface PartnerImportController {
@@ -24,6 +26,7 @@ export interface PartnerImportEffectContext {
   readonly creationJson: string;
   readonly publicationRedactions: Record<string, string>;
   readonly assertOwner: () => void;
+  readonly activateNativePackage?: boolean;
 }
 type ImportEffects = Pick<TransferDeps, "partnerId" | "createPartner" | "importItem" | "saveEnvironment" | "createConversation" | "createRoutine" | "verifyAutomation" | "pauseSource" | "resumeSource" | "enableRoutine"> & {
   validateItems?(items: ImportItem[]): void | Promise<void>;
@@ -37,18 +40,21 @@ export class PartnerImportManager {
   readonly #previews = new Map<string, OwnedValue<ImportSnapshot>>();
   readonly #jobs = new Map<string, { promise: Promise<AgentImportResult>; submissionHash: string }>();
   readonly #deletedPartners = new Set<string>();
+  readonly #packageLanes = new Map<string, Promise<AgentImportResult>>();
+  readonly #nativeActivations = new Map<string, Promise<AgentImportResult | undefined>>();
   #retired = false;
   constructor(private readonly options: {
     readonly storage: PartnerImportStorage;
     readonly home: string;
     readonly environment: NodeJS.ProcessEnv;
-    readonly prepareCreation: (selection: AgentImportSelection) => string;
+    readonly prepareCreation: (selection: AgentImportSelection, nativePackage?: boolean) => string;
+    readonly nativeRuntimeReady?: (partnerId: string) => boolean;
     readonly adoptSettings: (partnerId: string, assertOwner: () => void) => Promise<void>;
     readonly effects: (context: PartnerImportEffectContext) => ImportEffects | Promise<ImportEffects>;
     readonly runPass: <T>(partnerId: string, action: () => Promise<T>) => Promise<T>;
     readonly assertServiceOwner: () => void;
     readonly now?: () => number;
-    readonly onSaved?: (result: AgentImportResult) => void | Promise<void>;
+    readonly onSaved?: (result: AgentImportResult, nativePackage?: ImportSnapshot["nativePackage"]) => void | Promise<void>;
   }) {}
   #now(): number { return (this.options.now ?? Date.now)(); }
   #assert(): void { this.options.assertServiceOwner(); if (this.#retired) throw new AgentImportError("OWNER_CHANGED"); }
@@ -67,6 +73,46 @@ export class PartnerImportManager {
     if (!entry || entry.expires <= this.#now() || entry.owner !== ownerKey) throw new AgentImportError("PREVIEW_EXPIRED"); return entry.value;
   }
 
+  async packages(locale: string, scope: PartnerImportController): Promise<readonly PartnerPackageEntry[]> {
+    const assertOwner = this.#controller(scope); assertOwner();
+    const receipts = this.options.storage.listReceipts().filter(receipt => receipt.nativePackage && !receipt.cancelled && !receipt.creationRejected);
+    const entries: PartnerPackageEntry[] = [];
+    for (const id of PARTNER_PACKAGE_IDS) {
+      const pkg = await readNativePartnerPackage(this.options.home, id); assertOwner();
+      const installation = receipts.find(receipt => receipt.nativePackage?.packageId === id)?.result;
+      entries.push({ ...localizedPartnerPackageEntry(pkg.entry, locale), ...(installation ? { installation } : {}) });
+    }
+    return entries;
+  }
+
+  async invitePackage(identity: PartnerPackageIdentity, locale: string, scope: PartnerImportController): Promise<AgentImportResult> {
+    const assertOwner = this.#controller(scope); assertOwner();
+    const pkg = await readNativePartnerPackage(this.options.home, identity.packageId); assertOwner();
+    if (pkg.identity.packageVersion !== identity.packageVersion || pkg.identity.packageHash !== identity.packageHash) throw new AgentImportError("SELECTION_CHANGED");
+    const predecessor = this.#packageLanes.get(identity.packageId);
+    const job = (predecessor ?? Promise.resolve()).catch(() => {}).then(async () => {
+      assertOwner();
+      const existing = this.options.storage.listReceipts().find(receipt => receipt.nativePackage?.packageId === identity.packageId && !receipt.cancelled && !receipt.creationRejected);
+      if (existing) {
+        if (existing.nativePackage?.packageVersion === identity.packageVersion && existing.nativePackage.packageHash !== identity.packageHash) throw new AgentImportError("SELECTION_CHANGED");
+        if (existing.result.status === "complete") return await this.activatePackage(existing.result.partnerId) ?? existing.result;
+        const pending = await this.options.storage.environment.read(existing.result.partnerId, assertOwner); assertOwner();
+        if (pending?.pendingImport) return this.retry(existing.result.requestId, scope);
+        if (existing.nativePackage?.packageVersion !== identity.packageVersion) return existing.result;
+      }
+      const requestId = existing?.result.requestId ?? randomUUID();
+      const id = `package_${requestId}`; const invitationLocale = existing?.nativePackage?.locale ?? locale;
+      applyNativeLocale(pkg, invitationLocale); pkg.snapshot.nativePackage!.locale = invitationLocale;
+      this.#previews.set(id, { owner: scope.ownerKey, expires: this.#now() + PREVIEW_TTL_MS, value: pkg.snapshot, bytes: 0 });
+      try {
+        return await this.start({ previewId: id, requestId, name: pkg.snapshot.source.name,
+          avatarImageBase64: pkg.snapshot.avatarImageBase64, entryIds: pkg.snapshot.items.map(item => item.view.id), takeover: false, deferSetup: false }, scope);
+      } finally { this.#previews.delete(id); }
+    });
+    this.#packageLanes.set(identity.packageId, job);
+    try { return await job; } finally { if (this.#packageLanes.get(identity.packageId) === job) this.#packageLanes.delete(identity.packageId); }
+  }
+
   async sources(scope: PartnerImportController): Promise<readonly AgentImportSource[]> {
     const assertOwner = this.#controller(scope); assertOwner(); this.#prune();
     const deps = this.#readers(assertOwner); const reader = createImportSourceReader(deps);
@@ -79,6 +125,43 @@ export class PartnerImportManager {
       result.push({ id, kind: source.kind, name: name || `${source.kind} ${result.length + 1}` });
     }
     return result;
+  }
+
+  /** A real model selection completes only the runtime projection of an already saved package. */
+  async activatePackage(partnerId: string): Promise<AgentImportResult | undefined> {
+    this.#assert();
+    if (this.options.nativeRuntimeReady?.(partnerId) !== true) return undefined;
+    const previous = this.#nativeActivations.get(partnerId); if (previous) return previous;
+    const task = this.options.runPass(partnerId, async () => {
+      const assertOwner = () => { this.#assert(); if (this.#deletedPartners.has(partnerId)) throw new AgentImportError("IMPORT_CANCELLED"); };
+      assertOwner(); const receipt = this.options.storage.listReceipts().find(row => row.result.partnerId === partnerId && row.nativePackage && row.result.saved && !row.cancelled);
+      if (!receipt || receipt.checkpointCleared) return receipt?.result;
+      const pending = (await this.options.storage.environment.read(partnerId, assertOwner))?.pendingImport;
+      if (!pending) throw new AgentImportError("IMPORT_INTERRUPTED");
+      const snapshot = await deserializeImportSnapshotAsync(pending.snapshotJson, assertOwner);
+      const effects = await this.options.effects({ snapshot, selection: pending.selection, creationJson: pending.creationJson,
+        publicationRedactions: snapshot.publicationRedactions ?? {}, assertOwner, activateNativePackage: true });
+      try {
+        await effects.createPartner(partnerId, pending.selection); assertOwner();
+        for (const item of snapshot.items.filter(item => item.view.category === "skills" || item.view.category === "memory")) {
+          await effects.importItem(partnerId, item, snapshot); assertOwner();
+        }
+        const sessionId = await effects.createConversation(partnerId);
+        if (!sessionId) throw new AgentImportError("IMPORT_PARTNER_SETUP_REQUIRED");
+        receipt.result.canonicalSessionId = sessionId; receipt.result.status = "complete";
+        receipt.result.checks = receipt.result.checks.filter(check => check.entryId !== "runtime");
+        this.options.storage.saveReceipt(receipt);
+        await this.options.onSaved?.(receipt.result, receipt.nativePackage); assertOwner();
+        await this.#clearCheckpoint(receipt);
+      } catch (error) {
+        assertOwner(); receipt.result.status = "needs-attention";
+        receipt.result.checks = [...receipt.result.checks.filter(check => check.entryId !== "runtime"), { entryId: "runtime", status: "needs-attention", message: importFailureCode(error) }];
+        this.options.storage.saveReceipt(receipt);
+      }
+      return receipt.result;
+    });
+    this.#nativeActivations.set(partnerId, task);
+    try { return await task; } finally { if (this.#nativeActivations.get(partnerId) === task) this.#nativeActivations.delete(partnerId); }
   }
 
   async preview(sourceId: string, scope: PartnerImportController): Promise<AgentImportPreview> {
@@ -129,7 +212,7 @@ export class PartnerImportManager {
       creationJson = pending.creationJson;
     } else {
       snapshot = this.#owned(this.#previews, selection.previewId, scope.ownerKey);
-      creationJson = this.options.prepareCreation({ ...selection, name: createEnvironmentRedactor(snapshot.publicationRedactions ?? previewImportRedactions(snapshot.items))(selection.name) });
+      creationJson = this.options.prepareCreation({ ...selection, name: createEnvironmentRedactor(snapshot.publicationRedactions ?? previewImportRedactions(snapshot.items))(selection.name) }, snapshot.nativePackage !== undefined);
     }
     validateImportSelection(selection, snapshot); await validateImportRequestIdentity(snapshot, selection, prior); assertController();
     const result = await this.#dispatch(snapshot, selection, creationJson); assertController(); return result;
@@ -139,7 +222,12 @@ export class PartnerImportManager {
     const assertController = this.#controller(scope); assertController();
     const receipt = this.options.storage.readReceipt(requestId);
     if (!receipt) throw new AgentImportError("IMPORT_RECEIPT_MISSING");
-    if (receipt.cancelled || receipt.result.status === "complete") return receipt.result;
+    if (receipt.cancelled) return receipt.result;
+    if (receipt.nativePackage && receipt.result.saved && !receipt.checkpointCleared) {
+      const activated = await this.activatePackage(receipt.result.partnerId); assertController();
+      if (activated) return activated;
+    }
+    if (receipt.result.status === "complete") return receipt.result;
     const pending = (await this.options.storage.environment.read(receipt.result.partnerId, assertController))?.pendingImport;
     if (!pending) throw new AgentImportError("PREVIEW_EXPIRED");
     const snapshot = await deserializeImportSnapshotAsync(pending.snapshotJson, assertController); assertController();
@@ -237,10 +325,9 @@ export class PartnerImportManager {
     };
     const result = await transferPartnerImport(snapshot, selection, deps, reconcile, resumeSetup);
       assertOwner();
-      if (result.status === "complete") {
-        await this.#clearCheckpoint(this.options.storage.readReceipt(selection.requestId)!);
-      }
-      await this.options.onSaved?.(result); assertOwner(); return result;
+      await this.options.onSaved?.(result, snapshot.nativePackage); assertOwner();
+      if (result.status === "complete") await this.#clearCheckpoint(this.options.storage.readReceipt(selection.requestId)!);
+      return result;
     });
     const job = (async () => {
       for (let attempt = 0; ; attempt++) {
@@ -274,7 +361,11 @@ export class PartnerImportManager {
     this.#assert();
     for (const receipt of this.options.storage.listReceipts()) {
       this.#assert(); if (receipt.cancelled || receipt.creationRejected || !receipt.checkpointSaved) continue;
-      if (receipt.result.status === "complete" && !receipt.checkpointCleared) { await this.#clearCheckpoint(receipt); continue; }
+      if (receipt.result.status === "complete") {
+        if (receipt.nativePackage && !receipt.result.canonicalSessionId) { await this.activatePackage(receipt.result.partnerId); continue; }
+        if (receipt.nativePackage) await this.options.onSaved?.(receipt.result, receipt.nativePackage);
+        if (!receipt.checkpointCleared) await this.#clearCheckpoint(receipt); continue;
+      }
       if (receipt.result.status !== "running") continue;
       const pending = (await this.options.storage.environment.read(receipt.result.partnerId, () => this.#assert()))?.pendingImport;
       if (!pending) {
@@ -288,6 +379,7 @@ export class PartnerImportManager {
   }
 
   async #clearCheckpoint(receipt: ImportReceipt): Promise<void> {
+    if (receipt.nativePackage && !receipt.result.canonicalSessionId) return;
     const assertOwner = () => this.#assert(); assertOwner();
     const environment = await this.options.storage.environment.read(receipt.result.partnerId, assertOwner);
     if (environment?.pendingImport) await this.options.storage.environment.update(receipt.result.partnerId, assertOwner, value => { delete value.pendingImport; });
@@ -317,7 +409,8 @@ export class PartnerImportManager {
   }
 
   async close(): Promise<void> {
-    this.#retired = true; this.#sources.clear(); this.#previews.clear(); await Promise.allSettled([...this.#jobs.values()].map(job => job.promise));
+    this.#retired = true; this.#sources.clear(); this.#previews.clear();
+    await Promise.allSettled([...this.#jobs.values()].map(job => job.promise).concat([...this.#nativeActivations.values()].map(job => job.then(value => value!))));
   }
 }
 

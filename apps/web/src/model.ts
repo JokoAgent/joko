@@ -6035,6 +6035,7 @@ export type ExtensionOAuthApi = Pick<import("@connectrpc/connect").Client<typeof
 };
 
 export type ExtensionCardApi = Pick<import("@connectrpc/connect").Client<typeof import("@joko/contracts").ExtensionCardService>, "get" | "dispatch" | "authorizeLink" | "previewMail" | "beginAttachment" | "readMedia"> & {
+  readonly canAuthorizeAccount?: boolean;
   formScope(sessionId: string): string;
   uploadAttachment(sessionId: string, cardId: string, file: File, inline: boolean, signal: AbortSignal): Promise<string>;
   loadMedia(sessionId: string, cardId: string, uri: string, signal: AbortSignal): Promise<{

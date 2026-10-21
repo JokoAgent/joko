@@ -34,6 +34,7 @@ import { MobileTimelineImage } from "./MobileTimelineImage";
 
 type Props = ComponentProps<typeof MobileTimelineImage>;
 const prepare = vi.fn<Props["client"]["prepareTimelineImagePreview"]>();
+const prepareQueue = vi.fn<Props["client"]["prepareQueueImagePreview"]>();
 const confirm = vi.fn<Props["client"]["confirmTimelineImagePreview"]>();
 const release = vi.fn<Props["client"]["releaseTimelineImagePreview"]>();
 const open = vi.fn();
@@ -43,10 +44,11 @@ function image(id: string): MobileTimelineImagePreview {
 }
 beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true }); native.state = "active"; native.rect = [0, 80, 280, 140];
-  native.images.clear(); native.buttons.clear(); prepare.mockReset(); confirm.mockReset(); release.mockReset(); open.mockReset();
+  native.images.clear(); native.buttons.clear(); prepare.mockReset(); prepareQueue.mockReset(); confirm.mockReset(); release.mockReset(); open.mockReset();
   let next = 0; prepare.mockImplementation(async () => image(`preview-${++next}`));
   confirm.mockImplementation((id) => image(id));
-  props = { client: { prepareTimelineImagePreview: prepare, confirmTimelineImagePreview: confirm, releaseTimelineImagePreview: release },
+  prepareQueue.mockImplementation(async () => image("queue-preview"));
+  props = { client: { prepareTimelineImagePreview: prepare, prepareQueueImagePreview: prepareQueue, confirmTimelineImagePreview: confirm, releaseTimelineImagePreview: release },
     page: { pageId: "canonical-page", title: "diagram.png", mediaType: "image/png", byteSize: 200, sha256Hex: "a".repeat(64), widthPixels: 800, heightPixels: 400 },
     eventId: "canonical-event", ownerKey: "current-task", eligible: true, viewportPulse: 0,
     viewportRef: { current: { measureInWindow: (callback: (...rect: number[]) => void) => callback(0, 0, 400, 300) } as unknown as View },
@@ -64,6 +66,15 @@ function button(label: string) { return Array.from(host.querySelectorAll<HTMLBut
 function loadData(uri: string): ImageLoadEventData {
   return { cacheType: "none", source: { url: uri, width: 800, height: 400, mediaType: "image/png", isAnimated: false } };
 }
+
+it("uses the queued occurrence for a pending image preview and opens it on touch", async () => {
+  await render({ queueItemId: "pending-image" });
+  expect(prepareQueue).toHaveBeenCalledWith("pending-image", "canonical-page", expect.any(AbortSignal));
+  expect(prepare).not.toHaveBeenCalled();
+  await act(async () => button("Open diagram")!.click()); expect(open).toHaveBeenCalledOnce();
+  await render({ queueItemId: undefined, eventId: "replacement" });
+  expect(release).toHaveBeenCalledWith("queue-preview");
+});
 
 it("fits the image to its confirmed native canvas without replacing its source lease", async () => {
   await render(); const uri = "data:image/png;base64,preview-1";

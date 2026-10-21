@@ -77,6 +77,23 @@ function fixture() {
 }
 
 describe("Linux native output audio capture owner", () => {
+  it("admits small control requests only from the exact capture document, lease and media attempt", async () => {
+    const f = fixture(); await f.offer("channel-attempt", false);
+    const handler = vi.fn(async () => ({ controlling: true, controlGeneration: 2 })); f.media.setControlHandler(handler);
+    const event = { sender: h.windows.at(-1), senderFrame: h.windows.at(-1)!.mainFrame };
+    const invoke = h.handlers.get(REMOTE_DESKTOP_CAPTURE_CHANNELS.request)!;
+    const request = { type: "request", id: "control-1", request: { op: "control", lease: "lease", enabled: true } };
+    await expect(invoke(event, "lease", "channel-attempt", request)).resolves.toEqual({ type: "reply", id: "control-1", ok: true,
+      result: { controlling: true, controlGeneration: 2 } });
+    await expect(invoke(event, "lease", "old-attempt", request)).resolves.toMatchObject({ ok: false, error: "REMOTE_DESKTOP_LEASE_EXPIRED" });
+    await expect(invoke(event, "other", "channel-attempt", request)).resolves.toMatchObject({ ok: false });
+    await expect(invoke(event, "lease", "channel-attempt", { ...request, request: { op: "stop", lease: "lease" } })).rejects.toThrow(/invalid/u);
+    await expect(invoke({ sender: {}, senderFrame: event.senderFrame }, "lease", "channel-attempt", request)).rejects.toThrow();
+    expect(handler).toHaveBeenCalledOnce(); f.revoke();
+    await expect(invoke(event, "lease", "channel-attempt", request)).resolves.toMatchObject({ ok: false });
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
   it("keeps X11 Chromium JPEG and renderer viewing available without native capture or audio", async () => {
     h.native = false;
     const f = fixture();

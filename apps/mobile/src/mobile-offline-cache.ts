@@ -10,6 +10,7 @@ import type { MobileConnectionProfile } from "./connection-storage";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { NodeIdentity } from "./network";
+import { retainMobileHistoryPrefix } from "./mobile-history-continuity";
 
 export interface MobileOfflineCacheStorage {
   getItem(key: string): Promise<string | null>;
@@ -197,8 +198,27 @@ export class MobileOfflineCache {
         regularGenerations.get(entry.sessionId) === entry.sessionGeneration);
       const createdKeys: string[] = [];
       if (detailSessionId !== undefined) {
-        details = details.filter((entry) => entry.sessionId !== detailSessionId);
-        if (regularOwnerSession(owner, detailSessionId)) {
+        let retainedDetail = detail!;
+        let detailCachedAt = cachedAt;
+        let preservePrevious = false;
+        const previous = details.find(entry => entry.sessionId === detailSessionId);
+        if (previous && regularOwnerSession(owner, detailSessionId)) {
+          try {
+            const previousRaw = await this.storage.getItem(previous.key).catch(() => { preservePrevious = true; return null; });
+            if (previousRaw !== null) {
+              const record = readDetail(previousRaw, profile, previous);
+              const snapshot = readSnapshot(record.snapshot, "task snapshot");
+              assertDetailSnapshot(owner, detailSessionId, snapshot);
+              const merged = retainMobileHistoryPrefix(detail!, snapshot);
+              // A background read outside the existing budget keeps the last valid offline view.
+              if (merged !== detail! && new TextEncoder().encode(JSON.stringify(cacheableSnapshotJson(merged))).byteLength > maximumDetailBytes - 2048) {
+                retainedDetail = snapshot; detailCachedAt = record.cachedAt;
+              } else retainedDetail = merged;
+            }
+          } catch { /* A damaged prior copy cannot authorize retaining its history. */ }
+        }
+        if (!preservePrevious) details = details.filter((entry) => entry.sessionId !== detailSessionId);
+        if (regularOwnerSession(owner, detailSessionId) && !preservePrevious) {
           const token = this.newId();
           assertLocalId(token, "cache write");
           const key = detailKey(profile.profileId, detailSessionId, token);
@@ -207,8 +227,8 @@ export class MobileOfflineCache {
             identity: profileIdentity(profile),
             sessionId: detailSessionId,
             sessionGeneration: detail!.sessions[0]!.nativeBinding!.runtimeGeneration.toString(10),
-            cachedAt,
-            snapshot: cacheableSnapshotJson(detail!)
+            cachedAt: detailCachedAt,
+            snapshot: cacheableSnapshotJson(retainedDetail)
           };
           const raw = JSON.stringify(record);
           const size = utf8Size(raw, maximumDetailBytes, "current task");

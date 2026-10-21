@@ -5,6 +5,7 @@ package joko.v1;
 import "google/protobuf/timestamp.proto";
 import "joko/v1/workspace.proto";
 import "joko/v1/common.proto";
+import "joko/v1/extension_oauth.proto";
 
 // Static history only. Package authority and transient runtime state are private.
 message ExtensionCard {
@@ -29,6 +30,10 @@ message ExtensionCardServiceGetResponse {
   bool working = 3;
   bool interactive = 4;
   repeated string media_uris = 5;
+  // Host-assessed setup only; author HTML cannot create this authority.
+  bool host_authorization = 6;
+  ExtensionAuthorizationPhase authorization_phase = 7;
+  bool authorization_client_configured = 8;
 }
 message ExtensionCardFormValue {
   string name = 1;
@@ -45,6 +50,8 @@ message ExtensionCardServiceDispatchRequest {
 }
 message ExtensionCardServiceDispatchResponse {
   bool accepted = 1;
+  // Opaque flow identity for the trusted native controller, never author code.
+  string authorization_flow_id = 2;
 }
 message ExtensionCardServiceAuthorizeLinkRequest {
   string session_id = 1;

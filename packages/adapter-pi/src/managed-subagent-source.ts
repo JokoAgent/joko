@@ -80,6 +80,7 @@ const MAX_NATIVE_AUTH_BYTES = 4 * 1024 * 1024;
 const MAX_DEPTH = 1;
 const MAX_TASKS = 8;
 const MAX_CONCURRENCY = 4;
+const SPAWN_ARGV_BUDGET = process.platform === "win32" ? 30000 : 128000;
 const MAX_LIVE_CHILDREN = 20;
 const DEFAULT_WORKER_SOFT_LIMIT = 5;
 const DEFAULT_WORKER_HARD_LIMIT = 8;
@@ -2141,6 +2142,10 @@ async function startController(job, onProgress, ctx) {
   const launch = invocation(args);
   let child;
   try {
+    const argvUnits = [launch.command].concat(launch.args).reduce(function (total, argument) {
+      return total + (process.platform === "win32" ? argument.length : Buffer.byteLength(argument, "utf8")) + 3;
+    }, 0);
+    if (argvUnits > SPAWN_ARGV_BUDGET) throw new Error("Subagent command line exceeds the platform spawn budget (" + argvUnits + " > " + SPAWN_ARGV_BUDGET + ").");
     child = spawn(launch.command, launch.args, {
       cwd: process.cwd(),
       env: childEnvironment(prepared.childHome, job.route.provider),

@@ -228,6 +228,8 @@ message DevicePeerWriteFileAction {
   optional uint32 mode = 3;
   bool create_parents = 4;
   bool atomic = 5;
+  // Fail instead of replacing an existing file or following a symlink.
+  bool create_only = 6;
 }
 
 message DevicePeerRenameFileAction {

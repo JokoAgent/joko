@@ -123,6 +123,12 @@ export class PartnerRoutineManager {
     return this.engine.createOnce(input.partnerId, input.definition, this.creationId(input.partnerId, input.requestId), input.assertCaller);
     });
   }
+  /** Trusted package definitions are saved disabled independently of model and task readiness. */
+  async installPackage(partnerId: string, definition: RoutineInput, requestId: string, assertCurrent: () => void): Promise<Routine> {
+    assertCurrent(); const partner = this.options.partners.getPartner(partnerId);
+    if (partner.lifecycle !== "active" || definition.enabled) throw new PartnerRoutineError("invalid", "Package routines must be installed disabled.");
+    return this.engine.createOnce(partnerId, { ...definition, enabled: false }, this.creationId(partnerId, requestId), assertCurrent);
+  }
   creationId(partnerId: string, requestId: string): string { return createHash("sha256").update(JSON.stringify([partnerId, requestId])).digest("hex"); }
   creation(partnerId: string, requestId: string): { readonly routine?: Routine; readonly retired: boolean } {
     this.#owner(partnerId, false);

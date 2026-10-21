@@ -819,13 +819,13 @@ export function renderNativeTaskStatusDocument(
     ? `<div class="compact-row compact-row--idle">
         <span class="phase-mark phase-mark--idle" aria-hidden="true"></span>
         <div class="idle-main"><strong>Joko</strong><span>${escapeHtml(strings.ready)}</span></div>
-        ${countBadge(surface.counts.total, strings, true)}
+        ${countBadge(surface.counts, strings)}
         <a class="icon-action" href="${ACTION_SCHEME}//toggle" aria-label="${escapeAttribute(strings.expand)}" title="${escapeAttribute(strings.expand)}">${nativeIcon("chevron-down")}</a>
       </div>`
     : `<div class="compact-row">
         ${phaseMark(current.phase)}
         <a class="task-main" href="${focusUrl(current.sessionId)}"><strong>${escapeHtml(current.title || strings.untitled)}</strong><span>${escapeHtml(phaseLabel(current.phase, strings, current.interactionKind))}</span></a>
-        ${countBadge(surface.counts.total, strings)}
+        ${countBadge(surface.counts, strings)}
         <a class="icon-action" href="${ACTION_SCHEME}//toggle" aria-label="${escapeAttribute(strings.expand)}" title="${escapeAttribute(strings.expand)}">${nativeIcon("chevron-down")}</a>
       </div>`;
   const soundLabel = settings.sounds.enabled ? strings.mute : strings.unmute;
@@ -1117,10 +1117,17 @@ function phaseMark(phase: DesktopNativeTaskStatusPhase): string {
   return `<span class="phase-mark phase-mark--${phase}" aria-hidden="true"></span>`;
 }
 
-function countBadge(count: number, strings: NativeStrings, force = false): string {
-  return count > (force ? 0 : 1)
-    ? `<span class="count" aria-label="${escapeAttribute(strings.taskCount(count))}">${count}</span>`
-    : "";
+function countBadge(counts: DesktopNativeTaskStatusSurface["counts"], strings: NativeStrings): string {
+  const attention = counts.interaction + counts.completed + counts.error;
+  const segments = [
+    ...(attention > 0 ? [{ count: attention, label: strings.error, kind: "attention" }] : []),
+    ...(counts.running > 0 ? [{ count: counts.running, label: strings.running, kind: "running" }] : [])
+  ];
+  if (segments.length === 0) return "";
+  const label = segments.map(segment => `${segment.label}: ${segment.count}`).join("; ");
+  return `<span class="count" aria-label="${escapeAttribute(label)}" title="${escapeAttribute(label)}">${segments.map(segment =>
+    `<span class="count__${segment.kind}" aria-hidden="true">${segment.count}</span>`
+  ).join('<span class="count__separator" aria-hidden="true">·</span>')}</span>`;
 }
 
 
@@ -1170,7 +1177,8 @@ const NATIVE_TASK_STATUS_CSS = `
   .task-main { min-width:0; flex:1; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px; }
   .task-main strong, .task-copy strong { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:13px; }
   .task-main span, .expanded-shell header span, .task-status, .more { color:var(--muted); font-size:11px; }
-  .count { min-width:21px; height:21px; display:grid; place-items:center; border-radius:999px; background:var(--raised); border:1px solid var(--line); font-size:11px; font-weight:650; }
+  .count { flex-shrink:0; min-width:21px; height:21px; display:inline-flex; align-items:center; justify-content:center; gap:4px; padding:0 6px; border-radius:999px; background:var(--raised); border:1px solid var(--line); font-size:11px; font-weight:650; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .count__separator { color:var(--muted); }
   .icon-action, .expanded-shell nav a { width:28px; height:28px; display:grid; place-items:center; border:1px solid var(--line); border-radius:8px; background:var(--raised); color:var(--muted); transition:background .15s,border-color .15s,color .15s,transform .15s; }
   .icon-action:hover, .expanded-shell nav a:hover { border-color:var(--line-strong); background:var(--surface-hover); color:var(--text); }
   .icon-action:active, .expanded-shell nav a:active { transform:scale(.96); }

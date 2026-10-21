@@ -57,6 +57,9 @@ public class JokoRemotePresentationModule: Module {
       AsyncFunction("sendInput") { (view: RemoteDesktopVideoView, message: [String: Any]) -> Bool in
         view.sendInput(message)
       }
+      AsyncFunction("sendRequest") { (view: RemoteDesktopVideoView, message: [String: Any]) -> Bool in
+        view.sendRequest(message)
+      }
     }
 
     View(JokoWindowLayoutView.self) {

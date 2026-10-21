@@ -1,0 +1,7 @@
+Local worktree include rule matching in src/include-files.ts adapts
+apps/desktop/src/main/worktree/includePatternsEngine.ts from Cindy
+(https://github.com/makecindy/cindy), release v0.1.112, commit
+8bd60e8549cdcf0ada21e6f73d68dc0d0b71909d, licensed under Apache-2.0.
+Joko binds copying and recovery to its existing worktree lease, protected paths,
+operation deadlines and durable Git snapshots.
+See LICENSE.cindy for the Apache License 2.0 text.

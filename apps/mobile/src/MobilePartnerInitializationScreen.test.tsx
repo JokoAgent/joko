@@ -14,7 +14,7 @@ vi.mock("react-native", async () => {
     children?: ReactNode; accessibilityLabel?: string; accessibilityRole?: string; disabled?: boolean; onPress?: () => void;
   }) => React.createElement(tag, { "aria-label": accessibilityLabel, role: accessibilityRole, disabled, onClick: onPress }, children);
   return { ActivityIndicator: () => React.createElement("span", { role: "progressbar" }),
-    Pressable: element("button"), Text: element("span"), View: element("div"),
+    Pressable: element("button"), Text: element("span"), View: element("div"), ScrollView: element("div"),
     StyleSheet: { create: <T,>(value: T) => value, hairlineWidth: 1 } };
 });
 
@@ -43,6 +43,19 @@ afterEach(() => { if (root) act(() => root!.unmount()); container?.remove(); roo
   onBack.mockReset(); onOpenTask.mockReset(); vi.useRealTimers(); });
 
 describe("MobilePartnerInitializationScreen", () => {
+  it("offers actual configured models for an installed package without creating or opening a fake conversation", async () => {
+    const installed = { ...failed, initializationErrorCode: "modelUnavailable" as const,
+      capabilities: { ...failed.capabilities, modelChain: [] } };
+    const choice = { id: "real", label: "Real model · Provider", route: prepared.capabilities.modelChain[0]! };
+    const active = { ...transport(installed), models: vi.fn(() => [choice]), configure: vi.fn(async () => prepared) };
+    await render(active); expect(container.textContent).toContain("Choose a model");
+    expect(active.open).not.toHaveBeenCalled(); expect(active.configure).not.toHaveBeenCalled();
+    await press(choice.label);
+    expect(active.configure).toHaveBeenCalledWith(installed, choice, expect.any(AbortSignal));
+    expect(active.open).toHaveBeenCalledWith(prepared, expect.any(AbortSignal));
+    expect(onOpenTask).toHaveBeenCalledWith("session");
+  });
+
   it("observes pending stages at 2500ms and stops on a read failure while retaining completed progress", async () => {
     vi.useFakeTimers(); const active = transport(); await render(active);
     expect(container.textContent).toContain("Preparing the Partner home");

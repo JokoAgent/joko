@@ -31,6 +31,34 @@ afterEach(async () => {
 });
 
 describe("EphemeralWorktreeService", () => {
+  test("copies both local include conventions and restores captured edits before refreshing files", { timeout: 40_000 }, async () => {
+    const fixture = await createRepositoryFixture();
+    await writeFile(join(fixture.repositoryRoot, ".worktreeinclude"), "# local files\n*.ignored\n!excluded.ignored\n*.ignored\n!excluded.ignored\n!extra.ignored\ntracked.txt\n");
+    await writeFile(join(fixture.repositoryRoot, ".jokoworktreeinclude"), "extra.ignored\n");
+    await git(fixture.repositoryRoot, ["add", ".worktreeinclude", ".jokoworktreeinclude"]);
+    await git(fixture.repositoryRoot, ["commit", "-m", "configure local include files"]);
+    await writeFile(join(fixture.repositoryRoot, "config.ignored"), "original local config\n");
+    await writeFile(join(fixture.repositoryRoot, "extra.ignored"), "selected by independent rules\n");
+    await writeFile(join(fixture.repositoryRoot, "excluded.ignored"), "excluded\n");
+    const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot });
+    unwrap(await service.initialize());
+    const checkout = unwrap(await service.acquire({ sessionId: "include-source", cwd: fixture.repositoryRoot }));
+    expect(await readFile(join(checkout.lease.path, "config.ignored"), "utf8")).toBe("original local config\n");
+    expect(await readFile(join(checkout.lease.path, "extra.ignored"), "utf8")).toBe("selected by independent rules\n");
+    await expect(lstat(join(checkout.lease.path, "excluded.ignored"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await readFile(join(checkout.lease.path, "tracked.txt"), "utf8")).trim()).toBe("initial");
+    await writeFile(join(checkout.lease.path, "config.ignored"), "edited in isolated checkout\n");
+    const archived = unwrap(await service.release("include-source", { retainForRestore: true }));
+    expect(archived).toMatchObject({ reason: "restorable", pathRemoved: true });
+    await writeFile(join(fixture.repositoryRoot, "config.ignored"), "new source config\n");
+    const restored = unwrap(await service.acquire({ sessionId: "include-source", cwd: fixture.repositoryRoot }));
+    expect((await readFile(join(restored.lease.path, "config.ignored"), "utf8")).replaceAll("\r\n", "\n")).toBe("edited in isolated checkout\n");
+    expect(await git(restored.lease.path, ["diff", "--cached", "--name-only"])).toBe("");
+    const derived = unwrap(await service.derive({ sessionId: "include-copy", sourceSessionId: "include-source", sourceLeaseId: restored.lease.id }));
+    expect((await readFile(join(derived.lease.path, "config.ignored"), "utf8")).replaceAll("\r\n", "\n")).toBe("edited in isolated checkout\n");
+    service.dispose();
+  });
+
   test("persists exact recycle controls without charging native and source writer waits", { timeout: 40_000 }, async () => {
     const fixture = await createRepositoryFixture();
     const service = new EphemeralWorktreeService({ storageRoot: fixture.storageRoot, recycle: true });

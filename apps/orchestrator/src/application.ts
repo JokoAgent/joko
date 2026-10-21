@@ -245,6 +245,7 @@ import { PartnerRoutineStore } from "@joko/store";
 import { PartnerRoutineManager } from "./partner-routine-manager.js";
 import { PartnerRoutineTools } from "./partner-routine-tools.js";
 import { PartnerImportManager } from "./partner-import-manager.js";
+import { partnerPackageOpening } from "./partner-package-opening.js";
 import { PartnerImportStorage } from "./partner-import-storage.js";
 import { PartnerImportRuntime } from "./partner-import-runtime.js";
 import { adoptPartnerImportSettings, createPartnerImportEffects, preparePartnerImportCreation } from "./partner-import-effects.js";
@@ -254,6 +255,7 @@ import { ExtensionNetworkConnections } from "./extension-cards/network-connectio
 import { ExtensionNetworkSettings } from "./extension-cards/network-settings.js";
 import { ExtensionOAuthAccounts } from "./extension-cards/oauth-accounts.js";
 import { ExtensionOAuthSettings } from "./extension-cards/oauth-settings.js";
+import { ExtensionOAuthCards } from "./extension-cards/oauth-cards.js";
 import { ExtensionCardMedia } from "./extension-cards/media.js";
 import { ExtensionCardsManager } from "./extension-cards/manager.js";
 import { PartnerWorkingStatusManager } from "./partner-working-status.js";
@@ -1995,6 +1997,7 @@ export async function createOrchestratorApplication(
     sessionHost,
     workspaceService: workspaces,
     homesRoot: join(config.dataDirectory, "partner-homes"),
+    onReady: async partnerId => { await partnerImports?.activatePackage(partnerId); },
     onRoutineLifecycle: async (partnerId, state) => { await partnerRoutines?.lifecycle(partnerId, state); await partnerGroups?.partnerLifecycle(partnerId, state); },
     prepareImportDeletion: async partnerId => { await partnerImports?.prepareDeletion(partnerId); await startupPartnerImportRuntime?.close();
       partnerMemoryPreferences.remove(partnerStore.getPartner(partnerId).homeTargetId);
@@ -2271,9 +2274,11 @@ export async function createOrchestratorApplication(
     surfaces: extensionMainViews, engine: partnerRoutines.engine, ...(config.browser ? { executablePath: config.browser.executablePath } : {}) });
   startupRoutineRuntime = extensionRoutineRuntime;
   let extensionCardRuntime: ExtensionCardRuntime | undefined;
+  let extensionOAuthCards: ExtensionOAuthCards | undefined;
   const extensionCardMedia = new ExtensionCardMedia({ store, vault: credentialVault, artifacts, transfers: blobTransfers });
   const extensionCards = new ExtensionCardsManager({ store, vault: credentialVault,
     media: extensionCardMedia,
+    oauthCards: () => extensionOAuthCards,
     authority: id => extensionCardRuntime?.authority(id), redact: value => credentials.redactText(value),
     previewMail: async (...args) => { if (!extensionCardRuntime) throw new Error("Mail runtime unavailable."); return extensionCardRuntime.previewMail(...args); },
     dispatch: async (scope, event, assertCurrent) => {
@@ -2281,8 +2286,11 @@ export async function createOrchestratorApplication(
       await extensionCardRuntime.dispatch(scope, event, assertCurrent);
     } });
   startupExtensionCards = extensionCards;
+  extensionOAuthCards = new ExtensionOAuthCards({ cards: extensionCards, settings: extensionOAuth, accounts: extensionOAuthAccounts, store, catalog: extensionCatalog,
+    authority: id => extensionCardRuntime?.authority(id), locale: () => persistedLocale(store),
+    continueTask: (scope, text, guard) => sessionHost.enqueueExtensionCardMessage(scope.sessionId, scope.extensionId, text, guard) });
   extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store,
-    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, media: extensionCardMedia, connections: extensionConnections, oauth: extensionOAuthAccounts,
+    vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
     registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
     locale: () => persistedLocale(store),
     fetch: createOutboundStreamingFetch({ resolveProxy: dependencies.resolveOutboundProxy,
@@ -2305,13 +2313,35 @@ export async function createOrchestratorApplication(
   const helpFeedback = new HelpFeedbackStore(join(config.dataDirectory, "help-feedback"));
   const agentImportSources = dependencies.agentImportSources ?? { home: userInfo().homedir, environment: { ...process.env } };
   partnerImports = new PartnerImportManager({ storage: partnerImportStorage, ...agentImportSources,
-    prepareCreation: selection => preparePartnerImportCreation(partners, selection), adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, partnerImportStorage, id, assertOwner),
+    prepareCreation: (selection, native) => preparePartnerImportCreation(partners, selection, native),
+    nativeRuntimeReady: id => { const profile = partners.getPartner(id); return profile.lifecycle === "active" && profile.initializationState === "ready" && !!profile.canonicalSessionId; },
+    adoptSettings: (id, assertOwner) => adoptPartnerImportSettings(partners, store, partnerImportStorage, id, assertOwner),
     runPass: (id, action) => partners.runImportManagement(id, action),
     assertServiceOwner: assertImportService, effects: context => createPartnerImportEffects({ partners, routines: partnerRoutines!,
       storage: partnerImportStorage, store, memory: makerMemory, resources: piResources, artifacts,
       verification: partnerImportRuntime.verification, ...agentImportSources }, context),
-    onSaved: result => {
+    onSaved: async (result, nativePackage) => {
       if (!result.saved || !result.canonicalSessionId) return;
+      if (nativePackage) {
+        const welcomeEventId = `import-message-${createHash("sha256").update(JSON.stringify([result.canonicalSessionId, `package-welcome-${result.requestId}`])).digest("hex")}`;
+        if (store.findEvent(welcomeEventId, { includeTombstoned: true })) return;
+        if (result.checks.some(check => check.status === "needs-attention" && !check.entryId.startsWith("routine-") && check.message !== "MEMORY_DISABLED")) return;
+        if (store.listEvents({ sessionId: result.canonicalSessionId, limit: 1_000 }).some(event => event.payload.type === "message_complete" && event.payload.role === "user")) return;
+        const current = () => {
+          try {
+            assertImportService();
+            const profile = partners.getPartner(result.partnerId);
+            return profile.lifecycle === "active" && profile.canonicalSessionId === result.canonicalSessionId
+              && !store.listEvents({ sessionId: result.canonicalSessionId!, limit: 1_000 }).some(event => event.payload.type === "message_complete" && event.payload.role === "user");
+          } catch { return false; }
+        };
+        if (!current()) return;
+        const opening = await partnerPackageOpening(nativePackage, auxiliaryText, current);
+        if (!current()) return;
+        sessionHost.appendImportMessage(result.canonicalSessionId, `package-welcome-${result.requestId}`,
+          opening, () => { if (!current()) throw new Error("Partner opening owner changed."); });
+        return;
+      }
       sessionHost.appendImportMessage(result.canonicalSessionId, `import-saved-${result.requestId}`,
         "Imported content has been saved. You can review its saved, verified and active status here, retry missing items, and explicitly continue verification and schedule takeover.", assertImportService);
     } });

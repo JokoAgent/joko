@@ -12,6 +12,7 @@ async function fixture() {
     calls.push({ method: method.localName, input });
     const value = method.localName === "getSnapshot" ? { snapshot: {} } : method.localName === "beginClient" ? { ticket: { ticketId: "protected-client", relativeEndpoint: "/v1/credentials/upload/protected-client", maximumBytes: 2_048n } }
       : method.localName === "start" ? { flow: { flowId: "original-flow", extensionId: "extension", slotKey: "account", phase: ExtensionAuthorizationPhase.PREPARING } }
+        : method.localName === "dispatch" ? { accepted: true, authorizationFlowId: "host-card-flow" }
         : method.localName === "commitClient" || method.localName === "get" ? { state: { extensionId: "extension", revision: { value: 2n } } } : {};
     return { stream: false, service: method.parent, method, header: new Headers(), trailer: new Headers(), message: create(method.output, value) };
   }), stream: vi.fn() } as unknown as Transport;
@@ -39,4 +40,23 @@ it("cancels the original controller and rejects its late success after the node 
   expect(cancel.mock.calls[0]![0]).toEqual({ profileId: f.profile.id, serverId: f.profile.serverId, origin: f.profile.origin });
   release(toBinary(ExtensionOAuthServiceGetFlowResponseSchema, create(ExtensionOAuthServiceGetFlowResponseSchema, { flow: { flowId: "original-flow", phase: ExtensionAuthorizationPhase.COMPLETE } })));
   await rejected; expect(f.calls.filter(call => call.method === "cancelFlow")).toHaveLength(1); expect(f.calls.filter(call => call.method === "get")).toHaveLength(0);
+});
+it("completes only the host card's bound flow through the original native controller without starting an unbound flow", async () => {
+  const f = await fixture(), authorize = vi.fn(async (_owner: { profileId: string; serverId: string; origin: string }, _bytes: Uint8Array) => toBinary(ExtensionOAuthServiceGetFlowResponseSchema,
+    create(ExtensionOAuthServiceGetFlowResponseSchema, { flow: { flowId: "host-card-flow", phase: ExtensionAuthorizationPhase.COMPLETE } }))), cancel = vi.fn(async () => {});
+  Object.defineProperty(window, "jokoDesktop", { configurable: true, value: { extensionOAuth: { authorize, cancel } } });
+  const result = await f.gateway.extensionCardApi()!.dispatch({ sessionId: "task", cardId: "host-card", actionId: "host:connect-account" });
+  expect(result).toMatchObject({ accepted: true, authorizationFlowId: "host-card-flow" });
+  expect(authorize.mock.calls[0]![0]).toEqual({ profileId: f.profile.id, serverId: f.profile.serverId, origin: f.profile.origin });
+  expect(f.calls.map(call => call.method)).not.toContain("start"); expect(cancel).not.toHaveBeenCalled(); f.gateway.disconnect();
+});
+it("cancels the exact host-card flow on view cancellation and discards late native success", async () => {
+  const f = await fixture(), abort = new AbortController(); let release!: (bytes: Uint8Array) => void;
+  const authorize = vi.fn(async () => await new Promise<Uint8Array>(resolve => { release = resolve; })), cancel = vi.fn(async () => {});
+  Object.defineProperty(window, "jokoDesktop", { configurable: true, value: { extensionOAuth: { authorize, cancel } } });
+  const pending = f.gateway.extensionCardApi()!.dispatch({ sessionId: "task", cardId: "host-card", actionId: "host:connect-account" }, { signal: abort.signal });
+  const refused = expect(pending).rejects.toThrow(); await vi.waitFor(() => expect(authorize).toHaveBeenCalledOnce()); abort.abort();
+  release(toBinary(ExtensionOAuthServiceGetFlowResponseSchema, create(ExtensionOAuthServiceGetFlowResponseSchema, { flow: { flowId: "host-card-flow", phase: ExtensionAuthorizationPhase.COMPLETE } })));
+  await refused; expect(cancel).toHaveBeenCalledWith(expect.objectContaining({ profileId: f.profile.id }), "host-card-flow");
+  expect(f.calls.filter(call => call.method === "cancelFlow")).toMatchObject([{ input: { flowId: "host-card-flow" } }]); f.gateway.disconnect();
 });

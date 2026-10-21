@@ -175,6 +175,7 @@ export class RemoteDesktopController {
   #starting = false;
   #startingPeer: string | undefined;
   #inputStarting = false;
+  #inputRecoveryUsed = false;
   #framePending = false;
   #displayModePending = false;
   #displayWrite: Promise<void> | undefined;
@@ -343,14 +344,34 @@ export class RemoteDesktopController {
   }
 
   /** Input failure is control-scoped: preserve the lease, picture and viewer. */
-  releaseControl(): void {
+  async releaseControl(recoverInput = false): Promise<void> {
     const active = this.#active;
     if (active === undefined || (!active.controlling && !this.#inputStarting)) return;
+    const recover = recoverInput && active.controlling && !this.#inputStarting && !this.#inputRecoveryUsed
+      && !this.#starting && !this.#displayModePending && this.#displayRestoring === undefined && !active.backgroundViewing;
+    if (recover) this.#inputRecoveryUsed = true;
     active.controlling = false;
     active.controlGeneration = ++this.#controlGeneration;
-    this.#clearHostMute(active);
+    const generation = active.controlGeneration;
+    if (!recover) this.#clearHostMute(active);
+    else {
+      active.clipboardSync = false; active.syncGeneration = ++this.#syncGeneration;
+      this.#dependencies.stopClipboardVersion?.(); this.#retireSystemActions();
+    }
     this.#dependencies.stopInput();
     this.#dependencies.changed();
+    if (!recover) return;
+    try {
+      await this.#awaitSafety();
+      if (this.#active !== active || this.#starting || this.#displayModePending || active.controlGeneration !== generation) return;
+      this.#require(active.authority, active.lease);
+      await this.#control(active.authority, active, true, true);
+    } catch {
+      if (this.#active === active && !active.controlling) {
+        this.#clearHostMute(active); this.#dependencies.changed();
+        await this.#awaitSafety().catch(() => undefined);
+      }
+    }
   }
 
   /** Join exact captured safety cleanup after synchronous authority retirement. */
@@ -513,8 +534,9 @@ export class RemoteDesktopController {
     active.sequence = sequence;
     try {
       this.#dependencies.input(request.events, authority);
+      this.#inputRecoveryUsed = false;
     } catch (error) {
-      this.releaseControl();
+      void this.releaseControl();
       throw error;
     }
   }
@@ -838,15 +860,17 @@ export class RemoteDesktopController {
   async #control(
     authority: RemoteDesktopAuthority,
     active: ActiveRemoteDesktopLease,
-    enabled: boolean
+    enabled: boolean,
+    recovering = false
   ): Promise<{ readonly controlling: boolean; readonly controlGeneration: number }> {
     if (this.#locking !== undefined) throw new Error("REMOTE_DESKTOP_BUSY");
     if (enabled && !active.canControl) throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
     if (enabled && this.#inputStarting) throw new Error("REMOTE_DESKTOP_INPUT_BUSY");
+    if (!recovering) this.#inputRecoveryUsed = false;
     if (enabled) active.backgroundViewing = false;
     const generation = ++this.#controlGeneration;
     active.controlGeneration = generation;
-    this.#clearHostMute(active);
+    if (!recovering) this.#clearHostMute(active);
     if (enabled) {
       await this.#awaitSafety();
       this.#revalidateAsyncCompletion(authority, active);
@@ -869,13 +893,12 @@ export class RemoteDesktopController {
           () => this.#dependencies.startInput(active.display.id, authority)
         );
         if (generation !== this.#controlGeneration || this.#active !== active) {
-          this.#dependencies.stopInput();
           throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
         }
         active.controlling = true;
       } catch (error) {
-        this.#dependencies.stopInput();
-        if (this.#active === active) {
+        if (this.#active === active && generation === this.#controlGeneration) {
+          this.#dependencies.stopInput();
           active.controlling = false;
           this.#dependencies.changed();
         }

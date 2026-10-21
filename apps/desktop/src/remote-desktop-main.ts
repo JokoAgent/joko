@@ -95,8 +95,8 @@ export function createDesktopRemoteDesktopMainHost(
   const media = new DesktopRemoteDesktopMedia(join(options.sourceDirectory, "remote-desktop-capture-preload.cjs"),
     undefined, (leaseId) => { if (host?.state?.leaseId === leaseId) host.disconnect(); });
   const input = process.platform === "win32"
-    ? new DesktopRemoteDesktopWindowsInput(() => host?.releaseControl())
-    : new DesktopRemoteDesktopInput(() => host?.releaseControl());
+    ? new DesktopRemoteDesktopWindowsInput(() => host?.releaseControl(true))
+    : new DesktopRemoteDesktopInput(() => host?.releaseControl(true));
   const linuxMute = process.platform === "linux" && isDesktopRemoteDesktopWayland() && supportsDesktopRemoteDesktopLinuxMute()
     ? new DesktopRemoteDesktopLinuxMute() : undefined;
   const linuxWorkspace = process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture()

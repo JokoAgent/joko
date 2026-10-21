@@ -50,6 +50,8 @@ export interface PartnerListOptions {
 }
 
 export interface CreatePartnerInput extends PartnerDraft {
+  /** Trusted bundled-package installation, before a real model and canonical task are selected. */
+  readonly allowUnconfiguredModel?: true;
   readonly expectedDirectoryRevision: bigint;
   readonly requestId: string;
   readonly id?: string;
@@ -1030,7 +1032,7 @@ export class PartnerStore {
       if (this.#database.prepare("SELECT request_id FROM retired_partner_creations WHERE request_id = ?").get(requestId) !== undefined) {
         throw new PartnerStoreError("PARTNER_CREATION_RETIRED", "This partner creation request was retired.");
       }
-      const requestedDraft = partnerDraft({ ...input, avatar: avatarInput(input.avatar) });
+      const requestedDraft = partnerDraft({ ...input, avatar: avatarInput(input.avatar) }, acceptedImport && input.allowUnconfiguredModel === true);
       const fingerprint = creationFingerprint(input, requestedDraft);
       const existing = this.#database.prepare("SELECT * FROM partners WHERE creation_request_id = ?")
         .get(requestId) as Row | undefined;
@@ -1106,7 +1108,7 @@ export class PartnerStore {
         capabilities,
         usesDirectoryDefaults,
         ...(patch.taskModelOverride === null ? {} : { taskModelOverride: patch.taskModelOverride ?? current.taskModelOverride })
-      });
+      }, current.canonicalSessionId === undefined && current.capabilities.modelChain.length === 0 && patch.capabilities === undefined);
       if (sameProfileContent(current, next)) return current;
       const at = this.#now();
       const nextRevision = nextNumber(current.revision, "Partner revision");
@@ -1306,6 +1308,7 @@ export class PartnerStore {
       if (current.canonicalSessionId === undefined) {
         throw new PartnerStoreError("PARTNER_INVALID", "A canonical Session is required before the partner can become ready.");
       }
+      if (current.capabilities.modelChain.length === 0) throw new PartnerStoreError("PARTNER_INVALID", "A real model route is required before the partner can become ready.");
       if (current.initializationState === "ready" && current.initializationErrorCode === undefined) return current;
       const at = this.#now();
       const result = this.#database.prepare(`
@@ -1851,6 +1854,10 @@ export class PartnerStore {
       if (initializationState === "ready" && canonicalSessionId === undefined) {
         throw new Error("A ready partner has no canonical Session.");
       }
+      const capabilities = capabilitiesFromRow(row);
+      if (capabilities.modelChain.length === 0 && canonicalSessionId !== undefined) {
+        throw new Error("A canonical partner has no configured model.");
+      }
       return {
         id: entityId(row["id"], "Partner ID"),
         revision: BigInt(safeInteger(row["revision"], "Partner revision")),
@@ -1867,7 +1874,7 @@ export class PartnerStore {
         ...(initializationError === undefined ? {} : { initializationErrorCode: initializationError }),
         homeTargetId: entityId(row["home_target_id"], "Partner home Target ID"),
         ...(canonicalSessionId === undefined ? {} : { canonicalSessionId }),
-        capabilities: capabilitiesFromRow(row),
+        capabilities,
         ...taskModelFromRow(row),
         usesDirectoryDefaults: booleanInteger(row["uses_directory_defaults"], "Partner default inheritance"),
         createdAt: timestamp(row["created_at"], "Partner created time"),
@@ -2219,7 +2226,7 @@ function creationFingerprint(input: CreatePartnerInput, draft: NormalizedPartner
   })).digest("hex");
 }
 
-function partnerDraft(input: Omit<NormalizedPartnerDraft, "description"> & { readonly description?: string }): NormalizedPartnerDraft {
+function partnerDraft(input: Omit<NormalizedPartnerDraft, "description"> & { readonly description?: string }, allowUnconfiguredModel = false): NormalizedPartnerDraft {
   if (typeof input.usesDirectoryDefaults !== "boolean") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner default inheritance must be boolean.");
   }
@@ -2229,13 +2236,13 @@ function partnerDraft(input: Omit<NormalizedPartnerDraft, "description"> & { rea
     avatar: avatarRecord(input.avatar),
     identitySource: identityValue(input.identitySource),
     templateId: templateId(input.templateId),
-    capabilities: capabilitiesValue(input.capabilities),
+    capabilities: capabilitiesValue(input.capabilities, allowUnconfiguredModel),
     usesDirectoryDefaults: input.usesDirectoryDefaults,
     ...(input.taskModelOverride === undefined ? {} : { taskModelOverride: modelRoute(input.taskModelOverride) })
   };
 }
 
-function capabilitiesValue(value: PartnerCapabilitiesRecord): PartnerCapabilitiesRecord {
+function capabilitiesValue(value: PartnerCapabilitiesRecord, allowUnconfiguredModel = false): PartnerCapabilitiesRecord {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner capabilities are required.");
   }
@@ -2246,7 +2253,7 @@ function capabilitiesValue(value: PartnerCapabilitiesRecord): PartnerCapabilitie
   if (typeof value.planMode !== "boolean") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner Plan mode must be boolean.");
   }
-  if (!Array.isArray(value.modelChain) || value.modelChain.length < 1 || value.modelChain.length > MAX_MODEL_ROUTES) {
+  if (!Array.isArray(value.modelChain) || value.modelChain.length < (allowUnconfiguredModel ? 0 : 1) || value.modelChain.length > MAX_MODEL_ROUTES) {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner model chain must contain one to five routes.");
   }
   const routes = value.modelChain.map(modelRoute);
@@ -2316,7 +2323,7 @@ function capabilitiesFromColumns(row: Row, prefix: string): PartnerCapabilitiesR
     modelChain: routes,
     permissionMode: permissionMode as PartnerCapabilitiesRecord["permissionMode"],
     planMode: booleanInteger(row[`${prefix}plan_mode`], "Partner Plan mode")
-  });
+  }, prefix === "");
 }
 
 function modelChainJson(routes: readonly PartnerModelRouteRecord[]): string {

@@ -23,12 +23,13 @@ export const importedPartnerId = (requestId: string): string => `agent_import_${
 const creationRequestId = (requestId: string): string => `agent_import_${fingerprint(requestId).slice(0, 48)}`;
 
 /** Freeze configured model routes before checkpoint acceptance; source credentials never select a Backend. */
-export function preparePartnerImportCreation(partners: PartnerManager, selection: AgentImportSelection): string {
+export function preparePartnerImportCreation(partners: PartnerManager, selection: AgentImportSelection, nativePackage = false): string {
   const directory = partners.directory().state;
-  if (!directory.defaultCapabilities) throw new AgentImportError("IMPORT_MODEL_SETTINGS_REQUIRED");
+  if (!directory.defaultCapabilities && !nativePackage) throw new AgentImportError("IMPORT_MODEL_SETTINGS_REQUIRED");
   let name: string; try { name = normalizedPartnerName(selection.name); } catch { throw new AgentImportError("INVALID_SELECTION"); }
   if (partners.listPartners().some(profile => profile.id !== importedPartnerId(selection.requestId) && normalizedPartnerName(profile.displayName) === name)) throw new AgentImportError("IMPORT_NAME_EXISTS");
-  return JSON.stringify({ version: 1, directoryRevision: directory.revision.toString(), capabilities: directory.defaultCapabilities } satisfies CreationDraft);
+  return JSON.stringify({ version: 1, directoryRevision: directory.revision.toString(), capabilities: directory.defaultCapabilities
+    ?? { modelChain: [], permissionMode: "ask", planMode: false } } satisfies CreationDraft);
 }
 
 /** Explicit model/policy mapping can adopt those fields, but cannot adopt edits to imported identity or a different task. */
@@ -59,23 +60,32 @@ export async function createPartnerImportEffects(options: {
   const partnerId = importedPartnerId(selection.requestId);
   const prior = await storage.environment.read(partnerId, assertOwner); assertOwner();
   let stamp = prior?.targetOwner;
+  let packageStamp = prior?.packageOwner;
+  const packagePending = (profile: PartnerProfileRecord) => snapshot.nativePackage !== undefined && !profile.canonicalSessionId
+    && profile.initializationState === "error" && profile.initializationErrorCode === "model_unavailable";
+  const capturePackageOwner = (profile: PartnerProfileRecord) => ({ revision: profile.revision.toString(), profileVersion: profile.profileVersion, profileFingerprint: importProfileFingerprint(profile) });
   const captureOwner = (profile: PartnerProfileRecord) => captureImportOwner(profile, store);
-  if (prior?.profileUpdate && stamp) {
+  if (prior?.profileUpdate && (stamp || packageStamp)) {
     const current = partners.getPartner(partnerId);
-    if (current.revision === BigInt(prior.profileUpdate.fromRevision) + 1n && current.profileVersion === stamp.profileVersion + 1
-      && current.canonicalSessionId === stamp.sessionId && importProfileFingerprint(current) === prior.profileUpdate.expectedFingerprint) {
-      stamp = captureOwner(current);
-      await storage.environment.update(partnerId, assertOwner, value => { value.targetOwner = stamp; delete value.profileUpdate; });
+    if ((packagePending(current) ? current.revision >= BigInt(prior.profileUpdate.fromRevision) + 1n : current.revision === BigInt(prior.profileUpdate.fromRevision) + 1n) && current.profileVersion === (stamp ?? packageStamp)!.profileVersion + 1
+      && current.canonicalSessionId === stamp?.sessionId && importProfileFingerprint(current) === prior.profileUpdate.expectedFingerprint) {
+      if (packagePending(current)) packageStamp = capturePackageOwner(current); else stamp = captureOwner(current);
+      await storage.environment.update(partnerId, assertOwner, value => { value.targetOwner = stamp; value.packageOwner = packageStamp; delete value.profileUpdate; });
     }
   }
   let owner: PartnerProfileRecord | undefined;
   let runtimeGeneration: number | undefined;
   const assertPartner = (id: string): PartnerProfileRecord => {
     assertOwner(); const current = partners.getPartner(id);
-    if (current.lifecycle !== "active" || current.initializationState !== "ready" || !current.canonicalSessionId
+    if (current.lifecycle !== "active" || !(current.initializationState === "ready" && current.canonicalSessionId || packagePending(current))
       || owner && (current.id !== owner.id || current.revision !== owner.revision || current.profileVersion !== owner.profileVersion
         || current.canonicalSessionId !== owner.canonicalSessionId || current.homeTargetId !== owner.homeTargetId)) throw new AgentImportError("IMPORT_OWNER_CHANGED");
-    const session = store.getSession(current.canonicalSessionId).descriptor;
+    if (packagePending(current)) {
+      if (packageStamp && (packageStamp.revision !== current.revision.toString() || packageStamp.profileVersion !== current.profileVersion
+        || packageStamp.profileFingerprint !== importProfileFingerprint(current))) throw new AgentImportError("IMPORT_OWNER_CHANGED");
+      owner ??= current; return current;
+    }
+    const session = store.getSession(current.canonicalSessionId!).descriptor;
     const target = store.getTarget(current.homeTargetId).descriptor;
     const generation = store.getBackend(session.backendId).descriptor.instanceGeneration;
     if (runtimeGeneration !== undefined && runtimeGeneration !== generation) throw new AgentImportError("IMPORT_OWNER_CHANGED");
@@ -126,6 +136,7 @@ export async function createPartnerImportEffects(options: {
     } catch (error) { throw Object.assign(error instanceof AgentImportError ? error : new AgentImportError("MEMORY_WRITE_FAILED"), { importProgress: { saved, total: parts.length } }); }
   };
   const applyProfile = async (partnerId: string, items: ImportItem[]): Promise<void> => {
+    if (context.activateNativePackage) return;
     const previous = await environment(partnerId); if (!previous) throw new AgentImportError("CREDENTIAL_STORAGE_UNAVAILABLE");
     const applied = new Set(previous.appliedDocuments);
     const profile = { identity: "", user: "", instructions: "" };
@@ -140,13 +151,14 @@ export async function createPartnerImportEffects(options: {
     if (current.identitySource !== identity || previous.profileProjection.user !== profile.user || previous.profileProjection.instructions !== profile.instructions) {
       await update(partnerId, value => { value.profileUpdate = { fromRevision: current.revision.toString(), expectedFingerprint: importProfileFingerprint({ ...current, identitySource: identity }) }; });
       const changed = await partners.updatePartner(partnerId, current.revision, { identitySource: identity }); assertOwner(); owner = changed;
-      stamp = captureOwner(changed);
-      await update(partnerId, value => { value.targetOwner = stamp; delete value.profileUpdate; });
+      if (packagePending(changed)) packageStamp = capturePackageOwner(changed); else stamp = captureOwner(changed);
+      await update(partnerId, value => { value.targetOwner = stamp; value.packageOwner = packageStamp; delete value.profileUpdate; });
     }
   };
   return {
     partnerId: importedPartnerId,
     async validateItems(items: ImportItem[]) {
+      if (snapshot.nativePackage) return;
       for (const item of items) if (item.automation) {
         const delivery = importDelivery(snapshot.source, item.automation.original, items);
         item.automation.deliveries = delivery.deliveries;
@@ -154,29 +166,47 @@ export async function createPartnerImportEffects(options: {
       }
     },
     async createPartner(partnerId: string, input: AgentImportSelection) {
+      if (context.activateNativePackage) {
+        owner = partners.getPartner(partnerId);
+        if (owner.initializationState !== "ready" || !owner.canonicalSessionId) throw new AgentImportError("IMPORT_PARTNER_SETUP_REQUIRED");
+        packageStamp = undefined; stamp = captureOwner(owner);
+        await storage.environment.update(partnerId, assertOwner, value => { value.targetOwner = stamp; delete value.packageOwner; });
+        assertPartner(partnerId); return;
+      }
       let draft: CreationDraft;
       try { draft = JSON.parse(context.creationJson) as CreationDraft; } catch { throw new AgentImportError("IMPORT_CREATION_INVALID"); }
       if (draft.version !== 1 || !/^\d+$/.test(draft.directoryRevision) || !draft.capabilities) throw new AgentImportError("IMPORT_CREATION_INVALID");
       let created = await partners.createImportedPartner({ id: partnerId, requestId: creationRequestId(input.requestId),
+        ...(snapshot.nativePackage ? { allowUnconfiguredModel: true as const } : {}),
         expectedDirectoryRevision: BigInt(draft.directoryRevision), displayName: redact(input.name),
-        avatar: input.avatarImageBase64 ? { base64: input.avatarImageBase64 } : "orbit", templateId: "general",
-        identitySource: PARTNER_TEMPLATES[0].identitySource, capabilities: draft.capabilities, usesDirectoryDefaults: false });
+        avatar: input.avatarImageBase64 ? { base64: input.avatarImageBase64 } : snapshot.nativePackage?.avatarPreset ?? "orbit", templateId: "general",
+        identitySource: PARTNER_TEMPLATES[0].identitySource, description: snapshot.nativePackage?.description ?? "", capabilities: draft.capabilities, usesDirectoryDefaults: false });
       assertOwner();
-      if (created.lifecycle === "active" && created.initializationState === "error") created = await partners.retryInitialization(partnerId, created.revision);
-      if (created.initializationState !== "ready") throw new AgentImportError("IMPORT_PARTNER_SETUP_REQUIRED");
-      if (!stamp && (created.profileVersion !== 1 || created.displayName !== redact(input.name).trim() || created.templateId !== "general"
+      if (snapshot.nativePackage && !created.canonicalSessionId && created.initializationState === "pending") created = await partners.retryInitialization(partnerId, created.revision);
+      if (created.lifecycle === "active" && created.initializationState === "error" && !packagePending(created)) created = await partners.retryInitialization(partnerId, created.revision);
+      if (created.initializationState !== "ready" && !packagePending(created)) throw new AgentImportError("IMPORT_PARTNER_SETUP_REQUIRED");
+      if (!stamp && !packageStamp && (created.profileVersion !== 1 || created.displayName !== redact(input.name).trim() || created.templateId !== "general"
         || created.identitySource !== PARTNER_TEMPLATES[0].identitySource || created.usesDirectoryDefaults
         || fingerprint(created.capabilities) !== fingerprint(draft.capabilities) || created.homeTargetId !== `partner:${partnerId}`
-        || fingerprint(created.avatar) !== fingerprint(input.avatarImageBase64 ? decodePartnerAvatar(input.avatarImageBase64).image : "orbit"))) throw new AgentImportError("IMPORT_OWNER_CHANGED");
+        || fingerprint(created.avatar) !== fingerprint(input.avatarImageBase64 ? decodePartnerAvatar(input.avatarImageBase64).image : snapshot.nativePackage?.avatarPreset ?? "orbit"))) throw new AgentImportError("IMPORT_OWNER_CHANGED");
       owner = created; assertPartner(partnerId);
-      if (!stamp) { stamp = captureOwner(created); await update(partnerId, value => { value.targetOwner = stamp; }); }
+      if (packagePending(created)) {
+        await partners.prepareImportedHome(partnerId); assertPartner(partnerId);
+        packageStamp = capturePackageOwner(created); await update(partnerId, value => { value.packageOwner = packageStamp; });
+      } else if (!stamp) { stamp = captureOwner(created); await update(partnerId, value => { value.targetOwner = stamp; }); }
     },
     async importItem(partnerId: string, item: ImportItem) {
       const partner = assertPartner(partnerId);
+      if (snapshot.nativePackage && item.role === "identity") {
+        if (context.activateNativePackage) return;
+        await update(partnerId, value => { value.documents[item.view.id] = item.text ?? "";
+          if (!value.appliedDocuments.includes(item.view.id)) value.appliedDocuments.push(item.view.id); });
+        await applyProfile(partnerId, selected); return;
+      }
       if (item.view.category === "skills") {
         const slug = skillSlug(item); const projection = projectImportedSkill(item.files ?? [], slug, publicationRedactions);
-        const target = store.getTarget(partner.homeTargetId).descriptor;
-        const root = await prepareImportSkillRoot(target.workspaceRoot, () => { assertPartner(partnerId); });
+        const workspaceRoot = packagePending(partner) ? await partners.prepareImportedHome(partnerId) : store.getTarget(partner.homeTargetId).descriptor.workspaceRoot;
+        const root = await prepareImportSkillRoot(workspaceRoot, () => { assertPartner(partnerId); });
         const destination = path.join(root, slug);
         const publishedFiles = projection.files.map(({ interpreterLink: _link, ...file }) => file);
         try {
@@ -198,19 +228,38 @@ export async function createPartnerImportEffects(options: {
           }
         }
         assertPartner(partnerId);
+        await update(partnerId, value => { value.skillFiles[slug] = (item.files ?? []).map(file => ({ ...file, bytes: file.bytes.toString("base64") })); });
+        if (packagePending(partner)) return;
         const id = `imported_skill_${fingerprint([partnerId, item.view.id]).slice(0, 40)}`;
         const existing = options.resources.list({ targetId: partner.homeTargetId }).find(resource => resource.id === id);
         const resource = existing ?? await options.resources.discover({ id, backendId: partner.capabilities.modelChain[0]!.backendId,
           importedSkill: { partnerId, requestId: selection.requestId, entryId: item.view.id },
-          targetId: partner.homeTargetId, kind: "skill", scope: "project", name: redact(item.view.name), source: { kind: "local", path: destination }, workspaceRoot: target.workspaceRoot });
+          targetId: partner.homeTargetId, kind: "skill", scope: "project", name: redact(item.view.name), source: { kind: "local", path: destination }, workspaceRoot });
         assertPartner(partnerId);
         if (resource.state === "awaiting_approval") await options.resources.approve(resource.id, resource.discoveredRevision, `agent-import-${fingerprint(selection.requestId).slice(0, 32)}`);
         if (item.view.enabled !== false && !options.resources.get(id).enabled) await options.resources.setEnabled(id, true);
         assertPartner(partnerId);
-        await update(partnerId, value => { value.skillFiles[slug] = (item.files ?? []).map(file => ({ ...file, bytes: file.bytes.toString("base64") })); });
         return;
       }
       if (item.view.category !== "memory" && item.view.category !== "personality") return;
+      if (packagePending(partner)) {
+        const home = await partners.prepareImportedHome(partnerId);
+        const root = await prepareImportOwnedRoot(home, [".joko", "installed-knowledge"], () => { assertPartner(partnerId); });
+        for (const document of documents(item)) {
+          const file = path.join(root, `${fingerprint(document.id).slice(0, 32)}.md`);
+          const bytes = Buffer.from(redact(document.text));
+          try {
+            const existing = await fs.lstat(file);
+            if (!existing.isFile() || existing.isSymbolicLink() || !(await fs.readFile(file)).equals(bytes)) throw new AgentImportError("IMPORTED_MEMORY_CHANGED");
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            await fs.writeFile(file, bytes, { flag: "wx", mode: 0o600 });
+          }
+          await update(partnerId, value => { value.documents[document.id] = document.text; });
+        }
+        return;
+      }
+      if (snapshot.nativePackage && !options.memory.targetMemoryEnabled(partner.homeTargetId)) throw new AgentImportError("MEMORY_DISABLED");
       const docs = documents(item); let saved = 0, total = 0; let failure: AgentImportError | undefined;
       for (const file of [...(item.asset ? [item.asset] : []), ...(item.files ?? [])]) {
         const content = memoryFileContent({ ...file, executable: false });
@@ -269,20 +318,22 @@ export async function createPartnerImportEffects(options: {
           }
           if (item.view.category === "skills") value.skillFiles[skillSlug(item)] = (item.files ?? []).map(file => ({ ...file, bytes: file.bytes.toString("base64") }));
         }
-        value.sourceAutomations = items.flatMap(item => item.automation ? [{ entryId: item.view.id, kind: snapshot.source.kind, original: item.automation.original }] : []);
+        value.sourceAutomations = snapshot.source.kind === "package" ? [] : items.flatMap(item => item.automation ? [{ entryId: item.view.id, kind: snapshot.source.kind as "hermes" | "openclaw", original: item.automation.original }] : []);
         value.contentRedactions = retainedImportRedactions(items, publicationRedactions);
       });
       await applyProfile(partnerId, items);
     },
-    async createConversation(partnerId: string) { return assertPartner(partnerId).canonicalSessionId!; },
+    async createConversation(partnerId: string) { return assertPartner(partnerId).canonicalSessionId; },
     async createRoutine(partnerId: string, input: ImportedRoutineInput, creationId: string, item: ImportItem) {
       const partner = assertPartner(partnerId); if (!item.automation) throw new AgentImportError("SOURCE_AUTOMATION_INVALID");
       const routineId = routines.creationId(partnerId, creationId);
-      await update(partnerId, value => { value.automations[routineId] ??= { kind: snapshot.source.kind, original: item.automation!.original,
+      if (snapshot.source.kind !== "package") await update(partnerId, value => { value.automations[routineId] ??= { kind: snapshot.source.kind as "hermes" | "openclaw", original: item.automation!.original,
         sourceRoot: snapshot.source.root, sourceWorkspace: snapshot.source.workspace, sourceId: item.automation!.sourceId,
         handover: item.view.enabled ? "pending" : "ready", issues: [...(item.view.issues ?? [])], deliveries: item.automation!.deliveries,
         completed: Number((item.automation!.original.repeat as { completed?: unknown } | undefined)?.completed ?? 0) || 0 }; });
-      const routine = await routines.save({ partnerId, partnerRevision: partner.revision, requestId: creationId, definition: publicRoutine({ ...input, enabled: false }) });
+      const routine = snapshot.nativePackage
+        ? await routines.installPackage(partnerId, publicRoutine({ ...input, enabled: false }), creationId, () => { assertPartner(partnerId); })
+        : await routines.save({ partnerId, partnerRevision: partner.revision, requestId: creationId, definition: publicRoutine({ ...input, enabled: false }) });
       assertPartner(partnerId); return routine.id;
     },
     verifyAutomation: (partnerId: string, item: ImportItem) => verifyImportedAutomation(partnerId, item, () => { assertPartner(partnerId); }, options.verification, selected, snapshot.source.root),

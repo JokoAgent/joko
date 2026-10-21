@@ -35,6 +35,12 @@ function apiFixture(value = card()) {
     dispatch: vi.fn(async () => ({ accepted: true })), readMedia: vi.fn(async () => ({ dataUrl: "" })) };
   return api;
 }
+it("shows the computer callback requirement and never opens a loopback authorization from a phone", async () => {
+  const value = card(), api = apiFixture(value);
+  api.get.mockResolvedValue(create(ExtensionCardServiceGetResponseSchema, { card: value, interactive: true, hostAuthorization: true }));
+  await render(api); expect(element.textContent).toContain("Open Joko Desktop");
+  const current = poster(); await message(current.props, current.id, { type: "action", action: "host:connect-account" }); expect(api.dispatch).not.toHaveBeenCalled();
+});
 async function render(api: ReturnType<typeof apiFixture>, ownerKey = "owner", value = card(), readOnly = false) {
   await act(async () => root.render(<StrictMode><MobileExtensionCardsProvider ownerKey={ownerKey} bind={() => api as unknown as MobileExtensionCardApi}>
     <MobileExtensionCard card={value} colors={colors} locale="en" enabled readOnly={readOnly} />

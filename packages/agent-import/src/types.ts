@@ -1,5 +1,5 @@
 /** Native source identifiers are interoperability values, independent of a Backend. */
-export type AgentImportSourceKind = "hermes" | "openclaw";
+export type AgentImportSourceKind = "hermes" | "openclaw" | "package";
 export type AgentImportCategory = "personality" | "memory" | "skills" | "connections" | "automations";
 
 /** Safe domain projections are mapped into generated contracts at the service boundary. */
@@ -148,10 +148,27 @@ export interface ImportSnapshot {
   fingerprint: string;
   /** Private restart masks for values already embedded in selected source content. */
   publicationRedactions?: Record<string, string>;
+  nativePackage?: { packageId: string; packageVersion: string; packageHash: string; description: string; avatarPreset: "orbit" | "spark" | "leaf" | "wave"; locale?: string;
+    opening: { welcome: string; capabilities: string[]; onboardingSkill?: string; starterOptions?: string[] } };
 }
 
 export class AgentImportError extends Error {
   constructor(readonly code: string) { super(code); this.name = "AgentImportError"; }
+}
+
+export function validateNativePartnerPackage(value: unknown): asserts value is NonNullable<ImportSnapshot["nativePackage"]> {
+  const valid = (input: unknown): input is Record<string, unknown> => !!input && typeof input === "object" && !Array.isArray(input);
+  const text = (input: unknown, max: number): input is string => typeof input === "string" && input.length > 0 && input.length <= max && !input.includes("\0");
+  if (!valid(value) || Object.keys(value).some(key => !["packageId", "packageVersion", "packageHash", "description", "opening", "locale", "avatarPreset"].includes(key))
+    || !text(value.packageId, 100) || !/^[a-z0-9-]+$/.test(value.packageId) || !text(value.packageVersion, 40)
+    || !text(value.packageHash, 64) || !/^[a-f0-9]{64}$/.test(value.packageHash) || !text(value.description, 12_000)
+    || !["orbit", "spark", "leaf", "wave"].includes(String(value.avatarPreset))
+    || value.locale !== undefined && !text(value.locale, 30) || !valid(value.opening)) throw new AgentImportError("INVALID_PACKAGE");
+  const opening = value.opening;
+  if (Object.keys(opening).some(key => !["welcome", "capabilities", "onboardingSkill", "starterOptions"].includes(key))
+    || !text(opening.welcome, 12_000) || !Array.isArray(opening.capabilities) || opening.capabilities.length !== 3 || opening.capabilities.some(item => !text(item, 200))
+    || opening.onboardingSkill !== undefined && !text(opening.onboardingSkill, 100)
+    || opening.starterOptions !== undefined && (!Array.isArray(opening.starterOptions) || opening.starterOptions.length > 4 || opening.starterOptions.some(item => !text(item, 200)))) throw new AgentImportError("INVALID_PACKAGE");
 }
 
 export function object(value: unknown): Record<string, unknown> {

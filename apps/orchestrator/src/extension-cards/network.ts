@@ -5,6 +5,7 @@ import type { ExtensionCardMedia } from "./media.js";
 import type { ExtensionCardScope } from "./service.js";
 import { sniffMediaMime } from "./media-sniff.js";
 import type { ExtensionOAuthAccounts } from "./oauth-accounts.js";
+import { EXTENSION_FILE_MAXIMUM, EXTENSION_DIRECTORY_FILE_MAXIMUM, EXTENSION_DIRECTORY_MAXIMUM, type ExtensionFileDeposits } from "./files.js";
 
 const STRIPPED = new Set(["host", "connection", "content-length", "transfer-encoding", "upgrade", "cookie", "set-cookie", "origin", "referer", "authorization"]);
 const RESPONSE_HEADERS = ["content-type", "content-length", "cache-control", "etag", "last-modified", "retry-after", "mcp-session-id"];
@@ -19,6 +20,7 @@ interface Options {
   readonly resolveCredential: (reference: string) => string;
   readonly redact: (value: string) => string;
   readonly media?: ExtensionCardMedia;
+  readonly files?: ExtensionFileDeposits;
   readonly oauth?: Pick<ExtensionOAuthAccounts, "fresh" | "invalidate">;
   readonly connections?: {
     hosts(extensionId: string, declaration: NonNullable<ExtensionNetworkDeclaration["connections"]>[number]): readonly string[];
@@ -63,7 +65,34 @@ export class ExtensionNetwork {
       if (typeof method !== "string" || !["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(method)
         || scope.readOnly && !["GET", "HEAD"].includes(method)) throw new Error();
       const asMedia = payload.as === "media";
-      if (payload.as !== undefined && payload.as !== "text" && !asMedia || payload.uploadDir !== undefined || asMedia && (!this.options.media || !scope.task)) throw new Error();
+      const asFile = payload.as === "file";
+      if (payload.as !== undefined && payload.as !== "text" && !asMedia && !asFile || asMedia && (!this.options.media || !scope.task)
+        || asFile && (!this.options.files || !scope.task || scope.readOnly)) throw new Error();
+      let saveTo: { token: string; filename?: string } | undefined;
+      if (asFile) {
+        if (!payload.saveTo || typeof payload.saveTo !== "object" || Array.isArray(payload.saveTo)) throw new Error();
+        const value = payload.saveTo as Record<string, unknown>;
+        if (Object.keys(value).some(key => !["token", "filename"].includes(key)) || typeof value.token !== "string" || !/^[a-f0-9-]{36}$/u.test(value.token)
+          || value.filename !== undefined && (typeof value.filename !== "string" || !value.filename.length || value.filename.length > 128)) throw new Error();
+        saveTo = { token: value.token, ...(typeof value.filename === "string" ? { filename: value.filename } : {}) };
+      } else if (payload.saveTo !== undefined) throw new Error();
+      let uploadDir: { token: string; fields: Record<string, string>; prefix: string; field?: string } | undefined;
+      if (payload.uploadDir !== undefined) {
+        if (!this.options.files || !scope.task || scope.readOnly || !payload.uploadDir || typeof payload.uploadDir !== "object" || Array.isArray(payload.uploadDir)
+          || method !== "POST" || payload.upload !== undefined || payload.body !== undefined || asMedia) throw new Error();
+        const value = payload.uploadDir as Record<string, unknown>, fields: Record<string, string> = {};
+        if (Object.keys(value).some(key => !["token", "fields", "fileFieldPrefix", "fileField"].includes(key)) || typeof value.token !== "string" || !/^[a-f0-9-]{36}$/u.test(value.token)) throw new Error();
+        if (value.fields !== undefined) {
+          if (!value.fields || typeof value.fields !== "object" || Array.isArray(value.fields) || Object.keys(value.fields).length > 8) throw new Error();
+          for (const [name, item] of Object.entries(value.fields)) {
+            if (!/^[A-Za-z0-9_-]{1,64}$/u.test(name) || typeof item !== "string" || item.length > 131_072 || item.includes("\0")) throw new Error();
+            fields[name] = item;
+          }
+        }
+        if (value.fileFieldPrefix !== undefined && (typeof value.fileFieldPrefix !== "string" || !/^[A-Za-z0-9_-]{1,64}$/u.test(value.fileFieldPrefix))
+          || value.fileField !== undefined && (typeof value.fileField !== "string" || !/^[A-Za-z0-9_-]{1,64}$/u.test(value.fileField) || value.fileFieldPrefix !== undefined)) throw new Error();
+        uploadDir = { token: value.token, fields, prefix: typeof value.fileFieldPrefix === "string" ? value.fileFieldPrefix : "file-", ...(typeof value.fileField === "string" ? { field: value.fileField } : {}) };
+      }
       let upload: { hashes: string[]; field: string; fields: Record<string, string> } | undefined;
       if (payload.upload !== undefined) {
         if (!payload.upload || typeof payload.upload !== "object" || Array.isArray(payload.upload) || method !== "POST" || payload.body !== undefined || asMedia || !this.options.media || !scope.task) throw new Error();
@@ -83,7 +112,8 @@ export class ExtensionNetwork {
       }
       if (payload.body !== undefined && (typeof payload.body !== "string" || ["GET", "HEAD"].includes(method) || Buffer.byteLength(payload.body) > 256 * 1024)) throw new Error();
       if (payload.timeoutMs !== undefined && (typeof payload.timeoutMs !== "number" || !Number.isFinite(payload.timeoutMs))) throw new Error();
-      const timeoutMs = Math.min(upload || asMedia ? 300_000 : 60_000, Math.max(1000, typeof payload.timeoutMs === "number" ? payload.timeoutMs : upload || asMedia ? 120_000 : 30_000));
+      const heavy = upload || uploadDir || asMedia || asFile;
+      const timeoutMs = Math.min(heavy ? 300_000 : 60_000, Math.max(1000, typeof payload.timeoutMs === "number" ? payload.timeoutMs : heavy ? 120_000 : 30_000));
       const authorHeaders = new Headers();
       if (payload.headers !== undefined) {
         if (!payload.headers || typeof payload.headers !== "object" || Array.isArray(payload.headers) || Object.keys(payload.headers).length > 16) throw new Error();
@@ -110,6 +140,25 @@ export class ExtensionNetwork {
         }
         for (const [key, value] of Object.entries(upload.fields)) parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value.replace("{bytes}", () => String(total))}\r\n`));
         parts.push(...files, encoder.encode(`--${boundary}--\r\n`));
+        const bytes = new Uint8Array(parts.reduce((size, part) => size + part.byteLength, 0)); let offset = 0;
+        for (const part of parts) { bytes.set(part, offset); offset += part.byteLength; }
+        preparedBody = bytes.buffer; authorHeaders.set("content-type", `multipart/form-data; boundary=${boundary}`);
+      }
+      if (uploadDir) {
+        if (this.#largeResponse) throw new Error(); holdingLarge = this.#largeResponse = true;
+        current(); const transfer = this.options.files!.take(scope.task!, uploadDir.token);
+        if (!transfer || uploadDir.field !== undefined && transfer.files.length !== 1) return { ok: false, message: "The directory receipt is unavailable or does not contain exactly one file. Transfer dir again before retrying." };
+        const boundary = `----joko-extension-${randomUUID()}`, encoder = new TextEncoder(), parts: Uint8Array[] = [];
+        const declaredBytes = transfer.files.reduce((size, file) => size + file.size, 0);
+        for (const [name, value] of Object.entries(uploadDir.fields)) parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value.replace("{bytes}", () => String(declaredBytes))}\r\n`));
+        let total = 0;
+        for (let index = 0; index < transfer.files.length; index++) {
+          current(); const file = transfer.files[index]!, bytes = await file.read(); current();
+          if (bytes.byteLength > EXTENSION_DIRECTORY_FILE_MAXIMUM || (total += bytes.byteLength) > EXTENSION_DIRECTORY_MAXIMUM) throw new Error();
+          const name = (uploadDir.field ? file.relPath.split("/").at(-1)! : file.relPath).replace(/"/gu, "%22").replace(/[\r\n]/gu, "");
+          parts.push(encoder.encode(`--${boundary}\r\nContent-Disposition: form-data; name="${uploadDir.field ?? `${uploadDir.prefix}${index}`}"; filename="${name}"\r\nContent-Type: application/octet-stream\r\n\r\n`), bytes, encoder.encode("\r\n"));
+        }
+        parts.push(encoder.encode(`--${boundary}--\r\n`));
         const bytes = new Uint8Array(parts.reduce((size, part) => size + part.byteLength, 0)); let offset = 0;
         for (const part of parts) { bytes.set(part, offset); offset += part.byteLength; }
         preparedBody = bytes.buffer; authorHeaders.set("content-type", `multipart/form-data; boundary=${boundary}`);
@@ -168,6 +217,23 @@ export class ExtensionNetwork {
         }
         const contentType = (response.headers.get("content-type") ?? "").split(";")[0]!.trim().toLowerCase();
         const textual = contentType.startsWith("text/") || ["application/json", "application/xml", "application/x-www-form-urlencoded", "application/javascript"].includes(contentType) || contentType.endsWith("+json") || contentType.endsWith("+xml");
+        if (asFile && saveTo && response.status >= 200 && response.status < 300) {
+          if (Number(response.headers.get("content-length")) > EXTENSION_FILE_MAXIMUM) return { ok: false, message: "The downloaded file exceeds the 256 MiB limit." };
+          if (this.#largeResponse && !holdingLarge) throw new Error(); holdingLarge = this.#largeResponse = true;
+          const read = await readCapped(response, EXTENSION_FILE_MAXIMUM, () => {}, current); current();
+          if (read.truncated) return { ok: false, message: "The downloaded file exceeds the 256 MiB limit." };
+          let suggested = saveTo.filename;
+          if (!suggested) {
+            const match = /filename\*?=(?:UTF-8''|")?([^";]+)/iu.exec(response.headers.get("content-disposition") ?? "");
+            if (match?.[1]) { try { suggested = decodeURIComponent(match[1].trim()); } catch { suggested = match[1].trim(); } }
+          }
+          suggested ||= url.pathname.split("/").filter(Boolean).at(-1) ?? "download";
+          const fileName = await this.options.files!.write(scope.task!, saveTo.token, scrub(suggested), read.bytes, current); current();
+          if (!fileName) return { ok: false, message: "The save receipt is unavailable, expired or exhausted. Transfer save_dir again before retrying." };
+          const headers: Record<string, string> = {};
+          for (const name of RESPONSE_HEADERS) { const value = response.headers.get(name); if (value !== null) headers[name] = scrub(value); }
+          return { ok: true, status: response.status, headers, file: { file_name: fileName, bytes: read.bytes.byteLength, mime_type: contentType || "application/octet-stream" } };
+        }
         if (asMedia && response.status >= 200 && response.status < 300 && !textual) {
           if (this.#largeResponse && !holdingLarge) throw new Error(); holdingLarge = this.#largeResponse = true;
           const read = await readCapped(response, 256 * 1024 * 1024, () => {}, current); current();

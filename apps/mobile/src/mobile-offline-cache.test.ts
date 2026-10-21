@@ -152,6 +152,35 @@ function cacheFixture() {
 }
 
 describe("current-v1 mobile offline content cache", () => {
+  it("keeps a cached history prefix through overlapping background refresh and replaces it on reset", async () => {
+    const fixture = cacheFixture();
+    const event = (id: string, sequence: bigint) => create(EventSchema, { eventId: id, identity: { sessionId: "session-one" },
+      cursor: { generation: 42n, sequence }, payload: { kind: { case: "messageCompleted", value: { messageId: id,
+        role: MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: id } }] } } } });
+    const first = detail(); first.timeline = [event("older", 1n), event("boundary", 2n), event("latest", 3n)];
+    await fixture.cache.save(profile, node, owner(), first);
+    const refresh = detail(); refresh.timeline = [first.timeline[1]!, first.timeline[2]!, event("new", 4n)];
+    fixture.memory.failNextDetailRead(); await fixture.cache.save(profile, node, owner(), refresh);
+    expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["older", "boundary", "latest"]);
+    fixture.tick(); await fixture.cache.save(profile, node, owner(), refresh);
+    expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["older", "boundary", "latest", "new"]);
+    const reset = detail(); reset.timeline = [event("replacement", 5n)];
+    await fixture.cache.save(profile, node, owner(), reset);
+    expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["replacement"]);
+  });
+
+  it("does not retain history across an event-generation or native-runtime change", async () => {
+    const fixture = cacheFixture();
+    const first = detail(); first.timeline = [create(EventSchema, { eventId: "older" }), create(EventSchema, { eventId: "boundary" })];
+    await fixture.cache.save(profile, node, owner(), first);
+    const refresh = create(SnapshotSchema, { ...first, generation: 43n, timeline: [first.timeline[1]!] });
+    await fixture.cache.save(profile, node, owner(), refresh);
+    expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["boundary"]);
+    const restarted = detail("session-one", 8n); restarted.timeline = [create(EventSchema, { eventId: "new-runtime" })];
+    await fixture.cache.save(profile, node, owner([session("session-one", false, 8n)]), restarted);
+    expect((await fixture.cache.load(profile, "session-one"))?.detail?.timeline.map(item => item.eventId)).toEqual(["new-runtime"]);
+  });
+
   it("round-trips a task by its native generation independently of the service event generation", async () => {
     const fixture = cacheFixture();
     const currentDetail = detail();

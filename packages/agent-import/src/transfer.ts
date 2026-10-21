@@ -22,6 +22,7 @@ export interface ImportReceipt {
   partnerCreated: boolean;
   creationRejected?: 'IMPORT_NAME_EXISTS';
   cancelled: boolean;
+  nativePackage?: ImportSnapshot["nativePackage"];
   routines: Record<string, { id: string; phase: 'created' | 'verified' | 'pausing-source' | 'source-paused' | 'complete'; sourceRestored?: boolean }>;
 }
 
@@ -37,7 +38,7 @@ export interface TransferDeps {
   importItem(partnerId: string, item: ImportItem, snapshot: ImportSnapshot): Promise<void>;
   saveEnvironment(partnerId: string, items: ImportItem[]): Promise<void>;
   saveCheckpoint(partnerId: string, items: ImportItem[]): Promise<void>;
-  createConversation(partnerId: string): Promise<string>;
+  createConversation(partnerId: string): Promise<string | undefined>;
   createRoutine(partnerId: string, input: ImportedRoutineInput, creationId: string, item: ImportItem): Promise<string>;
   /** Success requires actual read evidence from the target environment, not just presence of keys. */
   verifyAutomation(partnerId: string, item: ImportItem): Promise<{ verified: boolean; reason?: string }>;
@@ -116,7 +117,8 @@ export async function transferPartnerImport(snapshot: ImportSnapshot, selection:
   // checkpoint. Normalize that case too, without requiring another source read.
   for (const item of items) for (const document of item.documents ?? []) document.id = recoveredDocumentId(document.id);
   const receipt: ImportReceipt = existing ?? { version: 1, selectionHash, submissionHash: importSubmissionFingerprint(selection), entryNames: {}, copied: [], routines: {}, deferSetup: selection.deferSetup,
-    environmentSaved: false, checkpointSaved: false, checkpointCleared: false, partnerCreated: false, cancelled: false, result: {
+    environmentSaved: false, checkpointSaved: false, checkpointCleared: false, partnerCreated: false, cancelled: false,
+    ...(snapshot.nativePackage ? { nativePackage: snapshot.nativePackage } : {}), result: {
     requestId: selection.requestId, partnerId: deps.partnerId(selection.requestId), status: 'running', checks: [], saved: false, savedEntryIds: [],
   } };
   receipt.selectionHash = selectionHash;

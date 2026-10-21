@@ -22,3 +22,8 @@ MailHtmlPreview and mailPreviewAppearance; Mobile plugins/MobileMailHtmlPreview.
 Joko adaptations bind these to service-owned task records, approved package
 generations, generated contracts and its UI components. The accompanying
 Apache License, Version 2.0 applies to these contributions.
+
+The bounded Remote Desktop media-channel request/reply protocol is adapted from
+packages/device-link/src/remoteDesktop.ts at the same release, under the same
+copyright and Apache-2.0 license. Joko adds current-v1 capability negotiation,
+lease-scoped validation and explicit unknown-result handling.

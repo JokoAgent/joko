@@ -21,3 +21,16 @@ apps/desktop/src/shared/ghost.ts and main/cindy-brain/networkSlot.ts at the same
 fixed release. Host credential setup and outbound proxy integration are Joko's.
 Media MIME validation is adapted from main/cindy-media/sniffMediaMime.ts and
 the exact media type mapping from main/cindy-media/blobStore.ts at that release.
+
+Directory upload receipts, bounded multipart assembly, save-directory receipts,
+safe non-overwriting filenames and downloaded file responses are adapted from
+main/cindy-brain/dirDeposit.ts and networkSlot.ts at the same fixed release.
+Joko adaptations bind each in-memory receipt to the approved installation,
+task occurrence, current workspace registration and authorization generation.
+
+Host-assessed OAuth setup cards and their original-controller authorization
+context are adapted from main/plugin-oauth/cards.ts, context.ts and
+transactions.ts and main/cindy-brain/ghostSetupCoordinator.ts at that release.
+Joko uses its existing authenticated Connection, private callback input and
+service-owned task queue to preserve that boundary without exposing controller
+offers, callback codes or tokens to an extension's HTML or runtime.

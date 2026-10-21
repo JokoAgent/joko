@@ -102,6 +102,7 @@ export interface DesktopRemoteDesktopMediaPort {
     events: readonly RemoteDesktopInput[]
   ) => void): () => void;
   setPresentationPongHandler(handler: (leaseId: string) => void): () => void;
+  setControlHandler?(handler: (leaseId: string, request: unknown) => Promise<unknown>): () => void;
   setPresentation(leaseId: string, enabled: boolean): void;
   setSessionState(nativeOnly: boolean, state?: DesktopRemoteDesktopSessionState): void;
   setPrivacyExclusions(owner: object, ids: readonly number[]): void;
@@ -227,6 +228,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   readonly #clipboardAuthorityListeners = new Set<() => void>();
   readonly #stopInputHandler: () => void;
   readonly #stopPresentationPongHandler: () => void;
+  readonly #stopControlHandler?: () => void;
   readonly #stopSubscriptions: readonly (() => void)[];
   readonly #timer: ReturnType<typeof setInterval>;
   #sessionState: DesktopRemoteDesktopSessionState = "unknown";
@@ -483,6 +485,11 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         // The generated heartbeat reports the resulting view-only state.
       }
     });
+    this.#stopControlHandler = dependencies.media.setControlHandler?.(async (leaseId, request) => {
+      const state = this.#controller.state;
+      if (this.#retired || !state || state.lease !== leaseId) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+      return this.#controller.request(this.#authority(state.controllerDeviceId), request);
+    });
     this.#stopPresentationPongHandler = dependencies.media.setPresentationPongHandler((leaseId) => {
       if (this.#retired) return;
       this.#controller.recordPresentationPong(leaseId);
@@ -554,9 +561,9 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   }
 
   /** Native injection failure is control-scoped; picture and lease stay alive. */
-  releaseControl(): void {
+  releaseControl(recoverInput = false): void {
     if (this.#retired) return;
-    this.#controller.releaseControl();
+    void this.#controller.releaseControl(recoverInput);
   }
 
   async getLockState(request: DevicePeerRemoteDesktopHostRequest) {
@@ -627,6 +634,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       readonly viewerDisplayRestore: boolean;
       readonly workspaceNavigation: boolean;
       readonly systemMenu: boolean;
+      readonly channelRequests?: boolean;
     };
     return create(RemoteDesktopCapabilitiesSchema, {
       protocolVersion: value.version,
@@ -662,7 +670,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       privacyScreen: value.privacyScreen,
       nativeCredentials: value.nativeCredentials,
       workspaceNavigation: value.workspaceNavigation,
-      systemMenu: value.systemMenu
+      systemMenu: value.systemMenu,
+      channelRequests: value.channelRequests === true
     });
   }
 
@@ -1091,6 +1100,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       clearInterval(this.#timer);
       this.#stopInputHandler();
       this.#stopPresentationPongHandler();
+      this.#stopControlHandler?.();
       for (const stop of this.#stopSubscriptions) stop();
     }
     const pending = this.#finishRetire();
@@ -1163,6 +1173,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         viewerDisplayRestore: false,
         workspaceNavigation: false,
         systemMenu: false,
+        channelRequests: this.#dependencies.media.setControlHandler !== undefined,
         platform: this.#dependencies.platform,
         displays: Object.freeze([]),
         permissions: disabledPermissions(this.#dependencies.platform)
@@ -1223,6 +1234,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         && this.#dependencies.restoreDisplayMode !== undefined,
       viewerDisplay: viewerDisplay && this.#dependencies.createViewerDisplay !== undefined,
       viewerDisplayRestore: viewerDisplay && this.#dependencies.createViewerDisplay !== undefined,
+      channelRequests: this.#dependencies.media.setControlHandler !== undefined,
       workspaceNavigation: this.#sessionState === "unlocked" && linux?.workspaceNavigation === true
         && this.#dependencies.workspaceAction !== undefined && this.#dependencies.stopWorkspaceActions !== undefined,
       systemMenu: this.#sessionState === "unlocked" && linux?.workspaceNavigation === true && linux.systemMenu === true

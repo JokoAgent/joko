@@ -5,6 +5,7 @@ import {
   type PartnerImportResult, type ListPartnerImportSourcesResponse, type PreviewPartnerImportResponse,
   type ReadPartnerImportPreviewResponse, type StartPartnerImportResponse, type GetPartnerImportStatusResponse, type RetryPartnerImportResponse,
   type StartPartnerImportRequestSchema,
+  type PartnerPackageEntry, type ListPartnerPackagesResponse, type InvitePartnerPackageResponse,
 } from "./gen/joko/v1/partner_import_pb.js";
 
 export interface PartnerImportPreview extends Omit<PartnerImportPreviewPage, "entries" | "nextOffset"> { readonly entries: readonly PartnerImportEntry[]; }
@@ -16,8 +17,12 @@ export interface PartnerImportApi {
   start(selection: MessageInitShape<typeof StartPartnerImportRequestSchema>["selection"], signal: AbortSignal): Promise<PartnerImportResult>;
   status(requestId: string, signal: AbortSignal): Promise<PartnerImportResult | undefined>;
   retry(requestId: string, resumeSetup: boolean, signal: AbortSignal): Promise<PartnerImportResult>;
+  packages?(locale: string, signal: AbortSignal): Promise<readonly PartnerPackageEntry[]>;
+  invitePackage?(entry: Pick<PartnerPackageEntry, "packageId" | "packageVersion" | "packageHash">, locale: string, signal: AbortSignal): Promise<PartnerImportResult>;
 }
 interface ImportRpc {
+  listPartnerPackages?(request: { locale: string }, options: { signal: AbortSignal }): Promise<ListPartnerPackagesResponse>;
+  invitePartnerPackage?(request: { packageId: string; packageVersion: string; packageHash: string; locale: string; controllerId: string }, options: { signal: AbortSignal }): Promise<InvitePartnerPackageResponse>;
   listPartnerImportSources(request: { controllerId: string }, options: { signal: AbortSignal }): Promise<ListPartnerImportSourcesResponse>;
   previewPartnerImport(request: { sourceId: string; controllerId: string }, options: { signal: AbortSignal }): Promise<PreviewPartnerImportResponse>;
   readPartnerImportPreview(request: { previewId: string; offset: number; controllerId: string }, options: { signal: AbortSignal }): Promise<ReadPartnerImportPreviewResponse>;
@@ -38,6 +43,16 @@ export function createPartnerImportApi(options: { rpc: ImportRpc; ownerKey: stri
   };
   return {
     ownerKey: options.ownerKey, newRequestId: options.newRequestId,
+    packages: (locale, signal) => invoke(signal, async () => {
+      if (!rpc.listPartnerPackages) throw new Error("Partner discovery is unavailable.");
+      const entries = (await rpc.listPartnerPackages({ locale }, { signal })).entries;
+      if (new Set(entries.map(entry => entry.packageId)).size !== entries.length || entries.some(entry => !entry.packageId || !entry.packageVersion || !/^[a-f0-9]{64}$/.test(entry.packageHash))) throw new Error("Partner discovery catalog is invalid.");
+      return entries;
+    }),
+    invitePackage: (entry, locale, signal) => invoke(signal, async () => {
+      if (!rpc.invitePartnerPackage) throw new Error("Partner discovery is unavailable.");
+      return result((await rpc.invitePartnerPackage({ packageId: entry.packageId, packageVersion: entry.packageVersion, packageHash: entry.packageHash, locale, controllerId }, { signal })).result);
+    }),
     sources: signal => invoke(signal, async () => {
       const sources = (await rpc.listPartnerImportSources({ controllerId }, { signal })).sources;
       if (sources.some(source => !source.id || source.kind === 0) || new Set(sources.map(source => source.id)).size !== sources.length) throw new Error("Import source catalog is invalid."); return sources;

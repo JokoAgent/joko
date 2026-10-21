@@ -3,7 +3,7 @@ import {
   dispatchMobileRemoteDesktopNativeCommand, MobileRemoteDesktopNativeBridgeError,
   parseMobileRemoteDesktopNativeCommand, parseMobileRemoteDesktopNativeEvent,
   parseMobileRemoteDesktopNativeInputBatch, parseMobileRemoteDesktopNativeViewport,
-  sendMobileRemoteDesktopNativeInput, type MobileRemoteDesktopNativeHandle
+  sendMobileRemoteDesktopNativeInput, sendMobileRemoteDesktopNativeRequest, type MobileRemoteDesktopNativeHandle
 } from "./remote-desktop-native-bridge";
 import { RTC_NETWORK } from "./remote-desktop-viewer";
 
@@ -20,6 +20,16 @@ const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwA
 const cursor = { visible: true, x: 0.4, y: 0.6, width: 16, height: 16, hotX: 1, hotY: 2, png };
 
 describe("native Remote Desktop private commands", () => {
+  it("uses an exact small native request and treats a thrown or malformed dispatch receipt as unknown", async () => {
+    const request = { epoch, attemptId, message: { type: "request" as const, id: "control-1", request: { op: "control", lease: "lease", enabled: true } } };
+    const handle: MobileRemoteDesktopNativeHandle = { receive: vi.fn(), sendInput: vi.fn(), sendRequest: vi.fn(async () => true) };
+    expect(await sendMobileRemoteDesktopNativeRequest(handle, request)).toBe(true);
+    expect(handle.sendRequest).toHaveBeenCalledWith(request);
+    await expect(sendMobileRemoteDesktopNativeRequest(handle, { ...request, message: { ...request.message, request: { op: "stop", lease: "lease" } } })).rejects.toThrow();
+    vi.mocked(handle.sendRequest!).mockRejectedValueOnce(new Error("native bridge failed"));
+    await expect(sendMobileRemoteDesktopNativeRequest(handle, request)).rejects.toThrow();
+    expect(parseMobileRemoteDesktopNativeEvent(event({ type: "channelReply", reply: { type: "reply", id: "control-1", ok: true, result: { controlling: true, controlGeneration: 2 } } }))).toMatchObject({ type: "channelReply" });
+  });
   it("keeps the full input grant and uint64 text without numeric coercion", () => {
     expect(parseMobileRemoteDesktopNativeCommand({ type: "inputAuthority", epoch, grant })).toEqual({ type: "inputAuthority", epoch, grant });
     for (const controlGeneration of [0, 1, "0", "01", "+1", "1.0", "18446744073709551616"]) {
