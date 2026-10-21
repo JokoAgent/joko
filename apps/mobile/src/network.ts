@@ -9,7 +9,7 @@ import { RemoteDesktopSystemActionKind, type RemoteDesktopSystemAction } from "@
 import { CollaborationService } from "@joko/contracts";
 import { ObjectiveService } from "@joko/contracts";
 import { McpAppService, McpAppNativeService } from "@joko/contracts";
-import { ExtensionCardService, extensionCardFormDeliveryScope } from "@joko/contracts";
+import { ExtensionCardService, ExtensionTaskService, extensionCardFormDeliveryScope } from "@joko/contracts";
 import type { MobileMcpAppApi } from "./mobile-mcp-app-api";
 import { createMobileObjectiveRpc, type MobileObjectiveRpc } from "./mobile-objective";
 import { createMobileCollaborationRpc, type MobileCollaborationRpc } from "./mobile-collaboration";
@@ -20,6 +20,7 @@ import { MobilePartnerCreationRejected, projectMobilePartnerCreationOptions, pro
   type MobilePartnerCreationOptions, type MobilePartnerCreationDraft, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { createPartnerRoutineApi, PartnerRoutineService, type PartnerRoutineApi, createPartnerImportApi, PartnerImportService, type PartnerImportApi } from "@joko/contracts";
+import { createPartnerHomeApi, PartnerHomeService, type PartnerHomeApi } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService, type PartnerGroupApi } from "@joko/contracts";
 import { createPartnerMemoryApi, type PartnerMemoryApi } from "@joko/contracts";
 import { createPartnerConnectionsApi, type PartnerConnectionsApi } from "@joko/contracts";
@@ -211,7 +212,7 @@ export interface MobileNetwork {
   showRemoteDesktopPermissionGuide?(credential: PairedCredential, peer: DevicePeerRouteIdentity,
     signal?: AbortSignal): Promise<RemoteDesktopPermissions>;
   startRemoteDesktop?(credential: PairedCredential, peer: DevicePeerRouteIdentity, displayId: string,
-    mode: RemoteDesktopStartMode, signal?: AbortSignal): Promise<RemoteDesktopLease>;
+    mode: RemoteDesktopStartMode, signal?: AbortSignal, control?: boolean): Promise<RemoteDesktopLease>;
   heartbeatRemoteDesktop?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     signal?: AbortSignal): Promise<RemoteDesktopControlState>;
   stopRemoteDesktop?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
@@ -252,12 +253,12 @@ export interface MobileNetwork {
   listRemoteDesktopDisplayModes?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     signal?: AbortSignal): Promise<readonly RemoteDesktopDisplayMode[]>;
   setRemoteDesktopDisplayMode?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
-    controlGeneration: bigint, modeId: string, temporary: boolean, signal?: AbortSignal): Promise<RemoteDesktopDisplayModeResult>;
+    controlGeneration: bigint, modeId: string, temporary: boolean, signal?: AbortSignal, control?: boolean): Promise<RemoteDesktopDisplayModeResult>;
   setRemoteDesktopViewerDisplay?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     controlGeneration: bigint, width: number, height: number,
-    signal?: AbortSignal): Promise<import("@joko/contracts").RemoteDesktopViewerDisplayResult>;
+    signal?: AbortSignal, control?: boolean): Promise<import("@joko/contracts").RemoteDesktopViewerDisplayResult>;
   restoreRemoteDesktopViewerDisplay?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
-    controlGeneration: bigint, signal?: AbortSignal): Promise<import("@joko/contracts").RemoteDesktopViewerDisplayResult>;
+    controlGeneration: bigint, signal?: AbortSignal, control?: boolean): Promise<import("@joko/contracts").RemoteDesktopViewerDisplayResult>;
   performRemoteDesktopSystemAction?(credential: PairedCredential, peer: DevicePeerRouteIdentity, leaseId: string,
     controlGeneration: bigint, action: RemoteDesktopSystemAction, signal?: AbortSignal): Promise<RemoteDesktopSystemAction>;
   transferRemoteDesktopClipboardText?(credential: PairedCredential, peer: DevicePeerRouteIdentity,
@@ -285,6 +286,7 @@ export interface MobileNetwork {
   readPartnerWorkingStatus?(credential: PairedCredential, partnerId: string, status: SessionWorkingStatus,
     locale: MobileSupportedLocale, signal?: AbortSignal): Promise<string | undefined>;
   partnerImportApi?(credential: PairedCredential, ownerKey: string, newRequestId: () => string, assertCurrent: (signal: AbortSignal) => void): PartnerImportApi;
+  partnerHomeApi?(credential: PairedCredential, ownerKey: string, assertCurrent: (signal: AbortSignal) => void): PartnerHomeApi;
   getPartnerCreationOptions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerCreationOptions>;
   createPartner?(credential: PairedCredential, requestId: string, expectedDirectoryRevision: bigint,
     draft: MobilePartnerCreationDraft, signal?: AbortSignal): Promise<MobilePartnerCreationResult>;
@@ -310,6 +312,7 @@ export interface MobileNetwork {
     action: "pause" | "resume" | "cancel", signal?: AbortSignal): Promise<PartnerSessionTaskView>;
   listExtensions(credential: PairedCredential, signal?: AbortSignal): Promise<MobileExtensionCatalog>;
   getExtension(credential: PairedCredential, extensionId: string, signal?: AbortSignal): Promise<MobileExtension>;
+  extensionTaskApi?(credential: PairedCredential): import("@connectrpc/connect").Client<typeof ExtensionTaskService>;
   getExtensionForRuntime(
     credential: PairedCredential,
     extensionId: string,
@@ -1554,9 +1557,9 @@ export const mobileNetwork: MobileNetwork = {
     if (!response.permissions) throw new Error("The Joko node returned no Remote Desktop permissions.");
     return response.permissions;
   },
-  async startRemoteDesktop(credential, peer, displayId, mode, signal) {
+  async startRemoteDesktop(credential, peer, displayId, mode, signal, control) {
     const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
-      .startRemoteDesktop({ peer, displayId, mode }, options(signal));
+      .startRemoteDesktop({ peer, displayId, mode, control: control === true }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.lease?.leaseId || response.lease.display?.displayId !== displayId) {
       throw new Error("The Joko node returned an invalid Remote Desktop lease.");
@@ -1713,31 +1716,31 @@ export const mobileNetwork: MobileNetwork = {
     }
     return Object.freeze([...response.modes]);
   },
-  async setRemoteDesktopDisplayMode(credential, peer, leaseId, controlGeneration, modeId, temporary, signal) {
+  async setRemoteDesktopDisplayMode(credential, peer, leaseId, controlGeneration, modeId, temporary, signal, control) {
     if (!REMOTE_DESKTOP_MODE_ID.test(modeId) || controlGeneration < 1n) {
       throw new Error("A current Remote Desktop display mode authority is required.");
     }
     const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
-      .setRemoteDesktopDisplayMode({ peer, leaseId, controlGeneration, modeId, temporary }, options(signal));
+      .setRemoteDesktopDisplayMode({ peer, leaseId, controlGeneration, modeId, temporary, control: control === true }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result) throw new Error("The Joko node returned no Remote Desktop mode result.");
     return response.result;
   },
-  async setRemoteDesktopViewerDisplay(credential, peer, leaseId, controlGeneration, width, height, signal) {
+  async setRemoteDesktopViewerDisplay(credential, peer, leaseId, controlGeneration, width, height, signal, control) {
     if (controlGeneration < 1n || !Number.isSafeInteger(width) || width < 320 || width > 2_560
       || !Number.isSafeInteger(height) || height < 320 || height > 2_560) {
       throw new Error("A current Remote Desktop viewer display authority and valid dimensions are required.");
     }
     const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
-      .setRemoteDesktopViewerDisplay({ peer, leaseId, controlGeneration, width, height }, options(signal));
+      .setRemoteDesktopViewerDisplay({ peer, leaseId, controlGeneration, width, height, control: control === true }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result?.lease) throw new Error("The Joko node returned no Remote Desktop viewer display result.");
     return response.result;
   },
-  async restoreRemoteDesktopViewerDisplay(credential, peer, leaseId, controlGeneration, signal) {
+  async restoreRemoteDesktopViewerDisplay(credential, peer, leaseId, controlGeneration, signal, control) {
     if (controlGeneration < 1n) throw new Error("A current Remote Desktop viewer display authority is required.");
     const response = await createClient(RemoteDesktopService, transport(credential.origin, credential.authKey))
-      .restoreRemoteDesktopViewerDisplay({ peer, leaseId, controlGeneration }, options(signal));
+      .restoreRemoteDesktopViewerDisplay({ peer, leaseId, controlGeneration, control: control === true }, options(signal));
     assertRemoteDesktopPeer(peer, response.peer);
     if (!response.result?.lease) throw new Error("The Joko node returned no Remote Desktop viewer display restore result.");
     return response.result;
@@ -1848,6 +1851,10 @@ export const mobileNetwork: MobileNetwork = {
   partnerImportApi(credential, ownerKey, newRequestId, assertCurrent) {
     return createPartnerImportApi({ rpc: createClient(PartnerImportService, transport(credential.origin, credential.authKey)), ownerKey,
       controllerId: newRequestId(), newRequestId, assertCurrent: () => assertCurrent(new AbortController().signal) });
+  },
+  partnerHomeApi(credential, ownerKey, assertCurrent) {
+    return createPartnerHomeApi({ rpc: createClient(PartnerHomeService, transport(credential.origin, credential.authKey)), ownerKey,
+      assertCurrent: () => assertCurrent(new AbortController().signal) });
   },
   async listPartners(credential, signal) {
     const response = await createClient(PartnerService, transport(credential.origin, credential.authKey))
@@ -2088,6 +2095,7 @@ export const mobileNetwork: MobileNetwork = {
       };
     }, requestSignal);
   },
+  extensionTaskApi(credential) { return createClient(ExtensionTaskService, transport(credential.origin, credential.authKey)); },
   async getExtension(credential, extensionId, signal) {
     if (!/^extension_[a-f0-9]{32}$/u.test(extensionId)) throw new Error("A current Extension is required.");
     const response = await createClient(ExtensionService, transport(credential.origin, credential.authKey))

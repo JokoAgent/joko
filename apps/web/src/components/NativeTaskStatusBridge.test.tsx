@@ -25,6 +25,8 @@ it("publishes only the concrete effective locale, including the unmount tombston
     value: {
       capabilities: ["native.taskStatus"],
       nativeTaskStatus: {
+        getSettings: vi.fn(async () => ({ enabled: true })),
+        onSettingsChanged: vi.fn(() => vi.fn()),
         publish,
         setVisibleSessions: vi.fn(async () => undefined),
         onAction: vi.fn(() => vi.fn())

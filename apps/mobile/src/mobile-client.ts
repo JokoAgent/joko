@@ -119,9 +119,9 @@ import { mobilePartnerVisibleReply, type MobilePartnerConversationTransport } fr
 import type { MobilePartnerDirectoryObservation } from "./mobile-partner-activity";
 import type { MobilePartnerWorkingTransport } from "./mobile-partner-working";
 import { projectSessionWorkingStatus, workingStatusTurnKey } from "@joko/contracts";
-import { validateMobilePartnerProfileDraft, mobilePartnerDraftCatalogIdentity, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
+import { validateMobilePartnerProfileDraft, mobilePartnerDraftCatalogIdentity, mobilePartnerProfileDraft, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import { sameMobilePartnerTaskOutputSource } from "./mobile-partner-task-outputs";
-import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
+import type { MobilePartnerInitializationModel, MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
 import { MobilePartnerCreationRejected, mobilePartnerCreationBackends, mobilePartnerCreationFields, validateMobilePartnerCreationDraft,
   type MobilePartnerCreationTransport, type MobilePartnerCreationResult } from "./mobile-partner-creation";
 import type { MobilePartnerCreationReceipts } from "./mobile-partner-creation-receipts";
@@ -390,6 +390,7 @@ import {
   mobileImageGalleryPreviewUri,
   mobileImageGalleryPage,
   mobileImageGalleryPageSummary,
+  mobileQueueGalleryPages,
   mobileTimelineGalleryPages,
   mobileTimelineGalleryWindowKey,
   sameMobileImageGalleryPage,
@@ -423,6 +424,8 @@ import {
 } from "./mobile-timeline-artifacts";
 import type { MobileFileShare, MobileFileShareProgress } from "./mobile-file-share";
 import type { MobileOfflineCache, MobileOfflineCacheSnapshot } from "./mobile-offline-cache";
+import { retainMobileHistoryPrefix } from "./mobile-history-continuity";
+import { SnapshotSchema } from "@joko/contracts";
 import { mobileProviderUsageIdentity, mobileProviderUsageSupported, type MobileProviderUsageTransport } from "./mobile-account-usage";
 import {
   canRestartMobileAutomationRun,
@@ -533,6 +536,12 @@ export interface MobileTaskSendObserver {
   readonly onDispatch?: (draft: MobileComposerDraft) => void;
 }
 
+export interface MobileNewTaskUploadObserver {
+  readonly signal: AbortSignal;
+  readonly waitForLeaveDecision: () => Promise<boolean>;
+  readonly onUploadingChange: (uploading: boolean) => void;
+}
+
 export interface MobilePushAuthority {
   readonly key: string;
   readonly profileId: string;
@@ -621,6 +630,10 @@ interface MobileImageGalleryLease {
     | {
         readonly kind: "markdown";
         readonly resourceLeaseId: string;
+      }
+    | {
+        readonly kind: "queue";
+        readonly queueItemId: string;
       };
   loaded?: {
     readonly loadId: string;
@@ -884,6 +897,7 @@ export class MobileClient {
   #queueEditLease?: MobileQueueEditLease;
   #queueInteractionLease?: MobileQueueInteractionLease;
   #newTaskSubmissionActive = false;
+  #newTaskUploadObserver?: MobileNewTaskUploadObserver;
   #composerImageEdit?: MobileComposerImageEditLease;
   #imageGallery?: MobileImageGalleryLease;
   #conversationShare?: MobileConversationShareLease;
@@ -1442,7 +1456,45 @@ export class MobileClient {
       }
       return matches[0]!;
     };
-    return { ownerKey, load, retry: async (selected, signal) => {
+    const models = (partner: MobilePartnerDirectoryProfile): readonly MobilePartnerInitializationModel[] => {
+      if (this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== ownerKey
+        || partner.canonicalSessionId || partner.initializationErrorCode !== "modelUnavailable") return [];
+      return mobilePartnerCreationBackends(this.#state.owner).filter(backend => backend.permissionModes.includes(partner.capabilities.permissionMode)
+        && (!partner.capabilities.planMode || backend.canSetPlanMode)).flatMap(backend => backend.models.map(model => {
+        const effort = model.efforts.find(option => option.default)?.id ?? model.efforts[0]?.id;
+        return { id: model.key, label: `${model.displayName} · ${model.providerName}`,
+          route: { backendId: model.backendId, providerId: model.providerId, modelId: model.modelId, fastMode: false,
+            ...(effort === undefined ? {} : { effort }) } };
+      }));
+    };
+    return { ownerKey, load, models, ...(this.network.updatePartnerProfile ? { configure: async (selected: MobilePartnerDirectoryProfile,
+      choice: MobilePartnerInitializationModel, signal: AbortSignal) => {
+      requireCurrent(signal);
+      const current = await load(selected.partnerId, signal);
+      if (mobilePartnerDirectoryIdentity(current) !== mobilePartnerDirectoryIdentity(selected)
+        || current.canonicalSessionId || current.initializationErrorCode !== "modelUnavailable") {
+        throw new Error("The Partner model setup changed; refresh before choosing a model.");
+      }
+      const model = models(current).find(candidate => candidate.id === choice.id && JSON.stringify(candidate.route) === JSON.stringify(choice.route));
+      if (!model) throw new Error("Choose an available model from this node.");
+      const action = this.#claimMutation();
+      try {
+        const updated = await this.network.updatePartnerProfile!(context.credential, current.partnerId, current.revision,
+          { ...mobilePartnerProfileDraft(current), usesDirectoryDefaults: false,
+            capabilities: { ...current.capabilities, modelChain: [model.route] } }, signal);
+        requireCurrent(signal);
+        const confirmed = await load(current.partnerId, signal);
+        if (confirmed.revision < updated.revision || confirmed.revision <= current.revision
+          || confirmed.homeTargetId !== current.homeTargetId || confirmed.lifecycle !== "active"
+          || JSON.stringify(confirmed.capabilities.modelChain) !== JSON.stringify([model.route])) {
+          throw new Error("The selected Partner model could not be confirmed.");
+        }
+        return confirmed;
+      } catch (error) {
+        signal.throwIfAborted();
+        throw new Error("The Partner model choice may have been applied. Refresh before choosing again.", { cause: error });
+      } finally { this.#releaseMutation(action); }
+    } } : {}), retry: async (selected, signal) => {
       requireCurrent(signal);
       const current = await load(selected.partnerId, signal);
       if (mobilePartnerDirectoryIdentity(current) !== mobilePartnerDirectoryIdentity(selected)
@@ -1626,8 +1678,8 @@ export class MobileClient {
         taskModels,
         canSwitchModel: controls?.canSwitchModel === true, canSetEffort: controls?.canSetEffort === true,
         canSetFastMode: controls?.canSetFastMode === true, canSetPlanMode: controls?.canSetPlanMode === true,
-        permissionModes: (controls?.permissionModes ?? []).filter((mode) => mode === PermissionMode.ASK || mode === PermissionMode.AUTO || mode === PermissionMode.BYPASS_PERMISSIONS)
-          .map((mode) => mode === PermissionMode.ASK ? "ask" as const : mode === PermissionMode.AUTO ? "auto" as const : "bypassPermissions" as const) };
+        permissionModes: (controls?.permissionModes ?? []).filter((mode) => mode === PermissionMode.ASK || mode === PermissionMode.ACCEPT_EDITS || mode === PermissionMode.AUTO || mode === PermissionMode.BYPASS_PERMISSIONS)
+          .map((mode) => mode === PermissionMode.ASK ? "ask" as const : mode === PermissionMode.ACCEPT_EDITS ? "acceptEdits" as const : mode === PermissionMode.AUTO ? "auto" as const : "bypassPermissions" as const) };
     };
     const listOutputs: NonNullable<MobilePartnerProfileTransport["listOutputs"]> = async (snapshot, signal) => {
       requireCurrent(signal);
@@ -1954,6 +2006,15 @@ export class MobileClient {
     const credential = context.credential;
     return new PartnerImportEditor(api, new PartnerImportReceipts(storage,
       JSON.stringify([credential.serverId, credential.profileId, credential.deviceId, new URL(credential.origin).href])));
+  }
+
+  partnerHomeApi(): import("@joko/contracts").PartnerHomeApi | undefined {
+    const context = this.#partnerPrivateContext(); if (!context || !this.network.partnerHomeApi) return undefined;
+    return this.network.partnerHomeApi(context.credential, context.authorityKey, signal => {
+      signal.throwIfAborted(); if (this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey) {
+        throw new Error("The Partner home service owner changed.");
+      }
+    });
   }
 
   partnerSkillsEditor(partner: MobilePartnerDirectoryProfile, conversationOwnerKey: string): import("@joko/contracts").PartnerSkillsEditor | undefined {
@@ -3052,6 +3113,25 @@ export class MobileClient {
             state: receipt.state }]
         : [])),
       list: (signal) => owned(signal, (current) => this.network.listExtensions(context.credential, current)),
+      getTaskPreferences: (expected, signal) => owned(signal, async current => {
+        await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
+        if (!api) throw new Error("Plugin task preferences are unavailable.");
+        const result = await api.getPreferences({ extensionId: expected.extensionId }, { signal: current }); requireCurrent(current);
+        if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin preference owner changed."); return result.preferences;
+      }),
+      setTaskPreferences: (expected, preferences, model, permissionMode, signal) => owned(signal, async current => {
+        await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
+        if (!api || preferences.extensionId !== expected.extensionId) throw new Error("Plugin task preferences are unavailable.");
+        const result = await api.updatePreferences({ extensionId: expected.extensionId, expectedRevision: preferences.revision, model, permissionMode,
+          targetId: preferences.targetId }, { signal: current }); requireCurrent(current);
+        if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin preference owner changed."); return result.preferences;
+      }),
+      retryTaskWriteAccess: (expected, taskId, signal) => owned(signal, async current => {
+        await readExactDetail(expected, current); const api = this.network.extensionTaskApi?.(context.credential);
+        if (!api) throw new Error("Plugin task permissions are unavailable.");
+        const result = await api.retryWriteAccess({ extensionId: expected.extensionId, taskId }, { signal: current }); requireCurrent(current);
+        if (!result.preferences || result.preferences.extensionId !== expected.extensionId) throw new Error("Plugin permission owner changed."); return result.preferences;
+      }),
       detail: (expected, signal) => owned(signal, (current) => readExactDetail(expected, current)),
       setEnabled: (expected, enabled, signal) => mutate(expected, "enabled", enabled, signal),
       setSidebarVisible: (expected, visible, signal) => mutate(expected, "sidebar", visible, signal),
@@ -3166,8 +3246,8 @@ export class MobileClient {
       capabilities: (host, signal) => checked(() => this.network.getRemoteDesktopCapabilities!(credential, route(host), signal)),
       permissions: (host, signal) => checked(() => this.network.getRemoteDesktopPermissions!(credential, route(host), signal)),
       showPermissionGuide: (host, signal) => checked(() => this.network.showRemoteDesktopPermissionGuide!(credential, route(host), signal)),
-      start: (host, displayId, mode, signal) => checked(() =>
-        this.network.startRemoteDesktop!(credential, route(host), displayId, mode, signal)),
+      start: (host, displayId, mode, signal, control) => checked(() =>
+        this.network.startRemoteDesktop!(credential, route(host), displayId, mode, signal, control)),
       heartbeat: (host, leaseId, signal) => checked(() =>
         this.network.heartbeatRemoteDesktop!(credential, route(host), leaseId, signal)),
       stop: async (host, leaseId, exit, signal) => {
@@ -3226,15 +3306,15 @@ export class MobileClient {
         this.network.getRemoteDesktopFrame!(credential, route(host), leaseId, cursorOverlay, signal)),
       listDisplayModes: (host, leaseId, signal) => checked(() =>
         this.network.listRemoteDesktopDisplayModes!(credential, route(host), leaseId, signal)),
-      setDisplayMode: (host, leaseId, controlGeneration, modeId, temporary, signal) => checked(() =>
-        this.network.setRemoteDesktopDisplayMode!(credential, route(host), leaseId, controlGeneration, modeId, temporary, signal)),
-      fitViewerDisplay: (host, leaseId, controlGeneration, width, height, signal) => checked(() => {
+      setDisplayMode: (host, leaseId, controlGeneration, modeId, temporary, signal, control) => checked(() =>
+        this.network.setRemoteDesktopDisplayMode!(credential, route(host), leaseId, controlGeneration, modeId, temporary, signal, control)),
+      fitViewerDisplay: (host, leaseId, controlGeneration, width, height, signal, control) => checked(() => {
         if (!this.network.setRemoteDesktopViewerDisplay) throw new Error("Remote Desktop viewer display is unavailable.");
-        return this.network.setRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, width, height, signal);
+        return this.network.setRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, width, height, signal, control);
       }),
-      restoreViewerDisplay: (host, leaseId, controlGeneration, signal) => checked(() => {
+      restoreViewerDisplay: (host, leaseId, controlGeneration, signal, control) => checked(() => {
         if (!this.network.restoreRemoteDesktopViewerDisplay) throw new Error("Remote Desktop viewer display restore is unavailable.");
-        return this.network.restoreRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, signal);
+        return this.network.restoreRemoteDesktopViewerDisplay(credential, route(host), leaseId, controlGeneration, signal, control);
       }),
       systemAction: (host, leaseId, controlGeneration, action, signal) => checked(() => {
         if (!this.network.performRemoteDesktopSystemAction) throw new Error("Remote Desktop system actions are unavailable.");
@@ -3332,6 +3412,10 @@ export class MobileClient {
     const previousAuthority = this.filesAuthorityKey();
     const previousPartnerAuthority = this.#partnerPrivateAuthorityKey(this.#state);
     let next = { ...this.#state, ...patch };
+    if (patch.detail && next.activeProfileId === this.#state.activeProfileId && next.selectedId === this.#state.selectedId
+      && next.taskSource?.kind === this.#state.taskSource?.kind) {
+      next = { ...next, detail: retainMobileHistoryPrefix(patch.detail, this.#state.detail) };
+    }
     const nextAuthority = this.#filesAuthorityKey(next);
     const nextPartnerAuthority = this.#partnerPrivateAuthorityKey(next);
     const sourceSessionChanged = this.#partnerPrivateSourceSessionId !== undefined
@@ -3967,7 +4051,11 @@ export class MobileClient {
     const profile = this.#profiles.find((candidate) => candidate.profileId === credential.profileId)
       ?? profileFromCredential(credential);
     try {
-      await this.offlineCache.save(profile, node, owner, detail);
+      const cachedDetail = detail && this.#state.detail === detail && this.#state.window === undefined && this.#state.older.length > 0
+        ? create(SnapshotSchema, { ...detail, timeline: [...this.#state.older, ...detail.timeline]
+          .filter((event, index, events) => events.findIndex(candidate => candidate.eventId === event.eventId) === index) })
+        : detail;
+      await this.offlineCache.save(profile, node, owner, cachedDetail);
       if (this.#current(epoch) && this.#credential === credential
         && this.#activeProfileId === credential.profileId) {
         this.#durableSnapshotAt = this.#lastAuthenticatedAt;
@@ -4756,6 +4844,12 @@ export class MobileClient {
     const joined = this.#joinedTask;
     return joined ? mobileSharedTaskDraftProfileId(joined.source.homeProfileId, joined.source.homeServerId,
       joined.source.homeOrigin, joined.source.joined.joinId) : this.#state.activeProfileId;
+  }
+
+  /** Durable presentation identity, independent of a transport or runtime occurrence. */
+  answerStateOwnerKey(): string | undefined {
+    const credential = this.#credential, session = this.#selectedSession();
+    return credential && session ? JSON.stringify([this.taskDraftProfileId(), credential.serverId, credential.origin, session.sessionId]) : undefined;
   }
 
   async openJoinedTask(joined: JoinedTaskShare): Promise<void> {
@@ -7689,6 +7783,14 @@ export class MobileClient {
     assertCurrent();
     return {
       workspaceId: files.authority.workspace.workspaceId, workdir: files.authority.workspace.serverPathDisplay, assertCurrent,
+      ...(this.mediaPreviewFiles ? { stageMedia: async (entry: WorkspaceEntry, blob: BlobRef, bytes: Uint8Array, signal: AbortSignal) => {
+        assertCurrent(signal);
+        const driver = this.mediaPreviewFiles!;
+        const staged = await driver.stage(credential.profileId, this.newId(), entry.relativePath, blob.mediaType, blob.sha256Hex, bytes, signal);
+        const release = () => { void driver.remove(staged).catch(() => undefined); };
+        try { assertCurrent(signal); } catch (error) { release(); throw error; }
+        return { uri: staged.uri, kind: staged.mediaKind, release };
+      } } : {}),
       revalidateSource: async (signal) => {
         assertCurrent(signal);
         const around = await this.network.readAround(credential, files.authority.sessionId, event.eventId, signal);
@@ -7944,6 +8046,69 @@ export class MobileClient {
     this.#conversationShare = undefined;
   }
 
+  taskQueueImagePages(queueItemId: string): readonly ReturnType<typeof mobileImageGalleryPageSummary>[] {
+    const item = this.taskQueueItems().find((candidate) => candidate.queueItemId === queueItemId);
+    return item ? mobileQueueGalleryPages(item).map(mobileImageGalleryPageSummary) : [];
+  }
+
+  #queueGalleryPages(queueItemId: string): readonly MobileImageGalleryPage[] {
+    const item = this.taskQueueItems().find((candidate) => candidate.queueItemId === queueItemId);
+    return item ? mobileQueueGalleryPages(item) : [];
+  }
+
+  async prepareQueueImagePreview(queueItemId: string, pageId: string, signal: AbortSignal): Promise<MobileTimelineImagePreview> {
+    const credential = this.#ready(), ownerKey = this.#taskAuthorityKey(), sessionId = this.#state.selectedId;
+    const page = this.#queueGalleryPages(queueItemId).find((candidate) => candidate.pageId === pageId);
+    if (!ownerKey || !sessionId || !page) throw new Error("The pending image is no longer in this task queue.");
+    const assertCurrent = (currentSignal?: AbortSignal): void => {
+      currentSignal?.throwIfAborted();
+      const current = this.#queueGalleryPages(queueItemId).find((candidate) => candidate.pageId === pageId);
+      if (this.#credential !== credential || this.#taskAuthorityKey() !== ownerKey || !current || !sameMobileImageGalleryPage(current, page)) {
+        throw new Error("The pending image changed or left the task queue.");
+      }
+    };
+    return this.#timelineImages.prepare({ ownerKey, page, assertCurrent,
+      revalidate: (currentSignal) => this.#revalidateQueueImage(credential, sessionId, page, assertCurrent, currentSignal),
+      download: (blob, currentSignal) => this.network.downloadBlob(credential, blob, currentSignal) }, signal);
+  }
+
+  async #revalidateQueueImage(credential: PairedCredential, sessionId: string, page: MobileImageGalleryPage,
+    assertCurrent: (signal?: AbortSignal) => void, signal: AbortSignal): Promise<void> {
+    assertCurrent(signal);
+    if (page.source.kind !== "queue") throw new Error("The pending image source is invalid.");
+    const detail = await this.network.readSession(credential, sessionId, signal);
+    assertCurrent(signal);
+    const session = detail.sessions.find((candidate) => candidate.sessionId === sessionId);
+    const source = page.source;
+    const items = detail.queueItems.filter((candidate) => candidate.queueItemId === source.queueItemId && candidate.sessionId === sessionId);
+    const current = items.length === 1 ? mobileQueueGalleryPages(items[0]!).find((candidate) => candidate.pageId === page.pageId) : undefined;
+    if (detail.scope?.kind.case !== "session" || detail.scope.kind.value.sessionId !== sessionId
+      || detail.server?.serverId !== credential.serverId || detail.generation !== this.#taskGeneration()
+      || session?.nativeBinding?.runtimeGeneration !== this.#selectedSession()?.nativeBinding?.runtimeGeneration
+      || !current || !sameMobileImageGalleryPage(current, page)) throw new Error("The pending image changed or left the task queue.");
+  }
+
+  async openQueueImageGallery(queueItemId: string, pageId: string, signal?: AbortSignal): Promise<MobileImageGalleryDescriptor> {
+    signal?.throwIfAborted();
+    if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
+    this.#retireImageGallery();
+    const credential = this.#ready(), taskAuthorityKey = this.#taskAuthorityKey(), sessionId = this.#state.selectedId;
+    const pages = this.#queueGalleryPages(queueItemId), initialIndex = pages.findIndex((page) => page.pageId === pageId);
+    if (!taskAuthorityKey || !sessionId || initialIndex < 0) throw new Error("The pending image is no longer in this task queue.");
+    const identity = { profileId: this.taskDraftProfileId()!, sessionId };
+    const snapshot = await this.composerDrafts.readSnapshot(identity);
+    const draft = normalizeMobileComposerDraft(snapshot.draft ?? emptyMobileComposerDraft());
+    const attachmentOwnerKey = this.taskAttachmentControls()?.surfaceOwnerKey;
+    const descriptor: MobileImageGalleryDescriptor = { leaseId: distinctAttachmentStorageId(this.newId, ...mobileComposerAttachmentStorageIds(draft.attachments)),
+      sourceKind: "timeline", sourceLabel: "Pending message", initialIndex, pages: pages.map(mobileImageGalleryPageSummary) };
+    const lease: MobileImageGalleryLease = { leaseId: descriptor.leaseId, profileId: credential.profileId,
+      credentialKey: mobileCredentialKey(credential), taskAuthorityKey, identity, snapshot, draft, descriptor, pages,
+      ...(attachmentOwnerKey === undefined ? {} : { attachmentOwnerKey }), source: { kind: "queue", queueItemId }, operationInFlight: false };
+    this.#imageGallery = lease;
+    try { await this.#assertImageGalleryCurrent(lease, undefined, signal); return descriptor; }
+    catch (error) { if (this.#imageGallery === lease) this.#retireImageGallery(); throw error; }
+  }
+
   async openTimelineImageGallery(
     eventId: string,
     pageId: string,
@@ -8143,7 +8308,8 @@ export class MobileClient {
     const page = lease.pages[pageIndex]!;
     const preview = this.#timelineImages.pinCached({ ownerKey: lease.taskAuthorityKey, page, assertCurrent: (currentSignal) => {
       currentSignal?.throwIfAborted();
-      if (this.#imageGallery !== lease || this.#taskAuthorityKey() !== lease.taskAuthorityKey || lease.pages[pageIndex] !== page) {
+      if (this.#imageGallery !== lease || this.#taskAuthorityKey() !== lease.taskAuthorityKey || lease.pages[pageIndex] !== page
+        || !this.imageGalleryCurrent(leaseId)) {
         throw new Error("The cached gallery preview source changed.");
       }
       if (lease.source.kind === "timeline" && (mobileTimelineGalleryWindowKey(this.#timelineEvents()) !== lease.source.windowKey
@@ -8164,6 +8330,10 @@ export class MobileClient {
       && mobileFilesGalleryWindowKey(this.#state.files) === source.filesWindowKey;
     if (source.kind === "markdown") {
       try { this.#markdownResources.assertCurrent(source.resourceLeaseId); return true; } catch { return false; }
+    }
+    if (source.kind === "queue") {
+      const pages = this.#queueGalleryPages(source.queueItemId);
+      return pages.length === lease.pages.length && pages.every((page, index) => sameMobileImageGalleryPage(page, lease.pages[index]!));
     }
     const events = this.#timelineEvents(); const pages = timelineGalleryPagesForSelection(events, source.eventId, source.pageId);
     return mobileTimelineGalleryWindowKey(events) === source.windowKey && pages.length === lease.pages.length
@@ -8352,6 +8522,9 @@ export class MobileClient {
       const older = [...page.events.filter((item) => !known.has(item.eventId)), ...this.#state.older];
       const window = this.#state.window ? [...older, ...this.#state.window] : undefined;
       this.#set({ older: window ? [] : older, window, before: page.before, historyEnd: !page.before });
+      if (!this.#joinedTask && window === undefined && this.#state.node && this.#state.owner && this.#state.detail) {
+        await this.#persistOfflineProjection(epoch, credential, this.#state.node, this.#state.owner, this.#state.detail);
+      }
     } catch (error) {
       if (this.#current(epoch) && isStaleHistory(error)) void this.refresh();
       throw error;
@@ -8587,7 +8760,8 @@ export class MobileClient {
     return key && this.network.objectiveRpc ? `${key}\u001fobjective-create\u001f${this.#epoch}` : undefined;
   }
 
-  async create(targetId: string, name: string, firstInput: MobileComposerDraft, objective?: MobileObjectiveInput, collaboration?: MobileWorkerForm): Promise<MobileNewTaskResult> {
+  async create(targetId: string, name: string, firstInput: MobileComposerDraft, objective?: MobileObjectiveInput, collaboration?: MobileWorkerForm,
+    uploadObserver?: MobileNewTaskUploadObserver): Promise<MobileNewTaskResult> {
     const input = normalizeMobileComposerDraft(firstInput);
     const objectiveInput = objective === undefined ? undefined : normalizeMobileObjectiveInput(objective);
     const workerForm = collaboration === undefined ? undefined : normalizeMobileWorkerForm(collaboration);
@@ -8635,6 +8809,7 @@ export class MobileClient {
     const createOperationId = this.newId();
     const action = this.#claimMutation();
     this.#newTaskSubmissionActive = true;
+    this.#newTaskUploadObserver = uploadObserver;
     try {
       const submission = await this.newTaskDrafts.beginSubmission(identity, { targetId, name, input, ...(workerForm ? { collaboration: workerForm } : {}) }, {
         connectionId: credential.connectionId,
@@ -8663,6 +8838,8 @@ export class MobileClient {
       if (this.#mutationOwner === action) this.#set({ busy: true });
       return await this.#continueNewTaskCreation(identity, submission, result);
     } finally {
+      uploadObserver?.onUploadingChange(false);
+      this.#newTaskUploadObserver = undefined;
       this.#newTaskSubmissionActive = false;
       this.#releaseMutation(action);
     }
@@ -8961,9 +9138,15 @@ export class MobileClient {
       return { sessionId: initial.sessionId, created: true, sent: false, definitive: true };
     }
     let prepared = initial;
+    const uploadObserver = initial.input.attachments.some(attachment => attachment.state === "local") ? this.#newTaskUploadObserver : undefined;
     try {
       await this.#validateNewTaskSubmissionInput(initial);
+      if (initial.input.attachments.some(attachment => attachment.state === "local")) uploadObserver?.onUploadingChange(true);
       prepared = await this.#uploadNewTaskAttachments(identity, initial);
+      if (uploadObserver && (await uploadObserver.waitForLeaveDecision() || uploadObserver.signal.aborted)) {
+        throw new Error("Attachment upload was cancelled. The first message remains in its task draft.");
+      }
+      uploadObserver?.onUploadingChange(false);
     } catch (error) {
       const retained = this.newTaskDrafts.readSync(identity)?.submission;
       const recovery = retained?.phase === "sending" && retained.createOperationId === initial.createOperationId
@@ -8998,6 +9181,8 @@ export class MobileClient {
     if (!this.newTaskDrafts) throw new Error("Retained new-task drafts are unavailable.");
     if (initial.input.attachments.every((attachment) => attachment.state === "uploaded")) return initial;
     if (!this.attachmentFiles) throw new Error("Staged mobile attachment bytes are unavailable.");
+    const signal = this.#newTaskUploadObserver
+      ? AbortSignal.any([this.#abort!.signal, this.#newTaskUploadObserver.signal]) : this.#abort?.signal;
     let submission = initial;
     const initialControls = this.taskAttachmentControls();
     if (!initialControls || initialControls.profileId !== identity.profileId) {
@@ -9015,8 +9200,11 @@ export class MobileClient {
         throw new Error("The created task changed while an attachment was being prepared.");
       }
       assertMobileAttachmentPolicy(submission.input.attachments, controls.policy);
-      const source = await this.attachmentFiles.verifyForUpload(identity.profileId, attachment, this.#abort?.signal);
-      const blob = await this.network.uploadBlob(this.#ready(), source, this.#abort?.signal);
+      signal?.throwIfAborted();
+      const source = await this.attachmentFiles.verifyForUpload(identity.profileId, attachment, signal);
+      signal?.throwIfAborted();
+      const blob = await this.network.uploadBlob(this.#ready(), source, signal);
+      signal?.throwIfAborted();
       const currentControls = this.taskAttachmentControls();
       if (this.#newTaskSendAuthority(submission).status !== "ready" || !currentControls
         || currentControls.surfaceOwnerKey !== initialControls.surfaceOwnerKey
@@ -13153,6 +13341,11 @@ export class MobileClient {
         || currentPages.some((page, index) => !sameMobileImageGalleryPage(page, lease.pages[index]!))) {
         throw new Error("The message Workspace images changed while the gallery was open.");
       }
+    } else if (source.kind === "queue") {
+      const pages = this.#queueGalleryPages(source.queueItemId);
+      if (pages.length !== lease.pages.length || pages.some((page, index) => !sameMobileImageGalleryPage(page, lease.pages[index]!))) {
+        throw new Error("The pending images changed or left the task queue.");
+      }
     } else {
       const events = this.#timelineEvents();
       if (mobileTimelineGalleryWindowKey(events) !== source.windowKey) {
@@ -13185,6 +13378,12 @@ export class MobileClient {
     signal.throwIfAborted();
     if (lease.source.kind === "markdown") return; // The resource owner revalidates its exact message and Workspace revision above.
     const page = loaded.page; const source = page.source; const credential = this.#ready();
+    if (lease.source.kind === "queue") {
+      await this.#revalidateQueueImage(credential, lease.identity.sessionId, page, () => {
+        if (!this.imageGalleryCurrent(lease.leaseId)) throw new Error("The pending image source changed.");
+      }, signal);
+      return;
+    }
     if (lease.source.kind === "files") {
       const context = this.#filesContext();
       if (context.key !== lease.source.filesAuthorityKey) throw new Error("The Files image authority changed.");

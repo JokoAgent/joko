@@ -50,6 +50,8 @@ export interface PartnerListOptions {
 }
 
 export interface CreatePartnerInput extends PartnerDraft {
+  /** Trusted bundled-package installation, before a real model and canonical task are selected. */
+  readonly allowUnconfiguredModel?: true;
   readonly expectedDirectoryRevision: bigint;
   readonly requestId: string;
   readonly id?: string;
@@ -114,7 +116,7 @@ CREATE TABLE partner_directory (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   revision INTEGER NOT NULL CHECK (revision BETWEEN 1 AND 9007199254740991),
   default_model_chain_json TEXT,
-  default_permission_mode TEXT CHECK (default_permission_mode IS NULL OR default_permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+  default_permission_mode TEXT CHECK (default_permission_mode IS NULL OR default_permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
   default_plan_mode INTEGER CHECK (default_plan_mode IS NULL OR default_plan_mode IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
@@ -142,7 +144,7 @@ CREATE TABLE partners (
   canonical_session_id TEXT UNIQUE,
   model_chain_json TEXT NOT NULL,
   task_model_json TEXT,
-  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -220,7 +222,7 @@ CREATE TABLE partner_profile_versions (
   identity_source TEXT NOT NULL,
   model_chain_json TEXT NOT NULL,
   task_model_json TEXT,
-  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+  permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
@@ -1030,7 +1032,7 @@ export class PartnerStore {
       if (this.#database.prepare("SELECT request_id FROM retired_partner_creations WHERE request_id = ?").get(requestId) !== undefined) {
         throw new PartnerStoreError("PARTNER_CREATION_RETIRED", "This partner creation request was retired.");
       }
-      const requestedDraft = partnerDraft({ ...input, avatar: avatarInput(input.avatar) });
+      const requestedDraft = partnerDraft({ ...input, avatar: avatarInput(input.avatar) }, acceptedImport && input.allowUnconfiguredModel === true);
       const fingerprint = creationFingerprint(input, requestedDraft);
       const existing = this.#database.prepare("SELECT * FROM partners WHERE creation_request_id = ?")
         .get(requestId) as Row | undefined;
@@ -1106,7 +1108,7 @@ export class PartnerStore {
         capabilities,
         usesDirectoryDefaults,
         ...(patch.taskModelOverride === null ? {} : { taskModelOverride: patch.taskModelOverride ?? current.taskModelOverride })
-      });
+      }, current.canonicalSessionId === undefined && current.capabilities.modelChain.length === 0 && patch.capabilities === undefined);
       if (sameProfileContent(current, next)) return current;
       const at = this.#now();
       const nextRevision = nextNumber(current.revision, "Partner revision");
@@ -1288,6 +1290,7 @@ export class PartnerStore {
         UPDATE partner_session_links SET role = 'history' WHERE session_id = ? AND partner_id = ? AND role = 'canonical'
       `).run(expected, current.id);
       if (Number(retired.changes) !== 1) throw unavailable("The previous canonical Session link is missing.");
+      this.#database.prepare("UPDATE partner_session_links SET role = 'history' WHERE partner_id = ? AND role = 'delegation'").run(current.id);
       this.#database.prepare(`
         INSERT INTO partner_session_links(
           session_id, partner_id, role, profile_version, parent_session_id, delegation_id, created_at
@@ -1306,6 +1309,7 @@ export class PartnerStore {
       if (current.canonicalSessionId === undefined) {
         throw new PartnerStoreError("PARTNER_INVALID", "A canonical Session is required before the partner can become ready.");
       }
+      if (current.capabilities.modelChain.length === 0) throw new PartnerStoreError("PARTNER_INVALID", "A real model route is required before the partner can become ready.");
       if (current.initializationState === "ready" && current.initializationErrorCode === undefined) return current;
       const at = this.#now();
       const result = this.#database.prepare(`
@@ -1315,6 +1319,32 @@ export class PartnerStore {
       if (Number(result.changes) !== 1) throw changed(current.id);
       this.#bumpDirectory(at);
       return this.getPartner(current.id);
+    });
+  }
+
+  /** The home Owner publishes a fully prepared execution Target and historical hand-off together. */
+  moveHome(input: { readonly partnerId: string; readonly expectedRevision: bigint; readonly sourceSessionId: string;
+    readonly targetId: string; readonly sessionId: string; readonly capabilities: PartnerCapabilitiesRecord }): PartnerProfileRecord {
+    return this.#write(() => {
+      const current = this.getPartner(input.partnerId); assertRevision(current, input.expectedRevision); assertMutable(current);
+      if (current.lifecycle !== "active" || current.canonicalSessionId !== input.sourceSessionId) throw changed(current.id);
+      const targetId = entityId(input.targetId, "Partner home Target ID"), sessionId = entityId(input.sessionId, "Canonical Session ID");
+      if (targetId === current.homeTargetId || sessionId === current.canonicalSessionId) throw new PartnerStoreError("PARTNER_INVALID", "A home change requires a fresh execution owner.");
+      const capabilities = capabilitiesValue(input.capabilities), at = this.#now();
+      const version = current.profileVersion + 1;
+      const retired = this.#database.prepare("UPDATE partner_session_links SET role = 'history' WHERE session_id = ? AND partner_id = ? AND role = 'canonical'")
+        .run(current.canonicalSessionId, current.id);
+      if (Number(retired.changes) !== 1) throw unavailable("The previous canonical Session link is missing.");
+      const updated = this.#database.prepare(`UPDATE partners SET revision = ?, profile_version = ?, home_target_id = ?, canonical_session_id = ?,
+        model_chain_json = ?, task_model_json = NULL, permission_mode = ?, plan_mode = ?, uses_directory_defaults = 0,
+        initialization_state = 'ready', invitation_stage = 'ready', initialization_error_code = NULL, updated_at = ? WHERE id = ? AND revision = ?`)
+        .run(nextNumber(current.revision, "Partner revision"), version, targetId, sessionId, JSON.stringify(capabilities.modelChain),
+          capabilities.permissionMode, capabilities.planMode ? 1 : 0, at, current.id, Number(current.revision));
+      if (Number(updated.changes) !== 1) throw changed(current.id);
+      this.#database.prepare(`INSERT INTO partner_session_links(session_id, partner_id, role, profile_version, parent_session_id, delegation_id, created_at)
+        VALUES (?, ?, 'canonical', ?, NULL, NULL, ?)`).run(sessionId, current.id, version, at);
+      this.#insertVersion(current.id, version, current.identitySource, capabilities, false, at);
+      this.#bumpDirectory(at); return this.getPartner(current.id);
     });
   }
 
@@ -1851,6 +1881,10 @@ export class PartnerStore {
       if (initializationState === "ready" && canonicalSessionId === undefined) {
         throw new Error("A ready partner has no canonical Session.");
       }
+      const capabilities = capabilitiesFromRow(row);
+      if (capabilities.modelChain.length === 0 && canonicalSessionId !== undefined) {
+        throw new Error("A canonical partner has no configured model.");
+      }
       return {
         id: entityId(row["id"], "Partner ID"),
         revision: BigInt(safeInteger(row["revision"], "Partner revision")),
@@ -1867,7 +1901,7 @@ export class PartnerStore {
         ...(initializationError === undefined ? {} : { initializationErrorCode: initializationError }),
         homeTargetId: entityId(row["home_target_id"], "Partner home Target ID"),
         ...(canonicalSessionId === undefined ? {} : { canonicalSessionId }),
-        capabilities: capabilitiesFromRow(row),
+        capabilities,
         ...taskModelFromRow(row),
         usesDirectoryDefaults: booleanInteger(row["uses_directory_defaults"], "Partner default inheritance"),
         createdAt: timestamp(row["created_at"], "Partner created time"),
@@ -2219,7 +2253,7 @@ function creationFingerprint(input: CreatePartnerInput, draft: NormalizedPartner
   })).digest("hex");
 }
 
-function partnerDraft(input: Omit<NormalizedPartnerDraft, "description"> & { readonly description?: string }): NormalizedPartnerDraft {
+function partnerDraft(input: Omit<NormalizedPartnerDraft, "description"> & { readonly description?: string }, allowUnconfiguredModel = false): NormalizedPartnerDraft {
   if (typeof input.usesDirectoryDefaults !== "boolean") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner default inheritance must be boolean.");
   }
@@ -2229,24 +2263,24 @@ function partnerDraft(input: Omit<NormalizedPartnerDraft, "description"> & { rea
     avatar: avatarRecord(input.avatar),
     identitySource: identityValue(input.identitySource),
     templateId: templateId(input.templateId),
-    capabilities: capabilitiesValue(input.capabilities),
+    capabilities: capabilitiesValue(input.capabilities, allowUnconfiguredModel),
     usesDirectoryDefaults: input.usesDirectoryDefaults,
     ...(input.taskModelOverride === undefined ? {} : { taskModelOverride: modelRoute(input.taskModelOverride) })
   };
 }
 
-function capabilitiesValue(value: PartnerCapabilitiesRecord): PartnerCapabilitiesRecord {
+function capabilitiesValue(value: PartnerCapabilitiesRecord, allowUnconfiguredModel = false): PartnerCapabilitiesRecord {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner capabilities are required.");
   }
   const permissionMode = value.permissionMode;
-  if (permissionMode !== "ask" && permissionMode !== "auto" && permissionMode !== "bypassPermissions") {
+  if (permissionMode !== "ask" && permissionMode !== "auto" && permissionMode !== "acceptEdits" && permissionMode !== "bypassPermissions") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner permission mode is invalid.");
   }
   if (typeof value.planMode !== "boolean") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner Plan mode must be boolean.");
   }
-  if (!Array.isArray(value.modelChain) || value.modelChain.length < 1 || value.modelChain.length > MAX_MODEL_ROUTES) {
+  if (!Array.isArray(value.modelChain) || value.modelChain.length < (allowUnconfiguredModel ? 0 : 1) || value.modelChain.length > MAX_MODEL_ROUTES) {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner model chain must contain one to five routes.");
   }
   const routes = value.modelChain.map(modelRoute);
@@ -2316,7 +2350,7 @@ function capabilitiesFromColumns(row: Row, prefix: string): PartnerCapabilitiesR
     modelChain: routes,
     permissionMode: permissionMode as PartnerCapabilitiesRecord["permissionMode"],
     planMode: booleanInteger(row[`${prefix}plan_mode`], "Partner Plan mode")
-  });
+  }, prefix === "");
 }
 
 function modelChainJson(routes: readonly PartnerModelRouteRecord[]): string {

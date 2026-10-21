@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { lstat, open, realpath } from "node:fs/promises";
-import { basename, extname, isAbsolute, relative, resolve } from "node:path";
+import { basename, extname, isAbsolute, relative, resolve, win32 } from "node:path";
 
 import { buildPartnerWorkbenchDigest, boundNativeSessionPreview, derivePartnerWorkbenchTaskState, derivePartnerWorkbenchAutomationState,
   partnerWorkbenchGroup, PARTNER_WORKBENCH_RECENT_WINDOW_MS, redactSecrets,
@@ -20,6 +20,9 @@ import { readSessionCodeHostReferences, refreshSessionCodeHostReferencesInBackgr
 import { PartnerWorkbenchPullRequests } from "./partner-workbench-pull-requests.js";
 import type { SessionHost } from "./session-host.js";
 import type { PartnerWorkbenchBriefReader } from "./partner-workbench-brief.js";
+import type { PartnerHomeProjects } from "./partner-home-projects.js";
+import type { PartnerHomeWorkbench } from "./partner-home-workbench.js";
+import type { PartnerHomeLocation } from "./partner-home-owner.js";
 import {
   checkPartnerWorkbenchProject,
   findPartnerWorkbenchProject,
@@ -48,6 +51,9 @@ export interface PartnerWorkbenchProjectView {
   readonly name: string;
   readonly addedAt: number;
   readonly exists: boolean;
+  readonly sourceComputerId?: string;
+  readonly sourceComputerName?: string;
+  readonly readOnly?: boolean;
 }
 
 export interface PartnerWorkbenchStateView {
@@ -65,6 +71,7 @@ export interface PartnerWorkbenchStateView {
 }
 
 interface TaskSource {
+  readonly carried?: true;
   readonly independentTaskId?: string;
   readonly project: string;
   readonly sessionId?: string;
@@ -115,6 +122,10 @@ export class PartnerWorkbenchManager {
   readonly #routines: () => Pick<PartnerRoutineManager, "list" | "history" | "nextRunAt"> | undefined;
   readonly #pullRequests: PartnerWorkbenchPullRequests;
   readonly #workbenches: PartnerWorkbenchStore;
+  readonly #remoteProjects: PartnerHomeProjects | undefined;
+  readonly #homeTransit: PartnerHomeWorkbench | undefined;
+  readonly #homeLocation: ((partnerId: string) => PartnerHomeLocation | undefined) | undefined;
+  readonly #homeChanging: (partnerId: string) => boolean;
   readonly #environment: PartnerWorkbenchProjectEnvironment;
   readonly #grants = new Map<string, PartnerWorkbenchState>();
   readonly #resolvedGrants = new Map<string, readonly { readonly project: string; readonly path: string; readonly addedAt: number }[]>();
@@ -131,6 +142,10 @@ export class PartnerWorkbenchManager {
     readonly workspaces: Pick<WorkspaceService, "register" | "unregister">;
     readonly briefs: Pick<PartnerWorkbenchBriefReader, "read">;
     readonly workbenches: PartnerWorkbenchStore;
+    readonly remoteProjects?: PartnerHomeProjects;
+    readonly homeTransit?: PartnerHomeWorkbench;
+    readonly homeLocation?: (partnerId: string) => PartnerHomeLocation | undefined;
+    readonly homeChanging?: (partnerId: string) => boolean;
     readonly managedDataDirectory: string;
     readonly homeDirectory?: string;
     readonly caseInsensitive?: boolean;
@@ -150,6 +165,8 @@ export class PartnerWorkbenchManager {
     this.#sessionTasks = options.sessionTasks ?? (() => undefined);
     this.#routines = options.routines ?? (() => undefined);
     this.#workbenches = options.workbenches;
+    this.#remoteProjects = options.remoteProjects; this.#homeTransit = options.homeTransit; this.#homeLocation = options.homeLocation;
+    this.#homeChanging = options.homeChanging ?? (() => false);
     this.#environment = {
       homeDirectory: options.homeDirectory ?? homedir(), managedDataDirectory: resolve(options.managedDataDirectory),
       caseInsensitive: options.caseInsensitive ?? (process.platform === "win32" || process.platform === "darwin")
@@ -159,7 +176,7 @@ export class PartnerWorkbenchManager {
   /** Install the sole durable grant before the Host can recover queued work. */
   async initialize(): Promise<void> {
     for (const partner of this.#partners.listPartners("active")) {
-      if (partner.initializationState !== "ready" || partner.canonicalSessionId === undefined) continue;
+      if (partner.initializationState !== "ready" || partner.canonicalSessionId === undefined || this.#homeChanging(partner.id)) continue;
       const owner = this.#owner(partner.id).stamp;
       await this.#installGrant(owner, await this.#workbenches.read(partner.id), false);
     }
@@ -193,9 +210,9 @@ export class PartnerWorkbenchManager {
 
   async addProject(owner: PartnerWorkbenchOwner, expectedRevision: bigint, rawPath: string): Promise<PartnerWorkbenchStateView & { readonly acceptedProject: string }> {
     this.#assertOwner(owner);
-    const path = await checkPartnerWorkbenchProject(rawPath, this.#environment);
+    const path = await this.#checkProject(owner, rawPath);
     const previous = await this.#workbenches.read(owner.partnerId);
-    const existing = await findPartnerWorkbenchProject(path, previous.projects.map((project) => project.path), this.#environment);
+    const existing = await this.#findProject(owner, path, previous.projects.map((project) => project.path));
     this.#assertOwner(owner);
     const state = await this.#workbenches.addProject(owner.partnerId, expectedRevision, existing ?? path);
     this.#assertOwner(owner);
@@ -207,7 +224,7 @@ export class PartnerWorkbenchManager {
   async removeProject(owner: PartnerWorkbenchOwner, expectedRevision: bigint, rawPath: string): Promise<PartnerWorkbenchStateView> {
     this.#assertOwner(owner);
     const previous = await this.#workbenches.read(owner.partnerId);
-    const path = await findPartnerWorkbenchProject(rawPath, previous.projects.map((project) => project.path), this.#environment);
+    const path = await this.#findProject(owner, rawPath, previous.projects.map((project) => project.path));
     this.#assertOwner(owner);
     if (path === undefined) throw new PartnerWorkbenchError("WORKBENCH_PROJECT_NOT_FOUND", "The project is no longer in this workbench.");
     const state = await this.#workbenches.removeProject(owner.partnerId, expectedRevision, path);
@@ -223,10 +240,13 @@ export class PartnerWorkbenchManager {
     const title = input.title.replace(/\s+/gu, " ").trim();
     const next = input.next?.replace(/\s+/gu, " ").trim() || null;
     if (title.length < 1 || title.length > 40 || (next?.length ?? 0) > 120 || input.verdict !== "done" && next === null) throw invalid("A bounded title and a next step for unfinished work are required.");
-    const ref = input.ref === undefined ? undefined : validatePartnerWorkbenchReference(input.ref, [project], this.#environment.caseInsensitive);
+    const ref = input.ref === undefined ? undefined : this.#remote(owner) && !/^https:/iu.test(input.ref)
+      ? (await this.#remoteProjects!.resolve(this.#remote(owner)!, project, input.ref, () => { this.#assertOwner(owner); })).actual
+      : validatePartnerWorkbenchReference(input.ref, [project], this.#environment.caseInsensitive);
     if (input.ref !== undefined && ref === undefined) throw invalid("A reference must be HTTPS without credentials or a path inside this project.");
     const view = await this.#view(owner, before);
     const source = this.#sources.get(owner.partnerId)?.get(input.taskId);
+    if (source?.carried) throw invalid("This judgment belongs to another computer. Grant a project here before starting new work.");
     const previous = before.judgments.find((item) => item.taskId === input.taskId);
     if (source === undefined && previous === undefined && !/^item:[A-Za-z0-9._:-]{1,240}$/u.test(input.taskId)) throw taskMissing();
     if (source !== undefined && source.project !== "" && source.project !== project || previous !== undefined && previous.project !== project) throw invalid("The task belongs to another granted project.");
@@ -263,6 +283,7 @@ export class PartnerWorkbenchManager {
     const task = [...view.tasks, ...view.candidates].find((item) => item.id === taskId);
     const source = this.#sources.get(owner.partnerId)?.get(taskId);
     if (task === undefined || source === undefined) throw taskMissing();
+    if (source.carried) return { task, transcript: [], truncated: false, artifacts: [] };
     if (source.project !== "") await this.#requireProject(owner, state, source.project);
     if (source.delegationId !== undefined) await this.#partners.getDelegation(source.delegationId, owner.partnerId);
     const preview = source.native !== undefined ? await this.#host.readNativeSessionPreview(source.native.backendId, source.native.entry)
@@ -274,6 +295,12 @@ export class PartnerWorkbenchManager {
   }
 
   async readProjectFile(owner: PartnerWorkbenchOwner, path: string): Promise<{ readonly path: string; readonly text: string; readonly truncated: boolean }> {
+    const remote = this.#remote(owner);
+    if (remote) {
+      const state = await this.#stateFor(owner), project = this.#remoteProjects!.projectFor(remote, path, state.projects.map(item => item.path));
+      if (!project) throw invalid("The reference is outside the current project scope.");
+      return this.#remoteProjects!.read(remote, project, path, () => this.#assertScope(owner, project));
+    }
     const reference = await this.resolveReference(owner, path);
     if (reference.kind !== "file" || ![".md", ".mdx", ".txt"].includes(extname(reference.value).toLowerCase())) throw invalid("Select a text document in a handed-over project.");
     const handle = await open(reference.value, "r");
@@ -296,6 +323,17 @@ export class PartnerWorkbenchManager {
 
   async resolveReference(owner: PartnerWorkbenchOwner, ref: string): Promise<{ readonly kind: "https" | "file"; readonly value: string; readonly workspaceId?: string; readonly relativePath?: string; readonly directory?: boolean }> {
     const state = await this.#stateFor(owner);
+    const remote = this.#remote(owner);
+    if (remote && !ref.startsWith("https://")) {
+      const project = this.#remoteProjects!.projectFor(remote, ref, state.projects.map(item => item.path));
+      if (!project) throw invalid("The reference is outside the current project scope.");
+      const actual = await this.#remoteProjects!.resolve(remote, project, ref, () => this.#assertScope(owner, project));
+      const workspaceId = `partner-workbench-read:${createHash("sha256").update(owner.targetId).update("\0").update(actual.project).digest("hex").slice(0, 32)}`;
+      await this.#workspaces.register({ id: workspaceId, root: actual.project, displayName: this.#remoteProjects!.paths(remote).basename(project), trusted: true,
+        remote: { targetId: remote.id, binding: { ...remote.remoteWorkspace!, workspaceRoot: actual.project } } });
+      this.#assertScope(owner, project); this.#referenceWorkspaces.set(workspaceId, { partnerId: owner.partnerId, project });
+      return { kind: "file", value: actual.actual, workspaceId, relativePath: actual.relativePath, directory: actual.directory };
+    }
     const validated = validatePartnerWorkbenchReference(ref, state.projects.map((project) => project.path), this.#environment.caseInsensitive);
     if (validated === undefined) throw invalid("The reference is outside the current project scope.");
     if (validated.startsWith("https://")) return { kind: "https", value: validated };
@@ -357,6 +395,7 @@ export class PartnerWorkbenchManager {
     const task = [...view.tasks, ...view.candidates].find((item) => item.id === taskId);
     const source = this.#sources.get(owner.partnerId)?.get(taskId);
     if (task === undefined || source === undefined || task.kind === "automation") throw taskMissing();
+    if (source.carried) throw invalid("This task belongs to another computer. Start new work in a project granted here.");
     if (source.project === "" && source.delegationId === undefined && source.independentTaskId === undefined) throw invalid("Hand over this task's project before continuing it.");
     if (source.project !== "") await this.#requireProject(owner, state, source.project);
     if (source.delegationId !== undefined) await this.#partners.getDelegation(source.delegationId, owner.partnerId);
@@ -431,7 +470,7 @@ export class PartnerWorkbenchManager {
       }
       await this.#assertScopeAfter(owner, source.project);
       const session = this.#store.getSession(sessionId!).descriptor;
-      if (session.archived || session.deletedAt !== undefined || session.remoteWorkspace !== undefined) throw taskMissing();
+      if (session.archived || session.deletedAt !== undefined || !this.#sameComputer(owner, this.#store.getTarget(session.targetId).descriptor)) throw taskMissing();
       const latest = this.#store.listRuns({ sessionId: session.id, limit: 1 })[0]?.descriptor;
       if (latest?.state === "dispatch_unknown") throw new PartnerWorkbenchError("WORKBENCH_DISPATCH_UNKNOWN", "The task's latest dispatch is unconfirmed. Inspect it before sending more work.");
       this.#assertScope(owner, source.project);
@@ -496,6 +535,19 @@ export class PartnerWorkbenchManager {
   }
 
   async #targetForProject(owner: PartnerWorkbenchOwner, directory: string, backendId: string, project: string): Promise<string> {
+    const remote = this.#remote(owner);
+    if (remote) {
+      const path = await this.#remoteProjects!.check(remote, directory, () => this.#assertScope(owner, project));
+      if (!this.#remoteProjects!.projectFor(remote, path, [project])) throw invalid("The task directory is outside this computer's project grant.");
+      const id = `partner-project:${createHash("sha256").update(JSON.stringify([owner.targetId, backendId, path])).digest("hex").slice(0, 32)}`;
+      const binding = { ...remote.remoteWorkspace!, workspaceRoot: path };
+      await this.#workspaces.register({ id, root: path, displayName: this.#remoteProjects!.paths(remote).basename(path), trusted: true, remote: { targetId: id, binding } });
+      this.#assertScope(owner, project);
+      await this.#host.registerTarget({ id, backendId, displayName: this.#remoteProjects!.paths(remote).basename(path), workspaceRoot: path, trusted: true, managed: false,
+        remoteWorkspace: binding }, { workspaceId: id, kind: "partner_workbench", partnerId: owner.partnerId,
+        homeTargetId: owner.targetId, homeCanonicalSessionId: owner.sessionId });
+      this.#assertScope(owner, project); return id;
+    }
     const path = await checkPartnerWorkbenchProject(directory, this.#environment);
     if (partnerWorkbenchProjectForDirectory(path, [project], this.#environment.caseInsensitive) === undefined) throw invalid("The native task's directory is outside this project.");
     const [actualPath, actualProject] = await Promise.all([realpath(path), realpath(project)]);
@@ -523,9 +575,9 @@ export class PartnerWorkbenchManager {
   }
 
   async #requireProject(owner: PartnerWorkbenchOwner, state: PartnerWorkbenchState, raw: string): Promise<string> {
-    const project = await findPartnerWorkbenchProject(raw, state.projects.map((item) => item.path), this.#environment);
+    const project = await this.#findProject(owner, raw, state.projects.map((item) => item.path));
     if (project === undefined) throw new PartnerWorkbenchError("WORKBENCH_PROJECT_NOT_FOUND", "The project grant was withdrawn. Reload this workbench.");
-    await checkPartnerWorkbenchProject(project, this.#environment);
+    await this.#checkProject(owner, project);
     this.#assertScope(owner, project);
     return project;
   }
@@ -533,6 +585,30 @@ export class PartnerWorkbenchManager {
   #assertScope(owner: PartnerWorkbenchOwner, project: string): void {
     this.#assertOwner(owner);
     if (project !== "" && !this.#grants.get(owner.partnerId)?.projects.some((item) => item.path === project)) throw new PartnerWorkbenchError("WORKBENCH_PROJECT_NOT_FOUND", "The project grant was withdrawn. Reload this workbench.");
+  }
+
+  #remote(owner: PartnerWorkbenchOwner): TargetDescriptor | undefined {
+    const target = this.#assertOwner(owner).target;
+    return target.remoteWorkspace?.kind === "device_peer" && this.#remoteProjects?.remote(target) ? target : undefined;
+  }
+  async #checkProject(owner: PartnerWorkbenchOwner, value: string): Promise<string> {
+    const remote = this.#remote(owner);
+    return remote ? this.#remoteProjects!.check(remote, value, () => { this.#assertOwner(owner); }) : checkPartnerWorkbenchProject(value, this.#environment);
+  }
+  async #findProject(owner: PartnerWorkbenchOwner, value: string, projects: readonly string[]): Promise<string | undefined> {
+    const remote = this.#remote(owner); if (!remote) return findPartnerWorkbenchProject(value, projects, this.#environment);
+    const normalized = this.#remoteProjects!.normalize(remote, value), paths = this.#remoteProjects!.paths(remote);
+    const key = (item: string) => paths === win32 ? item.toLowerCase() : item;
+    return projects.find(item => key(item) === key(normalized));
+  }
+  #projectFor(owner: PartnerWorkbenchOwner, value: string, projects: readonly string[]): string | undefined {
+    const remote = this.#remote(owner);
+    return remote ? this.#remoteProjects!.projectFor(remote, value, projects) : partnerWorkbenchProjectForDirectory(value, projects, this.#environment.caseInsensitive);
+  }
+  #sameComputer(owner: PartnerWorkbenchOwner, target: TargetDescriptor): boolean {
+    const remote = this.#remote(owner), binding = target.remoteWorkspace;
+    return remote ? binding?.kind === "device_peer" && remote.remoteWorkspace?.kind === "device_peer"
+      && binding.controllerDeviceId === remote.remoteWorkspace.controllerDeviceId && binding.targetDeviceId === remote.remoteWorkspace.targetDeviceId : binding === undefined;
   }
   async #assertScopeAfter(owner: PartnerWorkbenchOwner, project: string): Promise<void> {
     const current = await this.#workbenches.read(owner.partnerId);
@@ -560,7 +636,7 @@ export class PartnerWorkbenchManager {
     this.#host.extraDirectories.replaceWorkbenchGrant({ targetId: owner.targetId, revision: state.revision,
       directories: previousDirectories.map((entry) => ({ path: entry.path, addedAt: entry.addedAt })), current });
     const directories = await Promise.all(state.projects.map(async (project) => {
-      try { await checkPartnerWorkbenchProject(project.path, this.#environment); return { project: project.path, path: await realpath(project.path), addedAt: project.addedAt }; } catch { return undefined; }
+      try { const path = await this.#checkProject(owner, project.path); return { project: project.path, path: this.#remote(owner) ? path : await realpath(path), addedAt: project.addedAt }; } catch { return undefined; }
     }));
     this.#assertOwner(owner);
     if (this.#grants.get(owner.partnerId) !== state) return;
@@ -631,8 +707,10 @@ export class PartnerWorkbenchManager {
     const candidates: PartnerWorkbenchTask[] = [];
     const options = new Map<string, PartnerWorkbenchProjectOption>();
     const option = (path: string, key: "taskCount" | "nativeCount" | "automationCount", repository = false): void => {
-      if (!isAbsolute(path) || partnerWorkbenchProjectForDirectory(path, [this.#environment.managedDataDirectory], this.#environment.caseInsensitive) !== undefined) return;
-      const previous = options.get(path) ?? { path, name: basename(path) || path, taskCount: 0, nativeCount: 0, automationCount: 0, repository, granted: state.projects.some((item) => item.path === path) };
+      const remote = this.#remote(owner);
+      if (remote) { try { this.#remoteProjects!.normalize(remote, path); } catch { return; } }
+      else if (!isAbsolute(path) || partnerWorkbenchProjectForDirectory(path, [this.#environment.managedDataDirectory], this.#environment.caseInsensitive) !== undefined) return;
+      const previous = options.get(path) ?? { path, name: path.split(/[\\/]/u).filter(Boolean).at(-1) || path, taskCount: 0, nativeCount: 0, automationCount: 0, repository, granted: state.projects.some((item) => item.path === path) };
       options.set(path, { ...previous, [key]: previous[key] + 1, repository: previous.repository || repository });
     };
     let olderCount = 0;
@@ -643,12 +721,12 @@ export class PartnerWorkbenchManager {
       const background = ownBySession.get(session.id);
       const delegation = ownDelegations.get(session.id);
       const target = this.#store.getTarget(session.targetId).descriptor;
-      if (target.remoteWorkspace !== undefined || session.remoteWorkspace !== undefined || !target.trusted || session.archived || session.deletedAt !== undefined) continue;
+      if (!this.#sameComputer(owner, target) || !target.trusted || session.archived || session.deletedAt !== undefined) continue;
       const ownedTask = independent.get(session.id);
       if (background === undefined && delegation === undefined && ownedTask === undefined && (this.#partnerStore.getSessionLink(session.id) !== undefined || this.#store.sessionCreationServiceKind(session.id) !== undefined)) continue;
       const directory = session.worktree?.repositoryRoot ?? target.workspaceRoot;
       if (background === undefined && delegation === undefined) option(directory, "taskCount", session.worktree !== undefined);
-      const project = background?.project ?? partnerWorkbenchProjectForDirectory(directory, available, this.#environment.caseInsensitive) ?? (delegation === undefined && ownedTask === undefined ? undefined : "");
+      const project = background?.project ?? this.#projectFor(owner, directory, available) ?? (delegation === undefined && ownedTask === undefined ? undefined : "");
       if (project === undefined || project !== "" && !available.includes(project)) continue;
       if (session.updatedAt < since && background === undefined && delegation === undefined && ownedTask === undefined) { olderCount += 1; continue; }
       const id = `task:${session.id}`;
@@ -673,7 +751,7 @@ export class PartnerWorkbenchManager {
       sources.set(id, { project, sessionId: session.id, ...(delegation === undefined ? {} : { delegationId: delegation.id }), ...(ownedTask === undefined ? {} : { independentTaskId: ownedTask.id }) });
     }
     const unavailableSources: string[] = [];
-    const backends = this.#store.listBackends().filter((item) => item.descriptor.capabilities.get("session.preview")?.supported === true);
+    const backends = this.#remote(owner) ? [] : this.#store.listBackends().filter((item) => item.descriptor.capabilities.get("session.preview")?.supported === true);
     const scans = await Promise.all(backends.map(async (backend) => {
       try { return { backend: backend.descriptor, scan: await this.#host.scanNativeSessionPreviews(backend.descriptor.id, available) }; }
       catch { return { backend: backend.descriptor, scan: undefined }; }
@@ -699,9 +777,9 @@ export class PartnerWorkbenchManager {
     for (const schedule of this.#store.listSchedules()) {
       if (isPartnerRoutineSchedule(schedule)) continue;
       const target = this.#store.getTarget(schedule.targetId).descriptor;
-      if (target.remoteWorkspace !== undefined || !target.trusted) continue;
+      if (!this.#sameComputer(owner, target) || !target.trusted) continue;
       option(target.workspaceRoot, "automationCount");
-      const project = partnerWorkbenchProjectForDirectory(target.workspaceRoot, available, this.#environment.caseInsensitive)
+      const project = this.#projectFor(owner, target.workspaceRoot, available)
         ?? (schedule.sessionId === owner.sessionId || schedule.targetId === owner.targetId ? "" : undefined);
       if (project === undefined) continue;
       const occurrences = this.#store.listScheduleRuns(schedule.id, 20);
@@ -763,19 +841,21 @@ export class PartnerWorkbenchManager {
       } catch { this.#assertOwner(owner); unavailableSources.push(task.sourceLabel); }
     }));
     const briefs = await Promise.all(available.slice(0, 8).map(async (project) => {
-      try { return await this.#briefs.read(project, () => this.#assertScope(owner, project)); }
+      try { const remote = this.#remote(owner); return remote ? await this.#remoteProjects!.brief(remote, project, () => this.#assertScope(owner, project)) : await this.#briefs.read(project, () => this.#assertScope(owner, project)); }
       catch { this.#assertOwner(owner); unavailableSources.push(basename(project)); return undefined; }
     }));
     await this.#assertScopeAfter(owner, "");
     if (this.#grants.get(owner.partnerId)?.revision !== state.revision) throw new PartnerWorkbenchError("WORKBENCH_OWNER_CHANGED", "The workbench changed while loading. Reload its current state.");
     this.#sources.set(owner.partnerId, sources);
     for (const target of this.#store.listTargets().slice(0, 500)) {
-      if (!target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined || target.descriptor.managed
+      if (!target.descriptor.trusted || !this.#sameComputer(owner, target.descriptor) || target.descriptor.managed
         || typeof target.metadata === "object" && target.metadata !== null && "deletedAt" in target.metadata) continue;
       const path = target.descriptor.workspaceRoot;
-      if (!isAbsolute(path) || partnerWorkbenchProjectForDirectory(path, [this.#environment.managedDataDirectory], this.#environment.caseInsensitive) !== undefined) continue;
+      const remote = this.#remote(owner);
+      if (remote) { try { this.#remoteProjects!.normalize(remote, path); } catch { continue; } }
+      else if (!isAbsolute(path) || partnerWorkbenchProjectForDirectory(path, [this.#environment.managedDataDirectory], this.#environment.caseInsensitive) !== undefined) continue;
       let repository = false;
-      try { const git = await lstat(resolve(path, ".git")); repository = git.isDirectory() || git.isFile(); } catch { /* A configured project need not contain Git. */ }
+      if (!remote) try { const git = await lstat(resolve(path, ".git")); repository = git.isDirectory() || git.isFile(); } catch { /* A configured project need not contain Git. */ }
       const previous = options.get(path);
       options.set(path, { ...(previous ?? { path, name: basename(path), taskCount: 0, nativeCount: 0, automationCount: 0, granted: state.projects.some((item) => item.path === path) }), repository: previous?.repository === true || repository });
     }
@@ -828,19 +908,35 @@ export class PartnerWorkbenchManager {
   async #view(owner: PartnerWorkbenchOwner, state: PartnerWorkbenchState): Promise<PartnerWorkbenchStateView> {
     const projects = await Promise.all(state.projects.map(async (project): Promise<PartnerWorkbenchProjectView> => ({
       ...project, name: basename(project.path) || project.path,
-      exists: await checkPartnerWorkbenchProject(project.path, this.#environment).then(() => true).catch(() => false)
+      exists: await this.#checkProject(owner, project.path).then(() => true).catch(() => false)
     })));
     this.#assertOwner(owner);
-    return { owner, state, projects, ...await this.#collect(owner, state, projects) };
+    const collected = await this.#collect(owner, state, projects);
+    const location = this.#homeLocation?.(owner.partnerId), foreign = location ? this.#homeTransit?.foreign(owner.partnerId, location.deviceId) ?? [] : [];
+    const sources = new Map(this.#sources.get(owner.partnerId));
+    const carried = foreign.flatMap(computer => computer.judgments.map(judgment => {
+      const id = `carried:${createHash("sha256").update(JSON.stringify([computer.deviceId, judgment.taskId])).digest("hex").slice(0, 40)}`;
+      sources.set(id, { carried: true, project: judgment.project, item: judgment });
+      return { id, kind: "item" as const, project: judgment.project, title: judgment.title,
+        state: judgment.verdict === "done" ? "done" as const : "stopped" as const, group: judgment.verdict === "done" ? "done" as const : "todo" as const,
+        updatedAt: judgment.updatedAt, sourceLabel: computer.deviceName, readOnly: true, ownedBackground: false, unread: false,
+        judgment, digest: { purpose: judgment.next, recent: [] } };
+    }));
+    this.#sources.set(owner.partnerId, sources);
+    return { owner, state, projects: [...projects, ...foreign.flatMap(computer => computer.projects.map(project => ({ ...project,
+      name: project.path.split(/[\\/]/u).filter(Boolean).at(-1) ?? project.path, exists: false, readOnly: true,
+      sourceComputerId: computer.deviceId, sourceComputerName: computer.deviceName })))], ...collected, tasks: [...collected.tasks, ...carried] };
   }
 
   #owner(partnerId: string): OwnedPartnerWorkbench {
     const profile = this.#partners.getPartner(partnerId);
+    if (this.#homeChanging(partnerId)) throw unavailable();
     if (profile.canonicalSessionId === undefined) throw unavailable();
     this.#partners.canonicalCaller(profile.canonicalSessionId);
     const session = this.#store.getSession(profile.canonicalSessionId).descriptor;
     const target = this.#store.getTarget(profile.homeTargetId).descriptor;
-    if (session.targetId !== target.id || !target.trusted || target.remoteWorkspace !== undefined || session.remoteWorkspace !== undefined) throw unavailable();
+    if (session.targetId !== target.id || !target.trusted || target.remoteWorkspace?.kind === "ssh" || session.remoteWorkspace?.kind === "ssh"
+      || target.remoteWorkspace !== undefined && !this.#remoteProjects?.remote(target)) throw unavailable();
     return { profile, session, target, stamp: {
       partnerId: profile.id, profileVersion: profile.profileVersion, sessionId: session.id,
       sessionGeneration: session.binding.generation, targetId: target.id

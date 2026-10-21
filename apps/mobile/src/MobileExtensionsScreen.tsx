@@ -29,6 +29,7 @@ import {
 import { mobileExtensionUseReady } from "./mobile-extension-use-handoff";
 import { mobileExtensionLibraryReady, mobileExtensionLibrarySupported } from "./mobile-extension-library";
 import { MobileExtensionLibrary } from "./MobileExtensionLibrary";
+import { MobileExtensionTaskPreferences } from "./MobileExtensionTaskPreferences";
 import { MobileExtensionMainView } from "./MobileExtensionMainView";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 
@@ -623,6 +624,7 @@ export function MobileExtensionsScreen({
             </>}
 
             <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "extension.controls")}</Text>
+            {transport && extension.installed && <MobileExtensionTaskPreferences key={`${transport.ownerKey}:${extension.extensionId}`} extension={extension} transport={transport} colors={colors} locale={locale} disabled={selectedBusy || pending.length > 0} />}
             <View style={[styles.card, { backgroundColor: colors.surface, borderColor: colors.border }]}>
               <View style={styles.controlRow}>
                 <View style={styles.grow}>

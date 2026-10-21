@@ -114,7 +114,7 @@ export function createPersonalDevelopmentConnectService(options: {
     }),
     startPersonalDevelopmentTask: (request, context) => rpc(async () => {
       options.authenticateLocal(context); const coordinator = requireCoordinator();
-      if (request.permissionMode !== "ask" && request.permissionMode !== "auto" && request.permissionMode !== "bypassPermissions") throw invalid();
+      if (request.permissionMode !== "ask" && request.permissionMode !== "acceptEdits" && request.permissionMode !== "auto" && request.permissionMode !== "bypassPermissions") throw invalid();
       const intent = await coordinator.startTask({ operationId: request.operationId, request: request.request, title: request.title,
         targetId: request.targetId, fastMode: request.fastMode, permissionMode: request.permissionMode, planMode: request.planMode,
         ...(request.originSessionId ? { originSessionId: request.originSessionId } : {}), ...(request.providerId ? { providerId: request.providerId } : {}),

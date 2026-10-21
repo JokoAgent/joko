@@ -13,6 +13,25 @@ afterEach(() => {
 });
 
 describe("mobile push durable boundary", () => {
+  it("suppresses hidden task notifications and retires an already-claimed retry before reveal", () => {
+    const { store } = createFixture();
+    const connection = store.createConnection({ id: "hidden-mobile", name: "Phone", authKeyDigest: "hidden-mobile-digest",
+      device: { defaultName: "Phone", kind: "mobile", platform: "iOS", appVersion: "1" }, pairedAt: 10 });
+    const device = store.getDevice(connection.deviceId);
+    store.putMobilePushRegistration({ id: "hidden-registration", connectionId: connection.id, deviceId: device.id, expectedDeviceRevision: device.revision,
+      environment: "apns_sandbox", locale: "en", tokenDigest: digest("a"), sealedToken: sealedCredential(1, "encrypted-token"),
+      revocationSecretDigest: digest("b"), sealedRevocationSecret: sealedCredential(2, "encrypted-secret"), expiresAt: 50_000, now: 1000 });
+    store.updateSession("session-1", { hidden: true });
+    const done = (id: string, at: number) => store.appendEvent({ id, backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: 0,
+      emittedAt: at, traceId: `push:${id}`, payload: { type: "done", outcome: "completed" } });
+    done("hidden-done", 1100); expect(store.listMobilePushDeliveries()).toHaveLength(0);
+    store.updateSession("session-1", { hidden: false }); done("visible-done", 1200);
+    const claimed = store.claimNextMobilePushDelivery(1300)!; expect(claimed).toBeDefined();
+    store.updateSession("session-1", { hidden: true });
+    expect(store.finishMobilePushDelivery({ deliveryId: claimed.delivery.id, claimToken: claimed.delivery.claimToken!, outcome: "retry", outcomeCode: "apns_503", retryAt: 2000, now: 1400 }))
+      .toMatchObject({ status: "failed", outcomeCode: "TASK_HIDDEN" });
+    store.updateSession("session-1", { hidden: false }); expect(store.claimNextMobilePushDelivery(2000)).toBeUndefined();
+  });
   it("fences iOS registration, queues each attention subject once, and retires exact authority", () => {
     const { store, filePath } = createFixture();
     const connection = store.createConnection({

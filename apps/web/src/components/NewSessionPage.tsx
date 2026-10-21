@@ -1,4 +1,5 @@
 import type { JSONContent } from "@tiptap/core";
+import { builtinSkillIntentForText } from "../builtin-skill-intent.js";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent, JSX } from "react";
 import {
@@ -254,6 +255,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
   const [attachments, setAttachments] = useState<readonly AttachmentDraft[]>([]);
   const [browserComments, setBrowserComments] = useState<readonly BrowserCommentDraftItem[]>([]);
   const [extraDirectoryIds, setExtraDirectoryIds] = useState<readonly string[]>([]);
+  const builtinSkillIntentRef = useRef<"plugin_creator" | undefined>(undefined);
   const [attachmentError, setAttachmentError] = useState<string>();
   const [draftError, setDraftError] = useState<string>();
   const [dragging, setDragging] = useState(false);
@@ -358,6 +360,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
 
   const selectionKey = selection === undefined ? "" : newSessionSelectionValue(selection);
   const profileScope = `${controller.state.activeProfile?.serverId ?? ""}\u0000${controller.state.activeProfile?.id ?? ""}`;
+  useLayoutEffect(() => { builtinSkillIntentRef.current = undefined; }, [profileScope]);
   useLayoutEffect(() => {
     remoteProjectConnectionEpochRef.current += 1;
     remoteProjectCreateEpochRef.current += 1;
@@ -1099,6 +1102,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
       if (cancelled) return;
 
       restoredExecutionRef.current = restored;
+      builtinSkillIntentRef.current = restored?.builtinSkillIntent;
       setSelection(restoredSelection);
       editorDocumentRef.current = restoredDocument;
       setEditorDocument(restoredDocument);
@@ -1366,6 +1370,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
         ? { kind: "attach", reference: nativeReference }
         : { kind: "fresh" },
       providerId: modelSelection?.providerId ?? "",
+      builtinSkillIntent: builtinSkillIntentForText(text, builtinSkillIntentRef.current),
       modelId: modelSelection?.modelId ?? "",
       ...((selectedModel === undefined ? effort.length > 0 : execution.effortSupported && selectedModel.efforts.includes(effort)) ? { effort } : {}),
       fastMode: selectedModel === undefined ? fastMode : execution.fastModeSupported && selectedModel.supportsFast && fastMode,
@@ -2008,6 +2013,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     const sourceDraft = editorDocumentRef.current;
     const sourceInput: ComposerDraft = {
       text: sourceText,
+      builtinSkillIntent: builtinSkillIntentForText(sourceText, builtinSkillIntentRef.current),
       editorDocument: sourceEditorDocument,
       attachments: sourceAttachments,
       browserComments: sourceBrowserComments,

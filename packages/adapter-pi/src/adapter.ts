@@ -5,6 +5,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix as posixPath, relative, resolve, sep, win32 as win32Path } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
   CAPABILITIES,
   SESSION_REWIND_SERVICE_NODE_ONLY_OPTION,
@@ -42,6 +44,7 @@ import {
   type NativeHistoryProjection,
   type ImportPortableNativeSessionInput,
   type NativeSessionState,
+  type NativeTextInferenceInput,
   type KnownCapability,
   type PermissionMode,
   type PiEventMetadata,
@@ -312,6 +315,10 @@ export interface PiRemoteNavigationOwner {
 }
 
 export interface PiAdapterOptions {
+  readonly validateRemoteHomeDirectories?: (context: AdapterContext, directories: readonly ApprovedDirectory[]) => Promise<readonly { readonly path: string; readonly access: "read_only" | "read_write" }[] | undefined>;
+  /** Service adapter may replace a remote home's process-private Provider configuration with an authority transport. */
+  readonly prepareRemoteHomeRuntime?: (input: { readonly context: AdapterContext; readonly agentHome: string;
+    readonly environment: Readonly<NodeJS.ProcessEnv> }) => Promise<{ readonly environment: Readonly<Record<string, string>>; readonly discardNativeAuth: true } | undefined>;
   readonly agentHome: string;
   /** Service-owned parent containing every immutable Agent Home generation. */
   readonly managedGenerationsRoot?: string;
@@ -774,6 +781,7 @@ export class PiBackendAdapter implements
   #compatibilityProbe: Promise<PiCompatibilityOutcome> | undefined;
   #reconfiguration: Promise<void> | undefined;
   #disposed = false;
+  readonly #nativeTextFlights = new Set<AbortController>();
 
   constructor(options: PiAdapterOptions) {
     this.#agentHome = resolve(options.agentHome);
@@ -2278,7 +2286,10 @@ export class PiBackendAdapter implements
         if (directories.length > 0) throw piError("PI_REVIEW_POLICY_IMMUTABLE", "Reviewer runtime cannot add filesystem roots", "dispatch");
         return;
       }
-      const approvedRoots = await validateApprovedDirectories(directories, context.target.workspaceRoot);
+      const approvedRoots = context.target.remoteWorkspace === undefined
+        ? await validateApprovedDirectories(directories, context.target.workspaceRoot)
+        : await this.#options.validateRemoteHomeDirectories?.(context, directories) ?? [];
+      if (context.target.remoteWorkspace !== undefined && directories.length > 0 && approvedRoots.length !== directories.length) throw piError("PI_REMOTE_DIRECTORY_UNAVAILABLE", "The execution computer cannot confirm these directory grants", "dispatch");
       const nextControl = {
         ...currentControl,
         policyGeneration: currentControl.policyGeneration + 1,
@@ -3132,6 +3143,7 @@ export class PiBackendAdapter implements
       sessionId: context.sessionId,
       generation: context.generation + 1,
       target: context.target,
+      ...(context.modelSelection === undefined ? {} : { modelSelection: { ...context.modelSelection } }),
       ...(context.appendSystemPrompt === undefined ? {} : { appendSystemPrompt: context.appendSystemPrompt }),
       ...(context.runtimePolicy === undefined ? {} : { runtimePolicy: context.runtimePolicy }),
       ...(context.extraDirectories === undefined ? {} : { extraDirectories: context.extraDirectories }),
@@ -3548,6 +3560,7 @@ export class PiBackendAdapter implements
 
   async revokeProviderAuthentication(providerId: string): Promise<void> {
     assertProviderId(providerId);
+    for (const flight of this.#nativeTextFlights) flight.abort();
     // Install the startup fence before the first await. A start which already
     // captured the old snapshot is awaited and included in the rescan below.
     this.#providerAuthenticationRouteTokens.set(providerId, Symbol("provider-authentication-route"));
@@ -3649,7 +3662,38 @@ export class PiBackendAdapter implements
     }
   }
 
+  async inferNativeText(input: NativeTextInferenceInput): Promise<string> {
+    this.#assertNotDisposed();
+    const selected = this.#managedGeneration, options = selected.options, providerId = input.providerId, modelId = input.modelId;
+    if (!providerId || !modelId || !options.nativeAuthProviderIds?.includes(providerId) || !options.loadNativeAuth || !options.nativeModels?.some(value => value.providerId === providerId && value.modelId === modelId)
+      || !Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1000 || input.timeoutMs > 90_000 || input.system.length > 80_000 || input.user.length > 300_000) throw new Error("The selected native text route is unavailable.");
+    const owner = new AbortController(); this.#nativeTextFlights.add(owner);
+    const signal = AbortSignal.any([owner.signal, input.signal, AbortSignal.timeout(input.timeoutMs)]);
+    const current = () => { signal.throwIfAborted(); this.#assertNotDisposed(); input.assertCurrent(); input.assertModelAllowed(providerId, modelId);
+      if (selected !== this.#managedGeneration || selected.retired || this.#revokedProviderRoutes.has(providerId)) throw new Error("The native text route was retired.");
+      this.#assertProviderAuthenticationNotRevoked(options, providerId); };
+    try {
+      current(); const loaded = options.loadNativeAuth({ providerIds: [providerId], expectedCatalogGeneration: options.catalogGeneration! }); current();
+      if (loaded.catalogGeneration !== options.catalogGeneration) throw new Error("Native text credential generation changed.");
+      const credentials = normalizeNativeAuthMap(loaded.credentials, [providerId]);
+      if (!credentials[providerId]) throw new Error("Native text account is unavailable.");
+      const auth = new InMemoryCredentialStore(); await auth.modify(providerId, async () => credentials[providerId]); current();
+      const runtime = await ModelRuntime.create({ credentials: auth, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false, signal }); current();
+      const model = runtime.getModel(providerId, modelId); if (!model) throw new Error("The exact native text model is unavailable.");
+      const answer = await runtime.complete(model, { systemPrompt: input.system, messages: [{ role: "user", content: [{ type: "text", text: input.user }], timestamp: Date.now() }] }, { signal, maxTokens: 512, cacheRetention: "none" }); current();
+      const refreshed = await auth.read(providerId); current();
+      if (refreshed && JSON.stringify(refreshed) !== JSON.stringify(credentials[providerId])) {
+        if (!options.persistNativeAuth) throw new Error("Native text credential refresh cannot be persisted.");
+        await options.persistNativeAuth({ providerId, credential: refreshed, expectedCatalogGeneration: options.catalogGeneration! }); current();
+      }
+      const result = answer.content.filter(value => value.type === "text").map(value => value.text).join("").trim();
+      if (answer.stopReason === "error" || answer.stopReason === "aborted" || !result || result.length > 24_000) throw new Error("Native text inference produced no bounded answer.");
+      return result;
+    } finally { owner.abort(); this.#nativeTextFlights.delete(owner); }
+  }
+
   async dispose(): Promise<void> {
+    for (const flight of this.#nativeTextFlights) flight.abort();
     if (this.#disposed && this.#runtimes.size === 0 && this.#runtimeStarts.size === 0 && this.#subagentObservers.size === 0) return;
     this.#disposed = true;
     const observerResults = await Promise.allSettled([...this.#subagentObservers.values()].map(async (observer) => {
@@ -4700,7 +4744,7 @@ export class PiBackendAdapter implements
       fastMode: profile.initialFastMode,
       approvedRoots: context.target.remoteWorkspace === undefined
         ? await validateApprovedDirectories(context.extraDirectories ?? [], context.target.workspaceRoot)
-        : [],
+        : await options.validateRemoteHomeDirectories?.(context, context.extraDirectories ?? []) ?? [],
       runtimePolicy: profile.runtimePolicy,
       writtenAt: new Date().toISOString()
     };
@@ -4941,11 +4985,14 @@ export class PiBackendAdapter implements
       // fence an unresolved native default before it can receive the snapshot.
       this.#assertProviderAuthenticationNotRevoked(options, profile.providerId);
       await nativeSkills?.assertFilesCurrent(context.signal);
+      const remoteHome = context.target.remoteWorkspace === undefined ? undefined : await options.prepareRemoteHomeRuntime?.({ context,
+        agentHome: preparedAgentHome.path, environment: env });
+      if (remoteHome?.discardNativeAuth) preparedAgentHome = { path: preparedAgentHome.path, redactValues: [] };
       const process = await this.#processFactory({
         command: this.#command,
         args,
         cwd: runtimeWorkspaceRoot(context.target),
-        env,
+        env: remoteHome?.environment ?? env,
         ...(context.target.remoteWorkspace === undefined
           ? {}
           : { remoteWorkspace: context.target.remoteWorkspace })
@@ -5456,14 +5503,24 @@ export class PiBackendAdapter implements
     runtime: PiRuntime,
     request: PolicyDecisionRequest
   ): Promise<PolicyDecisionResult> {
-    return this.#runExclusiveSessionMutation(runtime, runtime.context, async () => {
+    const context = runtime.context;
       const control = await readControl(runtime.controlPath, runtime.transport.generation);
-      runtime.control = control;
       if (control.policyGeneration !== request.policyGeneration) return "stale";
-      const snapshot = runtime.context.policySnapshot;
-      if (snapshot === undefined) return "default";
-      return evaluateOrderedPolicyRules(snapshot, request.observation)?.action ?? "default";
-    });
+      const snapshot = context.policySnapshot;
+      const policy = snapshot === undefined ? "default" : evaluateOrderedPolicyRules(snapshot, request.observation)?.action ?? "default";
+      if (policy === "deny") return policy;
+      if (request.toolCall && context.nativeToolAuthorization) {
+        const authorization = context.nativeToolAuthorization;
+        const decision = await authorization.review({ ...request.toolCall, signal: context.signal });
+        authorization.assertCurrent(decision.authorizationRevision);
+        const current = await readControl(runtime.controlPath, runtime.transport.generation);
+        if (current.policyGeneration !== request.policyGeneration || runtime.context !== context) return "stale";
+        authorization.assertCurrent(decision.authorizationRevision);
+        if (decision.verdict === "block") return "deny";
+        if (decision.verdict === "ask") return "ask";
+        if (decision.verdict === "allow" && policy !== "ask") return "delegated_allow";
+      }
+      return policy;
   }
 
   async #confirmNativeSessionSwitch(
@@ -6500,7 +6557,8 @@ export class PiBackendAdapter implements
           path: command.sourceInfo?.path,
           ...(command.sourceInfo?.path === undefined
             ? {}
-            : managedResourceForRuntimePath(runtime.resources, command.sourceInfo.path)),
+            : { ...managedResourceForRuntimePath(runtime.resources, command.sourceInfo.path),
+                ...builtinSkillForRuntimePath(runtime.resources, command.sourceInfo.path) }),
           loaded: true
         })),
       managedInternalNames
@@ -8076,6 +8134,12 @@ function managedResourceForRuntimePath(
   const matches = resources.filter((resource) => resource.runtimePath !== undefined
     && isAbsolute(resource.runtimePath) && samePathOrContained(resource.runtimePath, path));
   return matches.length === 1 ? { resourceId: matches[0]!.id } : {};
+}
+
+function builtinSkillForRuntimePath(resources: readonly RuntimeResource[], path: string): Pick<RuntimeCommand, "builtinSkill"> {
+  const { resourceId } = managedResourceForRuntimePath(resources, path);
+  const owner = resources.find(resource => resource.id === resourceId && resource.kind === "skill");
+  return owner?.trustedBuiltin ? { builtinSkill: owner.trustedBuiltin } : {};
 }
 
 async function emitExactRuntimeToolUsage(

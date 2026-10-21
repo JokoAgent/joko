@@ -1,4 +1,5 @@
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
+import { pluginCreatorDraft } from "../builtin-skill-intent.js";
 import { registerWorkspaceHtmlPreviewSurface } from "../workspace-html-auto-reload.js";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, JSX, KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode, WheelEvent as ReactWheelEvent } from "react";
@@ -63,6 +64,7 @@ import { extensionMainViewReady } from "./ExtensionMainViewPage.js";
 import { ExtensionLibrarySection } from "./ExtensionLibrarySection.js";
 import { ExtensionNetworkSection } from "./ExtensionNetworkSection.js";
 import { ExtensionOAuthSection } from "./ExtensionOAuthSection.js";
+import { ExtensionTasksSection } from "./ExtensionTasksSection.js";
 import { openExtensionWindowFallback } from "../extension-window-navigation.js";
 import { SkillTools } from "./SkillTools.js";
 import { useExtensionSuggestionContinuation, type ExtensionSuggestionContinuationState } from "./use-extension-suggestion-continuation.js";
@@ -931,6 +933,19 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
   const [packageExport, setPackageExport] = useState<ExtensionCatalogEntryView>();
   const [packageRemoval, setPackageRemoval] = useState<ExtensionCatalogEntryView>();
   const [packageBatchOpen, setPackageBatchOpen] = useState(false);
+  const creatorControllerRef = useRef(controller); creatorControllerRef.current = controller;
+  const launchCreator = (trigger: HTMLButtonElement) => runAction("plugin-creator", async () => {
+    const source = controller;
+    const key = (value: AppController) => JSON.stringify([value.state.activeProfile?.id, value.state.activeProfile?.serverId,
+      value.state.activeProfile?.origin, value.state.connectionGeneration, value.state.connectionState]);
+    const owner = key(source);
+    const current = () => trigger.isConnected && trigger.ownerDocument.defaultView !== null && key(creatorControllerRef.current) === owner;
+    const original = await source.readNewSessionDraft();
+    if (!current()) throw new Error(t("composer.inputUnavailable"));
+    await source.saveNewSessionDraft(pluginCreatorDraft(original));
+    if (!current()) throw new Error(t("composer.inputUnavailable"));
+    source.navigate({ kind: "newSession" });
+  });
   const listRequest = useRef(0);
   const detailRequest = useRef(0);
   const detailRetryAbort = useRef<AbortController | undefined>(undefined);
@@ -1176,7 +1191,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
     <section className="extension-browser__catalog" aria-label={t("extensions.catalog") }>
       <div className="extension-browser__controls">
         <label className="extension-search"><Search aria-hidden="true" /><span className="sr-only">{t("extensions.search")}</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("extensions.searchPlaceholder")} /></label>
-        <div className="extension-catalog-actions"><div className="extension-facets" role="tablist" aria-label={t("extensions.filter") }>
+        <div className="extension-catalog-actions"><Button tone="ghost" disabled={controller.state.connectionState !== "connected"} onClick={event => launchCreator(event.currentTarget)}><Sparkles aria-hidden="true" />{t("extensions.createPlugin")}</Button><div className="extension-facets" role="tablist" aria-label={t("extensions.filter") }>
           {(["installed", "catalog", "local", "market"] as const).map((value) => <button type="button" role="tab" aria-selected={facet === value} tabIndex={facet === value ? 0 : -1} className={facet === value ? "is-active" : ""} key={value} onKeyDown={(event) => moveTablistSelection(event, "horizontal")} onClick={() => setFacet(value)}>{t(`extensions.facet.${value}`)}</button>)}
         </div>{hasPackageUpdates && <Button tone="ghost" onClick={() => setPackageBatchOpen(true)}><PackageCheck aria-hidden="true" />{t("extensions.package.updateAll")}</Button>}<Button tone="ghost" onClick={() => setSourcesOpen(true)}><FolderPlus aria-hidden="true" />{t("extensions.sources.manage")}</Button>
         </div>
@@ -1424,6 +1439,8 @@ function ExtensionDetail({ controller, extension, locale, busy, t, onEnabledChan
     {extension.library !== undefined && <ExtensionLibrarySection controller={controller} extension={extension} locale={locale} disabled={busy} t={t} />}
     {extension.owner.kind === "resource" && extension.installed && <ExtensionNetworkSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}
     {extension.owner.kind === "resource" && extension.installed && <ExtensionOAuthSection controller={controller} extension={extension} disabled={busy} t={t} onChanged={onNetworkChanged} />}
+    {extension.owner.kind === "resource" && extension.installed && <ExtensionTasksSection key={JSON.stringify([extension.id, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId,
+      controller.state.connectionGeneration, controller.state.connectionState])} controller={controller} extension={extension} disabled={busy} t={t} />}
     {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div><Button tone="primary" disabled={busy} onClick={onPackage}><Download aria-hidden="true" />{t("extensions.package.install")}</Button></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
       <label><span><strong>{t("extensions.enabled")}</strong><small>{t("extensions.enabledBody")}</small></span><CheckboxControl checked={extension.enabled} disabled={busy} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
       {extension.sidebarSupported && <label><span><strong>{t("extensions.showSidebar")}</strong><small>{t("extensions.showSidebarBody")}</small></span><CheckboxControl checked={extension.sidebarVisible} disabled={busy} onChange={(event) => onSidebarChange(event.target.checked)} /></label>}

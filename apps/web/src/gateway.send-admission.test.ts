@@ -18,12 +18,12 @@ import {
 } from "@joko/contracts";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
-import type { AppSnapshot, ComposerDraft, ConnectionProfile } from "./model.js";
+import type { AppSnapshot, ComposerDraft, ConnectionProfile, RuntimeCommandView, SessionResourceView } from "./model.js";
 
 describe("input preparation and admission", () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it("keeps the source generation through delayed attachment reads, snapshot changes, and response retry", async () => {
+  it.each([false, true])("keeps the source generation through delayed preparation, snapshot changes, and response retry (built-in Skill: %s)", async (builtinSkill) => {
     let generation = 4n;
     let snapshot: AppSnapshot | undefined;
     const submissions: SubmitOperationRequest[] = [];
@@ -63,14 +63,34 @@ describe("input preparation and admission", () => {
     const gateway = createOrchestratorGateway({ id: "connection", deviceId: "device", serverId: "server", name: "Browser",
       origin: "https://orchestrator.example" }, "secret", { onSnapshot: value => { snapshot = value; } }, () => transport);
     await gateway.connect();
+    let releaseCommands = () => {};
+    if (builtinSkill) {
+      const revision = "sha256:" + "a".repeat(64);
+      const command: RuntimeCommandView = { id: "creator-command", name: "creator", sessionId: "task", loaded: true, source: "skill",
+        inputMode: "text", resourceId: "creator-resource", builtinSkill: { id: "plugin_creator", revision }, description: "Creator" };
+      const resource: SessionResourceView = { sessionId: "task", id: "creator-resource", name: "Creator", kind: "skill",
+        discoveredRevision: revision, resourceVersion: "1", runtimeGeneration: 4 };
+      vi.spyOn(gateway, "listCommands").mockImplementation(async () => {
+        await new Promise<void>(resolve => { releaseCommands = resolve; }); return [command];
+      });
+      vi.spyOn(gateway, "listSessionResources").mockResolvedValue([resource]);
+    }
     const file = new File(["note"], "note.txt", { type: "text/plain" });
     let release!: (bytes: ArrayBuffer) => void;
     const read = vi.spyOn(file, "arrayBuffer").mockImplementation(() => new Promise(resolve => { release = resolve; }));
-    const draft: ComposerDraft = { text: "Review", attachments: [{ id: "local", kind: "file", file }], mentions: [], deliveryMode: "prompt" };
+    const draft: ComposerDraft = { text: builtinSkill ? "/joko-plugin-creator Review" : "Review",
+      ...(builtinSkill ? { builtinSkillIntent: "plugin_creator" as const } : {}),
+      attachments: [{ id: "local", kind: "file", file }], mentions: [], deliveryMode: "prompt" };
     await expect(gateway.send("task", draft, { expectedGeneration: 0n })).rejects.toThrow("source task generation");
     expect(read).not.toHaveBeenCalled();
     const admission = { expectedGeneration: generation };
     const pending = gateway.send("task", draft, admission);
+    if (builtinSkill) {
+      expect(read).not.toHaveBeenCalled();
+      generation = 5n; admission.expectedGeneration = generation;
+      releaseCommands();
+      await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+    }
     expect(read).toHaveBeenCalledOnce();
     expect(submissions).toEqual([]);
     generation = 5n;

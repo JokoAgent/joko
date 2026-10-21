@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { isWorktreeServiceError, WorktreeServiceError } from "./errors.js";
 import { runGit } from "./git.js";
+import { cleanCapturedIgnoredIncludes, copyWorktreeIncludeFiles, readWorktreeIncludeMatcher } from "./include-files.js";
 import { cancelWorktreeSourceUses, withWorktreeSourceLock } from "./source-use.js";
 import { deferRecycle, newRecyclePolicy, recycleFailureReason } from "./recycle-policy.js";
 import {
@@ -408,7 +409,7 @@ export class EphemeralWorktreeService {
         refreshed: false,
         strategy: "explicit",
         reason: "derived_session_snapshot"
-      }, control);
+      }, control, false);
       if (snapshotSha !== undefined) {
         await runGit(["stash", "apply", "--index", snapshotSha], created.path, control);
         if (!(await this.#snapshotMatchesWorktree(created, snapshotSha, control))) {
@@ -423,6 +424,7 @@ export class EphemeralWorktreeService {
       if (await worktreeHeadCommit(created.path, control) !== sourceHead || !(await sourceStillCurrent(snapshotSha))) {
         throw new WorktreeServiceError("SESSION_CONFLICT", "The source checkout changed before derivation completed.");
       }
+      await copyWorktreeIncludeFiles(source.path, created.path, control);
       return Object.freeze({ lease: leaseFromEntry(created), existing: false });
     } catch (error) {
       if (created !== undefined) {
@@ -619,7 +621,8 @@ export class EphemeralWorktreeService {
     detection: WorktreeCwdDetection,
     sessionId: string,
     source: WorktreeSourceResolution,
-    control: WorktreeOperationControl
+    control: WorktreeOperationControl,
+    copyIncludes = true
   ): Promise<ManagedWorktreeEntry> {
     const store = this.#requireStore();
     await validateOrdinaryDirectory(store.root, "STORAGE_UNSAFE", "The worktree storage root changed unsafely.");
@@ -675,6 +678,7 @@ export class EphemeralWorktreeService {
       if (attached !== branch || !(await isWorktreeCompletelyClean(path, control))) {
         throw new WorktreeServiceError("GIT_FAILED", "The created worktree did not reach a clean attached state.");
       }
+      if (copyIncludes) await copyWorktreeIncludeFiles(detection.repositoryRoot, path, control);
       const active: ManagedWorktreeEntry = { ...creating, status: "active", updatedAt: this.#now() };
       await store.set(active, control);
       return active;
@@ -1054,6 +1058,7 @@ export class EphemeralWorktreeService {
       if (recoveryRecord.status === "restored" && snapshotSha !== undefined) {
         await this.#deleteSnapshotRef(current, snapshotSha, control);
       }
+      await copyWorktreeIncludeFiles(current.repositoryRoot, current.path, control);
       const active = {
         ...current,
         status: "active" as const,
@@ -1175,11 +1180,22 @@ export class EphemeralWorktreeService {
       return undefined;
     }
 
-    const untracked = (await runGit(
+    const ignored = (await runGit(
+      ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"], entry.path, control
+    )).stdout.split("\0").filter(Boolean);
+    const [baseIncludes, checkoutIncludes] = await Promise.all([
+      readWorktreeIncludeMatcher(entry.repositoryRoot), readWorktreeIncludeMatcher(entry.path)
+    ]);
+    if (ignored.some(path => !baseIncludes(path) && !checkoutIncludes(path))) {
+      if (requireDerivableContent) throw new WorktreeServiceError("SESSION_CONFLICT",
+        "The source checkout contains ignored files outside its worktree include rules.");
+      return undefined;
+    }
+    const untracked = [...new Set([...(await runGit(
       ["ls-files", "--others", "--exclude-standard", "-z"],
       entry.path,
       control
-    )).stdout.split("\0").filter((path) => path.length > 0);
+    )).stdout.split("\0").filter((path) => path.length > 0), ...ignored])];
     const marker = `joko-worktree-snapshot:${snapshotOwnerKey(entry.sessionId)}:${randomUUID()}`;
     const created = await runGit(
       ["stash", "create", marker],
@@ -1606,6 +1622,7 @@ export class EphemeralWorktreeService {
     }
     await this.#assertRecordedBranchTip(current, control);
     await runGit(["reset", "--hard", "HEAD"], current.path, control);
+    await cleanCapturedIgnoredIncludes(current.path, snapshotSha, control);
     await runGit(["clean", "-fd"], current.path, control);
     if (!(await isWorktreeCompletelyClean(current.path, control))) {
       throw new WorktreeServiceError("SESSION_CONFLICT", "The checkout could not be cleaned without losing recovery authority.");
@@ -2113,7 +2130,7 @@ function validateRecycleControl(value: unknown): WorktreeRecycleControl {
 
 function snapshotHasUnsupportedContent(status: string): boolean {
   for (const record of status.split("\0")) {
-    if (record.startsWith("! ") || record.startsWith("u ")) return true;
+    if (record.startsWith("u ")) return true;
     if (record.startsWith("1 ") || record.startsWith("2 ")) {
       const submodule = record.split(" ", 4)[2];
       if (submodule?.startsWith("S") === true) return true;

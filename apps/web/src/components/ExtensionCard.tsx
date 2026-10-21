@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { mergeExtensionCardFormValues, omitExtensionCardFormPreview, readExtensionCardForm, readExtensionCardFormChange, extensionCardFormValuesToEntries,
   readMailCard, trackExtensionCardFormDelivery, releaseExtensionCardFormDelivery, type ExtensionCard as Card } from "@joko/contracts";
+import { ExtensionAuthorizationPhase, EXTENSION_OAUTH_CARD_ACTION } from "@joko/contracts";
 import { resolveExtensionCardMedia, extensionCardPosterMedia, extensionCardInlineImages, mailPreviewImages } from "@joko/contracts";
 import type { AppController } from "../controller.js";
 import type { ExtensionCardApi } from "../model.js";
@@ -41,7 +42,8 @@ export function ExtensionCard({ card, t }: { readonly card: Card; readonly t: Tr
 }
 function CardBody({ card, actions, api, t }: { card: Card; actions: Actions; api: ExtensionCardApi | undefined; t: Translator }) {
   const root = useRef<HTMLElement>(null), lifetime = useRef(new AbortController()), tail = useRef(Promise.resolve(true));
-  const [snapshot, setSnapshot] = useState<{ html: string; animatedHtml: string; working: boolean; interactive: boolean }>();
+  const authorizationOperation = useRef<AbortController | undefined>(undefined);
+  const [snapshot, setSnapshot] = useState<{ html: string; animatedHtml: string; working: boolean; interactive: boolean; hostAuthorization: boolean; authorizationPhase: ExtensionAuthorizationPhase; authorizationClientConfigured: boolean }>();
   const [visible, setVisible] = useState(false), [attempt, retry] = useState(0), [failed, setFailed] = useState(false), [busy, setBusy] = useState(false), [expanded, setExpanded] = useState(false);
   const [link, setLink] = useState<string>(), [prompt, setPrompt] = useState<{ action: string; placeholder: string; value: string }>();
   const [retryAttachment, setRetryAttachment] = useState<{ file: File; inline: boolean }>();
@@ -55,7 +57,7 @@ function CardBody({ card, actions, api, t }: { card: Card; actions: Actions; api
   const values = useRef(model.values); values.current = model.values;
   const current = useRef({ html, fields, api }); current.current = { html, fields, api };
   const scope = api?.formScope(card.sessionId), deliveryKey = card.cardId, attachmentDeliveryKey = `${card.cardId}:attachment`;
-  const mail = useMemo(() => readMailCard(html), [html]), canAct = Boolean(api && snapshot?.interactive && !actions.readOnly);
+  const mail = useMemo(() => readMailCard(html), [html]), canAct = Boolean(api && snapshot?.interactive && !actions.readOnly && (!snapshot.hostAuthorization || api.canAuthorizeAccount));
   const inlineImages = useMemo(() => extensionCardInlineImages([...(mail?.images ?? []), ...mailPreviewImages(model.values)], media), [mail, model.values.attachmentItems, media]);
   const readOnly = !canAct || Boolean(mail && (mail.supersededBy || !["draft", "syncing", "error"].includes(mail.state)));
   useEffect(() => {
@@ -74,7 +76,7 @@ function CardBody({ card, actions, api, t }: { card: Card; actions: Actions; api
     const abort = new AbortController();
     void api.get({ sessionId: card.sessionId, cardId: card.cardId }, { signal: abort.signal }).then(async result => {
       if (!abort.signal.aborted && result.card?.cardId === card.cardId && result.card.sessionId === card.sessionId) {
-        setSnapshot({ html: result.card.html, animatedHtml: result.animatedHtml, working: result.working, interactive: result.interactive }); setFailed(false);
+        setSnapshot({ html: result.card.html, animatedHtml: result.animatedHtml, working: result.working, interactive: result.interactive, hostAuthorization: result.hostAuthorization, authorizationPhase: result.authorizationPhase, authorizationClientConfigured: result.authorizationClientConfigured }); setFailed(false);
         const resolved = await resolveExtensionCardMedia(result.mediaUris ?? [], async uri => (await api.readMedia({ sessionId: card.sessionId, cardId: card.cardId, uri }, { signal: abort.signal })).dataUrl, abort.signal, mediaCache.current);
         if (!abort.signal.aborted) { mediaCache.current = resolved; setMedia(resolved); }
       }
@@ -102,15 +104,17 @@ function CardBody({ card, actions, api, t }: { card: Card; actions: Actions; api
   const act = async (actionId: string, promptText = ""): Promise<void> => {
     if (!api || !canAct || busy) return;
     setBusy(true);
+    const operation = new AbortController();
+    if (snapshot?.hostAuthorization) authorizationOperation.current = operation;
     try {
       if (!await tail.current) throw new Error("Card edits are pending.");
       lifetime.current.signal.throwIfAborted();
       const response = await api.dispatch({ sessionId: card.sessionId, cardId: card.cardId, actionId, prompt: promptText,
-        ...(fields.length ? { formValues: extensionCardFormValuesToEntries(values.current) } : {}) }, { signal: lifetime.current.signal });
+        ...(fields.length ? { formValues: extensionCardFormValuesToEntries(values.current) } : {}) }, { signal: AbortSignal.any([lifetime.current.signal, operation.signal]) });
       if (!response.accepted) throw new Error("Card action unavailable.");
       if (!lifetime.current.signal.aborted) { setFailed(false); retry(value => value + 1); }
     } catch { if (!lifetime.current.signal.aborted) setFailed(true); }
-    finally { if (!lifetime.current.signal.aborted) setBusy(false); }
+    finally { authorizationOperation.current = undefined; if (!lifetime.current.signal.aborted) setBusy(false); }
   };
   const attach = (file: File, inline: boolean): void => {
     if (!api || !scope || !mail || readOnly || busy) return;
@@ -139,18 +143,23 @@ function CardBody({ card, actions, api, t }: { card: Card; actions: Actions; api
   };
   const content = <>
     {fields.length > 0 && <ExtensionCardForm fields={fields} values={model.values} images={inlineImages} onAttachment={attach} disabled={readOnly || busy} expanded={expanded} t={t} onChange={save} />}
-    <Poster html={extensionCardPosterMedia(snapshot?.working && snapshot.animatedHtml ? snapshot.animatedHtml : html, media)} form={fields.length > 0} height={card.height}
+    {snapshot?.hostAuthorization ? <div className="extension-card__host-authorization"><p>{t(snapshot.authorizationClientConfigured ? "extensions.oauth.waitingBody" : "extensions.oauth.clientRequired")}</p>
+      {snapshot.authorizationPhase !== ExtensionAuthorizationPhase.COMPLETE && <Button tone="primary" disabled={!canAct || busy || !snapshot.authorizationClientConfigured} onClick={() => { void act(EXTENSION_OAUTH_CARD_ACTION); }}>{t("extensions.oauth.connect")}</Button>}
+    </div> : <Poster html={extensionCardPosterMedia(snapshot?.working && snapshot.animatedHtml ? snapshot.animatedHtml : html, media)} form={fields.length > 0} height={card.height}
       title={card.extensionName} disabled={!canAct || busy} onClick={click} api={api} card={card} t={t} onMedia={(uri, gallery, imageIndex) => {
         const registered = actions.gallery?.().filter(image => image.sessionId === card.sessionId) ?? [];
         const index = uri.endsWith(".glb") ? -1 : registered.findIndex(image => image.cardId === card.cardId && image.imageIndex === imageIndex);
         setPreview({ uri, gallery: index < 0 ? gallery.map(uri => ({ cardId: card.cardId, uri })) : registered, index: index < 0 ? Math.max(0, imageIndex) : index });
-      }} />
+      }} />}
   </>;
   return <article ref={root} className="extension-result-card" aria-busy={busy || snapshot?.working}>
     <header><strong>{card.extensionName}</strong>{(busy || snapshot?.working) && <Spinner />}
       {fields.length > 0 && <button type="button" onClick={() => setExpanded(true)}>{t("extensionCards.expand")}</button>}
     </header>
     {!api && <p className="extension-card__caption">{actions.readOnly ? t("extensionCards.readOnly") : t("extensionCards.unavailable")}</p>}
+    {snapshot?.hostAuthorization && (snapshot.authorizationPhase === ExtensionAuthorizationPhase.COMPLETE ? <p role="status">{t("extensions.oauth.connected")}</p>
+      : !api?.canAuthorizeAccount ? <p>{t("extensions.oauth.desktopRequired")}</p> : null)}
+    {snapshot?.hostAuthorization && busy && <Button onClick={() => authorizationOperation.current?.abort()}>{t("common.cancel")}</Button>}
     {(failed || attachmentFailed) && <div className="extension-card__failure" role="alert"><span>{t("extensionCards.failed")}</span>
       <Button disabled={busy} onClick={() => { if (attachmentFailed && retryAttachment) { tail.current = Promise.resolve(true); attach(retryAttachment.file, retryAttachment.inline); } else if (readExtensionCardFormChange(html) && !readOnly) save(values.current); else retry(value => value + 1); }}>{t("common.retry")}</Button></div>}
     {attachmentFailed && retryAttachment && <Button disabled={busy} onClick={() => { if (scope) releaseExtensionCardFormDelivery(scope, attachmentDeliveryKey); setRetryAttachment(undefined); setAttachmentFailed(false); }}>{t("common.cancel")}</Button>}

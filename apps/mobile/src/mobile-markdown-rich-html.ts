@@ -12,6 +12,8 @@ export interface MobileMarkdownColors {
   readonly accent: string;
   readonly border: string;
   readonly negative: string;
+  readonly positive?: string;
+  readonly warning?: string;
 }
 
 export function mobileMarkdownScriptValue(value: string): string {

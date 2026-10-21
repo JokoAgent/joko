@@ -118,7 +118,7 @@ export function validateMobilePartnerDraftFields(snapshot: MobilePartnerDraftFie
   if (!capabilities) throw new MobilePartnerProfileValidationError("defaults", "Partner directory defaults are not configured.");
   const chain = capabilities.modelChain;
   if (chain.length < 1 || chain.length > 5 || new Set(chain.map((route) => `${route.backendId}\u001f${route.providerId}\u001f${route.modelId}`)).size !== chain.length
-    || !["ask", "auto", "bypassPermissions"].includes(capabilities.permissionMode)) throw new MobilePartnerProfileValidationError("modelChain", "Select 1–5 unique Partner model routes.");
+    || !["ask", "acceptEdits", "auto", "bypassPermissions"].includes(capabilities.permissionMode)) throw new MobilePartnerProfileValidationError("modelChain", "Select 1–5 unique Partner model routes.");
   for (const route of chain) {
     const model = snapshot.models.find((candidate) => candidate.backendId === route.backendId
       && candidate.providerId === route.providerId && candidate.modelId === route.modelId);

@@ -371,11 +371,12 @@ describe("actual Mobile Remote Desktop Screen native composition", () => {
 
   it.each(["android", "ios"] as const)("opens local %s accessibility guidance without replacing the live view-only media", async platform => {
     native.platform = platform;
-    const value = transport(); await render(value); const epoch = await ready(); await streaming(epoch);
-    await act(async () => { button(copy.settings).click(); await flush(); button(copy.view).click(); await flush(); });
+    const value = transport();
+    vi.mocked(value.start).mockResolvedValueOnce(create(RemoteDesktopLeaseSchema, { leaseId: "lease-current", display: (await value.capabilities((await value.listHosts())[0]!)).displays[0], controlling: false, controlGeneration: 1n }));
     vi.mocked(value.control).mockRejectedValueOnce(new ConnectError("Private accessibility failure", Code.PermissionDenied, undefined,
       [{ desc: RemoteDesktopFailureSchema, value: create(RemoteDesktopFailureSchema, { reason: RemoteDesktopFailureReason.ACCESSIBILITY_PERMISSION_REQUIRED }) }]));
-    await act(async () => { button(copy.control).click(); await flush(); });
+    await render(value); const epoch = await ready(); await streaming(epoch);
+    await act(async () => { button(copy.settings).click(); await flush(); });
     expect(currentController.snapshot).toMatchObject({ status: "live", hasFrame: true, controlling: false, notice: "accessibility-permission" });
     const media = container.querySelector('[data-testid="remoteDesktop.media"]')!;
     const missing = create(RemoteDesktopPermissionsSchema, { screenRecording: RemoteDesktopPermissionStatus.GRANTED,
@@ -705,7 +706,7 @@ describe("actual Mobile Remote Desktop Screen native composition", () => {
     expect(mouse()).toBeNull();
     expect(native.values.get(mouseButtonsKey)).toBe(JSON.stringify({ version: 1, enabled: false }));
     await act(async () => { button(copy.mouseButtons).click(); await flush(); button(copy.view).click(); await flush(); });
-    expect(currentController.snapshot.controlling).toBe(false); expect(mouse()).toBeNull();
+    expect(currentController.snapshot).toMatchObject({ controlling: true, viewOnly: true, wantedControl: false }); expect(mouse()).toBeNull();
     await act(async () => { button(copy.control).click(); await flush(); });
     await act(async () => { button(copy.panelClose).click(); await flush(); });
     expect(mouse()).not.toBeNull();
@@ -775,7 +776,7 @@ describe("actual Mobile Remote Desktop Screen native composition", () => {
     expect(native.receive.mock.calls.map(call => call[0]).findLast(command => command.type === "restorePresentation"))
       .toEqual({ type: "restorePresentation", epoch, attemptId, restoreId: 7 });
     await act(async () => { nativeMessage(epoch, "presentation", { active: false }); await flush(); });
-    expect(currentController.snapshot).toMatchObject({ presenting: false, controlling: false, wantedControl: false });
+    expect(currentController.snapshot).toMatchObject({ presenting: false, controlling: true, wantedControl: true });
     expect(currentController.snapshot.restoreRequest).toBeUndefined();
     expect(native.values.get(pipKey)).toBe(JSON.stringify({ version: 1, enabled: true }));
   });

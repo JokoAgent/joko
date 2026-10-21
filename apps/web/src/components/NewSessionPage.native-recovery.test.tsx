@@ -98,6 +98,23 @@ afterEach(async () => {
 });
 
 describe("new-task native draft recovery", () => {
+  it("retains the built-in creator intent through hydration, first-send failure and retry", async () => {
+    const draft: NewSessionLocalDraft = { ...restoredDraft(), nativeStart: { kind: "fresh" },
+      text: "/joko-plugin-creator Build a timer", editorDocument: plainTextToComposerDocument("/joko-plugin-creator Build a timer"), builtinSkillIntent: "plugin_creator" };
+    const api = controller({ discover: async () => [], draft });
+    const onSubmit = vi.fn<(session: DelayedNewSessionDraft, input: ComposerDraft) => Promise<void>>()
+      .mockRejectedValueOnce(new Error("Creator is unavailable in the selected environment."))
+      .mockResolvedValueOnce(undefined);
+    const { container } = await renderPage(api, onSubmit); await flush();
+    expect(sendButton(container).disabled).toBe(false);
+    await act(async () => sendButton(container).click()); await flush();
+    expect(onSubmit.mock.calls[0]?.[1]).toMatchObject({ text: draft.text, builtinSkillIntent: "plugin_creator" });
+    expect(latestEditorProps?.document).toEqual(draft.editorDocument);
+    await act(async () => sendButton(container).click()); await flush();
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+    expect(onSubmit.mock.calls[1]?.[1]).toMatchObject({ text: draft.text, builtinSkillIntent: "plugin_creator" });
+  });
+
   it("keeps the editor read-only until the active Profile draft has hydrated", async () => {
     const pending = deferred<NewSessionLocalDraft | undefined>();
     const api = controller({ discover: async () => [], snapshotValue: emptySnapshot(), profile: connectionProfile("profile", "server") });

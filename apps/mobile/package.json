@@ -59,6 +59,7 @@
     "expo-updates": "57.0.18",
     "highlight.js": "11.11.1",
     "katex": "0.16.47",
+    "lucide-react-native": "0.468.0",
     "mermaid": "11.16.0",
     "pdfjs-dist": "5.7.284",
     "react": "19.2.3",

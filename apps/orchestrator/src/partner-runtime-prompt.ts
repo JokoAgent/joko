@@ -23,11 +23,17 @@ export class PartnerRuntimePromptResolver {
         || currentLink?.partnerId !== link.partnerId || currentLink.profileVersion !== link.profileVersion || currentLink.role !== link.role
         || groupTarget && !this.validGroupTarget(this.store.getSession(session.id).descriptor, profile.id)) throw new Error("The private runtime identity owner changed.");
     };
-    const environment = await this.readEnvironment(profile.id, assertOwner); assertOwner();
+    const carried = this.store.findSetting<PrivateProjection>("target", profile.homeTargetId, "partner-home.profile")?.value;
+    const environment = carried ? undefined : await this.readEnvironment(profile.id, assertOwner); assertOwner();
     const preferences = this.preferences.read(profile.homeTargetId);
     const memoryPrompt = this.memory && this.store.getBackend(session.backendId).descriptor.capabilities.get("memory.curated")?.supported !== true
       ? this.memory.runtimePrompt(profile.homeTargetId) : undefined;
-    if (!environment) return [identitySource, preferences.userContext?.trim() && `## User context\n${preferences.userContext.trim()}`, memoryPrompt].filter(Boolean).join("\n\n");
+    let carriedEnd = Math.min(carried?.identity.length ?? 0, 8000);
+    if (carried && carriedEnd < carried.identity.length && /[\uD800-\uDBFF]/u.test(carried.identity[carriedEnd - 1] ?? "")) carriedEnd--;
+    const carriedIdentity = carried && identitySource === carried.identity.slice(0, carriedEnd).trim() ? carried.identity : identitySource;
+    if (!environment) return [carriedIdentity,
+      (preferences.userContext ?? carried?.user)?.trim() && `## User context\n${(preferences.userContext ?? carried?.user)!.trim()}`,
+      carried?.instructions && `## Instructions\n${carried.instructions}`, memoryPrompt].filter(Boolean).join("\n\n");
     const projection = environment.profileProjection;
     let prefixEnd = Math.min(projection.identity.length, 8000);
     if (prefixEnd < projection.identity.length && /[\uD800-\uDBFF]/u.test(projection.identity[prefixEnd - 1] ?? "")) prefixEnd--;

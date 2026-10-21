@@ -867,6 +867,30 @@ class Ssh2RemoteFileTransport implements RemoteFileTransportPort {
         await this.mkdir(remotePath.dirname(path), { recursive: true, mode: 0o700, signal: request.signal });
       }
       await this.withSftp(request.signal, async (sftp) => {
+        if (request.createOnly === true) {
+          const parent = remotePath.dirname(path);
+          const canonicalParent = () => callbackOperation<string>(request.signal, done => sftp.realpath(parent, done), this.#invalidate);
+          if (await canonicalParent() !== parent) throw new RemoteSshError("FILE_TRANSFER_FAILED", "The remote destination changed.", false);
+          const handle = await callbackOperation<Buffer>(request.signal, done => sftp.open(path, "wx", { mode }, done), this.#invalidate);
+          let accepted = false;
+          try {
+            const validate = async () => {
+              if (await canonicalParent() !== parent || await callbackOperation<string>(request.signal, done => sftp.realpath(path, done), this.#invalidate) !== path) {
+                throw new RemoteSshError("FILE_TRANSFER_FAILED", "The remote destination changed.", false);
+              }
+            };
+            await validate();
+            await callbackOperation<void>(request.signal, done => sftp.write(handle, content, 0, content.byteLength, 0, done), this.#invalidate);
+            await validate(); accepted = true;
+          } finally {
+            // Keep the exclusive handle until validation finishes. A revoked or
+            // moved destination is cleared through that handle, never a path
+            // which may now name somebody else's file.
+            if (!accepted) await callbackOperation<void>(undefined, done => sftp.fsetstat(handle, { size: 0 }, done), () => undefined).catch(() => undefined);
+            await callbackOperation<void>(undefined, done => sftp.close(handle, done), () => undefined);
+          }
+          return;
+        }
         if (request.atomic !== true) {
           await callbackOperation<void>(
             request.signal,

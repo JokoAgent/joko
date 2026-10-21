@@ -185,6 +185,6 @@ function origin(value: unknown): value is RuntimeHandoffSource {
   const { targetId, targetRevision, workspaceRoot, realWorkspaceRoot, worktreeJson, permissionMode, planMode, promptDigest, ...base } = value;
   return parked(base) && boundedText(targetId, 512) && typeof targetRevision === "string" && /^[1-9][0-9]*$/u.test(targetRevision)
     && boundedText(workspaceRoot, 8192) && boundedText(realWorkspaceRoot, 8192) && typeof worktreeJson === "string" && worktreeJson.length <= 16384
-    && ["ask", "auto", "bypassPermissions"].includes(String(permissionMode)) && typeof planMode === "boolean"
+    && ["ask", "acceptEdits", "auto", "bypassPermissions"].includes(String(permissionMode)) && typeof planMode === "boolean"
     && typeof promptDigest === "string" && /^[a-f0-9]{64}$/u.test(promptDigest);
 }

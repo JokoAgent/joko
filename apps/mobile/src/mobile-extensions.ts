@@ -169,6 +169,10 @@ export type MobileExtensionUseResult =
   | { readonly kind: "task"; readonly sessionId: string };
 
 export interface MobileExtensionTransport {
+  getTaskPreferences?(expected: MobileExtension, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
+  retryTaskWriteAccess?(expected: MobileExtension, taskId: string, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
+  setTaskPreferences?(expected: MobileExtension, preferences: import("@joko/contracts").ExtensionTaskPreferences, model: import("@joko/contracts").ExtensionTaskRoute | undefined,
+    permissionMode: import("@joko/contracts").PermissionMode, signal: AbortSignal): Promise<import("@joko/contracts").ExtensionTaskPreferences>;
   readonly ownerKey: string;
   readonly pending: readonly MobileExtensionPendingMutation[];
   list(signal: AbortSignal): Promise<MobileExtensionCatalog>;

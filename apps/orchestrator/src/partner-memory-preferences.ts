@@ -46,6 +46,11 @@ export class PartnerMemoryPreferences {
     });
   }
   enabled(targetId: string): boolean { return this.read(targetId).enabled; }
+  move(sourceTargetId: string, targetId: string): void {
+    const source = this.read(sourceTargetId), target = this.read(targetId);
+    this.update(targetId, target.revision, { enabled: source.enabled,
+      ...(source.userContext === undefined ? {} : { userContext: source.userContext }) });
+  }
   remove(targetId: string): void { this.store.deleteSetting("target", targetId, key); }
 }
 export function validateMemoryUserContext(value: string): void {

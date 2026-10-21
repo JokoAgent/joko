@@ -26,7 +26,7 @@ function matchChineseLocale(locale: Intl.Locale): SystemLocale {
   const region = locale.region?.toLowerCase() ?? "";
 
   // Script is authoritative when it conflicts with the region. Both branches
-  // currently use zh-CN until the zh-TW catalog lands in its own parity slice.
+  // currently use zh-CN until the zh-TW catalog is available.
   if (script === "hans") return "zh-CN";
   if (script === "hant") return "zh-CN";
   if (region === "cn" || region === "sg") return "zh-CN";

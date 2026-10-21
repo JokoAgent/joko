@@ -8,6 +8,11 @@ import {
 } from "./backend-control-capabilities.js";
 
 describe("Backend control capabilities", () => {
+  it("offers Accept edits only when the current backend explicitly advertises it", () => {
+    expect(advertisedPermissionModes(backend({ "permission.modes": capability(["ask", "acceptEdits", "auto"]) }))).toEqual(["ask", "acceptEdits", "auto"]);
+    expect(advertisedPermissionModes(backend({ "permission.modes": capability(["ask", "auto"]) }))).not.toContain("acceptEdits");
+  });
+
   it("fails closed when a supported permission capability omits its option catalog", () => {
     const candidate = backend({
       "permission.modes": capability(),

@@ -36,6 +36,14 @@ function session(id: string, value?: SessionAttentionView): SessionView {
 }
 
 describe("session notification tracker", () => {
+  it("consumes hidden activity without notifying or replaying the old edge on reveal", () => {
+    const tracker = new SessionNotificationTracker();
+    tracker.observe("owner", []);
+    const task = { ...session("background", attention("done", 10n)), hidden: true };
+    expect(tracker.observe("owner", [task])).toEqual([]);
+    expect(tracker.observe("owner", [{ ...task, hidden: false }])).toEqual([]);
+    expect(tracker.observe("owner", [{ ...task, hidden: false, attention: attention("error", 11n) }])).toHaveLength(1);
+  });
   it("dispatches only through an enabled Desktop host while the window is unfocused", () => {
     expect(shouldDispatchSessionNotifications({ enabled: true, desktopAvailable: true, windowFocused: false })).toBe(true);
     expect(shouldDispatchSessionNotifications({ enabled: false, desktopAvailable: true, windowFocused: false })).toBe(false);

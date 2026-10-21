@@ -276,6 +276,8 @@ export interface RemoteFileWriteRequest {
   readonly mode?: number;
   readonly createParents?: boolean;
   readonly atomic?: boolean;
+  /** Atomically create a new regular file; existing files and symlinks fail. */
+  readonly createOnly?: boolean;
   readonly signal?: AbortSignal;
 }
 

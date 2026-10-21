@@ -168,7 +168,7 @@ describe('插件生成卡片的排版守卫(净化器与 builtin 供片不漂移
       '<div style="padding:8px 12px 10px">' +
       '<div style="font-size:12px;color:var(--text-secondary,#6b6b66);text-align:center;' +
       'white-space:nowrap;overflow:hidden;text-overflow:ellipsis">「一只猫」</div>' +
-      '<div style="margin-top:3px;font-size:10px;color:var(--text-tertiary,#9a9a94);text-align:center">Cindy Art · GPT Image 2</div>' +
+      '<div style="margin-top:3px;font-size:10px;color:var(--text-tertiary,#9a9a94);text-align:center">Image result · GPT Image 2</div>' +
       '</div></div>';
     const r = sanitizeExtensionCardHtml(result);
     expect(r.ok).toBe(true);
@@ -177,7 +177,7 @@ describe('插件生成卡片的排版守卫(净化器与 builtin 供片不漂移
       expect(r.html).toContain('height:auto');
       expect(r.html).toContain('background:var(--msg-tool-card-bg,var(--surface-elevated,#ffffff))');
       expect(r.html).toContain('text-align:center');
-      expect(r.html).toContain('Cindy Art · GPT Image 2');
+      expect(r.html).toContain('Image result · GPT Image 2');
     }
   });
 });

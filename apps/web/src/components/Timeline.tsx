@@ -2,6 +2,9 @@ import { createContext, isValidElement, memo, useCallback, useContext, useEffect
 import type { ComponentProps, CSSProperties, JSX, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { sessionHandoffMessages as handoffMessages } from "@joko/contracts";
+import { richAnswerText, splitRichAnswer } from "@joko/contracts";
+import { RichAnswer } from "./RichAnswer.js";
+import { RichAnswerMedia } from "./RichAnswerMedia.js";
 import { useExtensionMailLinkHandler } from "./ExtensionMailReader.js";
 import { assertBrowserActionCurrent, type BrowserActionContext, type HttpLinkOpenOptions } from "../browser-action.js";
 import { defaultRangeExtractor, elementScroll, useVirtualizer } from "@tanstack/react-virtual";
@@ -165,6 +168,8 @@ const TimelinePartnerDelegationContext = createContext<PartnerDelegationCardActi
 
 interface TimelinePersonalizationContextValue {
   readonly ownerKey: string;
+  readonly answerStateOwnerKey?: string;
+  readonly locale?: string;
   readonly streamFadeEnabled: boolean;
   readonly reducedMotion: boolean;
   readonly sessionId: string;
@@ -192,9 +197,10 @@ export interface TimelineShareSelection {
   readonly selectedIds: ReadonlySet<string>;
 }
 
-export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
+export function Timeline({ ownerKey, viewportOwnerKey, answerStateOwnerKey, sessionId, sessionName, workspaceId, onReadArtifact, items, sessionActive, derivationOrigin, sessionCreatedAt, onOpenDerivationOrigin, messageNavRailEnabled, streamFadeEnabled, onOpenHttpLink, onOpenWorkspaceHtml, onLoadWorkspaceAsset, onWorkspaceImageToComposer, subagentRuns, subagentRunDetails, onOpenSubagent, onStopSubagent, onGetPartnerDelegation, onCancelPartnerDelegation, onOpenPartnerSession, hasEarlier, historyLoading, historyError, onLoadEarlier, followLatestSignal = 0, focusRequest, bottomInset = 0, retryRunId, locale, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactUrlRelease, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onAddSelectionToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editableMessageId, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, messageActionResetSignal, onInlinePlanVisibilityChange, onRootChange }: {
   readonly ownerKey: string;
   readonly viewportOwnerKey: string;
+  readonly answerStateOwnerKey?: string;
   readonly sessionId: string;
   readonly sessionName: string;
   readonly workspaceId?: string;
@@ -362,6 +368,8 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
   const reducedMotion = usePrefersReducedMotion();
   const personalizationContext = useMemo<TimelinePersonalizationContextValue>(() => ({
     ownerKey,
+    answerStateOwnerKey,
+    locale,
     streamFadeEnabled,
     reducedMotion,
     sessionId,
@@ -371,7 +379,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     ...(onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml }),
     ...(onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset }),
     ...(onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer })
-  }), [onLoadWorkspaceAsset, mailLinkContext, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, reducedMotion, sessionId, streamFadeEnabled]);
+  }), [onLoadWorkspaceAsset, mailLinkContext, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, answerStateOwnerKey, locale, reducedMotion, sessionId, streamFadeEnabled]);
   const subagentContext = useMemo<TimelineSubagentContextValue>(() => ({
     runs: subagentRuns ?? new Map(),
     details: subagentRunDetails ?? new Map(),
@@ -1532,7 +1540,7 @@ function MessageBlock({ sessionId, sessionName, item, role, locale, reducedMotio
       && item.partnerPrivateOrigin === undefined && <PartnerLearningFooter feedback={item.learning} locale={locale}
         disabled={!partnerConversation.editable || selectionActive}
         onOpen={destination => partnerConversation.openLearningSettings(destination)} />}
-    {!selectionActive && !item.streaming && (showActions || partner !== undefined) && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={displayText} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer === undefined ? undefined : () => onAddMessageToComposer({ ...item, text: displayText })} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
+    {!selectionActive && !item.streaming && (showActions || partner !== undefined) && <MessageActions ownerKey={personalization.ownerKey} sessionId={sessionId} sessionName={sessionName} item={item} text={richAnswerText(displayText)} align="left" locale={locale} t={t} onAddMessageToComposer={onAddMessageToComposer === undefined ? undefined : () => onAddMessageToComposer({ ...item, text: richAnswerText(displayText) })} onFork={onForkMessage} forking={forking} onStartShareSelection={onStartShareSelection} editable={false} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} />}
   </>;
   return (
     <RenderedShareSelectionContext.Provider value={shareSelected}>
@@ -1873,6 +1881,16 @@ export function StreamingMarkdown({ text, streaming, streamFadeKey, t }: { reado
   const settleWord = useCallback((event: { readonly animationName: string; readonly currentTarget: { readonly dataset: DOMStringMap } }) => {
     if (fadeState !== undefined) markTimelineWordFadeSettled(fadeState, event);
   }, [fadeState]);
+  const parts = useMemo(() => streamFadeKey === undefined ? [] : splitRichAnswer(source), [source, streamFadeKey]);
+  if (parts.some(part => part.kind === "rich")) return <>{parts.map(part => part.kind === "rich"
+    ? <RichAnswer key={part.key} source={part.source} complete={part.complete || !streaming}
+      stateKey={JSON.stringify([personalization.answerStateOwnerKey ?? personalization.ownerKey, streamFadeKey, part.key])}
+      locale={personalization.locale ?? "en"}
+      renderMedia={node => <RichAnswerMedia node={node} actions={{ ownerKey: personalization.ownerKey, sessionId: personalization.sessionId, t,
+        onLoadWorkspaceAsset: personalization.onLoadWorkspaceAsset, onOpenHttpLink: personalization.onOpenHttpLink }} />}
+      renderMarkdown={(value, id) => <ParsedMarkdown key={id} text={value} t={t} onWordFadeSettled={settleWord} />} />
+    : <ParsedMarkdown key={part.key} text={fade ? repairStreamingMarkdown(part.source) : part.source} t={t}
+      wordFade={candidate} onWordFadeSettled={settleWord} />)}</>;
   return <ParsedMarkdown
     text={rendered}
     t={t}

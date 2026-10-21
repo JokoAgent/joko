@@ -203,6 +203,8 @@ export interface ClaudeSdkInitializationResult {
   readonly models: readonly ClaudeSdkModelInfo[];
   readonly account: ClaudeSdkAccountInfo;
   readonly commands?: readonly Readonly<Record<string, unknown>>[];
+  /** Native initialize acknowledgement for the exact plugins supplied at launch. */
+  readonly plugins_applied?: boolean;
   readonly fast_mode_state?: string;
   readonly fast_mode_disabled_reason?: string;
 }

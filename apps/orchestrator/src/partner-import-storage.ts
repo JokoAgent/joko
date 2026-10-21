@@ -1,4 +1,4 @@
-import { AgentImportError, createImportedEnvironmentStore, fingerprint, type ImportReceipt } from "@joko/agent-import";
+import { AgentImportError, createImportedEnvironmentStore, fingerprint, validateNativePartnerPackage, type ImportReceipt } from "@joko/agent-import";
 import type { OperationalStore } from "@joko/store";
 import type { CredentialVault } from "./credential-vault.js";
 
@@ -73,8 +73,9 @@ function strings(value: unknown): value is string[] { return Array.isArray(value
 
 /** No missing-field defaults or older receipt readers; validation never includes source content in errors. */
 export function validateImportReceipt(value: unknown): asserts value is ImportReceipt {
+  if (record(value) && value.nativePackage !== undefined) validateNativePartnerPackage(value.nativePackage);
   const required = ["version", "selectionHash", "submissionHash", "deferSetup", "result", "entryNames", "copied", "environmentSaved", "checkpointSaved", "checkpointCleared", "partnerCreated", "cancelled", "routines"];
-  if (!record(value) || !fields(value, required, ["creationRejected"]) || value.version !== 1 || typeof value.selectionHash !== "string" || !/^[a-f0-9]{64}$/.test(value.selectionHash)
+  if (!record(value) || !fields(value, required, ["creationRejected", "nativePackage"]) || value.version !== 1 || typeof value.selectionHash !== "string" || !/^[a-f0-9]{64}$/.test(value.selectionHash)
     || typeof value.submissionHash !== "string" || !/^[a-f0-9]{64}$/.test(value.submissionHash)
     || ["deferSetup", "environmentSaved", "checkpointSaved", "checkpointCleared", "partnerCreated", "cancelled"].some(key => typeof value[key] !== "boolean")
     || value.creationRejected !== undefined && value.creationRejected !== "IMPORT_NAME_EXISTS"

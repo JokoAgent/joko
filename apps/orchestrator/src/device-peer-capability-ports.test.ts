@@ -13,6 +13,16 @@ afterEach(() => {
 });
 
 describe("Device peer capability ports", () => {
+  it("preserves the explicit exclusive-create flag through the generated peer command", async () => {
+    const fixture = setup(), commands: DevicePeerCommand[] = [];
+    const harness = createInProcessDevicePeerHarness({ targetDeviceId: fixture.target.deviceId, capabilities: ["files", "process"], agent: { handle: async frame => {
+      commands.push(frame.payload as DevicePeerCommand); return { outcome: "completed", value: { case: "fileMutation", value: {} } };
+    } } });
+    fixture.owner.registerRoute(fixture.target, harness.transport);
+    const authority = fixture.owner.capture(fixture.controller, fixture.owner.list(fixture.controller)[0]!);
+    await createDevicePeerCapabilityPorts({ owner: fixture.owner, authority }).files!.write({ path: "C:\\peer\\result.bin", content: new Uint8Array([1, 2]), createOnly: true });
+    expect(commands).toMatchObject([{ action: { case: "writeFile", value: { createOnly: true, atomic: false } } }]);
+  });
   it("dispatches typed file commands through the exact captured route", async () => {
     const fixture = setup();
     const commands: DevicePeerCommand[] = [];

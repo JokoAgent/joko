@@ -21,7 +21,7 @@ afterEach(() => { for (const controller of controllers.splice(0)) controller.dis
 const SCOPE: DesktopRemoteDesktopViewerState = { generation: 1, active: false, target: { deviceId: "peer", name: "Remote desk" }, locale: "en", audio: true, hostMute: false, lockOnExit: false, clipboardSync: false, privacyScreen: false, clipboardSyncState: { available: true, active: false, pending: false } };
 
 function fixture(platform = "win32", temporary = false, portal = false, systemAudio = false,
-  initialState: Promise<DesktopRemoteDesktopViewerState> = Promise.resolve(SCOPE)) {
+  initialState: Promise<DesktopRemoteDesktopViewerState> = Promise.resolve(SCOPE), autoControl = false) {
   let onState!: (state: DesktopRemoteDesktopViewerState) => void;
   const inputCalls: { name: string; input: Record<string, unknown> }[] = [];
   let pendingControl: Promise<object> | undefined;
@@ -40,18 +40,18 @@ function fixture(platform = "win32", temporary = false, portal = false, systemAu
         return { ok: false as const, code: Code.FailedPrecondition, reason: RemoteDesktopFailureReason.LEASE_EXPIRED };
       }
       const output = name === "getRemoteDesktopCapabilities" ? { capabilities: { protocolVersion: 1, enabled: true,
-        canControl: !portal, platform: portal || systemAudio ? "linux" : platform, displays: [{ displayId: "one", name: "One", width: 1200, height: 800 }],
+        canControl: !portal, autoControl, platform: portal || systemAudio ? "linux" : platform, displays: [{ displayId: "one", name: "One", width: 1200, height: 800 }],
         jpegFallback: true, webrtcVideo: true, videoSettings: true, systemAudio, automaticReconnect: true, connectionTakeover: true, clipboardContent: true, hostMute: true, lockOnExit: true, clipboardSync: true, privacyScreen: true, displayModes: true, resolutionRestore: temporary,
         viewerDisplay: platform === "linux", viewerDisplayRestore: platform === "linux" } } :
-        name === "startRemoteDesktop" ? { lease: { leaseId: "lease", display: { displayId: "one", width: 1200, height: 800 }, controlling: false, controlGeneration: 1n } } :
+        name === "startRemoteDesktop" ? { lease: { leaseId: "lease", display: { displayId: "one", width: 1200, height: 800 }, controlling: input["control"] === true, controlGeneration: 1n } } :
         name === "setRemoteDesktopControl" ? await (pendingControl ?? Promise.resolve({ state: { controlling: input["enabled"], controlGeneration: geometryGeneration } })) :
         name === "heartbeatRemoteDesktop" ? { state: { controlling: !portal, controlGeneration: geometryGeneration } } :
         name === "getRemoteDesktopFrame" ? { result: { frame: { jpeg: new Uint8Array([255,216,255,217]) } } } :
         name === "listRemoteDesktopDisplayModes" ? { modes: [{ modeId: "mode", width: 1000, height: 700 }] } :
-        name === "setRemoteDesktopDisplayMode" ? { result: temporary ? { lease: { leaseId: "lease", display: { displayId: "one", width: 1000, height: 700 }, controlling: false, controlGeneration: ++geometryGeneration } } : {} } :
+        name === "setRemoteDesktopDisplayMode" ? { result: temporary ? { lease: { leaseId: "lease", display: { displayId: "one", width: 1000, height: 700 }, controlling: input["control"] === true, controlGeneration: ++geometryGeneration } } : {} } :
         name === "setRemoteDesktopViewerDisplay" || name === "restoreRemoteDesktopViewerDisplay" ? { result: { lease: { leaseId: "lease",
           display: name === "setRemoteDesktopViewerDisplay" ? { displayId: "mirror", width: input["width"], height: input["height"] } : { displayId: "one", width: 1200, height: 800 },
-          controlling: false, controlGeneration: ++geometryGeneration } } } :
+          controlling: input["control"] === true, controlGeneration: ++geometryGeneration } } } :
         name === "setRemoteDesktopHostMute" || name === "setRemoteDesktopPrivacyScreen" ? { result: { enabled: (input["request"] as { enabled: boolean }).enabled } } : {};
       return { ok: true as const, bytes: toBinary(method.output, create(method.output, output as MessageInitShape<typeof method.output>)) };
     }),
@@ -70,6 +70,15 @@ function fixture(platform = "win32", temporary = false, portal = false, systemAu
 async function flush(): Promise<void> { for (let i = 0; i < 16; i++) await Promise.resolve(); }
 
 describe("Desktop viewer presentation adapter", () => {
+  it("adopts host control in start and geometry receipts without a duplicate take-control", async () => {
+    const f = fixture("linux", true, false, false, Promise.resolve(SCOPE), true); await flush();
+    expect(f.inputCalls.find(call => call.name === "startRemoteDesktop")?.input["control"]).toBe(true);
+    expect(f.controller.snapshot.controlling).toBe(true);
+    await f.controller.setMode("mode"); await flush();
+    expect(f.controller.snapshot).toMatchObject({ controlling: true, lease: { controlGeneration: 3n } });
+    expect(f.inputCalls.find(call => call.name === "setRemoteDesktopDisplayMode")?.input["control"]).toBe(true);
+    expect(f.inputCalls.some(call => call.name === "setRemoteDesktopControl")).toBe(false);
+  });
   it("defers initial control until the shown viewer gains focus and preserves a later user release", async () => {
     vi.mocked(document.hasFocus).mockReturnValue(false);
     const f = fixture(); await flush(); f.post({ type: "framePresented" }); await flush();

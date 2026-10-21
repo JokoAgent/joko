@@ -434,6 +434,7 @@ export class NodeDevicePeerAgentExecutor {
           ...(command.action.value.mode === undefined ? {} : { mode: command.action.value.mode }),
           createParents: command.action.value.createParents,
           atomic: command.action.value.atomic,
+          createOnly: command.action.value.createOnly,
           signal
         });
         return mutationResult();
@@ -572,6 +573,7 @@ export class NodeDevicePeerAgentExecutor {
           controllerDeviceId: command.controllerDeviceId,
           displayId: command.action.value.displayId,
           mode: command.action.value.mode,
+          ...(command.action.value.control ? { control: true } : {}),
           signal
         });
         validateRemoteDesktopLease(value);
@@ -779,13 +781,14 @@ export class NodeDevicePeerAgentExecutor {
           controlGeneration: request.controlGeneration,
           modeId: request.modeId,
           temporary: request.temporary,
+          ...(request.control ? { control: true } : {}),
           signal
         });
         try {
           if (request.temporary) {
             if (value.lease === undefined) throw invalidRemoteDesktopHostResult();
             validateRemoteDesktopLease(value.lease);
-            if (value.lease.leaseId !== request.leaseId || value.lease.controlling
+            if (value.lease.leaseId !== request.leaseId || (!request.control && value.lease.controlling)
               || value.lease.controlGeneration <= request.controlGeneration) throw invalidRemoteDesktopHostResult();
           } else if (value.lease !== undefined) throw invalidRemoteDesktopHostResult();
           return { case: "remoteDesktopDisplayMode", value: clone(RemoteDesktopDisplayModeResultSchema, value) };
@@ -796,7 +799,7 @@ export class NodeDevicePeerAgentExecutor {
         const request = command.action.value;
         this.#resetRemoteDesktopClipboardTransferForLease(request.leaseId);
         const common = { controllerDeviceId: command.controllerDeviceId, leaseId: request.leaseId,
-          controlGeneration: request.controlGeneration, signal };
+          controlGeneration: request.controlGeneration, ...(request.control ? { control: true } : {}), signal };
         const host = this.#requireRemoteDesktop();
         let capabilities: RemoteDesktopCapabilities | undefined;
         if (command.action.case === "setRemoteDesktopViewerDisplay") {
@@ -819,7 +822,7 @@ export class NodeDevicePeerAgentExecutor {
         try {
           if (value.lease === undefined) throw invalidRemoteDesktopHostResult();
           validateRemoteDesktopLease(value.lease);
-          if (value.lease.leaseId !== request.leaseId || value.lease.controlling
+          if (value.lease.leaseId !== request.leaseId || (!request.control && value.lease.controlling)
             || value.lease.controlGeneration <= request.controlGeneration
             || (command.action.case === "setRemoteDesktopViewerDisplay"
               && (physicalDisplayIds.has(value.lease.display!.displayId)
@@ -1607,6 +1610,25 @@ export class LocalDevicePeerFileTransport implements DevicePeerFileTransportPort
     if (request.createParents) await this.mkdir(dirname(path), { recursive: true, mode: 0o700, signal: request.signal });
     await canonicalDirectory(dirname(path));
     request.signal?.throwIfAborted();
+    if (request.createOnly) {
+      const parent = dirname(path), handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), mode);
+      const opened = await handle.stat(); let accepted = false;
+      try {
+        const validate = async () => {
+          request.signal?.throwIfAborted(); await canonicalDirectory(parent);
+          const current = await lstat(path);
+          if (!opened.isFile() || !sameFileIdentity(opened, current) || current.isSymbolicLink() || !samePath(await realpath(path), path)) throw agentError(DevicePeerFailureCode.CONFLICT, false);
+        };
+        await validate(); await handle.writeFile(content); await validate(); await handle.close(); accepted = true;
+        return;
+      } finally {
+        if (!accepted) {
+          await handle.truncate(0).catch(() => undefined); await handle.close().catch(() => undefined);
+          const current = await lstat(path).catch(missingAsUndefined);
+          if (current && sameFileIdentity(opened, current)) await unlink(path).catch(ignoreMissing);
+        }
+      }
+    }
     const existing = await lstat(path).catch(missingAsUndefined);
     if (existing?.isSymbolicLink() || (existing !== undefined && !existing.isFile())) {
       throw agentError(DevicePeerFailureCode.CONFLICT, false);

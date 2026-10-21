@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { remoteEntryToken } from "@joko/contracts";
 
 import type { DesktopNativeTaskStatusAction } from "../src/channels.js";
 import {
@@ -97,6 +98,34 @@ class FakeClock {
 }
 
 describe("macOS native task-status host", () => {
+  it("keeps first remote attention passive, alerts on a real transition and clears only an unchanged committed entry", () => {
+    const sounds = vi.fn(), actions: DesktopNativeTaskStatusAction[] = [];
+    const host = createMacNativeTaskStatusHost({ supported: true,
+      getDisplays: () => [{ id: 1, name: "Primary", primary: true, bounds: { x: 0, y: 0, width: 1600, height: 900 } }],
+      createWindow: bounds => new FakeWindow(bounds), onAction: action => actions.push(action), onNewTask: () => undefined,
+      onOpenSettings: () => undefined, onToggleSounds: () => undefined, playSound: sounds });
+    host.setSettings({ enabled: true, display: { mode: "all" }, layout: "normal", sounds: SOUND_SETTINGS });
+    const remote = { sourceId: "node/epoch", runId: "run", silent: false, completionNotification: "none" as const };
+    const entry = { sessionId: "remote", title: "Task", detail: "", phase: "interaction" as const, activityLines: [], updatedAt: 1, remote };
+    const publish = (revision: number, sessions: readonly Record<string, unknown>[]) => host.publish(parseDesktopNativeTaskStatusSnapshot({ ownerId: "renderer", revision: String(revision), locale: "en", sessions }));
+    publish(1, [entry]); expect(host.surface()?.mode).toBe("compact"); expect(sounds).not.toHaveBeenCalled();
+    publish(2, [{ ...entry, phase: "running" }]); publish(3, [{ ...entry, phase: "error" }, { ...entry, sessionId: "other", phase: "error" }]);
+    expect(host.surface()?.mode).toBe("expanded"); expect(sounds).toHaveBeenCalledOnce();
+    const error = { ...entry, phase: "error" as const }; const token = remoteEntryToken(error);
+    host.focusSession(error.sessionId, token); expect(actions).toEqual([{ kind: "focus", sessionId: "remote", entryToken: token }]);
+    host.acknowledgeFocus("remote", "old"); expect(host.surface()?.sessions).toHaveLength(2);
+    host.acknowledgeFocus("remote", token); expect(host.surface()?.sessions.map(session => session.sessionId)).toEqual(["other"]);
+    publish(4, [{ ...error, updatedAt: 2 }, { ...entry, sessionId: "other", phase: "error" }]);
+    expect(host.surface()?.sessions.map(session => session.sessionId)).toEqual(["other"]); expect(sounds).toHaveBeenCalledOnce();
+    const { remote: _remote, ...local } = error;
+    // The same task can become the primary connection while its route commits.
+    // Preserve both prior reads and the token of a click still being committed.
+    const { remote: _otherRemote, ...localOther } = { ...entry, sessionId: "other", phase: "error" };
+    publish(5, [{ ...local, updatedAt: 2 }, localOther]);
+    expect(host.surface()?.sessions.map(session => session.sessionId)).toEqual(["other"]);
+    host.acknowledgeFocus("other", remoteEntryToken({ ...error, sessionId: "other" }));
+    expect(host.surface()?.sessions).toHaveLength(0); host.dispose();
+  });
   it("defines the ambient window as pointer-interactive but nonactivating", () => {
     expect(NATIVE_TASK_STATUS_WINDOW_INTERACTION).toMatchObject({
       resizable: true,
@@ -182,6 +211,31 @@ describe("macOS native task-status host", () => {
     expect(html).toContain("&lt;b&gt;unsafe&lt;/b&gt;");
     expect(html).not.toContain("<script>alert(1)</script>");
     expect(html).toContain("Content-Security-Policy");
+  });
+
+  it("shows disjoint attention and running counts without clipping multi-digit badges", () => {
+    const sessions = Array.from({ length: 25 }, (_, index) => ({
+      sessionId: `task-${index}`, title: `Task ${index}`, detail: "", activityLines: [], updatedAt: index,
+      phase: index < 12 ? "running" : index < 23 ? "interaction" : index === 23 ? "completed" : "error"
+    }));
+    const render = (items: typeof sessions, locale: "en" | "zh-CN" = "en") => renderNativeTaskStatusDocument({
+      ...projectDesktopNativeTaskStatusSurface(parseDesktopNativeTaskStatusSnapshot({
+        ownerId: "owner", revision: "1", locale, sessions: items
+      })), mode: "compact"
+    }, { enabled: true, display: { mode: "all" }, layout: "compact", sounds: SOUND_SETTINGS }, locale);
+    const both = render(sessions);
+    expect(both).toContain('aria-label="Needs attention: 13; Running: 12"');
+    expect(both).toContain('class="count__attention" aria-hidden="true">13</span>');
+    expect(both).toContain('class="count__running" aria-hidden="true">12</span>');
+    expect(both).toContain("flex-shrink:0");
+    expect(both).toContain("white-space:nowrap");
+    const running = render(sessions.slice(0, 1));
+    expect(running).toContain('aria-label="Running: 1"');
+    expect(running).not.toContain('class="count__attention"');
+    const attention = render(sessions.slice(12), "zh-CN");
+    expect(attention).toContain('aria-label="需要关注: 13"');
+    expect(attention).not.toContain('class="count__running"');
+    expect(render([])).not.toContain('class="count"');
   });
 
   it("restores an unexpectedly closed ambient window with bounded retry and stops after opt-out", () => {

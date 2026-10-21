@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { mkdtemp, mkdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { PassThrough } from "node:stream";
@@ -34,6 +34,7 @@ import {
   DevicePeerShowRemoteDesktopPermissionGuideActionSchema,
   DevicePeerStartRemoteDesktopActionSchema,
   DevicePeerStartProcessActionSchema,
+  DevicePeerWriteFileActionSchema,
   DevicePeerStopRemoteDesktopActionSchema,
   RemoteDesktopCapabilitiesSchema,
   RemoteDesktopLockState,
@@ -113,6 +114,21 @@ afterEach(async () => {
 });
 
 describe("Node Device peer recent project ownership", () => {
+  it("atomically creates receipt downloads and refuses to overwrite an existing target", async () => {
+    const root = await testRoot(), file = join(root, "download.bin");
+    const executor = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "recent.json") });
+    const command = create(DevicePeerCommandSchema, { capability: DevicePeerCapabilityKind.FILES, effect: DevicePeerEffectKind.SIDE_EFFECT,
+      action: { case: "writeFile", value: create(DevicePeerWriteFileActionSchema, { path: file, content: Buffer.from("first"), createOnly: true }) } });
+    try {
+      await executor.execute(command, new AbortController().signal, async () => {});
+      expect(await readFile(file, "utf8")).toBe("first");
+      command.action = { case: "writeFile", value: create(DevicePeerWriteFileActionSchema, { path: file, content: Buffer.from("replacement"), createOnly: true }) };
+      const refused: NodeDevicePeerAgentEmission[] = [];
+      await executor.execute(command, new AbortController().signal, async result => { refused.push(result); });
+      expect(refused.at(-1)?.phase).toBe(DevicePeerResponsePhase.FAILED);
+      expect(await readFile(file, "utf8")).toBe("first");
+    } finally { await executor.retire(); }
+  });
   it("settles admitted recent-directory writes before retirement completes", async () => {
     const root = await testRoot();
     const executor = new NodeDevicePeerAgentExecutor({

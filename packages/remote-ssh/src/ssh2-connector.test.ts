@@ -320,6 +320,10 @@ describe("Ssh2ResolvedAgentAuthConnector", () => {
       allowTruncated: true
     })).toString("utf8")).toBe("remo");
 
+    await files.write({ path: "/workspace/nested/receipt.bin", content: Buffer.from("first"), createOnly: true });
+    await expect(files.write({ path: "/workspace/nested/receipt.bin", content: Buffer.from("replacement"), createOnly: true })).rejects.toMatchObject({ code: "FILE_TRANSFER_FAILED" });
+    expect(Buffer.from(await files.read({ path: "/workspace/nested/receipt.bin", maximumBytes: 16 })).toString()).toBe("first");
+
     await files.rename("/workspace/nested/note.txt", "/workspace/nested/renamed.txt");
     await files.remove("/workspace", { recursive: true });
     await expect(files.stat("/workspace")).rejects.toMatchObject({ code: "FILE_TRANSFER_FAILED" });

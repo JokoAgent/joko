@@ -1,0 +1,25 @@
+{
+  "name": "joko-status-example",
+  "version": "1.0.0",
+  "type": "module",
+  "files": ["extensions", "ui"],
+  "pi": { "extensions": ["extensions/index.js"] },
+  "joko": {
+    "extensionSurfaces": {
+      "schemaVersion": 1,
+      "extensions": [{
+        "entry": "extensions/index.js",
+        "runtime": {
+          "html": "ui/runtime.html",
+          "tools": [{
+            "name": "show_status",
+            "description": "Show a status card with a user refresh action.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "readOnly": true
+          }],
+          "card": {}
+        }
+      }]
+    }
+  }
+}

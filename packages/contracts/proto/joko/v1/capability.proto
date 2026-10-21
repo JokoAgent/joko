@@ -95,6 +95,7 @@ enum PermissionMode {
   PERMISSION_MODE_ASK = 1;
   PERMISSION_MODE_AUTO = 2;
   PERMISSION_MODE_BYPASS_PERMISSIONS = 3;
+  PERMISSION_MODE_ACCEPT_EDITS = 4;
 }
 
 message ContextCapabilityOptions {

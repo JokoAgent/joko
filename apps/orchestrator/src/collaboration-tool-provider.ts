@@ -1,4 +1,5 @@
 import type { PermissionMode, SessionDescriptor } from "@joko/core";
+import { isExtensionTaskControlled } from "./extension-tasks.js";
 import {
   AuthorizationError,
   StoreError,
@@ -54,7 +55,7 @@ const WORKER_ROUTE_PROPERTIES = Object.freeze({
   model_id: ID_SCHEMA,
   effort: { type: "string", minLength: 1, maxLength: 64 },
   fast_mode: { type: "boolean" },
-  permission_mode: { type: "string", enum: ["ask", "auto", "bypassPermissions"] },
+  permission_mode: { type: "string", enum: ["ask", "acceptEdits", "auto", "bypassPermissions"] },
   plan_mode: { type: "boolean" }
 });
 
@@ -364,6 +365,7 @@ export class CollaborationToolBridgeProvider implements BridgeToolProvider {
       return caller.kind === "lead" ? publicTree(tree) : publicWorkerGoal(tree, caller.worker.id);
     }
     if (name === "start_goal") {
+      if (isExtensionTaskControlled(this.#store, caller.session.id)) throw new CollaborationToolError("NOT_AUTHORIZED", "Plugin task teams must start through their approved task API.");
       if (caller.kind !== "lead") throw new CollaborationToolError("NOT_AUTHORIZED", "A worker cannot lead a nested Goal.");
       assertKeys(input, ["title", "objective", "maximum_workers"]);
       const existing = this.#store.findActiveCollaborationGoalByLeadSession(caller.session.id);
@@ -644,11 +646,11 @@ export class CollaborationToolBridgeProvider implements BridgeToolProvider {
     const permission = optionalEnum(
       input["permission_mode"],
       "permission_mode",
-      ["ask", "auto", "bypassPermissions"] as const
+      ["ask", "acceptEdits", "auto", "bypassPermissions"] as const
     ) ?? caller.permissionMode;
     const parentWorkerId = optionalId(input["parent_worker_id"], "parent_worker_id");
     const effort = optionalText(input["effort"], "effort", 64) ?? caller.effort;
-    return this.#manager.createWorker({
+    const creation = {
       operationId: operationIdValue,
       goalId: lead.goalId,
       callerLeadSessionId: lead.session.id,
@@ -665,7 +667,8 @@ export class CollaborationToolBridgeProvider implements BridgeToolProvider {
         permissionMode: permission as PermissionMode,
         planMode: optionalBoolean(input["plan_mode"], "plan_mode") ?? caller.planMode
       }
-    });
+    };
+    return this.#manager.createWorker(creation);
   }
 
   #requireSession(context: BridgeToolCallContext): SessionDescriptor {
@@ -893,7 +896,7 @@ function validateWorkerSpecInput(input: Readonly<Record<string, unknown>>): void
   }
   optionalText(input["effort"], "effort", 64);
   optionalBoolean(input["fast_mode"], "fast_mode");
-  optionalEnum(input["permission_mode"], "permission_mode", ["ask", "auto", "bypassPermissions"] as const);
+  optionalEnum(input["permission_mode"], "permission_mode", ["ask", "acceptEdits", "auto", "bypassPermissions"] as const);
   optionalBoolean(input["plan_mode"], "plan_mode");
 }
 

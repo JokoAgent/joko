@@ -72,6 +72,7 @@ export const DESKTOP_CHANNELS = {
   nativeTaskStatusPublish: "joko:native-task-status:publish",
   nativeTaskStatusSetVisibleSessions: "joko:native-task-status:visible-sessions:set",
   nativeTaskStatusAction: "joko:native-task-status:action",
+  nativeTaskStatusAcknowledgeFocus: "joko:native-task-status:focus:acknowledge",
   keepAwakeGet: "joko:power:keep-awake:get",
   keepAwakeSet: "joko:power:keep-awake:set",
   keepAwakeChanged: "joko:power:keep-awake:changed",
@@ -145,6 +146,7 @@ export const DESKTOP_CHANNELS = {
   managedOrchestratorAdoptConnection: "joko:managed-orchestrator:adopt-connection",
   managedOrchestratorCompleteLogout: "joko:managed-orchestrator:complete-logout",
   remoteDesktopGetState: "joko:remote-desktop:get-state",
+  remoteDesktopSetAppearance: "joko:remote-desktop:set-appearance",
   remoteDesktopSetEnabled: "joko:remote-desktop:set-enabled",
   remoteDesktopConfigureWindowsSupport: "joko:remote-desktop:configure-windows-support",
   remoteDesktopDisconnect: "joko:remote-desktop:disconnect",
@@ -581,11 +583,11 @@ export interface DesktopSaveFileRequest {
 export interface DesktopNotification {
   readonly title: string;
   readonly body: string;
-  readonly navigation?: {
+    readonly navigation?: {
     readonly kind: "session";
     readonly profileId: string;
     readonly sessionId: string;
-  };
+    } | { readonly kind: "nativeTask"; readonly sessionId: string; readonly entryToken: string };
 }
 
 export interface DesktopAttentionKey {
@@ -627,6 +629,14 @@ export interface DesktopNativeTaskStatusPermission {
 }
 
 export interface DesktopNativeTaskStatusSession {
+  readonly remote?: {
+    readonly sourceId: string;
+    readonly runId: string;
+    readonly silent: boolean;
+    readonly completionNotification: "none" | "pending" | "teammate";
+    readonly observedCompletionOnly?: boolean;
+    readonly companion?: { readonly name: string; readonly glyph: string; readonly tint: string; readonly artwork?: string };
+  };
   readonly sessionId: string;
   readonly title: string;
   readonly detail: string;
@@ -705,7 +715,7 @@ export interface DesktopNativeTaskStatusDisplay {
 }
 
 export type DesktopNativeTaskStatusAction =
-  | { readonly kind: "focus"; readonly sessionId: string }
+  | { readonly kind: "focus"; readonly sessionId: string; readonly entryToken?: string }
   | {
       readonly kind: "permission";
       readonly sessionId: string;

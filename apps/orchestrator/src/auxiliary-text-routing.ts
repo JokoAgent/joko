@@ -180,7 +180,10 @@ export class AuxiliaryTextRouting {
             user: input.user,
             maxTokens: input.maxTokens,
             timeoutMs: Math.min(input.timeoutMs, MAXIMUM_ATTEMPT_TIME_MS),
-            signal: attemptSignal
+            signal: attemptSignal,
+            assertCurrent: () => {
+              if (stopped() !== undefined) throw new Error("Auxiliary text inference owner changed.");
+            }
           }), attemptSignal);
           const after = stopped();
           if (after !== undefined) return after;

@@ -1,0 +1,37 @@
+.partner-discovery { max-width: 1000px; }
+.partner-discovery .modal__body { overflow-anchor: none; }
+.partner-discovery__list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.partner-discovery__list > article { display: flex; align-items: start; gap: 12px; padding: 24px 20px; border-bottom: 1px solid var(--line); min-width: 0; }
+.partner-discovery__list > article:nth-child(odd) { border-right: 1px solid var(--line); }
+.partner-discovery__list > article > div { flex: 1; min-width: 0; }
+.partner-discovery__list .partner-avatar { width: 40px; height: 40px; flex: none; }
+.partner-discovery__list p { font-size: var(--text-12); color: var(--text-soft); line-height: 1.6; margin: 8px 0 0; overflow-wrap: anywhere; }
+.partner-discovery__name { font: inherit; font-weight: 600; color: var(--text); background: none; border: none; padding: 0; text-align: left; cursor: pointer; }
+.partner-discovery__name:focus-visible, .partner-discovery__bubble:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.partner-discovery__back { position: sticky; top: 0; background: var(--surface); z-index: 1; padding-bottom: 12px; display: flex; align-items: center; gap: 12px; justify-content: space-between; }
+.partner-discovery__compact { display: flex; min-width: 0; align-items: center; gap: 10px; }
+.partner-discovery__compact .partner-avatar { width: 28px; height: 28px; }
+.partner-discovery__compact strong { font-size: var(--text-12); white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+.partner-discovery__identity { display: flex; align-items: center; gap: 16px; margin: 12px 0 24px; }
+.partner-discovery__identity .partner-avatar { width: 72px; height: 72px; }
+.partner-discovery__identity h2 { flex: 1; font-size: var(--text-20); }
+.partner-discovery__bubble { display: flex; justify-content: space-between; gap: 20px; max-width: 100%; border: 1px solid var(--line); border-radius: 16px 16px 16px 0; background: var(--surface); color: var(--text); font: inherit; padding: 18px 22px; cursor: pointer; }
+.partner-discovery__bubble:hover { background: var(--surface-hover); }
+.partner-discovery__bubble span { color: var(--text-soft); }
+.partner-discovery__capabilities { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); list-style: none; padding: 24px 0; margin: 12px 0; gap: 12px; border-bottom: 1px solid var(--line); font-size: var(--text-13); }
+.partner-discovery__working { font-size: var(--text-16); margin: 28px 0; }
+.partner-discovery__module { margin: 24px 0; }
+.partner-discovery__module h3 { display: flex; align-items: center; gap: 10px; font-size: var(--text-14); }
+.partner-discovery__module h3 svg { width: 18px; height: 18px; color: var(--text-soft); }
+.partner-discovery__module > div { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.partner-discovery__module article { display: flex; gap: 16px; justify-content: space-between; padding: 16px; border-bottom: 1px solid var(--line); }
+.partner-discovery__module article:last-child { border-bottom: none; }
+.partner-discovery__module article > div { min-width: 0; }
+.partner-discovery__module strong { font-size: var(--text-13); }
+.partner-discovery__module article p { margin: 6px 0 0; color: var(--text-soft); font-size: var(--text-12); line-height: 1.6; overflow-wrap: anywhere; }
+.partner-discovery__module article > span { white-space: nowrap; font-size: var(--text-11); color: var(--text-soft); }
+.partner-discovery__memory { flex-direction: column; }
+.partner-discovery__memory ul { display: flex; flex-wrap: wrap; gap: 8px; padding: 0; margin: 0; list-style: none; }
+.partner-discovery__memory li { background: var(--surface); border: 1px solid var(--line); border-radius: 7px; padding: 5px 8px; font-size: var(--text-12); color: var(--text-soft); }
+@media (max-width: 720px) { .partner-discovery__list { grid-template-columns: minmax(0, 1fr); } .partner-discovery__list > article:nth-child(odd) { border-right: none; } }
+@media (max-width: 420px) { .partner-discovery__identity { flex-wrap: wrap; } .partner-discovery__capabilities { gap: 8px; font-size: var(--text-11); } .partner-discovery__list > article { flex-wrap: wrap; } .partner-discovery__list > article > .button { margin-left: 52px; } }

@@ -21,10 +21,13 @@ import type { JSX } from "react";
 import { PartnerCreationReceipts } from "../partner-creation-receipts.js";
 import { PartnerDeletionPanel } from "./PartnerDeletionPanel.js";
 import { PartnerRestartPanel } from "./PartnerRestartPanel.js";
+import { PartnerHomeDialog } from "./PartnerHomeDialog.js";
+import { partnerHomeMessages } from "@joko/contracts";
 import { PartnerResumeDialog } from "./PartnerResumeDialog.js";
 import { PartnerRoutineDialog } from "./PartnerRoutineDialog.js";
 import { PartnerGroupsSection } from "./PartnerGroups.js";
 import { PartnerImportDialog } from "./PartnerImportDialog.js";
+import { PartnerDiscoveryDialog, partnerDiscoveryTitle } from "./PartnerDiscoveryDialog.js";
 import { PartnerMemoryDialog } from "./PartnerMemoryDialog.js";
 import { PartnerConnectionsDialog } from "./PartnerConnectionsDialog.js";
 import { partnerTaskModelMessages } from "@joko/contracts";
@@ -115,6 +118,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, preparation
   const [showArchived, setShowArchived] = useState(false);
   const [creating, setCreating] = useState(false);
   const [importOwner, setImportOwner] = useState<string>();
+  const [discoveryOwner, setDiscoveryOwner] = useState<string>();
   const [editingDefaults, setEditingDefaults] = useState(false);
   const [deletePartner, setDeletePartner] = useState<PartnerProfileView>();
   const [restartPartner, setRestartPartner] = useState<PartnerProfileView>();
@@ -271,8 +275,12 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, preparation
         <Button onClick={() => setEditingDefaults(true)} disabled={catalog === undefined || usableModels.length === 0}><Settings2 aria-hidden="true" />{t("partners.defaults")}</Button>
         <Button tone="primary" onClick={() => setCreating(true)} disabled={!creationCatalogCurrent || loading}><UserRoundPlus aria-hidden="true" />{t("partners.invite")}</Button>
         <Button onClick={() => setImportOwner(ownerKey)} disabled={!creationCatalogCurrent || loading}>{partnerImportMessages(controller.state.effectiveLocale).title}</Button>
+        <Button onClick={() => setDiscoveryOwner(ownerKey)} disabled={!creationCatalogCurrent || loading}>{partnerDiscoveryTitle(controller.state.effectiveLocale)}</Button>
       </div>
     </header>
+    {discoveryOwner === ownerKey && creationCatalogCurrent && <PartnerDiscoveryDialog key={`discovery:${ownerKey}`} controller={controller} ownerKey={ownerKey}
+      foreground={foreground && controller.state.connectionState === "connected"} onClose={() => { setDiscoveryOwner(undefined); load(); }}
+      onCreated={result => { if (ownerRef.current === ownerKey && result.saved) { setDiscoveryOwner(undefined); load(); controller.navigate(result.canonicalSessionId ? { kind: "session", sessionId: result.canonicalSessionId } : { kind: "partners", partnerId: result.partnerId }); } }} />}
     {importOwner === ownerKey && creationCatalogCurrent && <PartnerImportDialog key={`import:${ownerKey}`} controller={controller} ownerKey={ownerKey}
       foreground={foreground && controller.state.connectionState === "connected"} t={t} onClose={() => { setImportOwner(undefined); load(); }}
       onCreated={result => { if (ownerRef.current === ownerKey && result.canonicalSessionId) { setImportOwner(undefined); load(); controller.navigate({ kind: "session", sessionId: result.canonicalSessionId }); } }} />}
@@ -368,6 +376,7 @@ export function PartnersPage({ controller, snapshot, focusPartnerId, preparation
       ownerKey={ownerKey}
       t={t}
       onClose={() => controller.navigate({ kind: "partners" })}
+      initialSection={selected.capabilities.modelChain.length === 0 ? "profile" : "activity"}
       onUpdated={mergeMutation}
       onActivityUpdated={(profile) => setCatalog((current) => current === undefined ? current : ({
         ...current,
@@ -393,12 +402,12 @@ function PartnerCard({ partner, controller, snapshot, workingOwner, pending, pre
   readonly onRestart: () => void;
   readonly onResume: () => void;
 }): JSX.Element {
-  const primary = partner.capabilities.modelChain[0]!;
+  const primary = partner.capabilities.modelChain[0];
   const statusTone = partner.initializationState === "ready" ? "success" : partner.initializationState === "error" ? "danger" : "warning";
   const working = workingOwner === undefined || !partner.activity.workingStatus ? undefined : currentPartnerWorkingStatus(partner, snapshot);
   return <article className={cx("partner-card", partner.lifecycle === "archived" && "is-archived")} data-partner-id={partner.id}
     data-preparation-target={preparationTarget ? "true" : undefined} tabIndex={preparationTarget ? -1 : undefined}>
-    <header><PartnerAvatar preset={partner.avatar} partner={partner} /><div><h2>{partner.displayName}</h2><p>{primary.providerId} · {primary.modelId}</p></div><Pill tone={partner.lifecycle === "paused" ? "warning" : statusTone}>{partner.lifecycle === "paused" ? partnerResumeMessages(controller.state.effectiveLocale).paused : t(`partners.state.${partner.initializationState}`)}</Pill></header>
+    <header><PartnerAvatar preset={partner.avatar} partner={partner} /><div><h2>{partner.displayName}</h2><p>{primary ? `${primary.providerId} · ${primary.modelId}` : t("partners.primaryModel")}</p></div><Pill tone={partner.lifecycle === "paused" ? "warning" : statusTone}>{partner.lifecycle === "paused" ? partnerResumeMessages(controller.state.effectiveLocale).paused : t(`partners.state.${partner.initializationState}`)}</Pill></header>
     {working && workingOwner ? <p className="partner-card__working" role="status" aria-live="polite">
       <PartnerWorkingLabel controller={controller} partner={partner} status={working} ownerKey={workingOwner} t={t} />
     </p> : <p className="partner-card__identity">{firstIdentityLine(partner.activity.latestReplyPreview || partner.description || partner.identitySource)}</p>}
@@ -412,7 +421,7 @@ function PartnerCard({ partner, controller, snapshot, workingOwner, pending, pre
     <footer>
       {partner.lifecycle === "active" && partner.initializationState === "ready" && <Button onClick={onOpen}><MessageSquare aria-hidden="true" />{t("partners.openTask")}</Button>}
       {partner.initializationState === "error" && <Button onClick={onRetry} disabled={pending}><RotateCcw aria-hidden="true" />{pending ? t("common.working") : t("common.retry")}</Button>}
-      <Button onClick={onEdit} disabled={preparationTarget && partner.initializationState !== "ready"}><Pencil aria-hidden="true" />{t("common.edit")}</Button>
+      <Button onClick={onEdit} disabled={preparationTarget && partner.capabilities.modelChain.length > 0}><Pencil aria-hidden="true" />{t("common.edit")}</Button>
       {partner.lifecycle === "active" && partner.canonicalSessionId !== undefined && <Button onClick={onRestart} disabled={pending}><RefreshCcw aria-hidden="true" />{t("partners.restartAction")}</Button>}
       {partner.lifecycle === "paused" && <Button onClick={onResume} disabled={pending || !workingOwner}><RotateCcw aria-hidden="true" />{partnerResumeMessages(controller.state.effectiveLocale).action}</Button>}
       {partner.lifecycle !== "paused" && <Button onClick={onArchive} disabled={pending}><Archive aria-hidden="true" />{partner.lifecycle === "archived" ? t("partners.restore") : t("session.archive")}</Button>}
@@ -706,6 +715,8 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
   const [memoryVisible, setMemoryVisible] = useState(false);
   const [connectionsVisible, setConnectionsVisible] = useState(false);
   const [restartVisible, setRestartVisible] = useState(false);
+  const [homeVisible, setHomeVisible] = useState(false);
+  const homeApi = useMemo(() => controller.partnerHomeApi(ownerKey), [controller, ownerKey]);
   const [restartBusy, setRestartBusy] = useState(false);
   const [resumeVisible, setResumeVisible] = useState(false);
   const [resumeBusy, setResumeBusy] = useState(false);
@@ -866,7 +877,14 @@ export function PartnerSettingsDialog({ partner, partners, directory, snapshot, 
       <PartnerRestartPanel key={`restart:${ownerKey}:${baseline.id}`} controller={controller} ownerKey={ownerKey}
         foreground={restartForeground} partner={restartVisible ? baseline : undefined} pending={[]} t={t}
         onClose={() => setRestartVisible(false)} onBusyChange={setRestartBusy} onChanged={() => undefined} />
-      <fieldset disabled={restartBusy || resumeVisible || memoryVisible || connectionsVisible} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
+      {baseline.lifecycle === "active" && baseline.initializationState === "ready" && baseline.canonicalSessionId && <Button disabled={saving || dirty || avatarPreparing || conflict || restartBusy || connectionsVisible} onClick={() => setHomeVisible(true)}>{partnerHomeMessages(controller.state.effectiveLocale).title}</Button>}
+      {homeVisible && <PartnerHomeDialog api={homeApi} partnerId={baseline.id} revision={baseline.revision} locale={controller.state.effectiveLocale} onClose={() => setHomeVisible(false)} onChanged={() => {
+        void controller.getPartner(baseline.id).then(profile => { if (ownerRef.current === ownerKey) {
+          setBaseline(profile); setDraft(editorDraft(profile)); onActivityUpdated(profile); setHomeVisible(false);
+          if (profile.canonicalSessionId) controller.navigate({ kind: "session", sessionId: profile.canonicalSessionId });
+        } });
+      }} />}
+      <fieldset disabled={restartBusy || resumeVisible || memoryVisible || connectionsVisible || homeVisible} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}>
       <div className="partner-editor__status"><Pill tone={conflict || saveError !== undefined ? "danger" : saving || dirty ? "warning" : "success"}>{status}</Pill><span>{t("partners.profileVersionValue", { version: baseline.profileVersion.toString() })}</span></div>
       {(conflict || saveError !== undefined) && <div className="partner-conflict" role="alert"><CircleAlert aria-hidden="true" /><div><strong>{conflict ? t("partners.conflictTitle") : t("partners.saveFailed")}</strong><p>{conflict ? t("partners.conflictBody") : saveError}</p></div><div><Button onClick={() => void reconcile(false)}>{t("partners.reload")}</Button><Button tone="primary" onClick={() => void reconcile(true)}>{t("common.retry")}</Button></div></div>}
       {!valid && <p className="partner-editor__validation" role="alert">{t("partners.invalidDraft")}</p>}
@@ -1241,7 +1259,8 @@ function TaskModelEditor({ value, capabilities, snapshot, disabled, locale, onCh
   readonly value?: PartnerModelRouteView; readonly capabilities: PartnerCapabilitiesView; readonly snapshot: AppSnapshot;
   readonly disabled: boolean; readonly locale: string; readonly onChange: (value: PartnerModelRouteView | undefined) => void;
 }): JSX.Element {
-  const m = partnerTaskModelMessages(locale), route = value ?? capabilities.modelChain[0]!;
+  const m = partnerTaskModelMessages(locale), route = value ?? capabilities.modelChain[0];
+  if (!route) return <></>;
   const models = partnerModels(snapshot).filter(model => {
     const backend = snapshot.backends.find(candidate => candidate.id === model.backendId);
     return backend?.capabilities.get("permission.modes")?.options.includes(capabilities.permissionMode)
@@ -1272,7 +1291,7 @@ function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: 
 }): JSX.Element {
   const models = partnerModels(snapshot);
   const chainBackends = value.modelChain.map(route => snapshot.backends.find(candidate => candidate.id === route.backendId));
-  const permissionOptions = (["ask", "auto", "bypassPermissions"] as const).filter(mode => chainBackends.every(candidate => candidate?.capabilities.get("permission.modes")?.supported === true && candidate.capabilities.get("permission.modes")?.options?.includes(mode)));
+  const permissionOptions = (["ask", "acceptEdits", "auto", "bypassPermissions"] as const).filter(mode => chainBackends.every(candidate => candidate?.capabilities.get("permission.modes")?.supported === true && candidate.capabilities.get("permission.modes")?.options?.includes(mode)));
   const planSupported = chainBackends.every(candidate => candidate?.capabilities.get("plan_mode")?.supported === true);
   const modelLabel = (model: ModelView): string => `${new Set(models.map(candidate => candidate.backendId)).size > 1
     ? `${snapshot.backends.find(candidate => candidate.id === model.backendId)?.name ?? model.backendId} · ` : ""}${model.providerName} · ${model.name}`;
@@ -1307,6 +1326,9 @@ function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: 
     if (model !== undefined) onChange({ ...value, modelChain: [...value.modelChain, routeForModel(model)] });
   };
   return <fieldset className="partner-capabilities" disabled={disabled}><legend>{t("partners.capabilities")}</legend>
+    {value.modelChain.length === 0 && <label className="field"><span>{t("partners.primaryModel")}</span><SelectControl value="" onChange={event => {
+      const model = models.find(candidate => modelKey(candidate) === event.target.value); if (model) onChange({ ...value, modelChain: [routeForModel(model)] });
+    }}><option value="">{t("partners.defaultsMissing")}</option>{models.filter(model => canSelectModel(model)).map(model => <option key={modelKey(model)} value={modelKey(model)}>{modelLabel(model)}</option>)}</SelectControl></label>}
     <div className="partner-model-chain">{value.modelChain.map((route, index) => {
       const model = snapshot.models.find((candidate) => modelKey(candidate) === routeKey(route));
       const options = models;
@@ -1322,8 +1344,8 @@ function CapabilitiesEditor({ value, snapshot, disabled = false, t, onChange }: 
         </div>}
       </div>;
     })}</div>
-    {value.modelChain.length < 5 && models.some((model) => canSelectModel(model) && !value.modelChain.some((route) => routeKey(route) === modelKey(model))) && <Button tone="ghost" onClick={addFallback}><Plus aria-hidden="true" />{t("partners.addFallback")}</Button>}
-    <div className="partner-capabilities__axes"><label className="field"><span>{t("controls.permission")}</span><SelectControl value={value.permissionMode} onChange={(event) => { const mode = permissionOptions.find(candidate => candidate === event.target.value); if (mode !== undefined) onChange({ ...value, permissionMode: mode }); }}>{!permissionOptions.includes(value.permissionMode) && <option value={value.permissionMode} disabled>{t(value.permissionMode === "ask" ? "permission.ask" : value.permissionMode === "auto" ? "permission.auto" : "permission.full")} · {t("common.unavailable")}</option>}{permissionOptions.map((mode) => <option value={mode} key={mode}>{t(mode === "ask" ? "permission.ask" : mode === "auto" ? "permission.auto" : "permission.full")}</option>)}</SelectControl></label><label className="check-row"><CheckboxControl checked={value.planMode} disabled={!planSupported} onChange={(event) => onChange({ ...value, planMode: event.target.checked })} /><span><strong>{t("controls.plan")}</strong><small>{planSupported ? t("partners.planHelp") : t("partners.planUnavailable")}</small></span></label></div>
+    {value.modelChain.length > 0 && value.modelChain.length < 5 && models.some((model) => canSelectModel(model) && !value.modelChain.some((route) => routeKey(route) === modelKey(model))) && <Button tone="ghost" onClick={addFallback}><Plus aria-hidden="true" />{t("partners.addFallback")}</Button>}
+    <div className="partner-capabilities__axes"><label className="field"><span>{t("controls.permission")}</span><SelectControl value={value.permissionMode} onChange={(event) => { const mode = permissionOptions.find(candidate => candidate === event.target.value); if (mode !== undefined) onChange({ ...value, permissionMode: mode }); }}>{!permissionOptions.includes(value.permissionMode) && <option value={value.permissionMode} disabled>{t(value.permissionMode === "ask" ? "permission.ask" : value.permissionMode === "acceptEdits" ? "permission.edits" : value.permissionMode === "auto" ? "permission.auto" : "permission.full")} · {t("common.unavailable")}</option>}{permissionOptions.map((mode) => <option value={mode} key={mode}>{t(mode === "ask" ? "permission.ask" : mode === "acceptEdits" ? "permission.edits" : mode === "auto" ? "permission.auto" : "permission.full")}</option>)}</SelectControl></label><label className="check-row"><CheckboxControl checked={value.planMode} disabled={!planSupported} onChange={(event) => onChange({ ...value, planMode: event.target.checked })} /><span><strong>{t("controls.plan")}</strong><small>{planSupported ? t("partners.planHelp") : t("partners.planUnavailable")}</small></span></label></div>
   </fieldset>;
 }
 
@@ -1348,7 +1370,7 @@ function defaultCapabilities(snapshot: AppSnapshot): PartnerCapabilitiesView {
   const permissionOptions = backend?.capabilities.get("permission.modes")?.options ?? [];
   return {
     modelChain: model === undefined ? [] : [routeForModel(model)],
-    permissionMode: permissionOptions.includes("ask") ? "ask" : permissionOptions.includes("auto") ? "auto" : "bypassPermissions",
+    permissionMode: permissionOptions.includes("ask") ? "ask" : permissionOptions.includes("acceptEdits") ? "acceptEdits" : permissionOptions.includes("auto") ? "auto" : "bypassPermissions",
     planMode: false
   };
 }
@@ -1360,7 +1382,7 @@ function partnerModels(snapshot: Pick<AppSnapshot, "backends" | "models">): read
     return model.available && model.routingEnabled !== false && backend !== undefined
       && backend.health !== "unavailable" && backend.installationState === "installed"
       && (backend.authenticationState === "authenticated" || backend.authenticationState === "notRequired")
-      && modes?.supported === true && modes.options.some((mode) => mode === "ask" || mode === "auto" || mode === "bypassPermissions")
+      && modes?.supported === true && modes.options.some((mode) => mode === "ask" || mode === "acceptEdits" || mode === "auto" || mode === "bypassPermissions")
       && (model.efforts.length === 0 || backend.capabilities.get("model.effort")?.supported === true);
   });
 }

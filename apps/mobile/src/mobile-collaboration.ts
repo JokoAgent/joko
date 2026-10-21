@@ -83,7 +83,7 @@ export interface MobileCollaborationRpc {
 export function normalizeMobileWorkerForm(value: MobileWorkerForm): MobileWorkerForm {
   if (!value || typeof value.role !== "string" || !text(value.role.trim(), 32) || !identity(value.targetId) || typeof value.initialTask !== "string"
     || value.initialTask.includes("\0") || [...value.initialTask.trim()].length > 32_000
-    || ![PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS].includes(value.permissionMode)) {
+    || ![PermissionMode.ASK, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS].includes(value.permissionMode)) {
     throw new Error("Review the worker role, route and initial task.");
   }
   if (value.sourceScope !== undefined && (typeof value.sourceScope !== "string" || !value.sourceScope || value.sourceScope.length > 64_000 || value.sourceScope.includes("\0"))) throw new Error("The confirmed collaboration source is invalid.");
@@ -122,7 +122,7 @@ export function projectMobileCollaborationTree(value: CollaborationGoalTree | un
       || (route.providerId === undefined) !== (route.modelId === undefined)
       || route.providerId !== undefined && !identity(route.providerId) || route.modelId !== undefined && !identity(route.modelId)
       || route.effort !== undefined && !identity(route.effort)
-      || ![PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS].includes(route.permissionMode)
+      || ![PermissionMode.ASK, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS].includes(route.permissionMode)
       || (worker.sessionId === undefined) !== (worker.sessionGeneration === undefined)
       || (worker.sessionId === undefined) !== (worker.backendInstanceGeneration === undefined)
       || worker.sessionId !== undefined && (!identity(worker.sessionId) || sessions.has(worker.sessionId) || worker.sessionId === goal.leadSessionId)

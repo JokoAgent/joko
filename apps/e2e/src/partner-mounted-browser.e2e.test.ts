@@ -71,6 +71,91 @@ describe("mounted Partner collaboration product chain", () => {
     fixture = undefined;
   });
 
+  mountedIt("discovers, installs without a model, configures and reopens a bundled partner with disabled routines through production Web", async () => {
+    fixture = await RealPiSystemFixture.start({ webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), keepRoot: true, enableInternalServer: true });
+    const manager = await fixture.pair("Partner package manager");
+    const challenge = required((await fixture.anonymous.connection.beginPairing({ deviceDisplayName: "Partner package Web" })).challenge, "the pairing challenge");
+    browser = await chromium.launch({ executablePath: requiredEnvironment("JOKO_BROWSER_EXECUTABLE"), headless: true });
+    const page = await browser.newPage({ viewport: { width: 1280, height: 800 }, locale: "en-US", colorScheme: "light" });
+    const errors: string[] = []; page.on("pageerror", error => errors.push(error.message));
+    await page.goto(`${fixture.baseUrl}/#/partners`, { waitUntil: "domcontentloaded" });
+    await page.locator(".connection-theme-toggle").click();
+    await page.locator(".connection-tabs > button").nth(2).click();
+    await page.locator("form.pair-form input[type=url]").fill(fixture.baseUrl);
+    await page.getByLabel("Pairing code").fill(fixture.pairingCode(challenge.challengeId));
+    await page.getByLabel("Device name").fill("Partner package Web");
+    await page.locator("form.pair-form button[type=submit]").click();
+    const discover = page.locator(".partners-page .route-header").getByRole("button", { name: "Discover partners", exact: true });
+    await discover.waitFor({ state: "visible", timeout: 30_000 }); await discover.click();
+    const dialog = page.getByRole("dialog", { name: "Discover partners", exact: true });
+    await dialog.locator(".partner-discovery__list > article").nth(9).waitFor({ state: "visible" });
+    expect(await dialog.locator(".partner-discovery__list > article").count()).toBe(10);
+    const firstName = required(await dialog.locator(".partner-discovery__name").first().textContent(), "package name");
+    const evidence = process.env.JOKO_PARTNER_PACKAGE_EVIDENCE_DIR;
+    if (evidence) { await mkdir(evidence, { recursive: true }); await page.screenshot({ path: join(evidence, "discovery-light-1280.png"), fullPage: true, animations: "disabled" }); }
+    await dialog.locator(".partner-discovery__name").first().click();
+    await dialog.getByRole("heading", { name: "How you work together", exact: true }).waitFor({ state: "visible" });
+    expect(await dialog.getByText("Off by default", { exact: true }).count()).toBeGreaterThan(0);
+    expect((await manager.clients.partner.listPartners({})).partners).toHaveLength(0);
+    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    await page.goto(`${fixture.baseUrl}/#/settings/appearance`);
+    await page.getByRole("radio", { name: "Dark", exact: true }).click();
+    await page.goto(`${fixture.baseUrl}/#/partners`); await discover.click();
+    await dialog.locator(".partner-discovery__name").first().click();
+    await page.setViewportSize({ width: 800, height: 600 }); await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
+    const detailLayout = await dialog.evaluate(element => ({
+      scrollTop: element.querySelector(".modal__body")!.scrollTop,
+      backBottom: element.querySelector(".partner-discovery__back")!.getBoundingClientRect().bottom,
+      identityTop: element.querySelector(".partner-discovery__identity")!.getBoundingClientRect().top
+    }));
+    expect(detailLayout.scrollTop).toBe(0); expect(detailLayout.backBottom).toBeLessThanOrEqual(detailLayout.identityTop);
+    expect(await overflow(page)).toBeLessThanOrEqual(1);
+    if (evidence) await page.screenshot({ path: join(evidence, "discovery-detail-dark-800.png"), fullPage: true, animations: "disabled" });
+    await dialog.locator(".partner-discovery__identity").getByRole("button", { name: "Invite", exact: true }).click();
+    const primary = page.getByRole("dialog").getByRole("combobox", { name: "Primary model", exact: true });
+    await primary.waitFor({ state: "visible", timeout: 60_000 });
+    const installedProfile = required((await manager.clients.partner.listPartners({})).partners[0], "installed partner");
+    expect(installedProfile.displayName).toBe(firstName); expect(installedProfile.canonicalSessionId).toBeUndefined();
+    expect(installedProfile.capabilities?.modelChain).toEqual([]);
+    expect(fixture.application.store.listSessions({ targetId: installedProfile.homeTargetId })).toHaveLength(0);
+    expect(fixture.application.partnerRoutines!.engine.list(installedProfile.partnerId)[0]!.enabled).toBe(false);
+    if (evidence) await page.screenshot({ path: join(evidence, "discovery-installed-model-pending-800.png"), fullPage: true, animations: "disabled" });
+    const modelSaved = page.waitForResponse(response => response.url().endsWith("/joko.v1.PartnerService/UpdatePartner") && response.status() === 200);
+    await primary.click(); await page.getByRole("option", { name: /Joko real Pi E2E model/u }).click(); await modelSaved;
+    const row = required(await waitFor(async () => (await manager.clients.partner.listPartners({})).partners[0],
+      partner => !!partner?.canonicalSessionId, "the explicitly configured Partner task", 60_000), "configured Partner");
+    const packages = await waitFor(() => fixture!.application.partnerImports!.packages("en", { ownerKey: "evidence", assertCurrent() {} }),
+      entries => entries.find(entry => entry.packageId === "engineer-bot")?.installation?.canonicalSessionId === row.canonicalSessionId,
+      "the original package receipt runtime projection");
+    const saved = required(packages.find(entry => entry.packageId === "engineer-bot")?.installation, "the durable installation receipt");
+    expect(saved).toMatchObject({ saved: true, status: "complete", partnerId: row.partnerId });
+    const routines = fixture.application.partnerRoutines!.list(row.partnerId);
+    expect(routines).toHaveLength(1); expect(routines[0]!.enabled).toBe(false);
+    expect(fixture.application.store.listRuns({ sessionId: row.canonicalSessionId! })).toHaveLength(0);
+    const welcomeId = `import-message-${createHash("sha256").update(JSON.stringify([row.canonicalSessionId, `package-welcome-${saved.requestId}`])).digest("hex")}`;
+    await waitFor(async () => fixture!.application.store.findEvent(welcomeId), event => event !== undefined, "the once-only package opening");
+    await fixture.application.partnerImports!.recover(); await fixture.application.partnerImports!.recover();
+    expect(fixture.application.store.listEvents({ sessionId: row.canonicalSessionId!, limit: 100 }).filter(event => event.id === welcomeId)).toHaveLength(1);
+    await page.keyboard.press("Escape"); await page.getByRole("dialog").waitFor({ state: "hidden" });
+    await page.goto(`${fixture.baseUrl}/#/partners`);
+    const navigationScrim = page.locator(".panel-scrim--navigation");
+    if (await navigationScrim.isVisible()) await page.locator(".sidebar").getByRole("button", { name: "Close navigation", exact: true }).click();
+    await discover.click();
+    const installed = dialog.locator(".partner-discovery__list > article").filter({ hasText: firstName });
+    await installed.getByRole("button", { name: "Open partner", exact: true }).click();
+    await waitFor(async () => page.url(), url => url.includes("#/tasks/"), "the original Partner task");
+    expect((await manager.clients.partner.listPartners({})).partners).toHaveLength(1);
+    const rootDirectory = fixture.rootDirectory, port = Number(new URL(fixture.baseUrl).port), internalPort = fixture.application.config.internalPort;
+    await fixture.close({ removeRoot: false }); fixture = undefined;
+    fixture = await RealPiSystemFixture.start({ rootDirectory, webDirectory: requiredEnvironment("JOKO_MOUNTED_WEB_DIR"), port, internalPort, enableInternalServer: true });
+    expect(fixture.application.store.findEvent(welcomeId)).toBeDefined();
+    expect(fixture.application.store.listEvents({ sessionId: row.canonicalSessionId!, limit: 100 }).filter(event => event.id === welcomeId)).toHaveLength(1);
+    const recovered = await fixture.application.partnerImports!.packages("en", { ownerKey: "evidence-restart", assertCurrent() {} });
+    expect(recovered.find(entry => entry.packageId === "engineer-bot")?.installation).toMatchObject({ requestId: saved.requestId, canonicalSessionId: row.canonicalSessionId });
+    expect(errors).toEqual([]);
+    if (evidence) await writeFile(join(evidence, "discovery-result.json"), JSON.stringify({ packages: packages.length, saved: saved.status, disabledRoutines: routines.length, providersCalled: fixture.providerRequests.length, errors }, null, 2));
+  }, 120_000);
+
   mountedIt("recovers a user-photo Partner after lost creation receipt, edits, service restart and narrow Web reload without duplicate initialization", async () => {
     const executablePath = requiredEnvironment("JOKO_BROWSER_EXECUTABLE");
     const webDirectory = requiredEnvironment("JOKO_MOUNTED_WEB_DIR");

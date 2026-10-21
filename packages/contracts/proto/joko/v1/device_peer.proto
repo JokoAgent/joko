@@ -228,6 +228,8 @@ message DevicePeerWriteFileAction {
   optional uint32 mode = 3;
   bool create_parents = 4;
   bool atomic = 5;
+  // Fail instead of replacing an existing file or following a symlink.
+  bool create_only = 6;
 }
 
 message DevicePeerRenameFileAction {
@@ -372,6 +374,7 @@ message DevicePeerShowRemoteDesktopPermissionGuideAction {}
 message DevicePeerStartRemoteDesktopAction {
   string display_id = 1;
   RemoteDesktopStartMode mode = 2;
+  bool control = 3;
 }
 
 message DevicePeerHeartbeatRemoteDesktopAction {
@@ -434,6 +437,7 @@ message DevicePeerSetRemoteDesktopDisplayModeAction {
   uint64 control_generation = 2;
   string mode_id = 3;
   bool temporary = 4;
+  bool control = 5;
 }
 
 message DevicePeerSetRemoteDesktopViewerDisplayAction {
@@ -441,11 +445,13 @@ message DevicePeerSetRemoteDesktopViewerDisplayAction {
   uint64 control_generation = 2;
   uint32 width = 3;
   uint32 height = 4;
+  bool control = 5;
 }
 
 message DevicePeerRestoreRemoteDesktopViewerDisplayAction {
   string lease_id = 1;
   uint64 control_generation = 2;
+  bool control = 3;
 }
 
 message DevicePeerCommand {

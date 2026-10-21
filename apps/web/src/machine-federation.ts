@@ -59,7 +59,7 @@ export function machineCacheFromSnapshot(profile: ConnectionProfile, snapshot: A
     origin: profile.origin,
     updatedAt: now,
     sessions: [...snapshot.sessions]
-      .filter((session) => safeIdentifier(session.id))
+      .filter((session) => !session.hidden && safeIdentifier(session.id))
       .sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id))
       .slice(0, MAX_CACHED_SESSIONS)
       .map((session) => ({

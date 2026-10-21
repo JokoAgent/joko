@@ -747,7 +747,10 @@ function runtimePermissions(runtime: ExtensionRuntimeDescriptor | undefined): re
     ...(runtime.card?.externalLinks ? [{ id: "runtime-card-links", label: "External card links", description: "Opens card links after owner confirmation.", required: true }] : []),
     ...(runtime.mail ? [{ id: "runtime-mail", label: "Mail drafts", description: "Uses the host mail editor with its provider account adapters.", required: true }] : []),
     ...(runtime.network ? [{ id: `runtime-network:${digest(runtime.network)}`, label: "Network access", description: `HTTPS requests to: ${[...runtime.network.hosts, ...(runtime.network.connections?.length ? ["addresses configured in connection settings"] : [])].join(", ")}. Protected credentials stay in the host.`, required: true }] : []),
-    ...(runtime.agent ? [{ id: "runtime-task-continuation", label: "Task continuation", description: "May continue the original task once after an explicit card action.", required: true }] : [])
+    ...(runtime.agent ? [{ id: "runtime-task-continuation", label: "Task continuation", description: "May continue the original task once after an explicit card action.", required: true }] : []),
+    ...(runtime.tasks ? [{ id: "runtime-managed-tasks", label: "Managed tasks", description: "Creates and controls its own ordinary tasks using your selected model and task permissions.", required: true }] : []),
+    ...(runtime.tasks?.hidden ? [{ id: "runtime-hidden-tasks", label: "Background tasks", description: "May hide its own tasks from normal lists, search and notifications. You can open or reveal them in plugin details.", required: true }] : []),
+    ...(runtime.text?.oneshot ? [{ id: "runtime-text", label: "Text inference", description: "Runs bounded one-shot text requests using your plugin model or auxiliary models.", required: true }] : [])
   ];
 }
 
@@ -808,7 +811,7 @@ function projectDefinitions(
         }),
         ...(entry.runtime === undefined ? {} : { runtime: { ...structuredClone(entry.runtime), extensionEntry: entry.extensionRelativePath } }),
         sidebarSupported: entry.mainView !== undefined,
-        tools: (entry.runtime?.tools ?? []).map(tool => ({ name: tool.name, description: tool.description, requiresPermission: !tool.readOnly })),
+        tools: (entry.runtime?.tools ?? []).map(tool => ({ name: tool.name, description: tool.description, requiresPermission: !tool.readOnly || entry.runtime?.network !== undefined })),
         permissions: runtimePermissions(entry.runtime),
         recommendations: copyRecommendations(entry.recommendations ?? []),
         setupRequirements: runtimeSetup(extensionId(bindingKey), entry.runtime),
@@ -917,7 +920,7 @@ function projectDefinitions(
         ...(detail.routineEvents === undefined || detail.entryPath === undefined ? {} : { routineEvents: { ...detail.routineEvents, extensionEntry: detail.entryPath } }),
         ...(detail.runtime === undefined || detail.entryPath === undefined ? {} : { runtime: { ...structuredClone(detail.runtime), extensionEntry: detail.entryPath } }),
         sidebarSupported: detail.mainView !== undefined,
-        tools: (detail.runtime?.tools ?? []).map(tool => ({ name: tool.name, description: tool.description, requiresPermission: !tool.readOnly })),
+        tools: (detail.runtime?.tools ?? []).map(tool => ({ name: tool.name, description: tool.description, requiresPermission: !tool.readOnly || detail.runtime?.network !== undefined })),
         permissions,
         recommendations: copyRecommendations(detail.recommendations ?? []),
         setupRequirements: runtimeSetup(id, detail.runtime),

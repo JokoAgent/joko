@@ -1,4 +1,4 @@
-import { type BlobRef, type Event } from "@joko/contracts";
+import { QueueItemState, type BlobRef, type Event, type QueueItem } from "@joko/contracts";
 import { mobileTimelineContent, type MobileTimelineContentSource } from "./mobile-timeline-content";
 import { MOBILE_BLOB_PREVIEW_MAXIMUM_BYTES } from "./network";
 import { bytesToDataUri, normalizeMediaType } from "./workspace-files";
@@ -32,6 +32,7 @@ export interface MobileImageGalleryPage {
   readonly source:
     | { readonly kind: "workspace"; readonly relativePath: string; readonly revisionKey: string }
     | { readonly kind: "artifact"; readonly artifactId: string; readonly sessionId: string }
+    | { readonly kind: "queue"; readonly queueItemId: string; readonly contentIndex: number }
     | MobileTimelineContentSource;
 }
 
@@ -97,6 +98,20 @@ export function mobileImageGalleryPageSummary(page: MobileImageGalleryPage): Mob
     ...(page.heightPixels === undefined ? {} : { heightPixels: page.heightPixels }),
     ...("eventId" in page.source ? { sourceEventId: page.source.eventId } : {})
   };
+}
+
+/** Image occurrences retain the pending item's identity until it leaves the queue. */
+export function mobileQueueGalleryPages(item: QueueItem): readonly MobileImageGalleryPage[] {
+  if (item.state !== QueueItemState.ACCEPTED || !item.queueItemId || !item.sessionId) return [];
+  return (item.input?.parts ?? []).flatMap((part, contentIndex) => {
+    if (part.content.case !== "image") return [];
+    const image = part.content.value;
+    const page = mobileImageGalleryPage({ pageId: JSON.stringify(["queue", item.queueItemId, contentIndex]),
+      title: image.altText || image.blob?.fileName || "Image", blob: image.blob,
+      widthPixels: image.widthPixels, heightPixels: image.heightPixels,
+      source: { kind: "queue", queueItemId: item.queueItemId, contentIndex } });
+    return page ? [page] : [];
+  });
 }
 
 export function mobileImageGalleryMediaType(value: string): MobileImageGalleryPage["mediaType"] | undefined {

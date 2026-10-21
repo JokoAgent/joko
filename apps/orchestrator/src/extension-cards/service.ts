@@ -115,6 +115,10 @@ export class ExtensionCardService {
   publishHostMail(extensionId: string, authorityKey: string, payload: { callId: string; html: string; state: "working" | "done" }, assertCurrent: () => void): Promise<{ accepted: boolean; reason?: string }> {
     return this.#enqueue(extensionId, authorityKey, { ...payload, type: "card-update", height: EXTENSION_CARD_HEIGHT_MIN, version: 1 }, assertCurrent, true);
   }
+  /** Host-assessed account requirements share trusted static markup publication. */
+  publishHostAuthorization(extensionId: string, authorityKey: string, callId: string, html: string, assertCurrent: () => void): Promise<{ accepted: boolean; reason?: string }> {
+    return this.#enqueue(extensionId, authorityKey, { type: "card-update", version: 1, callId, html, state: "done", height: EXTENSION_CARD_HEIGHT_MIN }, assertCurrent, true);
+  }
   #enqueue(extensionId: string, authorityKey: string, payload: unknown, assertCurrent: () => void, hostMail: boolean): Promise<{ accepted: boolean; reason?: string }> {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return Promise.resolve({ accepted: false, reason: "bad-shape" });
     const p = payload as Record<string, unknown>;

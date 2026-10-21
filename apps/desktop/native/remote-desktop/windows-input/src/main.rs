@@ -264,11 +264,9 @@ fn main() {
                 _ => (),
             }
         }
-        if service_worker {
-            if FAILED.load(std::sync::atomic::Ordering::SeqCst) { break; }
-            println!("ok");
-            if io::stdout().flush().is_err() { break; }
-        }
+        if FAILED.load(std::sync::atomic::Ordering::SeqCst) { break; }
+        println!("ok");
+        if io::stdout().flush().is_err() { break; }
     }
     release(&mut keys, &mut buttons);
 }

@@ -1,7 +1,7 @@
 import { capabilityNames } from "@joko/contracts";
 import type { BackendView, DeliveryMode, PermissionMode } from "../model.js";
 
-const PERMISSION_MODES = ["ask", "auto", "bypassPermissions"] as const;
+const PERMISSION_MODES = ["ask", "acceptEdits", "auto", "bypassPermissions"] as const;
 
 /**
  * Returns only the exact permission modes advertised by the current Backend

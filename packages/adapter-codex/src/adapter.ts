@@ -320,6 +320,7 @@ interface SessionRuntime {
   readonly planTurnIds: Set<string>;
   readonly planTextByTurn: Map<string, string>;
   readonly planContextByTurn: Map<string, AdapterContext>;
+  readonly nativeFileChanges: Map<string, JsonValue>;
   readonly yieldedExecCellsByTurnId: Map<string, Map<string, YieldedExecCell[]>>;
   yieldContinuation?: YieldContinuationClaim;
   yieldContinuationStartFlight?: Promise<void>;
@@ -532,6 +533,7 @@ const REVIEW_CREDENTIAL_GLOB_PATTERNS = [
 ] as const;
 
 export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implements CodexNativeAccountOperations, ProviderAuthenticationRevocation {
+  readonly nativeTextInferenceCapabilities = { pluginOneshot: true, maxTokens: false } as const;
   readonly id: string;
   readonly #instanceGeneration: number;
   readonly #providerId: string;
@@ -1875,6 +1877,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const assertNativeDispatchReady = (): void => {
       assertDispatchReady();
       nativeInput.assertCurrent();
+      context.nativeToolAuthorization?.assertCurrent();
     };
     assertNativeDispatchReady();
     const clientUserMessageId = yieldDispatch?.clientUserMessageId ?? context.operationId;
@@ -1932,7 +1935,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             }
           : {
               ...(runtime.fastMode ? { serviceTier: "fast" } : {}),
-              ...(runtime.permissionMode === "bypassPermissions" || runtime.nativeMemoryDirectory === undefined
+              ...(context.nativeToolAuthorization?.required ? { approvalPolicy: "untrusted", approvalsReviewer: "user", sandboxPolicy: { type: "readOnly" } } : {}),
+              ...(context.nativeToolAuthorization?.required || runtime.permissionMode === "bypassPermissions" || runtime.nativeMemoryDirectory === undefined
                 ? {}
                 : {
                     sandboxPolicy: {
@@ -2521,6 +2525,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #setPermissionMode(mode: PermissionMode, context: AdapterContext): Promise<void> {
+    if (mode === "acceptEdits") return this.unsupported("permission.modes");
     if (mode === "bypassPermissions" && !context.target.trusted) {
       throw adapterError({
         code: "CODEX_FULL_ACCESS_REQUIRES_TRUST",
@@ -3556,7 +3561,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   override async getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]> {
     const runtime = await this.#requireRuntime(context);
-    if (runtime.remote || runtime.runtimePolicy !== "standard" || runtime.nativeSkills === undefined) return [];
+    if (runtime.runtimePolicy !== "standard" || runtime.nativeSkills === undefined) return [];
     const observed = await this.#loadedSkillCatalog(runtime, context);
     const commands: RuntimeCommand[] = [];
     for (const mount of runtime.nativeSkills.skills) {
@@ -3564,7 +3569,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       const native = observed.get(mount.filePath);
       if (native === undefined || !/^[^\s/\\]+$/u.test(native.name)) continue;
       commands.push({ name: native.name, description: native.description, source: "skill", resourceId: mount.seed.resource.id,
-        loaded: true, inputMode: "resource_mention" });
+        loaded: true, inputMode: "resource_mention", ...(mount.seed.resource.trustedBuiltin ? { builtinSkill: mount.seed.resource.trustedBuiltin } : {}) });
     }
     return commands;
   }
@@ -4254,6 +4259,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       planTurnIds: new Set(),
       planTextByTurn: new Map(),
       planContextByTurn: new Map(),
+      nativeFileChanges: new Map(),
       yieldedExecCellsByTurnId: new Map(),
       retiredYieldContinuationsByClientId: new Map(),
       retiredYieldContinuationsByTurnId: new Map(),
@@ -4276,6 +4282,13 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           }
           if (this.#handleRetiredYieldNotification(runtime, method, params, input.hostGeneration)) return;
           if (!this.#acceptTurnNotification(runtime, method, params)) return;
+          if (method === "item/started" && isJsonObject(params) && isJsonObject(params["item"]) && params["item"]["type"] === "fileChange"
+            && typeof params["item"]["id"] === "string" && typeof params["turnId"] === "string") {
+            const evidence = nativeFileReviewEvidence(params["item"]["changes"]);
+            if (evidence) runtime.nativeFileChanges.set(JSON.stringify([params["threadId"], params["turnId"], params["item"]["id"]]), evidence);
+            if (runtime.nativeFileChanges.size > 2048) runtime.nativeFileChanges.delete(runtime.nativeFileChanges.keys().next().value!);
+          }
+          if (method === "turn/completed") runtime.nativeFileChanges.clear();
           const learningTurn = runtime.pendingTurnStart?.partnerLearningTurn ?? runtime.partnerLearningTurn;
           observeYieldedExecNotification(runtime, method, params);
           let logicalTerminal = false;
@@ -4432,7 +4445,24 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           };
           runtime.pendingServerRequests.set(key, pending);
           const requestContext = runtime.context;
+          let authorizationRevision: string | undefined;
           try {
+            authorizationRevision = requestContext.nativeToolAuthorization?.capture();
+            if (interaction.payload.kind === "permission" && requestContext.nativeToolAuthorization) {
+              const authority = requestContext.nativeToolAuthorization;
+              const payload = isJsonObject(params) ? params : {};
+              const fileEvidence = method === "item/fileChange/requestApproval"
+                ? nativeFileReviewEvidence(payload["changes"]) ?? runtime.nativeFileChanges.get(JSON.stringify([payload["threadId"], payload["turnId"], payload["itemId"]])) : undefined;
+              const reviewInput = method === "item/fileChange/requestApproval" ? { grantRoot: payload["grantRoot"] ?? null,
+                ...(fileEvidence ? { changes: fileEvidence } : { evidenceUnavailable: true }) } : payload;
+              const reviewed = await authority.review({ toolName: interaction.payload.toolName, input: reviewInput, signal: abort.signal });
+              authority.assertCurrent(reviewed.authorizationRevision);
+              authorizationRevision = reviewed.authorizationRevision;
+              if (pending.cancelled || runtime.pendingServerRequests.get(key) !== pending || !this.#isRuntimeCurrent(runtime, input.hostGeneration)
+                || !(requestThreadId === runtime.threadId ? runtime.state.activeTurnId === turnId && !runtime.state.terminalTurnIds.has(turnId) : runtime.nativeTasks.ownsActiveTurn(requestThreadId!, turnId!))) return undefined;
+              if (reviewed.verdict === "block") return interaction.toResponse({ kind: "selected", value: "deny_once" });
+              if (reviewed.verdict === "allow") return interaction.toResponse({ kind: "selected", value: "allow_once" });
+            }
             const outcome = await Promise.race([
               Promise.resolve().then(() => requestContext.requestInteraction(
                 interaction.payload,
@@ -4450,6 +4480,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
               || !(requestThreadId === runtime.threadId
                 ? runtime.state.activeTurnId === turnId && !runtime.state.terminalTurnIds.has(turnId)
                 : runtime.nativeTasks.ownsActiveTurn(requestThreadId!, turnId!))) return undefined;
+            requestContext.nativeToolAuthorization?.assertCurrent(authorizationRevision);
             return interaction.toResponse(outcome.decision);
           } finally {
             if (runtime.pendingServerRequests.get(key) === pending) {
@@ -6567,6 +6598,19 @@ interface ReviewResolvedPath {
   readonly absolutePath: string;
   readonly relativePath: string;
   readonly info: Stats;
+}
+
+function nativeFileReviewEvidence(value: JsonValue | undefined): JsonValue | undefined {
+  if (!Array.isArray(value) || !value.length || value.length > 256) return;
+  const changes: JsonValue[] = [];
+  for (const change of value) {
+    if (!isJsonObject(change) || typeof change["path"] !== "string" || !change["path"].trim() || change["path"].length > 4096 || !isJsonObject(change["kind"])
+      || !["add", "delete", "update"].includes(String(change["kind"]["type"]))) return;
+    const move = change["kind"]["move_path"] ?? change["kind"]["movePath"];
+    if (move !== undefined && move !== null && (typeof move !== "string" || !move.trim() || move.length > 4096)) return;
+    changes.push({ path: change["path"], kind: { type: change["kind"]["type"]!, ...(typeof move === "string" ? { move_path: move } : {}) } });
+  }
+  return JSON.stringify(changes).length <= 8192 ? changes : undefined;
 }
 
 function reviewDeniedServerRequest(method: string, _params: JsonValue): JsonValue | undefined {

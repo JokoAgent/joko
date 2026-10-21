@@ -25,7 +25,7 @@ export function createExtensionCardConnectService(manager: ExtensionCardsManager
         connections.fence(connection);
         const result = required().get(request.sessionId, request.cardId), card = result.card;
         return create(contract.ExtensionCardServiceGetResponseSchema, { animatedHtml: result.animatedHtml, working: result.working,
-          interactive: result.interactive, mediaUris: result.mediaUris, card: { cardId: card.id, sessionId: card.sessionId, extensionId: card.extensionId,
+          interactive: result.interactive, mediaUris: result.mediaUris, hostAuthorization: result.hostAuthorization, authorizationPhase: result.authorizationPhase, authorizationClientConfigured: result.authorizationClientConfigured, card: { cardId: card.id, sessionId: card.sessionId, extensionId: card.extensionId,
             extensionName: card.extensionName, toolUseId: card.toolUseId, html: card.html, text: card.text, height: card.height,
             updatedAt: timestampFromMs(card.updatedAt) } });
       });
@@ -37,6 +37,12 @@ export function createExtensionCardConnectService(manager: ExtensionCardsManager
       try { formValues = contract.extensionCardFormValuesFromEntries(request.formValues); }
       catch { throw new ConnectError("Invalid extension form values.", Code.InvalidArgument); }
       return effect(async () => {
+        const authorizationFlowId = required().oauthCards()?.start({ ...request, formValues }, { connectionId: connection.id,
+          assertCurrent: () => connections.fence(connection), onRevoked: listener => connections.onRevoked(connection.id, listener) });
+        if (authorizationFlowId) {
+          connections.fence(connection); context.signal.throwIfAborted();
+          return create(contract.ExtensionCardServiceDispatchResponseSchema, { accepted: true, authorizationFlowId });
+        }
         // Provider work outlives this delivery acknowledgement. Its retained
         // guard follows the authenticated Connection, not a completed HTTP RPC.
         const accepted = await required().dispatch({ ...request, formValues }, () => connections.fence(connection), connection.id);

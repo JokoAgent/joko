@@ -17,8 +17,15 @@ import type { ExtensionOAuthAccounts } from "./oauth-accounts.js";
 import { createExtensionMailReader, type ExtensionMailPreview } from "./mail-reader.js";
 import type { ExtensionCardMedia } from "./media.js";
 import { EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE } from "./runtime-bootstrap.js";
+import type { WorkspaceService } from "../workspace-service.js";
+import { captureExtensionFileWorkspace, ExtensionFileDeposits, extensionFileToolSchema } from "./files.js";
+import type { RemoteExecutionRouter } from "../remote-execution-router.js";
+import type { ExtensionOAuthCards } from "./oauth-cards.js";
+import type { ExtraDirectoryManager } from "../extra-directory-manager.js";
+import type { ExtensionTasks } from "../extension-tasks.js";
+import type { ExtensionText } from "../extension-text.js";
 
-interface Authority extends ExtensionCardAuthority { readonly surface: ExtensionMainViewAuthority }
+interface Authority extends ExtensionCardAuthority { readonly surface: ExtensionMainViewAuthority; readonly installationKey: string }
 interface Instance {
   readonly authority: Authority; readonly connectionId: string; readonly abort: AbortController;
   unregister: () => void; current: boolean; context?: BrowserContext; page?: Page; surface?: ExtensionMainViewSurface;
@@ -37,6 +44,12 @@ interface Options {
   readonly fetch?: typeof fetch;
   readonly resolveCredential?: (reference: string) => string;
   readonly media?: ExtensionCardMedia;
+  readonly workspaces?: Pick<WorkspaceService, "listRegistrations">;
+  readonly remoteFiles?: RemoteExecutionRouter["files"];
+  readonly oauthCards?: ExtensionOAuthCards;
+  readonly tasks?: Pick<ExtensionTasks, "installation" | "request" | "drain">;
+  readonly text?: Pick<ExtensionText, "oneshot">;
+  readonly extraDirectories?: Pick<ExtraDirectoryManager, "resolveSelection" | "listForTarget">;
   readonly connections?: Pick<ExtensionNetworkConnections, "hosts" | "token" | "identity" | "list">;
   readonly oauth?: Pick<ExtensionOAuthAccounts, "fresh" | "invalidate" | "identity" | "get" | "capture" | "reportInsufficientScopes">;
   readonly continueTask: (scope: ExtensionCardScope, text: string, guard: (() => Promise<void>) & { readonly signal: AbortSignal }) => Promise<void>;
@@ -50,9 +63,10 @@ export class ExtensionCardRuntime {
   #browser?: Browser; #browserOpening?: Promise<Browser>; #stopped = true; #generation = 0;
   #tail = Promise.resolve(); #unsubscribe?: () => void; #timer?: NodeJS.Timeout;
   readonly #network: ExtensionNetwork | undefined;
+  readonly #files = new ExtensionFileDeposits();
   constructor(private readonly options: Options) {
     if (options.fetch && options.resolveCredential) this.#network = new ExtensionNetwork({ fetch: options.fetch, resolveCredential: options.resolveCredential, redact: options.redact,
-      ...(options.connections ? { connections: options.connections } : {}), ...(options.oauth ? { oauth: options.oauth } : {}), ...(options.media ? { media: options.media } : {}) });
+      files: this.#files, ...(options.connections ? { connections: options.connections } : {}), ...(options.oauth ? { oauth: options.oauth } : {}), ...(options.media ? { media: options.media } : {}) });
   }
   authority(id: string): ExtensionCardAuthority | undefined {
     try { return this.#capture(id); } catch { return; }
@@ -98,7 +112,8 @@ export class ExtensionCardRuntime {
     const key = JSON.stringify({ ...surface, backendRevision: surface.backendRevision.toString(), resourceRevision: surface.resourceRevision.toString(),
       extensionRevision: extension.revision.toString(), connections: runtime.network?.connections?.map(declaration => this.options.connections?.identity(id, declaration) ?? null),
       oauth: runtime.network?.secrets?.filter(secret => secret.source === "oauth").map(secret => this.options.oauth?.identity(id, secret.key) ?? null) });
-    return { key, name: extension.name, runtime, surface };
+    const installationKey = JSON.stringify({ ...surface, backendRevision: surface.backendRevision.toString(), resourceRevision: surface.resourceRevision.toString() });
+    return { key, installationKey, name: extension.name, runtime, surface };
   }
   #assert(instance: Instance): void {
     if (this.#stopped || !instance.current || this.#instances.get(instance.authority.surface.extensionId) !== instance
@@ -141,9 +156,12 @@ export class ExtensionCardRuntime {
         const provider: BridgeToolProvider = { id: providerId, generation,
           get available() { return instance.current; },
           tools: authority.runtime.tools.map(tool => ({ serverId: providerId, name: tool.name, description: tool.description,
-            inputSchema: tool.inputSchema, requiresPermission: !tool.readOnly })),
+            inputSchema: authority.runtime.network ? extensionFileToolSchema(tool.inputSchema) : tool.inputSchema, requiresPermission: !tool.readOnly || authority.runtime.network !== undefined })),
           callTool: (name, args, signal, context) => this.#call(instance, name, args, signal, context) };
-        try { instance.unregister = this.options.registerProvider(provider); }
+        try {
+          if (provider.tools.length) instance.unregister = this.options.registerProvider(provider);
+          if (authority.runtime.tasks || authority.runtime.text) await this.#ensure(instance);
+        }
         catch { this.#retire(instance); this.#instances.delete(id); }
       }
     });
@@ -209,7 +227,7 @@ export class ExtensionCardRuntime {
       catch { return { ok: false }; }
       finally { instance.pending -= 1; }
     });
-    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined })})` });
+    await page.addInitScript({ content: `(${EXTENSION_CARD_RUNTIME_BOOTSTRAP_SOURCE})(${JSON.stringify({ agent: instance.authority.runtime.agent === true, network: instance.authority.runtime.network !== undefined, tasks: !!instance.authority.runtime.tasks, text: !!instance.authority.runtime.text })})` });
     if (instance.authority.runtime.mail) await page.addInitScript({ content: `${MAIL_COMPOSE_RUNTIME_SOURCE}\nObject.defineProperty(window, "jokoMail", { value: jokoMail, writable: false, configurable: false });` });
     await page.goto(url.href, { waitUntil: "load", timeout: 15_000 }); this.#assert(instance);
     return page;
@@ -237,6 +255,25 @@ export class ExtensionCardRuntime {
     const request = payload as Record<string, unknown>, id = instance.authority.surface.extensionId;
     const current = () => { this.#assert(instance); };
     switch (request.type) {
+      case "text-oneshot": {
+        if (!instance.authority.runtime.text?.oneshot || !this.options.text) return { ok: false, errorCode: "PERMISSION_DENIED" };
+        let signal = instance.abort.signal;
+        try {
+          const owner = this.#requestOwner(instance, request.callId); signal = owner.signal;
+          const result = await this.options.text.oneshot({ extensionId: id, resourceId: instance.authority.surface.resourceId, installation: instance.authority.installationKey,
+            ...owner }, request);
+          owner.assertCurrent(); return result;
+        } catch (error) { return { ok: false, errorCode: typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : signal.aborted ? "CANCELLED" : "SOURCE_CHANGED" }; }
+      }
+      case "tasks-request": {
+        if (!instance.authority.runtime.tasks || !this.options.tasks) return { ok: false, errorCode: "PERMISSION_DENIED" };
+        try {
+          const owner = this.#requestOwner(instance, request.callId);
+          const result = await this.options.tasks.request({ extensionId: id, resourceId: instance.authority.surface.resourceId, installation: this.options.tasks.installation(id, instance.authority.surface.resourceId),
+            ...owner }, request);
+          owner.assertCurrent(); return { ok: true, result: JSON.parse(JSON.stringify(result, (_key, value: unknown) => typeof value === "bigint" ? value.toString() : value)) as unknown };
+        } catch (error) { return { ok: false, errorCode: typeof (error as { code?: unknown }).code === "string" ? (error as { code: string }).code : "INTERNAL", message: "Plugin task request failed. Inspect the original request before retrying." }; }
+      }
       case "oauth-accounts": {
         const declaration = instance.authority.runtime.network?.secrets?.find(value => value.key === request.key && value.source === "oauth");
         if (!declaration || !this.options.oauth) return { ok: false };
@@ -288,20 +325,39 @@ export class ExtensionCardRuntime {
       default: return { ok: false };
     }
   }
+  #requestOwner(instance: Instance, callId: unknown) {
+    const current = () => this.#assert(instance);
+    if (callId === undefined) return { assertCurrent: current, signal: instance.abort.signal };
+    if (typeof callId !== "string") throw Object.assign(new Error("A source call identifier must be a string."), { code: "INVALID_REQUEST" });
+    const call = instance.callGuards.get(callId), scope = this.options.cards.cards.callInfoOf(callId);
+    if (!call || !scope || scope.extensionId !== instance.authority.surface.extensionId || scope.authorityKey !== instance.authority.key)
+      throw Object.assign(new Error("The source call is unavailable."), { code: "SOURCE_CALL_EXPIRED" });
+    const assertCurrent = () => { current(); call.assertCurrent(); };
+    assertCurrent(); return { assertCurrent, signal: AbortSignal.any([instance.abort.signal, call.signal]), sourceSessionId: scope.sessionId };
+  }
   async #call(instance: Instance, name: string, args: Readonly<Record<string, unknown>>, signal: AbortSignal | undefined, context: BridgeToolCallContext): Promise<BridgeToolCallResult> {
     this.#assert(instance); signal?.throwIfAborted(); validateExtensionEnvelope(args);
     if (!instance.authority.runtime.tools.some(tool => tool.name === name) || instance.calls.size >= 16) throw new Error("Extension tool unavailable.");
     const assertCurrent = () => {
-      this.#assert(instance); signal?.throwIfAborted();
+      this.#assert(instance); signal?.throwIfAborted(); context.assertCurrent?.();
       const session = this.options.store.getSession(context.sessionId).descriptor;
       if (session.targetId !== context.targetId || session.binding.generation !== context.generation || session.archived || session.deletedAt !== undefined) throw new Error("Extension task changed.");
     };
     assertCurrent();
+    const missing = instance.authority.runtime.network?.secrets?.some(secret => secret.source === "oauth") ? this.options.oauthCards?.missing(instance.authority.surface.extensionId) : undefined;
+    if (missing) {
+      const callId = this.options.cards.registerCall(instance.authority.surface.extensionId, instance.authority.key, context.sessionId, null), scope = this.options.cards.cards.callInfoOf(callId)!;
+      await this.options.oauthCards!.require(callId, scope, missing, assertCurrent); await this.options.cards.finalizeCall(callId);
+      return { content: [{ type: "text", text: "Connect the plugin account using the host authorization card to continue this task." }], isError: false,
+        structuredContent: { setup_required: true, joko_card_id: callId } };
+    }
     const page = await this.#ensure(instance); assertCurrent();
     const callId = this.options.cards.registerCall(instance.authority.surface.extensionId, instance.authority.key, context.sessionId, null);
     const callAbort = new AbortController();
+    const callSignal = AbortSignal.any([callAbort.signal, instance.abort.signal, ...(signal ? [signal] : [])]);
+    const assertCallCurrent = () => { callSignal.throwIfAborted(); assertCurrent(); };
     for (const id of instance.callGuards.keys()) if (!this.options.cards.cards.callInfoOf(id)) instance.callGuards.delete(id);
-    instance.callGuards.set(callId, { signal: AbortSignal.any([callAbort.signal, instance.abort.signal, ...(signal ? [signal] : [])]), assertCurrent });
+    instance.callGuards.set(callId, { signal: callSignal, assertCurrent: assertCallCurrent });
     instance.calls.add(callId);
     let rejectAbort: (reason?: unknown) => void = () => {};
     const cancelled = new Promise<never>((_, reject) => { rejectAbort = reject; });
@@ -314,9 +370,16 @@ export class ExtensionCardRuntime {
     const timer = setTimeout(cancel, 30 * 60_000); timer.unref();
     let finalized = false;
     try {
+      let preparedArgs = args;
+      if (instance.authority.runtime.network && (args.dir !== undefined || args.save_dir !== undefined || args.dir_deposit !== undefined || args.save_deposit !== undefined)) {
+        if (!this.options.workspaces) throw new Error("Extension file transfers are unavailable.");
+        const scope = this.options.cards.cards.callInfoOf(callId)!;
+        preparedArgs = await this.#files.prepare(scope, args, await captureExtensionFileWorkspace(this.options.store, this.options.workspaces, context, this.options.remoteFiles, callSignal, this.options.extraDirectories), assertCallCurrent);
+        assertCallCurrent();
+      }
       const value: unknown = await Promise.race([page.evaluate(async input => {
         return (window as unknown as { __jokoRuntime: { tool(value: unknown): Promise<unknown> } }).__jokoRuntime.tool(input);
-      }, { name, arguments: args, callId, sessionId: context.sessionId,
+      }, { name, arguments: preparedArgs, callId, sessionId: context.sessionId,
         readOnly: this.options.store.findSessionRuntimePolicy(context.sessionId)?.policy === "review_read_only" }), cancelled]);
       assertCurrent(); validateExtensionEnvelope(value);
       if (!value || typeof value !== "object" || Array.isArray(value) || typeof (value as { ok?: unknown }).ok !== "boolean") throw new Error("Extension tool returned an invalid result.");
@@ -353,6 +416,7 @@ export class ExtensionCardRuntime {
     finally { clearTimeout(timer); }
   }
   async #close(instance: Instance): Promise<void> {
+    this.#files.retire(instance.authority.key);
     this.#network?.retire(instance.authority.key); instance.callGuards.clear();
     const context = instance.context, surface = instance.surface;
     instance.context = undefined; instance.page = undefined; instance.surface = undefined;
@@ -363,6 +427,7 @@ export class ExtensionCardRuntime {
     this.#stopped = true; clearInterval(this.#timer); this.#unsubscribe?.();
     for (const instance of this.#instances.values()) this.#retire(instance);
     await this.#tail;
+    await this.options.tasks?.drain();
     await Promise.all([...this.#instances.values()].map(instance => this.#close(instance))); this.#instances.clear();
     await this.#browser?.close().catch(() => undefined); this.#browser = undefined;
   }

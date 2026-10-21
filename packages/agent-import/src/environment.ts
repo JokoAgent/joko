@@ -17,6 +17,7 @@ export interface ImportedEnvironment {
   appliedDocuments: string[];
   profileProjection: { identity: string; user: string; instructions: string };
   targetOwner?: { revision: string; profileVersion: number; sessionId: string; generation: number; workspaceRoot: string; profileFingerprint: string; identityFingerprint: string };
+  packageOwner?: { revision: string; profileVersion: number; profileFingerprint: string };
   profileUpdate?: { fromRevision: string; expectedFingerprint: string };
   contentRedactions: Record<string, string>;
   sourceAutomations: Array<{ entryId: string; kind: "hermes" | "openclaw"; original: Record<string, unknown> }>;
@@ -92,8 +93,8 @@ function stringMap(value: unknown): boolean { return record(value) && Object.val
 /** Current-v1 required fields are explicit; omitted old records cannot acquire defaults. */
 export function validateImportedEnvironment(value: unknown): asserts value is ImportedEnvironment {
   const fields = ["version", "source", "env", "mcp", "credentials", "files", "fileExecutables", "memoryFiles", "skillFiles", "documents", "appliedDocuments", "profileProjection", "contentRedactions", "sourceAutomations", "automations"];
-  if (!record(value) || fields.some(key => !Object.hasOwn(value, key)) || Object.keys(value).some(key => !fields.includes(key) && !["pendingImport", "targetOwner", "profileUpdate"].includes(key))
-    || value.version !== 1 || !record(value.source) || !["hermes", "openclaw"].includes(String(value.source.kind))
+  if (!record(value) || fields.some(key => !Object.hasOwn(value, key)) || Object.keys(value).some(key => !fields.includes(key) && !["pendingImport", "targetOwner", "packageOwner", "profileUpdate"].includes(key))
+    || value.version !== 1 || !record(value.source) || !["hermes", "openclaw", "package"].includes(String(value.source.kind))
     || ["agentId", "name", "root", "workspace", "configFile"].some(key => typeof (value.source as Record<string, unknown>)[key] !== "string")
     || !stringMap(value.env) || !stringMap(value.files) || !stringMap(value.memoryFiles) || !stringMap(value.documents) || !stringMap(value.contentRedactions)
     || !Array.isArray(value.appliedDocuments) || value.appliedDocuments.some(id => typeof id !== "string")
@@ -102,6 +103,8 @@ export function validateImportedEnvironment(value: unknown): asserts value is Im
       || !Number.isSafeInteger(value.targetOwner.profileVersion) || !Number.isSafeInteger(value.targetOwner.generation)
       || ["sessionId", "workspaceRoot", "profileFingerprint", "identityFingerprint"].some(key => typeof (value.targetOwner as Record<string, unknown>)[key] !== "string"))
     || value.profileUpdate !== undefined && (!record(value.profileUpdate) || typeof value.profileUpdate.fromRevision !== "string" || typeof value.profileUpdate.expectedFingerprint !== "string")
+    || value.packageOwner !== undefined && (!record(value.packageOwner) || typeof value.packageOwner.revision !== "string" || !/^\d+$/.test(value.packageOwner.revision)
+      || !Number.isSafeInteger(value.packageOwner.profileVersion) || typeof value.packageOwner.profileFingerprint !== "string")
     || !Array.isArray(value.mcp) || !Array.isArray(value.credentials) || !Array.isArray(value.sourceAutomations) || !record(value.automations)
     || !record(value.fileExecutables) || Object.values(value.fileExecutables).some(child => typeof child !== "boolean")
     || !record(value.skillFiles) || Object.values(value.skillFiles).some(files => !Array.isArray(files) || files.some(file => !record(file)

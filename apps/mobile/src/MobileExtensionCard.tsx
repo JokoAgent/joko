@@ -35,7 +35,7 @@ function CardBody({ card, colors, locale, enabled, readOnly: restricted, host }:
   const api = useMemo(() => enabled && !restricted ? host.bind(card.sessionId) : undefined, [host, card.sessionId, enabled, restricted]);
   const copy = mobileExtensionCardMessages(locale), lifetime = useRef(new AbortController()), tail = useRef(Promise.resolve(true));
   const [foreground, setForeground] = useState(AppState.currentState === "active"), [attempt, retry] = useState(0), [failed, setFailed] = useState(false), [busy, setBusy] = useState(false), [expanded, setExpanded] = useState(false);
-  const [snapshot, setSnapshot] = useState<{ html: string; animatedHtml: string; working: boolean; interactive: boolean }>();
+  const [snapshot, setSnapshot] = useState<{ html: string; animatedHtml: string; working: boolean; interactive: boolean; hostAuthorization: boolean }>();
   const [prompt, setPrompt] = useState<{ action: string; placeholder: string; value: string }>();
   const [retryAttachment, setRetryAttachment] = useState<boolean>();
   const [attachmentFailed, setAttachmentFailed] = useState(false);
@@ -44,7 +44,7 @@ function CardBody({ card, colors, locale, enabled, readOnly: restricted, host }:
   const [model, setModel] = useState({ base: incoming, values: incoming });
   if (JSON.stringify(model.base) !== JSON.stringify(incoming)) setModel({ base: incoming, values: mergeExtensionCardFormValues(model.values, model.base, incoming) });
   const values = useRef(model.values); values.current = model.values;
-  const scope = api?.formScope(card.sessionId), mail = useMemo(() => readMailCard(html), [html]), canAct = enabled && foreground && !restricted && Boolean(api && snapshot?.interactive), attachmentDeliveryKey = `${card.cardId}:attachment`;
+  const scope = api?.formScope(card.sessionId), mail = useMemo(() => readMailCard(html), [html]), canAct = enabled && foreground && !restricted && Boolean(api && snapshot?.interactive && !snapshot.hostAuthorization), attachmentDeliveryKey = `${card.cardId}:attachment`;
   const inlineImages = useMemo(() => extensionCardInlineImages([...(mail?.images ?? []), ...mailPreviewImages(model.values)], media), [mail, model.values.attachmentItems, media]);
   const readOnly = !canAct || Boolean(mail && (mail.supersededBy || !["draft", "syncing", "error"].includes(mail.state)));
   useEffect(() => { const listener = AppState.addEventListener("change", state => setForeground(state === "active")); return () => listener.remove(); }, []);
@@ -57,7 +57,7 @@ function CardBody({ card, colors, locale, enabled, readOnly: restricted, host }:
     const abort = new AbortController();
     void api.get({ sessionId: card.sessionId, cardId: card.cardId }, { signal: abort.signal }).then(async result => {
       if (!abort.signal.aborted && result.card?.cardId === card.cardId && result.card.sessionId === card.sessionId) {
-        setSnapshot({ html: result.card.html, animatedHtml: result.animatedHtml, working: result.working, interactive: result.interactive }); setFailed(false);
+        setSnapshot({ html: result.card.html, animatedHtml: result.animatedHtml, working: result.working, interactive: result.interactive, hostAuthorization: result.hostAuthorization }); setFailed(false);
         const resolved = await resolveExtensionCardMedia(result.mediaUris ?? [], async uri => (await api.readMedia({ sessionId: card.sessionId, cardId: card.cardId, uri }, { signal: abort.signal })).dataUrl, abort.signal, mediaCache.current);
         if (!abort.signal.aborted) { mediaCache.current = resolved; setMedia(resolved); }
       }
@@ -132,6 +132,7 @@ function CardBody({ card, colors, locale, enabled, readOnly: restricted, host }:
       {fields.length > 0 && <Pressable accessibilityRole="button" onPress={() => setExpanded(true)} style={styles.control}><Text style={{ color: colors.muted }}>{copy.expand}</Text></Pressable>}
     </View>
     {!api && <Text style={[styles.notice, { color: colors.muted }]}>{copy.readOnly}</Text>}
+    {snapshot?.hostAuthorization && <Text style={[styles.notice, { color: colors.muted }]}>{locale === "zh-CN" ? "请在 Joko 电脑端连接此账户。" : "Open Joko Desktop to connect this account."}</Text>}
     {(failed || attachmentFailed) && <View style={styles.failure}><Text accessibilityRole="alert" style={[styles.failureText, { color: colors.negative }]}>{copy.failed}</Text>
       <Pressable accessibilityRole="button" disabled={busy} style={styles.control} onPress={() => { if (attachmentFailed && retryAttachment !== undefined) { tail.current = Promise.resolve(true); attach(retryAttachment); } else if (readExtensionCardFormChange(html) && !readOnly) save(values.current); else retry(value => value + 1); }}><Text style={{ color: colors.accent }}>{copy.retry}</Text></Pressable>
       {attachmentFailed && <Pressable accessibilityRole="button" disabled={busy} style={styles.control} onPress={() => { if (scope) releaseExtensionCardFormDelivery(scope, attachmentDeliveryKey); setRetryAttachment(undefined); setAttachmentFailed(false); }}><Text style={{ color: colors.muted }}>{copy.cancel}</Text></Pressable>}

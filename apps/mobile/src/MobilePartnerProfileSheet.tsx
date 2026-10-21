@@ -10,6 +10,7 @@ import type { MobilePartnerDeletionTransport } from "./mobile-partner-deletion";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import { partnerSessionTaskMessages, partnerSessionTaskActive } from "@joko/contracts";
+import { partnerHomeMessages } from "@joko/contracts";
 import { mobilePartnerDirectoryIdentity, type MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
 import { MobilePartnerProfileValidationError, mobilePartnerProfileDraft, validateMobilePartnerProfileDraft,
   type MobilePartnerProfileDraft, type MobilePartnerProfileSnapshot, type MobilePartnerProfileTransport } from "./mobile-partner-profile";
@@ -34,7 +35,7 @@ interface OutputHandoff {
   readonly row: MobilePartnerTaskOutput;
 }
 
-export function MobilePartnerProfileSheet({ visible, partner, transport, deletionTransport, restartTransport, routineFactory, resumeFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale, onClose, onSaved, onSearch, online = true, onOutputsPageChange, onOpenOutputError, initialLearningDestination }: {
+export function MobilePartnerProfileSheet({ visible, partner, transport, deletionTransport, restartTransport, routineFactory, resumeFactory, memoryFactory, connectionsFactory, skillsFactory, colors, locale, onClose, onSaved, onSearch, online = true, onOutputsPageChange, onOpenOutputError, initialLearningDestination, onOpenHome }: {
   readonly visible: boolean;
   readonly partner?: MobilePartnerDirectoryProfile;
   readonly transport?: MobilePartnerProfileTransport;
@@ -54,6 +55,7 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
   readonly onOutputsPageChange?: (open: boolean) => void;
   readonly onOpenOutputError?: (message: string) => void;
   readonly initialLearningDestination?: PartnerLearningSettingsDestination;
+  readonly onOpenHome?: (partner: MobilePartnerDirectoryProfile) => void;
 }) {
   const binding = visible && partner && transport ? `${transport.ownerKey}\u001f${partner.partnerId}` : undefined;
   const [routine, setRoutine] = useState<PartnerRoutineEditor>();
@@ -315,6 +317,8 @@ export function MobilePartnerProfileSheet({ visible, partner, transport, deletio
         </View>}
         {skillsFactory && snapshot?.partner.initializationState === "ready" && snapshot.partner.canonicalSessionId && action(partnerSkillsMessages(locale).title,
           () => { if (transport) setSkills(skillsFactory(snapshot.partner, transport.ownerKey)); }, !editable || dirty || deletionBusy || avatarPreparing)}
+        {onOpenHome && snapshot?.partner.lifecycle === "active" && snapshot.partner.initializationState === "ready" && snapshot.partner.canonicalSessionId && action(partnerHomeMessages(locale).title,
+          () => { onOpenHome(snapshot.partner); onClose(); }, !editable || dirty || deletionBusy || avatarPreparing || restartBusy || !online || !foreground)}
         {connectionsFactory && snapshot?.partner.initializationState === "ready" && snapshot.partner.canonicalSessionId && action(partnerConnectionsMessages(locale).title,
           () => { if (transport) setConnections(connectionsFactory(snapshot.partner, transport.ownerKey)); }, !editable || dirty || deletionBusy || avatarPreparing)}
         {memoryFactory && snapshot?.partner.initializationState === "ready" && snapshot.partner.canonicalSessionId && action(partnerMemoryMessages(locale).title,

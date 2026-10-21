@@ -1,4 +1,5 @@
 import { EN_STRINGS, ZH_STRINGS, type NativeStrings } from "./i18n/native-task-status.js";
+import { NativeRemoteTaskTracker, remoteEntryToken } from "@joko/contracts";
 import type {
   DesktopNativeTaskStatusAction,
   DesktopNativeTaskStatusDecision,
@@ -95,6 +96,8 @@ export interface MacNativeTaskStatusHostOptions {
 }
 
 export interface MacNativeTaskStatusHost {
+  readonly acknowledgeFocus: (sessionId: string, token: string) => void;
+  readonly focusSession: (sessionId: string, token: string) => void;
   readonly setSettings: (settings: DesktopNativeTaskStatusSettings) => void;
   readonly setApplicationFocused: (focused: boolean) => void;
   readonly publish: (snapshot: DesktopNativeTaskStatusSnapshot) => void;
@@ -126,6 +129,12 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
   };
   let settings: DesktopNativeTaskStatusSettings | undefined;
   let snapshot: DesktopNativeTaskStatusSnapshot | undefined;
+  let lastIncomingSnapshot: DesktopNativeTaskStatusSnapshot | undefined;
+  const localDismissedSessions = new Map<string, string>();
+  const handoffFocusTokens = new Map<string, { readonly previous: string; readonly current: string }>();
+  const remoteTracker = new NativeRemoteTaskTracker();
+  let passiveRemoteSessions: ReadonlySet<string> = new Set();
+  const handoffPassiveSessions = new Map<string, DesktopNativeTaskStatusPhase>();
   let manualExpandedDisplayId: number | undefined;
   let disposed = false;
   let observedSnapshot = false;
@@ -241,7 +250,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     const at = now();
     const manualExpanded = manualExpandedDisplayId !== undefined;
     const unexpiredSessions = snapshot.sessions.filter((session) => {
-      if (!isTerminalPhase(session.phase)) return true;
+      if (session.remote || !isTerminalPhase(session.phase)) return true;
       const observedAt = terminalObservedAt.get(transientKey(session.sessionId, session.phase));
       return observedAt === undefined || observedAt + NATIVE_TASK_STATUS_UNREAD_TERMINAL_TTL_MS > at;
     });
@@ -287,16 +296,16 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       ...snapshot,
       sessions: Object.freeze(retainedSessions)
     };
-    const retainedSurface = projectDesktopNativeTaskStatusSurface(retainedSnapshot, { manualExpanded });
+    const retainedSurface = projectDesktopNativeTaskStatusSurface(retainedSnapshot, { manualExpanded, passiveSessionIds: passiveRemoteSessions });
     const activeSnapshot = {
       ...snapshot,
       sessions: Object.freeze(activeSessions)
     };
-    let surface = projectDesktopNativeTaskStatusSurface(activeSnapshot, { manualExpanded });
+    let surface = projectDesktopNativeTaskStatusSurface(activeSnapshot, { manualExpanded, passiveSessionIds: passiveRemoteSessions });
     if (!manualExpanded && surface.policy !== "blocking" &&
       retainedSessions.some((session) => isTerminalPhase(session.phase)) &&
       !activeSessions.some((session) => isTerminalPhase(session.phase))) {
-      surface = projectDesktopNativeTaskStatusSurface(retainedSnapshot, { suppressTransient: true });
+      surface = projectDesktopNativeTaskStatusSurface(retainedSnapshot, { suppressTransient: true, passiveSessionIds: passiveRemoteSessions });
     } else {
       surface = Object.freeze({
         ...surface,
@@ -566,7 +575,7 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     if (session === undefined) return;
     if (url.hostname === "focus") {
       playConfiguredSound("select");
-      options.onAction({ kind: "focus", sessionId });
+      options.onAction({ kind: "focus", sessionId, ...(session.remote || isTerminalPhase(session.phase) ? { entryToken: remoteEntryToken(session) } : {}) });
       return;
     }
     if (url.hostname !== "permission" || session.permission === undefined) return;
@@ -752,8 +761,14 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
     },
     publish: (next: DesktopNativeTaskStatusSnapshot) => {
       if (disposed || !options.supported || !isNewerNativeTaskStatusSnapshot(snapshot, next)) return;
-      const previous = snapshot;
+      const previous = lastIncomingSnapshot ?? snapshot;
+      const displayedIds = new Set(snapshot?.sessions.map(session => session.sessionId));
+      lastIncomingSnapshot = next;
       if (previous?.ownerId !== next.ownerId) {
+        remoteTracker.reset();
+        handoffPassiveSessions.clear();
+        localDismissedSessions.clear();
+        handoffFocusTokens.clear();
         manualExpandedDisplayId = undefined;
         manualExpandedAt = undefined;
         smartSuppressions.clear();
@@ -769,13 +784,45 @@ export function createMacNativeTaskStatusHost(options: MacNativeTaskStatusHostOp
       for (const key of terminalObservedAt.keys()) if (!nextTerminalKeys.has(key)) terminalObservedAt.delete(key);
       const observedAt = now();
       for (const key of nextTerminalKeys) if (!terminalObservedAt.has(key)) terminalObservedAt.set(key, observedAt);
-      snapshot = next;
+      const remote = remoteTracker.observe(next.sessions);
+      const previousById = new Map(previous?.sessions.map(session => [session.sessionId, session]));
+      const present = new Set(next.sessions.map(session => session.sessionId));
+      for (const key of handoffPassiveSessions.keys()) if (!present.has(key)) handoffPassiveSessions.delete(key);
+      for (const session of next.sessions) {
+        const old = previousById.get(session.sessionId);
+        if (!session.remote && old?.remote && old.phase === session.phase && old.updatedAt === session.updatedAt) {
+          handoffFocusTokens.set(session.sessionId, { previous: remoteEntryToken(old), current: remoteEntryToken(session) });
+          if (!displayedIds.has(session.sessionId)) localDismissedSessions.set(session.sessionId, remoteEntryToken(session));
+        }
+        const handoff = handoffFocusTokens.get(session.sessionId);
+        if (handoff?.current !== remoteEntryToken(session)) handoffFocusTokens.delete(session.sessionId);
+        if (!session.remote && old?.remote && old.phase === session.phase && passiveRemoteSessions.has(session.sessionId)) handoffPassiveSessions.set(session.sessionId, session.phase);
+        if (handoffPassiveSessions.get(session.sessionId) !== session.phase) handoffPassiveSessions.delete(session.sessionId);
+      }
+      passiveRemoteSessions = new Set([...remote.passive, ...handoffPassiveSessions.keys()]);
+      for (const key of localDismissedSessions.keys()) if (!present.has(key)) localDismissedSessions.delete(key);
+      for (const key of handoffFocusTokens.keys()) if (!present.has(key)) handoffFocusTokens.delete(key);
+      snapshot = { ...next, sessions: next.sessions.filter(session => !remote.dismissed.has(session.sessionId)
+        && localDismissedSessions.get(session.sessionId) !== remoteEntryToken(session)) };
       if (observedSnapshot && settings?.enabled === true) {
-        const event = highestSoundEvent(previous, next);
+        const event = highestSoundEvent(previous, next, remote.events.map(event => event.phase));
         if (event !== undefined) playConfiguredSound(event);
       }
       observedSnapshot = true;
       render();
+    },
+    acknowledgeFocus: (sessionId: string, token: string) => {
+      const session = snapshot?.sessions.find(value => value.sessionId === sessionId);
+      if (!session || !snapshot || !isTerminalPhase(session.phase)) return;
+      const currentToken = remoteEntryToken(session), handoff = handoffFocusTokens.get(sessionId);
+      if (currentToken !== token && !(handoff?.previous === token && handoff.current === currentToken)) return;
+      if (session.remote) { if (!remoteTracker.dismiss(session, token)) return; }
+      else localDismissedSessions.set(sessionId, currentToken);
+      snapshot = { ...snapshot, sessions: snapshot.sessions.filter(value => value.sessionId !== sessionId) }; render();
+    },
+    focusSession: (sessionId: string, token: string) => {
+      const session = snapshot?.sessions.find(value => value.sessionId === sessionId);
+      if (session?.remote && remoteEntryToken(session) === token) options.onAction({ kind: "focus", sessionId, entryToken: token });
     },
     refreshDisplays: render,
     refreshVisibility: render,
@@ -819,13 +866,13 @@ export function renderNativeTaskStatusDocument(
     ? `<div class="compact-row compact-row--idle">
         <span class="phase-mark phase-mark--idle" aria-hidden="true"></span>
         <div class="idle-main"><strong>Joko</strong><span>${escapeHtml(strings.ready)}</span></div>
-        ${countBadge(surface.counts.total, strings, true)}
+        ${countBadge(surface.counts, strings)}
         <a class="icon-action" href="${ACTION_SCHEME}//toggle" aria-label="${escapeAttribute(strings.expand)}" title="${escapeAttribute(strings.expand)}">${nativeIcon("chevron-down")}</a>
       </div>`
     : `<div class="compact-row">
         ${phaseMark(current.phase)}
         <a class="task-main" href="${focusUrl(current.sessionId)}"><strong>${escapeHtml(current.title || strings.untitled)}</strong><span>${escapeHtml(phaseLabel(current.phase, strings, current.interactionKind))}</span></a>
-        ${countBadge(surface.counts.total, strings)}
+        ${countBadge(surface.counts, strings)}
         <a class="icon-action" href="${ACTION_SCHEME}//toggle" aria-label="${escapeAttribute(strings.expand)}" title="${escapeAttribute(strings.expand)}">${nativeIcon("chevron-down")}</a>
       </div>`;
   const soundLabel = settings.sounds.enabled ? strings.mute : strings.unmute;
@@ -848,7 +895,7 @@ export function renderNativeTaskStatusDocument(
   const density = settings.layout === "compact" ? " density-compact" : "";
   return `<!doctype html><html lang="${locale === "zh-CN" ? "zh-CN" : "en"}"><head>
     <meta charset="utf-8"><meta name="color-scheme" content="light dark">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; media-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; media-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
     <meta name="viewport" content="width=device-width,initial-scale=1">
     <style>${NATIVE_TASK_STATUS_CSS}</style></head>
     <body><main class="status-surface${density}" role="status" aria-live="polite">${body}</main></body></html>`;
@@ -878,9 +925,12 @@ function renderSessionRow(session: DesktopNativeTaskStatusSurface["sessions"][nu
   </div>`;
   const activity = session.activityLines.length === 0 ? "" : `<ol class="activity-lines" aria-label="${escapeAttribute(strings.recentActivity)}">${session.activityLines.map((line) =>
     `<li class="activity-line activity-line--${line.kind}"><span aria-hidden="true"></span><p>${escapeHtml(line.text)}</p></li>`).join("")}</ol>`;
+  const companion = session.remote?.companion;
+  const identity = companion ? `<span class="remote-companion" style="color:${companion.tint}" aria-hidden="true">${companion.artwork
+    ? `<img src="${escapeAttribute(companion.artwork)}" alt="">` : escapeHtml(companion.glyph)}</span>` : "";
   return `<article class="task-row task-row--${session.phase}">
     <div class="task-status">${phaseMark(session.phase)}<span>${escapeHtml(phaseLabel(session.phase, strings, session.interactionKind))}</span></div>
-    <a class="task-copy" href="${focusUrl(session.sessionId)}"><strong>${escapeHtml(session.title || strings.untitled)}</strong>${session.detail ? `<p>${escapeHtml(session.detail)}</p>` : ""}</a>
+    <a class="task-copy" href="${focusUrl(session.sessionId)}"><strong>${identity}${escapeHtml(session.title || strings.untitled)}</strong>${session.detail ? `<p>${escapeHtml(session.detail)}</p>` : ""}</a>
     <a class="focus-action" href="${focusUrl(session.sessionId)}">${escapeHtml(strings.focus)}</a>
     ${activity}
     ${actions}
@@ -1064,13 +1114,14 @@ function clampInteger(value: number, minimum: number, maximum: number): number {
 
 function highestSoundEvent(
   previous: DesktopNativeTaskStatusSnapshot | undefined,
-  next: DesktopNativeTaskStatusSnapshot
+  next: DesktopNativeTaskStatusSnapshot,
+  remotePhases: readonly DesktopNativeTaskStatusPhase[] = []
 ): Exclude<DesktopNativeTaskStatusSoundEvent, "select"> | undefined {
   if (previous === undefined || previous.ownerId !== next.ownerId) return undefined;
   const phases = new Map(previous.sessions.map((session) => [session.sessionId, session.phase]));
   const changed = next.sessions
-    .filter((session) => phases.get(session.sessionId) !== session.phase)
-    .map((session) => session.phase);
+    .filter((session) => !session.remote && phases.get(session.sessionId) !== session.phase)
+    .map((session) => session.phase).concat(remotePhases);
   if (changed.includes("interaction")) return "attention";
   if (changed.includes("error")) return "error";
   if (changed.includes("completed")) return "complete";
@@ -1117,10 +1168,17 @@ function phaseMark(phase: DesktopNativeTaskStatusPhase): string {
   return `<span class="phase-mark phase-mark--${phase}" aria-hidden="true"></span>`;
 }
 
-function countBadge(count: number, strings: NativeStrings, force = false): string {
-  return count > (force ? 0 : 1)
-    ? `<span class="count" aria-label="${escapeAttribute(strings.taskCount(count))}">${count}</span>`
-    : "";
+function countBadge(counts: DesktopNativeTaskStatusSurface["counts"], strings: NativeStrings): string {
+  const attention = counts.interaction + counts.completed + counts.error;
+  const segments = [
+    ...(attention > 0 ? [{ count: attention, label: strings.error, kind: "attention" }] : []),
+    ...(counts.running > 0 ? [{ count: counts.running, label: strings.running, kind: "running" }] : [])
+  ];
+  if (segments.length === 0) return "";
+  const label = segments.map(segment => `${segment.label}: ${segment.count}`).join("; ");
+  return `<span class="count" aria-label="${escapeAttribute(label)}" title="${escapeAttribute(label)}">${segments.map(segment =>
+    `<span class="count__${segment.kind}" aria-hidden="true">${segment.count}</span>`
+  ).join('<span class="count__separator" aria-hidden="true">·</span>')}</span>`;
 }
 
 
@@ -1170,7 +1228,8 @@ const NATIVE_TASK_STATUS_CSS = `
   .task-main { min-width:0; flex:1; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:10px; }
   .task-main strong, .task-copy strong { overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:13px; }
   .task-main span, .expanded-shell header span, .task-status, .more { color:var(--muted); font-size:11px; }
-  .count { min-width:21px; height:21px; display:grid; place-items:center; border-radius:999px; background:var(--raised); border:1px solid var(--line); font-size:11px; font-weight:650; }
+  .count { flex-shrink:0; min-width:21px; height:21px; display:inline-flex; align-items:center; justify-content:center; gap:4px; padding:0 6px; border-radius:999px; background:var(--raised); border:1px solid var(--line); font-size:11px; font-weight:650; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .count__separator { color:var(--muted); }
   .icon-action, .expanded-shell nav a { width:28px; height:28px; display:grid; place-items:center; border:1px solid var(--line); border-radius:8px; background:var(--raised); color:var(--muted); transition:background .15s,border-color .15s,color .15s,transform .15s; }
   .icon-action:hover, .expanded-shell nav a:hover { border-color:var(--line-strong); background:var(--surface-hover); color:var(--text); }
   .icon-action:active, .expanded-shell nav a:active { transform:scale(.96); }
@@ -1211,6 +1270,8 @@ const NATIVE_TASK_STATUS_CSS = `
   .decision--danger { color:var(--red); }
   .decision--danger:hover { background:var(--red-soft); }
   .phase-mark { width:8px; height:8px; flex:0 0 auto; border-radius:999px; background:var(--muted); }
+  .remote-companion { display:inline-flex; align-items:center; justify-content:center; width:22px; height:22px; margin-right:6px; vertical-align:middle; border-radius:6px; overflow:hidden; }
+  .remote-companion img { width:100%; height:100%; object-fit:cover; }
   .phase-mark--idle { background:var(--green); box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 14%,transparent); }
   .phase-mark--running { background:var(--blue); box-shadow:0 0 0 3px color-mix(in srgb,var(--blue) 18%,transparent); }
   .phase-mark--interaction { background:var(--amber); }

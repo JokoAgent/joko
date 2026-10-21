@@ -74,6 +74,18 @@ const CAPABILITIES: RemoteDesktopHostCapabilities = Object.freeze({
 });
 
 describe("remote desktop portable protocol", () => {
+  it("returns acquired input authority with the initial view lease and keeps viewing when input is refused", async () => {
+    const fixture = controllerFixture();
+    const lease = await fixture.controller.request(AUTHORITY, { op: "start", displayId: "display-1", control: true }) as RemoteDesktopLease;
+    expect(lease.controlling).toBe(true);
+    expect(fixture.dependencies.startInput).toHaveBeenCalledOnce();
+    const denied = controllerFixture();
+    vi.mocked(denied.dependencies.startInput).mockRejectedValueOnce(new Error("REMOTE_DESKTOP_ACCESSIBILITY_PERMISSION_REQUIRED"));
+    const view = await denied.controller.request(AUTHORITY, { op: "start", displayId: "display-1", control: true }) as RemoteDesktopLease;
+    expect(view.controlling).toBe(false); expect(denied.controller.state?.lease).toBe(view.lease);
+    expect(() => parseRemoteDesktopRequest({ op: "start", displayId: "display-1", control: "true" })).toThrow("INVALID_REMOTE_DESKTOP_REQUEST");
+  });
+
   it("native authentication keeps ordinary paired viewing and control available", async () => {
     const fixture = controllerFixture();
     fixture.dependencies.authenticationSession = vi.fn(() => null);
@@ -604,6 +616,41 @@ describe("remote desktop finite authority controller", () => {
     expect(fixture.dependencies.input).toHaveBeenCalledTimes(2);
   });
 
+  it("repairs one native input failure while retaining privacy and mute, then fences an idle crash loop", async () => {
+    const fixture = controllerFixture(), lease = await start(fixture);
+    const control = await fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: true }) as { controlGeneration: number };
+    await fixture.controller.request(AUTHORITY, { op: "hostMute", lease: lease.lease, controlGeneration: control.controlGeneration, enabled: true });
+    await fixture.controller.request(AUTHORITY, { op: "privacyScreen", lease: lease.lease, controlGeneration: control.controlGeneration, enabled: true, lockOnExit: false });
+    vi.mocked(fixture.dependencies.stopPrivacyScreen!).mockClear(); vi.mocked(fixture.dependencies.stopHostMute!).mockClear();
+    await fixture.controller.releaseControl(true);
+    expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: true });
+    expect(fixture.dependencies.startInput).toHaveBeenCalledTimes(2);
+    expect(fixture.dependencies.stopPrivacyScreen).not.toHaveBeenCalled(); expect(fixture.dependencies.stopHostMute).not.toHaveBeenCalled();
+    fixture.controller.input(AUTHORITY, lease.lease, 1, [{ kind: "release" }]);
+    await fixture.controller.releaseControl(true); expect(fixture.dependencies.startInput).toHaveBeenCalledTimes(3);
+    await fixture.controller.releaseControl(true);
+    expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: false });
+    expect(fixture.dependencies.startInput).toHaveBeenCalledTimes(3); expect(fixture.dependencies.stopVideo).not.toHaveBeenCalled();
+    await fixture.controller.stopAndRestore();
+  });
+
+  it("drops a late recovery handshake without stopping replacement input after takeover", async () => {
+    const fixture = controllerFixture(), lease = await start(fixture);
+    await fixture.controller.request(AUTHORITY, { op: "control", lease: lease.lease, enabled: true });
+    let finish!: () => void;
+    vi.mocked(fixture.dependencies.startInput).mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    const recovery = fixture.controller.releaseControl(true);
+    await vi.waitFor(() => expect(finish).toBeTypeOf("function"));
+    const replacement = await fixture.controller.request(OTHER_AUTHORITY, { op: "start", displayId: "display-1", takeover: true }) as RemoteDesktopLease;
+    // Takeover waits for its own explicit control request after the old handshake retires.
+    finish(); await recovery;
+    await fixture.controller.request(OTHER_AUTHORITY, { op: "control", lease: replacement.lease, enabled: true });
+    const stopped = vi.mocked(fixture.dependencies.stopInput).mock.calls.length;
+    await Promise.resolve(); expect(fixture.dependencies.stopInput).toHaveBeenCalledTimes(stopped);
+    expect(fixture.controller.state).toMatchObject({ lease: replacement.lease, controlling: true });
+    await fixture.controller.stopAndRestore();
+  });
+
   it("cleans a failed input start and leaves the current lease view-only", async () => {
     const fixture = controllerFixture();
     const lease = await start(fixture);
@@ -641,7 +688,7 @@ describe("remote desktop finite authority controller", () => {
     finishInput();
     await expect(pending).rejects.toThrowError("REMOTE_DESKTOP_LEASE_EXPIRED");
     expect(fixture.controller.state).toMatchObject({ lease: lease.lease, controlling: false });
-    expect(fixture.dependencies.stopInput).toHaveBeenCalledTimes(3);
+    expect(fixture.dependencies.stopInput).toHaveBeenCalledOnce();
     expect(fixture.dependencies.stopVideo).not.toHaveBeenCalled();
   });
 
@@ -1319,6 +1366,16 @@ describe("temporary display modes and captured restoration", () => {
       return { id, name: "Built-in Display", width: selected.width, height: selected.height };
     });
   }
+  it("restarts input on the new temporary geometry before returning requested control", async () => {
+    const fixture = controllerFixture(); actualModes(fixture);
+    const { lease, control } = await controlled(fixture);
+    const result = await fixture.controller.request(AUTHORITY, { op: "resolution", lease: lease.lease,
+      controlGeneration: control.controlGeneration, modeId: "102", temporary: true, control: true }) as { lease: RemoteDesktopLease };
+    expect(result.lease).toMatchObject({ lease: lease.lease, controlling: true, display: { width: 1024, height: 640 } });
+    expect(result.lease.controlGeneration).toBeGreaterThan(control.controlGeneration);
+    expect(fixture.dependencies.startInput).toHaveBeenCalledTimes(2);
+    await fixture.controller.stopAndRestore();
+  });
   it("uses Linux host modes for a temporary same-lease change and restores the captured original on stop", async () => {
     const fixture = controllerFixture(); actualModes(fixture);
     vi.mocked(fixture.dependencies.capabilities).mockResolvedValue({ ...CAPABILITIES, platform: "linux",

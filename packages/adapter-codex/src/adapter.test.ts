@@ -44,6 +44,36 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it.each([false, true])("keeps native one-shot inference on an isolated exact-model protocol and original owner (cancelled=%s)", async cancelled => {
+    const setup = await createSetup(), owner = new AbortController(), allowed = vi.fn(); await setup.adapter.describe();
+    expect(setup.adapter.nativeTextInferenceCapabilities).toEqual({ pluginOneshot: true, maxTokens: false });
+    const result = setup.adapter.inferNativeText({ providerId: "openai", modelId: "gpt-test", system: "Answer exactly", user: "Question", maxTokens: 512,
+      timeoutMs: 10_000, signal: owner.signal, backendInstanceGeneration: 7, assertCurrent: () => owner.signal.throwIfAborted(), assertModelAllowed: allowed });
+    await vi.waitFor(() => expect(setup.fake.transport?.requests.some(request => request.method === "turn/start")).toBe(true));
+    const start = setup.fake.transport!.requests.find(request => request.method === "thread/start")!.params as JsonObject;
+    expect(start).toMatchObject({ model: "gpt-test", dynamicTools: [], developerInstructions: "Answer exactly" });
+    expect(JSON.stringify(start)).not.toContain("max_output_tokens");
+    if (cancelled) { owner.abort(); await expect(result).rejects.toThrow(); }
+    else {
+      const turn = setup.fake.transport!.requests.find(request => request.method === "turn/start")!.params as JsonObject;
+      await setup.fake.completeTurn(turn["threadId"] as string, "Exact answer"); await expect(result).resolves.toBe("Exact answer");
+    }
+    expect(allowed).toHaveBeenCalledWith("openai", "gpt-test");
+    expect(setup.fake.transport!.requests.some(request => request.method === "thread/unsubscribe")).toBe(true);
+  });
+  it("routes a delegated turn through observable native approval and fences a review revoked before response", async () => {
+    const setup = await createSetup(), events: EventPayload[] = []; let current = true, pause = false, release!: () => void;
+    const review = vi.fn(async () => { if (pause) await new Promise<void>(resolve => { release = resolve; }); return { verdict: "allow" as const, authorizationRevision: "original" }; });
+    const nativeToolAuthorization = { required: true, capture: () => "original", assertCurrent: () => { if (!current) throw new Error("Revoked"); }, review };
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), context(setup.target, events, { backendInstanceGeneration: 7 }));
+    const active = { ...context(setup.target, events, { binding, backendInstanceGeneration: 7, operationId: "delegated-action" }), nativeToolAuthorization };
+    await setup.adapter.send(prompt("Do the exact task"), active);
+    expect(setup.fake.transport!.requests.find(request => request.method === "turn/start")?.params).toMatchObject({ approvalPolicy: "untrusted", approvalsReviewer: "user", sandboxPolicy: { type: "readOnly" } });
+    await expect(setup.fake.requestCommandApproval(binding.nativeSessionId!, "turn-1")).resolves.toMatchObject({ decision: "accept" });
+    pause = true; const pending = setup.fake.requestCommandApproval(binding.nativeSessionId!, "turn-1");
+    await vi.waitFor(() => expect(review).toHaveBeenCalledTimes(2)); current = false; release();
+    await expect(pending).resolves.toMatchObject({ decision: "cancel" });
+  });
   it("preserves native model metadata presence and marks known capacity estimates without inventing declarations", async () => {
     const setup = await createSetup(); const original = setup.fake.modelList[0]!;
     setup.fake.modelList = [{ ...original, model: "gpt-5.4", description: "Native description", inputModalities: [], serviceTiers: [] },
@@ -151,6 +181,17 @@ describe("CodexBackendAdapter", () => {
     expect((await unconfigured.adapter.describe()).capabilities.get("runtime.commands")?.supported).toBe(false);
   });
 
+  it("attests only a built-in native mount and reads the actual remote Skill command catalog", async () => {
+    const builtin = await createSkillInputSetup(false, true);
+    expect((await builtin.adapter.getCommands(builtin.active))[0]?.builtinSkill).toEqual({ id: "plugin_creator", revision: builtin.mention.discoveredRevision });
+    builtin.fake.reviewSkills[0]!["path"] = join(builtin.source, "SKILL.md");
+    expect(await builtin.adapter.getCommands(builtin.active)).toEqual([]);
+    const remote = await createRemoteSkillInputSetup();
+    const commands = await remote.adapter.getCommands(remote.active);
+    expect(commands).toHaveLength(1); expect(commands[0]?.resourceId).toBe(remote.mention.reference);
+    expect(commands[0]?.builtinSkill).toBeUndefined();
+  });
+
   it("keeps same-name Skill identities separate and rejects malformed private native defaults", async () => {
     const duplicate = await createSkillInputSetup(true);
     expect(await duplicate.adapter.getCommands(duplicate.active)).toEqual([
@@ -234,7 +275,9 @@ describe("CodexBackendAdapter", () => {
     expect(entries).toContainEqual({ path: setup.snapshots[0]!.filePath, enabled: true });
     const methods = setup.remoteFake.transport!.requests.map(request => request.method);
     expect(methods.indexOf("thread/unsubscribe")).toBeLessThan(methods.indexOf("thread/resume"));
-    expect(await setup.adapter.getCommands(setup.active)).toEqual([]);
+    expect(await setup.adapter.getCommands(setup.active)).toEqual([expect.objectContaining({
+      name: "RemoteReport", source: "skill", loaded: true, resourceId: setup.seed.resource.id
+    })]);
     await setup.adapter.send({ ...prompt("@selected use it"), mentions: [setup.mention] }, setup.active);
     await setup.adapter.send({ ...prompt("continue"), disposition: "steer", mentions: [setup.mention] }, { ...setup.active, operationId: "remote-skill-steer" });
     const turns = setup.remoteFake.transport!.requests.filter(request => request.method === "turn/start" || request.method === "turn/steer");
@@ -5642,7 +5685,7 @@ async function createSetup(
   return { adapter, fake, host, target };
 }
 
-async function createSkillInputSetup(duplicateCommandName = false) {
+async function createSkillInputSetup(duplicateCommandName = false, builtin = false) {
   const source = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-input-skill-")));
   cleanups.push(() => rm(source, { recursive: true, force: true }));
   const body = "---\nname: seed-name\ndescription: Private reports\n---\nComplete private instructions.\n", helper = "Private helper";
@@ -5652,7 +5695,8 @@ async function createSkillInputSetup(duplicateCommandName = false) {
   const authority = { approved: true, dispatch: true, sourceIncarnation: 1 };
   const capturedSourceIncarnation = authority.sourceIncarnation;
   const seed = { sourcePath: source,
-    resource: { id: "approved-report", name: "Resource label", kind: "skill", source: "managed", state: "approved", revision, resourceVersion: 3n },
+    resource: { id: "approved-report", name: "Resource label", kind: "skill", source: "managed", state: "approved", revision, resourceVersion: 3n,
+      ...(builtin ? { trustedBuiltin: { id: "plugin_creator" as const, revision } } : {}) },
     assertCurrent: () => { if (!authority.approved || authority.sourceIncarnation !== capturedSourceIncarnation) throw new Error("Approval or source incarnation retired"); } } as const;
   const setup = await createSetup(7, { resolveNativeSkills: async () => duplicateCommandName
     ? [seed, { ...seed, resource: { ...seed.resource, id: "second-report" } }] : [seed] });

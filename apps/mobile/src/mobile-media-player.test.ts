@@ -6,6 +6,16 @@ import {
 } from "./mobile-media-player";
 
 describe("mobile media player protocol and HTML", () => {
+  it("plays explicit public media without gaining file or document access", () => {
+    const input = { instanceId: "public-1", kind: "video" as const, locale: "en" as const, mediaType: "", title: "Public clip",
+      background: "#000", surface: "#111", ink: "#fff", networkSource: true, uri: "https://example.org/video.mp4?q=a&b=c" };
+    const html = buildMobileMediaPlayerHtml(input);
+    expect(html).toContain("media-src https: http:"); expect(html).not.toContain("media-src file:");
+    expect(html).toContain("connect-src 'none'"); expect(html).toContain("frame-src 'none'");
+    expect(html).toContain('https://example.org/video.mp4?q=a&amp;b=c');
+    for (const uri of ["https://user:secret@example.org/video", "file:///cache/video.mp4", "data:video/mp4,AAAA", "javascript:alert(1)"])
+      expect(() => buildMobileMediaPlayerHtml({ ...input, uri })).toThrow(/URI/u);
+  });
   it("builds an offline file-only player with escaped title and exact local source", () => {
     const html = buildMobileMediaPlayerHtml({
       instanceId: "lease-1",

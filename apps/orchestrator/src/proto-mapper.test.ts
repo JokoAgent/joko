@@ -363,7 +363,7 @@ describe("proto mapper", () => {
           [capabilityNames.permissionModes, {
             key: capabilityNames.permissionModes,
             supported: true,
-            options: ["ask", "auto", "bypassPermissions"]
+            options: ["ask", "acceptEdits", "auto", "bypassPermissions"]
           }],
           [capabilityNames.permissionChange, { key: capabilityNames.permissionChange, supported: true }],
           [capabilityNames.contextUsage, { key: capabilityNames.contextUsage, supported: true }],
@@ -397,7 +397,7 @@ describe("proto mapper", () => {
     expect(capabilities.get(capabilityNames.permissionModes)?.options?.kind).toMatchObject({
       case: "permission",
       value: {
-        modes: [PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS],
+        modes: [PermissionMode.ASK, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS],
         mutableDuringSession: true
       }
     });

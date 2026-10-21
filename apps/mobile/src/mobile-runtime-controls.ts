@@ -111,6 +111,7 @@ export interface MobileNewTaskExecutionAuthority {
 
 const permissionModeOrder = [
   PermissionMode.ASK,
+  PermissionMode.ACCEPT_EDITS,
   PermissionMode.AUTO,
   PermissionMode.BYPASS_PERMISSIONS
 ] as const;
@@ -547,6 +548,7 @@ export function assertMobilePlanMode(controls: MobileRuntimeControls, enabled: b
 
 export function mobilePermissionModeLabel(mode: PermissionMode, locale: MobileSupportedLocale): string {
   switch (mode) {
+    case PermissionMode.ACCEPT_EDITS: return mobileMessage(locale, "controls.permission.edits");
     case PermissionMode.ASK: return mobileMessage(locale, "controls.permission.ask");
     case PermissionMode.AUTO: return mobileMessage(locale, "controls.permission.auto");
     case PermissionMode.BYPASS_PERMISSIONS: return mobileMessage(locale, "controls.permission.full");
@@ -556,6 +558,7 @@ export function mobilePermissionModeLabel(mode: PermissionMode, locale: MobileSu
 
 export function mobilePermissionModeDescription(mode: PermissionMode, locale: MobileSupportedLocale): string {
   switch (mode) {
+    case PermissionMode.ACCEPT_EDITS: return mobileMessage(locale, "controls.permission.editsDescription");
     case PermissionMode.ASK: return mobileMessage(locale, "controls.permission.askDescription");
     case PermissionMode.AUTO: return mobileMessage(locale, "controls.permission.autoDescription");
     case PermissionMode.BYPASS_PERMISSIONS: return mobileMessage(locale, "controls.permission.fullDescription");

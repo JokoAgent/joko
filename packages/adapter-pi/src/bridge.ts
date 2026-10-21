@@ -479,16 +479,18 @@ async function orderedPolicyDecision(
   ctx: any,
   control: Control,
   observation: PolicyObservation,
-): Promise<"allow" | "deny" | "ask" | "default" | "stale"> {
+  toolCall: { toolName: string; input: unknown },
+): Promise<"allow" | "deny" | "ask" | "default" | "stale" | "delegated_allow"> {
   if (!ctx.hasUI) return "stale";
   const encoded = Buffer.from(JSON.stringify({
     format: 1,
     policyGeneration: control.policyGeneration,
+    toolCall,
     ...observation,
   }), "utf8").toString("base64url");
   if (encoded.length > MAX_POLICY_DECISION_ENVELOPE_CHARACTERS) return "stale";
   const response = await ctx.ui.input(POLICY_DECISION_REQUEST_PREFIX + encoded, "");
-  return response === "allow" || response === "deny" || response === "ask" || response === "default" || response === "stale"
+  return response === "allow" || response === "deny" || response === "ask" || response === "default" || response === "stale" || response === "delegated_allow"
     ? response
     : "stale";
 }
@@ -738,15 +740,16 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
     if (control.planMode && (localReview.tier !== "green" || (risk !== "safe_read" && risk !== "safe_command"))) {
       return { block: true, reason: "Plan mode blocked a tool outside the read-only allowlist" };
     }
-    const orderedDecision = await orderedPolicyDecision(ctx, control, policyObservation(event.toolName, event.input, risk));
+    const reviewInput = (event.toolName === "write" || event.toolName === "edit") ? { path: toolPath(event.input) } : event.input;
+    const orderedDecision = await orderedPolicyDecision(ctx, control, policyObservation(event.toolName, event.input, risk), { toolName: event.toolName, input: reviewInput });
     try {
       assertPolicyUnchanged(control);
     } catch (error) {
       return { block: true, reason: error instanceof Error ? error.message : "Joko policy changed while ordered rules were evaluated" };
     }
     if (orderedDecision === "stale") return { block: true, reason: "Ordered policy evaluation was unavailable or stale" };
-    if (orderedDecision === "deny") return { block: true, reason: "An ordered owner policy rule denied this tool call" };
-    if (orderedDecision === "allow") return;
+    if (orderedDecision === "deny") return { block: true, reason: "The current owner policy or delegated task authority denied this tool call" };
+    if (orderedDecision === "allow" || orderedDecision === "delegated_allow") return;
     // Full Access is the user's explicit acceptance of execution with the Pi
     // process account. Immutable reviewer and Plan Mode boundaries above still
     // dominate it, but ordinary risk classification must not silently turn

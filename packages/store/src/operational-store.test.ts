@@ -37,6 +37,23 @@ afterEach(() => {
 });
 
 describe("OperationalStore", () => {
+  it("commits the Home context receipt with its native binding and retains an unknown claim through cold restart", () => {
+    const f = createFixture(), operation = { id: "home-context-once", kind: "restore_partner_home_context", body: { sessionId: "session-1" } };
+    f.store.claimDeferredEffectOperation(operation); f.store.armManualContextRebuild({ sessionId: "session-1", operationId: operation.id });
+    const claim = f.store.claimPendingContextRebuild("session-1")!;
+    f.store.subscribe(event => { if (event.operationId === operation.id) expect(f.store.getOperation(operation.id).status).toBe("completed"); });
+    f.store.completePendingContextRebuild({ sessionId: "session-1", claimToken: claim.claimToken, operationId: operation.id,
+      binding: { opaqueRef: "native/restored-home.jsonl", generation: 1 }, handoff: "Visible retained history.", traceId: "home-native-context" });
+    expect(f.store.findPendingContextRebuild("session-1")).toBeUndefined(); expect(f.store.getSessionContextHandoff("session-1")).toBeUndefined();
+    expect(f.store.getOperation(operation.id)).toMatchObject({ status: "completed", response: { sessionId: "session-1", generation: 1, bindingIdentity: expect.stringMatching(/^sha256:[a-f0-9]{64}$/u) } });
+    const unknown = { id: "home-context-unknown", kind: operation.kind, body: operation.body }; f.store.claimDeferredEffectOperation(unknown);
+    f.store.armManualContextRebuild({ sessionId: "session-1", operationId: unknown.id });
+    const file = f.store.filePath; f.store.close(); f.replaceStore(new OperationalStore(file));
+    expect(f.store.claimDeferredEffectOperation(operation)).toMatchObject({ claimed: false, value: { sessionId: "session-1", generation: 1 } });
+    expect(() => f.store.claimDeferredEffectOperation(unknown)).toThrow(OperationInProgressError);
+    expect(f.store.getSession("session-1").descriptor.binding.generation).toBe(1);
+    expect(f.store.findPendingContextRebuild("session-1")).toMatchObject({ sourceNativeOpaqueRef: "native/restored-home.jsonl" });
+  });
   it("atomically attributes parent and child usage once and keeps immutable Run update snapshots through recovery", () => {
     const f = createFixture(), published: PersistedEvent[] = [];
     const observe = (sourceId: string, tokens: number, measuredAt: number, runId = "run-1") => f.store.recordUsageObservation({

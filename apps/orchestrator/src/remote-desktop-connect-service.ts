@@ -96,7 +96,8 @@ export function createRemoteDesktopConnectService(
       const peer = fromProtoRouteIdentity(request.peer);
       const lease = await dependencies.coordinator.start(connection, peer, {
         displayId: request.displayId,
-        mode: request.mode
+        mode: request.mode,
+        ...(request.control ? { control: true } : {})
       }, context.signal);
       dependencies.connections.fence(connection);
       return create(contract.StartRemoteDesktopResponseSchema, {
@@ -305,7 +306,8 @@ export function createRemoteDesktopConnectService(
         leaseId: request.leaseId,
         controlGeneration: request.controlGeneration,
         modeId: request.modeId,
-        temporary: request.temporary
+        temporary: request.temporary,
+        ...(request.control ? { control: true } : {})
       }, context.signal);
       dependencies.connections.fence(connection);
       return create(contract.SetRemoteDesktopDisplayModeResponseSchema, {
@@ -318,7 +320,7 @@ export function createRemoteDesktopConnectService(
       const peer = fromProtoRouteIdentity(request.peer);
       const result = await dependencies.coordinator.setViewerDisplay(connection, peer, {
         leaseId: request.leaseId, controlGeneration: request.controlGeneration,
-        width: request.width, height: request.height
+        width: request.width, height: request.height, ...(request.control ? { control: true } : {})
       }, context.signal);
       dependencies.connections.fence(connection);
       return create(contract.SetRemoteDesktopViewerDisplayResponseSchema, { peer: toProtoRouteIdentity(peer), result });
@@ -328,7 +330,7 @@ export function createRemoteDesktopConnectService(
       const connection = authenticate(dependencies.connections, context);
       const peer = fromProtoRouteIdentity(request.peer);
       const result = await dependencies.coordinator.restoreViewerDisplay(connection, peer, {
-        leaseId: request.leaseId, controlGeneration: request.controlGeneration
+        leaseId: request.leaseId, controlGeneration: request.controlGeneration, ...(request.control ? { control: true } : {})
       }, context.signal);
       dependencies.connections.fence(connection);
       return create(contract.RestoreRemoteDesktopViewerDisplayResponseSchema, { peer: toProtoRouteIdentity(peer), result });

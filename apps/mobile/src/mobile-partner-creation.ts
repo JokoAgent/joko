@@ -52,9 +52,9 @@ export function mobilePartnerCreationBackends(owner: Snapshot | undefined): read
     if (!execution || permission.length !== 1 || permission[0]!.support !== CapabilitySupport.SUPPORTED
       || permission[0]!.options?.kind.case !== "permission" || execution.models.length === 0) return [];
     const advertised = permission[0]!.options.kind.value.modes;
-    if (new Set(advertised).size !== advertised.length || advertised.some((mode) => ![PermissionMode.ASK, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS].includes(mode))) return [];
+    if (new Set(advertised).size !== advertised.length || advertised.some((mode) => ![PermissionMode.ASK, PermissionMode.ACCEPT_EDITS, PermissionMode.AUTO, PermissionMode.BYPASS_PERMISSIONS].includes(mode))) return [];
     const modes = advertised.map((mode) => mode === PermissionMode.ASK ? "ask" as const
-      : mode === PermissionMode.AUTO ? "auto" as const : "bypassPermissions" as const);
+      : mode === PermissionMode.ACCEPT_EDITS ? "acceptEdits" as const : mode === PermissionMode.AUTO ? "auto" as const : "bypassPermissions" as const);
     if (modes.length === 0) return [];
     return [{ backendId: backend.backendId, displayName: backend.displayName,
       models: execution.models.map(model => ({ ...model, backendName: backend.displayName })),

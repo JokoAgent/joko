@@ -5,6 +5,7 @@ import {
   app,
   BrowserWindow,
   dialog,
+  nativeTheme,
   powerMonitor,
   powerSaveBlocker,
   screen,
@@ -39,6 +40,9 @@ import { desktopRemoteDesktopWindowsHost } from "./remote-desktop-windows-host.j
 import { readDesktopSystemAudioSupport } from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopSettingsStore } from "./remote-desktop-settings.js";
 import type { SystemAudioMuteGuard } from "./system-audio-mute.js";
+import { DesktopRemoteDesktopControlledOverlay } from "./remote-desktop-controlled-overlay.js";
+import type { DesktopRemoteDesktopControllerDirectory } from "./remote-desktop-controller-directory.js";
+import type { DesktopLocale } from "./channels.js";
 import { DesktopRemoteDesktopLinuxMute, supportsDesktopRemoteDesktopLinuxMute
 } from "./remote-desktop-linux-mute.js";
 import { DesktopRemoteDesktopLinuxWorkspace, readDesktopRemoteDesktopLinuxWorkspaceSupport
@@ -71,6 +75,8 @@ import {
 
 const MAC_SCREEN_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
 const MAC_ACCESSIBILITY_SETTINGS = "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+const localNotices = new Set<DesktopRemoteDesktopControlledOverlay>();
+export function refreshDesktopRemoteDesktopLocalNotices(): void { for (const notice of localNotices) notice.refresh(); }
 
 export interface DesktopRemoteDesktopMainOptions {
   readonly sourceDirectory: string;
@@ -81,6 +87,8 @@ export interface DesktopRemoteDesktopMainOptions {
   readonly getMainWindow: () => BrowserWindow | undefined;
   readonly changed: (state: DesktopRemoteDesktopState | undefined) => void;
   readonly retired?: () => void;
+  readonly controllerDirectory?: DesktopRemoteDesktopControllerDirectory;
+  readonly appearance?: () => { readonly dark: boolean; readonly locale: DesktopLocale };
 }
 
 /** Compose the production Electron adapters without exposing any host value to preload. */
@@ -92,11 +100,14 @@ export function createDesktopRemoteDesktopMainHost(
   }
   let host: DesktopRemoteDesktopHost | undefined;
   let displayAwake: number | undefined;
+  let controlledOverlay: DesktopRemoteDesktopControlledOverlay | undefined;
+  let privacyRequested = false;
   const media = new DesktopRemoteDesktopMedia(join(options.sourceDirectory, "remote-desktop-capture-preload.cjs"),
     undefined, (leaseId) => { if (host?.state?.leaseId === leaseId) host.disconnect(); });
+  const onPointer = (points: { x: number; y: number }[]) => controlledOverlay?.viewerPointer(points);
   const input = process.platform === "win32"
-    ? new DesktopRemoteDesktopWindowsInput(() => host?.releaseControl())
-    : new DesktopRemoteDesktopInput(() => host?.releaseControl());
+    ? new DesktopRemoteDesktopWindowsInput(() => host?.releaseControl(true), undefined, undefined, onPointer)
+    : new DesktopRemoteDesktopInput(() => host?.releaseControl(true), undefined, onPointer);
   const linuxMute = process.platform === "linux" && isDesktopRemoteDesktopWayland() && supportsDesktopRemoteDesktopLinuxMute()
     ? new DesktopRemoteDesktopLinuxMute() : undefined;
   const linuxWorkspace = process.platform === "linux" && supportsDesktopRemoteDesktopLinuxCapture()
@@ -104,6 +115,33 @@ export function createDesktopRemoteDesktopMainHost(
   const supportsPrivacy = (process.platform === "darwin" && typeof process.getSystemVersion === "function"
     && Number(process.getSystemVersion().split(".")[0]) >= 14)
     || (process.platform === "win32" && Number(osRelease().split(".")[2]) >= 19041);
+  let namedLease: string | undefined;
+  let controllerName: string | undefined;
+  const syncOverlay = (): void => {
+    const state = host?.state;
+    if (!state || privacyRequested) { controlledOverlay?.update(null); return; }
+    controlledOverlay?.update({ leaseId: state.leaseId, displayId: state.displayId,
+      controlling: state.controlling, peer: state.controllerDeviceId,
+      ...(namedLease === state.leaseId && controllerName ? { name: controllerName } : {}) });
+    if (namedLease === state.leaseId) return;
+    namedLease = state.leaseId; controllerName = undefined;
+    void options.controllerDirectory?.name(state.controllerDeviceId).then(name => {
+      if (host?.state?.leaseId !== state.leaseId || namedLease !== state.leaseId) return;
+      controllerName = name; syncOverlay();
+    }).catch(() => undefined);
+  };
+  if (supportsPrivacy) {
+    controlledOverlay = new DesktopRemoteDesktopControlledOverlay(
+      ids => media.setOverlayExclusions(ids),
+      async peer => { if (!options.controllerDirectory) throw new Error("REMOTE_DESKTOP_ACCESS_REVOKED"); await options.controllerDirectory.revoke(peer); },
+      peer => { if (host?.state?.controllerDeviceId === peer) host.disconnect(); },
+      { appearance: options.appearance ?? (() => ({ dark: nativeTheme?.shouldUseDarkColors === true, locale: "en" })),
+        changed: () => options.changed(host?.state) }
+    );
+    localNotices.add(controlledOverlay);
+  }
+  const refreshAppearance = (): void => controlledOverlay?.refresh();
+  nativeTheme?.on("updated", refreshAppearance);
   const privacy = process.platform === "linux" && isDesktopRemoteDesktopWayland() ? new DesktopRemoteDesktopLinuxPrivacyScreen({
     stopped: async (owner) => { await host!.stopPrivacyByUser(owner); },
     suspendInput: (current, signal) => input.pauseForPrivacy(current, signal)
@@ -293,7 +331,17 @@ export function createDesktopRemoteDesktopMainHost(
       && typeof process.getSystemVersion === "function" && Number(process.getSystemVersion().split(".")[0]) >= 12)
       ? { credentials: { native: new DesktopRemoteCredentialsNative(), owner: options.credentialsOwner,
         ...(process.platform === "linux" ? { lockState: readDesktopRemoteDesktopLinuxCredentialLockState } : {}) } } : {}),
-    ...(privacy === undefined ? {} : { privacyScreen: privacy }),
+    ...(privacy === undefined ? {} : { privacyScreen: {
+      set: async (owner: object, displayId: string, current: () => boolean, signal: AbortSignal) => {
+        privacyRequested = true; controlledOverlay?.update(null);
+        try { await privacy.set(owner, displayId, current, signal); }
+        catch (error) { if (!privacy.active) privacyRequested = false; syncOverlay(); throw error; }
+      },
+      release: async (owner: object) => {
+        try { await privacy.release(owner); }
+        finally { if (!privacy.active) privacyRequested = false; queueMicrotask(syncOverlay); }
+      }
+    } }),
     ...(clipboard === undefined ? {} : { clipboard, clipboardCounter: new DesktopRemoteDesktopClipboardCounter() }),
     ...(linuxMute === undefined ? {} : { hostMute: linuxMute }),
     ...(linuxWorkspace === undefined ? {} : {
@@ -352,9 +400,16 @@ export function createDesktopRemoteDesktopMainHost(
         try { powerSaveBlocker.stop(displayAwake); } catch { /* The OS already retired the blocker. */ }
         displayAwake = undefined;
       }
+      syncOverlay();
       options.changed(state);
     },
-    ...(options.retired === undefined ? {} : { retired: options.retired }),
+    localNoticeVisible: () => controlledOverlay?.visible === true,
+    retired: () => {
+      nativeTheme?.removeListener("updated", refreshAppearance);
+      controlledOverlay?.stop();
+      if (controlledOverlay) localNotices.delete(controlledOverlay);
+      options.retired?.();
+    },
     onDisplayChange: subscriptions.display,
     onSessionStateChange: subscriptions.session
   });

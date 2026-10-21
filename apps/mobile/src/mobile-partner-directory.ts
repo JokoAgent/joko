@@ -34,7 +34,7 @@ export interface MobilePartnerModelRoute {
 
 export interface MobilePartnerCapabilities {
   readonly modelChain: readonly MobilePartnerModelRoute[];
-  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
 }
 
@@ -240,7 +240,7 @@ export function projectMobilePartnerProfile(value: PartnerProfile): MobilePartne
     ...(initializationErrorCode === undefined ? {} : { initializationErrorCode }),
     homeTargetId: id(value.homeTargetId, "Partner home target ID"),
     ...(canonicalSessionId === undefined ? {} : { canonicalSessionId }),
-    capabilities: projectMobilePartnerCapabilities(value.capabilities),
+    capabilities: projectMobilePartnerCapabilities(value.capabilities, canonicalSessionId === undefined && initializationState !== "ready"),
     ...(value.taskModelOverride === undefined ? {} : { taskModelOverride: projectMobilePartnerModelRoute(value.taskModelOverride) }),
     usesDirectoryDefaults: value.usesDirectoryDefaults,
     createdAt: timestamp(value.createdAt, "Partner creation time"),
@@ -273,8 +273,8 @@ function projectMobilePartnerModelRoute(route: NonNullable<PartnerCapabilities>[
   };
 }
 
-export function projectMobilePartnerCapabilities(value: PartnerCapabilities | undefined): MobilePartnerCapabilities {
-  if (!value || value.modelChain.length < 1 || value.modelChain.length > 5) {
+export function projectMobilePartnerCapabilities(value: PartnerCapabilities | undefined, allowUnconfiguredModel = false): MobilePartnerCapabilities {
+  if (!value || value.modelChain.length < (allowUnconfiguredModel ? 0 : 1) || value.modelChain.length > 5) {
     throw new Error("The Joko node returned an invalid Partner model chain.");
   }
   const modelChain = value.modelChain.map(projectMobilePartnerModelRoute);
@@ -283,6 +283,7 @@ export function projectMobilePartnerCapabilities(value: PartnerCapabilities | un
     throw new Error("The Joko node returned an inconsistent Partner model chain.");
   }
   const permissionMode = value.permissionMode === PermissionMode.ASK ? "ask" as const
+    : value.permissionMode === PermissionMode.ACCEPT_EDITS ? "acceptEdits" as const
     : value.permissionMode === PermissionMode.AUTO ? "auto" as const
     : value.permissionMode === PermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions" as const : undefined;
   if (!permissionMode) throw new Error("The Joko node returned an unsupported Partner permission mode.");
@@ -290,6 +291,7 @@ export function projectMobilePartnerCapabilities(value: PartnerCapabilities | un
 }
 
 export function mobilePartnerPermissionToProto(mode: MobilePartnerCapabilities["permissionMode"]): PermissionMode {
+  if (mode === "acceptEdits") return PermissionMode.ACCEPT_EDITS;
   if (mode === "ask") return PermissionMode.ASK;
   if (mode === "auto") return PermissionMode.AUTO;
   if (mode === "bypassPermissions") return PermissionMode.BYPASS_PERMISSIONS;

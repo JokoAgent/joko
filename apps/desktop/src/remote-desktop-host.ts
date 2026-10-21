@@ -102,6 +102,7 @@ export interface DesktopRemoteDesktopMediaPort {
     events: readonly RemoteDesktopInput[]
   ) => void): () => void;
   setPresentationPongHandler(handler: (leaseId: string) => void): () => void;
+  setControlHandler?(handler: (leaseId: string, request: unknown) => Promise<unknown>): () => void;
   setPresentation(leaseId: string, enabled: boolean): void;
   setSessionState(nativeOnly: boolean, state?: DesktopRemoteDesktopSessionState): void;
   setPrivacyExclusions(owner: object, ids: readonly number[]): void;
@@ -196,6 +197,7 @@ export interface DesktopRemoteDesktopHostDependencies {
   createViewerDisplay?(sourceDisplayId: string, current: () => boolean, onFailure: () => void,
     signal: AbortSignal): Promise<import("@joko/device-peer").RemoteDesktopViewerDisplayHandle>;
   changed(state: DesktopRemoteDesktopState | undefined): void;
+  localNoticeVisible?(): boolean;
   retired?(): void;
   onDisplayChange?(listener: (displayId: string, geometryChanged: boolean,
     geometry?: { readonly width: number; readonly height: number; readonly metrics: readonly string[] }) => void): () => void;
@@ -227,6 +229,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   readonly #clipboardAuthorityListeners = new Set<() => void>();
   readonly #stopInputHandler: () => void;
   readonly #stopPresentationPongHandler: () => void;
+  readonly #stopControlHandler?: () => void;
   readonly #stopSubscriptions: readonly (() => void)[];
   readonly #timer: ReturnType<typeof setInterval>;
   #sessionState: DesktopRemoteDesktopSessionState = "unknown";
@@ -483,6 +486,11 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         // The generated heartbeat reports the resulting view-only state.
       }
     });
+    this.#stopControlHandler = dependencies.media.setControlHandler?.(async (leaseId, request) => {
+      const state = this.#controller.state;
+      if (this.#retired || !state || state.lease !== leaseId) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+      return this.#controller.request(this.#authority(state.controllerDeviceId), request);
+    });
     this.#stopPresentationPongHandler = dependencies.media.setPresentationPongHandler((leaseId) => {
       if (this.#retired) return;
       this.#controller.recordPresentationPong(leaseId);
@@ -524,6 +532,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     });
   }
 
+  get localNoticeVisible(): boolean { return this.#dependencies.localNoticeVisible?.() === true; }
+
   /** Main's compositor poll must not invalidate a change already owned by this lease. */
   managesDisplayGeometry(displayId: string, width: number, height: number): boolean {
     return this.#controller.changingDisplay
@@ -554,9 +564,9 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   }
 
   /** Native injection failure is control-scoped; picture and lease stay alive. */
-  releaseControl(): void {
+  releaseControl(recoverInput = false): void {
     if (this.#retired) return;
-    this.#controller.releaseControl();
+    void this.#controller.releaseControl(recoverInput);
   }
 
   async getLockState(request: DevicePeerRemoteDesktopHostRequest) {
@@ -627,11 +637,14 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       readonly viewerDisplayRestore: boolean;
       readonly workspaceNavigation: boolean;
       readonly systemMenu: boolean;
+      readonly channelRequests?: boolean;
+      readonly autoControl?: boolean;
     };
     return create(RemoteDesktopCapabilitiesSchema, {
       protocolVersion: value.version,
       enabled: value.enabled,
       canControl: value.canControl,
+      autoControl: value.autoControl === true,
       platform: value.platform,
       displays: value.displays.map((display) => create(RemoteDesktopDisplaySchema, {
         displayId: display.id,
@@ -662,7 +675,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       privacyScreen: value.privacyScreen,
       nativeCredentials: value.nativeCredentials,
       workspaceNavigation: value.workspaceNavigation,
-      systemMenu: value.systemMenu
+      systemMenu: value.systemMenu,
+      channelRequests: value.channelRequests === true
     });
   }
 
@@ -678,10 +692,12 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   async start(request: DevicePeerRemoteDesktopHostRequest & {
     readonly displayId: string;
     readonly mode: RemoteDesktopStartMode;
+    readonly control?: boolean;
   }) {
     const value = await this.#request(request, {
       op: "start",
       displayId: request.displayId,
+      ...(request.control ? { control: true } : {}),
       ...(request.mode === RemoteDesktopStartMode.RESUME ? { resume: true } : {}),
       ...(request.mode === RemoteDesktopStartMode.TAKEOVER ? { takeover: true } : {})
     }) as {
@@ -982,6 +998,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     readonly controlGeneration: bigint;
     readonly modeId: string;
     readonly temporary: boolean;
+    readonly control?: boolean;
   }) {
     if (request.controlGeneration < 1n
       || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -992,7 +1009,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       lease: request.leaseId,
       controlGeneration: Number(request.controlGeneration),
       modeId: request.modeId,
-      temporary: request.temporary
+      temporary: request.temporary,
+      ...(request.control ? { control: true } : {})
     }) as { readonly lease?: import("@joko/device-peer").RemoteDesktopLease };
     return create(RemoteDesktopDisplayModeResultSchema, value.lease === undefined ? {} : {
       lease: create(RemoteDesktopLeaseSchema, {
@@ -1006,20 +1024,21 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
   }
 
   async setViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
-    readonly controlGeneration: bigint; readonly width: number; readonly height: number;
+    readonly controlGeneration: bigint; readonly width: number; readonly height: number; readonly control?: boolean;
   }) { return this.#viewerDisplayRequest(request, { op: "viewerDisplay", width: request.width, height: request.height }); }
 
   async restoreViewerDisplay(request: DevicePeerRemoteDesktopLeaseRequest & {
     readonly controlGeneration: bigint;
+    readonly control?: boolean;
   }) { return this.#viewerDisplayRequest(request, { op: "restoreViewerDisplay" }); }
 
-  async #viewerDisplayRequest(request: DevicePeerRemoteDesktopLeaseRequest & { readonly controlGeneration: bigint },
+  async #viewerDisplayRequest(request: DevicePeerRemoteDesktopLeaseRequest & { readonly controlGeneration: bigint; readonly control?: boolean },
     operation: { readonly op: "viewerDisplay"; readonly width: number; readonly height: number } | { readonly op: "restoreViewerDisplay" }) {
     if (request.controlGeneration < 1n || request.controlGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw failure(RemoteDesktopFailureReason.LEASE_EXPIRED, false);
     }
     const value = await this.#request(request, { ...operation, lease: request.leaseId,
-      controlGeneration: Number(request.controlGeneration) }) as { readonly lease: import("@joko/device-peer").RemoteDesktopLease };
+      controlGeneration: Number(request.controlGeneration), ...(request.control ? { control: true } : {}) }) as { readonly lease: import("@joko/device-peer").RemoteDesktopLease };
     return create(RemoteDesktopViewerDisplayResultSchema, { lease: create(RemoteDesktopLeaseSchema, {
       leaseId: value.lease.lease, display: create(RemoteDesktopDisplaySchema, { displayId: value.lease.display.id,
         name: value.lease.display.name, width: value.lease.display.width, height: value.lease.display.height }),
@@ -1091,6 +1110,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       clearInterval(this.#timer);
       this.#stopInputHandler();
       this.#stopPresentationPongHandler();
+      this.#stopControlHandler?.();
       for (const stop of this.#stopSubscriptions) stop();
     }
     const pending = this.#finishRetire();
@@ -1163,6 +1183,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         viewerDisplayRestore: false,
         workspaceNavigation: false,
         systemMenu: false,
+        channelRequests: this.#dependencies.media.setControlHandler !== undefined,
         platform: this.#dependencies.platform,
         displays: Object.freeze([]),
         permissions: disabledPermissions(this.#dependencies.platform)
@@ -1223,6 +1244,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         && this.#dependencies.restoreDisplayMode !== undefined,
       viewerDisplay: viewerDisplay && this.#dependencies.createViewerDisplay !== undefined,
       viewerDisplayRestore: viewerDisplay && this.#dependencies.createViewerDisplay !== undefined,
+      channelRequests: this.#dependencies.media.setControlHandler !== undefined,
       workspaceNavigation: this.#sessionState === "unlocked" && linux?.workspaceNavigation === true
         && this.#dependencies.workspaceAction !== undefined && this.#dependencies.stopWorkspaceActions !== undefined,
       systemMenu: this.#sessionState === "unlocked" && linux?.workspaceNavigation === true && linux.systemMenu === true

@@ -45,6 +45,7 @@ export class SessionNotificationTracker {
       const previous = this.#seen.get(session.id);
       const wasKnown = this.#seen.has(session.id);
       this.#seen.set(session.id, fingerprint);
+      if (session.hidden) continue;
       if (
         fingerprint !== undefined
         && session.attention?.unread === true

@@ -93,7 +93,7 @@ export interface MobileAutomationSchedule {
     readonly effortId?: string;
     readonly fastMode: boolean;
   };
-  readonly permissionMode: "ask" | "auto" | "bypassPermissions";
+  readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
   readonly useWorktree: boolean;
   readonly worktreeSourceRef?: string;
@@ -526,6 +526,7 @@ function editableScheduleInputText(schedule: Schedule): string | undefined {
 }
 
 function schedulePermissionMode(value: PermissionMode): MobileAutomationSchedule["permissionMode"] {
+  if (value === PermissionMode.ACCEPT_EDITS) return "acceptEdits";
   if (value === PermissionMode.ASK) return "ask";
   if (value === PermissionMode.AUTO) return "auto";
   if (value === PermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";

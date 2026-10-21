@@ -7,7 +7,8 @@ import type { ExtensionCatalogManager } from "../extension-catalog.js";
 import { ExtensionOAuthAccounts, ExtensionOAuthError, type ExtensionOAuthCapture } from "./oauth-accounts.js";
 import type { ExtensionOAuthCallback, ExtensionOAuthOffer } from "./oauth-flow.js";
 
-interface Owner { readonly connectionId: string; readonly assertCurrent: () => void; readonly onRevoked: (listener: () => void) => () => void }
+export interface ExtensionOAuthOwner { readonly connectionId: string; readonly assertCurrent: () => void; readonly onRevoked: (listener: () => void) => () => void }
+type Owner = ExtensionOAuthOwner;
 interface Input { readonly capture: ExtensionOAuthCapture; readonly connectionId: string; readonly expiresAt: number }
 interface Flow {
   readonly id: string; readonly capture: ExtensionOAuthCapture; readonly owner: Owner; readonly abort: AbortController;
@@ -97,6 +98,7 @@ export class ExtensionOAuthSettings {
     return flow;
   }
   getFlow(id: string, connectionId: string) { return this.#view(this.#owned(id, connectionId)); }
+  async waitForFlow(id: string, connectionId: string) { const flow = this.#owned(id, connectionId); await flow.task; return this.#view(this.#owned(id, connectionId)); }
   beginCallback(id: string, connectionId: string) {
     const flow = this.#owned(id, connectionId);
     if (flow.phase !== Phase.AUTHORIZING || !flow.offer || !flow.callback || flow.inputTicket) throw new ExtensionOAuthError("INVALID_CONFIG");

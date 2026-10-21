@@ -43,6 +43,7 @@ export class PartnerMemoryManager {
       throw new ConnectError("Partner memory owner changed.", Code.FailedPrecondition);
     }
     const readOnly = partner.lifecycle === "archived" || partner.pauseCleanupPending === true
+      || this.partners.isHomeChanging(partnerId)
       || this.partners.listPendingRestarts().some(item => item.partnerId === partnerId);
     if (writable && readOnly) throw new ConnectError("Partner memory is read-only.", Code.FailedPrecondition);
     return create(contract.PartnerMemoryOwnerSchema, { partnerId, homeTargetId: target.id,

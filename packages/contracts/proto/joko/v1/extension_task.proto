@@ -1,0 +1,76 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/common.proto";
+
+message ExtensionTaskRoute {
+  string backend_id = 1;
+  string provider_id = 2;
+  string model_id = 3;
+  optional string effort = 4;
+  bool fast_mode = 5;
+}
+message ExtensionTaskModel {
+  ExtensionTaskRoute route = 1;
+  string name = 2;
+  repeated string efforts = 3;
+  bool supports_fast_mode = 4;
+}
+message ExtensionTaskDirectory {
+  string target_id = 1;
+  string name = 2;
+  string backend_id = 3;
+}
+message ExtensionTaskPreferences {
+  string extension_id = 1;
+  Revision revision = 2;
+  ExtensionTaskRoute model = 3;
+  optional string target_id = 4;
+  PermissionMode permission_mode = 5;
+  bool show_preferences = 6;
+  bool tasks_available = 7;
+  repeated ExtensionTaskModel models = 8;
+  repeated ExtensionTaskDirectory directories = 9;
+  repeated ExtensionTaskWriteRequest write_requests = 10;
+}
+message ExtensionTaskWriteRequest {
+  string task_id = 1;
+  string title = 2;
+  PermissionMode mode = 3;
+}
+message ExtensionBackgroundTask {
+  string task_id = 1;
+  string title = 2;
+  bool archived = 3;
+  bool running = 4;
+  google.protobuf.Timestamp updated_at = 5;
+}
+service ExtensionTaskService {
+  rpc GetPreferences(ExtensionTaskServiceGetPreferencesRequest) returns (ExtensionTaskServiceGetPreferencesResponse);
+  rpc UpdatePreferences(ExtensionTaskServiceUpdatePreferencesRequest) returns (ExtensionTaskServiceUpdatePreferencesResponse);
+  rpc ListBackgroundTasks(ExtensionTaskServiceListBackgroundTasksRequest) returns (ExtensionTaskServiceListBackgroundTasksResponse);
+  rpc RevealTask(ExtensionTaskServiceRevealTaskRequest) returns (ExtensionTaskServiceRevealTaskResponse);
+  rpc RetryWriteAccess(ExtensionTaskServiceRetryWriteAccessRequest) returns (ExtensionTaskServiceRetryWriteAccessResponse);
+}
+message ExtensionTaskServiceGetPreferencesRequest { string extension_id = 1; }
+message ExtensionTaskServiceGetPreferencesResponse { ExtensionTaskPreferences preferences = 1; }
+message ExtensionTaskServiceUpdatePreferencesRequest {
+  string extension_id = 1;
+  Revision expected_revision = 2;
+  ExtensionTaskRoute model = 3;
+  optional string target_id = 4;
+  PermissionMode permission_mode = 5;
+}
+message ExtensionTaskServiceUpdatePreferencesResponse { ExtensionTaskPreferences preferences = 1; }
+message ExtensionTaskServiceListBackgroundTasksRequest { string extension_id = 1; }
+message ExtensionTaskServiceListBackgroundTasksResponse { repeated ExtensionBackgroundTask tasks = 1; }
+message ExtensionTaskServiceRevealTaskRequest {
+  string extension_id = 1;
+  string task_id = 2;
+}
+message ExtensionTaskServiceRevealTaskResponse { string task_id = 1; }
+message ExtensionTaskServiceRetryWriteAccessRequest { string extension_id = 1; string task_id = 2; }
+message ExtensionTaskServiceRetryWriteAccessResponse { bool granted = 1; ExtensionTaskPreferences preferences = 2; }

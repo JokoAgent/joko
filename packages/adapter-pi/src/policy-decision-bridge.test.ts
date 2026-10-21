@@ -7,6 +7,15 @@ import {
 } from "./policy-decision-bridge.js";
 
 describe("managed policy decision bridge", () => {
+  it("carries bounded actual native action evidence and distinguishes delegated approval", async () => {
+    const notify = vi.fn(async () => undefined), decide = vi.fn(async () => "delegated_allow" as const);
+    const request = { policyGeneration: 1, observation: { subjectKind: "file_read" as const, risk: "read_only" as const, toolName: "read" },
+      toolCall: { toolName: "read", input: { path: "/workspace/README.md" } } };
+    await expect(handlePolicyDecisionExtensionRequest({ id: "delegated", method: "input", title: encodePolicyDecisionRequest(request) }, {
+      decide, transport: { closed: false, notify }, isCurrent: () => true
+    })).resolves.toBe(true);
+    expect(decide).toHaveBeenCalledWith(request); expect(notify).toHaveBeenCalledWith({ type: "extension_ui_response", id: "delegated", value: "delegated_allow" });
+  });
   it("round-trips one bounded typed observation to the host evaluator", async () => {
     const notify = vi.fn(async () => undefined);
     const decide = vi.fn(async () => "deny" as const);

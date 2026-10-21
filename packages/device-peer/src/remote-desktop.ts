@@ -132,6 +132,8 @@ export interface RemoteDesktopCapabilities {
   readonly viewerDisplayRestore: boolean;
   readonly workspaceNavigation: boolean;
   readonly systemMenu: boolean;
+  readonly channelRequests?: boolean;
+  readonly autoControl?: boolean;
 }
 
 export interface RemoteDesktopVideoSettings {
@@ -168,7 +170,7 @@ export type RemoteDesktopRequest =
   | RemoteDesktopIceRequest
   | { readonly op: "capabilities" }
   | { readonly op: "permissions"; readonly action: "check" | "guide" }
-  | { readonly op: "start"; readonly displayId: string; readonly resume?: boolean; readonly takeover?: boolean }
+  | { readonly op: "start"; readonly displayId: string; readonly resume?: boolean; readonly takeover?: boolean; readonly control?: boolean }
   | { readonly op: "heartbeat"; readonly lease: string }
   | { readonly op: "stop"; readonly lease: string; readonly lockScreen?: false }
   | { readonly op: "stop"; readonly lease: string; readonly lockScreen: true; readonly controlGeneration: number }
@@ -201,14 +203,15 @@ export type RemoteDesktopRequest =
       readonly cursorOverlay: boolean;
     }
   | { readonly op: "displayModes"; readonly lease: string }
-  | { readonly op: "viewerDisplay"; readonly lease: string; readonly controlGeneration: number; readonly width: number; readonly height: number }
-  | { readonly op: "restoreViewerDisplay"; readonly lease: string; readonly controlGeneration: number }
+  | { readonly op: "viewerDisplay"; readonly lease: string; readonly controlGeneration: number; readonly width: number; readonly height: number; readonly control?: boolean }
+  | { readonly op: "restoreViewerDisplay"; readonly lease: string; readonly controlGeneration: number; readonly control?: boolean }
   | {
       readonly op: "resolution";
       readonly lease: string;
       readonly controlGeneration: number;
       readonly modeId: string;
       readonly temporary: boolean;
+      readonly control?: boolean;
     };
 
 export function isRemoteDesktopPermission(value: unknown): value is RemoteDesktopPermission {
@@ -256,6 +259,8 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     || typeof value.viewerDisplayRestore !== "boolean"
     || typeof value.workspaceNavigation !== "boolean"
     || typeof value.systemMenu !== "boolean"
+    || (value.channelRequests !== undefined && typeof value.channelRequests !== "boolean")
+    || (value.autoControl !== undefined && typeof value.autoControl !== "boolean")
     || (value.platform !== "darwin" && value.platform !== "win32" && value.platform !== "linux")
     || !Array.isArray(value.displays)
     || value.displays.length > REMOTE_DESKTOP_MAX_DISPLAYS
@@ -303,6 +308,8 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     viewerDisplayRestore: value.viewerDisplayRestore,
     workspaceNavigation: value.workspaceNavigation,
     systemMenu: value.systemMenu,
+    ...(value.channelRequests === undefined ? {} : { channelRequests: value.channelRequests === true }),
+    ...(value.autoControl === undefined ? {} : { autoControl: value.autoControl === true }),
     platform: value.platform,
     displays: Object.freeze(displays),
     permissions: parseRemoteDesktopPermissions(value.permissions)
@@ -349,10 +356,11 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
       if (value.action !== "check" && value.action !== "guide") throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       return Object.freeze({ op: "permissions", action: value.action });
     case "start": {
-      requireExactKeys(value, ["op", "displayId"], ["resume", "takeover"]);
+      requireExactKeys(value, ["op", "displayId"], ["resume", "takeover", "control"]);
       if (!boundedIdentifier(value.displayId)
         || (value.resume !== undefined && typeof value.resume !== "boolean")
         || (value.takeover !== undefined && typeof value.takeover !== "boolean")
+        || (value.control !== undefined && typeof value.control !== "boolean")
         || (value.resume === true && value.takeover === true)) {
         throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       }
@@ -360,7 +368,8 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
         op: "start",
         displayId: value.displayId,
         ...(value.resume === true ? { resume: true } : {}),
-        ...(value.takeover === true ? { takeover: true } : {})
+        ...(value.takeover === true ? { takeover: true } : {}),
+        ...(value.control === true ? { control: true } : {})
       });
     }
     default:
@@ -423,26 +432,30 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
       requireExactKeys(value, ["op", "lease"]);
       return Object.freeze({ op: "displayModes", lease });
     case "viewerDisplay":
-      requireExactKeys(value, ["op", "lease", "controlGeneration", "width", "height"]);
+      requireExactKeys(value, ["op", "lease", "controlGeneration", "width", "height"], ["control"]);
       if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1
         || !Number.isSafeInteger(value.width) || (value.width as number) < 320 || (value.width as number) > 2560
-        || !Number.isSafeInteger(value.height) || (value.height as number) < 320 || (value.height as number) > 2560) {
+        || !Number.isSafeInteger(value.height) || (value.height as number) < 320 || (value.height as number) > 2560
+        || value.control !== undefined && typeof value.control !== "boolean") {
         throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       }
       return Object.freeze({ op: "viewerDisplay", lease, controlGeneration: value.controlGeneration as number,
-        width: value.width as number, height: value.height as number });
+        width: value.width as number, height: value.height as number, ...(value.control === true ? { control: true } : {}) });
     case "restoreViewerDisplay":
-      requireExactKeys(value, ["op", "lease", "controlGeneration"]);
-      if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1) {
+      requireExactKeys(value, ["op", "lease", "controlGeneration"], ["control"]);
+      if (!Number.isSafeInteger(value.controlGeneration) || (value.controlGeneration as number) < 1
+        || value.control !== undefined && typeof value.control !== "boolean") {
         throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       }
-      return Object.freeze({ op: "restoreViewerDisplay", lease, controlGeneration: value.controlGeneration as number });
+      return Object.freeze({ op: "restoreViewerDisplay", lease, controlGeneration: value.controlGeneration as number,
+        ...(value.control === true ? { control: true } : {}) });
     case "resolution":
-      requireExactKeys(value, ["op", "lease", "controlGeneration", "modeId", "temporary"]);
+      requireExactKeys(value, ["op", "lease", "controlGeneration", "modeId", "temporary"], ["control"]);
       if (!Number.isSafeInteger(value.controlGeneration)
         || (value.controlGeneration as number) < 1
         || typeof value.modeId !== "string"
-        || !/^[0-9]{1,10}$/u.test(value.modeId) || typeof value.temporary !== "boolean") {
+        || !/^[0-9]{1,10}$/u.test(value.modeId) || typeof value.temporary !== "boolean"
+        || value.control !== undefined && typeof value.control !== "boolean") {
         throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       }
       return Object.freeze({
@@ -450,7 +463,8 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
         lease,
         controlGeneration: value.controlGeneration as number,
         modeId: value.modeId,
-        temporary: value.temporary
+        temporary: value.temporary,
+        ...(value.control === true ? { control: true } : {})
       });
     case "control":
     case "presentation":

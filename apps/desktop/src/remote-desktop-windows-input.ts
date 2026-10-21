@@ -7,6 +7,8 @@ export interface DesktopRemoteDesktopWindowsInputRuntime {
   supported(signal: AbortSignal): Promise<boolean>;
   open(signal: AbortSignal): Promise<DesktopRemoteDesktopWindowsConnection>;
   project(displayId: string, x: number, y: number): { readonly x: number; readonly y: number };
+  globalPoint?(displayId: string, x: number, y: number): { readonly x: number; readonly y: number };
+  cursorScreenPoint?(): { readonly x: number; readonly y: number };
 }
 
 /** Uses the authorized SYSTEM input worker, with the ordinary user route as fallback. */
@@ -25,16 +27,24 @@ export class DesktopRemoteDesktopWindowsInput {
   #retired = false;
   #paused = false;
 
-  constructor(failed: () => void, fallback = new DesktopRemoteDesktopInput(failed), runtime: DesktopRemoteDesktopWindowsInputRuntime = {
+  constructor(failed: () => void, fallback?: DesktopRemoteDesktopInput, runtime: DesktopRemoteDesktopWindowsInputRuntime = {
     supported: async signal => await desktopRemoteDesktopWindowsHost.readSupport(signal) === "ready",
     open: signal => desktopRemoteDesktopWindowsHost.open({ mode: "input" }, signal),
+    globalPoint: (displayId, x, y) => {
+      const display = screen.getAllDisplays().find(item => String(item.id) === displayId);
+      if (display === undefined) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+      return { x: Math.round(display.bounds.x + x * (display.bounds.width - 1)),
+        y: Math.round(display.bounds.y + y * (display.bounds.height - 1)) };
+    },
     project: (displayId, x, y) => {
       const display = screen.getAllDisplays().find(item => String(item.id) === displayId);
       if (display === undefined) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
       return screen.dipToScreenPoint({ x: Math.round(display.bounds.x + x * (display.bounds.width - 1)),
         y: Math.round(display.bounds.y + y * (display.bounds.height - 1)) });
     }
-  }) { this.#failed = failed; this.#fallback = fallback; this.#runtime = runtime; }
+  }, private readonly onPointer?: (points: { x: number; y: number }[]) => (() => void) | void) {
+    this.#failed = failed; this.#fallback = fallback ?? new DesktopRemoteDesktopInput(failed, undefined, onPointer); this.#runtime = runtime;
+  }
 
   async start(displayId: string, signal: AbortSignal): Promise<void> {
     const promise = this.#start(displayId, signal);
@@ -70,17 +80,23 @@ export class DesktopRemoteDesktopWindowsInput {
   send(events: readonly RemoteDesktopInput[]): void {
     if (this.#paused) return;
     if (this.#connection === undefined) { this.#fallback.send(events); return; }
+    const points: { x: number; y: number }[] = [];
     const projected = events.flatMap(event => {
-      if (event.kind === "move" || event.kind === "button") return [{ ...event, ...this.#runtime.project(this.#displayId, event.x, event.y) }];
+      if (event.kind === "move" || event.kind === "button") {
+        const mapped = this.#runtime.project(this.#displayId, event.x, event.y);
+        if (this.onPointer) points.push(this.#runtime.globalPoint?.(this.#displayId, event.x, event.y) ?? screen.screenToDipPoint(mapped));
+        return [{ ...event, ...mapped }];
+      }
       if (event.kind !== "text") return [event];
       const scalars = Array.from(event.text); const pieces: RemoteDesktopInput[] = [];
       for (let index = 0; index < scalars.length; index += 256) pieces.push({ kind: "text", text: scalars.slice(index, index + 256).join("") });
       return pieces;
     });
-    for (let index = 0; index < projected.length; index += 64) this.#write(projected.slice(index, index + 64));
+    for (let index = 0; index < projected.length; index += 64) this.#write(projected.slice(index, index + 64),
+      points, events.some(event => event.kind === "scroll"));
   }
 
-  #write(events: readonly RemoteDesktopInput[]): void {
+  #write(events: readonly RemoteDesktopInput[], points: { x: number; y: number }[] = [], wheel = false): void {
     const connection = this.#connection;
     if (connection === undefined) return;
     const line = JSON.stringify(events);
@@ -90,7 +106,11 @@ export class DesktopRemoteDesktopWindowsInput {
     this.#queuedBytes += bytes;
     this.#writing = this.#writing.then(async () => {
       if (generation !== this.#generation || this.#connection !== connection) return;
-      if (await connection.request(line) !== "ok\n") throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+      const settled = this.onPointer && (points.length || wheel)
+        ? this.onPointer(wheel ? [this.#runtime.cursorScreenPoint?.() ?? screen.getCursorScreenPoint(), ...points] : points) : undefined;
+      try {
+        if (await connection.request(line) !== "ok\n") throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
+      } finally { settled?.(); }
     }).catch(() => { if (generation === this.#generation && this.#connection === connection) this.#fail(); })
       .finally(() => { this.#queuedBytes -= bytes; });
   }

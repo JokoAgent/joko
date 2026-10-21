@@ -407,7 +407,7 @@ export function CollaborationGoalPanel({
               }}>{workerTargets.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}</select></label>
               <label>{t("controls.model")}<select value={workerDraft.modelKey} onChange={(event) => { const value = event.currentTarget.value; setWorkerDraft((current) => ({ ...current, modelKey: value, effort: "", fastMode: false })); }}><option value="">{t("common.none")}</option>{draftModels.map((candidate) => <option key={modelKey(candidate)} value={modelKey(candidate)}>{candidate.providerName} · {candidate.name}</option>)}</select></label>
               <label>{t("controls.effort")}<select value={workerDraft.effort} onChange={(event) => { const value = event.currentTarget.value; setWorkerDraft((current) => ({ ...current, effort: value })); }}><option value="">{t("common.none")}</option>{draftModel?.efforts.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>
-              <label>{t("controls.permission")}<select value={workerDraft.permissionMode} onChange={(event) => { const value = event.currentTarget.value as PermissionMode; setWorkerDraft((current) => ({ ...current, permissionMode: value })); }}><option value="ask">{t("permission.ask")}</option><option value="auto">{t("permission.auto")}</option><option value="bypassPermissions">{t("permission.full")}</option></select></label>
+              <label>{t("controls.permission")}<select value={workerDraft.permissionMode} onChange={(event) => { const value = event.currentTarget.value as PermissionMode; setWorkerDraft((current) => ({ ...current, permissionMode: value })); }}><option value="ask">{t("permission.ask")}</option>{controller.state.snapshot.backends.find(candidate => candidate.id === draftTarget?.backendId)?.capabilities.get("permission.modes")?.options.includes("acceptEdits") && <option value="acceptEdits">{t("permission.edits")}</option>}<option value="auto">{t("permission.auto")}</option><option value="bypassPermissions">{t("permission.full")}</option></select></label>
               <label className="collaboration-panel__choice"><CheckboxControl checked={workerDraft.fastMode} disabled={draftModel?.supportsFast !== true} onChange={(event) => { const checked = event.currentTarget.checked; setWorkerDraft((current) => ({ ...current, fastMode: checked })); }} />{t("controls.fast")}</label>
               <label className="collaboration-panel__choice"><CheckboxControl checked={workerDraft.planMode} onChange={(event) => { const checked = event.currentTarget.checked; setWorkerDraft((current) => ({ ...current, planMode: checked })); }} />{t("controls.plan")}</label>
               <Button tone="primary" type="submit" disabled={collaborationReadOnly || pendingAction !== undefined || workerTargets.length === 0}><Plus aria-hidden="true" />{t("collaboration.addWorker")}</Button>
@@ -614,6 +614,7 @@ function targetName(targets: readonly TargetView[], targetId: string): string {
 }
 
 function permissionLabel(permission: PermissionMode, t: Translator): string {
+  if (permission === "acceptEdits") return t("permission.edits");
   if (permission === "ask") return t("permission.ask");
   if (permission === "auto") return t("permission.auto");
   return t("permission.full");

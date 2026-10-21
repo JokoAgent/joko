@@ -139,7 +139,7 @@ const CREATE_PROPERTIES = {
   model: { type: "string", minLength: 1, maxLength: 256 },
   effort: { type: "string", minLength: 1, maxLength: 64 },
   fastMode: { type: "boolean" },
-  permissionMode: { type: "string", enum: ["ask", "auto", "bypassPermissions"] },
+  permissionMode: { type: "string", enum: ["ask", "acceptEdits", "auto", "bypassPermissions"] },
   planMode: { type: "boolean" },
   targetSessionId: { ...ID_SCHEMA, description: "Explicit existing task binding." },
   bindToCurrentSession: { type: "boolean", description: "Bind to the authenticated calling task." },
@@ -1193,13 +1193,13 @@ function misfirePolicy(value: unknown): ScheduleRecord["misfirePolicy"] {
 }
 
 function permissionModeValue(value: unknown): PermissionMode {
-  if (value === "auto" || value === "bypassPermissions") return value;
+  if (value === "auto" || value === "acceptEdits" || value === "bypassPermissions") return value;
   if (value === undefined || value === "ask") return "ask";
   throw new SchedulerToolError("INVALID_ARGS", "permissionMode is invalid.");
 }
 
 function publicPermissionMode(value: unknown): PermissionMode {
-  return value === "auto" || value === "bypassPermissions" ? value : "ask";
+  return value === "auto" || value === "acceptEdits" || value === "bypassPermissions" ? value : "ask";
 }
 
 function validateAgentKind(value: unknown, backendId: string): void {

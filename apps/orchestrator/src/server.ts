@@ -1,6 +1,6 @@
 import { stat } from "node:fs/promises";
 import type { Socket } from "node:net";
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 
 import cors from "@fastify/cors";
 import fastifyStatic from "@fastify/static";
@@ -308,6 +308,26 @@ export async function createInternalServer(application: OrchestratorApplication)
     reply.header("x-content-type-options", "nosniff");
     return payload;
   });
+  server.post<{ Params: { sessionId: string; providerId: string; "*": string }; Body: unknown }>(
+    "/internal/partner-home-inference/:sessionId/:providerId/*",
+    { bodyLimit: 32 * 1024 * 1024 },
+    async (request, reply) => {
+      if (!application.partnerHomeInference) return reply.code(404).send({ error: "Partner inference is unavailable." });
+      const generation = request.headers["x-joko-pi-generation"];
+      if (typeof generation !== "string" || !/^(0|[1-9][0-9]{0,15})$/u.test(generation)) return reply.code(401).send({ error: "Invalid runtime generation." });
+      const controller = new AbortController();
+      const cancel = () => controller.abort();
+      request.raw.once("aborted", cancel); reply.raw.once("close", cancel);
+      try {
+        const response = await application.partnerHomeInference.request({ authorization: request.headers.authorization,
+          generation: Number(generation), sessionId: request.params.sessionId, providerId: request.params.providerId,
+          path: `/${request.params["*"]}`, body: request.body, headers: request.headers, signal: controller.signal });
+        reply.code(response.status); reply.header("cache-control", "no-store");
+        reply.header("content-type", response.headers.get("content-type") ?? "application/json");
+        return response.body ? reply.send(Readable.fromWeb(response.body as import("node:stream/web").ReadableStream)) : reply.send();
+      } catch { return reply.code(401).send({ error: "Partner inference authorization or generation is invalid." }); }
+    }
+  );
   server.post<{ Body: unknown }>(
     "/internal/mcp",
     { bodyLimit: 16 * 1024 * 1024 },

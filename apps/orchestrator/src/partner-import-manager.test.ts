@@ -4,7 +4,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError, createClient, createRouterTransport, type HandlerContext } from "@connectrpc/connect";
 import { afterEach, describe, expect, it } from "vitest";
-import { OperationalStore, PartnerStore, PartnerRoutineStore } from "@joko/store";
+import { OperationalStore, PartnerStore, PartnerRoutineStore, partnerHomeDirectoryName } from "@joko/store";
 import { FakeBackendAdapter, PI_LIKE_PROFILE } from "@joko/testkit";
 import { createPartnerImportApi, PartnerImportService, PartnerImportCategory, PartnerImportStatus, StartPartnerImportRequestSchema, GetPartnerImportStatusRequestSchema } from "@joko/contracts";
 import { readImportTree, createImportBudget } from "@joko/agent-import";
@@ -27,7 +27,7 @@ const backendProfile = { ...PI_LIKE_PROFILE, capabilities: [...PI_LIKE_PROFILE.c
   ? { ...capability, options: ["ask", "auto", "bypassPermissions"] } : capability), { key: "permission.change", supported: true },
   { key: "runtime.resources", supported: true, options: ["skill", "prompt"] }] };
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
-async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; observeImport?: (phase: string) => void } = {}) {
+async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolean; resourceFiles?: number; noDefaults?: boolean; observeImport?: (phase: string) => void; currentCanonicalSession?: () => string | undefined } = {}) {
   const root = await mkdtemp(join(tmpdir(), "joko-import-owner-")); const native = join(root, ".hermes");
   await mkdir(join(native, "skills", "reports"), { recursive: true }); await mkdir(join(native, "memories")); await mkdir(join(native, "cron"));
   await writeFile(join(native, "config.yaml"), "name: Analyst\n" + (options.nativeTools ? "tools:\n  allowed: [read]\n" : "")); await writeFile(join(native, ".env"), `ACCESS_TOKEN=${secret}\n`);
@@ -46,16 +46,19 @@ async function fixture(options: { changeDefaults?: boolean; nativeTools?: boolea
     partnerTargetRetired: id => profiles.isPartnerTargetRetired(id),
     partnerSessionPaused: id => profiles.isPartnerSessionPaused(id), partnerSessionRestarting: id => profiles.isPartnerSessionRestarting(id) }); await host.initialize();
   const vault = await CredentialVault.open(join(root, "credentials", "master.key")); const storage = new PartnerImportStorage(store, vault);
-  const resources = new PiResourceManager({ store, managedRoot: join(root, "resources"), maximumFiles: 2 }); await resources.initialize();
+  const resources = new PiResourceManager({ store, managedRoot: join(root, "resources"), maximumFiles: options.resourceFiles ?? 2 }); await resources.initialize();
   const memory = new MakerMemoryController({ store }); const scheduler = new ScheduleCoordinator(store, host);
   let imports: PartnerImportManager; let routines: PartnerRoutineManager;
   const partners = new PartnerManager({ store: profiles, operationalStore: store, sessionHost: host, homesRoot: join(root, "homes"),
     workspaceService: { register: async input => input, unregister: () => undefined },
-    onRoutineLifecycle: (id, lifecycle) => routines.lifecycle(id, lifecycle), prepareImportDeletion: id => imports.prepareDeletion(id) });
+    onRoutineLifecycle: (id, lifecycle) => routines.lifecycle(id, lifecycle), prepareImportDeletion: id => imports.prepareDeletion(id), onReady: async id => { await imports?.activatePackage(id); } });
   routines = new PartnerRoutineManager({ partners, store, scheduler, storage: new PartnerRoutineStore(join(root, "routines")) }); await routines.start();
-  profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false });
-  imports = new PartnerImportManager({ storage, home: root, environment: {}, assertServiceOwner: () => {}, prepareCreation: selection => {
-    const frozen = preparePartnerImportCreation(partners, selection);
+  if (!options.noDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { modelChain: [{ backendId: PI_LIKE_PROFILE.id, providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false });
+  imports = new PartnerImportManager({ storage, home: root, environment: {}, assertServiceOwner: () => {},
+    ...(options.currentCanonicalSession ? { currentCanonicalSession: options.currentCanonicalSession } : {}),
+    nativeRuntimeReady: id => partners.getPartner(id).initializationState === "ready",
+    prepareCreation: (selection, nativePackage) => {
+    const frozen = preparePartnerImportCreation(partners, selection, nativePackage);
     if (options.changeDefaults) profiles.setDirectoryDefaults(profiles.directoryState().revision, { ...profiles.directoryState().defaultCapabilities!, permissionMode: "auto" });
     return frozen;
   },
@@ -105,6 +108,71 @@ function observedImportEffect<Args extends unknown[], Result>(phase: string, act
   };
 }
 describe("native import service and owning effects", () => {
+  it("saves a complete package without a model and projects its saved files only after an explicit real model selection", async () => {
+    const f = await fixture({ resourceFiles: 20, noDefaults: true }); const signal = new AbortController().signal;
+    const entry = (await f.api.packages!("en", signal)).find(row => row.packageId === "engineer-bot")!;
+    const admitted = await f.api.invitePackage!(entry, "en", signal);
+    const saved = await f.imports.waitForRequest(admitted.requestId);
+    expect(saved).toMatchObject({ saved: true, status: "complete" }); expect(saved.canonicalSessionId).toBeUndefined();
+    const pending = f.partners.getPartner(saved.partnerId);
+    expect(pending).toMatchObject({ initializationState: "error", initializationErrorCode: "model_unavailable", capabilities: { modelChain: [] } });
+    expect(pending.identitySource).toContain("Joko");
+    const home = join(f.root, "homes", partnerHomeDirectoryName(pending.id));
+    expect((await readFile(join(home, "IDENTITY.md"), "utf8"))).toContain("Joko");
+    const files = await readImportTree(join(home, ".agents", "skills"), () => true, createImportBudget());
+    expect(files.filter(file => file.name.endsWith("/SKILL.md"))).toHaveLength(3);
+    expect(f.routines.engine.list(pending.id)).toHaveLength(1); expect(f.routines.engine.list(pending.id)[0]!.enabled).toBe(false);
+    expect(f.resources.list({ targetId: pending.homeTargetId })).toHaveLength(0);
+    expect(f.store.listSessions({ targetId: pending.homeTargetId })).toHaveLength(0);
+    expect(f.storage.readReceipt(saved.requestId)?.checkpointCleared).toBe(false);
+    await expect(f.partners.createPartner({ requestId: "manual_empty_model_request", expectedDirectoryRevision: f.partners.directory().state.revision,
+      displayName: "Manual", templateId: "general", avatar: "orbit", identitySource: "Manual identity", usesDirectoryDefaults: false,
+      capabilities: { modelChain: [], permissionMode: "ask", planMode: false } })).rejects.toMatchObject({ code: "PARTNER_INVALID" });
+    await f.imports.recover();
+    expect((await f.api.invitePackage!(entry, "zh-CN", signal)).requestId).toBe(saved.requestId);
+    const ready = await f.partners.updatePartner(pending.id, pending.revision, { capabilities: { modelChain: [{ backendId: PI_LIKE_PROFILE.id,
+      providerId: "test", modelId: "text", effort: "medium", fastMode: false }], permissionMode: "ask", planMode: false } });
+    expect(ready.initializationState).toBe("ready"); expect(ready.canonicalSessionId).toBeDefined();
+    expect(f.resources.list({ targetId: ready.homeTargetId })).toHaveLength(3);
+    expect(f.memory.list(ready.homeTargetId).filter(item => item.kind === "reference")).toHaveLength(1);
+    expect(f.routines.engine.list(ready.id)[0]!.enabled).toBe(false);
+    const receipt = f.storage.readReceipt(saved.requestId)!;
+    expect(receipt.result).toMatchObject({ saved: true, status: "complete", canonicalSessionId: ready.canonicalSessionId });
+    expect(receipt.checkpointCleared).toBe(true);
+    await f.imports.recover();
+    expect((await f.api.retry(saved.requestId, false, signal)).canonicalSessionId).toBe(ready.canonicalSessionId);
+    expect(f.profiles.listPartners()).toHaveLength(1);
+  }, 20_000);
+  it("discovers bundled partners and admits one durable installation with skills, knowledge and disabled routines", async () => {
+    let canonical: string | undefined;
+    const f = await fixture({ resourceFiles: 20, currentCanonicalSession: () => canonical }); const signal = new AbortController().signal;
+    const catalog = await f.api.packages!("en", signal);
+    expect(catalog).toHaveLength(10); const entry = catalog.find(row => row.packageId === "engineer-bot")!;
+    expect(entry.skills).toHaveLength(2); expect(entry.knowledge).toHaveLength(1); expect(entry.routines).toHaveLength(1);
+    await expect(f.api.invitePackage!({ ...entry, packageHash: "0".repeat(64) }, "en", signal)).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    const [first, second] = await Promise.all([f.api.invitePackage!(entry, "en", signal), f.api.invitePackage!(entry, "en", signal)]);
+    expect(second.requestId).toBe(first.requestId);
+    const result = await f.imports.waitForRequest(first.requestId);
+    expect(result).toMatchObject({ saved: true, status: "complete" });
+    const profile = f.partners.getPartner(result.partnerId);
+    expect(profile.displayName).toBe(entry.name); expect(profile.description).toBe(entry.description);
+    expect(profile.identitySource).toContain("Joko");
+    expect(f.resources.list({ targetId: profile.homeTargetId })).toHaveLength(3);
+    expect(f.routines.list(profile.id)).toHaveLength(1); expect(f.routines.list(profile.id)[0]!.enabled).toBe(false);
+    const receipt = f.storage.readReceipt(result.requestId)!;
+    expect(receipt.nativePackage?.packageId).toBe(entry.packageId); expect(receipt.checkpointCleared).toBe(true);
+    const restored = new PartnerImportStorage(f.store, await CredentialVault.open(join(f.root, "credentials", "master.key")));
+    expect(restored.readReceipt(result.requestId)?.nativePackage?.packageHash).toBe(entry.packageHash);
+    expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation?.partnerId).toBe(profile.id);
+    canonical = "new-main-canonical-session";
+    expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation?.canonicalSessionId).toBe(canonical);
+    expect((await f.api.invitePackage!(entry, "en", signal)).canonicalSessionId).toBe(canonical);
+    expect((await f.api.status(result.requestId, signal))?.canonicalSessionId).toBe(canonical);
+    expect(f.storage.readReceipt(result.requestId)?.result.canonicalSessionId).toBe(profile.canonicalSessionId);
+    const deletion = await f.partners.deletePartner({ requestId: "package_install_delete_0001", partnerId: profile.id, expectedRevision: profile.revision, confirmName: profile.displayName });
+    expect(deletion.phase).toBe("completed");
+    expect((await f.api.packages!("en", signal)).find(row => row.packageId === entry.packageId)?.installation).toBeUndefined();
+  }, 20_000);
   it("saves the complete five-category selection through the generated boundary and retains usable full originals after cold recovery", async ({ signal: testSignal, onTestFailed, onTestFinished }) => {
     type Phase = "fixture" | "sources" | "preview" | "start" | "completion" | "environment"
       | "published-tree" | "resources" | "resource-recovery" | "receipt-recovery" | "persistence" | "idempotency" | "complete";

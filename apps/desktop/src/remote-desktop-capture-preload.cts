@@ -18,6 +18,7 @@ const CHANNELS = Object.freeze({
   command: "joko:remote-desktop-capture:command",
   reply: "joko:remote-desktop-capture:reply",
   input: "joko:remote-desktop-capture:input",
+  request: "joko:remote-desktop-capture:request",
   nativeFrame: "joko:remote-desktop-capture:native-frame",
   nativeAudio: "joko:remote-desktop-capture:native-audio",
   presentationPong: "joko:remote-desktop-capture:presentation-pong",
@@ -579,6 +580,7 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
         }, 50);
       }
       let pending = 0;
+      let pendingRequests = 0;
       channel.onmessage = ({ data }) => {
         if (current !== generation || typeof data !== "string" || data.length > 32_768) {
           channel.close();
@@ -601,6 +603,23 @@ async function createAnswer(command: Extract<DesktopRemoteDesktopCaptureCommand,
         // A pong already in flight when presentation ends has no authority and
         // must not tear down the input channel after its challenge is retired.
         if (presentationChallenge === undefined && UUID.test(data)) return;
+        try {
+          const request: unknown = JSON.parse(data);
+          if (record(request) && request["type"] === "request" && typeof request["id"] === "string"
+            && /^[A-Za-z0-9_-]{1,64}$/u.test(request["id"])) {
+            const reply = (value: unknown): void => {
+              if (current !== generation || channel.readyState !== "open") return;
+              const wire = JSON.stringify(value);
+              if (new TextEncoder().encode(wire).byteLength <= 32_768 && channel.bufferedAmount <= 65_536) channel.send(wire);
+            };
+            if (pendingRequests >= 8) { reply({ type: "reply", id: request["id"], ok: false, error: "REMOTE_DESKTOP_BUSY" }); return; }
+            pendingRequests += 1;
+            void ipcRenderer.invoke(CHANNELS.request, command.leaseId, command.attemptId, request).then(reply,
+              () => reply({ type: "reply", id: request["id"], ok: false, error: "REMOTE_DESKTOP_REQUEST_FAILED" }))
+              .finally(() => { pendingRequests -= 1; });
+            return;
+          }
+        } catch { /* Ordinary input validation owns malformed batches. */ }
         if (pending >= 8) {
           channel.close();
           return;

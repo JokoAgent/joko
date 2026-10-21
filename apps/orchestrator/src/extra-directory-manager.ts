@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, resolve, posix, win32 } from "node:path";
 
 import { JokoError, type ApprovedDirectory } from "@joko/core";
 import type { OperationalStore, SettingRecord, StoredTarget } from "@joko/store";
@@ -56,7 +56,9 @@ export class ExtraDirectoryManager {
     if (previous !== undefined && previous.revision > input.revision) return;
     const target = this.store.getTarget(input.targetId);
     const records = input.directories.map((directory): ExtraDirectoryRecord => {
-      if (!isAbsolute(directory.path) || resolve(directory.path) !== directory.path) throw directoryError("WORKBENCH_DIRECTORY_INVALID", "The workbench project path is invalid.", "Choose a canonical project directory.");
+      const binding = target.descriptor.remoteWorkspace;
+      const paths = binding?.kind === "device_peer" ? binding.workspaceRoot.startsWith("/") ? posix : win32 : undefined;
+      if (paths ? !paths.isAbsolute(directory.path) || paths.normalize(directory.path) !== directory.path : !isAbsolute(directory.path) || resolve(directory.path) !== directory.path) throw directoryError("WORKBENCH_DIRECTORY_INVALID", "The workbench project path is invalid.", "Choose a canonical project directory.");
       return { id: stableDirectoryId(input.targetId, directory.path), workspaceId: workspaceIdForTarget(target), targetId: input.targetId,
         path: directory.path, access: "read_write", approved: true, approvedAt: directory.addedAt, updatedAt: directory.addedAt, revision: input.revision };
     });

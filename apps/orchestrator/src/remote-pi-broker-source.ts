@@ -1588,7 +1588,7 @@ function parseRelayRequest(header) {
   const lines = header.split("\r\n");
   const requestLine = lines.shift();
   if (!requestLine) fail();
-  const match = /^(POST) (\/internal\/(?:mcp|pi-native-auth)) HTTP\/1\.1$/.exec(requestLine);
+  const match = /^(POST) (\/internal\/(?:mcp|pi-native-auth|partner-home-inference\/[A-Za-z0-9._:%-]{1,768}\/[A-Za-z0-9._:%-]{1,1536}\/(?:v1\/messages(?:\/count_tokens)?|messages(?:\/count_tokens)?|responses(?:\/compact)?|chat\/completions))) HTTP\/1\.1$/.exec(requestLine);
   if (!match) fail();
   const headers = [];
   let authorization;
@@ -1626,7 +1626,8 @@ function parseRelayRequest(header) {
       headers.push([name, value]);
     }
   }
-  if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > MAX_HTTP_BODY_BYTES) fail();
+  const maximumBodyBytes = match[2].startsWith("/internal/partner-home-inference/") ? 32 * 1024 * 1024 : MAX_HTTP_BODY_BYTES;
+  if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maximumBodyBytes) fail();
   if (authorization === undefined || generation === undefined || contentType === undefined || headers.length > 128) fail();
   return { path: match[2], headers, authorization, generation, nativeAuthReservation, contentLength };
 }
@@ -2652,7 +2653,9 @@ async function rewrittenRelayRequest(parsed, body, session, relayAuthority) {
   let reserveRequest;
   let durableRequest = false;
   let outboundGeneration = routeGeneration;
-  if (parsed.path === "/internal/mcp") {
+  if (parsed.path.startsWith("/internal/partner-home-inference/")) {
+    if (parsed.nativeAuthReservation !== undefined || String(session.childGeneration) !== parsed.generation) fail();
+  } else if (parsed.path === "/internal/mcp") {
     if (
       parsed.nativeAuthReservation !== undefined
       || String(session.childGeneration) !== parsed.generation
@@ -2792,7 +2795,7 @@ async function rewrittenRelayRequest(parsed, body, session, relayAuthority) {
     }
   }
   const content = Buffer.from(JSON.stringify(value));
-  if (content.byteLength > MAX_HTTP_BODY_BYTES) fail();
+  if (content.byteLength > (parsed.path.startsWith("/internal/partner-home-inference/") ? 32 * 1024 * 1024 : MAX_HTTP_BODY_BYTES)) fail();
   const lines = [
     "POST " + parsed.path + " HTTP/1.1",
     ...parsed.headers.map(([name, entry]) => name + ": " + entry),
@@ -3004,6 +3007,21 @@ async function prepareRelay(session, relay) {
   endpoint.port = String(session.relayPort);
   descriptor.endpoint = endpoint.toString();
   descriptor.generation = session.childGeneration;
+  if (descriptor.homeInferenceModels !== undefined) {
+    if (descriptor.homeInferenceModels !== "agent-home/models.json" || descriptor.nativeAuthLease !== undefined) fail();
+    const modelsPath = join(session.runtimeRoot, "agent-home", "models.json");
+    const models = JSON.parse((await privateRegularFile(modelsPath, 16 * 1024 * 1024)).toString("utf8"));
+    if (!models || typeof models !== "object" || Array.isArray(models) || !models.providers || typeof models.providers !== "object") fail();
+    for (const provider of Object.values(models.providers)) {
+      if (!provider || typeof provider !== "object" || Array.isArray(provider)) fail();
+      const modelEndpoint = new URL(String(provider.baseUrl || ""));
+      if (modelEndpoint.protocol !== "http:" || modelEndpoint.hostname !== "127.0.0.1" || modelEndpoint.username || modelEndpoint.password
+        || !/^\/internal\/partner-home-inference\/[A-Za-z0-9._:%-]{1,768}\/[A-Za-z0-9._:%-]{1,1536}$/.test(modelEndpoint.pathname)
+        || modelEndpoint.search || modelEndpoint.hash || provider.apiKey !== "$JOKO_PI_MCP_TOKEN" || provider.authHeader !== true) fail();
+      modelEndpoint.port = String(session.relayPort); provider.baseUrl = modelEndpoint.toString();
+    }
+    await atomicJson(modelsPath, models);
+  }
   if (descriptor.nativeAuthLease !== undefined) {
     if (!descriptor.nativeAuthLease || typeof descriptor.nativeAuthLease !== "object" || Array.isArray(descriptor.nativeAuthLease)) fail();
     const nativeEndpoint = new URL(String(descriptor.nativeAuthLease.endpoint || ""));

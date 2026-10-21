@@ -1155,6 +1155,50 @@ describe("remote Pi broker source", () => {
     expect(expected).not.toContain("opaque-runtime-value");
   });
 
+  it("relays bounded home model requests with current authority and rejects stale native generations", async () => {
+    const root = await mkdtemp(join(tmpdir(), "joko-home-relay-")), source = join(root, "relay.mjs");
+    const harness = REMOTE_PI_BROKER_SOURCE.replace("main().catch(() => process.exit(1));", String.raw`
+const path = "/internal/partner-home-inference/session/provider/responses";
+const body = Buffer.from(JSON.stringify({model:"configured",input:"x".repeat(2*1024*1024)}));
+const header = (generation, endpoint=path) => "POST "+endpoint+" HTTP/1.1\r\ncontent-type: application/json\r\nauthorization: Bearer runtime-capability\r\nx-joko-pi-generation: "+generation+"\r\ncontent-length: "+body.length;
+const session = {stableBearer:"runtime-capability", childGeneration:2};
+const authority = {generation:9,bearer:"current-authority"};
+const output = await rewrittenRelayRequest(parseRelayRequest(header(2)),body,session,authority);
+const request = output.request.toString("utf8"), boundary = request.indexOf("\r\n\r\n");
+let stale=false, route=false, reservation=false;
+try { await rewrittenRelayRequest(parseRelayRequest(header(1)),body,session,authority); } catch { stale=true; }
+try { parseRelayRequest(header(2,"/internal/partner-home-inference/session/provider/admin")); } catch { route=true; }
+try { await rewrittenRelayRequest(parseRelayRequest(header(2)+"\r\nx-joko-pi-native-auth-reservation: "+Buffer.alloc(32).toString("base64url")),body,session,authority); } catch { reservation=true; }
+let forwarded;
+const target = createServer({allowHalfOpen:true}, socket => {
+  const chunks=[]; socket.on("data",chunk=>chunks.push(Buffer.from(chunk)));
+  socket.on("end",()=>{forwarded=Buffer.concat(chunks).toString("utf8");socket.end("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 11\r\nconnection: close\r\n\r\ndata: done\n");});
+});
+await new Promise(resolve=>target.listen(0,"127.0.0.1",resolve));
+const live = {...session,authorityEpoch:1,authority:{runtimeGeneration:9},currentBearer:authority.bearer,relayTargetPort:target.address().port,rotating:false,terminal:false};
+const connections=new Set(), relay=createServer(socket=>relayConnection(live,socket,connections));
+await new Promise(resolve=>relay.listen(0,"127.0.0.1",resolve));
+const http=await import("node:http");
+const streamed=await new Promise((resolve,reject)=>{
+  const outgoing=http.request({host:"127.0.0.1",port:relay.address().port,path,method:"POST",headers:{"content-type":"application/json",authorization:"Bearer runtime-capability","x-joko-pi-generation":"2","content-length":body.length}},incoming=>{
+    const chunks=[];incoming.on("data",chunk=>chunks.push(Buffer.from(chunk)));incoming.on("end",()=>resolve(Buffer.concat(chunks).toString("utf8")));incoming.on("error",reject);
+  });outgoing.on("error",reject);outgoing.end(body);
+});
+await new Promise(resolve=>relay.close(resolve)); await new Promise(resolve=>target.close(resolve));
+process.stdout.write(JSON.stringify({stale,route,reservation,headers:request.slice(0,boundary),bodyBytes:output.request.length-boundary-4,expectedBytes:body.length,streamed,forwardedHeaders:forwarded.slice(0,forwarded.indexOf("\r\n\r\n"))}));
+`);
+    await writeFile(source, harness);
+    try {
+      const result = spawnSync(process.execPath, [source], { encoding: "utf8", timeout: 10_000, windowsHide: true, maxBuffer: 16 * 1024 });
+      expect(result.error).toBeUndefined(); expect(result.status, result.stderr).toBe(0);
+      const value = JSON.parse(result.stdout); expect(value).toMatchObject({ stale: true, route: true, reservation: true });
+      expect(value.headers).toContain("authorization: Bearer current-authority"); expect(value.headers).toContain("x-joko-pi-generation: 9");
+      expect(value.headers).not.toContain("runtime-capability"); expect(value.bodyBytes).toBe(value.expectedBytes);
+      expect(value.streamed).toBe("data: done\n"); expect(value.forwardedHeaders).toContain("authorization: Bearer current-authority");
+      expect(value.forwardedHeaders).toContain("x-joko-pi-generation: 9"); expect(value.forwardedHeaders).not.toContain("runtime-capability");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it.runIf(process.platform === "win32")("queries exact Windows identities without module auto-loading", async () => {
     const root = await mkdtemp(join(tmpdir(), "joko-broker-query-"));
     const sourcePath = join(root, "query.mjs");

@@ -49,6 +49,7 @@ export interface PartnerWorkbenchDigest {
 }
 
 export interface PartnerWorkbenchTask {
+  readonly readOnly?: boolean;
   readonly id: string;
   readonly kind: "session" | "external" | "item" | "automation";
   readonly project: string;

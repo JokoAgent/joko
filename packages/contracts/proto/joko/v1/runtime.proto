@@ -393,6 +393,25 @@ message Session {
   // Absence means the Session has no surviving user input.
   google.protobuf.Timestamp last_user_input_at = 27;
   repeated TaskTag task_tags = 28;
+  // Host-owned background visibility, independent of archival or execution.
+  bool hidden = 29;
+  // Service-owned activity facts; task summaries are navigation aids and must
+  // not be reused as the completed reply or delivery ownership.
+  SessionTaskActivity task_activity = 30;
+}
+
+enum TaskCompletionNotification {
+  TASK_COMPLETION_NOTIFICATION_UNSPECIFIED = 0;
+  TASK_COMPLETION_NOTIFICATION_NONE = 1;
+  TASK_COMPLETION_NOTIFICATION_PENDING = 2;
+  TASK_COMPLETION_NOTIFICATION_TEAMMATE = 3;
+}
+
+message SessionTaskActivity {
+  string run_id = 1;
+  string completed_reply_summary = 2;
+  TaskCompletionNotification completion_notification = 3;
+  bool silent = 4;
 }
 
 message SessionContextState {
@@ -1028,6 +1047,13 @@ message RuntimeCommand {
   // snapshots, where commands from multiple Sessions share one collection.
   string session_id = 7;
   RuntimeCommandInputMode input_mode = 8;
+  // Attested by the service-owned bundle and the exact observed native loader path.
+  BuiltinSkillIdentity builtin_skill = 9;
+}
+
+message BuiltinSkillIdentity {
+  string id = 1;
+  string revision = 2;
 }
 
 // Display-safe exact identity for a resource proven loaded in one live task.

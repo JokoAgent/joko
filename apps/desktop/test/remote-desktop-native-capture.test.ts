@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { PassThrough } from "node:stream";
 import { ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("electron", () => ({ app: {} }));
 
@@ -11,6 +11,19 @@ import { DesktopRemoteDesktopNativeCapture, parseDesktopRemoteDesktopNativeFrame
   "../src/remote-desktop-native-capture.js";
 
 describe("Remote Desktop native capture boundary", () => {
+  afterEach(() => vi.useRealTimers());
+  it("allows ten seconds for a cold helper and bounds a later frame to three seconds", async () => {
+    vi.useFakeTimers(); const child = fakeChild();
+    const capture = new DesktopRemoteDesktopNativeCapture({ platform: "darwin", resolveBinary: async () => "/capture", spawn: () => child.process });
+    let settled = false;
+    const first = capture.frame("1", false, false).then(value => { settled = true; return value; });
+    await vi.advanceTimersByTimeAsync(3_001); expect(settled).toBe(false);
+    child.stdout.write(`${JSON.stringify({ jpeg: "AQ==", width: 1, height: 1, cursor: null })}\n`);
+    await expect(first).resolves.toMatchObject({ width: 1 });
+    const next = capture.frame("1", false, false);
+    await vi.advanceTimersByTimeAsync(3_000); await expect(next).resolves.toBeNull();
+    expect(child.process.kill).toHaveBeenCalled(); capture.stop();
+  });
   it("retires an unfiltered pull and proves exclusions only after a current filtered frame", async () => {
     const children: ReturnType<typeof fakeChild>[] = [];
     const arguments_: string[][] = [];

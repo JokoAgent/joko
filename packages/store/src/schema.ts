@@ -753,8 +753,9 @@ CREATE TABLE product_sessions (
         generation INTEGER NOT NULL CHECK (generation >= 0),
         pinned INTEGER NOT NULL CHECK (pinned IN (0, 1)),
         archived INTEGER NOT NULL CHECK (archived IN (0, 1)),
+        hidden INTEGER NOT NULL DEFAULT 0 CHECK (hidden IN (0, 1)),
         deleted_at INTEGER,
-        permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+        permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
         plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
         provider_id TEXT,
         model_id TEXT,
@@ -1465,7 +1466,7 @@ CREATE TABLE collaboration_workers (
         model_id TEXT,
         effort TEXT,
         fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
-        permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+        permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
         plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
         session_generation INTEGER CHECK (
           session_generation IS NULL OR session_generation BETWEEN 0 AND 9007199254740991
@@ -1623,7 +1624,7 @@ CREATE TABLE messaging_routes (
           effort IS NULL OR (length(effort) BETWEEN 1 AND 128 AND instr(effort, char(0)) = 0)
         ),
         fast_mode INTEGER NOT NULL CHECK (fast_mode IN (0, 1)),
-        permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'auto', 'bypassPermissions')),
+        permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
         plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
         created_at INTEGER NOT NULL CHECK (created_at >= 0),
         updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
@@ -1658,7 +1659,7 @@ CREATE TABLE messaging_conversations (
         effort TEXT,
         fast_mode INTEGER CHECK (fast_mode IS NULL OR fast_mode IN (0, 1)),
         permission_mode TEXT CHECK (
-          permission_mode IS NULL OR permission_mode IN ('ask', 'auto', 'bypassPermissions')
+          permission_mode IS NULL OR permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')
         ),
         plan_mode INTEGER CHECK (plan_mode IS NULL OR plan_mode IN (0, 1)),
         created_at INTEGER NOT NULL CHECK (created_at >= 0),

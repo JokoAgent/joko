@@ -1,4 +1,5 @@
 import type { TimelineHistoryCursorView, TimelineHistoryPageView, TimelineItemView } from "./model.js";
+import { richAnswerText } from "@joko/contracts";
 import { isInternalContinuationTimelineItem, projectRuntimeRecoveryTimeline } from "./runtime-recovery.js";
 import { visibleSelectionQuoteMessageText } from "./selection-quote.js";
 
@@ -70,7 +71,7 @@ export async function collectConversationMarkdown(
   for (const item of projectRuntimeRecoveryTimeline(ordered)) {
     const text = item.kind === "user"
       ? visibleSelectionQuoteMessageText(item.text ?? "", item.quotesEncoded === true).trim()
-      : (item.text ?? "").trim();
+      : richAnswerText(item.text ?? "").trim();
     if (text.length === 0) continue;
     const heading = `## ${item.kind === "user" ? labels.user : labels.assistant}`;
     markdownLength += heading.length + text.length + 4;

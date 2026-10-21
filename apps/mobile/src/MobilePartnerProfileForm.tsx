@@ -39,7 +39,7 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
   };
   const chainAxes = (effective?.modelChain ?? []).map(route => snapshot.taskModels?.find(model =>
     model.backendId === route.backendId && model.providerId === route.providerId && model.modelId === route.modelId) ?? snapshot);
-  const permissionModes = (["ask", "auto", "bypassPermissions"] as const).filter(mode => chainAxes.every(axes => axes.permissionModes.includes(mode)));
+  const permissionModes = (["ask", "acceptEdits", "auto", "bypassPermissions"] as const).filter(mode => chainAxes.every(axes => axes.permissionModes.includes(mode)));
   const canSetPlanMode = chainAxes.every(axes => axes.canSetPlanMode);
   return <>
             {caption("name")}
@@ -117,7 +117,8 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
               <Text style={[styles.label, { color: colors.ink }]}>{partnerTaskModelMessages(locale).title}</Text>
               {(() => {
                 const m = partnerTaskModelMessages(locale), taskCapabilities = effective ?? draft.capabilities;
-                const route = draft.taskModelOverride ?? taskCapabilities.modelChain[0]!;
+                const route = draft.taskModelOverride ?? taskCapabilities.modelChain[0];
+                if (!route) return null;
                 const models = (snapshot.taskModels ?? []).filter(model => model.permissionModes.includes(taskCapabilities.permissionMode)
                   && (!taskCapabilities.planMode || model.canSetPlanMode));
                 const model = models.find(candidate => candidate.backendId === route.backendId && candidate.providerId === route.providerId && candidate.modelId === route.modelId);
@@ -149,8 +150,8 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
             </View>}
             {caption("permission")}
             <View style={styles.choices}>
-              {(["ask", "auto", "bypassPermissions"] as const).map((permissionMode) => <View key={permissionMode}>{action(mobileMessage(locale,
-                permissionMode === "ask" ? "partnerProfile.ask" : permissionMode === "auto" ? "partnerProfile.auto" : "controls.permission.full"), () => change({ ...draft,
+              {(["ask", "acceptEdits", "auto", "bypassPermissions"] as const).map((permissionMode) => <View key={permissionMode}>{action(mobileMessage(locale,
+                permissionMode === "ask" ? "partnerProfile.ask" : permissionMode === "acceptEdits" ? "controls.permission.edits" : permissionMode === "auto" ? "partnerProfile.auto" : "controls.permission.full"), () => change({ ...draft,
                   capabilities: { ...draft.capabilities, permissionMode } }), !capabilitiesEditable || !permissionModes.includes(permissionMode),
               effective?.permissionMode === permissionMode)}</View>)}
             </View>

@@ -111,6 +111,8 @@ function fixture(webrtcVideo = true, controlling = false, mediaFeatures = false,
   const stop = vi.fn<MobileRemoteDesktopTransport["stop"]>(async () => undefined);
   const control = vi.fn<MobileRemoteDesktopTransport["control"]>(async (_host, _leaseId, enabled) =>
     create(RemoteDesktopControlStateSchema, { controlling: enabled, controlGeneration: 1n }));
+  // These view fixtures explicitly model a host that refuses the initial take-control.
+  if (!controlling) control.mockResolvedValueOnce(create(RemoteDesktopControlStateSchema, { controlling: false, controlGeneration: 1n }));
   const presentation = vi.fn<MobileRemoteDesktopTransport["presentation"]>(async () =>
     create(RemoteDesktopControlStateSchema, { controlling: false, controlGeneration: 1n }));
   const input = vi.fn<MobileRemoteDesktopTransport["input"]>(async () => undefined);
@@ -399,15 +401,17 @@ describe("Mobile floating mouse control grants", () => {
 describe("Mobile native media and background presentation", () => {
   const attemptId = "123e4567-e89b-42d3-a456-426614174000";
   const nextAttemptId = "123e4567-e89b-42d3-a456-426614174001";
-  async function nativeFixture(controlling = false, frameReady = true) {
+  async function nativeFixture(controlling = false, frameReady = true, channelRequests = false) {
     const value = fixture(true, controlling, true);
     value.heartbeat.mockResolvedValue(create(RemoteDesktopControlStateSchema, { controlling, controlGeneration: 1n }));
     const ticketClose = vi.fn(), ticketCurrent = vi.fn(() => true);
     value.transport.beginBackgroundTransition = vi.fn(() => ({ isCurrent: ticketCurrent, close: ticketClose }));
     const playback = vi.fn(async (_enabled: boolean) => undefined);
     const sendInput = vi.fn<(batch: MobileRemoteDesktopNativeInputBatch) => Promise<boolean>>(async () => true);
+    value.capabilities.channelRequests = channelRequests;
+    const sendRequest = vi.fn(async (_request: { readonly epoch: string; readonly attemptId: string; readonly message: { readonly id: string } }) => true);
     const controller = new MobileRemoteDesktopController(value.transport, undefined, undefined, {
-      nativeVideo: true, nativePictureInPicture: true, requiresPlaybackSession: true, playback, sendInput
+      nativeVideo: true, nativePictureInPicture: true, requiresPlaybackSession: true, playback, sendInput, sendRequest
     });
     const commands: Record<string, unknown>[] = [];
     controller.setViewerSink(command => commands.push({ ...command }));
@@ -417,8 +421,91 @@ describe("Mobile native media and background presentation", () => {
     event("iceConfig"); event("pipCapability", { supported: true });
     if (frameReady) event("videoFrameReady");
     event("streaming"); await flushAsync();
-    return { ...value, controller, commands, init, epoch, event, playback, sendInput, ticketClose, ticketCurrent };
+    return { ...value, controller, commands, init, epoch, event, playback, sendInput, sendRequest, ticketClose, ticketCurrent };
   }
+
+  it("keeps view-only local across heartbeat and rejects ordinary native input while release remains available", async () => {
+    vi.useFakeTimers(); const value = await nativeFixture(true); value.control.mockClear(); value.input.mockClear();
+    const generation = value.controller.snapshot.controlling;
+    await value.controller.setControl(false);
+    expect(value.controller.snapshot).toMatchObject({ controlling: generation, wantedControl: false, viewOnly: true });
+    expect(value.control).not.toHaveBeenCalled();
+    expect(value.commands.findLast(command => command.type === "inputAuthority")).toMatchObject({ grant: null });
+    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 3, events: [{ kind: "key", code: "KeyA", down: true }] });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(value.controller.snapshot).toMatchObject({ controlling: true, viewOnly: true, wantedControl: false });
+    expect(value.sendInput).not.toHaveBeenCalled(); expect(value.input).not.toHaveBeenCalled();
+    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 4, events: [{ kind: "release" }] });
+    await flushAsync(); expect(value.sendInput).toHaveBeenCalledOnce();
+    await value.controller.setControl(true);
+    expect(value.control).not.toHaveBeenCalled();
+    expect(value.controller.snapshot).toMatchObject({ viewOnly: false, wantedControl: true });
+    expect(value.commands.findLast(command => command.type === "inputAuthority")).toMatchObject({ grant: { controlGeneration: "1" } });
+    await value.controller.close();
+  });
+
+  it("requests host input with start when advertised and adopts it without a second control request", async () => {
+    const value = fixture(true, true); value.capabilities.autoControl = true;
+    const controller = new MobileRemoteDesktopController(value.transport);
+    await controller.open();
+    expect(value.start).toHaveBeenCalledWith(value.host, "display-1", RemoteDesktopStartMode.NEW, expect.any(AbortSignal), true);
+    expect(value.control).not.toHaveBeenCalled(); expect(controller.snapshot).toMatchObject({ controlling: true, wantedControl: true });
+    await controller.close();
+  });
+
+  it("adopts control restarted by a temporary display request without another input restart", async () => {
+    const value = fixture(true, true, false, true); value.capabilities.autoControl = true; value.capabilities.resolutionRestore = true;
+    value.setDisplayMode.mockResolvedValue(create(RemoteDesktopDisplayModeResultSchema, { lease: {
+      ...value.lease, controlling: true, controlGeneration: 2n, display: { ...value.lease.display!, width: 1280, height: 720 }
+    } }));
+    const controller = new MobileRemoteDesktopController(value.transport);
+    await controller.open(); await flushAsync(); await controller.setDisplayMode("20");
+    expect(value.setDisplayMode).toHaveBeenCalledWith(value.host, "lease-1", 1n, "20", true, expect.any(AbortSignal), true);
+    expect(controller.snapshot).toMatchObject({ controlling: true, wantedControl: true, status: "live" });
+    expect(value.control).not.toHaveBeenCalled(); await controller.close();
+  });
+
+  it("sends small native control requests over the current media channel and adopts only its matched reply", async () => {
+    const value = await nativeFixture(false, true, true); value.control.mockClear();
+    let finished = false;
+    const pending = value.controller.setControl(true).then(() => { finished = true; }); await flushAsync();
+    expect(value.sendRequest).toHaveBeenCalledOnce(); expect(value.control).not.toHaveBeenCalled();
+    const request = value.sendRequest.mock.calls[0]![0];
+    expect(request).toMatchObject({ epoch: value.epoch, attemptId, message: { type: "request", request: { op: "control", lease: "lease-1", enabled: true } } });
+    value.event("channelReply", { attemptId: nextAttemptId, reply: { type: "reply", id: request.message.id, ok: true, result: { controlling: false, controlGeneration: 2 } } });
+    expect(finished).toBe(false);
+    value.event("channelReply", { reply: { type: "reply", id: request.message.id, ok: true, result: { controlling: true, controlGeneration: 2 } } });
+    await pending; expect(value.controller.snapshot.controlling).toBe(true);
+    expect(value.control).not.toHaveBeenCalled(); await value.controller.close();
+  });
+
+  it("uses the relay only when native media confirms that a request was not sent", async () => {
+    const value = await nativeFixture(false, true, true); value.control.mockClear(); value.sendRequest.mockResolvedValueOnce(false);
+    await value.controller.setControl(true); expect(value.control).toHaveBeenCalledOnce(); await value.controller.close();
+  });
+
+  it("ends an in-flight native request as unknown on media fallback without replaying it on the relay", async () => {
+    const value = await nativeFixture(false, true, true); value.control.mockClear();
+    const pending = value.controller.setControl(true); await flushAsync();
+    value.event("fallback", { reason: "transport", retry: false }); await pending;
+    expect(value.control).not.toHaveBeenCalled(); await value.controller.close();
+  });
+
+  it("restores a foreground control loss on the same lease, shows progress and respects an explicit view-only choice", async () => {
+    vi.useFakeTimers(); const value = await nativeFixture(true); value.control.mockClear();
+    value.heartbeat.mockResolvedValue(create(RemoteDesktopControlStateSchema, { controlling: false, controlGeneration: 2n }));
+    let finish!: () => void;
+    value.control.mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve(create(RemoteDesktopControlStateSchema, { controlling: true, controlGeneration: 3n })); }));
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(value.controller.snapshot).toMatchObject({ status: "live", controlling: false, notice: "input-recovering" });
+    expect(value.control).toHaveBeenCalledOnce(); expect(value.start).toHaveBeenCalledOnce(); expect(value.stop).not.toHaveBeenCalled();
+    finish(); await flushAsync(); expect(value.controller.snapshot).toMatchObject({ controlling: true, notice: undefined });
+    value.control.mockResolvedValue(create(RemoteDesktopControlStateSchema, { controlling: false, controlGeneration: 4n }));
+    await value.controller.setControl(false);
+    value.heartbeat.mockResolvedValue(create(RemoteDesktopControlStateSchema, { controlling: false, controlGeneration: 4n }));
+    await vi.advanceTimersByTimeAsync(3_000); expect(value.control).toHaveBeenCalledTimes(2);
+    expect(value.controller.snapshot).toMatchObject({ controlling: false, viewOnly: true, wantedControl: false }); await value.controller.close();
+  });
 
   it("requires an actual native frame and keeps HTML media receipts outside native proof", async () => {
     const value = await nativeFixture(false, false);
@@ -633,7 +720,7 @@ describe("Mobile native media and background presentation", () => {
     const value = await nativeFixture(true); value.input.mockClear();
     let resolve!: (accepted: boolean) => void;
     value.sendInput.mockImplementationOnce(() => new Promise(receipt => { resolve = receipt; }));
-    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "release" }] });
+    value.controller.viewerMessage({ type: "input", epoch: value.epoch, sequence: 1, events: [{ kind: "key", code: "KeyA", down: true }] });
     if (retirement === "attempt") value.event("iceConfig", { attemptId: nextAttemptId });
     else if (retirement === "control") await value.controller.setControl(false);
     else if (retirement === "route") value.controller.setRouteFocused(false);
@@ -1442,7 +1529,7 @@ describe("Mobile permission guidance", () => {
     controller.setPermissionGuideVisible(true); await flushAsync(); await vi.advanceTimersByTimeAsync(2_000);
     expect(controller.snapshot).toMatchObject({ status: "live", media: "webrtc", hasFrame: true, controlling: false, wantedControl: false,
       permissions: { screenRecording: RemoteDesktopPermissionStatus.UNKNOWN, accessibility: RemoteDesktopPermissionStatus.GRANTED } });
-    expect(value.start).toHaveBeenCalledOnce(); expect(value.control).toHaveBeenCalledOnce(); expect(value.stop).not.toHaveBeenCalled();
+    expect(value.start).toHaveBeenCalledOnce(); expect(value.control).toHaveBeenCalledTimes(2); expect(value.stop).not.toHaveBeenCalled();
     expect(controller.snapshot.capabilities).toBe(value.capabilities); controller.setPermissionGuideVisible(false); await controller.close();
   });
 });
@@ -2972,19 +3059,19 @@ describe("MobileRemoteDesktopController", () => {
     const transfer = controller.copyToPhone();
     await flushAsync();
     expect(controller.snapshot.clipboardBusy).toBe(true);
-    value.control.mockResolvedValueOnce(create(RemoteDesktopControlStateSchema, {
+    resolveHeartbeat(create(RemoteDesktopControlStateSchema, {
       controlling: true, controlGeneration: 3n
     }));
-    await controller.setControl(true);
+    await flushAsync();
     expect(controller.snapshot.clipboardBusy).toBe(false);
     resolveRead(create(RemoteDesktopClipboardContentResultSchema, { data: json }));
     await transfer;
     expect(phone.writePortable).not.toHaveBeenCalled();
 
-    resolveHeartbeat(create(RemoteDesktopControlStateSchema, {
+    value.heartbeat.mockResolvedValue(create(RemoteDesktopControlStateSchema, {
       controlling: false, controlGeneration: 2n
     }));
-    await flushAsync();
+    await vi.advanceTimersByTimeAsync(3_000);
     expect(controller.snapshot.controlling).toBe(true);
 
     value.clipboardContent.mockClear();

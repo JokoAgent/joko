@@ -18,6 +18,7 @@ import {
   type ExtensionPackageExportJobView,
   type ExtensionPackageExportPreviewView,
   type ExtensionPackagePreviewView,
+  type NewSessionLocalDraft,
   type ExtensionSourceCatalogView,
   type PendingExtensionSuggestionView,
   type ResourceView
@@ -38,6 +39,38 @@ afterEach(async () => {
 });
 
 describe("Extension catalog interactions", () => {
+  it("opens the built-in creator in the retained ordinary task draft without inventing a model", async () => {
+    const original: NewSessionLocalDraft = { selection: { kind: "unselected" }, nativeStart: { kind: "fresh" },
+      providerId: "", modelId: "", fastMode: false, permissionMode: "ask", planMode: false,
+      text: "Build a timer", editorDocument: plainTextToComposerDocument("Build a timer"), mentions: [], attachments: [] };
+    const extension = readyExtension(), saveNewSessionDraft = vi.fn(async (_draft: NewSessionLocalDraft) => undefined), navigate = vi.fn();
+    const { container } = await renderExtensions({ extension, controller: {
+      listExtensions: vi.fn(async () => catalog(extension)), getExtension: vi.fn(async () => catalog(extension)),
+      readNewSessionDraft: vi.fn(async () => original), saveNewSessionDraft, navigate
+    } });
+    await act(async () => buttonWithText(container, "Create plugin").click()); await settle();
+    expect(saveNewSessionDraft).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      selection: { kind: "unselected" }, providerId: "", modelId: "", text: "/joko-plugin-creator Build a timer", builtinSkillIntent: "plugin_creator"
+    }));
+    expect(navigate).toHaveBeenCalledExactlyOnceWith({ kind: "newSession" });
+    expect(saveNewSessionDraft.mock.invocationCallOrder[0]).toBeLessThan(navigate.mock.invocationCallOrder[0]!);
+  });
+
+  it("retires creator entry when the original connection changes while its draft is loading", async () => {
+    let resolveDraft!: (draft: undefined) => void;
+    const pending = new Promise<undefined>(resolve => { resolveDraft = resolve; });
+    const extension = readyExtension(), saveNewSessionDraft = vi.fn(async () => undefined), navigate = vi.fn();
+    const view = await renderExtensions({ extension, controller: {
+      listExtensions: vi.fn(async () => catalog(extension)), getExtension: vi.fn(async () => catalog(extension)),
+      readNewSessionDraft: vi.fn(() => pending), saveNewSessionDraft, navigate
+    } });
+    await act(async () => buttonWithText(view.container, "Create plugin").click());
+    await view.rerenderController({ ...view.controller, state: { ...view.controller.state, connectionGeneration: 5 } });
+    await act(async () => resolveDraft(undefined)); await settle();
+    expect(saveNewSessionDraft).not.toHaveBeenCalled(); expect(navigate).not.toHaveBeenCalled();
+    expect(view.actionErrors).toHaveLength(1);
+  });
+
   it("opens a ready declared main view in place or through the trusted Desktop window host", async () => {
     const extension = { ...readyExtension(), mainView: { title: "Review view", icon: "layout" as const } };
     const view = catalog(extension);
@@ -680,11 +713,13 @@ async function renderExtensions(input: {
   readonly container: HTMLDivElement;
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
+  readonly actionErrors: unknown[];
   readonly rerenderController: (next: AppController, nextSnapshot?: AppSnapshot) => Promise<void>;
 }> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
+  const actionErrors: unknown[] = [];
   roots.push(root);
   const snapshot = {
     ...emptySnapshot(),
@@ -733,14 +768,14 @@ async function renderExtensions(input: {
       recommendationNonce={input.recommendationNonce}
       locale="en"
       t={(key, values) => translate("en", key, values)}
-      runAction={(_key, action) => { void action(); }}
+      runAction={(_key, action) => { void action().catch(error => actionErrors.push(error)); }}
       onSelectExtension={() => undefined}
       onOpenNavigation={() => undefined}
     />));
     await settle();
   };
   await render(controller);
-  return { container, controller, snapshot, rerenderController: render };
+  return { container, controller, snapshot, rerenderController: render, actionErrors };
 }
 
 function packageBackend(id: string): BackendView {

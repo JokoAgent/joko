@@ -8,6 +8,7 @@ export const REMOTE_DESKTOP_CAPTURE_CHANNELS = Object.freeze({
   command: "joko:remote-desktop-capture:command",
   reply: "joko:remote-desktop-capture:reply",
   input: "joko:remote-desktop-capture:input",
+  request: "joko:remote-desktop-capture:request",
   nativeFrame: "joko:remote-desktop-capture:native-frame",
   nativeAudio: "joko:remote-desktop-capture:native-audio",
   presentationPong: "joko:remote-desktop-capture:presentation-pong",

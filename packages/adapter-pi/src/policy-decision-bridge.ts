@@ -10,9 +10,10 @@ export const MAXIMUM_POLICY_IDENTIFIER_CHARACTERS = 256;
 export interface PolicyDecisionRequest {
   readonly policyGeneration: number;
   readonly observation: PolicyObservation;
+  readonly toolCall?: { readonly toolName: string; readonly input: unknown };
 }
 
-export type PolicyDecisionResult = PolicyRuleEffect | "default" | "stale";
+export type PolicyDecisionResult = PolicyRuleEffect | "default" | "stale" | "delegated_allow";
 
 type PolicyDecisionTransport = {
   readonly closed: boolean;
@@ -53,6 +54,7 @@ export function encodePolicyDecisionRequest(request: PolicyDecisionRequest): str
   const payload = Buffer.from(JSON.stringify({
     format: 1,
     policyGeneration: request.policyGeneration,
+    ...(request.toolCall ? { toolCall: request.toolCall } : {}),
     ...request.observation
   }), "utf8").toString("base64url");
   if (payload.length > MAXIMUM_POLICY_DECISION_ENVELOPE_CHARACTERS) {
@@ -92,11 +94,15 @@ function parsePolicyDecisionRequest(value: string): PolicyDecisionRequest | unde
   );
   const toolProviderId = boundedString(parsed["toolProviderId"], MAXIMUM_POLICY_IDENTIFIER_CHARACTERS);
   const toolName = boundedString(parsed["toolName"], MAXIMUM_POLICY_IDENTIFIER_CHARACTERS);
+  const toolCall = parsed["toolCall"];
+  if (toolCall !== undefined && (!isRecord(toolCall) || typeof toolCall["toolName"] !== "string" || !toolCall["toolName"] || toolCall["toolName"].length > 256
+    || !Object.hasOwn(toolCall, "input") || Object.keys(toolCall).some(key => !["toolName", "input"].includes(key)))) return undefined;
   if ((parsed["workspaceRelativePath"] !== undefined && workspaceRelativePath === undefined)
       || (parsed["toolProviderId"] !== undefined && toolProviderId === undefined)
       || (parsed["toolName"] !== undefined && toolName === undefined)) return undefined;
   return {
     policyGeneration,
+    ...(isRecord(toolCall) ? { toolCall: { toolName: toolCall["toolName"] as string, input: toolCall["input"] } } : {}),
     observation: {
       subjectKind: subjectKind as PolicyObservation["subjectKind"],
       risk: risk as PolicyObservation["risk"],

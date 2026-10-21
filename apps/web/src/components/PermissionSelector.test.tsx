@@ -27,6 +27,16 @@ afterEach(async () => {
 });
 
 describe("PermissionSelector", () => {
+  it("keeps Accept edits distinct from automatic and full access when selecting it", async () => {
+    const onChange = vi.fn<(mode: PermissionMode) => void>();
+    const container = document.body.appendChild(document.createElement("div")), root = createRoot(container); roots.push(root);
+    await act(async () => root.render(<PermissionSelector value="ask" modes={["ask", "acceptEdits", "auto", "bypassPermissions"]} onChange={onChange} t={(key, values) => translate("en", key, values)} />));
+    await act(async () => required(container.querySelector<HTMLButtonElement>(".permission-selector__trigger")).click());
+    const option = required([...document.querySelectorAll<HTMLButtonElement>('[role="option"]')].find(item => item.textContent?.startsWith("Accept edits")));
+    expect(option.classList.contains("is-danger")).toBe(false);
+    await act(async () => option.click()); expect(onChange).toHaveBeenCalledExactlyOnceWith("acceptEdits");
+  });
+
   it("portals above clipping ancestors, roves with Arrow/Home/End, and restores trigger focus", async () => {
     const onChange = vi.fn<(mode: PermissionMode) => void>();
     const container = document.createElement("div");

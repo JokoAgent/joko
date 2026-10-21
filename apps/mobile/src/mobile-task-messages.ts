@@ -10,6 +10,10 @@ type MobileTaskMessageRow = readonly [
 ];
 
 const mobileTaskMessageRows = [
+  ["newTask.leaveUploadTitle", "Leave while uploading?", "附件正在上传，要离开吗？", "附件正在上傳，要離開嗎？", "アップロード中に移動しますか？", "업로드 중에 나가시겠어요?"],
+  ["newTask.leaveUploadBody", "Leaving cancels this message. Its input is kept in the created task draft.", "离开会取消发送这条消息，输入会保留在已创建任务的草稿中。", "離開會取消傳送這則訊息，輸入會保留在已建立工作的草稿中。", "移動すると送信を中止します。入力は作成されたタスクの下書きに残ります。", "나가면 메시지 전송을 취소합니다. 입력은 생성된 작업의 초안에 보관됩니다."],
+  ["newTask.leaveUploadStay", "Keep waiting", "继续等待", "繼續等待", "待機を続ける", "계속 기다리기"],
+  ["newTask.leaveUploadDiscard", "Cancel send and leave", "取消发送并离开", "取消傳送並離開", "送信を中止して移動", "전송 취소 후 나가기"],
   ["task.renameSuggest", "Suggest title", "AI 起名", "AI 命名", "タイトルを提案", "제목 제안"],
   ["task.renameSuggesting", "Suggesting title…", "正在生成标题…", "正在產生標題…", "タイトルを提案中…", "제목 제안 중…"],
   ["task.renameNoMaterial", "There is not enough conversation to suggest a title. You can enter one.", "对话内容不足，可手动输入标题。", "對話內容不足，可手動輸入標題。", "会話の内容が不足しています。タイトルを入力できます。", "대화 내용이 부족합니다. 제목을 직접 입력할 수 있습니다."],
@@ -758,6 +762,8 @@ const mobileTaskMessageRows = [
   ["controls.enableFullAccess", "Enable full access", "启用完全访问权限", "啟用完整存取權", "フルアクセスを有効化", "전체 접근 활성화"],
   ["controls.changeError", "The task control could not be changed.", "无法更改任务控制项。", "無法變更任務控制項。", "タスクコントロールを変更できませんでした。", "작업 제어를 변경할 수 없습니다."],
   ["controls.permission.ask", "Ask before actions", "执行操作前询问", "執行操作前詢問", "操作前に確認", "동작 전에 묻기"],
+  ["controls.permission.edits", "Accept edits", "允许编辑", "允許編輯", "編集を許可", "편집 허용"],
+  ["controls.permission.editsDescription", "File edits proceed; other actions follow the selected backend's approval rules.", "文件编辑直接进行；其他操作遵循所选后端的审批规则。", "檔案編輯直接進行；其他操作遵循所選後端的核准規則。", "ファイル編集を許可し、他の操作は選択したバックエンドの承認規則に従います。", "파일 편집을 허용하며 다른 동작은 선택한 백엔드의 승인 규칙을 따릅니다."],
   ["controls.permission.askDescription", "Joko asks before actions that need approval.", "Joko 会在需要批准的操作前询问。", "Joko 會在需要核准的操作前詢問。", "承認が必要な操作の前に Joko が確認します。", "승인이 필요한 동작 전에 Joko가 묻습니다."],
   ["controls.permission.auto", "Allow safe actions", "允许安全操作", "允許安全操作", "安全な操作を許可", "안전한 동작 허용"],
   ["controls.permission.autoDescription", "The Backend may continue with its advertised safe automatic policy.", "Backend 可按其公布的安全自动策略继续。", "Backend 可依其公告的安全自動原則繼續。", "Backend は公開済みの安全な自動ポリシーで続行できます。", "Backend는 제공된 안전 자동 정책에 따라 계속할 수 있습니다."],

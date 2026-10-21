@@ -31,6 +31,7 @@ export function projectNativeTaskStatusSnapshot(
     interactionsBySession.set(interaction.sessionId, bucket);
   }
   const sessions = input.sessions.flatMap((session) => {
+    if (session.hidden) return [];
     const interaction = (interactionsBySession.get(session.id) ?? [])
       .slice()
       .sort((left, right) => interactionPriority(left.kind) - interactionPriority(right.kind) ||

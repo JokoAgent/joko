@@ -49,6 +49,7 @@ export interface PartnerLearningTurnHandle {
 }
 
 export interface AdapterContext {
+  readonly nativeToolAuthorization?: import("./native-tool-authorization.js").NativeToolAuthorization;
   readonly sessionId: SessionId;
   readonly generation: number;
   /** Orchestrator-owned Backend process-instance fence, distinct from Session generation. */
@@ -334,6 +335,8 @@ export interface RuntimeCommand {
   /** Exact managed Resource owner resolved inside the live runtime. */
   readonly resourceId?: string;
   readonly loaded: boolean;
+  /** Host-attested only after an exact native loader/path observation. */
+  readonly builtinSkill?: { readonly id: "plugin_creator"; readonly revision: string };
 }
 
 export interface NativeMemoryResetResult {
@@ -356,6 +359,8 @@ export interface RuntimeResource {
   readonly id: string;
   readonly kind: "extension" | "skill" | "prompt" | "package";
   readonly name: string;
+  /** Private service seed provenance, never accepted from a client manifest. */
+  readonly trustedBuiltin?: { readonly id: "plugin_creator"; readonly revision: string };
   readonly source: string;
   readonly state: "discovered" | "approved" | "loaded" | "disabled" | "error";
   /** Exact content revision captured into this immutable runtime snapshot. */
@@ -483,6 +488,7 @@ export interface NativeTextInferenceInput {
   readonly assertModelAllowed: (providerId: string, modelId: string) => void;
   readonly providerId?: string;
   readonly modelId?: string;
+  readonly maxTokens?: number;
 }
 
 export interface BackgroundTaskOutputResult {
@@ -496,6 +502,8 @@ export interface BackgroundTaskOutputResult {
 
 export interface BackendAdapter {
   readonly id: string;
+  /** Text review channels do not implicitly expose plugin one-shot inference. */
+  readonly nativeTextInferenceCapabilities?: { readonly pluginOneshot: true; readonly maxTokens: boolean };
   describe(): Promise<BackendDescriptor>;
   /** Optional native-account inference; never borrows a product Session or its tools. */
   inferNativeText?(input: NativeTextInferenceInput): Promise<string>;

@@ -664,7 +664,7 @@ function toProtoCapabilities(value: PartnerCapabilitiesRecord): contract.Partner
     modelChain: value.modelChain.map((route) => create(contract.PartnerModelRouteSchema, route)),
     permissionMode: value.permissionMode === "ask"
       ? contract.PermissionMode.ASK
-      : value.permissionMode === "auto" ? contract.PermissionMode.AUTO : contract.PermissionMode.BYPASS_PERMISSIONS,
+      : value.permissionMode === "acceptEdits" ? contract.PermissionMode.ACCEPT_EDITS : value.permissionMode === "auto" ? contract.PermissionMode.AUTO : contract.PermissionMode.BYPASS_PERMISSIONS,
     planMode: value.planMode
   });
 }
@@ -689,6 +689,7 @@ function fromProtoRoute(value: contract.PartnerModelRoute): PartnerModelRouteRec
 
 function fromProtoPermission(value: contract.PermissionMode): PartnerCapabilitiesRecord["permissionMode"] {
   if (value === contract.PermissionMode.ASK) return "ask";
+  if (value === contract.PermissionMode.ACCEPT_EDITS) return "acceptEdits";
   if (value === contract.PermissionMode.AUTO) return "auto";
   if (value === contract.PermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";
   throw new ConnectError("Partner permission mode is invalid.", Code.InvalidArgument);

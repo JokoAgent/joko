@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { create } from "@bufbuild/protobuf";
+import { ListPartnerHomeTargetsResponseSchema, InspectPartnerHomeTargetResponseSchema, MovePartnerHomeResponseSchema,
+  GetPartnerHomeMoveResponseSchema, RetryPartnerHomeMoveResponseSchema, type PartnerHomeApi } from "@joko/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AppController } from "../controller.js";
@@ -204,6 +207,10 @@ function controller(overrides: Partial<AppController> = {}, ownerId = "owner-one
     efforts: [], contextWindow: 8192, maximumOutputTokens: 2048, inputCostMicrosPerMillion: 0, outputCostMicrosPerMillion: 0, currencyCode: "USD" }] };
   return {
     state: { ready: true, connectionState: "connected", activeProfile: { id: ownerId, serverId: ownerId, origin: "https://node.invalid" }, snapshot },
+    partnerHomeApi: (ownerKey: string): PartnerHomeApi => ({ ownerKey,
+      list: vi.fn(async () => create(ListPartnerHomeTargetsResponseSchema)), inspect: vi.fn(async () => create(InspectPartnerHomeTargetResponseSchema)),
+      move: vi.fn(async () => create(MovePartnerHomeResponseSchema)), status: vi.fn(async () => create(GetPartnerHomeMoveResponseSchema)),
+      retry: vi.fn(async () => create(RetryPartnerHomeMoveResponseSchema)) }),
     listPartners: vi.fn(async () => catalog()), listPartnerSessions: vi.fn(async () => [link()]),
     getPartner: vi.fn(async () => partner()), updatePartner: vi.fn(), navigate: vi.fn(),
     ...overrides

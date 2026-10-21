@@ -98,6 +98,7 @@ message StartRemoteDesktopRequest {
   DevicePeerRouteIdentity peer = 1;
   string display_id = 2;
   RemoteDesktopStartMode mode = 3;
+  bool control = 4;
 }
 
 message StartRemoteDesktopResponse {
@@ -275,6 +276,7 @@ message SetRemoteDesktopDisplayModeRequest {
   uint64 control_generation = 3;
   string mode_id = 4;
   bool temporary = 5;
+  bool control = 6;
 }
 
 message SetRemoteDesktopDisplayModeResponse {
@@ -283,13 +285,14 @@ message SetRemoteDesktopDisplayModeResponse {
 }
 
 // Each Fit edge is an integer from 320 through 2560. Success returns actual
-// capture geometry with the same lease, view-only and a new control generation.
+// capture geometry with the same lease and a new control generation.
 message SetRemoteDesktopViewerDisplayRequest {
   DevicePeerRouteIdentity peer = 1;
   string lease_id = 2;
   uint64 control_generation = 3;
   uint32 width = 4;
   uint32 height = 5;
+  bool control = 6;
 }
 
 message SetRemoteDesktopViewerDisplayResponse {
@@ -301,6 +304,7 @@ message RestoreRemoteDesktopViewerDisplayRequest {
   DevicePeerRouteIdentity peer = 1;
   string lease_id = 2;
   uint64 control_generation = 3;
+  bool control = 4;
 }
 
 message RestoreRemoteDesktopViewerDisplayResponse {

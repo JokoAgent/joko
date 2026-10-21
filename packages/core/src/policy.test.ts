@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { decideToolCall, evaluateOrderedPolicyRules, isWithin, type PolicySnapshot } from "./policy.js";
 
@@ -10,6 +11,13 @@ const context = {
 };
 
 describe("permission policy", () => {
+  it("accepts bounded file edits while continuing to ask for commands and external tools", () => {
+    const edits = { ...context, mode: "acceptEdits" as const };
+    expect(decideToolCall({ name: "write", args: { path: "src/app.ts" } }, edits).action).toBe("allow");
+    expect(decideToolCall({ name: "bash", args: { command: "git status" } }, edits).action).toBe("ask");
+    expect(decideToolCall({ name: "mcp__service__publish", args: {} }, edits).action).toBe("ask");
+    expect(decideToolCall({ name: "write", args: { path: resolve(edits.workspaceRoot, "..", "outside", "file") } }, edits).action).toBe("ask");
+  });
   it("allows bounded workspace writes in auto mode", () => {
     expect(decideToolCall({ name: "write", args: { path: "src/app.ts" } }, context).action).toBe("allow");
   });

@@ -11,10 +11,11 @@ import type {
   DesktopNativeTaskStatusSettings,
   DesktopNativeTaskStatusSnapshot
 } from "./channels.js";
+import { NATIVE_TASK_STATUS_SESSION_LIMIT } from "@joko/contracts";
 import { isDesktopLocale } from "./channels.js";
 
 export const NATIVE_TASK_STATUS_MIN_DARWIN_MAJOR = 23;
-export const MAXIMUM_NATIVE_TASK_STATUS_SESSIONS = 64;
+export const MAXIMUM_NATIVE_TASK_STATUS_SESSIONS = NATIVE_TASK_STATUS_SESSION_LIMIT;
 export const MAXIMUM_NATIVE_TASK_STATUS_VISIBLE_SESSIONS = 8;
 export const DESKTOP_NATIVE_TASK_STATUS_SOUND_EVENTS = Object.freeze([
   "start", "attention", "complete", "error", "select"
@@ -139,7 +140,7 @@ export function parseDesktopNativeTaskStatusVisibleSessionIds(value: unknown): r
   }
   const seen = new Set<string>();
   const sessionIds = value.map((sessionId) => {
-    if (!isBoundedText(sessionId, 256) || seen.has(sessionId)) {
+    if (!isBoundedText(sessionId, 1024) || seen.has(sessionId)) {
       throw new TypeError("Native task-status visible task identities are invalid.");
     }
     seen.add(sessionId);
@@ -150,7 +151,7 @@ export function parseDesktopNativeTaskStatusVisibleSessionIds(value: unknown): r
 
 export function projectDesktopNativeTaskStatusSurface(
   snapshot: DesktopNativeTaskStatusSnapshot,
-  options: { readonly manualExpanded?: boolean; readonly suppressTransient?: boolean } = {}
+  options: { readonly manualExpanded?: boolean; readonly suppressTransient?: boolean; readonly passiveSessionIds?: ReadonlySet<string> } = {}
 ): DesktopNativeTaskStatusSurface {
   const sessions = Object.freeze([...snapshot.sessions].sort(compareSessions));
   const counts = Object.freeze({
@@ -165,11 +166,11 @@ export function projectDesktopNativeTaskStatusSurface(
   if (options.manualExpanded === true) {
     return Object.freeze({ mode: "expanded", policy: "manual", current, sessions, counts });
   }
-  const blocking = sessions.find((session) => session.phase === "interaction");
+  const blocking = sessions.find((session) => session.phase === "interaction" && !options.passiveSessionIds?.has(session.sessionId));
   if (blocking !== undefined) {
     return Object.freeze({ mode: "expanded", policy: "blocking", current: blocking, sessions, counts });
   }
-  const transient = sessions.find((session) => session.phase === "error" || session.phase === "completed");
+  const transient = sessions.find((session) => (session.phase === "error" || session.phase === "completed") && !options.passiveSessionIds?.has(session.sessionId));
   if (transient !== undefined && options.suppressTransient !== true) {
     return Object.freeze({ mode: "expanded", policy: "transient", current: transient, sessions, counts });
   }
@@ -260,9 +261,9 @@ function parseSoundSettings(value: unknown): DesktopNativeTaskStatusSettings["so
 function parseSession(value: unknown): DesktopNativeTaskStatusSession {
   if (!isRecord(value)) throw new TypeError("Native task-status task is invalid.");
   const required = ["activityLines", "detail", "phase", "sessionId", "title", "updatedAt"];
-  const optional = ["interactionKind", "permission", "startedAt"];
+  const optional = ["interactionKind", "permission", "startedAt", "remote"];
   if (!hasOnlyKeys(value, required, optional) || !required.every((key) => Object.hasOwn(value, key)) ||
-    !isBoundedText(value["sessionId"], 256) || !isDisplayText(value["title"], 160) ||
+    !isBoundedText(value["sessionId"], 1024) || !isDisplayText(value["title"], 160) ||
     !isDisplayText(value["detail"], 600) || !isPhase(value["phase"]) || !isTimestamp(value["updatedAt"]) ||
     (value["startedAt"] !== undefined && !isTimestamp(value["startedAt"])) ||
     (value["interactionKind"] !== undefined && !isInteractionKind(value["interactionKind"])) ||
@@ -271,6 +272,8 @@ function parseSession(value: unknown): DesktopNativeTaskStatusSession {
   }
   const activityLines = Object.freeze(value["activityLines"].map(parseActivityLine));
   const permission = value["permission"] === undefined ? undefined : parsePermission(value["permission"]);
+  const remote = value["remote"] === undefined ? undefined : parseRemote(value["remote"]);
+  if (remote && permission) throw new TypeError("Remote tasks cannot carry local permission actions.");
   if (permission !== undefined && value["phase"] !== "interaction") {
     throw new TypeError("Native task-status permission must belong to an interaction task.");
   }
@@ -283,8 +286,25 @@ function parseSession(value: unknown): DesktopNativeTaskStatusSession {
     activityLines,
     ...(value["startedAt"] === undefined ? {} : { startedAt: value["startedAt"] }),
     updatedAt: value["updatedAt"],
-    ...(permission === undefined ? {} : { permission })
+    ...(permission === undefined ? {} : { permission }),
+    ...(remote === undefined ? {} : { remote })
   });
+}
+
+function parseRemote(value: unknown): NonNullable<DesktopNativeTaskStatusSession["remote"]> {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["sourceId", "runId", "silent", "completionNotification"], ["companion", "observedCompletionOnly"])
+    || !isBoundedText(value["sourceId"], 1024) || !isDisplayText(value["runId"], 256)
+    || typeof value["silent"] !== "boolean" || value["observedCompletionOnly"] !== undefined && typeof value["observedCompletionOnly"] !== "boolean"
+    || !["none", "pending", "teammate"].includes(String(value["completionNotification"]))) throw new TypeError("Invalid remote task activity.");
+  const companion = value["companion"];
+  if (companion !== undefined && (!isRecord(companion) || !hasOnlyKeys(companion, ["name", "glyph", "tint"], ["artwork"])
+    || !isDisplayText(companion["name"], 160) || !isDisplayText(companion["glyph"], 8) || !/^#[a-f0-9]{6}$/iu.test(String(companion["tint"]))
+    || companion["artwork"] !== undefined && (typeof companion["artwork"] !== "string" || companion["artwork"].length > 80_000
+      || !/^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+=*$/u.test(companion["artwork"])))) throw new TypeError("Invalid remote companion identity.");
+  return Object.freeze({ sourceId: value["sourceId"], runId: value["runId"], silent: value["silent"],
+    completionNotification: value["completionNotification"] as "none" | "pending" | "teammate",
+    ...(value["observedCompletionOnly"] === undefined ? {} : { observedCompletionOnly: value["observedCompletionOnly"] as boolean }),
+    ...(companion === undefined ? {} : { companion: companion as NonNullable<DesktopNativeTaskStatusSession["remote"]>["companion"] }) });
 }
 
 function parseActivityLine(value: unknown): DesktopNativeTaskStatusSession["activityLines"][number] {

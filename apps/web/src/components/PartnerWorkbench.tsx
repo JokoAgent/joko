@@ -246,7 +246,10 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
     }
   }); };
   const browse = (path: string): void => { void act("browse", async (signal) => {
-    const listing = await controller.listProjectDirectories(path, signal);
+    const binding = session.remoteWorkspace;
+    const peer = binding?.kind === "device_peer" ? (await controller.listDevicePeers(signal)).find(item => item.route.targetDeviceId === binding.targetDeviceId) : undefined;
+    if (binding && !peer) throw new Error(t("workbench.taskUnavailable"));
+    const listing = peer ? await controller.listDevicePeerDirectories(peer.route, path, signal) : await controller.listProjectDirectories(path, signal);
     if (current()) setDirectoryListing(listing);
   }); };
   const pickFolder = (): void => { void act("pick", async () => {
@@ -319,7 +322,8 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
       ? "workbench.routineLastSuccess" : "workbench.routineLastFailure", { text: routine.lastRunSummary || t("workbench.routineNoSummary") });
   };
   const disabled = !editable || busy !== undefined;
-  const picking = view !== undefined && (view.projects.length === 0 || adding);
+  const currentProjects = view?.projects.filter(project => !project.readOnly) ?? [];
+  const picking = view !== undefined && (currentProjects.length === 0 || adding);
   const projectOptions = view?.projectOptions.filter((item) => !item.granted) ?? [];
   const visibleTasks = view?.tasks.filter((task) => (!picking || task.kind === "automation") && (selectedProject === undefined || task.project === "" || task.project === selectedProject)) ?? [];
   const understanding = session.state === "running" && (view?.candidates.some((item) => item.kind === "external" && item.judgment === undefined) ?? false);
@@ -359,7 +363,7 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
             {selectedDetail.artifacts.length > 0 && <section><h4>{t("workbench.outputs")}</h4>{selectedDetail.artifacts.map(output)}</section>}
           </>}
         </div>
-        {selected !== undefined && <form className="partner-workbench__composer" onSubmit={(event) => { event.preventDefault(); if (!disabled && messageDraft.trim() !== "") followUp(selected, messageDraft); }}>
+        {selected !== undefined && !selected.readOnly && <form className="partner-workbench__composer" onSubmit={(event) => { event.preventDefault(); if (!disabled && messageDraft.trim() !== "") followUp(selected, messageDraft); }}>
           <label className="sr-only" htmlFor={`workbench-draft-${session.id}`}>{t("workbench.direction")}</label>
           <textarea id={`workbench-draft-${session.id}`} value={messageDraft} maxLength={12_000} disabled={disabled} placeholder={t("workbench.directionPlaceholder")}
             onKeyDown={(event) => {
@@ -379,15 +383,17 @@ export function PartnerWorkbench({ controller, session, conversation, active, ow
           </div>
           {projectOptions.length > 8 && <Button disabled={disabled} onClick={() => setShowMoreProjects(!showMoreProjects)}>{showMoreProjects ? t("workbench.lessProjects") : t("workbench.moreProjects")}</Button>}
           <label className="field"><span>{t("workbench.projectPath")}</span><input value={pathDraft} maxLength={32_768} disabled={disabled} placeholder={t("projects.serverPathPlaceholder")} onChange={(event) => setPathDraft(event.target.value)} /></label>
-          <div className="partner-workbench__actions">{localProjectPickerOwner(controller) !== undefined ? <Button disabled={disabled} onClick={pickFolder}><FolderOpen aria-hidden="true" />{t("projects.browseLocal")}</Button> : <Button disabled={disabled} onClick={() => browse(pathDraft)}><FolderOpen aria-hidden="true" />{t("projects.browseService")}</Button>}
+          <div className="partner-workbench__actions">{session.remoteWorkspace === undefined && localProjectPickerOwner(controller) !== undefined ? <Button disabled={disabled} onClick={pickFolder}><FolderOpen aria-hidden="true" />{t("projects.browseLocal")}</Button> : <Button disabled={disabled} onClick={() => browse(pathDraft)}><FolderOpen aria-hidden="true" />{t("projects.browseService")}</Button>}
             {view.projects.length > 0 && <Button disabled={busy !== undefined} onClick={() => setAdding(false)}>{t("common.cancel")}</Button>}
-            <Button tone="primary" disabled={disabled || pathDraft.trim() === "" || view.projects.length >= 50} onClick={() => handOver(pathDraft.trim())}>{busy === "handover" ? t("common.working") : t("workbench.handOverAction")}</Button></div>
+            <Button tone="primary" disabled={disabled || pathDraft.trim() === "" || currentProjects.length >= 50} onClick={() => handOver(pathDraft.trim())}>{busy === "handover" ? t("common.working") : t("workbench.handOverAction")}</Button></div>
           {directoryListing !== undefined && <section className="partner-workbench__directory"><strong>{directoryListing.path}</strong><div>{directoryListing.directories.map((entry) => <Button key={entry.path} disabled={disabled} onClick={() => browse(entry.path)}><FolderOpen aria-hidden="true" />{entry.name}</Button>)}</div><div className="partner-workbench__actions"><Button disabled={disabled} onClick={() => browse(directoryListing.parentPath)}>{t("projects.browseServiceParent")}</Button><Button disabled={disabled} onClick={() => { setPathDraft(directoryListing.path); setDirectoryListing(undefined); }}>{t("projects.browseServiceChoose")}</Button></div></section>}
         </section> : <div className="partner-workbench__projects">
           <Button className={selectedProject === undefined ? "is-selected" : ""} onClick={() => onSelectProject(undefined)}>{t("workbench.allProjects")}</Button>
-          {view.projects.map((project) => <span className={cx("partner-workbench__project", selectedProject === project.path && "is-selected")} key={project.path}><button type="button" title={project.path} onClick={() => onSelectProject(project.path)}>{project.name}{!project.exists && <span> · {t("workbench.missing")}</span>}</button><IconButton label={t("workbench.removeProject", { name: project.name })} disabled={disabled} onClick={() => { void act("remove", async (signal) => { const result = await controller.removePartnerWorkbenchProject(view.owner, view.revision, project.path, signal); if (accept(result) && selectedProject === project.path) onSelectProject(undefined); }); }}><X aria-hidden="true" /></IconButton></span>)}
-          {view.projects.length < 50 && <IconButton label={t("workbench.addProject")} disabled={disabled} onClick={() => { setPathDraft(""); setAdding(true); }}><Plus aria-hidden="true" /></IconButton>}
+          {view.projects.map((project) => <span className={cx("partner-workbench__project", !project.readOnly && selectedProject === project.path && "is-selected")} key={`${project.sourceComputerId ?? "current"}:${project.path}`}><button type="button" title={project.path} disabled={project.readOnly} onClick={() => onSelectProject(project.path)}>{project.name}{project.readOnly ? <span> · {project.sourceComputerName} · {t("partners.readOnly")}</span> : !project.exists && <span> · {t("workbench.missing")}</span>}</button>{!project.readOnly && <IconButton label={t("workbench.removeProject", { name: project.name })} disabled={disabled} onClick={() => { void act("remove", async (signal) => { const result = await controller.removePartnerWorkbenchProject(view.owner, view.revision, project.path, signal); if (accept(result) && selectedProject === project.path) onSelectProject(undefined); }); }}><X aria-hidden="true" /></IconButton>}</span>)}
+          {currentProjects.length < 50 && <IconButton label={t("workbench.addProject")} disabled={disabled} onClick={() => { setPathDraft(""); setAdding(true); }}><Plus aria-hidden="true" /></IconButton>}
         </div>}
+        {picking && view.projects.some(project => project.readOnly) && <div className="partner-workbench__projects">{view.projects.filter(project => project.readOnly).map(project =>
+          <span className="partner-workbench__project" key={`${project.sourceComputerId}:${project.path}`} title={project.path}><span>{project.name} · {project.sourceComputerName} · {t("partners.readOnly")}</span></span>)}</div>}
         {pendingHandover !== undefined && <section className="partner-workbench__judgment"><p>{t("workbench.handoverPending")}</p><p>{pendingHandover.text}</p><Button disabled={disabled} onClick={() => { void act("handover-send", async () => { await send(pendingHandover.text); if (current()) { drafts.messages.delete(`handover:${pendingHandover.project}`); setPendingHandover(undefined); setSent(t("workbench.sent")); } }); }}>{t("common.retry")}</Button></section>}
         {understanding && <p className="partner-workbench__notice"><Spinner />{t("workbench.understanding", { name: partner?.displayName ?? "" })}</p>}
         {GROUPS.map((group) => {

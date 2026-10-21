@@ -241,6 +241,22 @@ async function fixture(options: FixtureOptions = {}) {
 }
 
 describe("McpRouter", () => {
+  it("captures the concrete native arguments and revalidates delegated authority immediately before MCP dispatch", async () => {
+    const f = await fixture(); let current = true;
+    const pause = deferred<void>(), entered = deferred<void>();
+    try {
+      await f.router.upsert({ id: "delegated", displayName: "Delegated tool", enabled: true, transport: "streamable_http", endpoint: "https://mcp.example.test/rpc", credentialBindings: [] });
+      const snapshot = f.router.createPiBridgeSnapshot({ endpoint: "http://127.0.0.1:4318/internal/mcp", sessionId: "session-1", targetId: "target-1", expectedPiGeneration: 1 });
+      const admitted = vi.fn(async (_session: string, _server: string, _tool: string, args: Readonly<Record<string, unknown>>) => {
+        expect(args).toEqual({ destination: "approved" }); entered.resolve(); await pause.promise;
+        return () => { if (!current) throw new Error("Delegation revoked"); };
+      }); f.router.setNativeToolAdmission(admitted);
+      const args = { destination: "approved" };
+      const result = f.router.executeBridgeCall({ ...bridgeScope(1), authorization: `Bearer ${snapshot.mcpBridge.token}`, generation: 1, serverId: "delegated", toolName: "echo", arguments: args });
+      await entered.promise; args.destination = "changed"; current = false; pause.resolve();
+      await expect(result).rejects.toThrow("Delegation revoked"); expect(f.factory.calledTools).toEqual([]);
+    } finally { pause.resolve(); await f.router.dispose(); f.store.close(); await rm(f.root, { recursive: true, force: true }); }
+  });
   it("keeps App-only tools out of the frozen model facade", async () => {
     const f = await fixture();
     try {

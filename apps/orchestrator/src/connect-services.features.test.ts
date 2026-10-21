@@ -5009,7 +5009,7 @@ describe("Connect typed feature boundaries", () => {
     expect(setSetting).not.toHaveBeenCalled();
   });
 
-  it("admits Backend defaults only from the current capability manifest", async () => {
+  it.each([contract.PermissionMode.ASK, contract.PermissionMode.ACCEPT_EDITS])("admits Backend default %s only from the current capability manifest", async admittedMode => {
     const capabilities = new Map<string, { key: string; supported: boolean; options?: readonly string[] }>();
     const setSetting = vi.fn();
     const deleteSetting = vi.fn();
@@ -5067,7 +5067,7 @@ describe("Connect typed feature boundaries", () => {
     capabilities.set("permission.modes", {
       key: "permission.modes",
       supported: true,
-      options: ["ask"]
+      options: [admittedMode === contract.PermissionMode.ACCEPT_EDITS ? "acceptEdits" : "ask"]
     });
     const unadvertisedPermission = await submit(
       "operation-backend-settings-permission-unadvertised",
@@ -5083,7 +5083,7 @@ describe("Connect typed feature boundaries", () => {
       "operation-backend-settings-permission-admitted",
       create(contract.BackendSettingsPatchSchema, {
         backendId: "backend-settings",
-        defaultPermissionMode: contract.PermissionMode.ASK
+        defaultPermissionMode: admittedMode
       })
     );
     expect(admittedPermission.operation).toMatchObject({ state: contract.OperationState.SUCCEEDED });

@@ -63,8 +63,8 @@ internal class HtmlSnapshotServer(root: String, private val entry: String, priva
           } catch (_: Exception) { clients.remove(socket); socket.close() }
         }
       }
-    }, "cindy-html-preview").apply { isDaemon = true }.start()
-    return "$origin/__cindy/$token"
+    }, "joko-html-preview").apply { isDaemon = true }.start()
+    return "$origin/__joko/$token"
   }
 
   fun stop() {
@@ -120,12 +120,12 @@ internal class HtmlSnapshotServer(root: String, private val entry: String, priva
       send(socket, 403); return
     }
     val rawPath = first[1].substringBefore('?')
-    if (rawPath == "/__cindy/$token") {
+    if (rawPath == "/__joko/$token") {
       val escaped = entry.split('/').joinToString("/") { URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
-      send(socket, 302, "Set-Cookie: cindy_$token=$token; HttpOnly; SameSite=Strict; Path=/\r\nLocation: /$escaped\r\n")
+      send(socket, 302, "Set-Cookie: joko_$token=$token; HttpOnly; SameSite=Strict; Path=/\r\nLocation: /$escaped\r\n")
       return
     }
-    if (headers["cookie"]?.split(';')?.map { it.trim() }?.contains("cindy_$token=$token") != true) { send(socket, 403); return }
+    if (headers["cookie"]?.split(';')?.map { it.trim() }?.contains("joko_$token=$token") != true) { send(socket, 403); return }
     var path = try { URLDecoder.decode(rawPath.replace("+", "%2B"), "UTF-8") } catch (_: Exception) { send(socket, 400); return }
     if (path.contains('\\') || path.contains('\u0000') || path.split('/').any { it == "." || it == ".." }) { send(socket, 403); return }
     if (path.endsWith('/')) path += "index.html"

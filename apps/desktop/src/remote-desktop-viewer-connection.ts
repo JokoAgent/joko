@@ -88,7 +88,7 @@ export class DesktopRemoteDesktopViewerConnection {
         if (selected?.route === undefined) throw new ConnectError("Target access unavailable.", Code.PermissionDenied);
         this.#peer = selected.route;
       }
-      const input = fromBinary(method.input, bytes) as Message & { peer?: DevicePeerRouteIdentity; leaseId?: string; lockScreen?: boolean; controlGeneration?: bigint; displayId?: string };
+      const input = fromBinary(method.input, bytes) as Message & { peer?: DevicePeerRouteIdentity; leaseId?: string; lockScreen?: boolean; controlGeneration?: bigint; displayId?: string; control?: boolean };
       const mode = changingMode ? input as Message & { leaseId: string; controlGeneration: bigint; temporary: boolean } : undefined;
       const viewer = fitting || restoring ? input as Message & { leaseId: string; controlGeneration: bigint; width?: number; height?: number } : undefined;
       if (mode || viewer) {
@@ -205,7 +205,7 @@ export class DesktopRemoteDesktopViewerConnection {
         }
         const next = output.result.lease;
         if (viewer || mode?.temporary) {
-          if (!next || next.leaseId !== modeLease.leaseId || next.controlling || next.controlGeneration <= modeLease.controlGeneration ||
+          if (!next || next.leaseId !== modeLease.leaseId || next.controlling && input.control !== true || next.controlGeneration <= modeLease.controlGeneration ||
             !next.display || !next.display.displayId ||
             (mode && next.display.displayId !== modeLease.display?.displayId && next.display.displayId !== this.#sourceDisplayId) ||
             (restoring && next.display.displayId !== this.#sourceDisplayId) ||

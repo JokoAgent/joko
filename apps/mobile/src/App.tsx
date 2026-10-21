@@ -28,6 +28,7 @@ import { useMobileFileTextActions } from "./use-mobile-file-text-actions";
 import { MobileFilesPreviewPager } from "./MobileFilesPreviewPager";
 import { mobileFilesPreviewCanSwipe, type MobileFilesPreviewPager as FilesPreviewPager } from "./mobile-files-preview-pager";
 import { MobileTimelineImage } from "./MobileTimelineImage";
+import { MobileUploadLeaveDecision } from "./mobile-upload-leave-decision";
 import { MobileUserMessageContent } from "./MobileUserMessageContent";
 import { MobileMessageRunFacts } from "./MobileMessageRunFacts";
 import { MobileMcpAppCard } from "./MobileMcpAppCard";
@@ -328,6 +329,7 @@ import { mobilePartnerWorkingStatus } from "./mobile-partner-working";
 import { mobilePartnerConversationRows, mobilePartnerTimeGroups, mobilePublicConversationInputs } from "./mobile-partner-presentation";
 import { useMobileHiddenHistory } from "./use-mobile-hidden-history";
 import { MobilePartnerProfileSheet } from "./MobilePartnerProfileSheet";
+import { MobilePartnerHomeSheet } from "./MobilePartnerHomeSheet";
 import type { MobilePartnerProfileSnapshot, MobilePartnerProfileTransport } from "./mobile-partner-profile";
 import { MobileConversationSearchSheet } from "./MobileConversationSearchSheet";
 import type { MobileConversationSearchHit } from "./mobile-conversation-search";
@@ -690,6 +692,7 @@ export function App() {
     background: dark ? "#15191d" : "#f7f6f3", surface: dark ? "#24292d" : "#ffffff",
     ink: dark ? "#f4f4f2" : "#242a2d", muted: dark ? "#adb6b7" : "#637073",
     border: dark ? "#394246" : "#e1e2df", accent: "#ff9800", negative: "#cc634e",
+    positive: dark ? "#69c49f" : "#197451", warning: dark ? "#f4b84f" : "#925800",
     brandBackground: dark ? "#302920" : "#fff1db", dark
   }), [dark]);
 
@@ -1892,6 +1895,9 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
   const [workspaceMentionsVisible, setWorkspaceMentionsVisible] = useState(false);
   const [mentionBusy, setMentionBusy] = useState(false);
   const [attachmentBusy, setAttachmentBusy] = useState(false);
+  const [uploadingSubmission, setUploadingSubmission] = useState(false);
+  const uploadingSubmissionRef = useRef(false);
+  const uploadLeaveDecisionRef = useRef<MobileUploadLeaveDecision | undefined>(undefined);
   const [pastedImageCount, setPastedImageCount] = useState(0);
   const [photoLibraryLease, setPhotoLibraryLease] = useState<MobilePhotoLibraryLease>();
   const [imageEditorLease, setImageEditorLease] = useState<MobileComposerImageEditorLease>();
@@ -1997,6 +2003,7 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
     return () => {
       current = false;
       mountedRef.current = false;
+      uploadLeaveDecisionRef.current?.dispose();
       attachmentAbortRef.current?.abort();
       attachmentNativeActivityRef.current = false;
       imagePasteLeaseRef.current = undefined;
@@ -2123,6 +2130,15 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
     && retained === undefined;
   referencesEditableRef.current = referencesEditable;
   const incomingShareBatch = incomingShareState.batch;
+  const requestLeave = (): void => {
+    const leave = (): void => { if (identity) void mobileNewTaskDrafts.flush(identity).catch(() => undefined); onBack(); };
+    if (!uploadingSubmissionRef.current || !uploadLeaveDecisionRef.current) { leave(); return; }
+    uploadLeaveDecisionRef.current.requestLeave(decide => Alert.alert(
+      mobileMessage(locale, "newTask.leaveUploadTitle"), mobileMessage(locale, "newTask.leaveUploadBody"), [
+        { text: mobileMessage(locale, "newTask.leaveUploadStay"), style: "cancel", onPress: () => decide(false) },
+        { text: mobileMessage(locale, "newTask.leaveUploadDiscard"), style: "destructive", onPress: () => decide(true) }
+      ], { cancelable: true, onDismiss: () => decide(false) }), leave);
+  };
   const incomingBatchIdRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     if (incomingBatchIdRef.current === incomingShareBatch?.batchId) return;
@@ -2136,14 +2152,13 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
     setExpandedIncomingItemIds(new Set());
   }, [incomingShareBatch?.batchId]);
   useEffect(() => {
-    if (!incomingShareBatch && !showIncomingShareEmpty) return;
     const subscription = BackHandler.addEventListener("hardwareBackPress", () => {
       if (Keyboard.isVisible()) Keyboard.dismiss();
-      else onBack();
+      else requestLeave();
       return true;
     });
     return () => subscription.remove();
-  }, [incomingShareBatch, onBack, showIncomingShareEmpty]);
+  }, [incomingShareBatch, onBack, showIncomingShareEmpty, uploadingSubmission]);
   useEffect(() => {
     if (incomingDestinationKind !== "existing_task" || !profileId || !incomingSessionId
       || state.selectedId !== incomingSessionId || state.status !== "connected") {
@@ -2972,16 +2987,23 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
   };
   const submit = (): void => {
     if (!identity || voice.busy) return;
+    const decision = new MobileUploadLeaveDecision();
+    uploadLeaveDecisionRef.current?.dispose(); uploadLeaveDecisionRef.current = decision;
     setError("");
     mobileNewTaskDrafts.save(identity, draft);
-    void mobileNewTaskDrafts.flush(identity).then(() => client.create(draft.targetId, draft.name, draft.input, undefined, draft.collaboration)).then((result) => {
+    void mobileNewTaskDrafts.flush(identity).then(() => client.create(draft.targetId, draft.name, draft.input, undefined, draft.collaboration, {
+      signal: decision.controller.signal, waitForLeaveDecision: () => decision.waitForLeaveDecision(),
+      onUploadingChange: uploading => { if (mountedRef.current && uploadLeaveDecisionRef.current === decision) {
+        uploadingSubmissionRef.current = uploading; setUploadingSubmission(uploading);
+      } }
+    })).then((result) => {
       if (result.sessionId) onCreated();
-    }).catch((failure) => setError(errorText(failure)));
+    }).catch((failure) => { if (mountedRef.current && !decision.controller.signal.aborted) setError(errorText(failure)); });
   };
   return <ScrollView contentContainerStyle={styles.screen} keyboardShouldPersistTaps="handled">
     <Back label={mobileMessage(locale, "common.tasks")}
       accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })}
-      onPress={() => { if (identity) void mobileNewTaskDrafts.flush(identity).catch(() => undefined); onBack(); }} colors={colors} />
+      onPress={requestLeave} colors={colors} />
     <Text style={[styles.title, { color: colors.ink }]}>{mobileMessage(locale,
       incomingShareBatch?.status === "ready" && incomingDestinationKind === "existing_task"
         ? "incoming.title" : "newTask.title")}</Text>
@@ -3458,6 +3480,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
   const [sharedBackendChoices, setSharedBackendChoices] = useState(false);
   const [partnerSettingsOwner, setPartnerSettingsOwner] = useState<string>();
+  const [partnerHome, setPartnerHome] = useState<{ readonly api: import("@joko/contracts").PartnerHomeApi; readonly partnerId: string; readonly revision: bigint }>();
   const [partnerLearningEntry, setPartnerLearningEntry] = useState<{ readonly owner: string;
     readonly destination: PartnerLearningSettingsDestination; readonly messageId: string; readonly completionEventId: string }>();
   const [partnerOutputsShell, setPartnerOutputsShell] = useState<{ readonly identity: string; readonly owner: string;
@@ -3515,6 +3538,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const copyInFlightRef = useRef(false);
   const timelineListRef = useRef<FlatList<MobileWorkItem<TimelineRow>>>(null);
   const timelineViewportRef = useRef<View>(null);
+  const queueViewportRef = useRef<View>(null);
   const partnerConversationTransport = client.partnerConversationTransport();
   const partnerIdentity = useMobilePartnerIdentity(partnerConversationTransport);
   const [visiblePartnerRows, setVisiblePartnerRows] = useState<{
@@ -6089,12 +6113,15 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           if (part.kind === "artifact") return renderTimelineArtifact(part.artifact);
           return <MobileMarkdownMessage key={`${markdownOwnerKey}/part/${part.contentIndex}`} text={part.text}
             colors={colors} locale={locale} ownerKey={`${markdownOwnerKey}/part/${part.contentIndex}`}
+            answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id, part.contentIndex])} streaming={!item.completed}
+            resourceText={item.text}
             resourceClient={client} messageId={item.id}
             resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
             onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />;
         }) : item.tool ? <MobileToolCallCard key={markdownOwnerKey} call={item.tool} ownerKey={markdownOwnerKey} colors={colors} locale={locale}
           enabled={state.status === "connected" || state.status === "offline"} />
           : item.kind === "assistant" ? <MobileMarkdownMessage key={markdownOwnerKey} text={item.text} colors={colors} locale={locale}
+          answerStateKey={JSON.stringify([client.answerStateOwnerKey(), item.id])} streaming={!item.completed}
           ownerKey={markdownOwnerKey} resourceClient={client} messageId={item.id}
           resourceOwnerKey={item.completed && !item.optimistic ? client.markdownResourceOwnerKey() : undefined}
           onOpenImage={openMarkdownImage} onOpenPath={openMarkdownPath} />
@@ -6356,10 +6383,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       </MobilePartnerConversationRow> : renderTimelineItem(item)}</View>} />
     </View>
     <View testID="task.controls-viewport" pointerEvents="box-none" style={controlsRegion}>
-    {queueItems.length > 0 && <View style={styles.queueRegion}>
+    {queueItems.length > 0 && <View ref={queueViewportRef} collapsable={false} style={styles.queueRegion}
+      onLayout={() => setImageViewportPulse(value => value + 1)}>
       <Text style={[styles.section, { color: colors.muted }]}>{mobileMessage(locale, "task.queue")}</Text>
       <ScrollView nestedScrollEnabled style={styles.queueScroll} contentContainerStyle={styles.queueList}
-        keyboardShouldPersistTaps="handled">
+        keyboardShouldPersistTaps="handled" onScroll={() => setImageViewportPulse(value => value + 1)} scrollEventThrottle={100}>
       {queueItems.map((item, index) => {
         const editing = queueEdit?.lease.queueItemId === item.queueItemId;
         const disabled = state.busy || voice.busy || state.status !== "connected" || queueMutationPending || interactions.length > 0 || (!!queueEdit && !editing);
@@ -6368,6 +6396,15 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           <Text style={[styles.caption, { color: colors.muted }]}>{mobileMessage(locale, "task.queued")} {index + 1} · {queueState(item.state, locale)}{item.editLocked && !editing ? mobileMessage(locale, "task.editingElsewhere") : ""}</Text>
           {item.sharedTaskAuthor?.displayName && <Text style={[styles.caption, { color: colors.muted }]}>{item.sharedTaskAuthor.displayName}</Text>}
           <Text selectable style={[styles.body, { color: colors.ink }]}>{queueItemSummary(item, locale)}</Text>
+          <View style={styles.actionRow}>{client.taskQueueImagePages(item.queueItemId).map((image, imageIndex, images) =>
+            <MobileTimelineImage key={image.pageId} client={client} page={image} eventId="" queueItemId={item.queueItemId}
+              ownerKey={client.taskPresentationOwnerKey()} eligible={state.status === "connected"} viewportPulse={imageViewportPulse}
+              viewportRef={queueViewportRef} maximumWidth={180} colors={colors} locale={locale}
+              openLabel={mobileMessage(locale, "task.openImage", { index: imageIndex + 1, count: images.length, name: image.title })}
+              disabled={state.status !== "connected"} onOpen={() => {
+                void imageGallery.open(signal => client.openQueueImageGallery(item.queueItemId, image.pageId, signal))
+                  .catch(failure => setLocalError(errorText(failure)));
+              }} />)}</View>
           <View style={styles.queueActions}>
             {queueCapabilities.edit && client.taskQueueItemOwned(item) && <Action label={editing ? mobileMessage(locale, "composer.editing") : mobileMessage(locale, "common.edit")} colors={colors} compact
               disabled={disabled || editing || item.editLocked || editableText === undefined}
@@ -6442,7 +6479,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     </View> : <View style={[styles.composer, { borderColor: colors.border, backgroundColor: colors.surface }]}>
       {partnerRead.partner && <Action label={[partnerRead.partner.capabilities.modelChain[0]?.modelId,
         mobileMessage(locale, partnerRead.partner.capabilities.permissionMode === "ask" ? "partnerProfile.ask"
-          : partnerRead.partner.capabilities.permissionMode === "auto" ? "partnerProfile.auto" : "controls.permission.full"),
+          : partnerRead.partner.capabilities.permissionMode === "acceptEdits" ? "controls.permission.edits" : partnerRead.partner.capabilities.permissionMode === "auto" ? "partnerProfile.auto" : "controls.permission.full"),
         ...(partnerRead.partner.capabilities.planMode ? [mobileMessage(locale, "partnerProfile.plan")] : [])].filter(Boolean).join(" · ")}
         colors={colors} compact disabled={!partnerProfileTransport || state.busy || attachmentBusy || voice.busy}
         onPress={openRuntimeControls} />}
@@ -6788,6 +6825,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
         return completed;
       }}
       onError={setLocalError} />
+    {partnerHome && <MobilePartnerHomeSheet key={partnerHome.api.ownerKey} api={partnerHome.api} partnerId={partnerHome.partnerId} revision={partnerHome.revision}
+      locale={locale} colors={colors} newRequestId={randomUUID} onClose={() => setPartnerHome(undefined)} onChanged={sessionId => {
+        void client.refresh().then(() => client.select(sessionId)).then(() => setPartnerHome(undefined)).catch(() => setLocalError(mobileMessage(locale, "partnerProfile.failed")));
+      }} />}
     <MobilePartnerProfileSheet visible={partnerSettingsVisible} partner={offlineOutputsShell?.partner ?? partnerRead.partner ?? client.partnerProfileContinuationPartner()}
       initialLearningDestination={partnerLearningEntry && partnerLearningEntry.owner === partnerSettingsOwner ? partnerLearningEntry.destination : undefined}
       transport={offlineOutputsShell?.transport ?? partnerProfileTransport} online={state.status === "connected"}
@@ -6795,6 +6836,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       memoryFactory={(partner, ownerKey) => client.partnerMemoryEditor(partner, ownerKey)}
       connectionsFactory={(partner, ownerKey) => client.partnerConnectionsEditor(partner, ownerKey)}
       skillsFactory={(partner, ownerKey) => client.partnerSkillsEditor(partner, ownerKey)}
+      onOpenHome={partner => { const api = client.partnerHomeApi(); if (api) setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision }); }}
       deletionTransport={client.partnerDeletionTransport()}
       restartTransport={client.partnerRestartTransport()}
       resumeFactory={partner => client.partnerResumeEditor(partner, partnerProfileTransport?.ownerKey)}

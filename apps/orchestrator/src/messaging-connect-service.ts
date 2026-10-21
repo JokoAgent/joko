@@ -1026,14 +1026,16 @@ function toProtoRuntimeStatus(
   }
 }
 
-function fromProtoPermissionMode(value: contract.PermissionMode): "ask" | "auto" | "bypassPermissions" {
+function fromProtoPermissionMode(value: contract.PermissionMode): "ask" | "acceptEdits" | "auto" | "bypassPermissions" {
   if (value === contract.PermissionMode.ASK) return "ask";
   if (value === contract.PermissionMode.AUTO) return "auto";
+  if (value === contract.PermissionMode.ACCEPT_EDITS) return "acceptEdits";
   if (value === contract.PermissionMode.BYPASS_PERMISSIONS) return "bypassPermissions";
   throw new ConnectError("permission_mode is required.", Code.InvalidArgument);
 }
 
 function toProtoPermissionMode(value: MessagingRouteRecord["permissionMode"]): contract.PermissionMode {
+  if (value === "acceptEdits") return contract.PermissionMode.ACCEPT_EDITS;
   if (value === "auto") return contract.PermissionMode.AUTO;
   if (value === "bypassPermissions") return contract.PermissionMode.BYPASS_PERMISSIONS;
   return contract.PermissionMode.ASK;

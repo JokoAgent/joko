@@ -689,6 +689,7 @@ export interface ManagedTextInferenceInput {
   readonly signal?: AbortSignal;
   readonly timeoutMs: number;
   readonly fetch?: typeof globalThis.fetch;
+  readonly assertCurrent?: () => void;
 }
 
 /** Bounded Orchestrator-owned utility inference; Provider credentials stay in the request stack. */
@@ -709,9 +710,22 @@ export function requestManagedTextInference(input: ManagedTextInferenceInput): P
     system: input.system,
     user: input.user,
     maxTokens: input.maxTokens,
+    retryReasoningBudget: true,
+    ...(input.assertCurrent === undefined ? {} : { assertCurrent: input.assertCurrent }),
     ...(input.signal === undefined ? {} : { signal: input.signal }),
     timeoutMs: input.timeoutMs
   });
+}
+
+/** Plugin one-shot output is user controlled. Omitted limits remain omitted on
+ * protocols that allow it; Messages requires the model's declared output limit. */
+export function requestPluginTextInference(input: Omit<ManagedTextInferenceInput, "maxTokens"> & { readonly maxTokens?: number; readonly modelOutputLimit: number }): Promise<string> {
+  if (!input.user.trim() || input.user.length > 33_024 || input.system.length > 32_768
+    || input.maxTokens !== undefined && (!Number.isSafeInteger(input.maxTokens) || input.maxTokens < 1)) throw new RangeError("Plugin text request is invalid.");
+  if (!Number.isSafeInteger(input.modelOutputLimit) || input.modelOutputLimit < 1) throw new RangeError("The model output limit is unavailable.");
+  return requestInference({ ...input, fetch: input.fetch ?? globalThis.fetch,
+    ...(input.maxTokens === undefined ? {} : { maxTokens: input.maxTokens }),
+    anthropicOutputLimit: input.modelOutputLimit });
 }
 
 async function requestInference(input: {
@@ -720,9 +734,12 @@ async function requestInference(input: {
   readonly system: string;
   readonly user: string;
   readonly image?: { readonly mimeType: string; readonly base64: string };
-  readonly maxTokens: number;
+  readonly maxTokens?: number;
+  readonly anthropicOutputLimit?: number;
   readonly signal?: AbortSignal;
   readonly timeoutMs: number;
+  readonly retryReasoningBudget?: boolean;
+  readonly assertCurrent?: () => void;
 }): Promise<string> {
   const endpoint = input.route.requestPath === undefined
     ? inferenceEndpoint(input.route.baseUrl, input.route.api)
@@ -732,6 +749,8 @@ async function requestInference(input: {
   const body = inferenceBody(input);
   let response: Response;
   try {
+    input.assertCurrent?.();
+    signal.throwIfAborted();
     response = await input.fetch(endpoint, {
       method: "POST",
       redirect: "error",
@@ -765,8 +784,31 @@ async function requestInference(input: {
     throw new InferenceFailure("INVALID_RESPONSE", { cause: error });
   }
   const output = inferenceText(parsed, input.route.api);
+  if (output.length === 0 && input.retryReasoningBudget === true && input.maxTokens !== undefined) {
+    const budget = reasoningRetryBudget(parsed, input.route.api, input.maxTokens);
+    if (budget !== undefined) {
+      input.assertCurrent?.();
+      signal.throwIfAborted();
+      return requestInference({ ...input, maxTokens: budget, retryReasoningBudget: false, signal });
+    }
+  }
   if (output.length === 0) throw new InferenceFailure("EMPTY_RESPONSE");
   return output;
+}
+
+/** Retry only a provider-declared length stop with no visible answer. */
+function reasoningRetryBudget(value: unknown, api: ProviderInferenceRoute["api"], requested: number): number | undefined {
+  if (!isRecord(value)) return undefined;
+  const first = Array.isArray(value["choices"]) ? value["choices"][0] : undefined;
+  const exhausted = api === "anthropic-messages" ? value["stop_reason"] === "max_tokens"
+    : api === "openai-responses" ? isRecord(value["incomplete_details"]) && value["incomplete_details"]["reason"] === "max_output_tokens"
+      : isRecord(first) && first["finish_reason"] === "length";
+  if (!exhausted) return undefined;
+  const usage = isRecord(value["usage"]) ? value["usage"] : undefined;
+  const observed = usage?.["completion_tokens"];
+  const burned = typeof observed === "number" && Number.isFinite(observed) && observed > 0 ? observed : 0;
+  const budget = Math.min(16_384, burned > 0 ? Math.max(requested * 2, requested + burned + 512) : Math.max(requested * 4, 4_096));
+  return budget > requested ? Math.ceil(budget) : undefined;
 }
 
 function inferenceBody(input: Parameters<typeof requestInference>[0]): unknown {
@@ -784,7 +826,7 @@ function inferenceBody(input: Parameters<typeof requestInference>[0]): unknown {
       model: input.route.modelId,
       system: input.system,
       messages: [{ role: "user", content }],
-      max_tokens: input.maxTokens
+      max_tokens: input.maxTokens ?? input.anthropicOutputLimit
     };
   }
   if (input.route.api === "openai-responses") {

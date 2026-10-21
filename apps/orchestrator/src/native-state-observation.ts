@@ -156,7 +156,7 @@ function normalizeMaterializedNativeState(value: unknown): MaterializedNativeSta
   if (
     typeof streaming !== "boolean" || typeof compacting !== "boolean" ||
     pendingMessages === undefined || typeof fastMode !== "boolean" ||
-    (permissionMode !== "ask" && permissionMode !== "auto" && permissionMode !== "bypassPermissions")
+    (permissionMode !== "ask" && permissionMode !== "auto" && permissionMode !== "acceptEdits" && permissionMode !== "bypassPermissions")
   ) throw new Error("Native state observation fields are invalid.");
   const nativeSessionId = optionalNativeIdentifier(value["nativeSessionId"]);
   const name = optionalText(value["name"], MAX_DISPLAY_LENGTH);

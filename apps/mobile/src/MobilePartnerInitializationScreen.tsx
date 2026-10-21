@@ -1,17 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { MobilePartnerAvatar } from "./MobilePartnerAvatar";
 import type { MobilePartnersColors } from "./MobilePartnersScreen";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
 import { mobileMessage } from "./mobile-messages";
 import type { MobilePartnerDirectoryProfile } from "./mobile-partner-directory";
-import type { MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
+import type { MobilePartnerInitializationModel, MobilePartnerInitializationTransport } from "./mobile-partner-initialization";
 
 interface InitializationState {
   readonly binding?: string;
   readonly partner?: MobilePartnerDirectoryProfile;
   readonly loading: boolean;
-  readonly error?: "read" | "retry" | "open";
+  readonly error?: "read" | "retry" | "open" | "configure";
 }
 
 export function MobilePartnerInitializationScreen({ partnerId, transport, colors, locale, onBack, onOpenTask }: {
@@ -35,10 +35,11 @@ export function MobilePartnerInitializationScreen({ partnerId, transport, colors
   const partner = current ? state.partner : undefined;
   const error = current ? state.error : undefined;
 
-  const run = (kind: "read" | "retry" | "open"): void => {
+  const run = (kind: "read" | "retry" | "open" | "configure", model?: MobilePartnerInitializationModel): void => {
     const active = transportRef.current; const expected = bindingRef.current;
     if (!active || !expected || flightRef.current || kind !== "read" && !partner) return;
     if (kind === "retry" && (partner?.initializationState !== "error" || error)) return;
+    if (kind === "configure" && (!model || !active.configure || error)) return;
     const controller = new AbortController(); requestRef.current = controller;
     const generation = ++generationRef.current;
     const valid = (): boolean => !controller.signal.aborted && bindingRef.current === expected
@@ -52,7 +53,8 @@ export function MobilePartnerInitializationScreen({ partnerId, transport, colors
     else setState((previous) => ({ ...previous, error: undefined }));
     const work = kind === "open" ? active.open(partner!, controller.signal).then((result) => {
       if (valid()) onOpenTask(result.sessionId);
-    }) : (kind === "retry" ? active.retry(partner!, controller.signal) : active.load(partnerId, controller.signal)).then((next) => {
+    }) : (kind === "configure" ? active.configure!(partner!, model!, controller.signal)
+      : kind === "retry" ? active.retry(partner!, controller.signal) : active.load(partnerId, controller.signal)).then((next) => {
       if (!valid()) return;
       if (next.partnerId !== partnerId || next.lifecycle !== "active") throw new Error("Initialization profile mismatch.");
       setState({ binding: expected, partner: next, loading: false });
@@ -91,7 +93,7 @@ export function MobilePartnerInitializationScreen({ partnerId, transport, colors
       </Text>
       {action(mobileMessage(locale, "common.refresh"), () => run("read"), !binding || busy || current && state.loading)}
     </View>
-    <View style={styles.center}>
+    <ScrollView contentContainerStyle={styles.center}>
       {!binding ? <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "partnerInitialization.offline")}</Text>
         : !partner ? <>
           {error ? <><Text accessibilityRole="alert" style={[styles.body, { color: colors.negative }]}>
@@ -108,6 +110,12 @@ export function MobilePartnerInitializationScreen({ partnerId, transport, colors
           {partner.initializationState === "error" ? <>
             {partner.initializationErrorCode && <Text style={[styles.body, styles.centered, { color: colors.muted }]}>
               {mobileMessage(locale, `partnerInitialization.reason.${partner.initializationErrorCode}`)}</Text>}
+            {partner.initializationErrorCode === "modelUnavailable" && transport?.configure && <View style={styles.notice}>
+              <Text style={[styles.body, { color: colors.ink }]}>{mobileMessage(locale, "partnerProfile.chooseModel")}</Text>
+              {(transport.models?.(partner) ?? []).map(model => <View key={model.id}>
+                {action(model.label, () => run("configure", model), busy || state.loading || !!error)}
+              </View>)}
+            </View>}
             {action(mobileMessage(locale, "partnerInitialization.retry"), () => run("retry"), busy || state.loading || !!error)}
           </> : <View accessibilityLiveRegion="polite" style={styles.stage}>
             {(!error || state.loading) && <ActivityIndicator color={colors.muted} />}
@@ -117,12 +125,12 @@ export function MobilePartnerInitializationScreen({ partnerId, transport, colors
           {busy && partner.initializationState === "error" && <ActivityIndicator color={colors.muted} />}
           {error && <View accessibilityRole="alert" style={styles.notice}>
             <Text style={[styles.body, styles.centered, { color: colors.negative }]}>{mobileMessage(locale,
-              error === "retry" ? "partnerInitialization.retryFailed" : error === "open"
+              error === "retry" || error === "configure" ? "partnerInitialization.retryFailed" : error === "open"
                 ? "partnerInitialization.openFailed" : "partnerInitialization.readFailed")}</Text>
             {action(mobileMessage(locale, "common.refresh"), () => run("read"), busy || state.loading)}
           </View>}
         </>}
-    </View>
+    </ScrollView>
   </View>;
 }
 
@@ -130,7 +138,7 @@ const styles = StyleSheet.create({
   screen: { flex: 1, paddingTop: 12 }, grow: { flex: 1, minWidth: 0 },
   header: { minHeight: 54, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14 },
   title: { fontSize: 20, lineHeight: 28, fontWeight: "600" }, body: { fontSize: 15, lineHeight: 22 },
-  center: { flex: 1, gap: 18, alignItems: "center", justifyContent: "center", padding: 24 },
+  center: { flexGrow: 1, gap: 18, alignItems: "center", justifyContent: "center", padding: 24 },
   centered: { textAlign: "center" }, stage: { flexDirection: "row", alignItems: "center", gap: 10 },
   notice: { alignItems: "center", gap: 14 }, action: { minHeight: 44, paddingHorizontal: 12, paddingVertical: 10,
     borderWidth: 1, borderRadius: 12, alignItems: "center", justifyContent: "center" }, disabled: { opacity: 0.45 }

@@ -690,6 +690,7 @@ export class OperationalStore {
   private readonly now: () => number;
   private readonly idFactory: () => string;
   private readonly suppressSessionNotifications: OperationalStoreOptions["suppressSessionNotifications"];
+  private readonly assistantTextForSearch: OperationalStoreOptions["assistantTextForSearch"];
   private readonly subscribers = new Set<EventSubscriber>();
   private readonly operationSubscribers = new Set<(operationId: string) => void>();
   private readonly pendingPublications: PersistedEvent[] = [];
@@ -710,6 +711,7 @@ export class OperationalStore {
     this.now = options.now ?? Date.now;
     this.idFactory = options.idFactory ?? randomUUID;
     this.suppressSessionNotifications = options.suppressSessionNotifications;
+    this.assistantTextForSearch = options.assistantTextForSearch;
     let messageVectorAvailable = false;
     try {
       try {
@@ -2176,7 +2178,9 @@ export class OperationalStore {
         JOIN mobile_push_registrations AS registration ON registration.id = delivery.registration_id
         JOIN connections AS connection ON connection.id = registration.connection_id
         JOIN devices AS device ON device.id = registration.device_id
+        JOIN product_sessions AS session ON session.id = delivery.session_id
         WHERE delivery.status = 'pending' AND delivery.available_at <= ?
+          AND session.hidden = 0
           AND registration.expires_at > ?
           AND connection.state = 'active' AND connection.device_id = registration.device_id
           AND device.state = 'active' AND device.kind = 'mobile'
@@ -2239,11 +2243,12 @@ export class OperationalStore {
         ).run(current.registrationId);
         return undefined;
       }
-      const status = input.outcome === "retry" ? "pending" : input.outcome;
-      const availableAt = input.outcome === "retry"
+      const hiddenRetry = input.outcome === "retry" && this.getSession(current.sessionId).descriptor.hidden === true;
+      const status = hiddenRetry ? "failed" : input.outcome === "retry" ? "pending" : input.outcome;
+      const availableAt = input.outcome === "retry" && !hiddenRetry
         ? safeNonNegativeInteger(input.retryAt, "Mobile push retry time")
         : current.availableAt;
-      if (input.outcome === "retry" && availableAt <= at) {
+      if (input.outcome === "retry" && !hiddenRetry && availableAt <= at) {
         throw new StoreError("Mobile push retry time must be in the future.");
       }
       this.database.prepare(`
@@ -2254,7 +2259,7 @@ export class OperationalStore {
       `).run(
         status,
         availableAt,
-        code,
+        hiddenRetry ? "TASK_HIDDEN" : code,
         at,
         asSqlInteger(this.requireActiveRevision()),
         id,
@@ -2273,7 +2278,8 @@ export class OperationalStore {
       SELECT MIN(delivery.available_at) AS available_at
       FROM mobile_push_deliveries AS delivery
       JOIN mobile_push_registrations AS registration ON registration.id = delivery.registration_id
-      WHERE delivery.status = 'pending' AND registration.expires_at > ?
+      JOIN product_sessions AS session ON session.id = delivery.session_id
+      WHERE delivery.status = 'pending' AND registration.expires_at > ? AND session.hidden = 0
     `).get(this.now()) as Row | undefined;
     const value = row?.["available_at"];
     return value === null || value === undefined ? undefined : numberValue(value);
@@ -3461,13 +3467,13 @@ export class OperationalStore {
         INSERT INTO product_sessions(
           id, backend_id, target_id, project_id, title, title_source, task_summary,
           summary_source_cursor, summary_updated_at, native_opaque_ref, native_binding_fingerprint, native_session_id,
-          generation, pinned, archived, deleted_at, permission_mode, plan_mode,
+          generation, pinned, archived, hidden, deleted_at, permission_mode, plan_mode,
           provider_id, model_id, effort, fast_mode, append_system_prompt,
           remote_location_kind, remote_host_target_id, remote_host_id, remote_controller_device_id,
           remote_target_device_id, remote_workspace_root, automation_schedule_id, automation_schedule_name,
           automation_run_id, derivation_kind, derivation_source_session_id,
           derivation_source_message_id, derivation_source_event_id, created_at, updated_at, revision
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         descriptor.id,
         descriptor.backendId,
@@ -3484,6 +3490,7 @@ export class OperationalStore {
         descriptor.binding.generation,
         boolInt(descriptor.pinned),
         boolInt(descriptor.archived),
+        boolInt(descriptor.hidden === true),
         descriptor.deletedAt ?? null,
         descriptor.permissionMode,
         boolInt(descriptor.planMode),
@@ -6050,7 +6057,7 @@ export class OperationalStore {
     readonly sessionId: string;
     readonly expectedSessionGeneration: number;
     readonly routeScopeKey: string;
-    readonly expectedPermissionMode?: "ask" | "auto" | "bypassPermissions";
+    readonly expectedPermissionMode?: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
     readonly updatedAt?: number;
   }): MessagingConversationRecord {
     return this.write(() => {
@@ -7319,7 +7326,7 @@ export class OperationalStore {
       : row["kind"] === "create_collaboration_worker_session" ? "collaboration" : row["kind"] === "create_messaging_session" ? "messaging" : "learning";
   }
 
-  listSessions(options: { readonly targetId?: string; readonly includeArchived?: boolean; readonly includeDeleted?: boolean } = {}): StoredSession[] {
+  listSessions(options: { readonly targetId?: string; readonly includeArchived?: boolean; readonly includeDeleted?: boolean; readonly excludeHidden?: boolean } = {}): StoredSession[] {
     this.assertOpen();
     const clauses: string[] = [];
     const params: Array<string | number> = [];
@@ -7329,6 +7336,7 @@ export class OperationalStore {
     }
     if (options.includeArchived !== true) clauses.push("archived = 0");
     if (options.includeDeleted !== true) clauses.push("deleted_at IS NULL");
+    if (options.excludeHidden === true) clauses.push("hidden = 0");
     const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
     return (this.database.prepare(
       `SELECT * FROM product_sessions ${where} ORDER BY pinned DESC, updated_at DESC, id`
@@ -8240,7 +8248,7 @@ export class OperationalStore {
   updateSession(
     id: string,
     patch: Omit<Partial<Pick<SessionDescriptor,
-      "title" | "pinned" | "archived" | "deletedAt" | "permissionMode" | "planMode" |
+      "title" | "pinned" | "archived" | "hidden" | "deletedAt" | "permissionMode" | "planMode" |
       "providerId" | "modelId" | "effort" | "fastMode" | "binding">>, "effort"> & {
         /** `null` explicitly clears a stale effort when the selected model exposes none. */
         readonly effort?: string | null;
@@ -8275,7 +8283,7 @@ export class OperationalStore {
       this.database.prepare(`
         UPDATE product_sessions SET
           title = ?, title_source = ?, native_opaque_ref = ?, native_binding_fingerprint = ?, native_session_id = ?, generation = ?,
-          pinned = ?, archived = ?, deleted_at = ?, permission_mode = ?, plan_mode = ?,
+          pinned = ?, archived = ?, hidden = ?, deleted_at = ?, permission_mode = ?, plan_mode = ?,
           provider_id = ?, model_id = ?, effort = ?, fast_mode = ?,
           task_summary = ?, summary_source_cursor = ?, summary_updated_at = ?,
           updated_at = ?, revision = ?
@@ -8289,6 +8297,7 @@ export class OperationalStore {
         binding.generation,
         boolInt(patch.pinned ?? descriptor.pinned),
         boolInt(patch.archived ?? descriptor.archived),
+        boolInt(patch.hidden ?? descriptor.hidden ?? false),
         patch.deletedAt ?? descriptor.deletedAt ?? null,
         patch.permissionMode ?? descriptor.permissionMode,
         boolInt(patch.planMode ?? descriptor.planMode),
@@ -8306,6 +8315,8 @@ export class OperationalStore {
         id,
         asSqlInteger(current.revision)
       );
+      if (patch.hidden === true) this.database.prepare(`UPDATE mobile_push_deliveries SET status = 'failed', outcome_code = 'TASK_HIDDEN', updated_at = ?, revision = ? WHERE session_id = ? AND status = 'pending'`)
+        .run(now, asSqlInteger(this.requireActiveRevision()), id);
       if (descriptor.deletedAt === undefined && patch.deletedAt !== undefined) {
         this.database.prepare("DELETE FROM session_objectives WHERE session_id = ?").run(id);
         this.database.prepare("DELETE FROM session_objective_generations WHERE session_id = ?").run(id);
@@ -8366,7 +8377,7 @@ export class OperationalStore {
       if (
         nativeBindingChanged || binding.generation !== descriptor.binding.generation ||
         patch.title !== undefined || patch.pinned !== undefined || patch.archived !== undefined ||
-        patch.deletedAt !== undefined
+        patch.deletedAt !== undefined || patch.hidden !== undefined
       ) this.appendSessionProjectionEvent(updated, `session-update:${id}:${updated.revision.toString(10)}`);
       return updated;
     });
@@ -11038,7 +11049,7 @@ export class OperationalStore {
   armManualContextRebuild(input: { readonly sessionId: string; readonly operationId: string }): PendingContextRebuild {
     return this.write(() => {
       const session = this.getSession(input.sessionId); const operation = this.getOperation(input.operationId);
-      if (operation.kind !== "restart_partner_runtime" || typeof operation.body !== "object" || operation.body === null
+      if (!["restart_partner_runtime", "restore_partner_home_context"].includes(operation.kind) || typeof operation.body !== "object" || operation.body === null
         || !("sessionId" in operation.body) || operation.body.sessionId !== input.sessionId) {
         throw new StoreError("Manual context rebuild requires its exact durable restart operation.");
       }
@@ -11233,6 +11244,13 @@ export class OperationalStore {
             : { nativeSessionId: updated.descriptor.binding.nativeSessionId })
         }
       });
+      const operation = input.operationId === undefined ? undefined : this.findOperation(input.operationId);
+      if (operation?.kind === "restore_partner_home_context") {
+        if (pending.reason !== "manual_restart" || typeof operation.body !== "object" || operation.body === null
+          || !("sessionId" in operation.body) || operation.body.sessionId !== input.sessionId) throw new StoreError("The home context receipt belongs to another native owner.");
+        this.completeDeferredEffectOperation(operation.id, operation.bodyHash, () => ({ sessionId: updated.descriptor.id,
+          generation: updated.descriptor.binding.generation, bindingIdentity: operationBodyHash(updated.descriptor.binding) }));
+      }
       return updated;
     });
   }
@@ -12493,7 +12511,7 @@ export class OperationalStore {
         SELECT event.session_id, ${timelineItemSql} AS timeline_item_id
         FROM message_search_fts
         JOIN events AS event ON event.global_cursor = message_search_fts.rowid
-        JOIN product_sessions AS session ON session.id = event.session_id AND session.deleted_at IS NULL
+        JOIN product_sessions AS session ON session.id = event.session_id AND session.deleted_at IS NULL AND session.hidden = 0
         WHERE ${candidateClause}
           AND event.global_cursor <= ?${scopeClause}${structured.clause}
           ${nativeVisibility?.clause("event") ?? ""}
@@ -12525,7 +12543,7 @@ export class OperationalStore {
           ) AS score
         FROM message_search_fts
         JOIN events AS event ON event.global_cursor = message_search_fts.rowid
-        JOIN product_sessions AS session ON session.id = event.session_id AND session.deleted_at IS NULL
+        JOIN product_sessions AS session ON session.id = event.session_id AND session.deleted_at IS NULL AND session.hidden = 0
         WHERE ${candidateClause}
           AND event.global_cursor <= ?${scopeClause}${structured.clause}
           ${nativeVisibility?.clause("event") ?? ""}
@@ -12672,7 +12690,7 @@ export class OperationalStore {
         FROM message_search_fts
         JOIN events AS event ON event.global_cursor = message_search_fts.rowid
         JOIN product_sessions AS session
-          ON session.id = event.session_id AND session.deleted_at IS NULL
+          ON session.id = event.session_id AND session.deleted_at IS NULL AND session.hidden = 0
         WHERE ${candidateClause}
           AND event.global_cursor <= ?${scopeClause}${structured.clause}
           ${input.nativeVisibility.clause("event")}
@@ -12715,7 +12733,7 @@ export class OperationalStore {
               ON embedding.event_cursor = ${MESSAGE_SEARCH_VECTOR_TABLE}.rowid
             JOIN events AS event ON event.global_cursor = ${MESSAGE_SEARCH_VECTOR_TABLE}.rowid
             JOIN product_sessions AS session
-              ON session.id = event.session_id AND session.deleted_at IS NULL
+              ON session.id = event.session_id AND session.deleted_at IS NULL AND session.hidden = 0
             WHERE ${MESSAGE_SEARCH_VECTOR_TABLE}.provider_id = ?
               AND ${MESSAGE_SEARCH_VECTOR_TABLE}.provider_generation_id = ?
               AND ${MESSAGE_SEARCH_VECTOR_TABLE}.model_id = ?
@@ -12806,7 +12824,7 @@ export class OperationalStore {
       FROM events AS event
       JOIN message_search_fts ON message_search_fts.rowid = event.global_cursor
       JOIN product_sessions AS session
-        ON session.id = event.session_id AND session.deleted_at IS NULL
+        ON session.id = event.session_id AND session.deleted_at IS NULL AND session.hidden = 0
       WHERE event.global_cursor IN (${placeholders})
     `).all(...fused.map((entry) => asSqlInteger(entry.eventCursor))) as Row[];
     const ranked = fairMessageSearchRows(materialized.map((row) => {
@@ -13137,7 +13155,7 @@ export class OperationalStore {
   }
 
   private indexVisibleMessage(event: PersistedEvent): void {
-    const visibleText = visibleMessageText(event.payload);
+    const visibleText = visibleMessageText(event.payload, this.assistantTextForSearch);
     if (visibleText === undefined) return;
     this.database.prepare(`
       INSERT INTO message_search_fts(rowid, event_id, visible_text)
@@ -14002,7 +14020,7 @@ export class OperationalStore {
     attention: SessionAttentionRecord,
     at: number
   ): void {
-    if (this.suppressSessionNotifications?.(session.descriptor.id) === true) return;
+    if (session.descriptor.hidden || this.suppressSessionNotifications?.(session.descriptor.id) === true) return;
     const message = this.latestMobilePushMessageOrigin(
       session.descriptor.id,
       attention.subjectCursor
@@ -17166,6 +17184,22 @@ export class OperationalStore {
     return makerMemoryEntryFromRow(row);
   }
 
+  /** Rebind curated Partner memory to a prepared home; native compression records stay with their old runtime. */
+  movePartnerMemory(sourceTargetId: string, targetId: string, partnerId: string): void {
+    this.write(() => {
+      const source = this.getTarget(sourceTargetId), target = this.getTarget(targetId);
+      for (const item of [source, target]) {
+        const metadata = item.metadata as { kind?: unknown; partnerId?: unknown } | null;
+        if (!item.descriptor.managed || !item.descriptor.trusted || metadata?.kind !== "partner_home" || metadata.partnerId !== partnerId) {
+          throw new StoreError("Partner memory requires two owned managed home Targets.");
+        }
+      }
+      this.database.prepare("UPDATE maker_memory_entries SET target_id = ?, revision = ? WHERE target_id = ? AND kind <> 'digest'")
+        .run(targetId, asSqlInteger(this.requireActiveRevision()), sourceTargetId);
+      this.database.prepare("UPDATE maker_memory_fts SET target_id = ? WHERE target_id = ? AND kind <> 'digest'").run(targetId, sourceTargetId);
+    });
+  }
+
   findMakerMemoryEntry(
     targetId: string,
     kind: MakerMemoryKind,
@@ -19038,7 +19072,7 @@ function escapeLikePattern(query: string): string {
   return query.replace(/[\\%_]/gu, (character) => `\\${character}`);
 }
 
-function visibleMessageText(payload: EventPayload): string | undefined {
+function visibleMessageText(payload: EventPayload, assistantTextForSearch?: (source: string) => string): string | undefined {
   if (payload.type === "message_complete"
     && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined
       || payload.role === "user" && payload.partnerPrivateOrigin !== undefined)) return undefined;
@@ -19060,6 +19094,7 @@ function visibleMessageText(payload: EventPayload): string | undefined {
   } else {
     return undefined;
   }
+  if (payload.type === "message_complete" && payload.role === "assistant" && assistantTextForSearch) parts = [assistantTextForSearch(parts.join("\n"))];
   const visible = parts
     .filter((part) => part.trim() !== "")
     .map((part) => redactSecrets(part))
@@ -19532,8 +19567,9 @@ function sessionFromRow(row: Row): StoredSession {
       },
       pinned: booleanValue(row["pinned"]),
       archived: booleanValue(row["archived"]),
+      ...(booleanValue(row["hidden"]) ? { hidden: true } : {}),
       ...optionalNumber("deletedAt", row["deleted_at"]),
-      permissionMode: enumValue(row["permission_mode"], ["ask", "auto", "bypassPermissions"] as const),
+      permissionMode: enumValue(row["permission_mode"], ["ask", "acceptEdits", "auto", "bypassPermissions"] as const),
       planMode: booleanValue(row["plan_mode"]),
       ...optionalString("providerId", row["provider_id"]),
       ...optionalString("modelId", row["model_id"]),
@@ -19633,7 +19669,7 @@ function collaborationWorkerFromRow(row: Row): CollaborationWorkerRecord {
     ...optionalString("modelId", row["model_id"]),
     ...optionalString("effort", row["effort"]),
     fastMode: booleanValue(row["fast_mode"]),
-    permissionMode: enumValue(row["permission_mode"], ["ask", "auto", "bypassPermissions"] as const),
+    permissionMode: enumValue(row["permission_mode"], ["ask", "acceptEdits", "auto", "bypassPermissions"] as const),
     planMode: booleanValue(row["plan_mode"]),
     ...optionalNumber("sessionGeneration", row["session_generation"]),
     ...optionalNumber("backendInstanceGeneration", row["backend_instance_generation"]),
@@ -19703,7 +19739,7 @@ function messagingRouteFromRow(row: Row): MessagingRouteRecord {
     ...optionalString("modelId", row["model_id"]),
     ...optionalString("effort", row["effort"]),
     fastMode: booleanValue(row["fast_mode"]),
-    permissionMode: enumValue(row["permission_mode"], ["ask", "auto", "bypassPermissions"] as const),
+    permissionMode: enumValue(row["permission_mode"], ["ask", "acceptEdits", "auto", "bypassPermissions"] as const),
     planMode: booleanValue(row["plan_mode"]),
     createdAt: numberValue(row["created_at"]),
     updatedAt: numberValue(row["updated_at"]),
@@ -19733,7 +19769,7 @@ function messagingConversationFromRow(row: Row): MessagingConversationRecord {
       : { fastMode: booleanValue(row["fast_mode"]) }),
     ...(row["permission_mode"] === null || row["permission_mode"] === undefined
       ? {}
-      : { permissionMode: enumValue(row["permission_mode"], ["ask", "auto", "bypassPermissions"] as const) }),
+      : { permissionMode: enumValue(row["permission_mode"], ["ask", "acceptEdits", "auto", "bypassPermissions"] as const) }),
     ...(row["plan_mode"] === null || row["plan_mode"] === undefined
       ? {}
       : { planMode: booleanValue(row["plan_mode"]) }),
@@ -22890,7 +22926,7 @@ function normalizeMessagingRoute(input: PutMessagingRouteInput): Pick<
   const effort = input.effort === undefined
     ? undefined
     : messagingIdentity(input.effort, "effort", 128);
-  if (input.permissionMode !== "ask" && input.permissionMode !== "auto" && input.permissionMode !== "bypassPermissions") {
+  if (input.permissionMode !== "ask" && input.permissionMode !== "auto" && input.permissionMode !== "acceptEdits" && input.permissionMode !== "bypassPermissions") {
     throw new StoreError("Messaging route permission mode is invalid.");
   }
   return {
@@ -22984,7 +23020,7 @@ function collaborationRouteIdentity(value: string, label: string): string {
 function collaborationPermissionMode(
   value: CreateCollaborationWorkerInput["permissionMode"]
 ): CreateCollaborationWorkerInput["permissionMode"] {
-  if (value !== "ask" && value !== "auto" && value !== "bypassPermissions") {
+  if (value !== "ask" && value !== "auto" && value !== "acceptEdits" && value !== "bypassPermissions") {
     throw new StoreError("Collaboration worker permission mode is invalid.");
   }
   return value;

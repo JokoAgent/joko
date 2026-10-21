@@ -2,7 +2,7 @@
 import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { create } from "@bufbuild/protobuf";
-import { ExtensionCardSchema, ExtensionCardServiceGetResponseSchema, extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
+import { ExtensionCardSchema, ExtensionCardServiceGetResponseSchema, ExtensionAuthorizationPhase, extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { afterEach, beforeAll, expect, it, vi } from "vitest";
 import type { AppController } from "../controller.js";
 import type { ExtensionCardApi } from "../model.js";
@@ -28,6 +28,22 @@ function apiFixture() {
   return { formScope, get: vi.fn(async () => create(ExtensionCardServiceGetResponseSchema, { card: card(), interactive: true })),
     dispatch: vi.fn(async () => ({ accepted: true })), authorizeLink: vi.fn(async () => ({ authorized: true })) } as unknown as ExtensionCardApi & { get: ReturnType<typeof vi.fn>; dispatch: ReturnType<typeof vi.fn> };
 }
+it("keeps host account authorization in Desktop controls and exposes an explicit cancel while authorizing", async () => {
+  const f = mount(), api = apiFixture(), hostCard = create(ExtensionCardSchema, { cardId: "host-authorization", sessionId: "task", extensionName: "Mail", html: '<p>Connect account</p><button data-joko-action="host:connect-account">Connect account</button>' });
+  api.get.mockResolvedValue(create(ExtensionCardServiceGetResponseSchema, { card: hostCard, interactive: true, hostAuthorization: true, authorizationPhase: ExtensionAuthorizationPhase.PREPARING, authorizationClientConfigured: true }));
+  await act(async () => f.root.render(<ExtensionCardTimelineProvider controller={controller(api)}><ExtensionCard card={hostCard} t={t} /></ExtensionCardTimelineProvider>));
+  expect(f.element.textContent).toContain("Desktop");
+  Object.assign(api, { canAuthorizeAccount: true });
+  let signal!: AbortSignal;
+  api.dispatch.mockImplementation(async (_request: unknown, options: { signal: AbortSignal }) => {
+    signal = options.signal; return await new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("Cancelled")), { once: true }));
+  });
+  await act(async () => f.root.render(<ExtensionCardTimelineProvider controller={controller(api, "desktop")}><ExtensionCard card={hostCard} t={t} /></ExtensionCardTimelineProvider>));
+  expect(f.element.querySelector("iframe")).toBeNull();
+  await act(async () => [...f.element.querySelectorAll("button")].find(button => button.textContent === "Connect account")!.click());
+  const cancel = [...f.element.querySelectorAll("button")].find(button => button.textContent === "Cancel"); expect(cancel).toBeDefined();
+  await act(async () => cancel!.click()); expect(signal.aborted).toBe(true);
+});
 it("retains its original API while the same owner's mail-link callback or parent state changes", async () => {
   const f = mount(), api = apiFixture(), view = controller(api), bind = vi.fn(() => ({ ...api })); Object.assign(view, { extensionCardApi: bind });
   const render = () => <ExtensionMailLinkContext.Provider value={async () => false}><ExtensionCardTimelineProvider controller={view}><ExtensionCard card={card()} t={t} /></ExtensionCardTimelineProvider></ExtensionMailLinkContext.Provider>;

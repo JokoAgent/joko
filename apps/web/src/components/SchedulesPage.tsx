@@ -1191,6 +1191,7 @@ function scheduleTemplateCapabilityLabel(capability: ScheduleTemplateCapability,
 }
 
 function permissionModeLabel(mode: ScheduleDraft["permissionMode"], t: Translator): string {
+  if (mode === "acceptEdits") return t("permission.edits");
   if (mode === "auto") return t("permission.auto");
   if (mode === "bypassPermissions") return t("permission.full");
   return t("permission.ask");

@@ -38,7 +38,7 @@ import { mobileRemoteDesktopShortcuts } from "./remote-desktop-keyboard";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import { MobileNativeRemoteDesktopView } from "./MobileNativeRemoteDesktopView";
 import { dispatchMobileRemoteDesktopNativeCommand, parseMobileRemoteDesktopNativeCommand,
-  sendMobileRemoteDesktopNativeInput, type MobileRemoteDesktopNativeHandle } from "./remote-desktop-native-bridge";
+  sendMobileRemoteDesktopNativeInput, sendMobileRemoteDesktopNativeRequest, type MobileRemoteDesktopNativeHandle } from "./remote-desktop-native-bridge";
 import { MobileRemoteDesktopPipPreferenceStore } from "./mobile-remote-desktop-pip-preference";
 import { MobileRemoteDesktopNativeTools, MobileRemoteDesktopNetworkStatus } from "./MobileRemoteDesktopNativeTools";
 import type { MobileAppLifecycleTransition } from "./mobile-app-lifecycle";
@@ -140,6 +140,10 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
     sendInput: async (batch: Parameters<MobileRemoteDesktopNativeHandle["sendInput"]>[0]) => {
       const handle = nativeView.current;
       return handle ? sendMobileRemoteDesktopNativeInput(handle, batch) : false;
+    },
+    sendRequest: async (request: Parameters<NonNullable<MobileRemoteDesktopNativeHandle["sendRequest"]>>[0]) => {
+      const handle = nativeView.current;
+      return handle ? sendMobileRemoteDesktopNativeRequest(handle, request) : false;
     },
     requiresPlaybackSession: Platform.OS === "ios",
     playback: async (enabled: boolean) => {
@@ -318,10 +322,10 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
   useEffect(() => { measureContainer(); return () => { measurement.current += 1; }; },
     [observedGeometry.width, observedGeometry.height, observedGeometry.insets.top, observedGeometry.insets.right,
       observedGeometry.insets.bottom, observedGeometry.insets.left]);
-  const interactionReady = snapshot.status === "live" && snapshot.hasFrame && snapshot.controlling
+  const interactionReady = snapshot.status === "live" && snapshot.hasFrame && snapshot.controlling && !snapshot.viewOnly
     && routeFocused && interactive && foreground && online && snapshot.exitStatus === "idle";
   const toolbarInputDisabled = !interactionReady || !snapshot.wantedControl || snapshot.displayModeBusy || snapshot.displaySwitchBusy;
-  const mouseControlsVisible = snapshot.mouseButtons && snapshot.status === "live" && snapshot.hasFrame && snapshot.controlling
+  const mouseControlsVisible = snapshot.mouseButtons && snapshot.status === "live" && snapshot.hasFrame && snapshot.controlling && !snapshot.viewOnly
     && routeFocused && interactive && foreground && online && !snapshot.keyboardOpen && !operations && snapshot.exitStatus === "idle";
   const touchpadVisible = fold !== null && snapshot.hasFrame && routeFocused && !snapshot.keyboardOpen && !operations;
   const layoutKey = `${mediaRect?.x}/${mediaRect?.y}/${mediaRect?.width}/${mediaRect?.height}/${controlsRect?.x}/${controlsRect?.y}/${controlsRect?.width}/${controlsRect?.height}`;
@@ -390,7 +394,7 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
         </Text>
       </View>
       {snapshot.status === "live" && <Text style={[styles.badge, { color: colors.ink, borderColor: colors.border }]}>
-        {snapshot.controlling ? copy.control : copy.view}
+        {snapshot.controlling && !snapshot.viewOnly ? copy.control : copy.view}
       </Text>}
     </View>
     <View ref={layoutContainer} testID="remoteDesktop.layout" style={styles.body} onLayout={measureContainer}>
@@ -468,8 +472,8 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
       style={systemSideRail && railRect ? { position: "absolute", left: railRect.x, top: railRect.y, width: railRect.width, height: railRect.height }
         : controlsRect ? { position: "absolute", left: controlsRect.x, width: controlsRect.width,
           top: controlsRect.y + controlsRect.height - toolbarHeight, maxHeight: controlsRect.height } : undefined}>
-      <CompactButton icon="control" label={snapshot.controlling ? copy.view : copy.control} colors={colors}
-        disabled={snapshot.status !== "live" || !snapshot.capabilities?.canControl} onPress={() => void controller.setControl(!snapshot.controlling)} />
+      <CompactButton icon="control" label={!snapshot.viewOnly ? copy.view : copy.control} colors={colors}
+        disabled={snapshot.status !== "live" || !snapshot.capabilities?.canControl} onPress={() => void controller.setControl(snapshot.viewOnly === true)} />
       {snapshot.capabilities?.workspaceNavigation && (["workspaceLeft", "workspaceRight"] as const).map(action => <CompactButton key={action}
         icon={action === "workspaceLeft" ? "left" : "right"} label={copy[action]} colors={colors}
         disabled={toolbarInputDisabled || snapshot.systemActionPending} onPress={() => { void controller.performSystemAction(action); }} />)}
@@ -506,9 +510,9 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
       </> : <>
       {panelPage === "controls" && <>
       <View style={styles.controlRow}>
-        <Button label={snapshot.controlling ? copy.view : copy.control} colors={colors}
-          selected={snapshot.controlling} disabled={snapshot.status !== "live" || !snapshot.capabilities?.canControl}
-          onPress={() => void controller.setControl(!snapshot.controlling)} />
+        <Button label={!snapshot.viewOnly ? copy.view : copy.control} colors={colors}
+          selected={!snapshot.viewOnly} disabled={snapshot.status !== "live" || !snapshot.capabilities?.canControl}
+          onPress={() => void controller.setControl(snapshot.viewOnly === true)} />
         {(["touch", "trackpad", "pan"] as const).map((mode) => <Button key={mode}
           label={mode === "touch" ? copy.touch : mode === "trackpad" ? copy.trackpad : copy.pan}
           colors={colors} selected={snapshot.inputMode === mode} disabled={snapshot.status !== "live"}
@@ -720,9 +724,9 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
       </>}
       {panelPage === "controls" && <>
       <View style={styles.controlRow}>
-        <Button label={copy.left} colors={colors} disabled={!snapshot.controlling} onPress={() => controller.click(0)} />
-        <Button label={copy.right} colors={colors} disabled={!snapshot.controlling} onPress={() => controller.click(2)} />
-        <Button label={copy.keyboard} colors={colors} disabled={!snapshot.controlling} onPress={() => { setPanelPage(null); controller.showKeyboard(); }} />
+        <Button label={copy.left} colors={colors} disabled={!snapshot.controlling || snapshot.viewOnly} onPress={() => controller.click(0)} />
+        <Button label={copy.right} colors={colors} disabled={!snapshot.controlling || snapshot.viewOnly} onPress={() => controller.click(2)} />
+        <Button label={copy.keyboard} colors={colors} disabled={!snapshot.controlling || snapshot.viewOnly} onPress={() => { setPanelPage(null); controller.showKeyboard(); }} />
         <Button label={copy.release} colors={colors} disabled={!snapshot.controlling} onPress={() => controller.releaseInput()} />
         <Button label={copy.fit} colors={colors} disabled={!snapshot.hasFrame} onPress={() => controller.fit()} />
       </View>
@@ -733,11 +737,11 @@ function RemoteDesktopSession({ transport, preferredDeviceId, routeFocused, inte
         interactive={interactive} foreground={foreground} routeFocused={routeFocused} online={online} />
       <View style={styles.controlRow}>
         <Button label={copy.copyToPhone} colors={colors}
-          disabled={snapshot.status !== "live" || !snapshot.controlling
+          disabled={snapshot.status !== "live" || !snapshot.controlling || snapshot.viewOnly
             || !snapshot.clipboardAvailable || snapshot.clipboardBusy}
           onPress={() => void controller.copyToPhone()} />
         <Button label={copy.pasteFromPhone} colors={colors}
-          disabled={snapshot.status !== "live" || !snapshot.controlling
+          disabled={snapshot.status !== "live" || !snapshot.controlling || snapshot.viewOnly
             || !snapshot.clipboardAvailable || snapshot.clipboardBusy}
           onPress={() => void controller.pasteFromPhone()} />
       </View>

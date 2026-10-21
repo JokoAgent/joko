@@ -10,6 +10,13 @@ import {
 } from "./native-task-status-bridge.js";
 
 describe("native task-status Web projection", () => {
+  it("excludes hidden task activity and permissions from the native status surface", () => {
+    const hidden = { ...session("hidden", "waiting", 2n, 20), hidden: true };
+    const visible = session("visible", "running", 1n, 10);
+    expect(projectNativeTaskStatusSnapshot({ ownerId: "owner", revision: 1n, locale: "en", sessions: [hidden, visible],
+      interactions: [{ ...interaction("hidden-permission", "permission", 2n, [PermissionDecisionKind.ALLOW_ONCE]), sessionId: hidden.id }], timelineBySession: new Map()
+    }).sessions.map(task => task.sessionId)).toEqual(["visible"]);
+  });
   it("separates Profile and connection generations before comparing snapshot revisions", () => {
     const first = nativeTaskStatusProjectionOwner({ id: "profile-one", serverId: "node" }, 3n);
     expect(nativeTaskStatusProjectionOwner({ id: "profile-two", serverId: "node" }, 3n)).not.toBe(first);

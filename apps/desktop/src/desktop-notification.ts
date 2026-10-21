@@ -124,6 +124,12 @@ export function parseDesktopNotification(value: unknown): DesktopNotification {
 }
 
 function parseDesktopNotificationNavigation(value: unknown): NonNullable<DesktopNotification["navigation"]> {
+  if (exactRecord(value) && Object.keys(value).sort().join(",") === "entryToken,kind,sessionId" && value["kind"] === "nativeTask"
+    && typeof value["sessionId"] === "string" && value["sessionId"].length > 0 && value["sessionId"].length <= 1024
+    && typeof value["entryToken"] === "string" && value["entryToken"].length > 0 && value["entryToken"].length <= 2048
+    && !/[\u0000-\u001f\u007f]/u.test(value["sessionId"] + value["entryToken"])) {
+    return Object.freeze({ kind: "nativeTask", sessionId: value["sessionId"], entryToken: value["entryToken"] });
+  }
   if (!exactRecord(value) || Object.keys(value).sort().join(",") !== "kind,profileId,sessionId"
     || value["kind"] !== "session"
     || !notificationIdentity(value["profileId"])

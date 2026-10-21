@@ -2,15 +2,22 @@ import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, resolve } from "node:path";
-import { redactSecrets, type PromptInput } from "@joko/core";
+import { redactSecrets, type PromptInput, type TargetDescriptor } from "@joko/core";
 import { NotFoundError, type OperationalStore, type PartnerModelRouteRecord, type PartnerProfileRecord, type QueueItemRecord } from "@joko/store";
 import type { PartnerManager } from "./partner-manager.js";
 import type { SessionHost, InteractionDecisionSubmission } from "./session-host.js";
 import type { WorkspaceService } from "./workspace-service.js";
 import type { SessionRuntimeProfile } from "./session-runtime-control.js";
 import { checkPartnerWorkbenchProject } from "./partner-workbench-project.js";
+import { persistSessionTaskActivity } from "./session-task-activity.js";
+import type { PartnerHomeProjects } from "./partner-home-projects.js";
 
 const SCOPE = "partner.session-tasks";
+function sameComputer(target: TargetDescriptor, home: TargetDescriptor): boolean {
+  const child = target.remoteWorkspace, parent = home.remoteWorkspace;
+  return parent === undefined ? child === undefined : parent.kind === "device_peer" && child?.kind === "device_peer"
+    && parent.controllerDeviceId === child.controllerDeviceId && parent.targetDeviceId === child.targetDeviceId;
+}
 const activeStates = ["preparing", "queued", "running", "waiting"] as const;
 export type PartnerSessionTaskStatus = typeof activeStates[number] | "completed" | "failed" | "cancelled" | "timed-out" | "unknown";
 export interface TaskModelSelection { readonly id: string; readonly effort?: string; readonly fastMode?: boolean }
@@ -44,7 +51,8 @@ export class PartnerSessionTaskManager {
   readonly #locks = new Map<string, Promise<unknown>>(); readonly #timers = new Map<string, ReturnType<typeof setTimeout>>();
   #unsubscribe?: () => void; #closed = false;
   constructor(readonly store: OperationalStore, readonly partners: PartnerManager, readonly host: TaskHost,
-    readonly workspaces: Pick<WorkspaceService, "register">, readonly managedDataDirectory: string, readonly now = Date.now) {
+    readonly workspaces: Pick<WorkspaceService, "register">, readonly managedDataDirectory: string, readonly now = Date.now,
+    readonly remoteProjects?: PartnerHomeProjects) {
     for (const row of store.listSettings("service", SCOPE)) this.#index(readRecord(row.value));
   }
 
@@ -140,14 +148,18 @@ export class PartnerSessionTaskManager {
       }
       const frozen = this.partners.resolveTaskModel(sessionId, selected), route = frozen.route;
       const home = this.store.getTarget(profile.homeTargetId).descriptor;
+      const remote = home.remoteWorkspace;
+      if (remote && (remote.kind !== "device_peer" || !this.remoteProjects?.remote(home))) throw invalid("This Partner execution computer is unavailable.");
+      if (remote && normalized.useWorktree) throw invalid("Creating an independent task worktree is unavailable on this execution computer. Start it in an explicitly selected project directory.");
       const directory = normalized.workingDir ?? home.workspaceRoot;
-      if (normalized.workingDir) {
+      if (normalized.workingDir && !remote) {
         if (!isAbsolute(directory)) throw invalid("An existing absolute working directory is required.");
         await checkPartnerWorkbenchProject(directory, { managedDataDirectory: this.managedDataDirectory, homeDirectory: homedir(), caseInsensitive: process.platform !== "linux" });
       }
-      const actual = await realpath(directory); if (!(await stat(actual)).isDirectory()) throw invalid("The working directory is unavailable.");
+      const actual = remote ? await this.remoteProjects!.executionDirectory(home, directory, () => { assertCaller(); frozen.assertCurrent(); }) : await realpath(directory);
+      if (!remote && !(await stat(actual)).isDirectory()) throw invalid("The working directory is unavailable.");
       assertCaller(); frozen.assertCurrent();
-      const targetId = `partner-task-target:${hash(JSON.stringify([profile.id, route.backendId, directory, actual])).slice(0, 32)}`;
+      const targetId = `partner-task-target:${hash(JSON.stringify([profile.id, home.id, route.backendId, directory, actual])).slice(0, 32)}`;
       const createdAt = this.now();
       let task: PartnerSessionTaskRecord = { version: 1, id, partnerId: profile.id, parentSessionId: sessionId, requestFingerprint: fingerprint,
         title: normalized.title ?? normalized.instruction.split("\n")[0]!.slice(0, 120), objective: normalized.instruction, contextRefs: normalized.contextRefs,
@@ -157,15 +169,18 @@ export class PartnerSessionTaskManager {
         timeoutMs: normalized.timeoutMs, deadlineAt: createdAt + normalized.timeoutMs, createdAt, updatedAt: createdAt, execution: 1, executionRunIds: [], status: "preparing", control: "active" };
       this.#save(task);
       try {
-        await this.workspaces.register({ id: targetId, root: actual, displayName: basename(directory), trusted: true });
+        const binding = remote === undefined ? undefined : { ...remote, workspaceRoot: actual };
+        await this.workspaces.register({ id: targetId, root: actual, displayName: basename(directory), trusted: true,
+          ...(binding ? { remote: { targetId, binding } } : {}) });
         assertCaller(); frozen.assertCurrent(); await this.#assertDirectory(task);
         const existing = this.store.listTargets(route.backendId).find(item => item.descriptor.id === targetId);
-        if (existing === undefined) await this.host.registerTarget({ id: targetId, backendId: route.backendId, displayName: basename(directory), workspaceRoot: actual, managed: !normalized.workingDir, trusted: true },
-          { workspaceId: targetId, kind: "partner_session_task", partnerId: profile.id });
-        else if (!existing.descriptor.trusted || existing.descriptor.workspaceRoot !== actual || existing.descriptor.remoteWorkspace !== undefined) throw changed();
+        if (existing === undefined) await this.host.registerTarget({ id: targetId, backendId: route.backendId, displayName: basename(directory), workspaceRoot: actual, managed: !normalized.workingDir, trusted: true,
+          ...(binding ? { remoteWorkspace: binding } : {}) },
+          { workspaceId: targetId, kind: "partner_session_task", partnerId: profile.id, homeTargetId: home.id, homeCanonicalSessionId: sessionId });
+        else if (!existing.descriptor.trusted || existing.descriptor.workspaceRoot !== actual || !sameComputer(existing.descriptor, home)) throw changed();
         const target = this.store.getTarget(targetId);
         const assertScope = () => { assertCaller(); frozen.assertCurrent();
-          const current = this.store.getTarget(targetId); if (current.revision !== target.revision || !current.descriptor.trusted || current.descriptor.remoteWorkspace !== undefined) throw changed(); };
+          const current = this.store.getTarget(targetId); if (current.revision !== target.revision || !current.descriptor.trusted || !sameComputer(current.descriptor, home)) throw changed(); };
         assertScope();
         const created = await this.host.createServiceSession({ operationId: `${id}:create`, serviceKind: "partner", targetId, title: task.title,
           providerId: route.providerId, modelId: route.modelId, ...(route.effort === undefined ? {} : { effort: route.effort }), fastMode: route.fastMode,
@@ -364,13 +379,21 @@ export class PartnerSessionTaskManager {
     try {
       const profile = this.partners.getPartner(task.partnerId);
       const parent = this.store.getSession(profile.canonicalSessionId ?? task.parentSessionId).descriptor;
-      if (parent.archived || parent.deletedAt !== undefined || profile.lifecycle !== "active" || profile.canonicalSessionId !== parent.id) return;
+      if (parent.archived || parent.deletedAt !== undefined || profile.lifecycle !== "active" || profile.canonicalSessionId !== parent.id) {
+        if (task.sessionId && task.runId) persistSessionTaskActivity(this.store, task.sessionId, { runId: task.runId, completionNotification: "none" });
+        return;
+      }
       const artifacts = task.sessionId ? this.store.listArtifacts({ sessionId: task.sessionId, limit: 100 }).filter(item => item.deletedAt === undefined)
         .map(item => ({ id: item.blob.id, name: item.blob.fileName ?? "Artifact", mimeType: item.blob.mimeType })) : [];
       this.host.enqueueServiceInput({ operationId: `${task.id}:result:${task.execution}`, sessionId: parent.id, source: "system",
         originSessionId: task.sessionId, prompt: prompt(`Independent task returned. Review its result and present the useful outcome to the user.\n${JSON.stringify({ taskId: task.id, sessionId: task.sessionId, title: task.title, status: task.status, result: task.result, error: task.error, artifacts })}`),
         onAdmitted: () => this.#save({ ...task, deliveredExecution: task.execution, updatedAt: this.now() }) });
-    } catch { /* The task remains readable. The same durable return identity may be admitted after recovery. */ }
+    } catch (error) {
+      if (error instanceof NotFoundError && task.sessionId && task.runId) {
+        persistSessionTaskActivity(this.store, task.sessionId, { runId: task.runId, completionNotification: "none" });
+      }
+      // An uncertain admission retains its exact durable return identity.
+    }
   }
   #result(sessionId: string) {
     const event = this.store.listEvents({ sessionId, order: "desc", limit: 500 }).find(event => event.payload.type === "message_complete" && event.payload.role === "assistant");
@@ -399,9 +422,19 @@ export class PartnerSessionTaskManager {
     if (!task.sessionId) throw invalid("The independent task Session is unavailable.");
     const session = this.store.getSession(task.sessionId).descriptor, target = this.store.getTarget(task.targetId).descriptor;
     if (session.targetId !== task.targetId || session.backendId !== task.route.backendId || session.archived || session.deletedAt !== undefined
-      || session.remoteWorkspace !== undefined || !target.trusted || target.remoteWorkspace !== undefined || target.workspaceRoot !== task.realDirectory) throw changed();
+      || !target.trusted || target.workspaceRoot !== task.realDirectory) throw changed();
+    const profile = this.partners.getPartner(task.partnerId), home = this.store.getTarget(profile.homeTargetId).descriptor;
+    if (profile.canonicalSessionId !== task.parentSessionId || !sameComputer(target, home) || target.remoteWorkspace && !this.remoteProjects?.remote(target)) throw changed();
   }
-  async #assertDirectory(task: PartnerSessionTaskRecord) { if (await realpath(task.directory) !== task.realDirectory || !(await stat(task.realDirectory)).isDirectory()) throw changed(); }
+  async #assertDirectory(task: PartnerSessionTaskRecord) {
+    const profile = this.partners.getPartner(task.partnerId), home = this.store.getTarget(profile.homeTargetId).descriptor;
+    if (profile.canonicalSessionId !== task.parentSessionId) throw changed();
+    if (home.remoteWorkspace) {
+      if (!this.remoteProjects?.remote(home) || await this.remoteProjects.executionDirectory(home, task.directory, () => {
+        if (this.partners.getPartner(task.partnerId).canonicalSessionId !== task.parentSessionId) throw changed();
+      }) !== task.realDirectory) throw changed();
+    } else if (await realpath(task.directory) !== task.realDirectory || !(await stat(task.realDirectory)).isDirectory()) throw changed();
+  }
   #queueOrigin(item: QueueItemRecord) { const operation = this.store.getOperation(item.operationId); return operation.kind === "service_send_input" ? (operation.body as { originSessionId?: string }).originSessionId : undefined; }
   #read(id: string) { const record = readRecord(this.store.getSetting("service", SCOPE, id).value); if (record.id !== id) throw changed(); return record; }
   #save(record: PartnerSessionTaskRecord) {
@@ -409,6 +442,8 @@ export class PartnerSessionTaskManager {
     // intentionally turns explicit undefined into null, so omit them before writing.
     const persisted = readRecord(JSON.parse(JSON.stringify(record)) as unknown);
     this.store.setSetting("service", SCOPE, persisted.id, persisted, this.now()); this.#index(persisted);
+    if (persisted.sessionId && persisted.runId) persistSessionTaskActivity(this.store, persisted.sessionId, { runId: persisted.runId,
+      completionNotification: persisted.deliveredExecution === persisted.execution ? "teammate" : "pending" });
   }
   #index(record: PartnerSessionTaskRecord) { this.#ids.add(record.id); if (record.sessionId) this.#sessions.set(record.sessionId, record.id); }
   #serial<T>(id: string, callback: () => T | Promise<T>): Promise<T> {
@@ -446,7 +481,7 @@ function readRecord(value: unknown): PartnerSessionTaskRecord {
   if (required.some(key => !Object.hasOwn(row, key)) || Object.keys(row).some(key => !required.includes(key) && !optional.includes(key)) || row["version"] !== 1
     || ["id", "partnerId", "parentSessionId", "title", "objective", "targetId", "directory", "realDirectory"].some(key => typeof row[key] !== "string" || !row[key])
     || !/^[a-f0-9]{64}$/u.test(String(row["requestFingerprint"])) || !["preparing", "queued", "running", "waiting", "completed", "failed", "cancelled", "timed-out", "unknown"].includes(String(row["status"]))
-    || !["active", "pausing", "paused", "cancelling"].includes(String(row["control"])) || !["ask", "auto", "bypassPermissions"].includes(String(row["permissionMode"]))
+    || !["active", "pausing", "paused", "cancelling"].includes(String(row["control"])) || !["ask", "acceptEdits", "auto", "bypassPermissions"].includes(String(row["permissionMode"]))
     || ["useWorktree", "explicitModel", "planMode"].some(key => typeof row[key] !== "boolean")
     || ["timeoutMs", "deadlineAt", "createdAt", "updatedAt", "execution"].some(key => !Number.isSafeInteger(row[key]) || Number(row[key]) < 1)
     || !Array.isArray(row["executionRunIds"]) || row["executionRunIds"].some(id => typeof id !== "string" || id.length < 1 || id.length > 256)

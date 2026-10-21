@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file joko/v1/partner_import.proto.
  */
 export const file_joko_v1_partner_import: GenFile = /*@__PURE__*/
-  fileDesc("Chxqb2tvL3YxL3BhcnRuZXJfaW1wb3J0LnByb3RvEgdqb2tvLnYxIl8KE1BhcnRuZXJJbXBvcnRTb3VyY2USCgoCaWQYASABKAkSLgoEa2luZBgCIAEoDjIgLmpva28udjEuUGFydG5lckltcG9ydFNvdXJjZUtpbmQSDAoEbmFtZRgDIAEoCSKJAgoSUGFydG5lckltcG9ydEVudHJ5EgoKAmlkGAEgASgJEg0KBWluZGV4GAIgASgNEjAKCGNhdGVnb3J5GAMgASgOMh4uam9rby52MS5QYXJ0bmVySW1wb3J0Q2F0ZWdvcnkSDAoEbmFtZRgEIAEoCRIYCgtkZXNjcmlwdGlvbhgFIAEoCUgAiAEBEhAKCHNlbGVjdGVkGAYgASgIEhQKB2VuYWJsZWQYByABKAhIAYgBARISCgpkZXBlbmRzX29uGAggAygJEhYKDmV4Y2x1c2l2ZV93aXRoGAkgAygJEg4KBmlzc3VlcxgKIAMoCUIOCgxfZGVzY3JpcHRpb25CCgoIX2VuYWJsZWQigwIKGFBhcnRuZXJJbXBvcnRQcmV2aWV3UGFnZRIKCgJpZBgBIAEoCRIsCgZzb3VyY2UYAiABKAsyHC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRTb3VyY2USDAoEbmFtZRgDIAEoCRIgChNhdmF0YXJfaW1hZ2VfYmFzZTY0GAQgASgJSACIAQESLAoHZW50cmllcxgFIAMoCzIbLmpva28udjEuUGFydG5lckltcG9ydEVudHJ5Eg0KBXRvdGFsGAYgASgNEhgKC25leHRfb2Zmc2V0GAcgASgNSAGIAQFCFgoUX2F2YXRhcl9pbWFnZV9iYXNlNjRCDgoMX25leHRfb2Zmc2V0IjYKF1BhcnRuZXJJbXBvcnRFbnRyeVJhbmdlEg0KBWZpcnN0GAEgASgNEgwKBGxhc3QYAiABKA0i+gEKFlBhcnRuZXJJbXBvcnRTZWxlY3Rpb24SEgoKcHJldmlld19pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJEgwKBG5hbWUYAyABKAkSIAoTYXZhdGFyX2ltYWdlX2Jhc2U2NBgEIAEoCUgAiAEBEhEKCWVudHJ5X2lkcxgFIAMoCRI2CgxlbnRyeV9yYW5nZXMYBiADKAsyIC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRFbnRyeVJhbmdlEhAKCHRha2VvdmVyGAcgASgIEhMKC2RlZmVyX3NldHVwGAggASgIQhYKFF9hdmF0YXJfaW1hZ2VfYmFzZTY0IjUKFVBhcnRuZXJJbXBvcnRQcm9ncmVzcxINCgVzYXZlZBgBIAEoDRINCgV0b3RhbBgCIAEoDSLJAQoSUGFydG5lckltcG9ydENoZWNrEhAKCGVudHJ5X2lkGAEgASgJEjEKBnN0YXR1cxgCIAEoDjIhLmpva28udjEuUGFydG5lckltcG9ydENoZWNrU3RhdHVzEhQKB21lc3NhZ2UYAyABKAlIAIgBARIwCghwcm9ncmVzcxgEIAEoCzIeLmpva28udjEuUGFydG5lckltcG9ydFByb2dyZXNzEhEKBG5hbWUYBSABKAlIAYgBAUIKCghfbWVzc2FnZUIHCgVfbmFtZSL8AQoTUGFydG5lckltcG9ydFJlc3VsdBISCgpyZXF1ZXN0X2lkGAEgASgJEhIKCnBhcnRuZXJfaWQYAiABKAkSIQoUY2Fub25pY2FsX3Nlc3Npb25faWQYAyABKAlIAIgBARIsCgZzdGF0dXMYBCABKA4yHC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRTdGF0dXMSKwoGY2hlY2tzGAUgAygLMhsuam9rby52MS5QYXJ0bmVySW1wb3J0Q2hlY2sSDQoFc2F2ZWQYBiABKAgSFwoPc2F2ZWRfZW50cnlfaWRzGAcgAygJQhcKFV9jYW5vbmljYWxfc2Vzc2lvbl9pZCI4Ch9MaXN0UGFydG5lckltcG9ydFNvdXJjZXNSZXF1ZXN0EhUKDWNvbnRyb2xsZXJfaWQYASABKAkiUQogTGlzdFBhcnRuZXJJbXBvcnRTb3VyY2VzUmVzcG9uc2USLQoHc291cmNlcxgBIAMoCzIcLmpva28udjEuUGFydG5lckltcG9ydFNvdXJjZSJHChtQcmV2aWV3UGFydG5lckltcG9ydFJlcXVlc3QSEQoJc291cmNlX2lkGAEgASgJEhUKDWNvbnRyb2xsZXJfaWQYAiABKAkiUgocUHJldmlld1BhcnRuZXJJbXBvcnRSZXNwb25zZRIyCgdwcmV2aWV3GAEgASgLMiEuam9rby52MS5QYXJ0bmVySW1wb3J0UHJldmlld1BhZ2UiXAofUmVhZFBhcnRuZXJJbXBvcnRQcmV2aWV3UmVxdWVzdBISCgpwcmV2aWV3X2lkGAEgASgJEg4KBm9mZnNldBgCIAEoDRIVCg1jb250cm9sbGVyX2lkGAMgASgJIlYKIFJlYWRQYXJ0bmVySW1wb3J0UHJldmlld1Jlc3BvbnNlEjIKB3ByZXZpZXcYASABKAsyIS5qb2tvLnYxLlBhcnRuZXJJbXBvcnRQcmV2aWV3UGFnZSJmChlTdGFydFBhcnRuZXJJbXBvcnRSZXF1ZXN0EjIKCXNlbGVjdGlvbhgBIAEoCzIfLmpva28udjEuUGFydG5lckltcG9ydFNlbGVjdGlvbhIVCg1jb250cm9sbGVyX2lkGAIgASgJIkoKGlN0YXJ0UGFydG5lckltcG9ydFJlc3BvbnNlEiwKBnJlc3VsdBgBIAEoCzIcLmpva28udjEuUGFydG5lckltcG9ydFJlc3VsdCIzCh1HZXRQYXJ0bmVySW1wb3J0U3RhdHVzUmVxdWVzdBISCgpyZXF1ZXN0X2lkGAEgASgJIk4KHkdldFBhcnRuZXJJbXBvcnRTdGF0dXNSZXNwb25zZRIsCgZyZXN1bHQYASABKAsyHC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRSZXN1bHQiRQoZUmV0cnlQYXJ0bmVySW1wb3J0UmVxdWVzdBISCgpyZXF1ZXN0X2lkGAEgASgJEhQKDHJlc3VtZV9zZXR1cBgCIAEoCCJKChpSZXRyeVBhcnRuZXJJbXBvcnRSZXNwb25zZRIsCgZyZXN1bHQYASABKAsyHC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRSZXN1bHQqlQEKF1BhcnRuZXJJbXBvcnRTb3VyY2VLaW5kEioKJlBBUlRORVJfSU1QT1JUX1NPVVJDRV9LSU5EX1VOU1BFQ0lGSUVEEAASJQohUEFSVE5FUl9JTVBPUlRfU09VUkNFX0tJTkRfSEVSTUVTEAESJwojUEFSVE5FUl9JTVBPUlRfU09VUkNFX0tJTkRfT1BFTkNMQVcQAiqDAgoVUGFydG5lckltcG9ydENhdGVnb3J5EicKI1BBUlRORVJfSU1QT1JUX0NBVEVHT1JZX1VOU1BFQ0lGSUVEEAASJwojUEFSVE5FUl9JTVBPUlRfQ0FURUdPUllfUEVSU09OQUxJVFkQARIiCh5QQVJUTkVSX0lNUE9SVF9DQVRFR09SWV9NRU1PUlkQAhIiCh5QQVJUTkVSX0lNUE9SVF9DQVRFR09SWV9TS0lMTFMQAxInCiNQQVJUTkVSX0lNUE9SVF9DQVRFR09SWV9DT05ORUNUSU9OUxAEEicKI1BBUlRORVJfSU1QT1JUX0NBVEVHT1JZX0FVVE9NQVRJT05TEAUqrgEKE1BhcnRuZXJJbXBvcnRTdGF0dXMSJQohUEFSVE5FUl9JTVBPUlRfU1RBVFVTX1VOU1BFQ0lGSUVEEAASIQodUEFSVE5FUl9JTVBPUlRfU1RBVFVTX1JVTk5JTkcQARIiCh5QQVJUTkVSX0lNUE9SVF9TVEFUVVNfQ09NUExFVEUQAhIpCiVQQVJUTkVSX0lNUE9SVF9TVEFUVVNfTkVFRFNfQVRURU5USU9OEAMqngIKGFBhcnRuZXJJbXBvcnRDaGVja1N0YXR1cxIrCidQQVJUTkVSX0lNUE9SVF9DSEVDS19TVEFUVVNfVU5TUEVDSUZJRUQQABImCiJQQVJUTkVSX0lNUE9SVF9DSEVDS19TVEFUVVNfQ09QSUVEEAESKAokUEFSVE5FUl9JTVBPUlRfQ0hFQ0tfU1RBVFVTX1ZFUklGSUVEEAISLworUEFSVE5FUl9JTVBPUlRfQ0hFQ0tfU1RBVFVTX05FRURTX0FUVEVOVElPThADEioKJlBBUlRORVJfSU1QT1JUX0NIRUNLX1NUQVRVU19UQUtFTl9PVkVSEAQSJgoiUEFSVE5FUl9JTVBPUlRfQ0hFQ0tfU1RBVFVTX1BBVVNFRBAFMoYFChRQYXJ0bmVySW1wb3J0U2VydmljZRJvChhMaXN0UGFydG5lckltcG9ydFNvdXJjZXMSKC5qb2tvLnYxLkxpc3RQYXJ0bmVySW1wb3J0U291cmNlc1JlcXVlc3QaKS5qb2tvLnYxLkxpc3RQYXJ0bmVySW1wb3J0U291cmNlc1Jlc3BvbnNlEmMKFFByZXZpZXdQYXJ0bmVySW1wb3J0EiQuam9rby52MS5QcmV2aWV3UGFydG5lckltcG9ydFJlcXVlc3QaJS5qb2tvLnYxLlByZXZpZXdQYXJ0bmVySW1wb3J0UmVzcG9uc2USbwoYUmVhZFBhcnRuZXJJbXBvcnRQcmV2aWV3Eiguam9rby52MS5SZWFkUGFydG5lckltcG9ydFByZXZpZXdSZXF1ZXN0Gikuam9rby52MS5SZWFkUGFydG5lckltcG9ydFByZXZpZXdSZXNwb25zZRJdChJTdGFydFBhcnRuZXJJbXBvcnQSIi5qb2tvLnYxLlN0YXJ0UGFydG5lckltcG9ydFJlcXVlc3QaIy5qb2tvLnYxLlN0YXJ0UGFydG5lckltcG9ydFJlc3BvbnNlEmkKFkdldFBhcnRuZXJJbXBvcnRTdGF0dXMSJi5qb2tvLnYxLkdldFBhcnRuZXJJbXBvcnRTdGF0dXNSZXF1ZXN0Gicuam9rby52MS5HZXRQYXJ0bmVySW1wb3J0U3RhdHVzUmVzcG9uc2USXQoSUmV0cnlQYXJ0bmVySW1wb3J0EiIuam9rby52MS5SZXRyeVBhcnRuZXJJbXBvcnRSZXF1ZXN0GiMuam9rby52MS5SZXRyeVBhcnRuZXJJbXBvcnRSZXNwb25zZWIGcHJvdG8z");
+  fileDesc("Chxqb2tvL3YxL3BhcnRuZXJfaW1wb3J0LnByb3RvEgdqb2tvLnYxIl8KE1BhcnRuZXJJbXBvcnRTb3VyY2USCgoCaWQYASABKAkSLgoEa2luZBgCIAEoDjIgLmpva28udjEuUGFydG5lckltcG9ydFNvdXJjZUtpbmQSDAoEbmFtZRgDIAEoCSKJAgoSUGFydG5lckltcG9ydEVudHJ5EgoKAmlkGAEgASgJEg0KBWluZGV4GAIgASgNEjAKCGNhdGVnb3J5GAMgASgOMh4uam9rby52MS5QYXJ0bmVySW1wb3J0Q2F0ZWdvcnkSDAoEbmFtZRgEIAEoCRIYCgtkZXNjcmlwdGlvbhgFIAEoCUgAiAEBEhAKCHNlbGVjdGVkGAYgASgIEhQKB2VuYWJsZWQYByABKAhIAYgBARISCgpkZXBlbmRzX29uGAggAygJEhYKDmV4Y2x1c2l2ZV93aXRoGAkgAygJEg4KBmlzc3VlcxgKIAMoCUIOCgxfZGVzY3JpcHRpb25CCgoIX2VuYWJsZWQigwIKGFBhcnRuZXJJbXBvcnRQcmV2aWV3UGFnZRIKCgJpZBgBIAEoCRIsCgZzb3VyY2UYAiABKAsyHC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRTb3VyY2USDAoEbmFtZRgDIAEoCRIgChNhdmF0YXJfaW1hZ2VfYmFzZTY0GAQgASgJSACIAQESLAoHZW50cmllcxgFIAMoCzIbLmpva28udjEuUGFydG5lckltcG9ydEVudHJ5Eg0KBXRvdGFsGAYgASgNEhgKC25leHRfb2Zmc2V0GAcgASgNSAGIAQFCFgoUX2F2YXRhcl9pbWFnZV9iYXNlNjRCDgoMX25leHRfb2Zmc2V0IjYKF1BhcnRuZXJJbXBvcnRFbnRyeVJhbmdlEg0KBWZpcnN0GAEgASgNEgwKBGxhc3QYAiABKA0i+gEKFlBhcnRuZXJJbXBvcnRTZWxlY3Rpb24SEgoKcHJldmlld19pZBgBIAEoCRISCgpyZXF1ZXN0X2lkGAIgASgJEgwKBG5hbWUYAyABKAkSIAoTYXZhdGFyX2ltYWdlX2Jhc2U2NBgEIAEoCUgAiAEBEhEKCWVudHJ5X2lkcxgFIAMoCRI2CgxlbnRyeV9yYW5nZXMYBiADKAsyIC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRFbnRyeVJhbmdlEhAKCHRha2VvdmVyGAcgASgIEhMKC2RlZmVyX3NldHVwGAggASgIQhYKFF9hdmF0YXJfaW1hZ2VfYmFzZTY0IjUKFVBhcnRuZXJJbXBvcnRQcm9ncmVzcxINCgVzYXZlZBgBIAEoDRINCgV0b3RhbBgCIAEoDSLJAQoSUGFydG5lckltcG9ydENoZWNrEhAKCGVudHJ5X2lkGAEgASgJEjEKBnN0YXR1cxgCIAEoDjIhLmpva28udjEuUGFydG5lckltcG9ydENoZWNrU3RhdHVzEhQKB21lc3NhZ2UYAyABKAlIAIgBARIwCghwcm9ncmVzcxgEIAEoCzIeLmpva28udjEuUGFydG5lckltcG9ydFByb2dyZXNzEhEKBG5hbWUYBSABKAlIAYgBAUIKCghfbWVzc2FnZUIHCgVfbmFtZSL8AQoTUGFydG5lckltcG9ydFJlc3VsdBISCgpyZXF1ZXN0X2lkGAEgASgJEhIKCnBhcnRuZXJfaWQYAiABKAkSIQoUY2Fub25pY2FsX3Nlc3Npb25faWQYAyABKAlIAIgBARIsCgZzdGF0dXMYBCABKA4yHC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRTdGF0dXMSKwoGY2hlY2tzGAUgAygLMhsuam9rby52MS5QYXJ0bmVySW1wb3J0Q2hlY2sSDQoFc2F2ZWQYBiABKAgSFwoPc2F2ZWRfZW50cnlfaWRzGAcgAygJQhcKFV9jYW5vbmljYWxfc2Vzc2lvbl9pZCI4Ch9MaXN0UGFydG5lckltcG9ydFNvdXJjZXNSZXF1ZXN0EhUKDWNvbnRyb2xsZXJfaWQYASABKAkiUQogTGlzdFBhcnRuZXJJbXBvcnRTb3VyY2VzUmVzcG9uc2USLQoHc291cmNlcxgBIAMoCzIcLmpva28udjEuUGFydG5lckltcG9ydFNvdXJjZSJHChtQcmV2aWV3UGFydG5lckltcG9ydFJlcXVlc3QSEQoJc291cmNlX2lkGAEgASgJEhUKDWNvbnRyb2xsZXJfaWQYAiABKAkiUgocUHJldmlld1BhcnRuZXJJbXBvcnRSZXNwb25zZRIyCgdwcmV2aWV3GAEgASgLMiEuam9rby52MS5QYXJ0bmVySW1wb3J0UHJldmlld1BhZ2UiXAofUmVhZFBhcnRuZXJJbXBvcnRQcmV2aWV3UmVxdWVzdBISCgpwcmV2aWV3X2lkGAEgASgJEg4KBm9mZnNldBgCIAEoDRIVCg1jb250cm9sbGVyX2lkGAMgASgJIlYKIFJlYWRQYXJ0bmVySW1wb3J0UHJldmlld1Jlc3BvbnNlEjIKB3ByZXZpZXcYASABKAsyIS5qb2tvLnYxLlBhcnRuZXJJbXBvcnRQcmV2aWV3UGFnZSJmChlTdGFydFBhcnRuZXJJbXBvcnRSZXF1ZXN0EjIKCXNlbGVjdGlvbhgBIAEoCzIfLmpva28udjEuUGFydG5lckltcG9ydFNlbGVjdGlvbhIVCg1jb250cm9sbGVyX2lkGAIgASgJIkoKGlN0YXJ0UGFydG5lckltcG9ydFJlc3BvbnNlEiwKBnJlc3VsdBgBIAEoCzIcLmpva28udjEuUGFydG5lckltcG9ydFJlc3VsdCIzCh1HZXRQYXJ0bmVySW1wb3J0U3RhdHVzUmVxdWVzdBISCgpyZXF1ZXN0X2lkGAEgASgJIk4KHkdldFBhcnRuZXJJbXBvcnRTdGF0dXNSZXNwb25zZRIsCgZyZXN1bHQYASABKAsyHC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRSZXN1bHQiRQoZUmV0cnlQYXJ0bmVySW1wb3J0UmVxdWVzdBISCgpyZXF1ZXN0X2lkGAEgASgJEhQKDHJlc3VtZV9zZXR1cBgCIAEoCCJKChpSZXRyeVBhcnRuZXJJbXBvcnRSZXNwb25zZRIsCgZyZXN1bHQYASABKAsyHC5qb2tvLnYxLlBhcnRuZXJJbXBvcnRSZXN1bHQiOQoUUGFydG5lclBhY2thZ2VNb2R1bGUSDAoEbmFtZRgBIAEoCRITCgtkZXNjcmlwdGlvbhgCIAEoCSIxChJQYXJ0bmVyUGFja2FnZVRvb2wSCgoCaWQYASABKAkSDwoHcHVycG9zZRgCIAEoCSI3ChhQYXJ0bmVyUGFja2FnZUNhcGFiaWxpdHkSDAoEaWNvbhgBIAEoCRINCgVsYWJlbBgCIAEoCSLZAwoTUGFydG5lclBhY2thZ2VFbnRyeRISCgpwYWNrYWdlX2lkGAEgASgJEhcKD3BhY2thZ2VfdmVyc2lvbhgCIAEoCRIUCgxwYWNrYWdlX2hhc2gYAyABKAkSDAoEbmFtZRgEIAEoCRITCgtkZXNjcmlwdGlvbhgFIAEoCRIOCgZhdmF0YXIYBiABKAkSDgoGYnViYmxlGAcgASgJEjcKDGNhcGFiaWxpdGllcxgIIAMoCzIhLmpva28udjEuUGFydG5lclBhY2thZ2VDYXBhYmlsaXR5Ei0KBnNraWxscxgJIAMoCzIdLmpva28udjEuUGFydG5lclBhY2thZ2VNb2R1bGUSMAoJa25vd2xlZGdlGAogAygLMh0uam9rby52MS5QYXJ0bmVyUGFja2FnZU1vZHVsZRIRCglyZW1lbWJlcnMYCyADKAkSKgoFdG9vbHMYDCADKAsyGy5qb2tvLnYxLlBhcnRuZXJQYWNrYWdlVG9vbBIvCghyb3V0aW5lcxgNIAMoCzIdLmpva28udjEuUGFydG5lclBhY2thZ2VNb2R1bGUSMgoMaW5zdGFsbGF0aW9uGA4gASgLMhwuam9rby52MS5QYXJ0bmVySW1wb3J0UmVzdWx0IiwKGkxpc3RQYXJ0bmVyUGFja2FnZXNSZXF1ZXN0Eg4KBmxvY2FsZRgBIAEoCSJMChtMaXN0UGFydG5lclBhY2thZ2VzUmVzcG9uc2USLQoHZW50cmllcxgBIAMoCzIcLmpva28udjEuUGFydG5lclBhY2thZ2VFbnRyeSKHAQobSW52aXRlUGFydG5lclBhY2thZ2VSZXF1ZXN0EhIKCnBhY2thZ2VfaWQYASABKAkSFwoPcGFja2FnZV92ZXJzaW9uGAIgASgJEhQKDHBhY2thZ2VfaGFzaBgDIAEoCRIOCgZsb2NhbGUYBCABKAkSFQoNY29udHJvbGxlcl9pZBgFIAEoCSJMChxJbnZpdGVQYXJ0bmVyUGFja2FnZVJlc3BvbnNlEiwKBnJlc3VsdBgBIAEoCzIcLmpva28udjEuUGFydG5lckltcG9ydFJlc3VsdCq9AQoXUGFydG5lckltcG9ydFNvdXJjZUtpbmQSKgomUEFSVE5FUl9JTVBPUlRfU09VUkNFX0tJTkRfVU5TUEVDSUZJRUQQABIlCiFQQVJUTkVSX0lNUE9SVF9TT1VSQ0VfS0lORF9IRVJNRVMQARInCiNQQVJUTkVSX0lNUE9SVF9TT1VSQ0VfS0lORF9PUEVOQ0xBVxACEiYKIlBBUlRORVJfSU1QT1JUX1NPVVJDRV9LSU5EX1BBQ0tBR0UQAyqDAgoVUGFydG5lckltcG9ydENhdGVnb3J5EicKI1BBUlRORVJfSU1QT1JUX0NBVEVHT1JZX1VOU1BFQ0lGSUVEEAASJwojUEFSVE5FUl9JTVBPUlRfQ0FURUdPUllfUEVSU09OQUxJVFkQARIiCh5QQVJUTkVSX0lNUE9SVF9DQVRFR09SWV9NRU1PUlkQAhIiCh5QQVJUTkVSX0lNUE9SVF9DQVRFR09SWV9TS0lMTFMQAxInCiNQQVJUTkVSX0lNUE9SVF9DQVRFR09SWV9DT05ORUNUSU9OUxAEEicKI1BBUlRORVJfSU1QT1JUX0NBVEVHT1JZX0FVVE9NQVRJT05TEAUqrgEKE1BhcnRuZXJJbXBvcnRTdGF0dXMSJQohUEFSVE5FUl9JTVBPUlRfU1RBVFVTX1VOU1BFQ0lGSUVEEAASIQodUEFSVE5FUl9JTVBPUlRfU1RBVFVTX1JVTk5JTkcQARIiCh5QQVJUTkVSX0lNUE9SVF9TVEFUVVNfQ09NUExFVEUQAhIpCiVQQVJUTkVSX0lNUE9SVF9TVEFUVVNfTkVFRFNfQVRURU5USU9OEAMqngIKGFBhcnRuZXJJbXBvcnRDaGVja1N0YXR1cxIrCidQQVJUTkVSX0lNUE9SVF9DSEVDS19TVEFUVVNfVU5TUEVDSUZJRUQQABImCiJQQVJUTkVSX0lNUE9SVF9DSEVDS19TVEFUVVNfQ09QSUVEEAESKAokUEFSVE5FUl9JTVBPUlRfQ0hFQ0tfU1RBVFVTX1ZFUklGSUVEEAISLworUEFSVE5FUl9JTVBPUlRfQ0hFQ0tfU1RBVFVTX05FRURTX0FUVEVOVElPThADEioKJlBBUlRORVJfSU1QT1JUX0NIRUNLX1NUQVRVU19UQUtFTl9PVkVSEAQSJgoiUEFSVE5FUl9JTVBPUlRfQ0hFQ0tfU1RBVFVTX1BBVVNFRBAFMs0GChRQYXJ0bmVySW1wb3J0U2VydmljZRJgChNMaXN0UGFydG5lclBhY2thZ2VzEiMuam9rby52MS5MaXN0UGFydG5lclBhY2thZ2VzUmVxdWVzdBokLmpva28udjEuTGlzdFBhcnRuZXJQYWNrYWdlc1Jlc3BvbnNlEmMKFEludml0ZVBhcnRuZXJQYWNrYWdlEiQuam9rby52MS5JbnZpdGVQYXJ0bmVyUGFja2FnZVJlcXVlc3QaJS5qb2tvLnYxLkludml0ZVBhcnRuZXJQYWNrYWdlUmVzcG9uc2USbwoYTGlzdFBhcnRuZXJJbXBvcnRTb3VyY2VzEiguam9rby52MS5MaXN0UGFydG5lckltcG9ydFNvdXJjZXNSZXF1ZXN0Gikuam9rby52MS5MaXN0UGFydG5lckltcG9ydFNvdXJjZXNSZXNwb25zZRJjChRQcmV2aWV3UGFydG5lckltcG9ydBIkLmpva28udjEuUHJldmlld1BhcnRuZXJJbXBvcnRSZXF1ZXN0GiUuam9rby52MS5QcmV2aWV3UGFydG5lckltcG9ydFJlc3BvbnNlEm8KGFJlYWRQYXJ0bmVySW1wb3J0UHJldmlldxIoLmpva28udjEuUmVhZFBhcnRuZXJJbXBvcnRQcmV2aWV3UmVxdWVzdBopLmpva28udjEuUmVhZFBhcnRuZXJJbXBvcnRQcmV2aWV3UmVzcG9uc2USXQoSU3RhcnRQYXJ0bmVySW1wb3J0EiIuam9rby52MS5TdGFydFBhcnRuZXJJbXBvcnRSZXF1ZXN0GiMuam9rby52MS5TdGFydFBhcnRuZXJJbXBvcnRSZXNwb25zZRJpChZHZXRQYXJ0bmVySW1wb3J0U3RhdHVzEiYuam9rby52MS5HZXRQYXJ0bmVySW1wb3J0U3RhdHVzUmVxdWVzdBonLmpva28udjEuR2V0UGFydG5lckltcG9ydFN0YXR1c1Jlc3BvbnNlEl0KElJldHJ5UGFydG5lckltcG9ydBIiLmpva28udjEuUmV0cnlQYXJ0bmVySW1wb3J0UmVxdWVzdBojLmpva28udjEuUmV0cnlQYXJ0bmVySW1wb3J0UmVzcG9uc2ViBnByb3RvMw");
 
 /**
  * @generated from message joko.v1.PartnerImportSource
@@ -558,6 +558,242 @@ export const RetryPartnerImportResponseSchema: GenMessage<RetryPartnerImportResp
   messageDesc(file_joko_v1_partner_import, 19);
 
 /**
+ * @generated from message joko.v1.PartnerPackageModule
+ */
+export type PartnerPackageModule = Message<"joko.v1.PartnerPackageModule"> & {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string description = 2;
+   */
+  description: string;
+};
+
+/**
+ * Describes the message joko.v1.PartnerPackageModule.
+ * Use `create(PartnerPackageModuleSchema)` to create a new message.
+ */
+export const PartnerPackageModuleSchema: GenMessage<PartnerPackageModule> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_import, 20);
+
+/**
+ * @generated from message joko.v1.PartnerPackageTool
+ */
+export type PartnerPackageTool = Message<"joko.v1.PartnerPackageTool"> & {
+  /**
+   * @generated from field: string id = 1;
+   */
+  id: string;
+
+  /**
+   * @generated from field: string purpose = 2;
+   */
+  purpose: string;
+};
+
+/**
+ * Describes the message joko.v1.PartnerPackageTool.
+ * Use `create(PartnerPackageToolSchema)` to create a new message.
+ */
+export const PartnerPackageToolSchema: GenMessage<PartnerPackageTool> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_import, 21);
+
+/**
+ * @generated from message joko.v1.PartnerPackageCapability
+ */
+export type PartnerPackageCapability = Message<"joko.v1.PartnerPackageCapability"> & {
+  /**
+   * @generated from field: string icon = 1;
+   */
+  icon: string;
+
+  /**
+   * @generated from field: string label = 2;
+   */
+  label: string;
+};
+
+/**
+ * Describes the message joko.v1.PartnerPackageCapability.
+ * Use `create(PartnerPackageCapabilitySchema)` to create a new message.
+ */
+export const PartnerPackageCapabilitySchema: GenMessage<PartnerPackageCapability> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_import, 22);
+
+/**
+ * @generated from message joko.v1.PartnerPackageEntry
+ */
+export type PartnerPackageEntry = Message<"joko.v1.PartnerPackageEntry"> & {
+  /**
+   * @generated from field: string package_id = 1;
+   */
+  packageId: string;
+
+  /**
+   * @generated from field: string package_version = 2;
+   */
+  packageVersion: string;
+
+  /**
+   * @generated from field: string package_hash = 3;
+   */
+  packageHash: string;
+
+  /**
+   * @generated from field: string name = 4;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string description = 5;
+   */
+  description: string;
+
+  /**
+   * @generated from field: string avatar = 6;
+   */
+  avatar: string;
+
+  /**
+   * @generated from field: string bubble = 7;
+   */
+  bubble: string;
+
+  /**
+   * @generated from field: repeated joko.v1.PartnerPackageCapability capabilities = 8;
+   */
+  capabilities: PartnerPackageCapability[];
+
+  /**
+   * @generated from field: repeated joko.v1.PartnerPackageModule skills = 9;
+   */
+  skills: PartnerPackageModule[];
+
+  /**
+   * @generated from field: repeated joko.v1.PartnerPackageModule knowledge = 10;
+   */
+  knowledge: PartnerPackageModule[];
+
+  /**
+   * @generated from field: repeated string remembers = 11;
+   */
+  remembers: string[];
+
+  /**
+   * @generated from field: repeated joko.v1.PartnerPackageTool tools = 12;
+   */
+  tools: PartnerPackageTool[];
+
+  /**
+   * @generated from field: repeated joko.v1.PartnerPackageModule routines = 13;
+   */
+  routines: PartnerPackageModule[];
+
+  /**
+   * @generated from field: joko.v1.PartnerImportResult installation = 14;
+   */
+  installation?: PartnerImportResult | undefined;
+};
+
+/**
+ * Describes the message joko.v1.PartnerPackageEntry.
+ * Use `create(PartnerPackageEntrySchema)` to create a new message.
+ */
+export const PartnerPackageEntrySchema: GenMessage<PartnerPackageEntry> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_import, 23);
+
+/**
+ * @generated from message joko.v1.ListPartnerPackagesRequest
+ */
+export type ListPartnerPackagesRequest = Message<"joko.v1.ListPartnerPackagesRequest"> & {
+  /**
+   * @generated from field: string locale = 1;
+   */
+  locale: string;
+};
+
+/**
+ * Describes the message joko.v1.ListPartnerPackagesRequest.
+ * Use `create(ListPartnerPackagesRequestSchema)` to create a new message.
+ */
+export const ListPartnerPackagesRequestSchema: GenMessage<ListPartnerPackagesRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_import, 24);
+
+/**
+ * @generated from message joko.v1.ListPartnerPackagesResponse
+ */
+export type ListPartnerPackagesResponse = Message<"joko.v1.ListPartnerPackagesResponse"> & {
+  /**
+   * @generated from field: repeated joko.v1.PartnerPackageEntry entries = 1;
+   */
+  entries: PartnerPackageEntry[];
+};
+
+/**
+ * Describes the message joko.v1.ListPartnerPackagesResponse.
+ * Use `create(ListPartnerPackagesResponseSchema)` to create a new message.
+ */
+export const ListPartnerPackagesResponseSchema: GenMessage<ListPartnerPackagesResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_import, 25);
+
+/**
+ * @generated from message joko.v1.InvitePartnerPackageRequest
+ */
+export type InvitePartnerPackageRequest = Message<"joko.v1.InvitePartnerPackageRequest"> & {
+  /**
+   * @generated from field: string package_id = 1;
+   */
+  packageId: string;
+
+  /**
+   * @generated from field: string package_version = 2;
+   */
+  packageVersion: string;
+
+  /**
+   * @generated from field: string package_hash = 3;
+   */
+  packageHash: string;
+
+  /**
+   * @generated from field: string locale = 4;
+   */
+  locale: string;
+
+  /**
+   * @generated from field: string controller_id = 5;
+   */
+  controllerId: string;
+};
+
+/**
+ * Describes the message joko.v1.InvitePartnerPackageRequest.
+ * Use `create(InvitePartnerPackageRequestSchema)` to create a new message.
+ */
+export const InvitePartnerPackageRequestSchema: GenMessage<InvitePartnerPackageRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_import, 26);
+
+/**
+ * @generated from message joko.v1.InvitePartnerPackageResponse
+ */
+export type InvitePartnerPackageResponse = Message<"joko.v1.InvitePartnerPackageResponse"> & {
+  /**
+   * @generated from field: joko.v1.PartnerImportResult result = 1;
+   */
+  result?: PartnerImportResult | undefined;
+};
+
+/**
+ * Describes the message joko.v1.InvitePartnerPackageResponse.
+ * Use `create(InvitePartnerPackageResponseSchema)` to create a new message.
+ */
+export const InvitePartnerPackageResponseSchema: GenMessage<InvitePartnerPackageResponse> = /*@__PURE__*/
+  messageDesc(file_joko_v1_partner_import, 27);
+
+/**
  * @generated from enum joko.v1.PartnerImportSourceKind
  */
 export enum PartnerImportSourceKind {
@@ -575,6 +811,11 @@ export enum PartnerImportSourceKind {
    * @generated from enum value: PARTNER_IMPORT_SOURCE_KIND_OPENCLAW = 2;
    */
   OPENCLAW = 2,
+
+  /**
+   * @generated from enum value: PARTNER_IMPORT_SOURCE_KIND_PACKAGE = 3;
+   */
+  PACKAGE = 3,
 }
 
 /**
@@ -700,6 +941,22 @@ export const PartnerImportCheckStatusSchema: GenEnum<PartnerImportCheckStatus> =
  * @generated from service joko.v1.PartnerImportService
  */
 export const PartnerImportService: GenService<{
+  /**
+   * @generated from rpc joko.v1.PartnerImportService.ListPartnerPackages
+   */
+  listPartnerPackages: {
+    methodKind: "unary";
+    input: typeof ListPartnerPackagesRequestSchema;
+    output: typeof ListPartnerPackagesResponseSchema;
+  },
+  /**
+   * @generated from rpc joko.v1.PartnerImportService.InvitePartnerPackage
+   */
+  invitePartnerPackage: {
+    methodKind: "unary";
+    input: typeof InvitePartnerPackageRequestSchema;
+    output: typeof InvitePartnerPackageResponseSchema;
+  },
   /**
    * @generated from rpc joko.v1.PartnerImportService.ListPartnerImportSources
    */

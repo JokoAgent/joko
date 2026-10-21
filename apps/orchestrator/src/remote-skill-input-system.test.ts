@@ -121,7 +121,17 @@ describe("registered remote project Skill input composition", () => {
       mountedPath = daemon.mountPaths[0]!;
       expect(mountedPath).toMatch(/^\/home\/test\/\.joko\/runtime\/v1\/codex-home\/\.joko-approved-skills\//u);
       expect(await files.read({ path: posix.join(posix.dirname(mountedPath), "assets/template.bin"), maximumBytes: 4 })).toEqual(Buffer.from([0, 255, 8, 12]));
-      expect((await sessions.listRuntimeCommands({ sessionId })).commands).toEqual([]);
+      expect((await sessions.listRuntimeCommands({ sessionId })).commands).toEqual([{
+        $typeName: "joko.v1.RuntimeCommand",
+        commandId: expect.stringMatching(/^[a-f0-9]{64}$/u),
+        name: "native-report",
+        description: "",
+        source: contract.RuntimeCommandSource.SKILL,
+        resourceId: loaded.resourceId,
+        loaded: true,
+        sessionId,
+        inputMode: contract.RuntimeCommandInputMode.RESOURCE_MENTION
+      }]);
       const nativeStart = daemon.messages.find(message => message.method === "thread/resume")!;
       expect(serialize(nativeStart.params)).toContain('"skills.config"');
       expect(serialize(nativeStart.params)).toContain('"enabled":false');

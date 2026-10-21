@@ -1,0 +1,133 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+import "joko/v1/common.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/device_peer.proto";
+import "joko/v1/partner.proto";
+
+// The Orchestrator owns a Partner's stable identity and visible history. A
+// residence names only its execution computer; SSH hosts are not residences.
+service PartnerHomeService {
+  rpc GetPartnerHome(GetPartnerHomeRequest) returns (GetPartnerHomeResponse);
+  rpc ListPartnerHomeTargets(ListPartnerHomeTargetsRequest) returns (ListPartnerHomeTargetsResponse);
+  rpc InspectPartnerHomeTarget(InspectPartnerHomeTargetRequest) returns (InspectPartnerHomeTargetResponse);
+  rpc MovePartnerHome(MovePartnerHomeRequest) returns (MovePartnerHomeResponse);
+  rpc GetPartnerHomeMove(GetPartnerHomeMoveRequest) returns (GetPartnerHomeMoveResponse);
+  rpc RetryPartnerHomeMove(RetryPartnerHomeMoveRequest) returns (RetryPartnerHomeMoveResponse);
+}
+
+message PartnerHomeIdentity {
+  string authority_server_id = 1;
+  string partner_id = 2;
+  uint64 generation = 3;
+}
+
+message PartnerHomeDestination {
+  oneof location {
+    bool service_node = 1;
+    DevicePeerRouteIdentity peer = 2;
+  }
+}
+
+message PartnerHome {
+  PartnerHomeIdentity identity = 1;
+  string device_id = 2;
+  string device_name = 3;
+  bool service_node = 4;
+  bool available = 5;
+  bool changing = 6;
+}
+
+message PartnerHomeTarget {
+  PartnerHomeDestination destination = 1;
+  string device_name = 2;
+  string platform = 3;
+  bool available = 4;
+}
+
+enum PartnerHomeTargetAvailability {
+  PARTNER_HOME_TARGET_AVAILABILITY_UNSPECIFIED = 0;
+  PARTNER_HOME_TARGET_AVAILABILITY_READY = 1;
+  PARTNER_HOME_TARGET_AVAILABILITY_OFFLINE = 2;
+  PARTNER_HOME_TARGET_AVAILABILITY_RUNTIME_UNAVAILABLE = 3;
+  PARTNER_HOME_TARGET_AVAILABILITY_ACCESS_REVOKED = 4;
+}
+
+// Each choice is obtained from an actual runtime check on the selected
+// execution computer. It never implies that another computer's login travels.
+message PartnerHomeModelChoice {
+  PartnerModelRoute route = 1;
+  string display_name = 2;
+  repeated PermissionMode permission_modes = 3;
+  bool can_set_plan_mode = 4;
+}
+
+enum PartnerHomeMovePhase {
+  PARTNER_HOME_MOVE_PHASE_UNSPECIFIED = 0;
+  PARTNER_HOME_MOVE_PHASE_WAITING = 1;
+  PARTNER_HOME_MOVE_PHASE_STOPPING = 2;
+  PARTNER_HOME_MOVE_PHASE_PREPARING = 3;
+  PARTNER_HOME_MOVE_PHASE_ACTIVATING = 4;
+  PARTNER_HOME_MOVE_PHASE_READY = 5;
+  PARTNER_HOME_MOVE_PHASE_NEEDS_ATTENTION = 6;
+}
+
+enum PartnerHomeBusyAction {
+  PARTNER_HOME_BUSY_ACTION_UNSPECIFIED = 0;
+  PARTNER_HOME_BUSY_ACTION_WAIT = 1;
+  PARTNER_HOME_BUSY_ACTION_STOP = 2;
+}
+
+enum PartnerHomeMoveFailure {
+  PARTNER_HOME_MOVE_FAILURE_UNSPECIFIED = 0;
+  PARTNER_HOME_MOVE_FAILURE_BUSY = 1;
+  PARTNER_HOME_MOVE_FAILURE_SOURCE_UNAVAILABLE = 2;
+  PARTNER_HOME_MOVE_FAILURE_TARGET_UNAVAILABLE = 3;
+  PARTNER_HOME_MOVE_FAILURE_RUNTIME_UNAVAILABLE = 4;
+  PARTNER_HOME_MOVE_FAILURE_STATE_CHANGED = 5;
+  PARTNER_HOME_MOVE_FAILURE_OUTCOME_UNKNOWN = 6;
+  PARTNER_HOME_MOVE_FAILURE_PREPARATION_FAILED = 7;
+}
+
+message PartnerHomeMove {
+  string request_id = 1;
+  PartnerHomeIdentity identity = 2;
+  PartnerHomeMovePhase phase = 3;
+  PartnerHomeMoveFailure failure = 4;
+  string source_device_name = 5;
+  string target_device_name = 6;
+  optional string canonical_session_id = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp updated_at = 9;
+}
+
+message GetPartnerHomeRequest { string partner_id = 1; }
+message GetPartnerHomeResponse { PartnerHome home = 1; optional PartnerHomeMove pending_move = 2; }
+message ListPartnerHomeTargetsRequest { string partner_id = 1; }
+message ListPartnerHomeTargetsResponse { PartnerHome home = 1; repeated PartnerHomeTarget targets = 2; optional PartnerHomeMove pending_move = 3; }
+message InspectPartnerHomeTargetRequest { string partner_id = 1; PartnerHomeDestination destination = 2; }
+message InspectPartnerHomeTargetResponse {
+  PartnerHomeIdentity identity = 1;
+  PartnerHomeTarget target = 2;
+  PartnerHomeTargetAvailability availability = 3;
+  repeated PartnerHomeModelChoice models = 4;
+}
+message MovePartnerHomeRequest {
+  string request_id = 1;
+  PartnerHomeIdentity expected_home = 2;
+  Revision expected_partner_revision = 3;
+  PartnerHomeDestination destination = 4;
+  PartnerCapabilities capabilities = 5;
+  PartnerHomeBusyAction busy_action = 6;
+  // Explicit offline continuation may retire the old runtime while its last
+  // already-admitted turn finishes. It never replays an unknown old request.
+  bool continue_when_source_offline = 7;
+}
+message MovePartnerHomeResponse { PartnerHomeMove move = 1; }
+message GetPartnerHomeMoveRequest { string request_id = 1; }
+message GetPartnerHomeMoveResponse { PartnerHomeMove move = 1; }
+message RetryPartnerHomeMoveRequest { string request_id = 1; }
+message RetryPartnerHomeMoveResponse { PartnerHomeMove move = 1; }

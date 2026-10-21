@@ -3,6 +3,7 @@ import { Code, ConnectError, type HandlerContext, type ServiceImpl } from "@conn
 import * as contract from "@joko/contracts";
 import { AgentImportError, type AgentImportPreview, type AgentImportResult, type AgentImportSource } from "@joko/agent-import";
 import type { PartnerImportManager, PartnerImportController } from "./partner-import-manager.js";
+import { partnerPackageRoutineRhythm } from "./partner-package-types.js";
 
 export function createPartnerImportConnectService(manager: PartnerImportManager | undefined,
   authenticate: (context: HandlerContext) => { readonly id: string }): ServiceImpl<typeof contract.PartnerImportService> {
@@ -25,6 +26,21 @@ export function createPartnerImportConnectService(manager: PartnerImportManager 
   };
   const result = (value: AgentImportResult) => toProtoImportResult(value, owner().entryNames(value.requestId));
   return {
+    listPartnerPackages: (request, context) => invoke(context, undefined, async controller =>
+      create(contract.ListPartnerPackagesResponseSchema, { entries: (await owner().packages(request.locale, controller)).map(entry =>
+        create(contract.PartnerPackageEntrySchema, { packageId: entry.packageId, packageVersion: entry.packageVersion, packageHash: entry.packageHash,
+          name: entry.name, description: entry.description, avatar: entry.avatar, bubble: entry.bubble,
+          capabilities: entry.capabilities.map(capability => create(contract.PartnerPackageCapabilitySchema, capability)),
+          skills: entry.skills.map(module => create(contract.PartnerPackageModuleSchema, module)),
+          knowledge: entry.knowledge.map(module => create(contract.PartnerPackageModuleSchema, { name: module.title, description: module.summary })),
+          remembers: entry.remembers, tools: entry.tools.map(tool => create(contract.PartnerPackageToolSchema, tool)),
+          routines: entry.routines.map(module => {
+            const rhythm = partnerPackageRoutineRhythm(module.cron, request.locale);
+            return create(contract.PartnerPackageModuleSchema, { name: module.name + (rhythm ? ` · ${rhythm}` : ""), description: module.summary });
+          }),
+          ...(entry.installation ? { installation: result(entry.installation) } : {}) })) })),
+    invitePartnerPackage: (request, context) => invoke(context, request.controllerId, async controller =>
+      create(contract.InvitePartnerPackageResponseSchema, { result: result(await owner().invitePackage(request, request.locale, controller)) })),
     listPartnerImportSources: (request, context) => invoke(context, request.controllerId, async controller =>
       create(contract.ListPartnerImportSourcesResponseSchema, { sources: (await owner().sources(controller)).map(toProtoImportSource) })),
     previewPartnerImport: (request, context) => invoke(context, request.controllerId, async controller =>
@@ -49,7 +65,7 @@ export function createPartnerImportConnectService(manager: PartnerImportManager 
 
 function toProtoImportSource(value: AgentImportSource): contract.PartnerImportSource {
   return create(contract.PartnerImportSourceSchema, { ...value,
-    kind: value.kind === "hermes" ? contract.PartnerImportSourceKind.HERMES : contract.PartnerImportSourceKind.OPENCLAW });
+    kind: value.kind === "package" ? contract.PartnerImportSourceKind.PACKAGE : value.kind === "hermes" ? contract.PartnerImportSourceKind.HERMES : contract.PartnerImportSourceKind.OPENCLAW });
 }
 function toProtoImportPage(value: AgentImportPreview, offset: number): contract.PartnerImportPreviewPage {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > value.entries.length) throw new AgentImportError("INVALID_SELECTION");

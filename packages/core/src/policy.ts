@@ -138,6 +138,11 @@ export function decideToolCall(call: ToolCall, context: PolicyContext): PolicyDe
     return { action: "ask", risk, reason: "The ask policy requires owner confirmation." };
   }
 
+  if (context.mode === "acceptEdits") {
+    return risk === "safe_read" || risk === "workspace_write"
+      ? { action: "allow", risk, reason: "The edit policy permits bounded workspace reads and file changes." }
+      : { action: "ask", risk, reason: "The edit policy requires confirmation for commands and external actions." };
+  }
   if (risk === "safe_read" || risk === "workspace_write" || risk === "safe_command") {
     return { action: "allow", risk, reason: "Auto policy classified the operation as bounded and safe." };
   }
