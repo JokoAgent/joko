@@ -416,6 +416,7 @@ describe("ClaudeCodeAdapter", () => {
     let committed = false;
     let released = false;
     const calls: Array<Parameters<ClaudeMcpRuntimeLease["call"]>[0]> = [];
+    let modelCall: Parameters<NonNullable<ClaudeMcpRuntimeLease["models"]>[number]["connect"]>[1] | undefined;
     const tool = {
       serverId: "approved-tools", name: "echo", description: "Echo an approved value",
       inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
@@ -423,6 +424,7 @@ describe("ClaudeCodeAdapter", () => {
     } as const;
     const lease: ClaudeMcpRuntimeLease = {
       tools: [tool],
+      models: [{ serverId: tool.serverId, connect: async (_transport, call) => { modelCall = call; } }],
       assertCurrent: () => { if (released || !committed) throw new Error("Stale product Session"); },
       call: async (input) => {
         calls.push(input);
@@ -450,10 +452,10 @@ describe("ClaudeCodeAdapter", () => {
     expect(sdk.retiredQueries).toEqual([sdk.queries[0]]);
     expect(sdk.queries[1]!.params.options.resume).toBe(binding.nativeSessionId);
     expect(sdk.queries[1]!.params.options.mcpTools).toMatchObject([tool]);
-    const call = sdk.queries[1]!.params.options.mcpTools![0]!;
+    await sdk.queries[1]!.params.options.mcpModels![0]!.connect({ start: async () => {}, send: async () => {}, close: async () => {} });
     const toolUseId = "native-approved-call";
     const nativeArguments = { value: "hello" };
-    const invoke = () => call.call(nativeArguments, { toolUseId, signal: new AbortController().signal });
+    const invoke = () => modelCall!({ toolName: tool.name, arguments: nativeArguments, toolUseId, signal: new AbortController().signal, modelCallId: "original-model-request" });
     const earlyCall = invoke();
     nativeArguments.value = "changed while awaiting root owner";
     const assistantUuid = randomUUID();
@@ -464,6 +466,7 @@ describe("ClaudeCodeAdapter", () => {
     await expect(earlyCall).resolves.toMatchObject({ content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" } });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.arguments).toEqual({ value: "hello" });
+    expect(calls[0]!.modelCallId).toBe("original-model-request");
     expect(calls[0]!.partnerLearningAuthority).toMatchObject({ source: learningSource, requestId: calls[0]!.requestId, serverId: tool.serverId, toolName: tool.name });
     expect(nativeReply).toHaveBeenCalledWith(assistantUuid);
     sdk.queries[1]!.push(assistantMessage(binding.nativeSessionId!, assistantUuid, [{ type: "text", text: "Repeated native frame" }]));

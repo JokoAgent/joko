@@ -1,4 +1,8 @@
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary, type MessageInitShape } from "@bufbuild/protobuf";
+import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateResponseSchema } from "@joko/contracts";
+import { ExtensionCardService } from "@joko/contracts";
+import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
+import type { McpAppApi } from "./model.js";
 import { AppDefaultModelService } from "@joko/contracts";
 import { HelpService, HelpRole, WorktreeRecycleAction, WorktreeRecycleState, WorktreeRecycleReason, type WorktreeRecycleRecord } from "@joko/contracts";
 import type { HelpMessageView, HelpAnswerView, HelpFeedbackDraftView, WorktreeRecycleRecordView } from "./model.js";
@@ -1955,6 +1959,9 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async send(sessionId: string, draft: ComposerDraft, admission: { readonly expectedGeneration: bigint }): Promise<void> {
     const scope = this.captureActionScope();
+    const edits = pendingExtensionCardFormDelivery(extensionCardFormDeliveryScope(scope.signal, sessionId));
+    if (edits && !await edits) throw new GatewayError("The card edits could not be saved. Retry the card edit before sending.");
+    scope.signal.throwIfAborted();
     const expectedGeneration = admission.expectedGeneration;
     if (expectedGeneration < 1n || expectedGeneration > BigInt(Number.MAX_SAFE_INTEGER)) {
       throw new GatewayError("Input requires the source task generation.");
@@ -5066,6 +5073,71 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }, assertCurrent: () => {
       if (this.#transport !== transport || this.#abort?.signal.aborted) throw new GatewayError("Group connection owner changed.");
     } });
+  }
+
+  mcpAppApi(): McpAppApi | undefined {
+    const transport = this.#transport;
+    if (transport === undefined) return;
+    const native = typeof window === "undefined" ? undefined : window.jokoDesktop?.mcpApps, profile = this.#profile;
+    if (native && profile) {
+      const owner = { profileId: profile.id, serverId: profile.serverId, origin: profile.origin };
+      return { operate: async request => fromBinary(McpAppServiceOperateResponseSchema,
+        await native.operate(owner, toBinary(McpAppServiceOperateRequestSchema, create(McpAppServiceOperateRequestSchema, request)))) };
+    }
+    const client = createClient(McpAppService, transport);
+    return { operate: (request, signal) => client.operate(request, { signal, timeoutMs: 120_000 }) };
+  }
+  extensionCardApi(): import("./model.js").ExtensionCardApi | undefined {
+    const transport = this.#transport, owner = this.#abort;
+    if (!transport || !owner) return;
+    const client = createClient(ExtensionCardService, transport);
+    const uploadScope = this.captureActionScope();
+    const assertCurrent = () => { owner.signal.throwIfAborted(); if (this.#transport !== transport || this.#abort !== owner) throw new GatewayError("Extension connection changed."); };
+    return {
+      formScope: sessionId => extensionCardFormDeliveryScope(owner.signal, sessionId),
+        loadMedia: async (sessionId, cardId, uri, signal) => {
+          assertCurrent(); const combined = AbortSignal.any([signal, owner.signal]); combined.throwIfAborted();
+          const { blob } = await client.readMedia({ sessionId, cardId, uri, metadataOnly: true }, { signal: combined });
+          assertCurrent(); combined.throwIfAborted(); if (!blob) throw new GatewayError("Extension media unavailable.");
+          let retained = false;
+          try {
+            retained = true; const url = await this.getArtifactUrl(blob.blobId);
+            assertCurrent(); combined.throwIfAborted();
+            const current = await client.readMedia({ sessionId, cardId, uri, metadataOnly: true }, { signal: combined });
+            assertCurrent(); combined.throwIfAborted();
+            if (current.blob?.blobId !== blob.blobId || current.blob.sha256Hex !== blob.sha256Hex) throw new GatewayError("Extension media changed.");
+            return { blob, url, release: () => { if (retained) { retained = false; this.releaseArtifactUrl(blob.blobId); } } };
+          } catch (error) { if (retained) this.releaseArtifactUrl(blob.blobId); throw error; }
+        },
+      beginAttachment: async (request, options) => { assertCurrent(); const result = await client.beginAttachment(request, { ...options,
+        signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; },
+      readMedia: async (request, options) => { assertCurrent(); const result = await client.readMedia(request, { ...options,
+        signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; },
+      uploadAttachment: async (sessionId, cardId, file, inline, signal) => {
+        assertCurrent(); signal.throwIfAborted();
+        if (file.size > 16 * 1024 * 1024) throw new GatewayError("Mail attachment exceeds 16 MB.");
+        const bytes = await file.arrayBuffer(), digest = await sha256Hex(bytes); assertCurrent(); signal.throwIfAborted();
+          if (bytes.byteLength !== file.size) throw new GatewayError("Mail attachment selection changed.");
+        const combined = AbortSignal.any([signal, owner.signal]);
+        const response = await client.beginAttachment({ sessionId, cardId, inline, fileName: file.name, mediaType: file.type || "application/octet-stream", byteSize: BigInt(file.size), sha256Hex: digest }, { signal: combined });
+        assertCurrent(); combined.throwIfAborted();
+        const upload = response.upload, endpoint = upload?.ticket?.relativeEndpoint;
+        if (!upload || !endpoint || upload.expectedSha256Hex !== digest || upload.expectedByteSize !== BigInt(file.size)
+          || !endpoint.startsWith("/v1/blobs/upload/") || endpoint.includes("\\") || endpoint.includes("?") || endpoint.includes("#")) throw new GatewayError("Invalid mail attachment upload ticket.");
+        const uploaded = await fetch(this.authorizedEndpoint(endpoint), { method: "PUT", body: file, signal: combined,
+          headers: { authorization: `Bearer ${uploadScope.authKey}`, "content-type": "application/octet-stream" } });
+        assertCurrent(); combined.throwIfAborted(); if (!uploaded.ok) throw new GatewayError("Mail attachment upload failed.");
+        return upload.uploadId;
+      },
+      previewMail: async (request, options) => { assertCurrent(); const result = await client.previewMail(request, { ...options,
+        signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; },
+      get: async (request, options) => { assertCurrent(); const result = await client.get(request, { ...options,
+        signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; },
+      dispatch: async (request, options) => { assertCurrent(); const result = await client.dispatch(request, { ...options,
+        signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; },
+      authorizeLink: async (request, options) => { assertCurrent(); const result = await client.authorizeLink(request, { ...options,
+        signal: options?.signal ? AbortSignal.any([options.signal, owner.signal]) : owner.signal }); assertCurrent(); return result; }
+    };
   }
   async uploadPartnerGroupFile(file: File, signal: AbortSignal): Promise<import("@joko/contracts").BlobRef> {
     return await this.uploadAttachment(file, this.captureActionScope(signal)) as unknown as import("@joko/contracts").BlobRef;
@@ -11033,6 +11105,8 @@ export function projectSnapshotEvent(
     case "statusStream":
     case "messageCompleted":
     case "partnerLearningChanged":
+    case "mcpAppChanged":
+    case "extensionCardChanged":
     case "toolCallStarted":
     case "toolCallUpdated":
     case "toolCallCompleted":
@@ -11173,6 +11247,8 @@ function isTimelineEvent(kind: NonNullable<NonNullable<Event["payload"]>["kind"]
     || kind === "statusStream"
     || kind === "messageCompleted"
     || kind === "partnerLearningChanged"
+    || kind === "mcpAppChanged"
+    || kind === "extensionCardChanged"
     || kind === "toolCallStarted"
     || kind === "toolCallUpdated"
     || kind === "toolCallCompleted"
@@ -11446,9 +11522,31 @@ function projectTimelineEvent(
       });
       break;
     }
+    case "extensionCardChanged": {
+      const card = kind.value.card;
+      if (card === undefined || card.sessionId !== sessionId || !card.cardId) changed = false;
+      else {
+        const existing = items.find(item => item.id === card.cardId);
+        replaceOrAppend({ id: card.cardId, sequence: existing?.sequence ?? sequence,
+          sourceEventId: existing?.sourceEventId ?? event.eventId, kind: "artifact", createdAt: existing?.createdAt ?? createdAt,
+          title: card.extensionName, text: card.text, extensionCard: card });
+      }
+      break;
+    }
+    case "mcpAppChanged": {
+      const card = kind.value.card;
+      if (card === undefined || card.sessionId !== sessionId || !card.cardId) changed = false;
+      else {
+        const existing = items.find(item => item.id === card.cardId);
+        replaceOrAppend({ id: card.cardId, sequence: existing?.sequence ?? sequence,
+          sourceEventId: existing?.sourceEventId ?? event.eventId, kind: "artifact", createdAt: existing?.createdAt ?? createdAt,
+          title: card.title, text: card.text, mcpApp: card });
+      }
+      break;
+    }
     case "artifactProduced": {
       const artifact = kind.value.artifact;
-      if (artifact === undefined) changed = false;
+      if (artifact === undefined || kind.value.embeddedInExtensionCard) changed = false;
       else replaceOrAppend({ id: event.eventId, sequence, kind: "artifact", createdAt, title: artifact.title, artifact: mapArtifact(artifact) });
       break;
     }

@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Public card projection. Tool arguments, View-only results and HTML stay private.
+message McpAppCard {
+  string card_id = 1;
+  string session_id = 2;
+  string title = 3;
+  string text = 4;
+  bool pending = 5;
+  bool cancelled = 6;
+  bool is_error = 7;
+  google.protobuf.Timestamp updated_at = 8;
+}
+
+enum McpAppOperation {
+  MCP_APP_OPERATION_UNSPECIFIED = 0;
+  MCP_APP_OPERATION_OPEN = 1;
+  MCP_APP_OPERATION_CANCEL_OPEN = 2;
+  MCP_APP_OPERATION_CONTEXT = 3;
+  MCP_APP_OPERATION_DISPLAY_MODE = 4;
+  MCP_APP_OPERATION_TEARDOWN = 5;
+}
+
+// View transport operations are available only to the isolated frame's private bridge.
+message McpAppServiceOperateRequest {
+  string session_id = 1;
+  McpAppOperation operation = 2;
+  string card_id = 3;
+  string view_id = 4;
+  string open_id = 5;
+  string context_json = 6;
+  string display_mode = 7;
+  string ui_owner_id = 8;
+}
+
+message McpAppServiceOperateResponse {
+  string view_id = 1;
+  string proxy_url = 2;
+  bool prefers_border = 3;
+}
+
+service McpAppService {
+  rpc Operate(McpAppServiceOperateRequest) returns (McpAppServiceOperateResponse);
+}
+
+// Native hosts keep private documents and standard App transport outside the public UI.
+enum McpAppNativeOperation {
+  MCP_APP_NATIVE_OPERATION_UNSPECIFIED = 0;
+  MCP_APP_NATIVE_OPERATION_OPEN = 1;
+  MCP_APP_NATIVE_OPERATION_MESSAGE = 2;
+  MCP_APP_NATIVE_OPERATION_POLL = 3;
+  MCP_APP_NATIVE_OPERATION_AUTHORIZE_LINK = 4;
+  MCP_APP_NATIVE_OPERATION_LINK_RESULT = 5;
+}
+
+message McpAppNativeDocument {
+  string view_id = 1;
+  string html = 2;
+  string csp = 3;
+  bool prefers_border = 4;
+  repeated string connect_domains = 5;
+  repeated string resource_domains = 6;
+  repeated string frame_domains = 7;
+  repeated string base_uri_domains = 8;
+}
+
+message McpAppNativeServiceOperateRequest {
+  McpAppServiceOperateRequest view = 1;
+  McpAppNativeOperation operation = 2;
+  string message_json = 3;
+  uint64 after = 4;
+  string link_id = 5;
+  string url = 6;
+  bool success = 7;
+}
+
+message McpAppNativeServiceOperateResponse {
+  McpAppNativeDocument document = 1;
+  string events_json = 2;
+  uint32 link_valid_for_ms = 3;
+}
+
+service McpAppNativeService {
+  rpc Operate(McpAppNativeServiceOperateRequest) returns (McpAppNativeServiceOperateResponse);
+}

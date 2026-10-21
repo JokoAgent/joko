@@ -2,6 +2,7 @@ import { createContext, isValidElement, memo, useCallback, useContext, useEffect
 import type { ComponentProps, CSSProperties, JSX, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { sessionHandoffMessages as handoffMessages } from "@joko/contracts";
+import { useExtensionMailLinkHandler } from "./ExtensionMailReader.js";
 import { assertBrowserActionCurrent, type BrowserActionContext, type HttpLinkOpenOptions } from "../browser-action.js";
 import { defaultRangeExtractor, elementScroll, useVirtualizer } from "@tanstack/react-virtual";
 import {
@@ -97,6 +98,8 @@ import { TimelineArtifactMedia, timelineArtifactMediaKind } from "./TimelineArti
 import { TimelineArtifactModel, timelineArtifactModelKind } from "./TimelineArtifactModel.js";
 import { NativeArtifactFileActionsMenu, NativeFileActionsContext } from "./NativeFileCopyMenu.js";
 import { useTimelineArtifactUrlCache } from "./timeline-artifact-url-cache.js";
+import { McpAppCard } from "./McpAppCard.js";
+import { ExtensionCard } from "./ExtensionCard.js";
 import { AudioArtworkContext } from "./AudioArtwork.js";
 import { timelineErrorCopy } from "../timeline-error-copy.js";
 import { GAMEPAD_SCROLL_EVENT } from "../gamepad-client.js";
@@ -250,6 +253,7 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
   readonly onInlinePlanVisibilityChange?: (visibility: InlinePlanVisibility | null) => void;
   readonly onRootChange?: (root: HTMLDivElement | null) => void;
 }): JSX.Element {
+  const mailLinkContext = useExtensionMailLinkHandler(onOpenHttpLink);
   const planTimelineItems = useMemo(() => projectInlinePlanTimeline(items), [items]);
   const partnerConversation = usePartnerConversation();
   const partnerPresentation = partnerConversation?.kind === "partner";
@@ -363,11 +367,11 @@ export function Timeline({ ownerKey, viewportOwnerKey, sessionId, sessionName, w
     sessionId,
     workspaceId,
     onReadArtifact,
-    ...(onOpenHttpLink === undefined ? {} : { onOpenHttpLink }),
+    ...(mailLinkContext === undefined ? {} : { onOpenHttpLink: mailLinkContext }),
     ...(onOpenWorkspaceHtml === undefined ? {} : { onOpenWorkspaceHtml }),
     ...(onLoadWorkspaceAsset === undefined ? {} : { onLoadWorkspaceAsset }),
     ...(onWorkspaceImageToComposer === undefined ? {} : { onWorkspaceImageToComposer })
-  }), [onLoadWorkspaceAsset, onOpenHttpLink, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, reducedMotion, sessionId, streamFadeEnabled]);
+  }), [onLoadWorkspaceAsset, mailLinkContext, onOpenWorkspaceHtml, onWorkspaceImageToComposer, onReadArtifact, workspaceId, ownerKey, reducedMotion, sessionId, streamFadeEnabled]);
   const subagentContext = useMemo<TimelineSubagentContextValue>(() => ({
     runs: subagentRuns ?? new Map(),
     details: subagentRunDetails ?? new Map(),
@@ -1258,6 +1262,8 @@ function WorkGroupBlock({ sessionId, sessionName, work, retryRunId, locale, redu
 }
 
 function TimelineBlock({ sessionId, sessionName, item, planAnimated = false, retryRunId, locale, reducedMotion, t, onRetry, onRecovery, recoveryContext, onArtifactUrl, onArtifactDownload, onWorkspaceRewind, onOpenGeneratedFile, onOpenTurnReview, onReobserveReview, onAddMessageToComposer, onForkMessage, forkingMessageId, shareSelection, onStartShareSelection, onToggleShareMessage, editingMessageId, editableMessageId, onEditMessage, onCancelEditMessage, onMoveEditedMessageToComposer, onPreviewMessageRewind, rewindToStartSupported, onDeleteMessage, messageDeleteBlockedReason, showMessageActions = true }: { readonly sessionId: string; readonly sessionName: string; readonly item: TimelineItemView; readonly planAnimated?: boolean; readonly retryRunId?: string; readonly locale: string; readonly reducedMotion: boolean; readonly t: Translator; readonly onRetry?: (error: ErrorView) => void; readonly onRecovery?: (error: ErrorView, action: ErrorRecoveryActionView) => void; readonly recoveryContext?: RecoveryActionContext; readonly onArtifactUrl: (blobId: string) => Promise<string>; readonly onArtifactDownload: OperationApi["downloadArtifact"]; readonly onWorkspaceRewind?: (workspaceId: string, changeSetId: string) => void; readonly onOpenGeneratedFile?: (workspaceId: string, relativePath: string) => void; readonly onOpenTurnReview?: (changeSetId: string, relativePath?: string) => void; readonly onReobserveReview?: (reviewRunId: string) => Promise<void>; readonly onAddMessageToComposer?: (item: TimelineItemView) => void; readonly onForkMessage?: (item: TimelineItemView) => void; readonly forkingMessageId?: string; readonly shareSelection?: TimelineShareSelection; readonly onStartShareSelection?: (item: TimelineItemView) => void; readonly onToggleShareMessage?: (itemId: string, extendRange: boolean) => void; readonly editingMessageId?: string; readonly editableMessageId?: string; readonly onEditMessage?: (item: TimelineItemView) => void; readonly onCancelEditMessage?: () => void; readonly onMoveEditedMessageToComposer?: (item: TimelineItemView, text: string) => Promise<void>; readonly onPreviewMessageRewind?: (item: TimelineItemView) => void; readonly rewindToStartSupported?: boolean; readonly onDeleteMessage?: (item: TimelineItemView) => void; readonly messageDeleteBlockedReason?: string; readonly showMessageActions?: boolean }): JSX.Element {
+  if (item.mcpApp !== undefined) return <McpAppCard card={item.mcpApp} locale={locale} t={t} />;
+  if (item.extensionCard !== undefined) return <ExtensionCard card={item.extensionCard} t={t} />;
   if (item.inlinePlan !== undefined) return <InlinePlanCard plan={item.inlinePlan} animated={planAnimated} t={t} />;
   switch (item.kind) {
     case "user": return <MessageBlock sessionId={sessionId} sessionName={sessionName} item={item} role="user" locale={locale} reducedMotion={reducedMotion} t={t} onArtifactUrl={onArtifactUrl} onArtifactDownload={onArtifactDownload} onAddMessageToComposer={onAddMessageToComposer} onForkMessage={onForkMessage} forking={forkingMessageId === item.id} shareSelection={shareSelection} onStartShareSelection={onStartShareSelection} onToggleShareMessage={onToggleShareMessage} editing={editingMessageId === item.id} editable={editableMessageId === item.id} onEdit={onEditMessage} onCancelEdit={onCancelEditMessage} onMoveEditedMessageToComposer={onMoveEditedMessageToComposer} onPreviewMessageRewind={onPreviewMessageRewind} rewindToStartSupported={rewindToStartSupported} onDeleteMessage={onDeleteMessage} messageDeleteBlockedReason={messageDeleteBlockedReason} showActions={showMessageActions} />;

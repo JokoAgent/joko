@@ -826,9 +826,11 @@ describe("session host, durable events, and reconnect semantics", () => {
 
     const anchor = await visibleTimelineAnchor(page);
     await page.context().setOffline(true);
-    // The event stream may belong to the SharedWorker rather than this Page.
-    // Interrupt its real server socket and reject retries until recovery.
-    releaseEventStreams = fixture.suspendPublicEventStreams();
+    // The SharedWorker may outlive Page-level offline emulation. Suspend all
+    // requests from this paired browser, including reconnect snapshots.
+    const browserConnections = fixture.application.store.listConnections().filter(connection => connection.name === "Mounted Timeline Web" && connection.state === "active");
+    expect(browserConnections.length).toBe(1);
+    releaseEventStreams = fixture.suspendPublicClientConnection(browserConnections[0]!.id);
     await page.locator(".offline-banner:visible,.error-banner:visible").first().waitFor({ state: "visible", timeout: 20_000 });
     const remoteOperation = await send(MOUNTED_TIMELINE_REMOTE);
     const remoteContext = await waitFor(async () => adapter.contexts.get(MOUNTED_TIMELINE_REMOTE),

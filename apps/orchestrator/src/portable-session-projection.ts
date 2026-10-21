@@ -49,7 +49,15 @@ export function projectPortableSessionMessages(
 ): PortableSessionProjection {
   const messages: PortableProjectedMessage[] = [];
   const artifacts: PortableProjectedArtifact[] = [];
+  const appHistory = new Map<string, number>();
   for (const [sourceOrder, event] of events.entries()) {
+    if (event.payload.type === "mcp_app_changed" || event.payload.type === "extension_card_changed") {
+      const card = event.payload.card, existing = appHistory.get(card.id);
+      const previous = existing === undefined ? undefined : messages[existing];
+      const message: PortableProjectedMessage = { sourceOrder: previous?.sourceOrder ?? sourceOrder, emittedAt: event.emittedAt,
+        role: "assistant", blocks: [{ kind: "text", text: `[Application history: ${"title" in card ? card.title : card.extensionName}]${card.text ? `\n${card.text}` : ""}` }] };
+      if (existing === undefined) { appHistory.set(card.id, messages.length); messages.push(message); } else messages[existing] = message;
+    }
     if (event.payload.type === "artifact") artifacts.push({ sourceOrder, emittedAt: event.emittedAt, payload: event.payload });
     if (event.payload.type === "status" && event.payload.key === "artifact_unavailable") artifacts.push({ sourceOrder, emittedAt: event.emittedAt, payload: { type: "status", key: "artifact_unavailable", text: event.payload.text ?? "" } });
     if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined

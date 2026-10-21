@@ -6,6 +6,9 @@ import { join } from "node:path";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+import { ListResourcesRequestSchema, ListRootsRequestSchema, ListRootsResultSchema, ReadResourceRequestSchema, JSONRPCMessageSchema } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createManagerState, ManagerConnection } from "./remote-manager/manager.mjs";
@@ -34,6 +37,54 @@ afterEach(async () => {
 });
 
 describe("remote Claude manager protocol", () => {
+  it("carries bidirectional standard MCP outside a waiting Query control and retires the exact transport", async () => {
+    const { connection, sdk, managerState } = await freshManagerFixture();
+    const started = await connection.request("query.start", {
+      requestId: QUERY_ID, queryId: QUERY_ID, sessionId: SESSION_ID, ownerKey: "a".repeat(64), ownerGeneration: "target:host:ssh:models", afterSeq: 0,
+      options: { ...queryOptions(), managedAgentTool: undefined, productMcpModels: [{ serverId: "resources" }] },
+    }, QUERY_ID) as { attachmentId: string };
+    const source = new Server({ name: "original-resource-server", version: "1" }, { capabilities: { resources: {} }, instructions: "Original instructions" });
+    source.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [{ uri: "data://fixture/roots", name: "Roots" }] }));
+    source.setRequestHandler(ReadResourceRequestSchema, async request => {
+      const roots = await source.request({ method: "roots/list" }, ListRootsResultSchema);
+      return { contents: [{ uri: request.params.uri, mimeType: "text/plain", text: roots.roots[0]!.name! }] };
+    });
+    let owner: { channelId: string; serverId: string; transport: Transport } | undefined;
+    connection.modelCallback = async (callback, value) => {
+      const serverId = String(value["serverId"]), channelId = String(value["channelId"]);
+      expect(serverId).toBe("resources");
+      if (callback === "productMcpConnect") {
+        const transport: Transport = { start: async () => {}, close: async () => { transport.onclose?.(); },
+          send: async message => { await connection.request("query.mcpMessage", { queryId: QUERY_ID, attachmentId: started.attachmentId, serverId, channelId, message }); },
+        };
+        owner = { serverId, channelId, transport }; await source.connect(transport);
+      } else {
+        expect(owner?.channelId).toBe(channelId);
+        if (callback === "productMcpMessage") owner!.transport.onmessage?.(JSONRPCMessageSchema.parse(value["message"]));
+        else await source.close();
+      }
+      return {};
+    };
+    const servers = sdk.queries[0]!.options["mcpServers"] as Record<string, { instance: { connect(transport: Transport): Promise<void>; close(): Promise<void> } }>;
+    const model = Object.values(servers)[0]!.instance, client = new Client({ name: "remote-native", version: "1" }, { capabilities: { roots: {} } });
+    client.setRequestHandler(ListRootsRequestSchema, async () => ({ roots: [{ uri: "file:///fixture", name: "Native root" }] }));
+    const [a, b] = InMemoryTransport.createLinkedPair();
+    cleanups.push(async () => { await Promise.allSettled([client.close(), model.close(), source.close()]); });
+    await Promise.all([client.connect(a), model.connect(b)]);
+    expect(client.getInstructions()).toBe("Original instructions"); expect(client.getServerCapabilities()).toEqual({ resources: {} });
+    expect((await client.listResources()).resources).toHaveLength(1);
+    let read = "";
+    sdk.queries[0]!.setModel = async () => { const result = await client.readResource({ uri: "data://fixture/roots" }), content = result.contents[0]!; read = "text" in content ? content.text : ""; };
+    await connection.request("query.setModel", { queryId: QUERY_ID, attachmentId: started.attachmentId, model: "selected-model" });
+    expect(read).toBe("Native root");
+    const privateOwner = owner!;
+    await expect(connection.request("query.mcpMessage", { queryId: QUERY_ID, attachmentId: randomUUID(), serverId: privateOwner.serverId, channelId: privateOwner.channelId,
+      message: { jsonrpc: "2.0", method: "notifications/roots/list_changed" } })).rejects.toHaveProperty("code", "attachment_stale");
+    await client.close();
+    await expect.poll(() => managerState.queries.get(QUERY_ID)?.mcpModels.size).toBe(0);
+    await expect(connection.request("query.mcpMessage", { queryId: QUERY_ID, attachmentId: started.attachmentId, serverId: privateOwner.serverId, channelId: privateOwner.channelId,
+      message: { jsonrpc: "2.0", method: "notifications/roots/list_changed" } })).rejects.toHaveProperty("code", "mcp_model_retired");
+  });
   it.each(["waiting", "queued"] as const)("persists fresh dispatch before delivering to a %s SDK reader and recovers the same owner", async (timing) => {
     const fixture = await freshManagerFixture();
     const { connection, authority, identity, sdk, managerState } = fixture;
@@ -495,15 +546,17 @@ describe("remote Claude manager protocol", () => {
 class ControlledInputQuery implements AsyncIterable<unknown> {
   readonly #input: AsyncIterator<unknown>;
   readonly #output = new AsyncQueue<unknown>();
-  constructor(params: { readonly prompt: AsyncIterable<unknown> }) { this.#input = params.prompt[Symbol.asyncIterator](); }
+  readonly options: Record<string, unknown>;
+  constructor(params: { readonly prompt: AsyncIterable<unknown>; readonly options?: Record<string, unknown> }) { this.#input = params.prompt[Symbol.asyncIterator](); this.options = params.options ?? {}; }
   [Symbol.asyncIterator](): AsyncIterator<unknown> { return this.#output; }
   read(): Promise<IteratorResult<unknown>> { return Promise.resolve(this.#input.next()); }
   close(): void { this.#output.close(); }
+  async setModel(_model?: string): Promise<void> {}
 }
 
 class ControlledInputSdk {
   readonly queries: ControlledInputQuery[] = [];
-  query(params: { readonly prompt: AsyncIterable<unknown> }): ControlledInputQuery {
+  query(params: { readonly prompt: AsyncIterable<unknown>; readonly options?: Record<string, unknown> }): ControlledInputQuery {
     const query = new ControlledInputQuery(params);
     this.queries.push(query);
     return query;
@@ -766,6 +819,7 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
 }
 
 class FrameClient {
+  modelCallback?: (callback: string, value: Record<string, unknown>) => Promise<unknown>;
   readonly callbackFrames: Array<Record<string, unknown>> = [];
   readonly reservationFrames: Array<Record<string, unknown>> = [];
   readonly #socket: net.Socket;
@@ -858,6 +912,13 @@ class FrameClient {
           waiter.resolve(frame);
         }
       } else if (frame["kind"] === "callback") {
+        if (this.modelCallback && ["productMcpConnect", "productMcpMessage", "productMcpClose"].includes(String(frame["callback"]))) {
+          void this.modelCallback(String(frame["callback"]), frame["value"] as Record<string, unknown>).then(
+            value => this.#socket.write(`${JSON.stringify({ v: 2, kind: "callback_result", callbackId: frame["callbackId"], ok: true, value })}\n`),
+            () => this.#socket.write(`${JSON.stringify({ v: 2, kind: "callback_result", callbackId: frame["callbackId"], ok: false })}\n`),
+          );
+          continue;
+        }
         if (frame["callback"] === "productMcpTool") this.callbackFrames.push(frame);
         if (frame["callback"] === "storeChildReserved") this.reservationFrames.push(frame);
         const value = frame["callback"] === "canUseTool"

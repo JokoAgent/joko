@@ -288,9 +288,13 @@ describe("mounted Timeline history windows", () => {
     const beforeOffline = await anchor(page);
     const beforeOfflineIds = await navIds(page);
     await page.context().setOffline(true);
-    releaseEventStreams = fixture.suspendPublicEventStreams();
+    const browserConnections = fixture.application.store.listConnections().filter(connection => connection.name === "History browser" && connection.state === "active");
+    expect(browserConnections.length).toBe(1);
+    const offline = fixture.suspendPublicClientConnection(browserConnections[0]!.id);
+    releaseEventStreams = offline;
     await page.locator(".offline-banner:visible,.error-banner:visible").first().waitFor({ state: "visible", timeout: 20_000 });
     for (let index = 57; index < 113; index += 1) await send(index);
+    expect(offline.blockedRequests).toBeGreaterThan(0);
     expect(await page.locator(".offline-banner:visible,.error-banner:visible").count()).toBeGreaterThan(0);
     expect(await navIds(page)).toEqual(beforeOfflineIds);
     releaseEventStreams();

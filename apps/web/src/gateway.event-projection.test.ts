@@ -1800,6 +1800,11 @@ describe("incremental event projection", () => {
     } });
     expect(snapshot.timelineBySession.get("session-1")?.find((item) => item.artifact?.blobId === "image-1")?.artifact?.description)
       .toBe("The tool's actual preview description");
+    apply({ case: "artifactProduced", value: { embeddedInExtensionCard: true, artifact: {
+      artifactId: "card-image", title: "Card image", kind: ArtifactKind.IMAGE,
+      blob: { blobId: "card-image", fileName: "card.png", mediaType: "image/png", byteSize: 12n, sha256Hex: "d".repeat(64) }
+    } } });
+    expect(snapshot.timelineBySession.get("session-1")?.some(item => item.artifact?.blobId === "card-image")).toBe(false);
     apply({ case: "artifactProduced", value: { artifact: {
       artifactId: "track-1", title: "Track", description: "Strings", kind: ArtifactKind.FILE,
       blob: { blobId: "track-1", fileName: "audio.wav", mediaType: "audio/wav", byteSize: 204n, sha256Hex: "b".repeat(64) },

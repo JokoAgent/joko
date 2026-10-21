@@ -82,6 +82,14 @@ export async function createPublicServer(application: OrchestratorApplication): 
     if (!permitted) return reply.code(403).send({ error: "Insecure Orchestrator access is limited to the configured local network." });
   });
   server.addHook("onSend", async (request, reply, payload) => {
+    if (/^\/mcp-apps\/(?:proxy|resource|bridge)\/[a-f0-9]{64}$/u.test(request.url)) {
+      reply.header("cross-origin-resource-policy", "cross-origin");
+      reply.header("x-content-type-options", "nosniff");
+      reply.header("referrer-policy", "no-referrer");
+      reply.header("cache-control", "no-store");
+      if (tls !== undefined) reply.header("strict-transport-security", "max-age=31536000; includeSubDomains");
+      return payload;
+    }
     if (isExtensionMainViewRequest(request.url)) {
       for (const [name, value] of Object.entries(surfaceHeaders())) reply.header(name, value);
       if (tls !== undefined) reply.header("strict-transport-security", "max-age=31536000; includeSubDomains");
@@ -167,6 +175,8 @@ export async function createPublicServer(application: OrchestratorApplication): 
       }
     }
   });
+
+  application.mcpAppSurfaces?.register(server);
 
   server.put<{ Params: { ticketId: string } }>(
     "/v1/credentials/upload/:ticketId",

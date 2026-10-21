@@ -85,6 +85,7 @@ const colors = { background: "#fff", surface: "#fff", ink: "#111", muted: "#666"
 const surface = ({ children }: { children?: ReactNode }) => createElement("div", null, children);
 
 beforeAll(async () => {
+  vi.doMock("react-native-webview", () => ({ WebView: surface }));
   vi.stubGlobal("__DEV__", false);
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   vi.doMock("react-native", () => ({
@@ -104,7 +105,7 @@ beforeAll(async () => {
   vi.doMock("react-native-svg", () => ({ SvgXml: () => null }));
   vi.doMock("expo-status-bar", () => ({ StatusBar: () => null }));
   vi.doMock("expo-constants", () => ({ default: {} }));
-  vi.doMock("expo-crypto", () => ({ randomUUID: () => "selected-occurrence" }));
+  vi.doMock("expo-crypto", () => ({ randomUUID: () => "selected-occurrence", getRandomBytes: (count: number) => new Uint8Array(count).fill(1) }));
   vi.doMock("expo-clipboard", () => ({}));
   for (const name of ["expo-image-picker", "expo-image-manipulator", "expo-image", "expo-sharing", "expo-file-system", "expo-media-library", "expo-audio", "expo-network", "expo-secure-store", "expo-notifications", "expo-application"]) vi.doMock(name, () => new Proxy({}, { get: (_object, key) => key === "then" ? undefined : () => undefined }));
   vi.doMock("expo-modules-core", () => ({ requireNativeModule: () => ({}), requireOptionalNativeModule: () => ({}), NativeModule: class {}, EventEmitter: class {} }));

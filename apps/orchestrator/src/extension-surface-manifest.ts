@@ -1,4 +1,6 @@
 import { extname, posix } from "node:path";
+import { parseMailReader, type MailReaderDeclaration } from "@joko/contracts";
+import { parseExtensionNetwork, type ExtensionNetworkDeclaration } from "./extension-cards/network-manifest.js";
 
 export const EXTENSION_MAIN_VIEW_ICONS = [
   "activity",
@@ -54,6 +56,7 @@ export interface ExtensionSurfaceBinding {
   readonly mainView?: ExtensionMainViewDescriptor;
   readonly library?: ExtensionLibraryDescriptor;
   readonly routineEvents?: ExtensionRoutineEventsDescriptor;
+  readonly runtime?: ExtensionRuntimeDescriptor;
   readonly recommendations?: readonly ExtensionRecommendationDescriptor[];
 }
 
@@ -105,14 +108,14 @@ export function parseExtensionSurfaceManifest(
   const result: ExtensionSurfaceBinding[] = [];
   for (const rawBinding of surfaces.extensions) {
     const binding = requirePlainObject(rawBinding, "Extension surface declaration");
-    requireExactKeys(binding, ["entry", "mainView", "library", "routineEvents", "recommendations"], ["entry"], "Extension surface declaration");
+    requireExactKeys(binding, ["entry", "mainView", "library", "routineEvents", "runtime", "recommendations"], ["entry"], "Extension surface declaration");
     const entry = requirePortablePath(binding.entry, "Extension surface entry");
     if (!EXTENSION_SUFFIXES.has(extname(entry).toLowerCase())) throw new Error("Extension surface entry has an unsupported file type.");
     if (!discoveredEntries.has(entry)) throw new Error("Extension surface entry does not exactly match a discovered Extension.");
     if (seenEntries.has(entry)) throw new Error("Extension surface entry is declared more than once.");
     seenEntries.add(entry);
 
-    if (binding.mainView === undefined && binding.library === undefined && binding.routineEvents === undefined && binding.recommendations === undefined) {
+    if (binding.mainView === undefined && binding.library === undefined && binding.routineEvents === undefined && binding.runtime === undefined && binding.recommendations === undefined) {
       throw new Error("Extension surface declaration must advertise at least one current capability.");
     }
     let mainView: ExtensionMainViewDescriptor | undefined;
@@ -143,16 +146,51 @@ export function parseExtensionSurfaceManifest(
       ? undefined
       : validateExtensionRecommendations(binding.recommendations).items;
     const routineEvents = binding.routineEvents === undefined ? undefined : parseExtensionRoutineEvents(binding.routineEvents);
+    const runtime = binding.runtime === undefined ? undefined : parseExtensionRuntime(binding.runtime);
+    if (runtime && !discoveredFiles.has(runtime.html)) throw new Error("Extension runtime HTML is not an inspected regular package file.");
     if (routineEvents && !discoveredFiles.has(routineEvents.html)) throw new Error("Routine publisher HTML is not an inspected regular package file.");
     result.push({
       entry,
       ...(mainView === undefined ? {} : { mainView }),
       ...(library === undefined ? {} : { library }),
       ...(routineEvents === undefined ? {} : { routineEvents }),
+      ...(runtime === undefined ? {} : { runtime }),
       ...(recommendations === undefined ? {} : { recommendations })
     });
   }
   return result;
+}
+
+export function parseExtensionRuntime(value: unknown): ExtensionRuntimeDescriptor {
+  const raw = requirePlainObject(value, "Extension runtime");
+  requireExactKeys(raw, ["html", "tools", "card", "mail", "mailReader", "agent", "network"], ["html", "tools"], "Extension runtime");
+  const html = requirePortablePath(raw.html, "Extension runtime HTML");
+  if (extname(html) !== ".html" || posix.dirname(html) === ".") throw new Error("Extension runtime HTML must be in a self-contained directory.");
+  if (!Array.isArray(raw.tools) || raw.tools.length < 1 || raw.tools.length > 64) throw new Error("Extension runtime must declare 1–64 tools.");
+  const tools = raw.tools.map(item => {
+    const tool = requirePlainObject(item, "Extension tool");
+    requireExactKeys(tool, ["name", "description", "inputSchema", "readOnly"], ["name", "description", "inputSchema"], "Extension tool");
+    if (typeof tool.name !== "string" || !/^[a-zA-Z][a-zA-Z0-9_-]{0,127}$/u.test(tool.name)
+      || typeof tool.description !== "string" || !tool.description.trim() || tool.description.length > 8000
+      || tool.readOnly !== undefined && typeof tool.readOnly !== "boolean") throw new Error("Extension tool declaration is invalid.");
+    const inputSchema = requirePlainObject(tool.inputSchema, "Extension tool schema");
+    if (inputSchema.type !== "object" || Buffer.byteLength(JSON.stringify(inputSchema)) > 64 * 1024) throw new Error("Extension tool schema is invalid.");
+    return { name: tool.name, description: tool.description, inputSchema: structuredClone(inputSchema), readOnly: tool.readOnly === true };
+  });
+  if (new Set(tools.map(tool => tool.name)).size !== tools.length) throw new Error("Extension tool names must be unique.");
+  let card: ExtensionRuntimeDescriptor["card"];
+  if (raw.card !== undefined) {
+    const declaration = requirePlainObject(raw.card, "Extension card");
+    requireExactKeys(declaration, ["externalLinks"], [], "Extension card");
+    if (declaration.externalLinks !== undefined && declaration.externalLinks !== true) throw new Error("External links capability must be true when present.");
+    card = declaration.externalLinks === true ? { externalLinks: true } : {};
+  }
+  if (raw.mail !== undefined && raw.mail !== true) throw new Error("Extension mail capability must be true when present.");
+  if (raw.agent !== undefined && raw.agent !== true) throw new Error("Extension task continuation capability must be true when present.");
+  const mailReader = raw.mailReader === undefined ? undefined : parseMailReader(raw.mailReader);
+  if (mailReader === null || mailReader && (raw.mail !== true || !tools.some(tool => tool.name === mailReader.tool))) throw new Error("Mail reader must name a declared tool and mail capability.");
+  const network = raw.network === undefined ? undefined : parseExtensionNetwork(raw.network);
+  return { html, tools, ...(card === undefined ? {} : { card }), ...(raw.mail === true ? { mail: true } : {}), ...(mailReader ? { mailReader } : {}), ...(raw.agent === true ? { agent: true } : {}), ...(network ? { network } : {}) };
 }
 
 /** Flat event declarations are adapted from the fixed publisher protocol. */
@@ -309,4 +347,14 @@ function requireExactKeys(
   if (keys.some((key) => !allowed.includes(key)) || required.some((key) => !Object.hasOwn(value, key))) {
     throw new Error(`${label} has an invalid shape.`);
   }
+}
+/** Resident logic runs in a separate browser sandbox, without Node or UI authority. */
+export interface ExtensionRuntimeDescriptor {
+  readonly html: string;
+  readonly tools: readonly { readonly name: string; readonly description: string; readonly inputSchema: Readonly<Record<string, unknown>>; readonly readOnly: boolean }[];
+  readonly card?: { readonly externalLinks?: true };
+  readonly mail?: true;
+  readonly mailReader?: MailReaderDeclaration;
+  readonly agent?: true;
+  readonly network?: ExtensionNetworkDeclaration;
 }

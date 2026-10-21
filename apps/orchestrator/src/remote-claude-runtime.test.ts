@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 
 import { claudeWorkspaceAuthority, loadClaudeRemoteManagerSource } from "@joko/adapter-claude-code";
 import { DEVICE_PEER_RUNTIME_EXECUTABLES } from "@joko/device-peer";
@@ -44,6 +45,30 @@ afterEach(async () => {
 });
 
 describe("RemoteClaudeRuntimeResolver", () => {
+  it("keeps standard MCP frames on the original Query connection and retires them before reconnect", async () => {
+    const fixture = createFixture(); cleanups.push(() => fixture.resolver.close());
+    const binding = await fixture.resolver.resolve(fixture.target);
+    const messages: unknown[] = [], closed = vi.fn(); let port: Transport | undefined;
+    const connect = vi.fn(async (transport: Transport) => { port = transport; transport.onmessage = message => { messages.push(message); }; transport.onclose = closed; await transport.start(); });
+    const query = await binding.runtime.query(queryParams(undefined, undefined, false, undefined, { mcpModels: [{ serverId: "resources", connect }] }));
+    const serialized = record(fixture.processes.startRequests.at(-1)!.params.options);
+    expect(serialized["productMcpModels"]).toEqual([{ serverId: "resources" }]); expect(JSON.stringify(serialized)).not.toContain('"connect"');
+    const channelId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    await expect(fixture.processes.invokeCallback("productMcpConnect", { serverId: "resources", channelId })).resolves.toEqual({});
+    await fixture.processes.invokeCallback("productMcpMessage", { serverId: "resources", channelId, message: { jsonrpc: "2.0", id: 0, method: "resources/list" } });
+    expect(messages).toEqual([{ jsonrpc: "2.0", id: 0, method: "resources/list" }]);
+    await port!.send({ jsonrpc: "2.0", id: 0, result: { resources: [] } });
+    expect(fixture.processes.frames.findLast(frame => frame["method"] === "query.mcpMessage")?.["params"]).toMatchObject({ serverId: "resources", channelId, message: { id: 0, result: { resources: [] } } });
+    await expect(fixture.processes.invokeCallback("productMcpConnect", { serverId: "unapproved", channelId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" })).rejects.toThrow("Callback failed");
+    await expect(fixture.processes.invokeCallback("productMcpMessage", { serverId: "other", channelId, message: { jsonrpc: "2.0", method: "notifications/roots/list_changed" } })).rejects.toThrow("Callback failed");
+    const before = messages.length;
+    fixture.processes.disconnectQuery(); await waitUntil(() => closed.mock.calls.length === 1);
+    await expect(port!.send({ jsonrpc: "2.0", id: 0, result: {} })).rejects.toThrow("mcp_model_retired");
+    await query.initializationResult();
+    await expect(fixture.processes.invokeCallback("productMcpMessage", { serverId: "resources", channelId, message: { jsonrpc: "2.0", id: 1, method: "resources/list" } })).rejects.toThrow("Callback failed");
+    expect(messages).toHaveLength(before); expect(connect).toHaveBeenCalledOnce();
+    await binding.runtime.retireQuery(query, 2_000);
+  });
   it("routes fresh context lifecycle and Query claims through one exact remote authority", async () => {
     const fixture = createFixture();
     cleanups.push(() => fixture.resolver.close());
@@ -890,10 +915,12 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     query.process.finish(1);
   }
 
-  invokeCallback(callback: "canUseTool" | "oauth" | "hook" | "managedAgentTool" | "productMcpTool", value: unknown): Promise<unknown> {
+  invokeCallback(callback: "canUseTool" | "oauth" | "hook" | "managedAgentTool" | "productMcpTool" | "productMcpConnect" | "productMcpMessage" | "productMcpClose", value: unknown): Promise<unknown> {
     const query = this.#query;
     if (query === undefined) return Promise.reject(new Error("No query is attached."));
-    const callbackId = callback === "oauth"
+    const callbackId = ["productMcpConnect", "productMcpMessage", "productMcpClose"].includes(callback)
+      ? crypto.randomUUID()
+      : callback === "oauth"
       ? "55555555-5555-4555-8555-555555555555"
       : callback === "hook"
         ? "99999999-9999-4999-8999-999999999999"
@@ -1015,6 +1042,7 @@ class FakeClaudeManagerProcesses implements RemoteProcessTransportPort {
     if (frame.method === "query.supportedModels") return process.respond(frame.id, initialization().models);
     if (frame.method === "query.accountInfo") return process.respond(frame.id, initialization().account);
     if (frame.method === "query.interrupt") return process.respond(frame.id, { still_queued: [] });
+    if (frame.method === "query.mcpMessage" || frame.method === "query.mcpClose") return process.respond(frame.id, {});
     if (["query.setModel", "query.setPermissionMode", "query.applyFlagSettings", "query.stopTask"].includes(frame.method)) {
       return process.respond(frame.id, undefined);
     }

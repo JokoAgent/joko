@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useMobileMailLink } from "./MobileExtensionMailReader";
 import { AppState, Linking, Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { WebView } from "react-native-webview";
@@ -38,6 +39,7 @@ interface Props {
 
 export const MobileMarkdownMessage = memo(function MobileMarkdownMessage({ text, colors, locale, ownerKey, selectable = true,
   resourceClient, resourceOwnerKey, messageId, onOpenImage, onOpenPath }: Props) {
+  const previewMail = useMobileMailLink();
   const resources = useMobileMarkdownResources({ client: resourceClient, ownerKey: resourceOwnerKey, messageId, text });
   const previous = useRef<MobileMarkdownParseResult | null>(null);
   const parsed = useMemo(() => parseMobileMarkdownIncremental(text, previous.current), [text]);
@@ -100,7 +102,7 @@ export const MobileMarkdownMessage = memo(function MobileMarkdownMessage({ text,
     return <Text key={index} accessibilityRole={external || actionablePath ? "link" : undefined}
       onPress={actionablePath ? () => { if (AppState.currentState === "active") actionablePath(); } : external ? () => {
         if (AppState.currentState !== "active") return;
-        void Linking.openURL(inline.url).catch(() => {
+        void (async () => { if (await previewMail?.(inline.url)) return; if (AppState.currentState === "active") await Linking.openURL(inline.url); })().catch(() => {
           if (mounted.current) setNotice(mobileMessage(locale, "markdown.linkFailed"));
         });
       } : undefined}

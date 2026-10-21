@@ -10,6 +10,8 @@ import { TaskSharingHost, type TaskSharingRuntimePort } from "./task-sharing-hos
 import { ConnectionManager } from "./connection-manager.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { TaskSharingReads } from "./task-sharing-reads.js";
+import type { ConnectServiceDependencies } from "./connect-services.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
@@ -48,6 +50,17 @@ it("keeps guest credentials outside ordinary authentication and validates receip
   expect(() => ordinary.authenticate(`Bearer ${member.secret}`)).toThrow();
   expect(() => f.host.getJoinReceipt({ intentId: "join-a", credentialSha256Hex: member.lease.proof.credentialSha256Hex }, other.lease)).toThrow(/another participant/);
   expect(f.store.listConnections()).toHaveLength(0);
+});
+it("shares only public application history for the exact task", async () => {
+  const f = await fixture(), guest = f.member("a");
+  const event = f.store.appendEvent({ id: "app-history", sessionId: "session", targetId: "target", backendId: "backend", generation: 1,
+    traceId: "app", payload: { type: "mcp_app_changed", card: { id: "card", sessionId: "session", title: "Example", text: "Public result", pending: false,
+      cancelled: false, isError: false, updatedAt: 1 } } });
+  const reads = new TaskSharingReads({ store: f.store } as ConnectServiceDependencies, () => 3n);
+  const projected = reads.projectEvent(guest.lease, event);
+  expect(projected?.payload?.kind).toMatchObject({ case: "mcpAppChanged", value: { card: { title: "Example", text: "Public result" } } });
+  if (event.payload.type !== "mcp_app_changed") throw new Error("Missing application history");
+  expect(reads.projectEvent(guest.lease, { ...event, sessionId: "other-session", payload: event.payload })).toBeUndefined();
 });
 it("replays only an exact durable member receipt and denies it immediately after removal", async () => {
   const f = await fixture(), member = f.member("a"), request = operation("request");

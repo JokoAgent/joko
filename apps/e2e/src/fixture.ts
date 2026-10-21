@@ -616,6 +616,22 @@ export class OrchestratorE2eFixture {
     return () => { this.#server.server.removeListener("request", rejectStream); };
   }
 
+  /** Browser contexts do not reliably put a SharedWorker offline. Cut the
+   * original authenticated client at the server, including snapshot retries,
+   * while the independent manager can continue producing durable events. */
+  suspendPublicClientConnection(connectionId: string): (() => void) & { readonly blockedRequests: number } {
+    this.application.store.getConnection(connectionId);
+    let blockedRequests = 0;
+    const rejectClient = (request: IncomingMessage): void => {
+      try {
+        if (this.#connections.authenticate(request.headers.authorization).id !== connectionId) return;
+      } catch { return; }
+      blockedRequests++; request.socket.destroy();
+    };
+    this.#server.server.prependListener("request", rejectClient); this.dropPublicConnections();
+    return Object.defineProperty(() => { this.#server.server.removeListener("request", rejectClient); }, "blockedRequests", { get: () => blockedRequests }) as (() => void) & { readonly blockedRequests: number };
+  }
+
   async close(options: { readonly removeRoot?: boolean } = {}): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;

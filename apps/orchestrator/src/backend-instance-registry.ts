@@ -126,6 +126,9 @@ export class BackendInstanceRegistry {
   readonly #factories = new Map<string, BackendInstanceFactory>();
   readonly #candidateCleanupOwners = new Map<string, BackendCandidateCleanupOwner>();
   readonly #retiredCleanupOwners = new Map<string, BackendRetiredCleanupOwner>();
+  readonly #disposing = new WeakMap<BackendAdapter, Promise<unknown>>();
+  readonly #forcing = new WeakMap<BackendAdapter, Promise<unknown>>();
+  readonly #disposed = new WeakSet<BackendAdapter>();
   readonly #retirementStepTimeoutMs: number;
   readonly #retirementRetryDelayMs: number;
   readonly #retirementAttempts: number;
@@ -520,15 +523,26 @@ export class BackendInstanceRegistry {
   }
 
   async #disposeAdapter(adapter: BackendAdapter): Promise<boolean> {
+    if (this.#disposed.has(adapter)) return true;
     if (await settleBeforeDeadline(
-      Promise.resolve().then(() => adapter.dispose()),
+      this.#cleanupAttempt(adapter, this.#disposing, () => adapter.dispose()),
       this.#retirementStepTimeoutMs
     )) return true;
     if (adapter.forceDispose === undefined) return false;
     return settleBeforeDeadline(
-      Promise.resolve().then(() => adapter.forceDispose!()),
+      this.#cleanupAttempt(adapter, this.#forcing, () => adapter.forceDispose!()),
       this.#retirementStepTimeoutMs
     );
+  }
+  #cleanupAttempt(adapter: BackendAdapter, pending: WeakMap<BackendAdapter, Promise<unknown>>, cleanup: () => Promise<void>): Promise<unknown> {
+    const existing = pending.get(adapter);
+    if (existing) return existing;
+    // A deadline does not stop Adapter cleanup. Reuse that exact pending call
+    // until it settles, including a late success after the caller timed out.
+    const attempt = Promise.resolve().then(cleanup);
+    pending.set(adapter, attempt);
+    void attempt.then(() => { this.#disposed.add(adapter); pending.delete(adapter); }, () => { pending.delete(adapter); });
+    return attempt;
   }
 
   async #cleanupRejectedCandidate(candidate: AvailableBackendInstance): Promise<boolean> {

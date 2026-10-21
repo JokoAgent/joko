@@ -3033,7 +3033,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         recovery: "Restore the Tool authority and retry the queued input."
       });
     }
-    if (lease.tools.length === 0) {
+    if (lease.tools.length === 0 && (lease.models?.length ?? 0) === 0) {
       lease.release();
       return runtime;
     }
@@ -3118,7 +3118,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     runtime: NativeRuntime,
     tool: ClaudeMcpTool,
     arguments_: Readonly<Record<string, unknown>>,
-    options: { readonly toolUseId: string; readonly signal: AbortSignal }
+    options: { readonly toolUseId: string; readonly signal: AbortSignal; readonly modelCallId?: string }
   ): Promise<ClaudeMcpCallResult> {
     const turn = runtime.activeTurn;
     const lease = runtime.mcpLease;
@@ -3167,6 +3167,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       requestId,
       arguments: capturedArguments,
       signal,
+      ...(options.modelCallId === undefined ? {} : { modelCallId: options.modelCallId }),
       ...(partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority })
     });
     signal.throwIfAborted();
@@ -3701,7 +3702,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     productMcpCall: (
       tool: ClaudeMcpTool,
       arguments_: Readonly<Record<string, unknown>>,
-      options: { readonly toolUseId: string; readonly signal: AbortSignal }
+      options: { readonly toolUseId: string; readonly signal: AbortSignal; readonly modelCallId?: string }
     ) => Promise<ClaudeMcpCallResult>,
     nativeSkills: NativeSkillSnapshot | undefined
   ): Promise<{
@@ -3885,6 +3886,14 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
           mcpTools: launch.mcpLease?.tools.map((tool) => ({
             ...tool,
             call: (arguments_, options) => productMcpCall(tool, arguments_, options)
+          })),
+          mcpModels: launch.mcpLease?.models?.map(model => ({
+            serverId: model.serverId,
+            connect: transport => model.connect(transport, call => {
+              const tool = launch.mcpLease!.tools.find(tool => tool.serverId === model.serverId && tool.name === call.toolName);
+              if (!tool) throw new Error("The model MCP tool is outside its frozen Query catalog.");
+              return productMcpCall(tool, call.arguments, { toolUseId: call.toolUseId, signal: call.signal, modelCallId: call.modelCallId });
+            })
           })),
           ...(launch.runtimePolicy === "review_read_only"
             ? {

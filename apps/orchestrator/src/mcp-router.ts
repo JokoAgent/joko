@@ -6,6 +6,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import { CallToolResultSchema, CreateTaskResultSchema, type CallToolRequest, type CreateTaskResult, type Progress } from "@modelcontextprotocol/sdk/types.js";
 import type { Transport, FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { PiMcpBridgeOptions, PiMcpToolDescriptor } from "@joko/adapter-pi";
 import { validateMcpEndpoint } from "@joko/adapter-pi";
@@ -31,6 +32,11 @@ import type {
   RemoteNativeAuthRunnerAttestation
 } from "./native-auth-recovery.js";
 import { nativeAuthCredentialDigest, verifyRemoteNativeAuthRunnerAttestation } from "./native-auth-recovery.js";
+import { MCP_APPS_EXTENSION, toolVisibleTo, uiToolUri } from "./mcp-apps/protocol.js";
+import { RESOURCE_MIME_TYPE } from "@modelcontextprotocol/ext-apps/server";
+import { AppConnection, type AppServerConfig } from "./mcp-apps/connection.js";
+import type { McpAppCapture, McpAppCaptureInput } from "./mcp-apps/manager.js";
+import type { McpModelChannel } from "./mcp-apps/server-proxy.js";
 
 export const MCP_BRIDGE_RESPONSE_MAXIMUM_BYTES = 2 * 1024 * 1024;
 const MCP_BRIDGE_INLINE_RESULT_MAXIMUM_BYTES = 512 * 1024;
@@ -110,6 +116,9 @@ export interface McpToolDescriptor {
   /** Host-only explicit mapping for supplier-owned structured audio fields. */
   readonly audioResultMapping?: McpAudioResultMapping;
   readonly requiresPermission: boolean;
+  readonly modelVisible?: boolean;
+  readonly appResourceUri?: string;
+  readonly appTitle?: string;
 }
 
 export interface McpServerDescriptor {
@@ -141,6 +150,8 @@ export interface McpCallResult {
   readonly content: readonly unknown[];
   readonly structuredContent?: Readonly<Record<string, unknown>>;
   readonly isError: boolean;
+  /** Private View metadata, removed from the model-facing normalization. */
+  readonly _meta?: Readonly<Record<string, unknown>>;
 }
 
 /** Binary outputs created by an in-process service provider, never accepted from remote MCP. */
@@ -161,6 +172,7 @@ export interface BridgeToolCallResult extends McpCallResult {
 
 export interface McpListedTool {
     readonly name: string;
+    readonly title?: string;
     readonly description?: string;
     readonly inputSchema: Readonly<Record<string, unknown>>;
     readonly outputSchema?: Readonly<Record<string, unknown>>;
@@ -174,6 +186,7 @@ export interface McpToolListPage {
 }
 
 export interface McpClientConnection {
+  readonly appConnection?: AppConnection;
   listTools(cursor?: string, signal?: AbortSignal): Promise<McpToolListPage>;
   callTool(name: string, arguments_: Readonly<Record<string, unknown>>, signal?: AbortSignal): Promise<McpCallResult>;
   readResource(uri: string, signal: AbortSignal): Promise<{ readonly contents: readonly unknown[] }>;
@@ -305,6 +318,12 @@ interface BridgeGrant {
   };
   expiresAt: number;
 }
+interface ModelChannel extends McpModelChannel { readonly grant: BridgeGrant; readonly runtime: Runtime }
+interface AppModelInvocation {
+  readonly connection: AppConnection;
+  readonly params: CallToolRequest["params"];
+  readonly onprogress?: (progress: Progress) => void;
+}
 
 interface NativeAuthLease {
   readonly runId: string;
@@ -374,6 +393,8 @@ export interface McpBridgeCallResult {
 
 export interface PiMcpBridgeSnapshot {
   readonly mcpBridge: PiMcpBridgeOptions;
+  /** Service-only HTTP/SSE protocol routes; never part of the Pi tool payload. */
+  readonly modelServerIds: readonly string[];
   readonly expiresAt: number;
   /** Recheck that this exact immutable grant is still live. */
   assertCurrent(): void;
@@ -385,6 +406,9 @@ export interface PiMcpBridgeSnapshot {
 export interface McpRouterOptions {
   readonly store: OperationalStore;
   readonly credentials: CredentialManager;
+  readonly onAppToolCall?: (input: McpAppCaptureInput) => Promise<McpAppCapture | undefined>;
+  readonly onAppConnectionOpen?: (connection: AppConnection) => void;
+  readonly onAppConnectionRelease?: (connection: AppConnection) => Promise<void>;
   readonly resultArtifacts?: McpResultArtifactStore;
   readonly audioResultDownloader?: McpAudioResultDownloader;
   readonly clientFactory?: McpClientFactory;
@@ -501,6 +525,12 @@ const DEFAULT_MCP_TOOL_DISCOVERY_POLICY: McpToolDiscoveryPolicy = {
 export class McpRouter {
   readonly #store: OperationalStore;
   readonly #credentials: CredentialManager;
+  readonly #onAppToolCall: McpRouterOptions["onAppToolCall"];
+  readonly #onAppConnectionOpen: McpRouterOptions["onAppConnectionOpen"];
+  readonly #onAppConnectionRelease: McpRouterOptions["onAppConnectionRelease"];
+  readonly #snapshotGrants = new WeakMap<PiMcpBridgeSnapshot, BridgeGrant>();
+  readonly #modelChannels = new Set<ModelChannel>();
+  readonly #modelConnections = new WeakMap<AppConnection, ModelChannel>();
   readonly #resultArtifacts: McpResultArtifactStore | undefined;
   readonly #audioArtifacts: McpAudioArtifacts | undefined;
   readonly #audioResultMapper: McpAudioResultMapper | undefined;
@@ -555,6 +585,9 @@ export class McpRouter {
     this.#capturePartnerLearningSave = options.capturePartnerLearningSave;
     this.#store = options.store;
     this.#credentials = options.credentials;
+    this.#onAppToolCall = options.onAppToolCall;
+    this.#onAppConnectionOpen = options.onAppConnectionOpen;
+    this.#onAppConnectionRelease = options.onAppConnectionRelease;
     this.#resultArtifacts = options.resultArtifacts;
     this.#audioArtifacts = options.resultArtifacts === undefined ? undefined : new McpAudioArtifacts(options.store, options.resultArtifacts);
     this.#audioResultMapper = options.resultArtifacts === undefined
@@ -791,6 +824,49 @@ export class McpRouter {
     return runtime.tools;
   }
 
+  /** Service-only configuration. Credential headers never enter generated UI contracts. */
+  appServerConfig(serverId: string): AppServerConfig | undefined {
+    const server = this.#servers.get(serverId);
+    if (server === undefined || !server.input.enabled || server.input.transport === "stdio") return;
+    const headers: Record<string, string> = {};
+    for (const binding of server.input.credentialBindings) {
+      if (binding.target !== "header") return;
+      headers[binding.name] = this.#credentials.resolve(binding.credentialReferenceId);
+    }
+    return { id: serverId, url: server.input.endpoint, transport: server.input.transport === "sse" ? "sse" : "http", headers };
+  }
+
+  /** The native peer negotiates its own callbacks. A model channel borrows only
+   * its original snapshot's configuration, never the current ambient server. */
+  createAppModelChannel(snapshot: PiMcpBridgeSnapshot, serverId: string,
+    peer: NonNullable<ConstructorParameters<typeof AppConnection>[1]>, assertPeer: () => void): McpModelChannel | undefined {
+    this.#assertInitialized(); snapshot.assertCurrent(); assertPeer();
+    const grant = this.#snapshotGrants.get(snapshot), generation = grant?.serverGenerations.get(serverId);
+    if (!grant || generation === undefined) throw new Error("MCP model channel has no original authority.");
+    const runtime = this.#requireRuntime(serverId, generation), config = runtime.connection.appConnection?.config;
+    if (!config) return;
+    if (this.#modelChannels.size >= 256) throw new Error("MCP model connection limit reached.");
+    let released = false;
+    const connection = new AppConnection({ ...config, ...(config.headers ? { headers: { ...config.headers } } : {}) }, peer);
+    const channel: ModelChannel = { connection, grant, runtime,
+      assertCurrent: () => {
+        assertPeer(); snapshot.assertCurrent();
+        if (released || this.#runtime(serverId, generation) !== runtime || this.#modelConnections.get(connection) !== channel) throw new Error("MCP model channel retired.");
+      },
+      release: async () => {
+        if (released) return; released = true; this.#modelConnections.delete(connection); this.#modelChannels.delete(channel);
+        if (this.#onAppConnectionRelease) await this.#onAppConnectionRelease(connection); else await connection.close();
+      }
+    };
+    this.#onAppConnectionOpen?.(connection);
+    this.#modelChannels.add(channel); this.#modelConnections.set(connection, channel); channel.assertCurrent(); return channel;
+  }
+  redactModelValue<T>(value: T): T {
+    const json = JSON.stringify(value);
+    if (json === undefined || Buffer.byteLength(json, "utf8") > this.#resultCapacityBytes) throw new McpResultResourceExhaustedError();
+    return JSON.parse(this.#redactText(json)) as T;
+  }
+
   async callTool(input: {
     readonly serverId: string;
     readonly toolName: string;
@@ -875,6 +951,7 @@ export class McpRouter {
       if (runtime === undefined || runtime.state !== "connected") continue;
       serverGenerations.set(server.input.id, server.generation);
       for (const tool of runtime.tools) {
+        if (tool.modelVisible === false) continue;
         tools.push({
           serverId: tool.serverId,
           name: tool.name,
@@ -962,6 +1039,7 @@ export class McpRouter {
     };
     this.#grants.set(key, grant);
     const snapshot: PiMcpBridgeSnapshot = {
+      modelServerIds: Object.freeze([...serverGenerations].filter(([serverId, generation]) => this.#runtime(serverId, generation)?.connection.appConnection !== undefined).map(([serverId]) => serverId).sort()),
       mcpBridge: {
         endpoint: input.endpoint,
         token,
@@ -994,9 +1072,11 @@ export class McpRouter {
       },
       revoke: () => {
         this.#grants.delete(key);
+        this.#retireModelChannels();
         void this.#retireAllUnused();
       }
     };
+    this.#snapshotGrants.set(snapshot, grant);
     return snapshot;
   }
 
@@ -1026,6 +1106,8 @@ export class McpRouter {
     readonly signal?: AbortSignal;
     readonly partnerLearningAuthority?: PartnerLearningToolAuthority;
     readonly partnerLearningProof?: string;
+    /** In-process only. This is never accepted from a native HTTP request. */
+    readonly appCall?: AppModelInvocation;
   }): Promise<McpBridgeCallResult> {
     this.#assertInitialized();
     const token = bearerToken(input.authorization);
@@ -1054,6 +1136,12 @@ export class McpRouter {
     const audioResultMapping = grant.audioResultMappings.get(
       audioResultMappingKey(input.serverId, input.toolName)
     );
+    const modelChannel = input.appCall === undefined ? undefined : this.#modelConnections.get(input.appCall.connection);
+    if (input.appCall && (!modelChannel || modelChannel.grant !== grant || modelChannel.runtime.serverId !== input.serverId
+      || input.appCall.params.name !== input.toolName || operationBodyHash(input.appCall.params.arguments ?? {}) !== operationBodyHash(input.arguments ?? {}))) throw new Error("MCP model call escaped its original channel.");
+    modelChannel?.assertCurrent();
+    let appCapture: McpAppCapture | undefined;
+    let modelTask: CreateTaskResult | undefined;
     try {
       const bridgeProvider = this.#bridgeToolProviders.get(input.serverId);
       if (bridgeProvider?.policySubject === "browser" && grant.productScope === undefined) {
@@ -1065,7 +1153,8 @@ export class McpRouter {
         serverId: input.serverId,
         sessionId: input.sessionId,
         targetId: input.targetId,
-        toolName: input.toolName
+        toolName: input.toolName,
+        ...(input.appCall ? { mcpParams: input.appCall.params } : {})
       });
       const requestIdentity = bridgeRequestIdentity(grant.authorityDigest, input.requestId);
       const effectIdentity = bridgeEffectIdentity(requestIdentity, requestBodyHash);
@@ -1096,6 +1185,7 @@ export class McpRouter {
         const targetRevision = this.#store.getTarget(session.targetId).revision;
         const context = { sessionId: session.id, targetId: session.targetId, generation: input.generation, requestIdentity, requestBodyHash };
         const guard = (): void => {
+          modelChannel?.assertCurrent();
           input.signal?.throwIfAborted();
           const current = this.#store.getSession(context.sessionId).descriptor;
           if (this.#findGrant(token) !== grant || this.#requireRuntime(input.serverId, serverGeneration) !== runtime
@@ -1105,13 +1195,41 @@ export class McpRouter {
             || this.#store.getTarget(context.targetId).revision !== targetRevision) throw new Error("MCP audio publication owner is no longer active.");
         };
         guard();
-        const replay = this.#audioArtifacts?.replay(context);
+        const replay = input.appCall?.params.task ? undefined : this.#audioArtifacts?.replay(context);
         if (replay !== undefined) result = replay;
         else {
-          const raw = await runtime.connection.callTool(input.toolName, input.arguments ?? {}, input.signal);
+          const tool = runtime.tools.find(candidate => candidate.name === input.toolName);
+          if (!input.appCall?.params.task && tool?.appResourceUri !== undefined && tool.inputSchema["type"] === "object"
+            && this.#servers.get(input.serverId)?.generation === serverGeneration) {
+            try {
+              appCapture = await this.#onAppToolCall?.({ sessionId: input.sessionId, serverId: input.serverId,
+                resourceUri: tool.appResourceUri,
+                tool: { name: tool.name, ...(tool.appTitle === undefined ? {} : { title: tool.appTitle }),
+                  inputSchema: { ...tool.inputSchema, type: "object" } },
+                arguments: input.arguments ?? {}, assertCurrent: guard,
+                ...((input.appCall?.connection ?? runtime.connection.appConnection) === undefined ? {} : { connection: input.appCall?.connection ?? runtime.connection.appConnection }) });
+            } catch { /* Card storage must not change the upstream tool's actual outcome. */ }
+          }
+          let raw: McpCallResult;
+          if (input.appCall) {
+            const client = await input.appCall.connection.getClient(input.signal); guard();
+            const request = { method: "tools/call" as const, params: input.appCall.params }, requestOptions = { signal: input.signal, onprogress: input.appCall.onprogress };
+            if (input.appCall.params.task) {
+              const response = await client.request(request, CreateTaskResultSchema, requestOptions); guard();
+              const task = { ...response }; delete task._meta; modelTask = this.redactModelValue(task);
+              raw = { content: [], isError: false };
+            } else {
+              const response = await client.request(request, CallToolResultSchema, requestOptions); guard();
+              raw = { ...response, isError: response.isError ?? false };
+            }
+          } else raw = await runtime.connection.callTool(input.toolName, input.arguments ?? {}, input.signal);
           guard();
+          if (appCapture !== undefined) {
+            await appCapture.complete({ ...raw, content: [...raw.content] }).catch(() => undefined);
+            appCapture = undefined;
+          }
           if (Buffer.byteLength(JSON.stringify(raw), "utf8") > this.#resultCapacityBytes) throw new McpResultResourceExhaustedError();
-          if (this.#audioArtifacts === undefined) result = raw;
+          if (this.#audioArtifacts === undefined || modelTask) result = raw;
           else {
             const mapped = audioResultMapping === undefined || this.#audioResultMapper === undefined
               ? { result: raw }
@@ -1121,7 +1239,7 @@ export class McpRouter {
               });
             result = await this.#audioArtifacts.publish(
               mapped.result, context, guard, (value) => this.#redactText(value), (value) => this.#normalizeResult(value, "MCP audio result").value,
-              { read: (uri, signal) => runtime.connection.readResource(uri, signal), ...(input.signal === undefined ? {} : { signal: input.signal }) },
+              { read: async (uri, signal) => input.appCall ? (await input.appCall.connection.getClient(signal)).readResource({ uri }, { signal }) : runtime.connection.readResource(uri, signal), ...(input.signal === undefined ? {} : { signal: input.signal }) },
               mapped.prepared
             );
           }
@@ -1197,8 +1315,10 @@ export class McpRouter {
         }
         guard();
       }
-      return await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts);
+      const projected = await this.#projectBridgeResult(result, input.serverId, input.toolName, hostImages, hostArtifacts);
+      return modelTask ? { ...projected, details: { ...projected.details, mcpTask: modelTask } } : projected;
     } catch (error) {
+      await appCapture?.cancel(input.signal?.aborted === true).catch(() => undefined);
       const errorCode = mcpBridgeErrorCode(error);
       return {
         content: [],
@@ -1212,6 +1332,7 @@ export class McpRouter {
   async dispose(): Promise<void> {
     this.#partnerLearningAuthorities.clear();
     this.#grants.clear();
+    await Promise.allSettled([...this.#modelChannels].map(channel => channel.release()));
     this.#detachedNativeAuthLeases.clear();
     this.#recoveryNativeAuthLeases.clear();
     this.#nativeAuthReleaseTails.clear();
@@ -2392,6 +2513,10 @@ export class McpRouter {
   #purgeGrants(): void {
     const now = this.#now();
     for (const [key, grant] of this.#grants) if (grant.expiresAt <= now) this.#grants.delete(key);
+    this.#retireModelChannels();
+  }
+  #retireModelChannels(): void {
+    for (const channel of this.#modelChannels) if (this.#grants.get(channel.grant.digest.toString("hex")) !== channel.grant) void channel.release().catch(() => undefined);
   }
 
   async #retireUnused(serverId: string): Promise<void> {
@@ -2467,8 +2592,11 @@ export class SdkMcpClientFactory implements McpClientFactory {
   }
 
   async connect(input: McpClientFactoryInput): Promise<McpClientConnection> {
-    const client = new Client({ name: "joko-orchestrator", version: "0.1.0" }, { capabilities: {} });
-    client.onclose = input.onClose;
+    let appConnection: AppConnection | undefined;
+    const client = new Client({ name: "joko-orchestrator", version: "0.1.0" }, {
+      capabilities: input.config.transport === "stdio" ? {} : { extensions: { [MCP_APPS_EXTENSION]: { mimeTypes: [RESOURCE_MIME_TYPE] } } }
+    });
+    client.onclose = () => { void appConnection?.close(); input.onClose(); };
     client.onerror = input.onError;
     let transport: Transport;
     if (input.config.transport === "stdio") {
@@ -2526,8 +2654,15 @@ export class SdkMcpClientFactory implements McpClientFactory {
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
     }
+    if (input.config.transport !== "stdio") {
+      const headers = Object.fromEntries(input.config.credentialBindings.map(binding => [binding.name, input.credentials[`header:${binding.name}`]!]));
+      appConnection = new AppConnection({ id: input.config.id, url: input.config.endpoint,
+        transport: input.config.transport === "sse" ? "sse" : "http", headers }, undefined, client);
+    }
     return {
+      ...(appConnection === undefined ? {} : { appConnection }),
       async listTools(cursor, signal) {
+        if (client.getServerCapabilities()?.tools === undefined) return { tools: [] };
         const result = await client.listTools(
           cursor === undefined ? undefined : { cursor },
           signal === undefined ? undefined : { signal }
@@ -2543,6 +2678,7 @@ export class SdkMcpClientFactory implements McpClientFactory {
         return {
           content: result.content,
           ...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
+          ...(result._meta === undefined ? {} : { _meta: result._meta }),
           isError: result.isError ?? false
         };
       },
@@ -2550,7 +2686,7 @@ export class SdkMcpClientFactory implements McpClientFactory {
         if (client.getServerCapabilities()?.resources === undefined) throw new Error("MCP server does not support reading result resources.");
         return client.readResource({ uri }, { signal });
       },
-      close: () => client.close()
+      close: async () => { await appConnection?.close(); await client.close(); }
     };
   }
 }
@@ -2617,11 +2753,15 @@ function normalizeTool(serverId: string, tool: McpListedTool): McpToolDescriptor
     assertBoundedJson(tool.outputSchema, 1024 * 1024, "MCP tool output schema");
   }
   const audioResultMapping = audioResultMappingFromMeta(tool._meta);
+  const appResourceUri = uiToolUri(tool);
   return {
     serverId,
     name: tool.name,
     description: tool.description ?? tool.name,
     inputSchema: tool.inputSchema,
+    ...(toolVisibleTo(tool, "model") ? {} : { modelVisible: false }),
+    ...(appResourceUri === undefined ? {} : { appResourceUri }),
+    ...(tool.title === undefined ? {} : { appTitle: tool.title }),
     ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
     ...(audioResultMapping === undefined ? {} : { audioResultMapping }),
     requiresPermission: audioResultMapping !== undefined && mcpAudioResultMappingUsesNetwork(audioResultMapping)

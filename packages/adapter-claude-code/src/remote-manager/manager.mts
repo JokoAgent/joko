@@ -9,7 +9,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import * as nativeSdk from "@anthropic-ai/claude-agent-sdk";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ListToolsRequestSchema, JSONRPCMessageSchema } from "@modelcontextprotocol/sdk/types.js";
 import { AjvJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/ajv";
 import { z } from "zod";
 
@@ -160,7 +160,8 @@ export class ManagerConnection {
       let message;
       try { message = JSON.parse(UTF8.decode(line)); }
       catch { return this.destroy(fault("protocol_error", false)); }
-      if (record(message) && message.v === PROTOCOL_VERSION && message.kind === "callback_result") {
+      if (record(message) && message.v === PROTOCOL_VERSION && (message.kind === "callback_result"
+        || message.kind === "request" && ["query.mcpMessage", "query.mcpClose"].includes(message.method))) {
         void this.handle(message).catch(() => this.destroy(fault("protocol_error", true)));
         continue;
       }
@@ -252,7 +253,10 @@ export class ManagerConnection {
     if (this.closed) return;
     this.closed = true;
     for (const query of this.state.queries.values()) {
-      if (query.connection === this) query.connection = undefined;
+      if (query.connection === this) {
+        query.connection = undefined;
+        for (const model of query.mcpModels.values()) if (model.connection === this) void model.close(false);
+      }
     }
     for (const pending of this.callbacks.values()) {
       clearTimeout(pending.timer);
@@ -265,6 +269,7 @@ export class ManagerConnection {
   }
 
   detachQuery(query) {
+    for (const model of query.mcpModels.values()) if (model.connection === this) void model.close(false);
     if (query.connection === this) query.connection = undefined;
     for (const [callbackId, pending] of this.callbacks) {
       if (pending.query !== query) continue;
@@ -301,6 +306,7 @@ async function dispatch(connection, method, params) {
   if (method === "query.initializationResult") return queryControl(connection, params, (query) => query.initializationResult());
   if (method === "query.supportedModels") return queryControl(connection, params, (query) => query.supportedModels());
   if (method === "query.accountInfo") return queryControl(connection, params, (query) => query.accountInfo());
+  if (method === "query.mcpMessage" || method === "query.mcpClose") return mcpModelControl(connection, method, params);
   if (method === "query.retire") return retireQuery(connection, params);
   if (method === "query.retireOwned") return retireOwnedQuery(connection, params);
   if (typeof method === "string" && method.startsWith("store.")) {
@@ -660,6 +666,7 @@ async function startQuery(connection, params) {
     queue,
     abortController,
     connection,
+    mcpModels: new Map(),
     attachmentId: randomUUID(),
     events: [],
     eventBytes: 0,
@@ -871,6 +878,7 @@ function beforeFreshInputConsumed(query, wasQueued) {
 }
 
 function closeQueryStore(query) {
+  for (const model of query.mcpModels.values()) void model.close(false);
   const store = query.sessionStore;
   query.sessionStore = undefined;
   try { store?.close(); } catch {}
@@ -954,8 +962,14 @@ async function queryOptions(value, query) {
       ? createManagedAgentServer(query)
       : invalid();
   const mcpServers = value.mcpServers === undefined ? {} : emptyRecord(value.mcpServers, "MCP servers");
-  const productMcpServers = createProductMcpServers(value.productMcpTools, query);
+  const modelIds = productMcpModelIds(value.productMcpModels);
+  const productMcpServers = createProductMcpServers(value.productMcpTools, query, modelIds);
   for (const [name, server] of Object.entries(productMcpServers)) mcpServers[name] = server;
+  for (const serverId of modelIds) {
+    const name = `joko_${createHash("sha256").update(serverId).digest("hex").slice(0, 24)}`;
+    if (name === MANAGED_AGENT_SERVER || Object.hasOwn(mcpServers, name)) throw fault("mcp_catalog_invalid", false);
+    mcpServers[name] = { type: "sdk", name, instance: new RemoteModelMcpServer(name, serverId, query) };
+  }
   if (managedAgentServer !== undefined) mcpServers[MANAGED_AGENT_SERVER] = managedAgentServer;
   const options = {
     abortController: query.abortController,
@@ -1056,7 +1070,72 @@ function sameFreshContextClaim(actual, claim) {
       && actual.sourceBinding[key] === claim.sourceBinding[key]);
 }
 
-function createProductMcpServers(value, query) {
+function productMcpModelIds(value) {
+  if (value === undefined) return new Set();
+  if (!Array.isArray(value) || value.length > 256) throw fault("mcp_catalog_invalid", false);
+  const identities = new Set();
+  for (const item of value) {
+    if (!record(item) || Object.keys(item).length !== 1 || typeof item.serverId !== "string") throw fault("mcp_catalog_invalid", false);
+    const id = boundedString(item.serverId, "MCP server", 512);
+    if (identities.has(id)) throw fault("mcp_catalog_invalid", false);
+    identities.add(id);
+  }
+  return identities;
+}
+
+/** The remote SDK retains its normal in-process MCP transport. Only standard
+ * protocol frames cross the original owned Query channel. */
+class RemoteModelMcpServer extends McpServer {
+  constructor(name, serverId, query) { super({ name, version: "1.0.0" }); this.serverId = serverId; this.query = query; this.active = undefined; }
+  async connect(transport) {
+    await this.active?.close();
+    const query = this.query, connection = query.connection, channelId = randomUUID(), serverId = this.serverId;
+    if (!connection || query.ended || query.retired || query.mcpModels.size >= 256) throw fault("mcp_model_unavailable", false);
+    let closed = false;
+    const originalClose = transport.onclose;
+    const port = { transport, connection, serverId,
+      close: async (notify = true) => {
+        if (closed) return; closed = true; query.mcpModels.delete(channelId);
+        if (this.active === port) this.active = undefined;
+        try { await transport.close(); } catch {}
+        if (notify && query.connection === connection && !connection.closed) await connection.callback(query, "productMcpClose", { serverId, channelId }).catch(() => {});
+      },
+    };
+    query.mcpModels.set(channelId, port); this.active = port;
+    transport.onmessage = message => {
+      if (closed || query.connection !== connection || query.ended || query.retired) return;
+      try {
+        const parsed = JSONRPCMessageSchema.parse(message);
+        if (jsonBytes(parsed) > MAX_MCP_PAYLOAD_BYTES) throw fault("mcp_message_invalid", false);
+        void connection.callback(query, "productMcpMessage", { serverId, channelId, message: parsed }, query.abortController.signal).catch(error => {
+          transport.onerror?.(error); void port.close(false);
+        });
+      } catch (error) { transport.onerror?.(error); void port.close(false); }
+    };
+    transport.onclose = () => { originalClose?.(); void port.close(); };
+    try {
+      await connection.callback(query, "productMcpConnect", { serverId, channelId }, query.abortController.signal);
+      if (closed || query.connection !== connection || query.ended || query.retired) throw fault("mcp_model_retired", false);
+      await transport.start();
+    } catch (error) { await port.close(false); throw error; }
+  }
+  async close() { await this.active?.close(); }
+}
+
+async function mcpModelControl(connection, method, params) {
+  const query = attachedQuery(connection, params);
+  if (query.ended || query.retired || !Object.keys(params).every(key => ["queryId", "attachmentId", "serverId", "channelId", ...(method === "query.mcpMessage" ? ["message"] : [])].includes(key))) throw fault("mcp_model_retired", false);
+  const channelId = uuid(params.channelId), serverId = boundedString(params.serverId, "MCP server", 512), model = query.mcpModels.get(channelId);
+  if (model === undefined && method === "query.mcpClose") return {};
+  if (!model || model.connection !== connection || model.serverId !== serverId) throw fault("mcp_model_retired", false);
+  if (method === "query.mcpClose") { await model.close(false); return {}; }
+  const message = JSONRPCMessageSchema.parse(params.message);
+  if (jsonBytes(message) > MAX_MCP_PAYLOAD_BYTES) throw fault("mcp_message_invalid", false);
+  await model.transport.send(message);
+  return {};
+}
+
+function createProductMcpServers(value, query, modelIds = new Set()) {
   if (value === undefined) return {};
   if (!Array.isArray(value) || value.length > 10_000 || jsonBytes(value) > MAX_MCP_PAYLOAD_BYTES) {
     throw fault("mcp_catalog_invalid", false);
@@ -1089,6 +1168,7 @@ function createProductMcpServers(value, query) {
   const servers = Object.create(null);
   const validator = new AjvJsonSchemaValidator();
   for (const [serverId, entries] of groups) {
+    if (modelIds.has(serverId)) continue;
     const name = `joko_${createHash("sha256").update(serverId).digest("hex").slice(0, 24)}`;
     if (name === MANAGED_AGENT_SERVER || Object.hasOwn(servers, name)) throw fault("mcp_catalog_invalid", false);
     const instance = new McpServer({ name, version: "1.0.0" });

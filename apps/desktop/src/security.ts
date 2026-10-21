@@ -10,7 +10,7 @@ export const DESKTOP_CONTENT_SECURITY_POLICY = [
   "default-src 'self'",
   "base-uri 'none'",
   "object-src 'none'",
-  "frame-src 'self' https: http:",
+  "frame-src 'self' https: http: joko-mcp-app:",
   "frame-ancestors 'none'",
   "form-action 'none'",
   // diagrams.net's fixed, self-hosted GraphViewer artifact evaluates its

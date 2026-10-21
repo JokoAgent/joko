@@ -1,0 +1,8 @@
+{
+  "name": "@joko/mobile-mcp-app-surface",
+  "version": "0.1.0",
+  "description": "Isolated native resources and persistent inline surfaces for MCP applications.",
+  "license": "MIT AND Apache-2.0",
+  "private": true,
+  "peerDependencies": { "expo": "*" }
+}

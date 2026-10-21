@@ -42,6 +42,7 @@ export {
   type ClaudeSdkManagedAgentResult,
   type ClaudeSdkManagedAgentTool,
   type ClaudeSdkMcpTool,
+  type ClaudeSdkMcpModelServer,
   type ClaudeSdkPermissionMode,
   type ClaudePermissionResult,
   type ClaudeCanUseToolOptions,

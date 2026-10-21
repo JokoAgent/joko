@@ -4,10 +4,11 @@ import type { RuntimeCommand, RuntimeToolDescriptor } from "@joko/core";
 import type { OperationalStore } from "@joko/store";
 
 import type { CredentialKind, CredentialManager } from "./credential-manager.js";
-import type { ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionRuntimeDescriptor, ExtensionRoutineEventsDescriptor, ExtensionMainViewDescriptor, ExtensionRecommendationDescriptor } from "./extension-surface-manifest.js";
 import type { ExtensionSourceDescriptor } from "./extension-source-manager.js";
 import type { McpServerDescriptor, McpServerInput } from "./mcp-router.js";
 import type { PiResourceDescriptor } from "./resource-manager.js";
+import { extensionNetworkCredentialReference } from "./extension-cards/network-manifest.js";
 
 export type ExtensionCatalogSource = "local" | "market";
 export type ExtensionInstallState = "available" | "installing" | "installed" | "update_available" | "error";
@@ -84,6 +85,7 @@ export interface ExtensionCatalogDescriptor {
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
+  readonly runtime?: ExtensionRuntimeDescriptor & { readonly extensionEntry: string };
   readonly sidebarSupported: boolean;
   readonly sidebarVisible: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
@@ -159,6 +161,7 @@ interface ExtensionDefinition {
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
+  readonly runtime?: ExtensionRuntimeDescriptor & { readonly extensionEntry: string };
   readonly sidebarSupported: boolean;
   readonly tools: readonly ExtensionToolDescriptor[];
   readonly permissions: readonly Omit<ExtensionPermissionDescriptor, "granted">[];
@@ -658,6 +661,7 @@ export class ExtensionCatalogManager {
       ...(definition.mainView === undefined ? {} : { mainView: { ...definition.mainView } }),
       ...(definition.library === undefined ? {} : { library: { ...definition.library } }),
       ...(definition.routineEvents === undefined ? {} : { routineEvents: structuredClone(definition.routineEvents) }),
+      ...(definition.runtime === undefined ? {} : { runtime: structuredClone(definition.runtime) }),
       sidebarSupported: definition.sidebarSupported,
       sidebarVisible: definition.sidebarSupported && record.sidebarVisible,
       tools,
@@ -727,6 +731,27 @@ export class ExtensionCatalogManager {
   }
 }
 
+function runtimePermissions(runtime: ExtensionRuntimeDescriptor | undefined): readonly Omit<ExtensionPermissionDescriptor, "granted">[] {
+  if (!runtime) return [];
+  return [
+    ...(runtime.card ? [{ id: "runtime-card", label: "Interactive cards", description: "Publishes inert cards and receives explicit card actions.", required: true }] : []),
+    ...(runtime.card?.externalLinks ? [{ id: "runtime-card-links", label: "External card links", description: "Opens card links after owner confirmation.", required: true }] : []),
+    ...(runtime.mail ? [{ id: "runtime-mail", label: "Mail drafts", description: "Uses the host mail editor with its provider account adapters.", required: true }] : []),
+    ...(runtime.network ? [{ id: `runtime-network:${digest(runtime.network)}`, label: "Network access", description: `HTTPS requests to: ${runtime.network.hosts.join(", ")}. Protected credentials stay in the host.`, required: true }] : []),
+    ...(runtime.agent ? [{ id: "runtime-task-continuation", label: "Task continuation", description: "May continue the original task once after an explicit card action.", required: true }] : [])
+  ];
+}
+
+function runtimeSetup(extensionId: string, runtime: ExtensionRuntimeDescriptor | undefined): readonly SetupRequirement[] {
+  const network = runtime?.network;
+  if (!network) return [];
+  return [...(network.secrets ?? []).map(secret => ({ id: `network-secret:${secret.key}`, label: secret.label,
+    description: secret.hint ?? `Protected ${secret.inject.header} credential for ${(secret.inject.hosts ?? network.hosts).join(", ")}.`,
+    kind: "secret" as const, required: true, credentialReferenceId: extensionNetworkCredentialReference(extensionId, network, secret),
+    credentialKinds: ["header_secret" as const, "api_key" as const] })),
+    { id: "permission-confirmation", label: "Allow extension network access", description: `Allow HTTPS requests to ${network.hosts.join(", ")}.`, kind: "confirmation", required: true }];
+}
+
 function projectDefinitions(
   resources: readonly PiResourceDescriptor[],
   mcpServers: readonly McpServerDescriptor[],
@@ -772,17 +797,19 @@ function projectDefinitions(
         ...(entry.library === undefined ? {} : {
           library: { ...entry.library, extensionEntry: entry.extensionRelativePath }
         }),
+        ...(entry.runtime === undefined ? {} : { runtime: { ...structuredClone(entry.runtime), extensionEntry: entry.extensionRelativePath } }),
         sidebarSupported: entry.mainView !== undefined,
-        tools: [],
-        permissions: [],
+        tools: (entry.runtime?.tools ?? []).map(tool => ({ name: tool.name, description: tool.description, requiresPermission: !tool.readOnly })),
+        permissions: runtimePermissions(entry.runtime),
         recommendations: copyRecommendations(entry.recommendations ?? []),
-        setupRequirements: [],
+        setupRequirements: runtimeSetup(extensionId(bindingKey), entry.runtime),
         authorityIdentity,
         projectionIdentity: digest({
           authorityIdentity,
           sourceState: source.state,
           sourceContentRevision: source.contentRevision,
           library: entry.library ?? null,
+          runtime: entry.runtime ?? null,
           recommendations: entry.recommendations ?? [],
           error: source.error
         }),
@@ -842,12 +869,12 @@ function projectDefinitions(
           : resource.state === "error"
             ? "error"
             : installed ? "installed" : "available";
-      const permissions = detail.detectedApis.map((api) => ({
+      const permissions = [...detail.detectedApis.map((api) => ({
         id: `runtime-api:${api}`,
         label: api,
         description: `Uses the ${api} runtime extension capability.`,
         required: true
-      }));
+      })), ...runtimePermissions(detail.runtime)];
       const authorityIdentity = digest({
         bindingKey,
         discoveredRevision: resource.discoveredRevision,
@@ -879,11 +906,12 @@ function projectDefinitions(
           library: { ...detail.library, extensionEntry: detail.entryPath }
         }),
         ...(detail.routineEvents === undefined || detail.entryPath === undefined ? {} : { routineEvents: { ...detail.routineEvents, extensionEntry: detail.entryPath } }),
+        ...(detail.runtime === undefined || detail.entryPath === undefined ? {} : { runtime: { ...structuredClone(detail.runtime), extensionEntry: detail.entryPath } }),
         sidebarSupported: detail.mainView !== undefined,
-        tools: [],
+        tools: (detail.runtime?.tools ?? []).map(tool => ({ name: tool.name, description: tool.description, requiresPermission: !tool.readOnly })),
         permissions,
         recommendations: copyRecommendations(detail.recommendations ?? []),
-        setupRequirements: [],
+        setupRequirements: runtimeSetup(id, detail.runtime),
         authorityIdentity,
         projectionIdentity: digest({
           authorityIdentity,
@@ -892,6 +920,7 @@ function projectDefinitions(
           enabled: resource.enabled,
           library: detail.library ?? null,
           routineEvents: detail.routineEvents ?? null,
+          runtime: detail.runtime ?? null,
           recommendations: detail.recommendations ?? [],
           update: updateIdentity,
           error: resource.error

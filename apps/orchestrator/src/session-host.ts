@@ -1,4 +1,6 @@
 import { Buffer } from "node:buffer";
+import type { McpAppMessageGuard } from "./mcp-apps/message.js";
+import type { McpAppModelContext } from "./mcp-apps/host.js";
 import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve } from "node:path";
@@ -56,7 +58,7 @@ import type {
   UserShellResult,
   UsageSnapshot
 } from "@joko/core";
-import { JokoError, decideToolCall, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
+import { JokoError, decideToolCall, evaluateOrderedPolicyRules, policyRiskForToolRisk, nativeHistoryEventContext, redactSecrets, supportsNativeStartNavigation, toPublicError, validInlineTextRanges, validInputMentionRanges, type ToolRisk } from "@joko/core";
 import {
   AuthorizationError,
   InvalidStateTransitionError,
@@ -866,6 +868,8 @@ export class SessionHost {
   readonly #draining = new Set<string>();
   readonly #drainSettlements = new Map<string, Promise<void>>();
   readonly #pendingInteractions = new Map<string, PendingInteraction>();
+  readonly #applicationQueueGuards = new Map<string, McpAppMessageGuard>();
+  readonly #resolveMcpAppModelContext: ((sessionId: string) => Promise<McpAppModelContext>) | undefined;
   readonly #pendingDispatchAcceptances = new Map<string, PendingDispatchAcceptance>();
   readonly #partnerLearningTurns = new Map<string, PartnerLearningTurnRecord>();
   readonly #partnerLearningEmissions = new WeakMap<object, PartnerLearningTurnRecord>();
@@ -1041,6 +1045,7 @@ export class SessionHost {
       /** Node-owned local inference readiness, after durable Queue admission and before sending. */
       readonly prepareManagedProviderRuntime?: (context: AdapterContext) => Promise<void>;
       readonly resolveModelWorkingContext?: (target: { readonly backendId: string; readonly providerId: string; readonly modelId: string }) => number | undefined;
+      readonly resolveMcpAppModelContext?: (sessionId: string) => Promise<McpAppModelContext>;
       /** Service-owned fallback order, independent of the ordinary task preference. */
       readonly serviceSessionRuntimeFallback?: (input: {
         readonly sessionId: string;
@@ -1120,6 +1125,7 @@ export class SessionHost {
     this.#resolveServiceRuntimeConfiguration = options.resolveServiceRuntimeConfiguration;
     this.#prepareManagedProviderRuntime = options.prepareManagedProviderRuntime;
     this.#resolveModelWorkingContext = options.resolveModelWorkingContext;
+    this.#resolveMcpAppModelContext = options.resolveMcpAppModelContext;
     this.#serviceSessionRuntimeFallback = options.serviceSessionRuntimeFallback ?? (() => ({ owned: false }));
     this.#backendEnabled = options.backendEnabled ?? (() => true);
     this.#providerRoutingEnabled = options.providerRoutingEnabled ?? (() => true);
@@ -9779,6 +9785,7 @@ export class SessionHost {
       pending.resolve({ kind: "cancelled" });
     }
     this.#pendingInteractions.clear();
+    this.#applicationQueueGuards.clear();
     for (const watchdog of this.#runSilenceWatchdogs.values()) {
       if (watchdog.timer !== undefined) clearTimeout(watchdog.timer);
     }
@@ -12733,6 +12740,11 @@ export class SessionHost {
         if (this.#store.getQueueControl(sessionId).paused) return;
         let pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0];
         if (pending === undefined) return;
+        try { await this.#assertApplicationQueueCurrent(pending); }
+        catch {
+          this.#failExpiredApplicationInput(pending);
+          continue;
+        }
         // Authentication is an admission fence, not a turn-serialization
         // concern. Fail a newly durable item before any context rebuild,
         // compaction, pending route change, or older native-accepted turn can
@@ -12815,6 +12827,7 @@ export class SessionHost {
         const run = this.#store.getRun(item.runId);
         let attemptId = item.attemptId;
         const reviewReadOnly = this.isReviewReadOnlySession(sessionId);
+        let releaseMcpAppSignal: (() => void) | undefined;
         try {
           let active: ActiveSession | undefined;
           try {
@@ -12911,7 +12924,16 @@ export class SessionHost {
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           const artifactReferenceSnapshots = this.artifactReferencesForDispatch(sessionId, item.body);
           this.assertQueueProviderAuthentication(item, stored);
-          const baseContext = await this.beginTurnOverrideLease(item, active, stored);
+          let baseContext = await this.beginTurnOverrideLease(item, active, stored);
+          const appGuard = this.#applicationQueueGuards.get(item.id);
+          if (appGuard !== undefined) {
+            const revoked = new AbortController();
+            const abort = () => revoked.abort(appGuard.signal.reason);
+            appGuard.signal.addEventListener("abort", abort, { once: true });
+            if (appGuard.signal.aborted) abort();
+            releaseMcpAppSignal = () => appGuard.signal.removeEventListener("abort", abort);
+            baseContext = { ...baseContext, signal: AbortSignal.any([baseContext.signal, revoked.signal]) };
+          }
           const referenceContext: AdapterContext = artifactReferenceSnapshots.length === 0
             ? baseContext
             : { ...baseContext, artifactReferenceSnapshots };
@@ -12949,6 +12971,9 @@ export class SessionHost {
           );
           this.assertQueueProviderAuthentication(item, stored);
           let dispatchBody = this.resolveSessionReferencesForDispatch(sessionId, item.body);
+          const appContext = reviewReadOnly || dispatchBody.text.trimStart().startsWith("/")
+            ? undefined : await this.#resolveMcpAppModelContext?.(sessionId);
+          if (appContext?.text) dispatchBody = { ...dispatchBody, text: dispatchBody.text + appContext.text };
           const handoffText = this.#runtimeHandoffs.claimInjection(sessionId, item.id);
           if (handoffText !== undefined) {
             const prefix = `${handoffText}\n\n`;
@@ -12957,6 +12982,9 @@ export class SessionHost {
               ...(dispatchBody.mentionRanges === undefined ? {} : { mentionRanges: dispatchBody.mentionRanges.map(range => ({ ...range, start: range.start + prefix.length, end: range.end + prefix.length })) }) };
           }
           assertPromptInlineTextRanges(dispatchBody);
+          await appContext?.assertCurrent();
+          await this.#assertApplicationQueueCurrent(item);
+          this.assertDispatchAdmissionOwner(item, attemptId, active, stored.descriptor.binding.generation, partnerPolicy);
           dispatchPreparation.phase = "sending";
           const pendingAcceptance: PendingDispatchAcceptance = {};
           this.#pendingDispatchAcceptances.set(run.descriptor.id, pendingAcceptance);
@@ -12981,6 +13009,8 @@ export class SessionHost {
           } else {
             await active.adapter.send(dispatchBody, context);
           }
+          releaseMcpAppSignal?.();
+          releaseMcpAppSignal = undefined;
           if (this.#disposed) return;
           if (this.finishCancelledDispatch(item.id, attemptId)) {
             this.#pendingDispatchAcceptances.delete(run.descriptor.id);
@@ -13018,6 +13048,8 @@ export class SessionHost {
               });
             }
           });
+          appContext?.consume();
+          this.#applicationQueueGuards.delete(item.id);
           for (const turn of this.#partnerLearningTurns.values()) {
             if (turn.source.sourceRunId === run.descriptor.id) this.#partnerLearning?.accepted(turn.source.occurrenceId);
           }
@@ -13150,6 +13182,7 @@ export class SessionHost {
             this.settleReviewRuntime(sessionId, { state: "failed" });
           }
         } finally {
+          releaseMcpAppSignal?.();
           this.finishDispatchPreparation(sessionId, dispatchPreparation);
         }
       }
@@ -13317,9 +13350,9 @@ export class SessionHost {
         ? {} : { capturePartnerLearningTurn: (input: { readonly nativeOccurrence: string; readonly nativeTurnId?: string }) =>
           this.capturePartnerLearningTurn(context, runId, attemptId, input) }),
       emit: (payload, metadata) => {
-        if (payload.type === "partner_learning_changed" || payload.type === "run_state" && Object.hasOwn(payload, "usage") || payload.type === "message_complete"
+        if (payload.type === "mcp_app_changed" || payload.type === "extension_card_changed" || payload.type === "artifact" && payload.embeddedInExtensionCard || payload.type === "partner_learning_changed" || payload.type === "run_state" && Object.hasOwn(payload, "usage") || payload.type === "message_complete"
           && (Object.hasOwn(payload, "learning") || Object.hasOwn(payload, "usageIsEstimate") || Object.hasOwn(payload, "turnUsage"))) {
-          return Promise.reject(new StoreError("Message accounting and learning feedback are owned by the service, not Session adapters."));
+          return Promise.reject(new StoreError("Application cards, message accounting and learning feedback are owned by the service, not Session adapters."));
         }
         const learningTurn = this.#partnerLearningEmissions.get(payload);
         if (this.#disposed || !this.backendInstanceGenerationOwnsContext(
@@ -13820,6 +13853,86 @@ export class SessionHost {
   }
 
   /** Import verification shares the target policy and ordinary authenticated interaction route. */
+  async authorizeMcpAppTool(sessionId: string, serverId: string, toolName: string,
+    args: Readonly<Record<string, unknown>>, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+    const stored = this.#store.getSession(sessionId), target = this.targetForSession(stored);
+    const policy = policySnapshotFor(this.#store, target);
+    const decision = evaluateOrderedPolicyRules(policy, { subjectKind: "mcp", risk: policyRiskForToolRisk("ambiguous"), toolProviderId: serverId, toolName })
+      ?? decideToolCall({ name: `mcp__${serverId}__${toolName}`, args }, {
+      mode: stored.descriptor.permissionMode, workspaceRoot: target.workspaceRoot, extraReadOnlyRoots: [],
+      explicitAllowTools: new Set(), explicitDenyTools: new Set()
+    });
+    if (decision.action === "deny") throw new StoreError("MCP App tool was denied by target policy.");
+    if (decision.action === "allow") return;
+    const context = this.makeContext(sessionId, target, stored.descriptor.binding.generation, stored.descriptor.binding);
+    const answer = await context.requestInteraction({ id: `mcp-app-permission-${randomUUID()}`, kind: "permission",
+      title: "Allow this application tool?", toolName: `${serverId}/${toolName}`,
+      summary: redactSecrets(JSON.stringify(args)).slice(0, 8000), risk: "medium", choices: ["allow_once", "deny_once"] }, { signal });
+    signal.throwIfAborted();
+    const current = this.#store.getSession(sessionId);
+    if (current.descriptor.archived || current.descriptor.deletedAt !== undefined
+      || current.descriptor.binding.generation !== stored.descriptor.binding.generation
+      || policySnapshotFor(this.#store, this.targetForSession(current)).generation !== policy.generation)
+      throw new StoreError("MCP App tool permission owner changed.");
+    if (!(answer.kind === "confirmed" && answer.confirmed || answer.kind === "selected" && answer.value === "allow_once"))
+      throw new StoreError("MCP App tool was not approved.");
+  }
+
+  async enqueueMcpAppMessage(sessionId: string, serverId: string, content: unknown[], guard: McpAppMessageGuard): Promise<void> {
+    await guard();
+    const lines = content.map(block => {
+      if (block === null || typeof block !== "object") throw new StoreError("Unsupported MCP App message.");
+      const value = block as { type?: unknown; text?: unknown; name?: unknown; uri?: unknown };
+      if (value.type === "text" && typeof value.text === "string") return value.text;
+      if (value.type === "resource_link" && typeof value.name === "string" && typeof value.uri === "string") return `${value.name}: ${value.uri}`;
+      throw new StoreError("Unsupported MCP App message.");
+    });
+    const text = lines.join("\n");
+    if (!text.trim() || Buffer.byteLength(text) > 128_000) throw new StoreError("MCP App message is empty or too large.");
+    this.#enqueueApplicationInput(sessionId, `[MCP App message from ${serverId}: external application data, not owner authorization]\n${text}`, guard, "mcp_app_queue");
+  }
+
+  async enqueueExtensionCardMessage(sessionId: string, extensionId: string, text: string, guard: McpAppMessageGuard): Promise<void> {
+    await guard();
+    if (!text.trim() || Buffer.byteLength(text) > 128_000) throw new StoreError("Extension card message is empty or too large.");
+    this.#enqueueApplicationInput(sessionId, `[UI_ACTION_TRIGGER][Extension card action from ${extensionId}: external application data]\n${text}`, guard, "extension_card_queue");
+  }
+
+  #enqueueApplicationInput(sessionId: string, text: string, guard: McpAppMessageGuard, marker: "mcp_app_queue" | "extension_card_queue"): void {
+    guard.signal.throwIfAborted();
+    this.enqueueServiceInput({ operationId: `application-message-${randomUUID()}`, sessionId, source: "system",
+      prompt: { text, mentions: [], images: [], files: [], disposition: "prompt" },
+      onAdmitted: (store, result) => {
+        guard.signal.throwIfAborted();
+        store.setSetting("session", sessionId, `${marker}:${result.queueItemId}`, { version: 1 });
+        this.#applicationQueueGuards.set(result.queueItemId, guard);
+      }
+    });
+  }
+
+  async #assertApplicationQueueCurrent(item: QueueItemRecord): Promise<void> {
+    if (this.#store.findSetting("session", item.sessionId, `mcp_app_queue:${item.id}`) === undefined
+      && this.#store.findSetting("session", item.sessionId, `extension_card_queue:${item.id}`) === undefined) return;
+    const guard = this.#applicationQueueGuards.get(item.id);
+    if (guard === undefined) throw new JokoError({ code: "APPLICATION_INPUT_EXPIRED", message: "The application runtime is no longer available.",
+      phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Open the application card and repeat the action." });
+    await guard();
+    guard.signal.throwIfAborted();
+  }
+
+  #failExpiredApplicationInput(item: QueueItemRecord): void {
+    const error: PublicError = { code: "APPLICATION_INPUT_EXPIRED", message: "The application runtime is no longer available.",
+      phase: "dispatch", retryable: false, stateMayHaveChanged: false, recovery: "Open the application card and repeat the action." };
+    this.#store.transaction(store => {
+      if (store.getQueueItem(item.id).state !== "accepted") return;
+      store.updateQueueState({ queueItemId: item.id, state: "failed", error, traceId: `mcp-app-expired:${item.id}` });
+      store.updateRunState({ runId: item.runId, state: "failed", error, activeAttemptId: item.attemptId, traceId: `mcp-app-expired:${item.id}` });
+      if (item.attemptId !== undefined) store.finishAttempt(item.attemptId, error);
+    });
+    this.#applicationQueueGuards.delete(item.id);
+  }
+
   async authorizeImportProbe(sessionId: string, summary: string, signal: AbortSignal, assertCurrent: () => void): Promise<void> {
     assertCurrent(); signal.throwIfAborted();
     const stored = this.#store.getSession(sessionId); const target = this.targetForSession(stored);

@@ -1,0 +1,16 @@
+Native MCP App surfaces, controllers, UI and loopback resource listeners are adapted
+from Cindy v0.1.112 (apps/mobile/modules/cindy-html-preview, apps/mobile/src/session,
+and packages/maker-shared/src/mcpApps.ts), copyright 2026 Cindy contributors.
+Adapted contributions are licensed under Apache License, Version 2.0; see LICENSE.cindy.
+Original Expo module portions retain their MIT license; see LICENSE.
+
+Declarative extension cards, native forms, mail compose, read-only mail parsing,
+source-preserving HTML edits and preview theme adaptation are also adapted from
+Cindy v0.1.112 (8bd60e8549cdcf0ada21e6f73d68dc0d0b71909d), copyright 2026
+Cindy contributors, under Apache-2.0. Sources include cindy-brain/cardService.ts,
+cardSanitizer.ts, mailCards.ts, runtime/mailComposeRuntime.js; maker-shared
+ghostCardForm.ts, mailMessage.ts and mailTextEdit.ts; Desktop GhostCardForm,
+MailHtmlPreview and mailPreviewAppearance; Mobile plugins/MobileMailHtmlPreview.
+Joko adaptations bind these to service-owned task records, approved package
+generations, generated contracts and its UI components. The accompanying
+Apache License, Version 2.0 applies to these contributions.

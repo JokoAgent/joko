@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rm } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
-import type { ExtensionLibraryDescriptor, ExtensionMainViewDescriptor, ExtensionRoutineEventsDescriptor } from "./extension-surface-manifest.js";
+import type { ExtensionLibraryDescriptor, ExtensionMainViewDescriptor, ExtensionRoutineEventsDescriptor, ExtensionRuntimeDescriptor } from "./extension-surface-manifest.js";
 import { inspectPiPackageCatalog } from "./pi-package-compatibility.js";
 import type { PiInstalledPackageLease, PiResourceManager } from "./resource-manager.js";
 
@@ -39,6 +39,7 @@ export interface ExtensionMainViewAuthority {
   readonly library?: ExtensionLibraryDescriptor;
   /** A node-owned resident publisher uses an inspected HTML entry independent of the visible view. */
   readonly routineEvents?: ExtensionRoutineEventsDescriptor;
+  readonly runtime?: ExtensionRuntimeDescriptor;
 }
 
 export interface ExtensionMainViewSurface {
@@ -250,7 +251,8 @@ export class ExtensionMainViewManager {
         const catalog = await inspectPiPackageCatalog(packageRoot);
         const extension = catalog.extensions.find((entry) => entry.relativePath === input.authority.extensionEntry);
         const publisher = input.authority.routineEvents;
-        const declarationMatches = publisher === undefined
+        const runtime = input.authority.runtime;
+        const declarationMatches = runtime !== undefined ? extension?.runtime?.html === input.authority.mainView.html && JSON.stringify(extension.runtime) === JSON.stringify(runtime) : publisher === undefined
           ? sameMainView(extension?.mainView, input.authority.mainView) && sameLibrary(extension?.library, input.authority.library)
           : extension?.routineEvents?.html === input.authority.mainView.html && JSON.stringify(extension.routineEvents) === JSON.stringify(publisher);
         if (extension === undefined || !declarationMatches
@@ -311,7 +313,7 @@ export class ExtensionMainViewManager {
         await this.#destroy(surface);
         throw new ExtensionMainViewError(410, "Extension main view was revoked.");
       }
-      if (renewPublisher && surface.authority.routineEvents) {
+      if (renewPublisher && (surface.authority.routineEvents || surface.authority.runtime)) {
         const renewed = { ...surface, expiresAt: this.#now() + this.#ttlMs }; this.#surfaces.set(surface.id, renewed);
       }
       return {
@@ -470,7 +472,8 @@ function validateAuthority(authority: ExtensionMainViewAuthority): void {
 
 function copyAuthority(authority: ExtensionMainViewAuthority): ExtensionMainViewAuthority {
   return { ...authority, mainView: { ...authority.mainView }, ...(authority.library === undefined ? {} : { library: { ...authority.library } }),
-    ...(authority.routineEvents === undefined ? {} : { routineEvents: structuredClone(authority.routineEvents) }) };
+    ...(authority.routineEvents === undefined ? {} : { routineEvents: structuredClone(authority.routineEvents) }),
+    ...(authority.runtime === undefined ? {} : { runtime: structuredClone(authority.runtime) }) };
 }
 
 function sameMainView(left: ExtensionMainViewDescriptor | undefined, right: ExtensionMainViewDescriptor): boolean {
