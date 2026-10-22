@@ -2920,7 +2920,8 @@ describe("Connect security and protocol audit", () => {
             kind: contract.DevicePeerFileKind.DIRECTORY,
             size: 0n,
             modifiedAt: toProtoTimestamp(1),
-            mode: 0o700
+            mode: 0o700,
+            version: "a".repeat(64)
           }) }
         };
       }

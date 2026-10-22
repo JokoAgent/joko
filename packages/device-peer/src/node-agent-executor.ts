@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import {
   constants,
@@ -397,7 +397,8 @@ export class NodeDevicePeerAgentExecutor {
             kind: protoFileKind(information.kind),
             size: BigInt(information.size),
             modifiedAt: timestampFromDate(new Date(information.modifiedAt)),
-            mode: information.mode
+            mode: information.mode,
+            version: information.version
           })
         };
       }
@@ -416,6 +417,7 @@ export class NodeDevicePeerAgentExecutor {
           path: command.action.value.path,
           maximumBytes,
           allowTruncated: command.action.value.allowTruncated,
+          ...(command.action.value.expectedVersion === undefined ? {} : { expectedVersion: command.action.value.expectedVersion }),
           signal
         });
         const information = await this.#files.stat(command.action.value.path, signal);
@@ -1545,7 +1547,8 @@ export class LocalDevicePeerFileTransport implements DevicePeerFileTransportPort
       kind: fileKind(information),
       size: boundedSafeSize(information.size),
       modifiedAt: information.mtimeMs,
-      mode: information.mode & 0o777
+      mode: information.mode & 0o777,
+      version: localFileVersion(accepted, information)
     };
   }
 
@@ -1571,6 +1574,10 @@ export class LocalDevicePeerFileTransport implements DevicePeerFileTransportPort
     request.signal?.throwIfAborted();
     const before = await lstat(path);
     if (!before.isFile() || before.isSymbolicLink()) throw agentError(DevicePeerFailureCode.NOT_FOUND, false);
+    if (request.expectedVersion !== undefined && (!/^[a-f0-9]{64}$/.test(request.expectedVersion)
+      || localFileVersion(path, before) !== request.expectedVersion)) {
+      throw agentError(DevicePeerFailureCode.CONFLICT, true);
+    }
     if (before.size > maximumBytes && request.allowTruncated !== true) {
       throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
     }
@@ -1579,6 +1586,9 @@ export class LocalDevicePeerFileTransport implements DevicePeerFileTransportPort
     try {
       const openedBefore = await handle.stat();
       if (!openedBefore.isFile() || openedBefore.isSymbolicLink() || !sameFileIdentity(before, openedBefore)) {
+        throw agentError(DevicePeerFailureCode.CONFLICT, true);
+      }
+      if (request.expectedVersion !== undefined && localFileVersion(path, openedBefore) !== request.expectedVersion) {
         throw agentError(DevicePeerFailureCode.CONFLICT, true);
       }
       const length = Math.min(openedBefore.size, maximumBytes);
@@ -1593,7 +1603,8 @@ export class LocalDevicePeerFileTransport implements DevicePeerFileTransportPort
       const openedAfter = await handle.stat();
       const after = await lstat(path);
       if (offset !== length || !sameStableFile(openedBefore, openedAfter)
-        || !sameStableFile(openedAfter, after)) {
+        || !sameStableFile(openedAfter, after)
+        || request.expectedVersion !== undefined && localFileVersion(path, openedAfter) !== request.expectedVersion) {
         throw agentError(DevicePeerFailureCode.CONFLICT, true);
       }
       request.signal?.throwIfAborted();
@@ -3305,6 +3316,12 @@ function missingAsUndefined(error: unknown): undefined {
 
 function ignoreMissing(error: unknown): void {
   if (!isMissing(error)) throw error;
+}
+
+function localFileVersion(path: string, information: Stats): string {
+  return createHash("sha256").update(JSON.stringify([
+    path, information.dev, information.ino, information.size, information.mtimeMs, information.ctimeMs
+  ])).digest("hex");
 }
 
 function samePath(left: string, right: string): boolean {
