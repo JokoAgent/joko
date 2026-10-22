@@ -27,7 +27,6 @@ import type { TaskSharingApi } from "@joko/contracts";
 import { TaskShareRuntimeService, BackgroundTaskOutputState, type BackgroundTaskOutput, type TaskShareRuntimeControl } from "@joko/contracts";
 import { streamSharedOwnerEvents } from "./shared-owner-events.js";
 import { createTerminalGateway } from "./terminal-gateway.js";
-import { createSimulatorViewerGateway } from "./simulator-viewer-gateway.js";
 import { createPersonalDevelopmentGateway } from "./personal-development-gateway.js";
 import { normalizeExtensionRecommendation } from "./extension-suggestion-handoff.js";
 import { UsageReportGroup } from "@joko/contracts";
@@ -1642,16 +1641,6 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   resizeTerminal(...args: Parameters<OperationApi["resizeTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).resizeTerminal(...args); }
   restartTerminal(...args: Parameters<OperationApi["restartTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).restartTerminal(...args); }
   closeTerminal(...args: Parameters<OperationApi["closeTerminal"]>) { return createTerminalGateway(this.requireTransport(), this.#abort?.signal).closeTerminal(...args); }
-  getSimulatorViewerState(...args: Parameters<OperationApi["getSimulatorViewerState"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).getSimulatorViewerState(...args); }
-  controlSimulatorInstance(...args: Parameters<OperationApi["controlSimulatorInstance"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).controlSimulatorInstance(...args); }
-  controlSimulatorViewerInput(...args: Parameters<OperationApi["controlSimulatorViewerInput"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).controlSimulatorViewerInput(...args); }
-  controlSimulatorViewerTouch(...args: Parameters<OperationApi["controlSimulatorViewerTouch"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).controlSimulatorViewerTouch(...args); }
-  setSimulatorViewerInteractionProfile(...args: Parameters<OperationApi["setSimulatorViewerInteractionProfile"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).setSimulatorViewerInteractionProfile(...args); }
-  getSimulatorViewerMutationState(...args: Parameters<OperationApi["getSimulatorViewerMutationState"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).getSimulatorViewerMutationState(...args); }
-  setSimulatorViewerMutationControl(...args: Parameters<OperationApi["setSimulatorViewerMutationControl"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).setSimulatorViewerMutationControl(...args); }
-  getSimulatorViewerControls(...args: Parameters<OperationApi["getSimulatorViewerControls"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).getSimulatorViewerControls(...args); }
-  controlSimulatorViewerCommand(...args: Parameters<OperationApi["controlSimulatorViewerCommand"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).controlSimulatorViewerCommand(...args); }
-  watchSimulatorFrames(...args: Parameters<OperationApi["watchSimulatorFrames"]>) { return createSimulatorViewerGateway(this.requireTransport(), this.#abort?.signal).watchSimulatorFrames(...args); }
 
   async getVoiceInputCapabilities(signal?: AbortSignal): Promise<VoiceInputCapabilityView> {
     const client = createClient(VoiceInputService, this.requireTransport());

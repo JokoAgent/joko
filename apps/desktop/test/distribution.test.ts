@@ -109,7 +109,6 @@ describe("Desktop distribution", () => {
       "!**/{.env,.env.*,*.db,*.db-shm,*.db-wal,*.log}"
     ]));
     expect(config.extraResources.map(({ from, to }) => ({ from, to }))).toEqual([
-      { from: "resources/ios-simulator", to: "ios-simulator" },
       { from: "resources/app-update.yml", to: "app-update.yml" },
       { from: "resources/native-task-status-sounds", to: "native-task-status-sounds" },
       { from: "dist/native-voice-shortcut", to: "native-voice-shortcut" },
@@ -117,16 +116,8 @@ describe("Desktop distribution", () => {
       { from: "dist/native-hardware", to: "native-hardware" },
       { from: "dist/native-gamepad", to: "native-gamepad" },
       { from: "dist/native-remote-desktop", to: "native-remote-desktop" },
-      { from: "dist/native-simulator-hid", to: "native-simulator-hid" },
-      { from: "dist/native-simulator-h264", to: "native-simulator-h264" },
       { from: "dist/orchestrator-runtime", to: "orchestrator-runtime" },
       { from: "dist/orchestrator-runtime/node_modules", to: "orchestrator-runtime/node_modules" }
-    ]);
-    expect(config.extraResources.find(item => item.to === "ios-simulator")?.filter).toEqual([
-      "manifest.json", "LICENSE.appium-webdriveragent", "WebDriverAgent-v15.1.6.tar.gz"
-    ]);
-    expect(config.extraResources.find(item => item.to === "native-simulator-hid")?.filter).toEqual([
-      "manifest.json", "joko-simulator-hid"
     ]);
     expect(config.extraResources.find(item => item.to === "native-gamepad")?.filter).toEqual([
       "manifest.json", "joko-macos-gamepad-helper"
@@ -140,9 +131,6 @@ describe("Desktop distribution", () => {
       "linux-viewer-display.py", "linux-credentials/main.py", "linux-credentials/channel.py", "linux-credentials/host.py",
       "linux-credentials/storage.py", "linux-credentials/platform_linux.py", "linux-credentials/requirements.txt",
       "joko-hyprland-privacy.so", "joko-hyprland-privacy.json"
-    ]);
-    expect(config.extraResources.find(item => item.to === "native-simulator-h264")?.filter).toEqual([
-      "manifest.json", "joko-simulator-h264"
     ]);
     expect(config.extraResources.filter(item => item.to.startsWith("orchestrator-runtime")))
       .toEqual(expect.arrayContaining([

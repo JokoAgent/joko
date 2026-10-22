@@ -133,7 +133,7 @@ jobs:
           retention-days: 3
 
   macos-policies:
-    name: macOS signing transaction and SimulatorKit build-policy fixtures
+    name: macOS signing transaction fixtures
     runs-on: macos-15
     timeout-minutes: 15
     steps:
@@ -167,11 +167,6 @@ jobs:
         id: signing
         run: node --test --test-reporter=spec apps/desktop/scripts/sign-mac-native-credentials.test.mjs 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/signing-transaction.log"
 
-      - name: Execute the existing SimulatorKit architecture build-policy checks
-        id: simulator
-        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
-        run: node --test --test-reporter=spec apps/desktop/scripts/native-simulator-hid-build-policy.test.mjs 2>&1 | tee "$RUNNER_TEMP/joko-native-logs/simulator-build-policy.log"
-
       - name: Record macOS check scope and retain short logs
         if: always()
         run: |
@@ -183,7 +178,6 @@ jobs:
           printf '%s\n' \
             'macOS source checks on macos-15:' \
             '- Native signing transaction fixtures: ${{ steps.signing.outcome }}' \
-            '- SimulatorKit architecture build-policy checks: ${{ steps.simulator.outcome }}' \
             '' \
             'Scope: existing Node test files outside the Vitest include patterns. Signing uses controlled fixtures; no real signing identity, notarization, simulator session, GUI, Accessibility/Input Monitoring/Screen Recording grant, or physical device was exercised.' \
             'Only the last 200 lines of each log are retained. Swift receiver execution is covered by the Mobile workflow and is not repeated here.' \

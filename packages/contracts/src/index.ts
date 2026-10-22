@@ -54,7 +54,6 @@ export * from "./gen/joko/v1/service_pb.js";
 export * from "./gen/joko/v1/app_default_model_pb.js";
 export * from "./app-default-model.js";
 export * from "./gen/joko/v1/settings_pb.js";
-export * from "./gen/joko/v1/simulator_viewer_pb.js";
 export * from "./gen/joko/v1/skill_pb.js";
 export * from "./gen/joko/v1/subagent_pb.js";
 export * from "./gen/joko/v1/snapshot_pb.js";

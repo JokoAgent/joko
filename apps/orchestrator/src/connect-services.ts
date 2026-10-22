@@ -28,8 +28,6 @@ import { listProjectDirectories } from "./project-directory-browser.js";
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
-import { SimulatorCreateError, SimulatorDeleteError, SimulatorLifecycleError, SimulatorMjpegError,
-  SimulatorResourceError, SimulatorScreenMapError } from "@joko/tool-ios-simulator";
 import {
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MAXIMUM,
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MINIMUM,
@@ -437,15 +435,6 @@ import { RemoteDesktopCoordinator } from "./remote-desktop-coordinator.js";
 import { createRemoteHostConnectService } from "./remote-host-connect-service.js";
 import { createSshKeyConnectService } from "./ssh-key-connect-service.js";
 import { createTerminalConnectService } from "./terminal-connect-service.js";
-import { createSimulatorViewerConnectService } from "./simulator-viewer-connect-service.js";
-import { SimulatorDriverError } from "./ios-simulator-driver-coordinator.js";
-import { SimulatorInputError } from "./ios-simulator-input-coordinator.js";
-import { SimulatorScreenshotError } from "./ios-simulator-screenshot.js";
-import { SimulatorStateControlError } from "./ios-simulator-state-control.js";
-import { SimulatorObservationError } from "./ios-simulator-screen-observation.js";
-import { SimulatorViewerFrameError } from "./ios-simulator-viewer-frames.js";
-import { SimulatorInstanceControlError } from "./ios-simulator-instance-control.js";
-import { SimulatorOwnershipError } from "./ios-simulator-ownership.js";
 import type { TerminalProvider } from "@joko/tool-terminal";
 import { createManagedModelRuntimeConnectService } from "./managed-model-runtime-connect-service.js";
 import { createMessagingConnectService } from "./messaging-connect-service.js";
@@ -819,7 +808,6 @@ export interface ConnectServiceSet {
   readonly sshKey: ServiceImpl<typeof contract.SshKeyService>;
   readonly voiceInput: ServiceImpl<typeof contract.VoiceInputService>;
   readonly terminal: ServiceImpl<typeof contract.TerminalService>;
-  readonly simulatorViewer: ServiceImpl<typeof contract.SimulatorViewerService>;
   readonly pi: ServiceImpl<typeof contract.PiService>;
 }
 
@@ -870,39 +858,6 @@ function toConnectError(error: unknown): ConnectError {
     return new ConnectError(redactSecrets(storedMessage ?? error.message), Code.FailedPrecondition);
   }
   if (error instanceof OperationInProgressError) return new ConnectError(error.message, Code.Aborted);
-  if (error instanceof SimulatorViewerFrameError) return new ConnectError(error.message,
-    error.code === "SUBSCRIPTION_LIMIT" ? Code.ResourceExhausted : Code.FailedPrecondition);
-  if (error instanceof SimulatorMjpegError) return new ConnectError(error.message,
-    error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
-      : error.code === "STREAM_TOO_LARGE" ? Code.ResourceExhausted
-        : error.code === "STREAM_TIMEOUT" ? Code.DeadlineExceeded
-          : error.code === "STREAM_INVALID" ? Code.DataLoss : Code.Unavailable);
-  if (error instanceof SimulatorInputError || error instanceof SimulatorStateControlError ||
-      error instanceof SimulatorScreenshotError) return new ConnectError(redactSecrets(error.message),
-    error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
-      : error.code === "MUTATION_CANCELLED" ? Code.Canceled
-        : error.code === "MUTATION_CONFLICT" ? Code.AlreadyExists
-          : error.code === "MUTATION_IN_PROGRESS" ? Code.Aborted : Code.FailedPrecondition);
-  if (error instanceof SimulatorObservationError || error instanceof SimulatorScreenMapError) {
-    return new ConnectError(redactSecrets(error.message),
-      error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
-        : error.code === "OBSERVATION_CANCELLED" ? Code.Canceled
-          : error.code === "UI_WAIT_TIMEOUT" ? Code.DeadlineExceeded : Code.Aborted);
-  }
-  if (error instanceof SimulatorOwnershipError || error instanceof SimulatorInstanceControlError ||
-      error instanceof SimulatorCreateError || error instanceof SimulatorDeleteError ||
-      error instanceof SimulatorLifecycleError || error instanceof SimulatorResourceError ||
-      error instanceof SimulatorDriverError) {
-    const code = error.code === "INVALID_ARGUMENT" ? Code.InvalidArgument
-      : error.code === "MUTATION_CANCELLED" ? Code.Canceled
-        : error.code === "STALE_SCOPE" || error.code === "STALE_INSTANCE" || error.code === "STALE_DRIVER" ||
-          error.code === "MUTATION_IN_PROGRESS" || error.code === "DEVICE_BUSY" ? Code.Aborted
-          : error.code === "DELETE_FORBIDDEN" ? Code.PermissionDenied
-            : error.code === "SESSION_INSTANCE_LIMIT_REACHED" ||
-              error.code === "RESOURCE_LIMIT_REACHED" ? Code.ResourceExhausted
-              : Code.FailedPrecondition;
-    return new ConnectError(redactSecrets(error.message), code);
-  }
   if (error instanceof InvalidStateTransitionError) return new ConnectError(error.message, Code.FailedPrecondition);
   if (error instanceof UsageReportQueryError) return new ConnectError(error.message, Code.InvalidArgument);
   if (error instanceof UsageReportCapacityError) return new ConnectError(error.message, Code.ResourceExhausted);
@@ -1250,7 +1205,6 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   router.service(contract.SshKeyService, withConnectErrors(services.sshKey));
   router.service(contract.VoiceInputService, withConnectErrors(services.voiceInput));
   router.service(contract.TerminalService, withConnectErrors(services.terminal));
-  router.service(contract.SimulatorViewerService, withConnectErrors(services.simulatorViewer));
   router.service(contract.PiService, withConnectErrors(services.pi));
 }
 
@@ -1464,12 +1418,6 @@ export function createConnectServices(application: OrchestratorApplication, proj
     onRevoked: (connectionId, listener) => dependencies.connections.onRevoked(connectionId, listener),
     isSessionMutationBlocked: (sessionId) => dependencies.sessionHost.isSessionTerminalMutationBlocked(sessionId),
     ...(application.registerServiceCleanup === undefined ? {} : { registerCleanup: (cleanup) => application.registerServiceCleanup!(cleanup) })
-  });
-  const simulatorViewer = createSimulatorViewerConnectService({
-    store: dependencies.store,
-    owner: application.simulatorViewer,
-    authenticate,
-    isSessionMutationBlocked: sessionId => dependencies.sessionHost.isSessionTerminalMutationBlocked(sessionId)
   });
   const sshKey = createSshKeyConnectService({
     ...(dependencies.sshKeys === undefined ? {} : { keys: dependencies.sshKeys }),
@@ -5509,7 +5457,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     extensionNetwork: createExtensionNetworkConnectService(application.extensionNetwork, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
     extensionOAuth: createExtensionOAuthConnectService(application.extensionOAuth, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
     extensionTasks: createExtensionTaskConnectService(application.extensionTasks, dependencies.connections, () => reconcileExtensionCatalog(dependencies)),
-    extensionCards: createExtensionCardConnectService(application.extensionCards, dependencies.connections), mcpApps: createMcpAppConnectService(application.mcpApps, application.mcpAppSurfaces, dependencies.connections), mcpAppsNative: createMcpAppNativeService(application.mcpApps, dependencies.connections), help: createHelpConnectService(application.helpAssistant, application.helpFeedback, dependencies.connections), appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, partnerHome, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, simulatorViewer, pi };
+    extensionCards: createExtensionCardConnectService(application.extensionCards, dependencies.connections), mcpApps: createMcpAppConnectService(application.mcpApps, application.mcpAppSurfaces, dependencies.connections), mcpAppsNative: createMcpAppNativeService(application.mcpApps, dependencies.connections), help: createHelpConnectService(application.helpAssistant, application.helpFeedback, dependencies.connections), appDefaultModel: createAppDefaultModelConnectService(application.appDefaultModels, dependencies.connections), connection, event, operation, backend, target, session, objective, portableSession, run, subagent, review, queue, scheduler, interaction, workspace, worktree, artifact, historyMaintenance, credential, settings, messaging, contact, partner, partnerRoutine, partnerGroup, partnerImport, partnerHome, collaborationGoal, managedModelRuntime, tool, extension, skill, browser, remoteHost, devicePeer, remoteDesktop, sshKey, voiceInput, terminal, pi };
 }
 
 function requireAuthentication(dependencies: ConnectServiceDependencies, context: HandlerContext): ConnectionRecord {
