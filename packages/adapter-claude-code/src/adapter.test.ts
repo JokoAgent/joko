@@ -61,6 +61,39 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("waits for the durable Source confirmation before the SDK can consume the exact native input", async () => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const { context } = contextFor(binding, { operationId: "source-native-fence" });
+    let confirm!: () => void, fingerprint = "";
+    const confirmed = new Promise<void>(ready => { confirm = ready; });
+    const sending = adapter.sendWithDurableNativeDispatchFence(textPrompt("Exact Source input"), context, async preparation => {
+      fingerprint = preparation.inputFingerprint; expect(preparation.nativeHistory.activeLineage).toEqual([]); await confirmed;
+    });
+    try {
+      await vi.waitFor(() => expect(fingerprint).toMatch(/^[a-f0-9]{64}$/u));
+      expect(sdk.queries[0]!.receivedInputs).toHaveLength(0);
+      await expect(adapter.setModel("claude-code", "model-a", context)).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
+      confirm(); await sending;
+      const native = sdk.queries[0]!.receivedInputs[0]!;
+      sdk.messages.set(binding.nativeSessionId!, [historyMessage("user", native.uuid!, binding.nativeSessionId!, native.message)]);
+      const history = await adapter.getNativeHistoryProjection(context);
+      expect(history.events.find(event => event.projectionKind === "message_user")?.metadata?.fields["nativeDispatchFingerprint"]).toBe(fingerprint);
+    } finally { confirm(); await sending.catch(() => {}); await adapter.dispose(); }
+  });
+
+  test.each(["rejected", "history changed"] as const)("keeps native input unread when durable Source confirmation is %s", async failure => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk);
+    const binding = await adapter.createSession(createInput(), contextFor().context), { context } = contextFor(binding, { operationId: "source-native-rejected" });
+    try {
+      await expect(adapter.sendWithDurableNativeDispatchFence(textPrompt("Undispatched input"), context, async () => {
+        if (failure === "rejected") throw new Error("Source persistence unavailable");
+        sdk.messages.set(binding.nativeSessionId!, [historyMessage("user", randomUUID(), binding.nativeSessionId!, { role: "user", content: "Another writer" })]);
+      })).rejects.toThrow();
+      expect(sdk.queries[0]!.receivedInputs).toHaveLength(0);
+    } finally { await adapter.dispose(); }
+  });
+
   test("observes edit mode and checks native PreToolUse authority even when file edits bypass canUseTool", async () => {
     const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk); let current = true;
     const review = vi.fn(async () => ({ verdict: "allow" as const, authorizationRevision: "original" }));

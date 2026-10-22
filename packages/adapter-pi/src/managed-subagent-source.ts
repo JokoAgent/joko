@@ -196,6 +196,23 @@ for (const name of credentialNames) {
   if (typeof value === "string" && value.length > 0) inheritedCredentials.set(name, value);
 }
 const inheritedRedactionValues = Array.from(inheritedCredentials.values());
+const hostedExecutionPath = process.env.JOKO_PI_HOSTED_EXECUTION_FILE;
+const hostedExecution = (() => {
+  if (hostedExecutionPath === undefined) return undefined;
+  if (!isAbsolute(hostedExecutionPath)) throw new Error("Hosted execution configuration is unavailable");
+  const info = lstatSync(hostedExecutionPath);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > 8 * 1024 * 1024 || !samePath(realpathSync(hostedExecutionPath), hostedExecutionPath)) {
+    throw new Error("Hosted execution configuration is unsafe");
+  }
+  const config = JSON.parse(readFileSync(hostedExecutionPath, "utf8"));
+  if (!config || config.format !== 1 || !["owner", "guest"].includes(config.trust)
+    || typeof config.bearer !== "string" || !/^[A-Za-z0-9_-]{32,256}$/.test(config.bearer)
+    || config.trust === "guest" && (typeof config.providerId !== "string" || !Array.isArray(config.modelIds) || !config.modelIds.length)) {
+    throw new Error("Hosted execution configuration is invalid");
+  }
+  inheritedRedactionValues.push(config.bearer);
+  return config;
+})();
 if (nativeAuthReservationToken) inheritedRedactionValues.push(nativeAuthReservationToken);
 for (const name of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]) {
   const value = process.env[name];
@@ -601,6 +618,7 @@ function gitPath(args) {
 function enforceIsolation(input) {
   const isolation = input && input.isolation === "require-worktree" ? "require-worktree" : "inherit";
   if (isolation !== "require-worktree") return;
+  if (hostedExecution?.trust === "guest") throw new Error("Shared Agent children cannot create or enter a worktree on the Provider's computer");
   const inside = spawnSync("git", ["rev-parse", "--is-inside-work-tree"], {
     cwd: process.cwd(), encoding: "utf8", windowsHide: true, shell: false
   });
@@ -732,14 +750,15 @@ function extensionPaths() {
   const silentEncryptedRetry = join(directory, "joko-managed-silent-encrypted-retry.ts");
   const autoReview = join(directory, "joko-managed-auto-review.mjs");
   const modelCatalog = join(directory, "joko-managed-model-catalog.mjs");
+  const hostedExecutor = join(directory, "joko-managed-hosted-executor.mjs");
   const runner = join(directory, RUNNER_FILE_NAME);
-  for (const path of [bridge, subagent, silentEncryptedRetry, autoReview, modelCatalog, runner]) {
+  for (const path of [bridge, subagent, silentEncryptedRetry, autoReview, modelCatalog, hostedExecutor, runner]) {
     const info = lstatSync(path);
     if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_DURABLE_JSON_BYTES || !samePath(realpathSync(path), path)) {
       throw new Error("managed extension path is unsafe: " + basename(path));
     }
   }
-  return { bridge: bridge, subagent: subagent, silentEncryptedRetry: silentEncryptedRetry, autoReview: autoReview, modelCatalog: modelCatalog, runner: runner };
+  return { bridge: bridge, subagent: subagent, silentEncryptedRetry: silentEncryptedRetry, autoReview: autoReview, modelCatalog: modelCatalog, hostedExecutor: hostedExecutor, runner: runner };
 }
 
 function childEnvironment(childHome, providerId) {
@@ -749,7 +768,7 @@ function childEnvironment(childHome, providerId) {
     if (typeof process.env[name] === "string") environment[name] = process.env[name];
   }
   for (const entry of credentials.entries()) environment[entry[0]] = entry[1];
-  for (const name of ["JOKO_PI_CONTROL_FILE", "JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE", "JOKO_PI_WORKSPACE_ROOT", "JOKO_PI_GENERATION"]) {
+  for (const name of ["JOKO_PI_CONTROL_FILE", "JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE", "JOKO_PI_WORKSPACE_ROOT", "JOKO_PI_GENERATION", "JOKO_PI_HOSTED_EXECUTION_FILE"]) {
     if (typeof process.env[name] === "string") environment[name] = process.env[name];
   }
   environment.JOKO_PI_SECRET_ENV_NAMES = JSON.stringify(Array.from(credentials.keys()));
@@ -1248,12 +1267,16 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
     const retryPath = join(runtimeDirectory, basename(paths.silentEncryptedRetry));
     const autoReviewPath = join(runtimeDirectory, basename(paths.autoReview));
     const modelCatalogPath = join(runtimeDirectory, basename(paths.modelCatalog));
+    const hostedExecutorPath = join(runtimeDirectory, basename(paths.hostedExecutor));
     const runnerScript = join(runDirectory, RUNNER_FILE_NAME);
     copyPrivateSnapshot(paths.bridge, bridgePath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.subagent, subagentPath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.silentEncryptedRetry, retryPath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.autoReview, autoReviewPath, MAX_DURABLE_JSON_BYTES, true);
     copyPrivateSnapshot(paths.modelCatalog, modelCatalogPath, MAX_DURABLE_JSON_BYTES, true);
+    copyPrivateSnapshot(paths.hostedExecutor, hostedExecutorPath, MAX_DURABLE_JSON_BYTES, true);
+    const childHostedExecutionPath = hostedExecution ? join(runtimeDirectory, "hosted-execution.json") : undefined;
+    if (childHostedExecutionPath) copyPrivateSnapshot(hostedExecutionPath, childHostedExecutionPath, 8 * 1024 * 1024, true);
     copyPrivateSnapshot(paths.runner, runnerScript, MAX_DURABLE_JSON_BYTES, true);
     const runnerScriptSha256 = createHash("sha256").update(readFileSync(runnerScript)).digest("hex");
     let runnerReservation;
@@ -1284,6 +1307,7 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
       "--provider", job.route.provider, "--model", job.route.model, "--thinking", job.route.effort,
       "--append-system-prompt", job.profile.prompt
     ];
+    if (hostedExecution?.trust === "guest") childArgs.push("--no-context-files");
     const nativeSessionId = job.sessionId || randomUUID();
     if (resumeSessionPath) childArgs.push("--session", resumeSessionPath);
     else childArgs.push("--session-id", nativeSessionId);
@@ -1336,6 +1360,7 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
       resumeSessionPath: resumeSessionPath,
       runtimeControlPath: runtimeControlPath,
       retryControlPath: retryControlPath,
+      ...(childHostedExecutionPath ? { hostedExecutionPath: childHostedExecutionPath } : {}),
       temporaryPath: temporaryPath,
       transcriptPath: join(runDirectory, "transcript.jsonl"),
       initialMessage: redact(message),
@@ -1696,6 +1721,9 @@ function routeFromContext(ctx, task) {
   validateThinkingForModel(selected, effort);
   const selectedProvider = routeToken(selected.provider, 128, "selected subagent provider", /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u);
   const selectedModel = routeToken(selected.id, MAX_MODEL_CHARS, "selected subagent model", /^[A-Za-z0-9][A-Za-z0-9._:@/+=-]{0,499}$/u);
+  if (hostedExecution?.trust === "guest" && (selectedProvider !== hostedExecution.providerId || !hostedExecution.modelIds.includes(selectedModel))) {
+    throw new Error("The shared Provider does not allow this subagent model");
+  }
   return { provider: selectedProvider, model: selectedModel, effort: effort };
 }
 
@@ -2141,6 +2169,7 @@ async function startController(job, onProgress, ctx) {
     "--thinking", job.route.effort,
     "--append-system-prompt", profile.prompt
   ];
+  if (hostedExecution?.trust === "guest") args.push("--no-context-files");
   const launch = invocation(args);
   let child;
   try {

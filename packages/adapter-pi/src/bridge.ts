@@ -4,6 +4,8 @@ import {
 } from "./policy-decision-bridge.js";
 import { provisionManagedAutoReviewRuntime } from "./auto-review-runtime.js";
 import { provisionManagedModelCatalogRuntime } from "./model-catalog-runtime.js";
+import { provisionHostedExecutorRuntime } from "./hosted-executor-runtime.js";
+import { MAXIMUM_PI_HOSTED_CONFIGURATION_BYTES } from "./hosted-executor.js";
 import { atomicWriteFile } from "./config.js";
 import {
   MAXIMUM_PI_RUNTIME_TOOL_CATALOG_BYTES,
@@ -33,6 +35,7 @@ export async function provisionManagedBridge(agentHome: string): Promise<string>
   const path = join(agentHome, "managed", BRIDGE_FILE_NAME);
   await provisionManagedAutoReviewRuntime(agentHome);
   await provisionManagedModelCatalogRuntime(agentHome);
+  await provisionHostedExecutorRuntime(agentHome);
   await atomicWriteFile(path, MANAGED_BRIDGE_SOURCE);
   return path;
 }
@@ -43,16 +46,18 @@ export async function provisionManagedBridge(agentHome: string): Promise<string>
  * Orchestrator. Secrets are never written into this source.
  */
 export const MANAGED_BRIDGE_SOURCE = String.raw`
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { closeSync, fsyncSync, lstatSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashTool, createLocalBashOperations, getPackageDir, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import * as piSdk from "@earendil-works/pi-coding-agent";
 import { clampThinkingLevel } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { createPiAutoReviewer } from "./joko-managed-auto-review.mjs";
 import { createPiModelCatalogAdditions } from "./joko-managed-model-catalog.mjs";
+import { createPiHostedExecutor } from "./joko-managed-hosted-executor.mjs";
 
 type ApprovedRoot = { path: string; access: "read_only" | "read_write" };
 type Control = { generation: number; policyGeneration: number; permissionMode: "ask" | "auto" | "bypassPermissions"; planMode: boolean; fastMode: boolean; approvedRoots: ApprovedRoot[]; runtimePolicy: "standard" | "review_read_only"; writtenAt: string };
@@ -86,6 +91,16 @@ const mcpToken = process.env.JOKO_PI_MCP_TOKEN;
 const resetReceiptRoot = process.env.JOKO_PI_RESET_RECEIPT_ROOT;
 const productSessionId = process.env.JOKO_PI_PRODUCT_SESSION_ID;
 const targetId = process.env.JOKO_PI_TARGET_ID;
+const hostedExecutionPath = process.env.JOKO_PI_HOSTED_EXECUTION_FILE;
+const hostedExecutor = (() => {
+  if (hostedExecutionPath === undefined) return undefined;
+  if (!isAbsolute(hostedExecutionPath)) throw new Error("Hosted execution configuration is unavailable");
+  const info = lstatSync(hostedExecutionPath);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > ${MAXIMUM_PI_HOSTED_CONFIGURATION_BYTES} || realpathSync(hostedExecutionPath) !== hostedExecutionPath) {
+    throw new Error("Hosted execution configuration is unsafe");
+  }
+  return createPiHostedExecutor(piSdk, JSON.parse(readFileSync(hostedExecutionPath, "utf8")));
+})();
 let secretEnvironmentNames: string[] = [];
 try {
   const parsed = JSON.parse(process.env.JOKO_PI_SECRET_ENV_NAMES ?? "[]");
@@ -604,21 +619,23 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
   // prompt, steer, follow-up, retry, and queued turn. Orchestrator validates model
   // eligibility before toggling the generation-fenced control value.
   pi.on("before_provider_request", (event, ctx) => {
+    hostedExecutor?.assertModel(ctx.model?.provider, ctx.model?.id);
     return learnedCachePayload(modelCatalog.prepareProviderPayload(ctx.model, event.payload, readControl().fastMode) ?? event.payload, ctx.model);
   });
 
   // Override model and direct-user bash execution so provider/MCP credentials
   // inherited by Pi are removed at the process spawn boundary.
-  const bashTool = createBashTool(process.cwd(), {
+  const bashTool = hostedExecutor ? hostedExecutor.createTools("catalog").bash : createBashTool(process.cwd(), {
     exposeSessionEnvironment: false,
     spawnHook: ({ command, cwd, env }) => ({ command, cwd, env: sanitizeEnvironment(env) }),
   });
   pi.registerTool({
     ...bashTool,
     execute: async (id, params, signal, onUpdate, ctx) => {
-      await commandGateRequest(ctx, "acquire", String(id));
+      if (!hostedExecutor) await commandGateRequest(ctx, "acquire", String(id));
       try {
-        return await bashTool.execute(
+        const current = hostedExecutor?.createTools(String(id), signal).bash ?? bashTool;
+        return await current.execute(
           id,
           { ...params, timeout: bashTimeout((params as { timeout?: unknown }).timeout) },
           signal,
@@ -626,10 +643,21 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
           ctx,
         );
       } finally {
-        await commandGateRequest(ctx, "release", String(id)).catch(() => undefined);
+        if (!hostedExecutor) await commandGateRequest(ctx, "release", String(id)).catch(() => undefined);
       }
     },
   });
+  const hostedToolNames = new Set(["read", "write", "edit", "ls", "find", "grep", "bash"]);
+  if (hostedExecutor) {
+    const templates = hostedExecutor.createTools("catalog");
+    for (const name of ["read", "write", "edit", "ls", "find", "grep"] as const) {
+      const template = templates[name];
+      pi.registerTool({ ...template, execute: async (id, params, signal, onUpdate, ctx) => {
+        const tool: any = hostedExecutor.createTools(String(id), signal)[name];
+        return tool.execute(id, params, signal, onUpdate, ctx);
+      } });
+    }
+  }
   const questionOption = Type.Object({
     label: Type.String({ minLength: 1, maxLength: 512 }),
     description: Type.Optional(Type.String({ maxLength: 2048 })),
@@ -722,7 +750,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
     },
   });
   pi.on("user_bash", () => {
-    const local = createLocalBashOperations();
+    const local = hostedExecutor ? hostedExecutor.createTools("user-" + randomUUID(), undefined, "user_shell").bashOperations : createLocalBashOperations();
     return {
       operations: {
         exec(command, cwd, options) {
@@ -751,6 +779,24 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
       control = readControl();
     } catch (error) {
       return { block: true, reason: error instanceof Error ? error.message : "Joko control state unavailable" };
+    }
+    if (hostedExecutor) {
+      const readOnly = ["read", "ls", "find", "grep"].includes(event.toolName);
+      if (control.runtimePolicy === "review_read_only" && !readOnly) {
+        return { block: true, reason: "The current execution mode permits only workspace reads" };
+      }
+      if (hostedToolNames.has(event.toolName)) {
+        // The authenticated source executor authorizes every actual operation,
+        // with the original task's roots, policy and interaction authority.
+        // Classifying against this computer's shadow files would grant the
+        // wrong authority and may inspect the provider owner's private files.
+        return;
+      }
+      if (hostedExecutor.trust === "guest") {
+        const allowed = new Set(["ask_user_question", "subagent", "subagent_status",
+          ...(mcp?.tools.map(tool => tool.runtimeName ?? "mcp__" + tool.serverId + "__" + tool.name) ?? [])]);
+        if (!allowed.has(event.toolName)) return { block: true, reason: "Shared Agent tool is outside the task executor allowlist" };
+      }
     }
     const risk = classifyTool(event.toolName, event.input, control);
     if (control.runtimePolicy === "review_read_only") {
@@ -814,12 +860,14 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
     if (!confirmed) return { block: true, reason: "The user declined this tool call" };
   });
 
-  pi.on("before_agent_start", async (_event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     const control = readControl();
-    if (control.runtimePolicy === "review_read_only") return;
+    const systemPrompt = hostedExecutor ? event.systemPrompt + "\n\n" + hostedExecutor.environmentNote : undefined;
+    if (control.runtimePolicy === "review_read_only") return systemPrompt === undefined ? undefined : { systemPrompt };
     ctx.ui.setStatus("joko-plan", control.planMode ? "plan" : undefined);
-    if (!control.planMode) return;
+    if (!control.planMode) return systemPrompt === undefined ? undefined : { systemPrompt };
     return {
+      ...(systemPrompt === undefined ? {} : { systemPrompt }),
       message: {
         customType: "joko-plan-mode",
         display: false,
@@ -1085,6 +1133,11 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
   // fire-and-forget status envelope. The Adapter consumes this reserved key
   // internally; it never becomes a user-visible status or durable event.
   pi.on("session_start", (_event, ctx) => {
+    if (hostedExecutor?.trust === "guest") {
+      const allowed = new Set([...hostedToolNames, "ask_user_question", "subagent", "subagent_status",
+        ...(mcp?.tools.map(tool => tool.runtimeName ?? "mcp__" + tool.serverId + "__" + tool.name) ?? [])]);
+      pi.setActiveTools(pi.getActiveTools().filter(name => allowed.has(name)));
+    }
     if (ctx.mode !== "rpc") return;
     try {
       const tools = pi.getAllTools().map((tool) => ({

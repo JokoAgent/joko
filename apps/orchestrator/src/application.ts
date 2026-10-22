@@ -89,6 +89,11 @@ import { AndroidToolBridgeProvider } from "./android-tool-bridge.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { BlobTransferCoordinator } from "./blob-transfers.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
+import { HostedAgentRuntime } from "./hosted-agent-runtime.js";
+import { HostedAgentSources } from "./hosted-agent-sources.js";
+import { createHostedAgentCodexAdapter } from "./hosted-agent-codex-factory.js";
+import { createHostedAgentClaudeAdapter } from "./hosted-agent-claude-factory.js";
+import { policySnapshotFor } from "./policy-settings.js";
 import {
   backendModelAccessRestricted,
   modelRoutingEnabled,
@@ -420,6 +425,7 @@ export interface OrchestratorApplication {
   readonly reviewCoordinator?: ReviewCoordinator;
   /** Authenticated reverse routes for exact controller-to-Device execution. */
   readonly devicePeers?: DevicePeerOwner;
+  readonly hostedAgentSources?: HostedAgentSources;
   /** Ephemeral, peer-fenced Remote Desktop lease and signaling authority. */
   readonly remoteDesktop?: RemoteDesktopCoordinator;
   /** Capability-neutral location switch shared by every remote runtime owner. */
@@ -490,6 +496,7 @@ export interface OrchestratorApplication {
   readonly partnerHomes?: PartnerHomeOwner;
   readonly partnerHomeRuntime?: PartnerHomeRuntimeAdapter;
   readonly partnerHomeInference?: PartnerHomeInference;
+  readonly hostedAgents?: HostedAgentRuntime;
   readonly partnerWorkingStatus?: PartnerWorkingStatusManager;
   readonly partnerWorkbenches?: PartnerWorkbenchManager;
   readonly partnerSessionTasks?: PartnerSessionTaskManager;
@@ -1604,6 +1611,8 @@ export async function createOrchestratorApplication(
   let startupCleanupHandled = false;
   let startupRoutineRuntime: ExtensionRoutineRuntime | undefined;
   let startupCardRuntime: ExtensionCardRuntime | undefined;
+  let startupHostedAgents: HostedAgentRuntime | undefined;
+  let hostedAgentSources: HostedAgentSources | undefined;
   let startupExtensionCards: ExtensionCardsManager | undefined;
   let startupBackendCleanup: Promise<readonly unknown[]> | undefined;
   const cleanupStartupBackendOwners = (): Promise<readonly unknown[]> => {
@@ -1614,12 +1623,15 @@ export async function createOrchestratorApplication(
         try { await cleanup(); } catch (error) { failures.push(error); }
       };
       await attempt(() => terminals.dispose());
+      await attempt(() => hostedAgentSources?.stopDiscovery());
+      await attempt(() => startupHostedAgents?.close());
       if (startupSessionHost === undefined) {
         await attempt(() => backendInstances.dispose());
       } else {
         await attempt(() => startupSessionHost!.dispose());
         await attempt(() => backendInstances.disposeRetainedCleanups());
       }
+      await attempt(() => hostedAgentSources?.close());
       await attempt(() => managedProviderProxy.close());
       return failures;
     })();
@@ -1636,6 +1648,91 @@ export async function createOrchestratorApplication(
     return current as ReturnType<typeof createPiAdapter>;
   };
   const initialAdapters: readonly BackendAdapter[] = backendInstances.availableAdapters();
+  const nativeProviderIds = (id: string) => (store.getBackend(id).descriptor.providers ?? []).map(provider => provider.providerId);
+  const nativeRemoteModels = (id: string) => {
+    if (backendInstances.adapter(id)?.hostedExecutionCapabilities?.toolsOnSource !== true) return [];
+    const descriptor = store.getBackend(id).descriptor;
+    return descriptor.models.filter(model => {
+      const authentication = descriptor.providers?.find(provider => provider.providerId === model.providerId)?.authenticationState ?? descriptor.authenticationState;
+      return (authentication === "authenticated" || authentication === "not_required") && providerRoutingEnabled(store, id, model.providerId)
+        && modelRoutingEnabled(store, id, model.providerId, model.modelId);
+    });
+  };
+  const hostedAgents = startupHostedAgents = new HostedAgentRuntime({ store, connections, root: join(config.dataDirectory, "hosted-agents"),
+    artifactCapacityBytes: artifacts.maximumBlobBytes, factories: [{ backendId: piBackendId, displayName: store.getBackend(piBackendId).descriptor.displayName,
+      providerIds: () => providers.list(piBackendId).map(provider => provider.provider.id),
+      providerDisplayName: providerId => providers.list(piBackendId).find(provider => provider.provider.id === providerId)?.displayName ?? providerId,
+      capabilities: () => store.getBackend(piBackendId).descriptor.capabilities,
+      version: () => store.getBackend(piBackendId).descriptor.version,
+      models: () => {
+        if (backendInstances.adapter(piBackendId)?.hostedExecutionCapabilities?.toolsOnSource !== true) return [];
+        const available = availableManagedProviderIds(providers.list(piBackendId), providerId => providerRoutingEnabled(store, piBackendId, providerId));
+        return store.getBackend(piBackendId).descriptor.models.filter(model => available.has(model.providerId)
+          && modelRoutingEnabled(store, piBackendId, model.providerId, model.modelId));
+      },
+      create: async creation => {
+        creation.signal.throwIfAborted();
+        const hostedSettings = effectivePiSettings(baseSettings, store.findSetting<unknown>("service", "orchestrator", `settings.pi.${piBackendId}`)?.value);
+        const allowed = new Set(creation.providerIds);
+        const snapshot = await providers.createPiGenerationSnapshot({ snapshotsRoot: join(creation.home, "provider-snapshots", randomUUID()), settings: hostedSettings,
+          providerEnabled: providerId => allowed.has(providerId) && providerRoutingEnabled(store, piBackendId, providerId),
+          modelEnabled: (providerId, modelId) => modelRoutingEnabled(store, piBackendId, providerId, modelId)
+            && (creation.trust === "owner" || creation.modelIds.includes(modelId)) });
+        creation.signal.throwIfAborted();
+        return createPiAdapter({ agentHome: snapshot.agentHome, sessionRoot: creation.home,
+          readBlob: async blob => ({ data: await creation.readBlob(blob), mimeType: blob.mimeType }),
+          ...(config.piExecutable === undefined ? {} : { command: config.piExecutable }),
+          providers: snapshot.providers, settings: hostedSettings, environment: snapshot.environment, secretEnvironmentNames: snapshot.secretEnvironmentNames,
+          catalogGeneration: snapshot.catalogGeneration, nativeAuthProviderIds: snapshot.nativeAuthProviderIds,
+          nativeAuthenticatedProviderIds: snapshot.nativeAuthenticatedProviderIds,
+          nativeModels: providerAuth.listNativeModels().filter(model => allowed.has(model.providerId)
+            && modelRoutingEnabled(store, piBackendId, model.providerId, model.modelId) && (creation.trust === "owner" || creation.modelIds.includes(model.modelId))),
+          loadNativeAuth: input => {
+            creation.signal.throwIfAborted(); if (input.providerIds.some(providerId => !allowed.has(providerId))) throw new Error("Hosted native Provider authentication is outside its scope.");
+            return providerAuth.loadNativeAuth(input);
+          },
+          persistNativeAuth: input => {
+            creation.signal.throwIfAborted(); if (!allowed.has(input.providerId)) throw new Error("Hosted native Provider authentication is outside its scope.");
+            return providerAuth.persistNativeAuth(input);
+          },
+          processSupervisor: createDefaultManagedProcessSupervisor(),
+          includeManagedSubagentTools: () => false, readAgentResourceSettings: () => runtimeGovernance.agentResource(),
+          readCollaborationSettings: () => runtimeGovernance.collaboration()
+        });
+      }
+    }, {
+      backendId: codexBackendId, displayName: store.getBackend(codexBackendId).descriptor.displayName,
+      providerIds: () => nativeProviderIds(codexBackendId),
+      providerDisplayName: providerId => store.getBackend(codexBackendId).descriptor.providers?.find(provider => provider.providerId === providerId)?.displayName ?? providerId,
+      capabilities: () => store.getBackend(codexBackendId).descriptor.capabilities, version: () => store.getBackend(codexBackendId).descriptor.version,
+      models: () => nativeRemoteModels(codexBackendId),
+      create: async creation => createHostedAgentCodexAdapter({ creation, backendId: codexBackendId, providers,
+        captureNativeAuthentication: async () => {
+          const original = backendInstances.adapter(codexBackendId);
+          if (!(original instanceof CodexBackendAdapter)) throw new Error("The original native account is unavailable.");
+          const assertOriginal = () => {
+            creation.signal.throwIfAborted(); creation.execution.assertCurrent();
+            if (backendInstances.adapter(codexBackendId) !== original) throw new Error("The original native account was replaced.");
+          };
+          assertOriginal(); const account = await original.captureHostedAuthentication(); assertOriginal();
+          if (account.kind === "chatgpt") return { kind: "chatgpt", readTokens: async (refresh, staleAccessToken) => {
+            assertOriginal(); const tokens = await account.readTokens(refresh, staleAccessToken); assertOriginal(); return tokens;
+          } };
+          return { kind: "api_key", readApiKey: async () => {
+            assertOriginal(); const apiKey = await account.readApiKey(); assertOriginal(); return apiKey;
+          } };
+        },
+        nativeEnvironment: Object.fromEntries(Object.entries(process.env).flatMap(([key, value]) => value === undefined ? [] : [[key, value]])),
+        executable: await localBackendRuntimeSetup.resolveExecutable() ?? config.codexExecutable ?? "codex", fetch: createOutboundFetch(dependencies.resolveOutboundProxy) })
+    }, {
+      backendId: claudeCodeBackendId, displayName: store.getBackend(claudeCodeBackendId).descriptor.displayName,
+      providerIds: () => nativeProviderIds(claudeCodeBackendId),
+      providerDisplayName: providerId => store.getBackend(claudeCodeBackendId).descriptor.providers?.find(provider => provider.providerId === providerId)?.displayName ?? providerId,
+      capabilities: () => store.getBackend(claudeCodeBackendId).descriptor.capabilities, version: () => store.getBackend(claudeCodeBackendId).descriptor.version,
+      models: () => nativeRemoteModels(claudeCodeBackendId),
+      create: creation => createHostedAgentClaudeAdapter({ creation, backendId: claudeCodeBackendId, providers, credentialPort: claudeCodeCredentialPort,
+        fetch: claudeCodeOAuthFetch, ...(config.claudeCodeExecutable === undefined ? {} : { pathToExecutable: config.claudeCodeExecutable }) })
+    }] });
   const resolveSessionContextDefaults = composeSessionContextDefaultsResolver([{
     adapter: { id: piBackendId },
     resolve: () => {
@@ -1720,7 +1817,8 @@ export async function createOrchestratorApplication(
     providerRoutingEnabled: (backendId, providerId) => providerRoutingEnabled(store, backendId, providerId)
       && configuredProviderRouteEnabled(backendId, providerId),
     modelRoutingEnabled: (backendId, providerId, modelId) => modelRoutingEnabled(store, backendId, providerId, modelId)
-      && configuredProviderRouteEnabled(backendId, providerId),
+      && configuredProviderRouteEnabled(backendId, providerId)
+      && hostedAgentSources?.modelAvailable(backendId, providerId, modelId) !== false,
     modelAccessRestricted: (backendId) => backendModelAccessRestricted(store, backendId)
       || (
         store.getBackend(backendId).descriptor.capabilities.get("provider.managed_catalog")?.supported === true
@@ -1796,6 +1894,21 @@ export async function createOrchestratorApplication(
     onServiceInteractionSettled: (input) => { partnerGroupRuntime?.interactionChanged(input.sessionId); return messaging?.onInteractionSettled(input); },
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
+  hostedAgentSources = new HostedAgentSources({ store, peers: devicePeers, registry: backendInstances, host: sessionHost,
+    temporaryRoot: join(config.dataDirectory, "hosted-source-transfers"), commandConcurrencyGate,
+    readBlob: async blob => (await artifacts.readBlob(blob)).data,
+    ...(dependencies.resolveOutboundProxy === undefined ? {} : { resolveProxy: dependencies.resolveOutboundProxy }),
+    environmentProxyForTarget: target => environmentProxyForTarget(target, process.env),
+    resolveCodexExecutable: () => localBackendRuntimeSetup.resolveExecutable(),
+    readPolicy: context => {
+      let session: ReturnType<OperationalStore["getSession"]>["descriptor"] | undefined;
+      try { session = store.getSession(context.sessionId).descriptor; } catch { /* Creation has no product Session yet. */ }
+      const snapshot = policySnapshotFor(store, context.target), permissionMode = session?.permissionMode ?? "ask", planMode = session?.planMode ?? false;
+      const current = sessionHost.extraDirectories.listForTarget(context.target.id);
+      const approvedRoots = (context.extraDirectories ?? []).filter(directory => current.some(candidate => candidate.id === directory.id && candidate.path === directory.path));
+      return { revision: JSON.stringify([snapshot.generation, permissionMode, planMode, approvedRoots]), permissionMode, planMode, approvedRoots, snapshot, confirmCredentials: true };
+    } });
+  await hostedAgentSources.initialize();
   const personalDevelopmentRoot = join(config.dataDirectory, "personal-development");
   personalDevelopmentNativeBroker = new PersonalDevelopmentNativeBroker({
     directory: join(config.dataDirectory, "personal-development-native"), connections
@@ -3129,6 +3242,8 @@ export async function createOrchestratorApplication(
     partnerHomes,
     partnerHomeRuntime,
     partnerHomeInference,
+    hostedAgents,
+    hostedAgentSources,
     partnerWorkbenches,
     partnerSessionTasks,
     partnerTaskOutputs,
@@ -3200,8 +3315,10 @@ export async function createOrchestratorApplication(
         serviceCleanups.clear();
         deferredBackendRestarts?.dispose();
         for (const cleanup of cleanups) await attempt(cleanup);
+        await attempt(() => hostedAgentSources?.stopDiscovery());
         await attempt(closePersonalDevelopment);
         await attempt(() => taskSharingHome.dispose());
+        await attempt(() => hostedAgents.close());
         await attempt(() => unregisterPersonalDevelopmentTools());
         await attempt(() => partnerImports?.close());
         await attempt(() => partnerHomes.close());
@@ -3255,6 +3372,7 @@ export async function createOrchestratorApplication(
         await attempt(() => artifactMaintenance.close());
         await attempt(() => historyMaintenance.close());
         await attempt(() => sessionHost.dispose());
+        await attempt(() => hostedAgentSources?.close());
         managedChildWorkspaces.close();
         await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => managedProviderProxy.close());

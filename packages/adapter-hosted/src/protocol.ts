@@ -1,0 +1,43 @@
+import type { HostedExecution, PermissionMode, PromptInput, SubagentControlInput, UserShellInput } from "@joko/core";
+
+/** Closed private values shared by the native Provider actor and its Source
+ * Adapter. Public clients use the generated protobuf service envelopes. */
+export type HostedNativeCommand =
+  | { readonly kind: "state" }
+  | { readonly kind: "send"; readonly input: PromptInput; readonly durableFence: boolean }
+  | { readonly kind: "abort" }
+  | { readonly kind: "delete" }
+  | { readonly kind: "set_model"; readonly providerId: string; readonly modelId: string }
+  | { readonly kind: "set_effort"; readonly effort: string }
+  | { readonly kind: "set_fast"; readonly enabled: boolean }
+  | { readonly kind: "set_permission"; readonly mode: PermissionMode }
+  | { readonly kind: "set_plan"; readonly enabled: boolean }
+  | { readonly kind: "set_name"; readonly name: string }
+  | { readonly kind: "set_auto_compaction"; readonly enabled: boolean }
+  | { readonly kind: "set_auto_retry"; readonly enabled: boolean }
+  | { readonly kind: "abort_retry" }
+  | { readonly kind: "compact"; readonly instructions?: string }
+  | { readonly kind: "commands" }
+  | { readonly kind: "resources" }
+  | { readonly kind: "tools" }
+  | { readonly kind: "tree" }
+  | { readonly kind: "history" }
+  | { readonly kind: "shell"; readonly input: UserShellInput }
+  | { readonly kind: "abort_shell" }
+  | { readonly kind: "control_subagent"; readonly input: SubagentControlInput };
+export interface HostedNativeOpen {
+  readonly runId: string;
+  readonly nativeSessionId: string;
+  readonly start: "create" | "resume";
+  readonly sessionId: string;
+  readonly targetId: string;
+  readonly generation: number;
+  readonly backendId: string;
+  readonly providerId: string;
+  readonly modelId: string;
+  readonly name?: string;
+  readonly permissionMode: PermissionMode;
+  readonly fastMode: boolean;
+  readonly effort?: string;
+  readonly workspace: Omit<HostedExecution["workspace"], "root" | "additionalRoots">;
+}

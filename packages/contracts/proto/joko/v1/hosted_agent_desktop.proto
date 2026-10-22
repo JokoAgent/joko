@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/hosted_agent.proto";
+
+// Main-process-only delegation to this managed Orchestrator's native factories.
+// Every method requires both the revocable owner bearer and the separate
+// committed Desktop-host proof. A renderer credential alone confers no access.
+service DesktopHostedAgentService {
+  rpc OpenDesktopHostedAgentDelegate(OpenDesktopHostedAgentDelegateRequest) returns (OpenDesktopHostedAgentDelegateResponse);
+  rpc InvokeDesktopHostedAgentDelegate(InvokeDesktopHostedAgentDelegateRequest) returns (InvokeDesktopHostedAgentDelegateResponse);
+  rpc CloseDesktopHostedAgentDelegate(CloseDesktopHostedAgentDelegateRequest) returns (CloseDesktopHostedAgentDelegateResponse);
+}
+
+message OpenDesktopHostedAgentDelegateRequest {
+  uint32 format = 1;
+  // A fresh identity for one captured Device route, retained across open retries.
+  string route_instance_id = 2;
+}
+message OpenDesktopHostedAgentDelegateResponse {
+  uint32 format = 1;
+  string delegate_id = 2;
+  // Supplied by the service; the caller cannot override the Source Hub.
+  string server_id = 3;
+}
+message InvokeDesktopHostedAgentDelegateRequest {
+  uint32 format = 1;
+  string delegate_id = 2;
+  // Main copies this only from the authenticated Device command envelope.
+  string controller_device_id = 3;
+  HostedAgentPeerMethod method = 4;
+  bytes request_bytes = 5;
+}
+message InvokeDesktopHostedAgentDelegateResponse { uint32 format = 1; bytes response_bytes = 2; }
+message CloseDesktopHostedAgentDelegateRequest { uint32 format = 1; string delegate_id = 2; }
+message CloseDesktopHostedAgentDelegateResponse { uint32 format = 1; }

@@ -246,7 +246,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
     }
     await this.#processOwner?.prepare(this.#options.shutdownTimeoutMs);
     const command = this.#options.command ?? "codex";
-    const args = [...(this.#options.args ?? ["app-server", "--stdio"])];
+    const args = [...(this.#options.args ?? ["app-server", "--listen", "stdio://"])];
     const environment = {
       ...(this.#options.env ?? createChildRuntimeEnvironment({
         allowedKeys: CODEX_RUNTIME_ENVIRONMENT_KEYS

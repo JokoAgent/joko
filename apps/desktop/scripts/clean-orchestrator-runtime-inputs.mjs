@@ -10,6 +10,7 @@ const runtimePackageRoots = [
   "packages/adapter-claude-code",
   "packages/adapter-codex",
   "packages/adapter-dictation-refinement",
+  "packages/adapter-hosted",
   "packages/adapter-pi",
   "packages/adapter-transcription-openai",
   "packages/adapter-transcription-realtime",

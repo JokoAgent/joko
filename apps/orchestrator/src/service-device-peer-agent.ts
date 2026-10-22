@@ -12,6 +12,7 @@ import {
   type DevicePeerTerminalHandle,
   type DevicePeerTerminalStartRequest,
   type DevicePeerTerminalTransportPort,
+  type DevicePeerNativeAgentPort,
   type NodeDevicePeerAgentConnection,
   type NodeDevicePeerAgentLifecycleOptions,
   type NodeDevicePeerRuntimeExecutableMap
@@ -39,6 +40,7 @@ export interface ServiceDevicePeerAgentOptions {
   readonly retryBaseDelayMs?: number;
   readonly retryMaximumDelayMs?: number;
   readonly runtimeExecutables?: NodeDevicePeerRuntimeExecutableMap;
+  readonly createNativeAgentPort?: () => DevicePeerNativeAgentPort;
 }
 
 /**
@@ -70,6 +72,7 @@ export class ServiceDevicePeerAgent {
     const createExecutor = options.createExecutor ?? (() => new NodeDevicePeerAgentExecutor({
       recentDirectoriesPath: serviceRecentDirectoriesPath(options.config),
       terminals: terminal,
+      ...(options.createNativeAgentPort === undefined ? {} : { nativeAgents: options.createNativeAgentPort() }),
       runtimeExecutables: options.runtimeExecutables ?? {}
     }));
     this.#lifecycle = new NodeDevicePeerAgentLifecycle({

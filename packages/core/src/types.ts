@@ -67,6 +67,7 @@ export const CAPABILITIES = [
   "input.file",
   "input.mention",
   "model.list",
+  "model.remote_execution",
   "model.switch",
   "model.effort",
   "model.fast_mode",

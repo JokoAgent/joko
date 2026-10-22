@@ -2539,6 +2539,19 @@ export function useAppController(): AppController {
       hasPendingDeviceNameUpdate: (deviceId: string) => artifactGateway?.hasPendingDeviceNameUpdate(deviceId) ?? false
     };
   }, [artifactGateway]);
+  const hostedAgentApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined || gatewayRef.current !== artifactGateway || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+        throw new Error("The model management connection changed.");
+      }
+      return artifactGateway;
+    };
+    return {
+      getHostedAgentSettings: (...args: Parameters<OperationApi["getHostedAgentSettings"]>) => original().getHostedAgentSettings(...args),
+      getHostedAgentCatalog: (...args: Parameters<OperationApi["getHostedAgentCatalog"]>) => original().getHostedAgentCatalog(...args),
+      updateHostedAgentSettings: (...args: Parameters<OperationApi["updateHostedAgentSettings"]>) => original().updateHostedAgentSettings(...args)
+    };
+  }, [artifactGateway, linkGatewayGeneration]);
   const remoteHostApi = useMemo(() => {
     const original = (): OrchestratorGateway => {
       if (artifactGateway === undefined) throw new Error("Connect to Joko before managing remote workspaces.");
@@ -3273,6 +3286,7 @@ export function useAppController(): AppController {
     cancelLocalBackendRuntimeInstall: (backendId, requestId) => gateway().cancelLocalBackendRuntimeInstall(backendId, requestId),
     updateBackendSettings: (backendId, patch) => gateway().updateBackendSettings(backendId, patch),
     ...deviceNameApi,
+    ...hostedAgentApi,
     setDeviceRemoteControlEnabled: (enabled) => gateway().setDeviceRemoteControlEnabled(enabled),
     setDeviceControlTargetEnabled: (targetDeviceId, enabled) => gateway().setDeviceControlTargetEnabled(targetDeviceId, enabled),
     setDeviceControllerAllowed: (controllerDeviceId, allowed) => gateway().setDeviceControllerAllowed(controllerDeviceId, allowed),

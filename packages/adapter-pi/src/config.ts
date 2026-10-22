@@ -646,7 +646,7 @@ function assertHeaderName(value: string): void {
   if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value)) throw piError("PI_INVALID_HEADER", `Invalid provider header name '${value}'`, "provision");
 }
 
-function keylessEnvName(providerId: string): string {
+export function keylessEnvName(providerId: string): string {
   return `JOKO_PI_KEYLESS_${providerId.replace(/[^A-Za-z0-9]/g, "_").toUpperCase()}`;
 }
 

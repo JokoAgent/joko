@@ -19,6 +19,7 @@ import {
 } from "./desktop-bootstrap-pipe.js";
 import { needsLocalPairingRecovery } from "./local-pairing-recovery.js";
 import { createInternalServer, createPublicServer } from "./server.js";
+import { createHostedAgentPeerPort } from "./hosted-agent-peer-port.js";
 import { OrchestratorServiceLifecycle, OrchestratorStartupInterruptedError } from "./service-lifecycle.js";
 import {
   createServiceDevicePeerRuntimeExecutables,
@@ -103,6 +104,9 @@ async function main(): Promise<void> {
     if (config.devicePeerAgent !== undefined) {
       const serviceDevicePeerAgent = new ServiceDevicePeerAgent({
         config: config.devicePeerAgent,
+        ...(application.hostedAgents === undefined ? {} : {
+          createNativeAgentPort: () => createHostedAgentPeerPort(application.hostedAgents!, config.devicePeerAgent!.controllerServerId)
+        }),
         runtimeExecutables: await createServiceDevicePeerRuntimeExecutables(config)
       });
       const unregister = application.registerServiceCleanup?.(() => serviceDevicePeerAgent.close());

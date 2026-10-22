@@ -10,6 +10,7 @@
     { "path": "../../packages/agent-import" },
     { "path": "../../packages/contracts" },
     { "path": "../../packages/core" },
+    { "path": "../../packages/adapter-hosted" },
     { "path": "../../packages/device-peer" },
     { "path": "../../packages/git-safety" },
     { "path": "../../packages/local-model-runtime" },

@@ -25,6 +25,7 @@ import {
   type BackendDescriptor,
   type Capability,
   type CreateNativeSessionInput,
+  type DurableNativeDispatchPreparation,
   type HostComposedCapability,
   type KnownCapability,
   type ManagedProviderRuntimePort,
@@ -77,7 +78,7 @@ import {
   type NativeThread,
   type NativeTurn
 } from "./protocol.js";
-import { projectCodexNativeHistory } from "./native-history.js";
+import { codexNativeDispatchFingerprint, projectCodexNativeHistory } from "./native-history.js";
 import { readCodexNativeSessionPreview } from "./native-session-preview.js";
 import {
   inspectCodexCatalogMaterialization,
@@ -119,8 +120,13 @@ import {
   type CodexSmartRoutingGeneration,
   type CodexSmartRoutingPreparation
 } from "./smart-subagent-routing.js";
+import { CodexHostedExecution, type CodexHostedExecutionOptions } from "./hosted-execution.js";
+import { withoutCodexSpawnModelOverrides } from "./hosted-guest.js";
+import { captureCodexHostedAuthentication, readCodexOwnedAuthentication, type CodexHostedAuthenticationAuthority } from "./hosted-authentication.js";
 
 export interface CodexAdapterOptions extends Omit<CodexInputResolvers, "resolveSkillMention"> {
+  /** Dedicated native process whose files and commands belong to the Source. */
+  readonly hostedExecution?: CodexHostedExecutionOptions;
   readonly managedProviders?: ManagedProviderRuntimePort;
   /** Spawn-time catalog and runtime revision owned by this exact Backend instance. */
   readonly smartRouting?: CodexSmartRoutingPreparation;
@@ -246,6 +252,7 @@ export type CodexLoginResult =
 
 /** Adapter-local port that callers can capability-detect without branching on a Backend ID. */
 export interface CodexNativeAccountOperations {
+  captureHostedAuthentication(): Promise<CodexHostedAuthenticationAuthority>;
   readAccount(refreshToken?: boolean): Promise<CodexAccountSnapshot>;
   readAccountUsage(providerId: string, signal?: AbortSignal): Promise<CodexAccountUsageSnapshot>;
   listModels(): Promise<readonly ProviderModel[]>;
@@ -533,10 +540,12 @@ const REVIEW_CREDENTIAL_GLOB_PATTERNS = [
 ] as const;
 
 export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implements CodexNativeAccountOperations, ProviderAuthenticationRevocation {
+  readonly hostedExecutionCapabilities = { toolsOnSource: true, isolatedGuests: true } as const;
   readonly nativeTextInferenceCapabilities = { pluginOneshot: true, maxTokens: false } as const;
   readonly id: string;
   readonly #instanceGeneration: number;
   readonly #providerId: string;
+  readonly #hosted: CodexHostedExecution | undefined;
   #host: AppServerHost;
   readonly #ownsHost: boolean;
   readonly #ownedHostOptions: AppServerHostOptions | undefined;
@@ -573,6 +582,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     readonly enabled: boolean;
   } | undefined;
   readonly #sessions = new Map<string, SessionRuntime>();
+  readonly #freshNativeHistory = new WeakMap<SessionRuntime, { readonly thread: NativeThread; readonly revision: bigint }>();
   readonly #sessionMutations = new Map<string, { count: number; rewinding: boolean }>();
   #models: readonly ProviderModel[] = [];
   readonly #managedProviders: ManagedProviderRuntimePort | undefined;
@@ -585,6 +595,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #smartRoutingHostFlight: Promise<number> | undefined;
   #account: CodexAccountSnapshot | undefined;
   #nativeAuthenticationEpoch = 0;
+  #hostedAuthenticationRefreshTail: Promise<void> = Promise.resolve();
   readonly #nativeTextFlights = new Set<AbortController>();
   #nativeAuthenticationRevoked = false;
   #nativeAuthenticationLogoutCompletedEpoch: number | undefined;
@@ -598,14 +609,26 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.id = options.id ?? "codex";
     this.#instanceGeneration = options.instanceGeneration;
     this.#providerId = options.providerId ?? "openai";
+    this.#hosted = options.hostedExecution === undefined ? undefined : new CodexHostedExecution(options.hostedExecution);
+    if (this.#hosted && (options.host !== undefined || options.remoteRuntimes !== undefined
+      || options.localMcpBridge !== undefined || options.resolveNativeSkills !== undefined || options.resolveNativeSkillPolicy !== undefined
+      || options.resolveNativeMemoryEnabled !== undefined || options.smartRouting !== undefined)) {
+      throw new TypeError("A hosted native process cannot borrow a local runtime, resources or subagent routing.");
+    }
+    const hostedGuest = this.#hosted?.execution.trust === "guest" ? this.#hosted.execution : undefined;
+    if (hostedGuest && (!options.appServer?.transport?.env
+      || options.appServer.transport.env["CODEX_HOME"] !== hostedGuest.guestHome
+      || options.managedProviders?.listProviders().some(provider => provider.providerId !== hostedGuest.providerId))) {
+      throw new TypeError("A shared native process requires its own Codex home and Provider snapshot.");
+    }
     this.#managedProviders = options.managedProviders;
     this.#smartRouting = options.smartRouting;
-    const transportArgs = options.appServer?.transport?.args ?? ["app-server", "--stdio"];
+    const transportArgs = options.appServer?.transport?.args ?? ["app-server", "--listen", "stdio://"];
     const ownedHostOptions: AppServerHostOptions = {
       ...options.appServer,
       transport: {
         ...options.appServer?.transport,
-        args: [...transportArgs],
+        args: this.#hosted?.execution.trust === "guest" ? withoutCodexSpawnModelOverrides(transportArgs) : [...transportArgs],
         ...(options.managedProviders === undefined ? {} : { managedEnvironment: options.managedProviders.environment })
       }
     };
@@ -830,7 +853,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       ...ownedOptions,
       transport: {
         ...ownedOptions.transport,
-        args: [...(ownedOptions.transport?.args ?? ["app-server", "--stdio"]), ...generation.launchArgs]
+        args: [...(ownedOptions.transport?.args ?? ["app-server", "--listen", "stdio://"]), ...generation.launchArgs]
       }
     });
     this.#host = smartHost;
@@ -1080,7 +1103,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       input.effort,
       input.fastMode
     );
-    if (input.permissionMode === "bypassPermissions" && !input.target.trusted) {
+    this.#hosted?.assertModel(input.providerId, input.modelId);
+    if (input.permissionMode === "bypassPermissions" && !input.target.trusted && this.#hosted === undefined) {
       throw adapterError({
         code: "CODEX_FULL_ACCESS_REQUIRES_TRUST",
         message: "Full access requires a trusted Target.",
@@ -1178,13 +1202,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const initialConfiguration: JsonObject = {
       ...(managedConfiguration ?? {}),
       ...(nativeConfiguration ?? {}),
+      ...(this.#hosted?.configuration() ?? {}),
       // Product Objectives own continuation, budgets, and pause/resume. A
       // native goal would create a second loop outside the durable Queue owner.
       "features.goals": false
     };
     const previousConfig = (request.params as JsonObject)["config"];
     Object.assign(request.params, {
-      config: { ...(isJsonObject(previousConfig) ? previousConfig : {}), ...initialConfiguration }
+      config: { ...(isJsonObject(previousConfig) ? previousConfig : {}), ...initialConfiguration },
+      ...(this.#hosted?.environments() ?? {}),
+      ...(this.#hosted === undefined ? {} : { developerInstructions: this.#hosted.instructions(input.appendSystemPrompt ?? context.appendSystemPrompt) })
     });
     let response;
     try {
@@ -1263,6 +1290,10 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         nativeSkills,
         ...(reviewWorkingDirectory === undefined ? {} : { reviewWorkingDirectory })
       });
+      if (request.method === "thread/start" && thread.historyMode === "paginated" && thread.turns.length === 0) {
+        const revision = scope.host.contentRevision(thread.id, response.hostGeneration);
+        if (revision !== undefined) this.#freshNativeHistory.set(runtime, { thread, revision });
+      }
     } catch (error) {
       managedRoute?.dispose();
       smartRoute?.dispose();
@@ -1345,7 +1376,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       nativeAuthenticationEpoch
     );
     const workingContextWindow = resolveWorkingContext(context, context.modelSelection?.providerId, context.modelSelection?.modelId);
-    const mustReloadConfiguration = workingContextWindow !== undefined || managedRoute !== undefined || smartRoute !== undefined
+    const mustReloadConfiguration = this.#hosted !== undefined || workingContextWindow !== undefined || managedRoute !== undefined || smartRoute !== undefined
       || (!inspection.scope.remote && (inspection.scope.openMcpBridge !== undefined || this.#resolveNativeSkills !== undefined))
       || (inspection.scope.prepareNativeSkills !== undefined && this.#resolveNativeSkills !== undefined);
     if (mustReloadConfiguration) {
@@ -1777,10 +1808,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     return this.#withNativeMutation(context, () => this.#send(input, context));
   }
 
+  async sendWithDurableNativeDispatchFence(input: PromptInput, context: AdapterContext,
+    persistFence: (preparation: DurableNativeDispatchPreparation) => Promise<void>): Promise<void> {
+    return this.#withNativeMutation(context, () => this.#send(input, context, undefined, persistFence));
+  }
+
   async #send(
     input: PromptInput,
     context: AdapterContext,
-    yieldDispatch?: YieldContinuationDispatch
+    yieldDispatch?: YieldContinuationDispatch,
+    persistFence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>
   ): Promise<void> {
     this.#assertOpen();
     assertDispatchNotCancelled(context.signal);
@@ -1880,6 +1917,21 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       context.nativeToolAuthorization?.assertCurrent();
     };
     assertNativeDispatchReady();
+    // Read native history before entering the record-write queue. Its returned
+    // revision fence remains valid while the Source persists this occurrence.
+    // The write-queue proof below never issues another native RPC.
+    const durableHistory = persistFence === undefined ? undefined : await this.#readDispatchHistory(runtime, context);
+    const preparation = durableHistory === undefined ? undefined : {
+      inputFingerprint: codexNativeDispatchFingerprint(nativeInput.input),
+      nativeHistory: projectCodexNativeHistory(durableHistory.thread, { maximumEvents: this.#maximumHistoryEvents })
+    };
+    const beforeDispatchAsync = persistFence !== undefined || input.mentions.some(mention => mention.kind === "resource")
+      ? async (signal: AbortSignal) => {
+          assertNativeDispatchReady(); await nativeInput.assertFilesCurrent(signal); durableHistory?.assertCurrent();
+          if (persistFence !== undefined && preparation !== undefined) await persistFence(preparation);
+          durableHistory?.assertCurrent(); assertNativeDispatchReady();
+        }
+      : undefined;
     const clientUserMessageId = yieldDispatch?.clientUserMessageId ?? context.operationId;
     const collaborationMode = runtime.runtimePolicy === "standard"
       && supportsNativeCollaboration(runtime.host.initializeResult?.userAgent)
@@ -1906,8 +1958,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
           clientUserMessageId,
           input: [...nativeInput.input],
           expectedTurnId: expectedTurnId!
-        }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertNativeDispatchReady,
-          ...(input.mentions.some(mention => mention.kind === "resource") ? { beforeDispatchAsync: nativeInput.assertFilesCurrent } : {}) });
+        }, { mutation: true, signal: dispatchSignal, beforeDispatch: () => { durableHistory?.assertCurrent(); assertNativeDispatchReady(); },
+          ...(beforeDispatchAsync === undefined ? {} : { beforeDispatchAsync }) });
         this.#assertRuntimeFence(runtime, context, response.hostGeneration);
         acceptedResponseShapePending = true;
         if (parseTurnSteer(response.value) !== expectedTurnId) {
@@ -1923,6 +1975,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         clientUserMessageId,
         input: [...nativeInput.input],
         cwd: runtime.reviewWorkingDirectory ?? runtime.targetWorkspaceRoot,
+        ...(this.#hosted?.environments() ?? {}),
         ...(runtime.modelId === undefined ? {} : { model: runtime.modelId }),
         ...(runtime.effort === undefined ? {} : { effort: runtime.effort }),
         ...(collaborationMode === undefined ? {} : { collaborationMode }),
@@ -1948,8 +2001,9 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }, {
         mutation: true,
         signal: dispatchSignal,
-        ...(input.mentions.some(mention => mention.kind === "resource") ? { beforeDispatchAsync: nativeInput.assertFilesCurrent } : {}),
+        ...(beforeDispatchAsync === undefined ? {} : { beforeDispatchAsync }),
         beforeDispatch: () => {
+          durableHistory?.assertCurrent();
           assertNativeDispatchReady();
           if (yieldDispatch !== undefined) yieldDispatch.claim.dispatchStarted = true;
         }
@@ -2403,6 +2457,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   async #setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
+    this.#hosted?.assertModel(providerId, modelId);
     let runtime = await this.#requireRuntime(context, "bound");
     this.#assertStandardRuntime(runtime, "change the model");
     assertYieldContinuationIdle(runtime);
@@ -2526,7 +2581,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async #setPermissionMode(mode: PermissionMode, context: AdapterContext): Promise<void> {
     if (mode === "acceptEdits") return this.unsupported("permission.modes");
-    if (mode === "bypassPermissions" && !context.target.trusted) {
+    if (mode === "bypassPermissions" && !context.target.trusted && this.#hosted === undefined) {
       throw adapterError({
         code: "CODEX_FULL_ACCESS_REQUIRES_TRUST",
         message: "Full access requires a trusted Target.",
@@ -2541,6 +2596,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const response = await runtime.host.request("thread/resume", {
       threadId: runtime.threadId,
       cwd: runtime.targetWorkspaceRoot,
+      ...(this.#hosted?.environments() ?? {}),
       excludeTurns: true,
       ...(runtime.nativeConfiguration === undefined ? {} : { config: runtime.nativeConfiguration }),
       ...permissionParams(mode)
@@ -2619,9 +2675,31 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       throw error;
     }
   }
+  async captureHostedAuthentication(): Promise<CodexHostedAuthenticationAuthority> {
+    this.#assertOpen();
+    if (this.#hosted) throw new Error("A hosted native process cannot delegate its account again.");
+    const epoch = this.#nativeAuthenticationEpoch;
+    const assertCurrent = () => { this.#assertOpen(); this.#assertNativeAuthenticationAdmission(epoch); };
+    await this.#ensureLocalHostStarted(); assertCurrent();
+    const home = this.#host.initializeResult?.codexHome;
+    if (!home) throw new Error("The native account profile is unavailable.");
+    const sourceEnvironment = this.#ownedHostOptions?.transport?.env ?? process.env;
+    const environmentApiKey = sourceEnvironment["OPENAI_API_KEY"] ?? sourceEnvironment["CODEX_API_KEY"];
+    return captureCodexHostedAuthentication({ home, ...(environmentApiKey === undefined ? {} : { environmentApiKey }), assertCurrent,
+      refresh: staleAccessToken => {
+        const refresh = this.#hostedAuthenticationRefreshTail.then(async () => {
+          assertCurrent(); const current = await readCodexOwnedAuthentication(home, environmentApiKey); assertCurrent();
+          if (current.kind !== "chatgpt") throw new Error("The native account changed.");
+          if (current.tokens.accessToken !== staleAccessToken) return;
+          await this.readAccount(true); assertCurrent();
+        });
+        this.#hostedAuthenticationRefreshTail = refresh.catch(() => undefined); return refresh;
+      } });
+  }
 
   async inferNativeText(input: NativeTextInferenceInput): Promise<string> {
     this.#assertOpen();
+    this.#hosted?.assertModel(input.providerId, input.modelId);
     if (input.backendInstanceGeneration !== this.#instanceGeneration) throw nativeAuthenticationObservationStale();
     if (!Number.isSafeInteger(input.timeoutMs) || input.timeoutMs < 1_000 || input.timeoutMs > 90_000
       || input.system.length > 80_000 || input.user.length > 300_000) throw new RangeError("Native text inference input is invalid.");
@@ -2907,7 +2985,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#disposed = true;
     for (const flight of this.#nativeTextFlights) flight.abort();
     this.#managedProviders?.dispose();
-    const flight = this.#disposeRuntimes().finally(() => this.#smartRouting?.cleanup());
+    const flight = this.#disposeRuntimes().finally(async () => { await this.#hosted?.close(); await this.#smartRouting?.cleanup(); });
     this.#disposeFlight = flight;
     return flight;
   }
@@ -2917,7 +2995,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#disposed = true;
     for (const flight of this.#nativeTextFlights) flight.abort();
     this.#managedProviders?.dispose();
-    const flight = this.#forceDisposeRuntimes().finally(() => this.#smartRouting?.cleanup());
+    const flight = this.#forceDisposeRuntimes().finally(async () => { await this.#hosted?.close(); await this.#smartRouting?.cleanup(); });
     this.#forceDisposeFlight = flight;
     return flight;
   }
@@ -3006,17 +3084,21 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const configuration: JsonObject = {
       ...(managedConfiguration ?? {}),
       ...(nativeConfiguration ?? {}),
+      ...(this.#hosted?.configuration() ?? {}),
       "features.goals": false
     };
     const response = await scope.host.request("thread/resume", {
       threadId,
       cwd: workspaceRoot,
+      ...(this.#hosted?.environments() ?? {}),
       ...(permissionMode === undefined ? {} : permissionParams(permissionMode)),
       excludeTurns: true,
       ...(selection === undefined
         ? smartRoute === undefined ? {} : { modelProvider: smartRoute.modelProviderId }
         : { modelProvider: smartRoute?.modelProviderId ?? selection.providerId, model: selection.modelId }),
-      ...(developerInstructions === undefined ? {} : { developerInstructions }),
+      ...(this.#hosted === undefined
+        ? developerInstructions === undefined ? {} : { developerInstructions }
+        : { developerInstructions: this.#hosted.instructions(developerInstructions) }),
       config: configuration
     }, { mutation: false, beforeDispatch: assertCurrent });
     assertCurrent();
@@ -3051,6 +3133,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       });
     }
     if (target.remoteWorkspace === undefined) {
+      this.#hosted?.assertCurrent();
       if (!isAbsolute(target.workspaceRoot)) {
         throw adapterError({
           code: "CODEX_TARGET_PATH_INVALID",
@@ -3080,10 +3163,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         ...(this.#localMcpBridge === undefined ? {} : { openMcpBridge: this.#localMcpBridge }),
         assertAuthorityCurrent: () => {
           this.#assertOpen();
+          this.#hosted?.assertCurrent();
           if (target.backendId !== this.id) throw remoteRuntimeStale();
         },
         assertCurrent: () => {
           this.#assertOpen();
+          this.#hosted?.assertCurrent();
           if (target.backendId !== this.id) throw remoteRuntimeStale();
         }
       };
@@ -3494,7 +3579,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   async #prepareSkills(scope: CodexReadScope, context: AdapterContext, nativeConfiguration?: JsonObject): Promise<{
     readonly nativeSkills?: NativeSkillSnapshot; readonly nativeConfiguration?: JsonObject
   }> {
-    if (context.runtimePolicy === "review_read_only" || this.#resolveNativeSkills === undefined
+    if (this.#hosted !== undefined || context.runtimePolicy === "review_read_only" || this.#resolveNativeSkills === undefined
       || (scope.remote && scope.prepareNativeSkills === undefined)) {
       return nativeConfiguration === undefined ? {} : { nativeConfiguration };
     }
@@ -3651,6 +3736,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     context: AdapterContext,
     stateMayHaveChanged = false
   ): Promise<{ readonly mcp?: CodexMcpRuntimeLease; readonly nativeConfiguration?: JsonObject }> {
+    if (this.#hosted) return { nativeConfiguration: this.#hosted.configuration() };
     if (!scope.remote && scope.openMcpBridge === undefined) return {};
     let mcp: CodexMcpRuntimeLease | undefined;
     try {
@@ -4210,7 +4296,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     // Historical descendants populate the product projection only. Provider
     // authority is registered from live notifications or the first exact
     // collab_spawn request while an operation lease is active.
-    const nativeMemoryDirectory = input.context.runtimePolicy === "review_read_only"
+    const nativeMemoryDirectory = this.#hosted !== undefined || input.context.runtimePolicy === "review_read_only"
       || !supportsNativeMemoryRuntime(input.scope.host, input.scope.pathStyle)
       ? undefined
       : codexNativeMemoryDirectory(input.scope.host, input.scope.pathStyle);
@@ -5261,6 +5347,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         threadId: runtime.threadId,
         ...(boundary === undefined ? {} : { lastTurnId: boundary.turnId }),
         cwd: derivation.target.workspaceRoot,
+        ...(this.#hosted?.environments() ?? {}),
         excludeTurns: true,
         ...(forkConfiguration === undefined ? {} : { config: forkConfiguration })
       }, { mutation: true, signal: dispatchSignal, beforeDispatch: assertForkDispatch });
@@ -5374,6 +5461,21 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       }
       }
     });
+  }
+  async #readDispatchHistory(runtime: SessionRuntime, context: AdapterContext): Promise<{ readonly thread: NativeThread; readonly assertCurrent: () => void }> {
+    const fresh = this.#freshNativeHistory.get(runtime), generation = runtime.hostGeneration, binding = runtime.binding;
+    if (fresh && runtime.host.contentRevision(runtime.threadId, generation) === fresh.revision) {
+      // A new paginated native thread has no rollout to enumerate until its
+      // first user entry. The actual thread/start response proves its empty
+      // history; any subsequent entry notification invalidates that proof at
+      // wire arrival, including while the Source is persisting its fence.
+      const assertCurrent = () => {
+        this.#assertHistoryRuntimeFence(runtime, context, binding, generation);
+        if (runtime.host.contentRevision(runtime.threadId, generation) !== fresh.revision) throw nativeHistoryReadFailure("STALE");
+      };
+      assertCurrent(); return { thread: fresh.thread, assertCurrent };
+    }
+    return this.#readCompleteHistory(runtime, context);
   }
 
   async #retireNativeAuthenticationRuntime(runtime: SessionRuntime): Promise<void> {
@@ -5985,6 +6087,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   }
 
   #assertBackendContext(context: AdapterContext): void {
+    if (this.#hosted) this.#hosted.assertContext(context);
+    else if (context.hostedExecution) throw new TypeError("The selected native Adapter has no hosted executor.");
     if (backendGeneration(context) !== this.#instanceGeneration) {
       throw adapterError({
         code: "CODEX_BACKEND_GENERATION_STALE",
@@ -6056,7 +6160,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     runtimePolicy: "standard" | "review_read_only",
     signal?: AbortSignal
   ): Promise<void> {
-    if (scope.remote || runtimePolicy === "review_read_only" || this.#resolveNativeMemoryEnabled === undefined) return;
+    if (this.#hosted !== undefined || scope.remote || runtimePolicy === "review_read_only" || this.#resolveNativeMemoryEnabled === undefined) return;
     await this.#withNativeMemoryReconcile(async () => {
       scope.assertCurrent();
       try {
@@ -6191,6 +6295,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#assertOpen();
     this.#assertBackendContext(context);
     assertDispatchNotCancelled(context.signal);
+    if (this.#hosted) {
+      if (context.runtimePolicy === "review_read_only" || context.target.remoteWorkspace) throw new TypeError("This hosted native execution does not accept another runtime domain.");
+      this.#hosted.assertModel(context.modelSelection?.providerId, context.modelSelection?.modelId);
+      await this.#ensureLocalHostStarted();
+      if (versionFromUserAgent(this.#host.initializeResult?.userAgent) !== AUDITED_APP_SERVER_VERSION) {
+        throw adapterError({ code: "CODEX_HOSTED_PROTOCOL_UNSUPPORTED", message: `Hosted Codex requires the audited ${AUDITED_APP_SERVER_VERSION} native protocol.`,
+          phase: "provision", recovery: "Select the supported native runtime before opening this task's hosted Agent." });
+      }
+      await this.#hosted.prepare(this.#host, this.#profileDirectory, context.signal);
+    }
     if (this.#sessions.get(context.sessionId)?.rewindUnknown) throw rewindUnknown();
     const admission = this.#sessionMutations.get(context.sessionId) ?? { count: 0, rewinding: false };
     if (admission.rewinding) throw rewindBusy();

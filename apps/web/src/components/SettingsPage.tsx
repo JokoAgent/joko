@@ -95,6 +95,7 @@ import { ManagedModelRuntimeSettings } from "./ManagedModelRuntimeSettings.js";
 import { RuntimeGovernanceSettings } from "./RuntimeGovernanceSettings.js";
 import { ToolPolicySettings } from "./ToolPolicySettings.js";
 import { DeviceControlSettings } from "./DeviceControlSettings.js";
+import { HostedAgentSettings } from "./HostedAgentSettings.js";
 import { NativeTaskStatusSettings } from "./NativeTaskStatusSettings.js";
 import { McpServerEditor } from "./McpServerEditor.js";
 import { ProviderOrderList } from "./ProviderOrderList.js";
@@ -3314,6 +3315,7 @@ function ConnectionSettings({ controller, snapshot, locale, t, runAction, showHe
       </div>
     </section>
     <DeviceControlSettings controller={controller} snapshot={snapshot} locale={locale} runAction={runAction} t={t} />
+    <HostedAgentSettings controller={controller} t={t} />
     <h3 className="settings-subheading">{t("settings.savedClient")}</h3>
     <section className="settings-card settings-list">{controller.state.profiles.map((profile) => <article key={profile.id}><div><StatusDot state={activeProfile?.id === profile.id ? controller.state.connectionState : "muted"} label={activeProfile?.id === profile.id ? controller.state.connectionState : t("settings.saved")} /><span><strong>{profile.name}</strong><small>{profile.origin}{profile.lastConnectedAt === undefined ? "" : ` · ${formatRelativeTime(profile.lastConnectedAt, locale)}`}</small></span></div><div>{activeProfile?.id === profile.id && <Pill tone="success">{t("common.current")}</Pill>}{profile.managedLocal !== true && <IconButton label={`${t("common.remove")} ${profile.name}`} onClick={() => void controller.forgetProfile(profile.id)}><Trash2 aria-hidden="true" /></IconButton>}</div></article>)}{controller.state.profiles.length === 0 && <p className="muted">{t("settings.noProfiles")}</p>}</section>
     <h3 className="settings-subheading">{t("settings.orchestratorDevices")}</h3>

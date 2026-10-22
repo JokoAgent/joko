@@ -8,6 +8,8 @@ import { createTaskSharingConnectService, createTaskSharingGuestConnectService }
 import { readTaskBackgroundOutput } from "./background-task-output.js";
 import { createAppDefaultModelConnectService } from "./app-default-model-connect-service.js";
 import { createHelpConnectService } from "./help-connect-service.js";
+import { createHostedAgentConnectService } from "./hosted-agent-connect-service.js";
+import { HOSTED_AGENT_WIRE_ENVELOPE_BYTES } from "./hosted-agent-wire.js";
 import { createMcpAppConnectService } from "./mcp-apps/connect-service.js";
 import { createExtensionCardConnectService } from "./extension-cards/connect-service.js";
 import { createExtensionNetworkConnectService } from "./extension-cards/network-connect-service.js";
@@ -493,6 +495,7 @@ import {
 import type { LocalCodexRuntime, LocalBackendRuntimeSnapshot } from "./local-codex-runtime.js";
 
 export interface ConnectServiceDependencies {
+  readonly hostedAgentSources?: OrchestratorApplication["hostedAgentSources"];
   readonly taskShares?: TaskShareStore;
   readonly connections: ConnectionManager;
   readonly store: OperationalStore;
@@ -1156,6 +1159,8 @@ const RUNTIME_GENERATION = BigInt(Date.now());
 /** Register all public v1 services. Every descriptor method receives a concrete handler. */
 export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): void {
   const services = createConnectServices(application, projectionShutdownSignal);
+  if (application.hostedAgents) router.service(contract.HostedAgentService, createHostedAgentConnectService(application.hostedAgents.connectOptions()),
+    { readMaxBytes: HOSTED_AGENT_WIRE_ENVELOPE_BYTES, writeMaxBytes: HOSTED_AGENT_WIRE_ENVELOPE_BYTES });
   if (services.taskSharing) router.service(contract.TaskSharingService, withConnectErrors(services.taskSharing));
   if (services.taskSharingGuest) router.service(contract.TaskSharingGuestService, withConnectErrors(services.taskSharingGuest));
   router.service(contract.ConnectionService, withConnectErrors(services.connection));
@@ -1236,6 +1241,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     connections: application.connections,
     store: application.store,
     devicePeers,
+    ...(application.hostedAgentSources === undefined ? {} : { hostedAgentSources: application.hostedAgentSources }),
     adapters: () => application.adapters,
     restartBackend: application.restartBackend,
     ...(application.localBackendRuntimeSetup === undefined ? {} : { localBackendRuntimeSetup: application.localBackendRuntimeSetup }),
@@ -2013,8 +2019,10 @@ export function createConnectServices(application: OrchestratorApplication, proj
       if (owner === undefined) throw new ConnectError("Local runtime setup is unavailable.", Code.Unimplemented);
       return { cancelled: owner.cancel(request.backendId, request.requestId) };
     },
-    listBackends: (request, context) => {
-      authenticate(context);
+    listBackends: async (request, context) => {
+      const connection = authenticate(context);
+      await dependencies.hostedAgentSources?.refresh(connection);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
       const result = paginate(dependencies.store.listBackends().map(toProtoBackend), request.page);
       return { backends: result.values, page: result.page };
     },
@@ -2045,7 +2053,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
       };
     },
     listProviders: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
+      await dependencies.hostedAgentSources?.refresh(connection);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
       const records = request.backendId === ""
         ? dependencies.store.listBackends()
         : [dependencies.store.getBackend(request.backendId)];
@@ -2314,8 +2324,10 @@ export function createConnectServices(application: OrchestratorApplication, proj
         )
       };
     },
-    listModels: (request, context) => {
-      authenticate(context);
+    listModels: async (request, context) => {
+      const connection = authenticate(context);
+      await dependencies.hostedAgentSources?.refresh(connection);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
       const records = request.backendId === ""
         ? dependencies.store.listBackends()
         : [dependencies.store.getBackend(request.backendId)];
@@ -2332,6 +2344,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
           descriptor.available = authenticationState === undefined
             ? backendAuthenticationAvailable(record.descriptor.authenticationState)
             : authenticationState === "authenticated" || authenticationState === "not_required";
+          descriptor.available &&= dependencies.hostedAgentSources?.modelAvailable(record.descriptor.id, model.providerId, model.modelId) !== false;
           return descriptor;
         }));
       const result = paginate(values, request.page);

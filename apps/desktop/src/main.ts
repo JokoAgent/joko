@@ -361,6 +361,7 @@ import {
 import { capturePackagedSmokeProcessBirthIdentitySync } from "./packaged-smoke-process-identity.js";
 import { DesktopDevicePeerAgentExecutor } from "./device-peer-agent.js";
 import { DesktopDevicePeerAgentLifecycle } from "./device-peer-agent-lifecycle.js";
+import { createDesktopHostedAgentDelegate, probeDesktopHostedAgentDelegate } from "./hosted-agent-delegate.js";
 import { createAuditedDesktopDevicePeerTerminalPort } from "./device-peer-terminal.js";
 import {
   createAuditedDesktopDevicePeerRuntimeExecutables,
@@ -7468,6 +7469,9 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
       capturedDesktopRemoteDesktopHosts.add(remoteDesktop);
       desktopRemoteDesktopHost = remoteDesktop;
       void broadcastDesktopRemoteDesktopSnapshot();
+      const nativeAgents = await createDesktopHostedAgentDelegate({ connection, readAuthKey: readCredential,
+        readHostKey: readDesktopDevicePeerAgentRouteAuthorization, isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent
+      }).catch(() => undefined);
       return new DesktopDevicePeerAgentExecutor({
         recentDirectoriesPath: join(
           app.getPath("userData"),
@@ -7476,13 +7480,18 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
         ),
         terminals,
         runtimeExecutables: locatedExecutables,
+        ...(nativeAgents === undefined ? {} : { nativeAgents }),
         remoteDesktop
       });
     },
     readAuthKey: readCredential,
     readRouteAuthorization: readDesktopDevicePeerAgentRouteAuthorization,
     readDefaultDeviceName: () => hostname().trim() || "Unknown Device",
-    isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent
+    isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent,
+    recoverNativeAgents(connection, signal) {
+      return probeDesktopHostedAgentDelegate({ connection, signal, readAuthKey: readCredential,
+        readHostKey: readDesktopDevicePeerAgentRouteAuthorization, isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent });
+    }
   });
   reconcileDesktopDevicePeerAgentLifecycle();
 }

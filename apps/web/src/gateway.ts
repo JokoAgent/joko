@@ -7,6 +7,9 @@ import type { McpAppApi } from "./model.js";
 import type { ExtensionProjectView, ExtensionProjectStateView } from "./model.js";
 import type { ExtensionProject as ProtoExtensionProject } from "@joko/contracts";
 import { AppDefaultModelService } from "@joko/contracts";
+import { HostedAgentService } from "@joko/contracts";
+import { hostedAgentSettingsMutation, projectHostedAgentCatalog, projectHostedAgentSettings, type HostedAgentSettingsUpdate,
+  type HostedAgentSettingsView, type HostedAgentCatalogView } from "./hosted-agent-settings.js";
 import { HelpService, HelpRole, WorktreeRecycleAction, WorktreeRecycleState, WorktreeRecycleReason, type WorktreeRecycleRecord } from "@joko/contracts";
 import type { HelpMessageView, HelpAnswerView, HelpFeedbackDraftView, WorktreeRecycleRecordView } from "./model.js";
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
@@ -7017,6 +7020,29 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
 
   async setDeviceRemoteControlEnabled(enabled: boolean): Promise<void> {
     await this.submit({ case: "setDeviceRemoteControlEnabled", value: { enabled } }, true);
+  }
+
+  async getHostedAgentSettings(signal?: AbortSignal): Promise<HostedAgentSettingsView> {
+    if (this.#taskSharing) throw new GatewayError("Shared task access cannot manage this node's models.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(HostedAgentService, scope.transport).getHostedAgentSettings({}, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return projectHostedAgentSettings(response.settings);
+  }
+  async getHostedAgentCatalog(signal?: AbortSignal): Promise<HostedAgentCatalogView> {
+    if (this.#taskSharing) throw new GatewayError("Shared task access cannot manage this node's models.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(HostedAgentService, scope.transport).getHostedAgentCatalog({ format: 1 }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return projectHostedAgentCatalog(response);
+  }
+  async updateHostedAgentSettings(update: HostedAgentSettingsUpdate, expectedRevision: bigint, signal?: AbortSignal): Promise<HostedAgentSettingsView> {
+    if (this.#taskSharing) throw new GatewayError("Shared task access cannot manage this node's models.", { code: "ACCESS_DENIED" });
+    if (expectedRevision < 0n || expectedRevision > 18_446_744_073_709_551_615n) throw new GatewayError("Invalid hosted Agent settings revision.");
+    const mutation = hostedAgentSettingsMutation(update), scope = this.captureActionScope(signal);
+    const response = await createClient(HostedAgentService, scope.transport).updateHostedAgentSettings({ expectedRevision, update: mutation }, { signal: scope.signal });
+    scope.signal.throwIfAborted();
+    return projectHostedAgentSettings(response.settings);
   }
 
   async setDeviceControlTargetEnabled(targetDeviceId: string, enabled: boolean): Promise<void> {

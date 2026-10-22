@@ -49,6 +49,8 @@ export interface PartnerLearningTurnHandle {
 }
 
 export interface AdapterContext {
+  /** Service-issued reverse tool channel; never supplied by a model or client. */
+  readonly hostedExecution?: import("./hosted-execution.js").HostedExecution;
   readonly nativeToolAuthorization?: import("./native-tool-authorization.js").NativeToolAuthorization;
   readonly sessionId: SessionId;
   readonly generation: number;
@@ -506,6 +508,8 @@ export interface BackgroundTaskOutputResult {
 
 export interface BackendAdapter {
   readonly id: string;
+  /** Native execution support, separate from remote HTTP model inference. */
+  readonly hostedExecutionCapabilities?: { readonly toolsOnSource: true; readonly isolatedGuests: true };
   /** Text review channels do not implicitly expose plugin one-shot inference. */
   readonly nativeTextInferenceCapabilities?: { readonly pluginOneshot: true; readonly maxTokens: boolean };
   describe(): Promise<BackendDescriptor>;

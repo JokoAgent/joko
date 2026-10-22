@@ -7,5 +7,6 @@ export { createXlsxBuffer, XlsxDocumentError, MAX_XLSX_SHEETS, MAX_XLSX_ROWS_PER
 export { readSheet, SheetReadError, type ReadSheetResult } from "./readSheet.js";
 export { inspectPdf, PdfInspectError, type InspectPdfResult } from "./inspectPdf.js";
 export { extractPdfText, PdfTextExtractionError, PDF_TEXT_MAX_BYTES, PDF_TEXT_MAX_PAGES, PDF_TEXT_TIMEOUT_MS, type PdfTextWorkerResult, type PdfTextWorker } from "./extractPdfText.js";
+export { extractPdfPageText, PDF_PAGE_TEXT_MAX_BYTES, PDF_PAGE_TEXT_MAX_PAGES, PDF_PAGE_TEXT_MAX_CHARS } from "./extractPdfText.js";
 export { renderPdf, PdfRenderError, PDF_PAGE_SIZES, RENDER_PDF_MAX_HTML_BYTES, type PdfRenderer, type PdfRenderRequest, type PdfRenderOutput, type RenderPdfResult } from "./renderPdf.js";
 export { PdfResourceError } from "./pdfText.js";

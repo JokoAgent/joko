@@ -3,7 +3,7 @@ import {
   type NodeDevicePeerAgentConnection,
   type NodeDevicePeerAgentLifecycleOptions
 } from "@joko/device-peer";
-import { DeviceKind } from "@joko/contracts";
+import { DeviceKind, DevicePeerCapabilityKind } from "@joko/contracts";
 
 import type { DesktopManagedOrchestratorConnection } from "./channels.js";
 import type { DesktopDevicePeerAgentExecutor } from "./device-peer-agent.js";
@@ -37,6 +37,14 @@ export interface DesktopDevicePeerAgentLifecycleOptions {
   readonly wait?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
   readonly retryBaseDelayMs?: number;
   readonly retryMaximumDelayMs?: number;
+  /** A Main-only proof probe. A transient native service failure leaves the
+   * file/process route available; successful recovery republishes that route. */
+  readonly recoverNativeAgents?: (connection: DesktopManagedOrchestratorConnection, signal: AbortSignal) => Promise<boolean>;
+}
+
+interface NativeRecovery {
+  readonly connection: DesktopManagedOrchestratorConnection;
+  readonly controller: AbortController;
 }
 
 /** Desktop retains only profile/credential composition. Route, reconnect,
@@ -46,11 +54,20 @@ export class DesktopDevicePeerAgentLifecycle {
   readonly #lifecycle: NodeDevicePeerAgentLifecycle;
   #desired: DesktopManagedOrchestratorConnection | undefined;
   #nodeDesired: NodeDevicePeerAgentConnection | undefined;
+  #nativeRecovery: NativeRecovery | undefined;
+  readonly #recoveries = new Set<Promise<void>>();
 
   constructor(options: DesktopDevicePeerAgentLifecycleOptions) {
     const runRoute = options.runRoute ?? runDesktopDevicePeerAgentRoute;
     const lifecycleOptions: NodeDevicePeerAgentLifecycleOptions = {
-      createExecutor: () => options.createExecutor(this.#requireDesired()),
+      createExecutor: async () => {
+        const desktop = this.#requireDesired(), executor = await options.createExecutor(desktop);
+        if (sameConnection(this.#desired, desktop)) {
+          if (executor.capabilities.includes(DevicePeerCapabilityKind.NATIVE_AGENTS)) this.#cancelNativeRecovery();
+          else if (options.recoverNativeAgents) this.#startNativeRecovery(desktop, options);
+        }
+        return executor;
+      },
       readAuthKey: options.readAuthKey,
       readDefaultDeviceName: options.readDefaultDeviceName,
       readRouteAuthorization: options.readRouteAuthorization,
@@ -83,6 +100,7 @@ export class DesktopDevicePeerAgentLifecycle {
       this.#lifecycle.setConnection(this.#nodeDesired);
       return;
     }
+    this.#cancelNativeRecovery();
     // Presentation-name replacement is still an exact Desktop authority
     // change even though the neutral route identity has no display field.
     if (connection !== undefined && this.#nodeDesired !== undefined
@@ -101,15 +119,54 @@ export class DesktopDevicePeerAgentLifecycle {
   }
 
   async stop(): Promise<void> {
+    this.#cancelNativeRecovery();
     this.#desired = undefined;
     this.#nodeDesired = undefined;
     await this.#lifecycle.stop();
+    await Promise.all([...this.#recoveries]);
   }
 
   async dispose(): Promise<void> {
+    this.#cancelNativeRecovery();
     this.#desired = undefined;
     this.#nodeDesired = undefined;
     await this.#lifecycle.dispose();
+    await Promise.all([...this.#recoveries]);
+  }
+
+  #cancelNativeRecovery(): void { this.#nativeRecovery?.controller.abort(); this.#nativeRecovery = undefined; }
+
+  #startNativeRecovery(connection: DesktopManagedOrchestratorConnection, options: DesktopDevicePeerAgentLifecycleOptions): void {
+    if (sameConnection(this.#nativeRecovery?.connection, connection)) return;
+    this.#cancelNativeRecovery();
+    const recovery: NativeRecovery = { connection, controller: new AbortController() };
+    this.#nativeRecovery = recovery;
+    const current = async () => this.#nativeRecovery === recovery && !recovery.controller.signal.aborted &&
+      sameConnection(this.#desired, connection) && await options.isAuthorityCurrent(connection);
+    const wait = options.wait ?? recoveryDelay;
+    const base = options.retryBaseDelayMs ?? 500, maximum = options.retryMaximumDelayMs ?? 30_000;
+    const worker = (async () => {
+      let attempt = 0;
+      while (await current()) {
+        await wait(Math.min(maximum, base * 2 ** Math.min(attempt++, 20)), recovery.controller.signal);
+        if (!await current()) return;
+        try {
+          if (!await options.recoverNativeAgents!(connection, recovery.controller.signal)) continue;
+          if (!await current()) return;
+          this.#nativeRecovery = undefined;
+          // Use the established lifecycle's generation change and exact old
+          // executor retirement. A recovered capability never mutates a live
+          // route or borrows its outstanding native calls.
+          this.#lifecycle.setConnection(undefined);
+          this.#lifecycle.setConnection(this.#nodeDesired);
+          return;
+        } catch { /* Proof, endpoint and native details remain Main-private. */ }
+      }
+    })().catch(() => {}).finally(() => {
+      this.#recoveries.delete(worker);
+      if (this.#nativeRecovery === recovery) this.#nativeRecovery = undefined;
+    });
+    this.#recoveries.add(worker);
   }
 
   #requireDesired(): DesktopManagedOrchestratorConnection {
@@ -117,6 +174,15 @@ export class DesktopDevicePeerAgentLifecycle {
     if (connection === undefined) throw new Error("Desktop Device peer authority is unavailable.");
     return connection;
   }
+}
+
+function recoveryDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    signal.throwIfAborted();
+    const done = () => { clearTimeout(timer); signal.removeEventListener("abort", aborted); resolve(); };
+    const aborted = () => { clearTimeout(timer); signal.removeEventListener("abort", aborted); reject(new Error("Native recovery was cancelled.")); };
+    const timer = setTimeout(done, milliseconds); timer.unref(); signal.addEventListener("abort", aborted, { once: true });
+  });
 }
 
 function sameNodeIdentity(

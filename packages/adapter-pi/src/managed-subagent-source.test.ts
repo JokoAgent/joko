@@ -271,6 +271,17 @@ describe("managed Pi subagent extension", () => {
     expect(() => helpers.timeoutMs({ timeoutSeconds: 86_401 })).toThrow(/10 to 86400/u);
   });
 
+  it("keeps a shared user's children on the original owner's approved Provider and models", () => {
+    const helpers = invocationHelpers({ trust: "guest", providerId: "shared", modelIds: ["approved"] });
+    const models = [{ provider: "shared", id: "approved", reasoning: false },
+      { provider: "shared", id: "other-model", reasoning: false }, { provider: "other-provider", id: "approved", reasoning: false }];
+    const context = { model: models[0], thinkingLevel: "off", modelRegistry: { getAvailable: () => models } };
+    expect(helpers.routeFromContext(context, { provider: "", model: "", thinking: "off" })).toEqual({ provider: "shared", model: "approved", effort: "off" });
+    for (const task of [{ provider: "shared", model: "other-model" }, { provider: "other-provider", model: "approved" }]) {
+      expect(() => helpers.routeFromContext(context, { ...task, thinking: "off" })).toThrow("does not allow this subagent model");
+    }
+  });
+
   it("forks only an immutable bounded user/assistant text snapshot", () => {
     const snapshot = parentSnapshotHelper()({
       sessionManager: {
@@ -445,7 +456,7 @@ function inheritedCredentialScopeHelper(): (
   };
 }
 
-function invocationHelpers(): InvocationHelpers {
+function invocationHelpers(hostedExecution?: { trust: "owner" | "guest"; providerId?: string; modelIds?: string[] }): InvocationHelpers {
   const constantsStart = MANAGED_SUBAGENT_SOURCE.indexOf("const MAX_TASKS");
   const constantsEnd = MANAGED_SUBAGENT_SOURCE.indexOf("\n\nconst liveChildren", constantsStart);
   const normalizationStart = MANAGED_SUBAGENT_SOURCE.indexOf("function optionalText");
@@ -458,6 +469,7 @@ function invocationHelpers(): InvocationHelpers {
     expect(boundary).toBeGreaterThanOrEqual(0);
   }
   const body = [
+    "const hostedExecution = " + JSON.stringify(hostedExecution ?? null) + ";",
     MANAGED_SUBAGENT_SOURCE.slice(constantsStart, constantsEnd),
     "function profileNames() { return Object.keys(PROFILES).join(' | '); }",
     MANAGED_SUBAGENT_SOURCE.slice(normalizationStart, normalizationEnd),
@@ -535,13 +547,14 @@ function resumeSessionValidationHelper(): (
 }
 
 function isolationHelper(
-  spawnProbe: (args: readonly string[]) => { status: number; stdout: string }
+  spawnProbe: (args: readonly string[]) => { status: number; stdout: string },
+  hostedExecution?: { readonly trust: "owner" | "guest" }
 ): (input: Record<string, unknown>) => void {
   const start = MANAGED_SUBAGENT_SOURCE.indexOf("function isContained");
   const end = MANAGED_SUBAGENT_SOURCE.indexOf("\n\nfunction parentContextSnapshot", start);
   expect(start).toBeGreaterThanOrEqual(0);
   expect(end).toBeGreaterThan(start);
-  const body = `${MANAGED_SUBAGENT_SOURCE.slice(start, end)}\n\nreturn enforceIsolation;`;
+  const body = `const hostedExecution = ${JSON.stringify(hostedExecution ?? null)};\n${MANAGED_SUBAGENT_SOURCE.slice(start, end)}\n\nreturn enforceIsolation;`;
   return Function("relative", "sep", "isAbsolute", "resolve", "realpathSync", "spawnSync", body)(
     relative,
     sep,

@@ -10,6 +10,8 @@ import Fastify, { type FastifyInstance } from "fastify";
 import type { OrchestratorApplication } from "./application.js";
 import { isLoopbackHost, isPrivateLanHost, isPrivateLanHttpOrigin, readTls } from "./config.js";
 import { registerConnectServices } from "./connect-services.js";
+import { registerHostedAgentDesktopService } from "./hosted-agent-desktop-service.js";
+import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { ConnectionAuthenticationError } from "./connection-manager.js";
 import { ExtensionMainViewError, surfaceHeaders } from "./extension-main-view-manager.js";
 import type { NativeAuthRunnerProof, RemoteNativeAuthRunnerAttestation } from "./native-auth-recovery.js";
@@ -39,7 +41,8 @@ export async function createPublicServer(application: OrchestratorApplication): 
   const server = Fastify({
     logger: {
       level: process.env.JOKO_LOG_LEVEL ?? "info",
-      redact: ["req.headers.authorization", "req.headers.cookie", "request.headers.authorization"]
+      redact: ["req.headers.authorization", "req.headers.cookie", "request.headers.authorization",
+        `req.headers["${DESKTOP_HOST_AUTHORIZATION_HEADER}"]`, `request.headers["${DESKTOP_HOST_AUTHORIZATION_HEADER}"]`]
     },
     disableRequestLogging: true,
     trustProxy: false,
@@ -242,6 +245,9 @@ export async function createPublicServer(application: OrchestratorApplication): 
   );
 
   const projectionShutdown = new AbortController();
+  if (application.hostedAgents) await registerHostedAgentDesktopService(server, {
+    runtime: application.hostedAgents, connections: application.connections, serverId: application.serverId
+  });
   // Idle projections must not hold the graceful request drain open.
   server.addHook("preClose", async () => { projectionShutdown.abort(); });
   await server.register(fastifyConnectPlugin, {

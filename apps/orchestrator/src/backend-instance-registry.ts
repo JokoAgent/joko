@@ -122,6 +122,8 @@ export interface BackendInstanceReplacementOptions {
  * expected-current CAS.
  */
 export class BackendInstanceRegistry {
+  #closing = false;
+  readonly #additions = new Map<string, Promise<BackendInstanceSnapshot>>();
   readonly #instances = new Map<string, BackendInstance>();
   readonly #factories = new Map<string, BackendInstanceFactory>();
   readonly #candidateCleanupOwners = new Map<string, BackendCandidateCleanupOwner>();
@@ -189,6 +191,25 @@ export class BackendInstanceRegistry {
       throw error;
     }
     return this.snapshots();
+  }
+
+  /** A discovered native source gets its own durable instance identity and
+   * generation. It cannot replace a local process or an already known source. */
+  add(factory: BackendInstanceFactory): Promise<BackendInstanceSnapshot> {
+    if (this.#closing) throw new Error("Backend instances are closing.");
+    validateFactory(factory);
+    const pending = this.#additions.get(factory.instanceId); if (pending) return pending;
+    if (this.#instances.has(factory.instanceId) || this.#factories.has(factory.instanceId)) throw new Error("Backend instance is already registered.");
+    const reservation = this.authority.reserveBackendInstanceGeneration({ backendId: factory.instanceId, adapterKind: factory.adapterKind });
+    this.#factories.set(factory.instanceId, factory);
+    const addition = (async () => {
+      const candidate = await this.#prepare(factory, reservation.generation, new Set(this.availableAdapters()));
+      try {
+        const published = await this.#publishProvisioned(candidate, reservation); this.#instances.set(factory.instanceId, published); return this.get(factory.instanceId);
+      } catch (error) { if (candidate.state === "available") await this.#cleanupRejectedCandidate(candidate); throw error; }
+    })().catch(error => { if (!this.#instances.has(factory.instanceId)) this.#factories.delete(factory.instanceId); throw error; })
+      .finally(() => { if (this.#additions.get(factory.instanceId) === addition) this.#additions.delete(factory.instanceId); });
+    this.#additions.set(factory.instanceId, addition); return addition;
   }
 
   snapshots(): readonly BackendInstanceSnapshot[] {
@@ -424,6 +445,7 @@ export class BackendInstanceRegistry {
   }
 
   async dispose(): Promise<void> {
+    this.#closing = true; await Promise.allSettled([...this.#additions.values()]);
     const adapters = this.availableAdapters();
     this.#instances.clear();
     this.#factories.clear();

@@ -1199,6 +1199,18 @@ export class SessionHost {
     return this.#adapters.get(backendId);
   }
 
+  /** Installs an additional, already-published process owner. Discovery cannot
+   * replace or borrow an existing Adapter's native or generation authority. */
+  installBackendInstance(adapter: BackendAdapter, descriptor: BackendDescriptor): void {
+    this.#assertOpen();
+    const durable = this.#store.getBackend(adapter.id).descriptor;
+    if (adapter.id !== descriptor.id || durable.instanceGeneration !== descriptor.instanceGeneration || durable.adapterKind !== descriptor.adapterKind
+      || this.#adapters.has(adapter.id) || this.#adapterGenerations.has(adapter.id)) throw new StoreError("The additional Backend instance is not its published owner.");
+    this.#adapters.set(adapter.id, adapter); this.#adapterGenerations.set(adapter.id, descriptor.instanceGeneration);
+    this.#initialBackendDescriptors.set(adapter.id, withSessionReferenceCapability(descriptor));
+    this.invalidateNativeSessionCatalog(adapter.id);
+  }
+
   /**
    * Point-in-time, content-free authority for work owned by this SessionHost
    * that a process shutdown could interrupt. Purely accepted/queued prompts

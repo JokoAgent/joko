@@ -1,0 +1,81 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve, sep } from "node:path";
+import { create, toBinary } from "@bufbuild/protobuf";
+import * as contract from "@joko/contracts";
+import { createInProcessDevicePeerHarness, NodeDevicePeerAgentExecutor } from "@joko/device-peer";
+import { OperationalStore } from "@joko/store";
+import { expect, it } from "vitest";
+import { ArtifactStore } from "./artifact-store.js";
+import { OperationalArtifactRepository } from "./artifact-repository.js";
+import { BackendInstanceRegistry } from "./backend-instance-registry.js";
+import { DevicePeerOwner } from "./device-peer-owner.js";
+import { SessionHost } from "./session-host.js";
+import { HostedAgentSources } from "./hosted-agent-sources.js";
+import { toProtoCapability } from "./proto-mapper.js";
+
+it("publishes actual paired native sources, retains paused and offline choices, and restores the same identity from the Source database", async () => {
+  const root = await mkdtemp(join(tmpdir(), "joko-native-source-catalog-"));
+  let store = new OperationalStore(join(root, "source.sqlite")), peers = new DevicePeerOwner({ store });
+  let registry = new BackendInstanceRegistry(store);
+  let host = new SessionHost(store, new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }), []);
+  const readPolicy = () => ({ revision: "source-policy", permissionMode: "ask" as const, planMode: false, approvedRoots: [], confirmCredentials: true });
+  const readBlob = async () => { throw new Error("No image dispatch in this catalog fixture."); };
+  let sources = new HostedAgentSources({ store, peers, registry, host, temporaryRoot: join(root, "incoming"), readPolicy, readBlob });
+  const controller = store.createConnection({ id: "source-connection", deviceId: "original-device", device: { defaultName: "Original", kind: "web", platform: "web" }, name: "Original", authKeyDigest: "original-digest" });
+  const target = store.createConnection({ id: "node-connection", deviceId: "model-node", device: { defaultName: "Native computer", kind: "service", platform: process.platform }, name: "Native computer", authKeyDigest: "node-digest" });
+  store.setDeviceRemoteControlEnabled(target.deviceId, true);
+  let remoteEnabled = true, malformed = false;
+  const native = new NodeDevicePeerAgentExecutor({ recentDirectoriesPath: join(root, "recent.json"), nativeAgents: {
+    invoke: async (method, _bytes, _signal, authority) => {
+      expect(authority.controllerDeviceId).toBe(controller.deviceId); expect(method).toBe(contract.HostedAgentPeerMethod.GET_CATALOG);
+      const backend = { backendId: "native-sdk", displayName: "Native Agent", version: "1", capabilities: [
+        { name: "input.text", support: contract.CapabilitySupport.SUPPORTED }, { name: "model.switch", support: contract.CapabilitySupport.SUPPORTED },
+        toProtoCapability({ key: "permission.modes", supported: true, options: ["ask", "acceptEdits", "auto", "bypassPermissions"] })
+      ], providers: [{ providerId: "provider", displayName: "Provider", connected: true, remoteInvocationEnabled: remoteEnabled,
+        models: [{ backendId: "native-sdk", key: { providerId: "provider", modelId: "native-model" }, displayName: "Model", logicalId: "stable-model", api: "openai-responses",
+          contextWindowTokens: 32768n, maximumOutputTokens: 1024n, inputModalities: [contract.ModelInputModality.TEXT], description: "Native model description",
+          displayThinkingLevels: ["low", "high"], defaultVisible: false, declaredSupportsFastMode: false, referenceApi: "openai-responses",
+          inputCostMicrosPerMillion: 2500000n, currencyCode: "USD", priceSource: contract.ModelPriceSource.UPSTREAM }] }] };
+      return toBinary(contract.GetHostedAgentCatalogResponseSchema, create(contract.GetHostedAgentCatalogResponseSchema, {
+        format: 1, remoteControlEnabled: true, backends: malformed ? [backend, { ...backend, backendId: "invalid", providers: backend.providers }] : [backend]
+      }));
+    }, retire: async () => {}
+  } });
+  const harness = createInProcessDevicePeerHarness({ targetDeviceId: target.deviceId, capabilities: ["native_agents"], agent: {
+    handle: async (frame, signal) => {
+      let value: contract.DevicePeerAgentResult["payload"] | undefined;
+      await native.execute(frame.payload as contract.DevicePeerCommand, signal, async result => { if (result.phase === contract.DevicePeerResponsePhase.COMPLETED) value = result.payload; });
+      return { outcome: "completed", value };
+    }, retire: () => native.retire()
+  } });
+  peers.registerRoute(target, harness.transport);
+  try {
+    await sources.initialize(); await host.initialize(); await sources.refresh(controller);
+    const descriptor = store.listBackends()[0]!.descriptor, id = descriptor.id;
+    expect(sources.source(id)).toEqual({ controllerDeviceId: controller.deviceId, targetDeviceId: target.deviceId, backendId: "native-sdk" });
+    expect(descriptor).toMatchObject({ adapterKind: "hosted", health: "healthy", displayName: "Native Agent · Native computer", instanceGeneration: 1 });
+    expect(descriptor.capabilities.get("input.text")?.supported).toBe(true);
+    expect(descriptor.capabilities.get("permission.modes")?.options).toEqual(["ask", "acceptEdits", "bypassPermissions"]);
+    expect(descriptor.providers?.[0]?.displayName).toBe("Provider · Native Agent · Native computer");
+    expect(descriptor.models[0]).toMatchObject({ logicalId: "stable-model", displayThinkingLevels: ["low", "high"], defaultVisible: false,
+      declaredSupportsFastMode: false, cost: { input: 2.5 }, pricing: { source: "upstream", currencyCode: "USD" } });
+    expect(host.currentAdapter(id)?.id).toBe(id); expect(sources.modelAvailable(id, "provider", "native-model")).toBe(true);
+    remoteEnabled = false; await sources.refresh(controller);
+    expect(sources.modelAvailable(id, "provider", "native-model")).toBe(false); expect(store.getBackend(id).descriptor.models).toHaveLength(1);
+    remoteEnabled = true; malformed = true; await sources.refresh(controller);
+    expect(store.listBackends()).toHaveLength(1); expect(sources.modelAvailable(id, "provider", "native-model")).toBe(false);
+    malformed = false; await sources.refresh(controller); expect(sources.modelAvailable(id, "provider", "native-model")).toBe(true);
+    await host.dispose(); await sources.close(); await peers.shutdown(); await native.retire(); store.close();
+    store = new OperationalStore(join(root, "source.sqlite")); peers = new DevicePeerOwner({ store }); registry = new BackendInstanceRegistry(store);
+    host = new SessionHost(store, new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }), []);
+    sources = new HostedAgentSources({ store, peers, registry, host, temporaryRoot: join(root, "incoming"), readPolicy, readBlob });
+    await sources.initialize(); await host.initialize();
+    expect(store.getBackend(id).descriptor).toMatchObject({ id, health: "unavailable", instanceGeneration: 2 });
+    expect(sources.modelAvailable(id, "provider", "native-model")).toBe(false); expect(host.currentAdapter(id)?.id).toBe(id);
+    expect(store.getBackend(id).descriptor.models[0]?.modelId).toBe("native-model");
+  } finally {
+    await host.dispose(); await sources.close(); await peers.shutdown(); store.close();
+    if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
+  }
+});

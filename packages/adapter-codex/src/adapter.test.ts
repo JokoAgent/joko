@@ -44,6 +44,34 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it.each([false, true])("persists a native dispatch fence at the write queue and rejects changed history before dispatch (changed=%s)", async changed => {
+    const setup = await createSetup(), events: EventPayload[] = [];
+    const initial = context(setup.target, events, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    const active = { ...initial, binding, operationId: "fenced-native-input" };
+    let release!: () => void;
+    const persist = vi.fn(async preparation => {
+      expect(preparation.inputFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+      expect(preparation.nativeHistory.activeLineage).toEqual([]);
+      expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(0);
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    const sending = setup.adapter.sendWithDurableNativeDispatchFence(prompt("Fenced input"), active, persist);
+    const observed = sending.catch(error => error);
+    await vi.waitFor(() => expect(persist).toHaveBeenCalledTimes(1));
+    await setup.fake.transport!.emitNotification(changed ? "thread/reverted" : "thread/name/updated", {
+      threadId: binding.nativeSessionId!, ...(changed ? {} : { threadName: "New metadata name" })
+    });
+    release();
+    const result = await observed;
+    if (changed) {
+      expect(result).toBeInstanceOf(Error);
+      expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(0);
+    } else {
+      expect(result).toBeUndefined();
+      expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(1);
+    }
+  });
   it.each([false, true])("keeps native one-shot inference on an isolated exact-model protocol and original owner (cancelled=%s)", async cancelled => {
     const setup = await createSetup(), owner = new AbortController(), allowed = vi.fn(); await setup.adapter.describe();
     expect(setup.adapter.nativeTextInferenceCapabilities).toEqual({ pluginOneshot: true, maxTokens: false });

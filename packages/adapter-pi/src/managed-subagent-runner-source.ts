@@ -591,6 +591,7 @@ async function main() {
     || config.temporaryPath !== expectedTemporaryPath || config.slotRoot !== expectedSlotRoot
     || config.transcriptPath !== expectedTranscriptPath || config.runtimeControlPath !== expectedRuntimeControlPath
     || config.retryControlPath !== expectedRetryControlPath
+    || config.hostedExecutionPath !== undefined && config.hostedExecutionPath !== path.join(expectedRuntimeDir, "hosted-execution.json")
   ) throw new Error("runner private layout mismatch");
   for (const directory of [expectedChildHome, expectedChildSessionDir, expectedRuntimeDir, expectedTemporaryPath, expectedSlotRoot]) {
     const info = fs.lstatSync(directory);
@@ -601,6 +602,7 @@ async function main() {
   boundedFile(expectedTranscriptPath, MAX_TRANSCRIPT_BYTES);
   boundedFile(expectedRuntimeControlPath, MAX_JSON_BYTES);
   boundedFile(expectedRetryControlPath, MAX_JSON_BYTES);
+  if (config.hostedExecutionPath !== undefined) boundedFile(config.hostedExecutionPath, 8 * 1024 * 1024);
   if (
     !config.child || !path.isAbsolute(config.child.command) || !Array.isArray(config.child.args)
     || config.child.args.length > 128 || config.child.args.some(function (value) { return typeof value !== "string" || value.length > 20000; })
@@ -707,6 +709,7 @@ async function main() {
     resumeSessionPath: config.resumeSessionPath,
     runtimeControlPath: config.runtimeControlPath,
     retryControlPath: config.retryControlPath,
+    ...(config.hostedExecutionPath === undefined ? {} : { hostedExecutionPath: config.hostedExecutionPath }),
     temporaryPath: config.temporaryPath,
     transcriptPath: config.transcriptPath
   });
@@ -729,6 +732,7 @@ async function main() {
   childEnv["JOKO_PI_SILENT_ENCRYPTED_RETRY_CONTROL_FILE"] = config.retryControlPath;
   childEnv["JOKO_PI_WORKSPACE_ROOT"] = config.workspaceRoot;
   childEnv["JOKO_PI_GENERATION"] = String(config.productGeneration);
+  if (config.hostedExecutionPath !== undefined) childEnv["JOKO_PI_HOSTED_EXECUTION_FILE"] = config.hostedExecutionPath;
   childEnv[DEPTH_ENV] = "1";
   childEnv[PARENT_PID_ENV] = String(process.pid);
   childEnv["TEMP"] = config.temporaryPath;

@@ -3,6 +3,7 @@ import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar
 import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine, BackgroundTaskOutput } from "@joko/contracts";
 import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask } from "@joko/contracts";
 import type { PersonalDevelopmentApi } from "./personal-development-api.js";
+import type { HostedAgentSettingsApi } from "./hosted-agent-settings.js";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
 export type SystemLocale = Exclude<Locale, "en-XA">;
@@ -5964,7 +5965,7 @@ export type ExtensionCardApi = Pick<import("@connectrpc/connect").Client<typeof 
   }>;
 };
 
-export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmentApi {
+export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmentApi, HostedAgentSettingsApi {
   mcpAppApi(): McpAppApi | undefined;
   extensionCardApi(): ExtensionCardApi | undefined;
   extensionNetworkApi(): ExtensionNetworkApi | undefined;

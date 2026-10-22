@@ -28,10 +28,11 @@ interface WorkerRequest {
 }
 
 interface TextWorkerRequest {
-  readonly kind: "extract_text";
+  readonly kind: "extract_text" | "extract_page_text";
   readonly data: Uint8Array;
   readonly maxPages: number;
   readonly maxChars: number;
+  readonly firstPage?: number;
 }
 
 export type PdfParserRequest = WorkerRequest | TextWorkerRequest;
@@ -151,7 +152,8 @@ async function extractText(request: TextWorkerRequest): Promise<PdfTextWorkerRes
     if (!Number.isSafeInteger(document.numPages) || document.numPages < 0) throw new Error("Invalid PDF page count.");
     const sections: string[] = [];
     let totalChars = 0, pagesInspected = 0, clipped = false;
-    for (let pageNumber = 1; pageNumber <= Math.min(document.numPages, request.maxPages); pageNumber += 1) {
+    const firstPage = request.kind === "extract_page_text" ? request.firstPage! : 1;
+    for (let pageNumber = firstPage; pageNumber <= Math.min(document.numPages, firstPage + request.maxPages - 1); pageNumber += 1) {
       const page = await document.getPage(pageNumber);
       try {
         const content = await page.getTextContent();
@@ -186,14 +188,16 @@ async function extractText(request: TextWorkerRequest): Promise<PdfTextWorkerRes
 // The native PDF library lives only in a dedicated Node process's main thread.
 // A Windows native teardown fault cannot terminate the caller's host process.
 if (process.send) process.once("message", (request: PdfParserRequest) => {
+  const textRequest = request?.kind === "extract_text" || request?.kind === "extract_page_text", ranged = request?.kind === "extract_page_text";
   if (!(request?.data instanceof Uint8Array) || request.data.byteLength === 0 || request.data.byteLength > 64 * 1024 * 1024
-    || !Number.isInteger(request.maxPages) || request.maxPages < 1 || request.maxPages > (request.kind === "extract_text" ? 40 : 50)
-    || (request.kind === "extract_text" && (request.data.byteLength > 20 * 1024 * 1024
-      || !Number.isInteger(request.maxChars) || request.maxChars < 1 || request.maxChars > 48_000))) {
+    || !Number.isInteger(request.maxPages) || request.maxPages < 1 || request.maxPages > (textRequest ? ranged ? 20 : 40 : 50)
+    || (ranged && (!Number.isSafeInteger(request.firstPage) || request.firstPage! < 1 || !Number.isSafeInteger(request.firstPage! + request.maxPages - 1)))
+    || (textRequest && (request.data.byteLength > (ranged ? 32 : 20) * 1024 * 1024
+      || !Number.isInteger(request.maxChars) || request.maxChars < 1 || request.maxChars > (ranged ? 100_000 : 48_000)))) {
     process.send?.({ ok: false }, () => process.disconnect?.()); return;
   }
   const job = request.kind === "inspect" ? inspect(request)
-    : request.kind === "extract_text" ? extractText(request) : Promise.reject(new Error("Unknown PDF worker request."));
+    : textRequest ? extractText(request) : Promise.reject(new Error("Unknown PDF worker request."));
   void job.then(
     result => process.send?.({ ok: true, result }, () => process.disconnect?.()),
     () => process.send?.({ ok: false }, () => process.disconnect?.())

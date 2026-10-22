@@ -14,6 +14,7 @@ import {
   NATIVE_HISTORY_REPLACES_TRANSIENT_FIELD,
   redactSecrets,
   snapshotNativeSkills,
+  assertHostedExecution,
   type ApprovedSkillResolver,
   type NativeSkillPolicyResolver,
   type NativeSkillSnapshot,
@@ -78,6 +79,7 @@ import {
   type ProcessPriorityResult
 } from "@joko/runtime-governance";
 import { provisionManagedBridge } from "./bridge.js";
+import { assertPiHostedModel, provisionPiHostedExecution, restrictPiHostedGuestHome } from "./hosted-execution.js";
 import { handleCommandGateExtensionRequest } from "./command-gate-bridge.js";
 import { capturePartnerLearningExtensionRequest, consumePartnerLearningNativeReply } from "./partner-learning-bridge.js";
 import {
@@ -103,6 +105,7 @@ import {
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MAXIMUM,
   PI_AUTO_COMPACTION_THRESHOLD_PERCENT_MINIMUM,
   managedEnvironmentReferenceName,
+  keylessEnvName,
   provisionManagedCatalog,
   piModelOutputTokenLimit,
   supportedPiThinkingLevels,
@@ -764,6 +767,7 @@ export class PiBackendAdapter implements
   ProviderAuthenticationRevocation,
   ProviderAuthenticationReconciliation {
   readonly id = "pi";
+  readonly hostedExecutionCapabilities = { toolsOnSource: true, isolatedGuests: true } as const;
   #options: PiAdapterOptions;
   #agentHome: string;
   #managedGeneration: PiManagedGeneration;
@@ -2017,6 +2021,7 @@ export class PiBackendAdapter implements
   }
 
   async setModel(providerId: string, modelId: string, context: AdapterContext): Promise<ProviderModel> {
+    assertPiHostedModel(context.hostedExecution, providerId, modelId);
     this.#assertReviewOperationAllowed(context, "change model");
     const runtime = this.#runtime(context);
     const model = await this.#runExclusiveSessionMutation(runtime, context, async () => {
@@ -4101,7 +4106,7 @@ export class PiBackendAdapter implements
       throw piError("PI_REQUEST_ABORTED", "Pi user shell was aborted before dispatch", "dispatch", { retryable: true });
     }
     const callId = `user-shell-${randomUUID()}`;
-    const commandGate = runtime.generationLease.generation.options.commandConcurrencyGate;
+    const commandGate = context.hostedExecution ? undefined : runtime.generationLease.generation.options.commandConcurrencyGate;
     const commandGateId = `${context.sessionId}:${context.generation}:${callId}`;
     const admission = await commandGate?.acquire({
       commandId: commandGateId,
@@ -4716,6 +4721,8 @@ export class PiBackendAdapter implements
     const workingContextWindow = readPiWorkingContext(context, profile.providerId, profile.modelId);
     let workingNativeWindow: number | undefined;
     try {
+      const hosted = context.hostedExecution;
+      assertPiHostedModel(hosted, profile.providerId, profile.modelId);
       this.#assertProviderAuthenticationNotRevoked(options, profile.providerId);
       await this.validateTarget(context.target);
       if (binding) await this.#sessionStore.assertManagedSession(binding.opaqueRef);
@@ -4765,7 +4772,7 @@ export class PiBackendAdapter implements
       permissionMode: profile.initialPermissionMode,
       planMode: profile.initialPlanMode,
       fastMode: profile.initialFastMode,
-      approvedRoots: context.target.remoteWorkspace === undefined
+      approvedRoots: hosted ? [] : context.target.remoteWorkspace === undefined
         ? await validateApprovedDirectories(context.extraDirectories ?? [], context.target.workspaceRoot)
         : await options.validateRemoteHomeDirectories?.(context, context.extraDirectories ?? []) ?? [],
       runtimePolicy: profile.runtimePolicy,
@@ -4785,17 +4792,17 @@ export class PiBackendAdapter implements
       context.generation,
       this.#silentEncryptedRetryEnabled
     );
-    const targetResources = profile.runtimePolicy === "review_read_only" ? undefined : context.target.trusted
+    const targetResources = profile.runtimePolicy === "review_read_only" || hosted ? undefined : context.target.trusted
       ? await options.resolveTargetResources?.(context)
       : undefined;
-    const nativeSkillsEnabled = profile.runtimePolicy !== "review_read_only" && context.target.trusted
+    const nativeSkillsEnabled = !hosted && profile.runtimePolicy !== "review_read_only" && context.target.trusted
       && context.target.remoteWorkspace === undefined && options.resolveNativeSkills !== undefined;
     let mergedResources = mergeManagedResourceSnapshots(managedResources, targetResources);
-    if (profile.runtimePolicy !== "review_read_only") {
+    if (profile.runtimePolicy !== "review_read_only" && !hosted) {
       const excluded = await options.resolveProjectExtensionExclusions?.(context);
       if (excluded?.length) mergedResources = { ...mergedResources, excludedExtensions: [...(mergedResources.excludedExtensions ?? []), ...excluded] };
     }
-    const [managedResourceSnapshot, projectResourceSnapshot] = profile.runtimePolicy === "review_read_only" ? [
+    const [managedResourceSnapshot, projectResourceSnapshot] = profile.runtimePolicy === "review_read_only" || hosted?.trust === "guest" ? [
       { extensionPaths: [], skillPaths: [], promptTemplatePaths: [], resources: [] },
       { skillPaths: [], resources: [] }
     ] : await Promise.all([
@@ -4829,7 +4836,7 @@ export class PiBackendAdapter implements
 
     const mcpBridge = profile.runtimePolicy === "review_read_only"
       ? undefined
-      : await options.resolveMcpBridge?.(context) ?? options.mcpBridge;
+      : hosted ? options.mcpBridge : await options.resolveMcpBridge?.(context) ?? options.mcpBridge;
     if (mcpBridge !== undefined && !mcpBridge.token) {
       throw piError("PI_MCP_CREDENTIAL_MISSING", "MCP bridge token must be supplied through the managed credential channel", "spawn");
     }
@@ -4866,6 +4873,7 @@ export class PiBackendAdapter implements
       "--no-prompt-templates",
       "--offline"
     ];
+    if (hosted?.trust === "guest") args.push("--no-context-files");
     for (const extensionPath of managedResourceSnapshot.extensionPaths) args.push("--extension", extensionPath);
     args.push("--extension", silentEncryptedRetryPath);
     if (context.target.remoteWorkspace === undefined && profile.runtimePolicy === "standard") {
@@ -4884,10 +4892,11 @@ export class PiBackendAdapter implements
     if (profile.providerId) args.push("--provider", profile.providerId);
     if (profile.modelId) args.push("--model", profile.modelId);
     if (profile.effort) args.push("--thinking", profile.effort);
-    const makerMemoryPrompt = profile.runtimePolicy === "review_read_only"
+    const makerMemoryPrompt = profile.runtimePolicy === "review_read_only" || hosted
       ? undefined
       : options.resolveMakerMemoryPrompt?.(context);
-    const appendPrompt = [DEFAULT_APPEND_SYSTEM_PROMPT, options.appendSystemPrompt, makerMemoryPrompt, context.appendSystemPrompt ?? profile.appendSystemPrompt].filter(Boolean).join("\n\n");
+    const appendPrompt = [DEFAULT_APPEND_SYSTEM_PROMPT, hosted?.trust === "guest" ? undefined : options.appendSystemPrompt,
+      makerMemoryPrompt, context.appendSystemPrompt ?? profile.appendSystemPrompt].filter(Boolean).join("\n\n");
     if (appendPrompt) {
       // The native CLI accepts a file here. Keep long instructions out of the
       // operating system command line and bind the private file to this runtime.
@@ -4898,11 +4907,21 @@ export class PiBackendAdapter implements
     }
 
     const baseEnvironment = this.#baseEnvironment();
-    const providerEnvironment = scopedManagedProviderEnvironment(options, catalog, profile.providerId);
+    let providerEnvironment = scopedManagedProviderEnvironment(options, catalog, profile.providerId);
+    let keylessEnvironment = catalog.keylessEnvironment;
+    if (hosted?.trust === "guest") {
+      const provider = options.providers?.find(provider => provider.id === hosted.providerId);
+      const names = new Set(provider ? managedProviderCredentialEnvironmentNames(provider) : []);
+      providerEnvironment = Object.fromEntries(Object.entries(providerEnvironment).filter(([name]) => names.has(name)));
+      const keylessName = provider?.keyless ? keylessEnvName(provider.id) : undefined;
+      keylessEnvironment = Object.fromEntries(Object.entries(catalog.keylessEnvironment).filter(([name]) => name === keylessName));
+      Object.assign(baseEnvironment, { HOME: hosted.guestHome, USERPROFILE: hosted.guestHome,
+        APPDATA: join(hosted.guestHome, "config"), LOCALAPPDATA: join(hosted.guestHome, "local") });
+    }
     const configuredEnvironment: NodeJS.ProcessEnv = {
       ...baseEnvironment,
       ...providerEnvironment,
-      ...catalog.keylessEnvironment
+      ...keylessEnvironment
     };
     const proxySecrets = credentialedProxySecrets(configuredEnvironment);
     const secretNames = new Set<string>([
@@ -4915,12 +4934,12 @@ export class PiBackendAdapter implements
     ]);
     const subagentCredentialNames = new Set<string>([
       ...[...secretNames].filter((name) => name !== "JOKO_PI_NATIVE_AUTH_RESERVATION_TOKEN"),
-      ...Object.keys(catalog.keylessEnvironment)
+      ...Object.keys(keylessEnvironment)
     ]);
     const env: NodeJS.ProcessEnv = {
       ...baseEnvironment,
       ...providerEnvironment,
-      ...catalog.keylessEnvironment,
+      ...keylessEnvironment,
       PI_CODING_AGENT_DIR: runtimeAgentHomePath,
       PI_CODING_AGENT_SESSION_DIR: this.#sessionStore.sessionsRoot,
       PI_SKIP_VERSION_CHECK: "1",
@@ -4949,17 +4968,19 @@ export class PiBackendAdapter implements
         [MANAGED_SUBAGENT_PRODUCT_SESSION_ENV]: context.sessionId,
         [MANAGED_SUBAGENT_RUN_ROOT_ENV]: managedSubagentRunRoot(this.#sessionStore.root),
         [MANAGED_SUBAGENT_NODE_ENV]: process.execPath,
-        JOKO_PI_NATIVE_AUTH_PROVIDER_IDS: JSON.stringify(options.nativeAuthProviderIds ?? []),
-        JOKO_PI_NATIVE_AUTHENTICATED_PROVIDER_IDS: JSON.stringify(options.nativeAuthenticatedProviderIds ?? []),
+        JOKO_PI_NATIVE_AUTH_PROVIDER_IDS: JSON.stringify((options.nativeAuthProviderIds ?? []).filter(id => hosted?.trust !== "guest" || id === hosted.providerId)),
+        JOKO_PI_NATIVE_AUTHENTICATED_PROVIDER_IDS: JSON.stringify((options.nativeAuthenticatedProviderIds ?? []).filter(id => hosted?.trust !== "guest" || id === hosted.providerId)),
         JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES: JSON.stringify([...subagentCredentialNames].sort()),
         [MANAGED_SUBAGENT_PROVIDER_CREDENTIAL_NAMES_ENV]: JSON.stringify(Object.fromEntries(
-          (options.providers ?? []).map((provider) => [
+          (options.providers ?? []).filter(provider => hosted?.trust !== "guest" || provider.id === hosted.providerId).map((provider) => [
             provider.id,
             managedProviderCredentialEnvironmentNames(provider)
           ])
         ))
       } : {})
     };
+    const hostedExecutionPath = await provisionPiHostedExecution(runtimeDirectory, context);
+    if (hostedExecutionPath) env.JOKO_PI_HOSTED_EXECUTION_FILE = hostedExecutionPath;
     if (context.target.remoteWorkspace === undefined) {
       Object.assign(env, toolchainThreadEnvironment(agentResourceSettings, env));
       if (managedSubagentToolsEnabled) {
@@ -4987,7 +5008,7 @@ export class PiBackendAdapter implements
     let preparedAgentHome: PreparedRuntimeAgentHome | undefined;
     let transport: PiRpcTransport | undefined;
     let acquiredManagedDurableStore: PiManagedDurableStore | undefined;
-    let redactValues: string[] = [...proxySecrets.values];
+    let redactValues: string[] = [...proxySecrets.values, ...(hosted ? [hosted.channel.bearer] : [])];
     try {
       preparedAgentHome = await this.#prepareRuntimeAgentHome(
         runtimeDirectory,
@@ -4995,6 +5016,7 @@ export class PiBackendAdapter implements
         managedGeneration,
         profile.providerId
       );
+      if (hosted) await restrictPiHostedGuestHome(preparedAgentHome.path, hosted);
       if (context.target.remoteWorkspace === undefined && profile.runtimePolicy === "standard") {
         await this.#cacheCompatibility.snapshot(join(preparedAgentHome.path, "request-option-compatibility.json"));
       }
@@ -5012,6 +5034,7 @@ export class PiBackendAdapter implements
           .map((name) => env[name])
           .filter((value): value is string => typeof value === "string" && value.length > 0),
         ...proxySecrets.values,
+        ...(hosted ? [hosted.channel.bearer] : []),
         ...preparedAgentHome.redactValues
       ];
       if (mcpBridge?.token) redactValues.push(mcpBridge.token);
@@ -5023,6 +5046,7 @@ export class PiBackendAdapter implements
       const remoteHome = context.target.remoteWorkspace === undefined ? undefined : await options.prepareRemoteHomeRuntime?.({ context,
         agentHome: preparedAgentHome.path, environment: env });
       if (remoteHome?.discardNativeAuth) preparedAgentHome = { path: preparedAgentHome.path, redactValues: [] };
+      if (hosted) assertHostedExecution(hosted);
       const process = await this.#processFactory({
         command: this.#command,
         args,
@@ -5153,7 +5177,7 @@ export class PiBackendAdapter implements
         control,
         autoRetry: profile.autoRetry ?? options.settings?.retry?.enabled ?? true,
         autoCompaction: profile.autoCompaction ?? options.settings?.compaction?.enabled ?? true,
-        compactionMemoryEnabled: options.isCompactionMemoryEnabled?.(context) === true,
+        compactionMemoryEnabled: !hosted && options.isCompactionMemoryEnabled?.(context) === true,
         autoCompactionThresholdPercent: profile.compactionThresholdPercent ?? configuredAutoCompactionThresholdPercent(options.settings),
         workingContextWindow,
         workingContextSelection: profile.providerId === undefined || profile.modelId === undefined ? undefined : `${profile.providerId}\0${profile.modelId}`,
@@ -5661,6 +5685,20 @@ export class PiBackendAdapter implements
   }
 
   #touchRuntime(runtime: PiRuntime, context: AdapterContext): void {
+    const hosted = runtime.context.hostedExecution;
+    if (hosted) {
+      assertHostedExecution(hosted);
+      if (!context.hostedExecution || context.hostedExecution.channel.bearer !== hosted.channel.bearer
+        || context.hostedExecution.channel.endpoint !== hosted.channel.endpoint
+        || context.hostedExecution.source.generation !== hosted.source.generation
+        || context.hostedExecution.source.sessionId !== hosted.source.sessionId
+        || context.hostedExecution.source.targetId !== hosted.source.targetId) {
+        throw piError("PI_HOSTED_AUTHORITY_CHANGED", "Hosted Agent execution authority changed", "dispatch");
+      }
+      assertHostedExecution(context.hostedExecution);
+    } else if (context.hostedExecution) {
+      throw piError("PI_HOSTED_AUTHORITY_CHANGED", "Cannot attach hosted execution authority to a local runtime", "dispatch");
+    }
     if (runtime.transport.generation !== context.generation) {
       throw piError("PI_STALE_GENERATION", "Pi runtime generation fence rejected a stale caller", "dispatch", {
         stateMayHaveChanged: false,

@@ -4704,7 +4704,7 @@ function providerApi(api: ProviderModel["api"]): ProviderApiCompatibility {
   }
 }
 
-function toProtoCapability(capability: Capability): ProtoCapability {
+export function toProtoCapability(capability: Capability): ProtoCapability {
   const scopeInvalid = capability.key === "session.rewind_to_start" && !nativeStartScopeOptionsAreValid(capability);
   return message<ProtoCapability>("joko.v1.Capability", {
     name: capability.key,
@@ -4714,7 +4714,7 @@ function toProtoCapability(capability: Capability): ProtoCapability {
   });
 }
 
-function fromProtoCapability(capability: ProtoCapability): Capability {
+export function fromProtoCapability(capability: ProtoCapability): Capability {
   const reason = capabilityReason(capability.support);
   const options = fromProtoCapabilityOptions(capability.options);
   return {

@@ -157,6 +157,62 @@ describe("Desktop Device peer agent lifecycle", () => {
     expect(readAuthKey).not.toHaveBeenCalled();
     expect(readRouteAuthorization).not.toHaveBeenCalled();
   });
+
+  it("keeps the file route alive during native failures, caps recovery backoff and republishes capabilities through exact route retirement", async () => {
+    let nativeReady = false, probes = 0;
+    const delays: number[] = [], releases: Array<() => void> = [];
+    const executors: Array<Omit<ReturnType<typeof fakeExecutor>, "capabilities"> & { readonly capabilities: readonly DevicePeerCapabilityKind[] }> = [];
+    const routed: Array<{ readonly capabilities: readonly DevicePeerCapabilityKind[]; readonly signal: AbortSignal }> = [];
+    const lifecycle = new DesktopDevicePeerAgentLifecycle({
+      createExecutor() {
+        const executor = { ...fakeExecutor(), capabilities: nativeReady ? [DevicePeerCapabilityKind.FILES, DevicePeerCapabilityKind.NATIVE_AGENTS] : [DevicePeerCapabilityKind.FILES] };
+        executors.push(executor); return executor;
+      },
+      readAuthKey: async () => "A".repeat(43), readRouteAuthorization: async () => "R".repeat(43),
+      readDefaultDeviceName: () => "Desktop", isAuthorityCurrent: () => true,
+      runRoute: async options => { routed.push({ capabilities: options.executor.capabilities, signal: options.signal }); await aborted(options.signal); },
+      recoverNativeAgents: async () => { if (++probes < 4) throw new Error("Private native endpoint is unavailable."); nativeReady = true; return true; },
+      retryBaseDelayMs: 10, retryMaximumDelayMs: 25,
+      wait: (milliseconds, signal) => new Promise<void>((resolve, reject) => {
+        delays.push(milliseconds); releases.push(resolve);
+        signal.addEventListener("abort", () => reject(new Error("cancelled")), { once: true });
+      })
+    });
+    try {
+      lifecycle.setConnection(FIRST); await eventually(() => routed.length === 1 && releases.length === 1);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        releases[attempt]!(); await eventually(() => releases.length === attempt + 2);
+        expect(routed).toHaveLength(1); expect(routed[0]?.signal.aborted).toBe(false);
+        expect(routed[0]?.capabilities).toEqual([DevicePeerCapabilityKind.FILES]);
+      }
+      releases[3]!(); await eventually(() => routed.length === 2);
+      expect(delays).toEqual([10, 20, 25, 25]); expect(probes).toBe(4);
+      expect(executors[0]?.retire).toHaveBeenCalledOnce(); expect(routed[0]?.signal.aborted).toBe(true);
+      expect(routed[1]?.capabilities).toEqual([DevicePeerCapabilityKind.FILES, DevicePeerCapabilityKind.NATIVE_AGENTS]);
+    } finally { await lifecycle.dispose(); }
+    expect(executors[1]?.retire).toHaveBeenCalledOnce();
+  });
+
+  it("cancels an old native probe on replacement and never lets its late result rebuild the new authority", async () => {
+    let finishProbe!: () => void;
+    let probeSignal: AbortSignal | undefined;
+    const routed: DesktopManagedOrchestratorConnection[] = [];
+    const lifecycle = new DesktopDevicePeerAgentLifecycle({
+      createExecutor: connection => ({ ...fakeExecutor(), capabilities: connection === FIRST
+        ? [DevicePeerCapabilityKind.FILES] : [DevicePeerCapabilityKind.FILES, DevicePeerCapabilityKind.NATIVE_AGENTS] }),
+      readAuthKey: async () => "A".repeat(43), readRouteAuthorization: async () => "R".repeat(43),
+      readDefaultDeviceName: () => "Desktop", isAuthorityCurrent: () => true,
+      runRoute: async options => { routed.push(options.connection); await aborted(options.signal); }, wait: immediateWait,
+      recoverNativeAgents: async (_connection, signal) => { probeSignal = signal; await new Promise<void>(resolve => { finishProbe = resolve; }); return true; }
+    });
+    try {
+      lifecycle.setConnection(FIRST); await eventually(() => probeSignal !== undefined && routed.length === 1);
+      lifecycle.setConnection(SECOND); expect(probeSignal?.aborted).toBe(true);
+      await eventually(() => routed.length === 2);
+      finishProbe(); await new Promise(resolve => setTimeout(resolve, 0));
+      expect(routed).toEqual([FIRST, SECOND]);
+    } finally { finishProbe?.(); await lifecycle.dispose(); }
+  });
 });
 
 function fakeExecutor() {

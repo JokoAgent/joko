@@ -1,8 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { projectCodexNativeHistory } from "./native-history.js";
-import type { NativeThread } from "./protocol.js";
+import { codexNativeDispatchFingerprint, projectCodexNativeHistory } from "./native-history.js";
+import type { JsonObject, NativeThread } from "./protocol.js";
 
 describe("Codex native history projection", () => {
+  it("matches outgoing native input with persisted schema defaults while preserving image bytes, text spans and ordering", () => {
+    const outgoing: JsonObject[] = [{ type: "text", text: "Source input", text_elements: [] }, { type: "image", url: "data:image/png;base64,AA==" }];
+    const persisted: JsonObject[] = [{ text_elements: [], text: "Source input", type: "text" }, { detail: null, url: "data:image/png;base64,AA==", type: "image" }];
+    expect(codexNativeDispatchFingerprint(outgoing)).toBe(codexNativeDispatchFingerprint(persisted));
+    expect(codexNativeDispatchFingerprint(outgoing)).not.toBe(codexNativeDispatchFingerprint([...outgoing].reverse()));
+    expect(codexNativeDispatchFingerprint(outgoing)).not.toBe(codexNativeDispatchFingerprint([{ ...outgoing[0]!, text: "Another input" }, outgoing[1]!]));
+    expect(codexNativeDispatchFingerprint(outgoing)).not.toBe(codexNativeDispatchFingerprint([outgoing[0]!, { ...outgoing[1]!, url: "data:image/png;base64,AQ==" }]));
+  });
   it("projects native Skill input as a safe name without exposing its private mount or body", () => {
     const privatePath = "C:\\private-runtime\\approved-copy\\SKILL.md";
     const thread: NativeThread = { id: "skill-input", turns: [{ id: "turn", status: "completed", items: [{

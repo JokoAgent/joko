@@ -118,6 +118,7 @@ import { isRemoteDesktopCredentialHandle, isRemoteDesktopCredentialRequest, isRe
 import { remoteDesktopHostIceServersFromContract } from "./remote-desktop-ice-config.js";
 import {
   DevicePeerRemoteDesktopHostError,
+  type DevicePeerNativeAgentPort,
   type DevicePeerRemoteDesktopHostPort,
   type DevicePeerFileStat,
   type DevicePeerFileTransportPort,
@@ -127,6 +128,7 @@ import {
   type DevicePeerTerminalHandle,
   type DevicePeerTerminalTransportPort
 } from "./ports.js";
+import { devicePeerNativeAgentMethodEffect, DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES } from "./native-agent-method.js";
 import { atomicWritePrivateFile, readPrivateFile, sameFileIdentity, sameStableFile } from "./private-files.js";
 import {
   isBoundedRemoteDesktopCursorPng,
@@ -202,6 +204,7 @@ export interface NodeDevicePeerAgentExecutorOptions {
   readonly terminals?: DevicePeerTerminalTransportPort;
   /** Omit outside the trusted Desktop Main host or while local opt-in is off. */
   readonly remoteDesktop?: DevicePeerRemoteDesktopHostPort;
+  readonly nativeAgents?: DevicePeerNativeAgentPort;
   /** Process-local executable identities. Reserved runtime tokens are resolved
    * only here and are never persisted in Target or Session bindings. */
   readonly runtimeExecutables?: NodeDevicePeerRuntimeExecutableMap;
@@ -241,6 +244,7 @@ export class NodeDevicePeerAgentExecutor {
   readonly #processes: DevicePeerProcessTransportPort;
   readonly #terminals: DevicePeerTerminalTransportPort | undefined;
   readonly #remoteDesktop: DevicePeerRemoteDesktopHostPort | undefined;
+  readonly #nativeAgents: DevicePeerNativeAgentPort | undefined;
   readonly #stopClipboardAuthority: (() => void) | undefined;
   readonly #runtimeExecutables: NodeDevicePeerRuntimeExecutableMap;
   readonly #activeProcesses = new Map<string, DevicePeerProcessHandle>();
@@ -258,6 +262,7 @@ export class NodeDevicePeerAgentExecutor {
     this.#processes = options.processes ?? new LocalDevicePeerProcessTransport();
     this.#terminals = options.terminals;
     this.#remoteDesktop = options.remoteDesktop;
+    this.#nativeAgents = options.nativeAgents;
     const clipboardSignal = new AbortController().signal;
     this.#stopClipboardAuthority = this.#remoteDesktop?.onClipboardAuthorityChanged?.(() => {
       const state = this.#remoteDesktopClipboardTransfer;
@@ -276,7 +281,8 @@ export class NodeDevicePeerAgentExecutor {
       DevicePeerCapabilityKind.PROCESS,
       ...(this.#terminals === undefined ? [] : [DevicePeerCapabilityKind.TERMINAL]),
       DevicePeerCapabilityKind.FORWARDING,
-      ...(this.#remoteDesktop === undefined ? [] : [DevicePeerCapabilityKind.REMOTE_DESKTOP])
+      ...(this.#remoteDesktop === undefined ? [] : [DevicePeerCapabilityKind.REMOTE_DESKTOP]),
+      ...(this.#nativeAgents === undefined ? [] : [DevicePeerCapabilityKind.NATIVE_AGENTS])
     ]);
   }
 
@@ -293,7 +299,8 @@ export class NodeDevicePeerAgentExecutor {
     const specification = commandSpecification(
       command,
       this.#terminals !== undefined,
-      this.#remoteDesktop !== undefined
+      this.#remoteDesktop !== undefined,
+      this.#nativeAgents !== undefined
     );
     validateCommandInput(command);
 
@@ -333,7 +340,8 @@ export class NodeDevicePeerAgentExecutor {
           for (const key of listener.connections) this.#reverseConnections.get(key)?.destroy();
           await closeServer(listener.server);
           await Promise.allSettled([...listener.pumps]);
-        })
+        }),
+        ...(this.#nativeAgents === undefined ? [] : [Promise.resolve().then(() => this.#nativeAgents!.retire())])
       ]),
       new Promise<void>((resolveTimeout) => setTimeout(resolveTimeout, RESOURCE_RETIRE_TIMEOUT_MS))
     ]);
@@ -352,6 +360,13 @@ export class NodeDevicePeerAgentExecutor {
     output: AgentOutput
   ): Promise<AgentPayload | undefined> {
     switch (command.action.case) {
+      case "invokeHostedAgent": {
+        if (!this.#nativeAgents) throw agentError(DevicePeerFailureCode.CAPABILITY_UNAVAILABLE, false);
+        const bytes = await this.#nativeAgents.invoke(command.action.value.method, command.action.value.requestBytes, signal,
+          { controllerDeviceId: command.controllerDeviceId });
+        if (!(bytes instanceof Uint8Array) || bytes.byteLength > DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES) throw agentError(DevicePeerFailureCode.INTERNAL, false);
+        return { case: "hostedAgent", value: { $typeName: "joko.v1.DevicePeerHostedAgentResult", responseBytes: bytes } };
+      }
       case "listRecentDirectories":
         return {
           case: "recentDirectories",
@@ -1839,7 +1854,8 @@ interface RemoteDesktopClipboardTransferState {
 function commandSpecification(
   command: DevicePeerCommand,
   terminalAvailable: boolean,
-  remoteDesktopAvailable: boolean
+  remoteDesktopAvailable: boolean,
+  nativeAgentsAvailable: boolean
 ): CommandSpecification {
   const byAction: Partial<Record<NonNullable<DevicePeerCommand["action"]["case"]>, CommandSpecification>> = {
     listRecentDirectories: readOnly(DevicePeerCapabilityKind.FILES),
@@ -1897,9 +1913,13 @@ function commandSpecification(
     transferRemoteDesktopClipboardText: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP),
     transferRemoteDesktopClipboardContent: effect(DevicePeerCapabilityKind.REMOTE_DESKTOP)
   };
-  const specification = command.action.case === undefined ? undefined : byAction[command.action.case];
+  const nativeEffect = command.action.case === "invokeHostedAgent" ? devicePeerNativeAgentMethodEffect(command.action.value.method) : undefined;
+  const specification = command.action.case === "invokeHostedAgent"
+    ? nativeEffect === undefined ? undefined : nativeEffect === "read_only" ? readOnly(DevicePeerCapabilityKind.NATIVE_AGENTS) : effect(DevicePeerCapabilityKind.NATIVE_AGENTS)
+    : command.action.case === undefined ? undefined : byAction[command.action.case];
   const unavailable = specification?.capability === DevicePeerCapabilityKind.TERMINAL && !terminalAvailable
-    || specification?.capability === DevicePeerCapabilityKind.REMOTE_DESKTOP && !remoteDesktopAvailable;
+    || specification?.capability === DevicePeerCapabilityKind.REMOTE_DESKTOP && !remoteDesktopAvailable
+    || specification?.capability === DevicePeerCapabilityKind.NATIVE_AGENTS && !nativeAgentsAvailable;
   if (specification === undefined || command.capability !== specification.capability
     || command.effect !== specification.effect || unavailable) {
     throw agentError(unavailable
@@ -1911,6 +1931,12 @@ function commandSpecification(
 
 function validateCommandInput(command: DevicePeerCommand): void {
   switch (command.action.case) {
+    case "invokeHostedAgent":
+      remoteDesktopControllerId(command.controllerDeviceId);
+      if (!(command.action.value.requestBytes instanceof Uint8Array) || command.action.value.requestBytes.byteLength > DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES) {
+        throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
+      }
+      return;
     case "listRecentDirectories":
       boundedInteger(command.action.value.maximumEntries, 1, MAXIMUM_RECENT_DIRECTORIES, "maximumEntries");
       return;
