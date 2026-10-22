@@ -30,6 +30,31 @@ afterEach(() => {
 });
 
 describe("Extension catalog gateway", () => {
+  it("preserves project ownership, both revisions, and target context across generated RPCs", async () => {
+    const project = { projectId: "a".repeat(64), name: "Project A", path: "/projects/a" };
+    const requests: { method: string; input: any }[] = [];
+    const gateway = await mount(async (method, input) => {
+      requests.push({ method, input });
+      if (method === "getSnapshot") return { snapshot: {} };
+      if (method === "listExtensionProjects") return { projects: [project] };
+      if (method === "resolveExtensionProject") return { project };
+      if (method === "getExtensionProjectState") return { state: { project, revision: { value: 3n }, disabledExtensionIds: [] } };
+      if (method === "listExtensions") return { extensions: [], catalogRevision: { value: 9n }, page: { totalSize: 0n } };
+      if (method === "submitOperation") return { operation: { operationId: input.operationId, connectionId: input.connectionId,
+        state: OperationState.SUCCEEDED, result: { payload: { case: "acknowledgement", value: { accepted: true } } } } };
+      throw new Error(`Unexpected method: ${method}`);
+    });
+    try {
+      expect(await gateway.listExtensionProjects()).toEqual([{ id: project.projectId, name: project.name, path: project.path }]);
+      expect(await gateway.resolveExtensionProject(project.path)).toMatchObject({ id: project.projectId });
+      const state = await gateway.getExtensionProjectState(project.projectId);
+      await gateway.setExtensionEnabled("extension-one", false, 7n, state);
+      await gateway.listExtensions({ targetId: "target-a" });
+      const mutation = requests.find(value => value.method === "submitOperation")!.input.mutation.payload;
+      expect(mutation.value).toMatchObject({ extensionId: "extension-one", enabled: false, expectedRevision: { value: 7n }, project: { projectId: project.projectId, expectedRevision: { value: 3n } } });
+      expect(requests.find(value => value.method === "listExtensions")!.input.targetId).toBe("target-a");
+    } finally { gateway.disconnect(); }
+  });
   it("restarts pagination after a revision change and returns one complete exact catalog", async () => {
     const requests: Array<{ readonly method: string; readonly input: any }> = [];
     let listCall = 0;

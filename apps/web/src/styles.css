@@ -2640,6 +2640,15 @@ button.attachment-chip__content:focus-visible { outline: 2px solid var(--accent-
 .extension-browser__catalog { display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--surface); }
 .extension-browser__detail { overflow-y: auto; padding: 22px clamp(18px, 3vw, 34px) 34px; }
 .extension-browser__controls { display: grid; gap: 9px; border-bottom: 1px solid var(--line); padding: 12px; background: var(--surface-raised); }
+.extension-project-scope { min-width: 0; display: grid; gap: 5px; }
+.extension-project-scope > label { min-width: 0; display: grid; gap: 5px; color: var(--text-muted); font-size: var(--text-10); }
+.extension-project-scope > p { margin: 0; color: var(--text-faint); font-size: var(--text-10); overflow-wrap: anywhere; }
+.extension-project-scope > div[role="alert"] { color: var(--red); font-size: var(--text-11); overflow-wrap: anywhere; }
+.extension-project-browser__path { display: flex; align-items: end; gap: 8px; }
+.extension-project-browser__path > label { min-width: 0; flex: 1; display: grid; gap: 5px; }
+.extension-project-browser__path input { width: 100%; min-width: 0; }
+.extension-project-browser__directories { display: grid; gap: 5px; max-height: 45vh; overflow: auto; margin-top: 12px; }
+.extension-project-browser__directories > button { justify-content: start; text-align: start; overflow-wrap: anywhere; }
 .extension-search { min-width: 0; height: 34px; display: flex; align-items: center; gap: 7px; border: 1px solid var(--line); border-radius: 9px; padding: 0 9px; background: var(--surface); color: var(--text-faint); }
 .extension-search:focus-within { border-color: var(--accent-edge); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-edge) 14%, transparent); }
 .extension-search > svg { width: 14px; height: 14px; flex: 0 0 auto; }

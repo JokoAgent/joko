@@ -4169,6 +4169,17 @@ export interface ExtensionRecommendationView {
   }>>>;
 }
 
+export interface ExtensionProjectView {
+  readonly id: string;
+  readonly name: string;
+  readonly path: string;
+}
+export interface ExtensionProjectStateView {
+  readonly project: ExtensionProjectView;
+  readonly revision: bigint;
+  readonly disabledExtensionIds: readonly string[];
+}
+
 export interface ExtensionCatalogEntryView {
   readonly id: string;
   readonly revision: bigint;
@@ -6255,9 +6266,11 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
     readonly installed?: boolean;
     readonly query?: string;
     readonly sessionId?: string;
+    readonly targetId?: string;
+    readonly includeProjectDisabled?: boolean;
     readonly signal?: AbortSignal;
   }): Promise<ExtensionCatalogView>;
-  getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal): Promise<ExtensionCatalogView>;
+  getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal, includeProjectDisabled?: boolean): Promise<ExtensionCatalogView>;
   openExtensionMainView(extensionId: string, expectedRevision: bigint, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
   getExtensionMainViewSurface(surfaceId: string, signal?: AbortSignal): Promise<ExtensionMainViewSurfaceView>;
   closeExtensionMainView(surfaceId: string, signal?: AbortSignal): Promise<boolean>;
@@ -6291,7 +6304,11 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   addExtensionSource(source: ExtensionSourceDraft, expectedCatalogRevision: bigint): Promise<void>;
   refreshExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void>;
   removeExtensionSource(sourceId: string, expectedRevision: bigint): Promise<void>;
-  setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint): Promise<void>;
+  listExtensionProjects(signal?: AbortSignal): Promise<readonly ExtensionProjectView[]>;
+  resolveExtensionProject(path: string, signal?: AbortSignal): Promise<ExtensionProjectView>;
+  getExtensionProjectState(projectId: string, signal?: AbortSignal): Promise<ExtensionProjectStateView>;
+  listExtensionProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView>;
+  setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint, project?: ExtensionProjectStateView): Promise<void>;
   setExtensionSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): Promise<void>;
   beginExtensionSetup(extensionId: string, expectedRevision: bigint): Promise<void>;
   submitExtensionSetupInteraction(

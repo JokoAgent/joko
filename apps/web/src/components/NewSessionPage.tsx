@@ -579,7 +579,7 @@ export function NewSessionPage({ controller, snapshot, initialTargetId, initialD
     && (selection?.kind === "target" ? item.targetId === selection.targetId : item.projectId === undefined))?.id;
   const suggestionContextKey = selection === undefined ? undefined : newSessionSuggestionContext(controller, snapshot, selection, recommendationReturn?.runtimeSessionId);
   const suggestionContextRef = useRef(suggestionContextKey); suggestionContextRef.current = suggestionContextKey;
-  const extensionSuggestions = useNewSessionExtensionSuggestions(controller, suggestionContextKey, suggestionCatalogRuntimeSessionId, newlyInstalledExtensionId, snapshot.extensionCatalogRevision);
+  const extensionSuggestions = useNewSessionExtensionSuggestions(controller, suggestionContextKey, suggestionCatalogRuntimeSessionId, newlyInstalledExtensionId, snapshot.extensionCatalogRevision, selected?.id);
   const applicableExtensionSuggestions = useMemo(() => backend === undefined ? [] : extensionSuggestions.extensions.filter((entry) =>
     extensionSuggestionApplicable(entry, { backendId: backend.id, ...(selected === undefined ? {} : { targetId: selected.id }), resources: snapshot.resources })
   ), [extensionSuggestions.extensions, backend?.id, selected?.id, snapshot.resources]);

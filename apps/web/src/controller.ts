@@ -3165,7 +3165,7 @@ export function useAppController(): AppController {
     terminateRuntimeProcess: (process) => gateway().terminateRuntimeProcess(process),
     listRuntimeTools: (sessionId) => gateway().listRuntimeTools(sessionId),
     listExtensions: async (options) => catalogGateway().listExtensions(options),
-    getExtension: async (extensionId, sessionId, signal) => catalogGateway().getExtension(extensionId, sessionId, signal),
+    getExtension: async (extensionId, sessionId, signal, includeProjectDisabled) => catalogGateway().getExtension(extensionId, sessionId, signal, includeProjectDisabled),
     openExtensionMainView: async (extensionId, expectedRevision, signal) =>
       catalogGateway().openExtensionMainView(extensionId, expectedRevision, signal),
     getExtensionMainViewSurface: async (surfaceId, signal) => catalogGateway().getExtensionMainViewSurface(surfaceId, signal),
@@ -3216,7 +3216,11 @@ export function useAppController(): AppController {
     addExtensionSource: async (source, expectedCatalogRevision) => catalogGateway().addExtensionSource(source, expectedCatalogRevision),
     refreshExtensionSource: async (sourceId, expectedRevision) => catalogGateway().refreshExtensionSource(sourceId, expectedRevision),
     removeExtensionSource: async (sourceId, expectedRevision) => catalogGateway().removeExtensionSource(sourceId, expectedRevision),
-    setExtensionEnabled: async (extensionId, enabled, expectedRevision) => catalogGateway().setExtensionEnabled(extensionId, enabled, expectedRevision),
+    listExtensionProjects: async (signal) => catalogGateway().listExtensionProjects(signal),
+    resolveExtensionProject: async (path, signal) => catalogGateway().resolveExtensionProject(path, signal),
+    getExtensionProjectState: async (projectId, signal) => catalogGateway().getExtensionProjectState(projectId, signal),
+    listExtensionProjectDirectories: async (path, signal) => catalogGateway().listProjectDirectories(path, signal),
+    setExtensionEnabled: async (extensionId, enabled, expectedRevision, project) => catalogGateway().setExtensionEnabled(extensionId, enabled, expectedRevision, project),
     setExtensionSidebarVisible: async (extensionId, visible, expectedRevision) => catalogGateway().setExtensionSidebarVisible(extensionId, visible, expectedRevision),
     beginExtensionSetup: async (extensionId, expectedRevision) => catalogGateway().beginExtensionSetup(extensionId, expectedRevision),
     submitExtensionSetupInteraction: async (extensionId, attemptId, fieldId, value, expectedRevision) =>

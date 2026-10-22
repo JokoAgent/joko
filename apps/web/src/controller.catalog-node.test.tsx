@@ -32,6 +32,8 @@ it("adopts a verified catalog node and keeps identical plugin, resource and mark
   expect(view.actions).toEqual(["node-b:resource:same-resource", "node-b:extension:same-extension", "node-b:market"]);
   for (const call of [() => old.setResourceEnabled("same-resource", true),
     () => old.setExtensionEnabled("same-extension", false, 1n),
+    () => old.listExtensionProjects(), () => old.getExtensionProjectState("original-project"),
+    () => old.resolveExtensionProject("/original/project"), () => old.listExtensionProjectDirectories("/original/project"),
     () => old.closeSkillMarketInstallPlan("original-plan"), () => old.closeExtensionMainView("original-view"),
     () => old.closeExtensionLibrary("original-library")]) {
     // Mounted views retire their original leases with .catch during unmount.

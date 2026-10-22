@@ -14,6 +14,7 @@ import { SnapshotProjector } from "./snapshot-projector.js";
 import { CollaborationGoalManager } from "./collaboration-goal-manager.js";
 import { ExtensionTasks, type ExtensionTaskOwner } from "./extension-tasks.js";
 import type { ExtensionCatalogDescriptor } from "./extension-catalog.js";
+import { ExtensionProjectPolicies, extensionProjectForTarget } from "./extension-project-policy.js";
 
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -33,7 +34,8 @@ async function fixture(options: { readonly edits?: boolean; readonly review?: Co
   const model = PI_LIKE_PROFILE.models[0]!, route = { backendId: adapter.id, providerId: model.providerId, modelId: model.modelId, fastMode: false };
   const teams = new CollaborationGoalManager({ store, sessionHost: host, readSettings: () => DEFAULT_COLLABORATION_SETTINGS,
     assertWorkerAdmission: lead => tasks.assertTeamWorkerCurrent(lead) });
-  const tasks = new ExtensionTasks({ store, host, catalog: { get: () => descriptor() }, defaults: { current: () => ({ ...route, effort: "" }) }, rootDirectory: join(root, "tasks"), redact: value => value, teams, reviewNativeTool: options.review });
+  const projects = new ExtensionProjectPolicies(store);
+  const tasks = new ExtensionTasks({ store, host, catalog: { get: () => descriptor() }, projects, defaults: { current: () => ({ ...route, effort: "" }) }, rootDirectory: join(root, "tasks"), redact: value => value, teams, reviewNativeTool: options.review });
   await teams.initialize();
   installation = tasks.installation(extensionId, "resource");
   host.setExtensionTaskQueueGuard(item => tasks.assertQueueCurrent(item));
@@ -41,8 +43,21 @@ async function fixture(options: { readonly edits?: boolean; readonly review?: Co
     assertCurrent: () => { if (!enabled || !installed || installation !== owner.installation) throw new Error("Retired source"); } };
   cleanups.push(async () => { await teams.close(); await host.dispose(); store.close(); await rm(root, { recursive: true, force: true }); });
   const request = (value: Record<string, unknown>) => tasks.request(owner, { type: "tasks-request", ...value });
-  return { root, store, host, teams, tasks, owner, extensionId, route, request, disable: () => { enabled = false; }, uninstall: () => { installed = false; }, reinstall: () => { installed = true; enabled = true; installation = tasks.installation(extensionId, "resource"); }, removeHidden: () => { hiddenAllowed = false; } };
+  return { root, store, host, teams, tasks, owner, extensionId, route, request, projects, descriptor, disable: () => { enabled = false; }, uninstall: () => { installed = false; }, reinstall: () => { installed = true; enabled = true; installation = tasks.installation(extensionId, "resource"); }, removeHidden: () => { hiddenAllowed = false; } };
 }
+it("checks project exceptions for new plugin tasks and subsequent access to an existing task", async () => {
+  const f = await fixture();
+  f.tasks.updatePreferences(f.extensionId, 0n, { model: f.route, targetId: "workspace", permissionMode: "ask" }, () => {});
+  const task = await f.request({ kind: "create", requestKey: "before-disable", title: "Existing task" }) as { taskId: string };
+  const project = extensionProjectForTarget(f.store.getTarget("workspace").descriptor);
+  f.projects.setEnabled(project.id, "connection", f.descriptor(), false, 0n);
+  const count = f.store.listSessions().length;
+  await expect(f.request({ kind: "get", taskId: task.taskId })).rejects.toThrow("disabled");
+  await expect(f.request({ kind: "create", requestKey: "after-disable", title: "Denied task" })).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+  expect(f.store.listSessions()).toHaveLength(count);
+  f.projects.setEnabled(project.id, "connection", f.descriptor(), true, f.projects.state(project.id, "connection").revision);
+  expect(await f.request({ kind: "get", taskId: task.taskId })).toMatchObject({ taskId: task.taskId });
+});
 it("adopts hidden ordinary Sessions atomically, dispatches one durable Run, and replays original input keys", async () => {
   const f = await fixture();
   const observed: boolean[] = [];

@@ -4,6 +4,7 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, join, relative, sep } from "node:path";
 import type { OperationalStore, QueueItemRecord, StoredSession, StoredRun } from "@joko/store";
 import type { ExtensionCatalogManager } from "./extension-catalog.js";
+import type { ExtensionProjectPolicies } from "./extension-project-policy.js";
 import type { SessionHost } from "./session-host.js";
 import type { AppDefaultModelCoordinator } from "./app-default-model.js";
 import type { CollaborationGoalManager } from "./collaboration-goal-manager.js";
@@ -94,6 +95,7 @@ export class ExtensionTasks {
   readonly #writeAttempts = new Map<string, { readonly extensionId: string; readonly taskId: string; readonly installation: string; readonly mode: "acceptEdits" | "auto"; pending: boolean }>();
   constructor(readonly options: { readonly store: OperationalStore; readonly host: SessionHost;
     readonly catalog: Pick<ExtensionCatalogManager, "get">; readonly defaults: Pick<AppDefaultModelCoordinator, "current">;
+    readonly projects?: Pick<ExtensionProjectPolicies, "enabledForTarget" | "assertEnabledForSession">;
     readonly rootDirectory: string; readonly redact: (text: string) => string; readonly teams?: CollaborationGoalManager;
     readonly reviewNativeTool?: (scope: ExtensionTaskReviewScope, request: NativeToolAuthorizationRequest, assertCurrent: () => void) => Promise<NativeToolAuthorizationDecision> }) {}
 
@@ -107,6 +109,7 @@ export class ExtensionTasks {
       this.#assert({ extensionId: receipt.extensionId, resourceId: receipt.resourceId, installation: receipt.installation, assertCurrent: () => {}, signal: new AbortController().signal });
       if (receipt.revoked) failure("PERMISSION_DENIED", "The original plugin task authorization was revoked.");
       const task = this.options.store.getSession(sessionId), lead = this.options.store.getSession(leadId), preferences = this.preferences(receipt.extensionId).config;
+      this.options.projects?.assertEnabledForSession(receipt.extensionId, sessionId);
       if (task.descriptor.archived || task.descriptor.deletedAt || lead.descriptor.archived || lead.descriptor.deletedAt
         || !permissionAllowed(task.descriptor.permissionMode, preferences.permissionMode)) failure("PERMISSION_DENIED", "The native task exceeds its current plugin permission policy.");
       const route = this.#route({ backendId: task.descriptor.backendId, providerId: task.descriptor.providerId, modelId: task.descriptor.modelId, effort: task.descriptor.effort, fastMode: task.descriptor.fastMode });
@@ -189,6 +192,7 @@ export class ExtensionTasks {
   }
   #assert(owner: ExtensionTaskOwner, hidden = false): void {
     owner.assertCurrent(); owner.signal.throwIfAborted();
+    if (owner.sourceSessionId) this.options.projects?.assertEnabledForSession(owner.extensionId, owner.sourceSessionId);
     const extension = this.options.catalog.get(owner.extensionId);
     const installation = this.options.store.findSetting<{ readonly active: boolean; readonly id: string }>("service", INSTALLATIONS, owner.resourceId)?.value;
     if (!extension.installed || !extension.enabled || extension.owner.kind !== "resource" || extension.owner.resourceId !== owner.resourceId
@@ -260,6 +264,7 @@ export class ExtensionTasks {
     this.#assert(owner); const receipt = this.#receipt(id), session = this.options.store.getSession(id);
     if (!receipt || receipt.version !== 1 || receipt.revoked || receipt.extensionId !== owner.extensionId || receipt.installation !== owner.installation
       || receipt.resourceId !== owner.resourceId || session.descriptor.remoteWorkspace || this.options.store.findCollaborationWorkerBySession(id)) failure("TASK_NOT_FOUND", "This plugin does not own that ordinary local task.");
+    this.options.projects?.assertEnabledForSession(owner.extensionId, id);
     return session;
   }
   #view(session: StoredSession) {
@@ -301,6 +306,7 @@ export class ExtensionTasks {
     if (!owner || owner.revoked || owner.installation !== receipt.installation || !installation?.active || installation.id !== receipt.installation || !extension.installed || !extension.enabled || !extension.runtime?.tasks
       || extension.owner.kind !== "resource" || extension.owner.resourceId !== receipt.resourceId || extension.permissions.some(p => p.required && !p.granted)) failure("PERMISSION_DENIED", "Plugin task authority was revoked before dispatch.");
     const preferences = this.preferences(receipt.extensionId).config, task = this.options.store.getSession(item.sessionId).descriptor;
+    this.options.projects?.assertEnabledForSession(receipt.extensionId, item.sessionId);
     if (task.planMode || !permissionAllowed(task.permissionMode, preferences.permissionMode)) failure("PERMISSION_DENIED", "The task exceeds the plugin permission policy.");
   }
   assertTeamWorkerCurrent(leadSessionId: string): void {
@@ -308,6 +314,7 @@ export class ExtensionTasks {
     if (!receipt) return;
     const extension = this.options.catalog.get(receipt.extensionId), installation = this.options.store.findSetting<{ readonly active: boolean; readonly id: string }>("service", INSTALLATIONS, receipt.resourceId)?.value;
     const task = this.options.store.getSession(leadSessionId).descriptor;
+    this.options.projects?.assertEnabledForSession(receipt.extensionId, leadSessionId);
     if (receipt.revoked || !installation?.active || installation.id !== receipt.installation || !extension.installed || !extension.enabled
       || !extension.runtime?.tasks || extension.permissions.some(value => value.required && !value.granted)
       || this.preferences(receipt.extensionId).config.permissionMode !== "auto" || task.permissionMode !== "auto" || task.planMode || task.archived || task.deletedAt) failure("PERMISSION_DENIED", "Plugin team authority changed before worker admission.");
@@ -430,7 +437,9 @@ export class ExtensionTasks {
             displayName: this.options.catalog.get(owner.extensionId).name, workspaceRoot, managed: true, trusted: true });
         }
         this.#target(targetId, route.backendId);
-        const current = () => { this.#assert(owner, hidden); this.#target(targetId!, route.backendId); if (stamp !== hash(this.preferences(owner.extensionId).config)) failure("STALE_REVISION", "Plugin task settings changed during creation."); this.#route(route); };
+        const current = () => { this.#assert(owner, hidden); this.#target(targetId!, route.backendId);
+          if (this.options.projects?.enabledForTarget(owner.extensionId, targetId!) === false) failure("PERMISSION_DENIED", "Plugin is disabled for this project.");
+          if (stamp !== hash(this.preferences(owner.extensionId).config)) failure("STALE_REVISION", "Plugin task settings changed during creation."); this.#route(route); };
         current();
         const receipt: TaskReceipt = { version: 1, extensionId: owner.extensionId, resourceId: owner.resourceId, installation: owner.installation, operationId, fingerprint };
         this.options.store.setSetting("service", TASKS, operationId, receipt);

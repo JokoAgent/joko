@@ -149,6 +149,7 @@ import {
   snapshotApprovedProjectResources,
   snapshotManagedRuntimeResources,
   type PiManagedRuntimeResourceSnapshot,
+  type PiManagedExtensionExclusion,
   type ProjectSkillCandidate
 } from "./resources.js";
 import { PiSessionStore, type PiExternalSessionSource } from "./session-store.js";
@@ -433,6 +434,7 @@ export interface PiAdapterOptions {
    * filesystem discovery is never used as a substitute.
    */
   readonly resolveTargetResources?: (context: AdapterContext) => PiManagedRuntimeResourceSnapshot | Promise<PiManagedRuntimeResourceSnapshot>;
+  readonly resolveProjectExtensionExclusions?: (context: AdapterContext) => readonly PiManagedExtensionExclusion[] | Promise<readonly PiManagedExtensionExclusion[]>;
   readonly resolveNativeSkills?: ApprovedSkillResolver;
   readonly resolveNativeSkillPolicy?: NativeSkillPolicyResolver;
   readonly mcpBridge?: PiMcpBridgeOptions;
@@ -4788,7 +4790,11 @@ export class PiBackendAdapter implements
       : undefined;
     const nativeSkillsEnabled = profile.runtimePolicy !== "review_read_only" && context.target.trusted
       && context.target.remoteWorkspace === undefined && options.resolveNativeSkills !== undefined;
-    const mergedResources = mergeManagedResourceSnapshots(managedResources, targetResources);
+    let mergedResources = mergeManagedResourceSnapshots(managedResources, targetResources);
+    if (profile.runtimePolicy !== "review_read_only") {
+      const excluded = await options.resolveProjectExtensionExclusions?.(context);
+      if (excluded?.length) mergedResources = { ...mergedResources, excludedExtensions: [...(mergedResources.excludedExtensions ?? []), ...excluded] };
+    }
     const [managedResourceSnapshot, projectResourceSnapshot] = profile.runtimePolicy === "review_read_only" ? [
       { extensionPaths: [], skillPaths: [], promptTemplatePaths: [], resources: [] },
       { skillPaths: [], resources: [] }
@@ -7953,7 +7959,9 @@ export function mergeManagedResourceSnapshots(
     skills: uniquePaths(target?.skills ?? [], global.skills),
     prompts: uniquePaths(target?.prompts ?? [], global.prompts),
     packages: uniquePaths(target?.packages ?? [], global.packages),
-    resources: [...resources.values()]
+    resources: [...resources.values()],
+    ...(global.excludedExtensions?.length || target?.excludedExtensions?.length
+      ? { excludedExtensions: [...(global.excludedExtensions ?? []), ...(target?.excludedExtensions ?? [])] } : {})
   };
 }
 

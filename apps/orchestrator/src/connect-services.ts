@@ -25,6 +25,7 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { workspaceMediaTypeForPath as mediaTypeForPath } from "./workspace-file-media.js";
 import { listProjectDirectories } from "./project-directory-browser.js";
+import type { ExtensionProjectPolicies, ExtensionProject } from "./extension-project-policy.js";
 import { inspectRemoteHostDirectory, validateRemoteHostDirectoryPath } from "./remote-host-directory-browser.js";
 import { fromBinary, toBinary } from "@bufbuild/protobuf";
 import { Code, ConnectError, type ConnectRouter, type HandlerContext, type ServiceImpl } from "@connectrpc/connect";
@@ -547,6 +548,7 @@ export interface ConnectServiceDependencies {
   readonly skillPublication?: SkillPublicationManager;
   readonly collaboration?: CollaborationManager;
   readonly extensionCatalog?: ExtensionCatalogManager;
+  readonly extensionProjects?: ExtensionProjectPolicies;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionPackagePublisher?: ExtensionPackagePublisher;
@@ -1290,6 +1292,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     ...(application.skillPublication === undefined ? {} : { skillPublication: application.skillPublication }),
     ...(application.collaboration === undefined ? {} : { collaboration: application.collaboration }),
     ...(application.extensionCatalog === undefined ? {} : { extensionCatalog: application.extensionCatalog }),
+    ...(application.extensionProjects === undefined ? {} : { extensionProjects: application.extensionProjects }),
     ...(application.extensionLibraries === undefined ? {} : { extensionLibraries: application.extensionLibraries }),
     ...(application.extensionMainViews === undefined ? {} : { extensionMainViews: application.extensionMainViews }),
     ...(application.extensionPackagePublisher === undefined ? {} : { extensionPackagePublisher: application.extensionPackagePublisher }),
@@ -4262,6 +4265,24 @@ export function createConnectServices(application: OrchestratorApplication, proj
   } satisfies ServiceImpl<typeof contract.ToolService>;
 
   const extension = {
+    listExtensionProjects: (_request, context) => {
+      authenticate(context);
+      if (!dependencies.extensionProjects) throw new ConnectError("Project plugin settings are unavailable.", Code.Unimplemented);
+      return { projects: dependencies.extensionProjects.list().map(mapExtensionProject) };
+    },
+    resolveExtensionProject: async (request, context) => {
+      const connection = authenticate(context);
+      if (!dependencies.extensionProjects) throw new ConnectError("Project plugin settings are unavailable.", Code.Unimplemented);
+      const project = await dependencies.extensionProjects.resolve(nonBlankRequest(request.path, "path"), connection.id, context.signal,
+        () => { dependencies.connections.fence(connection); });
+      return { project: mapExtensionProject(project) };
+    },
+    getExtensionProjectState: (request, context) => {
+      const connection = authenticate(context);
+      if (!dependencies.extensionProjects) throw new ConnectError("Project plugin settings are unavailable.", Code.Unimplemented);
+      const state = extensionCatalogAction(() => dependencies.extensionProjects!.state(nonBlankRequest(request.projectId, "project_id"), connection.id));
+      return { state: { project: mapExtensionProject(state.project), revision: toProtoRevision(state.revision), disabledExtensionIds: [...state.disabledExtensionIds] } };
+    },
     listExtensions: async (request, context) => {
       authenticate(context);
       if (dependencies.extensionCatalog === undefined) {
@@ -4277,9 +4298,15 @@ export function createConnectServices(application: OrchestratorApplication, proj
         : nonBlankRequest(request.sessionId, "session_id");
       const query = request.query.trim().toLocaleLowerCase("en-US");
       if (query.length > 256) throw invalidArgument("query exceeds the supported length");
-      const snapshot = await currentExtensionCatalog(dependencies, sessionId);
+      const snapshot = await currentExtensionCatalog(dependencies, sessionId, request.includeProjectDisabled || request.targetId !== undefined);
+      const targetId = request.targetId === undefined ? undefined : nonBlankRequest(request.targetId, "target_id");
+      if (targetId !== undefined && sessionId !== undefined && dependencies.store.getSession(sessionId).descriptor.targetId !== targetId) {
+        throw invalidArgument("Extension Session belongs to a different project.");
+      }
+      const scopedSnapshot = targetId === undefined || !dependencies.extensionProjects ? snapshot
+        : dependencies.extensionProjects.snapshot(snapshot, targetId);
       const source = request.source === undefined ? undefined : nativeExtensionSource(request.source);
-      const values = snapshot.entries
+      const values = scopedSnapshot.entries
         .filter((entry) => source === undefined || entry.source === source)
         .filter((entry) => request.installed === undefined || entry.installed === request.installed)
         .filter((entry) => query === "" || extensionSearchText(entry).includes(query))
@@ -4287,7 +4314,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const result = paginate(values, request.page);
       return {
         extensions: result.values,
-        catalogRevision: toProtoRevision(snapshot.revision),
+        catalogRevision: toProtoRevision(scopedSnapshot.revision),
         recoveredFromCorruption: snapshot.recoveredFromCorruption,
         page: result.page
       };
@@ -4301,9 +4328,15 @@ export function createConnectServices(application: OrchestratorApplication, proj
       const sessionId = request.sessionId === undefined
         ? undefined
         : nonBlankRequest(request.sessionId, "session_id");
-      const snapshot = await currentExtensionCatalog(dependencies, sessionId);
+      const snapshot = await currentExtensionCatalog(dependencies, sessionId, request.includeProjectDisabled);
       const entry = snapshot.entries.find((candidate) => candidate.id === extensionId);
-      if (entry === undefined) throw new ConnectError("Extension not found.", Code.NotFound);
+      if (entry === undefined) {
+        if (sessionId && dependencies.extensionProjects && !request.includeProjectDisabled
+          && !dependencies.extensionProjects.enabledForTarget(extensionId, dependencies.store.getSession(sessionId).descriptor.targetId)) {
+          throw new ConnectError("Plugin is disabled for this project.", Code.FailedPrecondition);
+        }
+        throw new ConnectError("Extension not found.", Code.NotFound);
+      }
       return {
         extension: mapExtensionCatalogEntry(entry),
         catalogRevision: toProtoRevision(snapshot.revision),
@@ -10655,7 +10688,8 @@ async function extensionPublisherEffect<T>(effect: () => Promise<T>): Promise<T>
 
 async function currentExtensionCatalog(
   dependencies: ConnectServiceDependencies,
-  sessionId?: string
+  sessionId?: string,
+  includeProjectDisabled = false
 ): Promise<NativeExtensionCatalogSnapshot> {
   await dependencies.extensionSources?.auditAvailability();
   const reconciled = reconcileExtensionCatalog(dependencies);
@@ -10670,7 +10704,16 @@ async function currentExtensionCatalog(
       ? { tools: (await dependencies.sessionHost.getRuntimeTools(sessionId)).tools }
       : {})
   };
-  return dependencies.extensionCatalog.snapshot(runtime);
+  const snapshot = dependencies.extensionCatalog.snapshot(runtime);
+  if (!dependencies.extensionProjects) return snapshot;
+  const scoped = dependencies.extensionProjects.snapshot(snapshot, session.descriptor.targetId);
+  if (!includeProjectDisabled) return scoped;
+  const available = new Set(scoped.entries.map(entry => entry.id));
+  return { ...snapshot, entries: snapshot.entries.map(entry => available.has(entry.id) ? entry : { ...entry, commands: [], useSupported: false }) };
+}
+
+function mapExtensionProject(project: ExtensionProject): contract.ExtensionProject {
+  return create(contract.ExtensionProjectSchema, { projectId: project.id, name: project.name, path: project.path });
 }
 
 function extensionSearchText(entry: NativeExtensionCatalogDescriptor): string {
@@ -21397,6 +21440,24 @@ async function dispatchMutation(
       if (payload.value.expectedRevision === undefined) throw invalidArgument("expected_revision is required");
       const expectedRevision = fromProtoRevision(payload.value.expectedRevision, "set_extension_enabled.expected_revision");
       const entry = requireExtensionMutation(dependencies, payload.value.extensionId, expectedRevision);
+      const project = payload.value.project;
+      if (project !== undefined) {
+        if (!dependencies.extensionProjects || !dependencies.piResources) throw new ConnectError("Project plugin settings are unavailable.", Code.Unimplemented);
+        const projectId = nonBlankRequest(project.projectId, "project.project_id");
+        if (!project.expectedRevision) throw invalidArgument("project.expected_revision is required");
+        const projectRevision = fromProtoRevision(project.expectedRevision, "project.expected_revision");
+        return presented(await host.mutate({ operationId, connection, kind: payload.case, body: mutation,
+          commit: () => extensionCatalogAction(() => {
+            const current = requireCurrentExtensionMutation(dependencies, entry.id, expectedRevision);
+            if (current.owner.kind !== "resource" || dependencies.piResources!.get(current.owner.resourceId).targetId !== undefined) {
+              throw new Error("Only globally installed plugins support project settings.");
+            }
+            dependencies.connections.fence(connection);
+            dependencies.extensionProjects!.setEnabled(projectId, connection.id, current, payload.value.enabled, projectRevision);
+            return { accepted: true, resultCase: "acknowledgement", entityId: current.id } satisfies OperationOutcome;
+          })
+        }));
+      }
       if (entry.owner.kind === "resource") {
         const resourceId = entry.owner.resourceId;
         if (dependencies.piResources === undefined) {

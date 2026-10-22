@@ -39,6 +39,42 @@ afterEach(async () => {
 });
 
 describe("Extension catalog interactions", () => {
+  it("uses the selected project's revision without changing global plugin availability", async () => {
+    const extension = readyExtension(), project = { id: "a".repeat(64), name: "Project A", path: "/projects/a" };
+    let state = { project, revision: 3n, disabledExtensionIds: [] as string[] };
+    const setExtensionEnabled = vi.fn(async (_id: string, enabled: boolean) => { state = { ...state, revision: 4n, disabledExtensionIds: enabled ? [] : [extension.id] }; });
+    const { container } = await renderExtensions({ extension, resources: [managedResource("resource-1")], controller: {
+      listExtensions: vi.fn(async () => catalog(extension)), getExtension: vi.fn(async () => catalog(extension)),
+      listExtensionProjects: vi.fn(async () => [project]), getExtensionProjectState: vi.fn(async () => state), setExtensionEnabled
+    } });
+    await settleMany();
+    const select = [...container.querySelectorAll<HTMLSelectElement>("select")].find(select => [...select.options].some(option => option.value === project.id))!;
+    await act(async () => { select.value = project.id; select.dispatchEvent(new Event("change", { bubbles: true })); }); await settleMany();
+    const checkbox = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find(input => input.closest("label")?.textContent?.includes("Available in this project"))!;
+    expect(checkbox.checked).toBe(true);
+    await act(async () => checkbox.click()); await settleMany();
+    expect(setExtensionEnabled).toHaveBeenCalledWith(extension.id, false, extension.revision, { project, revision: 3n, disabledExtensionIds: [] });
+    expect(checkbox.checked).toBe(false);
+    expect(buttonWithText(container, "Use").disabled).toBe(true);
+    await act(async () => { select.value = "global"; select.dispatchEvent(new Event("change", { bubbles: true })); }); await settleMany();
+    const global = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find(input => input.closest("label")?.textContent?.includes("Make this extension available"))!;
+    expect(global.checked).toBe(true);
+  });
+
+  it("keeps a failed project selected and blocks its toggle instead of writing globally", async () => {
+    const extension = readyExtension(), project = { id: "b".repeat(64), name: "Project B", path: "/projects/b" };
+    const setExtensionEnabled = vi.fn();
+    const { container } = await renderExtensions({ extension, resources: [managedResource("resource-1")], controller: {
+      listExtensions: vi.fn(async () => catalog(extension)), getExtension: vi.fn(async () => catalog(extension)), listExtensionProjects: vi.fn(async () => [project]),
+      getExtensionProjectState: vi.fn(async () => { throw new Error("Project settings unavailable"); }), setExtensionEnabled
+    } });
+    await settleMany();
+    const select = [...container.querySelectorAll<HTMLSelectElement>("select")].find(select => [...select.options].some(option => option.value === project.id))!;
+    await act(async () => { select.value = project.id; select.dispatchEvent(new Event("change", { bubbles: true })); }); await settleMany();
+    expect(select.value).toBe(project.id); expect(container.textContent).toContain("Project settings unavailable");
+    const checkbox = [...container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find(input => input.closest("label")?.textContent?.includes("Available in this project"))!;
+    expect(checkbox.disabled).toBe(true); expect(setExtensionEnabled).not.toHaveBeenCalled();
+  });
   it("opens the built-in creator in the retained ordinary task draft without inventing a model", async () => {
     const original: NewSessionLocalDraft = { selection: { kind: "unselected" }, nativeStart: { kind: "fresh" },
       providerId: "", modelId: "", fastMode: false, permissionMode: "ask", planMode: false,
@@ -130,7 +166,7 @@ describe("Extension catalog interactions", () => {
     });
 
     expect(listExtensions).toHaveBeenCalledWith(expect.objectContaining({ installed: true, sessionId: "runtime-session" }));
-    expect(getExtension).toHaveBeenCalledWith(extension.id, "runtime-session", expect.any(AbortSignal));
+    expect(getExtension).toHaveBeenCalledWith(extension.id, "runtime-session", expect.any(AbortSignal), true);
     await act(async () => buttonWithText(container, "Use").click());
     await settle();
 

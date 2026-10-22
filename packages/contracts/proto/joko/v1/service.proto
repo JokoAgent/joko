@@ -442,6 +442,9 @@ service WorktreeService {
 }
 
 service ExtensionService {
+  rpc ListExtensionProjects(ListExtensionProjectsRequest) returns (ListExtensionProjectsResponse);
+  rpc ResolveExtensionProject(ResolveExtensionProjectRequest) returns (ResolveExtensionProjectResponse);
+  rpc GetExtensionProjectState(GetExtensionProjectStateRequest) returns (GetExtensionProjectStateResponse);
   rpc ListExtensions(ListExtensionsRequest) returns (ListExtensionsResponse);
   rpc GetExtension(GetExtensionRequest) returns (GetExtensionResponse);
   rpc GetExtensionSourceGitPreflight(GetExtensionSourceGitPreflightRequest) returns (GetExtensionSourceGitPreflightResponse);
@@ -2430,7 +2433,16 @@ message ListExtensionsRequest {
   string query = 3;
   optional string session_id = 4;
   PageRequest page = 5;
+  optional string target_id = 6;
+  bool include_project_disabled = 7;
 }
+
+message ListExtensionProjectsRequest {}
+message ListExtensionProjectsResponse { repeated ExtensionProject projects = 1; }
+message ResolveExtensionProjectRequest { string path = 1; }
+message ResolveExtensionProjectResponse { ExtensionProject project = 1; }
+message GetExtensionProjectStateRequest { string project_id = 1; }
+message GetExtensionProjectStateResponse { ExtensionProjectState state = 1; }
 
 message ListExtensionsResponse {
   repeated ExtensionCatalogEntry extensions = 1;
@@ -2442,6 +2454,7 @@ message ListExtensionsResponse {
 message GetExtensionRequest {
   string extension_id = 1;
   optional string session_id = 2;
+  bool include_project_disabled = 3;
 }
 
 message GetExtensionResponse {

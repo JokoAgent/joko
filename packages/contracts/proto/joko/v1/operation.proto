@@ -365,6 +365,7 @@ message SetExtensionEnabledMutation {
   string extension_id = 1;
   bool enabled = 2;
   Revision expected_revision = 3;
+  ExtensionProjectPolicyMutation project = 4;
 }
 
 message AddExtensionSourceMutation {

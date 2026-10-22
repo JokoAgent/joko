@@ -128,6 +128,7 @@ import { DocumentToolBridgeProvider } from "./document-tool-provider.js";
 import { ChromiumDocumentPdfRenderer } from "./document-pdf-renderer.js";
 import { ElectronDocumentPdfRenderer } from "./document-electron-pdf-renderer.js";
 import { ExtensionCatalogManager } from "./extension-catalog.js";
+import { ExtensionProjectPolicies } from "./extension-project-policy.js";
 import { ExtensionLibraryManager } from "./extension-library-manager.js";
 import { ExtensionMainViewManager } from "./extension-main-view-manager.js";
 import { ExtensionPackagePublisher } from "./extension-package-publisher.js";
@@ -494,6 +495,7 @@ export interface OrchestratorApplication {
   readonly partnerSessionTasks?: PartnerSessionTaskManager;
   readonly partnerTaskOutputs?: PartnerTaskOutputProjection;
   readonly extensionCatalog?: ExtensionCatalogManager;
+  readonly extensionProjects?: ExtensionProjectPolicies;
   readonly extensionLibraries?: ExtensionLibraryManager;
   readonly extensionMainViews?: ExtensionMainViewManager;
   readonly extensionCards?: ExtensionCardsManager;
@@ -1015,6 +1017,7 @@ export async function createOrchestratorApplication(
   const extensionCatalog = new ExtensionCatalogManager({ store, credentials });
   extensionCatalog.initialize();
   extensionCatalog.reconcile(piResources.list(), mcpRouter.list(), extensionSources.snapshot().sources);
+  const extensionProjects = new ExtensionProjectPolicies(store);
   const extensionConnections = new ExtensionNetworkConnections({ store, credentials });
   const extensionNetwork = new ExtensionNetworkSettings({ catalog: extensionCatalog, connections: extensionConnections, credentials });
   await extensionNetwork.initialize();
@@ -1211,6 +1214,7 @@ export async function createOrchestratorApplication(
       providers.list(piBackendId),
       (providerId) => providerRoutingEnabled(store, piBackendId, providerId)
     );
+    const globalExtensionEntries = extensionCatalog.snapshot().entries;
     const bridgeGeneration = createTargetAwarePiBridgeGeneration(
       mcpRouter,
       bridgeEndpoint,
@@ -1275,6 +1279,7 @@ export async function createOrchestratorApplication(
     hostToolCapabilities,
     managedResources: resourceSnapshot,
     resolveTargetResources: (context) => piResources.targetRuntimeSnapshot("pi", privateResourceTarget(context) ?? context.target.id),
+    resolveProjectExtensionExclusions: (context) => extensionProjects.excludedNativeEntries(globalExtensionEntries, resourceSnapshot.resources, context.target.id),
     resolveNativeSkills: (context, signal) => piResources.runtimeSkillSnapshot(piBackendId, context.target.id, signal, partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id), context),
     resolveNativeSkillPolicy: context => partnerConnections?.nativeSkillPolicy(context),
     resolveMakerMemoryPrompt: (context) => makerMemory.runtimePrompt(context.target.id),
@@ -2196,7 +2201,7 @@ export async function createOrchestratorApplication(
   let extensionCardRuntime: ExtensionCardRuntime | undefined;
   let extensionOAuthCards: ExtensionOAuthCards | undefined;
   let extensionText: ExtensionText | undefined;
-  const extensionTasks = new ExtensionTasks({ store, host: sessionHost, catalog: extensionCatalog,
+  const extensionTasks = new ExtensionTasks({ store, host: sessionHost, catalog: extensionCatalog, projects: extensionProjects,
     defaults: { current: () => appDefaultModels?.current() }, rootDirectory: join(config.dataDirectory, "extension-tasks"), redact: value => credentials.redactText(value), teams: collaborationGoals,
     reviewNativeTool: createExtensionTaskNativeReviewer({ store, routes: modelRoutes, redact: value => credentials.redactText(value),
       adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter ? [adapter] : []; }) }) });
@@ -2206,6 +2211,7 @@ export async function createOrchestratorApplication(
   piResources.setExtensionTaskRemoval((transaction, resourceId) => extensionTasks.uninstall(transaction, resourceId));
   const extensionCardMedia = new ExtensionCardMedia({ store, vault: credentialVault, artifacts, transfers: blobTransfers });
   const extensionCards = new ExtensionCardsManager({ store, vault: credentialVault,
+    assertProject: (extensionId, sessionId) => extensionProjects.assertEnabledForSession(extensionId, sessionId),
     media: extensionCardMedia,
     oauthCards: () => extensionOAuthCards,
     authority: id => extensionCardRuntime?.authority(id), redact: value => credentials.redactText(value),
@@ -2218,7 +2224,7 @@ export async function createOrchestratorApplication(
   extensionOAuthCards = new ExtensionOAuthCards({ cards: extensionCards, settings: extensionOAuth, accounts: extensionOAuthAccounts, store, catalog: extensionCatalog,
     authority: id => extensionCardRuntime?.authority(id), locale: () => persistedLocale(store),
     continueTask: (scope, text, guard) => sessionHost.enqueueExtensionCardMessage(scope.sessionId, scope.extensionId, text, guard) });
-  extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store,
+  extensionCardRuntime = new ExtensionCardRuntime({ catalog: extensionCatalog, resources: piResources, store, projects: extensionProjects,
     vault: credentialVault, surfaces: extensionMainViews, cards: extensionCards, tasks: extensionTasks, text: { oneshot: (...args) => extensionText!.oneshot(...args) }, media: extensionCardMedia, oauthCards: extensionOAuthCards, workspaces, extraDirectories: sessionHost.extraDirectories, remoteFiles: (binding, signal) => remoteExecution.files(binding, signal), connections: extensionConnections, oauth: extensionOAuthAccounts,
     registerProvider: provider => mcpRouter.registerBridgeToolProvider(provider), redact: value => credentials.redactText(value),
     locale: () => persistedLocale(store),
@@ -3127,6 +3133,7 @@ export async function createOrchestratorApplication(
     partnerSessionTasks,
     partnerTaskOutputs,
     extensionCatalog,
+    extensionProjects,
     extensionLibraries,
     extensionMainViews,
     extensionCards,
