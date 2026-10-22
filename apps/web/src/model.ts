@@ -5913,125 +5913,22 @@ export interface ArtifactDownloadContext {
 /** Browser dispatch does not acknowledge that a file reached the user's disk. */
 export type ArtifactDownloadOutcome = "saved" | "dispatched" | "cancelled";
 
-export interface SimulatorViewerRouteView {
-  readonly instanceId: string;
-  readonly generation: bigint;
-  readonly leaseId: string;
-}
 
-export interface SimulatorViewerDeviceView {
-  readonly udid: string;
-  readonly name: string;
-  readonly state: string;
-  readonly runtimeIdentifier: string;
-  readonly runtimeName: string;
-  readonly deviceTypeIdentifier: string;
-  readonly available: boolean;
-}
 
-export interface SimulatorViewerInstanceView {
-  readonly route: SimulatorViewerRouteView;
-  readonly simulatorUdid: string;
-  readonly simulatorName: string;
-  readonly runtimeIdentifier: string;
-  readonly deviceTypeIdentifier: string;
-  readonly creationProvenance: "joko" | "external";
-  readonly lifecycleState: "stopped" | "ready" | "error";
-  readonly viewerState: "detached" | "attached";
-  readonly healthState: string;
-  readonly errorCode?: string;
-  readonly graceExpiresAtMs?: number;
-  readonly mutation: SimulatorViewerMutationStateView;
-}
 
-export type SimulatorViewerMutationSourceView = "agent" | "user";
 
-export interface SimulatorViewerMutationStateView {
-  readonly instanceId: string;
-  readonly activeSource: SimulatorViewerMutationSourceView | null;
-  readonly lastSource: SimulatorViewerMutationSourceView | null;
-  readonly queuedAgentMutations: number;
-  readonly agentPaused: boolean;
-  readonly takeoverPending: boolean;
-}
 
-export interface SimulatorViewerStateView {
-  readonly support: "supported" | "platformLimited" | "temporarilyUnavailable" | "unavailable";
-  readonly reasonCode?: string;
-  readonly devices: readonly SimulatorViewerDeviceView[];
-  readonly instances: readonly SimulatorViewerInstanceView[];
-}
 
-export type SimulatorViewerControlView =
-  | { readonly action: "create"; readonly templateUdid: string; readonly name: string }
-  | { readonly action: "attach"; readonly deviceUdid: string }
-  | { readonly action: "start" | "stop" | "detach" | "delete"; readonly route: SimulatorViewerRouteView };
 
-export interface SimulatorViewerControlResultView {
-  readonly instance: SimulatorViewerInstanceView;
-  readonly deleted: boolean;
-  readonly replayed: boolean;
-}
 
-export type SimulatorViewerInputView =
-  | { readonly action: "tap"; readonly xRatio: number; readonly yRatio: number }
-  | { readonly action: "swipe"; readonly startXRatio: number; readonly startYRatio: number;
-      readonly endXRatio: number; readonly endYRatio: number; readonly durationMs: number }
-  | { readonly action: "typeText"; readonly text: string };
 
-export interface SimulatorViewerInputResultView {
-  readonly replayed: boolean;
-}
 
-export interface SimulatorViewerTouchView {
-  readonly gestureId: string;
-  readonly sequence: number;
-  readonly phase: "begin" | "move" | "end" | "cancel";
-  readonly xRatio: number;
-  readonly yRatio: number;
-}
 
-export interface SimulatorViewerControlsView {
-  readonly viewportWidth: number;
-  readonly viewportHeight: number;
-  readonly orientation: "PORTRAIT" | "LANDSCAPE";
-  readonly nativeTouchAvailable: boolean;
-  readonly multiTouchAvailable: boolean;
-}
 
-export type SimulatorViewerCommandView =
-  | { readonly action: "home" | "lock" | "unlock" | "copyScreenshot" }
-  | { readonly action: "rotate"; readonly orientation: "PORTRAIT" | "LANDSCAPE" };
 
-export interface SimulatorViewerCommandResultView {
-  readonly replayed: boolean;
-  readonly screenshotBlobId?: string;
-}
 
-export type SimulatorViewerFrameEventView =
-  | { readonly kind: "connecting" | "reconnecting" | "disconnected";
-    readonly attempt: number; readonly nativeRoute: SimulatorViewerNativeRouteView }
-  | { readonly kind: "frame"; readonly sequence: bigint; readonly receivedAtMs: number;
-    readonly jpeg: Uint8Array; readonly nativeRoute: SimulatorViewerNativeRouteView }
-  | { readonly kind: "h264"; readonly sequence: bigint; readonly receivedAtMs: number;
-    readonly h264: Uint8Array; readonly width: number; readonly height: number;
-    readonly timestampMicros: number; readonly keyFrame: boolean;
-    readonly format: "annex-b"; readonly nativeRoute: SimulatorViewerNativeRouteView };
 
-export type SimulatorViewerNativeRouteView = "inactive" | "active" |
-  "fallbackUnavailable" | "fallbackLost" | "fallbackDecode";
 
-export interface SimulatorViewerVideoPreferenceView {
-  readonly subscriptionId: string;
-  readonly preferNativeH264: boolean;
-  readonly framesPerSecond: number;
-  readonly scalingPercent: number;
-  readonly orientation: "PORTRAIT" | "LANDSCAPE";
-  readonly mjpegFramesPerSecond: number;
-  readonly jpegQuality: number;
-  readonly mjpegScalingPercent: number;
-  readonly clientFallbackReason?: "decode_failed";
-}
 
 export interface McpAppApi {
   operate(request: import("@bufbuild/protobuf").MessageInitShape<typeof import("@joko/contracts").McpAppServiceOperateRequestSchema>, signal?: AbortSignal): Promise<import("@joko/contracts").McpAppServiceOperateResponse>;
@@ -6062,25 +5959,6 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   extensionNetworkApi(): ExtensionNetworkApi | undefined;
   extensionOAuthApi(): ExtensionOAuthApi | undefined;
   extensionTaskApi?(): ExtensionTaskApi | undefined;
-  getSimulatorViewerState(sessionId: string, signal?: AbortSignal): Promise<SimulatorViewerStateView>;
-  controlSimulatorInstance(sessionId: string, requestId: string, input: SimulatorViewerControlView, signal?: AbortSignal): Promise<SimulatorViewerControlResultView>;
-  controlSimulatorViewerInput(sessionId: string, requestId: string, route: SimulatorViewerRouteView,
-    input: SimulatorViewerInputView, signal?: AbortSignal): Promise<SimulatorViewerInputResultView>;
-  controlSimulatorViewerTouch(sessionId: string, route: SimulatorViewerRouteView,
-    touch: SimulatorViewerTouchView, signal?: AbortSignal): Promise<{ readonly accepted: boolean }>;
-  setSimulatorViewerInteractionProfile(sessionId: string, route: SimulatorViewerRouteView,
-    subscriptionId: string, active: boolean, signal?: AbortSignal): Promise<{ readonly applied: boolean }>;
-  getSimulatorViewerMutationState(sessionId: string, route: SimulatorViewerRouteView,
-    signal?: AbortSignal): Promise<SimulatorViewerMutationStateView>;
-  setSimulatorViewerMutationControl(sessionId: string, route: SimulatorViewerRouteView,
-    agentPaused: boolean, signal?: AbortSignal): Promise<SimulatorViewerMutationStateView>;
-  getSimulatorViewerControls(sessionId: string, route: SimulatorViewerRouteView,
-    signal?: AbortSignal): Promise<SimulatorViewerControlsView>;
-  controlSimulatorViewerCommand(sessionId: string, requestId: string, route: SimulatorViewerRouteView,
-    command: SimulatorViewerCommandView, signal?: AbortSignal): Promise<SimulatorViewerCommandResultView>;
-  watchSimulatorFrames(sessionId: string, route: SimulatorViewerRouteView,
-    signal?: AbortSignal,
-    preference?: SimulatorViewerVideoPreferenceView): AsyncIterable<SimulatorViewerFrameEventView>;
   getTerminalCapabilities(sessionId?: string, signal?: AbortSignal): Promise<TerminalCapabilitiesView>;
   listTerminals(sessionId: string, signal?: AbortSignal): Promise<readonly TerminalView[]>;
   createTerminal(sessionId: string, requestId: string, shellId: string, columns: number, rows: number, initialPalette: TerminalPaletteView, signal?: AbortSignal): Promise<TerminalView>;

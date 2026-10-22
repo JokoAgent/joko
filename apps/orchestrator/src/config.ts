@@ -3,7 +3,6 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPrivateLanDiscoveryHost } from "@joko/contracts";
-import { WDA_SOURCE_PIN } from "@joko/tool-ios-simulator";
 import { discoverBrowserExecutable } from "./browser-executable.js";
 import { discoverCodexExecutable } from "./codex-executable.js";
 
@@ -41,8 +40,6 @@ export interface OrchestratorConfig {
     readonly headless: boolean;
   };
   readonly pdfRendererHost?: { readonly executablePath: string; readonly appPath?: string };
-  readonly iosSimulatorDriver?: { readonly archivePath: string; readonly cacheRoot: string;
-    readonly nativeHidPath?: string; readonly nativeH264Path?: string };
   readonly mobilePush?: {
     readonly apns: {
       readonly teamId: string;
@@ -125,11 +122,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
   if (personalDevelopmentCommandHostPath !== undefined && !isAbsolute(personalDevelopmentCommandHostPath)) {
     throw new Error("JOKO_PERSONAL_DEVELOPMENT_COMMAND_HOST must be absolute.");
   }
-  const simulatorResources = environment.JOKO_DESKTOP_RESOURCES_PATH;
-  if (simulatorResources !== undefined && (!isAbsolute(simulatorResources) || !existsSync(simulatorResources)
-    || !lstatSync(simulatorResources).isDirectory() || lstatSync(simulatorResources).isSymbolicLink())) {
-    throw new Error("JOKO_DESKTOP_RESOURCES_PATH must be an existing absolute directory.");
-  }
   const mobilePush = readMobilePushConfig(environment);
   const remoteDesktopIce = readRemoteDesktopIceConfig(environment, workspaceRoot);
   const devicePeerAgent = readDevicePeerAgentConfig(environment, dataDirectory, allowInsecureLan);
@@ -176,12 +168,6 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): Orches
         }),
     ...(pdfHostExecutable === undefined ? {} : { pdfRendererHost: {
       executablePath: pdfHostExecutable, ...(pdfHostApp === undefined ? {} : { appPath: pdfHostApp })
-    } }),
-    ...(simulatorResources === undefined ? {} : { iosSimulatorDriver: {
-      archivePath: join(simulatorResources, "ios-simulator", WDA_SOURCE_PIN.archiveFileName),
-      cacheRoot: join(dataDirectory, "ios-simulator", "driver-cache"),
-      nativeHidPath: join(simulatorResources, "native-simulator-hid", "joko-simulator-hid"),
-      nativeH264Path: join(simulatorResources, "native-simulator-h264", "joko-simulator-h264")
     } }),
     ...(mobilePush === undefined ? {} : { mobilePush }),
     ...(remoteDesktopIce === undefined ? {} : { remoteDesktopIce }),

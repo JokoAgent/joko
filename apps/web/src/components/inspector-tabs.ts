@@ -1,4 +1,4 @@
-export const INSPECTOR_TAB_KINDS = ["context", "branches", "files", "changes", "background", "subagents", "shell", "terminal", "simulator", "tools", "browser", "workbench"] as const;
+export const INSPECTOR_TAB_KINDS = ["context", "branches", "files", "changes", "background", "subagents", "shell", "terminal", "tools", "browser", "workbench"] as const;
 
 export type InspectorTabKind = (typeof INSPECTOR_TAB_KINDS)[number];
 

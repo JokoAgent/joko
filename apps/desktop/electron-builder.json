@@ -46,15 +46,6 @@
   ],
   "extraResources": [
     {
-      "from": "resources/ios-simulator",
-      "to": "ios-simulator",
-      "filter": [
-        "manifest.json",
-        "LICENSE.appium-webdriveragent",
-        "WebDriverAgent-v15.1.6.tar.gz"
-      ]
-    },
-    {
       "from": "resources/app-update.yml",
       "to": "app-update.yml"
     },
@@ -124,22 +115,6 @@
         "linux-credentials/requirements.txt",
         "joko-hyprland-privacy.so",
         "joko-hyprland-privacy.json"
-      ]
-    },
-    {
-      "from": "dist/native-simulator-hid",
-      "to": "native-simulator-hid",
-      "filter": [
-        "manifest.json",
-        "joko-simulator-hid"
-      ]
-    },
-    {
-      "from": "dist/native-simulator-h264",
-      "to": "native-simulator-h264",
-      "filter": [
-        "manifest.json",
-        "joko-simulator-h264"
       ]
     },
     {

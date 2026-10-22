@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, describe, expect, it } from "vitest";
-import { WDA_SOURCE_PIN } from "@joko/tool-ios-simulator";
 
 import { loadConfig } from "./config.js";
 
@@ -14,10 +13,8 @@ const dataDirectory = join(fixtureRoot, "orchestrator-data");
 const sourceRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const explicitCodexExecutable = join(fixtureRoot, "codex.exe");
 const apnsPrivateKey = join(fixtureRoot, "AuthKey_TEST123456.p8");
-const desktopResources = join(fixtureRoot, "desktop-resources");
 const devicePeerAuthKey = join(fixtureRoot, "device-peer-auth-key");
 mkdirSync(workspaceRoot, { recursive: true });
-mkdirSync(desktopResources, { recursive: true });
 writeFileSync(explicitCodexExecutable, "", { flag: "wx" });
 writeFileSync(apnsPrivateKey, "private-key-fixture", { flag: "wx" });
 writeFileSync(devicePeerAuthKey, `${"A".repeat(43)}\n`, { flag: "wx", mode: 0o600 });
@@ -153,16 +150,6 @@ describe("Orchestrator network configuration", () => {
     expect(() => loadConfig({ ...base, JOKO_DOCUMENT_PDF_ELECTRON_EXECUTABLE: "relative/helper" })).toThrow();
   });
 
-  it("derives the pinned Simulator driver asset from the managed Desktop resource root", () => {
-    expect(loadConfig(base).iosSimulatorDriver).toBeUndefined();
-    expect(loadConfig({ ...base, JOKO_DESKTOP_RESOURCES_PATH: desktopResources }).iosSimulatorDriver)
-      .toEqual({ archivePath: join(desktopResources, "ios-simulator", WDA_SOURCE_PIN.archiveFileName),
-        cacheRoot: join(dataDirectory, "ios-simulator", "driver-cache"),
-        nativeHidPath: join(desktopResources, "native-simulator-hid", "joko-simulator-hid"),
-        nativeH264Path: join(desktopResources, "native-simulator-h264", "joko-simulator-h264") });
-    expect(() => loadConfig({ ...base, JOKO_DESKTOP_RESOURCES_PATH: "relative/resources" })).toThrow();
-    expect(() => loadConfig({ ...base, JOKO_DESKTOP_RESOURCES_PATH: join(fixtureRoot, "absent") })).toThrow();
-  });
 
   it("enables APNs only from one complete bounded credential configuration", () => {
     expect(loadConfig(base).mobilePush).toBeUndefined();
