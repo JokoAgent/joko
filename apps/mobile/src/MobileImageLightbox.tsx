@@ -580,11 +580,12 @@ export function MobileImageLightbox({
   const drawingReady = session !== undefined && decodedFor === loadKey && decoded !== undefined && natural.width > 0 && natural.height > 0
     && container.width > 0 && container.height > 0;
   const gallerySession = gallery ? session : undefined;
+  const readOnly = gallerySession?.readOnly === true;
   const originalOnly = session?.originalOnly === true || session?.animated === true || gallerySession?.expectedAnimated === true
     || mobileImageOutputMediaType(sourceMediaType) === undefined;
-  const canAnnotate = annotatable && session?.originalOnly !== true && session?.animated !== true
+  const canAnnotate = !readOnly && annotatable && session?.originalOnly !== true && session?.animated !== true
     && gallerySession?.expectedAnimated !== true && decoded?.isAnimated !== true;
-  const outputReady = drawingReady && !originalOnly && decoded?.isAnimated === false
+  const outputReady = !readOnly && drawingReady && !originalOnly && decoded?.isAnimated === false
     && mobileImageOutputMediaType(sourceMediaType) !== undefined;
   useEffect(() => {
     if (!gallery || !session || gallery.busy || decodedFor === loadKey) return;
@@ -755,7 +756,7 @@ export function MobileImageLightbox({
   const output = async (action: MobileImageOutputAction): Promise<void> => {
     const exactDecoded = decodedRef.current;
     const originalShare = action === "share" && originalOnly && gallery?.onShareOriginal;
-    if (!session || (!originalShare && (!onOutputAction || !outputReady)) || saveControllerRef.current || !exactDecoded
+    if (readOnly || !session || (!originalShare && (!onOutputAction || !outputReady)) || saveControllerRef.current || !exactDecoded
       || !drawingReady || gallery?.busy) return;
     cancelGesture();
     const controller = new AbortController();
@@ -954,11 +955,11 @@ export function MobileImageLightbox({
           onPress={() => { cancelGesture(); gallery.onRetry(); }} disabled={busy || gallery.busy} />}
         {gallery?.copySourceLabel && gallery.onCopySource && <ToolButton label={gallery.copySourceLabel}
           onPress={() => void copySource()} disabled={interactionBusy} />}
-        {onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "copy" ? "image.copying" : "image.copy")}
+        {!readOnly && onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "copy" ? "image.copying" : "image.copy")}
           onPress={() => void output("copy")} disabled={interactionBusy || !outputReady} />}
-        {onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "save" ? "image.saving" : "image.save")}
+        {!readOnly && onOutputAction && !originalOnly && <ToolButton label={mobileMessage(locale, outputAction === "save" ? "image.saving" : "image.save")}
           onPress={() => void output("save")} disabled={interactionBusy || !outputReady} />}
-        {(originalOnly ? gallery?.onShareOriginal : onOutputAction) && <ToolButton label={mobileMessage(locale, outputAction === "share" ? "image.sharing" : "image.share")}
+        {!readOnly && (originalOnly ? gallery?.onShareOriginal : onOutputAction) && <ToolButton label={mobileMessage(locale, outputAction === "share" ? "image.sharing" : "image.share")}
           onPress={() => void output("share")} disabled={interactionBusy || !(originalOnly ? drawingReady : outputReady)} />}
         <ToolButton label={mobileMessage(locale, "image.zoomOut")} onPress={() => zoom(-0.5)}
           disabled={interactionBusy || transform.scale <= MOBILE_LIGHTBOX_MIN_SCALE} />

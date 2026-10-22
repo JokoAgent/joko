@@ -603,6 +603,7 @@ interface MobileComposerImageEditLease {
 }
 
 interface MobileImageGalleryLease {
+  readonly cachedOnly?: true;
   previewLeaseIds?: Set<string>;
   readonly leaseId: string;
   readonly profileId: string;
@@ -3492,7 +3493,7 @@ export class MobileClient {
     }
     this.#markdownResources.retireStale();
     this.#fileHtmlResources.retireStale();
-    this.#timelineImages.retainOwner(this.#taskAuthorityKey());
+    this.#timelineImages.retainOwner(this.#taskAuthorityKey(true));
     this.#timelineImages.retireStale();
     this.#filesThumbnails.retainOwner(next.files.open ? this.filesAuthorityKey() : undefined);
     this.#filesThumbnails.retireStale();
@@ -4006,7 +4007,8 @@ export class MobileClient {
 
   async #clearOfflineCache(profileId: string): Promise<string | undefined> {
     try {
-      const results = await Promise.allSettled([this.offlineCache?.clear(profileId), this.readOnlyDictionaryCache?.clear(profileId)]);
+      const results = await Promise.allSettled([this.offlineCache?.clear(profileId), this.readOnlyDictionaryCache?.clear(profileId),
+        this.ownerNetwork.clearMediaCache?.(profileId)]);
       const failed = results.find((result) => result.status === "rejected");
       if (failed?.status === "rejected") throw failed.reason;
       return undefined;
@@ -7717,15 +7719,17 @@ export class MobileClient {
   assertFilesHtmlResourcesCurrent(leaseId: string): void { this.#fileHtmlResources.assertCurrent(leaseId); }
   releaseFilesHtmlResources(leaseId: string): void { this.#fileHtmlResources.release(leaseId); }
 
-  timelineImagePreviewOwnerKey(): string | undefined { return this.#taskAuthorityKey(); }
+  timelineImagePreviewOwnerKey(): string | undefined { return this.#taskAuthorityKey(true); }
 
   async prepareTimelineImagePreview(eventId: string, pageId: string, signal: AbortSignal): Promise<MobileTimelineImagePreview> {
     signal.throwIfAborted();
-    const credential = this.#ready(); const ownerKey = this.#taskAuthorityKey(); const sessionId = this.#state.selectedId;
-    if (!ownerKey || !sessionId) throw new Error("The inline image has no current task owner.");
+    const credential = this.#credential; const ownerKey = this.#taskAuthorityKey(true); const sessionId = this.#state.selectedId;
+    const offline = this.#state.status !== "connected";
+    const profile = credential ?? (offline ? this.#profiles.find((item) => item.profileId === this.#activeProfileId) : undefined);
+    if (!profile || !ownerKey || !sessionId || (!offline && !credential)) throw new Error("The inline image has no current task owner.");
     const currentPage = (events: readonly Event[]): MobileImageGalleryPage | undefined => {
       const sources = events.filter((event) => event.eventId === eventId && event.identity?.sessionId === sessionId
-        && event.cursor?.generation === this.#taskGeneration());
+        && event.cursor?.generation === (offline ? this.#state.detail?.generation : this.#taskGeneration()));
       return sources.length === 1 ? timelineGalleryPagesForSelection(events, eventId, pageId).find((page) => page.pageId === pageId) : undefined;
     };
     const page = currentPage(this.#timelineEvents());
@@ -7733,22 +7737,32 @@ export class MobileClient {
     const assertCurrent = (currentSignal?: AbortSignal) => {
       currentSignal?.throwIfAborted();
       const current = currentPage(this.#timelineEvents());
-      if (this.#disposed || this.#credential !== credential || this.#taskAuthorityKey() !== ownerKey
+      if (this.#disposed || this.#credential !== credential || this.#taskAuthorityKey(true) !== ownerKey
         || !current || !sameMobileImageGalleryPage(current, page)) throw new Error("The inline image source changed.");
     };
     const context: MobileTimelineImageContext = { ownerKey, page, assertCurrent,
       // A cached bitmap is presentation only; remounts also reauthorize the exact source through authenticated history.
       revalidate: async (currentSignal) => {
-        const around = await this.network.readAround(credential, sessionId, eventId, currentSignal);
+        if (offline) { assertCurrent(currentSignal); return; }
+        const around = await this.network.readAround(credential!, sessionId, eventId, currentSignal);
         assertCurrent(currentSignal);
         const fresh = currentPage(around);
         if (!fresh || !sameMobileImageGalleryPage(fresh, page)) throw new Error("The authenticated inline image source changed.");
       },
       download: async (blob, currentSignal) => {
-        const thumbnail = await this.network.readImageThumbnail(credential, blob, 1024, currentSignal);
+        if (offline) {
+          const thumbnail = await this.network.readCachedImageThumbnail?.(profile, blob, 1024, currentSignal);
+          assertCurrent(currentSignal);
+          if (thumbnail) return { bytes: thumbnail.data, mediaType: thumbnail.mediaType, thumbnail };
+          const cached = await this.network.readCachedBlob?.(profile, blob, currentSignal);
+          assertCurrent(currentSignal);
+          if (!cached) throw new Error("This image is not saved on this phone. Reconnect to download it.");
+          return cached;
+        }
+        const thumbnail = await this.network.readImageThumbnail(credential!, blob, 1024, currentSignal);
         assertCurrent(currentSignal);
         return thumbnail ? { bytes: thumbnail.data, mediaType: thumbnail.mediaType, thumbnail }
-          : this.network.downloadBlob(credential, blob, currentSignal);
+          : this.network.downloadBlob(credential!, blob, currentSignal);
       } };
     return this.#timelineImages.prepare(context, signal);
   }
@@ -8057,19 +8071,29 @@ export class MobileClient {
   }
 
   async prepareQueueImagePreview(queueItemId: string, pageId: string, signal: AbortSignal): Promise<MobileTimelineImagePreview> {
-    const credential = this.#ready(), ownerKey = this.#taskAuthorityKey(), sessionId = this.#state.selectedId;
+    const credential = this.#credential, ownerKey = this.#taskAuthorityKey(true), sessionId = this.#state.selectedId;
+    const offline = this.#state.status !== "connected";
+    const profile = credential ?? (offline ? this.#profiles.find((item) => item.profileId === this.#activeProfileId) : undefined);
     const page = this.#queueGalleryPages(queueItemId).find((candidate) => candidate.pageId === pageId);
-    if (!ownerKey || !sessionId || !page) throw new Error("The pending image is no longer in this task queue.");
+    if (!profile || !ownerKey || !sessionId || !page || !offline && !credential) throw new Error("The pending image is no longer in this task queue.");
     const assertCurrent = (currentSignal?: AbortSignal): void => {
       currentSignal?.throwIfAborted();
       const current = this.#queueGalleryPages(queueItemId).find((candidate) => candidate.pageId === pageId);
-      if (this.#credential !== credential || this.#taskAuthorityKey() !== ownerKey || !current || !sameMobileImageGalleryPage(current, page)) {
+      if (this.#credential !== credential || this.#taskAuthorityKey(true) !== ownerKey || !current || !sameMobileImageGalleryPage(current, page)) {
         throw new Error("The pending image changed or left the task queue.");
       }
     };
     return this.#timelineImages.prepare({ ownerKey, page, assertCurrent,
-      revalidate: (currentSignal) => this.#revalidateQueueImage(credential, sessionId, page, assertCurrent, currentSignal),
-      download: (blob, currentSignal) => this.network.downloadBlob(credential, blob, currentSignal) }, signal);
+      revalidate: async (currentSignal) => {
+        if (offline) { assertCurrent(currentSignal); return; }
+        await this.#revalidateQueueImage(credential!, sessionId, page, assertCurrent, currentSignal);
+      },
+      download: async (blob, currentSignal) => {
+        if (!offline) return this.network.downloadBlob(credential!, blob, currentSignal);
+        const cached = await this.network.readCachedBlob?.(profile, blob, currentSignal); assertCurrent(currentSignal);
+        if (!cached) throw new Error("This pending image is not saved on this phone. Reconnect to download it.");
+        return cached;
+      } }, signal);
   }
 
   async #revalidateQueueImage(credential: PairedCredential, sessionId: string, page: MobileImageGalleryPage,
@@ -8092,16 +8116,18 @@ export class MobileClient {
     signal?.throwIfAborted();
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
     this.#retireImageGallery();
-    const credential = this.#ready(), taskAuthorityKey = this.#taskAuthorityKey(), sessionId = this.#state.selectedId;
+    const cachedOnly = this.#state.status !== "connected";
+    const credential = this.#credential ?? (cachedOnly ? this.#profiles.find((item) => item.profileId === this.#activeProfileId) : undefined);
+    const taskAuthorityKey = this.#taskAuthorityKey(cachedOnly), sessionId = this.#state.selectedId;
     const pages = this.#queueGalleryPages(queueItemId), initialIndex = pages.findIndex((page) => page.pageId === pageId);
-    if (!taskAuthorityKey || !sessionId || initialIndex < 0) throw new Error("The pending image is no longer in this task queue.");
-    const identity = { profileId: this.taskDraftProfileId()!, sessionId };
+    if (!credential || !taskAuthorityKey || !sessionId || initialIndex < 0) throw new Error("The pending image is no longer in this task queue.");
+    const identity = { profileId: credential.profileId, sessionId };
     const snapshot = await this.composerDrafts.readSnapshot(identity);
     const draft = normalizeMobileComposerDraft(snapshot.draft ?? emptyMobileComposerDraft());
     const attachmentOwnerKey = this.taskAttachmentControls()?.surfaceOwnerKey;
     const descriptor: MobileImageGalleryDescriptor = { leaseId: distinctAttachmentStorageId(this.newId, ...mobileComposerAttachmentStorageIds(draft.attachments)),
       sourceKind: "timeline", sourceLabel: "Pending message", initialIndex, pages: pages.map(mobileImageGalleryPageSummary) };
-    const lease: MobileImageGalleryLease = { leaseId: descriptor.leaseId, profileId: credential.profileId,
+    const lease: MobileImageGalleryLease = { ...(cachedOnly ? { cachedOnly: true } : {}), leaseId: descriptor.leaseId, profileId: credential.profileId,
       credentialKey: mobileCredentialKey(credential), taskAuthorityKey, identity, snapshot, draft, descriptor, pages,
       ...(attachmentOwnerKey === undefined ? {} : { attachmentOwnerKey }), source: { kind: "queue", queueItemId }, operationInFlight: false };
     this.#imageGallery = lease;
@@ -8117,14 +8143,15 @@ export class MobileClient {
     signal?.throwIfAborted();
     if (!this.composerDrafts) throw new Error("Retained task drafts are unavailable on this mobile client.");
     this.#retireImageGallery();
-    const credential = this.#ready();
-    const taskAuthorityKey = this.#taskAuthorityKey();
+    const cachedOnly = this.#state.status !== "connected";
+    const credential = this.#credential ?? (cachedOnly ? this.#profiles.find((profile) => profile.profileId === this.#activeProfileId) : undefined);
+    const taskAuthorityKey = this.#taskAuthorityKey(cachedOnly);
     const sessionId = this.#state.selectedId;
-    if (!taskAuthorityKey || !sessionId) throw new Error("Open a current task before viewing its message images.");
+    if (!credential || !taskAuthorityKey || !sessionId) throw new Error("Open a current task before viewing its message images.");
     const events = this.#timelineEvents();
     const matches = events.filter((event) => event.eventId === eventId);
     const event = matches.length === 1 ? matches[0] : undefined;
-    if (!event || event.identity?.sessionId !== sessionId) {
+    if (!event || event.identity?.sessionId !== sessionId || cachedOnly && event.cursor?.generation !== this.#state.detail?.generation) {
       throw new Error("The durable image is no longer in the current Timeline window.");
     }
     const pages = timelineGalleryPagesForSelection(events, eventId, pageId);
@@ -8132,13 +8159,13 @@ export class MobileClient {
     if (initialIndex < 0 || pages.length === 0) {
       throw new Error("The selected image is not in its current durable Timeline source.");
     }
-    const identity = { profileId: this.taskDraftProfileId()!, sessionId };
+    const identity = { profileId: credential.profileId, sessionId };
     const snapshot = await this.composerDrafts.readSnapshot(identity);
     const draft = normalizeMobileComposerDraft(snapshot.draft ?? {
       text: "", mentions: [], atoms: [], slashCommands: [], attachments: []
     });
     signal?.throwIfAborted();
-    if (this.#taskAuthorityKey() !== taskAuthorityKey) throw new Error("The task changed while the image gallery was opening.");
+    if (this.#taskAuthorityKey(cachedOnly) !== taskAuthorityKey) throw new Error("The task changed while the image gallery was opening.");
     const attachmentOwnerKey = this.taskAttachmentControls()?.surfaceOwnerKey;
     const leaseId = distinctAttachmentStorageId(this.newId, ...mobileComposerAttachmentStorageIds(draft.attachments));
     const descriptor: MobileImageGalleryDescriptor = {
@@ -8153,6 +8180,7 @@ export class MobileClient {
       initialIndex
     };
     const lease: MobileImageGalleryLease = {
+      ...(cachedOnly ? { cachedOnly: true } : {}),
       leaseId,
       profileId: credential.profileId,
       credentialKey: mobileCredentialKey(credential),
@@ -8197,12 +8225,19 @@ export class MobileClient {
     lease.loaded = undefined;
     await this.#assertImageGalleryCurrent(lease, undefined, signal);
     const page = lease.pages[pageIndex]!;
-    const credential = this.#ready();
-    const download = await this.#downloadGalleryBlob(credential, page.blob, () => {
+    const assertCurrent = () => {
+      signal?.throwIfAborted();
       if (this.#imageGallery !== lease || !this.imageGalleryCurrent(leaseId) || lease.operationInFlight) throw new Error("The gallery image source changed before download.");
-    }, signal);
+    };
+    const profile = this.#credential ?? this.#profiles.find((item) => item.profileId === lease.profileId);
+    if (!profile) throw new Error("The gallery connection profile changed.");
+    const download = lease.cachedOnly ? await this.network.readCachedBlob?.(profile, page.blob, signal)
+      : await this.#downloadGalleryBlob(this.#ready(), page.blob, assertCurrent, signal);
+    assertCurrent();
+    if (!download) throw new Error("The original image is not saved on this phone. Reconnect to download it.");
     signal?.throwIfAborted();
-    if (normalizeMediaType(download.mediaType) !== page.mediaType || download.bytes.byteLength !== page.byteSize) {
+    if (normalizeMediaType(download.mediaType) !== page.mediaType || download.bytes.byteLength !== page.byteSize
+      || lease.cachedOnly && bytesToHex(sha256(download.bytes)) !== page.sha256Hex) {
       throw new Error("The authenticated gallery image changed media type or size.");
     }
     const decoded = inspectMobileImageGalleryBytes(download.bytes, page.mediaType);
@@ -8241,6 +8276,7 @@ export class MobileClient {
     }
     return {
       galleryLeaseId: lease.leaseId,
+      ...(lease.cachedOnly ? { readOnly: true } : {}),
       leaseId: loadId,
       pageId: page.pageId,
       pageIndex,
@@ -8281,6 +8317,15 @@ export class MobileClient {
     const lease = this.#imageGallery; const currentIndex = lease?.loaded?.pageIndex; const page = lease?.pages[pageIndex];
     if (!lease || lease.leaseId !== leaseId || currentIndex === undefined || !Number.isSafeInteger(pageIndex)
       || Math.abs(currentIndex - pageIndex) !== 1 || !page) throw new Error("The adjacent image has no current gallery owner.");
+    if (lease.cachedOnly) {
+      if (!("eventId" in page.source) && page.source.kind !== "queue") throw new Error("The saved image has no retained message source.");
+      const preview = page.source.kind === "queue" ? await this.prepareQueueImagePreview(page.source.queueItemId, page.pageId, signal)
+        : await this.prepareTimelineImagePreview(page.source.eventId, page.pageId, signal);
+      if (!this.imageGalleryCurrent(leaseId) || lease.loaded?.pageIndex !== currentIndex) {
+        this.#timelineImages.release(preview.leaseId); throw new Error("The saved gallery source changed.");
+      }
+      lease.previewLeaseIds ??= new Set(); lease.previewLeaseIds.add(preview.leaseId); return preview;
+    }
     const credential = this.#ready();
     const assertCurrent = (currentSignal?: AbortSignal) => {
       currentSignal?.throwIfAborted();
@@ -8308,7 +8353,7 @@ export class MobileClient {
     const page = lease.pages[pageIndex]!;
     const preview = this.#timelineImages.pinCached({ ownerKey: lease.taskAuthorityKey, page, assertCurrent: (currentSignal) => {
       currentSignal?.throwIfAborted();
-      if (this.#imageGallery !== lease || this.#taskAuthorityKey() !== lease.taskAuthorityKey || lease.pages[pageIndex] !== page
+      if (this.#imageGallery !== lease || this.#taskAuthorityKey(lease.cachedOnly) !== lease.taskAuthorityKey || lease.pages[pageIndex] !== page
         || !this.imageGalleryCurrent(leaseId)) {
         throw new Error("The cached gallery preview source changed.");
       }
@@ -8322,8 +8367,9 @@ export class MobileClient {
   }
 
   imageGalleryCurrent(leaseId: string): boolean {
-    const lease = this.#imageGallery; const credential = this.#credential;
-    if (!lease || lease.leaseId !== leaseId || !credential || this.#taskAuthorityKey() !== lease.taskAuthorityKey
+    const lease = this.#imageGallery;
+    const credential = this.#credential ?? (lease?.cachedOnly ? this.#profiles.find((item) => item.profileId === lease.profileId) : undefined);
+    if (!lease || lease.leaseId !== leaseId || !credential || this.#taskAuthorityKey(lease.cachedOnly) !== lease.taskAuthorityKey
       || mobileCredentialKey(credential) !== lease.credentialKey || this.taskAttachmentControls()?.surfaceOwnerKey !== lease.attachmentOwnerKey) return false;
     const source = lease.source;
     if (source.kind === "files") return this.#currentFiles(source.filesEpoch, source.filesAuthorityKey)
@@ -8407,6 +8453,7 @@ export class MobileClient {
 
     const galleryLease = this.#imageGallery;
     const loaded = galleryLease?.loaded;
+    if (galleryLease?.cachedOnly) throw new Error("Reconnect to the Joko node before exporting this image.");
     if (!galleryLease || !loaded || loaded.loadId !== leaseId || !loaded.confirmed || galleryLease.operationInFlight) {
       throw new Error("The decoded image no longer owns this output action.");
     }
@@ -8448,6 +8495,7 @@ export class MobileClient {
   async shareImageGalleryPageOriginal(galleryLeaseId: string, loadId: string, signal?: AbortSignal, onDispatch?: () => void): Promise<void> {
     signal?.throwIfAborted();
     const lease = this.#imageGallery; const loaded = lease?.loaded;
+    if (lease?.cachedOnly) throw new Error("Reconnect to the Joko node before sharing the original image.");
     if (!this.fileShare) throw new Error("System file sharing is unavailable on this mobile runtime.");
     if (!lease || lease.leaseId !== galleryLeaseId || !loaded || loaded.loadId !== loadId
       || !loaded.confirmed || lease.operationInFlight || this.#fileShareLease) {
@@ -12934,7 +12982,7 @@ export class MobileClient {
     ].join("\u001f");
   }
 
-  #taskAuthorityKey(): string | undefined {
+  #taskAuthorityKey(offlinePresentation = false): string | undefined {
     if (this.#joinedTask) {
       const { source, credential, lifetime } = this.#joinedTask, detail = this.#state.detail;
       const session = detail?.sessions[0], share = source.joined.share!, member = source.joined.member!;
@@ -12947,13 +12995,15 @@ export class MobileClient {
         member.memberGeneration.toString(), detail.generation.toString(), session.sessionId, session.backendId,
         session.targetId, session.nativeBinding.runtimeGeneration.toString()]);
     }
-    const credential = this.#credential;
+    const offline = offlinePresentation && this.#hasOfflineProjection()
+      && (this.#state.status === "offline" || this.#state.status === "connecting");
+    const credential = this.#credential ?? (offline ? this.#profiles.find((item) => item.profileId === this.#activeProfileId) : undefined);
     const owner = this.#state.owner;
     const detail = this.#state.detail;
     const sessionId = this.#state.selectedId;
     if (!credential || !owner || !detail || !sessionId
-      || !this.#foreground || this.#state.status !== "connected"
-      || detail.generation !== owner.generation || this.#state.activeProfileId !== credential.profileId
+      || !this.#foreground || (this.#state.status !== "connected" && !offline)
+      || (!offline && detail.generation !== owner.generation) || this.#state.activeProfileId !== credential.profileId
       || this.#state.node?.serverId !== credential.serverId
       || owner.server?.serverId !== credential.serverId || detail.server?.serverId !== credential.serverId) return undefined;
     const ownerSessions = owner.sessions.filter((candidate) => candidate.sessionId === sessionId);
@@ -12989,7 +13039,7 @@ export class MobileClient {
       || target.state !== TargetState.ACTIVE || detailTarget.state !== TargetState.ACTIVE
       || entityVersionKey(target.version) !== entityVersionKey(detailTarget.version)
       || backendAuthorityKey(backend) !== backendAuthorityKey(detailBackend)) return undefined;
-    return [
+    return (offline ? `readonly:${this.#state.offlineSnapshotAt}:` : "") + [
       credential.profileId,
       credential.connectionId,
       credential.deviceId,
@@ -13319,6 +13369,12 @@ export class MobileClient {
     signal?: AbortSignal
   ): Promise<MobileAttachmentControls | undefined> {
     signal?.throwIfAborted();
+    if (lease.cachedOnly) {
+      if (expectedCommitted !== undefined || !["timeline", "queue"].includes(lease.source.kind) || !this.imageGalleryCurrent(lease.leaseId)) {
+        throw new Error("The saved image gallery no longer owns this history window.");
+      }
+      return undefined;
+    }
     const credential = this.#ready();
     const controls = this.taskAttachmentControls();
     if (this.#imageGallery !== lease || mobileCredentialKey(credential) !== lease.credentialKey
@@ -15241,7 +15297,7 @@ function mobileImageOutputFileName(value: string, mediaType: string): string {
   return `Image.${extension}`;
 }
 
-function mobileCredentialKey(credential: PairedCredential): string {
+function mobileCredentialKey(credential: Pick<PairedCredential, "profileId" | "connectionId" | "deviceId" | "serverId">): string {
   return [credential.profileId, credential.connectionId, credential.deviceId, credential.serverId].join("\u001f");
 }
 

@@ -75,6 +75,7 @@ export interface MobileImageGalleryNativeDecode {
 }
 
 export interface MobileImageGalleryPageSession extends MobileComposerImageEditorSession {
+  readonly readOnly?: true;
   readonly galleryLeaseId: string;
   readonly pageId: string;
   readonly pageIndex: number;

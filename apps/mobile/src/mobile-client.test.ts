@@ -1873,9 +1873,10 @@ function clientWithOfflineCache(
   network: MobileNetwork,
   storage: MobileStorage,
   offlineCache: Pick<MobileOfflineCache, "load" | "save" | "clear">,
-  now: () => number = () => 2_000
+  now: () => number = () => 2_000,
+  newId?: () => string
 ) {
-  return client(network, storage, undefined, now, undefined, undefined, undefined,
+  return client(network, storage, undefined, now, newId, undefined, undefined,
     undefined, undefined, undefined, undefined, undefined, offlineCache);
 }
 
@@ -12843,6 +12844,46 @@ describe("native current-task Files ownership", () => {
     snapshot.queueItems[0]!.state = QueueItemState.DISPATCHING;
     await expect(app.shareImageGalleryPageOriginal(gallery.leaseId, original.leaseId)).rejects.toThrow(/pending image/u);
     await expect(app.prepareQueueImagePreview("pending-images", images[0]!.pageId, new AbortController().signal)).rejects.toThrow(/pending image/u);
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+
+  it("shows saved inline images on an offline cold start without loading credentials or enabling original-file actions", async () => {
+    const bytes = galleryPngBytes(3, 2), event = timelinePreviewEvent("saved.png", "image/png", bytes, sha256Hex(bytes));
+    const offline = memoryOfflineCache(), cachedOwner = offlineOwnerProjection(), cachedDetail = offlineDetailProjection();
+    event.cursor!.generation = cachedDetail.generation;
+    const queueBlob = create(BlobRefSchema, { blobId: "offline-pending", fileName: "pending.png", mediaType: "image/png", byteSize: BigInt(bytes.length), sha256Hex: sha256Hex(bytes) });
+    cachedDetail.queueItems = [create(QueueItemSchema, { queueItemId: "offline-pending", sessionId: "session", backendId: "backend", targetId: "target", state: QueueItemState.ACCEPTED,
+      input: { parts: [{ content: { case: "image", value: { blob: queueBlob } } }] } })];
+    cachedDetail.timeline = [event]; cachedDetail.resumeCursor = event.cursor;
+    await offline.cache.save(profileFromCredential(credential), node, cachedOwner, cachedDetail);
+    const network = fakeNetwork(); vi.mocked(network.inspect).mockRejectedValue(new Error("Wi-Fi unavailable"));
+    network.readCachedBlob = vi.fn(async () => ({ bytes, mediaType: "image/png" }));
+    network.readCachedImageThumbnail = vi.fn(async () => undefined);
+    network.clearMediaCache = vi.fn(async () => undefined);
+    const saved = memoryStorage(credential), app = clientWithOfflineCache(network, saved.storage, offline.cache, undefined, fixedIds("offline-gallery", "offline-original", "queue-gallery", "queue-original"));
+    await app.start(); expect(app.state.status).toBe("offline"); expect(saved.storage.loadCredential).not.toHaveBeenCalled();
+    expect(app.timelineImagePreviewOwnerKey()).toContain("readonly:");
+    const selected = timelineRows(app.state.detail!.timeline)[0]!.images![0]!;
+    const preview = await app.prepareTimelineImagePreview(selected.sourceEventId!, selected.pageId, new AbortController().signal);
+    expect(preview).toMatchObject({ width: 3, height: 2 });
+    expect(network.readCachedBlob).toHaveBeenCalledExactlyOnceWith(profileFromCredential(credential), expect.objectContaining({ blobId: "timeline-saved.png" }), expect.any(AbortSignal));
+    expect(network.readAround).not.toHaveBeenCalled(); expect(network.downloadBlob).not.toHaveBeenCalled(); expect(network.readImageThumbnail).not.toHaveBeenCalled();
+    const gallery = await app.openTimelineImageGallery(selected.sourceEventId!, selected.pageId);
+    const original = await app.loadImageGalleryPage(gallery.leaseId, 0);
+    expect(original).toMatchObject({ annotatable: false, addable: false, expectedWidthPixels: 3, expectedHeightPixels: 2 });
+    expect(app.imageGalleryCurrent(gallery.leaseId)).toBe(true);
+    app.confirmImageGalleryPageDecoded(gallery.leaseId, original.leaseId, original.pageId, { width: 3, height: 2, mediaType: "image/png", isAnimated: false });
+    await expect(app.shareImageGalleryPageOriginal(gallery.leaseId, original.leaseId)).rejects.toThrow(/Reconnect/u);
+    await expect(app.addImageGalleryPageToComposer(gallery.leaseId, original.leaseId)).rejects.toThrow(/capability|composer/u);
+    const queued = app.taskQueueImagePages("offline-pending")[0]!;
+    expect(await app.prepareQueueImagePreview("offline-pending", queued.pageId, new AbortController().signal)).toMatchObject({ width: 3, height: 2 });
+    const queuedGallery = await app.openQueueImageGallery("offline-pending", queued.pageId);
+    expect(await app.loadImageGalleryPage(queuedGallery.leaseId, 0)).toMatchObject({ readOnly: true, annotatable: false, addable: false });
+    app.setForeground(false); expect(app.timelineImagePreviewOwnerKey()).toBeUndefined();
+    expect(() => app.confirmTimelineImagePreview(preview.leaseId, { width: 3, height: 2 })).toThrow(/released|owner/u);
+    app.setForeground(true);
+    await app.forgetConnection(credential.profileId);
+    expect(network.clearMediaCache).toHaveBeenCalledWith(credential.profileId);
     expect(network.submit).not.toHaveBeenCalled();
   });
 
