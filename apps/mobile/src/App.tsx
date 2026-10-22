@@ -4753,7 +4753,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     return () => subscription.remove();
   }, [dismissRuntimeCommandPalette, runtimeCommandPaletteVisible]);
   const openTimelineImage = (row: TimelineRow, image: MobileImageGalleryPageSummary): void => {
-    if (galleryOpening || imageGallery.view || state.status !== "connected" || state.busy
+    if (galleryOpening || imageGallery.view || !client.timelineImagePreviewOwnerKey() || state.busy
       || attachmentBusy || voice.busy || !row.completed) return;
     setGalleryOpening(true);
     setComposerNotice("");
@@ -5981,11 +5981,11 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
     runNavigation={(intent) => { requestTaskHomeNavigation(intent, host === "drawer"); }} />;
   const renderTimelineImage = (item: TimelineRow, image: NonNullable<TimelineRow["images"]>[number], index: number): ReactNode => <MobileTimelineImage key={image.pageId} client={client} page={image}
             eventId={image.sourceEventId ?? item.eventId} ownerKey={client.timelineImagePreviewOwnerKey()}
-            eligible={visibleImageRows.has(item.id) && state.status === "connected" && !drawerOpen && !messageActionsVisible && !taskActionsVisible
+            eligible={visibleImageRows.has(item.id) && client.timelineImagePreviewOwnerKey() !== undefined && !drawerOpen && !messageActionsVisible && !taskActionsVisible
               && !interactionVisible && !contextVisible && imageGallery.view === undefined && imageEditorLease === undefined && photoLibraryLease === undefined}
             viewportRef={timelineViewportRef} viewportPulse={imageViewportPulse} maximumWidth={Math.max(1, homeLayout.detailWidth - 64)}
             colors={colors} locale={locale} openLabel={mobileMessage(locale, "task.openImage", { index: index + 1, count: (item.images?.length ?? 1), name: image.title })}
-            disabled={galleryOpening || imageGallery.view !== undefined || state.status !== "connected" || attachmentBusy || voice.busy}
+            disabled={galleryOpening || imageGallery.view !== undefined || !client.timelineImagePreviewOwnerKey() || attachmentBusy || voice.busy}
             onOpen={() => openTimelineImage(item, image)} />;
   const renderTimelineArtifact = (artifact: NonNullable<TimelineRow["artifacts"]>[number]): ReactNode => {
             const disabled = state.timelinePreview !== undefined || galleryOpening || imageGallery.view !== undefined
@@ -6398,10 +6398,10 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
           <Text selectable style={[styles.body, { color: colors.ink }]}>{queueItemSummary(item, locale)}</Text>
           <View style={styles.actionRow}>{client.taskQueueImagePages(item.queueItemId).map((image, imageIndex, images) =>
             <MobileTimelineImage key={image.pageId} client={client} page={image} eventId="" queueItemId={item.queueItemId}
-              ownerKey={client.taskPresentationOwnerKey()} eligible={state.status === "connected"} viewportPulse={imageViewportPulse}
+              ownerKey={client.timelineImagePreviewOwnerKey()} eligible={client.timelineImagePreviewOwnerKey() !== undefined} viewportPulse={imageViewportPulse}
               viewportRef={queueViewportRef} maximumWidth={180} colors={colors} locale={locale}
               openLabel={mobileMessage(locale, "task.openImage", { index: imageIndex + 1, count: images.length, name: image.title })}
-              disabled={state.status !== "connected"} onOpen={() => {
+              disabled={!client.timelineImagePreviewOwnerKey()} onOpen={() => {
                 void imageGallery.open(signal => client.openQueueImageGallery(item.queueItemId, image.pageId, signal))
                   .catch(failure => setLocalError(errorText(failure)));
               }} />)}</View>

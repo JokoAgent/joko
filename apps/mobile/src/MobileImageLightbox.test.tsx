@@ -406,6 +406,16 @@ describe("native image gallery formats and ownership", () => {
     expect(share).toHaveBeenCalledOnce(); expect(output).not.toHaveBeenCalled(); expect(native.burn).not.toHaveBeenCalled();
   });
 
+  it("keeps saved offline images viewable while hiding export and edit actions", async () => {
+    for (const mediaType of ["image/png", "image/gif"]) {
+      const page = { ...session(mediaType, mediaType === "image/gif", mediaType), readOnly: true as const, addable: false };
+      await render(page); await load(page);
+      for (const key of ["image.copy", "image.save", "image.share", "image.annotate"] as const) expect(button(key)).toBeUndefined();
+      expect(button("image.zoomIn")).toBeDefined(); expect(button("image.next")).toBeDefined();
+    }
+    expect(output).not.toHaveBeenCalled(); expect(share).not.toHaveBeenCalled(); expect(native.burn).not.toHaveBeenCalled();
+  });
+
   it("keeps ICO and APNG container originals free of static effects", async () => {
     for (const mediaType of ["image/x-icon", "image/apng"]) {
       const page = { ...session(mediaType, mediaType === "image/apng", mediaType), originalOnly: true,

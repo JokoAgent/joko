@@ -1,4 +1,6 @@
 import { Code, ConnectError, createClient, type Interceptor, type Transport } from "@connectrpc/connect";
+import { mobileMediaByteCache } from "./mobile-media-byte-cache";
+import type { MobileConnectionProfile } from "./connection-storage";
 import { projectPartnerDeletion, type PartnerDeletionView, type PartnerDeletionResult } from "@joko/contracts";
 import { projectPartnerRestart, type PartnerRestartView, type PartnerRestartResult } from "@joko/contracts";
 import { partnerSessionTaskAction, projectPartnerSessionTask, type PartnerSessionTaskView } from "@joko/contracts";
@@ -473,6 +475,9 @@ export interface MobileNetwork {
   probeTargetWorktree(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<MobileTargetWorktreeProbe>;
   listTargetWorktreeSources(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<readonly MobileTargetWorktreeSource[]>;
   downloadBlob(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload>;
+  readCachedBlob?(profile: MobileConnectionProfile, blob: BlobRef, signal?: AbortSignal): Promise<VerifiedBlobDownload | undefined>;
+  readCachedImageThumbnail?(profile: MobileConnectionProfile, blob: BlobRef, edge: 256 | 1024, signal?: AbortSignal): Promise<ImageThumbnail | undefined>;
+  clearMediaCache?(profileId: string): Promise<void>;
   readImageThumbnail(credential: PairedCredential, blob: BlobRef, edge: 256 | 1024, signal?: AbortSignal): Promise<ImageThumbnail | undefined>;
   authorizeBlobDownload(credential: PairedCredential, blob: BlobRef, signal?: AbortSignal): Promise<AuthorizedBlobDownload>;
   uploadBlob(credential: PairedCredential, source: MobileBlobUploadSource, signal?: AbortSignal): Promise<BlobRef>;
@@ -2872,13 +2877,39 @@ export const mobileNetwork: MobileNetwork = {
   },
   async downloadBlob(credential, blob, signal) {
     assertDownloadBlob(blob);
+    const current = mobileMediaByteCache.captureOwner(credential.profileId, () => signal?.throwIfAborted());
+    current();
     const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
       .getBlobDownloadTicket({ blobId: blob.blobId }, options(signal));
-    return downloadVerifiedBlob(credential, blob, response.ticket, signal);
+    current();
+    authorizeVerifiedBlobDownload(credential, blob, response.ticket);
+    const cached = await mobileMediaByteCache.get(credential, blob, current).catch(() => undefined);
+    current(); if (cached) return cached;
+    const result = await downloadVerifiedBlob(credential, blob, response.ticket, signal);
+    current();
+    await mobileMediaByteCache.put(credential, blob, result.bytes, current).catch(() => undefined);
+    current(); return result;
   },
+  async readCachedBlob(credential, blob, signal) {
+    const result = await mobileMediaByteCache.get(credential, blob, () => signal?.throwIfAborted()).catch(() => undefined);
+    signal?.throwIfAborted(); return result;
+  },
+  async readCachedImageThumbnail(credential, blob, edge, signal) {
+    const result = await mobileMediaByteCache.getThumbnail(credential, blob, edge, () => signal?.throwIfAborted()).catch(() => undefined);
+    signal?.throwIfAborted(); return result;
+  },
+  clearMediaCache: (profileId) => mobileMediaByteCache.clear(profileId),
   async readImageThumbnail(credential, blob, edge, signal) {
     assertDownloadBlob(blob);
-    const response = await createClient(ArtifactService, transport(credential.origin, credential.authKey))
+    const current = mobileMediaByteCache.captureOwner(credential.profileId, () => signal?.throwIfAborted());
+    const client = createClient(ArtifactService, transport(credential.origin, credential.authKey));
+    const cached = await mobileMediaByteCache.getThumbnail(credential, blob, edge, current).catch(() => undefined);
+    current();
+    if (cached) {
+      const authorization = await client.getBlobDownloadTicket({ blobId: blob.blobId }, options(signal));
+      current(); authorizeVerifiedBlobDownload(credential, blob, authorization.ticket); return cached;
+    }
+    const response = await client
       .getImageThumbnail({ expectedSourceBlob: blob, maximumEdgePixels: edge }, options(signal));
     signal?.throwIfAborted(); const source = response.sourceBlob;
     if (!source || source.blobId !== blob.blobId || source.sha256Hex !== blob.sha256Hex || source.byteSize !== blob.byteSize
@@ -2895,7 +2926,8 @@ export const mobileNetwork: MobileNetwork = {
       || value.widthPixels > edge || value.heightPixels > edge || value.sourceWidthPixels < 1 || value.sourceHeightPixels < 1
       || value.sourceWidthPixels > 16_384 || value.sourceHeightPixels > 16_384 || value.sourceWidthPixels * value.sourceHeightPixels > 64 * 1024 * 1024
       || Math.max(value.widthPixels, value.heightPixels) > Math.max(value.sourceWidthPixels, value.sourceHeightPixels)) throw new Error("The image thumbnail exceeds its presentation bounds.");
-    return value;
+    await mobileMediaByteCache.putThumbnail(credential, blob, edge, value, current).catch(() => undefined);
+    current(); return value;
   },
   async authorizeBlobDownload(credential, blob, signal) {
     assertShareBlob(blob);
@@ -2906,6 +2938,7 @@ export const mobileNetwork: MobileNetwork = {
   },
   async uploadBlob(credential, source, signal) {
     const exact = assertBlobUploadSource(source);
+    const current = mobileMediaByteCache.captureOwner(credential.profileId, () => signal?.throwIfAborted());
     const client = createClient(ArtifactService, transport(credential.origin, credential.authKey));
     const response = await client.beginBlobUpload({
       fileName: exact.fileName,
@@ -2914,7 +2947,7 @@ export const mobileNetwork: MobileNetwork = {
       sha256Hex: exact.sha256Hex,
       disposition: BlobDisposition.ATTACHMENT
     }, options(signal));
-    return uploadVerifiedBlob(
+    const result = await uploadVerifiedBlob(
       credential,
       exact,
       response.upload,
@@ -2924,6 +2957,14 @@ export const mobileNetwork: MobileNetwork = {
       )).blob,
       signal
     );
+    if (exact.mediaType.startsWith("image/") && exact.byteSize <= 32 * 1024 * 1024) {
+      await (async () => {
+        current(); const { File } = await import("expo-file-system"); const file = new File(exact.uri);
+        if (!file.exists || file.size !== exact.byteSize) return;
+        const bytes = await file.bytes(); current(); await mobileMediaByteCache.put(credential, result, bytes, current);
+      })().catch(() => undefined);
+    }
+    signal?.throwIfAborted(); return result;
   },
   async getVoiceInputCapabilities(credential, signal) {
     const response = await createClient(VoiceInputService, transport(credential.origin, credential.authKey))
