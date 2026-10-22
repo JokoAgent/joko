@@ -505,6 +505,29 @@ function messageText(message: unknown): string {
     .join("\n");
 }
 
+function learnedCachePayload(payload: unknown, model: { api?: string; provider?: string; id?: string; baseUrl?: string } | undefined): unknown {
+  if (model?.api !== "openai-completions" || !model.provider || !model.id || !model.baseUrl
+    || !payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
+  try {
+    const home = process.env.PI_CODING_AGENT_DIR;
+    if (!home || !isAbsolute(home)) return payload;
+    const path = resolve(home, "request-option-compatibility.json");
+    const info = lstatSync(path);
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 256 * 1024 || relative(path, realpathSync(path)) !== "") return payload;
+    const url = new URL(model.baseUrl);
+    if (!["http:", "https:"].includes(url.protocol) || !url.hostname) return payload;
+    url.hash = "";
+    const routeKey = createHash("sha256").update(JSON.stringify(["pi-cache-v1", model.api, url.href])).digest("hex");
+    const key = JSON.stringify([model.provider, model.id, routeKey]);
+    const rules = JSON.parse(readFileSync(path, "utf8"));
+    if (rules?.version !== 1 || !rules.routes || rules.routes[key]?.supportsLongCacheRetention !== false) return payload;
+    const next = { ...payload } as Record<string, unknown>;
+    delete next.prompt_cache_key;
+    delete next.prompt_cache_retention;
+    return next;
+  } catch { return payload; }
+}
+
 function readMcpDescriptor(): McpDescriptor | undefined {
   if (!mcpDescriptorPath || !mcpToken) return undefined;
   const descriptor = JSON.parse(readFileSync(mcpDescriptorPath, "utf8")) as McpDescriptor;
@@ -581,7 +604,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
   // prompt, steer, follow-up, retry, and queued turn. Orchestrator validates model
   // eligibility before toggling the generation-fenced control value.
   pi.on("before_provider_request", (event, ctx) => {
-    return modelCatalog.prepareProviderPayload(ctx.model, event.payload, readControl().fastMode);
+    return learnedCachePayload(modelCatalog.prepareProviderPayload(ctx.model, event.payload, readControl().fastMode) ?? event.payload, ctx.model);
   });
 
   // Override model and direct-user bash execution so provider/MCP credentials

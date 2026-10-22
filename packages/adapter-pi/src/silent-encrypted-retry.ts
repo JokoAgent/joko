@@ -209,13 +209,14 @@ type PiExtensionApi = {
 
 export default function installSilentEncryptedRetry(pi?: PiExtensionApi): void {
   const processGlobal = globalThis as typeof globalThis & { [INSTALLED]?: InstalledState };
-  if (processGlobal[INSTALLED] !== undefined || typeof globalThis.fetch !== "function" || pi === undefined) return;
+  if (typeof globalThis.fetch !== "function" || pi === undefined) return;
   const controlPath = process.env[CONTROL_ENV];
   const generation = Number(process.env.JOKO_PI_GENERATION);
   if (typeof controlPath !== "string" || !Number.isSafeInteger(generation) || generation < 0) return;
 
-  const originalFetch = globalThis.fetch.bind(globalThis);
-  const installed: InstalledState = { originalFetch };
+  const existing = processGlobal[INSTALLED];
+  const installed: InstalledState = existing ?? { originalFetch: globalThis.fetch.bind(globalThis) };
+  const { originalFetch } = installed;
   processGlobal[INSTALLED] = installed;
   pi.on("model_select", () => {
     installed.current = undefined;
@@ -224,11 +225,13 @@ export default function installSilentEncryptedRetry(pi?: PiExtensionApi): void {
   pi.on("before_provider_headers", (event, context) => {
     if (context.model?.api === "openai-responses") event.headers[PROVIDER_MARKER_HEADER] = "1";
   });
+  if (existing) return;
 
   globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const suppliedHeaders = init?.headers ?? (input instanceof Request ? input.headers : undefined);
+    if (new Headers(suppliedHeaders).get(PROVIDER_MARKER_HEADER) !== "1") return originalFetch(input, init);
     let request: Request;
     try { request = new Request(input, init); } catch { return originalFetch(input, init); }
-    if (request.headers.get(PROVIDER_MARKER_HEADER) !== "1") return originalFetch(input, init);
     const providerHeaders = new Headers(request.headers);
     providerHeaders.delete(PROVIDER_MARKER_HEADER);
     request = new Request(request, { headers: providerHeaders });

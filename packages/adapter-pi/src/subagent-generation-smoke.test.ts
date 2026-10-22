@@ -10,14 +10,19 @@ import { describe, expect, it } from "vitest";
 import { createPiAdapter } from "./adapter.js";
 import { managedSubagentSessionKey } from "./durable-subagent-runs.js";
 import { mkdtemp } from "./test-paths.js";
+import { PiCacheCompatibilityStore, piCacheRouteKey } from "./request-option-compatibility.js";
 
 describe("real managed Pi subagent smoke", () => {
   it("runs a durable background child against a local fake provider with stable sessions and no ambient resources or credential disclosure", { timeout: 75_000 }, async () => {
     const credentialCanary = "joko-subagent-secret-canary-value";
     const requests: Record<string, unknown>[] = [];
-    const server = await startSubagentProvider(requests, credentialCanary, 1_500);
+    const server = await startSubagentProvider(requests, credentialCanary, 1_500, "/api.openai.com/v1");
     const address = server.address() as AddressInfo;
     const agentHome = await mkdtemp(join(tmpdir(), "joko-real-pi-subagent-home-"));
+    const baseUrl = `http://127.0.0.1:${address.port}/api.openai.com/v1`;
+    expect(await new PiCacheCompatibilityStore(join(agentHome, "request-option-compatibility.json")).record({
+      providerId: "subagent-smoke", wireModelId: "subagent-smoke-model", routeKey: piCacheRouteKey(baseUrl, "openai-completions")!
+    })).toBe(true);
     const workspace = await mkdtemp(join(tmpdir(), "joko-real-pi-subagent-workspace-"));
     const ambientMarker = join(workspace, "ambient-project-extension-loaded");
     const ambientExtensionDirectory = join(workspace, ".pi", "extensions");
@@ -37,10 +42,11 @@ describe("real managed Pi subagent smoke", () => {
       sessionRoot: agentHome,
       providers: [{
         id: "subagent-smoke",
-        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        baseUrl,
         api: "openai-completions",
         keyless: true,
-        models: [{ id: "subagent-smoke-model", name: "Subagent Smoke", contextWindow: 16_384, maxTokens: 1_024 }]
+        models: [{ id: "subagent-smoke-model", name: "Subagent Smoke", contextWindow: 16_384, maxTokens: 1_024,
+          compat: { supportsLongCacheRetention: true } }]
       }],
       environment: { JOKO_SUBAGENT_SMOKE_KEY: credentialCanary },
       secretEnvironmentNames: ["JOKO_SUBAGENT_SMOKE_KEY"]
@@ -152,6 +158,10 @@ describe("real managed Pi subagent smoke", () => {
       expect(parentRequests).toHaveLength(4);
       expect(childRequests).toHaveLength(1);
       expect(childRequests[0]?.["model"]).toBe("subagent-smoke-model");
+      for (const request of requests) {
+        expect(request).not.toHaveProperty("prompt_cache_key");
+        expect(request).not.toHaveProperty("prompt_cache_retention");
+      }
       expect(requestToolNames(childRequests[0]!)).toEqual(["read", "grep", "find", "ls"]);
       expect(JSON.stringify(requests)).not.toContain(credentialCanary);
       expect(JSON.stringify(parentRequests[3])).toContain("joko-subagent-smoke-call:step-1");
@@ -320,11 +330,12 @@ function blob(bytes: Uint8Array, mimeType = "application/octet-stream", fileName
 async function startSubagentProvider(
   requests: Record<string, unknown>[],
   credentialCanary: string,
-  childDelayMs = 100
+  childDelayMs = 100,
+  basePath = "/v1"
 ): Promise<Server> {
   let parentRequestCount = 0;
   const server = createServer((request, response) => {
-    if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+    if (request.method !== "POST" || request.url !== `${basePath}/chat/completions`) {
       response.writeHead(404).end();
       return;
     }

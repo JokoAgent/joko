@@ -1,4 +1,4 @@
-type ManagedRuntimeFactoryName = "createPiAutoReviewer" | "createPiModelCatalogAdditions";
+type ManagedRuntimeFactoryName = "createPiAutoReviewer" | "createPiModelCatalogAdditions" | "isUnsupportedCacheOptionError";
 
 const FUNCTION_NAME_HELPER_SOURCE =
   'const __name = (target, value) => Object.defineProperty(target, "name", { value, configurable: true });';

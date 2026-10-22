@@ -169,6 +169,14 @@ import {
 import { PiRpcTransport, spawnPiProcess, type PiProcessFactory, type PiProcessSpec } from "./transport.js";
 import { PiEventTranslator } from "./translator.js";
 import {
+  handlePiCacheCompatibilityRequest,
+  PiCacheCompatibilityStore,
+  piCacheRouteKey,
+  type PiCacheCompatibilityRequest,
+  type PiCacheRoute
+} from "./request-option-compatibility.js";
+import { provisionManagedRequestOptionRecovery } from "./request-option-recovery.js";
+import {
   createDefaultManagedProcessSupervisor,
   type ManagedProcessSupervisor
 } from "./runtime-process.js";
@@ -568,10 +576,16 @@ interface PiRuntime {
   readonly managedDurableStore?: PiManagedDurableStore;
   readonly runtimeDirectory: string;
   readonly runtimeRoot: string;
+  readonly agentHomePath: string;
   readonly nativeAuth?: PiRuntimeNativeAuth;
   nativeAuthPersistenceRevoked: boolean;
   readonly controlPath: string;
   readonly silentEncryptedRetryControlPath: string;
+  readonly cacheCompatibilityLeases: Map<string, {
+    readonly route: PiCacheRoute;
+    readonly lifecycle: PiNativeLifecycle;
+    readonly context: AdapterContext;
+  }>;
   readonly artifactDirectory: string;
   readonly redactValues: readonly string[];
   readonly resources: readonly RuntimeResource[];
@@ -643,6 +657,8 @@ interface PiNativeLifecycle {
   initialUserMessageSeen: boolean;
   agentStarted: boolean;
   settlementReceived: boolean;
+  requestRecoveryTainted?: boolean;
+  recoveredCacheRoutes?: Set<string>;
 }
 
 interface PiRuntimeNativeAuth {
@@ -664,6 +680,7 @@ interface PiInitializedGeneration {
   readonly bridgePath: string;
   readonly subagentPath: string;
   readonly silentEncryptedRetryPath: string;
+  readonly requestOptionRecoveryPath: string;
   readonly managedResources: PiManagedRuntimeResourceSnapshot;
 }
 
@@ -782,6 +799,7 @@ export class PiBackendAdapter implements
   #reconfiguration: Promise<void> | undefined;
   #disposed = false;
   readonly #nativeTextFlights = new Set<AbortController>();
+  readonly #cacheCompatibility: PiCacheCompatibilityStore;
 
   constructor(options: PiAdapterOptions) {
     this.#agentHome = resolve(options.agentHome);
@@ -819,6 +837,7 @@ export class PiBackendAdapter implements
       ? createDefaultManagedProcessSupervisor()
       : undefined);
     this.#sessionStore = new PiSessionStore(sessionRoot);
+    this.#cacheCompatibility = new PiCacheCompatibilityStore(join(sessionRoot, "request-option-compatibility.json"));
     if (options.mcpBridge && !options.mcpBridge.token) {
       throw piError("PI_MCP_CREDENTIAL_MISSING", "MCP bridge token must be supplied through the managed credential channel", "provision");
     }
@@ -4526,10 +4545,11 @@ export class PiBackendAdapter implements
     const approvedResourceRoot = join(agentHome, "managed", "approved-resources");
     assertContained(join(agentHome, "managed"), approvedResourceRoot, "approved resource generation");
     await rm(approvedResourceRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
-    const [bridgePath, subagentPath, silentEncryptedRetryPath, snapshot] = await Promise.all([
+    const [bridgePath, subagentPath, silentEncryptedRetryPath, requestOptionRecoveryPath, snapshot] = await Promise.all([
       provisionManagedBridge(agentHome),
       provisionManagedSubagent(agentHome),
       provisionManagedSilentEncryptedRetry(agentHome),
+      provisionManagedRequestOptionRecovery(agentHome),
       snapshotManagedRuntimeResources({
         snapshot: options.managedResources,
         destinationRoot: approvedResourceRoot,
@@ -4542,6 +4562,7 @@ export class PiBackendAdapter implements
       bridgePath,
       subagentPath,
       silentEncryptedRetryPath,
+      requestOptionRecoveryPath,
       managedResources: {
         extensions: snapshot.directExtensionPaths,
         skills: snapshot.directSkillPaths,
@@ -4686,7 +4707,7 @@ export class PiBackendAdapter implements
     const releaseUnpublished = (): void => {
       this.#releaseManagedGenerationLease(generationLease);
     };
-    const { catalog, bridgePath, subagentPath, silentEncryptedRetryPath, managedResources } = await this.#initialize(managedGeneration).catch((error) => {
+    const { catalog, bridgePath, subagentPath, silentEncryptedRetryPath, requestOptionRecoveryPath, managedResources } = await this.#initialize(managedGeneration).catch((error) => {
       releaseUnpublished();
       throw error;
     });
@@ -4841,6 +4862,9 @@ export class PiBackendAdapter implements
     ];
     for (const extensionPath of managedResourceSnapshot.extensionPaths) args.push("--extension", extensionPath);
     args.push("--extension", silentEncryptedRetryPath);
+    if (context.target.remoteWorkspace === undefined && profile.runtimePolicy === "standard") {
+      args.push("--extension", requestOptionRecoveryPath);
+    }
     // The policy bridge must be the final tool_call handler. Approved managed
     // extensions and the service-owned subagent tools load first, so no later
     // handler can mutate arguments after the final permission decision.
@@ -4894,6 +4918,8 @@ export class PiBackendAdapter implements
       PI_CODING_AGENT_DIR: runtimeAgentHomePath,
       PI_CODING_AGENT_SESSION_DIR: this.#sessionStore.sessionsRoot,
       PI_SKIP_VERSION_CHECK: "1",
+      ...(context.target.remoteWorkspace === undefined && profile.runtimePolicy === "standard" ? { PI_CACHE_RETENTION: "long" } : {}),
+      JOKO_PI_REQUEST_OPTION_RECOVERY: context.target.remoteWorkspace === undefined && profile.runtimePolicy === "standard" ? "1" : "0",
       JOKO_PI_CONTROL_FILE: controlPath,
       [SILENT_ENCRYPTED_RETRY_CONTROL_ENV]: silentEncryptedRetryControlPath,
       JOKO_PI_WORKSPACE_ROOT: runtimeWorkspaceRoot(context.target),
@@ -4963,6 +4989,9 @@ export class PiBackendAdapter implements
         managedGeneration,
         profile.providerId
       );
+      if (context.target.remoteWorkspace === undefined && profile.runtimePolicy === "standard") {
+        await this.#cacheCompatibility.snapshot(join(preparedAgentHome.path, "request-option-compatibility.json"));
+      }
       if (workingContextWindow !== undefined && profile.providerId !== undefined && profile.modelId !== undefined) {
         const declared = mergeProviderModels(catalog.models, options.nativeModels ?? []).find((model) =>
           model.providerId === profile.providerId && model.modelId === profile.modelId);
@@ -5099,10 +5128,12 @@ export class PiBackendAdapter implements
         ...(managedDurableStore === undefined ? {} : { managedDurableStore }),
         runtimeDirectory,
         runtimeRoot,
+        agentHomePath: preparedAgentHome.path,
         ...(preparedAgentHome.nativeAuth === undefined ? {} : { nativeAuth: preparedAgentHome.nativeAuth }),
         nativeAuthPersistenceRevoked: false,
         controlPath,
         silentEncryptedRetryControlPath,
+        cacheCompatibilityLeases: new Map(),
         artifactDirectory,
         redactValues,
         resources: [...managedResourceSnapshot.resources, ...projectResourceSnapshot.resources,
@@ -5217,6 +5248,64 @@ export class PiBackendAdapter implements
     }
   }
 
+  async #resolveCacheCompatibility(
+    runtime: PiRuntime,
+    context: AdapterContext,
+    request: PiCacheCompatibilityRequest
+  ): Promise<Readonly<Record<string, unknown>>> {
+    const currentRuntime = () => !this.#disposed && this.#runtimes.get(runtime.key) === runtime
+      && !runtime.transport.closed && !runtime.abortRequested && !context.signal.aborted
+      && runtime.context.generation === context.generation && runtime.context.target.remoteWorkspace === undefined
+      && runtime.control.runtimePolicy === "standard";
+    const exactModel = async (route: PiCacheRoute) => {
+      if (!currentRuntime()) return false;
+      const model = (await this.#requestState(runtime, context)).model;
+      return currentRuntime() && model?.api === "openai-completions" && model.provider === route.providerId
+        && model.id === route.wireModelId && typeof model.baseUrl === "string"
+        && piCacheRouteKey(model.baseUrl, model.api) === route.routeKey;
+    };
+    if (request.action === "prepare") {
+      if (!await exactModel(request.route)) return {};
+      const applied = await this.#cacheCompatibility.has(request.route);
+      if (!currentRuntime()) return {};
+      const lifecycle = runtime.lifecycle;
+      if (applied || !request.hasCacheOptions || lifecycle === undefined || lifecycle.settlementReceived) {
+        return { current: true, applied };
+      }
+      const lease = randomUUID();
+      runtime.cacheCompatibilityLeases.set(lease, { route: { ...request.route }, lifecycle, context });
+      if (runtime.cacheCompatibilityLeases.size > 64) {
+        runtime.cacheCompatibilityLeases.delete(runtime.cacheCompatibilityLeases.keys().next().value!);
+      }
+      return { current: true, applied: false, lease };
+    }
+    const receipt = runtime.cacheCompatibilityLeases.get(request.lease);
+    // Consume before disk IO. Failed persistence cannot re-arm the same rejection.
+    runtime.cacheCompatibilityLeases.delete(request.lease);
+    if (!receipt || receipt.context !== context && receipt.lifecycle.currentContext !== context
+      || runtime.lifecycle !== receipt.lifecycle || !await exactModel(receipt.route)) return {};
+    const lifecycle = receipt.lifecycle;
+    const routeIdentity = JSON.stringify([receipt.route.providerId, receipt.route.wireModelId, receipt.route.routeKey]);
+    if (lifecycle.recoveredCacheRoutes?.has(routeIdentity)) return {};
+    lifecycle.recoveredCacheRoutes ??= new Set();
+    lifecycle.recoveredCacheRoutes.add(routeIdentity);
+    const replayIsCurrent = () => {
+      try {
+        if (!currentRuntime() || runtime.lifecycle !== lifecycle || lifecycle.settlementReceived
+          || lifecycle.requestRecoveryTainted || lifecycle.participants.length !== 1
+          || lifecycle.owner.disposition !== "prompt" || lifecycle.owner.context.rejectedRequestRecovery === undefined) return false;
+        lifecycle.owner.context.rejectedRequestRecovery.assertCurrent();
+        return true;
+      } catch { return false; }
+    };
+    const replayWasCurrent = replayIsCurrent();
+    if (!await this.#cacheCompatibility.record(receipt.route) || !await exactModel(receipt.route)) return {};
+    await this.#cacheCompatibility.snapshot(join(runtime.agentHomePath, "request-option-compatibility.json"));
+    // Learning remains useful to owner-managed automation, whose caller retains
+    // its own retry semantics. Only an unchanged zero-output user turn can replay.
+    return { applied: true, replay: replayWasCurrent && replayIsCurrent() };
+  }
+
   #wireRuntime(runtime: PiRuntime): void {
     const isCurrent = () => this.#runtimes.get(runtime.key) === runtime && runtime.transport.generation === runtime.context.generation;
     runtime.transport.onEvent((event) => {
@@ -5249,6 +5338,7 @@ export class PiBackendAdapter implements
         return;
       }
       const lifecycle = runtime.lifecycle;
+      if (lifecycle !== undefined && requestRecoveryOutputObserved(rawEvent)) lifecycle.requestRecoveryTainted = true;
       const runningExtensionCommand = runtime.runningExtensionCommand;
       const userShell = event.type === "bash_execution_update" ? runtime.userShell : undefined;
       const capturedEventContext = userShell?.context ?? (
@@ -5326,6 +5416,11 @@ export class PiBackendAdapter implements
               }
               return;
             }
+            if (await handlePiCacheCompatibilityRequest(rawEvent, {
+              resolve: request => this.#resolveCacheCompatibility(runtime, capturedEventContext, request),
+              transport: runtime.transport,
+              isCurrent
+            })) return;
             if (await handleCommandGateExtensionRequest(
               event as unknown as Record<string, unknown>,
               {
@@ -9141,4 +9236,19 @@ function timestamp(value: unknown): number {
   if (typeof value !== "string") return 0;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function requestRecoveryOutputObserved(event: Readonly<Record<string, unknown>>): boolean {
+  if (event.type === "tool_execution_start" || event.type === "compaction_start") return true;
+  if (event.type === "message_update" && isRecord(event.assistantMessageEvent)) {
+    const update = event.assistantMessageEvent;
+    return typeof update.delta === "string" && update.delta.length > 0
+      || typeof update.type === "string" && update.type.startsWith("toolcall_");
+  }
+  if (event.type !== "message_end" || !isRecord(event.message) || event.message.role !== "assistant") return false;
+  const content = event.message.content;
+  if (typeof content === "string") return content.length > 0;
+  return Array.isArray(content) && content.some(block => isRecord(block) && (block.type === "toolCall"
+    || typeof block.text === "string" && block.text.length > 0
+    || typeof block.thinking === "string" && block.thinking.length > 0));
 }
