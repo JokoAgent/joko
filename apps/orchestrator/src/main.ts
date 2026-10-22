@@ -20,6 +20,7 @@ import {
 import { needsLocalPairingRecovery } from "./local-pairing-recovery.js";
 import { createInternalServer, createPublicServer } from "./server.js";
 import { createHostedAgentPeerPort } from "./hosted-agent-peer-port.js";
+import { withProviderGroupPeerPort } from "./provider-group-peer.js";
 import { OrchestratorServiceLifecycle, OrchestratorStartupInterruptedError } from "./service-lifecycle.js";
 import {
   createServiceDevicePeerRuntimeExecutables,
@@ -105,7 +106,11 @@ async function main(): Promise<void> {
       const serviceDevicePeerAgent = new ServiceDevicePeerAgent({
         config: config.devicePeerAgent,
         ...(application.hostedAgents === undefined ? {} : {
-          createNativeAgentPort: () => createHostedAgentPeerPort(application.hostedAgents!, config.devicePeerAgent!.controllerServerId)
+          createNativeAgentPort: () => {
+            const native = createHostedAgentPeerPort(application.hostedAgents!, config.devicePeerAgent!.controllerServerId);
+            return application.providerGroups ? withProviderGroupPeerPort(native,
+              application.providerGroups.connectOptions(() => { throw new Error("A current Device route is required."); })) : native;
+          }
         }),
         runtimeExecutables: await createServiceDevicePeerRuntimeExecutables(config)
       });

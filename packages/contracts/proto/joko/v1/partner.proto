@@ -189,6 +189,8 @@ message PartnerCapabilities {
   repeated PartnerModelRoute model_chain = 1;
   PermissionMode permission_mode = 2;
   bool plan_mode = 3;
+  // Omitted means enabled. This is independent of the model's tool selection.
+  optional bool input_handoff = 4;
 }
 
 message PartnerTemplate {
@@ -389,6 +391,7 @@ message PartnerPatch {
     bool inherit_task_model = 9;
   }
   optional string description = 10;
+  optional bool input_handoff = 11;
 }
 
 message GetPartnerDirectoryRequest {}

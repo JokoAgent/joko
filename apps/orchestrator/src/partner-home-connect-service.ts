@@ -106,7 +106,7 @@ function capabilities(value: contract.PartnerCapabilities | undefined): PartnerC
   return { modelChain: value.modelChain.map(route => ({ backendId: route.backendId, providerId: route.providerId, modelId: route.modelId,
     ...(route.effort === undefined ? {} : { effort: route.effort }), fastMode: route.fastMode })),
     permissionMode: value.permissionMode === contract.PermissionMode.ASK ? "ask" : value.permissionMode === contract.PermissionMode.ACCEPT_EDITS ? "acceptEdits" : value.permissionMode === contract.PermissionMode.AUTO ? "auto" : "bypassPermissions",
-    planMode: value.planMode };
+    planMode: value.planMode, inputHandoff: value.inputHandoff ?? true };
 }
 function model(value: PartnerHomeModel): contract.PartnerHomeModelChoice {
   return create(contract.PartnerHomeModelChoiceSchema, { route: value.route, displayName: value.displayName, canSetPlanMode: value.canSetPlanMode,

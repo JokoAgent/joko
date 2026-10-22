@@ -365,6 +365,8 @@ export interface ClaudeCodeAdapterOptions extends ClaudeInputResolvers {
   /** Resolves an exact SSH-bound SDK runtime for remote Targets. */
   readonly remoteRuntimes?: ClaudeRemoteRuntimePort;
   readonly environment?: Readonly<Record<string, string | undefined>>;
+  /** Private owner-only local task shell environment, resolved per SDK runtime. */
+  readonly taskShellEnv?: (context: AdapterContext) => Readonly<Record<string, string>>;
   /** Opaque Orchestrator-owned persistence boundary for the native subscription account. */
   readonly credentialPort?: ClaudeCodeCredentialPort;
   readonly managedProviders?: ManagedProviderRuntimePort;
@@ -419,6 +421,7 @@ interface ActiveTurn {
   readonly operationId: string;
   mcpCallCancellation: AbortController;
   readonly mcpRootToolWaiters: Map<string, Deferred<void>>;
+  readonly nativeRootToolInputs: Map<string, { readonly input: Readonly<Record<string, unknown>>; claimed: boolean }>;
   readonly subtaskRouteLeases: Map<string, ManagedSubtaskRouteGrant>;
   readonly subtaskRouteAdmissions: Map<string, ManagedSubtaskRouteAdmission>;
   readonly subtaskRouteDecisions: Map<string, ManagedSubtaskRouteDecision>;
@@ -663,6 +666,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
   readonly #resolvedTargetRuntimes = new Set<ClaudeSdkRuntime>();
   readonly #instanceGeneration: number;
   readonly #environment: Readonly<Record<string, string>>;
+  readonly #taskShellEnv: ClaudeCodeAdapterOptions["taskShellEnv"];
   readonly #managedProviders: ManagedProviderRuntimePort | undefined;
   readonly #hostedSubscriptionTransport: ClaudeCodeAdapterOptions["hostedSubscriptionTransport"];
   readonly #pathToExecutable: string | undefined;
@@ -714,6 +718,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     this.id = id;
     this.#managedProviders = options.managedProviders;
     this.#hostedSubscriptionTransport = options.hostedSubscriptionTransport;
+    this.#taskShellEnv = options.taskShellEnv;
     this.#instanceGeneration = options.instanceGeneration;
     let subscriptionEnvironment: Readonly<Record<string, string>> | undefined;
     if (options.hostedSubscriptionTransport) {
@@ -1940,6 +1945,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       operationId,
       mcpCallCancellation: new AbortController(),
       mcpRootToolWaiters: new Map(),
+      nativeRootToolInputs: new Map(),
       subtaskRouteLeases: new Map(),
       subtaskRouteAdmissions: new Map(),
       subtaskRouteDecisions: new Map(),
@@ -3255,6 +3261,15 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     assertCurrent();
     const signal = AbortSignal.any([options.signal, runtime.abortController.signal, turn!.mcpCallCancellation.signal]);
     signal.throwIfAborted();
+    const nativeRootCall = tool.requiresNativeRoot ? turn!.nativeRootToolInputs.get(options.toolUseId) : undefined;
+    if (tool.requiresNativeRoot && (!nativeRootCall || nativeRootCall.claimed || !isDeepStrictEqual(nativeRootCall.input, capturedArguments))) throw new Error("The tool requires its original native root call.");
+    if (nativeRootCall) nativeRootCall.claimed = true;
+    const assertNativeRoot = (): void => {
+      assertCurrent();
+      if (!nativeRootCall || turn!.nativeRootToolInputs.get(options.toolUseId) !== nativeRootCall) {
+        throw new Error("The original native root tool call has ended.");
+      }
+    };
     const partnerLearningAuthority = learningTurn?.captureToolRequest({ requestId, serverId: tool.serverId, toolName: tool.name });
     const result = await lease!.call({
       serverId: tool.serverId,
@@ -3262,6 +3277,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       requestId,
       arguments: capturedArguments,
       signal,
+      ...(nativeRootCall === undefined ? {} : { nativeRootCall: { arguments: nativeRootCall.input, assertCurrent: assertNativeRoot } }),
       ...(options.modelCallId === undefined ? {} : { modelCallId: options.modelCallId }),
       ...(partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority })
     });
@@ -3981,6 +3997,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             CLAUDE_CODE_SUBAGENT_MODEL: subagentModel,
             CLAUDE_CODE_SUBAGENT_MODEL_FORCE: undefined,
             ...workingEnvironment,
+            ...(!context.target.remoteWorkspace && !context.hostedExecution && launch.runtimePolicy !== "review_read_only" ? this.#taskShellEnv?.(context) : {}),
             ...(context.hostedExecution ? claudeHostedEnvironment(context.hostedExecution, this.#environment) : {})
           },
           ...(launch.runtimePolicy === "review_read_only"
@@ -4444,6 +4461,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         throw nativeEventLimit();
       }
       runtime.toolNames.set(tool.callId, tool.name);
+      if (runtime.mcpLease?.tools.some(candidate => candidate.requiresNativeRoot && `mcp__${claudeMcpServerName(candidate.serverId)}__${candidate.name}` === tool.name)) {
+        const nativeContent = nativeMessage?.["content"];
+        const matches = Array.isArray(nativeContent) ? nativeContent.map(record).filter(block => block?.["type"] === "tool_use" && block["id"] === tool.callId && block["name"] === tool.name) : [];
+        const input = matches.length === 1 ? record(matches[0]?.["input"]) : undefined;
+        if (input && !turn.nativeRootToolInputs.has(tool.callId)) turn.nativeRootToolInputs.set(tool.callId, { input: structuredClone(input), claimed: false });
+      }
       if (runtime.nativeTaskProjectionEnabled) {
         await this.#publishNativeTaskEmissions(
           runtime,
@@ -4470,6 +4493,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (uuid !== undefined) addBoundedIdentity(turn.seenFrameUuids, uuid);
     const projected = this.#projection.user(message);
     for (const result of projected.toolResults) {
+      turn.nativeRootToolInputs.delete(result.callId);
       if (runtime.nativeTaskProjectionEnabled) runtime.nativeTasks.completeToolScope(result.callId);
       if (turn.seenToolResults.has(result.callId)) continue;
       addBoundedIdentity(turn.seenToolResults, result.callId);

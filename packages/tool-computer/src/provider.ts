@@ -44,6 +44,9 @@ export interface ComputerToolCallResult {
 
 export interface ComputerToolCallContext {
   readonly workspaceRoot?: string;
+  /** Product-owned admission for every physical primitive, including text
+   * chunks and replay steps. Never supplied by native tool arguments. */
+  readonly assertInputCurrent?: () => void;
 }
 
 export interface ComputerMcpToolPage {
@@ -271,7 +274,9 @@ export class ComputerToolProvider {
         name,
         normalized,
         signal,
-        context.workspaceRoot
+        context.workspaceRoot,
+        false,
+        context.assertInputCurrent
       ));
     }
     return enqueue(entry, async () => this.#withReconnect(entry, signal, async (connection, operationSignal) => {
@@ -279,6 +284,7 @@ export class ComputerToolProvider {
       if (!catalog.some((tool) => tool.name === name)) {
         throw new ComputerToolProviderError("unknown_tool", name);
       }
+      context.assertInputCurrent?.();
       const result = await connection.callTool(name, safeArguments, operationSignal);
       const stale = staleToolResult(result);
       if (stale !== undefined) throw new StaleTransportError(stale);
@@ -474,7 +480,8 @@ export class ComputerToolProvider {
     arguments_: Record<string, unknown>,
     signal: AbortSignal | undefined,
     workspaceRoot?: string,
-    automaticObservation = false
+    automaticObservation = false,
+    assertInputCurrent?: () => void
   ): Promise<ComputerToolCallResult> {
     if (name === "status" || name === "check_permissions") {
       const status = await this.#runtime.status({ signal });
@@ -489,7 +496,7 @@ export class ComputerToolProvider {
       return jsonToolResult(payload);
     }
     if (name === "replay_trajectory") {
-      return this.#replayTrajectory(entry, arguments_, signal, workspaceRoot);
+      return this.#replayTrajectory(entry, arguments_, signal, workspaceRoot, assertInputCurrent);
     }
 
     const stale = staleSnapshotResult(entry, name, arguments_);
@@ -517,6 +524,7 @@ export class ComputerToolProvider {
         if (this.#decorateCursor) await initializeCursorDecoration(entry, connection, name, operationSignal);
         if (chunks === undefined || chunks.length === 1) {
           const prepared = prepareDriverArguments(entry, name, arguments_);
+          assertInputCurrent?.();
           const response = await callDriverTool(connection, name, prepared, operationSignal);
           const stale = staleToolResult(response);
           if (stale !== undefined) throw new StaleTransportError(stale);
@@ -532,6 +540,7 @@ export class ComputerToolProvider {
             ...arguments_,
             text: chunk
           });
+          assertInputCurrent?.();
           const response = await callDriverTool(connection, name, prepared, operationSignal);
           const stale = staleToolResult(response);
           if (stale !== undefined) throw new StaleTransportError(stale);
@@ -683,7 +692,8 @@ export class ComputerToolProvider {
     entry: SessionEntry,
     arguments_: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
-    workspaceRoot: string | undefined
+    workspaceRoot: string | undefined,
+    assertInputCurrent?: () => void
   ): Promise<ComputerToolCallResult> {
     const prepared = await prepareTrajectory(arguments_, signal, workspaceRoot);
     if ("error" in prepared) return prepared.error;
@@ -696,6 +706,7 @@ export class ComputerToolProvider {
 
     for (let index = 0; index < prepared.actions.length; index += 1) {
       signal?.throwIfAborted();
+      assertInputCurrent?.();
       if (Date.now() - startedAt >= 10 * 60_000) {
         return errorToolResult("REPLAY_BUDGET_EXCEEDED", {
           message: "Trajectory replay exceeded its bounded wall-clock budget."
@@ -704,7 +715,7 @@ export class ComputerToolProvider {
       const action = prepared.actions[index]!;
       let result: ComputerToolCallResult;
       try {
-        result = await this.#callPublicTool(entry, action.tool, action.arguments, signal);
+        result = await this.#callPublicTool(entry, action.tool, action.arguments, signal, workspaceRoot, false, assertInputCurrent);
       } catch (error) {
         if (isAbortError(error)) throw error;
         result = errorToolResult("COMPUTER_DRIVER_ERROR", { message: "Recorded action failed." });

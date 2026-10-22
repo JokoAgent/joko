@@ -12,13 +12,17 @@ export interface HostedNativeSessionOwner {
   readonly nativeSessionId: string;
   readonly backendId: string;
   readonly trust: "owner" | "guest";
+  readonly providerGrant?: HostedNativeProviderGrantOwner;
+}
+export interface HostedNativeProviderGrantOwner {
+  readonly shareId: string; readonly memberId: string; readonly incarnation: number; readonly cleanupKey: string;
 }
 export interface HostedNativeSessionRecord {
   readonly format: 1;
   readonly key: string;
   readonly owner: HostedNativeSessionOwner;
   readonly leaseId: string;
-  readonly state: "creating" | "ready" | "closed";
+  readonly state: "creating" | "ready" | "closed" | "purging";
   readonly binding?: NativeSessionBinding;
 }
 export interface HostedNativeCallReceipt {
@@ -44,7 +48,7 @@ export class HostedAgentStore {
     if (start !== "create" && start !== "resume") throw new StoreError("The hosted native start is invalid.");
     return this.store.transaction(() => {
       const prior = this.find(key);
-      if (start === "create" && prior || start === "resume" && (!prior?.binding || prior.state === "creating")) {
+      if (start === "create" && prior || start === "resume" && (!prior?.binding || prior.state === "creating" || prior.state === "purging")) {
         throw new StoreError("The hosted native identity cannot be created or resumed with this request.");
       }
       const value: HostedNativeSessionRecord = { format: 1, key, owner: { ...owner }, leaseId,
@@ -56,11 +60,11 @@ export class HostedAgentStore {
     digest(key); const row = this.store.findSetting<unknown>("service", SCOPE, `session:${key}`);
     if (!row) return undefined;
     const value = record(row.value);
-    if (value.format !== 1 || value.key !== key || !["creating", "ready", "closed"].includes(value.state as string)) throw new StoreError("The hosted native record is invalid.");
+    if (value.format !== 1 || value.key !== key || !["creating", "ready", "closed", "purging"].includes(value.state as string)) throw new StoreError("The hosted native record is invalid.");
     validateOwner(value.owner as HostedNativeSessionOwner); identity(value.leaseId);
     if (this.key(value.owner as HostedNativeSessionOwner) !== key) throw new StoreError("The hosted native owner conflicts.");
     if (value.binding !== undefined) validateBinding(value.binding as NativeSessionBinding);
-    if (value.state !== "creating" && value.binding === undefined) throw new StoreError("The hosted native binding is missing.");
+    if (value.state !== "creating" && value.state !== "purging" && value.binding === undefined) throw new StoreError("The hosted native binding is missing.");
     if (Object.keys(value).some(name => !["format", "key", "owner", "leaseId", "state", "binding"].includes(name))) throw new StoreError("The hosted native record has unknown fields.");
     return value as unknown as HostedNativeSessionRecord;
   }
@@ -83,6 +87,20 @@ export class HostedAgentStore {
       if (!value.binding) return;
       this.store.setSetting("service", SCOPE, `session:${key}`, { ...value, state: "closed" });
     });
+  }
+  list(): readonly HostedNativeSessionRecord[] {
+    return this.store.listSettingsByKeyPrefix("service", SCOPE, "session:").map(row => this.find(row.key.slice("session:".length))!);
+  }
+  /** A confirmed process owner fences resumption before deleting its files. */
+  beginPurge(key: string, leaseId: string): void {
+    this.store.transaction(() => { const value = this.assertLease(key, leaseId);
+      this.store.setSetting("service", SCOPE, `session:${key}`, { ...value, state: "purging" }); });
+  }
+  finishPurge(key: string, leaseId: string): void {
+    this.store.transaction(() => { const value = this.assertLease(key, leaseId);
+      if (value.state !== "purging") throw new StoreError("The hosted native cleanup is not fenced.");
+      for (const row of this.store.listSettingsByKeyPrefix("service", SCOPE, `call:${key}:`)) this.store.deleteSetting("service", SCOPE, row.key);
+      this.store.deleteSetting("service", SCOPE, `session:${key}`); });
   }
   claimCall(key: string, leaseId: string, callId: string, bodyDigest: string): HostedNativeCallReceipt {
     identity(callId); digest(bodyDigest);
@@ -122,7 +140,12 @@ function digest(value: unknown): asserts value is string { if (typeof value !== 
 function validateOwner(owner: HostedNativeSessionOwner): void {
   const value = record(owner);
   for (const field of ["authorityId", "deviceId", "sessionId", "targetId", "nativeSessionId", "backendId"]) identity(value[field]);
-  if (!["owner", "guest"].includes(owner.trust) || Object.keys(value).some(name => !["authorityId", "deviceId", "sessionId", "targetId", "nativeSessionId", "backendId", "trust"].includes(name))) throw new StoreError("The hosted native owner is invalid.");
+  if (!["owner", "guest"].includes(owner.trust) || Object.keys(value).some(name => !["authorityId", "deviceId", "sessionId", "targetId", "nativeSessionId", "backendId", "trust", "providerGrant"].includes(name))) throw new StoreError("The hosted native owner is invalid.");
+  if (owner.providerGrant !== undefined) {
+    const grant = record(owner.providerGrant); identity(grant.shareId); identity(grant.memberId); digest(grant.cleanupKey);
+    if (owner.trust !== "guest" || !Number.isSafeInteger(grant.incarnation) || (grant.incarnation as number) < 1
+      || Object.keys(grant).some(name => !["shareId", "memberId", "incarnation", "cleanupKey"].includes(name))) throw new StoreError("The hosted Provider cleanup owner is invalid.");
+  }
 }
 function validateBinding(binding: NativeSessionBinding): void {
   const value = record(binding); identity(value.opaqueRef);

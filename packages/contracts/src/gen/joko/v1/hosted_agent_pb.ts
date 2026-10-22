@@ -8,13 +8,81 @@ import type { ModelDescriptor } from "./model_pb.js";
 import { file_joko_v1_model } from "./model_pb.js";
 import type { Capability } from "./capability_pb.js";
 import { file_joko_v1_capability } from "./capability_pb.js";
+import type { ProviderGroupSummary } from "./provider_group_pb.js";
+import { file_joko_v1_provider_group } from "./provider_group_pb.js";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file joko/v1/hosted_agent.proto.
  */
 export const file_joko_v1_hosted_agent: GenFile = /*@__PURE__*/
-  fileDesc("Chpqb2tvL3YxL2hvc3RlZF9hZ2VudC5wcm90bxIHam9rby52MSKnAQoaSG9zdGVkQWdlbnRQcm92aWRlckNhdGFsb2cSEwoLcHJvdmlkZXJfaWQYASABKAkSFAoMZGlzcGxheV9uYW1lGAIgASgJEiEKGXJlbW90ZV9pbnZvY2F0aW9uX2VuYWJsZWQYAyABKAgSEQoJY29ubmVjdGVkGAQgASgIEigKBm1vZGVscxgFIAMoCzIYLmpva28udjEuTW9kZWxEZXNjcmlwdG9yIrkBChlIb3N0ZWRBZ2VudEJhY2tlbmRDYXRhbG9nEhIKCmJhY2tlbmRfaWQYASABKAkSFAoMZGlzcGxheV9uYW1lGAIgASgJEjYKCXByb3ZpZGVycxgDIAMoCzIjLmpva28udjEuSG9zdGVkQWdlbnRQcm92aWRlckNhdGFsb2cSKQoMY2FwYWJpbGl0aWVzGAQgAygLMhMuam9rby52MS5DYXBhYmlsaXR5Eg8KB3ZlcnNpb24YBSABKAkiLgocR2V0SG9zdGVkQWdlbnRDYXRhbG9nUmVxdWVzdBIOCgZmb3JtYXQYASABKA0ihQEKHUdldEhvc3RlZEFnZW50Q2F0YWxvZ1Jlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDRIeChZyZW1vdGVfY29udHJvbF9lbmFibGVkGAIgASgIEjQKCGJhY2tlbmRzGAMgAygLMiIuam9rby52MS5Ib3N0ZWRBZ2VudEJhY2tlbmRDYXRhbG9nIlkKHUhvc3RlZEFnZW50UHJvdmlkZXJQZXJtaXNzaW9uEhIKCmJhY2tlbmRfaWQYASABKAkSEwoLcHJvdmlkZXJfaWQYAiABKAkSDwoHZW5hYmxlZBgDIAEoCCI2ChFIb3N0ZWRBZ2VudExpbWl0cxISCgpwZXJfZGV2aWNlGAEgASgNEg0KBXRvdGFsGAIgASgNIk8KFUhvc3RlZEFnZW50TGltaXRVc2FnZRINCgV0b3RhbBgBIAEoDRIPCgdkZXZpY2VzGAIgASgNEhYKDm1heGltdW1fZGV2aWNlGAMgASgNIvgBChNIb3N0ZWRBZ2VudFNldHRpbmdzEhAKCHJldmlzaW9uGAEgASgEEh4KFnJlbW90ZV9jb250cm9sX2VuYWJsZWQYAiABKAgSOQoJcHJvdmlkZXJzGAMgAygLMiYuam9rby52MS5Ib3N0ZWRBZ2VudFByb3ZpZGVyUGVybWlzc2lvbhIqCgZsaW1pdHMYBCABKAsyGi5qb2tvLnYxLkhvc3RlZEFnZW50TGltaXRzEhkKEWxpbWl0c19vdmVycmlkZGVuGAUgASgIEi0KBXVzYWdlGAYgASgLMh4uam9rby52MS5Ib3N0ZWRBZ2VudExpbWl0VXNhZ2UiHwodR2V0SG9zdGVkQWdlbnRTZXR0aW5nc1JlcXVlc3QiUAoeR2V0SG9zdGVkQWdlbnRTZXR0aW5nc1Jlc3BvbnNlEi4KCHNldHRpbmdzGAEgASgLMhwuam9rby52MS5Ib3N0ZWRBZ2VudFNldHRpbmdzIjUKIkhvc3RlZEFnZW50UmVtb3RlQ29udHJvbFBlcm1pc3Npb24SDwoHZW5hYmxlZBgBIAEoCCIYChZIb3N0ZWRBZ2VudFJlc2V0TGltaXRzIrECCiBVcGRhdGVIb3N0ZWRBZ2VudFNldHRpbmdzUmVxdWVzdBIZChFleHBlY3RlZF9yZXZpc2lvbhgBIAEoBBJFCg5yZW1vdGVfY29udHJvbBgCIAEoCzIrLmpva28udjEuSG9zdGVkQWdlbnRSZW1vdGVDb250cm9sUGVybWlzc2lvbkgAEjoKCHByb3ZpZGVyGAMgASgLMiYuam9rby52MS5Ib3N0ZWRBZ2VudFByb3ZpZGVyUGVybWlzc2lvbkgAEiwKBmxpbWl0cxgEIAEoCzIaLmpva28udjEuSG9zdGVkQWdlbnRMaW1pdHNIABI3CgxyZXNldF9saW1pdHMYBSABKAsyHy5qb2tvLnYxLkhvc3RlZEFnZW50UmVzZXRMaW1pdHNIAEIICgZ1cGRhdGUiUwohVXBkYXRlSG9zdGVkQWdlbnRTZXR0aW5nc1Jlc3BvbnNlEi4KCHNldHRpbmdzGAEgASgLMhwuam9rby52MS5Ib3N0ZWRBZ2VudFNldHRpbmdzIjsKFk9wZW5Ib3N0ZWRBZ2VudFJlcXVlc3QSDgoGZm9ybWF0GAEgASgNEhEKCW9wZW5fanNvbhgCIAEoDCJPChdPcGVuSG9zdGVkQWdlbnRSZXNwb25zZRIOCgZmb3JtYXQYASABKA0SDgoGcnVuX2lkGAIgASgJEhQKDHZpcnR1YWxfcm9vdBgDIAEoCSJfChZDYWxsSG9zdGVkQWdlbnRSZXF1ZXN0Eg4KBmZvcm1hdBgBIAEoDRIOCgZydW5faWQYAiABKAkSDwoHY2FsbF9pZBgDIAEoCRIUCgxjb21tYW5kX2pzb24YBCABKAwiPgoXQ2FsbEhvc3RlZEFnZW50UmVzcG9uc2USDgoGZm9ybWF0GAEgASgNEhMKC3Jlc3VsdF9qc29uGAIgASgMIjYKFUhvc3RlZEFnZW50UG9sbEN1cnNvchIOCgZydW5faWQYASABKAkSDQoFYWZ0ZXIYAiABKAQiWwoSSG9zdGVkQWdlbnRQb2xsUnVuEg4KBnJ1bl9pZBgBIAEoCRIOCgZjdXJzb3IYAiABKAQSEAoIZmluaXNoZWQYAyABKAgSEwoLZnJhbWVzX2pzb24YBCABKAwiWgoXUG9sbEhvc3RlZEFnZW50c1JlcXVlc3QSDgoGZm9ybWF0GAEgASgNEi8KB2N1cnNvcnMYAiADKAsyHi5qb2tvLnYxLkhvc3RlZEFnZW50UG9sbEN1cnNvciJVChhQb2xsSG9zdGVkQWdlbnRzUmVzcG9uc2USDgoGZm9ybWF0GAEgASgNEikKBHJ1bnMYAiADKAsyGy5qb2tvLnYxLkhvc3RlZEFnZW50UG9sbFJ1biJiChdSZXBseUhvc3RlZEFnZW50UmVxdWVzdBIOCgZmb3JtYXQYASABKA0SDgoGcnVuX2lkGAIgASgJEhIKCnJlcXVlc3RfaWQYAyABKAkSEwoLcmVzdWx0X2pzb24YBCABKAwiKgoYUmVwbHlIb3N0ZWRBZ2VudFJlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDSJ8Ch5SZWFkSG9zdGVkQWdlbnRBcnRpZmFjdFJlcXVlc3QSDgoGZm9ybWF0GAEgASgNEg4KBnJ1bl9pZBgCIAEoCRITCgthcnRpZmFjdF9pZBgDIAEoCRIOCgZvZmZzZXQYBCABKAQSFQoNbWF4aW11bV9ieXRlcxgFIAEoDSI/Ch9SZWFkSG9zdGVkQWdlbnRBcnRpZmFjdFJlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDRIMCgRkYXRhGAIgASgMIjkKF0Nsb3NlSG9zdGVkQWdlbnRSZXF1ZXN0Eg4KBmZvcm1hdBgBIAEoDRIOCgZydW5faWQYAiABKAkiKgoYQ2xvc2VIb3N0ZWRBZ2VudFJlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDSqhAwoVSG9zdGVkQWdlbnRQZWVyTWV0aG9kEigKJEhPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9VTlNQRUNJRklFRBAAEikKJUhPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9HRVRfU0VUVElOR1MQARIsCihIT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfVVBEQVRFX1NFVFRJTkdTEAISIQodSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX09QRU4QAxIhCh1IT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfQ0FMTBAEEiEKHUhPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9QT0xMEAUSIgoeSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX1JFUExZEAYSKgomSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX1JFQURfQVJUSUZBQ1QQBxIiCh5IT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfQ0xPU0UQCBIoCiRIT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfR0VUX0NBVEFMT0cQCTKABwoSSG9zdGVkQWdlbnRTZXJ2aWNlEmYKFUdldEhvc3RlZEFnZW50Q2F0YWxvZxIlLmpva28udjEuR2V0SG9zdGVkQWdlbnRDYXRhbG9nUmVxdWVzdBomLmpva28udjEuR2V0SG9zdGVkQWdlbnRDYXRhbG9nUmVzcG9uc2USaQoWR2V0SG9zdGVkQWdlbnRTZXR0aW5ncxImLmpva28udjEuR2V0SG9zdGVkQWdlbnRTZXR0aW5nc1JlcXVlc3QaJy5qb2tvLnYxLkdldEhvc3RlZEFnZW50U2V0dGluZ3NSZXNwb25zZRJyChlVcGRhdGVIb3N0ZWRBZ2VudFNldHRpbmdzEikuam9rby52MS5VcGRhdGVIb3N0ZWRBZ2VudFNldHRpbmdzUmVxdWVzdBoqLmpva28udjEuVXBkYXRlSG9zdGVkQWdlbnRTZXR0aW5nc1Jlc3BvbnNlElQKD09wZW5Ib3N0ZWRBZ2VudBIfLmpva28udjEuT3Blbkhvc3RlZEFnZW50UmVxdWVzdBogLmpva28udjEuT3Blbkhvc3RlZEFnZW50UmVzcG9uc2USVAoPQ2FsbEhvc3RlZEFnZW50Eh8uam9rby52MS5DYWxsSG9zdGVkQWdlbnRSZXF1ZXN0GiAuam9rby52MS5DYWxsSG9zdGVkQWdlbnRSZXNwb25zZRJXChBQb2xsSG9zdGVkQWdlbnRzEiAuam9rby52MS5Qb2xsSG9zdGVkQWdlbnRzUmVxdWVzdBohLmpva28udjEuUG9sbEhvc3RlZEFnZW50c1Jlc3BvbnNlElcKEFJlcGx5SG9zdGVkQWdlbnQSIC5qb2tvLnYxLlJlcGx5SG9zdGVkQWdlbnRSZXF1ZXN0GiEuam9rby52MS5SZXBseUhvc3RlZEFnZW50UmVzcG9uc2USbAoXUmVhZEhvc3RlZEFnZW50QXJ0aWZhY3QSJy5qb2tvLnYxLlJlYWRIb3N0ZWRBZ2VudEFydGlmYWN0UmVxdWVzdBooLmpva28udjEuUmVhZEhvc3RlZEFnZW50QXJ0aWZhY3RSZXNwb25zZRJXChBDbG9zZUhvc3RlZEFnZW50EiAuam9rby52MS5DbG9zZUhvc3RlZEFnZW50UmVxdWVzdBohLmpva28udjEuQ2xvc2VIb3N0ZWRBZ2VudFJlc3BvbnNlYgZwcm90bzM", [file_joko_v1_model, file_joko_v1_capability]);
+  fileDesc("Chpqb2tvL3YxL2hvc3RlZF9hZ2VudC5wcm90bxIHam9rby52MSJqChpIb3N0ZWRBZ2VudEd1ZXN0UmVsYXlTY29wZRIQCghyZWxheV9pZBgBIAEoCRISCgpiYWNrZW5kX2lkGAIgASgJEhMKC3Byb3ZpZGVyX2lkGAMgASgJEhEKCW1vZGVsX2lkcxgEIAMoCSJ4ChxIb3N0ZWRBZ2VudEd1ZXN0UmVsYXlSZXF1ZXN0EjIKBXNjb3BlGAEgASgLMiMuam9rby52MS5Ib3N0ZWRBZ2VudEd1ZXN0UmVsYXlTY29wZRIVCg1yZXF1ZXN0X2J5dGVzGAIgASgMEg0KBXB1cmdlGAMgASgIIoICChpIb3N0ZWRBZ2VudFByb3ZpZGVyQ2F0YWxvZxITCgtwcm92aWRlcl9pZBgBIAEoCRIUCgxkaXNwbGF5X25hbWUYAiABKAkSIQoZcmVtb3RlX2ludm9jYXRpb25fZW5hYmxlZBgDIAEoCBIRCgljb25uZWN0ZWQYBCABKAgSKAoGbW9kZWxzGAUgAygLMhguam9rby52MS5Nb2RlbERlc2NyaXB0b3ISEwoLYWNjZXNzX2tpbmQYBiABKAkSFgoOYWNjZXNzX3Byb2R1Y3QYByABKAkSLAoFZ3JvdXAYCCABKAsyHS5qb2tvLnYxLlByb3ZpZGVyR3JvdXBTdW1tYXJ5IucBChlIb3N0ZWRBZ2VudEJhY2tlbmRDYXRhbG9nEhIKCmJhY2tlbmRfaWQYASABKAkSFAoMZGlzcGxheV9uYW1lGAIgASgJEjYKCXByb3ZpZGVycxgDIAMoCzIjLmpva28udjEuSG9zdGVkQWdlbnRQcm92aWRlckNhdGFsb2cSKQoMY2FwYWJpbGl0aWVzGAQgAygLMhMuam9rby52MS5DYXBhYmlsaXR5Eg8KB3ZlcnNpb24YBSABKAkSGwoTbmF0aXZlX2FkYXB0ZXJfa2luZBgGIAEoCRIPCgdub2RlX2lkGAcgASgJIi4KHEdldEhvc3RlZEFnZW50Q2F0YWxvZ1JlcXVlc3QSDgoGZm9ybWF0GAEgASgNIoUBCh1HZXRIb3N0ZWRBZ2VudENhdGFsb2dSZXNwb25zZRIOCgZmb3JtYXQYASABKA0SHgoWcmVtb3RlX2NvbnRyb2xfZW5hYmxlZBgCIAEoCBI0CghiYWNrZW5kcxgDIAMoCzIiLmpva28udjEuSG9zdGVkQWdlbnRCYWNrZW5kQ2F0YWxvZyJZCh1Ib3N0ZWRBZ2VudFByb3ZpZGVyUGVybWlzc2lvbhISCgpiYWNrZW5kX2lkGAEgASgJEhMKC3Byb3ZpZGVyX2lkGAIgASgJEg8KB2VuYWJsZWQYAyABKAgiNgoRSG9zdGVkQWdlbnRMaW1pdHMSEgoKcGVyX2RldmljZRgBIAEoDRINCgV0b3RhbBgCIAEoDSJPChVIb3N0ZWRBZ2VudExpbWl0VXNhZ2USDQoFdG90YWwYASABKA0SDwoHZGV2aWNlcxgCIAEoDRIWCg5tYXhpbXVtX2RldmljZRgDIAEoDSL4AQoTSG9zdGVkQWdlbnRTZXR0aW5ncxIQCghyZXZpc2lvbhgBIAEoBBIeChZyZW1vdGVfY29udHJvbF9lbmFibGVkGAIgASgIEjkKCXByb3ZpZGVycxgDIAMoCzImLmpva28udjEuSG9zdGVkQWdlbnRQcm92aWRlclBlcm1pc3Npb24SKgoGbGltaXRzGAQgASgLMhouam9rby52MS5Ib3N0ZWRBZ2VudExpbWl0cxIZChFsaW1pdHNfb3ZlcnJpZGRlbhgFIAEoCBItCgV1c2FnZRgGIAEoCzIeLmpva28udjEuSG9zdGVkQWdlbnRMaW1pdFVzYWdlIh8KHUdldEhvc3RlZEFnZW50U2V0dGluZ3NSZXF1ZXN0IlAKHkdldEhvc3RlZEFnZW50U2V0dGluZ3NSZXNwb25zZRIuCghzZXR0aW5ncxgBIAEoCzIcLmpva28udjEuSG9zdGVkQWdlbnRTZXR0aW5ncyI1CiJIb3N0ZWRBZ2VudFJlbW90ZUNvbnRyb2xQZXJtaXNzaW9uEg8KB2VuYWJsZWQYASABKAgiGAoWSG9zdGVkQWdlbnRSZXNldExpbWl0cyKxAgogVXBkYXRlSG9zdGVkQWdlbnRTZXR0aW5nc1JlcXVlc3QSGQoRZXhwZWN0ZWRfcmV2aXNpb24YASABKAQSRQoOcmVtb3RlX2NvbnRyb2wYAiABKAsyKy5qb2tvLnYxLkhvc3RlZEFnZW50UmVtb3RlQ29udHJvbFBlcm1pc3Npb25IABI6Cghwcm92aWRlchgDIAEoCzImLmpva28udjEuSG9zdGVkQWdlbnRQcm92aWRlclBlcm1pc3Npb25IABIsCgZsaW1pdHMYBCABKAsyGi5qb2tvLnYxLkhvc3RlZEFnZW50TGltaXRzSAASNwoMcmVzZXRfbGltaXRzGAUgASgLMh8uam9rby52MS5Ib3N0ZWRBZ2VudFJlc2V0TGltaXRzSABCCAoGdXBkYXRlIlMKIVVwZGF0ZUhvc3RlZEFnZW50U2V0dGluZ3NSZXNwb25zZRIuCghzZXR0aW5ncxgBIAEoCzIcLmpva28udjEuSG9zdGVkQWdlbnRTZXR0aW5ncyI7ChZPcGVuSG9zdGVkQWdlbnRSZXF1ZXN0Eg4KBmZvcm1hdBgBIAEoDRIRCglvcGVuX2pzb24YAiABKAwiTwoXT3Blbkhvc3RlZEFnZW50UmVzcG9uc2USDgoGZm9ybWF0GAEgASgNEg4KBnJ1bl9pZBgCIAEoCRIUCgx2aXJ0dWFsX3Jvb3QYAyABKAkiXwoWQ2FsbEhvc3RlZEFnZW50UmVxdWVzdBIOCgZmb3JtYXQYASABKA0SDgoGcnVuX2lkGAIgASgJEg8KB2NhbGxfaWQYAyABKAkSFAoMY29tbWFuZF9qc29uGAQgASgMIj4KF0NhbGxIb3N0ZWRBZ2VudFJlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDRITCgtyZXN1bHRfanNvbhgCIAEoDCI2ChVIb3N0ZWRBZ2VudFBvbGxDdXJzb3ISDgoGcnVuX2lkGAEgASgJEg0KBWFmdGVyGAIgASgEIlsKEkhvc3RlZEFnZW50UG9sbFJ1bhIOCgZydW5faWQYASABKAkSDgoGY3Vyc29yGAIgASgEEhAKCGZpbmlzaGVkGAMgASgIEhMKC2ZyYW1lc19qc29uGAQgASgMIloKF1BvbGxIb3N0ZWRBZ2VudHNSZXF1ZXN0Eg4KBmZvcm1hdBgBIAEoDRIvCgdjdXJzb3JzGAIgAygLMh4uam9rby52MS5Ib3N0ZWRBZ2VudFBvbGxDdXJzb3IiVQoYUG9sbEhvc3RlZEFnZW50c1Jlc3BvbnNlEg4KBmZvcm1hdBgBIAEoDRIpCgRydW5zGAIgAygLMhsuam9rby52MS5Ib3N0ZWRBZ2VudFBvbGxSdW4iYgoXUmVwbHlIb3N0ZWRBZ2VudFJlcXVlc3QSDgoGZm9ybWF0GAEgASgNEg4KBnJ1bl9pZBgCIAEoCRISCgpyZXF1ZXN0X2lkGAMgASgJEhMKC3Jlc3VsdF9qc29uGAQgASgMIioKGFJlcGx5SG9zdGVkQWdlbnRSZXNwb25zZRIOCgZmb3JtYXQYASABKA0ifAoeUmVhZEhvc3RlZEFnZW50QXJ0aWZhY3RSZXF1ZXN0Eg4KBmZvcm1hdBgBIAEoDRIOCgZydW5faWQYAiABKAkSEwoLYXJ0aWZhY3RfaWQYAyABKAkSDgoGb2Zmc2V0GAQgASgEEhUKDW1heGltdW1fYnl0ZXMYBSABKA0iPwofUmVhZEhvc3RlZEFnZW50QXJ0aWZhY3RSZXNwb25zZRIOCgZmb3JtYXQYASABKA0SDAoEZGF0YRgCIAEoDCI5ChdDbG9zZUhvc3RlZEFnZW50UmVxdWVzdBIOCgZmb3JtYXQYASABKA0SDgoGcnVuX2lkGAIgASgJIioKGENsb3NlSG9zdGVkQWdlbnRSZXNwb25zZRIOCgZmb3JtYXQYASABKA0qrQgKFUhvc3RlZEFnZW50UGVlck1ldGhvZBIoCiRIT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfVU5TUEVDSUZJRUQQABIpCiVIT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfR0VUX1NFVFRJTkdTEAESLAooSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX1VQREFURV9TRVRUSU5HUxACEiEKHUhPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9PUEVOEAMSIQodSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX0NBTEwQBBIhCh1IT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfUE9MTBAFEiIKHkhPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9SRVBMWRAGEioKJkhPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9SRUFEX0FSVElGQUNUEAcSIgoeSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX0NMT1NFEAgSKAokSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX0dFVF9DQVRBTE9HEAkSJgoiSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX0dST1VQX0dFVBAKEicKI0hPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9HUk9VUF9QSUNLEAsSJwojSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX0dST1VQX0NPT0wQDBIpCiVIT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfR1JPVVBfTEVBU0VTEA0SLworSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX0dST1VQX1VTQUdFX1JFUE9SVBAOEigKJEhPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9HUk9VUF9VU0FHRRAPEjMKL0hPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9HUk9VUF9TQ0hFRFVMSU5HX1NUQVRFEBASMAosSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX0dVRVNUX1JFTEFZX0NBVEFMT0cQERItCilIT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfR1VFU1RfUkVMQVlfT1BFThASEi0KKUhPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9HVUVTVF9SRUxBWV9DQUxMEBMSLQopSE9TVEVEX0FHRU5UX1BFRVJfTUVUSE9EX0dVRVNUX1JFTEFZX1BPTEwQFBIuCipIT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfR1VFU1RfUkVMQVlfUkVQTFkQFRI2CjJIT1NURURfQUdFTlRfUEVFUl9NRVRIT0RfR1VFU1RfUkVMQVlfUkVBRF9BUlRJRkFDVBAWEi4KKkhPU1RFRF9BR0VOVF9QRUVSX01FVEhPRF9HVUVTVF9SRUxBWV9DTE9TRRAXMoAHChJIb3N0ZWRBZ2VudFNlcnZpY2USZgoVR2V0SG9zdGVkQWdlbnRDYXRhbG9nEiUuam9rby52MS5HZXRIb3N0ZWRBZ2VudENhdGFsb2dSZXF1ZXN0GiYuam9rby52MS5HZXRIb3N0ZWRBZ2VudENhdGFsb2dSZXNwb25zZRJpChZHZXRIb3N0ZWRBZ2VudFNldHRpbmdzEiYuam9rby52MS5HZXRIb3N0ZWRBZ2VudFNldHRpbmdzUmVxdWVzdBonLmpva28udjEuR2V0SG9zdGVkQWdlbnRTZXR0aW5nc1Jlc3BvbnNlEnIKGVVwZGF0ZUhvc3RlZEFnZW50U2V0dGluZ3MSKS5qb2tvLnYxLlVwZGF0ZUhvc3RlZEFnZW50U2V0dGluZ3NSZXF1ZXN0Giouam9rby52MS5VcGRhdGVIb3N0ZWRBZ2VudFNldHRpbmdzUmVzcG9uc2USVAoPT3Blbkhvc3RlZEFnZW50Eh8uam9rby52MS5PcGVuSG9zdGVkQWdlbnRSZXF1ZXN0GiAuam9rby52MS5PcGVuSG9zdGVkQWdlbnRSZXNwb25zZRJUCg9DYWxsSG9zdGVkQWdlbnQSHy5qb2tvLnYxLkNhbGxIb3N0ZWRBZ2VudFJlcXVlc3QaIC5qb2tvLnYxLkNhbGxIb3N0ZWRBZ2VudFJlc3BvbnNlElcKEFBvbGxIb3N0ZWRBZ2VudHMSIC5qb2tvLnYxLlBvbGxIb3N0ZWRBZ2VudHNSZXF1ZXN0GiEuam9rby52MS5Qb2xsSG9zdGVkQWdlbnRzUmVzcG9uc2USVwoQUmVwbHlIb3N0ZWRBZ2VudBIgLmpva28udjEuUmVwbHlIb3N0ZWRBZ2VudFJlcXVlc3QaIS5qb2tvLnYxLlJlcGx5SG9zdGVkQWdlbnRSZXNwb25zZRJsChdSZWFkSG9zdGVkQWdlbnRBcnRpZmFjdBInLmpva28udjEuUmVhZEhvc3RlZEFnZW50QXJ0aWZhY3RSZXF1ZXN0Giguam9rby52MS5SZWFkSG9zdGVkQWdlbnRBcnRpZmFjdFJlc3BvbnNlElcKEENsb3NlSG9zdGVkQWdlbnQSIC5qb2tvLnYxLkNsb3NlSG9zdGVkQWdlbnRSZXF1ZXN0GiEuam9rby52MS5DbG9zZUhvc3RlZEFnZW50UmVzcG9uc2ViBnByb3RvMw", [file_joko_v1_model, file_joko_v1_capability, file_joko_v1_provider_group]);
+
+/**
+ * Only the authenticated private Device route accepts this envelope. The group
+ * service captures the already approved person's identity and native model
+ * scope. Ordinary HostedAgentService opens cannot declare relay or trust.
+ *
+ * @generated from message joko.v1.HostedAgentGuestRelayScope
+ */
+export type HostedAgentGuestRelayScope = Message<"joko.v1.HostedAgentGuestRelayScope"> & {
+  /**
+   * @generated from field: string relay_id = 1;
+   */
+  relayId: string;
+
+  /**
+   * @generated from field: string backend_id = 2;
+   */
+  backendId: string;
+
+  /**
+   * @generated from field: string provider_id = 3;
+   */
+  providerId: string;
+
+  /**
+   * @generated from field: repeated string model_ids = 4;
+   */
+  modelIds: string[];
+};
+
+/**
+ * Describes the message joko.v1.HostedAgentGuestRelayScope.
+ * Use `create(HostedAgentGuestRelayScopeSchema)` to create a new message.
+ */
+export const HostedAgentGuestRelayScopeSchema: GenMessage<HostedAgentGuestRelayScope> = /*@__PURE__*/
+  messageDesc(file_joko_v1_hosted_agent, 0);
+
+/**
+ * @generated from message joko.v1.HostedAgentGuestRelayRequest
+ */
+export type HostedAgentGuestRelayRequest = Message<"joko.v1.HostedAgentGuestRelayRequest"> & {
+  /**
+   * @generated from field: joko.v1.HostedAgentGuestRelayScope scope = 1;
+   */
+  scope?: HostedAgentGuestRelayScope | undefined;
+
+  /**
+   * @generated from field: bytes request_bytes = 2;
+   */
+  requestBytes: Uint8Array;
+
+  /**
+   * A captured group grant may request final deletion after native closure.
+   * Valid only for GUEST_RELAY_CLOSE; never part of a public Source open.
+   *
+   * @generated from field: bool purge = 3;
+   */
+  purge: boolean;
+};
+
+/**
+ * Describes the message joko.v1.HostedAgentGuestRelayRequest.
+ * Use `create(HostedAgentGuestRelayRequestSchema)` to create a new message.
+ */
+export const HostedAgentGuestRelayRequestSchema: GenMessage<HostedAgentGuestRelayRequest> = /*@__PURE__*/
+  messageDesc(file_joko_v1_hosted_agent, 1);
 
 /**
  * A complete, credential-free view of actual native factories on this node.
@@ -47,6 +115,21 @@ export type HostedAgentProviderCatalog = Message<"joko.v1.HostedAgentProviderCat
    * @generated from field: repeated joko.v1.ModelDescriptor models = 5;
    */
   models: ModelDescriptor[];
+
+  /**
+   * @generated from field: string access_kind = 6;
+   */
+  accessKind: string;
+
+  /**
+   * @generated from field: string access_product = 7;
+   */
+  accessProduct: string;
+
+  /**
+   * @generated from field: joko.v1.ProviderGroupSummary group = 8;
+   */
+  group?: ProviderGroupSummary | undefined;
 };
 
 /**
@@ -54,7 +137,7 @@ export type HostedAgentProviderCatalog = Message<"joko.v1.HostedAgentProviderCat
  * Use `create(HostedAgentProviderCatalogSchema)` to create a new message.
  */
 export const HostedAgentProviderCatalogSchema: GenMessage<HostedAgentProviderCatalog> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 0);
+  messageDesc(file_joko_v1_hosted_agent, 2);
 
 /**
  * @generated from message joko.v1.HostedAgentBackendCatalog
@@ -84,6 +167,19 @@ export type HostedAgentBackendCatalog = Message<"joko.v1.HostedAgentBackendCatal
    * @generated from field: string version = 5;
    */
   version: string;
+
+  /**
+   * @generated from field: string native_adapter_kind = 6;
+   */
+  nativeAdapterKind: string;
+
+  /**
+   * Stable identity of the actual native execution service, separate from the
+   * Device route that may delegate to it.
+   *
+   * @generated from field: string node_id = 7;
+   */
+  nodeId: string;
 };
 
 /**
@@ -91,7 +187,7 @@ export type HostedAgentBackendCatalog = Message<"joko.v1.HostedAgentBackendCatal
  * Use `create(HostedAgentBackendCatalogSchema)` to create a new message.
  */
 export const HostedAgentBackendCatalogSchema: GenMessage<HostedAgentBackendCatalog> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 1);
+  messageDesc(file_joko_v1_hosted_agent, 3);
 
 /**
  * @generated from message joko.v1.GetHostedAgentCatalogRequest
@@ -108,7 +204,7 @@ export type GetHostedAgentCatalogRequest = Message<"joko.v1.GetHostedAgentCatalo
  * Use `create(GetHostedAgentCatalogRequestSchema)` to create a new message.
  */
 export const GetHostedAgentCatalogRequestSchema: GenMessage<GetHostedAgentCatalogRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 2);
+  messageDesc(file_joko_v1_hosted_agent, 4);
 
 /**
  * @generated from message joko.v1.GetHostedAgentCatalogResponse
@@ -135,7 +231,7 @@ export type GetHostedAgentCatalogResponse = Message<"joko.v1.GetHostedAgentCatal
  * Use `create(GetHostedAgentCatalogResponseSchema)` to create a new message.
  */
 export const GetHostedAgentCatalogResponseSchema: GenMessage<GetHostedAgentCatalogResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 3);
+  messageDesc(file_joko_v1_hosted_agent, 5);
 
 /**
  * @generated from message joko.v1.HostedAgentProviderPermission
@@ -162,7 +258,7 @@ export type HostedAgentProviderPermission = Message<"joko.v1.HostedAgentProvider
  * Use `create(HostedAgentProviderPermissionSchema)` to create a new message.
  */
 export const HostedAgentProviderPermissionSchema: GenMessage<HostedAgentProviderPermission> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 4);
+  messageDesc(file_joko_v1_hosted_agent, 6);
 
 /**
  * @generated from message joko.v1.HostedAgentLimits
@@ -184,7 +280,7 @@ export type HostedAgentLimits = Message<"joko.v1.HostedAgentLimits"> & {
  * Use `create(HostedAgentLimitsSchema)` to create a new message.
  */
 export const HostedAgentLimitsSchema: GenMessage<HostedAgentLimits> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 5);
+  messageDesc(file_joko_v1_hosted_agent, 7);
 
 /**
  * @generated from message joko.v1.HostedAgentLimitUsage
@@ -211,7 +307,7 @@ export type HostedAgentLimitUsage = Message<"joko.v1.HostedAgentLimitUsage"> & {
  * Use `create(HostedAgentLimitUsageSchema)` to create a new message.
  */
 export const HostedAgentLimitUsageSchema: GenMessage<HostedAgentLimitUsage> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 6);
+  messageDesc(file_joko_v1_hosted_agent, 8);
 
 /**
  * @generated from message joko.v1.HostedAgentSettings
@@ -253,7 +349,7 @@ export type HostedAgentSettings = Message<"joko.v1.HostedAgentSettings"> & {
  * Use `create(HostedAgentSettingsSchema)` to create a new message.
  */
 export const HostedAgentSettingsSchema: GenMessage<HostedAgentSettings> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 7);
+  messageDesc(file_joko_v1_hosted_agent, 9);
 
 /**
  * @generated from message joko.v1.GetHostedAgentSettingsRequest
@@ -266,7 +362,7 @@ export type GetHostedAgentSettingsRequest = Message<"joko.v1.GetHostedAgentSetti
  * Use `create(GetHostedAgentSettingsRequestSchema)` to create a new message.
  */
 export const GetHostedAgentSettingsRequestSchema: GenMessage<GetHostedAgentSettingsRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 8);
+  messageDesc(file_joko_v1_hosted_agent, 10);
 
 /**
  * @generated from message joko.v1.GetHostedAgentSettingsResponse
@@ -283,7 +379,7 @@ export type GetHostedAgentSettingsResponse = Message<"joko.v1.GetHostedAgentSett
  * Use `create(GetHostedAgentSettingsResponseSchema)` to create a new message.
  */
 export const GetHostedAgentSettingsResponseSchema: GenMessage<GetHostedAgentSettingsResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 9);
+  messageDesc(file_joko_v1_hosted_agent, 11);
 
 /**
  * @generated from message joko.v1.HostedAgentRemoteControlPermission
@@ -300,7 +396,7 @@ export type HostedAgentRemoteControlPermission = Message<"joko.v1.HostedAgentRem
  * Use `create(HostedAgentRemoteControlPermissionSchema)` to create a new message.
  */
 export const HostedAgentRemoteControlPermissionSchema: GenMessage<HostedAgentRemoteControlPermission> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 10);
+  messageDesc(file_joko_v1_hosted_agent, 12);
 
 /**
  * @generated from message joko.v1.HostedAgentResetLimits
@@ -313,7 +409,7 @@ export type HostedAgentResetLimits = Message<"joko.v1.HostedAgentResetLimits"> &
  * Use `create(HostedAgentResetLimitsSchema)` to create a new message.
  */
 export const HostedAgentResetLimitsSchema: GenMessage<HostedAgentResetLimits> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 11);
+  messageDesc(file_joko_v1_hosted_agent, 13);
 
 /**
  * @generated from message joko.v1.UpdateHostedAgentSettingsRequest
@@ -359,7 +455,7 @@ export type UpdateHostedAgentSettingsRequest = Message<"joko.v1.UpdateHostedAgen
  * Use `create(UpdateHostedAgentSettingsRequestSchema)` to create a new message.
  */
 export const UpdateHostedAgentSettingsRequestSchema: GenMessage<UpdateHostedAgentSettingsRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 12);
+  messageDesc(file_joko_v1_hosted_agent, 14);
 
 /**
  * @generated from message joko.v1.UpdateHostedAgentSettingsResponse
@@ -376,7 +472,7 @@ export type UpdateHostedAgentSettingsResponse = Message<"joko.v1.UpdateHostedAge
  * Use `create(UpdateHostedAgentSettingsResponseSchema)` to create a new message.
  */
 export const UpdateHostedAgentSettingsResponseSchema: GenMessage<UpdateHostedAgentSettingsResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 13);
+  messageDesc(file_joko_v1_hosted_agent, 15);
 
 /**
  * Native Adapter values use the closed current-v1 codec at the service boundary.
@@ -402,7 +498,7 @@ export type OpenHostedAgentRequest = Message<"joko.v1.OpenHostedAgentRequest"> &
  * Use `create(OpenHostedAgentRequestSchema)` to create a new message.
  */
 export const OpenHostedAgentRequestSchema: GenMessage<OpenHostedAgentRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 14);
+  messageDesc(file_joko_v1_hosted_agent, 16);
 
 /**
  * @generated from message joko.v1.OpenHostedAgentResponse
@@ -429,7 +525,7 @@ export type OpenHostedAgentResponse = Message<"joko.v1.OpenHostedAgentResponse">
  * Use `create(OpenHostedAgentResponseSchema)` to create a new message.
  */
 export const OpenHostedAgentResponseSchema: GenMessage<OpenHostedAgentResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 15);
+  messageDesc(file_joko_v1_hosted_agent, 17);
 
 /**
  * @generated from message joko.v1.CallHostedAgentRequest
@@ -461,7 +557,7 @@ export type CallHostedAgentRequest = Message<"joko.v1.CallHostedAgentRequest"> &
  * Use `create(CallHostedAgentRequestSchema)` to create a new message.
  */
 export const CallHostedAgentRequestSchema: GenMessage<CallHostedAgentRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 16);
+  messageDesc(file_joko_v1_hosted_agent, 18);
 
 /**
  * @generated from message joko.v1.CallHostedAgentResponse
@@ -483,7 +579,7 @@ export type CallHostedAgentResponse = Message<"joko.v1.CallHostedAgentResponse">
  * Use `create(CallHostedAgentResponseSchema)` to create a new message.
  */
 export const CallHostedAgentResponseSchema: GenMessage<CallHostedAgentResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 17);
+  messageDesc(file_joko_v1_hosted_agent, 19);
 
 /**
  * @generated from message joko.v1.HostedAgentPollCursor
@@ -505,7 +601,7 @@ export type HostedAgentPollCursor = Message<"joko.v1.HostedAgentPollCursor"> & {
  * Use `create(HostedAgentPollCursorSchema)` to create a new message.
  */
 export const HostedAgentPollCursorSchema: GenMessage<HostedAgentPollCursor> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 18);
+  messageDesc(file_joko_v1_hosted_agent, 20);
 
 /**
  * @generated from message joko.v1.HostedAgentPollRun
@@ -537,7 +633,7 @@ export type HostedAgentPollRun = Message<"joko.v1.HostedAgentPollRun"> & {
  * Use `create(HostedAgentPollRunSchema)` to create a new message.
  */
 export const HostedAgentPollRunSchema: GenMessage<HostedAgentPollRun> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 19);
+  messageDesc(file_joko_v1_hosted_agent, 21);
 
 /**
  * @generated from message joko.v1.PollHostedAgentsRequest
@@ -559,7 +655,7 @@ export type PollHostedAgentsRequest = Message<"joko.v1.PollHostedAgentsRequest">
  * Use `create(PollHostedAgentsRequestSchema)` to create a new message.
  */
 export const PollHostedAgentsRequestSchema: GenMessage<PollHostedAgentsRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 20);
+  messageDesc(file_joko_v1_hosted_agent, 22);
 
 /**
  * @generated from message joko.v1.PollHostedAgentsResponse
@@ -581,7 +677,7 @@ export type PollHostedAgentsResponse = Message<"joko.v1.PollHostedAgentsResponse
  * Use `create(PollHostedAgentsResponseSchema)` to create a new message.
  */
 export const PollHostedAgentsResponseSchema: GenMessage<PollHostedAgentsResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 21);
+  messageDesc(file_joko_v1_hosted_agent, 23);
 
 /**
  * @generated from message joko.v1.ReplyHostedAgentRequest
@@ -613,7 +709,7 @@ export type ReplyHostedAgentRequest = Message<"joko.v1.ReplyHostedAgentRequest">
  * Use `create(ReplyHostedAgentRequestSchema)` to create a new message.
  */
 export const ReplyHostedAgentRequestSchema: GenMessage<ReplyHostedAgentRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 22);
+  messageDesc(file_joko_v1_hosted_agent, 24);
 
 /**
  * @generated from message joko.v1.ReplyHostedAgentResponse
@@ -630,7 +726,7 @@ export type ReplyHostedAgentResponse = Message<"joko.v1.ReplyHostedAgentResponse
  * Use `create(ReplyHostedAgentResponseSchema)` to create a new message.
  */
 export const ReplyHostedAgentResponseSchema: GenMessage<ReplyHostedAgentResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 23);
+  messageDesc(file_joko_v1_hosted_agent, 25);
 
 /**
  * @generated from message joko.v1.ReadHostedAgentArtifactRequest
@@ -667,7 +763,7 @@ export type ReadHostedAgentArtifactRequest = Message<"joko.v1.ReadHostedAgentArt
  * Use `create(ReadHostedAgentArtifactRequestSchema)` to create a new message.
  */
 export const ReadHostedAgentArtifactRequestSchema: GenMessage<ReadHostedAgentArtifactRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 24);
+  messageDesc(file_joko_v1_hosted_agent, 26);
 
 /**
  * @generated from message joko.v1.ReadHostedAgentArtifactResponse
@@ -689,7 +785,7 @@ export type ReadHostedAgentArtifactResponse = Message<"joko.v1.ReadHostedAgentAr
  * Use `create(ReadHostedAgentArtifactResponseSchema)` to create a new message.
  */
 export const ReadHostedAgentArtifactResponseSchema: GenMessage<ReadHostedAgentArtifactResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 25);
+  messageDesc(file_joko_v1_hosted_agent, 27);
 
 /**
  * @generated from message joko.v1.CloseHostedAgentRequest
@@ -711,7 +807,7 @@ export type CloseHostedAgentRequest = Message<"joko.v1.CloseHostedAgentRequest">
  * Use `create(CloseHostedAgentRequestSchema)` to create a new message.
  */
 export const CloseHostedAgentRequestSchema: GenMessage<CloseHostedAgentRequest> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 26);
+  messageDesc(file_joko_v1_hosted_agent, 28);
 
 /**
  * @generated from message joko.v1.CloseHostedAgentResponse
@@ -728,7 +824,7 @@ export type CloseHostedAgentResponse = Message<"joko.v1.CloseHostedAgentResponse
  * Use `create(CloseHostedAgentResponseSchema)` to create a new message.
  */
 export const CloseHostedAgentResponseSchema: GenMessage<CloseHostedAgentResponse> = /*@__PURE__*/
-  messageDesc(file_joko_v1_hosted_agent, 27);
+  messageDesc(file_joko_v1_hosted_agent, 29);
 
 /**
  * Closed dispatch surface for the authenticated Device route. This cannot
@@ -786,6 +882,76 @@ export enum HostedAgentPeerMethod {
    * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GET_CATALOG = 9;
    */
   GET_CATALOG = 9,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GROUP_GET = 10;
+   */
+  GROUP_GET = 10,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GROUP_PICK = 11;
+   */
+  GROUP_PICK = 11,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GROUP_COOL = 12;
+   */
+  GROUP_COOL = 12,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GROUP_LEASES = 13;
+   */
+  GROUP_LEASES = 13,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GROUP_USAGE_REPORT = 14;
+   */
+  GROUP_USAGE_REPORT = 14,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GROUP_USAGE = 15;
+   */
+  GROUP_USAGE = 15,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GROUP_SCHEDULING_STATE = 16;
+   */
+  GROUP_SCHEDULING_STATE = 16,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CATALOG = 17;
+   */
+  GUEST_RELAY_CATALOG = 17,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_OPEN = 18;
+   */
+  GUEST_RELAY_OPEN = 18,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CALL = 19;
+   */
+  GUEST_RELAY_CALL = 19,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_POLL = 20;
+   */
+  GUEST_RELAY_POLL = 20,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_REPLY = 21;
+   */
+  GUEST_RELAY_REPLY = 21,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_READ_ARTIFACT = 22;
+   */
+  GUEST_RELAY_READ_ARTIFACT = 22,
+
+  /**
+   * @generated from enum value: HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CLOSE = 23;
+   */
+  GUEST_RELAY_CLOSE = 23,
 }
 
 /**

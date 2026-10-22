@@ -1,4 +1,5 @@
 import { StrictMode } from "react";
+import { captureProviderSharingInvitation } from "./provider-sharing-invitation.js";
 import { createRoot } from "react-dom/client";
 import "@fontsource-variable/jetbrains-mono";
 import { isDesktopRemoteDesktopViewerWindow } from "./remote-desktop-viewer-window.js";
@@ -8,6 +9,7 @@ import {
   installCurrentWindowActivationClickGuard
 } from "./window-activation-click.js";
 
+captureProviderSharingInvitation(window.location, window.history);
 const disposeActivationClickGuard = installCurrentWindowActivationClickGuard(window);
 const disconnectActivationClickPreference = connectDesktopActivationClickPreference(window.jokoDesktop, window);
 window.addEventListener("pagehide", () => {

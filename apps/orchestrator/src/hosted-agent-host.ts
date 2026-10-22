@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { HostedAgentRun, HostedAgentCleanupError, type HostedAgentCall, type HostedAgentRunOptions } from "./hosted-agent-run.js";
 import { HOSTED_AGENT_UNREAD_LIMIT, type HostedAgentFrame } from "./hosted-agent-exchange.js";
 import type { HostedNativeOpen } from "@joko/adapter-hosted";
+import type { HostedNativeProviderGrantOwner } from "@joko/store";
 
 /** Captured by the authenticated service, never deserialized from a caller's
  * payload. A shared Provider grant is separate from Device or task access. */
@@ -9,6 +10,18 @@ export interface HostedAgentPrincipal {
   readonly id: string;
   readonly deviceId: string;
   readonly trust: "owner" | "guest";
+  readonly assertCurrent: () => void;
+  /** Server-owned Provider capability. Never decoded from an open payload. */
+  readonly providerGrant?: HostedAgentProviderGrant;
+}
+export interface HostedAgentProviderGrant {
+  readonly backendId: string; readonly providerId: string; readonly modelIds: readonly string[];
+  readonly cleanupKey?: string;
+  readonly cleanupOwner?: HostedNativeProviderGrantOwner;
+  readonly purgeRequested?: () => boolean;
+  /** Captured at a trusted member relay; a member must execute directly. */
+  readonly groupMember?: true;
+  readonly recipient?: { readonly shareId: string; readonly memberId: string; readonly generation: number; readonly name: string; readonly avatarUrl: string | null };
   readonly assertCurrent: () => void;
 }
 export type HostedAgentOpen = HostedNativeOpen;
@@ -21,6 +34,7 @@ export interface HostedAgentHostOptions {
   readonly createRun?: (options: HostedAgentRunOptions) => Promise<HostedAgentRun>;
 }
 interface Entry {
+  readonly runId: string;
   readonly principal: HostedAgentPrincipal;
   readonly digest: string;
   readonly opening: Promise<HostedAgentRun>;
@@ -31,6 +45,7 @@ interface Entry {
   closedAt?: number;
   closing?: Promise<void>;
   assertAccess?: () => void;
+  purgeRequested?: boolean;
   readonly nativeKey: string;
 }
 export class HostedAgentHostError extends Error {
@@ -77,16 +92,20 @@ export class HostedAgentHost {
       if (entry.run && entry.run !== run) throw new HostedAgentHostError("CONFLICT");
       entry.run = run; entry.detach ??= run.exchange.onOutput(() => this.#notify()); preparedResolve(run); this.#notify();
     };
-    const entry: Entry = { principal, digest, nativeKey, prepared, touchedAt: this.#now(), opening: Promise.resolve().then(async () => {
+    const entry: Entry = { principal, runId: input.runId, digest, nativeKey, prepared, touchedAt: this.#now(), opening: Promise.resolve().then(async () => {
       const allowed = await this.#options.authorize(principal, snapshot); this.#assertEntry(principal, entry);
       entry.assertAccess = allowed.assertCurrent;
       const assertCurrent = () => { this.#assertEntry(principal, entry); allowed.assertCurrent(); };
+      // All awaited catalog/credential work has finished. A withdrawn reshare
+      // cannot slip between this synchronous admission and native creation.
+      principal.providerGrant?.assertCurrent();
       const run = await (this.#options.createRun ?? HostedAgentRun.create)({ ...allowed, ...snapshot,
         source: { authorityId: principal.id, deviceId: principal.deviceId, sessionId: snapshot.sessionId, targetId: snapshot.targetId, generation: snapshot.generation },
-        trust: principal.trust, assertCurrent, onCreated: captureRun });
+        trust: principal.trust, assertCurrent, onCreated: captureRun,
+        ...(principal.providerGrant?.cleanupOwner ? { providerCleanup: principal.providerGrant.cleanupOwner } : {}) });
       captureRun(run);
       try { assertCurrent(); }
-      catch (error) { await run.close(); run.disposeExchange(); throw error; }
+      catch (error) { await this.#closeRun(entry, run); run.disposeExchange(); throw error; }
       this.#notify(); return run;
     }).catch(error => {
       preparedReject(error);
@@ -117,9 +136,30 @@ export class HostedAgentHost {
   async close(principal: HostedAgentPrincipal, runId: string): Promise<void> {
     const entry = this.#entry(principal, runId); await this.#closeEntry(entry);
   }
+  activeProviderTurns(backendId: string, providerId: string): number {
+    return [...this.#entries.values()].reduce((sum, entry) => sum + (entry.run?.activeProviderTurns(backendId, providerId) ?? 0), 0);
+  }
   /** Internal route owner, usable after that route's captured authority ends. */
   async closePrincipal(principal: HostedAgentPrincipal): Promise<void> {
     const results = await Promise.allSettled([...this.#entries.values()].filter(entry => entry.principal === principal).map(entry => this.#closeEntry(entry)));
+    if (results.some(result => result.status === "rejected")) throw new HostedAgentHostError("UNAVAILABLE");
+  }
+  /** Terminal cleanup only. A revoked grant can close its exact old run but
+   * cannot recover a live principal, read output, or dispatch another call. */
+  async closeProviderGrant(credentialDigest: string, runId: string): Promise<void> {
+    if (!/^[a-f0-9]{64}$/u.test(credentialDigest) || !validId(runId)) throw new HostedAgentHostError("INVALID_REQUEST");
+    const results = await Promise.allSettled([...this.#entries.values()].filter(entry => entry.principal.trust === "guest"
+      && entry.principal.providerGrant?.cleanupKey === credentialDigest && entry.runId === runId).map(entry => this.#closeEntry(entry)));
+    if (results.some(result => result.status === "rejected")) throw new HostedAgentHostError("UNAVAILABLE");
+  }
+  /** Private owner-Device relay termination. Never exposed as a live guest
+   * authority or as an ordinary native service method. */
+  async closeRelayedGuest(principal: HostedAgentPrincipal, runId: string, purge: boolean): Promise<void> {
+    if (principal.trust !== "guest" || !validId(runId)) throw new HostedAgentHostError("INVALID_REQUEST");
+    const results = await Promise.allSettled([...this.#entries.values()].filter(entry => entry.principal.id === principal.id
+      && entry.principal.deviceId === principal.deviceId && entry.principal.trust === "guest" && entry.runId === runId).map(entry => {
+      if (purge) entry.purgeRequested = true; return this.#closeEntry(entry);
+    }));
     if (results.some(result => result.status === "rejected")) throw new HostedAgentHostError("UNAVAILABLE");
   }
   async poll(principal: HostedAgentPrincipal, cursors: readonly HostedAgentPollCursor[], signal: AbortSignal, waitMs = 30_000): Promise<readonly HostedAgentPollRun[]> {
@@ -159,7 +199,7 @@ export class HostedAgentHost {
     const now = this.#now();
     await Promise.all([...this.#entries].map(async ([key, entry]) => {
       let revoked = this.#disposed;
-      try { entry.principal.assertCurrent(); entry.assertAccess?.(); if (entry.closedAt === undefined) entry.run?.checkAuthority(); } catch { revoked = true; }
+      try { entry.principal.assertCurrent(); entry.principal.providerGrant?.assertCurrent(); entry.assertAccess?.(); if (entry.closedAt === undefined) entry.run?.checkAuthority(); } catch { revoked = true; }
       if (revoked || entry.closedAt === undefined && (entry.run && !entry.run.ready && !entry.run.initializing || now - entry.touchedAt >= 180_000)) await this.#closeEntry(entry).catch(() => {});
       if (entry.closedAt !== undefined && now - entry.closedAt >= 60_000) {
         entry.detach?.(); entry.run?.disposeExchange(); this.#entries.delete(key); this.#expired.add(key);
@@ -175,9 +215,13 @@ export class HostedAgentHost {
   }
   #closeEntry(entry: Entry): Promise<void> {
     return entry.closing ??= (async () => {
-      const run = entry.run ?? await entry.opening.catch(() => undefined); await run?.close(); entry.closedAt ??= this.#now();
+      const run = entry.run ?? await entry.opening.catch(() => undefined); if (run) await this.#closeRun(entry, run); entry.closedAt ??= this.#now();
       if (this.#nativeOwners.get(entry.nativeKey) === entry) this.#nativeOwners.delete(entry.nativeKey); this.#notify();
-    })().catch(error => { entry.closing = undefined; throw error; });
+    })().finally(() => { entry.closing = undefined; });
+  }
+  async #closeRun(entry: Entry, run: HostedAgentRun): Promise<void> {
+    if (entry.purgeRequested || entry.principal.providerGrant?.purgeRequested?.()) await run.purge();
+    else { await run.close(); if (entry.purgeRequested || entry.principal.providerGrant?.purgeRequested?.()) await run.purge(); }
   }
   #entry(principal: HostedAgentPrincipal, runId: string): Entry {
     this.#assertPrincipal(principal); const entry = this.#entries.get(this.#key(principal, runId));
@@ -191,7 +235,7 @@ export class HostedAgentHost {
   #assertPrincipal(principal: HostedAgentPrincipal): void {
     if (this.#disposed) throw new HostedAgentHostError("UNAVAILABLE");
     if (!principal || !validId(principal.id) || !validId(principal.deviceId) || !["owner", "guest"].includes(principal.trust)) throw new HostedAgentHostError("ACCESS_DENIED");
-    try { principal.assertCurrent(); } catch { throw new HostedAgentHostError("ACCESS_DENIED"); }
+    try { principal.assertCurrent(); principal.providerGrant?.assertCurrent(); } catch { throw new HostedAgentHostError("ACCESS_DENIED"); }
   }
   #key(principal: HostedAgentPrincipal, runId: string): string {
     if (!validId(runId)) throw new HostedAgentHostError("INVALID_REQUEST"); return JSON.stringify([principal.id, runId]);

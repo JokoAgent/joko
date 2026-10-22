@@ -228,6 +228,7 @@ interface JokoDesktopNativeTaskStatusSnapshot {
     readonly detail: string;
     readonly phase: JokoDesktopNativeTaskStatusPhase;
     readonly interactionKind?: "permission" | "question" | "plan" | "select" | "confirm" | "input" | "editor";
+    readonly inputHandoff?: true;
     readonly activityLines: readonly {
       readonly id: string;
       readonly kind: "user" | "assistant" | "status" | "tool";
@@ -527,7 +528,7 @@ interface JokoDesktopApi {
     bind(owner: import("@joko/contracts").DesktopRemoteDesktopViewerOwner): Promise<void>;
     retire(owner: import("@joko/contracts").DesktopRemoteDesktopViewerOwner): Promise<void>;
     open(owner: import("@joko/contracts").DesktopRemoteDesktopViewerOwner,
-      target: { readonly deviceId: string; readonly name: string }): Promise<{ readonly focusedExisting: boolean }>;
+      target: { readonly deviceId: string; readonly name: string; readonly inputHandoffRequestId?: string }): Promise<{ readonly focusedExisting: boolean }>;
   };
   readonly layout: {
     reset(): Promise<void>;

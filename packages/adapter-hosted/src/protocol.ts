@@ -4,7 +4,7 @@ import type { HostedExecution, PermissionMode, PromptInput, SubagentControlInput
  * Adapter. Public clients use the generated protobuf service envelopes. */
 export type HostedNativeCommand =
   | { readonly kind: "state" }
-  | { readonly kind: "send"; readonly input: PromptInput; readonly durableFence: boolean }
+  | { readonly kind: "send"; readonly input: PromptInput; readonly durableFence: boolean; readonly newGroupRound?: boolean }
   | { readonly kind: "abort" }
   | { readonly kind: "delete" }
   | { readonly kind: "set_model"; readonly providerId: string; readonly modelId: string }
@@ -39,5 +39,10 @@ export interface HostedNativeOpen {
   readonly permissionMode: PermissionMode;
   readonly fastMode: boolean;
   readonly effort?: string;
+  /** One-use capability from this Provider's authenticated stream. */
+  readonly groupSwitch?: string;
+  /** Owner-only direct member selection. A guest payload cannot opt out of
+   * its granting computer's server-owned group selection. */
+  readonly groupMember?: boolean;
   readonly workspace: Omit<HostedExecution["workspace"], "root" | "additionalRoots">;
 }

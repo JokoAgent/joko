@@ -14,6 +14,13 @@ function source(sessions = [session()]): NativeTaskStatusLiveSource { return { p
 function project(remotes: readonly NativeTaskStatusLiveSource[], selectedProfileIds = new Set([profile.id])) {
   return composeNativeTaskStatusProjection({ ownerId: "renderer", revision: 1n, locale: "en", remotes, selectedProfileIds });
 }
+it("keeps a remote private input marker on its exact source route without local permission actions", () => {
+  const original = source([{ ...session(), state: "idle" }]);
+  const result = project([{ ...original, snapshot: { ...original.snapshot, inputHandoffs: [{ sessionId: "same", requestId: "request", generation: 1, stepNumber: 2 }] } }]);
+  expect(result.snapshot.sessions[0]).toMatchObject({ phase: "interaction", inputHandoff: true, detail: "Private input is needed. Open the original task to continue." });
+  expect(result.snapshot.sessions[0]).not.toHaveProperty("permission");
+  expect([...result.routes.values()][0]).toMatchObject({ profileId: profile.id, epoch: 2, sessionId: "same", generation: 1n });
+});
 it("keeps identical session IDs on different nodes independently routed and never projects remote permission buttons", () => {
   const first = source(), second = { ...source(), profile: { ...profile, id: "other-profile", serverId: "other-node" } };
   const withPermission = { ...first, snapshot: { ...first.snapshot, interactions: [{ id: "permission", sessionId: "same", generation: 1n, kind: "permission" as const,

@@ -13,6 +13,33 @@ afterEach(() => {
 });
 
 describe("mobile push durable boundary", () => {
+  it("deduplicates private input notices without changing task attention and never revives a closed in-flight retry", () => {
+    const { store } = createFixture();
+    const connection = store.createConnection({ id: "handoff-mobile", name: "Phone", authKeyDigest: "handoff-mobile-digest",
+      device: { defaultName: "Phone", kind: "mobile", platform: "iOS", appVersion: "1" }, pairedAt: 10 });
+    const device = store.getDevice(connection.deviceId);
+    store.putMobilePushRegistration({ id: "handoff-registration", connectionId: connection.id, deviceId: device.id, expectedDeviceRevision: device.revision,
+      environment: "apns_sandbox", locale: "en", tokenDigest: digest("a"), sealedToken: sealedCredential(1, "encrypted-token"),
+      revocationSecretDigest: digest("b"), sealedRevocationSecret: sealedCredential(2, "encrypted-secret"), expiresAt: 50_000, now: 1_000 });
+    const subject = (id: string, instance: string) => store.appendEvent({ id, backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: 0,
+      emittedAt: 1_100, traceId: "private-input", payload: { type: "extension_ui_effect", effect: "notification", text: "Private input is needed." },
+      metadata: { namespace: "joko.input_handoff", fields: { requestId: id, instanceId: instance } } });
+    const first = subject("request-one", "host-one"), second = subject("request-two", "host-one");
+    expect(store.enqueueInputHandoffPush({ sessionId: "session-1", sourceCursor: first.globalCursor })).toBe(1);
+    expect(store.enqueueInputHandoffPush({ sessionId: "session-1", sourceCursor: first.globalCursor })).toBe(0);
+    expect(store.findSessionAttention("session-1")).toBeUndefined();
+    const claimed = store.claimNextMobilePushDelivery(1_200)!; expect(claimed.delivery.kind).toBe("awaiting");
+    store.enqueueInputHandoffPush({ sessionId: "session-1", sourceCursor: second.globalCursor });
+    store.cancelInputHandoffPushes({ instanceId: "host-one", requestId: "request-one" });
+    expect(store.listMobilePushDeliveries().find(value => value.subjectCursor === second.globalCursor)?.status).toBe("pending");
+    expect(store.finishMobilePushDelivery({ deliveryId: claimed.delivery.id, claimToken: claimed.delivery.claimToken!, outcome: "retry",
+      outcomeCode: "apns_503", retryAt: 2_000, now: 1_400 })).toMatchObject({ status: "failed", outcomeCode: "INPUT_HANDOFF_CLOSED" });
+    store.cancelInputHandoffPushes({ instanceId: "host-two", exceptInstance: true });
+    expect(store.claimNextMobilePushDelivery(2_100)).toBeUndefined();
+    const ordinary = store.appendEvent({ backendId: "pi", targetId: "target-1", sessionId: "session-1", generation: 0, traceId: "ordinary",
+      payload: { type: "status", key: "idle" } });
+    expect(() => store.enqueueInputHandoffPush({ sessionId: "session-1", sourceCursor: ordinary.globalCursor })).toThrow("service subject");
+  });
   it("suppresses hidden task notifications and retires an already-claimed retry before reveal", () => {
     const { store } = createFixture();
     const connection = store.createConnection({ id: "hidden-mobile", name: "Phone", authKeyDigest: "hidden-mobile-digest",

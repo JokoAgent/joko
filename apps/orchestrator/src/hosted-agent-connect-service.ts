@@ -8,8 +8,12 @@ import { HostedAgentWireError, HOSTED_AGENT_WIRE_FORMAT, assertHostedAgentWireFo
 import type { HostedAgentSettings, HostedAgentSettingsUpdate } from "./hosted-agent-settings.js";
 import { HostedAgentLimitError, type HostedAgentSessionSlots } from "./hosted-agent-limits.js";
 
+export type HostedAgentEndpointPort = Pick<HostedAgentHost, "call" | "poll" | "reply" | "readArtifact" | "close"> & {
+  begin(principal: HostedAgentPrincipal, input: Parameters<HostedAgentHost["begin"]>[1]): Promise<{ readonly workspaceRoot: string }>;
+};
+export type HostedAgentLifecycleEndpointPort = HostedAgentEndpointPort & Pick<HostedAgentHost, "closePrincipal" | "closeProviderGrant" | "closeRelayedGuest" | "activeProviderTurns" | "sweep" | "dispose">;
 export interface HostedAgentConnectOptions {
-  readonly host: HostedAgentHost;
+  readonly host: HostedAgentEndpointPort;
   /** The authority remains valid after this individual HTTP request ends.
    * It must derive owner/guest, Device and Provider access from a current grant. */
   readonly authenticate: (context: HandlerContext) => HostedAgentPrincipal | Promise<HostedAgentPrincipal>;

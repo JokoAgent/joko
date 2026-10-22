@@ -10,6 +10,8 @@ import type { ConnectionRecord } from "@joko/store";
 import type { ConnectionManager } from "./connection-manager.js";
 import { createHostedAgentPeerPort } from "./hosted-agent-peer-port.js";
 import type { HostedAgentRuntime } from "./hosted-agent-runtime.js";
+import { withProviderGroupPeerPort } from "./provider-group-peer.js";
+import type { ProviderGroupConnectOptions } from "./provider-group-connect-service.js";
 
 const FORMAT = 1;
 interface DesktopAuthority {
@@ -31,6 +33,7 @@ export interface HostedAgentDesktopServiceOptions {
   readonly connections: ConnectionManager;
   /** The managed service's own identity, never accepted from an RPC message. */
   readonly serverId: string;
+  readonly groupOptions?: Omit<ProviderGroupConnectOptions, "authenticate">;
 }
 
 /** Each committed Main-process route owns a distinct native authority. The
@@ -71,7 +74,9 @@ export class HostedAgentDesktopDelegates {
         if (!entry) {
           if (this.#routes.size >= 4_096) throw new ConnectError("Native Desktop route capacity has been reached.", Code.ResourceExhausted);
           const id = randomBytes(32).toString("base64url");
-          const port = createHostedAgentPeerPort(this.options.runtime, this.options.serverId, () => this.#assertAuthority(authority));
+          const native = createHostedAgentPeerPort(this.options.runtime, this.options.serverId, () => this.#assertAuthority(authority));
+          const port = this.options.groupOptions
+            ? withProviderGroupPeerPort(native, this.options.groupOptions, () => this.#assertAuthority(authority)) : native;
           let captured!: Delegate;
           const unsubscribe = this.options.connections.onRevoked(authority.connection.id, () => {
             void this.#retire(captured).catch(() => {});

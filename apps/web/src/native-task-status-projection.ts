@@ -24,7 +24,8 @@ export function composeNativeTaskStatusProjection(input: {
     const eligible = snapshot.sessions.filter(session => !session.hidden && !session.archived
       && (!source || partners.has(session.id) || input.selectedProfileIds.has(profile.id)));
     const base = projectNativeTaskStatusSnapshot({ ownerId: input.ownerId, revision: input.revision, locale: input.locale,
-      sessions: eligible, interactions: snapshot.interactions, timelineBySession: snapshot.timelineBySession });
+      sessions: eligible, interactions: snapshot.interactions, timelineBySession: snapshot.timelineBySession,
+      inputHandoffs: snapshot.inputHandoffs });
     const byId = new Map(base.sessions.map(session => [session.sessionId, session]));
     const observedCompletions = new Set<string>();
     if (source) for (const session of eligible) if (!byId.has(session.id) && session.taskActivity?.silent && session.state === "idle") {

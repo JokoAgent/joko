@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, realpath } from "node:fs/promises";
+import { chmod, lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import type { AdapterContext, AdapterEventMetadata, BackendAdapter, BlobRef, CreateNativeSessionInput, EventPayload, HostedExecution, NativeSessionBinding, PermissionMode, PromptInput, SubagentControlInput, UserShellInput } from "@joko/core";
-import type { HostedAgentStore, HostedNativeSessionOwner } from "@joko/store";
+import type { HostedAgentStore, HostedNativeSessionOwner, HostedNativeProviderGrantOwner } from "@joko/store";
 import { HostedAgentArtifacts } from "./hosted-agent-artifacts.js";
 import { HostedAgentExchange } from "./hosted-agent-exchange.js";
 import { HostedAgentSessionSlots, type HostedAgentSlot } from "./hosted-agent-limits.js";
@@ -20,6 +20,7 @@ export interface HostedAgentRunOptions {
   readonly source: { readonly authorityId: string; readonly deviceId: string; readonly sessionId: string; readonly targetId: string; readonly generation: number };
   readonly store: HostedAgentStore;
   readonly trust: "owner" | "guest";
+  readonly providerCleanup?: HostedNativeProviderGrantOwner;
   readonly backendId: string;
   readonly providerId: string;
   readonly modelId: string;
@@ -69,11 +70,14 @@ export class HostedAgentRun {
   #opening?: Promise<void>;
   #closing?: Promise<void>;
   #cleanup?: Promise<void>;
+  #purging?: Promise<void>;
+  #purgeRequested = false;
   #ready = false;
   #startupSettled = false;
   #inputOperationId?: string;
   #shellOperationId?: string;
   #inputImages: readonly BlobRef[] = [];
+  #activeProvider?: string;
   readonly #toolOwners = new Map<string, { readonly operationId: string; readonly origin: string }>();
 
   private constructor(options: HostedAgentRunOptions) {
@@ -86,7 +90,8 @@ export class HostedAgentRun {
     if (options.trust === "guest" && !options.modelIds.includes(options.modelId)) throw new Error("Shared Agent model is unavailable.");
     this.#options = options;
     this.#owner = { authorityId: options.source.authorityId, deviceId: options.source.deviceId, sessionId: options.source.sessionId,
-      targetId: options.source.targetId, nativeSessionId: options.nativeSessionId, backendId: options.backendId, trust: options.trust };
+      targetId: options.source.targetId, nativeSessionId: options.nativeSessionId, backendId: options.backendId, trust: options.trust,
+      ...(options.providerCleanup ? { providerGrant: options.providerCleanup } : {}) };
     this.id = options.store.key(this.#owner);
     this.#slot = options.slots.reserve(options.source.deviceId);
     try { this.exchange = new HostedAgentExchange({ assertCurrent: () => options.assertCurrent(), onOverflow: () => { void this.close().catch(() => {}); } }); }
@@ -104,6 +109,9 @@ export class HostedAgentRun {
   get initializing(): boolean { return !this.#startupSettled && !this.#lifetime.signal.aborted; }
   checkAuthority(): void { this.#assertAuthority(); }
   get workspaceRoot(): string { return join(this.#options.root, this.id, "workspace"); }
+  activeProviderTurns(backendId: string, providerId: string): number {
+    return this.#options.backendId === backendId && this.#activeProvider === providerId && !this.#nativeCleaned ? 1 : 0;
+  }
   readArtifact(id: string, offset: number, maximum: number): Promise<{ readonly data: string }> {
     this.#assertCurrent(); if (!this.#artifacts) throw new Error("Hosted Artifacts are unavailable."); return this.#artifacts.read(id, offset, maximum);
   }
@@ -132,6 +140,17 @@ export class HostedAgentRun {
       this.#lifetime.abort(); this.exchange.finish(); await this.#channel?.close();
       await this.#opening?.catch(() => {}); await this.#disposeNative(); this.#ready = false;
     })().catch(error => { this.#closing = undefined; throw error; });
+  }
+  /** Deletion owns this exact lease after the SDK and its processes close.
+   * An uncertain cleanup retains the run and quota so a later retry can finish. */
+  purge(): Promise<void> {
+    this.#purgeRequested = true;
+    return this.#purging ??= (async () => {
+      await this.close();
+      if (!this.#nativeCleaned) throw new HostedAgentCleanupError(this);
+      if (this.#claimed) await purgeHostedAgentStorage({ root: this.#options.root, store: this.#options.store, key: this.id, leaseId: this.#leaseId });
+      this.#slot.release();
+    })().catch(error => { this.#purging = undefined; throw error; });
   }
   /** The connection owner calls this after the final cursor was drained. */
   disposeExchange(): void { this.exchange.close(); this.#receipts.clear(); this.#expiredCalls.clear(); }
@@ -177,6 +196,7 @@ export class HostedAgentRun {
       if (prior.binding) {
         this.#context = { ...this.#context, binding: prior.binding };
         const resumed = await this.#adapter.resumeSession(prior.binding, this.#context); this.#assertAuthority(); this.#binding = resumed.binding;
+        if (resumed.streaming) this.#activeProvider = resumed.providerId ?? this.#options.providerId;
         this.#context = { ...this.#context, binding: resumed.binding, generation: resumed.binding.generation };
         if (resumed.providerId !== this.#options.providerId || resumed.modelId !== this.#options.modelId) {
           this.#options.assertModelAllowed(this.#options.providerId, this.#options.modelId);
@@ -202,6 +222,8 @@ export class HostedAgentRun {
   }
   async #emit(event: EventPayload, metadata?: AdapterEventMetadata, operationId?: string): Promise<void> {
     this.#assertAuthority();
+    if (event.type === "done" || event.type === "run_state" && ["completed", "aborted", "failed"].includes(event.state)) this.#activeProvider = undefined;
+    else if (event.type === "run_state" && ["running", "waiting", "retrying", "dispatch_unknown"].includes(event.state)) this.#activeProvider = this.#context?.modelSelection?.providerId ?? this.#options.providerId;
     if (event.type === "native_session_changed") {
       const binding: NativeSessionBinding = { opaqueRef: event.opaqueRef,
         ...(event.nativeSessionId === undefined ? {} : { nativeSessionId: event.nativeSessionId }),
@@ -212,7 +234,11 @@ export class HostedAgentRun {
       this.#options.store.bind(this.id, this.#leaseId, binding); this.#binding = binding;
       if (this.#context) this.#context = { ...this.#context, binding };
     }
-    this.exchange.emit(event, metadata, operationId);
+    // Some native SDK subscriptions retain the creation context. Once a turn
+    // is dispatched, its foreground events still belong to that original
+    // input operation so the Source can settle its exact queue item.
+    const owner = operationId === this.#options.runId ? this.#inputOperationId ?? operationId : operationId;
+    this.exchange.emit(event, metadata, owner);
   }
   async #executeTool(value: unknown, signal: AbortSignal): Promise<Record<string, unknown>> {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Hosted tool ownership is invalid.");
@@ -261,9 +287,9 @@ export class HostedAgentRun {
   #assertCurrent(): void { this.#assertAuthority(); if (!this.#ready || !this.#adapter || !this.#context || !this.#binding) throw new Error("Hosted Agent runtime is not active."); }
   #disposeNative(): Promise<void> {
     return this.#cleanup ??= (async () => {
-      await this.#adapter?.dispose(); await this.#artifacts?.close(); this.#toolOwners.clear(); this.#nativeCleaned = true;
+      await this.#adapter?.dispose(); await this.#artifacts?.close(); this.#toolOwners.clear(); this.#nativeCleaned = true; this.#activeProvider = undefined;
       try { if (this.#claimed && this.#options.store.find(this.id)?.leaseId === this.#leaseId) this.#options.store.close(this.id, this.#leaseId); }
-      finally { this.#slot.release(); }
+      finally { if (!this.#purgeRequested) this.#slot.release(); }
     })().catch(error => { this.#cleanup = undefined; throw error; });
   }
   async #invokeOnce(id: string, digest: string, command: HostedAgentCall): Promise<unknown> {
@@ -292,6 +318,7 @@ export class HostedAgentRun {
     switch (command.kind) {
       case "state": return adapter.inspectSession(this.#binding!, context);
       case "send":
+        this.#activeProvider = context.modelSelection?.providerId ?? this.#options.providerId;
         this.#inputOperationId = id;
         this.#inputImages = command.input.images.map(image => ({ ...image.blob }));
         this.#options.assertModelAllowed(context.modelSelection!.providerId, context.modelSelection!.modelId);
@@ -331,4 +358,21 @@ export class HostedAgentRun {
       case "control_subagent": if (!adapter.controlSubagent) throw new Error("Hosted child control is unsupported."); await adapter.controlSubagent(command.input, context); return null;
     }
   }
+}
+
+/** Only a confirmed closed process or its in-memory owner may call this.
+ * The persistent purge fence prevents a resume from replacing this lease
+ * while filesystem deletion awaits the operating system. */
+export async function purgeHostedAgentStorage(options: { readonly root: string; readonly store: HostedAgentStore; readonly key: string; readonly leaseId: string }): Promise<void> {
+  if (!isAbsolute(options.root) || resolve(options.root) !== options.root || !/^[a-f0-9]{64}$/u.test(options.key)) throw new Error("Hosted Agent cleanup path is invalid.");
+  const target = resolve(options.root, options.key);
+  if (target !== join(options.root, options.key) || target === options.root || await realpath(options.root) !== options.root) throw new Error("Hosted Agent cleanup path is unsafe.");
+  options.store.beginPurge(options.key, options.leaseId);
+  try {
+    const info = await lstat(target);
+    if (!info.isDirectory() || info.isSymbolicLink() || await realpath(target) !== target) throw new Error("Hosted Agent cleanup directory is unsafe.");
+    options.store.assertLease(options.key, options.leaseId);
+    await rm(target, { recursive: true, force: false });
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  options.store.finishPurge(options.key, options.leaseId);
 }

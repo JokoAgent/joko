@@ -222,6 +222,7 @@ import {
   type MobileInteractionSubmission
 } from "./mobile-interactions";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
+import type { MobileInputHandoffApi, MobileInputHandoffTasksApi } from "./mobile-input-handoff";
 import type {
   MobileComposerDraftIdentity,
   MobileComposerDraftSnapshot,
@@ -2125,6 +2126,31 @@ export class MobileClient {
     return this.network.partnerGroupApi(context.credential, context.authorityKey, this.newId, signal => {
       signal.throwIfAborted(); if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential) throw new Error("Partner group owner changed.");
     });
+  }
+
+  inputHandoffTasksApi(): MobileInputHandoffTasksApi | undefined {
+    const context = this.#partnerPrivateContext(), read = this.network.listInputHandoffTasks, ownerSignal = this.#abort?.signal, epoch = this.#epoch;
+    if (!context || !read || !ownerSignal || this.#joinedTask) return undefined;
+    const ownerKey = `${context.authorityKey}\u001f${epoch}`;
+    const current = () => !ownerSignal.aborted && this.#current(epoch) && !this.#joinedTask && this.#credential === context.credential
+      && this.#partnerPrivateAuthorityKey(this.#state) === context.authorityKey;
+    return { ownerKey, isCurrent: current, list: async signal => {
+      const active = AbortSignal.any([signal, ownerSignal]); active.throwIfAborted(); if (!current()) throw new Error("The input task owner changed.");
+      const tasks = await read.call(this.network, context.credential, active); active.throwIfAborted(); if (!current()) throw new Error("The input task owner changed.");
+      return tasks.filter(task => this.#state.owner?.sessions.some(session => !session.archived && session.sessionId === task.sessionId
+        && session.nativeBinding?.runtimeGeneration === task.generation));
+    } };
+  }
+
+  taskInputHandoffApi(): MobileInputHandoffApi | undefined {
+    const credential = this.#credential, ownerKey = this.taskHeaderSourceKey(), session = this.#selectedSession();
+    if (this.#joinedTask || !credential || !ownerKey || !session || session.archived || !this.#foreground
+      || this.#state.status !== "connected" || !this.#abort || !this.network.inputHandoffApi) return undefined;
+    const signal = this.#abort.signal;
+    return this.network.inputHandoffApi(credential, { ownerKey, sessionId: session.sessionId, deviceId: credential.deviceId, signal,
+      assertCurrent: active => { active.throwIfAborted(); signal.throwIfAborted();
+        if (this.#credential !== credential || this.#joinedTask || !this.#foreground || this.taskHeaderSourceKey() !== ownerKey
+          || this.#selectedSession()?.archived) throw new Error("The input handoff owner changed."); } });
   }
 
   mcpAppApi(sessionId: string): import("./mobile-mcp-app-api").MobileMcpAppApi | undefined {

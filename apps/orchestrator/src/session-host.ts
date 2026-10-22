@@ -70,6 +70,7 @@ import {
   SessionRuntimeHandoffStore,
   StaleGenerationError
 } from "@joko/store";
+import { TaskShareStore } from "@joko/store";
 import type {
   ConnectionRecord,
   ArtifactRecord,
@@ -90,6 +91,11 @@ import type {
 import type { PendingRuntimeHandoff, RuntimeHandoffSource } from "@joko/store";
 import { assertPersonalDevelopmentInput, readPersonalDevelopmentPurpose } from "./personal-development-purpose.js";
 import { buildSessionHandoffText, sessionHandoffMessages } from "./session-handoff-text.js";
+import type { ProviderGroupRuntime } from "./provider-group-runtime.js";
+import type { ProviderGroupSessionPort, ProviderGroupRecoveryLease } from "./provider-group-service.js";
+import type { ProviderGroupAssignment } from "./provider-group-router.js";
+import { providerGroupFailureSignals } from "./provider-group-failure-policy.js";
+import type { InputHandoffTaskScope } from "./input-handoff/coordinator.js";
 import { operationBodyHash } from "@joko/store";
 import type { ArtifactStore } from "./artifact-store.js";
 import { resolveStoredArtifactSource, validateLocalArtifactSource } from "./artifact-source.js";
@@ -872,6 +878,8 @@ export class SessionHost {
   readonly #drainSettlements = new Map<string, Promise<void>>();
   readonly #pendingInteractions = new Map<string, PendingInteraction>();
   readonly #applicationQueueGuards = new Map<string, McpAppMessageGuard>();
+  readonly #inputHandoffQueueScopes = new Map<string, InputHandoffTaskScope>();
+  readonly #inputHandoffAdmissions = new WeakSet<PromptInput>();
   #partnerHomeInputGuard: ((sessionId: string) => void) | undefined;
   #extensionTaskQueueGuard?: (item: QueueItemRecord) => void;
   #extensionNativeToolAuthorization?: (sessionId: string) => import("@joko/core").NativeToolAuthorization | undefined;
@@ -911,6 +919,8 @@ export class SessionHost {
   readonly #sessionRuntimeControlTails = new Map<string, Promise<void>>();
   readonly #sessionRuntimeControlEffects = new Set<string>();
   readonly #sessionRuntimeRecoveries = new Map<string, SessionRuntimeRecoveryState>();
+  #providerGroups?: ProviderGroupRuntime;
+  readonly #providerGroupRecoveries = new Map<string, { readonly runId: string; readonly controller: AbortController; readonly lease: ProviderGroupRecoveryLease }>();
   readonly #nativeHistoryTails = new Map<string, Promise<void>>();
   readonly #runtimeCommandTails = new Map<string, Promise<void>>();
   readonly #nativeStateTails = new Map<string, Promise<void>>();
@@ -1008,6 +1018,57 @@ export class SessionHost {
   readonly extraDirectories: ExtraDirectoryManager;
   #scheduledWorktreeReconciliation: Promise<void> | undefined;
   #disposed = false;
+
+  installProviderGroupRuntime(runtime: ProviderGroupRuntime): void {
+    if (this.#providerGroups && this.#providerGroups !== runtime) throw new StoreError("The Provider group runtime is already installed.");
+    this.#providerGroups = runtime;
+  }
+  providerGroupSessionPort(): ProviderGroupSessionPort {
+    return {
+      read: sessionId => {
+        try {
+          const session = this.#store.getSession(sessionId).descriptor, profile = this.getSessionRuntimeControl(sessionId).effective;
+          if (!profile) return undefined;
+          const backend = this.#store.getBackend(profile.backendId).descriptor;
+          const source = this.#providerGroups?.directory.sources().find(source => source.backendId === profile.backendId && source.providerId === profile.providerId);
+          const model = backend.models.find(model => model.providerId === profile.providerId && model.modelId === profile.modelId);
+          return { sessionId, profile, agentKind: source?.agentKind ?? backend.adapterKind,
+            ...(model?.logicalId === undefined ? {} : { logicalModelId: model.logicalId }),
+            eligible: !session.archived && session.deletedAt === undefined && session.remoteWorkspace === undefined && !this.isReviewReadOnlySession(sessionId)
+              && this.#store.getTarget(session.targetId).descriptor.trusted,
+            dispatchUnknown: this.#store.listRuns({ sessionId, states: ["dispatch_unknown"], limit: 1 }).length > 0
+              || ["effect", "unknown"].includes(this.#runtimeHandoffs.read(sessionId)?.pending?.phase ?? "") };
+        } catch { return undefined; }
+      },
+      handoff: async (sessionId, profile, options) => {
+        const assertCurrent = () => { if (!options.isCurrent()) throw new StoreError("The Provider group handoff was superseded."); };
+        assertCurrent(); const current = this.getSessionRuntimeControl(sessionId);
+        if (options.fresh) this.#stageSessionRuntimeHandoff({ sessionId, expectedGeneration: current.generation, patch: profile, source: "fallback", fresh: true }, this.#store.getSession(sessionId), current);
+        else await this.setSessionRuntimeControl({ sessionId, expectedGeneration: current.generation, patch: profile, source: "fallback", assertAuthority: assertCurrent });
+        assertCurrent(); const pending = this.#runtimeHandoffs.read(sessionId)?.pending;
+        const applied = pending ? await this.#performSessionRuntimeHandoff(sessionId, assertCurrent) : await this.#applyPendingSessionRuntimeControl(sessionId, true, assertCurrent);
+        assertCurrent(); if (!applied) return "unknown";
+        const effective = this.getSessionRuntimeControl(sessionId).effective;
+        return effective?.backendId === profile.backendId && effective.providerId === profile.providerId && effective.modelId === profile.modelId ? "committed" : "unknown";
+      },
+      continue: (sessionId, lease, options) => this.#continueProviderGroup(sessionId, lease, options),
+      status: (sessionId, state) => {
+        const session = this.#store.getSession(sessionId).descriptor;
+        this.#store.setSetting("session", sessionId, "provider.group-status", { format: 1, state, at: Date.now() });
+        this.#store.appendEvent({ backendId: session.backendId, targetId: session.targetId, sessionId, generation: session.binding.generation,
+          emittedAt: Date.now(), traceId: `provider-group:${sessionId}:${state}`, payload: { type: "session_changed" } });
+      }
+    };
+  }
+  activeProviderTurns(backendId: string, providerId: string): number {
+    return listAllRuns(this.#store, { activeOnly: true }).filter(run => {
+      if (!["running", "waiting", "retrying"].includes(run.descriptor.state)) return false;
+      const session = this.#store.getSession(run.descriptor.sessionId).descriptor;
+      if (session.backendId !== backendId || session.remoteWorkspace !== undefined) return false;
+      const item = this.#store.findQueueItemByRunId(session.id, run.descriptor.id);
+      return (item?.executionOverrides?.providerId ?? session.providerId) === providerId;
+    }).length;
+  }
 
   constructor(
     store: OperationalStore,
@@ -2779,11 +2840,35 @@ export class SessionHost {
     void this.drain(sessionId);
   }
 
+  /** Only the in-process coordinator owns this original native scope. Its
+   * metadata describes completion and contains no values entered by the owner. */
+  enqueueInputHandoffCompletion(scope: InputHandoffTaskScope, requestId: string, metadata: string): OperationExecution<EnqueueResult> {
+    this.#assertOpen(); scope.assertCurrent();
+    if (!requestId || requestId.length > 512 || /[\0\r\n]/u.test(requestId) || !metadata.startsWith("[Input handoff ended]")
+      || metadata.length > 16_384 || metadata.includes("\0")) throw new StoreError("The input handoff completion metadata is invalid.");
+    const session = this.#store.getSession(scope.sessionId).descriptor, target = this.#store.getTarget(scope.targetId).descriptor;
+    if (session.targetId !== scope.targetId || session.binding.generation !== scope.generation || session.remoteWorkspace !== undefined || target.remoteWorkspace !== undefined
+      || !target.trusted || session.archived || session.deletedAt !== undefined || this.isReviewReadOnlySession(scope.sessionId)) throw new StoreError("The original input handoff task is no longer current.");
+    const prompt: PromptInput = { text: metadata, images: [], files: [], mentions: [], disposition: "follow_up", inputHandoffContinuation: { requestId } };
+    this.#inputHandoffAdmissions.add(prompt);
+    let execution: OperationExecution<EnqueueResult>;
+    try {
+      execution = this.enqueueServiceInput({ operationId: stableId("input-handoff-completion", JSON.stringify([scope.sessionId, scope.targetId, scope.generation, requestId])),
+        sessionId: scope.sessionId, source: "system", prompt,
+        onAdmitted: (_store, result) => { scope.assertCurrent(); this.#inputHandoffQueueScopes.set(result.queueItemId, scope); } });
+    } finally { this.#inputHandoffAdmissions.delete(prompt); }
+    if (execution.replayed && this.#store.getQueueItem(execution.value.queueItemId).state === "accepted") {
+      scope.assertCurrent(); this.#inputHandoffQueueScopes.set(execution.value.queueItemId, scope); void this.drain(scope.sessionId);
+    }
+    return execution;
+  }
+
   /** Host-owned input admission for service workflows such as a granted
    * Scheduler script capability. The mutation and queue item commit before
    * the adapter is allowed to observe the work. */
   enqueueServiceInput(input: EnqueueServiceInput): OperationExecution<EnqueueResult> {
     this.#assertOpen();
+    if (input.prompt.inputHandoffContinuation && !this.#inputHandoffAdmissions.has(input.prompt)) throw new StoreError("Input handoff completion requires its original coordinator scope.");
     const acceptedPrompt = this.canonicalQueuedPrompt(input.sessionId, input.prompt);
     assertPromptInlineTextRanges(acceptedPrompt);
     this.assertInputCapabilities(input.sessionId, acceptedPrompt);
@@ -5217,19 +5302,21 @@ export class SessionHost {
   #stageSessionRuntimeHandoff(input: {
     readonly sessionId: string; readonly expectedGeneration: number; readonly patch: SessionRuntimePatch;
     readonly source?: SessionRuntimeMutationSource;
+    readonly fresh?: boolean;
   }, stored: StoredSession, snapshot: SessionRuntimeControlSnapshot): SessionRuntimeMutationResult {
     this.#assertRuntimeHandoffSession(stored);
     const current = snapshot.pending?.profile ?? snapshot.effective!;
     const profile = this.#resolveRuntimeHandoffProfile(stored, input.patch, current);
     const source = input.source ?? "agent";
-    this.#runtimeHandoffs.stage(input.sessionId, snapshot.generation + 1, profile, source);
+    this.#runtimeHandoffs.stage(input.sessionId, snapshot.generation + 1, profile, source, input.fresh);
     const accepted = this.#sessionRuntimeControl.acceptDeferred(input.sessionId, source, profile, snapshot.effective);
     this.#publishSessionRuntimeControlChanged(stored);
     return { status: "deferred", effectiveBoundary: "next_send", generation: accepted.generation,
       effective: snapshot.effective!, pending: accepted.pending };
   }
 
-  async #performSessionRuntimeHandoff(sessionId: string): Promise<boolean> {
+  async #performSessionRuntimeHandoff(sessionId: string, assertAuthority?: () => void): Promise<boolean> {
+    assertAuthority?.();
     let record = this.#runtimeHandoffs.read(sessionId), pending = record?.pending;
     if (!pending) return true;
     if (pending.phase === "unknown" || pending.phase === "effect") {
@@ -5247,6 +5334,7 @@ export class SessionHost {
       const adapter = this.requireAdapter(profile.backendId), targetBackendGeneration = this.requireAdapterGeneration(profile.backendId, adapter);
       releaseTargetAdmission = this.beginBackendAdmissionEffect(profile.backendId);
       const update = (next: PendingRuntimeHandoff): void => {
+        assertAuthority?.();
         record = this.#runtimeHandoffs.transition(sessionId, pending!.generation, next); pending = record.pending!;
       };
       if (pending.phase === "pending") {
@@ -5272,20 +5360,22 @@ export class SessionHost {
           } finally { lease.release(); }
         }
         this.#releaseSessionTools(sessionId);
-        update({ generation: pending.generation, source: pending.source, profile, phase: "closed", origin });
+        update({ generation: pending.generation, source: pending.source, profile, phase: "closed", origin, ...(pending.fresh ? { fresh: true } : {}) });
       }
       const origin = pending.origin!;
       const assertCurrent = async (): Promise<void> => {
+        assertAuthority?.();
         this.#assertOpen(); this.#store.assertSessionRuntimeHandoffSource(sessionId, origin);
         this.#assertRuntimeHandoffSession(this.#store.getSession(sessionId));
         this.#resolveRuntimeHandoffProfile(this.#store.getSession(sessionId), { ...profile }, profile);
         this.assertCurrentAdapterGeneration(profile.backendId, adapter, targetBackendGeneration);
         if (this.serviceRuntimeDigest(this.#store.getSession(sessionId).descriptor) !== origin.promptDigest
           || await realpath(origin.workspaceRoot) !== origin.realWorkspaceRoot) throw new StoreError("Native handoff private configuration or directory changed.");
+        assertAuthority?.();
       };
       await assertCurrent();
       if (pending.phase === "closed") {
-        const parked = record!.parked.find(row => row.backendId === profile.backendId)
+        const parked = pending.fresh ? undefined : record!.parked.find(row => row.backendId === profile.backendId)
           ?? (origin.backendId === profile.backendId ? origin : undefined);
         const events = listAllVisibleSessionEvents(this.#store, sessionId);
         const all = sessionHandoffMessages(events);
@@ -5336,7 +5426,7 @@ export class SessionHost {
         await assertCurrent();
         const state = await adapter.inspectSession(binding, selected); await assertCurrent();
         if (state.binding.opaqueRef !== binding.opaqueRef || state.binding.nativeSessionId !== binding.nativeSessionId
-          || state.providerId !== profile.providerId || state.modelId !== profile.modelId || state.effort !== profile.effort
+          || state.providerId !== profile.providerId || state.modelId !== profile.modelId || profile.effort !== undefined && state.effort !== profile.effort
           || state.fastMode !== profile.fastMode || state.permissionMode !== stored.descriptor.permissionMode
           || stored.descriptor.planMode && state.planMode !== true) throw new StoreError("The prepared runtime did not report the selected route and modes.");
         update({ ...pending, phase: "ready" });
@@ -5351,8 +5441,8 @@ export class SessionHost {
       if (latest?.phase === "effect") {
         if (error instanceof JokoError && error.publicError.stateMayHaveChanged === false && latest.effect !== "configure") {
           this.#runtimeHandoffs.transition(sessionId, latest.generation, latest.effect === "close"
-            ? { generation: latest.generation, source: latest.source, profile: latest.profile, phase: "pending" }
-            : { generation: latest.generation, source: latest.source, profile: latest.profile, phase: "closed", origin: latest.origin! });
+            ? { generation: latest.generation, source: latest.source, profile: latest.profile, phase: "pending", ...(latest.fresh ? { fresh: true } : {}) }
+            : { generation: latest.generation, source: latest.source, profile: latest.profile, phase: "closed", origin: latest.origin!, ...(latest.fresh ? { fresh: true } : {}) });
         } else this.#runtimeHandoffs.transition(sessionId, latest.generation, { ...latest, phase: "unknown" });
       }
       const session = this.#store.getSession(sessionId).descriptor;
@@ -5377,10 +5467,11 @@ export class SessionHost {
       || this.#sessionRuntimeControlEffects.has(sessionId);
   }
 
-  async #applyPendingSessionRuntimeControl(sessionId: string, forSend = false): Promise<boolean> {
+  async #applyPendingSessionRuntimeControl(sessionId: string, forSend = false, assertAuthority?: () => void): Promise<boolean> {
     return this.#withSessionRuntimeControlLock(sessionId, async () => {
+      assertAuthority?.();
       if (this.#runtimeHandoffs.read(sessionId)?.pending !== undefined) {
-        return forSend ? this.#performSessionRuntimeHandoff(sessionId) : true;
+        return forSend ? this.#performSessionRuntimeHandoff(sessionId, assertAuthority) : true;
       }
       const stored = this.#store.getSession(sessionId);
       const baseline = sessionRuntimeBaseline(stored.descriptor);
@@ -5401,8 +5492,10 @@ export class SessionHost {
       this.#sessionRuntimeControlEffects.add(sessionId);
       try {
         const active = await this.activate(sessionId);
+        assertAuthority?.();
         if (!this.#sessionRuntimeControl.generationMatches(sessionId, pending.generation)) return false;
-        await this.#applySessionRuntimeProfile(sessionId, active, pending.profile);
+        await this.#applySessionRuntimeProfile(sessionId, active, pending.profile, assertAuthority);
+        assertAuthority?.();
         if (!this.#sessionRuntimeControl.settlePending(sessionId, pending.generation)) return false;
         this.#publishSessionRuntimeControlChanged(this.#store.getSession(sessionId));
         return true;
@@ -5607,6 +5700,12 @@ export class SessionHost {
     terminalState: "cancelled" | "succeeded" | "exhausted" = "cancelled",
     terminalError?: PublicError
   ): void {
+    if (terminalState === "cancelled") {
+      this.#providerGroups?.service.noteUserAction(sessionId);
+      this.#providerGroups?.guestSwitch.drop(sessionId);
+      const group = this.#providerGroupRecoveries.get(sessionId);
+      if (group) { group.controller.abort(); this.#providerGroupRecoveries.delete(sessionId); this.providerGroupSessionPort().status(sessionId, "idle"); }
+    }
     const state = this.#sessionRuntimeRecoveries.get(sessionId);
     if (state?.timer !== undefined) clearTimeout(state.timer);
     if (state?.current !== undefined) {
@@ -5650,16 +5749,104 @@ export class SessionHost {
   }
 
   #noteSessionRuntimeRecoveryProgress(sessionId: string, runId: string, payload: EventPayload): void {
+    if (isSubstantiveSessionRuntimeProgress(payload)) this.#providerGroups?.service.noteProgress(sessionId);
     const state = this.#sessionRuntimeRecoveries.get(sessionId);
     if (state?.currentRunId !== runId || !isSubstantiveSessionRuntimeProgress(payload)) return;
     state.consecutiveAttempts = 0;
   }
 
   #terminalRunError(sessionId: string, runId: string): PublicError | undefined {
+    const held = this.#store.findSetting<{ readonly format: number; readonly payload: Extract<EventPayload, { readonly type: "error" }> }>("session", sessionId, `provider.group-error:${runId}`)?.value;
+    if (held?.format === 1 && held.payload.type === "error") return held.payload.error;
     const event = this.#store.listEvents({ sessionId, order: "desc", limit: 1_000 })
       .find((candidate) => candidate.runId === runId
         && candidate.payload.type === "error" && candidate.payload.terminal);
     return event?.payload.type === "error" ? event.payload.error : undefined;
+  }
+
+  #providerGroupApplies(item: QueueItemRecord): boolean {
+    const groups = this.#providerGroups;
+    if (!groups || hasTurnOverrides(item.executionOverrides) || item.body.inputHandoffContinuation !== undefined || this.isReviewReadOnlySession(item.sessionId)
+      || new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId === item.sessionId) return false;
+    const session = this.providerGroupSessionPort().read(item.sessionId); if (!session?.eligible || session.dispatchUnknown) return false;
+    const binding = groups.store.binding(item.sessionId);
+    return binding !== undefined || groups.remote.owns({ backendId: session.profile.backendId, providerId: session.profile.providerId })
+      || groups.store.snapshot({ backendId: session.profile.backendId, providerId: session.profile.providerId }).config !== undefined;
+  }
+  #providerGroupMayHandleRun(sessionId: string, runId: string, error: PublicError): boolean {
+    const item = this.#store.findQueueItemByRunId(sessionId, runId, { includeCleared: true });
+    return item !== undefined && !hasTurnOverrides(item.executionOverrides)
+      && new TaskShareStore(this.#store).getAuthorForOperation(item.operationId)?.sessionId !== sessionId
+      && !contextRecoveryEvidence(this.#store, sessionId, runId).hasExternalDispatchOwner
+      && (this.#providerGroups?.service.mayHandleTurnError(sessionId, providerGroupFailureSignals(error)) === true || this.#hasProviderGroupGuestOffer(sessionId));
+  }
+  #hasProviderGroupGuestOffer(sessionId: string): boolean {
+    const groups = this.#providerGroups; if (!groups) return false;
+    const session = this.#store.getSession(sessionId).descriptor, state = this.providerGroupSessionPort().read(sessionId);
+    return state?.eligible === true && !state.dispatchUnknown && groups.guestSwitch.has(sessionId, session.backendId, session.binding.generation);
+  }
+  async #recoverProviderGroup(sessionId: string, runId: string, error: PublicError): Promise<boolean> {
+    const groups = this.#providerGroups; if (!groups || !this.#providerGroupMayHandleRun(sessionId, runId, error)) return false;
+    const existing = this.#providerGroupRecoveries.get(sessionId); if (existing) return true;
+    const controller = new AbortController();
+    let entry!: { readonly runId: string; readonly controller: AbortController; readonly lease: ProviderGroupRecoveryLease };
+    const lease: ProviderGroupRecoveryLease = { isCurrent: () => {
+      if (this.#disposed || controller.signal.aborted || this.#providerGroupRecoveries.get(sessionId) !== entry) return false;
+      const session = this.#store.getSession(sessionId).descriptor;
+      return !session.archived && session.deletedAt === undefined && !this.#store.getQueueControl(sessionId).paused
+        && !listAllRuns(this.#store, { sessionId, activeOnly: true }).some(run => run.descriptor.state !== "queued")
+        && !listAllQueueItems(this.#store, { sessionId, states: ["accepted", "dispatching"] }).length;
+    } };
+    entry = { runId, controller, lease }; this.#providerGroupRecoveries.set(sessionId, entry);
+    try {
+      // The dispatch catch releases its native-effect preparation in the same
+      // turn. Handoff starts only after that exact effect has settled.
+      await this.#dispatchPreparations.get(sessionId)?.settled;
+      let handled: boolean;
+      const session = this.#store.getSession(sessionId).descriptor;
+      if (groups.guestSwitch.claim(sessionId, session.backendId, session.binding.generation)) {
+        const profile = this.getSessionRuntimeControl(sessionId).effective;
+        if (!profile || !lease.isCurrent()) throw new StoreError("The original Provider group offer expired.");
+        this.providerGroupSessionPort().status(sessionId, "switching");
+        try {
+          const switched = await this.providerGroupSessionPort().handoff(sessionId, profile, { beforeSend: false, fresh: true, isCurrent: lease.isCurrent });
+          if (switched !== "committed") throw new StoreError("The offered native handoff could not be confirmed.");
+          await this.#continueProviderGroup(sessionId, lease, { cause: "member-failed", switched: true, isCurrent: lease.isCurrent }); handled = true;
+        } finally { groups.guestSwitch.release(sessionId); }
+      } else handled = await groups.service.onTurnError(sessionId, providerGroupFailureSignals(error), lease, controller.signal);
+      if (!handled && lease.isCurrent()) this.#publishHeldProviderGroupError(sessionId, runId, error);
+      return true;
+    } catch (failure) {
+      if (lease.isCurrent()) this.#publishHeldProviderGroupError(sessionId, runId, error);
+      this.recordFailure("provider_group_recovery", failure); return true;
+    } finally {
+      if (this.#providerGroupRecoveries.get(sessionId) === entry) this.#providerGroupRecoveries.delete(sessionId);
+      this.#store.deleteSetting("session", sessionId, `provider.group-error:${runId}`);
+      void this.drain(sessionId);
+    }
+  }
+  async #continueProviderGroup(sessionId: string, lease: ProviderGroupRecoveryLease, options: { readonly cause: string; readonly switched: boolean; readonly isCurrent: () => boolean }): Promise<void> {
+    const recovery = this.#providerGroupRecoveries.get(sessionId);
+    if (!recovery || recovery.lease !== lease || !lease.isCurrent() || !options.isCurrent()) throw new StoreError("The Provider group continuation lost its original task lease.");
+    const source = this.#store.findQueueItemByRunId(sessionId, recovery.runId, { includeCleared: true }); if (!source) throw new StoreError("The interrupted input is unavailable.");
+    const evidence = contextRecoveryEvidence(this.#store, sessionId, recovery.runId);
+    const prompt: PromptInput = evidence.hasAssistantOrToolEffects ? { text: "Continue from the interrupted response. Do not repeat completed work or side effects.",
+      images: [], files: [], mentions: [], disposition: "prompt" } : { ...source.body, disposition: "prompt" };
+    if (!lease.isCurrent() || !options.isCurrent()) throw new StoreError("The Provider group continuation was superseded.");
+    this.enqueueServiceInput({ operationId: stableId("provider-group-continue", `${sessionId}:${recovery.runId}`), sessionId, source: "system", parentRunId: recovery.runId,
+      prompt: { ...prompt, automaticContinuation: { recoveryId: stableId("provider-group-recovery", recovery.runId), sourceRunId: recovery.runId, attempt: 1, maximumAttempts: 5, sessionTotal: 1 } } });
+  }
+  #publishHeldProviderGroupError(sessionId: string, runId: string, error: PublicError): void {
+    const session = this.#store.getSession(sessionId).descriptor;
+    this.#store.appendEvent({ id: stableId("provider-group-terminal", runId), backendId: session.backendId, targetId: session.targetId, sessionId, runId,
+      generation: session.binding.generation, emittedAt: Date.now(), traceId: `provider-group-terminal:${runId}`, payload: { type: "error", error, terminal: true } });
+  }
+  #captureProviderGroupUsage(runId: string, sessionId: string, profile: SessionRuntimeProfile): void {
+    const groups = this.#providerGroups; if (!groups) return;
+    const source = groups.directory.sources().find(source => source.backendId === profile.backendId && source.providerId === profile.providerId);
+    const backend = this.#store.getBackend(profile.backendId).descriptor;
+    groups.usage.capture(runId, { sessionId, ...profile, agentKind: source?.agentKind ?? backend.adapterKind, nodeId: source?.nodeId ?? this.#usageOwnerId,
+      nodeName: source?.displayName ?? this.#usageOwnerId, partyId: "owner", partyName: "Owner" });
   }
 
   #scheduleSessionRuntimeRecovery(sessionId: string, runId: string, error: PublicError): void {
@@ -6356,6 +6543,7 @@ export class SessionHost {
       artifactReferenceSnapshots: _untrustedArtifactSnapshots,
       automaticContinuation: _untrustedContinuation,
       objectiveContinuation: _untrustedObjectiveContinuation,
+      inputHandoffContinuation: _untrustedInputHandoffContinuation,
       quotesEncoded: _untrustedQuotesEncoded,
       pastedTextRanges: _untrustedPastedTextRanges,
       mentionRanges: _untrustedMentionRanges,
@@ -6378,7 +6566,8 @@ export class SessionHost {
         : { automaticContinuation: current.body.automaticContinuation }),
       ...(current.body.objectiveContinuation === undefined
         ? {}
-        : { objectiveContinuation: current.body.objectiveContinuation })
+        : { objectiveContinuation: current.body.objectiveContinuation }),
+      ...(current.body.inputHandoffContinuation === undefined ? {} : { inputHandoffContinuation: current.body.inputHandoffContinuation })
     }, { preserveSessionReferenceSnapshots: true, preserveArtifactReferenceSnapshots: true });
   }
 
@@ -6751,6 +6940,7 @@ export class SessionHost {
       sessionReferenceSnapshots: _sessionReferenceSnapshots,
       artifactReferenceSnapshots: _artifactReferenceSnapshots,
       objectiveContinuation: _objectiveContinuation,
+      inputHandoffContinuation: _inputHandoffContinuation,
       ...adapterPrompt
     } = prompt;
     const sessionMentions = prompt.mentions.flatMap((mention, mentionIndex) => mention.kind === "session"
@@ -7181,7 +7371,7 @@ export class SessionHost {
     let portableMessageCount = 0;
     visitVisibleSessionEvents(this.#store, input.sessionId, (event) => {
       if (event.payload.type === "message_complete") {
-        if (event.payload.automaticContinuation !== undefined || event.payload.objectiveContinuation !== undefined) return;
+        if (event.payload.automaticContinuation !== undefined || event.payload.objectiveContinuation !== undefined || event.payload.inputHandoffContinuation !== undefined) return;
         portableMessageCount += 1;
       } else if (event.payload.type !== "artifact" && !(event.payload.type === "status" && event.payload.key === "artifact_unavailable")) return;
       if (portableMessageCount > MAXIMUM_PORTABLE_SESSION_MESSAGES || events.length >= MAXIMUM_PORTABLE_SESSION_MESSAGES + 10_000) {
@@ -9868,6 +10058,9 @@ export class SessionHost {
   async dispose(): Promise<void> {
     if (this.#disposed) return;
     this.#disposed = true;
+    for (const recovery of this.#providerGroupRecoveries.values()) recovery.controller.abort();
+    this.#providerGroupRecoveries.clear();
+    await this.#providerGroups?.service.close();
     this.#partnerLearningTurns.clear();
     for (const calls of this.#nativeDerivationCleanupCalls.values()) {
       for (const controller of calls) controller.abort(new StoreError("Native derivation lifecycle work was interrupted by shutdown."));
@@ -9878,6 +10071,7 @@ export class SessionHost {
     }
     this.#pendingInteractions.clear();
     this.#applicationQueueGuards.clear();
+    this.#inputHandoffQueueScopes.clear();
     for (const watchdog of this.#runSilenceWatchdogs.values()) {
       if (watchdog.timer !== undefined) clearTimeout(watchdog.timer);
     }
@@ -10610,6 +10804,8 @@ export class SessionHost {
     let scheduledWorktreeSessionId: string | undefined;
     let releaseBackendAdmission: (() => void) | undefined;
     let privateCreationSessionId: string | undefined;
+    let groupAssignment: ProviderGroupAssignment | undefined;
+    let groupCreationEffectDispatched = false;
     try {
       const registeredTarget = this.assertTargetAcceptsSessionCreation(this.#store, input.targetId);
       const runtimeBackendId = "runtimeBackendId" in input ? input.runtimeBackendId : undefined;
@@ -10617,18 +10813,33 @@ export class SessionHost {
         || !registeredTarget.descriptor.trusted || registeredTarget.descriptor.remoteWorkspace !== undefined)) {
         throw new StoreError("A private Partner runtime selection requires a trusted local home.");
       }
-      const target = runtimeBackendId === undefined ? registeredTarget : { ...registeredTarget,
+      let target = runtimeBackendId === undefined ? registeredTarget : { ...registeredTarget,
         descriptor: { ...registeredTarget.descriptor, backendId: runtimeBackendId } };
-      const adapter = this.requireAdapter(target.descriptor.backendId);
-      const backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
-      const resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
-      const routedInput = this.resolveNewSessionRoute(target.descriptor.backendId, input);
+      let routedInput = this.resolveNewSessionRoute(target.descriptor.backendId, input);
+      const sessionId = stableId("session", input.operationId);
+      const initialProfile = routedInput.providerId && routedInput.modelId ? { backendId: target.descriptor.backendId, providerId: routedInput.providerId,
+        modelId: routedInput.modelId, ...(routedInput.effort === undefined ? {} : { effort: routedInput.effort }), fastMode: routedInput.fastMode } : undefined;
+      const initialSource = initialProfile && this.#providerGroups?.directory.sources().find(source => source.backendId === initialProfile.backendId && source.providerId === initialProfile.providerId);
+      const groupStart = initialProfile ? { sessionId, profile: initialProfile, agentKind: initialSource?.agentKind ?? this.#store.getBackend(initialProfile.backendId).descriptor.adapterKind,
+        ...(initialSource?.models.find(model => model.modelId === initialProfile.modelId)?.logicalId === undefined ? {} : {
+          logicalModelId: initialSource.models.find(model => model.modelId === initialProfile.modelId)!.logicalId! }) } : undefined;
+      if (groupStart && input.catalogImport === undefined && (!input.nativeStart || input.nativeStart.kind === "new" && input.nativeStart.parentNativeReference === undefined)
+        && registeredTarget.descriptor.trusted && registeredTarget.descriptor.remoteWorkspace === undefined) {
+        groupAssignment = await this.#providerGroups?.service.assignBeforeStart(groupStart, new AbortController().signal);
+        if (groupAssignment) {
+          groupAssignment.assertCurrent(); target = { ...registeredTarget, descriptor: { ...registeredTarget.descriptor, backendId: groupAssignment.profile.backendId } };
+          routedInput = { ...input, providerId: groupAssignment.profile.providerId, modelId: groupAssignment.profile.modelId,
+            ...(groupAssignment.profile.effort === undefined ? {} : { effort: groupAssignment.profile.effort }), fastMode: groupAssignment.profile.fastMode };
+        }
+      }
+      let adapter = this.requireAdapter(target.descriptor.backendId);
+      let backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
+      let resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
       if (input.catalogImport === undefined) {
         this.assertBackendCreationReady(target.descriptor.backendId, routedInput);
       }
       releaseBackendAdmission = this.beginBackendAdmissionEffect(target.descriptor.backendId);
       adapterForCleanup = adapter;
-      const sessionId = stableId("session", input.operationId);
       const worktreeOwner = "worktreeOwner" in input ? input.worktreeOwner : undefined;
       const automationOrigin = "automationOrigin" in input ? input.automationOrigin : undefined;
       if (worktreeOwner !== undefined && input.worktree === undefined) {
@@ -10739,7 +10950,7 @@ export class SessionHost {
         ? undefined
         : await this.#worktrees!.acquire({
             sessionId,
-            target: target.descriptor,
+            target: registeredTarget.descriptor,
             ...(input.worktree.sourceRef === undefined ? {} : { sourceRef: input.worktree.sourceRef }),
             refreshRemote: input.worktree.refreshRemote
           });
@@ -10754,7 +10965,7 @@ export class SessionHost {
           createdAt: now
         } satisfies ScheduledWorktreeOwner, now);
       }
-      const runtimeTarget = sessionWorktree === undefined
+      let runtimeTarget = sessionWorktree === undefined
         ? target.descriptor
         : { ...target.descriptor, workspaceRoot: sessionWorktree.path };
       if (nativeStart.kind === "new" && input.worktree === undefined && !target.descriptor.managed &&
@@ -10799,7 +11010,7 @@ export class SessionHost {
         this.#store.setSetting("service", sessionId, PRIVATE_CREATION_RECEIPT_KEY, { version: 1, operationId: claim.operation.id, phase: "prepared" } satisfies PrivateCreationReceipt);
         input.assertServiceScope(); await input.beforeNativeCreation(sessionId, runtimeTarget); input.assertServiceScope();
       }
-      const context = { ...this.provisionalContext(
+      let context = { ...this.provisionalContext(
         sessionId,
         runtimeTarget,
         1,
@@ -10878,17 +11089,42 @@ export class SessionHost {
           if (privateCreationSessionId !== undefined) this.#store.setSetting("service", privateCreationSessionId, PRIVATE_CREATION_RECEIPT_KEY,
             { version: 1, operationId: claim.operation.id, phase: "creating" } satisfies PrivateCreationReceipt);
           if ("serviceKind" in input && input.serviceKind === "personal_development") personalNativeCreationDispatched = true;
-          binding = await adapter.createSession({
-            target: runtimeTarget,
-            name: input.title,
-            ...(!attaching && routedInput.providerId !== undefined ? { providerId: routedInput.providerId } : {}),
-            ...(!attaching && routedInput.modelId !== undefined ? { modelId: routedInput.modelId } : {}),
-            ...(!attaching && routedInput.effort !== undefined ? { effort: routedInput.effort } : {}),
-            fastMode: attaching ? false : routedInput.fastMode,
-            permissionMode: attaching ? "ask" : input.permissionMode,
-            ...(nativeAppendSystemPrompt === undefined ? {} : { appendSystemPrompt: nativeAppendSystemPrompt }),
-            nativeStart
-          }, context);
+          for (;;) {
+            try {
+              if (groupAssignment) {
+                groupAssignment.assertCurrent();
+                this.#runtimeHandoffs.stageCreation({ operationId: claim.operation.id, operationBodyHash: claim.operation.bodyHash, sessionId,
+                  targetId: registeredTarget.descriptor.id, targetRevision: registeredTarget.revision.toString(), backendId: target.descriptor.backendId,
+                  backendInstanceGeneration, workspaceRoot: runtimeTarget.workspaceRoot });
+                this.#runtimeHandoffs.creationPhase(claim.operation.id, "effect"); groupCreationEffectDispatched = true;
+              }
+              binding = await adapter.createSession({ target: runtimeTarget, name: input.title,
+                ...(!attaching && routedInput.providerId !== undefined ? { providerId: routedInput.providerId } : {}),
+                ...(!attaching && routedInput.modelId !== undefined ? { modelId: routedInput.modelId } : {}),
+                ...(!attaching && routedInput.effort !== undefined ? { effort: routedInput.effort } : {}),
+                fastMode: attaching ? false : routedInput.fastMode, permissionMode: attaching ? "ask" : input.permissionMode,
+                ...(nativeAppendSystemPrompt === undefined ? {} : { appendSystemPrompt: nativeAppendSystemPrompt }), nativeStart }, context);
+              break;
+            } catch (error) {
+              if (!groupAssignment || !groupStart) throw error;
+              const evidence = providerGroupFailureSignals(error);
+              const closed = evidence.stateMayHaveChanged === false;
+              this.#runtimeHandoffs.creationPhase(claim.operation.id, closed ? "closed" : "unknown");
+              if (!closed) throw error;
+              groupCreationEffectDispatched = false;
+              const next = await this.#providerGroups!.service.nextAfterStartFailure(groupStart, groupAssignment, error, context.signal);
+              if (!next) throw error; groupAssignment = next;
+              groupAssignment.assertCurrent(); releaseBackendAdmission?.();
+              target = { ...registeredTarget, descriptor: { ...registeredTarget.descriptor, backendId: next.profile.backendId } };
+              adapter = this.requireAdapter(target.descriptor.backendId); adapterForCleanup = adapter;
+              backendInstanceGeneration = this.requireAdapterGeneration(target.descriptor.backendId, adapter);
+              resourceCatalogEpoch = this.backendResourceCatalogEpoch(target.descriptor.backendId);
+              releaseBackendAdmission = this.beginBackendAdmissionEffect(target.descriptor.backendId);
+              routedInput = { ...input, providerId: next.profile.providerId, modelId: next.profile.modelId, ...(next.profile.effort === undefined ? {} : { effort: next.profile.effort }), fastMode: next.profile.fastMode };
+              runtimeTarget = { ...runtimeTarget, backendId: target.descriptor.backendId };
+              context = { ...this.provisionalContext(sessionId, runtimeTarget, 1, undefined, nativeAppendSystemPrompt, backendInstanceGeneration, sessionWorktree), operationId: claim.operation.id };
+            }
+          }
           createdBinding = binding;
           contextForCleanup = { ...context, binding };
           if (!attaching && input.planMode) await adapter.setPlanMode(true, contextForCleanup);
@@ -11005,10 +11241,12 @@ export class SessionHost {
               updatedAt: presentationAt
             };
             const created = store.createSession(descriptor, {
-              localRuntimeBackendSelection: runtimeBackendId !== undefined,
+              localRuntimeBackendSelection: runtimeBackendId !== undefined || groupAssignment !== undefined,
               nativeSessionBlank: nativeStart.kind === "new"
                 && nativeStart.parentNativeReference === undefined
             });
+            groupAssignment?.commit();
+            this.#runtimeHandoffs.finishCreation(claim.operation.id);
             if ("onAdmitted" in input && input.onAdmitted !== undefined) input.onAdmitted(store, created);
             if ("serviceKind" in input && input.serviceKind === "extension") {
               input.assertServiceScope?.();
@@ -11129,13 +11367,14 @@ export class SessionHost {
         } catch { /* A failed native cleanup keeps the original creation unknown. */ }
       }
       if (acquiredWorktreeSessionId !== undefined && this.#worktrees !== undefined) {
-        if (!personalNativeCreationDispatched || personalNativeCreationClosed) {
+        if ((!personalNativeCreationDispatched && !groupCreationEffectDispatched) || personalNativeCreationClosed) {
           await this.#worktrees.release(acquiredWorktreeSessionId).catch(() => undefined);
         }
         this.#store.deleteSetting("service", acquiredWorktreeSessionId, SCHEDULED_WORKTREE_OWNER_SETTING_KEY);
       }
       return this.failClaimedEffect(operationKind, claim.operation.id, claim.operation.bodyHash, error);
     } finally {
+      groupAssignment?.release();
       this.#nativeCatalogAdoptionFlights.delete(claim.operation.id);
       releaseBackendAdmission?.();
       if (scheduledWorktreeSessionId !== undefined) {
@@ -11470,6 +11709,7 @@ export class SessionHost {
   private failAcceptedQueueItemsForAuthentication(sessionId: string): void {
     const stored = this.#store.getSession(sessionId);
     for (const item of listAllQueueItems(this.#store, { sessionId, states: ["accepted"] })) {
+      if (this.#providerGroupApplies(item)) continue;
       const failure = this.queueProviderAuthenticationFailure(item, stored);
       if (failure !== undefined) this.failQueueItemForAuthentication(item, failure);
     }
@@ -12805,7 +13045,8 @@ export class SessionHost {
       && !this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId)
     ) return;
     if (
-      this.#runSilenceRecoveries.has(sessionId)
+      this.#providerGroupRecoveries.has(sessionId)
+      || this.#runSilenceRecoveries.has(sessionId)
       || this.#runtimeRestartFences.has(sessionId)
       || this.#disposed
       || this.#partnerSessionRestarting(sessionId)
@@ -12825,7 +13066,8 @@ export class SessionHost {
           && !this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId)
         ) return;
         if (
-          this.#runSilenceRecoveries.has(sessionId)
+          this.#providerGroupRecoveries.has(sessionId)
+          || this.#runSilenceRecoveries.has(sessionId)
           || this.#runtimeRestartFences.has(sessionId)
           || this.#partnerSessionRestarting(sessionId)
           || this.#partnerSessionPaused(sessionId)
@@ -12842,6 +13084,16 @@ export class SessionHost {
         catch {
           this.#failExpiredApplicationInput(pending);
           continue;
+        }
+        if (this.#providerGroupApplies(pending)) {
+          if (listAllRuns(this.#store, { sessionId, activeOnly: true }).some(run => run.descriptor.id !== pending!.runId && run.descriptor.state !== "queued")) return;
+          try { await this.#providerGroups!.service.beforeSend(sessionId, new AbortController().signal); }
+          catch (error) {
+            this.providerGroupSessionPort().status(sessionId, "unavailable");
+            this.recordFailure("provider_group_before_send", error); return;
+          }
+          if (this.#store.getQueueControl(sessionId).paused) return;
+          pending = this.#store.listQueueItems({ sessionId, states: ["accepted"], limit: 1 })[0]; if (!pending) return;
         }
         // Authentication is an admission fence, not a turn-serialization
         // concern. Fail a newly durable item before any context rebuild,
@@ -13112,6 +13364,13 @@ export class SessionHost {
           dispatchPreparation.phase = "sending";
           const pendingAcceptance: PendingDispatchAcceptance = {};
           this.#pendingDispatchAcceptances.set(run.descriptor.id, pendingAcceptance);
+          if (!reviewReadOnly) {
+            const profile = this.getSessionRuntimeControl(sessionId).effective;
+            if (profile) this.#captureProviderGroupUsage(run.descriptor.id, sessionId, item.executionOverrides?.providerId && item.executionOverrides.modelId
+              ? { ...profile, providerId: item.executionOverrides.providerId, modelId: item.executionOverrides.modelId } : profile);
+            this.#providerGroups?.service.turnStarted(sessionId);
+              this.#providerGroups?.reporter.leasesChanged();
+          }
           if (!reviewReadOnly && active.adapter.sendWithDurableNativeDispatchFence !== undefined) {
             await active.adapter.sendWithDurableNativeDispatchFence(dispatchBody, context, (preparation) => {
               this.assertDispatchAdmissionOwner(
@@ -13258,6 +13517,9 @@ export class SessionHost {
               : "Start a new review after checking provider and artifact availability."
           } : adapterFailure;
           const uncertain = failure.stateMayHaveChanged;
+          this.#providerGroups?.service.turnSettled(sessionId, false);
+          this.#providerGroups?.reporter.leasesChanged();
+          const groupRecovery = !uncertain && this.#providerGroupMayHandleRun(sessionId, run.descriptor.id, failure);
           if (uncertain) {
             const active = this.#active.get(sessionId);
             if (active !== undefined) this.markNativeStateObservationStale(sessionId, active);
@@ -13279,7 +13541,8 @@ export class SessionHost {
               activeAttemptId: attemptId,
               error: failure,
               traceId: `dispatch:${item.id}:failed`,
-              operationId: item.operationId
+              operationId: item.operationId,
+              ...(groupRecovery ? { holdTerminalAttention: true } : {})
             });
             if (attemptId !== undefined) store.finishAttempt(attemptId, failure);
             if (recoveryTrigger !== undefined) {
@@ -13297,6 +13560,7 @@ export class SessionHost {
           if (!uncertain) {
             removeNativeDispatchRecoveryEntry(this.#store, sessionId, run.descriptor.id);
             await this.notifyServiceRunSettled(sessionId, run.descriptor.id, "failed");
+            if (groupRecovery) void this.#recoverProviderGroup(sessionId, run.descriptor.id, failure);
           }
           if (recoveryTrigger?.reason === "context_overflow") this.ensureContextOverflowReplay(sessionId);
           if (this.isReviewReadOnlySession(sessionId)) {
@@ -13581,6 +13845,9 @@ export class SessionHost {
               emittedAt,
               traceId: `adapter:${sessionId}:${randomUUID()}`,
               payload: publishedPayload,
+              ...(publishedPayload.type === "done" && publishedPayload.outcome === "failed" && runId !== undefined
+                && this.#terminalRunError(sessionId, runId) !== undefined
+                && this.#providerGroupMayHandleRun(sessionId, runId, this.#terminalRunError(sessionId, runId)!) ? { holdTerminalAttention: true } : {}),
               ...(durableMetadata === undefined ? {} : {
                 metadata: { namespace: durableMetadata.namespace, fields: durableMetadata.fields },
                 ...(durableMetadata.pi === undefined ? {} : { pi: durableMetadata.pi })
@@ -13631,7 +13898,10 @@ export class SessionHost {
                 appendAndArmRecovery(store);
               });
             } else if (durablePayload.type === "error" && durablePayload.terminal && runId !== undefined) {
-              this.#store.transaction(appendAndArmRecovery);
+              if (this.#providerGroupMayHandleRun(sessionId, runId, durablePayload.error)) {
+                this.#store.setSetting("session", sessionId, `provider.group-error:${runId}`, { format: 1, payload: durablePayload });
+                this.providerGroupSessionPort().status(sessionId, "switching");
+              } else this.#store.transaction(appendAndArmRecovery);
             } else if (durablePayload.type === "usage") {
               this.#store.transaction((store) => {
                 const usageItem = runId === undefined ? undefined : listAllQueueItems(store, { sessionId })
@@ -14081,6 +14351,13 @@ export class SessionHost {
   setPartnerHomeInputGuard(guard: (sessionId: string) => void): void { this.#partnerHomeInputGuard = guard; }
 
   async #assertApplicationQueueCurrent(item: QueueItemRecord): Promise<void> {
+    const completion = item.body.inputHandoffContinuation;
+    if (completion) {
+      const scope = this.#inputHandoffQueueScopes.get(item.id);
+      if (!scope || scope.sessionId !== item.sessionId || scope.targetId !== this.#store.getSession(item.sessionId).descriptor.targetId
+        || scope.generation !== this.#store.getSession(item.sessionId).descriptor.binding.generation) throw new StoreError("The original input handoff completion scope expired.");
+      scope.assertCurrent();
+    }
     this.#extensionTaskQueueGuard?.(item);
     if (this.#store.findSetting("session", item.sessionId, `mcp_app_queue:${item.id}`) === undefined
       && this.#store.findSetting("session", item.sessionId, `extension_card_queue:${item.id}`) === undefined) return;
@@ -14283,6 +14560,8 @@ export class SessionHost {
     learningTurn?: PartnerLearningTurnRecord
   ): Promise<void> {
     this.clearRunSilenceWatchdog(sessionId);
+    this.#providerGroups?.service.turnSettled(sessionId, outcome === "completed");
+    this.#providerGroups?.reporter.leasesChanged();
     if (this.isReviewReadOnlySession(sessionId)) {
       await this.finishReviewSettledSession(sessionId, outcome, settledRunId);
       this.settleReviewRuntime(sessionId, this.reviewRuntimeOutcome(sessionId, outcome));
@@ -14319,11 +14598,13 @@ export class SessionHost {
       const scheduleAttention = run.descriptor.source === "schedule"
         ? this.#scheduleRunNotifications?.settle(run.descriptor.id, state)
         : undefined;
+      const groupRecovery = error !== undefined && this.#providerGroupMayHandleRun(sessionId, run.descriptor.id, error);
       this.#store.updateRunState({
         runId: run.descriptor.id,
         state,
         ...(error === undefined ? {} : { error }),
         ...(scheduleAttention?.suppressAttention === true ? { suppressTerminalAttention: true } : {}),
+        ...(groupRecovery ? { holdTerminalAttention: true } : {}),
         ...(scheduleAttention?.markHistoryRead === true ? { markScheduleRunRead: true } : {}),
         traceId: `settled:${run.descriptor.id}`
       });
@@ -14333,6 +14614,8 @@ export class SessionHost {
           settledRunId === run.descriptor.id && terminalUsageObserved
         );
       }
+      const groupUsage = this.#store.getRun(run.descriptor.id).descriptor.usage;
+      if (groupUsage) { this.#providerGroups?.usage.finish(run.descriptor.id, groupUsage); this.#providerGroups?.reporter.usageChanged(); }
       if (run.descriptor.activeAttemptId !== undefined) this.#store.finishAttempt(run.descriptor.activeAttemptId, error);
       for (const item of listAllQueueItems(this.#store, { sessionId, states: ["backend_accepted"] })
         .filter((item) => item.runId === run.descriptor.id)) {
@@ -14357,7 +14640,8 @@ export class SessionHost {
     this.tryApplyProviderAuthenticationRuntimeInvalidation(sessionId);
     await this.#applyPendingSessionRuntimeControl(sessionId);
     for (const failure of runtimeRecoveryFailures) {
-      this.#scheduleSessionRuntimeRecovery(sessionId, failure.runId, failure.error);
+      if (this.#providerGroupMayHandleRun(sessionId, failure.runId, failure.error)) void this.#recoverProviderGroup(sessionId, failure.runId, failure.error);
+      else this.#scheduleSessionRuntimeRecovery(sessionId, failure.runId, failure.error);
     }
     this.refreshRunSilenceWatchdog(sessionId);
     void this.reconcileScheduledWorktrees();
@@ -15012,6 +15296,7 @@ export class SessionHost {
       readonly inputDelivery: Extract<EventPayload, { readonly type: "message_complete" }>["inputDelivery"];
       readonly automaticContinuation: Extract<EventPayload, { readonly type: "message_complete" }>["automaticContinuation"];
       readonly objectiveContinuation: Extract<EventPayload, { readonly type: "message_complete" }>["objectiveContinuation"];
+      readonly inputHandoffContinuation: Extract<EventPayload, { readonly type: "message_complete" }>["inputHandoffContinuation"];
       readonly collaborationReportOrigin: CollaborationReportOrigin | undefined;
       readonly taskMessageOrigin: TaskMessageOrigin | undefined;
     };
@@ -15056,7 +15341,8 @@ export class SessionHost {
           || event.payload.automaticContinuation !== undefined
           || event.payload.collaborationReportOrigin !== undefined
           || event.payload.taskMessageOrigin !== undefined
-          || event.payload.objectiveContinuation !== undefined)
+          || event.payload.objectiveContinuation !== undefined
+          || event.payload.inputHandoffContinuation !== undefined)
       ) {
         const metadata: AcceptedUserMetadata = {
           acceptedInput: event.payload.acceptedInput,
@@ -15064,6 +15350,7 @@ export class SessionHost {
           inputDelivery: event.payload.inputDelivery,
           automaticContinuation: event.payload.automaticContinuation,
           objectiveContinuation: event.payload.objectiveContinuation,
+          inputHandoffContinuation: event.payload.inputHandoffContinuation,
           collaborationReportOrigin: event.payload.collaborationReportOrigin,
           taskMessageOrigin: event.payload.taskMessageOrigin
         };
@@ -15091,7 +15378,11 @@ export class SessionHost {
       }
     });
     const projections = projectNativeHistory(session.id, session.binding.opaqueRef, history);
-    for (const projection of projections) {
+    for (const incomingProjection of projections) {
+      const projection = incomingProjection.payload.type !== "message_complete" ? incomingProjection : (() => {
+        const { inputHandoffContinuation: _untrustedInputHandoffContinuation, ...payload } = incomingProjection.payload;
+        return { ...incomingProjection, payload };
+      })();
       const projectionEntryId = nativeHistoryEventContext(projection.payload)?.identity?.entryId;
       // A live automatic lifecycle has a more precise reason and stable
       // compaction ID than the persisted native summary. Only an exact entry
@@ -15143,6 +15434,7 @@ export class SessionHost {
             ...(acceptedMetadata.objectiveContinuation === undefined
               ? {}
               : { objectiveContinuation: acceptedMetadata.objectiveContinuation }),
+            ...(acceptedMetadata.inputHandoffContinuation === undefined ? {} : { inputHandoffContinuation: acceptedMetadata.inputHandoffContinuation }),
             ...(acceptedMetadata.collaborationReportOrigin === undefined ? {} : { collaborationReportOrigin: acceptedMetadata.collaborationReportOrigin }),
             ...(acceptedMetadata.taskMessageOrigin === undefined ? {} : { taskMessageOrigin: acceptedMetadata.taskMessageOrigin })
           });
@@ -15228,7 +15520,7 @@ export class SessionHost {
   ): EventPayload {
     if (payload.type !== "message_complete") return payload;
     const { partnerPrivateOrigin: _untrustedPrivateOrigin, collaborationReportOrigin: _untrustedReportOrigin,
-      taskMessageOrigin: _untrustedTaskOrigin, ...messagePayload } = payload;
+      taskMessageOrigin: _untrustedTaskOrigin, inputHandoffContinuation: _untrustedInputHandoffContinuation, ...messagePayload } = payload;
     if (runId === undefined) return messagePayload;
     const queued = this.#store.findQueueItemByRunId(sessionId, runId);
     if (queued === undefined) return messagePayload;
@@ -15273,6 +15565,7 @@ export class SessionHost {
       ...(queued.body.objectiveContinuation === undefined
         ? {}
         : { objectiveContinuation: queued.body.objectiveContinuation }),
+      ...(queued.body.inputHandoffContinuation === undefined ? {} : { inputHandoffContinuation: queued.body.inputHandoffContinuation }),
       inputDelivery
     };
   }

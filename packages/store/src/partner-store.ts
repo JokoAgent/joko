@@ -118,10 +118,12 @@ CREATE TABLE partner_directory (
   default_model_chain_json TEXT,
   default_permission_mode TEXT CHECK (default_permission_mode IS NULL OR default_permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
   default_plan_mode INTEGER CHECK (default_plan_mode IS NULL OR default_plan_mode IN (0, 1)),
+  default_input_handoff INTEGER CHECK (default_input_handoff IS NULL OR default_input_handoff IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
   CHECK ((default_model_chain_json IS NULL) = (default_permission_mode IS NULL)),
-  CHECK ((default_model_chain_json IS NULL) = (default_plan_mode IS NULL))
+  CHECK ((default_model_chain_json IS NULL) = (default_plan_mode IS NULL)),
+  CHECK ((default_model_chain_json IS NULL) = (default_input_handoff IS NULL))
 ) STRICT;
 
 CREATE TABLE partners (
@@ -146,6 +148,7 @@ CREATE TABLE partners (
   task_model_json TEXT,
   permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
+  input_handoff INTEGER NOT NULL CHECK (input_handoff IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   updated_at INTEGER NOT NULL CHECK (updated_at >= created_at)
@@ -224,6 +227,7 @@ CREATE TABLE partner_profile_versions (
   task_model_json TEXT,
   permission_mode TEXT NOT NULL CHECK (permission_mode IN ('ask', 'acceptEdits', 'auto', 'bypassPermissions')),
   plan_mode INTEGER NOT NULL CHECK (plan_mode IN (0, 1)),
+  input_handoff INTEGER NOT NULL CHECK (input_handoff IN (0, 1)),
   uses_directory_defaults INTEGER NOT NULL CHECK (uses_directory_defaults IN (0, 1)),
   created_at INTEGER NOT NULL CHECK (created_at >= 0),
   PRIMARY KEY(partner_id, version)
@@ -410,7 +414,7 @@ export class PartnerStore {
   directoryState(): PartnerDirectoryState {
     this.#assertOpen();
     const row = this.#database.prepare(`
-      SELECT revision, default_model_chain_json, default_permission_mode, default_plan_mode, updated_at,
+      SELECT revision, default_model_chain_json, default_permission_mode, default_plan_mode, default_input_handoff, updated_at,
         (SELECT COUNT(*) FROM partners WHERE lifecycle = 'active') AS active_count,
         (SELECT COUNT(*) FROM partners WHERE lifecycle = 'archived') AS archived_count,
         (SELECT COUNT(*) FROM partners WHERE lifecycle <> 'deleted' AND initialization_state = 'error') AS error_count
@@ -450,19 +454,19 @@ export class PartnerStore {
         const nextVersion = nextSafeInteger(current.profileVersion, "Partner profile version");
         const result = this.#database.prepare(`
           UPDATE partners SET revision = ?, profile_version = ?, model_chain_json = ?, permission_mode = ?,
-            plan_mode = ?, initialization_state = CASE WHEN lifecycle = 'paused' THEN 'ready' ELSE 'pending' END,
+            plan_mode = ?, input_handoff = ?, initialization_state = CASE WHEN lifecycle = 'paused' THEN 'ready' ELSE 'pending' END,
             invitation_stage = CASE WHEN lifecycle = 'paused' THEN 'ready' ELSE 'home' END,
             initialization_error_code = NULL, updated_at = ?
           WHERE id = ? AND revision = ?
         `).run(nextRevision, nextVersion, modelChainJson(next.modelChain), next.permissionMode,
-          next.planMode ? 1 : 0, at, current.id, Number(current.revision));
+          next.planMode ? 1 : 0, next.inputHandoff === false ? 0 : 1, at, current.id, Number(current.revision));
         if (Number(result.changes) !== 1) throw changed(current.id);
         this.#insertVersion(current.id, nextVersion, current.identitySource, next, true, at, current.taskModelOverride);
       }
       this.#database.prepare(`
         UPDATE partner_directory SET default_model_chain_json = ?, default_permission_mode = ?,
-          default_plan_mode = ?, revision = ?, updated_at = ? WHERE singleton = 1
-      `).run(modelChainJson(next.modelChain), next.permissionMode, next.planMode ? 1 : 0,
+          default_plan_mode = ?, default_input_handoff = ?, revision = ?, updated_at = ? WHERE singleton = 1
+      `).run(modelChainJson(next.modelChain), next.permissionMode, next.planMode ? 1 : 0, next.inputHandoff === false ? 0 : 1,
         nextNumber(directory.revision, "Partner directory revision"), at);
       return profiles.map((profile) => this.getPartner(profile.id));
     });
@@ -1070,12 +1074,12 @@ export class PartnerStore {
         INSERT INTO partners(
           id, creation_request_id, creation_fingerprint, revision, profile_version, display_name, description, normalized_name, avatar_json, identity_source, template_id,
           lifecycle, initialization_state, invitation_stage, initialization_error_code,
-          home_target_id, canonical_session_id, model_chain_json, task_model_json, permission_mode, plan_mode,
+          home_target_id, canonical_session_id, model_chain_json, task_model_json, permission_mode, plan_mode, input_handoff,
           uses_directory_defaults, created_at, updated_at
-        ) VALUES (?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, 'active', 'pending', 'home', NULL, ?, NULL, ?, NULL, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, 'active', 'pending', 'home', NULL, ?, NULL, ?, NULL, ?, ?, ?, ?, ?, ?)
       `).run(id, requestId, fingerprint, draft.displayName, draft.description, normalizedPartnerName(draft.displayName), JSON.stringify(draft.avatar),
         draft.identitySource, draft.templateId, homeTargetId, modelChainJson(draft.capabilities.modelChain),
-        draft.capabilities.permissionMode, draft.capabilities.planMode ? 1 : 0,
+        draft.capabilities.permissionMode, draft.capabilities.planMode ? 1 : 0, draft.capabilities.inputHandoff === false ? 0 : 1,
         draft.usesDirectoryDefaults ? 1 : 0, at, at);
       this.#insertVersion(id, 1, draft.identitySource, draft.capabilities, draft.usesDirectoryDefaults, at);
       this.#bumpDirectory(at);
@@ -1117,14 +1121,14 @@ export class PartnerStore {
       const result = this.#database.prepare(`
         UPDATE partners SET
           revision = ?, profile_version = ?, display_name = ?, description = ?, normalized_name = ?, avatar_json = ?, identity_source = ?,
-          model_chain_json = ?, task_model_json = ?, permission_mode = ?, plan_mode = ?, uses_directory_defaults = ?,
+          model_chain_json = ?, task_model_json = ?, permission_mode = ?, plan_mode = ?, input_handoff = ?, uses_directory_defaults = ?,
           initialization_state = CASE WHEN lifecycle = 'paused' THEN 'ready' ELSE 'pending' END,
           invitation_stage = CASE WHEN lifecycle = 'paused' THEN 'ready' ELSE 'home' END,
           initialization_error_code = NULL, updated_at = ?
         WHERE id = ? AND revision = ?
       `).run(nextRevision, nextVersion, next.displayName, next.description, normalizedPartnerName(next.displayName), JSON.stringify(next.avatar),
         next.identitySource, modelChainJson(next.capabilities.modelChain), taskModelJson(next.taskModelOverride), next.capabilities.permissionMode,
-        next.capabilities.planMode ? 1 : 0, next.usesDirectoryDefaults ? 1 : 0,
+        next.capabilities.planMode ? 1 : 0, next.capabilities.inputHandoff === false ? 0 : 1, next.usesDirectoryDefaults ? 1 : 0,
         at, current.id, Number(current.revision));
       if (Number(result.changes) !== 1) throw changed(current.id);
       if (typeof current.avatar !== "string" && JSON.stringify(current.avatar) !== JSON.stringify(next.avatar)) {
@@ -1336,10 +1340,10 @@ export class PartnerStore {
         .run(current.canonicalSessionId, current.id);
       if (Number(retired.changes) !== 1) throw unavailable("The previous canonical Session link is missing.");
       const updated = this.#database.prepare(`UPDATE partners SET revision = ?, profile_version = ?, home_target_id = ?, canonical_session_id = ?,
-        model_chain_json = ?, task_model_json = NULL, permission_mode = ?, plan_mode = ?, uses_directory_defaults = 0,
+        model_chain_json = ?, task_model_json = NULL, permission_mode = ?, plan_mode = ?, input_handoff = ?, uses_directory_defaults = 0,
         initialization_state = 'ready', invitation_stage = 'ready', initialization_error_code = NULL, updated_at = ? WHERE id = ? AND revision = ?`)
         .run(nextNumber(current.revision, "Partner revision"), version, targetId, sessionId, JSON.stringify(capabilities.modelChain),
-          capabilities.permissionMode, capabilities.planMode ? 1 : 0, at, current.id, Number(current.revision));
+          capabilities.permissionMode, capabilities.planMode ? 1 : 0, capabilities.inputHandoff === false ? 0 : 1, at, current.id, Number(current.revision));
       if (Number(updated.changes) !== 1) throw changed(current.id);
       this.#database.prepare(`INSERT INTO partner_session_links(session_id, partner_id, role, profile_version, parent_session_id, delegation_id, created_at)
         VALUES (?, ?, 'canonical', ?, NULL, NULL, ?)`).run(sessionId, current.id, version, at);
@@ -1924,11 +1928,11 @@ export class PartnerStore {
   ): void {
     this.#database.prepare(`
       INSERT INTO partner_profile_versions(
-        partner_id, version, identity_source, model_chain_json, task_model_json, permission_mode, plan_mode,
+        partner_id, version, identity_source, model_chain_json, task_model_json, permission_mode, plan_mode, input_handoff,
         uses_directory_defaults, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(partnerId, version, identitySource, modelChainJson(capabilities.modelChain), taskModelJson(taskModelOverride),
-      capabilities.permissionMode, capabilities.planMode ? 1 : 0, usesDirectoryDefaults ? 1 : 0, at);
+      capabilities.permissionMode, capabilities.planMode ? 1 : 0, capabilities.inputHandoff === false ? 0 : 1, usesDirectoryDefaults ? 1 : 0, at);
   }
 
   #bumpDirectory(at: number): void {
@@ -2248,7 +2252,8 @@ function creationFingerprint(input: CreatePartnerInput, draft: NormalizedPartner
     capabilities: draft.usesDirectoryDefaults ? null : {
       modelChain: modelChainJson(draft.capabilities.modelChain),
       permissionMode: draft.capabilities.permissionMode,
-      planMode: draft.capabilities.planMode
+      planMode: draft.capabilities.planMode,
+      inputHandoff: draft.capabilities.inputHandoff !== false
     }
   })).digest("hex");
 }
@@ -2280,6 +2285,9 @@ function capabilitiesValue(value: PartnerCapabilitiesRecord, allowUnconfiguredMo
   if (typeof value.planMode !== "boolean") {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner Plan mode must be boolean.");
   }
+  if (value.inputHandoff !== undefined && typeof value.inputHandoff !== "boolean") {
+    throw new PartnerStoreError("PARTNER_INVALID", "Partner input handoff must be boolean.");
+  }
   if (!Array.isArray(value.modelChain) || value.modelChain.length < (allowUnconfiguredModel ? 0 : 1) || value.modelChain.length > MAX_MODEL_ROUTES) {
     throw new PartnerStoreError("PARTNER_INVALID", "Partner model chain must contain one to five routes.");
   }
@@ -2290,7 +2298,7 @@ function capabilitiesValue(value: PartnerCapabilitiesRecord, allowUnconfiguredMo
     if (identities.has(identity)) throw new PartnerStoreError("PARTNER_INVALID", "Partner model routes must be unique.");
     identities.add(identity);
   }
-  return { modelChain: routes, permissionMode, planMode: value.planMode };
+  return { modelChain: routes, permissionMode, planMode: value.planMode, inputHandoff: value.inputHandoff !== false };
 }
 
 function modelRoute(value: PartnerModelRouteRecord): PartnerModelRouteRecord {
@@ -2318,8 +2326,9 @@ function nullableCapabilitiesFromRow(row: Row, prefix: string): PartnerCapabilit
   const rawModelChain = row[`${prefix}model_chain_json`];
   const rawPermission = row[`${prefix}permission_mode`];
   const rawPlan = row[`${prefix}plan_mode`];
-  if (rawModelChain === null && rawPermission === null && rawPlan === null) return undefined;
-  if (rawModelChain === null || rawPermission === null || rawPlan === null) {
+  const rawInputHandoff = row[`${prefix}input_handoff`];
+  if (rawModelChain === null && rawPermission === null && rawPlan === null && rawInputHandoff === null) return undefined;
+  if (rawModelChain === null || rawPermission === null || rawPlan === null || rawInputHandoff === null) {
     throw unavailable("Partner directory defaults are incomplete.");
   }
   return capabilitiesFromColumns(row, prefix);
@@ -2349,7 +2358,8 @@ function capabilitiesFromColumns(row: Row, prefix: string): PartnerCapabilitiesR
   return capabilitiesValue({
     modelChain: routes,
     permissionMode: permissionMode as PartnerCapabilitiesRecord["permissionMode"],
-    planMode: booleanInteger(row[`${prefix}plan_mode`], "Partner Plan mode")
+    planMode: booleanInteger(row[`${prefix}plan_mode`], "Partner Plan mode"),
+    inputHandoff: booleanInteger(row[`${prefix}input_handoff`], "Partner input handoff")
   }, prefix === "");
 }
 
@@ -2385,12 +2395,14 @@ function sameProfileContent(current: PartnerProfileRecord, next: NormalizedPartn
     && taskModelJson(current.taskModelOverride) === taskModelJson(next.taskModelOverride)
     && current.capabilities.permissionMode === next.capabilities.permissionMode
     && current.capabilities.planMode === next.capabilities.planMode
+    && current.capabilities.inputHandoff === next.capabilities.inputHandoff
     && modelChainJson(current.capabilities.modelChain) === modelChainJson(next.capabilities.modelChain);
 }
 
 function sameCapabilities(current: PartnerCapabilitiesRecord, next: PartnerCapabilitiesRecord): boolean {
   return current.permissionMode === next.permissionMode
     && current.planMode === next.planMode
+    && current.inputHandoff === next.inputHandoff
     && modelChainJson(current.modelChain) === modelChainJson(next.modelChain);
 }
 

@@ -261,12 +261,13 @@ function parseSoundSettings(value: unknown): DesktopNativeTaskStatusSettings["so
 function parseSession(value: unknown): DesktopNativeTaskStatusSession {
   if (!isRecord(value)) throw new TypeError("Native task-status task is invalid.");
   const required = ["activityLines", "detail", "phase", "sessionId", "title", "updatedAt"];
-  const optional = ["interactionKind", "permission", "startedAt", "remote"];
+  const optional = ["interactionKind", "inputHandoff", "permission", "startedAt", "remote"];
   if (!hasOnlyKeys(value, required, optional) || !required.every((key) => Object.hasOwn(value, key)) ||
     !isBoundedText(value["sessionId"], 1024) || !isDisplayText(value["title"], 160) ||
     !isDisplayText(value["detail"], 600) || !isPhase(value["phase"]) || !isTimestamp(value["updatedAt"]) ||
     (value["startedAt"] !== undefined && !isTimestamp(value["startedAt"])) ||
     (value["interactionKind"] !== undefined && !isInteractionKind(value["interactionKind"])) ||
+    (value["inputHandoff"] !== undefined && value["inputHandoff"] !== true) ||
     !Array.isArray(value["activityLines"]) || value["activityLines"].length > 3) {
     throw new TypeError("Native task-status task is invalid.");
   }
@@ -277,12 +278,16 @@ function parseSession(value: unknown): DesktopNativeTaskStatusSession {
   if (permission !== undefined && value["phase"] !== "interaction") {
     throw new TypeError("Native task-status permission must belong to an interaction task.");
   }
+  if (value["inputHandoff"] && (value["phase"] !== "interaction" || permission || value["interactionKind"] !== undefined)) {
+    throw new TypeError("A private input handoff cannot carry ordinary interaction decisions.");
+  }
   return Object.freeze({
     sessionId: value["sessionId"],
     title: value["title"],
     detail: value["detail"],
     phase: value["phase"],
     ...(value["interactionKind"] === undefined ? {} : { interactionKind: value["interactionKind"] }),
+    ...(value["inputHandoff"] ? { inputHandoff: true } : {}),
     activityLines,
     ...(value["startedAt"] === undefined ? {} : { startedAt: value["startedAt"] }),
     updatedAt: value["updatedAt"],

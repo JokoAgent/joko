@@ -3064,6 +3064,8 @@ function toProtoEventPayload(event: PersistedEvent, context: EventMappingContext
           nativeIdentity: toProtoNativeMessageIdentity(payload.nativeHistory?.identity),
           automaticContinuation: payload.automaticContinuation !== undefined,
           runtimeRecoveryId: payload.automaticContinuation?.recoveryId ?? "",
+          inputHandoffContinuation: payload.inputHandoffContinuation === undefined ? undefined
+            : message<contract.InputHandoffContinuation>("joko.v1.InputHandoffContinuation", payload.inputHandoffContinuation),
           partnerPrivateOrigin: payload.partnerPrivateOrigin === undefined ? undefined
             : message<contract.PartnerPrivateMessageOrigin>("joko.v1.PartnerPrivateMessageOrigin", payload.partnerPrivateOrigin),
           collaborationReportOrigin: payload.collaborationReportOrigin === undefined ? undefined
@@ -3570,6 +3572,14 @@ function fromProtoEventPayload(
               "event.payload.message_started.objective_continuation.turn"
             )
           }
+        }),
+        ...(payload.kind.value.inputHandoffContinuation === undefined ? {} : {
+          inputHandoffContinuation: (() => {
+            if (payload.kind.value.role !== MessageRole.USER || !payload.kind.value.userInputAccepted) {
+              throw new ProtoMappingError("invalid_argument", "event.payload.input_handoff_continuation", "Only accepted task input can carry a handoff completion.");
+            }
+            return { requestId: requireText(payload.kind.value.inputHandoffContinuation.requestId, "event.payload.input_handoff_continuation.request_id") };
+          })()
         }),
         ...(fromProtoNativeMessageIdentity(payload.kind.value.nativeIdentity) === undefined
           ? {}

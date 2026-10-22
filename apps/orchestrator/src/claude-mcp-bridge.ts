@@ -62,7 +62,8 @@ export function createClaudeMcpBridge(options: {
           name: tool.name,
           description: tool.description,
           inputSchema: tool.inputSchema,
-          ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema })
+          ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
+          ...(tool.requiresNativeRoot ? { requiresNativeRoot: true as const } : {})
         })),
         models: snapshot.modelServerIds.map(serverId => ({ serverId, connect: async (transport, callNative) => {
           assertCurrent();
@@ -134,6 +135,7 @@ export function createClaudeMcpBridge(options: {
             toolName: call.toolName,
             arguments: call.arguments,
             signal,
+            ...(call.nativeRootCall === undefined ? {} : { nativeRootProof: snapshot.mcpBridge.captureRootCall!({ requestId: call.requestId, serverId: call.serverId, toolName: call.toolName, ...call.nativeRootCall }) }),
             ...(original === undefined ? {} : { appCall: original.invocation }),
             ...(call.partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority: call.partnerLearningAuthority })
           });

@@ -202,6 +202,8 @@ const rows = [
   ["partnerProfile.auto", "Automatically allow supported actions", "自动允许支持的操作", "自動允許支援的操作", "対応する操作を自動で許可", "지원되는 작업 자동 허용"],
   ["partnerProfile.autoWarning", "This Partner may act without asking for each supported action. Save these permissions?", "此伙伴可能无需逐次确认即执行支持的操作。保存这些权限？", "此夥伴可能無需逐次確認即執行支援的操作。儲存這些權限？", "このパートナーは対応する操作を個別の確認なしで実行できます。この権限を保存しますか？", "이 파트너는 지원되는 작업을 매번 묻지 않고 실행할 수 있습니다. 이 권한을 저장할까요?"],
   ["partnerProfile.plan", "Plan mode", "计划模式", "計畫模式", "プランモード", "계획 모드"],
+  ["partnerProfile.inputHandoff", "Allow input handoff", "允许请求输入代填", "允許要求輸入代填", "入力の引き継ぎを許可", "입력 요청 허용"],
+  ["partnerProfile.inputHandoffHint", "Let this Partner ask you to enter passwords, codes or other private text. Your input stays out of the conversation.", "允许此伙伴请你填写密码、验证码等私密内容，输入内容不会进入对话。", "允許此夥伴請你填寫密碼、驗證碼等私密內容，輸入內容不會進入對話。", "このパートナーがパスワードやコードなどの非公開テキストを求めることを許可します。入力は会話に残りません。", "이 파트너가 비밀번호나 코드 등의 비공개 입력을 요청하도록 허용합니다. 입력 내용은 대화에 남지 않습니다."],
   ["partnerProfile.save", "Save Partner", "保存伙伴", "儲存夥伴", "パートナーを保存", "파트너 저장"],
   ["partnerProfile.discardTitle", "Discard unsaved changes?", "丢弃未保存的更改？", "捨棄未儲存的變更？", "未保存の変更を破棄しますか？", "저장하지 않은 변경 사항을 삭제할까요?"],
   ["partnerProfile.discard", "Discard", "丢弃", "捨棄", "破棄", "삭제"],

@@ -279,7 +279,7 @@ export class PartnerHomeRuntimeAdapter implements PartnerHomeRuntime {
     for (;;) { const page = this.options.store.listEvents({ sessionId, afterCursor, limit: 1000 }); if (!page.length) return [...unavailable];
       for (const event of page) {
         if (event.globalCursor > through) return [...unavailable]; afterCursor = event.globalCursor;
-        if (event.payload.type !== "message_complete" || event.payload.role !== "user" || event.payload.partnerPrivateOrigin || event.payload.automaticContinuation || event.payload.objectiveContinuation) continue;
+        if (event.payload.type !== "message_complete" || event.payload.role !== "user" || event.payload.partnerPrivateOrigin || event.payload.automaticContinuation || event.payload.objectiveContinuation || event.payload.inputHandoffContinuation) continue;
         for (const block of event.payload.blocks) if (block.kind === "image" || block.kind === "artifact") {
           await verify(block.blob); assertCurrent();
           if (block.kind === "artifact" && block.audioMetadata?.artwork) { await verify(block.audioMetadata.artwork.blob); assertCurrent(); }

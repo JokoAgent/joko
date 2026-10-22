@@ -315,11 +315,12 @@ export class RemoteDesktopCoordinator {
   async start(
     connection: ConnectionRecord,
     identity: DevicePeerSelectionIdentity,
-    input: { readonly displayId: string; readonly mode: contract.RemoteDesktopStartMode; readonly control?: boolean },
+    input: { readonly displayId: string; readonly mode: contract.RemoteDesktopStartMode; readonly control?: boolean; readonly inputHandoffRequestId?: string },
     signal: AbortSignal
   ): Promise<contract.RemoteDesktopLease> {
     this.#assertOpen();
     validateIdentifier(input.displayId, "display_id", true);
+    if (input.inputHandoffRequestId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/u.test(input.inputHandoffRequestId)) throw invalidArgument("Input handoff request is invalid.");
     if (input.mode !== contract.RemoteDesktopStartMode.NEW
       && input.mode !== contract.RemoteDesktopStartMode.RESUME
       && input.mode !== contract.RemoteDesktopStartMode.TAKEOVER) {
@@ -350,7 +351,8 @@ export class RemoteDesktopCoordinator {
           create(contract.DevicePeerStartRemoteDesktopActionSchema, {
             displayId: input.displayId,
             mode: input.mode,
-            control: input.control === true
+            control: input.control === true,
+            inputHandoffRequestId: input.inputHandoffRequestId
           }),
           "side_effect"
         ), signal, "remoteDesktopLease", "joko.v1.RemoteDesktopLease");
@@ -361,7 +363,8 @@ export class RemoteDesktopCoordinator {
         throw error;
       }
       validateLease(value);
-      if (value.display?.displayId !== input.displayId || (resumeState?.viewerDisplayActive
+      if ((input.inputHandoffRequestId === undefined ? value.display?.displayId !== input.displayId || value.inputHandoffRequestId !== undefined
+        : value.inputHandoffRequestId !== input.inputHandoffRequestId || !value.window) || (resumeState?.viewerDisplayActive
         && (value.leaseId === resumeState.leaseId || (!input.control && value.controlling) || value.controlGeneration <= resumeState.controlGeneration))) {
         void this.#bestEffortStopLease(cleanupAuthority, value.leaseId);
         throw invalidTargetResponse();

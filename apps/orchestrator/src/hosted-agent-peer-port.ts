@@ -7,6 +7,7 @@ import type { HostedAgentRuntime } from "./hosted-agent-runtime.js";
 import { createHostedAgentConnectService } from "./hosted-agent-connect-service.js";
 import { HostedAgentWireError } from "./hosted-agent-wire.js";
 import type { HostedAgentPrincipal } from "./hosted-agent-host.js";
+import { createHostedAgentGuestPeerPort, hostedAgentGuestPeerDescriptor } from "./hosted-agent-guest-peer.js";
 
 /** The outbound service-node configuration already pins the authenticated
  * controller server. The command payload cannot supply its trust or identity.
@@ -15,6 +16,7 @@ export function createHostedAgentPeerPort(runtime: HostedAgentRuntime, controlle
   if (!controllerServerId || controllerServerId.length > 256 || /[\0\r\n]/u.test(controllerServerId)) throw new Error("The native controller identity is invalid.");
   const lifetime = new AbortController(), principals = new Map<string, { readonly principal: HostedAgentPrincipal; readonly client: ReturnType<typeof makeClient> }>();
   const options = runtime.connectOptions();
+  const guestRelay = createHostedAgentGuestPeerPort(runtime, controllerServerId, assertAuthorityCurrent);
   let retirement: Promise<void> | undefined;
   function makeClient(principal: HostedAgentPrincipal) { return createClient(contract.HostedAgentService, createRouterTransport(({ service }) => {
     service(contract.HostedAgentService, createHostedAgentConnectService({ ...options, authenticate: () => principal }),
@@ -22,6 +24,7 @@ export function createHostedAgentPeerPort(runtime: HostedAgentRuntime, controlle
   })); }
   return {
     invoke: async (kind, bytes, signal, authority) => {
+      if (hostedAgentGuestPeerDescriptor(kind)) return guestRelay.invoke(kind, bytes, signal, authority);
       assertAuthorityCurrent();
       lifetime.signal.throwIfAborted(); signal.throwIfAborted();
       // This is the controller identity inserted by the authenticated Device
@@ -44,7 +47,7 @@ export function createHostedAgentPeerPort(runtime: HostedAgentRuntime, controlle
     },
     retire: () => {
       lifetime.abort();
-      return retirement ??= Promise.all([...principals.values()].map(scope => runtime.host.closePrincipal(scope.principal))).then(() => {})
+      return retirement ??= Promise.all([guestRelay.retire(), ...[...principals.values()].map(scope => runtime.endpoint.closePrincipal(scope.principal))]).then(() => {})
         .catch(error => { retirement = undefined; throw error; });
     }
   };

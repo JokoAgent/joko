@@ -3,6 +3,13 @@ import { mobilePartnerCreationDraft, validateMobilePartnerCreationDraft } from "
 import { creationSnapshot } from "./test/mobile-partner-creation";
 
 describe("Partner creation draft", () => {
+  it("starts enabled for independent capability settings and retains an inherited disabled policy", () => {
+    const base = { ...creationSnapshot, options: { ...creationSnapshot.options, defaultCapabilities: undefined } };
+    expect(mobilePartnerCreationDraft(base)?.capabilities.inputHandoff).toBe(true);
+    const defaults = { ...creationSnapshot.options.defaultCapabilities!, inputHandoff: false };
+    const inherited = { ...creationSnapshot, options: { ...creationSnapshot.options, defaultCapabilities: defaults } };
+    expect(mobilePartnerCreationDraft(inherited)?.capabilities.inputHandoff).toBe(false);
+  });
   it("validates the complete creation fields, name collision and fresh capabilities without a synthetic Partner", () => {
     const initial = mobilePartnerCreationDraft(creationSnapshot)!;
     const draft = { ...initial, displayName: "N".repeat(200), avatar: { base64: "/9j/2w==" } };

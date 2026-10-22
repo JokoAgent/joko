@@ -28,7 +28,7 @@ export function activeRuntimeRecovery(
 
 /** A host-owned continuation is product bookkeeping, never authored history. */
 export function isInternalContinuationTimelineItem(item: TimelineItemView): boolean {
-  return item.automaticContinuation !== undefined || item.objectiveContinuation !== undefined;
+  return item.automaticContinuation !== undefined || item.objectiveContinuation !== undefined || item.inputHandoffContinuation !== undefined;
 }
 
 /**

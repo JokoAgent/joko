@@ -128,9 +128,10 @@ export class PartnerHomeOwner {
     readonly expectedPartnerRevision: bigint; readonly destination: PartnerHomeLocation; readonly capabilities: PartnerCapabilitiesRecord;
     readonly busyAction: "wait" | "stop"; readonly continueWhenSourceOffline: boolean }): Promise<PartnerHomeMoveRecord> {
     this.#assert(); identity(input.requestId); identity(input.partnerId);
+    const capabilities = { ...input.capabilities, inputHandoff: input.capabilities.inputHandoff !== false };
     const fingerprint = digest({ requestId: input.requestId, partnerId: input.partnerId, expectedGeneration: input.expectedGeneration,
       expectedPartnerRevision: input.expectedPartnerRevision.toString(), destination: locationIdentity(input.destination),
-      capabilities: input.capabilities, busyAction: input.busyAction, continueWhenSourceOffline: input.continueWhenSourceOffline });
+      capabilities, busyAction: input.busyAction, continueWhenSourceOffline: input.continueWhenSourceOffline });
     const previous = this.storage.move(input.requestId);
     if (previous) {
       if (previous.fingerprint !== fingerprint) throw new PartnerHomeError("state-changed", "This home-change request already names another action.");
@@ -141,12 +142,12 @@ export class PartnerHomeOwner {
       if (profile.revision !== input.expectedPartnerRevision || home.generation !== input.expectedGeneration
         || profile.lifecycle !== "active" || !profile.ready || !profile.sessionId || this.storage.changing(input.partnerId)
         || digest(locationIdentity(home.location)) === digest(locationIdentity(input.destination))) throw new PartnerHomeError("state-changed", "Refresh the Partner home before moving it.");
-      await this.runtime.assertDestination(input.destination, input.capabilities); this.#assert();
+      await this.runtime.assertDestination(input.destination, capabilities); this.#assert();
       const latest = this.runtime.profile(input.partnerId);
       if (latest.revision !== profile.revision || latest.sessionId !== profile.sessionId) throw new PartnerHomeError("state-changed", "The Partner changed during the target check.");
       const at = this.#now();
       const move: PartnerHomeMoveRecord = { version: 1, requestId: input.requestId, fingerprint, partnerId: input.partnerId,
-        partnerRevision: profile.revision.toString(), source: home, destination: copy(input.destination), capabilities: copy(input.capabilities),
+        partnerRevision: profile.revision.toString(), source: home, destination: copy(input.destination), capabilities: copy(capabilities),
         busyAction: input.busyAction, continueWhenSourceOffline: input.continueWhenSourceOffline,
         sourceSessionId: profile.sessionId, sourceSessionIds: [...new Set([profile.sessionId, ...this.runtime.sessions(input.partnerId)])],
         createdAt: at, updatedAt: at, phase: "waiting", resumePhase: "waiting", committed: false, sourceFenced: true };
@@ -267,9 +268,9 @@ function parseMove(value: unknown): PartnerHomeMoveRecord {
     || row.sourceSessionIds.some(value => typeof value !== "string")) invalid();
   for (const sessionId of row.sourceSessionIds) identity(sessionId as string);
   const home = parseHome(row.source); if (home.partnerId !== row.partnerId) invalid(); parseLocation(row.destination);
-  const capabilities = record(row.capabilities); exact(capabilities, ["modelChain", "permissionMode", "planMode"]);
+  const capabilities = record(row.capabilities); exact(capabilities, ["modelChain", "permissionMode", "planMode", "inputHandoff"]);
   if (!Array.isArray(capabilities.modelChain) || capabilities.modelChain.length < 1 || capabilities.modelChain.length > 5
-    || !["ask", "acceptEdits", "auto", "bypassPermissions"].includes(String(capabilities.permissionMode)) || typeof capabilities.planMode !== "boolean") invalid();
+    || !["ask", "acceptEdits", "auto", "bypassPermissions"].includes(String(capabilities.permissionMode)) || typeof capabilities.planMode !== "boolean" || typeof capabilities.inputHandoff !== "boolean") invalid();
   for (const route of capabilities.modelChain) {
     const item = record(route); exact(item, ["backendId", "providerId", "modelId", "fastMode"], ["effort"]);
     if (["backendId", "providerId", "modelId"].some(key => typeof item[key] !== "string") || typeof item.fastMode !== "boolean"

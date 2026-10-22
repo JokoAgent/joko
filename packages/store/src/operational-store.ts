@@ -2154,6 +2154,43 @@ export class OperationalStore {
     });
   }
 
+  /** Owner-only service attention. It never changes a task's Run or creates
+   * an ordinary question; the subject must already be a durable notification. */
+  enqueueInputHandoffPush(input: { readonly sessionId: string; readonly sourceCursor: bigint }): number {
+    return this.write(() => {
+      const session = this.getSession(input.sessionId).descriptor, at = this.now();
+      const row = this.database.prepare("SELECT * FROM events WHERE global_cursor = ? AND session_id = ?").get(asSqlInteger(input.sourceCursor), session.id) as Row | undefined;
+      const event = row === undefined ? undefined : eventFromRow(row);
+      if (!event || event.generation !== session.binding.generation || event.payload.type !== "extension_ui_effect" || event.payload.effect !== "notification"
+        || event.metadata?.namespace !== "joko.input_handoff" || !event.metadata.fields["requestId"] || !event.metadata.fields["instanceId"]
+        || session.hidden || session.archived || session.deletedAt !== undefined) throw new StoreError("Input handoff push has no current service subject.");
+      const insert = this.database.prepare(`INSERT OR IGNORE INTO mobile_push_deliveries(
+        id,registration_id,session_id,kind,subject_cursor,subject_generation,status,available_at,attempts,created_at,updated_at,revision
+      ) VALUES (?,?,?,'awaiting',?,?,'pending',?,0,?,?,?)`);
+      let added = 0;
+      for (const registration of this.listMobilePushRegistrations()) {
+        const connection = this.getConnection(registration.connectionId), device = this.getDevice(registration.deviceId);
+        if (registration.expiresAt <= at || connection.state !== "active" || connection.deviceId !== device.id || device.state !== "active"
+          || device.kind !== "mobile" || device.platform.toLowerCase() !== "ios") continue;
+        added += Number(insert.run(this.idFactory(), registration.id, session.id, asSqlInteger(input.sourceCursor), session.binding.generation,
+          at, at, at, asSqlInteger(this.requireActiveRevision())).changes);
+      }
+      return added;
+    });
+  }
+
+  /** Stop pending notices and mark in-flight notices closed so an explicit
+   * upstream retry cannot resurrect them. Unknown effects keep their outcome. */
+  cancelInputHandoffPushes(input: { readonly instanceId: string; readonly requestId?: string; readonly exceptInstance?: true }): number {
+    return this.write(() => Number(this.database.prepare(`UPDATE mobile_push_deliveries SET status=CASE WHEN status='pending' THEN 'failed' ELSE status END,
+      outcome_code='INPUT_HANDOFF_CLOSED', updated_at=?, revision=? WHERE status IN ('pending','dispatching') AND subject_cursor IN (
+        SELECT global_cursor FROM events WHERE namespace='joko.input_handoff'
+          AND COALESCE(json_extract(metadata_json,'$.instanceId'),'') ${input.exceptInstance ? "<>" : "="} ?
+          ${input.requestId === undefined ? "" : "AND json_extract(metadata_json,'$.requestId') = ?"}
+      )`).run(this.now(), asSqlInteger(this.requireActiveRevision()), nonBlank(input.instanceId, "Input handoff notification owner"),
+      ...(input.requestId === undefined ? [] : [nonBlank(input.requestId, "Input handoff request")])).changes));
+  }
+
   recoverInterruptedMobilePushDeliveries(now = this.now()): number {
     return this.write(() => Number(this.database.prepare(`
       UPDATE mobile_push_deliveries
@@ -2244,11 +2281,13 @@ export class OperationalStore {
         return undefined;
       }
       const hiddenRetry = input.outcome === "retry" && this.getSession(current.sessionId).descriptor.hidden === true;
-      const status = hiddenRetry ? "failed" : input.outcome === "retry" ? "pending" : input.outcome;
-      const availableAt = input.outcome === "retry" && !hiddenRetry
+      const handoffClosedRetry = input.outcome === "retry" && current.outcomeCode === "INPUT_HANDOFF_CLOSED";
+      const suppressRetry = hiddenRetry || handoffClosedRetry;
+      const status = suppressRetry ? "failed" : input.outcome === "retry" ? "pending" : input.outcome;
+      const availableAt = input.outcome === "retry" && !suppressRetry
         ? safeNonNegativeInteger(input.retryAt, "Mobile push retry time")
         : current.availableAt;
-      if (input.outcome === "retry" && !hiddenRetry && availableAt <= at) {
+      if (input.outcome === "retry" && !suppressRetry && availableAt <= at) {
         throw new StoreError("Mobile push retry time must be in the future.");
       }
       this.database.prepare(`
@@ -2259,7 +2298,7 @@ export class OperationalStore {
       `).run(
         status,
         availableAt,
-        hiddenRetry ? "TASK_HIDDEN" : code,
+        hiddenRetry ? "TASK_HIDDEN" : handoffClosedRetry ? "INPUT_HANDOFF_CLOSED" : code,
         at,
         asSqlInteger(this.requireActiveRevision()),
         id,
@@ -9387,6 +9426,7 @@ export class OperationalStore {
       if (input.suppressTerminalAttention === true && input.state !== "completed") {
         throw new StoreError("Only successful terminal Run attention can be suppressed.");
       }
+      if (input.holdTerminalAttention === true && input.state !== "failed") throw new StoreError("Only a failed Run recovery may hold terminal attention.");
       if (
         input.markScheduleRunRead === true
         && (current.descriptor.source !== "schedule" || input.state !== "completed")
@@ -9479,7 +9519,10 @@ export class OperationalStore {
           at: sourceEvent.emittedAt
         });
       } else if (isTerminalRunState(input.state)) {
-        if (input.suppressTerminalAttention === true) {
+        if (input.holdTerminalAttention === true) {
+          // The failed state and durable lifecycle event stay authoritative.
+          // Its recovery owner publishes the terminal error if no member works.
+        } else if (input.suppressTerminalAttention === true) {
           this.clearSessionAttentionFromLifecycle(
             session,
             sourceEvent,
@@ -10350,7 +10393,7 @@ export class OperationalStore {
       const event = origin && this.findEvent(origin.eventId);
       if (!event || event.payload.type !== "message_complete" || event.payload.role !== "assistant"
         || event.payload.partnerPrivateOrigin !== undefined || event.payload.automaticContinuation !== undefined
-        || event.payload.objectiveContinuation !== undefined || event.backendId !== turn.source.backendId
+        || event.payload.objectiveContinuation !== undefined || event.payload.inputHandoffContinuation !== undefined || event.backendId !== turn.source.backendId
         || event.targetId !== turn.source.targetId || event.generation !== turn.source.bindingGeneration) return false;
       if (turn.completionEventId !== undefined) {
         if (turn.completionEventId !== event.id || turn.messageId !== origin!.messageId) {
@@ -10595,7 +10638,12 @@ export class OperationalStore {
       }
       this.currentFrame().events.push(event);
       this.bindRunUsageCompletion(event);
-      if (event.payload.type === "error" && event.payload.terminal) {
+      if (input.holdTerminalAttention === true && !(event.payload.type === "error" && event.payload.terminal
+        || event.payload.type === "done" && event.payload.outcome === "failed")) throw new StoreError("Only failed lifecycle attention can be held.");
+      if (input.holdTerminalAttention === true) {
+        // A server-owned recovery lease retains this fact without an interim
+        // red dot. No SDK payload or public Event field can set this option.
+      } else if (event.payload.type === "error" && event.payload.terminal) {
         this.recordSessionAttention({
           sessionId: event.sessionId,
           kind: "error",
@@ -10715,6 +10763,7 @@ export class OperationalStore {
       "json_extract(event.payload_json, '$.payload.type') = 'message_complete'",
       "json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL",
       "json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL",
+      "json_extract(event.payload_json, '$.payload.inputHandoffContinuation') IS NULL",
       "(json_extract(event.payload_json, '$.payload.role') <> 'user' OR json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL)"
     ];
     const params: Array<string | number | bigint | null> = [...(nativeVisibility?.params ?? []), sessionId];
@@ -11526,6 +11575,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.role') = 'user'
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.inputHandoffContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL
       ORDER BY event.global_cursor DESC
       LIMIT 1
@@ -13912,6 +13962,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.role') IN ('user', 'assistant')
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.inputHandoffContinuation') IS NULL
         AND (json_extract(event.payload_json, '$.payload.role') <> 'user' OR json_extract(event.payload_json, '$.payload.partnerPrivateOrigin') IS NULL)
         AND (
           (
@@ -14084,6 +14135,7 @@ export class OperationalStore {
         AND json_extract(event.payload_json, '$.payload.role') = 'assistant'
         AND json_extract(event.payload_json, '$.payload.automaticContinuation') IS NULL
         AND json_extract(event.payload_json, '$.payload.objectiveContinuation') IS NULL
+        AND json_extract(event.payload_json, '$.payload.inputHandoffContinuation') IS NULL
         ${nativeVisibility.clause("event")}
       ORDER BY event.global_cursor DESC
       LIMIT 1
@@ -19074,7 +19126,7 @@ function escapeLikePattern(query: string): string {
 
 function visibleMessageText(payload: EventPayload, assistantTextForSearch?: (source: string) => string): string | undefined {
   if (payload.type === "message_complete"
-    && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined
+    && (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined || payload.inputHandoffContinuation !== undefined
       || payload.role === "user" && payload.partnerPrivateOrigin !== undefined)) return undefined;
   let parts: readonly string[];
   if (payload.type === "message_complete" && (payload.role === "user" || payload.role === "assistant")) {
@@ -20003,7 +20055,7 @@ function withSessionAttention(
 function isRunUsageCompletion(event: PersistedEvent): boolean {
   return event.payload.type === "message_complete" && event.payload.role === "assistant"
     && event.payload.partnerPrivateOrigin === undefined && event.payload.automaticContinuation === undefined
-    && event.payload.objectiveContinuation === undefined && event.payload.blocks.some(block =>
+    && event.payload.objectiveContinuation === undefined && event.payload.inputHandoffContinuation === undefined && event.payload.blocks.some(block =>
       block.kind === "image" || block.kind === "artifact" || block.kind === "text" && block.text.trim().length > 0);
 }
 

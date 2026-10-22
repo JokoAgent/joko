@@ -19,6 +19,7 @@ export function createHostedAgentSourceController(options: {
   readonly binding: () => NativeSessionBinding; readonly temporaryRoot: string;
   readonly readPolicy: (context: AdapterContext) => HostedAgentExecutorPolicy;
   readonly assertContext: (context: AdapterContext) => void; readonly assertCurrent: () => void;
+  readonly onGroupSwitch?: (offer: string) => void;
   readonly commandConcurrencyGate?: CommandConcurrencyGate;
   readonly codexExecutable?: string;
   readonly readBlob?: (blob: BlobRef, context: AdapterContext) => Promise<Uint8Array>;
@@ -78,6 +79,7 @@ export function createHostedAgentSourceController(options: {
     };
   };
   const controller = new HostedAgentController({ port, context: options.context, executor: initialExecutor, binding: options.binding,
+    ...(options.onGroupSwitch === undefined ? {} : { onGroupSwitch: options.onGroupSwitch }),
     temporaryRoot: join(options.temporaryRoot, options.runId), assertCurrent: options.assertCurrent, resolveOperation: id => {
       const owner = owners.get(id); if (!owner) throw new Error("The original native dispatch is unavailable."); return owner;
     } });

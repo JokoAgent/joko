@@ -19,6 +19,7 @@ export type HostedAgentFrame = {
   readonly payload:
     | { readonly kind: "event"; readonly event: EventPayload; readonly metadata?: AdapterEventMetadata; readonly operationId?: string }
     | { readonly kind: "request"; readonly id: string; readonly request: HostedAgentRequest; readonly operationId?: string }
+    | { readonly kind: "group_switch"; readonly offer: string }
     | { readonly kind: "cancel_request"; readonly id: string };
 };
 interface PendingRequest {
@@ -59,6 +60,9 @@ export class HostedAgentExchange {
   emit(event: EventPayload, metadata?: AdapterEventMetadata, operationId?: string): void {
     this.#append({ kind: "event", event, ...(metadata === undefined ? {} : { metadata }), ...(operationId === undefined ? {} : { operationId }) });
   }
+  /** Used only by the authenticated service relay. SDK events use emit and
+   * cannot manufacture control frames or request identities. */
+  forward(payload: HostedAgentFrame["payload"]): void { this.#append(payload); }
   async tool(input: unknown, signal: AbortSignal, operationId?: string): Promise<Record<string, unknown>> {
     const result = await this.#request({ kind: "tool", input }, signal, operationId);
     if (!result || typeof result !== "object" || Array.isArray(result)) throw new HostedAgentExchangeError("CONFLICTING_REPLY");

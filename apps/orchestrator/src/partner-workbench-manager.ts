@@ -661,7 +661,7 @@ export class PartnerWorkbenchManager {
     const tail = this.#store.listEvents({ sessionId, order: "desc", limit: 120, activeNativeTimeline: true }).reverse();
     const items = (events: readonly PersistedEvent[]): PartnerWorkbenchTranscriptItem[] => events.flatMap((event) => {
       const payload = event.payload;
-      if (payload.type !== "message_complete" || payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined
+      if (payload.type !== "message_complete" || payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined || payload.inputHandoffContinuation !== undefined
         || payload.role === "user" && (payload.partnerPrivateOrigin !== undefined || payload.automationOrigin !== undefined || payload.inputDelivery === "scheduler")) return [];
       if (payload.role === "user" && event.runId !== undefined) {
         try { if (this.#store.getRun(event.runId).descriptor.source === "system") return []; } catch { return []; }

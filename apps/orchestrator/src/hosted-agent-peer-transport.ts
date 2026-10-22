@@ -4,16 +4,20 @@ import * as contract from "@joko/contracts";
 import { devicePeerNativeAgentMethodEffect, DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES } from "@joko/device-peer";
 import type { DevicePeerAuthority, DevicePeerOwner } from "./device-peer-owner.js";
 import { hostedAgentPeerMethod } from "./hosted-agent-peer-port.js";
+import { hostedAgentGuestPeerMethod } from "./hosted-agent-guest-peer.js";
 
 /** Uses the exact captured Device relation/route and a generated native-only
  * command. It never starts a local SDK or infers a URL from a model name. */
-export function createHostedAgentPeerTransport(options: { readonly owner: DevicePeerOwner; readonly authority: DevicePeerAuthority }): Transport {
+export function createHostedAgentPeerTransport(options: { readonly owner: DevicePeerOwner; readonly authority: DevicePeerAuthority;
+  readonly guestRelay?: { readonly scope: contract.HostedAgentGuestRelayScope; readonly shouldPurge?: () => boolean } }): Transport {
   return {
     unary: async (method, signal, timeoutMs, _header, input) => {
       options.authority.assertCurrent(["native_agents"]);
-      const kind = hostedAgentPeerMethod(method), effect = devicePeerNativeAgentMethodEffect(kind);
+      const kind = options.guestRelay ? hostedAgentGuestPeerMethod(method) : hostedAgentPeerMethod(method), effect = devicePeerNativeAgentMethodEffect(kind);
       if (effect === undefined) throw new ConnectError("Native Agent method is unsupported.", Code.Unimplemented);
-      const requestBytes = toBinary(method.input, create(method.input, input));
+      const nestedBytes = toBinary(method.input, create(method.input, input));
+      const requestBytes = options.guestRelay ? toBinary(contract.HostedAgentGuestRelayRequestSchema, create(contract.HostedAgentGuestRelayRequestSchema,
+        { scope: options.guestRelay.scope, requestBytes: nestedBytes, purge: kind === contract.HostedAgentPeerMethod.GUEST_RELAY_CLOSE && options.guestRelay.shouldPurge?.() === true })) : nestedBytes;
       if (requestBytes.byteLength > DEVICE_PEER_NATIVE_AGENT_MAXIMUM_BYTES) throw new ConnectError("Native Agent request exceeds its limit.", Code.ResourceExhausted);
       const deadline = timeoutMs !== undefined && timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined;
       const active = signal && deadline ? AbortSignal.any([signal, deadline]) : signal ?? deadline ?? new AbortController().signal;

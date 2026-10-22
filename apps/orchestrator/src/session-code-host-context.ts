@@ -235,7 +235,7 @@ function sessionCodeHostContext(
     limit: CONTEXT_EVENT_LIMIT
   })) {
     if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined
-      || event.payload.objectiveContinuation !== undefined) continue;
+      || event.payload.objectiveContinuation !== undefined || event.payload.inputHandoffContinuation !== undefined) continue;
     for (const block of event.payload.blocks) {
       if (block.kind === "text") context.push(block.text);
     }

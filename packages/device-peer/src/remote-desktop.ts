@@ -134,6 +134,7 @@ export interface RemoteDesktopCapabilities {
   readonly systemMenu: boolean;
   readonly channelRequests?: boolean;
   readonly autoControl?: boolean;
+  readonly handoffWindow?: boolean;
 }
 
 export interface RemoteDesktopVideoSettings {
@@ -156,6 +157,15 @@ export interface RemoteDesktopLease {
   readonly display: RemoteDesktopDisplay;
   readonly controlling: boolean;
   readonly controlGeneration: number;
+  readonly inputHandoffRequestId?: string;
+  readonly window?: { readonly app: string; readonly title?: string };
+}
+
+/** Chosen by the trusted Source handoff, never by a viewer. */
+export interface RemoteDesktopHandoffWindow {
+  readonly requestId: string; readonly windowId: number; readonly pid: number;
+  readonly displayId: string; readonly app: string; readonly title?: string;
+  readonly width: number; readonly height: number;
 }
 
 /** Capture-adapter result. Dimensions are checked before pixels may leave the host. */
@@ -170,7 +180,7 @@ export type RemoteDesktopRequest =
   | RemoteDesktopIceRequest
   | { readonly op: "capabilities" }
   | { readonly op: "permissions"; readonly action: "check" | "guide" }
-  | { readonly op: "start"; readonly displayId: string; readonly resume?: boolean; readonly takeover?: boolean; readonly control?: boolean }
+  | { readonly op: "start"; readonly displayId: string; readonly resume?: boolean; readonly takeover?: boolean; readonly control?: boolean; readonly inputHandoffRequestId?: string }
   | { readonly op: "heartbeat"; readonly lease: string }
   | { readonly op: "stop"; readonly lease: string; readonly lockScreen?: false }
   | { readonly op: "stop"; readonly lease: string; readonly lockScreen: true; readonly controlGeneration: number }
@@ -261,6 +271,7 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     || typeof value.systemMenu !== "boolean"
     || (value.channelRequests !== undefined && typeof value.channelRequests !== "boolean")
     || (value.autoControl !== undefined && typeof value.autoControl !== "boolean")
+    || (value.handoffWindow !== undefined && typeof value.handoffWindow !== "boolean")
     || (value.platform !== "darwin" && value.platform !== "win32" && value.platform !== "linux")
     || !Array.isArray(value.displays)
     || value.displays.length > REMOTE_DESKTOP_MAX_DISPLAYS
@@ -272,6 +283,7 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
   }
   if (value.platform === "win32" && value.lockOnExit) throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
+  if (value.handoffWindow === true && value.platform !== "darwin") throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
   if (value.clipboardInline && !value.clipboardSync) throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
   if (value.platform !== "darwin" && value.platform !== "linux" && value.nativeCredentials) throw new Error("INVALID_REMOTE_DESKTOP_CAPABILITIES");
   if (value.resolutionRestore && (value.platform === "win32" || !value.displayModes)) {
@@ -310,6 +322,7 @@ export function parseRemoteDesktopHostCapabilities(value: unknown): RemoteDeskto
     systemMenu: value.systemMenu,
     ...(value.channelRequests === undefined ? {} : { channelRequests: value.channelRequests === true }),
     ...(value.autoControl === undefined ? {} : { autoControl: value.autoControl === true }),
+    ...(value.handoffWindow === undefined ? {} : { handoffWindow: value.handoffWindow === true }),
     platform: value.platform,
     displays: Object.freeze(displays),
     permissions: parseRemoteDesktopPermissions(value.permissions)
@@ -356,11 +369,12 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
       if (value.action !== "check" && value.action !== "guide") throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       return Object.freeze({ op: "permissions", action: value.action });
     case "start": {
-      requireExactKeys(value, ["op", "displayId"], ["resume", "takeover", "control"]);
+      requireExactKeys(value, ["op", "displayId"], ["resume", "takeover", "control", "inputHandoffRequestId"]);
       if (!boundedIdentifier(value.displayId)
         || (value.resume !== undefined && typeof value.resume !== "boolean")
         || (value.takeover !== undefined && typeof value.takeover !== "boolean")
         || (value.control !== undefined && typeof value.control !== "boolean")
+        || (value.inputHandoffRequestId !== undefined && (typeof value.inputHandoffRequestId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(value.inputHandoffRequestId)))
         || (value.resume === true && value.takeover === true)) {
         throw new Error("INVALID_REMOTE_DESKTOP_REQUEST");
       }
@@ -369,7 +383,8 @@ export function parseRemoteDesktopRequest(value: unknown): RemoteDesktopRequest 
         displayId: value.displayId,
         ...(value.resume === true ? { resume: true } : {}),
         ...(value.takeover === true ? { takeover: true } : {}),
-        ...(value.control === true ? { control: true } : {})
+        ...(value.control === true ? { control: true } : {}),
+        ...(typeof value.inputHandoffRequestId === "string" ? { inputHandoffRequestId: value.inputHandoffRequestId } : {})
       });
     }
     default:

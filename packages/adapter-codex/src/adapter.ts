@@ -125,6 +125,7 @@ import { withoutCodexSpawnModelOverrides } from "./hosted-guest.js";
 import { captureCodexHostedAuthentication, readCodexOwnedAuthentication, type CodexHostedAuthenticationAuthority } from "./hosted-authentication.js";
 
 export interface CodexAdapterOptions extends Omit<CodexInputResolvers, "resolveSkillMention"> {
+  readonly taskShellEnv?: (context: AdapterContext) => Readonly<Record<string, string>>;
   /** Dedicated native process whose files and commands belong to the Source. */
   readonly hostedExecution?: CodexHostedExecutionOptions;
   readonly managedProviders?: ManagedProviderRuntimePort;
@@ -187,6 +188,8 @@ export interface CodexMcpCallLease {
   readonly assertCurrent: () => void;
   readonly release: () => void;
   readonly partnerLearningAuthority?: PartnerLearningToolAuthority;
+  /** Present only for the original local native root turn. */
+  readonly assertNativeRoot?: () => void;
 }
 
 export interface CodexMcpRoute {
@@ -574,6 +577,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #resolveNativeMemoryEnabled: CodexAdapterOptions["resolveNativeMemoryEnabled"];
   readonly #resolveNativeSkills: ApprovedSkillResolver | undefined;
   readonly #resolveNativeSkillPolicy: NativeSkillPolicyResolver | undefined;
+  readonly #taskShellEnv: CodexAdapterOptions["taskShellEnv"];
   #catalogMaterializationTail: Promise<void> = Promise.resolve();
   #nativeMemoryReconcileTail: Promise<void> = Promise.resolve();
   #nativeMemoryOverride: {
@@ -674,6 +678,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#remoteRuntimes = options.remoteRuntimes;
     this.#resolveNativeSkills = options.resolveNativeSkills;
     this.#resolveNativeSkillPolicy = options.resolveNativeSkillPolicy;
+    this.#taskShellEnv = options.taskShellEnv;
     this.#localMcpBridge = options.localMcpBridge;
     this.#resolveNativeMemoryEnabled = options.resolveNativeMemoryEnabled;
     if (!Number.isSafeInteger(this.#instanceGeneration) || this.#instanceGeneration < 1) {
@@ -1198,7 +1203,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     }
     if (smartRoute !== undefined) (request.params as JsonObject)["modelProvider"] = smartRoute.modelProviderId;
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
-    nativeConfiguration = workingContextConfiguration(nativeConfiguration, context, input.providerId, input.modelId);
+    nativeConfiguration = workingContextConfiguration({ ...(nativeConfiguration ?? {}), ...this.#taskShellConfiguration(context) }, context, input.providerId, input.modelId);
     const initialConfiguration: JsonObject = {
       ...(managedConfiguration ?? {}),
       ...(nativeConfiguration ?? {}),
@@ -1401,7 +1406,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     const preparedSkills = await this.#prepareSkills(inspection.scope, context, preparedMcp.nativeConfiguration).catch(async (error) => {
       managedRoute?.dispose(); smartRoute?.dispose(); await mcp?.release().catch(() => undefined); throw error;
     });
-    const nativeConfiguration = workingContextConfiguration(preparedSkills.nativeConfiguration, context,
+    const nativeConfiguration = workingContextConfiguration({ ...preparedSkills.nativeConfiguration, ...this.#taskShellConfiguration(context) }, context,
       context.modelSelection?.providerId, context.modelSelection?.modelId);
     const nativeSkills = preparedSkills.nativeSkills;
     if (mustReloadConfiguration) {
@@ -2598,7 +2603,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       cwd: runtime.targetWorkspaceRoot,
       ...(this.#hosted?.environments() ?? {}),
       excludeTurns: true,
-      ...(runtime.nativeConfiguration === undefined ? {} : { config: runtime.nativeConfiguration }),
+      config: { ...runtime.nativeConfiguration, ...this.#taskShellConfiguration(context) },
       ...permissionParams(mode)
     }, {
       mutation: true,
@@ -3464,6 +3469,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     };
   }
 
+  #taskShellConfiguration(context: AdapterContext): JsonObject {
+    if (this.#hosted !== undefined || context.hostedExecution !== undefined || context.target.remoteWorkspace !== undefined
+      || context.runtimePolicy === "review_read_only") return {};
+    const allowed = new Set(["JOKO_INPUT_HANDOFF_ROUTE", "SUDO_ASKPASS", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "GIT_ASKPASS"]);
+    return Object.fromEntries(Object.entries(this.#taskShellEnv?.(context) ?? {}).filter(([name]) => allowed.has(name)).map(([name, value]) => {
+      if (typeof value !== "string" || value.includes("\0")) throw new TypeError("The task shell environment is invalid.");
+      return [`shell_environment_policy.set.${name}`, value];
+    }));
+  }
+
   async #buildMcpConfiguration(
     scope: CodexReadScope,
     routes: readonly CodexMcpRoute[],
@@ -3808,7 +3823,12 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     try {
       assertCurrent();
       const partnerLearningAuthority = originalTurnId === undefined ? undefined : learningTurn?.captureToolRequest(request);
+      const assertNativeRoot = originalTurnId === undefined || runtime.remote || runtime.context.hostedExecution !== undefined ? undefined : () => {
+        assertCurrent();
+        if (threadId !== runtime.threadId || runtime.state.activeTurnId !== originalTurnId || runtime.state.terminalTurnIds.has(originalTurnId)) throw mcpCallStale(runtime.remote);
+      };
       return { signal: abort.signal, assertCurrent, release,
+        ...(assertNativeRoot === undefined ? {} : { assertNativeRoot }),
         ...(partnerLearningAuthority === undefined ? {} : { partnerLearningAuthority }) };
     } catch (error) {
       release();
@@ -3915,7 +3935,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       mcp = preparedMcp.mcp;
       const preparedSkills = await this.#prepareSkills(this.#scopeForRuntime(runtime), context, preparedMcp.nativeConfiguration);
       nativeSkills = preparedSkills.nativeSkills;
-      const nativeConfiguration = workingContextConfiguration({ ...preparedSkills.nativeConfiguration,
+      const nativeConfiguration = workingContextConfiguration({ ...preparedSkills.nativeConfiguration, ...this.#taskShellConfiguration(context),
         ...(runtime.effort === undefined ? {} : { model_reasoning_effort: runtime.effort }),
         service_tier: runtime.fastMode ? "fast" : null
       }, context, providerId, modelId);

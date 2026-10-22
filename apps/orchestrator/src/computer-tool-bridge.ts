@@ -2,6 +2,7 @@ import { realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 import { isWithin } from "@joko/core/policy";
+import { withAgentDesktopInput } from "./input-handoff/input-ownership.js";
 import {
   ComputerToolArgumentError,
   ComputerToolProvider,
@@ -156,13 +157,15 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
       }, true, workspaceRoot);
     }
     try {
-      const result = await this.#callWithSession(
-        context.sessionId,
-        call.name,
-        safeArguments,
-        signal,
-        workspaceRoot
-      );
+      const invoke = (assertInputCurrent?: () => void) => this.#callWithSession(context.sessionId, call.name, safeArguments, signal, workspaceRoot, assertInputCurrent);
+      context.assertCurrent?.();
+      const result = definition.annotations?.["readOnlyHint"] === true ? await invoke()
+        : await withAgentDesktopInput(async assertInputCurrent => {
+          signal?.throwIfAborted(); context.assertCurrent?.(); assertInputCurrent();
+          const value = await invoke(() => { signal?.throwIfAborted(); context.assertCurrent?.(); assertInputCurrent(); });
+          signal?.throwIfAborted(); context.assertCurrent?.(); assertInputCurrent(); return value;
+        }, { ...(signal ? { signal } : {}), ...(context.assertCurrent ? { assertCurrent: context.assertCurrent } : {}) });
+      context.assertCurrent?.();
       return mapSelectedToolResult(call.name, result, workspaceRoot);
     } catch (error) {
       if (isAbortError(error)) return requestCancelledResult();
@@ -213,7 +216,8 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
     name: string,
     arguments_: Readonly<Record<string, unknown>>,
     signal: AbortSignal | undefined,
-    workspaceRoot: string
+    workspaceRoot: string,
+    assertInputCurrent?: () => void
   ): Promise<ComputerToolCallResult> {
     let fence = this.#sessionFences.get(sessionId);
     if (fence === undefined) {
@@ -221,13 +225,13 @@ export class ComputerToolBridgeProvider implements BridgeToolProvider {
       this.#sessionFences.set(sessionId, fence);
     }
     try {
-      return await this.#provider.callTool(fence, name, arguments_, signal, { workspaceRoot });
+      return await this.#provider.callTool(fence, name, arguments_, signal, { workspaceRoot, ...(assertInputCurrent ? { assertInputCurrent } : {}) });
     } catch (error) {
       if (!(error instanceof ComputerToolProviderError) || error.code !== "stale_session") throw error;
       this.#sessionFences.delete(sessionId);
       const replacement = await this.#provider.openSession(sessionId, signal);
       this.#sessionFences.set(sessionId, replacement);
-      return this.#provider.callTool(replacement, name, arguments_, signal, { workspaceRoot });
+      return this.#provider.callTool(replacement, name, arguments_, signal, { workspaceRoot, ...(assertInputCurrent ? { assertInputCurrent } : {}) });
     }
   }
 }

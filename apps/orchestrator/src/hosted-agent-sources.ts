@@ -20,6 +20,12 @@ import { snapshotSourceProjectFiles } from "./hosted-agent-project-files.js";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 import type { HostedAgentClaudeWebFetchOptions } from "./hosted-agent-claude-web-network.js";
 import type { BlobRef } from "@joko/core";
+import type { ProviderSharingDirectoryPort, ProviderSharingReceivedIdentity, ProviderSharingRecipient } from "./provider-sharing-ports.js";
+import { providerSharingBackendId } from "./provider-sharing-ports.js";
+import { createProviderGroupPeerTransport } from "./provider-group-peer.js";
+import { createHostedAgentGuestPeerCapture } from "./hosted-agent-guest-peer-capture.js";
+import type { ProviderGroupGuestSwitch } from "./provider-group-guest-switch.js";
+import type { ProviderGroupStore } from "@joko/store";
 
 const SCOPE = "hosted-sources.v1";
 const FORWARDED = new Set(["session.resume", "session.detach", "session.tree", "turn.stream", "turn.abort", "turn.steer", "turn.follow_up", "input.text",
@@ -32,6 +38,7 @@ interface SourceRecord {
   readonly deviceName: string;
   readonly catalog: JsonValue;
   readonly remoteControlEnabled: boolean;
+  readonly received?: ProviderSharingReceivedIdentity;
 }
 interface SourceEntry { readonly id: string; record: SourceRecord; catalog: contract.HostedAgentBackendCatalog; available: boolean; }
 interface Pool { readonly client: HostedAgentConnectClient; readonly poller: HostedAgentPoller; readonly assertCurrent: () => void; }
@@ -43,6 +50,8 @@ export interface HostedAgentSourcesOptions {
   readonly readBlob: (blob: BlobRef) => Promise<Uint8Array>;
   readonly resolveProxy?: HostedAgentClaudeWebFetchOptions["resolveProxy"];
   readonly environmentProxyForTarget?: HostedAgentClaudeWebFetchOptions["environmentProxyForTarget"];
+  readonly sharing?: ProviderSharingDirectoryPort;
+  readonly sourceDeviceId?: string;
 }
 const runFile = promisify(execFile);
 
@@ -53,18 +62,83 @@ export class HostedAgentSources {
   readonly #entries = new Map<string, SourceEntry>();
   readonly #refreshing = new Map<string, Promise<void>>();
   readonly #pools = new Map<string, Pool>();
+  #groupSwitch?: ProviderGroupGuestSwitch;
+  #groupStore?: ProviderGroupStore;
+  readonly #preparedGroupMembers = new Map<string, string>();
   #closed = false;
   #discoveryClosed = false;
   constructor(options: HostedAgentSourcesOptions) { this.#options = options; }
+  installGroupSwitch(value: ProviderGroupGuestSwitch): void { if (this.#groupSwitch && this.#groupSwitch !== value) throw new Error("The Source group switch owner changed."); this.#groupSwitch = value; }
+  installGroupStore(value: ProviderGroupStore): void { this.#groupStore = value; }
+  prepareGroupMember(sessionId: string, backendId: string): void { this.#preparedGroupMembers.set(sessionId, backendId); }
   async initialize(): Promise<void> {
     for (const row of this.#options.store.listSettingsByKeyPrefix("service", SCOPE, "source:")) {
-      const record = parseRecord(row.value), id = sourceId(record.source);
+      const record = parseRecord(row.value), id = record.received ? providerSharingBackendId(record.received.joinId, record.received.nativeBackendId) : sourceId(record.source);
       if (row.key !== `source:${id}`) throw new Error("The saved native source identity conflicts.");
       const catalog = parseCatalog(record.catalog, record.source.backendId), entry = { id, record, catalog, available: false };
       this.#entries.set(id, entry); await this.#install(entry);
     }
   }
   source(backendId: string): HostedAgentDeviceSource | undefined { return this.#entries.get(backendId)?.record.source; }
+  sourceKind(backendId: string): "device" | "share" | undefined { const entry = this.#entries.get(backendId); return entry ? entry.record.received ? "share" : "device" : undefined; }
+  groupCatalog(): readonly { readonly backendId: string; readonly source: HostedAgentDeviceSource; readonly name: string;
+    readonly available: boolean; readonly catalog: contract.HostedAgentBackendCatalog; readonly received?: ProviderSharingReceivedIdentity }[] {
+    return [...this.#entries.values()].map(entry => ({ backendId: entry.id, source: entry.record.source, name: entry.record.deviceName,
+      available: entry.available && entry.record.remoteControlEnabled, catalog: entry.catalog, ...(entry.record.received ? { received: entry.record.received } : {}) }));
+  }
+  /** An owner-only coordinator uses the exact existing Device route. A
+   * received Provider grant cannot obtain group management or quota access. */
+  captureGroupPeer(backendId: string) {
+    const entry = this.#entries.get(backendId); if (!entry || entry.record.received || !entry.catalog.nodeId) throw new Error("The group owner Device route is unavailable.");
+    const authority = this.#options.peers.captureBinding(entry.record.source.controllerDeviceId, entry.record.source.targetDeviceId, ["native_agents"]);
+    return { transport: createProviderGroupPeerTransport({ owner: this.#options.peers, authority }), assertCurrent: () => authority.assertCurrent(["native_agents"]),
+      ownerNodeId: entry.catalog.nodeId, nativeBackendId: entry.record.source.backendId };
+  }
+  resolveGroupMember(nodeId: string, nativeBackendId: string, providerId: string): string | undefined {
+    return [...this.#entries.values()].find(entry => entry.catalog.nodeId === nodeId && entry.record.source.backendId === nativeBackendId
+      && !entry.record.received && entry.catalog.providers.some(provider => provider.providerId === providerId))?.id;
+  }
+  captureNativeForGroup(backendId: string, runId: string) {
+    const entry = this.#entries.get(backendId); if (!entry) throw new Error("The group member native source is unavailable.");
+    return this.#capture(entry, runId);
+  }
+  captureGuestForGroup(backendId: string, recipient: ProviderSharingRecipient, providerId: string, modelIds: readonly string[], assertCurrent: () => void, shouldPurge?: () => boolean) {
+    const entry = this.#entries.get(backendId); if (!entry || entry.record.received) throw new Error("The owner Device group member is unavailable.");
+    const authority = this.#options.peers.captureBinding(entry.record.source.controllerDeviceId, entry.record.source.targetDeviceId, ["native_agents"]);
+    return createHostedAgentGuestPeerCapture({ owner: this.#options.peers, authority, recipient, backendId: entry.record.source.backendId, providerId, modelIds,
+      assertCurrent, ...(shouldPurge === undefined ? {} : { shouldPurge }) });
+  }
+  async refreshShared(signal: AbortSignal): Promise<void> {
+    if (this.#closed || this.#discoveryClosed) throw new Error("Native source discovery is closed.");
+    const sharing = this.#options.sharing; if (!sharing) return;
+    const seen = new Set<string>();
+    await Promise.allSettled(sharing.listReceived().map(async received => {
+      if (received.state !== "active") return;
+      sharing.assertReceived(received); const sourceDeviceId = this.#options.sourceDeviceId;
+      if (!sourceDeviceId) throw new Error("The original Provider source node is unavailable.");
+      const captured = sharing.captureNative(received, sourceDeviceId);
+      const snapshot = await captured.client.catalog(signal); captured.assertCurrent();
+      const raw = snapshot.backends.find(backend => backend.backendId === received.nativeBackendId);
+      if (!raw) throw new Error("The shared native catalog no longer contains its granted Backend.");
+      const catalog = parseCatalog(toJson(contract.HostedAgentBackendCatalogSchema, raw), received.nativeBackendId);
+      if (catalog.providers.some(provider => provider.providerId !== received.providerId)) throw new Error("The shared native catalog exceeds its Provider grant.");
+      const identity: ProviderSharingReceivedIdentity = { joinId: received.joinId, shareId: received.shareId, memberId: received.memberId, generation: received.generation,
+        hostServerId: received.hostServerId, nativeBackendId: received.nativeBackendId, providerId: received.providerId };
+      const source = { controllerDeviceId: sourceDeviceId, targetDeviceId: received.hostServerId, backendId: received.nativeBackendId };
+      const record: SourceRecord = { format: 1, source, deviceName: received.ownerName, received: identity,
+        catalog: toJson(contract.HostedAgentBackendCatalogSchema, catalog), remoteControlEnabled: snapshot.remoteControlEnabled };
+      const prior = this.#entries.get(received.backendId), entry = prior ?? { id: received.backendId, record, catalog, available: true };
+      entry.record = record; entry.catalog = catalog; entry.available = true; this.#entries.set(entry.id, entry);
+      seen.add(received.backendId);
+      this.#options.store.setSetting("service", SCOPE, `source:${entry.id}`, record);
+      if (prior) await this.#options.registry.refresh(entry.id); else await this.#install(entry);
+    }));
+    signal.throwIfAborted();
+    for (const entry of this.#entries.values()) if (entry.record.received) {
+      const received = sharing.listReceived().find(row => row.backendId === entry.id);
+      if (!seen.has(entry.id) || received?.state !== "active") { entry.available = false; await this.#options.registry.refresh(entry.id); }
+    }
+  }
   modelAvailable(backendId: string, providerId: string, modelId: string): boolean | undefined {
     const entry = this.#entries.get(backendId); if (!entry) return undefined;
     return entry.available && entry.record.remoteControlEnabled && entry.catalog.providers.some(provider => provider.providerId === providerId
@@ -103,7 +177,7 @@ export class HostedAgentSources {
     const seen = new Set(outcomes.flatMap(outcome => outcome.status === "fulfilled" ? outcome.value : []));
     // A failed or incomplete node response does not erase its last known
     // identities. They remain unavailable until an authoritative refresh.
-    for (const entry of this.#entries.values()) if (entry.record.source.controllerDeviceId === connection.deviceId && !seen.has(entry.id)) {
+    for (const entry of this.#entries.values()) if (!entry.record.received && entry.record.source.controllerDeviceId === connection.deviceId && !seen.has(entry.id)) {
       entry.available = false; await this.#options.registry.refresh(entry.id);
     }
   }
@@ -116,6 +190,10 @@ export class HostedAgentSources {
           const policy = this.#options.readPolicy(context), session = this.#session(context.sessionId);
           return { permissionMode: policy.permissionMode, fastMode: session?.fastMode ?? false, ...(session?.effort === undefined ? {} : { effort: session.effort }) };
         }, assertContext: context => this.#assertContext(context),
+        takeGroupSwitch: context => this.#groupSwitch?.takeForOpen(context.sessionId, entry.id),
+        takeNewGroupRound: context => this.#groupSwitch?.takeNewRound(context.sessionId) === true,
+        isGroupMember: context => !entry.record.received && (this.#preparedGroupMembers.get(context.sessionId) === entry.id
+          || this.#groupStore?.binding(context.sessionId)?.backendId === entry.id),
         workspace: async context => {
           this.#assertContext(context);
           let isGitRepository = false;
@@ -128,13 +206,12 @@ export class HostedAgentSources {
             ...(context.appendSystemPrompt === undefined ? {} : { personalInstructions: context.appendSystemPrompt }) };
         },
         capture: async (runId, context) => {
-          this.#assertContext(context); const pool = this.#pool(entry.record.source);
+          this.#assertContext(context); const captured = this.#capture(entry, runId), pool = captured.pool;
           const codexExecutable = await this.#options.resolveCodexExecutable?.(); this.#assertContext(context); pool.assertCurrent();
-          const authority = this.#options.peers.captureBinding(entry.record.source.controllerDeviceId, entry.record.source.targetDeviceId, ["native_agents"]);
-          const cleanup = this.#options.peers.captureHostedAgentCleanup(authority, runId);
-          return { client: pool.client, assertCurrent: pool.assertCurrent, close: cleanup,
+          return { client: pool.client, assertCurrent: pool.assertCurrent, close: captured.close,
             createController: input => createHostedAgentSourceController({ ...input, poller: pool.poller, temporaryRoot: this.#options.temporaryRoot,
               readPolicy: this.#options.readPolicy, assertContext: sourceContext => this.#assertContext(sourceContext), assertCurrent: pool.assertCurrent,
+              onGroupSwitch: offer => { this.#assertContext(context); pool.assertCurrent(); this.#groupSwitch?.offer(context.sessionId, entry.id, context.generation, offer); },
               ...(codexExecutable === undefined ? {} : { codexExecutable }),
               readBlob: blob => this.#options.readBlob(blob),
               ...(this.#options.resolveProxy === undefined ? {} : { resolveProxy: this.#options.resolveProxy }),
@@ -152,6 +229,20 @@ export class HostedAgentSources {
     const client = new HostedAgentConnectClient(createClient(contract.HostedAgentService, createHostedAgentPeerTransport({ owner: this.#options.peers, authority })), assertCurrent);
     const pool = { client, assertCurrent, poller: new HostedAgentPoller(client) }; this.#pools.set(key, pool); return pool;
   }
+  #capture(entry: SourceEntry, runId: string): { readonly pool: Pool; readonly client: HostedAgentConnectClient; readonly assertCurrent: () => void; readonly close: (signal?: AbortSignal) => Promise<void> } {
+    const received = entry.record.received;
+    if (received) {
+      const sharing = this.#options.sharing; if (!sharing || !this.#options.sourceDeviceId) throw new Error("Provider share authority is unavailable.");
+      sharing.assertReceived(received); const captured = sharing.captureNative(received, this.#options.sourceDeviceId);
+      const key = JSON.stringify(["share", received.joinId, received.nativeBackendId, received.generation, this.#options.sourceDeviceId]);
+      let pool = this.#pools.get(key);
+      if (!pool) { pool = { client: captured.client, assertCurrent: captured.assertCurrent, poller: new HostedAgentPoller(captured.client) }; this.#pools.set(key, pool); }
+      pool.assertCurrent(); return { pool, client: pool.client, assertCurrent: pool.assertCurrent, close: (signal = AbortSignal.timeout(15_000)) => captured.close(runId, signal) };
+    }
+    const pool = this.#pool(entry.record.source);
+    const authority = this.#options.peers.captureBinding(entry.record.source.controllerDeviceId, entry.record.source.targetDeviceId, ["native_agents"]);
+    return { pool, client: pool.client, assertCurrent: pool.assertCurrent, close: this.#options.peers.captureHostedAgentCleanup(authority, runId) };
+  }
   #descriptor(entry: SourceEntry): BackendDescriptor {
     const native = new Map(entry.catalog.capabilities.map(fromProtoCapability).map(capability => [capability.key, capability]));
     const capabilities = new Map<string, Capability>(CAPABILITIES.map(key => {
@@ -166,7 +257,9 @@ export class HostedAgentSources {
       health: entry.available && entry.record.remoteControlEnabled && hasModels ? "healthy" : "unavailable", installationState: "installed", authenticationState: "not_required",
       capabilities, models: entry.catalog.providers.flatMap(provider => provider.models.map(fromModel)), providers: entry.catalog.providers.map(provider => ({ providerId: provider.providerId,
         displayName: `${provider.displayName} · ${entry.catalog.displayName} · ${entry.record.deviceName}`, api: provider.models[0]?.api ?? "", authenticationState: provider.connected ? "not_required" : "signed_out", loginMethods: [],
-        supportsLogin: false, supportsLogout: false, supportsRefresh: false, supportsModelRefresh: false })), tools: [], diagnostics: [] };
+        supportsLogin: false, supportsLogout: false, supportsRefresh: false, supportsModelRefresh: false,
+        ...(["managed", "apiKey", "oauth", "subscription", "localKeyless", "customEndpoint"].includes(provider.accessKind) ? { accessKind: provider.accessKind as NonNullable<BackendDescriptor["providers"]>[number]["accessKind"] } : {}),
+        ...(provider.accessProduct ? { accessProduct: provider.accessProduct } : {}) })), tools: [], diagnostics: [] };
   }
   #assertContext(context: AdapterContext): void {
     if (this.#closed) throw new Error("Native sources are closed."); context.signal.throwIfAborted();
@@ -183,9 +276,12 @@ function parseRecord(value: unknown): SourceRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("The saved native source is invalid.");
   const record = value as SourceRecord;
   if (record.format !== 1 || !record.source || typeof record.deviceName !== "string" || typeof record.remoteControlEnabled !== "boolean"
-    || Object.keys(record).some(key => !["format", "source", "deviceName", "catalog", "remoteControlEnabled"].includes(key))
+    || Object.keys(record).some(key => !["format", "source", "deviceName", "catalog", "remoteControlEnabled", "received"].includes(key))
     || Object.keys(record.source).some(key => !["controllerDeviceId", "targetDeviceId", "backendId"].includes(key))
     || ![record.source.controllerDeviceId, record.source.targetDeviceId, record.source.backendId].every(validIdentity)) throw new Error("The saved native source is invalid.");
+  if (record.received && (Object.keys(record.received).some(key => !["joinId", "shareId", "memberId", "generation", "hostServerId", "nativeBackendId", "providerId"].includes(key))
+    || ![record.received.joinId, record.received.shareId, record.received.memberId, record.received.hostServerId, record.received.nativeBackendId, record.received.providerId].every(validIdentity)
+    || !Number.isSafeInteger(record.received.generation) || record.received.generation < 1)) throw new Error("The saved shared native source is invalid.");
   return record;
 }
 function parseCatalog(json: JsonValue, backendId: string): contract.HostedAgentBackendCatalog {

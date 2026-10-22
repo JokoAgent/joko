@@ -32,7 +32,7 @@ const prompt = z.strictObject({ text, images: z.array(z.strictObject({ blob, alt
 });
 const noArgs = ["state", "abort", "delete", "abort_retry", "commands", "resources", "tools", "tree", "history", "abort_shell"] as const;
 const callSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("send"), input: prompt, durableFence: z.boolean() }),
+  z.strictObject({ kind: z.literal("send"), input: prompt, durableFence: z.boolean(), newGroupRound: z.boolean().optional() }),
   ...noArgs.map(kind => z.strictObject({ kind: z.literal(kind) })),
   z.strictObject({ kind: z.literal("set_model"), providerId: id, modelId: id }),
   z.strictObject({ kind: z.literal("set_effort"), effort: id }),
@@ -48,7 +48,7 @@ const callSchema = z.discriminatedUnion("kind", [
     action: z.enum(["stop", "steer", "follow_up", "resume"]), message: text.optional() }) })
 ]);
 const openSchema = z.strictObject({ runId: id, nativeSessionId: id, start: z.enum(["create", "resume"]), sessionId: id, targetId: id, generation: unsigned, backendId: id, providerId: id, modelId: id,
-  name: z.string().max(16_384).refine(value => !value.includes("\0")).optional(),
+  name: z.string().max(16_384).refine(value => !value.includes("\0")).optional(), groupSwitch: z.string().regex(/^[a-f0-9]{64}$/u).optional(), groupMember: z.boolean().optional(),
   permissionMode: permission, fastMode: z.boolean(), effort: id.optional(), workspace: z.strictObject({ platform: z.enum(["win32", "darwin", "linux"]),
     shell: z.string().max(16_384), isGitRepository: z.boolean(), personalInstructions: z.string().max(1024 * 1024).optional(),
     contextFiles: z.array(z.strictObject({ path: z.string().min(1).max(16_384).refine(value => !value.includes("\0")), content: z.string().max(1024 * 1024) })).max(128).optional() }) });

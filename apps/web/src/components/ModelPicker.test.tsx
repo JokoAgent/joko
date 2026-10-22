@@ -16,7 +16,7 @@ import {
   clearModelEffort
 } from "../model-picker-preferences.js";
 import type { ModelView } from "../model.js";
-import { ModelPicker, type ModelPickerSelection } from "./ModelPicker.js";
+import { ModelPicker, type ModelPickerProps, type ModelPickerSelection } from "./ModelPicker.js";
 import { Modal } from "./ui.js";
 
 const roots: Root[] = [];
@@ -42,6 +42,34 @@ afterEach(async () => {
 });
 
 describe("ModelPicker", () => {
+  it.each([false, true])("shows the exact group member quota after the group owner routes to another Backend (member=%s)", async member => {
+    const usage = { group: { backendId: member ? "group-owner" : "backend-picker", providerId: "provider-a" },
+      ...(member ? { memberRoute: { backendId: "backend-picker", providerId: "provider-a" } } : {}),
+      nodeName: "Studio computer", quotaReadable: true, usedPercent: 42.5, resetAt: 1000 };
+    const otherBackend = { ...models[0]!, backendId: "another-backend", modelId: "other-model", name: "Other model" };
+    const onSelect = vi.fn(), selected = { backendId: "backend-picker", providerId: "provider-a", modelId: "model-small", fastMode: false };
+    await renderPicker(onSelect, "owner-one", undefined, false, undefined, [...models, otherBackend], selected, undefined, usage);
+    const running = translate("en", "modelPicker.groupRunning", { name: usage.nodeName }), quota = translate("en", "modelPicker.groupUsage", { percent: 42.5 });
+    expect(document.querySelector(".model-picker-trigger")?.getAttribute("title")).toContain(running);
+    await openPicker();
+    const small = findRow("Small"); expect(small.textContent).toContain(running); expect(small.textContent).toContain(quota);
+    expect(findRow("Large").title).toContain(quota); expect(findRow("Beta model").textContent).not.toContain(running); expect(findRow("Other model").textContent).not.toContain(running);
+    expect(document.querySelectorAll('.model-picker__rail button[title]')).toHaveLength(1);
+    expect(document.querySelector('.model-picker__rail button[title]')?.getAttribute("title")).toContain(quota);
+    await act(async () => small.click()); expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining(selected));
+  });
+
+  it.each([false, true])("withholds private or unknown group quota without inventing zero (readable=%s)", async quotaReadable => {
+    const usage = { group: { backendId: "backend-picker", providerId: "provider-a" }, nodeName: "Shared computer", quotaReadable,
+      ...(quotaReadable ? {} : { usedPercent: 99 }) };
+    await renderPicker(vi.fn(), "owner-one", undefined, false, undefined, models, undefined, undefined, usage); await openPicker();
+    const small = findRow("Small"), hidden = translate("en", "modelPicker.groupPrivateUsage");
+    expect(small.textContent).toContain(translate("en", "modelPicker.groupRunning", { name: usage.nodeName }));
+    expect(small.textContent?.includes(hidden)).toBe(!quotaReadable);
+    expect(small.textContent).not.toContain(translate("en", "modelPicker.groupUsage", { percent: 0 }));
+    expect(small.textContent).not.toContain(translate("en", "modelPicker.groupUsage", { percent: 99 }));
+    expect(findRow("Beta model").textContent).not.toContain(hidden);
+  });
   it("uses declared defaults and observes external exact-route effort changes and reset without a stale row cache", async () => {
     const declared = { ...models[0]!, metadata: { defaultEffort: "high" } };
     const onSelect = vi.fn();
@@ -449,7 +477,8 @@ async function renderPicker(
   onOpen?: () => void | Promise<void>,
   pickerModels: readonly ModelView[] = models,
   value?: ModelPickerSelection,
-  onConnectSource?: () => void
+  onConnectSource?: () => void,
+  providerGroupUsage?: ModelPickerProps["providerGroupUsage"]
 ): Promise<void> {
   const container = document.createElement("div");
   document.body.append(container);
@@ -465,6 +494,7 @@ async function renderPicker(
     onConnectSource={onConnectSource}
     allowDefault={allowDefault}
     seedDefault={seedDefault}
+    providerGroupUsage={providerGroupUsage}
   />));
 }
 

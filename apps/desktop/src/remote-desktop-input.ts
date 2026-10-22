@@ -12,7 +12,7 @@ import type {
   RemoteDesktopInput
 } from "@joko/device-peer";
 
-import type { DesktopRemoteDesktopInputPort } from "./remote-desktop-host.js";
+import type { DesktopRemoteDesktopInputPort, DesktopRemoteDesktopInputOwnership } from "./remote-desktop-host.js";
 import { verifyPackagedDesktopRemoteDesktopBinary } from "./remote-desktop-native-manifest.js";
 import {
   linuxRemoteDesktopInputMapping, readDesktopRemoteDesktopLinuxInputSupport,
@@ -34,7 +34,7 @@ export type DesktopRemoteDesktopSessionState =
 export interface DesktopRemoteDesktopInputRuntime {
   readonly platform: NodeJS.Platform;
   resolveBinary(prepare?: boolean): Promise<string>;
-  spawn(binary: string): ChildProcessWithoutNullStreams;
+  spawn(binary: string, arguments_?: readonly string[]): ChildProcessWithoutNullStreams;
   display(displayId: string): RemoteDesktopDisplay & {
     readonly x: number;
     readonly y: number;
@@ -54,6 +54,9 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
   readonly #runtime: DesktopRemoteDesktopInputRuntime;
   #child: ChildProcessWithoutNullStreams | undefined;
   #displayId = "";
+  #window: { readonly windowId: number; readonly pid: number } | undefined;
+  #ownership: DesktopRemoteDesktopInputOwnership | undefined;
+  #inputAbort: AbortController | undefined;
   #generation = 0;
   #heartbeat: ReturnType<typeof setInterval> | undefined;
   #stopping: Promise<void> = Promise.resolve();
@@ -72,9 +75,11 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     this.#runtime = runtime;
   }
 
-  async start(displayId: string, signal: AbortSignal): Promise<void> {
+  async start(displayId: string, signal: AbortSignal, window?: { readonly windowId: number; readonly pid: number }, ownership?: DesktopRemoteDesktopInputOwnership): Promise<void> {
     if (this.#retired) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
     this.stop();
+    if (window && !ownership) throw new Error("REMOTE_DESKTOP_HANDOFF_UNAVAILABLE");
+    if (window && (this.#runtime.platform !== "darwin" || !Number.isSafeInteger(window.windowId) || window.windowId < 1 || window.windowId > 0xffff_ffff || !Number.isSafeInteger(window.pid) || window.pid < 1)) throw new Error("REMOTE_DESKTOP_HANDOFF_UNAVAILABLE");
     if (this.#runtime.platform !== "darwin" && this.#runtime.platform !== "win32" && this.#runtime.platform !== "linux") {
       throw new Error("REMOTE_DESKTOP_INPUT_UNSUPPORTED");
     }
@@ -99,9 +104,11 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     }
     throwIfAborted(signal);
     if (generation !== this.#generation) throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
-    const child = this.#runtime.spawn(binary);
+    const child = this.#runtime.spawn(binary, window ? ["--window", String(window.windowId), String(window.pid)] : []);
     this.#child = child;
     this.#displayId = displayId;
+    this.#window = window;
+    this.#ownership = ownership; this.#inputAbort = new AbortController();
     this.#linuxMapping = linuxMapping;
     this.#linuxLayout = linuxLayout;
     child.stderr.resume();
@@ -179,6 +186,7 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
 
   send(events: readonly RemoteDesktopInput[]): void {
     if (this.#privacyPaused) return;
+    if (this.#window) { this.#write(events); return; }
     if (this.#runtime.platform === "linux") {
       if (this.#linuxMapping === undefined || this.#child === undefined) throw new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE");
       const projected = events.flatMap((event) => {
@@ -215,8 +223,11 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     if (this.#heartbeat !== undefined) clearInterval(this.#heartbeat);
     this.#heartbeat = undefined;
     const child = this.#child;
+    const ownership = this.#ownership; this.#ownership = undefined;
+    this.#inputAbort?.abort(); this.#inputAbort = undefined;
     this.#child = undefined;
     this.#displayId = "";
+    this.#window = undefined;
     this.#linuxMapping = undefined;
     this.#linuxLayout = "";
     this.#linuxAck?.(new Error("REMOTE_DESKTOP_LEASE_EXPIRED"));
@@ -235,6 +246,7 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
       const confirmed = (): void => {
         this.#pendingInputReleases.delete(child);
         child.off("exit", confirmed);
+        void ownership?.close().catch(() => undefined);
       };
       const closed = (): void => {
         confirmed();
@@ -338,6 +350,7 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
     }
     this.#linuxQueueBytes += size;
     const generation = this.#generation;
+    const ownership = this.#ownership, signal = this.#inputAbort?.signal;
     this.#linuxQueue = this.#linuxQueue.then(async () => {
       if (generation !== this.#generation || this.#child !== child) return;
       if (this.#runtime.platform === "linux") {
@@ -349,7 +362,11 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
       }
       const settled = this.onPointer && (points.length || wheel)
         ? this.onPointer(wheel ? [this.#runtime.cursorScreenPoint?.() ?? screen.getCursorScreenPoint(), ...points] : points) : undefined;
+      let complete: (() => Promise<void>) | undefined;
+      let acknowledged = false;
       try {
+        if (events.length && ownership && signal) complete = await ownership.begin(events as readonly RemoteDesktopInput[], signal);
+        if (generation !== this.#generation || this.#child !== child) return;
         // Completion owns the actual native injection, not just stdin's buffer.
         await new Promise<void>((resolveAck, rejectAck) => {
           let done = false;
@@ -363,7 +380,8 @@ export class DesktopRemoteDesktopInput implements DesktopRemoteDesktopInputPort 
           try { child.stdin.write(line, error => { if (error) finish(new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE")); }); }
           catch { finish(new Error("REMOTE_DESKTOP_INPUT_UNAVAILABLE")); }
         });
-      } finally { settled?.(); }
+        acknowledged = true;
+      } finally { settled?.(); if (acknowledged) await complete?.(); }
     }).catch(() => { if (generation === this.#generation && this.#child === child) this.#failed(); })
       .finally(() => { if (generation === this.#generation) this.#linuxQueueBytes -= size; });
   }
@@ -885,7 +903,7 @@ function electronInputRuntime(): DesktopRemoteDesktopInputRuntime {
   return {
     platform: process.platform,
     resolveBinary: resolveDesktopRemoteDesktopInputBinary,
-    spawn: (binary) => spawn(binary, [], { stdio: "pipe", windowsHide: true }),
+    spawn: (binary, arguments_ = []) => spawn(binary, [...arguments_], { stdio: "pipe", windowsHide: true }),
     display: (displayId) => {
       const display = screen.getAllDisplays().find((item) => String(item.id) === displayId);
       return display === undefined ? undefined : Object.freeze({

@@ -45,6 +45,16 @@ beforeEach(() => { Object.defineProperty(process, "platform", { ...platform, val
 afterEach(async () => { for (const media of cleanup.splice(0)) await media.retire(); Object.defineProperty(process, "platform", platform); });
 
 describe("Remote Desktop privacy capture receipt", () => {
+  it("captures only the Source's current native window and discards pixels if the request retires during capture", async () => {
+    const f = fixture(); let current = true;
+    const validateWindow = vi.fn(async () => current);
+    const request = { ...frameRequest(), window: { requestId: "private-request", windowId: 91, pid: 80, displayId: "1", app: "Login", width: 400, height: 300 }, validateWindow };
+    const pending = f.media.frame(request); await vi.waitFor(() => expect(f.children).toHaveLength(1));
+    expect(f.args[0]![0]).toBe("1"); expect(f.args[0]!.at(-1)).toBe("window:91"); expect(f.args[0]).toContain("cursor-overlay");
+    current = false; f.respond(0); await expect(pending).resolves.toBeNull();
+    await expect(f.media.frame(request)).rejects.toThrow("HANDOFF_UNAVAILABLE");
+    expect(f.children).toHaveLength(1); expect(h.getSources).not.toHaveBeenCalled(); expect(validateWindow).toHaveBeenCalledTimes(3);
+  });
   it("unions overlay and privacy windows and restores each remaining owner independently", async () => {
     const f = fixture(), owner = {};
     await f.media.setOverlayExclusions([20]); f.media.setPrivacyExclusions(owner, [10]);

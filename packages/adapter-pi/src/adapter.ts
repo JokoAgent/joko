@@ -82,6 +82,7 @@ import { provisionManagedBridge } from "./bridge.js";
 import { assertPiHostedModel, provisionPiHostedExecution, restrictPiHostedGuestHome } from "./hosted-execution.js";
 import { handleCommandGateExtensionRequest } from "./command-gate-bridge.js";
 import { capturePartnerLearningExtensionRequest, consumePartnerLearningNativeReply } from "./partner-learning-bridge.js";
+import { PiNativeRootTools } from "./native-root-tools.js";
 import {
   handlePolicyDecisionExtensionRequest,
   type PolicyDecisionRequest,
@@ -266,6 +267,8 @@ export interface PiMcpBridgeOptions {
   readonly endpoint: string;
   readonly token: string;
   readonly tools: readonly PiMcpToolDescriptor[];
+  /** Private host mint, never serialized into the native descriptor/environment. */
+  readonly captureRootCall?: (input: { readonly requestId: string; readonly serverId: string; readonly toolName: string; readonly arguments: Readonly<Record<string, unknown>>; readonly assertCurrent: () => void }) => string;
   /** One-shot, model-invisible authority for registering an exact managed runner key. */
   readonly nativeAuthReservationToken?: string;
   /** Host-owned, generation-fenced lease channel for Pi-native credentials. */
@@ -327,6 +330,8 @@ export interface PiRemoteNavigationOwner {
 }
 
 export interface PiAdapterOptions {
+  /** Private owner-only local task shell environment, resolved per runtime. */
+  readonly taskShellEnv?: (context: AdapterContext) => Readonly<Record<string, string>>;
   readonly validateRemoteHomeDirectories?: (context: AdapterContext, directories: readonly ApprovedDirectory[]) => Promise<readonly { readonly path: string; readonly access: "read_only" | "read_write" }[] | undefined>;
   /** Service adapter may replace a remote home's process-private Provider configuration with an authority transport. */
   readonly prepareRemoteHomeRuntime?: (input: { readonly context: AdapterContext; readonly agentHome: string;
@@ -595,6 +600,7 @@ interface PiRuntime {
   readonly redactValues: readonly string[];
   readonly resources: readonly RuntimeResource[];
   readonly mcpTools: readonly PiMcpToolDescriptor[];
+  readonly nativeRootTools: PiNativeRootTools;
   readonly nativeSkills?: NativeSkillSnapshot;
   readonly generationLease: PiManagedGenerationLease;
   translator: PiEventTranslator;
@@ -4940,6 +4946,7 @@ export class PiBackendAdapter implements
       ...baseEnvironment,
       ...providerEnvironment,
       ...keylessEnvironment,
+      ...(!context.target.remoteWorkspace && !context.hostedExecution && profile.runtimePolicy !== "review_read_only" ? options.taskShellEnv?.(context) : {}),
       PI_CODING_AGENT_DIR: runtimeAgentHomePath,
       PI_CODING_AGENT_SESSION_DIR: this.#sessionStore.sessionsRoot,
       PI_SKIP_VERSION_CHECK: "1",
@@ -5169,6 +5176,7 @@ export class PiBackendAdapter implements
         resources: [...managedResourceSnapshot.resources, ...projectResourceSnapshot.resources,
           ...(nativeSkills?.skills.filter(mount => !mount.discovery).map(mount => ({ ...mount.seed.resource, runtimePath: mount.path })) ?? [])],
         mcpTools: mcpBridge?.tools ?? [],
+        nativeRootTools: new PiNativeRootTools(mcpBridge?.tools ?? [], mcpBridge?.captureRootCall),
         ...(nativeSkills ? { nativeSkills } : {}),
         generationLease,
         translator: undefined as unknown as PiEventTranslator,
@@ -5382,6 +5390,8 @@ export class PiBackendAdapter implements
         delete lifecycle!.currentUserOccurrence;
       }
       const capturedLearningTurn = lifecycle?.currentPartnerLearningTurn;
+      runtime.nativeRootTools.observe(rawEvent, lifecycle, () => isCurrent() && runtime.lifecycle === lifecycle && lifecycle !== undefined && !capturedEventContext.signal.aborted);
+      const rootRequest = isExtensionUiRequest(event) && isCurrent() ? runtime.nativeRootTools.request(rawEvent, lifecycle) : undefined;
       const learningRequest = isExtensionUiRequest(event) && isCurrent()
         ? capturePartnerLearningExtensionRequest(rawEvent, capturedLearningTurn, runtime.mcpTools) : undefined;
       const learningReply = isExtensionUiRequest(event) && isCurrent()
@@ -5438,6 +5448,10 @@ export class PiBackendAdapter implements
               })
             );
           } else if (isExtensionUiRequest(event)) {
+            if (rootRequest !== undefined) {
+              if (rootRequest.id !== "" && !runtime.transport.closed) await runtime.transport.notify({ type: "extension_ui_response", ...rootRequest });
+              return;
+            }
             if (runtime.translator.consumeCompactionNativeIdentity(rawEvent)) return;
             if (learningReply) return;
             if (learningRequest !== undefined) {

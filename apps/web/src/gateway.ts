@@ -8,6 +8,14 @@ import type { ExtensionProjectView, ExtensionProjectStateView } from "./model.js
 import type { ExtensionProject as ProtoExtensionProject } from "@joko/contracts";
 import { AppDefaultModelService } from "@joko/contracts";
 import { HostedAgentService } from "@joko/contracts";
+import { ProviderSharingService, createProviderSharingApi, type ProviderSharingApi, type GetHostedAgentCatalogResponse, type DevicePeerRouteIdentity } from "@joko/contracts";
+import { createInputHandoffGateway } from "./input-handoff-gateway.js";
+import type { InputHandoffApi } from "./input-handoff.js";
+import { watchInputHandoffTasks } from "./input-handoff-task-watch.js";
+import { ProviderGroupService } from "@joko/contracts";
+import { createProviderGroupSettingsApi, type ProviderGroupSettingsApi } from "./provider-group-settings.js";
+import { projectTaskProviderGroupUsage, type TaskProviderGroupUsageView } from "./provider-group-task-usage.js";
+import { WorkspaceTextPreviewCache, workspacePreviewConnectionFailure } from "./workspace-text-preview-cache.js";
 import { hostedAgentSettingsMutation, projectHostedAgentCatalog, projectHostedAgentSettings, type HostedAgentSettingsUpdate,
   type HostedAgentSettingsView, type HostedAgentCatalogView } from "./hosted-agent-settings.js";
 import { HelpService, HelpRole, WorktreeRecycleAction, WorktreeRecycleState, WorktreeRecycleReason, type WorktreeRecycleRecord } from "@joko/contracts";
@@ -1014,6 +1022,10 @@ export interface PairingOutcome {
 }
 
 export interface OrchestratorGateway extends Omit<OperationApi, "openBrowserPage" | "recoverBrowserPage">, AppDefaultModelUiPort {
+  inputHandoffApi(openLive?: (peer: DevicePeerRouteIdentity, requestId: string, signal: AbortSignal) => Promise<void>): InputHandoffApi;
+  providerSharingApi(): ProviderSharingApi;
+  providerSharingCatalog(signal: AbortSignal): Promise<GetHostedAgentCatalogResponse>;
+  providerGroupSettingsApi(): ProviderGroupSettingsApi;
   taskSharingApi(): TaskSharingApi;
   getSharedTaskRuntimeControl(sessionId: string): Promise<TaskShareRuntimeControl>;
   getSharedTaskBackends(): Promise<readonly BackendView[]>;
@@ -1128,6 +1140,43 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   #eventRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   #eventRefreshQueued = false;
   readonly #artifactUrls = new Map<string, ArtifactUrlLease>();
+  readonly #workspaceTextPreviews = new WorkspaceTextPreviewCache();
+  #inputHandoffs: NonNullable<AppSnapshot["inputHandoffs"]> = [];
+  #stopInputHandoffWatch = () => {};
+
+  inputHandoffApi(openLive?: (peer: DevicePeerRouteIdentity, requestId: string, signal: AbortSignal) => Promise<void>): InputHandoffApi {
+    if (this.#taskSharing) throw new GatewayError("The computer owner must authorize input handoff.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope();
+    const assertCurrent = () => { scope.signal.throwIfAborted(); if (this.#transport !== scope.transport) throw new Error("The input handoff connection changed."); };
+    return createInputHandoffGateway({ transport: scope.transport, signal: scope.signal, assertCurrent,
+      upload: (value, ticket, signal) => { assertCurrent(); return this.uploadCredentialTicket(value, ticket, { ...scope, signal }); },
+      ...(openLive ? { openLive } : {}) });
+  }
+  providerSharingApi(): ProviderSharingApi {
+    if (this.#taskSharing) throw new GatewayError("The computer owner must manage Provider shares.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope();
+    const rpc = createClient(ProviderSharingService, scope.transport);
+    return createProviderSharingApi(rpc, signal => { signal.throwIfAborted(); scope.signal.throwIfAborted();
+      if (this.#transport !== scope.transport) throw new Error("The Provider sharing connection changed."); }, scope.signal);
+  }
+  async providerSharingCatalog(signal: AbortSignal): Promise<GetHostedAgentCatalogResponse> {
+    if (this.#taskSharing) throw new GatewayError("The computer owner must manage Provider shares.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope(signal), value = await createClient(HostedAgentService, scope.transport).getHostedAgentCatalog({ format: 1 }, { signal: scope.signal });
+    scope.signal.throwIfAborted(); if (this.#transport !== scope.transport) throw new Error("The Provider sharing connection changed."); return value;
+  }
+  providerGroupSettingsApi(): ProviderGroupSettingsApi {
+    if (this.#taskSharing) throw new GatewayError("The computer owner must manage Provider groups.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope(), api = createProviderGroupSettingsApi(createClient(ProviderGroupService, scope.transport));
+    const invoke = async <T>(signal: AbortSignal | undefined, work: (signal: AbortSignal) => Promise<T>): Promise<T> => {
+      const active = signal ? AbortSignal.any([signal, scope.signal]) : scope.signal;
+      const assertCurrent = () => { active.throwIfAborted(); if (this.#transport !== scope.transport) throw new Error("The Provider group connection changed."); };
+      assertCurrent(); const value = await work(active); assertCurrent(); return value;
+    };
+    return { getProviderGroup: (key, signal) => invoke(signal, active => api.getProviderGroup(key, active)),
+      listProviderGroupCandidates: (key, signal) => invoke(signal, active => api.listProviderGroupCandidates(key, active)),
+      updateProviderGroup: (key, revision, config, signal) => invoke(signal, active => api.updateProviderGroup(key, revision, config, active)),
+      getProviderGroupUsage: (query, signal) => invoke(signal, active => api.getProviderGroupUsage(query, active)) };
+  }
 
   constructor(
     profile: ConnectionProfile | undefined,
@@ -1230,6 +1279,17 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       this.#callbacks.onState?.("connected");
       if (options?.snapshotOnly !== true) {
         this.publishLiveSnapshot(true);
+        if (!this.#taskSharing && this.#callbacks.onLiveSnapshot) this.#stopInputHandoffWatch = watchInputHandoffTasks({ transport, signal: abort.signal,
+          isCurrent: () => this.#abort === abort && this.#transport === transport,
+          ownerKey: () => `${this.#profile?.serverId}:${this.#snapshot?.generation}`,
+          changed: tasks => {
+            if (this.#abort !== abort || this.#transport !== transport) return;
+            this.#inputHandoffs = tasks;
+            if (this.#snapshot) {
+              this.#snapshot = { ...this.#snapshot, inputHandoffs: tasks }; this.#callbacks.onSnapshot?.(this.#snapshot);
+              if (this.#liveSnapshotConnected) this.#callbacks.onLiveSnapshot?.(this.#snapshot);
+            }
+          } });
         this.#streamTask = this.consumeEvents(abort.signal);
       }
     } catch (error) {
@@ -1267,6 +1327,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   disconnect(): void {
+    this.#stopInputHandoffWatch(); this.#stopInputHandoffWatch = () => {}; this.#inputHandoffs = [];
+    if (this.#snapshot?.inputHandoffs?.length) { this.#snapshot = { ...this.#snapshot, inputHandoffs: [] }; this.#callbacks.onSnapshot?.(this.#snapshot); }
     this.publishLiveSnapshot(false);
     this.#sharedTaskReady = false;
     this.#sharingApi = undefined;
@@ -1281,6 +1343,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     this.#streamTask = undefined;
     for (const lease of this.#artifactUrls.values()) if (lease.url !== undefined) URL.revokeObjectURL(lease.url);
     this.#artifactUrls.clear();
+    this.#workspaceTextPreviews.clear();
     this.#callbacks.onState?.("disconnected");
   }
 
@@ -1316,6 +1379,23 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
       this.#abort === undefined ? undefined : { signal: this.#abort.signal }
     );
     await this.refresh();
+  }
+
+  async readTaskProviderGroupUsage(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<TaskProviderGroupUsageView | undefined> {
+    if (this.#taskSharing) throw new GatewayError("The task owner must read Provider group usage.", { code: "ACCESS_DENIED" });
+    const scope = this.captureActionScope(signal);
+    const identity = () => {
+      scope.signal.throwIfAborted();
+      const session = this.#snapshot?.sessions.find(item => item.id === sessionId);
+      if (!session || session.generation !== generation || session.state === "closed" || this.#transport !== scope.transport) {
+        throw new GatewayError("The original task generation is no longer current.");
+      }
+      return JSON.stringify([session.backendId, session.model?.providerId, session.model?.modelId]);
+    };
+    const original = identity();
+    const response = await createClient(ProviderGroupService, scope.transport).getTaskProviderGroupUsage({ sessionId, generation }, { signal: scope.signal });
+    if (identity() !== original) throw new GatewayError("The task Provider group member changed.");
+    return projectTaskProviderGroupUsage(response);
   }
 
   async readSessionArtifact(sessionId: string, artifactId: string, signal: AbortSignal): Promise<ArtifactView> {
@@ -1918,6 +1998,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     ) return;
     const previousRaw = this.#rawSnapshot;
     const sameGeneration = previousRaw?.generation === raw.generation;
+    if (!sameGeneration) this.#inputHandoffs = [];
     const previousSessions = new Map(previousRaw?.sessions.map((session) => [session.sessionId, session.nativeBinding?.runtimeGeneration]));
     const retainedSessions = new Map(raw.sessions.filter((session) => sameGeneration
       && session.nativeBinding?.runtimeGeneration !== undefined
@@ -1932,6 +2013,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     }), ...raw.timeline] };
     const mapped = {
       ...mapSnapshot(raw, entryMap, managedModelRuntimes, this.isLocalUserInput),
+      inputHandoffs: sameGeneration ? this.#inputHandoffs : [],
       // A deletion fence can outlive its descriptor until App adopts the
       // authoritative history response. It never supplies cached body text.
       timelineHistoryRevisionBySession: sameGeneration
@@ -6481,6 +6563,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
         throw new GatewayError("Orchestrator returned an out-of-order workspace file change stream.");
       }
       previousSequence = change.sequence;
+      this.#workspaceTextPreviews.invalidate(change.workspaceId, change.path);
+      if (change.previousPath !== undefined) this.#workspaceTextPreviews.invalidate(change.workspaceId, change.previousPath);
       yield change;
     }
   }
@@ -6501,21 +6585,46 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async readWorkspaceFile(workspaceId: string, path: string): Promise<WorkspaceFilePreviewView> {
-    const client = createClient(WorkspaceService, this.requireTransport());
+    const scope = this.captureActionScope(), identity = this.workspacePreviewScope(workspaceId), cacheRevision = this.#workspaceTextPreviews.revision;
+    const client = createClient(WorkspaceService, scope.transport);
     const response = await client.readWorkspaceFile({
       workspaceId,
       relativePath: path,
       startByte: 0n,
       maximumBytes: 2_097_152n
-    }, this.#abort === undefined ? undefined : { signal: this.#abort.signal });
+    }, { signal: scope.signal }).catch((error: unknown) => {
+      if (!workspacePreviewConnectionFailure(error)) this.#workspaceTextPreviews.invalidate(workspaceId, path);
+      throw error;
+    });
+    scope.signal.throwIfAborted();
+    if (this.requireTransport() !== scope.transport || this.workspacePreviewScope(workspaceId) !== identity) throw new GatewayError("The workspace file source changed.");
     if (response.preview === undefined) throw new GatewayError("Orchestrator returned no file preview.");
-    return mapFilePreview(response.preview);
+    const preview = mapFilePreview(response.preview);
+    if (preview.path !== path) throw new GatewayError("Orchestrator returned a different workspace file.");
+    if (identity !== undefined && cacheRevision === this.#workspaceTextPreviews.revision) this.#workspaceTextPreviews.set(identity, workspaceId, preview);
+    return preview;
+  }
+
+  peekWorkspaceFile(workspaceId: string, path: string): WorkspaceFilePreviewView | undefined {
+    const identity = this.workspacePreviewScope(workspaceId);
+    return identity === undefined ? undefined : this.#workspaceTextPreviews.get(identity, workspaceId, path);
+  }
+
+  private workspacePreviewScope(workspaceId: string): string | undefined {
+    if (!this.#transport || !this.#abort || this.#abort.signal.aborted || this.#taskSharing) return;
+    const snapshot = this.#snapshot, workspace = snapshot?.workspaces.find(value => value.id === workspaceId);
+    if (!workspace || !snapshot) return;
+    const target = snapshot.targets.find(value => value.id === workspace.targetId);
+    if (target?.archived) return;
+    return JSON.stringify([snapshot.generation.toString(), workspace.id, workspace.targetId, workspace.kind, workspace.serverPath,
+      workspace.trusted, workspace.remoteWorkspace, target?.revision.toString(), target?.backendId, target?.trusted, target?.remoteWorkspace]);
   }
 
   async writeWorkspaceTextFile(
     workspaceId: string,
     draft: WorkspaceTextFileWriteDraft
   ): Promise<WorkspaceTextFileWriteResultView> {
+    this.#workspaceTextPreviews.invalidate(workspaceId, draft.path);
     const client = createClient(WorkspaceService, this.requireTransport());
     const response = await client.writeWorkspaceTextFile({
       workspaceId,
@@ -6660,6 +6769,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async createWorkspaceEntry(draft: WorkspaceEntryMutationDraft): Promise<void> {
+    this.#workspaceTextPreviews.invalidate(draft.workspaceId, draft.path);
     await this.submit({
       case: "createWorkspaceEntry",
       value: {
@@ -6672,6 +6782,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async moveWorkspaceEntry(draft: WorkspaceEntryMoveDraft): Promise<void> {
+    this.#workspaceTextPreviews.invalidate(draft.workspaceId, draft.sourcePath);
+    this.#workspaceTextPreviews.invalidate(draft.workspaceId, draft.destinationPath);
     await this.submit({ case: "moveWorkspaceEntry", value: {
       workspaceId: draft.workspaceId,
       sourceRelativePath: draft.sourcePath,
@@ -6681,6 +6793,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async deleteWorkspaceEntry(draft: WorkspaceEntryDeleteDraft): Promise<void> {
+    this.#workspaceTextPreviews.invalidate(draft.workspaceId, draft.path);
     await this.submit({ case: "deleteWorkspaceEntry", value: {
       workspaceId: draft.workspaceId,
       relativePath: draft.path,
@@ -6690,6 +6803,7 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
   }
 
   async copyWorkspaceEntry(draft: WorkspaceEntryMoveDraft): Promise<void> {
+    this.#workspaceTextPreviews.invalidate(draft.workspaceId, draft.destinationPath);
     await this.submit({ case: "copyWorkspaceEntry", value: {
       workspaceId: draft.workspaceId,
       sourceRelativePath: draft.sourcePath,
@@ -11525,6 +11639,10 @@ function projectTimelineEvent(
       const inputDelivery = uiMessageInputDelivery(kind.value.inputDelivery);
       const inputOperationId = kind.value.role === 1 ? event.identity?.operationId : undefined;
       const rawObjectiveContinuation = kind.value.objectiveContinuation;
+      const handoffContinuation = kind.value.inputHandoffContinuation;
+      if (handoffContinuation && (kind.value.role !== 1 || !userInputAccepted || !handoffContinuation.requestId)) {
+        throw new Error("The server returned an invalid input handoff completion.");
+      }
       if (rawObjectiveContinuation !== undefined && (
         kind.value.role !== 1
         || rawObjectiveContinuation.ownerGeneration <= 0n
@@ -11564,6 +11682,7 @@ function projectTimelineEvent(
               ownerGeneration: rawObjectiveContinuation.ownerGeneration,
               turn: rawObjectiveContinuation.turn
             } }),
+        ...(handoffContinuation ? { inputHandoffContinuation: { requestId: handoffContinuation.requestId } } : {}),
         streaming: kind.value.role !== 1
       });
       break;
@@ -21177,7 +21296,8 @@ function protoPartnerCapabilities(value: PartnerCapabilitiesView) {
   return {
     modelChain: value.modelChain.map(protoPartnerRoute),
     permissionMode: protoPartnerPermission(value.permissionMode),
-    planMode: value.planMode
+    planMode: value.planMode,
+    inputHandoff: value.inputHandoff !== false
   };
 }
 
@@ -21192,6 +21312,7 @@ function protoPartnerPatch(value: PartnerPatchView) {
     ...(value.modelChain === undefined ? {} : { modelChain: { routes: value.modelChain.map(protoPartnerRoute) } }),
     ...(value.permissionMode === undefined ? {} : { permissionMode: protoPartnerPermission(value.permissionMode) }),
     ...(value.planMode === undefined ? {} : { planMode: value.planMode }),
+    ...(value.inputHandoff === undefined ? {} : { inputHandoff: value.inputHandoff }),
     ...(value.usesDirectoryDefaults === undefined ? {} : { usesDirectoryDefaults: value.usesDirectoryDefaults })
   };
 }
@@ -21234,7 +21355,7 @@ function mapPartnerCapabilities(value: ProtoPartnerCapabilities | undefined, all
     : value.permissionMode === ProtoPermissionMode.AUTO ? "auto" as const
       : value.permissionMode === ProtoPermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions" as const : undefined;
   if (permissionMode === undefined) throw new GatewayError("Orchestrator returned an unsupported Partner permission mode.");
-  return { modelChain: routes, permissionMode, planMode: value.planMode };
+  return { modelChain: routes, permissionMode, planMode: value.planMode, inputHandoff: value.inputHandoff ?? true };
 }
 
 function mapPartnerProfile(value: ProtoPartnerProfile | undefined): PartnerProfileView {

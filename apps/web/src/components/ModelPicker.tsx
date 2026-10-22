@@ -83,6 +83,14 @@ export interface ModelPickerProps {
   readonly effortEnabled?: boolean;
   readonly fastEnabled?: boolean;
   readonly useMorphPopover?: boolean;
+  readonly providerGroupUsage?: {
+    readonly group: { readonly backendId: string; readonly providerId: string };
+    readonly memberRoute?: { readonly backendId: string; readonly providerId: string };
+    readonly nodeName: string;
+    readonly quotaReadable: boolean;
+    readonly usedPercent?: number;
+    readonly resetAt?: number;
+  };
 }
 
 interface PickerRow {
@@ -125,7 +133,8 @@ export function ModelPicker({
   onMutateFavorite,
   effortEnabled = true,
   fastEnabled = true,
-  useMorphPopover = false
+  useMorphPopover = false,
+  providerGroupUsage
 }: ModelPickerProps): JSX.Element {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -164,10 +173,10 @@ export function ModelPicker({
     && (selectedModel === undefined || !isRoutableConversationModel(selectedModel));
   const connectSourceRequired = routableModels.length === 0 && onConnectSource !== undefined;
   const providerGroups = useMemo(() => {
-    const groups = new Map<string, { readonly id: string; readonly providerId: string; readonly name: string; readonly models: ModelView[] }>();
+    const groups = new Map<string, { readonly id: string; readonly backendId: string; readonly providerId: string; readonly name: string; readonly models: ModelView[] }>();
     for (const model of visibleModels) {
       const id = providerPreferenceKey(model.backendId, model.providerId);
-      const group = groups.get(id) ?? { id, providerId: model.providerId, name: model.providerName, models: [] };
+      const group = groups.get(id) ?? { id, backendId: model.backendId, providerId: model.providerId, name: model.providerName, models: [] };
       group.models.push(model);
       groups.set(id, group);
     }
@@ -510,6 +519,7 @@ export function ModelPicker({
   const selectedEffortLabel = effortEnabled && selectedModel !== undefined && value?.effort !== undefined
     ? effortLabel(selectedModel, value.effort, t)
     : undefined;
+  const selectedGroupUsage = value === undefined ? undefined : groupUsageText(value, providerGroupUsage, t);
   const panelContents = <>
       <header className="model-picker__header">
         <Search aria-hidden="true" />
@@ -535,6 +545,7 @@ export function ModelPicker({
             key={provider.id}
             active={rail === `provider:${provider.id}`}
             label={provider.name}
+            detail={groupUsageText(provider, providerGroupUsage, t)}
             mark={providerMark(provider.name, provider.id)}
             onClick={() => { setRail(`provider:${provider.id}`); setActiveRowKey(undefined); setConfigRowKey(undefined); }}
           />)}
@@ -568,6 +579,7 @@ export function ModelPicker({
               effortEnabled={effortEnabled}
               fastEnabled={fastEnabled}
               favoriteActionsDisabled={favoriteBusy}
+              providerGroupUsage={providerGroupUsage}
             />
             {filteredRows.length === 0 && (routableModels.length === 0 && onConnectSource !== undefined
               ? <div className="model-picker__empty"><Unplug aria-hidden="true" /><strong>{t("modelPicker.noSources")}</strong><span>{t("modelPicker.noSourcesBody")}</span><Button tone="primary" onClick={() => { close(false); onConnectSource(); }}>{t("modelPicker.connectSource")}</Button></div>
@@ -612,6 +624,7 @@ export function ModelPicker({
         : connectSourceRequired ? t("modelPicker.connectSource")
         : ariaLabel ?? t("controls.model")}
       aria-haspopup="dialog"
+      title={selectedGroupUsage === undefined ? undefined : `${selectedLabel} · ${selectedGroupUsage}`}
       aria-expanded={open}
       disabled={disabled}
       onMouseDown={useMorphPopover && onSelectionFocus !== undefined ? (event) => event.preventDefault() : undefined}
@@ -621,7 +634,7 @@ export function ModelPicker({
       }}
     >
       <span className="model-picker-trigger__mark">{providerMark(selectedModel?.providerName ?? "", selectedModel?.providerId ?? value?.providerId ?? "")}</span>
-      <span className={cx("model-picker-trigger__label", selectedModelUnavailable && "is-unavailable")}><strong>{selectedLabel}</strong>{value !== undefined && <small>{selectedModel?.providerName ?? value.providerId}{selectedModelUnavailable ? ` · ${t("modelPicker.sourceDisconnected")}` : ""}</small>}</span>
+      <span className={cx("model-picker-trigger__label", selectedModelUnavailable && "is-unavailable")}><strong>{selectedLabel}</strong>{value !== undefined && <small>{selectedModel?.providerName ?? value.providerId}{selectedGroupUsage === undefined ? "" : ` · ${selectedGroupUsage}`}{selectedModelUnavailable ? ` · ${t("modelPicker.sourceDisconnected")}` : ""}</small>}</span>
       <span className="model-picker-trigger__configuration">
         {selectedEffortLabel !== undefined && <small>{selectedEffortLabel}</small>}
         {fastEnabled && selectedModel !== undefined && value !== undefined && value.fastMode && selectedModel.supportsFast && <Zap aria-label={t("controls.fast")} />}
@@ -667,7 +680,8 @@ function ModelRows({
   onChangeConfiguration,
   effortEnabled,
   fastEnabled,
-  favoriteActionsDisabled
+  favoriteActionsDisabled,
+  providerGroupUsage
 }: {
   readonly rows: readonly PickerRow[];
   readonly value: ModelPickerSelection | undefined;
@@ -689,6 +703,7 @@ function ModelRows({
   readonly effortEnabled: boolean;
   readonly fastEnabled: boolean;
   readonly favoriteActionsDisabled: boolean;
+  readonly providerGroupUsage?: ModelPickerProps["providerGroupUsage"];
 }): JSX.Element {
   let previousSection = "";
   return <>{rows.map((row) => {
@@ -699,8 +714,9 @@ function ModelRows({
     const active = activeRowKey === row.key;
     const tier = priceTiers.get(modelKey(row.model)) ?? 0;
     const rowEffortLabel = row.effort === undefined ? undefined : effortLabel(row.model, row.effort, t);
+    const usage = groupUsageText(row.model, providerGroupUsage, t);
     return <div className="model-picker__section-fragment" key={row.key}>
-      {showSection && <div className="model-picker__section-label">{section}</div>}
+      {showSection && <div className="model-picker__section-label">{section}{row.favorite === undefined && usage ? ` · ${usage}` : ""}</div>}
       <div
         ref={(element) => { if (element === null) rowRefs.delete(row.key); else rowRefs.set(row.key, element); }}
         id={rowDomId(listboxId, row.key)}
@@ -715,6 +731,7 @@ function ModelRows({
         aria-selected={selected}
         aria-disabled={!row.model.available}
         aria-keyshortcuts="ArrowLeft"
+        title={usage === undefined ? undefined : `${row.model.name} · ${usage}`}
         tabIndex={row.model.available ? 0 : -1}
         onFocus={() => onActivate(row.key)}
         onPointerMove={() => onActivate(row.key)}
@@ -736,6 +753,7 @@ function ModelRows({
         <span className="model-picker__row-copy">
           <span><strong>{row.model.name}</strong>{row.favorite !== undefined && <small>{t("modelPicker.savedConfiguration")}</small>}</span>
           {layout !== "badge" && <small>{row.model.modelId}</small>}
+          {usage && <small className="model-picker__group-usage">{usage}</small>}
         </span>
         <PriceMark model={row.model} tier={tier} t={t} />
         <span className="model-picker__row-config-summary">
@@ -891,16 +909,25 @@ function configFlyoutBounds(panelElement: HTMLDivElement | null): ModelPickerCon
   return bounds.right > bounds.left && bounds.bottom > bounds.top ? bounds : viewport;
 }
 
-function RailButton({ active, label, mark, onClick, children }: {
+function RailButton({ active, label, detail, mark, onClick, children }: {
   readonly active: boolean;
   readonly label: string;
+  readonly detail?: string;
   readonly mark?: string;
   readonly onClick: () => void;
   readonly children?: JSX.Element;
 }): JSX.Element {
-  return <button type="button" className={active ? "is-active" : undefined} aria-pressed={active} onClick={onClick}>
-    <span>{children ?? mark}</span><small>{label}</small>
+  return <button type="button" className={active ? "is-active" : undefined} aria-pressed={active} title={detail === undefined ? undefined : `${label} · ${detail}`} onClick={onClick}>
+    <span>{children ?? mark}</span><small>{label}</small>{detail && <small className="model-picker__group-usage">{detail}</small>}
   </button>;
+}
+
+function groupUsageText(route: { readonly backendId: string; readonly providerId: string }, usage: ModelPickerProps["providerGroupUsage"], t: Translator): string | undefined {
+  if (!usage || ![usage.group, usage.memberRoute].some(candidate => candidate?.backendId === route.backendId && candidate.providerId === route.providerId)) return undefined;
+  const running = t("modelPicker.groupRunning", { name: usage.nodeName });
+  if (!usage.quotaReadable) return `${running} · ${t("modelPicker.groupPrivateUsage")}`;
+  return typeof usage.usedPercent === "number" && Number.isFinite(usage.usedPercent) && usage.usedPercent >= 0
+    ? `${running} · ${t("modelPicker.groupUsage", { percent: usage.usedPercent })}` : running;
 }
 
 function PriceMark({ model, tier, t }: { readonly model: ModelView; readonly tier: 0 | 1 | 2 | 3; readonly t: Translator }): JSX.Element | null {

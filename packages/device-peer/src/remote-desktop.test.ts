@@ -433,6 +433,18 @@ describe("remote desktop portable protocol", () => {
 });
 
 describe("remote desktop finite authority controller", () => {
+  it("resolves one current handoff window on the source and refuses operations outside it", async () => {
+    const fixture = controllerFixture(), window = { requestId: "request-1", windowId: 91, pid: 80, displayId: "display-1", app: "Login", width: 400, height: 300 };
+    fixture.dependencies.handoffWindow = vi.fn(async () => window); fixture.dependencies.handoffCurrent = vi.fn(async () => true); fixture.dependencies.handoffEnded = vi.fn();
+    const lease = await fixture.controller.request(AUTHORITY, { op: "start", displayId: "viewer-cannot-select-window", inputHandoffRequestId: window.requestId, control: true }) as RemoteDesktopLease;
+    expect(lease).toMatchObject({ inputHandoffRequestId: "request-1", window: { app: "Login" }, display: { id: "display-1", width: 400, height: 300 } });
+    expect(fixture.dependencies.startInput).toHaveBeenCalledWith("display-1", AUTHORITY, window);
+    await expect(fixture.controller.request(AUTHORITY, { op: "displayModes", lease: lease.lease })).rejects.toThrow("HANDOFF_UNAVAILABLE");
+    await expect(fixture.controller.request(AUTHORITY, { op: "offer", lease: lease.lease, sdp: "offer", attemptId: "one", cursorOverlay: true, settings: { fps: 30, quality: "auto", audio: true } })).rejects.toThrow("HANDOFF_UNAVAILABLE");
+    vi.mocked(fixture.dependencies.handoffCurrent).mockResolvedValue(false);
+    await expect(fixture.controller.request(AUTHORITY, { op: "frame", lease: lease.lease, cursorOverlay: true })).rejects.toThrow("LEASE_EXPIRED");
+    expect(fixture.dependencies.frame).not.toHaveBeenCalled(); expect(fixture.dependencies.handoffEnded).toHaveBeenCalledOnce();
+  });
   it("Linux system audio failure preserves the exact view lease for a muted offer", async () => {
     const fixture = controllerFixture();
     vi.mocked(fixture.dependencies.capabilities).mockResolvedValue({ ...CAPABILITIES, platform: "linux",

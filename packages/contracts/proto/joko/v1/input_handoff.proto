@@ -1,0 +1,205 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/operation.proto";
+import "joko/v1/device_peer.proto";
+
+enum InputHandoffStatePhase {
+  INPUT_HANDOFF_STATE_PHASE_UNSPECIFIED = 0;
+  INPUT_HANDOFF_STATE_PHASE_READING = 1;
+  INPUT_HANDOFF_STATE_PHASE_READY = 2;
+  INPUT_HANDOFF_STATE_PHASE_WORKING = 3;
+  INPUT_HANDOFF_STATE_PHASE_FINISHING = 4;
+  INPUT_HANDOFF_STATE_PHASE_SUCCEEDED = 5;
+  INPUT_HANDOFF_STATE_PHASE_CANCELLED = 6;
+  INPUT_HANDOFF_STATE_PHASE_FAILED = 7;
+  INPUT_HANDOFF_STATE_PHASE_EXPIRED = 8;
+}
+
+enum InputHandoffDecisionKind {
+  INPUT_HANDOFF_DECISION_KIND_UNSPECIFIED = 0;
+  INPUT_HANDOFF_DECISION_KIND_DONE = 1;
+  INPUT_HANDOFF_DECISION_KIND_CANCEL = 2;
+  INPUT_HANDOFF_DECISION_KIND_STAY = 3;
+  INPUT_HANDOFF_DECISION_KIND_REFRESH = 4;
+  INPUT_HANDOFF_DECISION_KIND_CLAIM = 5;
+  INPUT_HANDOFF_DECISION_KIND_PICTURE = 6;
+}
+
+message InputHandoffSourceState {
+  string app = 1;
+  optional string window = 2;
+  optional string origin = 3;
+  optional string warning = 4;
+}
+message InputHandoffHolderState {
+  bool local = 1;
+  optional string device_id = 2;
+  optional string name = 3;
+  optional string platform = 4;
+}
+message InputHandoffOptionState { string id = 1; string label = 2; }
+message InputHandoffTextState {
+  string label = 1;
+  string content_type = 2;
+  optional string placeholder = 3;
+  bool multiline = 4;
+  bool filled = 5;
+  repeated InputHandoffOptionState suggestions = 6;
+}
+message InputHandoffControlState {
+  string id = 1;
+  oneof control { InputHandoffTextState text = 2; string error_note = 3; }
+}
+message InputHandoffDeviceCodeState { string code = 1; string url = 2; string origin = 3; }
+
+// Owner-only transient structure. No field values, pixels, QR contents or
+// native element bindings may be added to events, history or plain decisions.
+message InputHandoffState {
+  string request_id = 1;
+  uint64 revision = 2;
+  InputHandoffStatePhase phase = 3;
+  string purpose = 4;
+  optional string note = 5;
+  InputHandoffHolderState holder = 6;
+  optional string requester = 7;
+  optional string command = 8;
+  InputHandoffSourceState source = 9;
+  uint32 step_number = 10;
+  repeated InputHandoffControlState controls = 11;
+  optional uint64 finishing_until_ms = 12;
+  optional string failure = 13;
+  bool agent_controlled = 14;
+  bool remote_input = 15;
+  bool terminal = 16;
+  bool picture = 17;
+  bool live_view = 18;
+  InputHandoffDeviceCodeState device_code = 19;
+  optional string qr = 20;
+}
+message ListInputHandoffsRequest { string session_id = 1; }
+message ListInputHandoffsResponse { repeated InputHandoffState states = 1; }
+message DecideInputHandoffRequest { string request_id = 1; uint64 expected_revision = 2; InputHandoffDecisionKind decision = 3; }
+message DecideInputHandoffResponse { bool accepted = 1; }
+message BeginInputHandoffSubmissionRequest {
+  string request_id = 1;
+  uint64 expected_revision = 2;
+  // Digest of the exact bounded presentation displayed by this owner client.
+  string presentation_sha256 = 3;
+}
+message BeginInputHandoffSubmissionResponse { CredentialUploadTicket ticket = 1; }
+message SubmitInputHandoffRequest { string request_id = 1; uint64 expected_revision = 2; string credential_upload_ticket_id = 3; }
+message SubmitInputHandoffResponse { bool accepted = 1; }
+message ReadInputHandoffPictureRequest { string request_id = 1; uint64 expected_revision = 2; string presentation_sha256 = 3; }
+// A dedicated, current-owner read; never an Artifact or ordinary state/event.
+message ReadInputHandoffPictureResponse { bytes jpeg = 1; uint32 width = 2; uint32 height = 3; optional string qr_text = 4; optional string qr_url = 5; }
+message OpenInputHandoffLiveViewRequest { string request_id = 1; uint64 expected_revision = 2; string presentation_sha256 = 3; }
+// The source resolves the committed native Main, then its real DevicePeer
+// relation. A controller cannot supply a target or a native window identifier.
+message OpenInputHandoffLiveViewResponse { DevicePeerRouteIdentity peer = 1; string request_id = 2; }
+
+service InputHandoffService {
+  rpc ListInputHandoffTasks(ListInputHandoffTasksRequest) returns (ListInputHandoffTasksResponse);
+  rpc ListInputHandoffs(ListInputHandoffsRequest) returns (ListInputHandoffsResponse);
+  rpc DecideInputHandoff(DecideInputHandoffRequest) returns (DecideInputHandoffResponse);
+  rpc BeginInputHandoffSubmission(BeginInputHandoffSubmissionRequest) returns (BeginInputHandoffSubmissionResponse);
+  rpc SubmitInputHandoff(SubmitInputHandoffRequest) returns (SubmitInputHandoffResponse);
+  rpc ReadInputHandoffPicture(ReadInputHandoffPictureRequest) returns (ReadInputHandoffPictureResponse);
+  rpc OpenInputHandoffLiveView(OpenInputHandoffLiveViewRequest) returns (OpenInputHandoffLiveViewResponse);
+}
+
+message ListInputHandoffTasksRequest {}
+// Dedicated owner attention, without field labels, purpose, note or picture.
+message InputHandoffTaskSummary {
+  string session_id = 1;
+  string request_id = 2;
+  uint64 generation = 3;
+  uint32 step_number = 4;
+}
+message ListInputHandoffTasksResponse { repeated InputHandoffTaskSummary tasks = 1; }
+
+// Main-only, loopback-only committed Desktop proof plus ordinary owner bearer.
+// This is a closed native mailbox, never a generic process or renderer API.
+enum NativeInputHandoffMethod {
+  NATIVE_INPUT_HANDOFF_METHOD_UNSPECIFIED = 0;
+  NATIVE_INPUT_HANDOFF_METHOD_PERMISSION = 1;
+  NATIVE_INPUT_HANDOFF_METHOD_REQUEST_PERMISSION = 2;
+  NATIVE_INPUT_HANDOFF_METHOD_WINDOWS = 3;
+  NATIVE_INPUT_HANDOFF_METHOD_SNAPSHOT = 4;
+  NATIVE_INPUT_HANDOFF_METHOD_ACT = 5;
+  NATIVE_INPUT_HANDOFF_METHOD_COMMAND_LINE = 6;
+  NATIVE_INPUT_HANDOFF_METHOD_CAPTURE = 7;
+  NATIVE_INPUT_HANDOFF_METHOD_FOCUSED_FIELD = 8;
+  NATIVE_INPUT_HANDOFF_METHOD_POINTER = 9;
+  NATIVE_INPUT_HANDOFF_METHOD_QR = 10;
+  NATIVE_INPUT_HANDOFF_METHOD_RAISE = 11;
+}
+message RegisterNativeInputHandoffHostRequest { string host_instance_id = 1; string platform = 2; uint32 process_id = 3; }
+message RegisterNativeInputHandoffHostResponse { uint64 host_generation = 1; }
+message PollNativeInputHandoffCommandRequest { string host_instance_id = 1; uint64 host_generation = 2; }
+message NativeInputHandoffCommand { string command_id = 1; NativeInputHandoffMethod method = 2; bytes payload = 3; }
+message PollNativeInputHandoffCommandResponse { NativeInputHandoffCommand command = 1; }
+message AdmitNativeInputHandoffCommandRequest { string host_instance_id = 1; uint64 host_generation = 2; string command_id = 3; }
+message AdmitNativeInputHandoffCommandResponse { bool current = 1; }
+message CompleteNativeInputHandoffCommandRequest { string host_instance_id = 1; uint64 host_generation = 2; string command_id = 3; bool success = 4; bytes payload = 5; }
+message CompleteNativeInputHandoffCommandResponse { bool accepted = 1; }
+message NativeInputHandoffWindowScope {
+  string host_instance_id = 1;
+  uint64 host_generation = 2;
+  string request_id = 3;
+  // Derived by Main from the verified DevicePeer command envelope.
+  string controller_device_id = 4;
+  uint32 window_id = 5;
+  uint32 process_id = 6;
+}
+message NativeInputHandoffWindow {
+  string request_id = 1;
+  uint32 window_id = 2;
+  uint32 process_id = 3;
+  string app = 4;
+  optional string title = 5;
+  repeated double frame = 6;
+}
+message ResolveNativeInputHandoffWindowResponse { NativeInputHandoffWindow window = 1; }
+message ResolveNativeInputHandoffWindowRequest {
+  string host_instance_id = 1; uint64 host_generation = 2; string request_id = 3;
+  string controller_device_id = 4; uint32 window_id = 5; uint32 process_id = 6;
+}
+message CheckNativeInputHandoffWindowRequest {
+  string host_instance_id = 1; uint64 host_generation = 2; string request_id = 3;
+  string controller_device_id = 4; uint32 window_id = 5; uint32 process_id = 6;
+}
+message EndNativeInputHandoffWindowRequest {
+  string host_instance_id = 1; uint64 host_generation = 2; string request_id = 3;
+  string controller_device_id = 4; uint32 window_id = 5; uint32 process_id = 6;
+}
+message CheckNativeInputHandoffWindowResponse { bool current = 1; }
+message EndNativeInputHandoffWindowResponse {}
+message BeginNativeInputHandoffInputRequest {
+  NativeInputHandoffWindowScope window = 1;
+  string input_owner_id = 2;
+  // Only held-key/button/release metadata. Text and pointer coordinates never
+  // cross this ownership channel.
+  bytes gesture_state = 3;
+}
+message BeginNativeInputHandoffInputResponse { string input_batch_id = 1; }
+message FinishNativeInputHandoffInputRequest {
+  NativeInputHandoffWindowScope window = 1;
+  string input_owner_id = 2;
+  string input_batch_id = 3;
+  // Main sends this only after actual native releases/exit, never on enqueue.
+  bool closed = 4;
+}
+message FinishNativeInputHandoffInputResponse {}
+service DesktopInputHandoffHostService {
+  rpc RegisterNativeInputHandoffHost(RegisterNativeInputHandoffHostRequest) returns (RegisterNativeInputHandoffHostResponse);
+  rpc PollNativeInputHandoffCommand(PollNativeInputHandoffCommandRequest) returns (PollNativeInputHandoffCommandResponse);
+  rpc AdmitNativeInputHandoffCommand(AdmitNativeInputHandoffCommandRequest) returns (AdmitNativeInputHandoffCommandResponse);
+  rpc CompleteNativeInputHandoffCommand(CompleteNativeInputHandoffCommandRequest) returns (CompleteNativeInputHandoffCommandResponse);
+  rpc ResolveNativeInputHandoffWindow(ResolveNativeInputHandoffWindowRequest) returns (ResolveNativeInputHandoffWindowResponse);
+  rpc CheckNativeInputHandoffWindow(CheckNativeInputHandoffWindowRequest) returns (CheckNativeInputHandoffWindowResponse);
+  rpc EndNativeInputHandoffWindow(EndNativeInputHandoffWindowRequest) returns (EndNativeInputHandoffWindowResponse);
+  rpc BeginNativeInputHandoffInput(BeginNativeInputHandoffInputRequest) returns (BeginNativeInputHandoffInputResponse);
+  rpc FinishNativeInputHandoffInput(FinishNativeInputHandoffInputRequest) returns (FinishNativeInputHandoffInputResponse);
+}

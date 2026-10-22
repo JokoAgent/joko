@@ -73,7 +73,7 @@ export function mobilePartnerCreationDraft(snapshot: MobilePartnerCreationSnapsh
   return { displayName: "", description: template.description, avatar, identitySource: template.identitySource, templateId: template.templateId,
     usesDirectoryDefaults: inherited,
     capabilities: inherited ? defaults! : { modelChain: [{ backendId: model.backendId, providerId: model.providerId, modelId: model.modelId,
-      fastMode: false, ...(effort === undefined ? {} : { effort }) }], permissionMode: backend.permissionModes[0]!, planMode: false } };
+      fastMode: false, ...(effort === undefined ? {} : { effort }) }], permissionMode: backend.permissionModes[0]!, planMode: false, inputHandoff: true } };
 }
 
 export function mobilePartnerCreationFields(snapshot: MobilePartnerCreationSnapshot, draft: MobilePartnerCreationDraft): MobilePartnerDraftFields | undefined {

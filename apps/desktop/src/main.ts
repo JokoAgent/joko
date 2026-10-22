@@ -416,6 +416,7 @@ import {
 } from "./desktop-open-with-document.js";
 import { NativeArtifactSourceRevealer } from "./native-artifact-source-revealer.js";
 import { DesktopPersonalDevelopmentHost } from "./personal-development-native-host.js";
+import { DesktopInputHandoffHost } from "./input-handoff-native-host.js";
 import { DesktopPersonalDevelopmentVersions } from "./personal-development-native-versions.js";
 import { personalVersionProfileOverride } from "./personal-development-version-bootstrap.js";
 import { resolveManagedArtifactSource } from "./managed-artifact-source.js";
@@ -886,6 +887,7 @@ let desktopUpdateNativeInstallQuitHandoffPending = false;
 let desktopCompleteExitQuitHandoffPending = false;
 let desktopPersonalVersionQuitHandoffPending = false;
 let desktopPersonalDevelopmentHost: DesktopPersonalDevelopmentHost | undefined;
+let desktopInputHandoffHost: DesktopInputHandoffHost | undefined;
 let desktopCompleteExit: Promise<void> | undefined;
 let desktopUpdateAutoRelaunchPolicy: DesktopUpdateAutoRelaunchPolicy | undefined;
 let desktopUpdateAutoRelaunchPolicyInitialization: Promise<void> | undefined;
@@ -987,6 +989,7 @@ if (!app.requestSingleInstanceLock()) {
   desktopOpenIntentIngress.activateSingleInstance(process.argv);
   app.on("before-quit", (event) => {
     desktopPersonalDevelopmentHost?.close();
+    desktopInputHandoffHost?.close();
     nativeFileClipboard?.cancelPending();
     nativeFileOpener?.cancelPending();
     windowsOpenWithApps?.cancelPending();
@@ -7442,6 +7445,7 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
       remoteDesktop = createDesktopRemoteDesktopMainHost({
         connectionsAllowed: () => !desktopRemoteDesktopWindowsSetupBusy,
         sourceDirectory,
+        inputHandoff: desktopInputHandoffHost,
         settings,
         credentialsOwner: { profileId: connection.profileId, serverId: connection.serverId, deviceId: connection.deviceId },
         systemAudioMute: globalVoiceSystemAudio,
@@ -7506,6 +7510,11 @@ function reconcileDesktopDevicePeerAgentLifecycle(): void {
     && isDesktopDevicePeerAgentAuthorityCurrent(managedOrchestratorConnection)
     ? managedOrchestratorConnection
     : undefined;
+  if (desktopInputHandoffHost === undefined && connection !== undefined) {
+    desktopInputHandoffHost = new DesktopInputHandoffHost({ readAuthKey: readCredential,
+      readHostKey: readDesktopDevicePeerAgentRouteAuthorization, isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent });
+  }
+  desktopInputHandoffHost?.setConnection(connection);
   desktopDevicePeerAgentLifecycle?.setConnection(connection);
   if (desktopPersonalDevelopmentHost === undefined && connection !== undefined) {
     const versions = new DesktopPersonalDevelopmentVersions({ profileDirectory: app.getPath("userData"),

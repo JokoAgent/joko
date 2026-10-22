@@ -9,6 +9,7 @@ export interface ClaudeMcpTool {
   readonly description: string;
   readonly inputSchema: Readonly<Record<string, unknown>>;
   readonly outputSchema?: Readonly<Record<string, unknown>>;
+  readonly requiresNativeRoot?: true;
 }
 
 export interface ClaudeMcpCallResult {
@@ -44,6 +45,8 @@ export interface ClaudeMcpRuntimeLease {
     readonly signal: AbortSignal;
     readonly partnerLearningAuthority?: PartnerLearningToolAuthority;
     readonly modelCallId?: string;
+    /** Private closure created only after observing the original SDK root tool. */
+    readonly nativeRootCall?: { readonly arguments: Readonly<Record<string, unknown>>; readonly assertCurrent: () => void };
   }): Promise<ClaudeMcpCallResult>;
   release(): void;
 }

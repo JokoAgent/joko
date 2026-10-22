@@ -39,6 +39,7 @@ import { workspaceDocumentController, type WorkspaceLeaveChoice, type WorkspaceL
 import { registerWorkspaceDocumentLeaveGate, requestWorkspaceDocumentLeave } from "../workspace-document-lifecycle.js";
 import { nextActiveWorkspaceTab, workspaceOpenTabsStore } from "../workspace-open-tabs.js";
 import { workspaceSelectedFileStore } from "../workspace-selected-file.js";
+import { workspacePreviewConnectionFailure } from "../workspace-text-preview-cache.js";
 import { useAppShortcut } from "../use-app-shortcut.js";
 import type { Translator } from "./types.js";
 import { InteractionPromptSlot } from "./InteractionPortal.js";
@@ -128,11 +129,14 @@ interface RailDragState {
 }
 
 interface FilePreviewState {
+  readonly ownerKey?: string;
   readonly workspaceId?: string;
   readonly path?: string;
   readonly preview?: WorkspaceFilePreviewView;
   readonly loading: boolean;
   readonly error?: string;
+  readonly cached?: boolean;
+  readonly unavailable?: boolean;
 }
 
 /**
@@ -207,6 +211,11 @@ export function WorkspaceFilesRoute({
   }, []);
   const selectedPathResult = useMemo(() => safeWorkspacePath(route.file), [route.file]);
   const selectedPath = selectedPathResult.path;
+  const previewOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
+    controller.state.connectionGeneration, workspace.id, workspace.targetId, workspace.serverPath, workspace.remoteWorkspace]);
+  const selectedPreviewState = previewState.ownerKey === previewOwnerKey && previewState.workspaceId === workspace.id && previewState.path === selectedPath
+    ? previewState : undefined;
+  const selectedPreview = selectedPreviewState?.preview ?? (selectedPath === undefined ? undefined : controller.peekWorkspaceFile?.(workspace.id, selectedPath));
   const selectedPathRef = useRef(selectedPath);
   selectedPathRef.current = selectedPath;
   const canWrite = backend.capabilities.get("workspace.files.write")?.supported === true;
@@ -335,39 +344,38 @@ export function WorkspaceFilesRoute({
   useEffect(() => {
     let current = true;
     if (selectedPathResult.error !== undefined) {
-      setPreviewState({ workspaceId: workspace.id, path: route.file, loading: false, error: t("workspace.invalidPath") });
+      setPreviewState({ ownerKey: previewOwnerKey, workspaceId: workspace.id, path: route.file, loading: false, error: t("workspace.invalidPath") });
       return () => { current = false; };
     }
     if (selectedPath === undefined) {
-      setPreviewState({ workspaceId: workspace.id, loading: false });
+      setPreviewState({ ownerKey: previewOwnerKey, workspaceId: workspace.id, loading: false });
       return () => { current = false; };
     }
-    setPreviewState((previous) => ({
-      workspaceId: workspace.id,
-      path: selectedPath,
-      ...(previous.workspaceId === workspace.id && previous.path === selectedPath && previous.preview !== undefined ? { preview: previous.preview } : {}),
-      loading: true
-    }));
+    const cached = controllerRef.current.peekWorkspaceFile?.(workspace.id, selectedPath);
+    setPreviewState((previous) => previous.ownerKey === previewOwnerKey && previous.workspaceId === workspace.id && previous.path === selectedPath && previous.preview !== undefined
+      ? { ...previous, loading: true, error: undefined }
+      : { ownerKey: previewOwnerKey, workspaceId: workspace.id, path: selectedPath, preview: cached, cached: cached !== undefined, loading: true });
     void controllerRef.current.readWorkspaceFile(workspace.id, selectedPath).then((preview) => {
       if (!current) return;
       if (preview.path !== selectedPath) throw new Error("Joko service returned a different workspace file.");
-      setPreviewState({ workspaceId: workspace.id, path: selectedPath, preview, loading: false });
+      setPreviewState({ ownerKey: previewOwnerKey, workspaceId: workspace.id, path: selectedPath, preview, loading: false });
     }).catch((error: unknown) => {
       if (!current) return;
-      setPreviewState((previous) => previous.workspaceId === workspace.id
+      setPreviewState((previous) => previous.ownerKey === previewOwnerKey && previous.workspaceId === workspace.id
         && previous.path === selectedPath
         && previous.preview !== undefined
-        && workspaceDocumentController.shouldPreventUnload((identity) => (
+        && (workspacePreviewConnectionFailure(error) || workspaceDocumentController.shouldPreventUnload((identity) => (
           identity.workspaceId === workspace.id && identity.path === selectedPath
-        ))
+        )))
         // A watcher refresh failure must not unmount a dirty editor and lose
         // its in-memory draft. Keep the last fenced preview and retry on the
         // next workspace revision.
-        ? { workspaceId: workspace.id, path: selectedPath, preview: previous.preview, loading: false }
-        : { workspaceId: workspace.id, path: selectedPath, loading: false, error: messageOf(error, t("workspace.filePreviewUnavailable")) });
+        ? { ...previous, loading: false, unavailable: workspacePreviewConnectionFailure(error), cached: previous.cached
+            || !workspaceDocumentController.shouldPreventUnload(identity => identity.workspaceId === workspace.id && identity.path === selectedPath) }
+        : { ownerKey: previewOwnerKey, workspaceId: workspace.id, path: selectedPath, loading: false, error: messageOf(error, t("workspace.filePreviewUnavailable")) });
     });
     return () => { current = false; };
-  }, [previewRefreshSequence, route.file, selectedPath, selectedPathResult.error, t, workspace.id, workspace.revision]);
+  }, [previewOwnerKey, previewRefreshSequence, route.file, selectedPath, selectedPathResult.error, t, workspace.id, workspace.revision]);
 
   const navigateFile = useCallback((path: string | undefined, options?: { readonly search?: string; readonly line?: number }): void => {
     const canonical = path === undefined ? undefined : safeWorkspacePath(path).path;
@@ -891,6 +899,7 @@ export function WorkspaceFilesRoute({
             onOpenNavigation={openNavigation}
           />
           <div className="workspace-files-route__body">
+            {selectedPreviewState?.unavailable && <p className="muted" role="status">{t("workspace.cachedPreviewUnavailable")}</p>}
             {selectedPathResult.error === true
               ? <div className="workspace-file-body workspace-file-body__state is-error" role="alert">{t("workspace.invalidPath")}</div>
               : <WorkspaceFileBody
@@ -899,10 +908,10 @@ export function WorkspaceFilesRoute({
                   sessionId={session.id}
                   workspaceId={workspace.id}
                   path={selectedPath}
-                  preview={previewState.workspaceId === workspace.id && previewState.path === selectedPath ? previewState.preview : undefined}
-                  loading={previewState.workspaceId === workspace.id && previewState.path === selectedPath && previewState.loading}
-                  error={previewState.workspaceId === workspace.id && previewState.path === selectedPath ? previewState.error : undefined}
-                  canWrite={canWrite}
+                  preview={selectedPreview}
+                  loading={selectedPreviewState?.loading ?? selectedPath !== undefined}
+                  error={selectedPreviewState?.error}
+                  canWrite={canWrite && selectedPreviewState?.preview !== undefined && selectedPreviewState.cached !== true}
                   search={route.search}
                   line={route.line}
                   onSearchJumpConsumed={() => navigateFile(selectedPath)}

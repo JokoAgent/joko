@@ -44,6 +44,33 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
+  it("keeps input handoff on each local thread configuration across start and resume", async () => {
+    let revision = 1;
+    const taskShellEnv = vi.fn((ctx: AdapterContext) => ({ JOKO_INPUT_HANDOFF_ROUTE: `private-route-${ctx.sessionId}-${revision}`,
+      GIT_ASKPASS: "private-askpass", UNRELATED_HOST_SECRET: "never-forward" }));
+    const setup = await createSetup(7, { taskShellEnv });
+    const first = context(setup.target, [], { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), first);
+    const second = { ...first, sessionId: "second-session" };
+    await setup.adapter.createSession(sessionInput(setup.target), second);
+    const starts = setup.fake.transport!.requests.filter(request => request.method === "thread/start");
+    expect(starts[0]!.params).toMatchObject({ config: { "shell_environment_policy.set.JOKO_INPUT_HANDOFF_ROUTE": `private-route-${first.sessionId}-1`, "shell_environment_policy.set.GIT_ASKPASS": "private-askpass" } });
+    expect(starts[1]!.params).toMatchObject({ config: { "shell_environment_policy.set.JOKO_INPUT_HANDOFF_ROUTE": "private-route-second-session-1" } });
+    expect(JSON.stringify(starts)).not.toContain("never-forward");
+    await setup.adapter.closeSession(binding, { ...first, binding }); revision = 2;
+    await setup.adapter.resumeSession(binding, { ...first, binding });
+    expect(setup.fake.transport!.requests.findLast(request => request.method === "thread/resume")!.params)
+      .toMatchObject({ config: { "shell_environment_policy.set.JOKO_INPUT_HANDOFF_ROUTE": `private-route-${first.sessionId}-2` } });
+  });
+  it("does not request local input handoff for a remote thread", async () => {
+    const taskShellEnv = vi.fn(() => ({ GIT_ASKPASS: "local-secret-route" }));
+    const setup = await createRemoteSetup({ taskShellEnv });
+    setup.remoteFake.seedThread("/srv/joko-project");
+    const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+    await setup.adapter.createSession({ ...sessionInput(setup.target), nativeStart: { kind: "attach", nativeReference: candidate.nativeReference } }, context(setup.target, [], { backendInstanceGeneration: 7 }));
+    expect(taskShellEnv).not.toHaveBeenCalled();
+    expect(JSON.stringify(setup.remoteFake.transport!.requests)).not.toContain("local-secret-route");
+  });
   it.each([false, true])("persists a native dispatch fence at the write queue and rejects changed history before dispatch (changed=%s)", async changed => {
     const setup = await createSetup(), events: EventPayload[] = [];
     const initial = context(setup.target, events, { backendInstanceGeneration: 7 });
@@ -2535,9 +2562,19 @@ describe("CodexBackendAdapter", () => {
     }));
     const call = opened[0]!.beginToolCall(threadId, { requestId: "local-tool", serverId: "tools", toolName: "read" });
     expect(() => call.assertCurrent()).not.toThrow();
+    expect(call.assertNativeRoot).toBeTypeOf("function"); expect(() => call.assertNativeRoot!()).not.toThrow();
+    const childThreadId = "local-owned-tool-child";
+    await setup.fake.transport!.emitNotification("thread/started", { thread: { id: childThreadId, parentThreadId: threadId, agentRole: "worker" } });
+    await setup.fake.transport!.emitNotification("turn/started", { threadId: childThreadId, turn: { id: "local-child-turn", status: "inProgress", items: [], error: null } });
+    await setup.fake.transport!.emitNotification("item/started", { threadId, turnId: "turn-1", item: { type: "collabAgentToolCall", id: "local-spawn", tool: "spawnAgent",
+      status: "inProgress", senderThreadId: threadId, receiverThreadIds: [childThreadId], agentsStates: { [childThreadId]: { status: "running", message: null } } } });
+    const child = opened[0]!.beginToolCall(childThreadId, { requestId: "local-child-tool", serverId: "tools", toolName: "read" });
+    expect(child.assertNativeRoot).toBeUndefined(); child.release();
+    await setup.fake.transport!.emitNotification("turn/completed", { threadId: childThreadId, turn: { id: "local-child-turn", status: "completed", items: [], error: null } });
     expect(() => opened[0]!.beginToolCall("foreign-thread", { requestId: "foreign-tool", serverId: "tools", toolName: "read" })).toThrow();
     await setup.fake.completeTurn(threadId);
     expect(call.signal.aborted).toBe(true);
+    expect(() => call.assertNativeRoot!()).toThrow();
     call.release();
 
     await setup.adapter.setPermissionMode("auto", bound);
@@ -2878,6 +2915,7 @@ describe("CodexBackendAdapter", () => {
     }));
     const call = opened[0]!.beginToolCall(threadId, { requestId: "remote-tool", serverId: "tools", toolName: "read" });
     expect(() => call.assertCurrent()).not.toThrow();
+    expect(call.assertNativeRoot).toBeUndefined();
     expect(() => opened[0]!.beginToolCall("unowned-native-thread", { requestId: "unowned-tool", serverId: "tools", toolName: "read" })).toThrow();
 
     bridgeGeneration = 2;
@@ -5850,6 +5888,7 @@ async function createRemoteSkillInputSetup() {
 }
 
 async function createRemoteSetup(options: {
+  readonly taskShellEnv?: CodexAdapterOptions["taskShellEnv"];
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly resolveNativeMemoryEnabled?: CodexAdapterOptions["resolveNativeMemoryEnabled"];
   readonly targetWorkspaceRoot?: string;
@@ -5888,6 +5927,7 @@ async function createRemoteSetup(options: {
   const adapter = new CodexBackendAdapter({
     id: "codex-test",
     instanceGeneration: 7,
+    ...(options.taskShellEnv === undefined ? {} : { taskShellEnv: options.taskShellEnv }),
     host: localHost,
     remoteRuntimes: {
       resolve: resolveRemote,

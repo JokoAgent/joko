@@ -61,6 +61,33 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("keeps askpass in the original local task Query and refreshes its private route on resume", async () => {
+    const sdk = new FakeSdkRuntime(); let route = "route-first";
+    const taskShellEnv = vi.fn((context: AdapterContext) => ({ JOKO_INPUT_HANDOFF_ROUTE: `${context.sessionId}:${route}`, SUDO_ASKPASS: "/private/askpass" }));
+    const adapter = adapterFor(sdk, { taskShellEnv });
+    const first = { ...contextFor().context, sessionId: "askpass-first" }, second = { ...contextFor().context, sessionId: "askpass-second" };
+    try {
+      const binding = await adapter.createSession(createInput(), first);
+      await adapter.createSession(createInput(), second);
+      expect(sdk.queries[0]!.params.options.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-first:route-first", SUDO_ASKPASS: "/private/askpass" });
+      expect(sdk.queries[1]!.params.options.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-second:route-first" });
+      await adapter.closeSession(binding, { ...first, binding }); route = "route-resumed";
+      await adapter.resumeSession(binding, { ...first, binding });
+      expect(sdk.queries.at(-1)!.params.options.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-first:route-resumed" });
+      expect(sdk.queries[1]!.params.options.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-second:route-first" });
+    } finally { await adapter.dispose(); }
+  });
+
+  test("does not grant the owner askpass route to a native read-only review", async () => {
+    const sdk = new FakeSdkRuntime(), taskShellEnv = vi.fn(() => ({ JOKO_INPUT_HANDOFF_ROUTE: "private-owner-route" }));
+    const adapter = adapterFor(sdk, { taskShellEnv });
+    try {
+      await adapter.createSession(createInput({ runtimePolicy: "review_read_only" }), contextFor(undefined, { runtimePolicy: "review_read_only" }).context);
+      expect(taskShellEnv).not.toHaveBeenCalled();
+      expect(sdk.queries[0]!.params.options.env).not.toHaveProperty("JOKO_INPUT_HANDOFF_ROUTE");
+    } finally { await adapter.dispose(); }
+  });
+
   test("waits for the durable Source confirmation before the SDK can consume the exact native input", async () => {
     const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk);
     const binding = await adapter.createSession(createInput(), contextFor().context);
@@ -493,6 +520,7 @@ describe("ClaudeCodeAdapter", () => {
     let modelCall: Parameters<NonNullable<ClaudeMcpRuntimeLease["models"]>[number]["connect"]>[1] | undefined;
     const tool = {
       serverId: "approved-tools", name: "echo", description: "Echo an approved value",
+      requiresNativeRoot: true,
       inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
       outputSchema: { type: "object", properties: { echoed: { type: "string" } }, required: ["echoed"] }
     } as const;
@@ -540,6 +568,8 @@ describe("ClaudeCodeAdapter", () => {
     await expect(earlyCall).resolves.toMatchObject({ content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" } });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.arguments).toEqual({ value: "hello" });
+    expect(calls[0]!.nativeRootCall?.arguments).toEqual({ value: "hello" });
+    calls[0]!.nativeRootCall!.assertCurrent();
     expect(calls[0]!.modelCallId).toBe("original-model-request");
     expect(calls[0]!.partnerLearningAuthority).toMatchObject({ source: learningSource, requestId: calls[0]!.requestId, serverId: tool.serverId, toolName: tool.name });
     expect(nativeReply).toHaveBeenCalledWith(assistantUuid);

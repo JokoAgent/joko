@@ -7,6 +7,7 @@ import type { AdapterContext, BackendAdapter, BackendDescriptor, BlobRef, Create
   NativeSessionNavigation, NativeSessionNavigationResult, NativeSessionState, PromptInput, ProviderModel, RuntimeCommand, RuntimeResource,
   RuntimeToolCatalog, SessionTree, SubagentControlInput, TargetDescriptor, UserShellInput, UserShellResult } from "@joko/core";
 import type { HostedNativeCommand, HostedNativeOpen } from "./protocol.js";
+import { JokoError, toPublicError } from "@joko/core";
 
 const identity = z.string().min(1).max(512).refine(value => !/[\0\r\n]/u.test(value));
 const sourceSchema = z.strictObject({ controllerDeviceId: identity, targetDeviceId: identity, backendId: identity });
@@ -43,6 +44,9 @@ export interface HostedAgentSourceAdapterOptions {
   readonly readPolicy: (context: AdapterContext) => Pick<NativeSessionState, "permissionMode" | "fastMode" | "effort">;
   readonly assertContext: (context: AdapterContext) => void;
   readonly onRuntimeUnavailable?: (context: AdapterContext) => void;
+  readonly takeGroupSwitch?: (context: AdapterContext) => string | undefined;
+  readonly takeNewGroupRound?: (context: AdapterContext) => boolean;
+  readonly isGroupMember?: (context: AdapterContext) => boolean;
 }
 interface ActiveSourceSession {
   readonly binding: NativeSessionBinding;
@@ -151,7 +155,9 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   async #send(input: PromptInput, context: AdapterContext, fence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>): Promise<void> {
     if (input.files.length || input.mentions.length) throw new Error("Hosted native file and resource input is not connected.");
     if (!context.operationId) throw new Error("Hosted native dispatch requires its original operation identity.");
-    await this.#call(this.#active(context), { kind: "send", input, durableFence: fence !== undefined }, context, fence);
+    const newGroupRound = this.#options.takeNewGroupRound?.(context) === true;
+    await this.#call(this.#active(context), { kind: "send", input, durableFence: fence !== undefined,
+      ...(newGroupRound ? { newGroupRound: true } : {}) }, context, fence);
   }
   #binding(context: AdapterContext, nativeSessionId: string): NativeSessionBinding {
     const value: SourceBinding = { format: 1, backendId: this.id, source: this.#options.source, sessionId: context.sessionId, targetId: context.target.id, nativeSessionId };
@@ -170,7 +176,10 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     creation?: Pick<CreateNativeSessionInput, "permissionMode" | "fastMode" | "effort" | "name">): Promise<ActiveSourceSession> {
     this.#check(context); this.#parse(binding, context);
     const current = this.#sessions.get(context.sessionId);
-    if (current && !current.failure) { this.#active(context, binding); return Promise.resolve(current); }
+    if (current && !current.failure && !(start === "resume" && current.binding.opaqueRef === binding.opaqueRef
+      && current.binding.nativeSessionId === binding.nativeSessionId && context.generation === current.binding.generation + 1)) {
+      this.#active(context, binding); return Promise.resolve(current);
+    }
     const pending = this.#opening.get(context.sessionId); if (pending) return pending.then(active => {
       if (active.binding.opaqueRef !== binding.opaqueRef || active.binding.generation !== context.generation) throw new Error("Hosted native startup ownership conflicts."); return active;
     });
@@ -183,16 +192,21 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   }
   async #open(binding: NativeSessionBinding, context: AdapterContext, start: "create" | "resume",
     creation?: Pick<CreateNativeSessionInput, "permissionMode" | "fastMode" | "effort" | "name">): Promise<ActiveSourceSession> {
-    const saved = this.#parse(binding, context), runId = randomUUID(), connection = await this.#options.capture(runId, context);
+    const saved = this.#parse(binding, context), runId = randomUUID();
+    let connection: HostedAgentSourceConnection;
+    try { connection = await this.#options.capture(runId, context); }
+    catch (error) { throw closedStartup(error); }
     this.#unclosed.set(runId, connection);
     let active: ActiveSourceSession | undefined;
     try {
       this.#check(context); connection.assertCurrent(); await this.validateTarget(context.target);
       const selection = context.modelSelection; if (!selection) throw new Error("Hosted native restoration requires its retained model source.");
       const policy = this.#options.readPolicy(context), workspace = await this.#options.workspace(context);
+      const groupSwitch = this.#options.takeGroupSwitch?.(context);
+      const groupMember = this.#options.isGroupMember?.(context) === true;
       const opened = await connection.client.open({ runId, nativeSessionId: saved.nativeSessionId, start, sessionId: context.sessionId, targetId: context.target.id,
         generation: context.generation, backendId: this.#options.source.backendId, providerId: selection.providerId, modelId: selection.modelId,
-        ...(creation?.name === undefined ? {} : { name: creation.name }),
+        ...(creation?.name === undefined ? {} : { name: creation.name }), ...(groupSwitch === undefined ? {} : { groupSwitch }), ...(groupMember ? { groupMember: true } : {}),
         permissionMode: creation?.permissionMode ?? policy.permissionMode, fastMode: creation?.fastMode ?? policy.fastMode,
         ...((creation?.effort ?? policy.effort) === undefined ? {} : { effort: creation?.effort ?? policy.effort }), workspace }, context.signal);
       this.#check(context); connection.assertCurrent();
@@ -211,7 +225,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     } catch (error) {
       // Cleanup remains owned even when authority changes after native open.
       try { await connection.close(); this.#unclosed.delete(runId); } catch (cleanup) { throw new AggregateError([error, cleanup], "Hosted native startup cleanup could not be confirmed."); }
-      if (active) await this.#close(active); throw error;
+      if (active) await this.#close(active); throw closedStartup(error);
     }
   }
   async #state(active: ActiveSourceSession, context: AdapterContext): Promise<NativeSessionState> {
@@ -247,4 +261,9 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     if (context.hostedExecution || context.target.backendId !== this.id || !Number.isSafeInteger(context.generation) || context.generation < 0) throw new Error("Hosted native source authority is invalid.");
   }
   #assertOpen(): void { if (this.#closed) throw new Error("Hosted native Adapter is closed."); }
+}
+function closedStartup(error: unknown): JokoError {
+  const failure = toPublicError(error, { code: "HOSTED_AGENT_START_FAILED", phase: "session_start", retryable: true, stateMayHaveChanged: false,
+    recovery: "The exact failed native startup was closed. Select an available authorized Source or retry." });
+  return new JokoError({ ...failure, stateMayHaveChanged: false }, { cause: error });
 }

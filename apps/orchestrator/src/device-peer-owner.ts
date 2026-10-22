@@ -4,7 +4,8 @@ import { clone, create, isMessage, fromBinary, toBinary } from "@bufbuild/protob
 import { DevicePeerCommandSchema, DevicePeerCloseRemoteDesktopCredentialsActionSchema,
   DevicePeerCapabilityKind, RemoteDesktopCredentialResultSchema,
   DevicePeerEffectKind as ContractDevicePeerEffectKind, type DevicePeerCommand,
-  CloseHostedAgentRequestSchema, CloseHostedAgentResponseSchema, HostedAgentPeerMethod, DevicePeerHostedAgentResultSchema } from "@joko/contracts";
+  CloseHostedAgentRequestSchema, CloseHostedAgentResponseSchema, HostedAgentPeerMethod, DevicePeerHostedAgentResultSchema,
+  HostedAgentGuestRelayScopeSchema, HostedAgentGuestRelayRequestSchema } from "@joko/contracts";
 import {
   DevicePeerRegistryError,
   isRemoteDesktopCredentialHandle,
@@ -308,16 +309,19 @@ export class DevicePeerOwner {
   /** Exact native-run cleanup reserved while the ordinary relation is current.
    * Revocation cannot revive reads, prompts or settings; it can still close the
    * already owned native process on the same captured target route. */
-  captureHostedAgentCleanup(authority: DevicePeerAuthority, runId: string): (signal?: AbortSignal) => Promise<void> {
+  captureHostedAgentCleanup(authority: DevicePeerAuthority, runId: string, guestRelay?: { readonly scope: import("@joko/contracts").HostedAgentGuestRelayScope; readonly shouldPurge?: () => boolean }): (signal?: AbortSignal) => Promise<void> {
     authority.assertCurrent(["native_agents"]);
     if (!runId || runId.length > 512 || /[\0\r\n]/u.test(runId)) throw new DevicePeerAuthorityError("invalid_identity", "The native run identity is invalid.");
     const route = this.#routes.getRoute(authority.identity.targetDeviceId);
     if (route === undefined || route.routeGeneration !== authority.identity.routeGeneration) throw routeUnavailable();
+    const guestScope = guestRelay === undefined ? undefined : clone(HostedAgentGuestRelayScopeSchema, guestRelay.scope);
     return async signal => {
       if (this.#routes.getRoute(route.targetDeviceId) !== route) throw routeUnavailable();
       const command = create(DevicePeerCommandSchema, { capability: DevicePeerCapabilityKind.NATIVE_AGENTS, effect: ContractDevicePeerEffectKind.SIDE_EFFECT,
-        action: { case: "invokeHostedAgent", value: { method: HostedAgentPeerMethod.CLOSE,
-          requestBytes: toBinary(CloseHostedAgentRequestSchema, create(CloseHostedAgentRequestSchema, { format: 1, runId })) } } });
+        action: { case: "invokeHostedAgent", value: { method: guestScope === undefined ? HostedAgentPeerMethod.CLOSE : HostedAgentPeerMethod.GUEST_RELAY_CLOSE,
+          requestBytes: guestScope === undefined ? toBinary(CloseHostedAgentRequestSchema, create(CloseHostedAgentRequestSchema, { format: 1, runId }))
+            : toBinary(HostedAgentGuestRelayRequestSchema, create(HostedAgentGuestRelayRequestSchema, { scope: guestScope,
+              requestBytes: toBinary(CloseHostedAgentRequestSchema, create(CloseHostedAgentRequestSchema, { format: 1, runId })), purge: guestRelay?.shouldPurge?.() === true })) } } });
       const claim = this.#routes.registerClaim({ requestId: randomUUID(), controllerDeviceId: authority.controllerDeviceId,
         targetDeviceId: route.targetDeviceId, routeGeneration: route.routeGeneration, capability: "native_agents", effectKind: "side_effect",
         action: "invokeHostedAgent", payload: injectControllerIdentity(command, authority.controllerDeviceId) });

@@ -61,6 +61,8 @@ import { resourceKindsForBackend } from "../resource-capabilities.js";
 import type { RunAction, Translator } from "./types.js";
 import { Button, ErrorBanner, IconButton, Modal, ModalBackButton, Pill, SegmentedControl, Spinner, StatusDot, Tip, cx, formatRelativeTime, CheckboxControl, SelectControl, SwitchControl } from "./ui.js";
 import { ProviderLoginDialog } from "./ProviderLoginDialog.js";
+import { ProviderSharingOwnerSettings } from "./ProviderSharingOwnerSettings.js";
+import { ProviderGroupOwnerSettings } from "./ProviderGroupOwnerSettings.js";
 import { ProviderMark } from "./ProviderMark.js";
 import { ProviderEditor } from "./ProviderEditor.js";
 import { ProviderFlowBackButton, ProviderFlowFooter, ProviderWizardProgress } from "./ProviderFlow.js";
@@ -350,7 +352,7 @@ export function SettingsPage({ controller, snapshot, activeTargetId, locale, t, 
             {section === "automation" && <SettingsPageSection id="automation"><AutomationSettings controller={controller} snapshot={snapshot} activeTargetId={activeTargetId} runAction={runAction} onSuccess={showSuccess} t={t} /></SettingsPageSection>}
             {section === "import" && <SettingsPageSection id="import"><TaskImportSettings controller={controller} snapshot={snapshot} onImportPortable={onImportPortableSession} runAction={runAction} onSuccess={showSuccess} t={t} /></SettingsPageSection>}
             {section === "contacts" && <SettingsPageSection id="contacts"><ContactsSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} locale={locale} t={t} /></SettingsPageSection>}
-            {section === "sharing" && <SettingsPageSection id="sharing"><TaskSharingSettings key={`${controller.state.activeProfile?.id}:${controller.state.connectionGeneration}`} controller={controller} t={t} /></SettingsPageSection>}
+            {section === "sharing" && <SettingsPageSection id="sharing"><ProviderSharingOwnerSettings key={`providers:${controller.state.activeProfile?.id}:${controller.state.connectionGeneration}`} controller={controller} /><TaskSharingSettings key={`${controller.state.activeProfile?.id}:${controller.state.connectionGeneration}`} controller={controller} t={t} /></SettingsPageSection>}
             {section === "messaging" && <SettingsPageSection id="messaging"><MessagingSettings key={controller.state.activeProfile?.id ?? "disconnected"} controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection>}
             {section === "about" && <><SettingsPageSection id="about"><AboutSettings controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection><SettingsPageSection id="backends"><SettingsSectionHeading title={t("settings.backends")} body={t("settings.backendsBody")} /><BackendSettings controller={controller} snapshot={snapshot} runAction={runAction} showHeading={false} t={t} /></SettingsPageSection><SettingsPageSection id="worktreeRecycle"><WorktreeRecycleSettings controller={controller} t={t} /></SettingsPageSection>{desktopCapabilityKey.split("\n").includes("development.personal") && <SettingsPageSection id="personalDevelopment"><PersonalDevelopmentSettings controller={controller} snapshot={snapshot} t={t} /></SettingsPageSection>}<SettingsPageSection id="diagnostics"><DiagnosticSettings controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection><SettingsPageSection id="runtime"><RuntimeProcessMonitor controller={controller} snapshot={snapshot} runAction={runAction} t={t} /></SettingsPageSection></>}
           </div>
@@ -3316,6 +3318,7 @@ function ConnectionSettings({ controller, snapshot, locale, t, runAction, showHe
     </section>
     <DeviceControlSettings controller={controller} snapshot={snapshot} locale={locale} runAction={runAction} t={t} />
     <HostedAgentSettings controller={controller} t={t} />
+    <ProviderGroupOwnerSettings controller={controller} t={t} />
     <h3 className="settings-subheading">{t("settings.savedClient")}</h3>
     <section className="settings-card settings-list">{controller.state.profiles.map((profile) => <article key={profile.id}><div><StatusDot state={activeProfile?.id === profile.id ? controller.state.connectionState : "muted"} label={activeProfile?.id === profile.id ? controller.state.connectionState : t("settings.saved")} /><span><strong>{profile.name}</strong><small>{profile.origin}{profile.lastConnectedAt === undefined ? "" : ` · ${formatRelativeTime(profile.lastConnectedAt, locale)}`}</small></span></div><div>{activeProfile?.id === profile.id && <Pill tone="success">{t("common.current")}</Pill>}{profile.managedLocal !== true && <IconButton label={`${t("common.remove")} ${profile.name}`} onClick={() => void controller.forgetProfile(profile.id)}><Trash2 aria-hidden="true" /></IconButton>}</div></article>)}{controller.state.profiles.length === 0 && <p className="muted">{t("settings.noProfiles")}</p>}</section>
     <h3 className="settings-subheading">{t("settings.orchestratorDevices")}</h3>

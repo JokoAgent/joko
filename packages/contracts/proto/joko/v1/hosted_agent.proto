@@ -4,6 +4,7 @@ package joko.v1;
 
 import "joko/v1/model.proto";
 import "joko/v1/capability.proto";
+import "joko/v1/provider_group.proto";
 
 // Private native execution between an original task node and a Provider node.
 // Authentication classifies owner/guest and supplies the source Device; neither
@@ -33,6 +34,37 @@ enum HostedAgentPeerMethod {
   HOSTED_AGENT_PEER_METHOD_READ_ARTIFACT = 7;
   HOSTED_AGENT_PEER_METHOD_CLOSE = 8;
   HOSTED_AGENT_PEER_METHOD_GET_CATALOG = 9;
+  HOSTED_AGENT_PEER_METHOD_GROUP_GET = 10;
+  HOSTED_AGENT_PEER_METHOD_GROUP_PICK = 11;
+  HOSTED_AGENT_PEER_METHOD_GROUP_COOL = 12;
+  HOSTED_AGENT_PEER_METHOD_GROUP_LEASES = 13;
+  HOSTED_AGENT_PEER_METHOD_GROUP_USAGE_REPORT = 14;
+  HOSTED_AGENT_PEER_METHOD_GROUP_USAGE = 15;
+  HOSTED_AGENT_PEER_METHOD_GROUP_SCHEDULING_STATE = 16;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CATALOG = 17;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_OPEN = 18;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CALL = 19;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_POLL = 20;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_REPLY = 21;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_READ_ARTIFACT = 22;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CLOSE = 23;
+}
+
+// Only the authenticated private Device route accepts this envelope. The group
+// service captures the already approved person's identity and native model
+// scope. Ordinary HostedAgentService opens cannot declare relay or trust.
+message HostedAgentGuestRelayScope {
+  string relay_id = 1;
+  string backend_id = 2;
+  string provider_id = 3;
+  repeated string model_ids = 4;
+}
+message HostedAgentGuestRelayRequest {
+  HostedAgentGuestRelayScope scope = 1;
+  bytes request_bytes = 2;
+  // A captured group grant may request final deletion after native closure.
+  // Valid only for GUEST_RELAY_CLOSE; never part of a public Source open.
+  bool purge = 3;
 }
 
 // A complete, credential-free view of actual native factories on this node.
@@ -43,6 +75,9 @@ message HostedAgentProviderCatalog {
   bool remote_invocation_enabled = 3;
   bool connected = 4;
   repeated ModelDescriptor models = 5;
+  string access_kind = 6;
+  string access_product = 7;
+  ProviderGroupSummary group = 8;
 }
 message HostedAgentBackendCatalog {
   string backend_id = 1;
@@ -50,6 +85,10 @@ message HostedAgentBackendCatalog {
   repeated HostedAgentProviderCatalog providers = 3;
   repeated Capability capabilities = 4;
   string version = 5;
+  string native_adapter_kind = 6;
+  // Stable identity of the actual native execution service, separate from the
+  // Device route that may delegate to it.
+  string node_id = 7;
 }
 message GetHostedAgentCatalogRequest { uint32 format = 1; }
 message GetHostedAgentCatalogResponse {

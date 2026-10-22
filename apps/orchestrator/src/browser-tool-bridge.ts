@@ -27,6 +27,7 @@ import {
 import type { ArtifactStore } from "./artifact-store.js";
 import { BUILTIN_BROWSER_RECIPES, BUILTIN_BROWSER_SITE_GUIDES } from "./browser-builtin-catalog.js";
 import { BROWSER_RECIPE_AUTHOR_RULES, BROWSER_WORKFLOW_RULES } from "./browser-rules.js";
+import { hasSecretPages, isSecretPage } from "./input-handoff/secretTaint.js";
 import type { BrowserTransferCoordinator } from "./browser-transfers.js";
 import type { BridgeToolCallContext, BridgeToolProvider, McpCallResult, McpToolDescriptor } from "./mcp-router.js";
 import type {
@@ -632,7 +633,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         const pageId = requiredString(input, "page_id", 512);
         this.#assertPageContext(pageId);
         const limit = optionalInteger(input, "limit", 1, MAXIMUM_DIAGNOSTIC_READ_LIMIT);
-        return this.#withLease(async (lease) => textResult({
+        return this.#withPageReadLease(pageId, async (lease) => textResult({
           messages: (await this.#browser.readConsoleMessages(
             pageId,
             lease,
@@ -644,7 +645,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         const pageId = requiredString(input, "page_id", 512);
         this.#assertPageContext(pageId);
         const limit = optionalInteger(input, "limit", 1, MAXIMUM_DIAGNOSTIC_READ_LIMIT);
-        return this.#withLease(async (lease) => textResult({
+        return this.#withPageReadLease(pageId, async (lease) => textResult({
           requests: (await this.#browser.readHttpRequestSummaries(
             pageId,
             lease,
@@ -899,7 +900,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         });
       case "console": {
         const pageId = this.#unifiedPageId(input);
-        return this.#withLease(async (lease) => browserResult(action, {
+        return this.#withPageReadLease(pageId, async (lease) => browserResult(action, {
           messages: (await this.#browser.readConsoleMessages(pageId, lease, {
             ...(input["limit"] === undefined ? {} : { limit: requiredInteger(input, "limit", 1, MAXIMUM_DIAGNOSTIC_READ_LIMIT) }),
             ...(input["filter"] === undefined ? {} : { filter: requiredString(input, "filter", 4_096, true) }),
@@ -950,7 +951,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         return this.#executeUnifiedAct(input, signal);
       case "requests": {
         const pageId = this.#unifiedPageId(input);
-        return this.#withLease(async (lease) => browserResult(action, {
+        return this.#withPageReadLease(pageId, async (lease) => browserResult(action, {
           requests: (await this.#browser.readHttpRequestSummaries(pageId, lease, {
             ...(input["limit"] === undefined ? {} : { limit: requiredInteger(input, "limit", 1, MAXIMUM_DIAGNOSTIC_READ_LIMIT) }),
             ...(input["filter"] === undefined ? {} : { filter: requiredString(input, "filter", 4_096, true) }),
@@ -960,7 +961,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       }
       case "responseBody": {
         const pageId = this.#unifiedPageId(input);
-        return this.#withLease(async (lease) => browserResult(action, await this.#browser.readResponseBody(
+        return this.#withPageReadLease(pageId, async (lease) => browserResult(action, await this.#browser.readResponseBody(
           pageId,
           lease,
           requiredString(input, "url", 4_096),
@@ -972,7 +973,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       case "extract": {
         const pageId = this.#unifiedPageId(input);
         const spec = requiredRecord(input, "extract") as unknown as BrowserExtractSpec;
-        return this.#withLease(async (lease) => browserResult(action, await this.#browser.extract(
+        return this.#withPageReadLease(pageId, async (lease) => browserResult(action, await this.#browser.extract(
           pageId,
           lease,
           spec,
@@ -1104,7 +1105,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           const started = Date.now();
           while (true) {
             signal?.throwIfAborted();
-            const ready = await this.#withLease((lease) => this.#browser.evaluatePage(
+            const ready = await this.#withPageReadLease(pageId, (lease) => this.#browser.evaluatePage(
               pageId, lease, requiredString(request, "fn", 64 * 1024), Math.min(2_000, timeout)
             ));
             if (ready === true) return browserResult("act", { kind, ready: true });
@@ -1127,7 +1128,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
         });
       }
       case "evaluate": {
-        const result = await this.#withLease((lease) => this.#browser.evaluatePage(
+        const result = await this.#withPageReadLease(pageId, (lease) => this.#browser.evaluatePage(
           pageId,
           lease,
           requiredString(request, "fn", 64 * 1024),
@@ -1382,7 +1383,7 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
           if (step.fn === undefined) throw new Error("Browser recipe evaluate step requires fn.");
           const pageId = this.#unifiedPageId(input);
           const source = interpolateRecipe(step.fn, vars);
-          const value = await this.#withLease((lease) => this.#browser.evaluateBundledRecipe(
+          const value = await this.#withPageReadLease(pageId, (lease) => this.#browser.evaluateBundledRecipe(
             pageId,
             lease,
             source,
@@ -1521,6 +1522,19 @@ export class BrowserToolBridgeProvider implements BridgeToolProvider {
       pageId,
       detail: "screenshot"
     });
+  }
+
+  async #withPageReadLease<T>(pageId: string, callback: (lease: BrowserLease) => Promise<T>): Promise<T> {
+    const assertReadable = async () => {
+      if (!hasSecretPages()) return;
+      const generation = this.#browser.generation;
+      this.#assertPageContext(pageId);
+      const page = (await this.#browser.listPages()).find(value => value.id === pageId);
+      this.#assertPageContext(pageId);
+      if (!page || this.#browser.generation !== generation) throw new Error("The Browser page changed before the read.");
+      if (isSecretPage(page.url)) throw new Error("The owner entered private text on this page. Script evaluation, network and console reads are paused until this tab leaves the page. Use snapshot or screenshot, or navigate on.");
+    };
+    return this.#withLease(async lease => { await assertReadable(); const result = await callback(lease); await assertReadable(); return result; });
   }
 
   async #withLease<T>(callback: (lease: BrowserLease) => Promise<T>): Promise<T> {

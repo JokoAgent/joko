@@ -591,6 +591,7 @@ export class NodeDevicePeerAgentExecutor {
           displayId: command.action.value.displayId,
           mode: command.action.value.mode,
           ...(command.action.value.control ? { control: true } : {}),
+          ...(command.action.value.inputHandoffRequestId === undefined ? {} : { inputHandoffRequestId: command.action.value.inputHandoffRequestId }),
           signal
         });
         validateRemoteDesktopLease(value);
@@ -2053,6 +2054,7 @@ function validateCommandInput(command: DevicePeerCommand): void {
       remoteDesktopControllerId(command.controllerDeviceId);
       remoteDesktopDisplayId(command.action.value.displayId);
       remoteDesktopStartMode(command.action.value.mode);
+      if (command.action.value.inputHandoffRequestId !== undefined && !/^[A-Za-z0-9_-]{1,128}$/u.test(command.action.value.inputHandoffRequestId)) throw agentError(DevicePeerFailureCode.INVALID_REQUEST, false);
       return;
     case "heartbeatRemoteDesktop":
     case "getRemoteDesktopFrame":

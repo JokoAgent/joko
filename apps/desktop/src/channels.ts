@@ -656,6 +656,8 @@ export interface DesktopNativeTaskStatusSession {
   readonly detail: string;
   readonly phase: DesktopNativeTaskStatusPhase;
   readonly interactionKind?: DesktopNativeTaskStatusInteractionKind;
+  /** A private owner handoff is pending; it carries no ordinary Interaction or decision. */
+  readonly inputHandoff?: true;
   readonly activityLines: readonly DesktopNativeTaskStatusActivityLine[];
   readonly startedAt?: number;
   readonly updatedAt: number;

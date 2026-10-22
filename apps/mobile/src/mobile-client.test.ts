@@ -1842,6 +1842,34 @@ describe("mobile current task delegated reads", () => {
 });
 
 const clients: MobileClient[] = [];
+describe("native input handoff captured task owner", () => {
+  it("exposes the native input service only for the current owner task and retires its scope on background or runtime replacement", async () => {
+    const network = fakeNetwork(), owner = clone(SnapshotSchema, snapshot), detail = clone(SnapshotSchema, snapshot);
+    network.readOwner = vi.fn(async () => ({ connection, device, snapshot: owner })); network.readSession = vi.fn(async () => detail);
+    let captured!: import("./mobile-input-handoff").MobileInputHandoffScope;
+    network.inputHandoffApi = vi.fn((_credential: PairedCredential, scope: import("./mobile-input-handoff").MobileInputHandoffScope): import("./mobile-input-handoff").MobileInputHandoffApi => { captured = scope; return { ownerKey: scope.ownerKey, sessionId: scope.sessionId, deviceId: scope.deviceId,
+      isCurrent: () => { try { scope.assertCurrent(scope.signal); return true; } catch { return false; } }, list: async () => [], decide: async () => true, submit: async () => true,
+      picture: async () => ({ mime: "image/jpeg", width: 1, height: 1, data: "/9j/" }) }; });
+    const app = client(network, memoryStorage(credential).storage); await app.start();
+    expect(app.taskInputHandoffApi()).toMatchObject({ sessionId: "session", deviceId: credential.deviceId });
+    captured.assertCurrent(new AbortController().signal);
+    owner.sessions[0]!.nativeBinding!.runtimeGeneration = 55n; detail.sessions[0]!.nativeBinding!.runtimeGeneration = 55n;
+    expect(() => captured.assertCurrent(new AbortController().signal)).toThrow("owner changed");
+    expect(app.taskInputHandoffApi()).toBeDefined(); const refreshed = captured;
+    app.setForeground(false); expect(app.taskInputHandoffApi()).toBeUndefined(); expect(() => refreshed.assertCurrent(new AbortController().signal)).toThrow();
+    expect(network.submit).not.toHaveBeenCalled();
+  });
+  it("filters Home attention by the actual owned native generation and drops late summaries after owner retirement", async () => {
+    const network = fakeNetwork(), tasks = [{ sessionId: "session", requestId: "current", generation: 8n, stepNumber: 1 },
+      { sessionId: "session", requestId: "old", generation: 7n, stepNumber: 1 }, { sessionId: "foreign", requestId: "foreign", generation: 8n, stepNumber: 1 }];
+    network.listInputHandoffTasks = vi.fn(async () => tasks);
+    const app = client(network, memoryStorage(credential).storage); await app.start(); const api = app.inputHandoffTasksApi()!;
+    expect(await api.list(new AbortController().signal)).toEqual([tasks[0]]);
+    let finish!: (value: typeof tasks) => void; vi.mocked(network.listInputHandoffTasks).mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const pending = api.list(new AbortController().signal), rejected = expect(pending).rejects.toThrow(); app.setForeground(false); finish(tasks); await rejected;
+    expect(app.inputHandoffTasksApi()).toBeUndefined(); expect(api.isCurrent()).toBe(false);
+  });
+});
 function client(
   network: MobileNetwork,
   storage: MobileStorage,
@@ -1918,6 +1946,7 @@ describe("shared task source on the native task client", () => {
   }
   it("keeps Home ownership and a colliding remote Session separate, including retained drafts and denied controls", async () => {
     const value = sharedFixture(), network = fakeNetwork(), instance = client(network, memoryStorage(credential).storage);
+    network.inputHandoffApi = vi.fn();
     await instance.start(); const ownerReads = vi.mocked(network.readOwner).mock.calls.length;
     vi.spyOn(instance, "taskSharingApi").mockReturnValue(value.api);
     await instance.openJoinedTask(value.joined);
@@ -1929,6 +1958,7 @@ describe("shared task source on the native task client", () => {
     expect(instance.taskDraftProfileId()).not.toBe(credential.profileId);
     expect(instance.taskRuntimeControls()?.canSetPermission).toBe(false);
     expect(instance.taskRuntimeControls()?.canSetPlanMode).toBe(false);
+    expect(instance.taskInputHandoffApi()).toBeUndefined(); expect(network.inputHandoffApi).not.toHaveBeenCalled();
     expect(instance.canOpenFiles()).toBe(false); expect(instance.taskSessionMentionControls()).toBeUndefined();
     expect(network.readOwner).toHaveBeenCalledTimes(ownerReads);
     await instance.select("session");

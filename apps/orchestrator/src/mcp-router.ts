@@ -116,6 +116,7 @@ export interface McpToolDescriptor {
   /** Host-only explicit mapping for supplier-owned structured audio fields. */
   readonly audioResultMapping?: McpAudioResultMapping;
   readonly requiresPermission: boolean;
+  readonly requiresNativeRoot?: true;
   readonly modelVisible?: boolean;
   readonly appResourceUri?: string;
   readonly appTitle?: string;
@@ -259,6 +260,8 @@ export interface BridgeToolPolicyDeclaration {
 /** Product scope authenticated from the durable Session binding, never from tool arguments. */
 export interface BridgeToolCallContext {
   readonly assertCurrent?: () => void;
+  /** Present only after consuming a service-owned proof of the SDK root tool. */
+  readonly assertNativeRoot?: () => void;
   readonly sessionId: string;
   readonly targetId: string;
   readonly generation: number;
@@ -318,6 +321,10 @@ interface BridgeGrant {
     readonly leases: Map<string, NativeAuthLease>;
   };
   expiresAt: number;
+}
+interface NativeRootProof {
+  readonly grant: BridgeGrant; readonly requestId: string; readonly serverId: string; readonly toolName: string;
+  readonly argumentsHash: string; readonly assertCurrent: () => void; readonly expiresAt: number;
 }
 interface ModelChannel extends McpModelChannel { readonly grant: BridgeGrant; readonly runtime: Runtime }
 interface AppModelInvocation {
@@ -554,6 +561,7 @@ export class McpRouter {
     readonly errorCode?: McpToolDiscoveryErrorCode;
   }>();
   readonly #grants = new Map<string, BridgeGrant>();
+  readonly #nativeRootProofs = new Map<string, NativeRootProof>();
   /**
    * A detached child owns its short native-auth lease independently of the
    * parent Pi runtime's ordinary MCP grant. Keeping only the bearer digest and
@@ -963,7 +971,8 @@ export class McpRouter {
           description: tool.description,
           inputSchema: tool.inputSchema,
           ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
-          requiresPermission: tool.requiresPermission
+          requiresPermission: tool.requiresPermission,
+          ...(tool.requiresNativeRoot ? { requiresNativeRoot: true as const } : {})
         });
         if (tool.audioResultMapping !== undefined) {
           // The catalog descriptor is observable through list/get. Re-parse it
@@ -1002,7 +1011,8 @@ export class McpRouter {
           description: tool.description,
           inputSchema: tool.inputSchema,
           ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
-          requiresPermission: tool.requiresPermission
+          requiresPermission: tool.requiresPermission,
+          ...(tool.requiresNativeRoot ? { requiresNativeRoot: true as const } : {})
         });
         if (tool.audioResultMapping !== undefined) {
           audioResultMappings.set(
@@ -1048,6 +1058,7 @@ export class McpRouter {
         endpoint: input.endpoint,
         token,
         tools,
+        captureRootCall: capture => this.#captureNativeRootProof(grant, capture),
         ...(nativeAuthReservationToken === undefined ? {} : { nativeAuthReservationToken }),
         ...(input.nativeAuthLease === undefined ? {} : {
           nativeAuthLease: {
@@ -1123,6 +1134,7 @@ export class McpRouter {
     readonly signal?: AbortSignal;
     readonly partnerLearningAuthority?: PartnerLearningToolAuthority;
     readonly partnerLearningProof?: string;
+    readonly nativeRootProof?: string;
     /** In-process only. This is never accepted from a native HTTP request. */
     readonly appCall?: AppModelInvocation;
   }): Promise<McpBridgeCallResult> {
@@ -1151,6 +1163,16 @@ export class McpRouter {
     if (!grant.tools.some((tool) => tool.serverId === input.serverId && tool.name === input.toolName)) {
       throw new Error("MCP tool is not present in this Pi runtime snapshot.");
     }
+    let assertNativeRoot: (() => void) | undefined;
+    const rootRequired = grant.tools.some(tool => tool.serverId === input.serverId && tool.name === input.toolName && tool.requiresNativeRoot);
+    if (rootRequired) {
+      const proof = typeof input.nativeRootProof === "string" ? this.#nativeRootProofs.get(input.nativeRootProof) : undefined;
+      if (!proof || proof.grant !== grant || proof.expiresAt <= this.#now() || proof.requestId !== input.requestId || proof.serverId !== input.serverId
+        || proof.toolName !== input.toolName || proof.argumentsHash !== operationBodyHash(input.arguments ?? {})) throw new Error("This tool requires its original native root call.");
+      this.#nativeRootProofs.delete(input.nativeRootProof!);
+      assertNativeRoot = () => { if (this.#grants.get(grant.digest.toString("hex")) !== grant || grant.expiresAt <= this.#now()) throw new Error("Native root tool authority retired."); proof.assertCurrent(); };
+      assertNativeRoot();
+    } else if (input.nativeRootProof !== undefined) throw new Error("Native root proof does not belong to this tool.");
     const audioResultMapping = grant.audioResultMappings.get(
       audioResultMappingKey(input.serverId, input.toolName)
     );
@@ -1206,6 +1228,7 @@ export class McpRouter {
         const context = { sessionId: session.id, targetId: session.targetId, generation: input.generation, requestIdentity, requestBodyHash };
         const guard = (): void => {
           assertDelegated?.();
+          assertNativeRoot?.();
           modelChannel?.assertCurrent();
           input.signal?.throwIfAborted();
           const current = this.#store.getSession(context.sessionId).descriptor;
@@ -1277,6 +1300,7 @@ export class McpRouter {
         };
         const guard = (): void => {
           assertDelegated?.();
+          assertNativeRoot?.();
           input.signal?.throwIfAborted();
           const current = this.#store.getSession(context.sessionId).descriptor;
           if (this.#findGrant(token) !== grant
@@ -1305,6 +1329,7 @@ export class McpRouter {
               effectIdentity,
               requestBodyHash,
               assertCurrent: guard,
+              ...(assertNativeRoot === undefined ? {} : { assertNativeRoot }),
               ...(partnerLearningSave === undefined ? {} : { partnerLearningSave })
             }
           );
@@ -1355,6 +1380,7 @@ export class McpRouter {
   async dispose(): Promise<void> {
     this.#partnerLearningAuthorities.clear();
     this.#grants.clear();
+    this.#nativeRootProofs.clear();
     await Promise.allSettled([...this.#modelChannels].map(channel => channel.release()));
     this.#detachedNativeAuthLeases.clear();
     this.#recoveryNativeAuthLeases.clear();
@@ -2537,7 +2563,18 @@ export class McpRouter {
   #purgeGrants(): void {
     const now = this.#now();
     for (const [key, grant] of this.#grants) if (grant.expiresAt <= now) this.#grants.delete(key);
+    for (const [key, proof] of this.#nativeRootProofs) if (proof.expiresAt <= now || this.#grants.get(proof.grant.digest.toString("hex")) !== proof.grant) this.#nativeRootProofs.delete(key);
     this.#retireModelChannels();
+  }
+  #captureNativeRootProof(grant: BridgeGrant, input: NonNullable<PiMcpBridgeOptions["captureRootCall"]> extends (input: infer T) => string ? T : never): string {
+    this.#purgeGrants(); input.assertCurrent();
+    if (!grant.productScope || this.#grants.get(grant.digest.toString("hex")) !== grant || !boundedBridgeRequestId(input.requestId)
+      || !grant.tools.some(tool => tool.serverId === input.serverId && tool.name === input.toolName && tool.requiresNativeRoot)
+      || this.#nativeRootProofs.size >= 1_024) throw new Error("Native root tool proof is unavailable.");
+    const proof = randomBytes(32).toString("base64url");
+    this.#nativeRootProofs.set(proof, { grant, requestId: input.requestId, serverId: input.serverId, toolName: input.toolName,
+      argumentsHash: operationBodyHash(input.arguments), assertCurrent: input.assertCurrent, expiresAt: this.#now() + 30_000 });
+    return proof;
   }
   #retireModelChannels(): void {
     for (const channel of this.#modelChannels) if (this.#grants.get(channel.grant.digest.toString("hex")) !== channel.grant) void channel.release().catch(() => undefined);
@@ -2955,7 +2992,8 @@ function bridgeGrantAuthorityDigest(input: {
       description: tool.description,
       inputSchema: tool.inputSchema,
       ...(tool.outputSchema === undefined ? {} : { outputSchema: tool.outputSchema }),
-      requiresPermission: tool.requiresPermission
+      requiresPermission: tool.requiresPermission,
+      ...(tool.requiresNativeRoot ? { requiresNativeRoot: true } : {})
     })),
     audioResultMappings: [...input.audioResultMappings]
       .sort(([left], [right]) => left.localeCompare(right, "en"))

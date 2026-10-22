@@ -42,7 +42,7 @@ export function copyPartnerHomeHistory(input: { readonly store: OperationalStore
     for (const event of events) {
       if (event.globalCursor > input.throughCursor) return { count, readThroughCursor };
       afterCursor = event.globalCursor;
-      if (event.payload.type !== "message_complete" || event.payload.partnerPrivateOrigin !== undefined || event.payload.automaticContinuation || event.payload.objectiveContinuation) continue;
+      if (event.payload.type !== "message_complete" || event.payload.partnerPrivateOrigin !== undefined || event.payload.automaticContinuation || event.payload.objectiveContinuation || event.payload.inputHandoffContinuation) continue;
       const payload = event.payload;
       const blocks: MessageBlock[] = [];
       for (const block of payload.blocks) {

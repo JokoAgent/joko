@@ -512,6 +512,7 @@ function recentConversationEvents(store: OperationalStore, sessionId: string): P
         && (event.payload.role === "user" || event.payload.role === "assistant")
         && event.payload.automaticContinuation === undefined
         && event.payload.objectiveContinuation === undefined
+        && event.payload.inputHandoffContinuation === undefined
       ) selected.push(event);
       if (selected.length === 6) break;
     }
@@ -643,6 +644,7 @@ function conversationContext(events: readonly PersistedEvent[]): string {
       event.payload.type !== "message_complete"
       || event.payload.automaticContinuation !== undefined
       || event.payload.objectiveContinuation !== undefined
+      || event.payload.inputHandoffContinuation !== undefined
       || (event.payload.role !== "user" && event.payload.role !== "assistant")
     ) return [];
     const text = event.payload.blocks

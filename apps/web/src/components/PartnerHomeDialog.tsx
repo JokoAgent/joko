@@ -3,8 +3,9 @@ import { PermissionMode, PartnerHomeBusyAction, PartnerHomeMovePhase, partnerHom
   type ListPartnerHomeTargetsResponse, type PartnerHomeApi, type PartnerHomeMove, type PartnerHomeModelChoice } from "@joko/contracts";
 import { Modal, Button } from "./ui.js";
 
-export function PartnerHomeDialog({ api, partnerId, revision, locale, onClose, onChanged }: {
+export function PartnerHomeDialog({ api, partnerId, revision, inputHandoff = true, locale, onClose, onChanged }: {
   readonly api: PartnerHomeApi; readonly partnerId: string; readonly revision: bigint; readonly locale: string;
+  readonly inputHandoff?: boolean;
   readonly onClose: () => void; readonly onChanged: (sessionId: string) => void;
 }) {
   const text = partnerHomeMessages(locale), [catalog, setCatalog] = useState<ListPartnerHomeTargetsResponse>();
@@ -43,7 +44,7 @@ export function PartnerHomeDialog({ api, partnerId, revision, locale, onClose, o
     setBusy(true); setError(false); const signal = new AbortController().signal;
     try { const requestId = sent.current ?? crypto.randomUUID(); sent.current = requestId;
       const value = await api.move({ requestId, expectedHome: catalog.home.identity, expectedPartnerRevision: { value: revision }, destination: target.destination,
-        capabilities: { modelChain: [choice.route], permissionMode: permission, planMode: plan }, busyAction, continueWhenSourceOffline: offline }, signal);
+        capabilities: { modelChain: [choice.route], permissionMode: permission, planMode: plan, inputHandoff }, busyAction, continueWhenSourceOffline: offline }, signal);
       if (alive.current) { setMove(value.move); if (value.move) sent.current = undefined; }
     } catch { if (alive.current) setError(true); } finally { if (alive.current) setBusy(false); }
   };

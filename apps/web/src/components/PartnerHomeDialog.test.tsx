@@ -25,9 +25,9 @@ function fixture(pending = false) {
     retry: vi.fn(async () => create(RetryPartnerHomeMoveResponseSchema, { move: { ...receipt, phase: PartnerHomeMovePhase.READY, canonicalSessionId: "recovered-session" } })) };
   return { api, changed: vi.fn(), close: vi.fn() };
 }
-async function mount(f: ReturnType<typeof fixture>) {
+async function mount(f: ReturnType<typeof fixture>, inputHandoff = true) {
   const host = document.createElement("div"); document.body.append(host); const root = createRoot(host); roots.push(root);
-  await act(async () => { root.render(<PartnerHomeDialog api={f.api} partnerId="partner" revision={9n} locale="en" onChanged={f.changed} onClose={f.close} />); });
+  await act(async () => { root.render(<PartnerHomeDialog api={f.api} partnerId="partner" revision={9n} inputHandoff={inputHandoff} locale="en" onChanged={f.changed} onClose={f.close} />); });
 }
 async function select(label: string, value: string) {
   const field = [...document.querySelectorAll("label")].find(item => item.textContent?.startsWith(label))?.querySelector("select");
@@ -39,14 +39,14 @@ async function click(label: string) {
   if (!button) throw new Error(`Missing action: ${label}`); await act(async () => { button.click(); });
 }
 it("requires an actual target model and sends explicit permissions and busy policy before following the new canonical Session", async () => {
-  const f = fixture(); await mount(f); await select(text.choose, "1");
+  const f = fixture(); await mount(f, false); await select(text.choose, "1");
   expect(f.api.inspect).toHaveBeenCalledWith("partner", expect.objectContaining({ location: expect.objectContaining({ case: "peer" }) }), expect.any(AbortSignal));
   const action = [...document.querySelectorAll("button")].find(item => item.textContent === text.change)!;
   expect(action.disabled).toBe(true); await select(text.model, "0"); await select(text.permissions, String(PermissionMode.ACCEPT_EDITS));
   const stop = [...document.querySelectorAll("label")].find(item => item.textContent === text.stop)!.querySelector("input")!;
   await act(async () => { stop.click(); }); await click(text.change);
   expect(f.api.move).toHaveBeenCalledOnce(); expect(f.api.move).toHaveBeenCalledWith(expect.objectContaining({ expectedPartnerRevision: { value: 9n }, busyAction: PartnerHomeBusyAction.STOP,
-    capabilities: expect.objectContaining({ permissionMode: PermissionMode.ACCEPT_EDITS }) }), expect.any(AbortSignal));
+    capabilities: expect.objectContaining({ permissionMode: PermissionMode.ACCEPT_EDITS, inputHandoff: false }) }), expect.any(AbortSignal));
   await act(async () => { await new Promise(resolve => setTimeout(resolve, 550)); });
   expect(f.changed).toHaveBeenCalledWith("new-main-session");
 });

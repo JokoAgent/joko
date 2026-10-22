@@ -1,0 +1,13 @@
+.provider-sharing-settings { display: grid; gap: var(--settings-section-gap); min-width: 0; }
+.provider-sharing-settings [role="tabpanel"] { display: grid; gap: var(--settings-card-gap); min-width: 0; }
+.provider-sharing-settings .settings-card { display: grid; gap: var(--settings-row-gap); padding: var(--settings-card-padding); min-width: 0; }
+.provider-sharing-settings .settings-actions { display: flex; align-items: center; flex-wrap: wrap; gap: var(--settings-row-gap); }
+.provider-sharing-settings label { display: grid; gap: var(--settings-copy-gap); min-width: 0; }
+.provider-sharing-settings input:not([type="checkbox"]), .provider-sharing-settings select, .provider-sharing-settings textarea { width: 100%; min-width: 0; }
+.provider-sharing-settings textarea { min-height: 88px; resize: vertical; }
+.provider-sharing-settings h4, .provider-sharing-settings p { margin: 0; overflow-wrap: anywhere; }
+.provider-sharing-person, .provider-sharing-invitation { display: grid; gap: var(--settings-row-gap); border-top: 1px solid var(--line); padding-top: var(--settings-card-padding); min-width: 0; }
+.provider-sharing-person-heading { display: flex; align-items: center; flex-wrap: wrap; gap: var(--settings-row-gap); }
+.provider-sharing-code { display: block; font-family: var(--font-mono); font-size: 28px; font-weight: 600; letter-spacing: .25em; font-variant-numeric: tabular-nums; }
+.provider-sharing-settings .provider-sharing-compare { display: flex; align-items: center; gap: var(--settings-row-gap); }
+@media (max-width: 640px) { .provider-sharing-settings .settings-actions > button { max-width: 100%; white-space: normal; } }

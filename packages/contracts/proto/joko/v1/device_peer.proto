@@ -379,6 +379,7 @@ message DevicePeerStartRemoteDesktopAction {
   string display_id = 1;
   RemoteDesktopStartMode mode = 2;
   bool control = 3;
+  optional string input_handoff_request_id = 4;
 }
 
 message DevicePeerHeartbeatRemoteDesktopAction {

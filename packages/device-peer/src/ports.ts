@@ -177,6 +177,7 @@ export interface DevicePeerRemoteDesktopHostPort {
     readonly displayId: string;
     readonly mode: RemoteDesktopStartMode;
     readonly control?: boolean;
+    readonly inputHandoffRequestId?: string;
   }): Promise<RemoteDesktopLease>;
   heartbeat(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopControlState>;
   stop(request: DevicePeerRemoteDesktopLeaseRequest & {

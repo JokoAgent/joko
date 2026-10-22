@@ -377,6 +377,9 @@ export interface PromptInput {
   /** Queue-private authority for one Objective-owned turn. Public input
    * contracts never accept or emit this marker. */
   readonly objectiveContinuation?: ObjectiveContinuationInput;
+  /** Queue-private completion of an owner input handoff. Public input never
+   * accepts this marker; the originating live task must still authorize it. */
+  readonly inputHandoffContinuation?: { readonly requestId: string };
 }
 
 export interface AutomaticContinuationInput {

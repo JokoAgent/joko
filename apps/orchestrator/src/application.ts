@@ -43,6 +43,7 @@ import {
   type BackendAuthenticationState,
   type BackendDescriptor,
   type KnownCapability,
+  type ProviderAccountUsageSnapshot,
   type TargetDescriptor
 } from "@joko/core";
 import { JOKO_API_VERSION } from "@joko/contracts";
@@ -91,6 +92,13 @@ import { BlobTransferCoordinator } from "./blob-transfers.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import { HostedAgentRuntime } from "./hosted-agent-runtime.js";
 import { HostedAgentSources } from "./hosted-agent-sources.js";
+import { InputHandoffCoordinator } from "./input-handoff/coordinator.js";
+import { NativeInputHandoffHost } from "./input-handoff/native-host.js";
+import { InputHandoffNotifications } from "./input-handoff/notifications.js";
+import { InputHandoffTools, INPUT_HANDOFF_TOOL_PROVIDER_ID } from "./input-handoff-tools.js";
+import { createProviderSharingRuntime, type ProviderSharingRuntime } from "./provider-sharing-runtime.js";
+import { ProviderGroupRuntime } from "./provider-group-runtime.js";
+import { createProviderGroupHostedEndpoint } from "./provider-group-hosted.js";
 import { createHostedAgentCodexAdapter } from "./hosted-agent-codex-factory.js";
 import { createHostedAgentClaudeAdapter } from "./hosted-agent-claude-factory.js";
 import { policySnapshotFor } from "./policy-settings.js";
@@ -497,6 +505,10 @@ export interface OrchestratorApplication {
   readonly partnerHomeRuntime?: PartnerHomeRuntimeAdapter;
   readonly partnerHomeInference?: PartnerHomeInference;
   readonly hostedAgents?: HostedAgentRuntime;
+  readonly providerSharing?: ProviderSharingRuntime;
+  readonly providerGroups?: ProviderGroupRuntime;
+  readonly inputHandoff?: InputHandoffCoordinator;
+  readonly nativeInputHandoff?: NativeInputHandoffHost;
   readonly partnerWorkingStatus?: PartnerWorkingStatusManager;
   readonly partnerWorkbenches?: PartnerWorkbenchManager;
   readonly partnerSessionTasks?: PartnerSessionTaskManager;
@@ -680,6 +692,11 @@ export async function createOrchestratorApplication(
   let personalDevelopment: PersonalDevelopmentOwner | undefined;
   let personalDevelopmentCoordinator: PersonalDevelopmentCoordinator | undefined;
   let personalDevelopmentNativeBroker: PersonalDevelopmentNativeBroker | undefined;
+  let inputHandoff: InputHandoffCoordinator | undefined;
+  let nativeInputHandoff: NativeInputHandoffHost | undefined;
+  let inputHandoffNotifications: InputHandoffNotifications | undefined;
+  let providerSharing: ProviderSharingRuntime | undefined;
+  let providerGroups: ProviderGroupRuntime | undefined;
   let personalDevelopmentDoctor: PersonalDevelopmentDoctor | undefined;
   let stopPersonalDevelopmentNotifications = (): void => undefined;
   let personalDevelopmentClose: Promise<void> | undefined;
@@ -737,6 +754,7 @@ export async function createOrchestratorApplication(
   });
   const serverId = durableServerId(store);
   const connections = new ConnectionManager(store);
+  nativeInputHandoff = new NativeInputHandoffHost(connections);
   let lastLanDiscoveryDiagnosticAt = 0;
   const lanDiscovery = new LanDiscoveryService({
     self: () => ({
@@ -1099,6 +1117,7 @@ export async function createOrchestratorApplication(
     store,
     catalog: () => mcpRouter.toolPolicyDeclarations()
   });
+  const unregisterInputHandoffTools = mcpRouter.registerBridgeToolProvider(new InputHandoffTools({ store, coordinator: () => inputHandoff }));
   const lspBridge = new LspToolBridgeProvider({
     isUserEnabled: () => languageToolsEnabled(
       store.findSetting<unknown>("service", "orchestrator", LANGUAGE_TOOL_SETTING_KEY)?.value
@@ -1242,6 +1261,7 @@ export async function createOrchestratorApplication(
     );
     try {
       return createPiAdapter({
+    taskShellEnv: context => inputHandoff?.envFor(context) ?? {},
     agentHome: providerSnapshot.agentHome,
     sessionRoot: config.piAgentHome,
     managedGenerationsRoot: generationsRoot,
@@ -1448,6 +1468,7 @@ export async function createOrchestratorApplication(
               toolPolicies.enabledForSession(sessionId, targetId, policyId)
           });
           return createCodexAdapter({
+            taskShellEnv: context => inputHandoff?.envFor(context) ?? {},
             id: instanceId,
             instanceGeneration: generation,
             localMcpBridge: (input) => mcpBridge!.openLocal(input),
@@ -1511,6 +1532,7 @@ export async function createOrchestratorApplication(
       adapterKind: "claude-agent-sdk-stdio",
       displayName: "Claude Code",
       create: ({ instanceId, generation }) => createClaudeCodeAdapter({
+        taskShellEnv: context => inputHandoff?.envFor(context) ?? {},
         id: instanceId,
         instanceGeneration: generation,
         mcpBridge: createClaudeMcpBridge({
@@ -1624,7 +1646,9 @@ export async function createOrchestratorApplication(
       };
       await attempt(() => terminals.dispose());
       await attempt(() => hostedAgentSources?.stopDiscovery());
-      await attempt(() => startupHostedAgents?.close());
+      await attempt(() => inputHandoff?.close());
+      await attempt(() => inputHandoffNotifications?.close());
+      await attempt(() => nativeInputHandoff?.close());
       if (startupSessionHost === undefined) {
         await attempt(() => backendInstances.dispose());
       } else {
@@ -1632,6 +1656,9 @@ export async function createOrchestratorApplication(
         await attempt(() => backendInstances.disposeRetainedCleanups());
       }
       await attempt(() => hostedAgentSources?.close());
+      await attempt(() => startupHostedAgents?.close());
+      await attempt(() => providerGroups?.close());
+      await attempt(() => providerSharing?.close());
       await attempt(() => managedProviderProxy.close());
       return failures;
     })();
@@ -1658,8 +1685,13 @@ export async function createOrchestratorApplication(
         && modelRoutingEnabled(store, id, model.providerId, model.modelId);
     });
   };
-  const hostedAgents = startupHostedAgents = new HostedAgentRuntime({ store, connections, root: join(config.dataDirectory, "hosted-agents"),
+  const hostedAgents = startupHostedAgents = new HostedAgentRuntime({ store, connections, nodeId: serverId, root: join(config.dataDirectory, "hosted-agents"),
+    authenticateGuest: context => { if (!providerSharing) throw new Error("Provider sharing is unavailable."); return providerSharing.authenticateGuest(context); },
+    decorateCatalog: catalog => providerGroups?.decorateCatalog(catalog) ?? catalog,
+    resolveSharedProvider: (backendId, providerId) => providerGroups?.sharedProvider(backendId, providerId),
     artifactCapacityBytes: artifacts.maximumBlobBytes, factories: [{ backendId: piBackendId, displayName: store.getBackend(piBackendId).descriptor.displayName,
+      isolatedGuests: () => backendInstances.adapter(piBackendId)?.hostedExecutionCapabilities?.isolatedGuests === true,
+      describe: () => store.getBackend(piBackendId).descriptor,
       providerIds: () => providers.list(piBackendId).map(provider => provider.provider.id),
       providerDisplayName: providerId => providers.list(piBackendId).find(provider => provider.provider.id === providerId)?.displayName ?? providerId,
       capabilities: () => store.getBackend(piBackendId).descriptor.capabilities,
@@ -1702,6 +1734,8 @@ export async function createOrchestratorApplication(
       }
     }, {
       backendId: codexBackendId, displayName: store.getBackend(codexBackendId).descriptor.displayName,
+      isolatedGuests: () => backendInstances.adapter(codexBackendId)?.hostedExecutionCapabilities?.isolatedGuests === true,
+      describe: () => store.getBackend(codexBackendId).descriptor,
       providerIds: () => nativeProviderIds(codexBackendId),
       providerDisplayName: providerId => store.getBackend(codexBackendId).descriptor.providers?.find(provider => provider.providerId === providerId)?.displayName ?? providerId,
       capabilities: () => store.getBackend(codexBackendId).descriptor.capabilities, version: () => store.getBackend(codexBackendId).descriptor.version,
@@ -1726,6 +1760,8 @@ export async function createOrchestratorApplication(
         executable: await localBackendRuntimeSetup.resolveExecutable() ?? config.codexExecutable ?? "codex", fetch: createOutboundFetch(dependencies.resolveOutboundProxy) })
     }, {
       backendId: claudeCodeBackendId, displayName: store.getBackend(claudeCodeBackendId).descriptor.displayName,
+      isolatedGuests: () => backendInstances.adapter(claudeCodeBackendId)?.hostedExecutionCapabilities?.isolatedGuests === true,
+      describe: () => store.getBackend(claudeCodeBackendId).descriptor,
       providerIds: () => nativeProviderIds(claudeCodeBackendId),
       providerDisplayName: providerId => store.getBackend(claudeCodeBackendId).descriptor.providers?.find(provider => provider.providerId === providerId)?.displayName ?? providerId,
       capabilities: () => store.getBackend(claudeCodeBackendId).descriptor.capabilities, version: () => store.getBackend(claudeCodeBackendId).descriptor.version,
@@ -1733,6 +1769,9 @@ export async function createOrchestratorApplication(
       create: creation => createHostedAgentClaudeAdapter({ creation, backendId: claudeCodeBackendId, providers, credentialPort: claudeCodeCredentialPort,
         fetch: claudeCodeOAuthFetch, ...(config.claudeCodeExecutable === undefined ? {} : { pathToExecutable: config.claudeCodeExecutable }) })
     }] });
+  providerSharing = await createProviderSharingRuntime({ store, directory: join(config.dataDirectory, "provider-sharing"), serverId,
+    origin: config.publicOrigin, vault: credentialVault, native: hostedAgents, connections,
+    closeNative: (digest, runId) => hostedAgents.endpoint.closeProviderGrant(digest, runId) });
   const resolveSessionContextDefaults = composeSessionContextDefaultsResolver([{
     adapter: { id: piBackendId },
     resolve: () => {
@@ -1876,6 +1915,7 @@ export async function createOrchestratorApplication(
       };
     },
     onSessionRuntimeClosed: (sessionId) => {
+      inputHandoff?.cleanupSession(sessionId);
       sessionWorktrees.notifyRecycleOpportunity(sessionId);
       androidRuntimeForSessionCleanup?.closeSession(sessionId);
       void computerBridgeForSessionCleanup?.closeSession(sessionId).catch(() => undefined);
@@ -1895,6 +1935,7 @@ export async function createOrchestratorApplication(
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
   hostedAgentSources = new HostedAgentSources({ store, peers: devicePeers, registry: backendInstances, host: sessionHost,
+    sharing: providerSharing.directory, sourceDeviceId: serverId,
     temporaryRoot: join(config.dataDirectory, "hosted-source-transfers"), commandConcurrencyGate,
     readBlob: async blob => (await artifacts.readBlob(blob)).data,
     ...(dependencies.resolveOutboundProxy === undefined ? {} : { resolveProxy: dependencies.resolveOutboundProxy }),
@@ -1909,6 +1950,29 @@ export async function createOrchestratorApplication(
       return { revision: JSON.stringify([snapshot.generation, permissionMode, planMode, approvedRoots]), permissionMode, planMode, approvedRoots, snapshot, confirmCredentials: true };
     } });
   await hostedAgentSources.initialize();
+  const providerGroupOwnerGeneration = randomUUID();
+  providerGroups = new ProviderGroupRuntime({ store, registry: backendInstances, sources: hostedAgentSources, nodeId: serverId,
+    nodeName: () => hostname().trim() || "This computer", sessions: sessionHost.providerGroupSessionPort(),
+    ownerGeneration: () => { if (closed) throw new Error("Provider groups have closed."); return providerGroupOwnerGeneration; },
+    activeTurns: (backendId, providerId) => sessionHost.activeProviderTurns(backendId, providerId) + hostedAgents.endpoint.activeProviderTurns(backendId, providerId),
+    assertRemoteAllowed: key => { if (!hostedAgents.settings.providerEnabled(key.backendId, key.providerId)) throw new Error("Remote Provider use is disabled."); },
+    sharing: providerSharing.directory, ownedRecipients: key => providerSharing!.host.ownedRecipients(key.backendId, key.providerId),
+    readAccountUsage: async (backendId, providerId, signal) => {
+      signal.throwIfAborted(); const backend = backendInstances.get(backendId).descriptor;
+      const managed = providers.list(backendId).find(entry => entry.provider.id === providerId);
+      if (managed?.capabilities?.has("provider.account_usage")) return providerAccountUsage.get(providerId, signal);
+      if (!backend.capabilities.get("provider.account_usage")?.supported) return undefined;
+      return sessionHost.invokeBackendAdapter(backendId, async adapter => {
+        const operations = adapter as BackendAdapter & { readAccountUsage?: (providerId: string, signal?: AbortSignal) => Promise<ProviderAccountUsageSnapshot> };
+        if (!operations.readAccountUsage) return undefined;
+        const snapshot = await operations.readAccountUsage(providerId, signal); signal.throwIfAborted();
+        return snapshot.providerId === providerId ? snapshot : undefined;
+      });
+    } });
+  sessionHost.installProviderGroupRuntime(providerGroups);
+  hostedAgents.installEndpoint(createProviderGroupHostedEndpoint({ base: hostedAgents.host, runtime: providerGroups,
+    root: join(config.dataDirectory, "hosted-agents"), assertSelection: (principal, input) => hostedAgents.assertGuestSelection(principal, input),
+    capture: (member, principal, modelIds, assertCurrent) => providerGroups!.captureHosted(member, principal, modelIds, assertCurrent) }));
   const personalDevelopmentRoot = join(config.dataDirectory, "personal-development");
   personalDevelopmentNativeBroker = new PersonalDevelopmentNativeBroker({
     directory: join(config.dataDirectory, "personal-development-native"), connections
@@ -2049,6 +2113,38 @@ export async function createOrchestratorApplication(
     forgetIndependentTasks: (partnerId) => partnerSessionTasks?.forgetPartner(partnerId),
     resumeIndependentReturns: async (partnerId) => partnerSessionTasks?.refreshPartner(partnerId)
   });
+  const inputHandoffDisabled = (sessionId: string): boolean => {
+    const session = store.getSession(sessionId).descriptor, link = partnerStore.getSessionLink(sessionId);
+    const policy = toolPolicies.snapshot().find(value => value.toolProviderId === INPUT_HANDOFF_TOOL_PROVIDER_ID);
+    if (policy && !(policy.targetSettings.find(value => value.targetId === session.targetId)?.effectiveEnabled ?? policy.userEffectiveEnabled)) return true;
+    if (!link) return false;
+    const partner = partnerStore.getPartner(link.partnerId), selection = partnerConnectionPreferences.read(partner.homeTargetId).toolsets;
+    return partner.capabilities.inputHandoff === false || partner.lifecycle !== "active" || partner.pauseCleanupPending || partnerStore.isPartnerSessionPaused(sessionId)
+      || selection.mode === "allowlist" && !selection.ids.includes(INPUT_HANDOFF_TOOL_PROVIDER_ID);
+  };
+  inputHandoffNotifications = new InputHandoffNotifications({ store, push: mobilePush,
+    isCurrent: requestId => inputHandoff?.isCurrent(requestId) === true });
+  inputHandoff = new InputHandoffCoordinator({ credentials, native: nativeInputHandoff!,
+    publish: (sessionId, snapshot) => inputHandoffNotifications!.publish(sessionId, snapshot),
+    notifyOwner: (sessionId, snapshot) => inputHandoffNotifications!.notify(sessionId, snapshot),
+    isDisabledForSession: async sessionId => inputHandoffDisabled(sessionId),
+    captureScope: identity => {
+      const workspace = sessionHost.captureToolWorkspace(identity);
+      const assertCurrent = () => {
+        workspace.assertCurrent();
+        if (workspace.remote || closed || store.findSessionRuntimePolicy(identity.sessionId)?.policy === "review_read_only"
+          || store.findCollaborationWorkerBySession(identity.sessionId) || inputHandoffDisabled(identity.sessionId)) throw new Error("The original task cannot use input handoff.");
+      };
+      assertCurrent(); return { ...identity, assertCurrent };
+    },
+    continueAgent: async (scope, requestId, metadata) => { sessionHost.enqueueInputHandoffCompletion(scope, requestId, metadata); },
+    liveViewAvailable: () => !!nativeInputHandoff?.currentDeviceId(),
+    describeDevice: deviceId => {
+      const device = store.getDevice(deviceId);
+      return { name: device.name, platform: device.kind === "mobile" ? "mobile" : "desktop" };
+    } });
+  nativeInputHandoff!.setLiveHandoffPort(inputHandoff);
+  await inputHandoff.initialize();
   const partnerWorkbenches = new PartnerWorkbenchManager({ partners, partnerStore, store, host: sessionHost, workspaces,
     workbenches: partnerWorkbenchStore, managedDataDirectory: config.dataDirectory,
     remoteProjects: partnerHomeProjects, homeTransit: partnerHomeWorkbench, homeChanging: partnerId => partnerHomeStorage.changing(partnerId),
@@ -3244,6 +3340,10 @@ export async function createOrchestratorApplication(
     partnerHomeInference,
     hostedAgents,
     hostedAgentSources,
+    providerSharing,
+    providerGroups,
+    inputHandoff,
+    nativeInputHandoff,
     partnerWorkbenches,
     partnerSessionTasks,
     partnerTaskOutputs,
@@ -3316,10 +3416,13 @@ export async function createOrchestratorApplication(
         deferredBackendRestarts?.dispose();
         for (const cleanup of cleanups) await attempt(cleanup);
         await attempt(() => hostedAgentSources?.stopDiscovery());
+        await attempt(() => inputHandoff?.close());
+        await attempt(() => inputHandoffNotifications?.close());
+        await attempt(() => nativeInputHandoff?.close());
         await attempt(closePersonalDevelopment);
         await attempt(() => taskSharingHome.dispose());
-        await attempt(() => hostedAgents.close());
         await attempt(() => unregisterPersonalDevelopmentTools());
+        await attempt(() => unregisterInputHandoffTools());
         await attempt(() => partnerImports?.close());
         await attempt(() => partnerHomes.close());
         await attempt(() => partnerSessionTasks?.close());
@@ -3373,6 +3476,9 @@ export async function createOrchestratorApplication(
         await attempt(() => historyMaintenance.close());
         await attempt(() => sessionHost.dispose());
         await attempt(() => hostedAgentSources?.close());
+        await attempt(() => hostedAgents.close());
+        await attempt(() => providerGroups?.close());
+        await attempt(() => providerSharing?.close());
         managedChildWorkspaces.close();
         await attempt(() => backendInstances.disposeRetainedCleanups());
         await attempt(() => managedProviderProxy.close());

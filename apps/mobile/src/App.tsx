@@ -239,6 +239,8 @@ import {
   type MobileQuoteSelectionLease
 } from "./mobile-composer-quote";
 import { MobileInteractionSheet } from "./MobileInteractionSheet";
+import { MobileInputHandoffPanel } from "./MobileInputHandoffPanel";
+import { MobileInputHandoffTasks } from "./MobileInputHandoffTasks";
 import { MobileRuntimeControlsSheet } from "./MobileRuntimeControlsSheet";
 import { MobileAccountUsageSummary } from "./MobileAccountUsageSummary";
 import { mobileUsageProviderKey } from "./mobile-account-usage";
@@ -1455,6 +1457,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       {!newTaskInSystemBar && <Action label={mobileMessage(locale, "common.new")} onPress={() => navigate({ kind: "new-task" })} colors={colors} compact disabled={state.status !== "connected"} />}
     </View>
     <MobileSharedTaskEntries client={client} colors={colors} locale={locale} foreground={foreground} onOpen={onSelect} />
+    {foreground && state.status === "connected" && <MobileInputHandoffHomeEntry colors={colors} state={state} locale={locale} onOpen={sessionId => navigate({ kind: "session", sessionId })} />}
     {(incomingShare.batch || incomingShare.error) && <View style={[styles.card,
       { marginHorizontal: 16, marginBottom: 8, backgroundColor: colors.surface, borderColor: colors.border }]}>
       <Text accessibilityRole="alert" style={[styles.caption, { color: incomingShare.error ? colors.negative : colors.ink }]}>
@@ -1611,6 +1614,11 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
 }
 
 type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
+
+function MobileInputHandoffHomeEntry({ colors, state, locale, onOpen }: ScreenProps & { readonly onOpen: (sessionId: string) => void }) {
+  const api = client.inputHandoffTasksApi?.();
+  return api ? <MobileInputHandoffTasks key={api.ownerKey} api={api} sessions={state.owner?.sessions ?? []} colors={colors} locale={locale} onOpen={onOpen} /> : null;
+}
 
 function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onExtensions, onPartnerResources, onPartners, onPartnerChats, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
@@ -3480,7 +3488,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
   const [sharedBackendChoices, setSharedBackendChoices] = useState(false);
   const [partnerSettingsOwner, setPartnerSettingsOwner] = useState<string>();
-  const [partnerHome, setPartnerHome] = useState<{ readonly api: import("@joko/contracts").PartnerHomeApi; readonly partnerId: string; readonly revision: bigint }>();
+  const [partnerHome, setPartnerHome] = useState<{ readonly api: import("@joko/contracts").PartnerHomeApi; readonly partnerId: string; readonly revision: bigint; readonly inputHandoff: boolean }>();
   const [partnerLearningEntry, setPartnerLearningEntry] = useState<{ readonly owner: string;
     readonly destination: PartnerLearningSettingsDestination; readonly messageId: string; readonly completionEventId: string }>();
   const [partnerOutputsShell, setPartnerOutputsShell] = useState<{ readonly identity: string; readonly owner: string;
@@ -3881,6 +3889,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const advertisedQueueCapabilities = client.taskQueueCapabilities();
   const queueCapabilities = workerReadOnly ? { ...advertisedQueueCapabilities, edit: false, cancel: false, reorder: false } : advertisedQueueCapabilities;
   const interactions = state.status === "connected" ? client.taskInteractions() : [];
+  const inputHandoffApi = state.status === "connected" && !workerReadOnly ? client.taskInputHandoffApi?.() : undefined;
   const runtimeControls = state.status === "connected" ? client.taskRuntimeControls() : undefined;
   const providerUsageTransport = state.status === "connected" ? client.taskProviderUsageTransport() : undefined;
   const usageProviders = providerUsageTransport?.providers.filter(provider => provider.providerId === session?.model?.model?.providerId) ?? [];
@@ -6451,6 +6460,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       <Action label={mobileMessage(locale, "composer.cancelEdit")} colors={colors} compact disabled={state.status !== "connected" || state.busy}
         onPress={cancelQueueEdit} />
     </View>}
+    {inputHandoffApi && !conversationShare.active && <MobileInputHandoffPanel api={inputHandoffApi} colors={colors} locale={locale} />}
     {partnerRead.partner?.lifecycle === "paused" && <Text accessibilityLiveRegion="polite" style={{ color: colors.muted }}>{partnerResumeMessages(locale).paused}</Text>}
     {partnerRead.partner && partnerWorkingStatus && !conversationShare.active && interactions.length === 0
       && <View style={[styles.partnerWorkingFrame, { backgroundColor: colors.surface }]}>
@@ -6826,6 +6836,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       }}
       onError={setLocalError} />
     {partnerHome && <MobilePartnerHomeSheet key={partnerHome.api.ownerKey} api={partnerHome.api} partnerId={partnerHome.partnerId} revision={partnerHome.revision}
+      inputHandoff={partnerHome.inputHandoff}
       locale={locale} colors={colors} newRequestId={randomUUID} onClose={() => setPartnerHome(undefined)} onChanged={sessionId => {
         void client.refresh().then(() => client.select(sessionId)).then(() => setPartnerHome(undefined)).catch(() => setLocalError(mobileMessage(locale, "partnerProfile.failed")));
       }} />}
@@ -6836,7 +6847,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       memoryFactory={(partner, ownerKey) => client.partnerMemoryEditor(partner, ownerKey)}
       connectionsFactory={(partner, ownerKey) => client.partnerConnectionsEditor(partner, ownerKey)}
       skillsFactory={(partner, ownerKey) => client.partnerSkillsEditor(partner, ownerKey)}
-      onOpenHome={partner => { const api = client.partnerHomeApi(); if (api) setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision }); }}
+      onOpenHome={partner => { const api = client.partnerHomeApi(); if (api) setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision, inputHandoff: partner.capabilities.inputHandoff ?? true }); }}
       deletionTransport={client.partnerDeletionTransport()}
       restartTransport={client.partnerRestartTransport()}
       resumeFactory={partner => client.partnerResumeEditor(partner, partnerProfileTransport?.ownerKey)}

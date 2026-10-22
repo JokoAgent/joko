@@ -65,6 +65,16 @@ const close = vi.fn(); const saved = vi.fn();
 const transport = (ownerKey = "owner"): MobilePartnerProfileTransport => ({ ownerKey,
   load: vi.fn(async () => ({ ...profileSnapshot, ownerKey })),
   save: vi.fn(async (_snapshot, draft) => ({ ...profilePartner, ...draft, revision: 3n, profileVersion: 4n })) });
+it("edits and saves the independent input handoff switch while disabling edits for inherited capability settings", async () => {
+  const active = transport(); await render(active);
+  const label = mobileMessage("en", "partnerProfile.inputHandoff"), toggle = container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!;
+  expect(toggle.checked).toBe(true); expect(toggle.disabled).toBe(false); await act(async () => toggle.click()); await press("Save Partner");
+  expect(active.save).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ capabilities: expect.objectContaining({ inputHandoff: false }) }), expect.any(AbortSignal));
+  const inherited = { ...profilePartner, usesDirectoryDefaults: true };
+  const inheritedTransport = transport("inherited-owner"); inheritedTransport.load = vi.fn(async () => ({ ...profileSnapshot, partner: inherited, ownerKey: inheritedTransport.ownerKey }));
+  await render(inheritedTransport, undefined, undefined, inherited);
+  expect(container.querySelector<HTMLInputElement>(`input[aria-label="${label}"]`)!.disabled).toBe(true);
+});
 async function render(active?: MobilePartnerProfileTransport, resumeFactory?: (partner: typeof profilePartner) => PartnerResumeEditor | undefined,
   routineFactory?: (partnerId: string, ownerKey: string) => PartnerRoutineEditor | undefined, partner = profilePartner,
   memoryFactory?: (partner: typeof profilePartner, ownerKey: string) => PartnerMemoryEditor | undefined,

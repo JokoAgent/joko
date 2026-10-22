@@ -231,7 +231,7 @@ export class PartnerLearningManager {
         if (event.payload.type === "message_complete" && event.payload.role === "user"
           && event.runId === turn.source.sourceRunId && event.payload.acceptedInput !== undefined) {
           if (event.payload.partnerPrivateOrigin !== undefined || event.payload.automaticContinuation !== undefined
-            || event.payload.objectiveContinuation !== undefined) return [];
+            || event.payload.objectiveContinuation !== undefined || event.payload.inputHandoffContinuation !== undefined) return [];
           foundBoundary = true; break;
         }
       }
@@ -255,7 +255,7 @@ function sameSource(left: PartnerLearningTurnSource, right: PartnerLearningTurnS
 function reviewMessage(event: PersistedEvent): { readonly identity: string; readonly message: PartnerLearningReviewMessage } | undefined {
   const payload = event.payload;
   if (payload.type === "message_complete") {
-    if (payload.partnerPrivateOrigin !== undefined || payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined
+    if (payload.partnerPrivateOrigin !== undefined || payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined || payload.inputHandoffContinuation !== undefined
       || payload.role === "user" && payload.acceptedInput === undefined) return undefined;
     return { identity: `${payload.role}:${payload.nativeHistory?.identity?.entryId ?? event.id}`,
       message: { id: event.id, role: payload.role, text: payload.blocks.flatMap(block => block.kind === "text" ? [block.text] : []).join("\n").slice(0, 6_000) } };

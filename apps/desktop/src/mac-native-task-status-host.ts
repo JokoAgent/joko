@@ -871,7 +871,7 @@ export function renderNativeTaskStatusDocument(
       </div>`
     : `<div class="compact-row">
         ${phaseMark(current.phase)}
-        <a class="task-main" href="${focusUrl(current.sessionId)}"><strong>${escapeHtml(current.title || strings.untitled)}</strong><span>${escapeHtml(phaseLabel(current.phase, strings, current.interactionKind))}</span></a>
+        <a class="task-main" href="${focusUrl(current.sessionId)}"><strong>${escapeHtml(current.title || strings.untitled)}</strong><span>${escapeHtml(phaseLabel(current.phase, strings, current.interactionKind, current.inputHandoff))}</span></a>
         ${countBadge(surface.counts, strings)}
         <a class="icon-action" href="${ACTION_SCHEME}//toggle" aria-label="${escapeAttribute(strings.expand)}" title="${escapeAttribute(strings.expand)}">${nativeIcon("chevron-down")}</a>
       </div>`;
@@ -929,7 +929,7 @@ function renderSessionRow(session: DesktopNativeTaskStatusSurface["sessions"][nu
   const identity = companion ? `<span class="remote-companion" style="color:${companion.tint}" aria-hidden="true">${companion.artwork
     ? `<img src="${escapeAttribute(companion.artwork)}" alt="">` : escapeHtml(companion.glyph)}</span>` : "";
   return `<article class="task-row task-row--${session.phase}">
-    <div class="task-status">${phaseMark(session.phase)}<span>${escapeHtml(phaseLabel(session.phase, strings, session.interactionKind))}</span></div>
+    <div class="task-status">${phaseMark(session.phase)}<span>${escapeHtml(phaseLabel(session.phase, strings, session.interactionKind, session.inputHandoff))}</span></div>
     <a class="task-copy" href="${focusUrl(session.sessionId)}"><strong>${identity}${escapeHtml(session.title || strings.untitled)}</strong>${session.detail ? `<p>${escapeHtml(session.detail)}</p>` : ""}</a>
     <a class="focus-action" href="${focusUrl(session.sessionId)}">${escapeHtml(strings.focus)}</a>
     ${activity}
@@ -1147,7 +1147,7 @@ function smartSuppressionIdentity(
   ownerId: string,
   session: DesktopNativeTaskStatusSnapshot["sessions"][number]
 ): string {
-  return `${ownerId}\u0000${session.sessionId}\u0000${session.interactionKind ?? "interaction"}\u0000${session.updatedAt}`;
+  return `${ownerId}\u0000${session.sessionId}\u0000${session.inputHandoff ? "input_handoff" : session.interactionKind ?? "interaction"}\u0000${session.updatedAt}`;
 }
 
 function terminalDwell(phase: DesktopNativeTaskStatusPhase): number {
@@ -1185,10 +1185,12 @@ function countBadge(counts: DesktopNativeTaskStatusSurface["counts"], strings: N
 function phaseLabel(
   phase: DesktopNativeTaskStatusPhase,
   strings: NativeStrings,
-  interactionKind?: DesktopNativeTaskStatusSurface["sessions"][number]["interactionKind"]
+  interactionKind?: DesktopNativeTaskStatusSurface["sessions"][number]["interactionKind"],
+  inputHandoff?: true
 ): string {
   if (phase === "running") return strings.running;
   if (phase === "interaction") {
+    if (inputHandoff) return strings.inputHandoff;
     if (interactionKind === "permission") return strings.awaitingPermission;
     if (interactionKind === "plan") return strings.awaitingPlan;
     if (interactionKind !== undefined) return strings.awaitingQuestion;

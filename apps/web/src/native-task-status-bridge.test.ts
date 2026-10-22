@@ -10,6 +10,24 @@ import {
 } from "./native-task-status-bridge.js";
 
 describe("native task-status Web projection", () => {
+  it("projects a private input wait from safe metadata without creating an ordinary interaction or changing task state", () => {
+    const idle = session("private-input", "idle", 3n, 10);
+    const base = { ownerId: "owner", revision: 1n, locale: "zh-CN" as const, sessions: [idle], interactions: [], timelineBySession: new Map() };
+    const marker = { sessionId: idle.id, requestId: "request", generation: 3, stepNumber: 1 };
+    const result = projectNativeTaskStatusSnapshot({ ...base, inputHandoffs: [marker] });
+    expect(result.sessions).toEqual([expect.objectContaining({ sessionId: idle.id, phase: "interaction", inputHandoff: true, detail: "需要你代为输入，请打开原任务继续。" })]);
+    expect(result.sessions[0]).not.toHaveProperty("permission"); expect(result.sessions[0]).not.toHaveProperty("interactionKind");
+    expect(idle.state).toBe("idle"); expect(base.interactions).toEqual([]);
+    expect(projectNativeTaskStatusSnapshot({ ...base, inputHandoffs: [{ ...marker, generation: 2 }] }).sessions).toEqual([]);
+    expect(projectNativeTaskStatusSnapshot(base).sessions).toEqual([]);
+  });
+  it("keeps a real permission decision ahead of a concurrent private input marker", () => {
+    const task = session("permission", "waiting", 7n, 30), permission = interaction("request", "permission", 7n, [PermissionDecisionKind.ALLOW_ONCE]);
+    const result = projectNativeTaskStatusSnapshot({ ownerId: "owner", revision: 1n, locale: "en", sessions: [task], interactions: [permission], timelineBySession: new Map(),
+      inputHandoffs: [{ sessionId: task.id, requestId: "private-request", generation: 7, stepNumber: 1 }] });
+    expect(result.sessions[0]).toMatchObject({ interactionKind: "permission", permission: { interactionId: "request", allow: true } });
+    expect(result.sessions[0]).not.toHaveProperty("inputHandoff");
+  });
   it("excludes hidden task activity and permissions from the native status surface", () => {
     const hidden = { ...session("hidden", "waiting", 2n, 20), hidden: true };
     const visible = session("visible", "running", 1n, 10);

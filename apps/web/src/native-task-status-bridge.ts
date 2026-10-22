@@ -10,6 +10,7 @@ export interface NativeTaskStatusProjectionInput {
   readonly sessions: readonly SessionView[];
   readonly interactions: readonly InteractionView[];
   readonly timelineBySession: ReadonlyMap<string, readonly TimelineItemView[]>;
+  readonly inputHandoffs?: readonly { readonly sessionId: string; readonly requestId: string; readonly generation: number; readonly stepNumber: number }[];
 }
 
 export function nativeTaskStatusProjectionOwner(
@@ -36,10 +37,15 @@ export function projectNativeTaskStatusSnapshot(
       .slice()
       .sort((left, right) => interactionPriority(left.kind) - interactionPriority(right.kind) ||
         left.createdAt - right.createdAt)[0];
-    const phase = nativeTaskPhase(session, interaction);
+    const handoff = interaction === undefined && input.inputHandoffs?.some(value => value.sessionId === session.id
+      && Number.isSafeInteger(value.generation) && value.generation > 0 && BigInt(value.generation) === session.generation
+      && typeof value.requestId === "string" && value.requestId.length > 0 && value.requestId.length <= 128
+      && Number.isSafeInteger(value.stepNumber) && value.stepNumber > 0);
+    const phase = handoff ? "interaction" : nativeTaskPhase(session, interaction);
     if (phase === undefined) return [];
     const title = boundedDisplayText(interaction?.title || session.name || "Untitled task", 160);
-    const detail = boundedDisplayText(interaction?.message || session.summary || "", 600);
+    const detail = handoff ? input.locale === "zh-CN" ? "需要你代为输入，请打开原任务继续。" : "Private input is needed. Open the original task to continue."
+      : boundedDisplayText(interaction?.message || session.summary || "", 600);
     const permission = interaction?.kind === "permission"
       ? nativePermissionProjection(interaction)
       : undefined;
@@ -50,6 +56,7 @@ export function projectNativeTaskStatusSnapshot(
       detail,
       phase,
       ...(interaction === undefined ? {} : { interactionKind: interaction.kind }),
+      ...(handoff ? { inputHandoff: true as const } : {}),
       activityLines,
       ...(session.activeRunStartedAt === undefined ? {} : { startedAt: session.activeRunStartedAt }),
       updatedAt: Math.max(session.updatedAt, session.attention?.updatedAt ?? 0, interaction?.createdAt ?? 0),

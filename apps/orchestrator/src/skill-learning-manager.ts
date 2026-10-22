@@ -431,7 +431,7 @@ export class SkillLearningManager {
         .filter((event) => event.payload.type === "message_complete"
           && (event.payload.role === "assistant" || event.payload.role === "user")
           && event.payload.automaticContinuation === undefined
-          && event.payload.objectiveContinuation === undefined)
+          && event.payload.objectiveContinuation === undefined && event.payload.inputHandoffContinuation === undefined)
         .slice(0, 20)
         .reverse()
         .map((event) => {

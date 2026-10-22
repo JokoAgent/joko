@@ -54,3 +54,13 @@ it("rejects incompatible stored native metadata instead of adding a compatibilit
     expect(() => store.find(session.key)).toThrow("unknown");
   } finally { database.close(); }
 });
+it("fences only the exact cleanup lease and removes its native receipts with the binding", () => {
+  const database = new OperationalStore(":memory:"); try {
+    const store = new HostedAgentStore(database), session = store.claim(owner, "original", "create"); store.bind(session.key, "original", binding);
+    store.claimCall(session.key, "original", "send", "1".repeat(64)); store.close(session.key, "original");
+    store.claim(owner, "replacement", "resume"); expect(() => store.beginPurge(session.key, "original")).toThrow("changed");
+    store.close(session.key, "replacement"); store.beginPurge(session.key, "replacement");
+    expect(() => store.claim(owner, "another", "resume")).toThrow("cannot"); expect(() => store.finishPurge(session.key, "original")).toThrow("changed");
+    store.finishPurge(session.key, "replacement"); expect(store.find(session.key)).toBeUndefined(); expect(store.call(session.key, "send")).toBeUndefined();
+  } finally { database.close(); }
+});

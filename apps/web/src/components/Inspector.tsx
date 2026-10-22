@@ -1,4 +1,5 @@
 import { ArtifactDownloadButton } from "./ArtifactDownloadButton.js";
+import { workspacePreviewConnectionFailure } from "../workspace-text-preview-cache.js";
 import { usePartnerConversation } from "./PartnerConversation.js";
 import { PartnerWorkbench, type PartnerWorkbenchDrafts } from "./PartnerWorkbench.js";
 import { readTerminalAppearance } from "../terminal-appearance.js";
@@ -1463,6 +1464,13 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
   const [preview, setPreview] = useState<WorkspaceFilePreviewView>();
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string>();
+  const [previewSource, setPreviewSource] = useState<string>();
+  const previewRef = useRef(preview);
+  previewRef.current = preview;
+  const previewSourceRef = useRef(previewSource);
+  previewSourceRef.current = previewSource;
+  const [previewCached, setPreviewCached] = useState(false);
+  const [previewUnavailable, setPreviewUnavailable] = useState(false);
   const [searchMatches, setSearchMatches] = useState<readonly WorkspaceSearchMatchView[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState<string>();
@@ -1482,7 +1490,10 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
   const controllerRef = useRef(controller);
   controllerRef.current = controller;
   const selected = findEntry(rootEntries, selectedPath);
-  const selectedPreview = preview?.path === selectedPath ? preview : undefined;
+  const filePreviewOwner = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
+    controller.state.connectionGeneration, workspace?.id, workspace?.targetId, workspace?.serverPath, workspace?.remoteWorkspace]);
+  const selectedPreview = previewSource === filePreviewOwner && preview?.path === selectedPath ? preview
+    : workspace && selectedPath ? controller.peekWorkspaceFile?.(workspace.id, selectedPath) : undefined;
   const commitSelectionQuote = useCallback((quote: ComposerFileSelectionQuoteDraft): void => {
     onSelectionQuote(sessionId, quote);
   }, [onSelectionQuote, sessionId]);
@@ -1537,16 +1548,22 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
     if (workspace === undefined || selectedPath === undefined) return;
     let current = true;
     const requestEpoch = ++previewRequestEpochRef.current;
+    const cached = controllerRef.current.peekWorkspaceFile?.(workspace.id, selectedPath);
+    const keepDirty = previewSourceRef.current === filePreviewOwner && previewRef.current?.path === selectedPath && editorRef.current?.isDirty() === true;
+    setPreview(keepDirty ? previewRef.current : cached); setPreviewSource(filePreviewOwner); setPreviewCached(!keepDirty && cached !== undefined); setPreviewUnavailable(false);
     setPreviewLoading(true);
     void controllerRef.current.readWorkspaceFile(workspace.id, selectedPath).then((next) => {
-      if (current && previewRequestEpochRef.current === requestEpoch) setPreview(next);
+      if (current && previewRequestEpochRef.current === requestEpoch) { setPreview(next); setPreviewCached(false); }
     }).catch((error: unknown) => {
-      if (current && previewRequestEpochRef.current === requestEpoch) setPreviewError(messageOf(error));
+      if (current && previewRequestEpochRef.current === requestEpoch) {
+        if ((cached || keepDirty) && workspacePreviewConnectionFailure(error)) { setPreviewUnavailable(true); setPreviewCached(!keepDirty); }
+        else { if (!editorRef.current?.isDirty()) setPreview(undefined); setPreviewError(messageOf(error)); }
+      }
     }).finally(() => {
       if (current && previewRequestEpochRef.current === requestEpoch) setPreviewLoading(false);
     });
     return () => { current = false; };
-  }, [selectedPath, workspace?.id, workspace?.revision]);
+  }, [filePreviewOwner, selectedPath, workspace?.id, workspace?.revision]);
 
   useEffect(() => {
     setSearchMatches([]);
@@ -1606,9 +1623,10 @@ export function FilesPanel({ controller, workspace, sessionId, canWrite, t, onSe
         {selectedPath === undefined ? <p className="muted">{t("workspace.noSelection")}</p> : <>
           <div className="file-preview-card__name"><FileCode2 aria-hidden="true" /><div><strong>{selectedPreview?.name ?? selected?.name ?? selectedPath.split("/").at(-1)}</strong><span>{selectedPath}</span></div></div>
           {selected?.status !== undefined && <Pill tone={selected.status === "conflicted" ? "danger" : "warning"}>{selected.status}</Pill>}
-          {previewLoading && <Spinner label={t("workspace.loadingPreview")} />}
+          {previewLoading && selectedPreview === undefined && <Spinner label={t("workspace.loadingPreview")} />}
+          {previewUnavailable && <p className="muted" role="status">{t("workspace.cachedPreviewUnavailable")}</p>}
           {previewError !== undefined && <p className="inline-error" role="alert">{previewError}</p>}
-          {selectedPreview?.kind === "text" && selectedPreview.text !== undefined && (canWrite && !selectedPreview.truncated && selectedPreview.revision !== undefined
+          {selectedPreview?.kind === "text" && selectedPreview.text !== undefined && (canWrite && !previewCached && previewSource === filePreviewOwner && !selectedPreview.truncated && selectedPreview.revision !== undefined
             ? <WorkspaceFileEditorPane
                 ref={editorRef}
                 key={selectedPreview.path}

@@ -569,6 +569,38 @@ class ScriptedPiProcess extends EventEmitter {
 }
 
 describe("PiBackendAdapter", () => {
+  it("keeps askpass in each local task process and refreshes its private route on resume", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-askpass-")), specs: PiProcessSpec[] = []; let route = "first";
+    const taskShellEnv = vi.fn((context: AdapterContext) => ({ JOKO_INPUT_HANDOFF_ROUTE: `${context.sessionId}:${route}`, SUDO_ASKPASS: "/private/askpass" }));
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1", taskShellEnv,
+      processFactory: spec => { specs.push(spec); return new ScriptedPiProcess(spec) as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "askpass", backendId: "pi", displayName: "Local", workspaceRoot: directory, managed: true, trusted: true };
+    const first = { ...makeContext(target, []), sessionId: "askpass-first" }, second = { ...makeContext(target, []), sessionId: "askpass-second" };
+    try {
+      const binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, first);
+      await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, second);
+      expect(specs[0]!.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-first:first", SUDO_ASKPASS: "/private/askpass" });
+      expect(specs[1]!.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-second:first" });
+      await adapter.closeSession(binding, { ...first, binding }); route = "resumed";
+      await adapter.resumeSession(binding, { ...first, binding });
+      expect(specs.at(-1)!.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-first:resumed" });
+      expect(specs[1]!.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-second:first" });
+    } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("does not grant the owner askpass route to a native read-only review", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-review-askpass-")), specs: PiProcessSpec[] = [];
+    const taskShellEnv = vi.fn(() => ({ JOKO_INPUT_HANDOFF_ROUTE: "private-owner-route" }));
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1", taskShellEnv,
+      processFactory: spec => { specs.push(spec); return new ScriptedPiProcess(spec) as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "review-askpass", backendId: "pi", displayName: "Review", workspaceRoot: directory, managed: true, trusted: true };
+    const context = { ...makeContext(target, []), runtimePolicy: "review_read_only" as const };
+    try {
+      await adapter.createSession({ target, runtimePolicy: "review_read_only", fastMode: false, permissionMode: "ask" }, context);
+      expect(taskShellEnv).not.toHaveBeenCalled(); expect(specs[0]!.env).not.toHaveProperty("JOKO_INPUT_HANDOFF_ROUTE");
+    } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
   it.each([false, true])("uses the exact native account model without tools or durable credential files (revoked=%s)", async revoked => {
     const home = await mkdtemp(join(tmpdir(), "joko-native-review-")); let current = true;
     const initial = { type: "oauth" as const, access: "private-access", refresh: "private-refresh", expires: Date.now() + 60_000 };

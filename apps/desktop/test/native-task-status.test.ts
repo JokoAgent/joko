@@ -16,6 +16,14 @@ import {
 } from "../src/native-task-status.js";
 
 describe("native task-status contract", () => {
+  it("admits a dedicated private input marker while refusing ordinary decisions on it", () => {
+    const task = { ...session("private-input", "interaction", 1), inputHandoff: true };
+    const input = { ownerId: "renderer", revision: "1", locale: "en", sessions: [task] };
+    expect(parseDesktopNativeTaskStatusSnapshot(input).sessions[0]).toMatchObject({ inputHandoff: true });
+    for (const patch of [{ inputHandoff: false }, { phase: "running" }, { interactionKind: "input" }, { permission: { interactionId: "ordinary", generation: "1", allow: true, allowForSession: false, deny: true } }]) {
+      expect(() => parseDesktopNativeTaskStatusSnapshot({ ...input, sessions: [{ ...task, ...patch }] })).toThrow();
+    }
+  });
   it("accepts the complete 500 mirror but rejects overflow and remote local-permission actions", () => {
     const base = { ownerId: "renderer", revision: "1", locale: "en", sessions: Array.from({ length: 500 }, (_, index) => session(`task-${index}`, "running", index)) };
     expect(parseDesktopNativeTaskStatusSnapshot(base).sessions).toHaveLength(500);

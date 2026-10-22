@@ -9,6 +9,9 @@ import { readTaskBackgroundOutput } from "./background-task-output.js";
 import { createAppDefaultModelConnectService } from "./app-default-model-connect-service.js";
 import { createHelpConnectService } from "./help-connect-service.js";
 import { createHostedAgentConnectService } from "./hosted-agent-connect-service.js";
+import { createInputHandoffConnectService } from "./input-handoff-connect-service.js";
+import { createProviderSharingConnectService, createProviderSharingGuestConnectService } from "./provider-sharing-connect-service.js";
+import { createProviderGroupConnectService } from "./provider-group-connect-service.js";
 import { HOSTED_AGENT_WIRE_ENVELOPE_BYTES } from "./hosted-agent-wire.js";
 import { createMcpAppConnectService } from "./mcp-apps/connect-service.js";
 import { createExtensionCardConnectService } from "./extension-cards/connect-service.js";
@@ -1161,6 +1164,28 @@ export function registerConnectServices(router: ConnectRouter, application: Orch
   const services = createConnectServices(application, projectionShutdownSignal);
   if (application.hostedAgents) router.service(contract.HostedAgentService, createHostedAgentConnectService(application.hostedAgents.connectOptions()),
     { readMaxBytes: HOSTED_AGENT_WIRE_ENVELOPE_BYTES, writeMaxBytes: HOSTED_AGENT_WIRE_ENVELOPE_BYTES });
+  if (application.inputHandoff && application.nativeInputHandoff && application.devicePeers) router.service(contract.InputHandoffService,
+    createInputHandoffConnectService({ coordinator: application.inputHandoff, native: application.nativeInputHandoff,
+      connections: application.connections, peers: application.devicePeers }));
+  if (application.providerSharing) {
+    router.service(contract.ProviderSharingService, createProviderSharingConnectService(application.providerSharing.connectOptions()));
+    router.service(contract.ProviderSharingGuestService, createProviderSharingGuestConnectService(application.providerSharing.host));
+  }
+  if (application.providerGroups) router.service(contract.ProviderGroupService, createProviderGroupConnectService({ ...application.providerGroups.connectOptions(context => {
+    const connection = application.connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
+    return { id: connection.id, trust: "owner", management: true,
+      assertCurrent: () => { context.signal.throwIfAborted(); application.connections.fence(connection); } };
+  }), taskAccountUsage: async (sessionId, generation, signal) => {
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      const session = application.store.getSession(sessionId).descriptor;
+      if (BigInt(session.binding.generation) !== generation || session.deletedAt !== undefined) throw new ConnectError("The original task generation is no longer current.", Code.FailedPrecondition);
+    };
+    assertCurrent();
+    const usage = await application.providerGroups!.taskAccountUsage(sessionId, signal);
+    assertCurrent();
+    return usage;
+  } }));
   if (services.taskSharing) router.service(contract.TaskSharingService, withConnectErrors(services.taskSharing));
   if (services.taskSharingGuest) router.service(contract.TaskSharingGuestService, withConnectErrors(services.taskSharingGuest));
   router.service(contract.ConnectionService, withConnectErrors(services.connection));

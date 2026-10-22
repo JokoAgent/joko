@@ -27,6 +27,7 @@ import { createPartnerGroupApi, PartnerGroupService, type PartnerGroupApi } from
 import { createPartnerMemoryApi, type PartnerMemoryApi } from "@joko/contracts";
 import { createPartnerConnectionsApi, type PartnerConnectionsApi } from "@joko/contracts";
 import { createPartnerSkillsApi, type PartnerSkillsApi } from "@joko/contracts";
+import { createMobileInputHandoffApi, readMobileInputHandoffTasks, type MobileInputHandoffApi, type MobileInputHandoffScope, type MobileInputHandoffTask } from "./mobile-input-handoff";
 import {
   ArtifactKind, ArtifactService, BackendService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
@@ -191,6 +192,8 @@ export interface MobilePushCapabilityResult {
 }
 
 export interface MobileNetwork {
+  inputHandoffApi?(credential: PairedCredential, scope: MobileInputHandoffScope): MobileInputHandoffApi;
+  listInputHandoffTasks?(credential: PairedCredential, signal: AbortSignal): Promise<readonly MobileInputHandoffTask[]>;
   mcpAppApi?(credential: PairedCredential, ownerKey: string): MobileMcpAppApi;
   extensionCardApi?(credential: PairedCredential): import("./mobile-extension-card-api").MobileExtensionCardApi;
   getProviderUsage?(credential: PairedCredential, backendId: string, providerId: string,
@@ -1445,6 +1448,8 @@ function validRemoteDesktopDisplayModes(modes: readonly RemoteDesktopDisplayMode
 }
 
 export const mobileNetwork: MobileNetwork = {
+  inputHandoffApi: (credential, scope) => createMobileInputHandoffApi({ credential, scope, transport: transport(credential.origin, credential.authKey) }),
+  listInputHandoffTasks: (credential, signal) => readMobileInputHandoffTasks(transport(credential.origin, credential.authKey), signal),
   async inspect(origin, signal) {
     const response = await createClient(ConnectionService, transport(normalizeNodeOrigin(origin))).getServerInfo({}, options(signal));
     return parseNodeIdentity(response.server);
@@ -1882,7 +1887,7 @@ export const mobileNetwork: MobileNetwork = {
           avatar: protoMobilePartnerAvatar(draft.avatar), identitySource: draft.identitySource, templateId: draft.templateId,
           usesDirectoryDefaults: draft.usesDirectoryDefaults, ...(draft.usesDirectoryDefaults ? {} : { capabilities: {
             modelChain: [...capabilities.modelChain], permissionMode: mobilePartnerPermissionToProto(capabilities.permissionMode),
-            planMode: capabilities.planMode } }) } }, options(signal));
+            planMode: capabilities.planMode, inputHandoff: capabilities.inputHandoff ?? true } }) } }, options(signal));
       signal?.throwIfAborted();
       projectMobilePartnerCreationOptions(response.directory);
       return projectMobilePartnerCreationResult(response.partner);
@@ -1999,7 +2004,7 @@ export const mobileNetwork: MobileNetwork = {
         usesDirectoryDefaults: draft.usesDirectoryDefaults,
         ...(draft.usesDirectoryDefaults ? {} : { modelChain: { routes: [...draft.capabilities.modelChain] },
           permissionMode: mobilePartnerPermissionToProto(draft.capabilities.permissionMode),
-          planMode: draft.capabilities.planMode })
+          planMode: draft.capabilities.planMode, inputHandoff: draft.capabilities.inputHandoff ?? true })
       } }, options(signal));
     const partner = projectMobilePartnerProfileUpdate(partnerId, expectedRevision, response);
     if (typeof draft.avatar === "string" ? partner.avatar !== draft.avatar

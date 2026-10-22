@@ -27,6 +27,9 @@ describe("runtime recovery presentation", () => {
       }),
       item("hidden-objective-prompt", 4n, "user", {
         objectiveContinuation: { ownerGeneration: 2n, turn: 3 }
+      }),
+      item("hidden-handoff-completion", 5n, "user", {
+        inputHandoffContinuation: { requestId: "original-request" }
       })
     ];
 

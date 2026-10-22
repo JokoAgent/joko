@@ -23,7 +23,7 @@ export const REMOTE_DESKTOP_VIEWER_CHANNELS = Object.freeze({ bind: PREFIX + "bi
 interface ViewerBinding {
   readonly source: WebContents;
   readonly owner: DesktopRemoteDesktopViewerOwner;
-  readonly target: { readonly deviceId: string; readonly name: string };
+  readonly target: { readonly deviceId: string; readonly name: string; readonly inputHandoffRequestId?: string };
   connection: DesktopRemoteDesktopViewerConnection;
   closing: boolean;
   clipboardPending: boolean;
@@ -96,14 +96,15 @@ export class DesktopRemoteDesktopViewerWindows {
       const owner = parseDesktopRemoteDesktopViewerOwner(value);
       if (!sameDesktopRemoteDesktopViewerOwner(owner, this.#owners.get(event.sender))) throw new Error("Viewer connection retired.");
       if (typeof target !== "object" || target === null || Array.isArray(target) ||
-        Object.keys(target).sort().join(",") !== "deviceId,name") throw new TypeError("Invalid viewer target.");
+        !["deviceId,name", "deviceId,inputHandoffRequestId,name"].includes(Object.keys(target).sort().join(","))) throw new TypeError("Invalid viewer target.");
       const record = target as Record<string, unknown>;
       if (typeof record["deviceId"] !== "string" || !record["deviceId"] || record["deviceId"].length > 256 ||
         record["deviceId"] === owner.deviceId || typeof record["name"] !== "string" ||
-        !record["name"] || record["name"].length > 256 || /[\u0000-\u001f\u007f]/u.test(record["name"])) {
+        !record["name"] || record["name"].length > 256 || /[\u0000-\u001f\u007f]/u.test(record["name"])
+        || record["inputHandoffRequestId"] !== undefined && (typeof record["inputHandoffRequestId"] !== "string" || !/^[A-Za-z0-9_-]{1,128}$/u.test(record["inputHandoffRequestId"]))) {
         throw new TypeError("Invalid viewer target.");
       }
-      return this.open(event.sender, owner, { deviceId: record["deviceId"], name: record["name"] });
+      return this.open(event.sender, owner, { deviceId: record["deviceId"], name: record["name"], ...(typeof record["inputHandoffRequestId"] === "string" ? { inputHandoffRequestId: record["inputHandoffRequestId"] } : {}) });
     });
     ipcMain.handle(c.state, (event) => this.state(this.localSender(event)));
     ipcMain.handle(c.ready, (event, generation: unknown) => {
@@ -279,7 +280,8 @@ export class DesktopRemoteDesktopViewerWindows {
   private connection(entry: Pick<ViewerBinding, "owner" | "source" | "target">): DesktopRemoteDesktopViewerConnection {
     return new DesktopRemoteDesktopViewerConnection(entry.owner, entry.target.deviceId, {
       current: () => this.options.quitting() || entry.source.isDestroyed() ? undefined : this.#owners.get(entry.source),
-      readAuthKey: this.options.readAuthKey
+      readAuthKey: this.options.readAuthKey,
+      inputHandoffRequestId: entry.target.inputHandoffRequestId
     });
   }
 
@@ -293,7 +295,7 @@ export class DesktopRemoteDesktopViewerWindows {
 
   private async open(source: WebContents, owner: DesktopRemoteDesktopViewerOwner,
     target: ViewerBinding["target"]): Promise<{ readonly focusedExisting: boolean }> {
-    const existing = [...this.#viewers].find((item) => item.binding?.source === source && item.binding.target.deviceId === target.deviceId);
+    const existing = [...this.#viewers].find((item) => item.binding?.source === source && item.binding.target.deviceId === target.deviceId && item.binding.target.inputHandoffRequestId === target.inputHandoffRequestId);
     if (existing !== undefined) {
       const focusedExisting = !existing.window.isDestroyed();
       existing.presentation.open(); this.prewarm(); return { focusedExisting };
@@ -359,7 +361,7 @@ export class DesktopRemoteDesktopViewerWindows {
     });
     binding.clipboardSync = new DesktopRemoteDesktopViewerClipboardSync({
       scope: () => ({ connection: binding.connection, generation: entry.generation, focusRevision: binding.inputRevision,
-        desired: this.options.preferences.get(owner, target.deviceId).clipboardSync,
+        desired: !target.inputHandoffRequestId && this.options.preferences.get(owner, target.deviceId).clipboardSync,
         eligible: this.active(entry) && entry.window.isFocused() && !binding.clipboardPending && binding.syncSuspensions === 0 && !binding.syncExitFailed }),
       changed: () => this.publish(entry), clipboard: binding.clipboard
     });
@@ -441,6 +443,7 @@ export class DesktopRemoteDesktopViewerWindows {
       clipboardSyncState: { available: false, active: false, pending: false } };
     const preferences = this.options.preferences.get(binding.owner, binding.target.deviceId);
     return { generation: entry.generation, active: this.active(entry), target: binding.target, locale: this.options.locale(), ...preferences,
+      ...(binding.target.inputHandoffRequestId ? { audio: false, hostMute: false, lockOnExit: false, clipboardSync: false, privacyScreen: false } : {}),
       clipboardSyncState: binding.clipboardSync?.snapshot ?? { available: false, active: false, pending: false } };
   }
   private publish(entry: ViewerWindow): void {

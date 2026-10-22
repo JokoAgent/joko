@@ -1,6 +1,6 @@
 import { unicodeCorpus } from "./i18n/test-corpus.js";
 import { create } from "@bufbuild/protobuf";
-import type { Transport } from "@connectrpc/connect";
+import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import {
   ErrorInfoSchema,
   FileKind,
@@ -10,6 +10,7 @@ import {
   ListWorkspaceEntriesResponseSchema,
   ListWorkspaceFilesResponseSchema,
   OperationState,
+  ReadWorkspaceFileResponseSchema,
   SearchWorkspaceResponseSchema,
   SnapshotSchema,
   SubmitOperationResponseSchema,
@@ -24,6 +25,78 @@ import { describe, expect, it, vi } from "vitest";
 import { createOrchestratorGateway } from "./gateway.js";
 
 describe("formal Workspace Files gateway", () => {
+  it("paints previous text immediately while actual reads still revalidate the original source", async () => {
+    let body = "first", reads = 0;
+    const transport = transportFor(method => {
+      if (method.localName !== "readWorkspaceFile") throw new Error("Unexpected file request");
+      reads++;
+      return textResponse("src/a.ts", body);
+    }, snapshotWithWorkspace());
+    const gateway = await connectedGateway(transport);
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")).toBeUndefined();
+    await gateway.readWorkspaceFile("workspace-1", "src/a.ts");
+    body = "second";
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")?.text).toBe("first");
+    expect(reads).toBe(1);
+    expect((await gateway.readWorkspaceFile("workspace-1", "src/a.ts")).text).toBe("second");
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")?.text).toBe("second");
+    const other = await connectedGateway(transport);
+    expect(other.peekWorkspaceFile?.("workspace-1", "src/a.ts")).toBeUndefined();
+    gateway.disconnect(); other.disconnect();
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")).toBeUndefined();
+  });
+
+  it("keeps transient failure copies but retires cache on denied reads and workspace replacement", async () => {
+    let failure: Code | undefined;
+    const snapshot = snapshotWithWorkspace();
+    const gateway = await connectedGateway(transportFor(method => {
+      if (method.localName !== "readWorkspaceFile") throw new Error("Unexpected file request");
+      if (failure) throw new ConnectError("file request failed", failure);
+      return textResponse("src/a.ts", "authorized");
+    }, snapshot));
+    await gateway.readWorkspaceFile("workspace-1", "src/a.ts");
+    failure = Code.Unavailable;
+    await expect(gateway.readWorkspaceFile("workspace-1", "src/a.ts")).rejects.toThrow();
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")?.text).toBe("authorized");
+    failure = Code.PermissionDenied;
+    await expect(gateway.readWorkspaceFile("workspace-1", "src/a.ts")).rejects.toThrow();
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")).toBeUndefined();
+    failure = undefined; await gateway.readWorkspaceFile("workspace-1", "src/a.ts");
+    snapshot.workspaces[0]!.serverPathDisplay = "different-root"; await gateway.refresh();
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")).toBeUndefined();
+    gateway.disconnect();
+  });
+
+  it("discards a late response after reconnecting the same Gateway", async () => {
+    let finish!: (value: unknown) => void;
+    const gateway = await connectedGateway(transportFor(method => {
+      if (method.localName !== "readWorkspaceFile") throw new Error("Unexpected file request");
+      return new Promise(resolve => { finish = resolve; });
+    }, snapshotWithWorkspace()));
+    const pending = gateway.readWorkspaceFile("workspace-1", "src/a.ts");
+    const rejected = expect(pending).rejects.toThrow();
+    await gateway.connect(); finish(textResponse("src/a.ts", "old connection")); await rejected;
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")).toBeUndefined();
+    gateway.disconnect();
+  });
+
+  it("invalidates watcher paths and cannot repopulate them from an earlier in-flight read", async () => {
+    let finish: ((value: unknown) => void) | undefined;
+    let waiting = false;
+    const gateway = await connectedGateway(transportFor(method => {
+      if (method.localName !== "readWorkspaceFile") throw new Error("Unexpected file request");
+      return waiting ? new Promise(resolve => { finish = resolve; }) : textResponse("src/a.ts", "old");
+    }, snapshotWithWorkspace(), method => method.localName === "watchWorkspaceFileChanges"
+      ? workspaceChanges([create(WatchWorkspaceFileChangesResponseSchema, { change: { workspaceId: "workspace-1", kind: WorkspaceFileChangeKind.MODIFIED,
+          relativePath: "src/a.ts", sequence: 1n, streamRevision: "watch-1" } })]) : idleStream()));
+    await gateway.readWorkspaceFile("workspace-1", "src/a.ts"); waiting = true;
+    const pending = gateway.readWorkspaceFile("workspace-1", "src/a.ts");
+    for await (const _change of gateway.watchWorkspaceFileChanges({ kind: "workspace", workspaceId: "workspace-1" })) { /* consume the real invalidation */ }
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")).toBeUndefined();
+    finish!(textResponse("src/a.ts", "earlier read")); await pending;
+    expect(gateway.peekWorkspaceFile?.("workspace-1", "src/a.ts")).toBeUndefined(); gateway.disconnect();
+  });
+
   it("maps the typed workspace watcher stream and rejects absolute path leakage", async () => {
     const streamInputs: any[] = [];
     const transport = transportFor(
@@ -752,6 +825,10 @@ function entry(relativePath: string, displayName: string, opaqueRevision: string
     revision: { opaqueRevision },
     generated: false
   };
+}
+
+function textResponse(path: string, text: string) {
+  return create(ReadWorkspaceFileResponseSchema, { preview: { entry: entry(path, path, `revision-${text}`), content: { case: "text", value: { utf8Text: text } } } });
 }
 
 function snapshotWithWorkspace(): ReturnType<typeof create<typeof SnapshotSchema>> {

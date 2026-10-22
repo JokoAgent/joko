@@ -12,7 +12,7 @@ export interface DesktopRemoteDesktopViewerOwner {
 export interface DesktopRemoteDesktopViewerState {
   readonly generation: number;
   readonly active: boolean;
-  readonly target: { readonly deviceId: string; readonly name: string } | null;
+  readonly target: { readonly deviceId: string; readonly name: string; readonly inputHandoffRequestId?: string } | null;
   readonly locale: "en" | "zh-CN" | "en-XA";
   readonly audio: boolean;
   readonly hostMute: boolean;

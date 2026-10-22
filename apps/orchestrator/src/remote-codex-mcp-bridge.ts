@@ -287,11 +287,16 @@ export class CodexMcpBridgeManager {
       const signal = AbortSignal.any([extra.signal, call.signal, routeAbort]);
       try {
         signal.throwIfAborted(); call.assertCurrent();
+        const rootRequired = route.tools.some(tool => tool.name === request.params.name && tool.requiresNativeRoot);
+        if (rootRequired && !call.assertNativeRoot) throw new Error("Ask the parent agent to request owner input.");
+        const nativeRootProof = rootRequired ? snapshot.mcpBridge.captureRootCall!({ requestId, serverId: route.serverId, toolName: request.params.name,
+          arguments: request.params.arguments ?? {}, assertCurrent: call.assertNativeRoot! }) : undefined;
         const progressToken = request.params._meta?.progressToken;
         const result = await this.#router.executeBridgeCall({
           authorization: `Bearer ${snapshot.mcpBridge.token}`, requestId, generation: input.generation,
           sessionId: input.sessionId, targetId: input.targetId, serverId: route.serverId,
           toolName: request.params.name, arguments: request.params.arguments, signal,
+          ...(nativeRootProof === undefined ? {} : { nativeRootProof }),
           ...(connection ? { appCall: { connection, params: request.params,
             ...(progressToken === undefined ? {} : { onprogress: (progress: import("@modelcontextprotocol/sdk/types.js").Progress) => {
               try { assertCurrent(); call.assertCurrent(); } catch { return; }

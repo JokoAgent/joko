@@ -171,6 +171,9 @@ export class MobilePushCoordinator {
   notifyGroupStep(input: Parameters<OperationalStore["enqueuePartnerGroupStepPush"]>[0]): void {
     this.#store.enqueuePartnerGroupStepPush(input); this.wake();
   }
+  notifyInputHandoff(input: Parameters<OperationalStore["enqueueInputHandoffPush"]>[0]): void {
+    this.#store.enqueueInputHandoffPush(input); this.wake();
+  }
 
   async close(): Promise<void> {
     if (this.#closed) return;

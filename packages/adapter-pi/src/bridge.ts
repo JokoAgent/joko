@@ -64,7 +64,7 @@ type Control = { generation: number; policyGeneration: number; permissionMode: "
 type PolicySubjectKind = "file_read" | "file_write" | "command" | "network" | "mcp" | "browser" | "resource" | "extra_directory";
 type PolicyRisk = "read_only" | "low" | "medium" | "high" | "critical";
 type PolicyObservation = { subjectKind: PolicySubjectKind; risk: PolicyRisk; workspaceRelativePath?: string; toolProviderId?: string; toolName?: string };
-type McpTool = { serverId: string; name: string; runtimeName?: string; policySubject?: PolicySubjectKind; description: string; inputSchema: Record<string, unknown>; outputSchema?: Record<string, unknown>; requiresPermission: boolean };
+type McpTool = { serverId: string; name: string; runtimeName?: string; policySubject?: PolicySubjectKind; description: string; inputSchema: Record<string, unknown>; outputSchema?: Record<string, unknown>; requiresPermission: boolean; requiresNativeRoot?: true };
 type McpDescriptor = { endpoint: string; generation: number; sessionId: string; targetId: string; tools: McpTool[] };
 type McpBridgeErrorCode = "resource_exhausted" | "artifact_unavailable" | "invalid_result";
 type NativeBinding = { opaqueRef: string; nativeSessionId?: string; generation: number };
@@ -78,6 +78,7 @@ const MAX_RUNTIME_TOOL_CATALOG_BYTES = ${MAXIMUM_PI_RUNTIME_TOOL_CATALOG_BYTES};
 const RUNTIME_TOOL_CATALOG_CHUNK_BYTES = ${PI_RUNTIME_TOOL_CATALOG_CHUNK_BYTES};
 const COMMAND_GATE_REQUEST_PREFIX = "joko:command-gate/v1/";
 const PARTNER_LEARNING_REQUEST_PREFIX = "joko:tool-turn/v1/";
+const NATIVE_ROOT_REQUEST_PREFIX = "joko:native-root-call/v1/";
 const PARTNER_LEARNING_REPLY_STATUS_KEY = "joko-reply-identity/v1";
 const COMPACTION_IDENTITY_STATUS_KEY = "joko-compaction-identity/v1";
 const POLICY_DECISION_REQUEST_PREFIX = "joko:policy-decision/v1/";
@@ -1054,6 +1055,8 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
           }
           if (!ctx.hasUI) throw new Error("The original tool turn bridge is unavailable");
           const captureRequest = Buffer.from(JSON.stringify({ requestId: _id, serverId: descriptor.serverId, toolName: descriptor.name }), "utf8").toString("base64url");
+          const nativeRootProof = descriptor.requiresNativeRoot ? await ctx.ui.input(NATIVE_ROOT_REQUEST_PREFIX + captureRequest, "") : undefined;
+          if (descriptor.requiresNativeRoot && (typeof nativeRootProof !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(nativeRootProof))) throw new Error("Ask the parent agent to request owner input.");
           const partnerLearningProof = await ctx.ui.input(PARTNER_LEARNING_REQUEST_PREFIX + captureRequest, "");
           if (partnerLearningProof !== "untracked" && (typeof partnerLearningProof !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(partnerLearningProof))) {
             throw new Error("The original tool turn was not acknowledged");
@@ -1076,6 +1079,7 @@ export default async function jokoManagedBridge(pi: ExtensionAPI): Promise<void>
               sessionId: mcp.sessionId,
               targetId: mcp.targetId,
               ...(partnerLearningProof === "untracked" ? {} : { partnerLearningProof }),
+              ...(nativeRootProof === undefined ? {} : { nativeRootProof }),
             }),
             signal,
           });

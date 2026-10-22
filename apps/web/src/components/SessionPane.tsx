@@ -33,10 +33,12 @@ import { formatTokenCount, resolveDisplayContextWindow } from "./ContextCapacity
 import { ErrorTailBanner } from "./ErrorTailBanner.js";
 import { InteractionDialog } from "./InteractionDialog.js";
 import { InteractionPromptHost } from "./InteractionPortal.js";
+import { InputHandoffPanel } from "./InputHandoffCard.js";
 import { MessageDeleteDialog } from "./MessageDeleteDialog.js";
 import { MessageForkDialog } from "./MessageForkDialog.js";
 import { MessageRewindDialog, type MessageRewindPreviewState } from "./MessageRewindDialog.js";
 import { ModelPicker } from "./ModelPicker.js";
+import type { TaskProviderGroupUsageView } from "../provider-group-task-usage.js";
 import { PermissionSelector } from "./PermissionSelector.js";
 import { PinnedPlanPanel } from "./PinnedPlanPanel.js";
 import { RetryStatusIndicator } from "./RetryStatusIndicator.js";
@@ -212,6 +214,28 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   readonly onOpenSessionWindow?: () => void;
 }): JSX.Element {
   const guest = controller.state.sessionAccess?.role === "guest";
+  const providerGroupOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
+    controller.state.connectionGeneration, session.id, session.generation.toString(), session.backendId, session.model?.providerId, session.model?.modelId]);
+  const providerGroupOwnerRef = useRef(providerGroupOwnerKey);
+  providerGroupOwnerRef.current = providerGroupOwnerKey;
+  const providerGroupReadRef = useRef<AbortController | undefined>(undefined);
+  const [providerGroupRead, setProviderGroupRead] = useState<{ readonly key: string; readonly value?: TaskProviderGroupUsageView }>();
+  const refreshTaskProviderGroupUsage = useCallback(async () => {
+    providerGroupReadRef.current?.abort();
+    const read = new AbortController(); providerGroupReadRef.current = read;
+    if (guest || reviewReadOnly || !controller.readTaskProviderGroupUsage) return;
+    try {
+      const value = await controller.readTaskProviderGroupUsage(session.id, session.generation, read.signal);
+      if (!read.signal.aborted && providerGroupOwnerRef.current === providerGroupOwnerKey) setProviderGroupRead({ key: providerGroupOwnerKey, ...(value ? { value } : {}) });
+    } catch {
+      if (!read.signal.aborted && providerGroupOwnerRef.current === providerGroupOwnerKey) setProviderGroupRead({ key: providerGroupOwnerKey });
+    }
+  }, [controller.readTaskProviderGroupUsage, providerGroupOwnerKey, session.id, session.generation, guest, reviewReadOnly]);
+  useEffect(() => {
+    void refreshTaskProviderGroupUsage();
+    return () => providerGroupReadRef.current?.abort();
+  }, [refreshTaskProviderGroupUsage]);
+  const providerGroupUsage = providerGroupRead?.key === providerGroupOwnerKey ? providerGroupRead.value : undefined;
   const exportDownload = useArtifactDownload(session.id, controller.exportSession);
   const partnerConversation = usePartnerConversation();
   const partnerRuntimeLocked = partnerConversation?.kind !== "task";
@@ -739,7 +763,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const errorTailActions = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? executableRecoveryActions(errorTailProjection.item.error, recoveryContext)
     : [];
-  const accountUsageResetAt = providerAccountUsageResetAt(
+  const accountUsageResetAt = providerGroupUsage ? providerGroupUsage.resetAt : providerAccountUsageResetAt(
     controller.state.snapshot.providers,
     session.model?.providerId,
     Date.now(),
@@ -1823,7 +1847,8 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         useMorphPopover
         onSelectionFocus={() => setComposerFocusRequest((current) => current + 1)}
         t={t}
-        onOpen={() => controller.refreshProviderModels(session.backendId, undefined, true).catch(() => undefined)}
+        providerGroupUsage={providerGroupUsage}
+        onOpen={() => Promise.allSettled([controller.refreshProviderModels(session.backendId, undefined, true), refreshTaskProviderGroupUsage()]).then(() => undefined)}
         onConnectSource={guest ? undefined : () => { window.location.hash = "#/settings/providers"; }}
         onSelect={(selection) => {
           if (selection === undefined) return;
@@ -2166,6 +2191,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       </div>}
       {activeCompaction !== undefined && <CompactionStatusIndicator compaction={activeCompaction} t={t} />}
       {activeRetry !== undefined && <RetryStatusIndicator retry={activeRetry} t={t} />}
+      {!guest && !reviewReadOnly && controller.inputHandoff && <InputHandoffPanel api={controller.inputHandoff} sessionId={session.id}
+        ownerKey={`${timelineResourceOwnerKey}:${controller.state.connectionGeneration}:${session.generation}`}
+        viewer={{ deviceId: controller.state.activeProfile?.deviceId ?? null }} />}
       {interaction !== undefined && interaction.kind !== "plan" && partnerConversation?.kind === "partner" && <PartnerWorkingStatus
         controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} waiting
         suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} />}

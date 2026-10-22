@@ -465,7 +465,7 @@ export function sessionHandoffMessages(events: readonly PersistedEvent[]): Hando
     const key = event.runId ?? "unscoped";
     const base = { createdAt: event.emittedAt };
     if (payload.type === "message_complete") {
-      if (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined) continue;
+      if (payload.automaticContinuation !== undefined || payload.objectiveContinuation !== undefined || payload.inputHandoffContinuation !== undefined) continue;
       const text = payload.blocks.flatMap(block => {
         if (block.kind === "text") return [redactSecrets(block.text)];
         if (block.kind === "image") return ["[Image attachment]"];

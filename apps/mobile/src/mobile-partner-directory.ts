@@ -36,6 +36,7 @@ export interface MobilePartnerCapabilities {
   readonly modelChain: readonly MobilePartnerModelRoute[];
   readonly permissionMode: "ask" | "acceptEdits" | "auto" | "bypassPermissions";
   readonly planMode: boolean;
+  readonly inputHandoff?: boolean;
 }
 
 export interface MobilePartnerActivity {
@@ -287,7 +288,7 @@ export function projectMobilePartnerCapabilities(value: PartnerCapabilities | un
     : value.permissionMode === PermissionMode.AUTO ? "auto" as const
     : value.permissionMode === PermissionMode.BYPASS_PERMISSIONS ? "bypassPermissions" as const : undefined;
   if (!permissionMode) throw new Error("The Joko node returned an unsupported Partner permission mode.");
-  return { modelChain, permissionMode, planMode: value.planMode };
+  return { modelChain, permissionMode, planMode: value.planMode, inputHandoff: value.inputHandoff ?? true };
 }
 
 export function mobilePartnerPermissionToProto(mode: MobilePartnerCapabilities["permissionMode"]): PermissionMode {

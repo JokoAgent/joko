@@ -7,7 +7,8 @@ import { join, resolve, sep } from "node:path";
 import { Code, createClient } from "@connectrpc/connect";
 import { toJsonString } from "@bufbuild/protobuf";
 import { createConnectTransport } from "@connectrpc/connect-node";
-import { GetHostedAgentCatalogResponseSchema, HostedAgentService } from "@joko/contracts";
+import { GetHostedAgentCatalogResponseSchema, HostedAgentService, InputHandoffService, ProviderSharingService, ProviderGroupService,
+  ProviderGroupStrategy } from "@joko/contracts";
 import { expect, it } from "vitest";
 import { createOrchestratorApplication, type OrchestratorApplication } from "./application.js";
 import type { OrchestratorConfig } from "./config.js";
@@ -66,6 +67,27 @@ it("serves authenticated native hosting from the actual application with node-ow
     expect(initialProvider?.models[0]).toMatchObject({ backendId: "pi", key: { providerId: "host-provider", modelId: "host-model" } });
     expect(toJsonString(GetHostedAgentCatalogResponseSchema, initialCatalog)).not.toContain("native-provider-node-test-key");
     expect(toJsonString(GetHostedAgentCatalogResponseSchema, initialCatalog)).not.toContain(`127.0.0.1:${address.port}`);
+    expect((await createClient(InputHandoffService, transport).listInputHandoffs({ sessionId: "original-task" })).states).toEqual([]);
+    expect((await createClient(ProviderSharingService, transport).listProviderShares({})).owned).toEqual([]);
+    const groupApi = createClient(ProviderGroupService, transport), groupKey = { backendId: "pi", providerId: "host-provider" };
+    application.store.createSession({ id: "quota-task", backendId: "pi", targetId: config.workspace.id, title: "Quota task",
+      binding: { opaqueRef: "quota-task", generation: 7 }, pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+    expect((await groupApi.getTaskProviderGroupUsage({ sessionId: "quota-task", generation: 7n })).member).toBeUndefined();
+    await expect(groupApi.getTaskProviderGroupUsage({ sessionId: "quota-task", generation: 8n })).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    await expect(createClient(ProviderGroupService, createConnectTransport({ baseUrl, httpVersion: "1.1" }))
+      .getTaskProviderGroupUsage({ sessionId: "quota-task", generation: 7n })).rejects.toMatchObject({ code: Code.Unauthenticated });
+    const candidates = (await groupApi.listProviderGroupCandidates({ key: groupKey })).candidates;
+    const localMember = candidates.find(candidate => candidate.member?.nodeId === application!.serverId)?.member;
+    expect(localMember).toMatchObject({ backendId: "pi", providerId: "host-provider", capacity: 4 });
+    const group = (await groupApi.updateProviderGroup({ key: groupKey, expectedRevision: 0n,
+      update: { case: "config", value: { strategy: ProviderGroupStrategy.LEAST_BUSY, autoSwitch: true, members: [localMember!] } } })).group!;
+    expect((await generated.getHostedAgentCatalog({ format: 1 })).backends.find(backend => backend.backendId === "pi")?.providers
+      .find(provider => provider.providerId === "host-provider")?.group).toMatchObject({ strategy: ProviderGroupStrategy.LEAST_BUSY, memberCount: 1 });
+    application.providerGroups!.store.commitBinding("quota-task", { group: groupKey, groupRevision: group.revision.toString(), memberKey: localMember!.key,
+      backendId: "pi", providerId: "host-provider", modelId: "host-model", ownerNodeId: application.serverId }, group.revision);
+    expect((await groupApi.getTaskProviderGroupUsage({ sessionId: "quota-task", generation: 7n })).member)
+      .toMatchObject({ group: groupKey, memberKey: localMember!.key, backendId: "pi", providerId: "host-provider", quotaReadable: true });
+    await groupApi.updateProviderGroup({ key: groupKey, expectedRevision: group.revision, update: { case: "delete", value: {} } });
     let settings = (await generated.getHostedAgentSettings({})).settings!;
     expect(settings.remoteControlEnabled).toBe(false); expect(settings.limits).toMatchObject({ perDevice: 16, total: 64 });
     const open = { runId: "disabled-computer", nativeSessionId: "retained-native", start: "create" as const, sessionId: "original-task", targetId: "original-workspace",
