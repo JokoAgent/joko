@@ -24,6 +24,7 @@ import type { ExtensionOAuthCards } from "./oauth-cards.js";
 import type { ExtraDirectoryManager } from "../extra-directory-manager.js";
 import type { ExtensionTasks } from "../extension-tasks.js";
 import type { ExtensionText } from "../extension-text.js";
+import type { ExtensionProjectPolicies } from "../extension-project-policy.js";
 
 interface Authority extends ExtensionCardAuthority { readonly surface: ExtensionMainViewAuthority; readonly installationKey: string }
 interface Instance {
@@ -37,6 +38,7 @@ interface Options {
   readonly catalog: Pick<ExtensionCatalogManager, "get" | "snapshot" | "onAuthorityChanged">;
   readonly resources: Pick<PiResourceManager, "get">;
   readonly store: OperationalStore; readonly vault: CredentialVault;
+  readonly projects?: Pick<ExtensionProjectPolicies, "enabledForTarget" | "assertEnabledForSession">;
   readonly surfaces: ExtensionMainViewManager; readonly cards: ExtensionCardsManager;
   readonly registerProvider: (provider: BridgeToolProvider) => () => void;
   readonly redact: (text: string) => string;
@@ -81,7 +83,7 @@ export class ExtensionCardRuntime {
     };
     const reader = createExtensionMailReader({ authorize: current, captureScope: () => current,
       plugins: () => [...this.#instances.values()].flatMap(instance => {
-        try { this.#assert(instance); return instance.authority.runtime.mailReader ? [{ id: instance.authority.surface.extensionId, reader: instance.authority.runtime.mailReader }] : []; } catch { return []; }
+        try { this.#assert(instance); this.options.projects?.assertEnabledForSession(instance.authority.surface.extensionId, sessionId); return instance.authority.runtime.mailReader ? [{ id: instance.authority.surface.extensionId, reader: instance.authority.runtime.mailReader }] : []; } catch { return []; }
       }),
       call: async (plugin, url, markRead) => {
         current(); const instance = this.#instances.get(plugin.id); if (!instance) throw new Error("Mail source changed.");
@@ -155,6 +157,8 @@ export class ExtensionCardRuntime {
         const providerId = `${id}-runtime`, generation = ++this.#generation;
         const provider: BridgeToolProvider = { id: providerId, generation,
           get available() { return instance.current; },
+          includeForTarget: targetId => this.options.projects?.enabledForTarget(id, targetId) ?? true,
+          includeForSession: sessionId => this.options.projects?.enabledForTarget(id, this.options.store.getSession(sessionId).descriptor.targetId) ?? true,
           tools: authority.runtime.tools.map(tool => ({ serverId: providerId, name: tool.name, description: tool.description,
             inputSchema: authority.runtime.network ? extensionFileToolSchema(tool.inputSchema) : tool.inputSchema, requiresPermission: !tool.readOnly || authority.runtime.network !== undefined })),
           callTool: (name, args, signal, context) => this.#call(instance, name, args, signal, context) };
@@ -342,6 +346,7 @@ export class ExtensionCardRuntime {
       this.#assert(instance); signal?.throwIfAborted(); context.assertCurrent?.();
       const session = this.options.store.getSession(context.sessionId).descriptor;
       if (session.targetId !== context.targetId || session.binding.generation !== context.generation || session.archived || session.deletedAt !== undefined) throw new Error("Extension task changed.");
+      this.options.projects?.assertEnabledForSession(instance.authority.surface.extensionId, context.sessionId);
     };
     assertCurrent();
     const missing = instance.authority.runtime.network?.secrets?.some(secret => secret.source === "oauth") ? this.options.oauthCards?.missing(instance.authority.surface.extensionId) : undefined;
@@ -395,6 +400,8 @@ export class ExtensionCardRuntime {
   async dispatch(scope: ExtensionCardScope, event: ExtensionCardAction, assertCurrent: () => void): Promise<void> {
     const instance = this.#instances.get(scope.extensionId);
     if (!instance || instance.authority.key !== scope.authorityKey) throw new Error("Extension source changed.");
+    const callerCurrent = assertCurrent;
+    assertCurrent = () => { callerCurrent(); this.options.projects?.assertEnabledForSession(scope.extensionId, scope.sessionId); };
     this.#assert(instance); assertCurrent();
     const page = await this.#ensure(instance); this.#assert(instance); assertCurrent();
     for (const id of instance.callGuards.keys()) if (!this.options.cards.cards.callInfoOf(id)) instance.callGuards.delete(id);

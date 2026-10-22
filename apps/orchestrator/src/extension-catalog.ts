@@ -82,6 +82,8 @@ export interface ExtensionCatalogDescriptor {
   readonly author?: string;
   readonly description: string;
   readonly enabled: boolean;
+  /** Private installed entry identity, never executable bytes in public contracts. */
+  readonly runtimeEntryPath?: string;
   readonly mainView?: ExtensionMainViewDescriptor & { readonly extensionEntry: string };
   readonly library?: { readonly schemaVersion: 1; readonly extensionEntry: string };
   readonly routineEvents?: ExtensionRoutineEventsDescriptor & { readonly extensionEntry: string };
@@ -141,6 +143,7 @@ interface SetupRequirement {
 interface ExtensionDefinition {
   readonly id: string;
   readonly bindingKey: string;
+  readonly runtimeEntryPath?: string;
   readonly binding: ExtensionOwnerBinding;
   readonly source: ExtensionCatalogSource;
   readonly installed: boolean;
@@ -658,6 +661,7 @@ export class ExtensionCatalogManager {
       ...(definition.author === undefined ? {} : { author: definition.author }),
       description: definition.description,
       enabled: definition.enabled,
+      ...(definition.runtimeEntryPath === undefined ? {} : { runtimeEntryPath: definition.runtimeEntryPath }),
       ...(definition.mainView === undefined ? {} : { mainView: { ...definition.mainView } }),
       ...(definition.library === undefined ? {} : { library: { ...definition.library } }),
       ...(definition.routineEvents === undefined ? {} : { routineEvents: structuredClone(definition.routineEvents) }),
@@ -904,6 +908,7 @@ function projectDefinitions(
           resourceVersion: resource.versionNumber
         },
         source: resource.sourceKind === "local" ? "local" : "market",
+        ...(detail.entryPath === undefined ? {} : { runtimeEntryPath: detail.entryPath }),
         installed,
         installState,
         name: detail.name || resource.name,

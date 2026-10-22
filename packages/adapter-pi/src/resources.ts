@@ -33,12 +33,19 @@ export interface ProjectResourceSnapshot {
  * resources from Agent Home or the workspace and only consumes these paths
  * after copying them into a generation-scoped runtime directory.
  */
+export interface PiManagedExtensionExclusion {
+  readonly resourceId: string;
+  readonly entryPath?: string;
+}
+
 export interface PiManagedRuntimeResourceSnapshot {
   readonly extensions: readonly string[];
   readonly skills: readonly string[];
   readonly prompts: readonly string[];
   readonly packages: readonly string[];
   readonly resources: readonly RuntimeResource[];
+  /** Host-owned project exclusions, sampled before the native process starts. */
+  readonly excludedExtensions?: readonly PiManagedExtensionExclusion[];
 }
 
 export interface ManagedRuntimeResourceSnapshotOptions {
@@ -303,6 +310,17 @@ export async function snapshotManagedRuntimeResources(
   const seen = new Set<string>();
   const copiedBySource = new Map<string, string>();
   const snapshot = options.snapshot ?? { extensions: [], skills: [], prompts: [], packages: [], resources: [] };
+  const excluded = (snapshot.excludedExtensions ?? []).flatMap(entry => {
+    const resource = snapshot.resources.find(resource => resource.id === entry.resourceId);
+    // A project package can supersede a global package of the same identity.
+    // The exception belongs only to the original installed resource.
+    if (!resource?.runtimePath) return [];
+    const root = resource.runtimePath;
+    const selected = entry.entryPath === undefined ? root : resolve(root, entry.entryPath);
+    assertContained(root, selected, "project plugin exclusion");
+    return [pathIdentity(selected)];
+  });
+  const isExcluded = (source: string) => excluded.some(entry => pathContains(entry, pathIdentity(source)));
 
   const copyGroup = async (kind: "extension" | "skill" | "prompt" | "package", paths: readonly string[]): Promise<string[]> => {
     const copied: string[] = [];
@@ -328,7 +346,7 @@ export async function snapshotManagedRuntimeResources(
     return copied;
   };
 
-  const directExtensionPaths = await copyGroup("extension", snapshot.extensions);
+  const directExtensionPaths = await copyGroup("extension", snapshot.extensions.filter(source => !isExcluded(source)));
   const directSkillPaths = await copyGroup("skill", snapshot.skills);
   const directPromptTemplatePaths = await copyGroup("prompt", snapshot.prompts);
   extensionPaths.push(...directExtensionPaths);
@@ -337,7 +355,8 @@ export async function snapshotManagedRuntimeResources(
   const packagePaths = await copyGroup("package", snapshot.packages);
   for (const packagePath of packagePaths) {
     const expanded = await expandHeadlessPackage(packagePath);
-    extensionPaths.push(...expanded.extensionPaths);
+    const source = [...copiedBySource].find(([, destination]) => destination === packagePath)![0];
+    extensionPaths.push(...expanded.extensionPaths.filter(entry => !isExcluded(join(source, relative(packagePath, entry)))));
     skillPaths.push(...expanded.skillPaths);
     promptTemplatePaths.push(...expanded.promptTemplatePaths);
   }

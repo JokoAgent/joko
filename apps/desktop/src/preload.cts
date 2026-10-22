@@ -8,6 +8,7 @@ import type {
   DesktopDeepLinkAcknowledgement,
   DesktopDeepLinkDelivery,
   DesktopExtensionWindowOpenResult,
+  DesktopExtensionWindowOwner,
   DesktopExtensionLibraryBeginSaveRequest,
   DesktopExtensionLibraryClipboardRequest,
   DesktopExtensionLibraryCommitSaveRequest,
@@ -413,9 +414,9 @@ const desktopApi = Object.freeze({
     }
   }),
   extensionWindows: Object.freeze({
-    open: (extensionId: string): Promise<DesktopExtensionWindowOpenResult> => {
-      if (!isDesktopExtensionId(extensionId)) return Promise.reject(new TypeError("Extension identity is invalid."));
-      return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionWindowOpen, extensionId)
+    open: (owner: DesktopExtensionWindowOwner): Promise<DesktopExtensionWindowOpenResult> => {
+      if (!isDesktopExtensionWindowOwner(owner)) return Promise.reject(new TypeError("Extension window owner is invalid."));
+      return ipcRenderer.invoke(DESKTOP_CHANNELS.extensionWindowOpen, owner)
         .then(parseDesktopExtensionWindowOpenResult);
     }
   }),
@@ -1290,6 +1291,12 @@ function isDesktopSessionWindowOwner(value: unknown): value is DesktopSessionWin
 
 function isDesktopExtensionId(value: unknown): value is string {
   return typeof value === "string" && /^extension_[a-f0-9]{32}$/u.test(value);
+}
+
+function isDesktopExtensionWindowOwner(value: unknown): value is DesktopExtensionWindowOwner {
+  return exactRecord(value, ["extensionId", "profileId", "serverId"]) && isDesktopExtensionId(value["extensionId"])
+    && [value["profileId"], value["serverId"]].every(part => typeof part === "string" && part.length > 0 && part.length <= 256
+      && part === part.trim() && !/[\u0000-\u001f\u007f]/u.test(part));
 }
 
 function isDesktopPageSearchRequest(value: unknown): value is DesktopPageSearchRequest {

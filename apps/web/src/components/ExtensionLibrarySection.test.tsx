@@ -23,6 +23,26 @@ afterEach(async () => {
 });
 
 describe("ExtensionLibrarySection", () => {
+  it("uses the selected remote node's typed path without opening the client's local folder picker", async () => {
+    const extension = libraryExtension("a", "Canvas"), pickLocation = vi.fn();
+    Object.defineProperty(window, "jokoDesktop", { configurable: true, value: {
+      capabilities: ["extension.libraryLocationPicker"], extensionLibraries: { pickLocation }
+    } });
+    const validate = vi.fn(async () => ({ libraryRoot: "/srv/library", warnings: [] }));
+    const { container } = await render(extension, {
+      state: { activeProfile: { id: "other-node", serverId: "other", deviceId: "device", name: "Other node", origin: "https://other.example" } } as AppController["state"],
+      getExtensionLibraryOverview: vi.fn(async () => overview(extension, { location: { kind: "default", path: "/srv/current-library", generation: 1n } })),
+      listExtensionLibraryTrash: vi.fn(async () => []), listExtensionLibraryGrace: vi.fn(async () => []),
+      validateExtensionLibraryLocation: validate
+    });
+    await act(async () => button(container, "Move Library").click());
+    await act(async () => button(document.body, "Use typed path").click());
+    const input = document.body.querySelector<HTMLInputElement>('.extension-library-dialog input')!;
+    expect(document.activeElement).toBe(input); expect(pickLocation).not.toHaveBeenCalled();
+    await act(async () => setValue(input, "/srv/libraries"));
+    await act(async () => button(document.body, "Check location").click());
+    expect(validate).toHaveBeenCalledWith(extension.id, extension.revision, "/srv/libraries", expect.any(AbortSignal));
+  });
   it("shows verified usage and requires location validation plus a visible cloud warning before relocation", async () => {
     const extension = libraryExtension("a", "Canvas");
     const validate = vi.fn(async () => ({
@@ -269,7 +289,9 @@ function view(controller: AppController, extension: ExtensionCatalogEntryView) {
 }
 
 function createController(overrides: Partial<AppController>): AppController {
-  return { state: { preferences: { navigationOpen: true } }, ...overrides } as unknown as AppController;
+  return { state: { preferences: { navigationOpen: true }, activeProfile: {
+    id: "local-node", serverId: "local", deviceId: "local-device", name: "This computer", origin: "http://127.0.0.1", managedLocal: true
+  } }, ...overrides } as unknown as AppController;
 }
 
 function libraryExtension(seed: string, name: string): ExtensionCatalogEntryView {

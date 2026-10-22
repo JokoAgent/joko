@@ -5,6 +5,20 @@ import { describe, expect, it, vi } from "vitest";
 import { DESKTOP_CHANNELS, isDesktopSessionWindowContext, type DesktopSessionWindowContext } from "../src/channels.js";
 import { buildTaskShareInvitation, type DesktopRemoteDesktopApi } from "@joko/contracts";
 
+it("sends the complete plugin window owner through the real preload and rejects unscoped or extra fields", async () => {
+  const f = loadPreload("main-document");
+  const api = f.exposed["extensionWindows"] as { open(owner: unknown): Promise<unknown> };
+  const owner = { extensionId: `extension_${"a".repeat(32)}`, profileId: "connection-a", serverId: "node-a" };
+  f.invoke.mockResolvedValue({ focusedExisting: false });
+  await expect(api.open(owner)).resolves.toEqual({ focusedExisting: false });
+  expect(f.invoke).toHaveBeenCalledWith(DESKTOP_CHANNELS.extensionWindowOpen, owner);
+  const count = f.invoke.mock.calls.length;
+  for (const invalid of [owner.extensionId, { ...owner, serverId: "" }, { ...owner, profileId: "wrong\nprofile" }, { ...owner, secret: "extra" }]) {
+    await expect(api.open(invalid)).rejects.toThrow("owner is invalid");
+  }
+  expect(f.invoke).toHaveBeenCalledTimes(count);
+});
+
 describe("private task invitation preload handoff", () => {
   it("delivers once to its captured Document, acknowledges acceptance and retires the listener", async () => {
     const f = loadPreload("main-document");

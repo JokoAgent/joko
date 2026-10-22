@@ -68,10 +68,13 @@ import { ExtensionTasksSection } from "./ExtensionTasksSection.js";
 import { openExtensionWindowFallback } from "../extension-window-navigation.js";
 import { SkillTools } from "./SkillTools.js";
 import { useExtensionSuggestionContinuation, type ExtensionSuggestionContinuationState } from "./use-extension-suggestion-continuation.js";
+import { CatalogNodePicker, CatalogNodeUnavailable, useCatalogNodeSelection, type CatalogNodeSelection } from "./CatalogNodePicker.js";
+import { ExtensionProjectScopePicker, useExtensionProjectScope } from "./ExtensionProjectScope.js";
 
-export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExtensionId, recommendationNonce, selectedTab, locale, t, runAction, onSelectExtension, onSelectTab, onOpenNavigation }: {
+interface ToolsPageProps {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
+  readonly catalogProfileId?: string;
   readonly runtimeSessionId?: string;
   readonly selectedExtensionId?: string;
   readonly recommendationNonce?: string;
@@ -82,7 +85,12 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
   readonly onSelectExtension?: (extensionId: string | undefined) => void;
   readonly onSelectTab?: (tab: ToolsTab) => void;
   readonly onOpenNavigation: () => void;
-}): JSX.Element {
+}
+export function ToolsPage(props: ToolsPageProps): JSX.Element {
+  const catalogScope = useCatalogNodeSelection(props.controller, props.catalogProfileId);
+  return <ToolsPageContent key={catalogScope.owner} {...props} catalogScope={catalogScope} />;
+}
+function ToolsPageContent({ controller, snapshot, runtimeSessionId, selectedExtensionId, recommendationNonce, selectedTab, locale, t, runAction, onSelectExtension, onSelectTab, onOpenNavigation, catalogScope }: ToolsPageProps & { readonly catalogScope: CatalogNodeSelection }): JSX.Element {
   const [tab, setTab] = useState<ToolsTab>(selectedExtensionId === undefined ? selectedTab ?? "browser" : "extensions");
   const [selectedExtension, setSelectedExtension] = useState(selectedExtensionId);
   const [removeResource, setRemoveResource] = useState<ResourceView>();
@@ -140,20 +148,22 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
       <header className="route-header">
         {!controller.state.preferences.navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
         <div><p className="eyebrow">{t("tools.eyebrow")}</p><h1>{t("tools.title")}</h1><p>{t("tools.subtitle")}</p></div>
-        <Pill tone={snapshot.browsers.some((browser) => browser.state === "ready") ? "success" : "neutral"}>{t("tools.providerCount", { count: snapshot.browsers.length })}</Pill>
+        {tab === "extensions" || tab === "skills" ? <CatalogNodePicker scope={catalogScope} tab={tab} t={t} />
+          : <Pill tone={snapshot.browsers.some((browser) => browser.state === "ready") ? "success" : "neutral"}>{t("tools.providerCount", { count: snapshot.browsers.length })}</Pill>}
       </header>
       <div className="route-tabs" role="tablist" aria-label={t("tools.title")} aria-orientation="horizontal">
         <TabButton id="browser" current={tab} onClick={selectTab}><Globe2 />{t("tools.browser")}</TabButton>
-        <TabButton id="extensions" current={tab} onClick={selectTab}><Boxes />{t("extensions.title")}<span>{snapshot.extensions.length}</span></TabButton>
-        <TabButton id="skills" current={tab} onClick={selectTab}><Sparkles />{t("skills.title")}<span>{snapshot.resources.filter((resource) => resource.kind === "skill" && resource.state !== "removed").length}</span></TabButton>
+        <TabButton id="extensions" current={tab} onClick={selectTab}><Boxes />{t("extensions.title")}<span>{catalogScope.ready ? snapshot.extensions.length : "—"}</span></TabButton>
+        <TabButton id="skills" current={tab} onClick={selectTab}><Sparkles />{t("skills.title")}<span>{catalogScope.ready ? snapshot.resources.filter((resource) => resource.kind === "skill" && resource.state !== "removed").length : "—"}</span></TabButton>
         <TabButton id="resources" current={tab} onClick={selectTab}><Braces />{t("tools.resources")}<span>{snapshot.resources.length}</span></TabButton>
         <TabButton id="mcp" current={tab} onClick={selectTab}><Boxes />{t("tools.mcp")}</TabButton>
         <TabButton id="activity" current={tab} onClick={selectTab}><Wrench />{t("tools.activity")}<span>{activity.length}</span></TabButton>
       </div>
       <div id="tools-tabpanel" className="route-page__content" role="tabpanel" aria-labelledby={`tools-tab-${tab}`}>
         {tab === "browser" && <BrowserTools controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} sessions={browserSessions} commentTargets={browserCommentTargets} locale={locale} t={t} runAction={runAction} />}
-        {tab === "extensions" && <ExtensionTools controller={controller} snapshot={snapshot} runtimeSessionId={runtimeSessionId} selectedId={selectedExtension} recommendationNonce={recommendationNonce} locale={locale} t={t} runAction={runAction} onSelect={selectExtension} />}
-        {tab === "skills" && <SkillTools controller={controller} backends={snapshot.backends} targets={snapshot.targets} resources={snapshot.resources} locale={locale} t={t} />}
+        {(tab === "extensions" || tab === "skills") && !catalogScope.ready && <CatalogNodeUnavailable scope={catalogScope} tab={tab} t={t} />}
+        {tab === "extensions" && catalogScope.ready && <ExtensionTools controller={controller} snapshot={snapshot} runtimeSessionId={runtimeSessionId} selectedId={selectedExtension} recommendationNonce={recommendationNonce} locale={locale} t={t} runAction={runAction} onSelect={selectExtension} />}
+        {tab === "skills" && catalogScope.ready && <SkillTools controller={controller} backends={snapshot.backends} targets={snapshot.targets} resources={snapshot.resources} locale={locale} t={t} />}
         {tab === "resources" && <ResourcesTools controller={controller} backends={snapshot.backends} targets={snapshot.targets} resources={snapshot.resources} t={t} runAction={runAction} onRemove={setRemoveResource} />}
         {tab === "mcp" && <McpTools controller={controller} backends={mcpBackends} servers={snapshot.settings.mcpServers} t={t} runAction={runAction} />}
         {tab === "activity" && <ActivityTools activity={activity} locale={locale} t={t} />}
@@ -915,6 +925,8 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
   readonly runAction: RunAction;
   readonly onSelect: (extensionId: string | undefined) => void;
 }): JSX.Element {
+  const projectScope = useExtensionProjectScope(controller);
+  const catalogSessionId = projectScope.project === undefined ? runtimeSessionId : undefined;
   const [facet, setFacet] = useState<ExtensionFacet>("installed");
   const [query, setQuery] = useState("");
   const [entries, setEntries] = useState<readonly ExtensionCatalogEntryView[]>([]);
@@ -985,9 +997,10 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
     const timer = window.setTimeout(() => {
       const filters = extensionFacetFilters(facet);
       void controller.listExtensions({
+        includeProjectDisabled: true,
         ...filters,
         ...(query.trim() === "" ? {} : { query: query.trim() }),
-        ...(runtimeSessionId === undefined ? {} : { sessionId: runtimeSessionId }),
+        ...(catalogSessionId === undefined ? {} : { sessionId: catalogSessionId }),
         signal: abort.signal
       }).then((catalog) => {
         if (abort.signal.aborted || request !== listRequest.current) return;
@@ -1001,16 +1014,16 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
       });
     }, query.trim() === "" ? 0 : 180);
     return () => { window.clearTimeout(timer); abort.abort(); };
-  }, [controller, facet, query, refreshRevision, runtimeSessionId]);
+  }, [controller, facet, query, refreshRevision, catalogSessionId]);
 
   const loadDetail = useCallback(async (extensionId: string, signal?: AbortSignal): Promise<ExtensionCatalogEntryView> => {
-    const catalog = await controller.getExtension(extensionId, runtimeSessionId, signal);
+    const catalog = await controller.getExtension(extensionId, catalogSessionId, signal, true);
     const next = catalog.extensions[0];
     if (next === undefined || next.id !== extensionId) throw new Error(t("extensions.detailUnavailable"));
     setCatalogRevision(catalog.revision);
     setRecovered(catalog.recoveredFromCorruption);
     return next;
-  }, [controller, runtimeSessionId, t]);
+  }, [controller, catalogSessionId, t]);
 
   useEffect(() => {
     detailRetryAbort.current?.abort();
@@ -1190,6 +1203,7 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
   return <div className={cx("extension-browser", selectedId !== undefined && "has-selection")}>
     <section className="extension-browser__catalog" aria-label={t("extensions.catalog") }>
       <div className="extension-browser__controls">
+        <ExtensionProjectScopePicker scope={projectScope} controller={controller} disabled={mutationKey !== undefined} t={t} />
         <label className="extension-search"><Search aria-hidden="true" /><span className="sr-only">{t("extensions.search")}</span><input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("extensions.searchPlaceholder")} /></label>
         <div className="extension-catalog-actions"><Button tone="ghost" disabled={controller.state.connectionState !== "connected"} onClick={event => launchCreator(event.currentTarget)}><Sparkles aria-hidden="true" />{t("extensions.createPlugin")}</Button><div className="extension-facets" role="tablist" aria-label={t("extensions.filter") }>
           {(["installed", "catalog", "local", "market"] as const).map((value) => <button type="button" role="tab" aria-selected={facet === value} tabIndex={facet === value ? 0 : -1} className={facet === value ? "is-active" : ""} key={value} onKeyDown={(event) => moveTablistSelection(event, "horizontal")} onClick={() => setFacet(value)}>{t(`extensions.facet.${value}`)}</button>)}
@@ -1237,14 +1251,21 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
       {!detailLoading && detailError === undefined && selectedDetail !== undefined && <ExtensionDetail
         controller={controller}
         extension={selectedDetail}
+        projectSelected={projectScope.project !== undefined}
+        projectReady={projectScope.ready}
+        projectEnabled={selectedDetail.enabled && !projectScope.state?.disabledExtensionIds.includes(selectedDetail.id)}
+        projectSupported={selectedDetail.owner.kind === "resource" && snapshot.resources.some(resource => resource.id === (selectedDetail.owner.kind === "resource" ? selectedDetail.owner.resourceId : "") && resource.targetId === undefined)}
         locale={locale}
         busy={mutationKey !== undefined || continuationLocksDetail}
         t={t}
-        onEnabledChange={(enabled) => mutate(
+        onEnabledChange={(enabled) => projectScope.ready && mutate(
           `extension-enabled:${selectedDetail.id}`,
           selectedDetail.id,
-          () => controller.setExtensionEnabled(selectedDetail.id, enabled, selectedDetail.revision),
-          enabled ? suggestionMutation("enable", selectedDetail) : undefined
+          async () => {
+            try { await controller.setExtensionEnabled(selectedDetail.id, enabled, selectedDetail.revision, projectScope.project ? projectScope.state : undefined); }
+            finally { projectScope.refresh(); }
+          },
+          enabled && !projectScope.project ? suggestionMutation("enable", selectedDetail) : undefined
         )}
         onSidebarChange={(visible) => mutate(`extension-sidebar:${selectedDetail.id}`, selectedDetail.id, () => controller.setExtensionSidebarVisible(selectedDetail.id, visible, selectedDetail.revision))}
         onSetup={() => setSetupOpen(true)}
@@ -1253,13 +1274,19 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
         onPackage={() => openPackage(selectedDetail)}
         onExport={() => setPackageExport(selectedDetail)}
         onRemove={() => setPackageRemoval(selectedDetail)}
-        onOpenMainView={() => controller.navigate({ kind: "extensionMainView", extensionId: selectedDetail.id })}
+        onOpenMainView={() => {
+          const profile = controller.state.activeProfile;
+          if (profile) controller.navigate({ kind: "extensionMainView", extensionId: selectedDetail.id, profileId: profile.id, serverId: profile.serverId });
+        }}
         onOpenWindow={() => runAction(`extension-window:${selectedDetail.id}`, async () => {
+          const profile = controller.state.activeProfile;
+          if (!profile) throw new Error(t("catalog.unavailable"));
+          const source = { profileId: profile.id, serverId: profile.serverId };
           if (window.jokoDesktop?.capabilities.includes("extension.windows") === true) {
-            await window.jokoDesktop.extensionWindows.open(selectedDetail.id);
+            await window.jokoDesktop.extensionWindows.open({ extensionId: selectedDetail.id, ...source });
             return;
           }
-          if (openExtensionWindowFallback(window.location, selectedDetail.id) === null) {
+          if (openExtensionWindowFallback(window.location, selectedDetail.id, source) === null) {
             throw new Error(t("extensions.mainView.windowFailed"));
           }
         })}
@@ -1413,9 +1440,13 @@ function ExtensionSuggestionContinuation({ state, busy, canAct, t, onRetry, onCa
   </section>;
 }
 
-function ExtensionDetail({ controller, extension, locale, busy, t, onEnabledChange, onSidebarChange, onSetup, onNetworkChanged, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
+function ExtensionDetail({ controller, extension, projectSelected, projectReady, projectEnabled, projectSupported, locale, busy, t, onEnabledChange, onSidebarChange, onSetup, onNetworkChanged, onUse, onPackage, onExport, onRemove, onOpenMainView, onOpenWindow }: {
   readonly controller: AppController;
   readonly extension: ExtensionCatalogEntryView;
+  readonly projectSelected: boolean;
+  readonly projectReady: boolean;
+  readonly projectEnabled: boolean;
+  readonly projectSupported: boolean;
   readonly locale: string;
   readonly busy: boolean;
   readonly t: Translator;
@@ -1431,8 +1462,9 @@ function ExtensionDetail({ controller, extension, locale, busy, t, onEnabledChan
   readonly onOpenWindow: () => void;
 }): JSX.Element {
   const sourceOwned = extension.owner.kind === "source";
+  const effectiveEnabled = projectSelected ? projectReady ? projectEnabled : undefined : extension.enabled;
   return <article className="extension-detail">
-    <header className="extension-detail__header"><span className="extension-detail__icon"><Boxes aria-hidden="true" /></span><div><p className="eyebrow">{extension.source === "local" ? t("extensions.local") : t("extensions.market")}</p><h2>{extension.name}</h2><p>{extension.description || t("extensions.noDescription")}</p></div><Pill tone={sourceOwned ? extensionInstallTone(extension.installState) : extension.enabled ? "success" : "neutral"}>{sourceOwned ? extensionInstallLabel(extension.installState, t) : extension.enabled ? t("common.enabled") : t("common.disabled")}</Pill></header>
+    <header className="extension-detail__header"><span className="extension-detail__icon"><Boxes aria-hidden="true" /></span><div><p className="eyebrow">{extension.source === "local" ? t("extensions.local") : t("extensions.market")}</p><h2>{extension.name}</h2><p>{extension.description || t("extensions.noDescription")}</p></div><Pill tone={sourceOwned ? extensionInstallTone(extension.installState) : effectiveEnabled ? "success" : "neutral"}>{sourceOwned ? extensionInstallLabel(extension.installState, t) : effectiveEnabled === undefined ? t("common.loading") : effectiveEnabled ? t("common.enabled") : t("common.disabled")}</Pill></header>
     {extension.error !== undefined && <p className="extension-detail__error" role="alert"><AlertTriangle aria-hidden="true" />{extension.error}</p>}
     <dl className="extension-detail__metadata"><div><dt>{t("extensions.version")}</dt><dd>{extension.version ?? t("common.unknown")}</dd></div><div><dt>{t("extensions.author")}</dt><dd>{extension.author ?? t("common.unknown")}</dd></div><div><dt>{t("common.state")}</dt><dd>{extensionInstallLabel(extension.installState, t)}</dd></div><div><dt>{t("extensions.owner")}</dt><dd>{extension.owner.kind === "resource" ? t("extensions.resourceOwner") : extension.owner.kind === "mcp" ? t("extensions.mcpOwner") : t("extensions.sourceOwner")}</dd></div></dl>
     {extension.mainView !== undefined && <section className="extension-main-view-actions"><LayoutDashboard aria-hidden="true" /><div><strong>{extension.mainView.title ?? t("extensions.mainView.title")}</strong><p>{extensionMainViewReady(extension) ? t("extensions.mainView.readyBody") : t("extensions.mainView.notReadyBody")}</p></div><Button tone="primary" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenMainView}>{t("extensions.mainView.open")}</Button><Button tone="ghost" disabled={busy || !extensionMainViewReady(extension)} onClick={onOpenWindow}><ExternalLink aria-hidden="true" />{t("extensions.mainView.openWindow")}</Button></section>}
@@ -1442,7 +1474,7 @@ function ExtensionDetail({ controller, extension, locale, busy, t, onEnabledChan
     {extension.owner.kind === "resource" && extension.installed && <ExtensionTasksSection key={JSON.stringify([extension.id, controller.state.activeProfile?.id, controller.state.activeProfile?.serverId,
       controller.state.connectionGeneration, controller.state.connectionState])} controller={controller} extension={extension} disabled={busy} t={t} />}
     {sourceOwned ? <section className="extension-source-available"><FolderPlus aria-hidden="true" /><div><strong>{t("extensions.sourceAvailable")}</strong><p>{t("extensions.sourceAvailableBody")}</p></div><Button tone="primary" disabled={busy} onClick={onPackage}><Download aria-hidden="true" />{t("extensions.package.install")}</Button></section> : <section className="extension-detail__settings" aria-label={t("extensions.configuration") }>
-      <label><span><strong>{t("extensions.enabled")}</strong><small>{t("extensions.enabledBody")}</small></span><CheckboxControl checked={extension.enabled} disabled={busy} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
+      <label><span><strong>{t(projectSelected ? "extensions.project.enabled" : "extensions.enabled")}</strong><small>{t(projectSelected ? !projectSupported ? "extensions.project.unsupported" : !extension.enabled ? "extensions.project.globallyDisabled" : "extensions.project.enabledBody" : "extensions.enabledBody")}</small></span><CheckboxControl checked={projectSelected ? projectReady && projectEnabled : extension.enabled} disabled={busy || projectSelected && (!projectReady || !projectSupported || !extension.enabled)} onChange={(event) => onEnabledChange(event.target.checked)} /></label>
       {extension.sidebarSupported && <label><span><strong>{t("extensions.showSidebar")}</strong><small>{t("extensions.showSidebarBody")}</small></span><CheckboxControl checked={extension.sidebarVisible} disabled={busy} onChange={(event) => onSidebarChange(event.target.checked)} /></label>}
       {extension.setup.state !== "notRequired" && <button type="button" disabled={busy} onClick={onSetup}><span><strong>{t("extensions.setup")}</strong><small>{extension.setup.error ?? extensionSetupLabel(extension.setup.state, t)}</small></span><Pill tone={extension.setup.state === "ready" ? "success" : extension.setup.state === "failed" ? "danger" : "warning"}>{extensionSetupLabel(extension.setup.state, t)}</Pill></button>}
     </section>}
@@ -1451,7 +1483,7 @@ function ExtensionDetail({ controller, extension, locale, busy, t, onEnabledChan
       <Button tone="ghost" disabled={busy} onClick={onExport}><Download aria-hidden="true" />{t("extensions.export.open")}</Button>
       <Button tone="ghost" className="danger-text" disabled={busy} onClick={onRemove}><Trash2 aria-hidden="true" />{t("extensions.package.uninstall")}</Button>
     </section>}
-    <ExtensionDetailSection title={t("extensions.commands")} empty={t("extensions.noCommands")} items={extension.commands.map((command) => <div className="extension-capability-row" key={`${command.sessionId}\u0000${command.name}`}><span><strong>/{command.name}</strong><small>{command.description}</small></span><Button tone="primary" disabled={busy || !extension.enabled} onClick={() => onUse(command)}><Play aria-hidden="true" />{extension.setup.state === "ready" || extension.setup.state === "notRequired" ? t("extensions.use") : t("extensions.configureToUse")}</Button></div>)} />
+    <ExtensionDetailSection title={t("extensions.commands")} empty={t("extensions.noCommands")} items={extension.commands.map((command) => <div className="extension-capability-row" key={`${command.sessionId}\u0000${command.name}`}><span><strong>/{command.name}</strong><small>{command.description}</small></span><Button tone="primary" disabled={busy || !extension.enabled || projectSelected && (!projectReady || !projectEnabled)} onClick={() => onUse(command)}><Play aria-hidden="true" />{extension.setup.state === "ready" || extension.setup.state === "notRequired" ? t("extensions.use") : t("extensions.configureToUse")}</Button></div>)} />
     <ExtensionDetailSection title={t("extensions.tools")} empty={t("extensions.noTools")} items={extension.tools.map((tool) => <div className="extension-capability-row" key={tool.name}><span><strong>{tool.name}</strong><small>{tool.description}</small></span>{tool.requiresPermission && <Pill tone="warning">{t("extensions.permissionRequired")}</Pill>}</div>)} />
     <ExtensionDetailSection title={t("extensions.permissions")} empty={t("extensions.noPermissions")} items={extension.permissions.map((permission) => <div className="extension-capability-row" key={permission.id}><span><strong>{permission.label}</strong><small>{permission.description}</small></span><Pill tone={permission.granted ? "success" : permission.required ? "warning" : "neutral"}>{permission.granted ? t("extensions.granted") : permission.required ? t("extensions.required") : t("extensions.optional")}</Pill></div>)} />
   </article>;

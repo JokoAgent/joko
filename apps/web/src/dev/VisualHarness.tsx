@@ -183,6 +183,7 @@ export function VisualHarness(): JSX.Element {
   const providerLoginFlows = useRef(new Map<string, ProviderLoginFlowView>());
   const sequence = useRef(100);
   const extensionPackageExports = useRef(new Map<string, ExtensionPackageExportJobView>());
+  const extensionProjectPreferences = useRef(new Map<string, { revision: bigint; disabledExtensionIds: string[] }>());
   const [state, setState] = useState<ControllerState>(() => initialControllerState(scenario, files));
   const sessionFixture = useRef(state.snapshot.sessions);
   sessionFixture.current = state.snapshot.sessions;
@@ -557,6 +558,11 @@ export function VisualHarness(): JSX.Element {
       connect: async (profile, options): Promise<void> => {
         record(`connection-connect:${profile.id}:${options?.automatic === true ? "automatic" : "current"}`);
       },
+      openMachineCatalog: async (profileId, tab): Promise<boolean> => {
+        record(`catalog-node:${profileId}:${tab}`);
+        if (profileId === state.activeProfile?.id) return true;
+        throw new Error("The selected node is offline.");
+      },
       pair: async (_origin, _code, _deviceName, options): Promise<void> => {
         record(`connection-pair:${options?.automatic === true ? "automatic" : "current"}`);
       },
@@ -584,6 +590,21 @@ export function VisualHarness(): JSX.Element {
       },
       refresh: async (): Promise<void> => { record("refresh"); },
       extensionTaskApi: () => undefined,
+      listExtensionProjects: async () => [{ id: "a".repeat(64), name: "Joko workspace", path: "D:\\joko" }],
+      resolveExtensionProject: async (path, signal) => {
+        signal?.throwIfAborted();
+        if (path !== "D:\\joko") throw new Error("Choose a visual fixture directory.");
+        return { id: "a".repeat(64), name: "Joko workspace", path };
+      },
+      getExtensionProjectState: async (projectId, signal) => {
+        signal?.throwIfAborted();
+        if (projectId !== "a".repeat(64)) throw new Error("Visual project unavailable.");
+        return { project: { id: projectId, name: "Joko workspace", path: "D:\\joko" },
+          ...extensionProjectPreferences.current.get(projectId) ?? { revision: 0n, disabledExtensionIds: [] } };
+      },
+      listExtensionProjectDirectories: async (_path, signal) => {
+        signal?.throwIfAborted(); return { path: "D:\\joko", parentPath: "D:\\joko", directories: [], truncated: false };
+      },
       listExtensions: async (options = {}): Promise<ExtensionCatalogView> => {
         options.signal?.throwIfAborted();
         const query = options.query?.trim().toLocaleLowerCase("en-US") ?? "";
@@ -838,7 +859,16 @@ export function VisualHarness(): JSX.Element {
       addExtensionSource: async (source, revision): Promise<void> => { record(`extension-source:add:${source.kind}:${revision.toString(10)}`); },
       refreshExtensionSource: async (sourceId, revision): Promise<void> => { record(`extension-source:refresh:${sourceId}:${revision.toString(10)}`); },
       removeExtensionSource: async (sourceId, revision): Promise<void> => { record(`extension-source:remove:${sourceId}:${revision.toString(10)}`); },
-      setExtensionEnabled: async (extensionId, enabled, expectedRevision): Promise<void> => {
+      setExtensionEnabled: async (extensionId, enabled, expectedRevision, project): Promise<void> => {
+        if (project) {
+          const current = extensionProjectPreferences.current.get(project.project.id) ?? { revision: 0n, disabledExtensionIds: [] };
+          if (current.revision !== project.revision) throw new Error("Visual project settings changed.");
+          const extension = extensionFixture.current.extensions.find(value => value.id === extensionId);
+          if (!extension || extension.revision !== expectedRevision || enabled && !extension.enabled) throw new Error("Visual plugin settings changed.");
+          extensionProjectPreferences.current.set(project.project.id, { revision: current.revision + 1n,
+            disabledExtensionIds: enabled ? current.disabledExtensionIds.filter(id => id !== extensionId) : [...new Set([...current.disabledExtensionIds, extensionId])] });
+          record(`extension-project-enabled:${extensionId}:${enabled ? "on" : "off"}`); return;
+        }
         mutateVisualExtension(extensionId, expectedRevision, (extension) => {
           if (!extension.installed || extension.owner.kind === "source") {
             throw new Error("The visual extension is not installed.");
@@ -3545,7 +3575,8 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
     connectionGeneration: connectionScenario ? 0 : 1,
     profiles: connectionScenario
       ? [managedConnectionProfile, savedConnectionProfile]
-      : parameters.scenario === "connections" ? [activeProfile] : [],
+      : parameters.scenario === "connections" ? [activeProfile]
+        : parameters.scenario === "extensions" ? [activeProfile, savedConnectionProfile] : [],
     machineCaches: [],
     machinePresenceByProfile: { [activeProfile.id]: "current" },
     activeProfile: connectionScenario ? undefined : activeProfile,

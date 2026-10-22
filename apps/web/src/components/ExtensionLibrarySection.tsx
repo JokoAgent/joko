@@ -51,6 +51,9 @@ export function ExtensionLibrarySection({ controller, extension, locale, disable
   readonly disabled: boolean;
   readonly t: Translator;
 }): JSX.Element | null {
+  const localLocationPicker = controller.state.activeProfile?.managedLocal === true
+    && window.jokoDesktop?.capabilities.includes("extension.libraryLocationPicker") === true
+    ? window.jokoDesktop?.extensionLibraries : undefined;
   const ready = extensionLibraryReady(extension);
   const [loadRevision, setLoadRevision] = useState(0);
   const [loadState, setLoadState] = useState<LoadState>({ phase: "loading" });
@@ -187,13 +190,13 @@ export function ExtensionLibrarySection({ controller, extension, locale, disable
     setValidationError(undefined);
   };
   const pickCandidate = (): void => {
-    if (window.jokoDesktop?.capabilities.includes("extension.libraryLocationPicker") !== true) {
+    if (!localLocationPicker) {
       candidateInput.current?.focus();
       return;
     }
     const request = ++validationRequest.current;
     const expectedIntent = locationIntent;
-    void window.jokoDesktop.extensionLibraries.pickLocation().then((selection) => {
+    void localLocationPicker.pickLocation().then((selection) => {
       if (request === validationRequest.current && expectedIntent !== undefined && locationIntent === expectedIntent && !selection.cancelled) {
         updateCandidate(selection.path);
       }
@@ -293,7 +296,7 @@ export function ExtensionLibrarySection({ controller, extension, locale, disable
       initialFocus={() => candidateInput.current}
     >
       <div className="extension-library-dialog">
-        <label><span>{t("extensions.library.parentFolder")}</span><div><input ref={candidateInput} value={candidate} onChange={(event) => updateCandidate(event.target.value)} placeholder={t("extensions.library.pathPlaceholder")} disabled={validating || busy !== undefined} /><Button disabled={validating || busy !== undefined} onClick={pickCandidate}><FolderOpen aria-hidden="true" />{window.jokoDesktop?.capabilities.includes("extension.libraryLocationPicker") === true ? t("extensions.library.browse") : t("extensions.library.enterPath")}</Button></div></label>
+        <label><span>{t("extensions.library.parentFolder")}</span><div><input ref={candidateInput} value={candidate} onChange={(event) => updateCandidate(event.target.value)} placeholder={t("extensions.library.pathPlaceholder")} disabled={validating || busy !== undefined} /><Button disabled={validating || busy !== undefined} onClick={pickCandidate}><FolderOpen aria-hidden="true" />{localLocationPicker ? t("extensions.library.browse") : t("extensions.library.enterPath")}</Button></div></label>
         <p className="muted">{t("extensions.library.parentHint", { name: extension.id })}</p>
         {validationError !== undefined && <p className="extension-library-dialog__error" role="alert"><AlertTriangle aria-hidden="true" />{validationError}</p>}
         {validation !== undefined && <div className="extension-library-validation" role="status"><HardDrive aria-hidden="true" /><div><strong>{t("extensions.library.locationReady")}</strong><p title={validation.libraryRoot}>{validation.libraryRoot}</p><small>{t("extensions.library.freeValue", { value: validation.diskFreeBytes === undefined ? t("common.unknown") : formatBytes(validation.diskFreeBytes) })}</small></div></div>}

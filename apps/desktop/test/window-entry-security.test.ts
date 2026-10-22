@@ -5,12 +5,15 @@ import {
   INSPECTOR_WINDOW_FRAME_NAME,
   INSPECTOR_WINDOW_URL,
   isDesktopExtensionId,
+  isDesktopExtensionWindowOwner,
+  desktopExtensionWindowKey,
   isInspectorWindowOpenRequest
 } from "../src/channels.js";
 import {
   createNavigationPolicy,
   isAllowedDesktopAppEntrySearch,
   isAllowedExtensionWindowNavigation,
+  extensionWindowEntryUrl,
   isAllowedMainFrameNavigation,
   isAllowedPackagedBundleResource,
   isAllowedPrimaryWindowNavigation,
@@ -42,21 +45,29 @@ describe("trusted auxiliary window entries", () => {
   it("binds an Extension window to its exact native owner identity", () => {
     const policy = createNavigationPolicy(resolve("dist/web/index.html"));
     const id = "extension_0123456789abcdef0123456789abcdef";
-    const entry = `joko://app/index.html?extensionWindow=1&bootExtension=${id}#/extensions/${id}`;
-    expect(isAllowedExtensionWindowNavigation(entry, id, policy)).toBe(true);
+    const owner = { extensionId: id, profileId: "connection/one", serverId: "node-one" };
+    const entry = extensionWindowEntryUrl("joko://app/index.html?old=1#/tasks/old", owner);
+    expect(entry).toBe(`joko://app/index.html?extensionWindow=1&bootExtension=${id}#/extensions/${id}?profile=connection%2Fone&server=node-one`);
+    expect(isAllowedExtensionWindowNavigation(entry, owner, policy)).toBe(true);
     expect(isAllowedPackagedBundleResource(entry, policy)).toBe(true);
-    expect(isAllowedExtensionWindowNavigation(entry, "extension_11111111111111111111111111111111", policy)).toBe(false);
-    expect(isAllowedExtensionWindowNavigation("joko://app/index.html", id, policy)).toBe(false);
+    expect(isAllowedExtensionWindowNavigation(entry, { ...owner, extensionId: "extension_11111111111111111111111111111111" }, policy)).toBe(false);
+    expect(isAllowedExtensionWindowNavigation("joko://app/index.html", owner, policy)).toBe(false);
+    expect(isAllowedExtensionWindowNavigation(entry, { ...owner, profileId: "other" }, policy)).toBe(false);
+    expect(isAllowedExtensionWindowNavigation(entry, { ...owner, serverId: "other" }, policy)).toBe(false);
+    expect(desktopExtensionWindowKey(owner)).not.toBe(desktopExtensionWindowKey({ ...owner, profileId: "other" }));
+    expect(desktopExtensionWindowKey(owner)).not.toBe(desktopExtensionWindowKey({ ...owner, serverId: "other" }));
+    expect(isDesktopExtensionWindowOwner({ ...owner, profileId: "" })).toBe(false);
+    expect(isDesktopExtensionWindowOwner({ ...owner, secret: "unexpected" })).toBe(false);
     const mismatchedRoute = `joko://app/index.html?extensionWindow=1&bootExtension=${id}#/extensions/extension_11111111111111111111111111111111`;
     expect(isAllowedExtensionWindowNavigation(
       mismatchedRoute,
-      id,
+      owner,
       policy
     )).toBe(false);
     expect(isAllowedPackagedBundleResource(mismatchedRoute, policy)).toBe(false);
     expect(isAllowedExtensionWindowNavigation(
       `joko://app/index.html?extensionWindow=1&bootExtension=${id}&auth=secret#/extensions/${id}`,
-      id,
+      owner,
       policy
     )).toBe(false);
   });

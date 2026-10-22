@@ -7831,6 +7831,44 @@ describe("managed resource precedence", () => {
     await adapter.dispose();
   });
 
+  it("applies project exclusions to native argv only when a new runtime starts", async () => {
+    const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-project-policy-home-"));
+    const workspace = await mkdtemp(join(tmpdir(), "joko-pi-project-policy-workspace-"));
+    const source = await mkdtemp(join(tmpdir(), "joko-pi-project-policy-source-"));
+    await mkdir(join(source, "extensions"));
+    await writeFile(join(source, "package.json"), JSON.stringify({ pi: { extensions: ["extensions/a.ts", "extensions/b.ts"] } }));
+    for (const name of ["a", "b"]) await writeFile(join(source, "extensions", `${name}.ts`), `export default () => '${name}';`);
+    const specs: PiProcessSpec[] = []; let disabled = false;
+    const adapter = createPiAdapter({ agentHome, sessionRoot: agentHome,
+      providers: [{ id: "local", baseUrl: "http://127.0.0.1:11434/v1", api: "openai-completions", keyless: true,
+        models: [{ id: "test-model", contextWindow: 32_768, maxTokens: 4_096 }] }],
+      managedResources: { extensions: [], skills: [], prompts: [], packages: [source],
+        resources: [{ id: "bundle", kind: "package", name: "Bundle", source: "local:bundle", state: "approved", runtimePath: source }] },
+      resolveProjectExtensionExclusions: () => disabled ? [{ resourceId: "bundle", entryPath: "extensions/a.ts" }] : [],
+      versionProbe: async () => "pi 99.99.99-latest-test",
+      processFactory: spec => { specs.push(spec); return new ScriptedPiProcess(spec) as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "target-policy", backendId: "pi", displayName: "Policy", workspaceRoot: workspace, managed: false, trusted: true };
+    try {
+      const options = { target, providerId: "local", modelId: "test-model", fastMode: false, permissionMode: "ask" as const };
+      await adapter.createSession(options, makeContext(target, []));
+      const first = valuesForArgument(specs[0]!.args, "--extension");
+      expect(first.some(entry => entry.endsWith("a.ts"))).toBe(true);
+      disabled = true;
+      await adapter.createSession(options, { ...makeContext(target, []), sessionId: "session-2" });
+      const second = valuesForArgument(specs[1]!.args, "--extension");
+      expect(specs).toHaveLength(2);
+      expect(second.some(entry => entry.endsWith("a.ts"))).toBe(false);
+      expect(second.some(entry => entry.endsWith("b.ts"))).toBe(true);
+      expect(valuesForArgument(specs[0]!.args, "--extension")).toEqual(first);
+      const untrusted = { ...target, trusted: false };
+      await adapter.createSession({ ...options, target: untrusted }, { ...makeContext(untrusted, []), sessionId: "session-untrusted" });
+      expect(valuesForArgument(specs[2]!.args, "--extension").some(entry => entry.endsWith("a.ts"))).toBe(false);
+      disabled = false;
+      await adapter.createSession(options, { ...makeContext(target, []), sessionId: "session-3" });
+      expect(valuesForArgument(specs[3]!.args, "--extension").some(entry => entry.endsWith("a.ts"))).toBe(true);
+    } finally { await adapter.dispose(); }
+  });
+
   it("does not trust a custom executable that only returns a semantic version", async () => {
     const agentHome = await mkdtemp(join(tmpdir(), "joko-pi-custom-compatibility-home-"));
     const workspace = await mkdtemp(join(tmpdir(), "joko-pi-custom-compatibility-workspace-"));

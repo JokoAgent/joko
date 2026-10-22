@@ -512,36 +512,6 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     return () => { retired = true; };
   }, [bootSessionId, sessionApplicationWindow]);
   useEffect(() => {
-    if (typeof BroadcastChannel === "undefined") return;
-    const channel = new BroadcastChannel("joko:application-window-bootstrap");
-    const requestId = extensionApplicationWindow
-      ? `${Date.now().toString(36)}-${window.crypto.getRandomValues(new Uint32Array(2)).join("-")}`
-      : undefined;
-    channel.onmessage = (event: MessageEvent<unknown>): void => {
-      if (typeof event.data !== "object" || event.data === null || Array.isArray(event.data)) return;
-      const message = event.data as Record<string, unknown>;
-      if (!auxiliaryApplicationWindow && message["kind"] === "request-profile" && typeof message["requestId"] === "string") {
-        const profileId = controllerRef.current.state.activeProfile?.id;
-        if (profileId !== undefined) channel.postMessage({ kind: "profile", requestId: message["requestId"], profileId });
-        return;
-      }
-      if (requestId !== undefined && message["kind"] === "profile" && message["requestId"] === requestId &&
-        typeof message["profileId"] === "string" && message["profileId"].length <= 256) {
-        setBootConnectionProfileId(message["profileId"]);
-      }
-    };
-    if (requestId === undefined) return () => channel.close();
-    const request = (): void => channel.postMessage({ kind: "request-profile", requestId });
-    request();
-    const timer = window.setInterval(request, 500);
-    const stop = window.setTimeout(() => window.clearInterval(timer), 10_000);
-    return () => {
-      window.clearInterval(timer);
-      window.clearTimeout(stop);
-      channel.close();
-    };
-  }, [auxiliaryApplicationWindow, extensionApplicationWindow]);
-  useEffect(() => {
     if (!auxiliaryApplicationWindow || !state.ready || state.activeProfile !== undefined ||
       state.connectionState !== "disconnected" || bootConnectionProfileId === undefined || bootConnectionAttemptedRef.current) return;
     const profile = state.profiles.find((candidate) => candidate.id === bootConnectionProfileId);
@@ -882,8 +852,14 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
     state.route,
     state.snapshot.sessions
   ]);
-  const lastRuntimeSessionIdRef = useRef<string | undefined>(activeSession?.id);
-  if (activeSession !== undefined) lastRuntimeSessionIdRef.current = activeSession.id;
+  const runtimeSessionOwner = JSON.stringify([state.activeProfile?.id, state.activeProfile?.serverId, state.connectionGeneration]);
+  const lastRuntimeSessionOwnerRef = useRef(runtimeSessionOwner);
+  const lastRuntimeSessionIdRef = useRef<string | undefined>(undefined);
+  if (lastRuntimeSessionOwnerRef.current !== runtimeSessionOwner) {
+    lastRuntimeSessionOwnerRef.current = runtimeSessionOwner;
+    lastRuntimeSessionIdRef.current = undefined;
+  }
+  if (activeSession !== undefined && state.connectionState === "connected") lastRuntimeSessionIdRef.current = activeSession.id;
   else if (lastRuntimeSessionIdRef.current !== undefined
     && !state.snapshot.sessions.some((session) => session.id === lastRuntimeSessionIdRef.current)) {
     lastRuntimeSessionIdRef.current = undefined;
@@ -2480,34 +2456,40 @@ export function AppWithController({ controller, initialInspectorSubagentFocusReq
           {state.route.kind === "tools" && <ToolsPage
             controller={controller}
             snapshot={state.snapshot}
-            runtimeSessionId={lastRuntimeSessionIdRef.current}
+            catalogProfileId={state.route.profileId}
+            runtimeSessionId={state.route.profileId === undefined ? lastRuntimeSessionIdRef.current : undefined}
             selectedExtensionId={state.route.extensionId}
             recommendationNonce={state.route.recommendationNonce}
             selectedTab={state.route.tab}
             locale={state.effectiveLocale}
             t={t}
             runAction={runAction}
-            onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(extensionId === undefined ? { tab: "extensions" } : { extensionId }), ...(state.route.kind === "tools" && extensionId === state.route.extensionId && state.route.recommendationNonce !== undefined ? { recommendationNonce: state.route.recommendationNonce } : {}) })}
-            onSelectTab={(tab) => controller.navigate({ kind: "tools", ...(tab === "browser" ? {} : { tab }) })}
+            onSelectExtension={(extensionId) => controller.navigate({ kind: "tools", ...(state.route.kind === "tools" && state.route.profileId ? { profileId: state.route.profileId } : {}), ...(extensionId === undefined ? { tab: "extensions" } : { extensionId }), ...(state.route.kind === "tools" && extensionId === state.route.extensionId && state.route.recommendationNonce !== undefined ? { recommendationNonce: state.route.recommendationNonce } : {}) })}
+            onSelectTab={(tab) => controller.navigate({ kind: "tools", ...((tab === "extensions" || tab === "skills") && state.route.kind === "tools" && state.route.profileId ? { profileId: state.route.profileId } : {}), ...(tab === "browser" ? {} : { tab }) })}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
           />}
-          {state.route.kind === "extensionMainView" && <ExtensionMainViewPage
+          {state.route.kind === "extensionMainView" && (state.route.profileId !== undefined
+            && (state.route.profileId !== state.activeProfile?.id || state.route.serverId !== state.activeProfile?.serverId)
+            ? <p role="alert">{t("catalog.unavailable")}</p> : <ExtensionMainViewPage
             controller={controller}
             extensionId={state.route.extensionId}
             t={t}
             navigationOpen={navigationOpen}
             onOpenNavigation={() => setWindowNavigationOpen(true)}
             onOpenIndependent={(extensionId) => {
+              const profile = controller.state.activeProfile;
+              if (!profile) return;
+              const source = { profileId: profile.id, serverId: profile.serverId };
               if (window.jokoDesktop?.capabilities.includes("extension.windows") === true) {
-                void window.jokoDesktop.extensionWindows.open(extensionId)
+                void window.jokoDesktop.extensionWindows.open({ extensionId, ...source })
                   .catch(() => setActionError(t("extensions.mainView.windowFailed")));
                 return;
               }
-              if (openExtensionWindowFallback(window.location, extensionId) === null) {
+              if (openExtensionWindowFallback(window.location, extensionId, source) === null) {
                 setActionError(t("extensions.mainView.windowFailed"));
               }
             }}
-          />}
+          />)}
           {state.route.kind === "settings" && <SettingsPage controller={controller} snapshot={state.snapshot} activeTargetId={settingsTargetIdRef.current} locale={state.effectiveLocale} t={t} runAction={runAction} onImportPortableSession={portableImportTargets.length === 0 ? undefined : () => { void choosePortableSessionImport(); }} />}
           </>}
           </Suspense>

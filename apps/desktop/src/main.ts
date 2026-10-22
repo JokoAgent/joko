@@ -76,7 +76,9 @@ import {
   INSPECTOR_WINDOW_FEATURES,
   INSPECTOR_WINDOW_FRAME_NAME,
   INSPECTOR_WINDOW_URL,
-  isDesktopExtensionId,
+  isDesktopExtensionWindowOwner,
+  desktopExtensionWindowKey,
+  type DesktopExtensionWindowOwner,
   isDesktopProjectDirectoryRequest,
   isDesktopSessionDragGestureId,
   isDesktopSessionDragPreviewRequest,
@@ -471,6 +473,7 @@ import {
   DESKTOP_APP_ENTRY_URL,
   DESKTOP_APP_SCHEME,
   isAllowedExtensionWindowNavigation,
+  extensionWindowEntryUrl,
   isAllowedMainFrameNavigation,
   isAllowedPackagedBundleResource,
   isAllowedPrimaryWindowNavigation,
@@ -757,7 +760,7 @@ let managedInspectorWindowState: windowStateKeeper.State | undefined;
 let managedRuntimeProcessMonitorWindowState: windowStateKeeper.State | undefined;
 const sessionWindows = new SessionWindowRegistry<BrowserWindow, WebContents>();
 const extensionWindows = new Map<string, BrowserWindow>();
-const extensionWindowIdsByContents = new Map<WebContents, string>();
+const extensionWindowIdsByContents = new Map<WebContents, DesktopExtensionWindowOwner>();
 interface DedicatedHardwareCatalogOwner {
   readonly contents: WebContents;
   readonly documentOccurrence: string;
@@ -4191,21 +4194,20 @@ function waitForPackagedSmokeSecondInstanceIntent(): Promise<DesktopInboundOpenI
 
 type DesktopUiWindowIdentity =
   | { readonly kind: "session"; readonly id: string }
-  | { readonly kind: "extension"; readonly id: string };
+  | { readonly kind: "extension"; readonly id: string; readonly profileId: string; readonly serverId: string };
 
 async function loadUi(window: BrowserWindow, identity?: DesktopUiWindowIdentity): Promise<void> {
   const withWindowIdentity = (value: string): string => {
     if (identity === undefined) return value;
+    if (identity.kind === "extension") return extensionWindowEntryUrl(value, {
+      extensionId: identity.id, profileId: identity.profileId, serverId: identity.serverId
+    });
     const url = new URL(value);
     url.search = "";
     if (identity.kind === "session") {
       url.searchParams.set("sessionWindow", "1");
       url.searchParams.set("bootSession", identity.id);
       url.hash = `#/tasks/${encodeURIComponent(identity.id)}`;
-    } else {
-      url.searchParams.set("extensionWindow", "1");
-      url.searchParams.set("bootExtension", identity.id);
-      url.hash = `#/extensions/${encodeURIComponent(identity.id)}`;
     }
     return url.href;
   };
@@ -5218,20 +5220,21 @@ async function openSessionApplicationWindow(
 }
 
 async function openExtensionApplicationWindow(
-  extensionId: string
+  owner: DesktopExtensionWindowOwner
 ): Promise<{ readonly focusedExisting: boolean }> {
-  if (!isDesktopExtensionId(extensionId)) throw new TypeError("Extension identity is invalid.");
-  const existing = extensionWindows.get(extensionId);
+  if (!isDesktopExtensionWindowOwner(owner)) throw new TypeError("Extension window owner is invalid.");
+  const extensionId = owner.extensionId, key = desktopExtensionWindowKey(owner);
+  const existing = extensionWindows.get(key);
   if (existing !== undefined && !existing.isDestroyed()) {
     showWindowFromTray(existing);
     return { focusedExisting: true };
   }
   if (existing !== undefined) {
-    extensionWindows.delete(extensionId);
-    for (const [contents, ownerId] of extensionWindowIdsByContents) {
-      if (ownerId === extensionId) extensionWindowIdsByContents.delete(contents);
+    extensionWindows.delete(key);
+    for (const [contents, existingOwner] of extensionWindowIdsByContents) {
+      if (desktopExtensionWindowKey(existingOwner) === key) extensionWindowIdsByContents.delete(contents);
     }
-    extensionWindowStates.delete(extensionId);
+    extensionWindowStates.delete(key);
   }
   if ([...extensionWindows.values()].filter((candidate) => !candidate.isDestroyed()).length >= MAXIMUM_EXTENSION_WINDOWS) {
     throw new Error("Extension window capacity reached.");
@@ -5249,7 +5252,7 @@ async function openExtensionApplicationWindow(
   const state = windowStateKeeper({
     defaultWidth: EXTENSION_WINDOW_DEFAULT_GEOMETRY.width,
     defaultHeight: EXTENSION_WINDOW_DEFAULT_GEOMETRY.height,
-    file: extensionWindowStateFile(extensionId)
+    file: extensionWindowStateFile(key)
   });
   const window = new BrowserWindow({
     x: state.x,
@@ -5281,9 +5284,9 @@ async function openExtensionApplicationWindow(
   });
   const windowContents = window.webContents;
   const attentionSourceId = windowContents.id;
-  extensionWindows.set(extensionId, window);
-  extensionWindowIdsByContents.set(windowContents, extensionId);
-  extensionWindowStates.set(extensionId, state);
+  extensionWindows.set(key, window);
+  extensionWindowIdsByContents.set(windowContents, owner);
+  extensionWindowStates.set(key, state);
   state.manage(window);
   windowContents.setZoomFactor(currentWindowZoomFactor);
 
@@ -5292,7 +5295,7 @@ async function openExtensionApplicationWindow(
     if (extensionUiLoadRecovery !== undefined || window.isDestroyed() || quitting) return;
     const options = {
       unavailable: () => window.isDestroyed() || quitting,
-      load: () => loadUi(window, { kind: "extension", id: extensionId }),
+      load: () => loadUi(window, { kind: "extension", id: extensionId, profileId: owner.profileId, serverId: owner.serverId }),
       presentFailure: (error: unknown, attempt: number) =>
         presentDesktopWindowLoadFailure("extension", error, attempt),
       close: () => {
@@ -5333,13 +5336,13 @@ async function openExtensionApplicationWindow(
     return { action: "deny" };
   });
   windowContents.on("will-navigate", (event, url) => {
-    if (!isAllowedExtensionWindowNavigation(url, extensionId, navigationPolicy)) {
+    if (!isAllowedExtensionWindowNavigation(url, owner, navigationPolicy)) {
       event.preventDefault();
       if (isSafeExternalUrl(url)) void openExternalSafely(url).catch(() => undefined);
     }
   });
   windowContents.on("will-redirect", (event, url) => {
-    if (!isAllowedExtensionWindowNavigation(url, extensionId, navigationPolicy)) event.preventDefault();
+    if (!isAllowedExtensionWindowNavigation(url, owner, navigationPolicy)) event.preventDefault();
   });
   windowContents.on("will-attach-webview", (event) => event.preventDefault());
   windowContents.on("select-bluetooth-device", (event, _devices, callback) => {
@@ -5354,9 +5357,9 @@ async function openExtensionApplicationWindow(
     releaseDesktopAttentionSource(attentionSourceId);
     stopGlobalVoiceShortcutCapture(windowContents);
     releaseApplicationMenuShortcutRecording(attentionSourceId);
-    if (extensionWindows.get(extensionId) === window) extensionWindows.delete(extensionId);
+    if (extensionWindows.get(key) === window) extensionWindows.delete(key);
     extensionWindowIdsByContents.delete(windowContents);
-    extensionWindowStates.delete(extensionId);
+    extensionWindowStates.delete(key);
     clearDesktopNativeTaskStatusVisibility(windowContents);
   });
   beginExtensionUiLoadRecovery();
@@ -5952,8 +5955,8 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
   for (const window of sessionWindows.values()) {
     if (!window.isDestroyed()) targets.push({ window, defaults: SESSION_WINDOW_DEFAULT_GEOMETRY });
   }
-  for (const [extensionId, window] of extensionWindows) {
-    const state = extensionWindowStates.get(extensionId);
+  for (const [windowKey, window] of extensionWindows) {
+    const state = extensionWindowStates.get(windowKey);
     if (state === undefined) continue;
     if (window.isDestroyed()) resetDormantManagedWindowState(state);
     else targets.push({ window, state, defaults: EXTENSION_WINDOW_DEFAULT_GEOMETRY });
@@ -5980,7 +5983,7 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
 
   const openExtensionStateFiles = new Set([...extensionWindows]
     .filter(([, window]) => !window.isDestroyed())
-    .map(([extensionId]) => extensionWindowStateFile(extensionId)));
+    .map(([windowKey]) => extensionWindowStateFile(windowKey)));
   const entries = await readdir(app.getPath("userData"), { withFileTypes: true }).catch(() => []);
   await Promise.all(entries.flatMap((entry) => entry.isFile() && entry.name.startsWith(EXTENSION_WINDOW_STATE_PREFIX) &&
       entry.name.endsWith(".json") && !openExtensionStateFiles.has(entry.name)
@@ -6005,8 +6008,8 @@ async function resetDesktopApplicationLayout(initiatingContents: WebContents): P
   ], initiatingContents);
 }
 
-function extensionWindowStateFile(extensionId: string): string {
-  return `${EXTENSION_WINDOW_STATE_PREFIX}${createHash("sha256").update(extensionId).digest("hex").slice(0, 24)}.json`;
+function extensionWindowStateFile(windowKey: string): string {
+  return `${EXTENSION_WINDOW_STATE_PREFIX}${createHash("sha256").update(windowKey).digest("hex").slice(0, 24)}.json`;
 }
 
 function destroySessionWindows(): void {
@@ -7958,8 +7961,8 @@ function registerIpc(): void {
   });
   ipcMain.handle(DESKTOP_CHANNELS.extensionWindowOpen, async (event, ...parameters: unknown[]) => {
     assertTrustedIpcSender(event);
-    if (parameters.length !== 1 || !isDesktopExtensionId(parameters[0])) {
-      throw new TypeError("Extension window open requires one exact Extension identity.");
+    if (parameters.length !== 1 || !isDesktopExtensionWindowOwner(parameters[0])) {
+      throw new TypeError("Extension window open requires one exact node and Extension owner.");
     }
     return openExtensionApplicationWindow(parameters[0]);
   });
@@ -8303,8 +8306,8 @@ function registerIpc(): void {
       window.close();
       return;
     }
-    const extensionId = extensionWindowIdsByContents.get(event.sender);
-    if (extensionId !== undefined && extensionWindows.get(extensionId) === window) {
+    const extensionOwner = extensionWindowIdsByContents.get(event.sender);
+    if (extensionOwner !== undefined && extensionWindows.get(desktopExtensionWindowKey(extensionOwner)) === window) {
       window.close();
       return;
     }
@@ -10501,9 +10504,9 @@ function trustedApplicationWindowForContents(contents: WebContents): BrowserWind
   const sessionOwner = sessionWindows.ownerForContents(contents);
   if (sessionOwner !== undefined && ownedSessionWindowForContents(contents) === owner
     && isAllowedSessionWindowNavigation(contents.getURL(), sessionOwner.sessionId, navigationPolicy)) return owner;
-  const extensionId = extensionWindowIdsByContents.get(contents);
-  return extensionId !== undefined && extensionWindows.get(extensionId) === owner
-    && isAllowedExtensionWindowNavigation(contents.getURL(), extensionId, navigationPolicy) ? owner : undefined;
+  const extensionOwner = extensionWindowIdsByContents.get(contents);
+  return extensionOwner !== undefined && extensionWindows.get(desktopExtensionWindowKey(extensionOwner)) === owner
+    && isAllowedExtensionWindowNavigation(contents.getURL(), extensionOwner, navigationPolicy) ? owner : undefined;
 }
 
 function isTrustedApplicationContents(contents: WebContents): boolean {

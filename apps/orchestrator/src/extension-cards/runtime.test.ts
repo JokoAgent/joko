@@ -14,6 +14,7 @@ import { parseExtensionRuntime, type ExtensionRuntimeDescriptor } from "../exten
 import { ExtensionCardRuntime, validateExtensionEnvelope } from "./runtime.js";
 import { ExtensionCardsManager } from "./manager.js";
 import type { ExtensionTasks, ExtensionTaskOwner } from "../extension-tasks.js";
+import { ExtensionProjectPolicies, extensionProjectForTarget } from "../extension-project-policy.js";
 
 const browserIt = process.env.JOKO_BROWSER_EXECUTABLE ? it : it.skip;
 it("bounds every plugin envelope before asynchronous admission", () => {
@@ -29,6 +30,10 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   store.upsertTarget({ id: "target", backendId: "runtime", displayName: "Workspace", workspaceRoot: root, managed: false, trusted: true });
   store.createSession({ id: "task", backendId: "runtime", targetId: "target", title: "Task", binding: { opaqueRef: "native", generation: 1 },
     pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+  store.upsertTarget({ id: "other-target", backendId: "runtime", displayName: "Other project", workspaceRoot: join(root, "other"), managed: false, trusted: true });
+  store.createSession({ id: "other-task", backendId: "runtime", targetId: "other-target", title: "Other", binding: { opaqueRef: "other", generation: 1 },
+    pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+  const projects = new ExtensionProjectPolicies(store);
   const id = "extension_0123456789abcdef0123456789abcdef", revision = `sha256:${"a".repeat(64)}`;
   let enabled = true, changed: ((ids: readonly string[]) => void) | undefined, connectionIdentity = "original";
   const declaration: ExtensionRuntimeDescriptor = parseExtensionRuntime({ html: "ui/logic/index.html", tools: ["card", "mail", "inspect", "network", "read_mail", "transfer", "tasks", "text"].map(name => ({ name, description: `Fixture ${name}`, inputSchema: { type: "object" }, readOnly: ["inspect", "network", "read_mail"].includes(name) })),
@@ -124,11 +129,15 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     }
     expect(owner.sourceSessionId).toBe("task"); return { taskId: "managed-task", revision: "configuration", hidden: true, usage: 1n };
   }) };
-  const manager = new ExtensionCardsManager({ store, vault, authority: extensionId => runtime?.authority(extensionId), redact: value => value,
+  const manager = new ExtensionCardsManager({ store, vault, assertProject: (extensionId, sessionId) => projects.assertEnabledForSession(extensionId, sessionId), authority: extensionId => runtime?.authority(extensionId), redact: value => value,
     dispatch: (scope, event, assertCurrent) => runtime!.dispatch(scope, event, assertCurrent) });
   const startupErrors: string[] = [];
+  const openSurface = surfaces.open.bind(surfaces);
+  vi.spyOn(surfaces, "open").mockImplementation(async input => {
+    try { return await openSurface(input); } catch (error) { startupErrors.push(String(error)); throw error; }
+  });
   const registration = { id: "target", root, displayName: "Workspace", trusted: true };
-  runtime = new ExtensionCardRuntime({ store, vault, cards: manager, surfaces, executablePath: process.env.JOKO_BROWSER_EXECUTABLE,
+  runtime = new ExtensionCardRuntime({ store, vault, cards: manager, surfaces, projects, executablePath: process.env.JOKO_BROWSER_EXECUTABLE,
     tasks, text: { oneshot: async (owner, input) => {
       owner.assertCurrent(); const key = (input as { prompt: string }).prompt; textCalls.push(key);
       if (key.startsWith("deferred-text-")) {
@@ -139,7 +148,8 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     } },
     workspaces: { listRegistrations: () => [registration] },
     launch: async () => {
-      const browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE, headless: true, chromiumSandbox: true });
+      const browser = await chromium.launch({ executablePath: process.env.JOKO_BROWSER_EXECUTABLE, headless: true, chromiumSandbox: true })
+        .catch(error => { startupErrors.push(String(error)); throw error; });
       const open = browser.newContext.bind(browser);
       browser.newContext = async options => {
         const context = await open(options);
@@ -165,7 +175,7 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
   const publicCards = () => store.listEvents({ sessionId: "task" }).flatMap(event => event.payload.type === "extension_card_changed" ? [event.payload.card] : []);
   try {
     await surfaces.initialize(); await runtime.start();
-    const provider = providers.get(`${id}-runtime`)!; expect(provider).toBeDefined();
+    const provider = providers.get(`${id}-runtime`)!; expect(provider, startupErrors.join("; ")).toBeDefined();
     const managed = await provider.callTool("tasks", {}, undefined, context);
     expect(managed.structuredContent).toMatchObject({ task: { taskId: "managed-task", revision: "configuration", hidden: true, usage: "1" },
       text: { ok: true, text: '{"summary":"Done"}' }, failureCode: "TASK_NOT_FOUND", hasCredentials: false });
@@ -256,6 +266,24 @@ browserIt("runs inspected tools in Chromium, preserves mail edits through sendin
     }, { timeout: 6000 });
     expect((await provider.callTool("inspect", {}, undefined, context)).structuredContent?.sends).toBe(1);
     expect(await action("send")).toBe(false);
+    const project = extensionProjectForTarget(store.getTarget("target").descriptor);
+    const pendingKey = "deferred-text-project-disabled";
+    const pendingResult = provider.callTool("text", { key: pendingKey }, undefined, context).then(() => false, () => true);
+    await vi.waitFor(() => expect(delayedText.has(pendingKey)).toBe(true));
+    projects.setEnabled(project.id, "connection", extension(), false, 0n);
+    expect(provider.includeForTarget?.("target")).toBe(false);
+    expect(provider.includeForSession?.("task", "target")).toBe(false);
+    expect(provider.includeForTarget?.("other-target")).toBe(true);
+    expect(manager.get("task", cardId).interactive).toBe(false);
+    expect(() => delayedText.get(pendingKey)!.owner.assertCurrent()).toThrow("disabled");
+    delayedText.get(pendingKey)!.release(); expect(await pendingResult).toBe(true);
+    expect(textEffects).not.toContain(pendingKey);
+    await expect(provider.callTool("card", {}, undefined, context)).rejects.toThrow("disabled");
+    const other = await provider.callTool("card", {}, undefined, { sessionId: "other-task", targetId: "other-target", generation: 1 });
+    expect(other.isError).toBe(false); expect(provider.available).toBe(true);
+    projects.setEnabled(project.id, "connection", extension(), true, projects.state(project.id, "connection").revision);
+    expect(provider.includeForSession?.("task", "target")).toBe(true);
+    expect((await provider.callTool("card", {}, undefined, context)).isError).toBe(false);
     const before = publicCards().length;
     connectionIdentity = "changed";
     await expect(provider.callTool("network", {}, undefined, context)).rejects.toThrow();

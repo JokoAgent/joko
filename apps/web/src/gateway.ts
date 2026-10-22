@@ -4,6 +4,8 @@ import { McpAppService, McpAppServiceOperateRequestSchema, McpAppServiceOperateR
 import { ExtensionCardService, ExtensionNetworkService, ExtensionOAuthService, ExtensionTaskService, ExtensionOAuthServiceGetFlowRequestSchema, ExtensionOAuthServiceGetFlowResponseSchema, ExtensionAuthorizationPhase } from "@joko/contracts";
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import type { McpAppApi } from "./model.js";
+import type { ExtensionProjectView, ExtensionProjectStateView } from "./model.js";
+import type { ExtensionProject as ProtoExtensionProject } from "@joko/contracts";
 import { AppDefaultModelService } from "@joko/contracts";
 import { HelpService, HelpRole, WorktreeRecycleAction, WorktreeRecycleState, WorktreeRecycleReason, type WorktreeRecycleRecord } from "@joko/contracts";
 import type { HelpMessageView, HelpAnswerView, HelpFeedbackDraftView, WorktreeRecycleRecordView } from "./model.js";
@@ -5403,6 +5405,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     readonly installed?: boolean;
     readonly query?: string;
     readonly sessionId?: string;
+    readonly targetId?: string;
+    readonly includeProjectDisabled?: boolean;
     readonly signal?: AbortSignal;
   } = {}): Promise<ExtensionCatalogView> {
     const scope = this.captureActionScope(options.signal);
@@ -5425,6 +5429,8 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
           ...(options.installed === undefined ? {} : { installed: options.installed }),
           query: options.query ?? "",
           ...(options.sessionId === undefined ? {} : { sessionId: options.sessionId }),
+          ...(options.targetId === undefined ? {} : { targetId: options.targetId }),
+          includeProjectDisabled: options.includeProjectDisabled ?? false,
           page: { pageSize: 500, pageToken }
         }, { signal: scope.signal });
         const pageRevision = response.catalogRevision?.value;
@@ -5465,11 +5471,12 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     throw new GatewayError("Extension catalog changed repeatedly while it was being loaded.");
   }
 
-  async getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal): Promise<ExtensionCatalogView> {
+  async getExtension(extensionId: string, sessionId?: string, signal?: AbortSignal, includeProjectDisabled = false): Promise<ExtensionCatalogView> {
     const scope = this.captureActionScope(signal);
     const response = await createClient(ExtensionService, scope.transport).getExtension({
       extensionId,
-      ...(sessionId === undefined ? {} : { sessionId })
+      ...(sessionId === undefined ? {} : { sessionId }),
+      includeProjectDisabled
     }, { signal: scope.signal });
     if (response.extension === undefined || response.catalogRevision?.value === undefined) {
       throw new GatewayError("Orchestrator returned an incomplete Extension detail.");
@@ -5998,8 +6005,34 @@ class ConnectOrchestratorGateway implements OrchestratorGateway {
     await this.submit({ case: "removeExtensionSource", value: { sourceId, expectedRevision: { value: expectedRevision } } }, true);
   }
 
-  async setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint): Promise<void> {
-    await this.submit({ case: "setExtensionEnabled", value: { extensionId, enabled, expectedRevision: { value: expectedRevision } } }, true);
+  async listExtensionProjects(signal?: AbortSignal): Promise<readonly ExtensionProjectView[]> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).listExtensionProjects({}, { signal: scope.signal });
+    return response.projects.map(mapExtensionProject);
+  }
+
+  async resolveExtensionProject(path: string, signal?: AbortSignal): Promise<ExtensionProjectView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).resolveExtensionProject({ path }, { signal: scope.signal });
+    return mapExtensionProject(response.project);
+  }
+
+  async getExtensionProjectState(projectId: string, signal?: AbortSignal): Promise<ExtensionProjectStateView> {
+    const scope = this.captureActionScope(signal);
+    const response = await createClient(ExtensionService, scope.transport).getExtensionProjectState({ projectId }, { signal: scope.signal });
+    if (!response.state || response.state.revision === undefined) throw new GatewayError("Project plugin settings are incomplete.");
+    const project = mapExtensionProject(response.state.project);
+    if (project.id !== projectId) throw new GatewayError("Project plugin settings belong to a different directory.");
+    return { project, revision: response.state.revision.value, disabledExtensionIds: [...response.state.disabledExtensionIds] };
+  }
+
+  async listExtensionProjectDirectories(path: string, signal?: AbortSignal): Promise<ProjectDirectoryListingView> {
+    return this.listProjectDirectories(path, signal);
+  }
+
+  async setExtensionEnabled(extensionId: string, enabled: boolean, expectedRevision: bigint, project?: ExtensionProjectStateView): Promise<void> {
+    await this.submit({ case: "setExtensionEnabled", value: { extensionId, enabled, expectedRevision: { value: expectedRevision },
+      ...(project ? { project: { projectId: project.project.id, expectedRevision: { value: project.revision } } } : {}) } }, true);
   }
 
   async setExtensionSidebarVisible(extensionId: string, visible: boolean, expectedRevision: bigint): Promise<void> {
@@ -17087,6 +17120,11 @@ function mapExtensionSource(source: ProtoExtensionSourceDescriptor): ExtensionSo
     ...(refreshedAt === undefined ? {} : { refreshedAt }),
     ...(source.error === undefined ? {} : { error: source.error })
   };
+}
+
+function mapExtensionProject(project: ProtoExtensionProject | undefined): ExtensionProjectView {
+  if (!project || !/^[a-f0-9]{64}$/u.test(project.projectId) || !project.name || !project.path) throw new GatewayError("Project directory is incomplete.");
+  return { id: project.projectId, name: project.name, path: project.path };
 }
 
 function mapExtensionCatalogEntry(extension: ProtoExtensionCatalogEntry): ExtensionCatalogEntryView {

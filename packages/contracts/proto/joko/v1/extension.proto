@@ -661,3 +661,20 @@ message ExtensionCatalogSnapshot {
   repeated ExtensionCatalogEntry entries = 2;
   bool recovered_from_corruption = 3;
 }
+
+message ExtensionProject {
+  string project_id = 1;
+  string name = 2;
+  string path = 3;
+}
+
+message ExtensionProjectState {
+  ExtensionProject project = 1;
+  Revision revision = 2;
+  repeated string disabled_extension_ids = 3;
+}
+
+message ExtensionProjectPolicyMutation {
+  string project_id = 1;
+  Revision expected_revision = 2;
+}

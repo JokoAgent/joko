@@ -7,7 +7,7 @@ const EMPTY_ENTRIES: readonly ExtensionCatalogEntryView[] = [];
 const EMPTY_HINTS: HomeTaskHints = {};
 
 /** A failed catalog read does not remove the built-in task suggestions. */
-export function useNewSessionExtensionSuggestions(controller: AppController, contextKey: string | undefined, runtimeSessionId?: string, newlyInstalledId?: string, catalogRevision?: bigint): {
+export function useNewSessionExtensionSuggestions(controller: AppController, contextKey: string | undefined, runtimeSessionId?: string, newlyInstalledId?: string, catalogRevision?: bigint, targetId?: string): {
   readonly extensions: readonly ExtensionCatalogEntryView[];
   readonly hints: HomeTaskHints;
 } {
@@ -20,13 +20,13 @@ export function useNewSessionExtensionSuggestions(controller: AppController, con
     if (contextKey === undefined || typeof sourceController.listExtensions !== "function") return;
     const request = new AbortController();
     void Promise.all([
-      sourceController.listExtensions({ ...(runtimeSessionId === undefined ? {} : { sessionId: runtimeSessionId }), signal: request.signal }),
+      sourceController.listExtensions({ ...(runtimeSessionId === undefined ? {} : { sessionId: runtimeSessionId }), ...(targetId === undefined ? {} : { targetId }), signal: request.signal }),
       sourceController.readRecentExtensionSuggestions?.().catch(() => []) ?? Promise.resolve([])
     ]).then(([catalog, recentIds]) => {
       if (!request.signal.aborted && currentKey.current === contextKey) setResult({ key: contextKey, entries: catalog.extensions, recentIds });
     }).catch(() => { /* Keep the built-in catalog available while offline. */ });
     return () => request.abort();
-  }, [contextKey, runtimeSessionId, catalogRevision]);
+  }, [contextKey, runtimeSessionId, catalogRevision, targetId]);
   if (result === undefined || result.key !== contextKey) return { extensions: EMPTY_ENTRIES, hints: EMPTY_HINTS };
   return { extensions: result.entries, hints: { recentIds: result.recentIds, ...(newlyInstalledId === undefined ? {} : { newlyInstalledId }) } };
 }

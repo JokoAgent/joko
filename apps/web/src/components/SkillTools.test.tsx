@@ -21,6 +21,7 @@ import type {
   TargetView
 } from "../model.js";
 import { diffLineClass, groupSkillCatalog, SkillTools } from "./SkillTools.js";
+import { requestCatalogNavigationLeave } from "../catalog-navigation-leave.js";
 
 const roots: Root[] = [];
 
@@ -36,6 +37,20 @@ afterEach(async () => {
 });
 
 describe("SkillTools", () => {
+  it("keeps the actual unsaved file on a declined node change and discards only after explicit acceptance", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const container = await renderSkills(skillController());
+    await settle();
+    await act(async () => buttonWithText(container, "Edit").click());
+    const editor = required(container.querySelector<HTMLTextAreaElement>('[aria-label="Skill file editor"]'));
+    await act(async () => setInputValue(editor, "# Unsaved original-node draft"));
+    await act(async () => { expect(await requestCatalogNavigationLeave(new AbortController().signal)).toBe(false); });
+    expect(editor.value).toBe("# Unsaved original-node draft");
+    expect(container.contains(editor)).toBe(true);
+    await act(async () => { expect(await requestCatalogNavigationLeave(new AbortController().signal)).toBe(true); });
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[aria-label="Skill file editor"]')).toBeNull();
+  });
   it("reviews a frozen remote project Skill before approval and keeps failure retry and enable separate from loaded state", async () => {
     let skill: SkillDescriptorView = { ...projectSkill(), state: "awaitingApproval", enabled: false,
       canEdit: false, canDelete: false, canToggle: false, contentAvailable: true };

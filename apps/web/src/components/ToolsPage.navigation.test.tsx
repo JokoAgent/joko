@@ -23,7 +23,9 @@ afterEach(async () => {
 describe("Tools route tabs", () => {
   it("opens the actual Skills panel and follows manual selection, history, and extension deep links", async () => {
     const controller = {
-      state: { preferences: { navigationOpen: true } },
+      state: { preferences: { navigationOpen: true }, connectionState: "connected", activeProfile: {
+        id: "catalog-profile", serverId: "catalog-node", deviceId: "catalog-device", name: "Catalog", origin: "https://catalog.example"
+      } },
       listSkills: vi.fn(async () => ({ revision: 1n, skills: [] })),
       listSkillRecoveries: vi.fn(async () => []),
       listExtensions: vi.fn(async () => ({ revision: 0n, extensions: [], recoveredFromCorruption: false })),

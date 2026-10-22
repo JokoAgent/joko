@@ -35,6 +35,7 @@ interface Options {
   readonly store: OperationalStore;
   readonly vault: CredentialVault;
   readonly authority: (extensionId: string) => ExtensionCardAuthority | undefined;
+  readonly assertProject?: (extensionId: string, sessionId: string) => void;
   readonly redact: (text: string) => string;
   readonly dispatch: (scope: ExtensionCardScope, event: ExtensionCardAction, assertCurrent: () => void) => Promise<void>;
   readonly previewMail?: (sessionId: string, url: string, read: boolean, opened: boolean, signal: AbortSignal, assertCurrent: () => void) => Promise<ExtensionMailPreview>;
@@ -78,6 +79,7 @@ export class ExtensionCardsManager {
   }
   assertAuthority(scope: ExtensionCardScope): ExtensionCardAuthority {
     this.assertScope(scope);
+    this.options.assertProject?.(scope.extensionId, scope.sessionId);
     const authority = this.options.authority(scope.extensionId);
     if (!authority || authority.key !== scope.authorityKey) throw new Error("Extension card source changed.");
     return authority;
@@ -100,7 +102,9 @@ export class ExtensionCardsManager {
   get(sessionId: string, cardId: string): { card: ExtensionCardProjection; animatedHtml: string; working: boolean; interactive: boolean; mediaUris: string[]; hostAuthorization: boolean; authorizationPhase?: import("@joko/contracts").ExtensionAuthorizationPhase; authorizationClientConfigured: boolean } {
     const saved = this.#read(sessionId, cardId), source = this.options.authority(saved.row.extensionId);
     const hostAuthorization = isHostAuthorization(saved.row.html), authorization = hostAuthorization ? this.oauthCards()?.view(cardId) : undefined;
-    const interactive = (hostAuthorization ? authorization?.interactive === true : source?.key === saved.row.authorityKey) && this.options.store.findSessionRuntimePolicy(sessionId)?.policy !== "review_read_only";
+    let projectAvailable = true;
+    try { this.options.assertProject?.(saved.row.extensionId, sessionId); } catch { projectAvailable = false; }
+    const interactive = projectAvailable && (hostAuthorization ? authorization?.interactive === true : source?.key === saved.row.authorityKey) && this.options.store.findSessionRuntimePolicy(sessionId)?.policy !== "review_read_only";
     const transient = interactive ? this.#transient.get(cardId) : undefined;
     return { card: this.#projection(saved.row, source?.name), mediaUris: extensionCardMediaUris(saved.row.html), hostAuthorization, authorizationClientConfigured: authorization?.clientConfigured === true, ...(authorization ? { authorizationPhase: authorization.phase } : {}),
       animatedHtml: transient?.updatedAt === saved.row.updatedAt ? transient.animatedHtml ?? "" : "",
