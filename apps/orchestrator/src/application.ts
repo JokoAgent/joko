@@ -266,6 +266,7 @@ import {
 } from "./remote-backend-runtime-setup.js";
 import { RemotePiProcessFactory } from "./remote-pi-process.js";
 import { RemoteWorkspaceService } from "./remote-workspace-service.js";
+import { RemoteFileVersionCache } from "./remote-file-version-cache.js";
 import { RemoteHostToolBridgeProvider } from "./remote-host-tool-provider.js";
 import { ReviewCoordinator } from "./review-coordinator.js";
 import { DurableReviewEvidenceProvider } from "./review-evidence-provider.js";
@@ -847,7 +848,9 @@ export async function createOrchestratorApplication(
     store,
     authorityRoot: join(config.dataDirectory, "remote-pi-authority")
   });
-  const remoteWorkspaceFiles = new RemoteWorkspaceService(remoteExecution);
+  const remoteWorkspaceFiles = new RemoteWorkspaceService(remoteExecution, {
+    cache: new RemoteFileVersionCache(join(config.dataDirectory, "remote-file-cache"))
+  });
   const remoteTerminals = new RemoteTerminalRuntimeResolver(remoteExecution);
   const terminals = new TerminalProvider({
     onActivity: () => runtimeActivity.markBlockingActivity(),

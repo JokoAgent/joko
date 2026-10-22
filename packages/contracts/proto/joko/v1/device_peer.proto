@@ -220,6 +220,8 @@ message DevicePeerReadFileAction {
   string path = 1;
   uint64 maximum_bytes = 2;
   bool allow_truncated = 3;
+  // When supplied, bind the opened file descriptor to this host stat version.
+  optional string expected_version = 4;
 }
 
 message DevicePeerWriteFileAction {
@@ -556,6 +558,8 @@ message DevicePeerFileStatResult {
   uint64 size = 2;
   google.protobuf.Timestamp modified_at = 3;
   uint32 mode = 4;
+  // Opaque host version of this exact path and filesystem object.
+  string version = 5;
 }
 
 message DevicePeerFileEntry {

@@ -13,6 +13,7 @@ import type {
 } from "@joko/remote-ssh";
 
 import type { RemoteExecutionRouter } from "./remote-execution-router.js";
+import { RemoteFileVersionCache, type RemoteFileCacheIdentity } from "./remote-file-version-cache.js";
 import {
   WORKSPACE_GIT_COMMIT_MESSAGE_MAXIMUM_BYTES,
   WORKSPACE_GIT_IMAGE_MAXIMUM_BYTES,
@@ -78,11 +79,13 @@ export interface RemoteSkillSourceAuthority {
 
 export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   readonly #remoteExecution: RemoteExecutionRouter;
+  readonly #cache: RemoteFileVersionCache | undefined;
   readonly #registrations = new Map<string, WorkspaceRegistration>();
   #closed = false;
 
-  constructor(remoteExecution: RemoteExecutionRouter) {
+  constructor(remoteExecution: RemoteExecutionRouter, options: { readonly cache?: RemoteFileVersionCache } = {}) {
     this.#remoteExecution = remoteExecution;
+    this.#cache = options.cache;
   }
 
   async register(input: WorkspaceRegistration): Promise<WorkspaceRegistration> {
@@ -158,7 +161,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     return { identity, assertCurrent, preview: async (path, maximumBytes = WORKSPACE_TEXT_FILE_MAXIMUM_BYTES, maximumFileBytes, readSignal) => {
       const currentSignal = signal === undefined ? readSignal : readSignal === undefined ? signal : AbortSignal.any([signal, readSignal]);
       assertCurrent(); currentSignal?.throwIfAborted();
-      const result = await this.#preview(registration, files, path, maximumBytes, maximumFileBytes, currentSignal);
+      const result = await this.#preview(registration, files, path, maximumBytes, maximumFileBytes, currentSignal, assertCurrent);
       assertCurrent(); currentSignal?.throwIfAborted();
       return result;
     } };
@@ -171,8 +174,8 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     let result: unknown;
     switch (method) {
       case "list": result = await this.#list(registration, transports.files, args[0] as string, args[1] as WorkspaceEntryListingOptions | undefined); break;
-      case "preview": result = await this.#preview(registration, transports.files, args[0] as string, args[1] as number, args[2] as number | undefined); break;
-      case "materializeFile": result = await this.#materialize(registration, transports.files, args); break;
+      case "preview": result = await this.#preview(registration, transports.files, args[0] as string, args[1] as number, args[2] as number | undefined, undefined, transports.assertCurrent); break;
+      case "materializeFile": result = await this.#materialize(registration, transports.files, args, transports.assertCurrent); break;
       case "listFiles": result = await this.#listFiles(registration, transports.files); break;
       case "writeTextFile": result = await this.#writeTextFile(registration, transports.files, args[0] as WorkspaceTextFileWriteInput); break;
       case "createEntry": result = await this.#createEntry(registration, transports.files, args[0] as { path: string; kind: "file" | "directory"; expectedRevision: string }); break;
@@ -265,11 +268,13 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
     files: RemoteFileTransportPort,
     relativePath: string,
     maximumBytes: number,
-    maximumFileBytes?: number,
-    signal?: AbortSignal
+    maximumFileBytes: number | undefined,
+    signal: AbortSignal | undefined,
+    sourceIsCurrent: () => void
   ): Promise<WorkspaceFilePreview> {
+    const assertCurrent = this.#fileGuard(registration, sourceIsCurrent, signal);
     const path = remoteWorkspacePath(registration, relativePath, false);
-    signal?.throwIfAborted();
+    assertCurrent();
     if (await files.realpath(path, signal) !== path) throw new WorkspaceFilePreviewError("Remote preview path is not canonical.", "invalid");
     signal?.throwIfAborted();
     const before = await files.stat(path, signal);
@@ -286,6 +291,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       if (remoteRevision(before) !== remoteRevision(after)) {
         throw new WorkspaceFilePreviewError("Remote file changed while it was read.", "stale");
       }
+      assertCurrent();
       return {
         entry: remoteEntry(canonicalRelative(relativePath), after),
         observedRevision: remoteRevision(after),
@@ -293,18 +299,7 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         truncated: false
       };
     }
-    const bytes = Buffer.from(await files.read({
-      path,
-      ...(signal === undefined ? {} : { signal }),
-      maximumBytes: Math.min(Math.max(before.size, 1), limit),
-      allowTruncated: true
-    }));
-    signal?.throwIfAborted();
-    const after = await files.stat(path, signal);
-    if (remoteRevision(before) !== remoteRevision(after) || await files.realpath(path, signal) !== path) {
-      throw new WorkspaceFilePreviewError("Remote file changed while it was read.", "stale");
-    }
-    signal?.throwIfAborted();
+    const { bytes, after } = await this.#readFileBytes(registration, files, path, before, limit, true, assertCurrent, signal);
     const entry = remoteEntry(canonicalRelative(relativePath), after, contentRevision(bytes));
     if (isTextMediaType(mediaType)) {
       if (bytes.includes(0)) throw new WorkspaceFilePreviewError("Remote file is not valid text.", "unsupported");
@@ -319,7 +314,8 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
   async #materialize(
     registration: WorkspaceRegistration,
     files: RemoteFileTransportPort,
-    args: readonly unknown[]
+    args: readonly unknown[],
+    sourceIsCurrent: () => void
   ): Promise<unknown> {
     const [relativePath, expectedRevision, ingest, signal] = args as [
       string,
@@ -331,13 +327,16 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
       }) => Promise<unknown>,
       AbortSignal | undefined
     ];
-    signal?.throwIfAborted();
+    const assertCurrent = this.#fileGuard(registration, sourceIsCurrent, signal);
+    assertCurrent();
     const path = remoteWorkspacePath(registration, relativePath, false);
+    if (await files.realpath(path, signal) !== path) throw new WorkspaceFilePreviewError("Remote download path is not canonical.", "invalid");
     const before = await files.stat(path, signal);
     if (before.kind !== "file" || before.size > 64 * 1024 * 1024) {
       throw new WorkspaceFilePreviewError("Remote download requires a bounded regular file.", "unsupported");
     }
-    const content = Buffer.from(await files.read({ path, maximumBytes: Math.max(before.size, 1), signal }));
+    const { bytes: content } = await this.#readFileBytes(registration, files, path, before,
+      Math.max(before.size, 1), false, assertCurrent, signal);
     const revision = contentRevision(content);
     if (expectedRevision !== revision && expectedRevision !== remoteRevision(before)) {
       throw new WorkspaceFilePreviewError("Remote file changed before download.", "stale");
@@ -351,17 +350,67 @@ export class RemoteWorkspaceService implements RemoteWorkspaceDelegate {
         expectedSize: content.byteLength,
         ...(signal === undefined ? {} : { signal }),
         beforeFinalize: async (snapshot) => {
-          signal?.throwIfAborted();
+          assertCurrent();
           const current = await files.stat(path, signal);
-          if (remoteRevision(current) !== remoteRevision(before) || snapshot.sha256 !== fileHash(content)) {
+          if (remoteRevision(current) !== remoteRevision(before) || snapshot.sha256 !== fileHash(content)
+            || await files.realpath(path, signal) !== path) {
             throw new WorkspaceFilePreviewError("Remote file changed while it was downloaded.", "stale");
           }
+          assertCurrent();
         }
       });
     } finally {
       await handle.close().catch(() => undefined);
       await rm(directory, { recursive: true, force: true });
     }
+  }
+
+  #fileGuard(registration: WorkspaceRegistration, sourceIsCurrent: () => void, signal?: AbortSignal): () => void {
+    return () => {
+      signal?.throwIfAborted(); this.#assertOpen(); sourceIsCurrent();
+      if (this.#registrations.get(registration.id) !== registration) {
+        throw new WorkspaceFilePreviewError("The remote workspace read authority changed. Open the source again.", "stale");
+      }
+    };
+  }
+
+  async #readFileBytes(
+    registration: WorkspaceRegistration,
+    files: RemoteFileTransportPort,
+    path: string,
+    before: RemoteFileStat,
+    maximumBytes: number,
+    allowTruncated: boolean,
+    assertCurrent: () => void,
+    signal?: AbortSignal
+  ): Promise<{ readonly bytes: Buffer; readonly after: RemoteFileStat }> {
+    assertCurrent();
+    const identity: RemoteFileCacheIdentity | undefined = typeof before.version === "string" && /^[a-f0-9]{64}$/.test(before.version)
+      ? { source: createHash("sha256").update(JSON.stringify([
+          "remote-workspace-file-v1", registration.id, registration.root, registration.remote?.targetId,
+          registration.remote?.binding, path
+        ])).digest("hex"), version: before.version, size: before.size } : undefined;
+    let cached: Buffer | undefined;
+    if (identity && this.#cache) {
+      try { cached = await this.#cache.read(identity, maximumBytes, assertCurrent); }
+      catch { assertCurrent(); }
+    }
+    assertCurrent();
+    const bytes = cached ?? Buffer.from(await files.read({ path,
+      maximumBytes: Math.min(Math.max(before.size, 1), maximumBytes), allowTruncated,
+      ...(identity === undefined ? {} : { expectedVersion: identity.version }),
+      ...(signal === undefined ? {} : { signal }) }));
+    const after = await files.stat(path, signal);
+    if (remoteRevision(before) !== remoteRevision(after) || await files.realpath(path, signal) !== path) {
+      throw new WorkspaceFilePreviewError("Remote file changed while it was read.", "stale");
+    }
+    assertCurrent();
+    if (cached === undefined && identity && this.#cache && bytes.byteLength === before.size) {
+      try { await this.#cache.write(identity, bytes, assertCurrent); }
+      catch { assertCurrent(); }
+    }
+    assertCurrent();
+    return { bytes, after };
   }
 
   async #listFiles(registration: WorkspaceRegistration, files: RemoteFileTransportPort): Promise<WorkspaceFileIndex> {
@@ -828,7 +877,8 @@ function safeEntryName(value: string): boolean {
 }
 
 function remoteRevision(info: RemoteFileStat): string {
-  return `remote-meta:${info.kind}:${info.mode}:${info.size}:${info.modifiedAt}`;
+  return info.version === undefined ? `remote-meta:${info.kind}:${info.mode}:${info.size}:${info.modifiedAt}`
+    : `remote-version:${info.version}:${info.kind}:${info.mode}:${info.size}:${info.modifiedAt}`;
 }
 
 function contentRevision(content: Uint8Array): string {

@@ -27,6 +27,7 @@ export interface DevicePeerFileStat {
   readonly size: number;
   readonly modifiedAt: number;
   readonly mode: number;
+  readonly version: string;
 }
 
 export interface DevicePeerDirectoryEntry {
@@ -37,6 +38,8 @@ export interface DevicePeerDirectoryEntry {
 export interface DevicePeerFileReadRequest {
   readonly path: string;
   readonly maximumBytes: number;
+  /** Reject before reading if the opened object no longer has this version. */
+  readonly expectedVersion?: string;
   /** Return a bounded prefix when the file is larger instead of failing closed. */
   readonly allowTruncated?: boolean;
   readonly signal?: AbortSignal;

@@ -255,6 +255,8 @@ export interface RemoteFileStat {
   readonly size: number;
   readonly modifiedAt: number;
   readonly mode: number;
+  /** Present only when the host can attest the exact filesystem object version. */
+  readonly version?: string;
 }
 
 export interface RemoteDirectoryEntry {
@@ -265,6 +267,8 @@ export interface RemoteDirectoryEntry {
 export interface RemoteFileReadRequest {
   readonly path: string;
   readonly maximumBytes: number;
+  /** A version-capable host must bind its opened descriptor to this stat receipt. */
+  readonly expectedVersion?: string;
   /** Return a bounded prefix when the file is larger instead of failing closed. */
   readonly allowTruncated?: boolean;
   readonly signal?: AbortSignal;

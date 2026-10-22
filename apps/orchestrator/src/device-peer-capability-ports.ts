@@ -98,7 +98,8 @@ class PeerFiles implements DevicePeerFileTransportPort {
       kind: fileKind(value.kind),
       size: safeNumber(value.size, "file size"),
       modifiedAt: timestampMillis(value.modifiedAt),
-      mode: boundedInteger(value.mode, 0, 0xffffffff, "file mode")
+      mode: boundedInteger(value.mode, 0, 0xffffffff, "file mode"),
+      version: fileVersion(value.version)
     });
   }
 
@@ -125,7 +126,8 @@ class PeerFiles implements DevicePeerFileTransportPort {
       create(contract.DevicePeerReadFileActionSchema, {
         path: peerPath(request.path),
         maximumBytes: BigInt(maximumBytes),
-        allowTruncated: request.allowTruncated === true
+        allowTruncated: request.allowTruncated === true,
+        ...(request.expectedVersion === undefined ? {} : { expectedVersion: fileVersion(request.expectedVersion) })
       })
     ), request.signal, "fileRead") as contract.DevicePeerFileReadResult;
     if (!(value.content instanceof Uint8Array) || value.content.byteLength > maximumBytes) {
@@ -883,6 +885,11 @@ function effect(value: contract.DevicePeerEffectKind): "read_only" | "side_effec
   if (value === contract.DevicePeerEffectKind.READ_ONLY) return "read_only";
   if (value === contract.DevicePeerEffectKind.SIDE_EFFECT) return "side_effect";
   throw invalid("A Device peer effect kind is required.");
+}
+
+function fileVersion(value: string): string {
+  if (!/^[a-f0-9]{64}$/.test(value)) throw protocolFailure("The peer returned an invalid file version.");
+  return value;
 }
 
 function fileKind(value: contract.DevicePeerFileKind): DevicePeerFileKind {

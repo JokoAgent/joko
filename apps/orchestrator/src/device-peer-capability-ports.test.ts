@@ -1,4 +1,4 @@
-import { DevicePeerLoopbackHost, type DevicePeerCommand } from "@joko/contracts";
+import { DevicePeerFileKind, DevicePeerLoopbackHost, type DevicePeerCommand } from "@joko/contracts";
 import { createInProcessDevicePeerHarness, type DevicePeerRequestFrame } from "@joko/device-peer";
 import { OperationalStore } from "@joko/store";
 import { afterEach, describe, expect, it } from "vitest";
@@ -13,6 +13,23 @@ afterEach(() => {
 });
 
 describe("Device peer capability ports", () => {
+  it("requires the current host-attested version on every file stat result", async () => {
+    const fixture = setup();
+    let version = "a".repeat(64);
+    const harness = createInProcessDevicePeerHarness({ targetDeviceId: fixture.target.deviceId, capabilities: ["files", "process"],
+      agent: { handle: async () => ({ outcome: "completed", value: { case: "fileStat", value: {
+        kind: DevicePeerFileKind.FILE, size: 5n, modifiedAt: { seconds: 4n, nanos: 0 }, mode: 0o644, version
+      } } }) } });
+    fixture.owner.registerRoute(fixture.target, harness.transport);
+    const authority = fixture.owner.capture(fixture.controller, fixture.owner.list(fixture.controller)[0]!);
+    const files = createDevicePeerCapabilityPorts({ owner: fixture.owner, authority }).files!;
+    expect(await files.stat("C:\\peer\\owned.txt")).toEqual({ kind: "file", size: 5, modifiedAt: 4000, mode: 0o644, version });
+    for (const invalid of ["", "../source", "a".repeat(63), "a".repeat(65), "z".repeat(64)]) {
+      version = invalid;
+      await expect(files.stat("C:\\peer\\owned.txt")).rejects.toThrow("invalid file version");
+    }
+  });
+
   it("preserves the explicit exclusive-create flag through the generated peer command", async () => {
     const fixture = setup(), commands: DevicePeerCommand[] = [];
     const harness = createInProcessDevicePeerHarness({ targetDeviceId: fixture.target.deviceId, capabilities: ["files", "process"], agent: { handle: async frame => {
