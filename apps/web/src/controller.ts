@@ -113,6 +113,7 @@ import {
 } from "./machine-federation.js";
 import { PartnerSourceDirectory, partnerSourceKey, resolvePartnerSourceProfile, resolvePartnerSourceSession, validatePartnerSourceOwner, type PartnerSourceView } from "./partner-sources.js";
 import { requestPartnerNavigationLeave } from "./partner-navigation-leave.js";
+import { requestCatalogNavigationLeave } from "./catalog-navigation-leave.js";
 
 const LIGHT_APP_ICON_URL = lightAppIconUrl;
 const DARK_APP_ICON_URL = darkAppIconUrl;
@@ -130,8 +131,8 @@ export type AppRoute =
   | { readonly kind: "projects"; readonly projectId?: string }
   | { readonly kind: "partners"; readonly partnerId?: string; readonly profileId?: string; readonly preparation?: boolean; readonly groupId?: string }
   | { readonly kind: "schedules"; readonly scheduleId?: string }
-  | { readonly kind: "tools"; readonly tab?: ToolsTab; readonly extensionId?: string; readonly recommendationNonce?: string }
-  | { readonly kind: "extensionMainView"; readonly extensionId: string }
+  | { readonly kind: "tools"; readonly profileId?: string; readonly tab?: ToolsTab; readonly extensionId?: string; readonly recommendationNonce?: string }
+  | { readonly kind: "extensionMainView"; readonly extensionId: string; readonly profileId?: string; readonly serverId?: string }
   | { readonly kind: "settings" };
 
 interface MachineSessionMessageTarget {
@@ -225,6 +226,7 @@ export interface AppController extends OperationApi {
   refreshMachines(): Promise<void>;
   setMachineSelection(selection: MachineSelection): Promise<void>;
   switchMachine(profileId: string): Promise<void>;
+  openMachineCatalog(profileId: string, tab: "extensions" | "skills", signal?: AbortSignal): Promise<boolean>;
   openMachineSession(profileId: string, sessionId: string, messageTarget?: MachineSessionMessageTarget): Promise<void>;
   refreshPartnerSource?(sourceKey: string): Promise<void>;
   openSourcePartner?(sourceKey: string, partnerId: string, destination: "session" | "settings" | "preparation"): Promise<void>;
@@ -616,13 +618,17 @@ export function useAppController(): AppController {
           effectiveManagedStatus = managedRecoveryStatus("identityConflict");
         }
       }
-      const routedProfileId = routeRef.current.kind === "session" || routeRef.current.kind === "partners" ? routeRef.current.profileId : undefined;
+      const routedProfileId = routeRef.current.kind === "session" || routeRef.current.kind === "partners" || routeRef.current.kind === "tools" || routeRef.current.kind === "extensionMainView" ? routeRef.current.profileId : undefined;
       const routedProfile = routedProfileId === undefined ? undefined : profiles.find((profile) => profile.id === routedProfileId);
-      const automaticProfile = routedProfile ?? (automaticConnectionAvailable
+      const expectedServerId = routeRef.current.kind === "extensionMainView" ? routeRef.current.serverId : undefined;
+      const automaticProfile = routedProfileId !== undefined
+        ? expectedServerId === undefined || expectedServerId === routedProfile?.serverId ? routedProfile : undefined
+        : (automaticConnectionAvailable
         ? automaticConnectionProfile(effectivePreferences.automaticConnectionTarget, profiles, effectiveManagedStatus)
         : undefined);
       startupAutoConnectRef.current = automaticProfile;
       startupManagedLocalAutoPendingRef.current = automaticConnectionAvailable
+        && routedProfileId === undefined
         && effectivePreferences.automaticConnectionTarget?.kind === "managedLocal"
         && automaticProfile === undefined
         && effectiveManagedStatus?.state === "starting";
@@ -1788,6 +1794,67 @@ export function useAppController(): AppController {
 
   const refreshMachines = useCallback((): Promise<void> => runMachineRefresh(true), [runMachineRefresh]);
 
+  const openMachineCatalog = useCallback(async (
+    profileId: string, tab: "extensions" | "skills", signal?: AbortSignal
+  ): Promise<boolean> => {
+    const intent = ++machineSwitchIntentRef.current;
+    const profile = profilesRef.current.find(candidate => candidate.id === profileId);
+    if (!profile) throw new Error("The selected catalog node is no longer saved on this client.");
+    const key = remoteMachineProfileKey(profile);
+    let hash = appRouteHash(routeRef.current), locationHash = window.location.hash, navigationRevision = navigationRevisionRef.current;
+    const abort = new AbortController();
+    const retire = (): void => abort.abort();
+    const combined = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
+    let generation = gatewayGenerationRef.current;
+    const current = (): boolean => !combined.aborted && machineSwitchIntentRef.current === intent
+      && gatewayGenerationRef.current === generation && appRouteHash(routeRef.current) === hash
+      && window.location.hash === locationHash && navigationRevisionRef.current === navigationRevision
+      && profilesRef.current.some(candidate => remoteMachineProfileKey(candidate) === key);
+    window.addEventListener("pagehide", retire);
+    try {
+      const leave = requestCatalogNavigationLeave(combined);
+      if ((leave && !await leave) || !current()) return false;
+      const needsConnection = activeProfileRef.current === undefined || remoteMachineProfileKey(activeProfileRef.current) !== key
+        || connectionStateRef.current !== "connected";
+      if (needsConnection) {
+        // Verify the exact saved node and its authenticated catalog before giving
+        // up the current connection. A failed probe cannot expose the local list.
+        await loadMachineSnapshot(profile);
+        if (!current()) return false;
+      }
+      const route = routeRef.current;
+      const destination: AppRoute = route.kind === "tools" && route.profileId === profileId && route.extensionId
+        ? route : { kind: "tools", profileId, tab };
+      const destinationHash = appRouteHash(destination);
+      if (hash !== destinationHash) {
+        navigate(destination, { replace: true, signal: combined, isCurrent: current });
+        if (appRouteHash(routeRef.current) !== destinationHash) return false;
+        hash = destinationHash; locationHash = window.location.hash; navigationRevision = navigationRevisionRef.current;
+      }
+      if (needsConnection) {
+        const connecting = connect(profile);
+        generation = gatewayGenerationRef.current;
+        await connecting;
+      }
+      if (!current() || activeProfileRef.current === undefined
+        || remoteMachineProfileKey(activeProfileRef.current) !== key || connectionStateRef.current !== "connected") return false;
+      return true;
+    } finally { window.removeEventListener("pagehide", retire); }
+  }, [connect, loadMachineSnapshot, navigate]);
+
+  useEffect(() => {
+    const route = state.route;
+    if (!state.ready || route.kind !== "tools" || !route.profileId || explicitDisconnectRef.current) return;
+    const profile = profilesRef.current.find(candidate => candidate.id === route.profileId);
+    if (profile && activeProfileRef.current && remoteMachineProfileKey(activeProfileRef.current) === remoteMachineProfileKey(profile)
+      && ["connected", "connecting"].includes(connectionStateRef.current)) return;
+    const abort = new AbortController();
+    void openMachineCatalog(route.profileId, route.tab === "skills" ? "skills" : "extensions", abort.signal).catch(error => {
+      if (!abort.signal.aborted) setState(current => ({ ...current, error: messageOf(error) }));
+    });
+    return () => abort.abort();
+  }, [state.ready, state.route, state.navigationRevision, openMachineCatalog]);
+
   const switchMachine = useCallback(async (profileId: string): Promise<void> => {
     const intent = ++machineSwitchIntentRef.current;
     const profile = profilesRef.current.find((candidate) => candidate.id === profileId);
@@ -2225,6 +2292,13 @@ export function useAppController(): AppController {
     };
   }, [artifactGateway]);
   const linkGatewayGeneration = gatewayGenerationRef.current;
+  const catalogGateway = useCallback((): OrchestratorGateway => {
+    if (artifactGateway === undefined || gatewayRef.current !== artifactGateway
+      || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+      throw new Error("The catalog node connection is no longer current.");
+    }
+    return artifactGateway;
+  }, [artifactGateway, linkGatewayGeneration]);
   useEffect(() => {
     for (const [pageId, preview] of htmlPreviewsRef.current) {
       const browser = state.snapshot.browsers.find((value) => value.id === preview.browserId);
@@ -2780,6 +2854,7 @@ export function useAppController(): AppController {
     refreshMachines,
     setMachineSelection,
     switchMachine,
+    openMachineCatalog,
     openMachineSession,
     openSourcePartner,
     refreshPartnerSource: (sourceKey) => partnerDirectoryRef.current!.refresh(sourceKey),
@@ -3024,59 +3099,59 @@ export function useAppController(): AppController {
     listBrowserActivity: (browserId, pageId) => gateway().listBrowserActivity(browserId, pageId),
     listBrowserTransfers: (browserId, pageId) => gateway().listBrowserTransfers(browserId, pageId),
     uploadBrowserFile: (browserId, pageId, file, inputHint) => gateway().uploadBrowserFile(browserId, pageId, file, inputHint),
-    approveResource: (resourceId, discoveredRevision) => gateway().approveResource(resourceId, discoveredRevision),
-    discoverProjectResources: (targetId) => gateway().discoverProjectResources(targetId),
-    addResource: (draft) => gateway().addResource(draft),
-    setResourceEnabled: (resourceId, enabled) => gateway().setResourceEnabled(resourceId, enabled),
-    removeResource: (resourceId) => gateway().removeResource(resourceId),
+    approveResource: async (resourceId, discoveredRevision) => catalogGateway().approveResource(resourceId, discoveredRevision),
+    discoverProjectResources: async (targetId) => catalogGateway().discoverProjectResources(targetId),
+    addResource: async (draft) => catalogGateway().addResource(draft),
+    setResourceEnabled: async (resourceId, enabled) => catalogGateway().setResourceEnabled(resourceId, enabled),
+    removeResource: async (resourceId) => catalogGateway().removeResource(resourceId),
     ...skillReadApi,
-    listSkillLearningRuns: (signal) => gateway().listSkillLearningRuns(signal),
-    getSkillLearningRun: (runId, signal) => gateway().getSkillLearningRun(runId, signal),
-    applySkillLearning: (run, confirmReplace, signal) => gateway().applySkillLearning(run, confirmReplace, signal),
-    discardSkillLearning: (run, signal) => gateway().discardSkillLearning(run, signal),
-    cancelSkillLearning: (run, signal) => gateway().cancelSkillLearning(run, signal),
-    getSkillResourceUsageReport: (resourceId, timeZone, signal) =>
-      gateway().getSkillResourceUsageReport(resourceId, timeZone, signal),
-    prepareSkillFileEdit: (sessionId, key, expectedFileRevision, content, signal) =>
-      gateway().prepareSkillFileEdit(sessionId, key, expectedFileRevision, content, signal),
-    prepareSkillRename: (sessionId, name, signal) => gateway().prepareSkillRename(sessionId, name, signal),
-    applySkillDraft: (draft, signal) => gateway().applySkillDraft(draft, signal),
-    setSkillEnabled: (skill, enabled, signal) => gateway().setSkillEnabled(skill, enabled, signal),
-    deleteSkill: (session, confirmation, signal) => gateway().deleteSkill(session, confirmation, signal),
-    getSkillMarketGitPreflight: (signal) => gateway().getSkillMarketGitPreflight(signal),
-    addSkillMarketSource: (source, expectedCatalogRevision, signal) =>
-      gateway().addSkillMarketSource(source, expectedCatalogRevision, signal),
-    refreshSkillMarketSource: (sourceId, expectedRevision, signal) =>
-      gateway().refreshSkillMarketSource(sourceId, expectedRevision, signal),
-    removeSkillMarketSource: (sourceId, expectedRevision, signal) =>
-      gateway().removeSkillMarketSource(sourceId, expectedRevision, signal),
+    listSkillLearningRuns: async (signal) => catalogGateway().listSkillLearningRuns(signal),
+    getSkillLearningRun: async (runId, signal) => catalogGateway().getSkillLearningRun(runId, signal),
+    applySkillLearning: async (run, confirmReplace, signal) => catalogGateway().applySkillLearning(run, confirmReplace, signal),
+    discardSkillLearning: async (run, signal) => catalogGateway().discardSkillLearning(run, signal),
+    cancelSkillLearning: async (run, signal) => catalogGateway().cancelSkillLearning(run, signal),
+    getSkillResourceUsageReport: async (resourceId, timeZone, signal) =>
+      catalogGateway().getSkillResourceUsageReport(resourceId, timeZone, signal),
+    prepareSkillFileEdit: async (sessionId, key, expectedFileRevision, content, signal) =>
+      catalogGateway().prepareSkillFileEdit(sessionId, key, expectedFileRevision, content, signal),
+    prepareSkillRename: async (sessionId, name, signal) => catalogGateway().prepareSkillRename(sessionId, name, signal),
+    applySkillDraft: async (draft, signal) => catalogGateway().applySkillDraft(draft, signal),
+    setSkillEnabled: async (skill, enabled, signal) => catalogGateway().setSkillEnabled(skill, enabled, signal),
+    deleteSkill: async (session, confirmation, signal) => catalogGateway().deleteSkill(session, confirmation, signal),
+    getSkillMarketGitPreflight: async (signal) => catalogGateway().getSkillMarketGitPreflight(signal),
+    addSkillMarketSource: async (source, expectedCatalogRevision, signal) =>
+      catalogGateway().addSkillMarketSource(source, expectedCatalogRevision, signal),
+    refreshSkillMarketSource: async (sourceId, expectedRevision, signal) =>
+      catalogGateway().refreshSkillMarketSource(sourceId, expectedRevision, signal),
+    removeSkillMarketSource: async (sourceId, expectedRevision, signal) =>
+      catalogGateway().removeSkillMarketSource(sourceId, expectedRevision, signal),
     ...skillMarketReadApi,
-    createSkillMarketInstallPlan: (identity, target, signal) =>
-      gateway().createSkillMarketInstallPlan(identity, target, signal),
-    getSkillMarketInstallPlan: (planId, signal) => gateway().getSkillMarketInstallPlan(planId, signal),
-    closeSkillMarketInstallPlan: (planId, signal) => gateway().closeSkillMarketInstallPlan(planId, signal),
-    installSkillMarketPlan: (plan, confirmReplacement, signal) =>
-      gateway().installSkillMarketPlan(plan, confirmReplacement, signal),
-    listSkillMarketSyncPolicies: (signal) => gateway().listSkillMarketSyncPolicies(signal),
-    listSkillMarketSyncJobs: (resourceId, signal) => gateway().listSkillMarketSyncJobs(resourceId, signal),
-    getSkillMarketSyncJob: (jobId, signal) => gateway().getSkillMarketSyncJob(jobId, signal),
-    enableSkillMarketSync: (resourceId, expectedResourceRevision, target, signal) =>
-      gateway().enableSkillMarketSync(resourceId, expectedResourceRevision, target, signal),
-    disableSkillMarketSync: (policy, signal) => gateway().disableSkillMarketSync(policy, signal),
-    enqueueSkillMarketSync: (policy, signal) => gateway().enqueueSkillMarketSync(policy, signal),
-    cancelSkillMarketSync: (job, signal) => gateway().cancelSkillMarketSync(job, signal),
-    retrySkillMarketSync: (job, signal) => gateway().retrySkillMarketSync(job, signal),
+    createSkillMarketInstallPlan: async (identity, target, signal) =>
+      catalogGateway().createSkillMarketInstallPlan(identity, target, signal),
+    getSkillMarketInstallPlan: async (planId, signal) => catalogGateway().getSkillMarketInstallPlan(planId, signal),
+    closeSkillMarketInstallPlan: async (planId, signal) => catalogGateway().closeSkillMarketInstallPlan(planId, signal),
+    installSkillMarketPlan: async (plan, confirmReplacement, signal) =>
+      catalogGateway().installSkillMarketPlan(plan, confirmReplacement, signal),
+    listSkillMarketSyncPolicies: async (signal) => catalogGateway().listSkillMarketSyncPolicies(signal),
+    listSkillMarketSyncJobs: async (resourceId, signal) => catalogGateway().listSkillMarketSyncJobs(resourceId, signal),
+    getSkillMarketSyncJob: async (jobId, signal) => catalogGateway().getSkillMarketSyncJob(jobId, signal),
+    enableSkillMarketSync: async (resourceId, expectedResourceRevision, target, signal) =>
+      catalogGateway().enableSkillMarketSync(resourceId, expectedResourceRevision, target, signal),
+    disableSkillMarketSync: async (policy, signal) => catalogGateway().disableSkillMarketSync(policy, signal),
+    enqueueSkillMarketSync: async (policy, signal) => catalogGateway().enqueueSkillMarketSync(policy, signal),
+    cancelSkillMarketSync: async (job, signal) => catalogGateway().cancelSkillMarketSync(job, signal),
+    retrySkillMarketSync: async (job, signal) => catalogGateway().retrySkillMarketSync(job, signal),
     getCollaborationDirectory,
-    createCollaborationScope: (kind, name, expectedCatalogRevision, signal) =>
-      gateway().createCollaborationScope(kind, name, expectedCatalogRevision, signal),
-    updateCollaborationScope: (scope, name, signal) => gateway().updateCollaborationScope(scope, name, signal),
-    deleteCollaborationScope: (scope, signal) => gateway().deleteCollaborationScope(scope, signal),
-    updateSkillMarketAccess: (entry, collaborationRevision, selection, signal) =>
-      gateway().updateSkillMarketAccess(entry, collaborationRevision, selection, signal),
-    startSkillPublication: (preview, metadata, access, signal) => gateway().startSkillPublication(preview, metadata, access, signal),
-    cancelSkillPublication: (job, signal) => gateway().cancelSkillPublication(job, signal),
-    retrySkillPublication: (job, signal) => gateway().retrySkillPublication(job, signal),
-    listSessionResources: (sessionId, signal) => gateway().listSessionResources(sessionId, signal),
+    createCollaborationScope: async (kind, name, expectedCatalogRevision, signal) =>
+      catalogGateway().createCollaborationScope(kind, name, expectedCatalogRevision, signal),
+    updateCollaborationScope: async (scope, name, signal) => catalogGateway().updateCollaborationScope(scope, name, signal),
+    deleteCollaborationScope: async (scope, signal) => catalogGateway().deleteCollaborationScope(scope, signal),
+    updateSkillMarketAccess: async (entry, collaborationRevision, selection, signal) =>
+      catalogGateway().updateSkillMarketAccess(entry, collaborationRevision, selection, signal),
+    startSkillPublication: async (preview, metadata, access, signal) => catalogGateway().startSkillPublication(preview, metadata, access, signal),
+    cancelSkillPublication: async (job, signal) => catalogGateway().cancelSkillPublication(job, signal),
+    retrySkillPublication: async (job, signal) => catalogGateway().retrySkillPublication(job, signal),
+    listSessionResources: async (sessionId, signal) => catalogGateway().listSessionResources(sessionId, signal),
     listRuntimeProcesses: (backendId, signal) => gateway().listRuntimeProcesses(backendId, signal),
     getUsageHistory: (days, backendId, providerId, signal) => gateway().getUsageHistory(days, backendId, providerId, signal),
     getUsageReport: usageApi.getUsageReport,
@@ -3089,70 +3164,70 @@ export function useAppController(): AppController {
       gateway().resetModelPriceOverride(backendId, providerId, modelId, signal),
     terminateRuntimeProcess: (process) => gateway().terminateRuntimeProcess(process),
     listRuntimeTools: (sessionId) => gateway().listRuntimeTools(sessionId),
-    listExtensions: (options) => gateway().listExtensions(options),
-    getExtension: (extensionId, sessionId, signal) => gateway().getExtension(extensionId, sessionId, signal),
-    openExtensionMainView: (extensionId, expectedRevision, signal) =>
-      gateway().openExtensionMainView(extensionId, expectedRevision, signal),
-    getExtensionMainViewSurface: (surfaceId, signal) => gateway().getExtensionMainViewSurface(surfaceId, signal),
-    closeExtensionMainView: (surfaceId, signal) => gateway().closeExtensionMainView(surfaceId, signal),
-    getExtensionLibraryOverview: (extensionId, expectedRevision, signal) =>
-      gateway().getExtensionLibraryOverview(extensionId, expectedRevision, signal),
-    validateExtensionLibraryLocation: (extensionId, expectedRevision, candidate, signal) =>
-      gateway().validateExtensionLibraryLocation(extensionId, expectedRevision, candidate, signal),
-    relocateExtensionLibrary: (extensionId, expectedRevision, destination, signal) =>
-      gateway().relocateExtensionLibrary(extensionId, expectedRevision, destination, signal),
-    rebindExtensionLibrary: (extensionId, expectedRevision, candidate, signal) =>
-      gateway().rebindExtensionLibrary(extensionId, expectedRevision, candidate, signal),
-    unbindExtensionLibrary: (extensionId, expectedRevision, signal) =>
-      gateway().unbindExtensionLibrary(extensionId, expectedRevision, signal),
-    repairExtensionLibraryState: (signal) => gateway().repairExtensionLibraryState(signal),
-    repairExtensionLibraryMetadata: (extensionId, expectedRevision, signal) =>
-      gateway().repairExtensionLibraryMetadata(extensionId, expectedRevision, signal),
-    trashExtensionLibrary: (extensionId, expectedRevision, confirmation, signal) =>
-      gateway().trashExtensionLibrary(extensionId, expectedRevision, confirmation, signal),
-    listExtensionLibraryTrash: (extensionId, signal) => gateway().listExtensionLibraryTrash(extensionId, signal),
-    restoreExtensionLibraryTrash: (trashId, confirmation, destination, signal) =>
-      gateway().restoreExtensionLibraryTrash(trashId, confirmation, destination, signal),
-    purgeExtensionLibraryTrash: (trashId, confirmation, signal) =>
-      gateway().purgeExtensionLibraryTrash(trashId, confirmation, signal),
-    listExtensionLibraryGrace: (extensionId, signal) => gateway().listExtensionLibraryGrace(extensionId, signal),
-    rollbackExtensionLibrary: (extensionId, expectedRevision, graceId, signal) =>
-      gateway().rollbackExtensionLibrary(extensionId, expectedRevision, graceId, signal),
-    purgeExpiredExtensionLibraries: (signal) => gateway().purgeExpiredExtensionLibraries(signal),
-    openExtensionLibrary: (extensionId, expectedRevision, surfaceId, signal) =>
-      gateway().openExtensionLibrary(extensionId, expectedRevision, surfaceId, signal),
-    callExtensionLibrary: (sessionId, call, signal) => gateway().callExtensionLibrary(sessionId, call, signal),
-    closeExtensionLibrary: (sessionId, signal) => gateway().closeExtensionLibrary(sessionId, signal),
-    getExtensionPackagePreview: (extensionId, expectedRevision, backendId, signal) =>
-      gateway().getExtensionPackagePreview(extensionId, expectedRevision, backendId, signal),
-    adoptExtensionPackage: (preview, allowSourceReplacement, signal) =>
-      gateway().adoptExtensionPackage(preview, allowSourceReplacement, signal),
-    removeExtensionPackage: (extensionId, expectedRevision, signal) =>
-      gateway().removeExtensionPackage(extensionId, expectedRevision, signal),
-    getExtensionPackageExportPreview: (extensionId, expectedRevision, signal) =>
-      gateway().getExtensionPackageExportPreview(extensionId, expectedRevision, signal),
-    listExtensionPackageExports: (extensionId, signal) => gateway().listExtensionPackageExports(extensionId, signal),
-    getExtensionPackageExport: (exportId, signal) => gateway().getExtensionPackageExport(exportId, signal),
-    startExtensionPackageExport: (preview, signal) => gateway().startExtensionPackageExport(preview, signal),
-    cancelExtensionPackageExport: (exportId, expectedRevision, signal) =>
-      gateway().cancelExtensionPackageExport(exportId, expectedRevision, signal),
-    getExtensionSourceGitPreflight: (signal) => gateway().getExtensionSourceGitPreflight(signal),
-    listExtensionSources: (signal) => gateway().listExtensionSources(signal),
-    addExtensionSource: (source, expectedCatalogRevision) => gateway().addExtensionSource(source, expectedCatalogRevision),
-    refreshExtensionSource: (sourceId, expectedRevision) => gateway().refreshExtensionSource(sourceId, expectedRevision),
-    removeExtensionSource: (sourceId, expectedRevision) => gateway().removeExtensionSource(sourceId, expectedRevision),
-    setExtensionEnabled: (extensionId, enabled, expectedRevision) => gateway().setExtensionEnabled(extensionId, enabled, expectedRevision),
-    setExtensionSidebarVisible: (extensionId, visible, expectedRevision) => gateway().setExtensionSidebarVisible(extensionId, visible, expectedRevision),
-    beginExtensionSetup: (extensionId, expectedRevision) => gateway().beginExtensionSetup(extensionId, expectedRevision),
-    submitExtensionSetupInteraction: (extensionId, attemptId, fieldId, value, expectedRevision) =>
-      gateway().submitExtensionSetupInteraction(extensionId, attemptId, fieldId, value, expectedRevision),
-    saveExtensionSetupCredential: (extensionId, attemptId, fieldId, kind, secret, expectedRevision, signal) =>
-      gateway().saveExtensionSetupCredential(extensionId, attemptId, fieldId, kind, secret, expectedRevision, signal),
-    completeExtensionSetup: (extensionId, attemptId, expectedRevision) =>
-      gateway().completeExtensionSetup(extensionId, attemptId, expectedRevision),
-    cancelExtensionSetup: (extensionId, attemptId, expectedRevision) =>
-      gateway().cancelExtensionSetup(extensionId, attemptId, expectedRevision),
-    revokeExtensionSetup: (extensionId, expectedRevision) => gateway().revokeExtensionSetup(extensionId, expectedRevision),
+    listExtensions: async (options) => catalogGateway().listExtensions(options),
+    getExtension: async (extensionId, sessionId, signal) => catalogGateway().getExtension(extensionId, sessionId, signal),
+    openExtensionMainView: async (extensionId, expectedRevision, signal) =>
+      catalogGateway().openExtensionMainView(extensionId, expectedRevision, signal),
+    getExtensionMainViewSurface: async (surfaceId, signal) => catalogGateway().getExtensionMainViewSurface(surfaceId, signal),
+    closeExtensionMainView: async (surfaceId, signal) => catalogGateway().closeExtensionMainView(surfaceId, signal),
+    getExtensionLibraryOverview: async (extensionId, expectedRevision, signal) =>
+      catalogGateway().getExtensionLibraryOverview(extensionId, expectedRevision, signal),
+    validateExtensionLibraryLocation: async (extensionId, expectedRevision, candidate, signal) =>
+      catalogGateway().validateExtensionLibraryLocation(extensionId, expectedRevision, candidate, signal),
+    relocateExtensionLibrary: async (extensionId, expectedRevision, destination, signal) =>
+      catalogGateway().relocateExtensionLibrary(extensionId, expectedRevision, destination, signal),
+    rebindExtensionLibrary: async (extensionId, expectedRevision, candidate, signal) =>
+      catalogGateway().rebindExtensionLibrary(extensionId, expectedRevision, candidate, signal),
+    unbindExtensionLibrary: async (extensionId, expectedRevision, signal) =>
+      catalogGateway().unbindExtensionLibrary(extensionId, expectedRevision, signal),
+    repairExtensionLibraryState: async (signal) => catalogGateway().repairExtensionLibraryState(signal),
+    repairExtensionLibraryMetadata: async (extensionId, expectedRevision, signal) =>
+      catalogGateway().repairExtensionLibraryMetadata(extensionId, expectedRevision, signal),
+    trashExtensionLibrary: async (extensionId, expectedRevision, confirmation, signal) =>
+      catalogGateway().trashExtensionLibrary(extensionId, expectedRevision, confirmation, signal),
+    listExtensionLibraryTrash: async (extensionId, signal) => catalogGateway().listExtensionLibraryTrash(extensionId, signal),
+    restoreExtensionLibraryTrash: async (trashId, confirmation, destination, signal) =>
+      catalogGateway().restoreExtensionLibraryTrash(trashId, confirmation, destination, signal),
+    purgeExtensionLibraryTrash: async (trashId, confirmation, signal) =>
+      catalogGateway().purgeExtensionLibraryTrash(trashId, confirmation, signal),
+    listExtensionLibraryGrace: async (extensionId, signal) => catalogGateway().listExtensionLibraryGrace(extensionId, signal),
+    rollbackExtensionLibrary: async (extensionId, expectedRevision, graceId, signal) =>
+      catalogGateway().rollbackExtensionLibrary(extensionId, expectedRevision, graceId, signal),
+    purgeExpiredExtensionLibraries: async (signal) => catalogGateway().purgeExpiredExtensionLibraries(signal),
+    openExtensionLibrary: async (extensionId, expectedRevision, surfaceId, signal) =>
+      catalogGateway().openExtensionLibrary(extensionId, expectedRevision, surfaceId, signal),
+    callExtensionLibrary: async (sessionId, call, signal) => catalogGateway().callExtensionLibrary(sessionId, call, signal),
+    closeExtensionLibrary: async (sessionId, signal) => catalogGateway().closeExtensionLibrary(sessionId, signal),
+    getExtensionPackagePreview: async (extensionId, expectedRevision, backendId, signal) =>
+      catalogGateway().getExtensionPackagePreview(extensionId, expectedRevision, backendId, signal),
+    adoptExtensionPackage: async (preview, allowSourceReplacement, signal) =>
+      catalogGateway().adoptExtensionPackage(preview, allowSourceReplacement, signal),
+    removeExtensionPackage: async (extensionId, expectedRevision, signal) =>
+      catalogGateway().removeExtensionPackage(extensionId, expectedRevision, signal),
+    getExtensionPackageExportPreview: async (extensionId, expectedRevision, signal) =>
+      catalogGateway().getExtensionPackageExportPreview(extensionId, expectedRevision, signal),
+    listExtensionPackageExports: async (extensionId, signal) => catalogGateway().listExtensionPackageExports(extensionId, signal),
+    getExtensionPackageExport: async (exportId, signal) => catalogGateway().getExtensionPackageExport(exportId, signal),
+    startExtensionPackageExport: async (preview, signal) => catalogGateway().startExtensionPackageExport(preview, signal),
+    cancelExtensionPackageExport: async (exportId, expectedRevision, signal) =>
+      catalogGateway().cancelExtensionPackageExport(exportId, expectedRevision, signal),
+    getExtensionSourceGitPreflight: async (signal) => catalogGateway().getExtensionSourceGitPreflight(signal),
+    listExtensionSources: async (signal) => catalogGateway().listExtensionSources(signal),
+    addExtensionSource: async (source, expectedCatalogRevision) => catalogGateway().addExtensionSource(source, expectedCatalogRevision),
+    refreshExtensionSource: async (sourceId, expectedRevision) => catalogGateway().refreshExtensionSource(sourceId, expectedRevision),
+    removeExtensionSource: async (sourceId, expectedRevision) => catalogGateway().removeExtensionSource(sourceId, expectedRevision),
+    setExtensionEnabled: async (extensionId, enabled, expectedRevision) => catalogGateway().setExtensionEnabled(extensionId, enabled, expectedRevision),
+    setExtensionSidebarVisible: async (extensionId, visible, expectedRevision) => catalogGateway().setExtensionSidebarVisible(extensionId, visible, expectedRevision),
+    beginExtensionSetup: async (extensionId, expectedRevision) => catalogGateway().beginExtensionSetup(extensionId, expectedRevision),
+    submitExtensionSetupInteraction: async (extensionId, attemptId, fieldId, value, expectedRevision) =>
+      catalogGateway().submitExtensionSetupInteraction(extensionId, attemptId, fieldId, value, expectedRevision),
+    saveExtensionSetupCredential: async (extensionId, attemptId, fieldId, kind, secret, expectedRevision, signal) =>
+      catalogGateway().saveExtensionSetupCredential(extensionId, attemptId, fieldId, kind, secret, expectedRevision, signal),
+    completeExtensionSetup: async (extensionId, attemptId, expectedRevision) =>
+      catalogGateway().completeExtensionSetup(extensionId, attemptId, expectedRevision),
+    cancelExtensionSetup: async (extensionId, attemptId, expectedRevision) =>
+      catalogGateway().cancelExtensionSetup(extensionId, attemptId, expectedRevision),
+    revokeExtensionSetup: async (extensionId, expectedRevision) => catalogGateway().revokeExtensionSetup(extensionId, expectedRevision),
     listBackgroundTasks: (sessionId, signal) => gateway().listBackgroundTasks(sessionId, signal),
     getBackgroundTaskOutput: (sessionId, backgroundTaskId, signal) => gateway().getBackgroundTaskOutput(sessionId, backgroundTaskId, signal),
     cancelBackgroundTask: (sessionId, backgroundTaskId) => gateway().cancelBackgroundTask(sessionId, backgroundTaskId),
@@ -3235,9 +3310,9 @@ export function useAppController(): AppController {
     partnerGroupApi: ownerKey => gateway().partnerGroupApi(ownerKey),
     mcpAppApi: () => gateway().mcpAppApi(),
     extensionCardApi: () => gateway().extensionCardApi(),
-    extensionNetworkApi: () => gateway().extensionNetworkApi(),
-    extensionOAuthApi: () => gateway().extensionOAuthApi(),
-    extensionTaskApi: () => gateway().extensionTaskApi?.(),
+    extensionNetworkApi: () => catalogGateway().extensionNetworkApi(),
+    extensionOAuthApi: () => catalogGateway().extensionOAuthApi(),
+    extensionTaskApi: () => catalogGateway().extensionTaskApi?.(),
     uploadPartnerGroupFile: (file, signal) => gateway().uploadPartnerGroupFile(file, signal),
     partnerMemoryApi: (partnerId, ownerKey) => gateway().partnerMemoryApi(partnerId, ownerKey),
     partnerConnectionsApi: (partnerId, ownerKey) => gateway().partnerConnectionsApi(partnerId, ownerKey),
@@ -3524,7 +3599,7 @@ export function useAppController(): AppController {
     resetPromptRecommendationSettings: () => gateway().resetPromptRecommendationSettings(),
     updateLanguageToolSettings: (enabled) => gateway().updateLanguageToolSettings(enabled),
     updateToolPolicySettings: (toolProviderId, targetId, patch) => gateway().updateToolPolicySettings(toolProviderId, targetId, patch),
-    updateAgentResourceSettings: (patch) => gateway().updateAgentResourceSettings(patch),
+    updateAgentResourceSettings: async (patch) => catalogGateway().updateAgentResourceSettings(patch),
     updateCollaborationSettings: (patch) => gateway().updateCollaborationSettings(patch),
     updateGitSafetySettings: (patch) => gateway().updateGitSafetySettings(patch),
     cleanupGitSafetySavepoints: () => gateway().cleanupGitSafetySavepoints(),
@@ -3534,8 +3609,8 @@ export function useAppController(): AppController {
     setSessionRuntimeFallbackEnabled: (enabled) => gateway().setSessionRuntimeFallbackEnabled(enabled),
     resetSessionRuntimeFallback: () => gateway().resetSessionRuntimeFallback(),
     createDiagnosticsBundle: () => gateway().createDiagnosticsBundle(),
-    installResource: (resourceId) => gateway().installResource(resourceId),
-    updateResource: (resourceId) => gateway().updateResource(resourceId),
+    installResource: async (resourceId) => catalogGateway().installResource(resourceId),
+    updateResource: async (resourceId) => catalogGateway().updateResource(resourceId),
     captureBrowserScreenshot: (browserId, pageId, fullPage) => gateway().captureBrowserScreenshot(browserId, pageId, fullPage),
     getArtifactUrl,
     releaseArtifactUrl,
@@ -3544,7 +3619,7 @@ export function useAppController(): AppController {
     openArtifactFile,
     openArtifactFileWithApplication,
     revealArtifactSource
-  }), [skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
+  }), [catalogGateway, openMachineCatalog, skillReadApi, skillMarketReadApi, deviceNameApi, saveProvider, getCollaborationDirectory, getMessagingSettings, openHttpLink, openWorkspaceHtml, readWorkspaceHtmlSnapshot, remoteHostApi, newTaskDraftApi, inputApi, mcpApi, terminalApi, readDraftSnapshot, saveDraftIfRevision, restoreFirstInputDraft, listWorkspaceChangeSets, previewWorkspaceRewind, executeWorkspaceRewind, readDraft, saveDraft, navigateSessionBranch, copyArtifactFile, openArtifactFile, openArtifactFileWithApplication, revealArtifactSource, voiceApi, downloadArtifact, exportSession, exportPortableSession, getArtifactUrl, readWorkspaceFile, releaseArtifactUrl, updateAuxiliaryTextSettings, predictNextPrompt, cancelAutomaticConnectionAttempt, connect, disconnect, forgetProfile, gateway, logoutConnection, logoutProfile, mutatePreferences, navigate, openMachineSession, pair, probeRuntimeActivity, refreshDiscoveredNodes, refreshMachines, retryManagedOrchestrator, revokeDevice, searchRemoteSessionMessages, setAutomaticConnectionEnabled, setCodeFamily, setCodeSize, setComposerSendShortcut, setLocale, setMachineSelection, setSessionNotificationsEnabled, setUiFamily, setUiSize, state, switchMachine, updatePreferences]);
 }
 
 function upsertMachineCache(caches: readonly MachineCacheView[], cache: MachineCacheView): readonly MachineCacheView[] {
@@ -4188,20 +4263,31 @@ export function routeFromHash(hash: string): AppRoute {
   if (parts[0] === "partners") return { kind: "partners", ...(parts[1] === undefined ? {} : { partnerId: parts[1] }),
     ...(query.get("profile") ? { profileId: query.get("profile")! } : {}), ...(query.get("prepare") === "1" ? { preparation: true } : {}) };
   if (parts[0] === "tools") {
+    const profile = query.get("profile");
+    const profileId = profile && profile.length <= 256 && profile === profile.trim() && !/[\u0000-\u001f\u007f]/u.test(profile)
+      ? profile : undefined;
     const extensionId = query.get("extension")?.trim();
     const recommendationNonce = routeRecommendationNonce(query);
     if (extensionId !== undefined && /^extension_[a-f0-9]{32}$/u.test(extensionId)) return {
-      kind: "tools", extensionId,
+      kind: "tools", extensionId, ...(profileId === undefined ? {} : { profileId }),
       ...(recommendationNonce === undefined ? {} : { recommendationNonce })
     };
     const tab = query.get("tab");
     return {
       kind: "tools",
+      ...(profileId === undefined ? {} : { profileId }),
       ...(tab !== null && tab !== "browser" && (TOOLS_TABS as readonly string[]).includes(tab) ? { tab: tab as ToolsTab } : {})
     };
   }
   if (parts[0] === "extensions" && parts[1] !== undefined && /^extension_[a-f0-9]{32}$/u.test(parts[1])) {
-    return { kind: "extensionMainView", extensionId: parts[1] };
+    const profileId = query.get("profile"), serverId = query.get("server");
+    if (profileId === null && serverId === null) return { kind: "extensionMainView", extensionId: parts[1] };
+    if ([profileId, serverId].every(value => value !== null && value.length > 0 && value.length <= 256
+      && value === value.trim() && !/[\u0000-\u001f\u007f]/u.test(value))
+      && query.getAll("profile").length === 1 && query.getAll("server").length === 1) {
+      return { kind: "extensionMainView", extensionId: parts[1], profileId: profileId!, serverId: serverId! };
+    }
+    return { kind: "session" };
   }
   if (parts[0] === "settings") return { kind: "settings" };
   if (parts[0] === "tasks" && parts[1] === "new") {
@@ -4282,9 +4368,14 @@ export function appRouteHash(route: AppRoute): string {
     if (route.extensionId !== undefined) query.set("extension", route.extensionId);
     else if (route.tab !== undefined && route.tab !== "browser") query.set("tab", route.tab);
     if (route.extensionId !== undefined && route.recommendationNonce !== undefined) query.set("recommendation", route.recommendationNonce);
+    if (route.profileId !== undefined) query.set("profile", route.profileId);
     return `#/tools${query.size === 0 ? "" : `?${query.toString()}`}`;
   }
-  if (route.kind === "extensionMainView") return `#/extensions/${encodeURIComponent(route.extensionId)}`;
+  if (route.kind === "extensionMainView") {
+    const query = new URLSearchParams();
+    if (route.profileId !== undefined && route.serverId !== undefined) { query.set("profile", route.profileId); query.set("server", route.serverId); }
+    return `#/extensions/${encodeURIComponent(route.extensionId)}${query.size ? `?${query}` : ""}`;
+  }
   return `#/${route.kind}`;
 }
 

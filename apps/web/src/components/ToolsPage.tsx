@@ -68,10 +68,12 @@ import { ExtensionTasksSection } from "./ExtensionTasksSection.js";
 import { openExtensionWindowFallback } from "../extension-window-navigation.js";
 import { SkillTools } from "./SkillTools.js";
 import { useExtensionSuggestionContinuation, type ExtensionSuggestionContinuationState } from "./use-extension-suggestion-continuation.js";
+import { CatalogNodePicker, CatalogNodeUnavailable, useCatalogNodeSelection, type CatalogNodeSelection } from "./CatalogNodePicker.js";
 
-export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExtensionId, recommendationNonce, selectedTab, locale, t, runAction, onSelectExtension, onSelectTab, onOpenNavigation }: {
+interface ToolsPageProps {
   readonly controller: AppController;
   readonly snapshot: AppSnapshot;
+  readonly catalogProfileId?: string;
   readonly runtimeSessionId?: string;
   readonly selectedExtensionId?: string;
   readonly recommendationNonce?: string;
@@ -82,7 +84,12 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
   readonly onSelectExtension?: (extensionId: string | undefined) => void;
   readonly onSelectTab?: (tab: ToolsTab) => void;
   readonly onOpenNavigation: () => void;
-}): JSX.Element {
+}
+export function ToolsPage(props: ToolsPageProps): JSX.Element {
+  const catalogScope = useCatalogNodeSelection(props.controller, props.catalogProfileId);
+  return <ToolsPageContent key={catalogScope.owner} {...props} catalogScope={catalogScope} />;
+}
+function ToolsPageContent({ controller, snapshot, runtimeSessionId, selectedExtensionId, recommendationNonce, selectedTab, locale, t, runAction, onSelectExtension, onSelectTab, onOpenNavigation, catalogScope }: ToolsPageProps & { readonly catalogScope: CatalogNodeSelection }): JSX.Element {
   const [tab, setTab] = useState<ToolsTab>(selectedExtensionId === undefined ? selectedTab ?? "browser" : "extensions");
   const [selectedExtension, setSelectedExtension] = useState(selectedExtensionId);
   const [removeResource, setRemoveResource] = useState<ResourceView>();
@@ -140,20 +147,22 @@ export function ToolsPage({ controller, snapshot, runtimeSessionId, selectedExte
       <header className="route-header">
         {!controller.state.preferences.navigationOpen && <IconButton className="mobile-panel-toggle" label={t("a11y.openNavigation")} onClick={onOpenNavigation}><Menu aria-hidden="true" /></IconButton>}
         <div><p className="eyebrow">{t("tools.eyebrow")}</p><h1>{t("tools.title")}</h1><p>{t("tools.subtitle")}</p></div>
-        <Pill tone={snapshot.browsers.some((browser) => browser.state === "ready") ? "success" : "neutral"}>{t("tools.providerCount", { count: snapshot.browsers.length })}</Pill>
+        {tab === "extensions" || tab === "skills" ? <CatalogNodePicker scope={catalogScope} tab={tab} t={t} />
+          : <Pill tone={snapshot.browsers.some((browser) => browser.state === "ready") ? "success" : "neutral"}>{t("tools.providerCount", { count: snapshot.browsers.length })}</Pill>}
       </header>
       <div className="route-tabs" role="tablist" aria-label={t("tools.title")} aria-orientation="horizontal">
         <TabButton id="browser" current={tab} onClick={selectTab}><Globe2 />{t("tools.browser")}</TabButton>
-        <TabButton id="extensions" current={tab} onClick={selectTab}><Boxes />{t("extensions.title")}<span>{snapshot.extensions.length}</span></TabButton>
-        <TabButton id="skills" current={tab} onClick={selectTab}><Sparkles />{t("skills.title")}<span>{snapshot.resources.filter((resource) => resource.kind === "skill" && resource.state !== "removed").length}</span></TabButton>
+        <TabButton id="extensions" current={tab} onClick={selectTab}><Boxes />{t("extensions.title")}<span>{catalogScope.ready ? snapshot.extensions.length : "—"}</span></TabButton>
+        <TabButton id="skills" current={tab} onClick={selectTab}><Sparkles />{t("skills.title")}<span>{catalogScope.ready ? snapshot.resources.filter((resource) => resource.kind === "skill" && resource.state !== "removed").length : "—"}</span></TabButton>
         <TabButton id="resources" current={tab} onClick={selectTab}><Braces />{t("tools.resources")}<span>{snapshot.resources.length}</span></TabButton>
         <TabButton id="mcp" current={tab} onClick={selectTab}><Boxes />{t("tools.mcp")}</TabButton>
         <TabButton id="activity" current={tab} onClick={selectTab}><Wrench />{t("tools.activity")}<span>{activity.length}</span></TabButton>
       </div>
       <div id="tools-tabpanel" className="route-page__content" role="tabpanel" aria-labelledby={`tools-tab-${tab}`}>
         {tab === "browser" && <BrowserTools controller={controller} browsers={snapshot.browsers} browserSettings={snapshot.settings.browsers} sessions={browserSessions} commentTargets={browserCommentTargets} locale={locale} t={t} runAction={runAction} />}
-        {tab === "extensions" && <ExtensionTools controller={controller} snapshot={snapshot} runtimeSessionId={runtimeSessionId} selectedId={selectedExtension} recommendationNonce={recommendationNonce} locale={locale} t={t} runAction={runAction} onSelect={selectExtension} />}
-        {tab === "skills" && <SkillTools controller={controller} backends={snapshot.backends} targets={snapshot.targets} resources={snapshot.resources} locale={locale} t={t} />}
+        {(tab === "extensions" || tab === "skills") && !catalogScope.ready && <CatalogNodeUnavailable scope={catalogScope} tab={tab} t={t} />}
+        {tab === "extensions" && catalogScope.ready && <ExtensionTools controller={controller} snapshot={snapshot} runtimeSessionId={runtimeSessionId} selectedId={selectedExtension} recommendationNonce={recommendationNonce} locale={locale} t={t} runAction={runAction} onSelect={selectExtension} />}
+        {tab === "skills" && catalogScope.ready && <SkillTools controller={controller} backends={snapshot.backends} targets={snapshot.targets} resources={snapshot.resources} locale={locale} t={t} />}
         {tab === "resources" && <ResourcesTools controller={controller} backends={snapshot.backends} targets={snapshot.targets} resources={snapshot.resources} t={t} runAction={runAction} onRemove={setRemoveResource} />}
         {tab === "mcp" && <McpTools controller={controller} backends={mcpBackends} servers={snapshot.settings.mcpServers} t={t} runAction={runAction} />}
         {tab === "activity" && <ActivityTools activity={activity} locale={locale} t={t} />}
@@ -1253,13 +1262,19 @@ function ExtensionTools({ controller, snapshot, runtimeSessionId, selectedId, re
         onPackage={() => openPackage(selectedDetail)}
         onExport={() => setPackageExport(selectedDetail)}
         onRemove={() => setPackageRemoval(selectedDetail)}
-        onOpenMainView={() => controller.navigate({ kind: "extensionMainView", extensionId: selectedDetail.id })}
+        onOpenMainView={() => {
+          const profile = controller.state.activeProfile;
+          if (profile) controller.navigate({ kind: "extensionMainView", extensionId: selectedDetail.id, profileId: profile.id, serverId: profile.serverId });
+        }}
         onOpenWindow={() => runAction(`extension-window:${selectedDetail.id}`, async () => {
+          const profile = controller.state.activeProfile;
+          if (!profile) throw new Error(t("catalog.unavailable"));
+          const source = { profileId: profile.id, serverId: profile.serverId };
           if (window.jokoDesktop?.capabilities.includes("extension.windows") === true) {
-            await window.jokoDesktop.extensionWindows.open(selectedDetail.id);
+            await window.jokoDesktop.extensionWindows.open({ extensionId: selectedDetail.id, ...source });
             return;
           }
-          if (openExtensionWindowFallback(window.location, selectedDetail.id) === null) {
+          if (openExtensionWindowFallback(window.location, selectedDetail.id, source) === null) {
             throw new Error(t("extensions.mainView.windowFailed"));
           }
         })}

@@ -90,10 +90,10 @@ describe("Extension catalog interactions", () => {
     });
 
     await act(async () => buttonWithText(container, "Open view").click());
-    expect(navigate).toHaveBeenCalledWith({ kind: "extensionMainView", extensionId: extension.id });
+    expect(navigate).toHaveBeenCalledWith({ kind: "extensionMainView", extensionId: extension.id, profileId: "profile", serverId: "server" });
     await act(async () => buttonWithText(container, "Open in new window").click());
     await settle();
-    expect(open).toHaveBeenCalledWith(extension.id);
+    expect(open).toHaveBeenCalledWith({ extensionId: extension.id, profileId: "profile", serverId: "server" });
   });
 
   it("shows a Source main-view declaration without allowing it to open before installation", async () => {

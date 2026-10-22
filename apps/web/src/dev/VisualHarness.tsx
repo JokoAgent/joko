@@ -557,6 +557,11 @@ export function VisualHarness(): JSX.Element {
       connect: async (profile, options): Promise<void> => {
         record(`connection-connect:${profile.id}:${options?.automatic === true ? "automatic" : "current"}`);
       },
+      openMachineCatalog: async (profileId, tab): Promise<boolean> => {
+        record(`catalog-node:${profileId}:${tab}`);
+        if (profileId === state.activeProfile?.id) return true;
+        throw new Error("The selected node is offline.");
+      },
       pair: async (_origin, _code, _deviceName, options): Promise<void> => {
         record(`connection-pair:${options?.automatic === true ? "automatic" : "current"}`);
       },
@@ -3545,7 +3550,8 @@ function initialControllerState(parameters: HarnessParameters, files: VisualWork
     connectionGeneration: connectionScenario ? 0 : 1,
     profiles: connectionScenario
       ? [managedConnectionProfile, savedConnectionProfile]
-      : parameters.scenario === "connections" ? [activeProfile] : [],
+      : parameters.scenario === "connections" ? [activeProfile]
+        : parameters.scenario === "extensions" ? [activeProfile, savedConnectionProfile] : [],
     machineCaches: [],
     machinePresenceByProfile: { [activeProfile.id]: "current" },
     activeProfile: connectionScenario ? undefined : activeProfile,

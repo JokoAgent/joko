@@ -539,7 +539,7 @@ interface JokoDesktopApi {
     onChanged(listener: (settings: JokoDesktopMainWindowCloseSettings) => void): () => void;
   };
   readonly extensionWindows: {
-    open(extensionId: string): Promise<{ readonly focusedExisting: boolean }>;
+    open(owner: { readonly extensionId: string; readonly profileId: string; readonly serverId: string }): Promise<{ readonly focusedExisting: boolean }>;
   };
   readonly extensionLibraries: {
     pickLocation(): Promise<{ readonly cancelled: true } | { readonly cancelled: false; readonly path: string }>;

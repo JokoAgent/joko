@@ -43,6 +43,7 @@ import { SkillUsagePanel } from "./SkillUsagePanel.js";
 import { SkillLearningTools } from "./SkillLearningTools.js";
 import { resourceKindsForBackend } from "../resource-capabilities.js";
 import { resourceSourceKindLabel, resourceStateLabel } from "../resource-presentation.js";
+import { registerCatalogNavigationLeave } from "../catalog-navigation-leave.js";
 import { Button, EmptyState, IconButton, Modal, Pill, SelectControl, cx, formatRelativeTime } from "./ui.js";
 
 type LoadState<T> =
@@ -170,6 +171,12 @@ function LocalSkillTools({ controller, backends, targets, resources, locale, t, 
   const dirty = editing && fileState?.kind === "ready" && editorText !== fileState.value.content;
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
+  useEffect(() => registerCatalogNavigationLeave(signal => {
+    if (!dirtyRef.current) return undefined;
+    const accepted = !signal.aborted && window.confirm(t("skills.unsavedLeave"));
+    if (accepted && !signal.aborted) { dirtyRef.current = false; setEditing(false); }
+    return Promise.resolve(accepted && !signal.aborted);
+  }), [t]);
 
   const loadCatalog = useCallback(() => setRefreshSequence((value) => value + 1), []);
 

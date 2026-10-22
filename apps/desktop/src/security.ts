@@ -1,5 +1,6 @@
 import { isAbsolute, dirname, extname, relative, resolve, sep } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { desktopExtensionWindowKey, isDesktopExtensionWindowOwner, type DesktopExtensionWindowOwner } from "./channels.js";
 
 export const DESKTOP_APP_SCHEME = "joko";
 export const DESKTOP_APP_HOST = "app";
@@ -176,17 +177,13 @@ export function isAllowedSessionWindowNavigation(
 
 export function isAllowedExtensionWindowNavigation(
   value: string,
-  extensionId: string,
+  owner: DesktopExtensionWindowOwner,
   policy: DesktopNavigationPolicy
 ): boolean {
-  if (!/^extension_[a-f0-9]{32}$/u.test(extensionId) || !isAllowedMainFrameNavigation(value, policy)) return false;
+  if (!isDesktopExtensionWindowOwner(owner) || !isAllowedMainFrameNavigation(value, policy)) return false;
   try {
-    const url = new URL(value);
-    const keys = [...url.searchParams.keys()].sort();
-    return keys.join(",") === "bootExtension,extensionWindow"
-      && url.searchParams.get("extensionWindow") === "1"
-      && url.searchParams.get("bootExtension") === extensionId
-      && url.hash === `#/extensions/${encodeURIComponent(extensionId)}`;
+    const found = extensionWindowOwner(new URL(value));
+    return found !== undefined && desktopExtensionWindowKey(found) === desktopExtensionWindowKey(owner);
   } catch {
     return false;
   }
@@ -200,8 +197,31 @@ function isAllowedPackagedAppResourceHash(url: URL): boolean {
   if (url.search === "") return true;
   const sessionId = sessionWindowIdentity(url.searchParams);
   if (sessionId !== undefined) return url.hash === `#/tasks/${encodeURIComponent(sessionId)}`;
+  return extensionWindowOwner(url) !== undefined;
+}
+
+export function extensionWindowEntryUrl(base: string, owner: DesktopExtensionWindowOwner): string {
+  desktopExtensionWindowKey(owner);
+  const url = new URL(base);
+  url.username = ""; url.password = "";
+  url.search = "";
+  url.searchParams.set("extensionWindow", "1");
+  url.searchParams.set("bootExtension", owner.extensionId);
+  const query = new URLSearchParams({ profile: owner.profileId, server: owner.serverId });
+  url.hash = `#/extensions/${encodeURIComponent(owner.extensionId)}?${query}`;
+  return url.href;
+}
+
+function extensionWindowOwner(url: URL): DesktopExtensionWindowOwner | undefined {
   const extensionId = extensionWindowIdentity(url.searchParams);
-  return extensionId !== undefined && url.hash === `#/extensions/${encodeURIComponent(extensionId)}`;
+  if (extensionId === undefined) return undefined;
+  const parts = url.hash.split("?");
+  const [route, search] = parts;
+  if (parts.length !== 2 || route !== `#/extensions/${encodeURIComponent(extensionId)}` || search === undefined) return undefined;
+  const query = new URLSearchParams(search);
+  if ([...query.keys()].sort().join(",") !== "profile,server") return undefined;
+  const owner = { extensionId, profileId: query.get("profile"), serverId: query.get("server") };
+  return isDesktopExtensionWindowOwner(owner) ? owner : undefined;
 }
 
 function sessionWindowIdentity(query: URLSearchParams): string | undefined {

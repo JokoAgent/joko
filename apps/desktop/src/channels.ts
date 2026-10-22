@@ -402,6 +402,20 @@ export interface DesktopExtensionWindowOpenResult {
   readonly focusedExisting: boolean;
 }
 
+export interface DesktopExtensionWindowOwner {
+  readonly extensionId: string;
+  readonly profileId: string;
+  readonly serverId: string;
+}
+export function isDesktopExtensionWindowOwner(value: unknown): value is DesktopExtensionWindowOwner {
+  return plainRecordWithKeys(value, ["extensionId", "profileId", "serverId"])
+    && isDesktopExtensionId(value.extensionId) && boundedDragText(value.profileId, 256) && boundedDragText(value.serverId, 256);
+}
+export function desktopExtensionWindowKey(owner: DesktopExtensionWindowOwner): string {
+  if (!isDesktopExtensionWindowOwner(owner)) throw new TypeError("Extension window owner is invalid.");
+  return JSON.stringify([owner.profileId, owner.serverId, owner.extensionId]);
+}
+
 export type DesktopExtensionLibraryLocationSelection =
   | { readonly cancelled: true }
   | { readonly cancelled: false; readonly path: string };

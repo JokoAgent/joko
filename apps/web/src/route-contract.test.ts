@@ -14,7 +14,10 @@ describe("public route contract", () => {
       { route: { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef" } as const, hash: "#/tools?extension=extension_0123456789abcdef0123456789abcdef" },
       { route: { kind: "tools", tab: "skills" } as const, hash: "#/tools?tab=skills" },
       { route: { kind: "tools", tab: "extensions" } as const, hash: "#/tools?tab=extensions" },
+      { route: { kind: "tools", tab: "skills", profileId: "node/one" } as const, hash: "#/tools?tab=skills&profile=node%2Fone" },
+      { route: { kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef", profileId: "node/one" } as const, hash: "#/tools?extension=extension_0123456789abcdef0123456789abcdef&profile=node%2Fone" },
       { route: { kind: "extensionMainView", extensionId: "extension_0123456789abcdef0123456789abcdef" } as const, hash: "#/extensions/extension_0123456789abcdef0123456789abcdef" },
+      { route: { kind: "extensionMainView", extensionId: "extension_0123456789abcdef0123456789abcdef", profileId: "connection/one", serverId: "node-one" } as const, hash: "#/extensions/extension_0123456789abcdef0123456789abcdef?profile=connection%2Fone&server=node-one" },
       { route: { kind: "newSession" } as const, hash: "#/tasks/new" },
       { route: { kind: "newSession", targetId: "project/one" } as const, hash: "#/tasks/new?target=project%2Fone" },
       { route: { kind: "newSession", dialogueBackendId: "agent/one" } as const, hash: "#/tasks/new?dialogue=agent%2Fone" }
@@ -27,8 +30,11 @@ describe("public route contract", () => {
     expect(routeFromHash("#/tools?extension=not-an-extension")).toEqual({ kind: "tools" });
     expect(routeFromHash("#/tools?tab=unknown")).toEqual({ kind: "tools" });
     expect(routeFromHash("#/tools?tab=browser")).toEqual({ kind: "tools" });
+    expect(routeFromHash("#/tools?tab=skills&profile=%20foreign%20")).toEqual({ kind: "tools", tab: "skills" });
+    expect(routeFromHash("#/tools?profile=%00foreign")).toEqual({ kind: "tools" });
     expect(routeFromHash("#/tools?extension=extension_0123456789abcdef0123456789abcdef&tab=skills")).toEqual({ kind: "tools", extensionId: "extension_0123456789abcdef0123456789abcdef" });
     expect(routeFromHash("#/extensions/not-an-extension")).toEqual({ kind: "session" });
+    expect(routeFromHash("#/extensions/extension_0123456789abcdef0123456789abcdef?profile=another")).toEqual({ kind: "session" });
     expect(routeFromHash("#/tasks/new?target=project&dialogue=agent")).toEqual({ kind: "newSession", targetId: "project" });
     expect(routeFromHash("#/tasks/session-1")).toEqual({ kind: "session", sessionId: "session-1" });
   });

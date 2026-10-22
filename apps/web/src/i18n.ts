@@ -4926,6 +4926,11 @@ const en = {
   "interaction.action.install": "Install",
   "interaction.action.enable": "Enable",
   "tools.eyebrow": "Runtime",
+  "catalog.node": "Catalog node",
+  "catalog.missingNode": "Node no longer saved",
+  "catalog.offline": "Offline",
+  "catalog.connecting": "Opening plugins and skills on {name}…",
+  "catalog.unavailable": "Connect to the selected node to manage its plugins and skills.",
   "tools.subtitle": "Inspect tool providers, approve managed resources, and take over remote browser pages.",
   "tools.providerCount": "{count} providers",
   "tools.activity": "Activity",
@@ -6230,6 +6235,11 @@ export type MessageKey = keyof typeof en;
 export const messageKeys: readonly MessageKey[] = Object.freeze(Object.keys(en) as MessageKey[]);
 
 const zhBase: Record<MessageKey, string> = {
+  "catalog.node": "目录所在节点",
+  "catalog.missingNode": "节点已不在保存列表中",
+  "catalog.offline": "离线",
+  "catalog.connecting": "正在打开 {name} 上的插件与技能…",
+  "catalog.unavailable": "连接到所选节点后，可管理其插件与技能。",
   "extensionCards.failed": "卡片未能完成保存或操作。请重试后再发送消息。",
   "extensionCards.readOnly": "此卡片仅供查看。",
   "extensionCards.unavailable": "连接任务所在节点后即可使用此卡片。",
