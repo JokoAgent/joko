@@ -41,8 +41,29 @@ export function claudeHostedSettings(hosted: HostedExecution): Exclude<ClaudeSdk
     disableAllHooks: true, disableClaudeAiConnectors: true, disableRemoteControl: true,
     disableSkillShellExecution: true, autoMemoryEnabled: false, autoDreamEnabled: false,
     includeGitInstructions: false, claudeMdExcludes: [...excludes],
+    ...hostedPermissions(hosted),
     ...(hosted.trust === "guest" ? { availableModels: [...hosted.modelIds], enforceAvailableModels: true } : {})
   };
+}
+
+function hostedPermissions(hosted: HostedExecution): { readonly permissions?: { readonly allow: string[]; readonly deny: string[]; readonly ask: string[] } } {
+  const files = hosted.workspace.contextFiles ?? [], permissions = { allow: [] as string[], deny: [] as string[], ask: [] as string[] };
+  for (const name of ["settings.json", "settings.local.json"]) {
+    const expected = resolve(hosted.workspace.root, ".claude", name);
+    const file = files.find(file => process.platform === "win32" ? resolve(file.path).toLowerCase() === expected.toLowerCase() : resolve(file.path) === expected);
+    if (!file) continue;
+    const parsed = JSON.parse(file.content) as { readonly permissions?: Readonly<Record<string, unknown>> };
+    for (const side of ["allow", "deny", "ask"] as const) {
+      const rules = parsed.permissions?.[side];
+      if (rules === undefined) continue;
+      if (!Array.isArray(rules) || rules.length > 1024 || rules.some(rule => typeof rule !== "string" || !rule || rule.length > 4096 || rule.includes("\0"))) {
+        throw new Error("The Source native permission snapshot is invalid.");
+      }
+      permissions[side].push(...rules as string[]);
+    }
+  }
+  for (const side of ["allow", "deny", "ask"] as const) permissions[side] = [...new Set(permissions[side])];
+  return Object.values(permissions).some(rules => rules.length) ? { permissions } : {};
 }
 
 export function claudeHostedEnvironment(hosted: HostedExecution, environment: Readonly<Record<string, string>>): Readonly<Record<string, string | undefined>> {

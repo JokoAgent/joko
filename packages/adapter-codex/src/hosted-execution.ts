@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { assertHostedExecution, hostedExecutionEnvironmentNote, type AdapterContext, type HostedExecution } from "@joko/core";
 import type { AppServerHost } from "./host.js";
 import type { JsonObject } from "./protocol.js";
+import type { CodexMcpSessionInput, CodexMcpRuntimeLease } from "./adapter.js";
 import { CODEX_HOSTED_GUEST_THREAD_CONFIG, assertNoCodexUserInstructions, codexGuestFeatureOverrides, listCodexFeatures } from "./hosted-guest.js";
 
 /** Private native execution transport. Never persist these values in a Session. */
@@ -16,6 +17,8 @@ export interface CodexHostedExecServerLease {
 export interface CodexHostedExecutionOptions {
   readonly execution: HostedExecution;
   readonly openExecServer: (execution: HostedExecution) => Promise<CodexHostedExecServerLease>;
+  /** Source-owned MCP facade; never use the model computer's local catalog. */
+  readonly openMcpBridge?: (input: CodexMcpSessionInput) => Promise<CodexMcpRuntimeLease>;
 }
 
 /** One dedicated app-server's Source execution environment and isolated policy. */

@@ -52,6 +52,7 @@ export async function createHostedAgentClaudeAdapter(options: {
         assertCurrent: () => { creation.signal.throwIfAborted(); creation.execution.assertCurrent(); } } } : {}),
       ...(options.pathToExecutable ? { pathToClaudeCodeExecutable: options.pathToExecutable } : {}),
       probeCwd: creation.execution.workspace.root, settingSources: [],
+      ...(creation.sourceMcp ? { mcpBridge: creation.sourceMcp.claude() } : {}),
       readBlob: async blob => ({ data: await creation.readBlob(blob), mimeType: blob.mimeType }),
       processOwner: { rootDirectory: join(home, "processes"), instanceId: options.backendId, generation: 1,
         recoverStale: true, supervisor: createDefaultManagedProcessSupervisor() },

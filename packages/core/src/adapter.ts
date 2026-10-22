@@ -13,6 +13,7 @@ import type {
   NativeSessionStart,
   PermissionMode,
   PromptInput,
+  QueueItemId,
   ArtifactReferenceSnapshot,
   ProviderModel,
   SessionId,
@@ -65,6 +66,8 @@ export interface AdapterContext {
   readonly resolveModelWorkingContext?: (selection: { readonly providerId: string; readonly modelId: string }) => number | undefined;
   /** Stable host operation identity for idempotent Backend mutations. */
   readonly operationId?: string;
+  /** Original durable input owner, minted by SessionHost rather than native callers. */
+  readonly inputQueueItemId?: QueueItemId;
   /** Private authority for one user-owned dispatch. A Backend may recover a
    * deterministic optional-field rejection only before producing output or
    * running tools. Recheck after learning and immediately before replay. */

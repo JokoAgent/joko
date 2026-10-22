@@ -206,16 +206,19 @@ export interface CodexMcpRuntimeLease {
   readonly release: () => Promise<void>;
 }
 
-export interface CodexMcpOpenInput {
+export interface CodexMcpSessionInput {
   readonly sessionId: string;
   readonly targetId: string;
   readonly generation: number;
-  readonly threadId: string;
   readonly signal?: AbortSignal;
   /** Rechecks the Adapter/Session/Target authority without requiring an installed runtime. */
   readonly assertSessionCurrent: () => void;
   /** Acquires the active native root-or-descendant turn fence for one call. */
   readonly beginToolCall: (threadId: string, request: { readonly requestId: string; readonly serverId: string; readonly toolName: string }) => CodexMcpCallLease;
+}
+
+export interface CodexMcpOpenInput extends CodexMcpSessionInput {
+  readonly threadId: string;
 }
 
 export interface CodexRemoteRuntimePort {
@@ -574,6 +577,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   readonly #catalogEntrySources = new WeakMap<NativeSessionCatalogEntry, CodexCatalogSource>();
   readonly #remoteRuntimes: CodexRemoteRuntimePort | undefined;
   readonly #localMcpBridge: CodexAdapterOptions["localMcpBridge"];
+  readonly #hostedMcpBridge: CodexHostedExecutionOptions["openMcpBridge"];
   readonly #resolveNativeMemoryEnabled: CodexAdapterOptions["resolveNativeMemoryEnabled"];
   readonly #resolveNativeSkills: ApprovedSkillResolver | undefined;
   readonly #resolveNativeSkillPolicy: NativeSkillPolicyResolver | undefined;
@@ -679,7 +683,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     this.#resolveNativeSkills = options.resolveNativeSkills;
     this.#resolveNativeSkillPolicy = options.resolveNativeSkillPolicy;
     this.#taskShellEnv = options.taskShellEnv;
-    this.#localMcpBridge = options.localMcpBridge;
+    this.#localMcpBridge = options.hostedExecution?.openMcpBridge ?? options.localMcpBridge;
+    this.#hostedMcpBridge = options.hostedExecution?.openMcpBridge;
     this.#resolveNativeMemoryEnabled = options.resolveNativeMemoryEnabled;
     if (!Number.isSafeInteger(this.#instanceGeneration) || this.#instanceGeneration < 1) {
       throw new TypeError("Codex Backend instance generation must be a positive integer.");
@@ -1183,9 +1188,16 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       nativeAuthenticationEpoch
     );
     let nativeConfiguration: JsonObject | undefined;
+    let initialMcp: CodexMcpRuntimeLease | undefined;
     if (runtimePolicy === "standard" && (scope.remote || scope.openMcpBridge !== undefined)) {
       try {
-        nativeConfiguration = await this.#buildMcpConfiguration(scope, [], context.signal);
+        if (this.#hostedMcpBridge) {
+          // A fresh native thread has no rollout to resume. Install the private
+          // Source routes at creation; tool admission still requires its live turn.
+          const prepared = await this.#openMcpRuntime(scope, undefined, context);
+          initialMcp = prepared.mcp;
+          nativeConfiguration = prepared.nativeConfiguration;
+        } else nativeConfiguration = await this.#buildMcpConfiguration(scope, [], context.signal);
       } catch (error) {
         managedRoute?.dispose();
         smartRoute?.dispose();
@@ -1199,7 +1211,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         const prepared = await this.#prepareSkills(scope, context, nativeConfiguration);
         nativeSkills = prepared.nativeSkills;
         nativeConfiguration = prepared.nativeConfiguration;
-      } catch (error) { managedRoute?.dispose(); smartRoute?.dispose(); throw error; }
+      } catch (error) { managedRoute?.dispose(); smartRoute?.dispose(); await initialMcp?.release(); throw error; }
     }
     if (smartRoute !== undefined) (request.params as JsonObject)["modelProvider"] = smartRoute.modelProviderId;
     const managedConfiguration = this.#nativeRouteConfiguration(managedRoute, smartRoute);
@@ -1232,6 +1244,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     } catch (error) {
       if (reviewWorkingDirectory !== undefined) await removeReviewWorkingDirectory(reviewWorkingDirectory);
       await nativeSkills?.dispose();
+      await initialMcp?.release();
       managedRoute?.dispose();
       smartRoute?.dispose();
       throw this.#requestFailure(error, "provision", "CODEX_SESSION_CREATE_FAILED", true);
@@ -1279,7 +1292,8 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
         permissionMode: input.permissionMode,
         managedRoute,
         smartRoute,
-        mcpPending: runtimePolicy === "standard" && !scope.remote && scope.openMcpBridge !== undefined,
+        mcp: initialMcp,
+        mcpPending: runtimePolicy === "standard" && !scope.remote && scope.openMcpBridge !== undefined && initialMcp === undefined,
         nativeConfiguration,
         providerId: smartRoute === undefined
           ? optionalString(record["modelProvider"]) ?? input.providerId
@@ -1303,6 +1317,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
       managedRoute?.dispose();
       smartRoute?.dispose();
       await nativeSkills?.dispose();
+      await initialMcp?.release();
       if (createdThreadId !== undefined) {
         await scope.host.releaseUnboundThread(createdThreadId, response.hostGeneration).catch(() => undefined);
       }
@@ -3747,20 +3762,19 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
 
   async #openMcpRuntime(
     scope: CodexReadScope,
-    threadId: string,
+    threadId: string | undefined,
     context: AdapterContext,
     stateMayHaveChanged = false
   ): Promise<{ readonly mcp?: CodexMcpRuntimeLease; readonly nativeConfiguration?: JsonObject }> {
-    if (this.#hosted) return { nativeConfiguration: this.#hosted.configuration() };
+    if (this.#hosted && scope.openMcpBridge === undefined) return { nativeConfiguration: this.#hosted.configuration() };
     if (!scope.remote && scope.openMcpBridge === undefined) return {};
     let mcp: CodexMcpRuntimeLease | undefined;
     try {
       if (scope.openMcpBridge !== undefined) {
-        mcp = await scope.openMcpBridge({
+        const input: CodexMcpSessionInput = {
           sessionId: context.sessionId,
           targetId: context.target.id,
           generation: context.generation,
-          threadId,
           signal: context.signal,
           assertSessionCurrent: () => {
             this.#assertOpen();
@@ -3771,9 +3785,14 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
             if (mcp === undefined) throw mcpUnavailable(scope.remote);
             return this.#beginMcpCall(context.sessionId, mcp, requestThreadId, request);
           }
-        });
+        };
+        if (this.#hostedMcpBridge) mcp = await this.#hostedMcpBridge(input);
+        else {
+          if (threadId === undefined) throw mcpUnavailable(scope.remote);
+          mcp = await scope.openMcpBridge({ ...input, threadId });
+        }
       }
-      const nativeConfiguration = await this.#buildMcpConfiguration(scope, mcp?.routes ?? [], context.signal);
+      const nativeConfiguration = { ...this.#hosted?.configuration(), ...await this.#buildMcpConfiguration(scope, mcp?.routes ?? [], context.signal) };
       return { ...(mcp === undefined ? {} : { mcp }), nativeConfiguration };
     } catch (error) {
       await mcp?.release().catch(() => undefined);
@@ -3823,7 +3842,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
     try {
       assertCurrent();
       const partnerLearningAuthority = originalTurnId === undefined ? undefined : learningTurn?.captureToolRequest(request);
-      const assertNativeRoot = originalTurnId === undefined || runtime.remote || runtime.context.hostedExecution !== undefined ? undefined : () => {
+      const assertNativeRoot = originalTurnId === undefined || runtime.remote ? undefined : () => {
         assertCurrent();
         if (threadId !== runtime.threadId || runtime.state.activeTurnId !== originalTurnId || runtime.state.terminalTurnIds.has(originalTurnId)) throw mcpCallStale(runtime.remote);
       };
@@ -5926,7 +5945,7 @@ export class CodexBackendAdapter extends CapabilityDrivenBackendAdapter implemen
   #mcpCanRemain(runtime: SessionRuntime, allowPending = false): boolean {
     if (runtime.mcpPending) return allowPending;
     if (runtime.mcp === undefined) return true;
-    if (!runtime.remote && runtime.mcp.routes.length === 0) {
+    if (!runtime.remote && !this.#hostedMcpBridge && runtime.mcp.routes.length === 0) {
       return runtimeHasProductWork(runtime) || runtime.nativeTasks.hasActiveTasks();
     }
     try {

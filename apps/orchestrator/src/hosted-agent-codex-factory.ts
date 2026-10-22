@@ -45,7 +45,8 @@ export async function createHostedAgentCodexAdapter(options: {
       XDG_CONFIG_HOME: join(home, "config"), XDG_CACHE_HOME: join(home, "cache"), XDG_DATA_HOME: join(home, "data"), XDG_STATE_HOME: join(home, "state") } }).environment, home);
     const runtime = { ...provider.runtime, secretEnvironmentNames: [...new Set([...provider.runtime.secretEnvironmentNames, ...Object.keys(selectedNative)])] };
     const adapter = createCodexAdapter({ id: options.backendId, instanceGeneration: creation.nativeOwner.backendInstanceGeneration,
-      profileDirectory: home, managedProviders: runtime, hostedExecution: { execution: creation.execution, openExecServer: createHostedAgentCodexTunnel },
+      profileDirectory: home, managedProviders: runtime, hostedExecution: { execution: creation.execution, openExecServer: createHostedAgentCodexTunnel,
+        ...(creation.sourceMcp ? { openMcpBridge: input => creation.sourceMcp!.codex(input) } : {}) },
       readBlob: async blob => ({ data: await creation.readBlob(blob), mimeType: blob.mimeType }),
       appServer: { requireEphemeralAuth: true,
         ...(account?.kind === "chatgpt" ? { externalAuth: { readTokens: async (refresh: boolean, staleAccessToken?: string) => {

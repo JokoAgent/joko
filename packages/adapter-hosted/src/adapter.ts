@@ -41,6 +41,12 @@ export interface HostedAgentSourceAdapterOptions {
   readonly describe: () => BackendDescriptor | Promise<BackendDescriptor>;
   readonly capture: (runId: string, context: AdapterContext) => HostedAgentSourceConnection | Promise<HostedAgentSourceConnection>;
   readonly workspace: (context: AdapterContext) => HostedNativeOpen["workspace"] | Promise<HostedNativeOpen["workspace"]>;
+  readonly resources?: (context: AdapterContext) => readonly RuntimeResource[];
+  readonly commands?: (context: AdapterContext) => readonly RuntimeCommand[];
+  readonly prepareInput?: (input: PromptInput, context: AdapterContext, shadow: string) => Promise<{ readonly input: PromptInput; readonly assertCurrent: () => void;
+    readonly commit?: (preparation: DurableNativeDispatchPreparation) => Promise<void> }>;
+  readonly releaseWorkspace?: (context: AdapterContext) => void | Promise<void>;
+  readonly deleteWorkspace?: (context: AdapterContext) => void | Promise<void>;
   readonly readPolicy: (context: AdapterContext) => Pick<NativeSessionState, "permissionMode" | "fastMode" | "effort">;
   readonly assertContext: (context: AdapterContext) => void;
   readonly onRuntimeUnavailable?: (context: AdapterContext) => void;
@@ -67,7 +73,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   readonly #options: HostedAgentSourceAdapterOptions;
   readonly #sessions = new Map<string, ActiveSourceSession>();
   readonly #opening = new Map<string, Promise<ActiveSourceSession>>();
-  readonly #unclosed = new Map<string, HostedAgentSourceConnection>();
+  readonly #unclosed = new Map<string, { readonly connection: HostedAgentSourceConnection; readonly context: AdapterContext }>();
   #closed = false;
   constructor(options: HostedAgentSourceAdapterOptions) {
     identity.parse(options.id); sourceSchema.parse(options.source);
@@ -126,8 +132,14 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   async compact(instructions: string | undefined, context: AdapterContext): Promise<"compacted" | "noop"> {
     return await this.#call(this.#active(context), { kind: "compact", ...(instructions === undefined ? {} : { instructions }) }, context) as "compacted" | "noop";
   }
-  async getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]> { return await this.#call(this.#active(context), { kind: "commands" }, context) as readonly RuntimeCommand[]; }
-  async getResources(context: AdapterContext): Promise<readonly RuntimeResource[]> { return await this.#call(this.#active(context), { kind: "resources" }, context) as readonly RuntimeResource[]; }
+  async getCommands(context: AdapterContext): Promise<readonly RuntimeCommand[]> {
+    this.#active(context);
+    return this.#options.commands?.(context) ?? await this.#call(this.#active(context), { kind: "commands" }, context) as readonly RuntimeCommand[];
+  }
+  async getResources(context: AdapterContext): Promise<readonly RuntimeResource[]> {
+    this.#active(context);
+    return this.#options.resources?.(context) ?? await this.#call(this.#active(context), { kind: "resources" }, context) as readonly RuntimeResource[];
+  }
   async getRuntimeTools(context: AdapterContext): Promise<RuntimeToolCatalog> { return await this.#call(this.#active(context), { kind: "tools" }, context) as RuntimeToolCatalog; }
   async getTree(context: AdapterContext): Promise<SessionTree> { return await this.#call(this.#active(context), { kind: "tree" }, context) as SessionTree; }
   async getNativeHistoryProjection(context: AdapterContext): Promise<NativeHistoryProjection> {
@@ -137,7 +149,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
   async abortUserShell(context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "abort_shell" }, context); }
   async controlSubagent(input: SubagentControlInput, context: AdapterContext): Promise<void> { await this.#call(this.#active(context), { kind: "control_subagent", input }, context); }
   async deleteSession(binding: NativeSessionBinding, context: AdapterContext): Promise<void> {
-    const active = await this.#activate(binding, context, "resume"); await this.#call(active, { kind: "delete" }, context); await this.#close(active);
+    const active = await this.#activate(binding, context, "resume"); await this.#call(active, { kind: "delete" }, context); await this.#close(active); await this.#options.deleteWorkspace?.(context);
   }
   async exportSession(_context: AdapterContext): Promise<BlobRef> { throw new Error("Hosted native export is not connected."); }
   async navigateTree(_target: NativeNavigationTarget, _summarize: boolean, _context: AdapterContext, _instructions: string | undefined,
@@ -148,16 +160,24 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     this.#closed = true; await Promise.allSettled([...this.#opening.values()]);
     const results = await Promise.allSettled([...this.#sessions.values()].map(active => this.#close(active)));
     const orphaned = await Promise.allSettled([...this.#unclosed].filter(([id]) => ![...this.#sessions.values()].some(active => active.runId === id))
-      .map(async ([id, connection]) => { await connection.close(); this.#unclosed.delete(id); }));
+      .map(async ([id, owner]) => { await owner.connection.close(); await this.#options.releaseWorkspace?.(owner.context); this.#unclosed.delete(id); }));
     const failures = [...results, ...orphaned].filter((value): value is PromiseRejectedResult => value.status === "rejected");
     if (failures.length) throw new AggregateError(failures.map(value => value.reason), "Hosted native cleanup could not be confirmed.");
   }
   async #send(input: PromptInput, context: AdapterContext, fence?: (preparation: DurableNativeDispatchPreparation) => Promise<void>): Promise<void> {
-    if (input.files.length || input.mentions.length) throw new Error("Hosted native file and resource input is not connected.");
+    if ((input.files.length || input.mentions.length) && !this.#options.prepareInput) throw new Error("Hosted native input requires its Source resolver.");
     if (!context.operationId) throw new Error("Hosted native dispatch requires its original operation identity.");
+    const active = this.#active(context);
+    const prepared = await this.#options.prepareInput?.(input, context, active.shadow);
+    this.#check(context); prepared?.assertCurrent();
+    if (prepared?.commit && !fence) throw new Error("File input requires its original durable native dispatch confirmation.");
+    if (active !== this.#active(context)) throw new Error("The Source runtime changed while its input was prepared.");
     const newGroupRound = this.#options.takeNewGroupRound?.(context) === true;
-    await this.#call(this.#active(context), { kind: "send", input, durableFence: fence !== undefined,
-      ...(newGroupRound ? { newGroupRound: true } : {}) }, context, fence);
+    const preparedFence = fence && prepared ? async (value: DurableNativeDispatchPreparation) => {
+      prepared.assertCurrent(); await fence(value); prepared.assertCurrent(); await prepared.commit?.(value); prepared.assertCurrent();
+    } : fence;
+    await this.#call(active, { kind: "send", input: prepared?.input ?? input, durableFence: fence !== undefined,
+      ...(newGroupRound ? { newGroupRound: true } : {}) }, context, preparedFence);
   }
   #binding(context: AdapterContext, nativeSessionId: string): NativeSessionBinding {
     const value: SourceBinding = { format: 1, backendId: this.id, source: this.#options.source, sessionId: context.sessionId, targetId: context.target.id, nativeSessionId };
@@ -196,7 +216,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     let connection: HostedAgentSourceConnection;
     try { connection = await this.#options.capture(runId, context); }
     catch (error) { throw closedStartup(error); }
-    this.#unclosed.set(runId, connection);
+    this.#unclosed.set(runId, { connection, context });
     let active: ActiveSourceSession | undefined;
     try {
       this.#check(context); connection.assertCurrent(); await this.validateTarget(context.target);
@@ -225,7 +245,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     } catch (error) {
       // Cleanup remains owned even when authority changes after native open.
       try { await connection.close(); this.#unclosed.delete(runId); } catch (cleanup) { throw new AggregateError([error, cleanup], "Hosted native startup cleanup could not be confirmed."); }
-      if (active) await this.#close(active); throw closedStartup(error);
+      if (active) await this.#close(active); else await this.#options.releaseWorkspace?.(context); throw closedStartup(error);
     }
   }
   async #state(active: ActiveSourceSession, context: AdapterContext): Promise<NativeSessionState> {
@@ -253,6 +273,7 @@ export class HostedAgentSourceAdapter implements BackendAdapter {
     active.controller.abortPending();
     return active.closing ??= (async () => {
       await active.connection.close(); this.#unclosed.delete(active.runId); await active.controller.stop();
+      await this.#options.releaseWorkspace?.(active.context);
       if (this.#sessions.get(active.context.sessionId) === active) this.#sessions.delete(active.context.sessionId);
     })().catch(error => { active.closing = undefined; throw error; });
   }

@@ -421,7 +421,7 @@ interface ActiveTurn {
   readonly operationId: string;
   mcpCallCancellation: AbortController;
   readonly mcpRootToolWaiters: Map<string, Deferred<void>>;
-  readonly nativeRootToolInputs: Map<string, { readonly input: Readonly<Record<string, unknown>>; claimed: boolean }>;
+  readonly nativeMcpToolCalls: Map<string, { readonly name: string; readonly input: Readonly<Record<string, unknown>>; claimed: boolean }>;
   readonly subtaskRouteLeases: Map<string, ManagedSubtaskRouteGrant>;
   readonly subtaskRouteAdmissions: Map<string, ManagedSubtaskRouteAdmission>;
   readonly subtaskRouteDecisions: Map<string, ManagedSubtaskRouteDecision>;
@@ -1866,7 +1866,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
     await this.refreshModelWorkingContext(context);
     runtime = this.#requireIdleRuntime(context);
-    if (!context.hostedExecution && runtime.runtimePolicy === "standard" && runtime.mcpLease === undefined
+    if (runtime.runtimePolicy === "standard" && runtime.mcpLease === undefined
       && this.#mcpBridge !== undefined) {
       runtime = await this.#bindProductMcp(runtime, context);
     }
@@ -1945,7 +1945,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       operationId,
       mcpCallCancellation: new AbortController(),
       mcpRootToolWaiters: new Map(),
-      nativeRootToolInputs: new Map(),
+      nativeMcpToolCalls: new Map(),
       subtaskRouteLeases: new Map(),
       subtaskRouteAdmissions: new Map(),
       subtaskRouteDecisions: new Map(),
@@ -3231,7 +3231,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       .update(options.toolUseId).digest("hex");
     const name = `mcp__${claudeMcpServerName(tool.serverId)}__${tool.name}`;
     if (turn !== undefined && lease !== undefined && this.#isTurnCurrent(runtime, turn)
-      && !turn.seenToolStarts.has(options.toolUseId)) {
+      && !turn.nativeMcpToolCalls.has(options.toolUseId)) {
       let waiter = turn.mcpRootToolWaiters.get(options.toolUseId);
       if (waiter === undefined) {
         if (turn.mcpRootToolWaiters.size >= MAX_PENDING_INTERACTIONS) {
@@ -3251,8 +3251,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     const assertCurrent = (): void => {
       if (turn === undefined || lease === undefined || !this.#isTurnCurrent(runtime, turn)
         || turn.terminalClaimed || turn.stopping || !turn.nativeIdentityConfirmed
-        || !turn.seenToolStarts.has(options.toolUseId)
-        || runtime.toolNames.get(options.toolUseId) !== name) {
+        || turn.nativeMcpToolCalls.get(options.toolUseId)?.name !== name) {
         throw new Error("The product MCP call lacks an active root tool owner.");
       }
       lease.assertCurrent();
@@ -3261,12 +3260,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     assertCurrent();
     const signal = AbortSignal.any([options.signal, runtime.abortController.signal, turn!.mcpCallCancellation.signal]);
     signal.throwIfAborted();
-    const nativeRootCall = tool.requiresNativeRoot ? turn!.nativeRootToolInputs.get(options.toolUseId) : undefined;
+    const nativeRootCall = tool.requiresNativeRoot ? turn!.nativeMcpToolCalls.get(options.toolUseId) : undefined;
     if (tool.requiresNativeRoot && (!nativeRootCall || nativeRootCall.claimed || !isDeepStrictEqual(nativeRootCall.input, capturedArguments))) throw new Error("The tool requires its original native root call.");
     if (nativeRootCall) nativeRootCall.claimed = true;
     const assertNativeRoot = (): void => {
       assertCurrent();
-      if (!nativeRootCall || turn!.nativeRootToolInputs.get(options.toolUseId) !== nativeRootCall) {
+      if (!nativeRootCall || turn!.nativeMcpToolCalls.get(options.toolUseId) !== nativeRootCall) {
         throw new Error("The original native root tool call has ended.");
       }
     };
@@ -4067,11 +4066,11 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
             : {}),
           ...(launch.runtimePolicy === "standard" ? { extraArgs: { "replay-user-messages": null } } : {}),
           includePartialMessages: true,
-          mcpTools: context.hostedExecution ? createClaudeHostedTools(context.hostedExecution) : launch.mcpLease?.tools.map((tool) => ({
+          mcpTools: context.hostedExecution || launch.mcpLease ? [...(context.hostedExecution ? createClaudeHostedTools(context.hostedExecution) : []), ...(launch.mcpLease?.tools.map((tool) => ({
             ...tool,
-            call: (arguments_, options) => productMcpCall(tool, arguments_, options)
-          })),
-          mcpModels: context.hostedExecution ? undefined : launch.mcpLease?.models?.map(model => ({
+            call: (arguments_: Readonly<Record<string, unknown>>, options: Parameters<typeof productMcpCall>[2]) => productMcpCall(tool, arguments_, options)
+          })) ?? [])] : undefined,
+          mcpModels: launch.mcpLease?.models?.map(model => ({
             serverId: model.serverId,
             connect: transport => model.connect(transport, call => {
               const tool = launch.mcpLease!.tools.find(tool => tool.serverId === model.serverId && tool.name === call.toolName);
@@ -4456,17 +4455,22 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     }
     const projected = this.#projection.assistant(message);
     appendTurnBlocks(turn, projected.blocks);
+    // Exact SDK identities attest calls privately. Display redaction can alter
+    // both tool names and call IDs and must never decide native authority.
+    const nativeContent = nativeMessage?.["content"];
+    if (runtime.mcpLease && Array.isArray(nativeContent)) for (const raw of nativeContent) {
+      const block = record(raw), id = stringValue(block?.["id"]), name = stringValue(block?.["name"]), input = record(block?.["input"]);
+      if (block?.["type"] !== "tool_use" || !id || !name || !input || id.length > 512 || turn.nativeMcpToolCalls.has(id)
+        || !runtime.mcpLease.tools.some(tool => name === `mcp__${claudeMcpServerName(tool.serverId)}__${tool.name}`)) continue;
+      if (turn.nativeMcpToolCalls.size >= MAX_PENDING_INTERACTIONS) throw nativeEventLimit();
+      turn.nativeMcpToolCalls.set(id, { name, input: structuredClone(input), claimed: false });
+      turn.mcpRootToolWaiters.get(id)?.resolve(undefined);
+    }
     for (const tool of projected.toolCalls) {
       if (runtime.toolNames.size >= MAX_SESSION_TOOL_NAMES && !runtime.toolNames.has(tool.callId)) {
         throw nativeEventLimit();
       }
       runtime.toolNames.set(tool.callId, tool.name);
-      if (runtime.mcpLease?.tools.some(candidate => candidate.requiresNativeRoot && `mcp__${claudeMcpServerName(candidate.serverId)}__${candidate.name}` === tool.name)) {
-        const nativeContent = nativeMessage?.["content"];
-        const matches = Array.isArray(nativeContent) ? nativeContent.map(record).filter(block => block?.["type"] === "tool_use" && block["id"] === tool.callId && block["name"] === tool.name) : [];
-        const input = matches.length === 1 ? record(matches[0]?.["input"]) : undefined;
-        if (input && !turn.nativeRootToolInputs.has(tool.callId)) turn.nativeRootToolInputs.set(tool.callId, { input: structuredClone(input), claimed: false });
-      }
       if (runtime.nativeTaskProjectionEnabled) {
         await this.#publishNativeTaskEmissions(
           runtime,
@@ -4475,7 +4479,6 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       }
       if (turn.seenToolStarts.has(tool.callId)) continue;
       addBoundedIdentity(turn.seenToolStarts, tool.callId);
-      turn.mcpRootToolWaiters.get(tool.callId)?.resolve(undefined);
       await this.#emit(runtime, turn, {
         type: "tool_start",
         callId: tool.callId,
@@ -4492,8 +4495,12 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
     if (uuid !== undefined && turn.seenFrameUuids.has(uuid)) return;
     if (uuid !== undefined) addBoundedIdentity(turn.seenFrameUuids, uuid);
     const projected = this.#projection.user(message);
+    const nativeContent = record(envelope["message"])?.["content"];
+    if (Array.isArray(nativeContent)) for (const raw of nativeContent) {
+      const block = record(raw), id = stringValue(block?.["tool_use_id"]);
+      if (block?.["type"] === "tool_result" && id) turn.nativeMcpToolCalls.delete(id);
+    }
     for (const result of projected.toolResults) {
-      turn.nativeRootToolInputs.delete(result.callId);
       if (runtime.nativeTaskProjectionEnabled) runtime.nativeTasks.completeToolScope(result.callId);
       if (turn.seenToolResults.has(result.callId)) continue;
       addBoundedIdentity(turn.seenToolResults, result.callId);
@@ -5792,7 +5799,13 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
         && (typeof model !== "string" || !hosted.modelIds.includes(model))) return "The shared Provider does not allow this delegated model.";
       return undefined;
     }
-    if (toolName.startsWith("mcp__")) return "This MCP service does not belong to the task's Source catalog.";
+    if (toolName.startsWith("mcp__")) {
+      try {
+        runtime.mcpLease?.assertCurrent();
+        if (runtime.mcpLease?.tools.some(tool => toolName === `mcp__${claudeMcpServerName(tool.serverId)}__${tool.name}`)) return undefined;
+      } catch { return "The task's Source MCP catalog is no longer current."; }
+      return "This MCP service does not belong to the task's Source catalog.";
+    }
     if (hosted.trust === "guest" && !(CLAUDE_HOSTED_GUEST_TOOLS as readonly string[]).includes(toolName)) {
       return "This native tool is unavailable in an isolated shared task.";
     }
@@ -5847,7 +5860,7 @@ export class ClaudeCodeAdapter extends CapabilityDrivenBackendAdapter implements
       // The executor on the task computer performs its own current policy and
       // credential review. A second model-computer permission card grants no
       // filesystem authority and would duplicate the Source decision.
-      if (toolName.startsWith(`mcp__${claudeMcpServerName(CLAUDE_HOSTED_EXECUTOR_SERVER)}__`)) {
+      if (toolName.startsWith("mcp__")) {
         return { behavior: "allow", updatedInput: input };
       }
     }

@@ -92,15 +92,15 @@ it("bounds actual directory junctions to the trusted Source and does not scan th
   await expect(snapshotSourceProjectFiles(context(path.join(source, ".claude", "rules", "alias")))).rejects.toThrow(/canonical/u);
 });
 
-it("uses the v1 128-file ceiling and the fixed six-directory-level bound", async () => {
+it("uses the 512-file ceiling and the fixed six-directory-level bound", async () => {
   const { source } = await fixture(); await put(source, "AGENTS.md", "Root instructions have priority.");
   await put(source, ".claude/rules/a/b/c/d/e/f/allowed.md", "Depth six.");
   await put(source, ".claude/rules/a/b/c/d/e/f/g/too-deep.md", "Beyond depth six.");
   const first = await snapshotSourceProjectFiles(context(source));
   expect(relative(first)).toEqual([".claude/rules/a/b/c/d/e/f/allowed.md", "AGENTS.md"]);
-  for (let index = 0; index < 140; index++) await put(source, `.claude/rules/rule-${String(index).padStart(3, "0")}.md`, "Small rule.");
+  for (let index = 0; index < 540; index++) await put(source, `.claude/rules/rule-${String(index).padStart(3, "0")}.md`, "Small rule.");
   const files = await snapshotSourceProjectFiles(context(source));
-  expect(files).toHaveLength(128); expect(files[0]?.path).toBe("AGENTS.md");
+  expect(files).toHaveLength(512); expect(files[0]?.path).toBe("AGENTS.md");
   expect(files.some(file => file.path.endsWith("too-deep.md"))).toBe(false);
 });
 

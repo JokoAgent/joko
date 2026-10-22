@@ -18,6 +18,8 @@ export interface ExecutorPathAlias {
   from: string;
   /** 对应的本机真实目录。 */
   to: string;
+  /** An immutable input file never maps descendant or traversal paths. */
+  kind?: "file";
 }
 
 export interface ExecutorWorkspaceRoots {
@@ -530,7 +532,7 @@ export class ExecutorWorkspace {
       expanded.push(alias);
       const canonicalPaths = [realPathOrAncestor(alias.to), realPathOrAncestorPortable(alias.to)];
       for (const canonical of canonicalPaths) {
-        if (path.resolve(canonical) !== path.resolve(alias.to)) expanded.push({ from: alias.from, to: canonical });
+        if (path.resolve(canonical) !== path.resolve(alias.to)) expanded.push({ ...alias, to: canonical });
       }
     }
     const seen = new Set<string>();
@@ -543,6 +545,8 @@ export class ExecutorWorkspace {
       })
       .sort((a, b) => b.from.length - a.from.length);
   }
+
+  addAliases(aliases: readonly ExecutorPathAlias[]): void { this.setAliases([...this.aliases, ...aliases]); }
 
   /**
    * 命令沿用 Desktop 的完整环境(与本机 Agent 一致)，虚拟化只作用于 Agent 看到的路径文本。
@@ -600,7 +604,7 @@ export class ExecutorWorkspace {
   localPathFromAgent(input: string): string | null {
     for (const alias of this.aliases) {
       const rest = stripAliasPrefix(input, alias.from);
-      if (rest !== null) return rest ? path.join(alias.to, ...rest.split('/')) : alias.to;
+      if (rest !== null && (alias.kind !== 'file' || !rest)) return rest ? path.join(alias.to, ...rest.split('/')) : alias.to;
     }
     return null;
   }
@@ -613,7 +617,8 @@ export class ExecutorWorkspace {
   localGlobFromAgent(pattern: string): string | null {
     const windows = process.platform === 'win32';
     for (const alias of this.aliases) {
-      if (stripAliasPrefix(pattern, alias.from) === null) continue;
+      const suffix = stripAliasPrefix(pattern, alias.from);
+      if (suffix === null || alias.kind === 'file' && suffix) continue;
       const from = alias.from.replace(/[\\/]+$/, '');
       const rest = pattern.slice(from.length).replace(/^[\\/]/, '');
       const local = alias.to.replace(windows ? /[\\/]+$/ : /\/+$/, '');

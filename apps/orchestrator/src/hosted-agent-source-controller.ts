@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import type { AdapterContext, BlobRef, NativeSessionBinding, PromptInput } from "@joko/core";
+import type { AdapterContext, BlobRef, NativeSessionBinding, PromptInput, ToolCall, NativeToolAuthorizationDecision } from "@joko/core";
 import type { HostedAgentSourceController } from "@joko/adapter-hosted";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 import { HostedAgentController, type HostedAgentOperationOwner } from "./hosted-agent-controller.js";
@@ -11,6 +11,9 @@ import { HostedAgentClaudeExecutor } from "./hosted-agent-claude-executor.js";
 import { createHostedAgentClaudeWebFetch, type HostedAgentClaudeWebFetchOptions } from "./hosted-agent-claude-web-network.js";
 import { readHostedAgentClaudePdf } from "./hosted-agent-claude-pdf.js";
 import { terminalEnvironment } from "@joko/tool-terminal";
+import type { ExecutorPathAlias } from "./hosted-agent-workspace.js";
+import type { SourceInputMount } from "./hosted-agent-source-attachments.js";
+import type { HostedAgentSourceMcp } from "./hosted-agent-source-mcp.js";
 
 /** Service-owned tool and Artifact ports behind the transport-only Adapter.
  * Each native occurrence retains the exact original SessionHost callbacks. */
@@ -18,6 +21,10 @@ export function createHostedAgentSourceController(options: {
   readonly poller: HostedAgentPoller; readonly runId: string; readonly shadow: string; readonly context: AdapterContext;
   readonly binding: () => NativeSessionBinding; readonly temporaryRoot: string;
   readonly readPolicy: (context: AdapterContext) => HostedAgentExecutorPolicy;
+  readonly aliases?: (context: AdapterContext) => readonly ExecutorPathAlias[];
+  readonly inputFiles?: (context: AdapterContext) => readonly SourceInputMount[];
+  readonly mcp?: HostedAgentSourceMcp;
+  readonly reviewTool?: (context: AdapterContext, call: ToolCall, signal: AbortSignal, assertCurrent: () => void, policy: HostedAgentExecutorPolicy) => Promise<NativeToolAuthorizationDecision>;
   readonly assertContext: (context: AdapterContext) => void; readonly assertCurrent: () => void;
   readonly onGroupSwitch?: (offer: string) => void;
   readonly commandConcurrencyGate?: CommandConcurrencyGate;
@@ -28,7 +35,10 @@ export function createHostedAgentSourceController(options: {
 }): HostedAgentSourceController {
   const owners = new Map<string, HostedAgentOperationOwner>(), port = options.poller.attach(options.runId);
   const executor = (context: AdapterContext) => new HostedAgentExecutor({ context, virtualRoot: options.shadow,
+    ...(options.aliases === undefined ? {} : { aliases: options.aliases(context) }),
+    ...(options.inputFiles === undefined ? {} : { inputFiles: () => options.inputFiles!(context) }),
     readPolicy: () => options.readPolicy(context), assertCurrent: () => { options.assertContext(context); options.assertCurrent(); },
+    ...(options.reviewTool === undefined ? {} : { reviewTool: (call, signal, assertCurrent, policy) => options.reviewTool!(context, call, signal, assertCurrent, policy) }),
     ...(options.commandConcurrencyGate === undefined ? {} : { commandConcurrencyGate: options.commandConcurrencyGate }) });
   const initialExecutor = executor(options.context);
   const lifetime = new AbortController();
@@ -46,6 +56,11 @@ export function createHostedAgentSourceController(options: {
         ownerExecutor.assertCurrent(signal); const result = await readHostedAgentClaudePdf(bytes, pages, signal); ownerExecutor.assertCurrent(signal); return result;
       } };
     return async (input: unknown, signal: AbortSignal): Promise<Record<string, unknown>> => {
+    if ((input as { operation?: unknown } | null)?.operation === "mcp.request") {
+      if (!options.mcp || !input || Object.keys(input).some(key => key !== "operation" && key !== "request")) throw new Error("The original MCP runtime is unavailable.");
+      options.assertContext(context); options.assertCurrent();
+      return options.mcp.execute((input as { request: unknown }).request, context, ownerExecutor.workspace, signal, () => { options.assertContext(context); options.assertCurrent(); });
+    }
     if ((input as { operation?: unknown } | null)?.operation === "input.blob") {
       const request = input as { blob?: BlobRef; offset?: number; maximum?: number }, blob = request.blob;
       const expected = blob && images.find(candidate => candidate.id === blob.id && candidate.sha256 === blob.sha256 && candidate.byteLength === blob.byteLength && candidate.mimeType === blob.mimeType);
@@ -90,6 +105,9 @@ export function createHostedAgentSourceController(options: {
         || context.target.id !== options.context.target.id || context.target.workspaceRoot !== options.context.target.workspaceRoot) throw new Error("The native operation belongs to another Source task.");
       if (owners.has(id)) return;
       if (owners.size >= 65_536) throw new Error("The original native operation capacity is unavailable.");
+      // New input aliases must project identically in live events and after
+      // native history is reloaded with the accepted input receipts.
+      if (options.aliases) initialExecutor.workspace.addAliases(options.aliases(context));
       const sourceExecutor = id === options.runId ? initialExecutor : executor(context);
       owners.set(id, { context, executor: sourceExecutor, executeTool: executeTool(sourceExecutor, context, input), ...(fence === undefined ? {} : {
         persistFence: async (operationId, preparation) => {

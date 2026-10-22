@@ -7,8 +7,10 @@ import { HostedAgentArtifacts } from "./hosted-agent-artifacts.js";
 import { HostedAgentExchange } from "./hosted-agent-exchange.js";
 import { HostedAgentSessionSlots, type HostedAgentSlot } from "./hosted-agent-limits.js";
 import { createHostedAgentToolChannel, type HostedAgentToolChannel } from "./hosted-agent-tool-channel.js";
+import { HostedAgentNativeMcp } from "./hosted-agent-native-mcp.js";
 import type { HostedNativeCommand } from "@joko/adapter-hosted";
 import { materializeHostedProjectFiles } from "./hosted-agent-project-files.js";
+import { hostedDirectoryPath } from "./hosted-agent-directories.js";
 
 export type HostedAgentCall = HostedNativeCommand;
 
@@ -40,6 +42,7 @@ export interface HostedAgentRunOptions {
    * The application owns Provider login, network and native executable choice. */
   readonly createAdapter: (input: { readonly home: string; readonly trust: "owner" | "guest"; readonly providerId: string;
     readonly modelIds: readonly string[]; readonly signal: AbortSignal; readonly execution: HostedExecution;
+    readonly sourceMcp?: HostedAgentNativeMcp;
     readonly readBlob: (blob: BlobRef) => Promise<Uint8Array>;
     readonly nativeOwner: { readonly sessionId: string; readonly targetId: string; readonly generation: number; readonly backendInstanceGeneration: number } }) => BackendAdapter | Promise<BackendAdapter>;
 }
@@ -79,6 +82,7 @@ export class HostedAgentRun {
   #inputImages: readonly BlobRef[] = [];
   #activeProvider?: string;
   readonly #toolOwners = new Map<string, { readonly operationId: string; readonly origin: string }>();
+  #mcp?: HostedAgentNativeMcp;
 
   private constructor(options: HostedAgentRunOptions) {
     if (!options.runId || options.runId.length > 512 || !isAbsolute(options.root) || resolve(options.root) !== options.root
@@ -170,16 +174,22 @@ export class HostedAgentRun {
       this.#channel = await createHostedAgentToolChannel({ assertCurrent: () => this.#assertAuthority(), execute: (input, signal) => this.#executeTool(input, signal) });
       this.#artifacts = new HostedAgentArtifacts({ root, maximumBytes: this.#options.artifactCapacityBytes, assertCurrent: () => this.#assertAuthority(), exchange: this.exchange });
       const hosted: HostedExecution = {
-        workspace: { ...this.#options.workspace, contextFiles, root: workspace, additionalRoots: [] },
+        workspace: { ...this.#options.workspace, contextFiles, root: workspace,
+          additionalRoots: (this.#options.workspace.additionalDirectoryIds ?? []).map(id => hostedDirectoryPath(workspace, id)) },
         channel: this.#channel, source: { sessionId: this.#options.source.sessionId, targetId: this.#options.source.targetId, generation: this.#options.source.generation },
         assertCurrent: () => this.#assertAuthority(),
         ...(this.#options.trust === "owner" ? { trust: "owner" as const } : { trust: "guest" as const, guestHome: root,
           providerId: this.#options.providerId, modelIds: [...this.#options.modelIds] })
       };
+      const nativeOwner = { sessionId: `hosted-session:${this.id}`, targetId: `hosted-target:${this.id}`, generation: prior.binding?.generation ?? 1, backendInstanceGeneration: 1 };
+      if (hosted.workspace.mcpEnabled) this.#mcp = await HostedAgentNativeMcp.create({ owner: nativeOwner, signal: this.#lifetime.signal,
+        assertCurrent: () => this.#assertAuthority(), execute: (request, signal) => this.exchange.tool({ operation: "mcp.request", request }, signal,
+          request.kind === "catalog" || request.kind === "model_open" || request.kind === "model_poll" || request.kind === "model_close" ? this.#options.runId : this.#inputOperationId ?? this.#options.runId) });
       this.#adapter = await this.#options.createAdapter({ home, trust: this.#options.trust, providerId: this.#options.providerId,
         modelIds: this.#options.modelIds, signal: this.#lifetime.signal, execution: hosted,
+        ...(this.#mcp ? { sourceMcp: this.#mcp } : {}),
         readBlob: blob => this.#readInputBlob(blob),
-        nativeOwner: { sessionId: `hosted-session:${this.id}`, targetId: `hosted-target:${this.id}`, generation: prior.binding?.generation ?? 1, backendInstanceGeneration: 1 } }); this.#assertAuthority();
+        nativeOwner }); this.#assertAuthority();
       if (this.#adapter.id !== this.#options.backendId || this.#adapter.hostedExecutionCapabilities?.toolsOnSource !== true
         || this.#options.trust === "guest" && this.#adapter.hostedExecutionCapabilities.isolatedGuests !== true) throw new Error("This native Adapter does not support isolated hosted execution.");
       const target = { id: `hosted-target:${this.id}`, backendId: this.#adapter.id, displayName: "Hosted Agent", workspaceRoot: workspace, trusted: false, managed: true };
@@ -287,7 +297,7 @@ export class HostedAgentRun {
   #assertCurrent(): void { this.#assertAuthority(); if (!this.#ready || !this.#adapter || !this.#context || !this.#binding) throw new Error("Hosted Agent runtime is not active."); }
   #disposeNative(): Promise<void> {
     return this.#cleanup ??= (async () => {
-      await this.#adapter?.dispose(); await this.#artifacts?.close(); this.#toolOwners.clear(); this.#nativeCleaned = true; this.#activeProvider = undefined;
+      await this.#adapter?.dispose(); await this.#mcp?.close(); await this.#artifacts?.close(); this.#toolOwners.clear(); this.#nativeCleaned = true; this.#activeProvider = undefined;
       try { if (this.#claimed && this.#options.store.find(this.id)?.leaseId === this.#leaseId) this.#options.store.close(this.id, this.#leaseId); }
       finally { if (!this.#purgeRequested) this.#slot.release(); }
     })().catch(error => { this.#cleanup = undefined; throw error; });

@@ -604,6 +604,13 @@ export interface RuntimeTextResourceSeed {
   readonly assertCurrent: () => void;
 }
 
+/** Service-selected native catalog on the original node. Only its approved
+ * non-project text resources may follow another exact runtime owner. */
+export interface RuntimeResourceCatalogSource {
+  readonly backendId: string;
+  readonly assertCurrent: () => void;
+}
+
 const MAXIMUM_RUNTIME_TEXT_RESOURCE_BYTES = 256 * 1024;
 const MAXIMUM_MARKET_DIFF_CHANGES = 1_000;
 const MAXIMUM_MARKET_DIFF_TEXT_BYTES = 2 * 1024 * 1024;
@@ -2475,7 +2482,8 @@ export class PiResourceManager {
     targetId: string,
     signal: AbortSignal,
     allowedSkillIds?: ReadonlySet<string>,
-    runtimeOwner?: AdapterContext
+    runtimeOwner?: AdapterContext,
+    catalogSource?: RuntimeResourceCatalogSource
   ): Promise<readonly RuntimeTextResourceSeed[]> {
     this.#assertInitialized();
     const expectedBackendId = nonBlank(backendId, "Backend ID");
@@ -2484,8 +2492,9 @@ export class PiResourceManager {
     const snapshot = this.#mutate(async () => {
       signal.throwIfAborted();
       this.#assertTargetOwner(expectedBackendId, expectedTargetId, runtimeOwner);
+      const sourceOwns = this.#runtimeCatalogSource(catalogSource, runtimeOwner);
       const records = [...this.#records.values()]
-        .filter((record) => record.backendId === expectedBackendId || runtimeOwner !== undefined && record.kind === "skill"
+        .filter((record) => record.backendId === expectedBackendId || sourceOwns(record) || runtimeOwner !== undefined && record.kind === "skill"
           && record.targetId === expectedTargetId && (record.partnerSkill !== undefined || record.importedSkill !== undefined)
           && allowedSkillIds?.has(record.id) === true)
         .filter((record) => record.targetId === undefined || record.targetId === expectedTargetId)
@@ -2534,6 +2543,7 @@ export class PiResourceManager {
         } as const;
         const assertCurrent = (): void => {
           this.#assertTargetOwner(expectedBackendId, expectedTargetId, runtimeOwner);
+          if (sourceOwns(record)) catalogSource!.assertCurrent();
           const current = this.#records.get(authority.id);
           // A live runtime observation advances only the durable presentation
           // state from approved/installed to loaded. Accept that single exact
@@ -2582,18 +2592,20 @@ export class PiResourceManager {
   }
 
   /** Complete approved directories for native loaders, with an exact service lease. */
-  async runtimeSkillSnapshot(backendId: string, targetId: string, signal: AbortSignal, allowedSkillIds?: ReadonlySet<string>, runtimeOwner?: AdapterContext): Promise<readonly ApprovedSkillSeed[]> {
+  async runtimeSkillSnapshot(backendId: string, targetId: string, signal: AbortSignal, allowedSkillIds?: ReadonlySet<string>, runtimeOwner?: AdapterContext,
+    catalogSource?: RuntimeResourceCatalogSource): Promise<readonly ApprovedSkillSeed[]> {
     this.#assertInitialized();
     targetId = runtimeOwner === undefined ? targetId : this.#privateResourceTarget?.(runtimeOwner) ?? targetId;
     const snapshot = this.#mutate(async () => {
       signal.throwIfAborted();
       this.#assertTargetOwner(backendId, targetId, runtimeOwner);
+      const sourceOwns = this.#runtimeCatalogSource(catalogSource, runtimeOwner);
       const seeds: ApprovedSkillSeed[] = [];
       if (this.#builtinSkills && this.#backendSupportsResourceKind(backendId, "skill") && allowedSkillIds === undefined) {
         seeds.push(...await this.#builtinSkills.snapshot(() => this.#assertTargetOwner(backendId, targetId, runtimeOwner), signal));
       }
       for (const record of this.#records.values()) {
-        if (record.backendId !== backendId && !(runtimeOwner !== undefined && record.targetId === targetId
+        if (record.backendId !== backendId && !sourceOwns(record) && !(runtimeOwner !== undefined && record.targetId === targetId
           && (record.partnerSkill !== undefined || record.importedSkill !== undefined) && allowedSkillIds?.has(record.id) === true)
           || (record.targetId !== undefined && record.targetId !== targetId)
           || record.kind !== "skill" || !record.enabled || !runtimeTextState(record.state)
@@ -2608,6 +2620,7 @@ export class PiResourceManager {
         const assertCurrent = () => {
           remoteSourceGuard?.();
           this.#assertTargetOwner(backendId, targetId, runtimeOwner);
+          if (sourceOwns(record)) catalogSource!.assertCurrent();
           const current = this.#records.get(authority.id);
           const sameIncarnation = current !== undefined && ((current.state === authority.state && current.versionNumber === authority.versionNumber)
             || (current.state === "loaded" && (authority.state === "approved" || authority.state === "installed")
@@ -2634,6 +2647,13 @@ export class PiResourceManager {
       return Object.freeze(seeds);
     });
     return waitForCaller(snapshot, signal);
+  }
+
+  #runtimeCatalogSource(source: RuntimeResourceCatalogSource | undefined, runtimeOwner: AdapterContext | undefined): (record: StoredResource) => boolean {
+    if (source === undefined) return () => false;
+    if (runtimeOwner === undefined) throw new Error("A cross-Backend resource catalog requires an exact runtime owner.");
+    nonBlank(source.backendId, "Resource catalog Backend ID"); source.assertCurrent();
+    return record => record.backendId === source.backendId && record.targetId === undefined && record.scope !== "project";
   }
 
   async #runtimeSnapshot(backendId: string, targetId: string | undefined, targetOnly: boolean): Promise<PiRuntimeResourceSnapshot> {

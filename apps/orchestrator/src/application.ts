@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ManagedProviderProxy } from "./managed-provider-proxy.js";
 import { answerDeliveryPrompt } from "./answer-delivery-prompt.js";
+import { createHostedAgentAutoReviewer } from "./hosted-agent-auto-review.js";
 import { richAnswerText } from "@joko/contracts";
 import { lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { hostname, userInfo } from "node:os";
@@ -56,7 +57,7 @@ import {
 } from "@joko/remote-ssh";
 import { createCommandConcurrencyGate } from "@joko/runtime-governance";
 import { createSocks5Dispatcher } from "@joko/outbound-network";
-import { ContactStore, OperationalStore, PartnerStore, PartnerWorkbenchStore, VoiceDictionaryPeerStore } from "@joko/store";
+import { ContactStore, NotFoundError, OperationalStore, PartnerStore, PartnerWorkbenchStore, VoiceDictionaryPeerStore } from "@joko/store";
 import { GitSafetyCoordinator, NodeGitCommandRunner, ProjectGitBootstrap } from "@joko/git-safety";
 import { AndroidAutomationRuntimeFactory } from "@joko/tool-android";
 import { BrowserProvider, type BrowserActivity } from "@joko/tool-browser";
@@ -92,6 +93,7 @@ import { BlobTransferCoordinator } from "./blob-transfers.js";
 import { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import { HostedAgentRuntime } from "./hosted-agent-runtime.js";
 import { HostedAgentSources } from "./hosted-agent-sources.js";
+import { HostedAgentSourceResourceCatalog } from "./hosted-agent-source-resource-catalog.js";
 import { InputHandoffCoordinator } from "./input-handoff/coordinator.js";
 import { NativeInputHandoffHost } from "./input-handoff/native-host.js";
 import { InputHandoffNotifications } from "./input-handoff/notifications.js";
@@ -1728,6 +1730,7 @@ export async function createOrchestratorApplication(
             return providerAuth.persistNativeAuth(input);
           },
           processSupervisor: createDefaultManagedProcessSupervisor(),
+          ...(creation.sourceMcp ? { mcpBridge: creation.sourceMcp.pi() } : {}),
           includeManagedSubagentTools: () => false, readAgentResourceSettings: () => runtimeGovernance.agentResource(),
           readCollaborationSettings: () => runtimeGovernance.collaboration()
         });
@@ -1934,21 +1937,39 @@ export async function createOrchestratorApplication(
     onServiceInteractionSettled: (input) => { partnerGroupRuntime?.interactionChanged(input.sessionId); return messaging?.onInteractionSettled(input); },
     closeSessionTerminals: (sessionId) => terminals.closeSession(sessionId)
   });
+  let hostedAgentAutoReview: ReturnType<typeof createHostedAgentAutoReviewer> | undefined;
+  const readHostedAgentPolicy = (context: AdapterContext): import("./hosted-agent-executor.js").HostedAgentExecutorPolicy => {
+    let session: ReturnType<OperationalStore["getSession"]>["descriptor"] | undefined;
+    try { session = store.getSession(context.sessionId).descriptor; }
+    catch (error) { if (!(error instanceof NotFoundError && error.resource === "Session" && error.id === context.sessionId)) throw error; }
+    const snapshot = policySnapshotFor(store, context.target), permissionMode = session?.permissionMode ?? "ask", planMode = session?.planMode ?? false;
+    const current = sessionHost.extraDirectories.listForTarget(context.target.id);
+    const approvedRoots = (context.extraDirectories ?? []).filter(directory => current.some(candidate => candidate.id === directory.id
+      && candidate.path === directory.path && candidate.access === directory.access));
+    return { revision: JSON.stringify([snapshot.generation, permissionMode, planMode, approvedRoots]), permissionMode, planMode, approvedRoots, snapshot, confirmCredentials: true };
+  };
+  const hostedResourceCatalog = new HostedAgentSourceResourceCatalog({ store, resources: piResources,
+    nativeBackends: new Map([["pi", piBackendId], ["codex", codexBackendId], ["claude-agent-sdk-stdio", claudeCodeBackendId]]),
+    allowedSkillIds: context => partnerConnections?.targetSkillReferences(privateResourceTarget(context) ?? context.target.id) });
   hostedAgentSources = new HostedAgentSources({ store, peers: devicePeers, registry: backendInstances, host: sessionHost,
     sharing: providerSharing.directory, sourceDeviceId: serverId,
     temporaryRoot: join(config.dataDirectory, "hosted-source-transfers"), commandConcurrencyGate,
+    mcpRouter, includeToolPolicy: (context, policyId) => toolPolicies.enabledForSession(context.sessionId, context.target.id, policyId),
+    resolveMemoryPrompt: context => makerMemory.runtimePrompt(context.target.id),
     readBlob: async blob => (await artifacts.readBlob(blob)).data,
+    resolveFile: blob => artifacts.resolveBlobPath(blob),
+    resolveArtifactMention: createArtifactMentionResolver({ store, artifacts, resolveTarget: session => ({ ...sessionWorktrees.effectiveTarget(session), backendId: session.descriptor.backendId }),
+      assertBackendCurrent: context => { const current = backendInstances.get(context.target.backendId);
+        if (current.generation !== context.backendInstanceGeneration) throw new Error("The original Source Backend instance changed."); } }),
     ...(dependencies.resolveOutboundProxy === undefined ? {} : { resolveProxy: dependencies.resolveOutboundProxy }),
     environmentProxyForTarget: target => environmentProxyForTarget(target, process.env),
     resolveCodexExecutable: () => localBackendRuntimeSetup.resolveExecutable(),
-    readPolicy: context => {
-      let session: ReturnType<OperationalStore["getSession"]>["descriptor"] | undefined;
-      try { session = store.getSession(context.sessionId).descriptor; } catch { /* Creation has no product Session yet. */ }
-      const snapshot = policySnapshotFor(store, context.target), permissionMode = session?.permissionMode ?? "ask", planMode = session?.planMode ?? false;
-      const current = sessionHost.extraDirectories.listForTarget(context.target.id);
-      const approvedRoots = (context.extraDirectories ?? []).filter(directory => current.some(candidate => candidate.id === directory.id && candidate.path === directory.path));
-      return { revision: JSON.stringify([snapshot.generation, permissionMode, planMode, approvedRoots]), permissionMode, planMode, approvedRoots, snapshot, confirmCredentials: true };
-    } });
+    readPolicy: readHostedAgentPolicy,
+    resolveTextResources: (context, nativeKind) => hostedResourceCatalog.text(context, nativeKind),
+    resolveNativeSkills: (context, signal, nativeKind) => hostedResourceCatalog.skills(context, signal, nativeKind),
+    resolveNativeSkillPolicy: context => partnerConnections?.nativeSkillPolicy(context),
+    reviewTool: (context, call, signal, assertCurrent, policy) => hostedAgentAutoReview?.(context, call, signal, assertCurrent, policy)
+      ?? Promise.resolve({ verdict: "ask", unavailable: true, reason: "Automatic review is unavailable; confirm this action explicitly." }) });
   await hostedAgentSources.initialize();
   const providerGroupOwnerGeneration = randomUUID();
   providerGroups = new ProviderGroupRuntime({ store, registry: backendInstances, sources: hostedAgentSources, nodeId: serverId,
@@ -2452,6 +2473,8 @@ export async function createOrchestratorApplication(
   const messageSearch = new MessageSearchEmbeddingCoordinator({ store, providers });
   messageSearchForHelperTools = messageSearch;
   const auxiliaryText = new AuxiliaryTextRouting({ store, routes: modelRoutes, providers });
+  hostedAgentAutoReview = createHostedAgentAutoReviewer({ store, auxiliary: auxiliaryText, readPolicy: readHostedAgentPolicy,
+    redact: value => credentials.redactText(value) });
   extensionText = new ExtensionText({ store, tasks: extensionTasks, catalog: extensionCatalog, routes: modelRoutes, auxiliary: auxiliaryText,
     adapters: () => backendInstances.snapshots().flatMap(instance => { const adapter = backendInstances.adapter(instance.instanceId); return adapter === undefined ? [] : [adapter]; }) });
   const helpAssistant = new HelpAssistant({ store, auxiliary: auxiliaryText,

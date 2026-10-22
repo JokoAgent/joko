@@ -51,7 +51,9 @@ const openSchema = z.strictObject({ runId: id, nativeSessionId: id, start: z.enu
   name: z.string().max(16_384).refine(value => !value.includes("\0")).optional(), groupSwitch: z.string().regex(/^[a-f0-9]{64}$/u).optional(), groupMember: z.boolean().optional(),
   permissionMode: permission, fastMode: z.boolean(), effort: id.optional(), workspace: z.strictObject({ platform: z.enum(["win32", "darwin", "linux"]),
     shell: z.string().max(16_384), isGitRepository: z.boolean(), personalInstructions: z.string().max(1024 * 1024).optional(),
-    contextFiles: z.array(z.strictObject({ path: z.string().min(1).max(16_384).refine(value => !value.includes("\0")), content: z.string().max(1024 * 1024) })).max(128).optional() }) });
+    memoryInstructions: z.string().max(1024 * 1024).optional(), mcpEnabled: z.literal(true).optional(),
+    additionalDirectoryIds: z.array(z.string().regex(/^[a-f0-9]{64}$/u)).max(128).refine(ids => new Set(ids).size === ids.length).optional(),
+    contextFiles: z.array(z.strictObject({ path: z.string().min(1).max(16_384).refine(value => !value.includes("\0")), content: z.string().max(1024 * 1024) })).max(512).optional() }) });
 const replySchema = z.discriminatedUnion("ok", [z.strictObject({ ok: z.literal(true), value: z.unknown() }),
   z.strictObject({ ok: z.literal(false), code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/u) })]);
 export class HostedAgentWireError extends Error { constructor() { super("The hosted Agent wire value is invalid."); } }

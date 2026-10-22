@@ -1,8 +1,8 @@
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { HostedAgentSourceAdapter } from "@joko/adapter-hosted";
 import { HostedAgentService } from "@joko/contracts";
@@ -23,12 +23,17 @@ import { createHostedAgentCodexAdapter } from "./hosted-agent-codex-factory.js";
 import { CredentialManager, ProviderCatalogManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import { SessionHost } from "./session-host.js";
+import { McpRouter } from "./mcp-router.js";
+import { HostedAgentSourceMcp } from "./hosted-agent-source-mcp.js";
+import { hostedDirectoryId } from "./hosted-agent-directories.js";
 
 const binary = process.env["JOKO_CODEX_HOSTED_TEST_BINARY"];
 describe.skipIf(!binary)("Codex native Source product Session", () => {
-  it("persists the product Queue and native dispatch fence while bootstrapping the actual Source exec-server before native create completes", async () => {
+  it.each([true, false])("persists the product Queue and native fence with Source MCP enabled=%s before native create completes", async withMcpTools => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "joko-codex-source-session-"))), workspace = join(root, "workspace"), nativeRoot = join(root, "model-node");
     await mkdir(workspace); await mkdir(nativeRoot);
+    const additional = join(root, "approved-additional"); await mkdir(additional); await writeFile(join(additional, "proof-extra.txt"), "ORIGINAL CODEX EXTRA DIRECTORY");
+    let nativeAdditional = "";
     const requests: Record<string, unknown>[] = [], selectedModel: ProviderModel = { providerId: "fixture", modelId: "native-model", displayName: "Native model",
       api: "openai-responses", contextWindow: 32768, maxOutputTokens: 1024, supportsImages: true, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
     let networkAuthorization = "";
@@ -36,11 +41,13 @@ describe.skipIf(!binary)("Codex native Source product Session", () => {
       const chunks: Buffer[] = []; for await (const chunk of request) chunks.push(Buffer.from(chunk));
       requests.push(JSON.parse(Buffer.concat(chunks).toString()) as Record<string, unknown>); networkAuthorization = request.headers.authorization ?? "";
       const tool = requests.length === 1;
+      const script = `const fs=require("node:fs");fs.writeFileSync("queue-proof.txt","ORIGINAL SOURCE QUEUE");process.stdout.write(fs.readFileSync(${JSON.stringify(join(nativeAdditional, "proof-extra.txt"))},"utf8"));`;
       const command = process.platform === "win32"
-        ? `& '${process.execPath.replaceAll("'", "''")}' -e "require('node:fs').writeFileSync('queue-proof.txt','ORIGINAL SOURCE QUEUE')"`
-        : `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('queue-proof.txt','ORIGINAL SOURCE QUEUE')"`;
+        ? `& '${process.execPath.replaceAll("'", "''")}' -e '${script.replaceAll("'", "''")}'`
+        : `'${process.execPath.replaceAll("'", "'\"'\"'")}' -e '${script.replaceAll("'", "'\"'\"'")}'`;
       const item = tool ? { type: "function_call", id: "source-tool", call_id: "source-tool-call", name: "exec_command", status: "completed",
         arguments: JSON.stringify({ cmd: command, login: false, yield_time_ms: 1000, max_output_tokens: 1000 }) }
+        : requests.length === 2 && withMcpTools ? { type: "function_call", id: "source-mcp", call_id: "source-mcp-call", namespace: `mcp__joko_source_${createHash("sha256").update("original_tools").digest("hex").slice(0, 24)}`, name: "owner_echo", status: "completed", arguments: "{}" }
         : { type: "message", id: "source-answer", role: "assistant", status: "completed", content: [{ type: "output_text", text: "ORIGINAL SOURCE QUEUE", annotations: [] }] };
       const events = [{ type: "response.created", response: { id: "source-response-" + requests.length, status: "in_progress", output: [] } },
         { type: "response.output_item.done", output_index: 0, item },
@@ -52,6 +59,11 @@ describe.skipIf(!binary)("Codex native Source product Session", () => {
     const address = model.address(); if (!address || typeof address === "string") throw new Error("Missing controlled model listener.");
     const sourceStore = new OperationalStore(join(root, "source.sqlite")), nativeStore = new OperationalStore(join(root, "native.sqlite")), slots = new HostedAgentSessionSlots();
     const credentials = new CredentialManager({ vault: await CredentialVault.open(join(root, "vault.key")), storagePath: join(root, "credentials.json") }); await credentials.initialize();
+    const sourceRouter = new McpRouter({ store: sourceStore, credentials }); await sourceRouter.initialize(); let sourceMcp: HostedAgentSourceMcp | undefined;
+    if (withMcpTools) sourceRouter.registerBridgeToolProvider({ id: "original_tools", generation: 1, available: true,
+      tools: [{ serverId: "original_tools", name: "owner_echo", description: "Original task owner tool", inputSchema: { type: "object", properties: {} }, requiresPermission: false, requiresNativeRoot: true }],
+      callTool: async (_name, _args, _signal, context) => { context.assertCurrent?.(); context.assertNativeRoot?.(); expect(context.targetId).toBe("original-target");
+        return { content: [{ type: "text", text: "ORIGINAL_CODEX_MCP_BYTES" }], isError: false }; } });
     const providers = new ProviderCatalogManager({ store: nativeStore, credentials, nativeBackendId: "native-owner" }); providers.initialize();
     const ticket = credentials.createUploadTicket(); credentials.upload(ticket.credentialUploadTicketId, "model-node-private-key");
     await credentials.commitUpload({ credentialUploadTicketId: ticket.credentialUploadTicketId, credentialReferenceId: "source-provider-key", displayName: "Native source Provider", kind: "api_key" });
@@ -72,6 +84,8 @@ describe.skipIf(!binary)("Codex native Source product Session", () => {
       createAdapter: async creation => {
         expect(creation.nativeOwner.backendInstanceGeneration).toBe(1); expect(creation.nativeOwner.generation).toBe(1);
         created++; nativeWorkspace = creation.execution.workspace.root; nativeHome = creation.home;
+        nativeAdditional = creation.execution.workspace.additionalRoots[0]!;
+        expect(nativeAdditional).toContain("approved-"); expect(nativeAdditional).not.toBe(additional);
         const adapter = await createHostedAgentCodexAdapter({ creation: { ...creation, providerIds: [selectedModel.providerId], assertModelAllowed },
           backendId: "codex", providers, executable: binary!, captureNativeAuthentication });
         const create = adapter.createSession.bind(adapter);
@@ -88,20 +102,25 @@ describe.skipIf(!binary)("Codex native Source product Session", () => {
       createHostedAgentConnectService({ host: nativeHost, authenticate: () => principal })))), principal.assertCurrent);
     const poller = new HostedAgentPoller(client), sourceId = "source-native-codex";
     const capabilities: Capability[] = ["session.resume", "session.detach", "turn.stream", "turn.abort", "turn.steer", "turn.follow_up", "input.text", "input.image", "model.list", "model.switch",
-      "permission.change", "context.usage", "context.compact", "runtime.tools"].map(key => ({ key, supported: true }));
+      "permission.change", "context.usage", "context.compact", "runtime.tools", "tool.mcp"].map(key => ({ key, supported: true }));
     capabilities.push({ key: "permission.modes", supported: true, options: ["ask", "bypassPermissions"] });
+    capabilities.push({ key: "workspace.extra_dirs", supported: true });
     const descriptor: BackendDescriptor = { id: sourceId, adapterKind: "hosted", instanceGeneration: 1, displayName: "Codex on paired device", version: "0.159.2",
       installationState: "installed", health: "healthy", authenticationState: "authenticated", capabilities: new Map(capabilities.map(capability => [capability.key, capability])),
       models: [selectedModel], tools: [], diagnostics: [] };
     const assertContext = (context: AdapterContext) => { if (context.target.id !== "original-target" || context.target.workspaceRoot !== workspace) throw new Error("Wrong task Source."); };
     let sourceArtifacts: ArtifactStore;
     const adapter = new HostedAgentSourceAdapter({ id: sourceId, source: { controllerDeviceId: principal.deviceId, targetDeviceId: "model-node", backendId: "codex" },
-      describe: () => descriptor, assertContext, workspace: () => ({ platform: process.platform as "win32" | "darwin" | "linux", shell: "powershell", isGitRepository: false }),
+      describe: () => descriptor, assertContext, releaseWorkspace: async () => { await sourceMcp?.close(); }, workspace: context => {
+        sourceMcp = new HostedAgentSourceMcp({ store: sourceStore, router: sourceRouter, context, assertCurrent: () => assertContext(context), includeToolPolicy: () => true });
+        return { platform: process.platform as "win32" | "darwin" | "linux", shell: "powershell", isGitRepository: false, mcpEnabled: true,
+          additionalDirectoryIds: (context.extraDirectories ?? []).map(hostedDirectoryId) }; },
       readPolicy: () => ({ permissionMode: "bypassPermissions", fastMode: false }), capture: async runId => { nativeRunId = runId; return { client, assertCurrent: principal.assertCurrent,
         close: () => client.close(runId, new AbortController().signal), createController: input => createHostedAgentSourceController({ ...input, poller,
+          mcp: sourceMcp!,
           temporaryRoot: join(root, "incoming"), assertCurrent: principal.assertCurrent, assertContext, codexExecutable: binary!, commandConcurrencyGate: gate,
           readBlob: async blob => (await sourceArtifacts.readBlob(blob)).data,
-          readPolicy: () => ({ revision: "source-policy", permissionMode: "bypassPermissions", planMode: false, approvedRoots: [], confirmCredentials: true }) }) }; } });
+          readPolicy: context => ({ revision: "source-policy", permissionMode: "bypassPermissions", planMode: false, approvedRoots: context.extraDirectories ?? [], confirmCredentials: true }) }) }; } });
     const registry = new BackendInstanceRegistry(sourceStore);
     let host: SessionHost | undefined;
     try {
@@ -111,6 +130,7 @@ describe.skipIf(!binary)("Codex native Source product Session", () => {
       host = new SessionHost(sourceStore, artifacts, registry.availableAdapters(), { backendDescriptors: registry.descriptors(), backendDescriptorsAlreadyPublished: true });
       await host.initialize(); await host.registerTarget({ id: "original-target", backendId: sourceId, displayName: "Original workspace", workspaceRoot: workspace, managed: true, trusted: true });
       const connection = sourceStore.createConnection({ id: "owner", name: "Task Source", authKeyDigest: "fixture-digest" });
+      await host.extraDirectories.add({ workspaceId: "original-target", serverPath: additional, access: "read_only" });
       const createdSession = await host.createSession({ operationId: "create-native-source", connection, targetId: "original-target", title: "Codex Source task", providerId: selectedModel.providerId,
         modelId: selectedModel.modelId, permissionMode: "bypassPermissions", planMode: false, fastMode: false }).catch(error => {
           throw new Error(JSON.stringify({ source: error.storedError, native: nativeFailures.map(error => error instanceof Error ? { ...error, message: error.message } : error) }));
@@ -128,7 +148,16 @@ describe.skipIf(!binary)("Codex native Source product Session", () => {
       expect({ state: queued.state, error: queued.error, errors: sourceStore.listEvents({ sessionId, limit: 1000 }).filter(event => event.payload.type === "error").map(event => event.payload),
         nativeFailures: nativeFailures.map(error => error instanceof Error ? { ...error, message: error.message } : error) })
         .toEqual({ state: "completed", error: undefined, errors: [], nativeFailures: [] });
-      expect(requests).toHaveLength(2); expect(networkAuthorization).toBe("Bearer model-node-private-key");
+      expect(requests).toHaveLength(withMcpTools ? 3 : 2);
+      if (withMcpTools) {
+        expect(requests[0]!["tools"]).toEqual(expect.arrayContaining([expect.objectContaining({ type: "namespace",
+          name: `mcp__joko_source_${createHash("sha256").update("original_tools").digest("hex").slice(0, 24)}`,
+          tools: expect.arrayContaining([expect.objectContaining({ name: "owner_echo" })]) })]));
+        const mcpOutput = (requests[2]!["input"] as Record<string, unknown>[]).find(item => item["type"] === "function_call_output" && item["call_id"] === "source-mcp-call");
+        expect(mcpOutput).toMatchObject({ output: expect.arrayContaining([expect.objectContaining({ type: "input_text", text: "ORIGINAL_CODEX_MCP_BYTES" })]) });
+      } else expect((requests[0]!["tools"] as { name?: string }[]).filter(tool => tool.name?.startsWith("mcp__"))).toEqual([]);
+      expect(networkAuthorization).toBe("Bearer model-node-private-key");
+      expect(JSON.stringify(requests[1])).toContain("ORIGINAL CODEX EXTRA DIRECTORY");
       expect(captureNativeAuthentication).not.toHaveBeenCalled();
       await expect(readFile(join(nativeHome, "auth.json"))).rejects.toMatchObject({ code: "ENOENT" });
       expect(JSON.stringify(requests[0])).toContain("data:image/png;base64," + imageBytes.toString("base64"));
@@ -144,7 +173,7 @@ describe.skipIf(!binary)("Codex native Source product Session", () => {
         .toContain(dispatchFingerprint);
       await host.dispose(); host = undefined; expect(slots.summary().total).toBe(0);
     } finally {
-      await host?.dispose(); await adapter.dispose(); await poller.close(); await nativeHost.dispose(); gate.close(); sourceStore.close(); nativeStore.close();
+      await host?.dispose(); await adapter.dispose(); await poller.close(); await nativeHost.dispose(); await sourceMcp?.close(); await sourceRouter.dispose(); gate.close(); sourceStore.close(); nativeStore.close();
       model.closeAllConnections(); await new Promise<void>(closed => model.close(() => closed()));
       if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe native Source cleanup.");
       await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });

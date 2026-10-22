@@ -11,6 +11,7 @@ import type { HostedAgentConnectOptions, HostedAgentLifecycleEndpointPort } from
 import { toProtoCapability, toProtoModelDescriptor } from "./proto-mapper.js";
 import { HOSTED_AGENT_WIRE_FORMAT } from "./hosted-agent-wire.js";
 import { purgeHostedAgentStorage } from "./hosted-agent-run.js";
+import type { HostedAgentNativeMcp } from "./hosted-agent-native-mcp.js";
 
 export interface HostedAgentBackendFactory {
   readonly backendId: string;
@@ -27,6 +28,7 @@ export interface HostedAgentBackendFactory {
 }
 export interface HostedAgentBackendCreation {
   readonly home: string; readonly trust: "owner" | "guest"; readonly providerId: string;
+  readonly sourceMcp?: HostedAgentNativeMcp;
   readonly providerIds: readonly string[]; readonly modelIds: readonly string[]; readonly signal: AbortSignal; readonly execution: HostedExecution;
   readonly nativeOwner: { readonly sessionId: string; readonly targetId: string; readonly generation: number; readonly backendInstanceGeneration: number };
   readonly readBlob: (blob: BlobRef) => Promise<Uint8Array>;

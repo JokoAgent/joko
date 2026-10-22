@@ -535,7 +535,7 @@ describe("ClaudeCodeAdapter", () => {
       release: () => { released = true; }
     };
     const bridge: ClaudeMcpBridgePort = { open: vi.fn(() => { if (!committed) throw new Error("Not durable"); return lease; }) };
-    const adapter = adapterFor(sdk, { mcpBridge: bridge });
+    const adapter = adapterFor(sdk, { mcpBridge: bridge, redactValues: ["native-approved", "mcp__joko_"] });
     const binding = await adapter.createSession(createInput(), contextFor().context);
     expect(bridge.open).not.toHaveBeenCalled();
     expect(sdk.queries[0]!.params.options).toMatchObject({ strictMcpConfig: true, mcpServers: {}, settingSources: ["user", "project", "local"] });
@@ -571,6 +571,7 @@ describe("ClaudeCodeAdapter", () => {
     expect(calls[0]!.nativeRootCall?.arguments).toEqual({ value: "hello" });
     calls[0]!.nativeRootCall!.assertCurrent();
     expect(calls[0]!.modelCallId).toBe("original-model-request");
+    expect(source.events.find(event => event.type === "tool_start")).toMatchObject({ callId: "[REDACTED]-call", name: expect.stringMatching(/^\[REDACTED\]/u) });
     expect(calls[0]!.partnerLearningAuthority).toMatchObject({ source: learningSource, requestId: calls[0]!.requestId, serverId: tool.serverId, toolName: tool.name });
     expect(nativeReply).toHaveBeenCalledWith(assistantUuid);
     sdk.queries[1]!.push(assistantMessage(binding.nativeSessionId!, assistantUuid, [{ type: "text", text: "Repeated native frame" }]));

@@ -3,9 +3,9 @@ import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import type { AdapterContext, BackendDescriptor, NativeSessionBinding } from "@joko/core";
 import { expect, it, vi } from "vitest";
-import { HostedAgentSourceAdapter, type HostedAgentSourceConnection, type HostedAgentSourceController } from "./adapter.js";
+import { HostedAgentSourceAdapter, type HostedAgentSourceConnection, type HostedAgentSourceController, type HostedAgentSourceAdapterOptions } from "./adapter.js";
 
-async function fixture() {
+async function fixture(prepareInput?: HostedAgentSourceAdapterOptions["prepareInput"]) {
   const root = await realpath(await mkdtemp(join(tmpdir(), "joko-source-adapter-")));
   const context: AdapterContext = { sessionId: "task", generation: 1, target: { id: "target", backendId: "source-native", displayName: "Task", workspaceRoot: root,
     managed: true, trusted: true }, operationId: "create-task", modelSelection: { providerId: "provider", modelId: "model" }, signal: new AbortController().signal,
@@ -13,18 +13,20 @@ async function fixture() {
   const descriptor: BackendDescriptor = { id: "source-native", adapterKind: "hosted", instanceGeneration: 1, displayName: "Source", version: "1", health: "healthy",
     installationState: "installed", authenticationState: "authenticated", capabilities: new Map(), models: [], tools: [], diagnostics: [] };
   const open = vi.fn<HostedAgentSourceConnection["client"]["open"]>(async input => ({ runId: input.runId, virtualRoot: "/provider/private/workspace" }));
-  const close = vi.fn(async () => {}), stop = vi.fn(async () => {}), owners = new Map<string, AdapterContext>();
+  const close = vi.fn(async () => {}), stop = vi.fn(async () => {}), release = vi.fn(async () => {}), forget = vi.fn(async () => {}), owners = new Map<string, AdapterContext>();
+  const fences = new Map<string, NonNullable<Parameters<HostedAgentSourceController["registerOperation"]>[2]>>();
   let binding!: () => NativeSessionBinding;
   const controller: HostedAgentSourceController = { start: () => new Promise<void>(() => {}), stop, abortPending: () => {},
-    registerOperation: (id, context) => { owners.set(id, context); }, projectResult: value => value,
+    registerOperation: (id, context, fence) => { owners.set(id, context); if (fence) fences.set(id, fence); }, projectResult: value => value,
     projectState: state => ({ ...state, binding: binding() }), projectHistory: history => history };
   const call = vi.fn<HostedAgentSourceConnection["client"]["call"]>(async () => ({ binding: { opaqueRef: "/provider/native.jsonl", generation: 1 }, streaming: false,
     compacting: false, pendingMessages: 0, providerId: "provider", modelId: "model", fastMode: false, permissionMode: "ask" }));
   const adapter = new HostedAgentSourceAdapter({ id: descriptor.id, source: { targetDeviceId: "provider-node", controllerDeviceId: "source-device", backendId: "native" },
-    describe: () => descriptor, assertContext: () => {}, readPolicy: () => ({ permissionMode: "ask", fastMode: false }),
+    describe: () => descriptor, assertContext: () => {}, readPolicy: () => ({ permissionMode: "ask", fastMode: false }), releaseWorkspace: release, deleteWorkspace: forget,
+    ...(prepareInput === undefined ? {} : { prepareInput }),
     workspace: () => ({ platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false }),
     capture: () => ({ client: { open, call }, close, assertCurrent: () => {}, createController: input => { binding = input.binding; return controller; } }) });
-  return { root, context, adapter, open, call, close, stop, owners, cleanup: async () => {
+  return { root, context, adapter, open, call, close, stop, release, forget, owners, fences, cleanup: async () => {
     await adapter.dispose(); if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe test cleanup."); await rm(root, { recursive: true, force: true });
   } };
 }
@@ -49,6 +51,31 @@ it("retains a Source-owned binding, rejects a substituted node, and resumes the 
   } finally { await f.cleanup(); }
 });
 
+it("prepares input against its actual native shadow and rechecks the original Source reference at the durable dispatch boundary", async () => {
+  let current = true;
+  const prepare = vi.fn<NonNullable<HostedAgentSourceAdapterOptions["prepareInput"]>>(async (input, _context, shadow) => ({
+    input: { ...input, text: `${input.text}\nPath: ${shadow}/proof.txt` }, assertCurrent: () => { if (!current) throw new Error("Original file reference changed."); }
+  }));
+  const f = await fixture(prepare), persist = vi.fn(async () => {});
+  try {
+    const binding = await f.adapter.createSession({ target: f.context.target, providerId: "provider", modelId: "model", permissionMode: "ask", fastMode: false }, f.context);
+    const input = { text: "Original file", images: [], files: [], mentions: [], disposition: "prompt" as const };
+    await f.adapter.send(input, { ...f.context, binding, operationId: "prepared-source" });
+    expect(prepare.mock.calls[0]?.[2]).toBe("/provider/private/workspace");
+    expect(f.call.mock.calls.at(-1)?.[2]).toMatchObject({ kind: "send", input: { text: "Original file\nPath: /provider/private/workspace/proof.txt" } });
+    const nativeCall = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (...args) => {
+      if (args[2].kind === "send" && args[2].durableFence) {
+        current = false;
+        await f.fences.get(args[1])!({ inputFingerprint: "a".repeat(64), nativeHistory: { events: [], activeLineage: [] } });
+      }
+      return nativeCall(...args);
+    });
+    await expect(f.adapter.sendWithDurableNativeDispatchFence(input, { ...f.context, binding, operationId: "retired-file-source" }, persist)).rejects.toThrow(/file reference changed/u);
+    expect(persist).not.toHaveBeenCalled();
+  } finally { await f.cleanup(); }
+});
+
 it("retains uncertain startup cleanup until the exact captured native connection confirms closure", async () => {
   const f = await fixture(); f.open.mockRejectedValueOnce(new Error("The original delivery outcome is unknown."));
   f.close.mockRejectedValueOnce(new Error("Native cleanup is unconfirmed."));
@@ -56,6 +83,40 @@ it("retains uncertain startup cleanup until the exact captured native connection
     await expect(f.adapter.createSession({ target: f.context.target, providerId: "provider", modelId: "model", permissionMode: "ask", fastMode: false }, f.context))
       .rejects.toThrow("cleanup could not be confirmed");
     expect(f.open).toHaveBeenCalledTimes(1); expect(f.close).toHaveBeenCalledTimes(1);
+    expect(f.release).not.toHaveBeenCalled();
     await f.adapter.dispose(); expect(f.close).toHaveBeenCalledTimes(2); expect(f.open).toHaveBeenCalledTimes(1);
+    expect(f.release).toHaveBeenCalledOnce(); expect(f.release).toHaveBeenCalledWith(f.context);
+  } finally { await f.cleanup(); }
+});
+
+it("admits file snapshots only after the original durable fence and before native input consumption", async () => {
+  const order: string[] = [], commit = vi.fn(async () => { order.push("receipt"); });
+  const f = await fixture(async input => ({ input, assertCurrent: () => {}, commit }));
+  try {
+    const binding = await f.adapter.createSession({ target: f.context.target, providerId: "provider", modelId: "model", permissionMode: "ask", fastMode: false }, f.context);
+    const input = { text: "File input", images: [], files: [], mentions: [], disposition: "prompt" as const }, nativeCall = f.call.getMockImplementation()!;
+    f.call.mockImplementation(async (...args) => {
+      if (args[2].kind === "send" && args[2].durableFence) {
+        await f.fences.get(args[1])!({ inputFingerprint: "b".repeat(64), nativeHistory: { events: [], activeLineage: [] } }); order.push("native");
+      }
+      return nativeCall(...args);
+    });
+    await expect(f.adapter.send(input, { ...f.context, binding, operationId: "unfenced" })).rejects.toThrow(/durable/u);
+    await expect(f.adapter.sendWithDurableNativeDispatchFence(input, { ...f.context, binding, operationId: "failed-fence" }, async () => { throw new Error("Persistence failed."); })).rejects.toThrow("Persistence failed");
+    expect(commit).not.toHaveBeenCalled();
+    await f.adapter.sendWithDurableNativeDispatchFence(input, { ...f.context, binding, operationId: "accepted" }, async () => { order.push("persist"); });
+    expect(order).toEqual(["persist", "receipt", "native"]);
+  } finally { await f.cleanup(); }
+});
+
+it("forgets task input copies only after the exact native deletion and connection close succeed", async () => {
+  const f = await fixture();
+  try {
+    const binding = await f.adapter.createSession({ target: f.context.target, providerId: "provider", modelId: "model", permissionMode: "ask", fastMode: false }, f.context);
+    f.close.mockRejectedValueOnce(new Error("Closure is uncertain."));
+    await expect(f.adapter.deleteSession(binding, { ...f.context, binding })).rejects.toThrow("Closure is uncertain"); expect(f.forget).not.toHaveBeenCalled();
+    await f.adapter.closeSession(binding, { ...f.context, binding }); expect(f.forget).not.toHaveBeenCalled();
+    await f.adapter.deleteSession(binding, { ...f.context, binding });
+    expect(f.forget).toHaveBeenCalledOnce(); expect(f.close.mock.invocationCallOrder.at(-1)!).toBeLessThan(f.forget.mock.invocationCallOrder[0]!);
   } finally { await f.cleanup(); }
 });

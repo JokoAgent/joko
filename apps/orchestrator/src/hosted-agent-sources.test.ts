@@ -21,7 +21,9 @@ it("publishes actual paired native sources, retains paused and offline choices, 
   let host = new SessionHost(store, new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }), []);
   const readPolicy = () => ({ revision: "source-policy", permissionMode: "ask" as const, planMode: false, approvedRoots: [], confirmCredentials: true });
   const readBlob = async () => { throw new Error("No image dispatch in this catalog fixture."); };
-  let sources = new HostedAgentSources({ store, peers, registry, host, temporaryRoot: join(root, "incoming"), readPolicy, readBlob });
+  const reviewTool = async () => ({ verdict: "ask" as const });
+  const resolveTextResources = async () => [];
+  let sources = new HostedAgentSources({ store, peers, registry, host, temporaryRoot: join(root, "incoming"), readPolicy, readBlob, reviewTool, resolveTextResources });
   const controller = store.createConnection({ id: "source-connection", deviceId: "original-device", device: { defaultName: "Original", kind: "web", platform: "web" }, name: "Original", authKeyDigest: "original-digest" });
   const target = store.createConnection({ id: "node-connection", deviceId: "model-node", device: { defaultName: "Native computer", kind: "service", platform: process.platform }, name: "Native computer", authKeyDigest: "node-digest" });
   store.setDeviceRemoteControlEnabled(target.deviceId, true);
@@ -56,7 +58,9 @@ it("publishes actual paired native sources, retains paused and offline choices, 
     expect(sources.source(id)).toEqual({ controllerDeviceId: controller.deviceId, targetDeviceId: target.deviceId, backendId: "native-sdk" });
     expect(descriptor).toMatchObject({ adapterKind: "hosted", health: "healthy", displayName: "Native Agent · Native computer", instanceGeneration: 1 });
     expect(descriptor.capabilities.get("input.text")?.supported).toBe(true);
-    expect(descriptor.capabilities.get("permission.modes")?.options).toEqual(["ask", "acceptEdits", "bypassPermissions"]);
+    expect(descriptor.capabilities.get("permission.modes")?.options).toEqual(["ask", "acceptEdits", "auto", "bypassPermissions"]);
+    expect(descriptor.capabilities.get("runtime.resources")).toMatchObject({ supported: true, options: ["skill", "prompt"] });
+    expect(descriptor.capabilities.get("input.mention")).toMatchObject({ supported: true, options: ["resource"] });
     expect(descriptor.providers?.[0]?.displayName).toBe("Provider · Native Agent · Native computer");
     expect(descriptor.models[0]).toMatchObject({ logicalId: "stable-model", displayThinkingLevels: ["low", "high"], defaultVisible: false,
       declaredSupportsFastMode: false, cost: { input: 2.5 }, pricing: { source: "upstream", currencyCode: "USD" } });
@@ -66,6 +70,15 @@ it("publishes actual paired native sources, retains paused and offline choices, 
     remoteEnabled = true; malformed = true; await sources.refresh(controller);
     expect(store.listBackends()).toHaveLength(1); expect(sources.modelAvailable(id, "provider", "native-model")).toBe(false);
     malformed = false; await sources.refresh(controller); expect(sources.modelAvailable(id, "provider", "native-model")).toBe(true);
+    const staleTarget = { id: "stale-target", backendId: id, displayName: "Original", workspaceRoot: root, managed: false, trusted: true };
+    await host.registerTarget(staleTarget);
+    store.createSession({ id: "stale-task", backendId: id, targetId: staleTarget.id, title: "Retired occurrence", binding: { opaqueRef: "retained", generation: 2 },
+      pinned: false, archived: false, permissionMode: "ask", planMode: false, fastMode: false, createdAt: 1, updatedAt: 1 });
+    await expect(host.currentAdapter(id)!.createSession({ target: staleTarget, providerId: "provider", modelId: "native-model", permissionMode: "ask", fastMode: false }, {
+      sessionId: "stale-task", generation: 1, backendInstanceGeneration: descriptor.instanceGeneration, target: staleTarget, operationId: "retired-create",
+      signal: new AbortController().signal, emit: async () => {}, requestInteraction: async () => ({ kind: "cancelled" }), artifactCapacityBytes: 1024,
+      storeArtifact: async () => { throw new Error("No stale artifacts."); }
+    })).rejects.toThrow(/Source task authority changed/u);
     await host.dispose(); await sources.close(); await peers.shutdown(); await native.retire(); store.close();
     store = new OperationalStore(join(root, "source.sqlite")); peers = new DevicePeerOwner({ store }); registry = new BackendInstanceRegistry(store);
     host = new SessionHost(store, new ArtifactStore({ rootDirectory: join(root, "artifacts"), repository: new OperationalArtifactRepository(store), ingestRoots: [root] }), []);

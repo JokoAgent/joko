@@ -4,9 +4,10 @@ import { promisify } from "node:util";
 import { fromJson, toJson, type JsonValue } from "@bufbuild/protobuf";
 import { createClient } from "@connectrpc/connect";
 import * as contract from "@joko/contracts";
-import { CAPABILITIES, JokoError, type AdapterContext, type BackendDescriptor, type Capability, type ProviderModel } from "@joko/core";
+import { CAPABILITIES, JokoError, type AdapterContext, type BackendDescriptor, type Capability, type ProviderModel, type ToolCall, type NativeToolAuthorizationDecision,
+  type ApprovedSkillSeed, type NativeSkillPolicyResolver, type ArtifactMentionResolver } from "@joko/core";
 import { HostedAgentSourceAdapter, type HostedAgentDeviceSource } from "@joko/adapter-hosted";
-import { TaskShareStore, type ConnectionRecord, type OperationalStore } from "@joko/store";
+import { NotFoundError, SessionRuntimeHandoffStore, TaskShareStore, type ConnectionRecord, type OperationalStore } from "@joko/store";
 import type { BackendInstanceRegistry } from "./backend-instance-registry.js";
 import type { DevicePeerOwner } from "./device-peer-owner.js";
 import type { SessionHost } from "./session-host.js";
@@ -17,6 +18,16 @@ import { createHostedAgentPeerTransport } from "./hosted-agent-peer-transport.js
 import { createHostedAgentSourceController } from "./hosted-agent-source-controller.js";
 import { fromProtoCapability, fromProtoTimestamp } from "./proto-mapper.js";
 import { snapshotSourceProjectFiles } from "./hosted-agent-project-files.js";
+import { hostedDirectoryId } from "./hosted-agent-directories.js";
+import { snapshotSourceInstructions } from "./hosted-agent-source-instructions.js";
+import { HostedAgentSourceResources } from "./hosted-agent-source-resources.js";
+import { prepareSourceWorkspaceInput } from "./hosted-agent-source-input.js";
+import { HostedAgentSourceAttachments } from "./hosted-agent-source-attachments.js";
+import { HostedAgentSourceMcp } from "./hosted-agent-source-mcp.js";
+import type { McpRouter } from "./mcp-router.js";
+import { join } from "node:path";
+import type { RuntimeTextResourceSeed } from "./resource-manager.js";
+import type { SourceProjectFilesOptions } from "./hosted-agent-project-files.js";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 import type { HostedAgentClaudeWebFetchOptions } from "./hosted-agent-claude-web-network.js";
 import type { BlobRef } from "@joko/core";
@@ -31,7 +42,7 @@ const SCOPE = "hosted-sources.v1";
 const FORWARDED = new Set(["session.resume", "session.detach", "session.tree", "turn.stream", "turn.abort", "turn.steer", "turn.follow_up", "input.text",
   "input.image", "model.list", "model.switch", "model.effort", "model.fast_mode", "permission.modes", "permission.change", "plan_mode", "context.usage", "context.compact",
   "context.auto_compact", "context.auto_retry", "workspace.files", "workspace.files.watch", "workspace.files.write", "workspace.diff", "workspace.generated_files",
-  "runtime.commands", "runtime.tools", "runtime.user_shell", "interaction.permission", "interaction.question", "interaction.plan_review"]);
+  "runtime.commands", "runtime.tools", "runtime.user_shell", "interaction.permission", "interaction.question", "interaction.plan_review", "workspace.extra_dirs"]);
 interface SourceRecord {
   readonly format: 1;
   readonly source: HostedAgentDeviceSource;
@@ -48,6 +59,16 @@ export interface HostedAgentSourcesOptions {
   readonly commandConcurrencyGate?: CommandConcurrencyGate;
   readonly resolveCodexExecutable?: () => Promise<string | undefined>;
   readonly readBlob: (blob: BlobRef) => Promise<Uint8Array>;
+  readonly reviewTool?: (context: AdapterContext, call: ToolCall, signal: AbortSignal, assertCurrent: () => void, policy: HostedAgentExecutorPolicy) => Promise<NativeToolAuthorizationDecision>;
+  readonly resolveTextResources?: (context: AdapterContext, nativeKind: string) => Promise<readonly RuntimeTextResourceSeed[]>;
+  readonly resolveNativeSkills?: (context: AdapterContext, signal: AbortSignal, nativeKind: string) => Promise<readonly ApprovedSkillSeed[]>;
+  readonly resolveNativeSkillPolicy?: NativeSkillPolicyResolver;
+  readonly resolveFile?: (blob: BlobRef, context: AdapterContext) => Promise<string>;
+  readonly resolveArtifactMention?: ArtifactMentionResolver;
+  readonly mcpRouter?: McpRouter;
+  readonly includeToolPolicy?: (context: AdapterContext, policyId: string) => boolean;
+  readonly resolveMemoryPrompt?: (context: AdapterContext) => string | undefined;
+  readonly resourceAllowed?: SourceProjectFilesOptions["resourceAllowed"];
   readonly resolveProxy?: HostedAgentClaudeWebFetchOptions["resolveProxy"];
   readonly environmentProxyForTarget?: HostedAgentClaudeWebFetchOptions["environmentProxyForTarget"];
   readonly sharing?: ProviderSharingDirectoryPort;
@@ -65,13 +86,20 @@ export class HostedAgentSources {
   #groupSwitch?: ProviderGroupGuestSwitch;
   #groupStore?: ProviderGroupStore;
   readonly #preparedGroupMembers = new Map<string, string>();
+  readonly #contextGuards = new WeakMap<AdapterContext, () => void>();
+  readonly #attachments?: HostedAgentSourceAttachments;
   #closed = false;
   #discoveryClosed = false;
-  constructor(options: HostedAgentSourcesOptions) { this.#options = options; }
+  constructor(options: HostedAgentSourcesOptions) {
+    this.#options = options;
+    if (options.resolveFile && options.resolveArtifactMention) this.#attachments = new HostedAgentSourceAttachments({ store: options.store,
+      root: join(options.temporaryRoot, "inputs"), resolveFile: options.resolveFile, resolveArtifactMention: options.resolveArtifactMention, assertContext: context => this.#assertContext(context) });
+  }
   installGroupSwitch(value: ProviderGroupGuestSwitch): void { if (this.#groupSwitch && this.#groupSwitch !== value) throw new Error("The Source group switch owner changed."); this.#groupSwitch = value; }
   installGroupStore(value: ProviderGroupStore): void { this.#groupStore = value; }
   prepareGroupMember(sessionId: string, backendId: string): void { this.#preparedGroupMembers.set(sessionId, backendId); }
   async initialize(): Promise<void> {
+    await this.#attachments?.initialize();
     for (const row of this.#options.store.listSettingsByKeyPrefix("service", SCOPE, "source:")) {
       const record = parseRecord(row.value), id = record.received ? providerSharingBackendId(record.received.joinId, record.received.nativeBackendId) : sourceId(record.source);
       if (row.key !== `source:${id}`) throw new Error("The saved native source identity conflicts.");
@@ -182,6 +210,8 @@ export class HostedAgentSources {
     }
   }
   async #install(entry: SourceEntry): Promise<void> {
+    const resources = new HostedAgentSourceResources();
+    const mcps = new Map<string, HostedAgentSourceMcp>(), mcpKey = (context: AdapterContext) => JSON.stringify([context.sessionId, context.generation, context.backendInstanceGeneration]);
     const snapshot = await this.#options.registry.add({ instanceId: entry.id, adapterKind: "hosted", displayName: entry.catalog.displayName,
       create: ({ generation }) => new HostedAgentSourceAdapter({ id: entry.id, source: entry.record.source, describe: () => this.#descriptor(entry),
         onRuntimeUnavailable: context => this.#options.host.invalidateRuntime({ backendId: entry.id, backendInstanceGeneration: generation,
@@ -190,19 +220,53 @@ export class HostedAgentSources {
           const policy = this.#options.readPolicy(context), session = this.#session(context.sessionId);
           return { permissionMode: policy.permissionMode, fastMode: session?.fastMode ?? false, ...(session?.effort === undefined ? {} : { effort: session.effort }) };
         }, assertContext: context => this.#assertContext(context),
+        releaseWorkspace: async context => { const key = mcpKey(context), mcp = mcps.get(key); mcps.delete(key); await mcp?.close(); await this.#attachments?.release(context); await resources.release(context); },
+        deleteWorkspace: async context => { this.#assertContext(context); await this.#attachments?.forget(context.sessionId); },
+        prepareInput: (input, context, shadow) => {
+          this.#assertContext(context);
+          const session = this.#options.store.getSession(context.sessionId).descriptor, target = this.#options.store.getTarget(context.target.id);
+          const metadata = target.metadata, value = metadata !== null && typeof metadata === "object" && !Array.isArray(metadata) && "workspaceId" in metadata ? metadata.workspaceId : undefined;
+          const workspaceId = session.worktree?.workspaceId
+            ?? (typeof value === "string" && value ? value : target.descriptor.id);
+          return prepareSourceWorkspaceInput(input, context, { shadow, workspaceId, resources, assertCurrent: () => this.#assertContext(context),
+            ...(this.#attachments ? { attachments: this.#attachments.begin(context, shadow) } : {}) });
+        },
+        ...(this.#options.resolveTextResources === undefined && this.#options.resolveNativeSkills === undefined ? {} : {
+          resources: context => resources.resources(context),
+          commands: context => resources.commands(context)
+        }),
         takeGroupSwitch: context => this.#groupSwitch?.takeForOpen(context.sessionId, entry.id),
         takeNewGroupRound: context => this.#groupSwitch?.takeNewRound(context.sessionId) === true,
         isGroupMember: context => !entry.record.received && (this.#preparedGroupMembers.get(context.sessionId) === entry.id
           || this.#groupStore?.binding(context.sessionId)?.backendId === entry.id),
         workspace: async context => {
           this.#assertContext(context);
+          await this.#attachments?.capture(context);
+          const nativeKind = entry.catalog.nativeAdapterKind;
           let isGitRepository = false;
           try { isGitRepository = (await runFile("git", ["rev-parse", "--is-inside-work-tree"], {
             cwd: context.target.workspaceRoot, signal: context.signal, timeout: 5000, windowsHide: true, maxBuffer: 1024
           })).stdout.trim() === "true"; } catch { context.signal.throwIfAborted(); }
-          const contextFiles = await snapshotSourceProjectFiles(context, { assertCurrent: () => this.#assertContext(context) });
+          const skills = this.#options.resolveNativeSkills ? await resources.captureSkills(context,
+            await this.#options.resolveNativeSkills(context, context.signal, nativeKind), await this.#options.resolveNativeSkillPolicy?.(context)) : [];
+          const textResources = await this.#options.resolveTextResources?.(context, nativeKind) ?? [];
+          const skillIds = new Set(skills.map(skill => skill.id));
+          const projectFiles = [...await snapshotSourceProjectFiles(context, { assertCurrent: () => this.#assertContext(context),
+            ...(this.#options.resourceAllowed === undefined ? {} : { resourceAllowed: this.#options.resourceAllowed }) }),
+            ...resources.capture(context, [...skills, ...textResources.filter(seed => !skillIds.has(seed.id))])];
+          const contextFiles = await snapshotSourceInstructions(context, { files: projectFiles,
+            nativeKind, assertCurrent: () => this.#assertContext(context) });
+          const mcpEnabled = this.#options.mcpRouter !== undefined && entry.catalog.capabilities.some(capability => capability.name === "tool.mcp" && capability.support === contract.CapabilitySupport.SUPPORTED);
+          if (mcpEnabled) {
+            const key = mcpKey(context); await mcps.get(key)?.close();
+            mcps.set(key, new HostedAgentSourceMcp({ router: this.#options.mcpRouter!, store: this.#options.store, context, assertCurrent: () => this.#assertContext(context),
+              includeToolPolicy: policyId => this.#options.includeToolPolicy?.(context, policyId) ?? true }));
+          }
+          const memoryInstructions = mcpEnabled ? this.#options.resolveMemoryPrompt?.(context) : undefined;
           this.#assertContext(context);
           return { platform: process.platform as "win32" | "linux" | "darwin", shell: "bash", isGitRepository, contextFiles,
+            ...(mcpEnabled ? { mcpEnabled: true as const } : {}), ...(memoryInstructions ? { memoryInstructions } : {}),
+            additionalDirectoryIds: this.#options.readPolicy(context).approvedRoots.map(hostedDirectoryId),
             ...(context.appendSystemPrompt === undefined ? {} : { personalInstructions: context.appendSystemPrompt }) };
         },
         capture: async (runId, context) => {
@@ -210,7 +274,15 @@ export class HostedAgentSources {
           const codexExecutable = await this.#options.resolveCodexExecutable?.(); this.#assertContext(context); pool.assertCurrent();
           return { client: pool.client, assertCurrent: pool.assertCurrent, close: captured.close,
             createController: input => createHostedAgentSourceController({ ...input, poller: pool.poller, temporaryRoot: this.#options.temporaryRoot,
-              readPolicy: this.#options.readPolicy, assertContext: sourceContext => this.#assertContext(sourceContext), assertCurrent: pool.assertCurrent,
+              ...(mcps.get(mcpKey(input.context)) ? { mcp: mcps.get(mcpKey(input.context))! } : {}),
+              readPolicy: sourceContext => {
+                const policy = this.#options.readPolicy(sourceContext), authority = resources.authority(sourceContext, input.shadow), attachments = this.#attachments?.authority(sourceContext, input.shadow);
+                return { ...policy, revision: JSON.stringify([policy.revision, authority.revision, attachments?.revision]), approvedRoots: [...policy.approvedRoots, ...authority.approvedRoots,
+                  ...(attachments?.files.map((file, index) => ({ id: `input:${index}`, path: file.path, access: "read_only" as const })) ?? [])] };
+              }, aliases: sourceContext => [...resources.authority(sourceContext, input.shadow).aliases, ...(this.#attachments?.authority(sourceContext, input.shadow).aliases ?? [])],
+              ...(this.#attachments ? { inputFiles: (sourceContext: AdapterContext) => this.#attachments!.authority(sourceContext, input.shadow).files } : {}),
+              assertContext: sourceContext => this.#assertContext(sourceContext), assertCurrent: pool.assertCurrent,
+              ...(this.#options.reviewTool === undefined ? {} : { reviewTool: this.#options.reviewTool }),
               onGroupSwitch: offer => { this.#assertContext(context); pool.assertCurrent(); this.#groupSwitch?.offer(context.sessionId, entry.id, context.generation, offer); },
               ...(codexExecutable === undefined ? {} : { codexExecutable }),
               readBlob: blob => this.#options.readBlob(blob),
@@ -248,11 +320,27 @@ export class HostedAgentSources {
     const capabilities = new Map<string, Capability>(CAPABILITIES.map(key => {
       const capability = native.get(key), supported = FORWARDED.has(key) && capability?.supported === true;
       if (!supported) return [key, { key, supported: false, reason: "not_implemented" }];
-      // Native auto approval does not supply the original task's AI review.
-      return [key, key === "permission.modes" ? { ...capability!, options: (capability!.options ?? []).filter(mode => mode !== "auto") } : capability!];
+      return [key, key === "permission.modes" && !this.#options.reviewTool
+        ? { ...capability!, options: (capability!.options ?? []).filter(mode => mode !== "auto") } : capability!];
     }));
     capabilities.set("model.remote_execution", { key: "model.remote_execution", supported: true });
+    if ((this.#options.resolveTextResources || this.#options.resolveNativeSkills) && native.get("input.text")?.supported) {
+      capabilities.set("runtime.resources", { key: "runtime.resources", supported: true, options: ["skill", "prompt"] });
+      capabilities.set("input.mention", { key: "input.mention", supported: true, options: ["resource"] });
+    }
+    if (native.get("input.text")?.supported && native.get("workspace.files")?.supported) {
+      capabilities.set("input.mention", { key: "input.mention", supported: true,
+        options: [...(capabilities.get("input.mention")?.options ?? []), "workspace_file", "workspace_directory", "workspace_line_range"] });
+      if (this.#attachments) {
+        capabilities.set("input.file", { key: "input.file", supported: true });
+        capabilities.set("input.mention", { key: "input.mention", supported: true, options: [...capabilities.get("input.mention")!.options!, "artifact"] });
+      }
+    }
     const hasModels = entry.catalog.providers.some(provider => provider.connected && provider.remoteInvocationEnabled && provider.models.length > 0);
+    if (this.#options.mcpRouter && native.get("tool.mcp")?.supported) {
+      capabilities.set("tool.mcp", { key: "tool.mcp", supported: true });
+      if (this.#options.resolveMemoryPrompt) capabilities.set("memory.curated", { key: "memory.curated", supported: true });
+    }
     return { id: entry.id, adapterKind: "hosted", instanceGeneration: 0, displayName: `${entry.catalog.displayName} · ${entry.record.deviceName}`, version: entry.catalog.version,
       health: entry.available && entry.record.remoteControlEnabled && hasModels ? "healthy" : "unavailable", installationState: "installed", authenticationState: "not_required",
       capabilities, models: entry.catalog.providers.flatMap(provider => provider.models.map(fromModel)), providers: entry.catalog.providers.map(provider => ({ providerId: provider.providerId,
@@ -263,11 +351,40 @@ export class HostedAgentSources {
   }
   #assertContext(context: AdapterContext): void {
     if (this.#closed) throw new Error("Native sources are closed."); context.signal.throwIfAborted();
+    let guard = this.#contextGuards.get(context);
+    if (!guard) {
+      const targetRevision = this.#options.store.getTarget(context.target.id).revision;
+      const generation = this.#options.store.getBackend(context.target.backendId).descriptor.instanceGeneration;
+      const nativeKind = this.#entries.get(context.target.backendId)?.catalog.nativeAdapterKind;
+      const session = this.#session(context.sessionId);
+      const handoffs = new SessionRuntimeHandoffStore(this.#options.store);
+      const admitsHandoff = () => handoffs.admitsTarget({ sessionId: context.sessionId, targetId: context.target.id,
+        backendId: context.target.backendId, generation: context.generation, backendInstanceGeneration: context.backendInstanceGeneration ?? -1,
+        workspaceRoot: context.target.workspaceRoot, ...(context.operationId === undefined ? {} : { operationId: context.operationId }) });
+      const workspace = session?.backendId === context.target.backendId && session.binding.generation === context.generation
+        ? this.#options.host.captureToolWorkspace({ sessionId: context.sessionId, targetId: context.target.id, generation: context.generation }) : undefined;
+      guard = () => {
+        const backend = this.#options.store.getBackend(context.target.backendId).descriptor, target = this.#options.store.getTarget(context.target.id);
+        const current = this.#session(context.sessionId);
+        if (backend.instanceGeneration !== generation || context.backendInstanceGeneration !== undefined && context.backendInstanceGeneration !== generation
+          || this.#entries.get(context.target.backendId)?.catalog.nativeAdapterKind !== nativeKind
+          || target.revision !== targetRevision || !target.descriptor.trusted
+          || current !== undefined && (current.deletedAt !== undefined || current.archived
+            || (current.backendId !== context.target.backendId || current.binding.generation !== context.generation || current.targetId !== context.target.id) && !admitsHandoff())
+          || workspace !== undefined && (workspace.root !== context.target.workspaceRoot || workspace.remote)) throw new Error("The original Source task authority changed.");
+        workspace?.assertCurrent();
+      };
+      this.#contextGuards.set(context, guard);
+    }
+    guard();
     const author = context.operationId === undefined ? undefined : new TaskShareStore(this.#options.store).getAuthorForOperation(context.operationId);
     if (author?.sessionId === context.sessionId) throw new JokoError({ code: "HOSTED_AGENT_TASK_GUEST_DENIED", message: "Shared-task guests cannot invoke a remote Agent source.",
       phase: "authorization", retryable: false, stateMayHaveChanged: false, recovery: "Use an owner-authorized local model for guest input." });
   }
-  #session(id: string) { try { return this.#options.store.getSession(id).descriptor; } catch { return undefined; } }
+  #session(id: string) {
+    try { return this.#options.store.getSession(id).descriptor; }
+    catch (error) { if (error instanceof NotFoundError && error.resource === "Session" && error.id === id) return undefined; throw error; }
+  }
 }
 function sourceId(source: HostedAgentDeviceSource): string {
   return "hosted-" + createHash("sha256").update(JSON.stringify([source.controllerDeviceId, source.targetDeviceId, source.backendId])).digest("hex").slice(0, 32);

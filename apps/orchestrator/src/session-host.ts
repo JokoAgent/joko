@@ -13274,7 +13274,7 @@ export class SessionHost {
           this.assertSessionNotPendingScheduleDeletion(sessionId);
           const artifactReferenceSnapshots = this.artifactReferencesForDispatch(sessionId, item.body);
           this.assertQueueProviderAuthentication(item, stored);
-          let baseContext = await this.beginTurnOverrideLease(item, active, stored);
+          let baseContext: AdapterContext = { ...await this.beginTurnOverrideLease(item, active, stored), inputQueueItemId: item.id };
           if (!reviewReadOnly && run.descriptor.source === "user" && run.descriptor.parentRunId === undefined
             && target.remoteWorkspace === undefined && item.body.disposition === "prompt"
             && item.body.automaticContinuation === undefined && item.body.objectiveContinuation === undefined) {

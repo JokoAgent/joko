@@ -3,16 +3,18 @@ import { execFile } from "node:child_process";
 import { constants } from "node:fs";
 import { access, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createGrepToolDefinition, createLocalBashOperations, type ExtensionContext, type GrepToolInput } from "@earendil-works/pi-coding-agent";
-import { classifyToolCall, decideToolCall, redactSecrets, type AdapterContext, type ApprovedDirectory,
-  type PermissionMode, type PolicySnapshot, type ToolCall } from "@joko/core";
+import { classifyToolCall, decideToolCall, evaluateOrderedPolicyRules, policyObservationForToolCall, redactSecrets, type AdapterContext, type ApprovedDirectory,
+  type PermissionMode, type PolicySnapshot, type ToolCall, type NativeToolAuthorizationDecision } from "@joko/core";
 import type { CommandConcurrencyGate } from "@joko/runtime-governance";
 import { terminalEnvironment } from "@joko/tool-terminal";
 import { ExecutorWorkspace, realPathOrAncestor, type ExecutorPathAlias } from "./hosted-agent-workspace.js";
 import { isShareCredentialCommand, isShareCredentialPath, shareCredentialGitReads } from "./hosted-agent-credentials.js";
 import { GitCredentialHistory } from "./hosted-agent-git-credentials.js";
+import { hostedDirectoryId, hostedDirectoryPath } from "./hosted-agent-directories.js";
+import type { SourceInputMount } from "./hosted-agent-source-attachments.js";
 
 const RAW_FILE_LIMIT = 16 * 1024 * 1024;
 const REQUEST_LIMIT = 64 * 1024 * 1024;
@@ -33,11 +35,13 @@ export interface HostedAgentExecutorOptions {
   readonly context: AdapterContext;
   readonly virtualRoot: string;
   readonly aliases?: readonly ExecutorPathAlias[];
+  readonly inputFiles?: () => readonly SourceInputMount[];
   readonly readPolicy: () => HostedAgentExecutorPolicy;
   /** Captured by the original SessionHost dispatch, never an inbound identity. */
   readonly assertCurrent: () => void;
   readonly commandConcurrencyGate?: CommandConcurrencyGate;
   readonly ripgrepExecutable?: string;
+  readonly reviewTool?: (call: ToolCall, signal: AbortSignal, assertCurrent: () => void, policy: HostedAgentExecutorPolicy) => Promise<NativeToolAuthorizationDecision>;
   readonly credentialConsent?: {
     readonly hasForSession: () => boolean;
     readonly allowForSession: () => Promise<void>;
@@ -95,7 +99,9 @@ export class HostedAgentExecutor {
     this.#options = options;
     this.#workspace = new ExecutorWorkspace({ workingDir: options.context.target.workspaceRoot, aliases: [
       { from: options.virtualRoot, to: options.context.target.workspaceRoot },
-      { from: virtual("home"), to: homedir() }, { from: virtual("temporary"), to: tmpdir() }, ...(options.aliases ?? [])
+      { from: virtual("home"), to: homedir() }, { from: virtual("temporary"), to: tmpdir() },
+      ...(options.context.extraDirectories ?? []).map(directory => ({ from: hostedDirectoryPath(options.virtualRoot, hostedDirectoryId(directory)), to: directory.path })),
+      ...(options.aliases ?? [])
     ] });
     this.#workspace.setVirtualRoot(options.virtualRoot);
   }
@@ -321,8 +327,12 @@ export class HostedAgentExecutor {
     this.#assertCurrent(signal);
     if (request.operation !== "tool.begin") return this.#toolOperation(request, call, signal);
     const policy = this.#options.readPolicy(), native = this.#options.context.nativeToolAuthorization, revision = native?.capture();
+    const inputFiles = this.#options.inputFiles?.() ?? [], inputPath = String(call.args.path ?? call.args.cwd ?? "");
+    const inputMount = inputFiles.find(file => isWithinInput(file.path, inputPath));
+    if (inputMount && (!sameInputPath(inputMount.path, inputPath) || !["read", "ls", "find", "grep"].includes(call.name))) throw new HostedAgentExecutorError("ACCESS_DENIED");
     const assert = () => {
       this.#assertCurrent(signal);
+      inputMount?.assertCurrent();
       if (this.#options.readPolicy().revision !== policy.revision) throw new HostedAgentExecutorError("STALE_AUTHORITY");
       try { native?.assertCurrent(revision); } catch { throw new HostedAgentExecutorError("STALE_AUTHORITY"); }
     };
@@ -335,6 +345,9 @@ export class HostedAgentExecutor {
     const local = decideToolCall(call, context);
     const requested = requestedPath && call.name !== "bash" ? decideToolCall({ ...call, args: { ...call.args, path: requestedPath } }, context) : local;
     if (local.action === "deny" || requested.action === "deny") throw new HostedAgentExecutorError("ACCESS_DENIED");
+    const orderedAsk = policy.snapshot !== undefined && [call, ...(requestedPath && call.name !== "bash"
+      ? [{ ...call, args: { ...call.args, path: requestedPath } }] : [])].some(value =>
+        evaluateOrderedPolicyRules(policy.snapshot!, policyObservationForToolCall(value, context))?.action === "ask");
     const delegated = await native?.review({ toolName: call.name, input: call.args, signal }); assert();
     if (delegated?.verdict === "block" || delegated?.unavailable) throw new HostedAgentExecutorError("ACCESS_DENIED");
     const commandOptions = { cwd: String(call.args.cwd ?? this.#options.context.target.workspaceRoot), platform: process.platform,
@@ -347,10 +360,18 @@ export class HostedAgentExecutor {
       if (reads && await this.#gitCredentials.provesSafe(String(call.args.command), reads, signal)) credential = false;
       assert();
     }
+    // The Provider's native approval is not authority on this computer. Run
+    // contextual review here, after deterministic policy and credential gates.
+    const automatic = !credential && !orderedAsk && policy.permissionMode === "auto" && delegated?.verdict !== "ask" && delegated?.verdict !== "allow"
+      && (local.action === "ask" || requested.action === "ask")
+      ? await this.#options.reviewTool?.(call, signal, assert, policy) : undefined;
+    assert();
+    if (automatic?.verdict === "block") throw new HostedAgentExecutorError("ACCESS_DENIED");
     const key = createHash("sha256").update(JSON.stringify([request.callId, call.name === "edit" ? "write" : call.name, call.args])).digest("hex");
     const approval = this.#approvals.get(key);
     const approved = approval && approval.revision === policy.revision && approval.authorization === revision && approval.expiresAt > Date.now();
-    if (!approved && (credential || delegated?.verdict === "ask" || (local.action === "ask" || requested.action === "ask") && delegated?.verdict !== "allow")) {
+    if (!approved && (credential || orderedAsk || delegated?.verdict === "ask" || automatic?.verdict === "ask"
+      || (local.action === "ask" || requested.action === "ask") && delegated?.verdict !== "allow" && automatic?.verdict !== "allow")) {
       const summaryInput = ["write", "edit"].includes(call.name) ? { path: call.args.path } : call.args;
       const summary = credential ? "This operation may expose task credentials to the shared Provider's computer. Confirm it on this task's computer.\n" + redactSecrets(JSON.stringify(summaryInput)).slice(0, 8192)
         : `Allow ${call.name} on the task's computer?\n${redactSecrets(JSON.stringify(summaryInput)).slice(0, 8192)}`;
@@ -431,6 +452,8 @@ async function readAuthorizedLines(handle: Awaited<ReturnType<typeof open>>, ran
   return { lines: projected, totalLines, sha256: hash.digest("hex") };
 }
 
+function sameInputPath(a: string, b: string): boolean { return process.platform === "win32" ? resolve(a).toLowerCase() === resolve(b).toLowerCase() : resolve(a) === resolve(b); }
+function isWithinInput(root: string, target: string): boolean { const value = relative(root, target); return value === "" || value !== ".." && !value.startsWith("..\\") && !value.startsWith("../") && !isAbsolute(value); }
 function record(value: unknown): Record<string, unknown> { if (!value || typeof value !== "object" || Array.isArray(value)) throw new HostedAgentExecutorError("INVALID_REQUEST"); return value as Record<string, unknown>; }
 function text(value: unknown, maximum: number): string { if (typeof value !== "string" || !value || value.length > maximum || value.includes("\0")) throw new HostedAgentExecutorError("INVALID_REQUEST"); return value; }
 function keys(value: Record<string, unknown>, allowed: readonly string[]): void { if (Object.keys(value).some(key => !allowed.includes(key))) throw new HostedAgentExecutorError("INVALID_REQUEST"); }

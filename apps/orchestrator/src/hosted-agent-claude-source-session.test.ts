@@ -1,7 +1,7 @@
-import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createClient, createRouterTransport } from "@connectrpc/connect";
 import { HostedAgentSourceAdapter } from "@joko/adapter-hosted";
 import { HostedAgentService } from "@joko/contracts";
@@ -22,16 +22,32 @@ import { createHostedAgentClaudeAdapter } from "./hosted-agent-claude-factory.js
 import { CredentialManager, ProviderCatalogManager } from "./credential-manager.js";
 import { CredentialVault } from "./credential-vault.js";
 import { SessionHost } from "./session-host.js";
+import { snapshotSourceInstructions } from "./hosted-agent-source-instructions.js";
+import { CLAUDE_HOSTED_EXECUTOR_SERVER } from "@joko/adapter-claude-code";
+import { McpRouter } from "./mcp-router.js";
+import { HostedAgentSourceMcp } from "./hosted-agent-source-mcp.js";
 
 describe("Claude native Source product Session", () => {
   it("uses the durable product Queue, Source image and MCP, and persisted native history before closing the real SDK", async () => {
     const root = await realpath(await mkdtemp(join(tmpdir(), "joko-claude-source-session-"))), workspace = join(root, "workspace"), nativeRoot = join(root, "model-node");
     await mkdir(workspace); await mkdir(nativeRoot);
+    const personalHome = join(root, "source-home"); await mkdir(join(personalHome, ".claude"), { recursive: true });
+    await writeFile(join(personalHome, ".claude", "CLAUDE.md"), "SOURCE_PERSONAL_GUIDANCE @guide.md");
+    await writeFile(join(personalHome, ".claude", "guide.md"), "SOURCE_PERSONAL_IMPORTED_GUIDANCE");
+    const deniedRead = `mcp__joko_${createHash("sha256").update(CLAUDE_HOSTED_EXECUTOR_SERVER).digest("hex").slice(0, 24)}__Read`;
+    await writeFile(join(personalHome, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: [deniedRead] },
+      hooks: { SessionStart: [{ command: "never-run-source-hook" }] }, env: { ANTHROPIC_API_KEY: "never-transfer-source-key" } }));
+    await writeFile(join(workspace, "denied-note.txt"), "ORIGINAL_DENIED_SOURCE_CONTENT");
     const requests: Record<string, unknown>[] = [], headers: Headers[] = [];
     const selectedModel: ProviderModel = { providerId: "claude-code", modelId: "claude-sonnet-4-6", displayName: "Native model", api: "anthropic-messages",
       contextWindow: 200000, maxOutputTokens: 16384, supportsImages: true, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
     const sourceStore = new OperationalStore(join(root, "source.sqlite")), nativeStore = new OperationalStore(join(root, "native.sqlite")), slots = new HostedAgentSessionSlots();
     const vault = await CredentialVault.open(join(root, "vault.key")), credentials = new CredentialManager({ vault, storagePath: join(root, "credentials.json") }); await credentials.initialize();
+    const sourceRouter = new McpRouter({ store: sourceStore, credentials }); await sourceRouter.initialize(); let sourceMcp: HostedAgentSourceMcp | undefined;
+    sourceRouter.registerBridgeToolProvider({ id: "original_tools", generation: 1, available: true,
+      tools: [{ serverId: "original_tools", name: "owner_echo", description: "Original task owner tool", inputSchema: { type: "object", properties: {} }, requiresPermission: false, requiresNativeRoot: true }],
+      callTool: async (_name, _args, _signal, context) => { context.assertCurrent?.(); context.assertNativeRoot?.(); expect(context.targetId).toBe("original-target");
+        return { content: [{ type: "text", text: "ORIGINAL_CLAUDE_MCP_BYTES" }], isError: false }; } });
     const providers = new ProviderCatalogManager({ store: nativeStore, credentials, nativeBackendId: "native-owner" }); providers.initialize();
     const gate = createCommandConcurrencyGate({ readMaximum: () => 1 });
     const principal = { id: "source-hub", deviceId: "source-device", trust: "owner" as const, assertCurrent: () => undefined };
@@ -54,10 +70,14 @@ describe("Claude native Source product Session", () => {
             expect(String(url).startsWith("https://api.anthropic.com/v1/messages")).toBe(true);
             if (String(url).includes("count_tokens")) return new Response('{"input_tokens":5}', { headers: { "content-type": "application/json" } });
             const body = JSON.parse(Buffer.from(init?.body as Uint8Array).toString("utf8")) as Record<string, unknown>; requests.push(body); headers.push(new Headers(init?.headers));
-            const tools = body.tools as { name: string }[], name = tools.find(tool => tool.name.endsWith("__Write"))?.name;
+            expect(requests.length).toBeLessThanOrEqual(4);
+            const tools = body.tools as { name: string }[], name = tools.find(tool => tool.name.endsWith("__Write"))?.name, mcpName = tools.find(tool => tool.name.endsWith("__owner_echo"))?.name;
             const used = JSON.stringify(body.messages).includes("created successfully");
-            return modelResponse(body, requests.length, !used && name ? [{ type: "tool_use", id: "source-queue-write", name,
-              input: { file_path: join(nativeWorkspace, "queue-proof.txt"), content: "ORIGINAL SOURCE QUEUE" } }] : [{ type: "text", text: "ORIGINAL SOURCE QUEUE" }]);
+            return modelResponse(body, requests.length, requests.length === 1 ? [{ type: "tool_use", id: "source-queue-denied-read", name: deniedRead,
+              input: { file_path: join(nativeWorkspace, "denied-note.txt") } }] : !used && name ? [{ type: "tool_use", id: "source-queue-write", name,
+              input: { file_path: join(nativeWorkspace, "queue-proof.txt"), content: "ORIGINAL SOURCE QUEUE" } }]
+              : mcpName && !JSON.stringify(body.messages).includes("ORIGINAL_CLAUDE_MCP_BYTES") ? [{ type: "tool_use", id: "source-original-mcp", name: mcpName, input: {} }]
+              : [{ type: "text", text: "ORIGINAL SOURCE QUEUE" }]);
           }) as typeof fetch });
         const create = adapter.createSession.bind(adapter);
         adapter.createSession = async (input, context) => { try { return await create(input, context); } catch (error) { nativeFailures.push(error); throw error; } };
@@ -74,7 +94,7 @@ describe("Claude native Source product Session", () => {
       createHostedAgentConnectService({ host: nativeHost, authenticate: () => principal })))), principal.assertCurrent);
     const poller = new HostedAgentPoller(client), sourceId = "source-native-claude";
     const capabilities: Capability[] = ["session.resume", "session.detach", "turn.stream", "turn.abort", "turn.follow_up", "input.text", "input.image", "model.list", "model.switch",
-      "permission.change", "context.usage", "runtime.tools"].map(key => ({ key, supported: true }));
+      "permission.change", "context.usage", "runtime.tools", "tool.mcp"].map(key => ({ key, supported: true }));
     capabilities.push({ key: "permission.modes", supported: true, options: ["ask", "bypassPermissions"] });
     const descriptor: BackendDescriptor = { id: sourceId, adapterKind: "hosted", instanceGeneration: 1, displayName: "Claude on paired device", version: "0.3.280",
       installationState: "installed", health: "healthy", authenticationState: "authenticated", capabilities: new Map(capabilities.map(capability => [capability.key, capability])),
@@ -82,9 +102,13 @@ describe("Claude native Source product Session", () => {
     const assertContext = (context: AdapterContext) => { if (context.target.id !== "original-target" || context.target.workspaceRoot !== workspace) throw new Error("Wrong task Source."); };
     let sourceArtifacts: ArtifactStore;
     const adapter = new HostedAgentSourceAdapter({ id: sourceId, source: { controllerDeviceId: principal.deviceId, targetDeviceId: "model-node", backendId: "claude-code" },
-      describe: () => descriptor, assertContext, workspace: () => ({ platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false }),
+      describe: () => descriptor, assertContext, releaseWorkspace: async () => { await sourceMcp?.close(); }, workspace: async context => {
+        sourceMcp = new HostedAgentSourceMcp({ store: sourceStore, router: sourceRouter, context, assertCurrent: () => assertContext(context), includeToolPolicy: () => true });
+        return { platform: process.platform as "win32" | "darwin" | "linux", shell: "bash", isGitRepository: false, mcpEnabled: true,
+          contextFiles: await snapshotSourceInstructions(context, { nativeKind: "claude-agent-sdk-stdio", home: personalHome, environment: {}, files: [], assertCurrent: () => assertContext(context) }) }; },
       readPolicy: () => ({ permissionMode: "bypassPermissions", fastMode: false }), capture: async runId => { nativeRunId = runId; return { client, assertCurrent: principal.assertCurrent,
         close: () => client.close(runId, new AbortController().signal), createController: input => createHostedAgentSourceController({ ...input, poller,
+          mcp: sourceMcp!,
           temporaryRoot: join(root, "incoming"), assertCurrent: principal.assertCurrent, assertContext, commandConcurrencyGate: gate,
           readBlob: async blob => (await sourceArtifacts.readBlob(blob)).data,
           readPolicy: () => ({ revision: "source-policy", permissionMode: "bypassPermissions", planMode: false, approvedRoots: [], confirmCredentials: true }) }) }; } });
@@ -114,8 +138,13 @@ describe("Claude native Source product Session", () => {
       expect({ state: queued.state, error: queued.error, errors: sourceStore.listEvents({ sessionId, limit: 1000 }).filter(event => event.payload.type === "error").map(event => event.payload),
         nativeFailures: nativeFailures.map(error => error instanceof Error ? { ...error, message: error.message } : error) })
         .toEqual({ state: "completed", error: undefined, errors: [], nativeFailures: [] });
-      expect(requests).toHaveLength(2); expect(headers.every(header => header.get("authorization") === "Bearer " + token)).toBe(true);
+      expect(requests).toHaveLength(4); expect(JSON.stringify(requests[3]!.messages)).toContain("ORIGINAL_CLAUDE_MCP_BYTES");
+      expect(headers.every(header => header.get("authorization") === "Bearer " + token)).toBe(true);
       expect(JSON.stringify(requests[0])).toContain(imageBytes.toString("base64"));
+      expect(JSON.stringify(requests[0])).toContain("SOURCE_PERSONAL_GUIDANCE");
+      expect(JSON.stringify(requests[0])).toContain("SOURCE_PERSONAL_IMPORTED_GUIDANCE");
+      expect(JSON.stringify(requests[1]!.messages).includes('"is_error":true')).toBe(true);
+      expect(/ORIGINAL_DENIED_SOURCE_CONTENT|never-run-source-hook|never-transfer-source-key/u.test(JSON.stringify(requests))).toBe(false);
       expect(await readFile(join(workspace, "queue-proof.txt"), "utf8")).toBe("ORIGINAL SOURCE QUEUE");
       await expect(readFile(join(nativeWorkspace, "queue-proof.txt"))).rejects.toMatchObject({ code: "ENOENT" });
       const events = sourceStore.listEvents({ sessionId, limit: 1000 });
@@ -127,7 +156,7 @@ describe("Claude native Source product Session", () => {
         .toContain(dispatchFingerprint);
       await host.dispose(); host = undefined; expect(slots.summary().total).toBe(0);
     } finally {
-      await host?.dispose(); await adapter.dispose(); await poller.close(); await nativeHost.dispose(); gate.close(); sourceStore.close(); nativeStore.close();
+      await host?.dispose(); await adapter.dispose(); await poller.close(); await nativeHost.dispose(); await sourceMcp?.close(); await sourceRouter.dispose(); gate.close(); sourceStore.close(); nativeStore.close();
       if (!resolve(root).startsWith(resolve(tmpdir()) + sep)) throw new Error("Unsafe native Source cleanup.");
       await rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 });
     }

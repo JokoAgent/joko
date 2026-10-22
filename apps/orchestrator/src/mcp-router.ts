@@ -1137,6 +1137,7 @@ export class McpRouter {
     readonly nativeRootProof?: string;
     /** In-process only. This is never accepted from a native HTTP request. */
     readonly appCall?: AppModelInvocation;
+    readonly assertCallerCurrent?: () => void;
   }): Promise<McpBridgeCallResult> {
     this.#assertInitialized();
     input = { ...input, arguments: structuredClone(input.arguments ?? {}) };
@@ -1180,7 +1181,9 @@ export class McpRouter {
     if (input.appCall && (!modelChannel || modelChannel.grant !== grant || modelChannel.runtime.serverId !== input.serverId
       || input.appCall.params.name !== input.toolName || operationBodyHash(input.appCall.params.arguments ?? {}) !== operationBodyHash(input.arguments ?? {}))) throw new Error("MCP model call escaped its original channel.");
     modelChannel?.assertCurrent();
-    const assertDelegated = await this.#nativeToolAdmission?.(input.sessionId, input.serverId, input.toolName, input.arguments ?? {}, input.signal ?? new AbortController().signal);
+    input.assertCallerCurrent?.();
+    const assertAdmission = await this.#nativeToolAdmission?.(input.sessionId, input.serverId, input.toolName, input.arguments ?? {}, input.signal ?? new AbortController().signal);
+    const assertDelegated = () => { input.assertCallerCurrent?.(); assertAdmission?.(); };
     assertDelegated?.();
     let appCapture: McpAppCapture | undefined;
     let modelTask: CreateTaskResult | undefined;

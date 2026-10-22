@@ -14,7 +14,7 @@ export interface SourceProjectFilesOptions {
 const INSTRUCTIONS = ["CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md", "AGENTS.md", "AGENTS.override.md"] as const;
 const SETTINGS = [".claude/settings.json", ".claude/settings.local.json"] as const;
 const DIRECTORIES = [".claude/skills", ".claude/agents", ".claude/commands", ".claude/rules", ".agents/skills", ".codex/skills", ".pi/skills", ".pi/prompts"] as const;
-const MAX_FILES = 128, MAX_FILE_BYTES = 512 * 1024, MAX_TOTAL_BYTES = 4 * 1024 * 1024;
+const MAX_FILES = 512, MAX_FILE_BYTES = 512 * 1024, MAX_TOTAL_BYTES = 4 * 1024 * 1024;
 const MAX_CONTEXT_JSON_BYTES = 6 * 1024 * 1024, VIRTUAL_PATH_RESERVE_BYTES = 128 * 1024;
 const MAX_DEPTH = 6, MAX_CANDIDATES = 4096;
 const MANIFEST = ".joko-project-snapshot.json", MAX_MANIFEST_BYTES = 1024 * 1024;
@@ -47,7 +47,7 @@ export async function snapshotSourceProjectFiles(context: AdapterContext, option
       if (!data) return;
       let content = decodeText(data);
       if (content === undefined) return;
-      if (settings) { const sanitized = sanitizeSettings(content); if (sanitized === undefined) return; content = sanitized; }
+      if (settings) { const sanitized = sanitizeHostedPermissionSettings(content); if (sanitized === undefined) return; content = sanitized; }
       if (hasCredentials(content)) return;
       // Budget the largest Host-safe import form. Keeping an approved relative
       // import active can only reduce this size; no candidate is truncated.
@@ -120,7 +120,7 @@ async function materialize(root: string, files: readonly HostedProjectFile[], gu
       || typeof file.content !== "string" || file.content.includes("\0") || hasCredentials(file.content)) throw new Error("Hosted project snapshot is invalid.");
     const size = Buffer.byteLength(file.content); bytes += size;
     if (size > MAX_FILE_BYTES || bytes > MAX_TOTAL_BYTES || unique.has(key(file.path))) throw new Error("Hosted project snapshots exceed their limit."); unique.add(key(file.path));
-    if (SETTINGS.includes(file.path as typeof SETTINGS[number]) && sanitizeSettings(file.content) !== file.content) throw new Error("Hosted project settings are not sanitized.");
+    if (SETTINGS.includes(file.path as typeof SETTINGS[number]) && sanitizeHostedPermissionSettings(file.content, 1024) !== file.content) throw new Error("Hosted project settings are not sanitized.");
   }
   const prepared = files.map(file => ({ path: file.path, content: instructionContent(file.content, file.path, unique) }));
   if (prepared.some(file => Buffer.byteLength(file.content) > MAX_FILE_BYTES) || prepared.reduce((sum, file) => sum + Buffer.byteLength(file.content), 0) > MAX_TOTAL_BYTES) throw new Error("Hosted project snapshots exceed their limit.");
@@ -253,26 +253,34 @@ function allowedPath(value: string): boolean {
   if (INSTRUCTIONS.includes(value as typeof INSTRUCTIONS[number]) || SETTINGS.includes(value as typeof SETTINGS[number])) return true;
   return DIRECTORIES.some(directory => value.startsWith(`${directory}/`) && value.slice(directory.length + 1).split("/").length <= MAX_DEPTH + 1);
 }
-function sanitizeSettings(content: string): string | undefined {
+/** Only native permission strings may leave the Source settings file. */
+export function sanitizeHostedPermissionSettings(content: string, maximumRules = 512): string | undefined {
   let value: unknown; try { value = JSON.parse(content); } catch { return undefined; }
   const permissions = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).permissions : undefined;
   if (!permissions || typeof permissions !== "object" || Array.isArray(permissions)) return undefined;
   const kept: Record<string, string[]> = {};
   for (const name of ["allow", "deny", "ask"]) {
     const rules = (permissions as Record<string, unknown>)[name];
-    if (Array.isArray(rules)) kept[name] = rules.filter((rule): rule is string => typeof rule === "string" && !!rule && rule.length <= 4096).slice(0, 512);
+    if (Array.isArray(rules)) kept[name] = rules.filter((rule): rule is string => typeof rule === "string" && !!rule && rule.length <= 4096).slice(0, maximumRules);
   }
   return Object.values(kept).some(rules => rules.length) ? JSON.stringify({ permissions: kept }, null, 2) : undefined;
 }
 function protectImports(text: string, file: string, approved: ReadonlySet<string>): string {
+  return mapSourceInstructionImports(text, candidate => {
+    const relative = path.posix.normalize(path.posix.join(path.posix.dirname(file), candidate.replaceAll("\\", "/")));
+    return !/^(?:[~\/]|[A-Za-z]:)/u.test(candidate) && allowedPath(relative) && approved.has(key(relative)) ? `@${candidate}` : `\`@${candidate}\``;
+  });
+}
+/** Claude-style imports outside fenced and inline code, shared by collection
+ * and materialization so the same token cannot gain a new meaning on Host. */
+export function mapSourceInstructionImports(text: string, replace: (candidate: string) => string): string {
   let fence: string | undefined;
   return text.split(/(\r?\n)/u).map(line => {
     const marker = /^\s*(```|~~~)/u.exec(line)?.[1];
     if (fence) { if (marker === fence) fence = undefined; return line; }
     if (marker) { fence = marker; return line; }
     return line.split(/(`+[^`]*`+)/u).map((part, index) => index % 2 ? part : part.replace(/(^|[\s(])@([^\s`'"()<>[\]{}]+)/gu, (whole, prefix: string, candidate: string) => {
-      const relative = path.posix.normalize(path.posix.join(path.posix.dirname(file), candidate.replaceAll("\\", "/")));
-      return !/^(?:[~\/]|[A-Za-z]:)/u.test(candidate) && allowedPath(relative) && approved.has(key(relative)) ? whole : `${prefix}\`@${candidate}\``;
+      return `${prefix}${replace(candidate)}`;
     })).join("");
   }).join("");
 }
