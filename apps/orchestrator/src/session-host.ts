@@ -13011,6 +13011,32 @@ export class SessionHost {
           const artifactReferenceSnapshots = this.artifactReferencesForDispatch(sessionId, item.body);
           this.assertQueueProviderAuthentication(item, stored);
           let baseContext = await this.beginTurnOverrideLease(item, active, stored);
+          if (!reviewReadOnly && run.descriptor.source === "user" && run.descriptor.parentRunId === undefined
+            && target.remoteWorkspace === undefined && item.body.disposition === "prompt"
+            && item.body.automaticContinuation === undefined && item.body.objectiveContinuation === undefined) {
+            const admittedGeneration = stored.descriptor.binding.generation;
+            baseContext = { ...baseContext, rejectedRequestRecovery: { assertCurrent: () => {
+              const current = this.#store.getQueueItem(item.id);
+              const currentSession = this.#store.getSession(sessionId);
+              const currentRun = this.#store.getRun(item.runId).descriptor;
+              const attempt = attemptId === undefined ? undefined : this.#store.getAttempt(attemptId).descriptor;
+              this.assertSessionNotPendingScheduleDeletion(sessionId);
+              this.assertPartnerPolicyReady(sessionId, partnerPolicy);
+              this.assertQueueProviderAuthentication(current, currentSession);
+              if (this.#disposed || this.#active.get(sessionId) !== active
+                || (this.#backgroundTasks.get(sessionId)?.size ?? 0) > 0 || this.#userShells.has(sessionId)
+                || currentSession.descriptor.binding.generation !== admittedGeneration
+                || current.backendInstanceGeneration !== active.backendInstanceGeneration
+                || this.#store.getBackend(target.backendId).descriptor.instanceGeneration !== active.backendInstanceGeneration
+                || !["dispatching", "backend_accepted"].includes(current.state)
+                || current.attemptId !== attemptId || current.runId !== item.runId
+                || attempt?.runId !== item.runId || attempt.generation !== admittedGeneration
+                || attempt.backendInstanceGeneration !== active.backendInstanceGeneration || attempt.endedAt !== undefined
+                || currentRun.activeAttemptId !== attemptId || !["queued", "running", "waiting", "retrying"].includes(currentRun.state)) {
+                throw new StoreError("The originating user request no longer owns optional-field recovery.");
+              }
+            } } };
+          }
           const appGuard = this.#applicationQueueGuards.get(item.id);
           if (appGuard !== undefined) {
             const revoked = new AbortController();

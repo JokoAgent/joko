@@ -700,6 +700,7 @@ function prepareChildHome() {
   const credentialValues = [];
   try {
     copyManagedFile(parentHome, childHome, "models.json", 16 * 1024 * 1024, true, credentialValues);
+    copyManagedFile(parentHome, childHome, "request-option-compatibility.json", 256 * 1024, false, credentialValues);
     writeFileSync(
       join(childHome, "settings.json"),
       JSON.stringify({ defaultProjectTrust: "never", checkForUpdates: false }, null, 2) + "\n",
@@ -1239,6 +1240,7 @@ async function launchReservedDurableJob(pi, job, message, resumeSessionPath, onU
   try {
     copyPrivateSnapshot(join(parentHome, "models.json"), join(childHome, "models.json"), 16 * 1024 * 1024, true);
     copyPrivateSnapshot(join(parentHome, "settings.json"), join(childHome, "settings.json"), 4 * 1024 * 1024, true);
+    copyPrivateSnapshot(join(parentHome, "request-option-compatibility.json"), join(childHome, "request-option-compatibility.json"), 256 * 1024, false);
     const bridgePath = join(runtimeDirectory, basename(paths.bridge));
     const subagentPath = join(runtimeDirectory, basename(paths.subagent));
     const retryPath = join(runtimeDirectory, basename(paths.silentEncryptedRetry));

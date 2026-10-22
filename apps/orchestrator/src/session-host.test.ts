@@ -233,6 +233,30 @@ afterEach(async () => {
 });
 
 describe("SessionHost", () => {
+  it.each(["user", "system", "schedule"] as const)("grants rejected-request replay only to a live user-owned dispatch (%s)", async source => {
+    class RecoveryCaptureAdapter extends FakeBackendAdapter {
+      captured?: AdapterContext;
+      override async send(_input: PromptInput, context: AdapterContext): Promise<void> { this.captured = context; }
+    }
+    const adapter = new RecoveryCaptureAdapter(PI_LIKE_PROFILE);
+    const f = await createFixture(adapter);
+    const { sessionId } = (await f.host.createSession({ operationId: `recovery-${source}-create`, connection: f.connection,
+      targetId: "target-one", title: "Recovery authority", fastMode: false, permissionMode: "ask", planMode: false })).value;
+    const prompt: PromptInput = { text: "Keep the original dispatch.", images: [], files: [], mentions: [], disposition: "prompt" };
+    const result = source === "user" ? f.host.enqueueInput({ operationId: `recovery-${source}-input`, connection: f.connection, sessionId, prompt })
+      : f.host.enqueueServiceInput({ operationId: `recovery-${source}-input`, sessionId, source, prompt });
+    await eventually(() => adapter.captured !== undefined && f.store.getQueueItem(result.value.queueItemId).state === "backend_accepted");
+    const authority = adapter.captured!.rejectedRequestRecovery;
+    if (source === "user") {
+      expect(authority).toBeDefined();
+      expect(() => authority!.assertCurrent()).not.toThrow();
+    } else expect(authority).toBeUndefined();
+    await f.host.abort(sessionId, result.value.runId);
+    await eventually(() => f.store.getRun(result.value.runId).descriptor.state === "aborted");
+    if (authority) expect(() => authority.assertCurrent()).toThrow("no longer owns");
+    expect(JSON.stringify(f.store.listEvents({ sessionId }), (_key, value) => typeof value === "bigint" ? value.toString() : value)).not.toContain("rejectedRequestRecovery");
+  });
+
   it("captures the tool's effective checkout and retires it when its exact worktree lease is lost", async () => {
     let f!: Awaited<ReturnType<typeof createFixture>>, active = true;
     const worktrees = {

@@ -1078,6 +1078,7 @@ describe("PiBackendAdapter", () => {
       expect(includeManagedSubagentTools).toHaveBeenCalledTimes(1);
       expect(valuesForArgument(specs[0]!.args, "--extension").map((path) => path.split(/[\\/]/u).at(-1))).toEqual([
         "joko-managed-silent-encrypted-retry.ts",
+        "joko-managed-request-option-recovery.ts",
         "joko-managed-bridge.ts"
       ]);
       expect(specs[0]!.env).not.toHaveProperty("JOKO_PI_SUBAGENT_CREDENTIAL_ENV_NAMES");
@@ -2290,6 +2291,7 @@ describe("PiBackendAdapter", () => {
     expect(specs[0]?.args).toEqual(expect.arrayContaining(["--mode", "rpc", "--no-approve", "--no-extensions", "--no-skills"]));
     expect(valuesForArgument(specs[0]!.args, "--extension").map((path) => path.split(/[\\/]/u).at(-1))).toEqual([
       "joko-managed-silent-encrypted-retry.ts",
+      "joko-managed-request-option-recovery.ts",
       "joko-managed-subagent.ts",
       "joko-managed-bridge.ts"
     ]);
@@ -6510,7 +6512,7 @@ describe("PiBackendAdapter", () => {
       type: "switch_session",
       sessionPath: binding.opaqueRef
     }));
-    expect(valuesForArgument(specs[1]!.args, "--extension")).toHaveLength(4);
+    expect(valuesForArgument(specs[1]!.args, "--extension")).toHaveLength(5);
     expect(specs[1]?.env.JOKO_PI_MCP_TOKEN).toBe("bridge-two");
 
     await adapter.updateManagedGeneration({
@@ -6551,7 +6553,7 @@ describe("PiBackendAdapter", () => {
     expect(specs[2]?.env.PI_CODING_AGENT_SESSION_DIR).toBe(join(sessionRoot, "sessions"));
     expect(specs[2]?.env.JOKO_GENERATION_MARKER).toBe("two");
     expect(specs[2]?.args).toEqual(expect.arrayContaining(["--no-prompt-templates", "--offline", "--skill", "--prompt-template"]));
-    expect(valuesForArgument(specs[2]!.args, "--extension")).toHaveLength(4);
+    expect(valuesForArgument(specs[2]!.args, "--extension")).toHaveLength(5);
     expect(valuesForArgument(specs[2]!.args, "--extension").at(-1)?.split(/[\\/]/u).at(-1)).toBe("joko-managed-bridge.ts");
     await expect(adapter.getRuntimeTools(nextContext)).rejects.toMatchObject({
       publicError: { code: "PI_RUNTIME_TOOL_CATALOG_UNAVAILABLE" }

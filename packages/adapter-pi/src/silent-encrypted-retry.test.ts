@@ -126,6 +126,7 @@ describe("silent encrypted-content recovery", () => {
         return new Response("ok", { status: 200 });
       };
       const module = await import(`${pathToFileURL(extensionPath).href}?test=${Date.now()}`) as ManagedExtensionModule;
+      installForProvider(module);
       const hooks = installForProvider(module);
 
       const requestBody = JSON.stringify({
