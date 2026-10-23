@@ -26,7 +26,7 @@ export function ProviderGroupSettings({ api, nodeName, providers, t }: ProviderG
   return <section className="provider-group-settings" aria-labelledby="provider-group-settings-title">
     <div className="settings-section-heading"><div className="settings-section-heading__copy"><h3 id="provider-group-settings-title">{t("settings.providerGroups.title")}</h3>
       <p>{t("settings.providerGroups.body", { name: nodeName })}</p></div></div>
-    <label className="setting-row"><strong>{t("settings.providerGroups.provider")}</strong><select value={available} onChange={event => setSelected(event.target.value)}>
+    <label className="setting-row"><span className="setting-row__copy"><strong>{t("settings.providerGroups.provider")}</strong></span><select value={available} onChange={event => setSelected(event.target.value)}>
       {providers.map(provider => <option key={keyOf(provider)} value={keyOf(provider)}>{provider.displayName}</option>)}
     </select></label>
     {provider && <GroupPanel key={available} api={api} provider={provider} t={t} />}
@@ -74,11 +74,11 @@ function GroupPanel({ api, provider, t }: { readonly api: ProviderGroupSettingsA
     {feedback && <p role={feedback === "saved" ? "status" : "alert"}>{t(`settings.providerGroups.${feedback}`)}</p>}
     {busy && !draft && <p role="status">{t("settings.providerGroups.loading")}</p>}
     {draft && <div className="settings-card">
-      <label className="setting-row"><strong>{t("settings.providerGroups.strategy")}</strong><select value={draft.strategy} disabled={busy} onChange={event => change({ ...draft, strategy: Number(event.target.value) })}>
+      <label className="setting-row"><span className="setting-row__copy"><strong>{t("settings.providerGroups.strategy")}</strong></span><select value={draft.strategy} disabled={busy} onChange={event => change({ ...draft, strategy: Number(event.target.value) })}>
         <option value={contract.ProviderGroupStrategy.LEAST_BUSY}>{t("settings.providerGroups.leastBusy")}</option><option value={contract.ProviderGroupStrategy.ROUND_ROBIN}>{t("settings.providerGroups.roundRobin")}</option>
         <option value={contract.ProviderGroupStrategy.ORDERED}>{t("settings.providerGroups.ordered")}</option><option value={contract.ProviderGroupStrategy.WEIGHTED}>{t("settings.providerGroups.weighted")}</option>
       </select></label>
-      <div className="setting-row provider-group-settings__toggle"><strong>{t("settings.providerGroups.autoSwitch")}</strong><SwitchControl checked={draft.autoSwitch} disabled={busy} aria-label={t("settings.providerGroups.autoSwitch")}
+      <div className="setting-row provider-group-settings__toggle"><div><strong>{t("settings.providerGroups.autoSwitch")}</strong></div><SwitchControl checked={draft.autoSwitch} disabled={busy} aria-label={t("settings.providerGroups.autoSwitch")}
         onChange={event => change({ ...draft, autoSwitch: event.target.checked })} /></div>
       <h4>{t("settings.providerGroups.members")}</h4>
       {!rows.length && <p>{t("settings.providerGroups.noCandidates")}</p>}
@@ -97,8 +97,10 @@ function GroupPanel({ api, provider, t }: { readonly api: ProviderGroupSettingsA
               aria-invalid={!parseInteger(selected.weight, 100)} onChange={event => setMember({ weight: event.target.value })} /></label>
             <label>{t("settings.providerGroups.paused")}<SwitchControl checked={selected.value.paused} disabled={busy} aria-label={`${t("settings.providerGroups.paused")} ${member.displayName}`}
               onChange={event => setMember({ value: create(contract.ProviderGroupMemberSchema, { ...selected.value, paused: event.target.checked }) })} /></label>
-            <Button disabled={busy || index === 0} onClick={() => move(-1)} aria-label={t("settings.providerGroups.moveUp", { name: member.displayName })}>↑</Button>
-            <Button disabled={busy || index === draft.members.length - 1} onClick={() => move(1)} aria-label={t("settings.providerGroups.moveDown", { name: member.displayName })}>↓</Button>
+            <div className="provider-group-settings__reorder">
+              <Button disabled={busy || index === 0} onClick={() => move(-1)} aria-label={t("settings.providerGroups.moveUp", { name: member.displayName })}>↑</Button>
+              <Button disabled={busy || index === draft.members.length - 1} onClick={() => move(1)} aria-label={t("settings.providerGroups.moveDown", { name: member.displayName })}>↓</Button>
+            </div>
             {member.kind === contract.ProviderGroupMemberKind.LOCAL && <p className="muted">{t("settings.providerGroups.localPause")}</p>}
           </div>}
         </div>;
@@ -126,7 +128,7 @@ function UsagePanel({ api, provider, t }: { readonly api: ProviderGroupSettingsA
     estimated: filtered.some(row => row.currencyCode === currency && row.estimated), incomplete: filtered.some(row => row.currencyCode === currency && (!row.tokensComplete || !row.costComplete)) }));
   const filter = (label: "person" | "node" | "model", selected: string, change: (value: string) => void, values: readonly [string, string][]) => <label>{t(`settings.providerGroups.${label}`)}<select value={selected} onChange={event => change(event.target.value)}>
     <option value="">{t("settings.providerGroups.all")}</option>{[...new Map(values).entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}</select></label>;
-  return <div className="settings-card"><h4>{t("settings.providerGroups.usage")}</h4><div className="provider-group-settings__usage-filters">
+  return <div className="settings-card settings-card--content provider-group-settings__usage"><h4>{t("settings.providerGroups.usage")}</h4><div className="provider-group-settings__usage-filters">
     <label>{t("settings.providerGroups.period")}<select value={period} onChange={event => setPeriod(event.target.value as typeof period)}>
       {[["all", "all"], ["30d", "last30Days"], ["7d", "last7Days"], ["today", "today"], ["day", "specificDay"]].map(([value, label]) => <option key={value} value={value}>{t(`settings.providerGroups.${label as ProviderGroupSettingsMessage}`)}</option>)}
     </select></label>{period === "day" && <input type="date" value={date} aria-label={t("settings.providerGroups.specificDay")} onChange={event => setDate(event.target.value)} />}

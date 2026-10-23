@@ -2243,7 +2243,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         placeholder={presentation === "filesRail" ? <div className="interaction-files-rail-placeholder" role="status">{t("interaction.waitForReply")}</div> : undefined}
       >
         {guest && interaction !== undefined && !["permission", "question", "plan"].includes(interaction.kind)
-          ? <div role="status" className="settings-card">{t("taskSharing.waitingHost")}</div>
+          ? <div role="status" className="settings-card settings-card--content">{t("taskSharing.waitingHost")}</div>
           : <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />}
       </InteractionPromptHost>
       {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionId={session.id} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.effectiveLocale} t={t} getTimelineRoot={getTimelineRoot} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}

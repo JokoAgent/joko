@@ -30,7 +30,7 @@ export function WallpaperSection({ t }: { readonly t: (key: MessageKey, values?:
     restoreSelectionFocus.current = true;
     choose(mode);
   };
-  return <section className="settings-card wallpaper-settings" aria-label={t("settings.wallpaper.title")} aria-busy={state.loading || state.busy}>
+  return <section className="settings-card settings-card--content wallpaper-settings" aria-label={t("settings.wallpaper.title")} aria-busy={state.loading || state.busy}>
     <div className="wallpaper-settings__heading">
       <div><strong>{t("settings.wallpaper.title")}</strong><p className="muted">{t("settings.wallpaper.body")}</p></div>
       <Button disabled={disabled || (settings?.mode === "none" && settings.maskOpacity === 0.2)} onClick={() => void reset()}><RotateCcw aria-hidden="true" />{t("settings.wallpaper.reset")}</Button>

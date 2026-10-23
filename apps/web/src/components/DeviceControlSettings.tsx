@@ -254,8 +254,8 @@ function DeviceNameEditor({ device, controller, ownerId, drafts, t }: {
             if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); perform("rename"); }
             if (event.key === "Escape") { event.preventDefault(); discardDraft(); }
           }} />
-        <small>{t(projected.manualDisplayName === undefined ? "settings.deviceControl.defaultName" : "settings.deviceControl.manualName", { name: projected.defaultDisplayName })}</small>
       </label>
+      <small>{t(projected.manualDisplayName === undefined ? "settings.deviceControl.defaultName" : "settings.deviceControl.manualName", { name: projected.defaultDisplayName })}</small>
       <div className="device-control-name-actions">
         <Button disabled={pending || uncertain || device.revoked || !canSave} onClick={() => perform("rename")}>{t("common.save")}</Button>
         <Button disabled={pending || uncertain || device.revoked || projected.manualDisplayName === undefined} onClick={() => perform("reset")}>{t("settings.deviceControl.resetName")}</Button>

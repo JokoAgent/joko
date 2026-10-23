@@ -1,4 +1,5 @@
 .provider-group-settings { min-width: 0; margin-block: var(--settings-section-gap); }
+.provider-group-settings :is(select, input:not([type="checkbox"])) { min-width: 0; max-width: 100%; min-height: var(--settings-control-height); border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px; background: var(--surface); color: var(--text); font-size: var(--text-12); }
 .provider-group-settings .setting-row > select { width: min(var(--settings-control-width), 100%); min-height: var(--settings-control-height); }
 .provider-group-settings__toggle { flex-direction: row; align-items: center; }
 .provider-group-settings__member { padding-block: var(--settings-card-padding); border-block-start: 1px solid var(--line); }
@@ -8,8 +9,11 @@
 .provider-group-settings__fields > label, .provider-group-settings__usage-filters > label { display: flex; flex-direction: column; min-width: 0; gap: var(--settings-row-gap); }
 .provider-group-settings__fields input { width: 6rem; min-height: var(--settings-control-height); }
 .provider-group-settings__fields p { flex-basis: 100%; margin: 0; font-size: var(--text-12); }
+.provider-group-settings__reorder { display: flex; gap: var(--settings-row-gap); }
 .provider-group-settings__actions { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: var(--settings-row-gap); padding-block: var(--settings-card-padding); }
+.provider-group-settings__usage { display: grid; gap: var(--settings-row-gap); }
+.provider-group-settings__usage > :is(h4, p), .provider-group-settings__usage-filters { margin: 0; }
 .provider-group-settings__usage-table { overflow-x: auto; }
 .provider-group-settings__usage-table table { width: 100%; text-align: start; border-collapse: collapse; }
 .provider-group-settings__usage-table th, .provider-group-settings__usage-table td { padding: var(--settings-row-gap); text-align: start; }
-@media (max-width: 760px) { .provider-group-settings .setting-row > select { width: 100%; } .provider-group-settings__actions > .button { flex: 1; } .provider-group-settings__usage-filters > label { flex: 1 1 8rem; } }
+@media (max-width: 760px) { .provider-group-settings .setting-row > select { width: 100%; } .provider-group-settings__usage-filters > label { flex: 1 1 8rem; } }

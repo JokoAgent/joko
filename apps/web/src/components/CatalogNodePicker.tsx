@@ -56,7 +56,7 @@ export function CatalogNodePicker({ scope, tab, t }: {
 export function CatalogNodeUnavailable({ scope, tab, t }: {
   readonly scope: CatalogNodeSelection; readonly tab: "extensions" | "skills"; readonly t: Translator;
 }): JSX.Element {
-  return <section className="settings-card" aria-busy={scope.selection?.loading === true}>
+  return <section className="settings-card settings-card--content catalog-node-unavailable" aria-busy={scope.selection?.loading === true}>
     <p role={scope.selection?.error ? "alert" : "status"}>{scope.selection?.loading
       ? t("catalog.connecting", { name: scope.profile?.name ?? t("catalog.node") })
       : scope.selection?.error ?? t("catalog.unavailable")}</p>

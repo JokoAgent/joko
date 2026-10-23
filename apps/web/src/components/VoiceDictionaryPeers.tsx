@@ -155,7 +155,7 @@ export function VoiceDictionaryPeers({ api, t, enabled }: { readonly api: VoiceD
   const phaseKey = status && ({ off: "settings.voicePeers.off", waiting: "settings.voicePeers.waiting", syncing: "settings.voicePeers.syncing",
     up_to_date: "settings.voicePeers.upToDate", error: "settings.voicePeers.failed" } as const)[status.phase];
   return <section className="voice-input-setting-stack" aria-label={t("settings.voicePeers.title")}>
-    <div><strong>{t("settings.voicePeers.title")}</strong><p className="muted">{t("settings.voicePeers.hint")}</p></div>
+    <div className="voice-input-setting-copy"><strong>{t("settings.voicePeers.title")}</strong><p className="muted">{t("settings.voicePeers.hint")}</p></div>
     {!status && !error && <p role="status">{t("settings.voicePeers.loading")}</p>}
     {error && <ErrorBanner message={t("settings.voicePeers.failed")} />}
     {status && <>

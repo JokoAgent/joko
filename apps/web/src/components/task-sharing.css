@@ -1,7 +1,14 @@
 .task-sharing-settings { display: grid; gap: 16px; min-width: 0; }
 .task-sharing-settings > .settings-heading { margin-bottom: 0; }
+.task-sharing-settings > .button, .task-sharing-settings form > .button { justify-self: start; }
+.task-sharing-settings .settings-card--content { display: grid; gap: var(--settings-row-gap); }
+.task-sharing-settings .settings-card--content > :is(h3, h4, p) { margin: 0; overflow-wrap: anywhere; }
+.task-sharing-settings .settings-card--content > h3 { font-size: var(--text-13); }
+.task-sharing-settings .settings-card--content > :is(.button, .pill) { justify-self: start; }
+.task-sharing-settings .settings-card--content > .setting-row:last-child { padding-bottom: 0; }
 .task-sharing-settings form { display: grid; gap: 12px; }
 .task-sharing-settings label { display: grid; gap: 6px; }
+.task-sharing-settings :is(input, textarea) { width: 100%; min-width: 0; min-height: var(--settings-control-height); border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px; background: var(--surface); color: var(--text); }
 .task-sharing-settings textarea { min-height: 90px; resize: vertical; width: 100%; }
 .task-sharing-settings [role="tablist"], .task-sharing-settings .settings-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .task-sharing-session { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
