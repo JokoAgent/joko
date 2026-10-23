@@ -51,7 +51,7 @@ describe("Inspector workspace discovery", () => {
       .mockRejectedValueOnce(new Error("root denied"))
       .mockResolvedValueOnce([file("recovered.ts")]);
     const { container } = await mount(<FilesPanel
-      controller={{ listWorkspaceEntries } as unknown as AppController}
+      controller={{ state: { connectionGeneration: 1 }, listWorkspaceEntries } as unknown as AppController}
       workspace={workspace([])}
       sessionId="session-one"
       canWrite={false}
@@ -102,6 +102,7 @@ describe("Inspector workspace discovery", () => {
     });
     const { container } = await mount(<FilesPanel
       controller={{
+        state: { connectionGeneration: 1 },
         listWorkspaceEntries: vi.fn(async () => []),
         searchWorkspacePage
       } as unknown as AppController}

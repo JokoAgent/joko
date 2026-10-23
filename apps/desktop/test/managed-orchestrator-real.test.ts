@@ -7,9 +7,13 @@ import type { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it } from "vitest";
-import { createClient } from "@connectrpc/connect";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { Code, createClient } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-node";
-import { ConnectionService, EntityKind, EventService, OperationService, OperationState, type Device } from "@joko/contracts";
+import { ConnectionService, DesktopHostedAgentService, EntityKind, EventService, GetHostedAgentCatalogRequestSchema,
+  GetHostedAgentCatalogResponseSchema, GetHostedAgentSettingsRequestSchema, GetHostedAgentSettingsResponseSchema, HostedAgentPeerMethod,
+  OperationService, OperationState, type Device } from "@joko/contracts";
+import { createDesktopHostedAgentDelegate } from "../src/hosted-agent-delegate.js";
 
 import {
   probeManagedOrchestratorConnection,
@@ -31,6 +35,30 @@ afterEach(async () => {
 });
 
 describe("real managed Orchestrator child", () => {
+  it("delegates the Desktop route to the actual managed native factories using its private committed proof", async () => {
+    const fixture = createFixture(), runtime = await startRealManagedOrchestrator(fixture), authKey = runtime.takeAuthKey();
+    await runtime.commit();
+    let current = true;
+    const ownerOnly = createClient(DesktopHostedAgentService, createConnectTransport({ baseUrl: runtime.connection.origin, httpVersion: "1.1" }));
+    await expect(ownerOnly.openDesktopHostedAgentDelegate({ format: 1, routeInstanceId: randomUUID() },
+      { headers: { authorization: `Bearer ${authKey}` } })).rejects.toMatchObject({ code: Code.Unauthenticated });
+    const port = await createDesktopHostedAgentDelegate({ connection: runtime.connection,
+      readAuthKey: async () => authKey, readHostKey: async () => runtime.readDesktopHostAuthKey(), isAuthorityCurrent: () => current });
+    try {
+      const signal = new AbortController().signal, authority = { controllerDeviceId: "original-task-device" };
+      const catalog = fromBinary(GetHostedAgentCatalogResponseSchema, await port.invoke(HostedAgentPeerMethod.GET_CATALOG,
+        toBinary(GetHostedAgentCatalogRequestSchema, create(GetHostedAgentCatalogRequestSchema, { format: 1 })), signal, authority));
+      expect(catalog).toMatchObject({ format: 1, remoteControlEnabled: false });
+      expect(catalog.backends.some(backend => backend.backendId === "pi" && backend.capabilities.length > 0)).toBe(true);
+      const settings = fromBinary(GetHostedAgentSettingsResponseSchema, await port.invoke(HostedAgentPeerMethod.GET_SETTINGS,
+        toBinary(GetHostedAgentSettingsRequestSchema, create(GetHostedAgentSettingsRequestSchema)), signal, authority));
+      expect(settings.settings).toMatchObject({ remoteControlEnabled: false, limits: { perDevice: 16, total: 64 }, usage: { total: 0 } });
+      current = false;
+      await port.retire(); await port.retire();
+      await expect(port.invoke(HostedAgentPeerMethod.GET_CATALOG, new Uint8Array(), signal, authority)).rejects.toBeDefined();
+    } finally { await port.retire(); await runtime.stop(); }
+  }, 45_000);
+
   it("survives persistent Desktop release after the durable ACK and then stops explicitly", async (context) => {
     const fixture = createFixture();
     const startedAt = performance.now();

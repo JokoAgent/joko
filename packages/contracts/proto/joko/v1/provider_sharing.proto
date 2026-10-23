@@ -1,0 +1,121 @@
+syntax = "proto3";
+package joko.v1;
+
+import "joko/v1/model.proto";
+import "joko/v1/hosted_agent.proto";
+
+// Owner management uses the ordinary Home Connection. Foreign credentials are
+// accepted only by ProviderSharingGuestService and the scoped native service.
+service ProviderSharingService {
+  rpc ListProviderShares(ListProviderSharesRequest) returns (ListProviderSharesResponse);
+  rpc CreateProviderShareLink(CreateProviderShareLinkRequest) returns (CreateProviderShareLinkResponse);
+  rpc DecideProviderShareRequest(DecideProviderShareRequestRequest) returns (DecideProviderShareRequestResponse);
+  rpc SetProviderShareMember(SetProviderShareMemberRequest) returns (SetProviderShareMemberResponse);
+  rpc DecideProviderReshare(DecideProviderReshareRequest) returns (DecideProviderReshareResponse);
+  rpc PreviewProviderShare(PreviewProviderShareRequest) returns (PreviewProviderShareResponse);
+  rpc ApplyProviderShare(ApplyProviderShareRequest) returns (ApplyProviderShareResponse);
+  rpc RefreshProviderSharing(RefreshProviderSharingRequest) returns (RefreshProviderSharingResponse);
+  rpc WithdrawProviderShare(WithdrawProviderShareRequest) returns (WithdrawProviderShareResponse);
+  rpc LeaveReceivedProviderShare(LeaveReceivedProviderShareRequest) returns (LeaveReceivedProviderShareResponse);
+}
+service ProviderSharingGuestService {
+  rpc InspectProviderShare(InspectProviderShareRequest) returns (InspectProviderShareResponse);
+  rpc SubmitProviderShareRequest(SubmitProviderShareRequestRequest) returns (SubmitProviderShareRequestResponse);
+  rpc GetProviderShareRequest(GetProviderShareRequestRequest) returns (GetProviderShareRequestResponse);
+  rpc WithdrawProviderShareRequest(WithdrawProviderShareRequestRequest) returns (WithdrawProviderShareRequestResponse);
+  rpc ReadProviderShare(ReadProviderShareRequest) returns (ReadProviderShareResponse);
+  rpc LeaveProviderShare(LeaveProviderShareRequest) returns (LeaveProviderShareResponse);
+  rpc GetProviderShareLeaveReceipt(GetProviderShareLeaveReceiptRequest) returns (GetProviderShareLeaveReceiptResponse);
+  rpc SyncProviderReshares(SyncProviderResharesRequest) returns (SyncProviderResharesResponse);
+  rpc CloseProviderShareRun(CloseProviderShareRunRequest) returns (CloseProviderShareRunResponse);
+}
+
+message ProviderSharingPerson { string name = 1; optional string avatar_url = 2; }
+message ProviderSharingMember {
+  string member_id = 1; uint64 generation = 2; ProviderSharingPerson person = 3;
+  string status = 4; uint64 joined_at_ms = 5; string home_server_id = 6;
+}
+message ProviderSharingRequest {
+  string request_id = 1; string share_id = 2; string link_id = 3; ProviderSharingPerson person = 4;
+  string pairing_code = 5; string status = 6; uint64 created_at_ms = 7; uint64 expires_at_ms = 8;
+  optional string member_id = 9;
+}
+message ProviderSharingReshare {
+  string id = 1; string share_id = 2; string member_id = 3; string device_id = 4;
+  string key = 5; ProviderSharingPerson person = 6; string state = 7;
+  uint64 requested_at_ms = 8; optional uint64 decided_at_ms = 9;
+}
+message ProviderSharingOwned {
+  string share_id = 1; uint64 generation = 2; string backend_id = 3; string provider_id = 4;
+  string provider_name = 5; ProviderSharingPerson owner = 6; uint64 revision = 7;
+  repeated ProviderSharingMember members = 8; repeated ProviderSharingRequest requests = 9;
+  repeated ProviderSharingReshare reshares = 10;
+}
+message ProviderSharingPreview {
+  string host_origin = 1; string host_server_id = 2; string share_id = 3; string backend_id = 4;
+  string provider_id = 5; string provider_name = 6; ProviderSharingPerson owner = 7;
+  string state = 8; uint64 expires_at_ms = 9;
+}
+message ProviderSharingReceived {
+  string join_id = 1; string host_origin = 2; string host_server_id = 3; string share_id = 4;
+  string member_id = 5; uint64 generation = 6; string backend_id = 7; string native_backend_id = 8;
+  string provider_id = 9; string provider_name = 10; ProviderSharingPerson owner = 11;
+  string state = 12; repeated ModelDescriptor models = 13;
+}
+message ProviderSharingIntent {
+  string operation_id = 1; string join_id = 2; string status = 3; string error_code = 4;
+  ProviderSharingPreview preview = 5; ProviderSharingRequest request = 6;
+}
+message ListProviderSharesRequest {}
+message ListProviderSharesResponse {
+  repeated ProviderSharingOwned owned = 1; repeated ProviderSharingReceived received = 2;
+  repeated ProviderSharingIntent intents = 3;
+}
+message CreateProviderShareLinkRequest {
+  string operation_id = 1; string backend_id = 2; string provider_id = 3;
+  string provider_name = 4; ProviderSharingPerson owner = 5;
+}
+message CreateProviderShareLinkResponse { string link = 1; string link_id = 2; uint64 expires_at_ms = 3; ProviderSharingOwned share = 4; }
+message DecideProviderShareRequestRequest { string operation_id = 1; string request_id = 2; bool approve = 3; }
+message SetProviderShareMemberRequest { string operation_id = 1; string share_id = 2; string member_id = 3; uint64 generation = 4; string action = 5; }
+message DecideProviderReshareRequest { string operation_id = 1; string id = 2; bool approve = 3; }
+message DecideProviderShareRequestResponse { ProviderSharingOwned share = 1; }
+message SetProviderShareMemberResponse { ProviderSharingOwned share = 1; }
+message DecideProviderReshareResponse { ProviderSharingOwned share = 1; }
+message PreviewProviderShareRequest { string link = 1; }
+message PreviewProviderShareResponse { ProviderSharingPreview preview = 1; }
+message ApplyProviderShareRequest { string operation_id = 1; string link = 2; ProviderSharingPerson person = 3; }
+message ApplyProviderShareResponse { ProviderSharingIntent intent = 1; }
+message RefreshProviderSharingRequest {}
+message RefreshProviderSharingResponse {
+  repeated ProviderSharingOwned owned = 1; repeated ProviderSharingReceived received = 2;
+  repeated ProviderSharingIntent intents = 3;
+}
+message WithdrawProviderShareRequest { string operation_id = 1; string application_id = 2; }
+message WithdrawProviderShareResponse { ProviderSharingIntent intent = 1; }
+message LeaveReceivedProviderShareRequest { string operation_id = 1; string join_id = 2; }
+message LeaveReceivedProviderShareResponse { ProviderSharingReceived received = 1; }
+message InspectProviderShareRequest { string invitation = 1; }
+message InspectProviderShareResponse { ProviderSharingPreview preview = 1; }
+message SubmitProviderShareRequestRequest {
+  string request_id = 1; string invitation = 2; string home_server_id = 3; string device_id = 4;
+  ProviderSharingPerson person = 5; string request_sha256_hex = 6; string credential_sha256_hex = 7;
+}
+message SubmitProviderShareRequestResponse { ProviderSharingRequest request = 1; ProviderSharingMember member = 2; ProviderSharingPreview preview = 3; }
+message GetProviderShareRequestRequest { string request_id = 1; }
+message GetProviderShareRequestResponse { ProviderSharingRequest request = 1; ProviderSharingMember member = 2; ProviderSharingPreview preview = 3; }
+message WithdrawProviderShareRequestRequest { string operation_id = 1; string request_id = 2; }
+message WithdrawProviderShareRequestResponse { ProviderSharingRequest request = 1; ProviderSharingMember member = 2; ProviderSharingPreview preview = 3; }
+message ReadProviderShareRequest { string share_id = 1; }
+message ReadProviderShareResponse { ProviderSharingPreview share = 1; ProviderSharingMember member = 2; GetHostedAgentCatalogResponse catalog = 3; }
+message LeaveProviderShareRequest { string operation_id = 1; string share_id = 2; }
+message LeaveProviderShareResponse { ProviderSharingPreview share = 1; ProviderSharingMember member = 2; GetHostedAgentCatalogResponse catalog = 3; }
+message GetProviderShareLeaveReceiptRequest { string operation_id = 1; string share_id = 2; }
+message GetProviderShareLeaveReceiptResponse { ProviderSharingPreview share = 1; ProviderSharingMember member = 2; GetHostedAgentCatalogResponse catalog = 3; }
+message ProviderSharingReshareEntry { string key = 1; ProviderSharingPerson person = 2; }
+message ProviderSharingReshareBatch { string id = 1; uint32 index = 2; uint32 count = 3; }
+message SyncProviderResharesRequest { repeated ProviderSharingReshareEntry entries = 1; ProviderSharingReshareBatch batch = 2; }
+message ProviderSharingReshareState { string key = 1; string state = 2; }
+message SyncProviderResharesResponse { repeated ProviderSharingReshareState entries = 1; ProviderSharingReshareBatch batch = 2; bool complete = 3; }
+message CloseProviderShareRunRequest { string run_id = 1; }
+message CloseProviderShareRunResponse {}

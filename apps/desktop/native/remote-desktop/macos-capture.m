@@ -50,7 +50,17 @@ static BOOL ownedLoggedInSession(void) {
     && console.boolValue && loginDone.boolValue && locked != nil;
 }
 
-static NSDictionary *readCursor(CGDirectDisplayID display) {
+static CGRect handoffWindowBounds(CGWindowID window) {
+  NSArray *windows = CFBridgingRelease(CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, window));
+  for (NSDictionary *entry in windows) {
+    if ([entry[(__bridge NSString *)kCGWindowNumber] unsignedIntValue] != window) continue;
+    CGRect frame = CGRectZero;
+    if (CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)entry[(__bridge NSString *)kCGWindowBounds], &frame)) return frame;
+  }
+  return CGRectZero;
+}
+
+static NSDictionary *readCursor(CGRect bounds) {
   typedef boolean_t (*CursorVisible)(void);
   CursorVisible visible = (CursorVisible)dlsym(RTLD_DEFAULT, "CGCursorIsVisible");
   if (!visible) return nil;
@@ -68,7 +78,6 @@ static NSDictionary *readCursor(CGDirectDisplayID display) {
   if (!event) return nil;
   CGPoint point = CGEventGetLocation(event);
   CFRelease(event);
-  CGRect bounds = CGDisplayBounds(display);
   if (bounds.size.width <= 0 || bounds.size.height <= 0) return nil;
   NSPoint hot = cursor.hotSpot;
   return @{
@@ -94,6 +103,13 @@ int main(int argc, const char *argv[]) {
     NSString *excluded = (nativeVideo && argc == 8) || (!nativeVideo && argc == 3)
       ? [NSString stringWithUTF8String:argv[argc - 1]] : @"";
     if ((argc == 3 || argc == 8) && excluded.length == 0) return 2;
+    CGWindowID onlyWindow = 0;
+    if ([excluded hasPrefix:@"window:"]) {
+      const char *digits = excluded.UTF8String + 7; char *windowEnd = NULL;
+      unsigned long windowId = strtoul(digits, &windowEnd, 10);
+      if (!nativeVideo || !*digits || *windowEnd || windowId == 0 || windowId > UINT32_MAX) return 2;
+      onlyWindow = (CGWindowID)windowId; excluded = @"";
+    }
     NSArray<NSString *> *excludedIds = excluded.length ? [excluded componentsSeparatedByString:@","] : @[];
     if (excludedIds.count > 256) return 2;
     NSMutableSet<NSNumber *> *validatedIds = [NSMutableSet set];
@@ -140,7 +156,7 @@ int main(int argc, const char *argv[]) {
     const CFStringRef *intervalKey = dlsym(RTLD_DEFAULT,
       "kCGDisplayStreamMinimumFrameTime");
     const CFStringRef *cursorKey = dlsym(RTLD_DEFAULT, "kCGDisplayStreamShowCursor");
-    if (!excluded.length && (!create || !start || !intervalKey || !cursorKey)) return 4;
+    if (!excluded.length && !onlyWindow && (!create || !start || !intervalKey || !cursorKey)) return 4;
 
     CGDirectDisplayID display = (uint32_t)value;
     size_t width = CGDisplayPixelsWide(display), height = CGDisplayPixelsHigh(display);
@@ -184,7 +200,7 @@ int main(int argc, const char *argv[]) {
       if (!separateCursor || cursorReading) return;
       cursorReading = YES;
       dispatch_async(dispatch_get_main_queue(), ^{
-        NSDictionary *value = readCursor(display);
+        NSDictionary *value = readCursor(onlyWindow ? handoffWindowBounds(onlyWindow) : CGDisplayBounds(display));
         dispatch_async(queue, ^{ cursor = value; cursorReading = NO; });
       });
     };
@@ -251,7 +267,43 @@ int main(int argc, const char *argv[]) {
           reply();
         }
       };
-    if (excluded.length) {
+    if (onlyWindow) {
+      double backing = 1;
+      CGDisplayModeRef displayMode = CGDisplayCopyDisplayMode(display);
+      if (displayMode) {
+        backing = MAX(1.0, (double)CGDisplayModeGetPixelHeight(displayMode) / MAX(1.0, (double)CGDisplayPixelsHigh(display)));
+        CGDisplayModeRelease(displayMode);
+      }
+      if (!physicalMaxEdge) backing = 1; // the logical tier stays in points
+      [SCShareableContent getShareableContentExcludingDesktopWindows:YES onScreenWindowsOnly:YES
+        completionHandler:^(SCShareableContent *content, NSError *error) {
+          if (error) _exit(5);
+          SCWindow *selected = nil;
+          for (SCWindow *candidate in content.windows) if (candidate.windowID == onlyWindow) selected = candidate;
+          // A window that is gone or hidden is never replaced by anything else.
+          if (!selected || selected.frame.size.width < 1 || selected.frame.size.height < 1) _exit(5);
+          SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:selected];
+          double windowWidth = selected.frame.size.width * backing, windowHeight = selected.frame.size.height * backing;
+          double fit = MIN(1.0, edgeLimit / MAX(windowWidth, windowHeight));
+          SCStreamConfiguration *config = [SCStreamConfiguration new];
+          config.width = MAX(2, (size_t)(windowWidth * fit) & ~(size_t)1);
+          config.height = MAX(2, (size_t)(windowHeight * fit) & ~(size_t)1);
+          // Fill the frame, so a point in the picture is the same fraction of the window.
+          if ([config respondsToSelector:@selector(setScalesToFit:)]) [config setValue:@YES forKey:@"scalesToFit"];
+          if ([config respondsToSelector:@selector(setPreservesAspectRatio:)]) [config setValue:@NO forKey:@"preservesAspectRatio"];
+          config.minimumFrameInterval = CMTimeMake(1, fps);
+          config.showsCursor = NO;
+          config.pixelFormat = kCVPixelFormatType_32BGRA;
+          config.queueDepth = 3;
+          PrivacyCaptureOutput *output = [PrivacyCaptureOutput new];
+          output.handler = receiveFrame;
+          output.stream = [[SCStream alloc] initWithFilter:filter configuration:config delegate:output];
+          NSError *failure = nil;
+          if (![output.stream addStreamOutput:output type:SCStreamOutputTypeScreen sampleHandlerQueue:queue error:&failure]) _exit(5);
+          CFRetain((__bridge CFTypeRef)output);
+          [output.stream startCaptureWithCompletionHandler:^(NSError *failure) { if (failure) _exit(5); }];
+        }];
+    } else if (excluded.length) {
       // Masks must be explicitly excluded from ScreenCaptureKit. Missing masks
       // or a failed filtered stream never fall back to ordinary capture.
       [SCShareableContent getShareableContentExcludingDesktopWindows:NO onScreenWindowsOnly:NO

@@ -438,7 +438,27 @@ function userMessageBlocks(item: NativeThreadItem): readonly MessageBlock[] {
 }
 
 function nativeUserFingerprint(item: NativeThreadItem): string {
-  return createHash("sha256").update(JSON.stringify({ role: "user", content: item["content"] ?? [] })).digest("hex");
+  const content = item["content"] ?? [];
+  if (!Array.isArray(content)) throw new ProtocolShapeError("native user input content must be an array");
+  return codexNativeDispatchFingerprint(content);
+}
+
+/** The pinned native schema materializes these defaults when persisting input.
+ * Object property order is not part of a native message's identity. */
+export function codexNativeDispatchFingerprint(content: readonly JsonValue[]): string {
+  const normalized = content.map(item => {
+    if (!isJsonObject(item)) return item;
+    if (item["type"] === "text") return { ...item, text_elements: item["text_elements"] === undefined ? [] : item["text_elements"] };
+    if (item["type"] === "image" || item["type"] === "localImage") return { ...item, detail: item["detail"] === undefined ? null : item["detail"] };
+    return item;
+  });
+  return createHash("sha256").update(JSON.stringify(canonicalNativeValue({ role: "user", content: normalized }))).digest("hex");
+}
+function canonicalNativeValue(value: JsonValue): JsonValue {
+  if (Array.isArray(value)) return value.map(canonicalNativeValue);
+  if (isJsonObject(value)) return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([key, entry]) => [key, canonicalNativeValue(entry)]));
+  return value;
 }
 
 function turnStatusProjection(turn: NativeTurn): ItemProjection {

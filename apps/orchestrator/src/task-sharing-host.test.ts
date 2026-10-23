@@ -12,6 +12,7 @@ import { ArtifactStore } from "./artifact-store.js";
 import { OperationalArtifactRepository } from "./artifact-repository.js";
 import { TaskSharingReads } from "./task-sharing-reads.js";
 import type { ConnectServiceDependencies } from "./connect-services.js";
+import { createTaskSharingRuntime } from "./task-sharing-runtime.js";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => { for (const cleanup of cleanups.splice(0).reverse()) cleanup(); });
@@ -50,6 +51,30 @@ it("keeps guest credentials outside ordinary authentication and validates receip
   expect(() => ordinary.authenticate(`Bearer ${member.secret}`)).toThrow();
   expect(() => f.host.getJoinReceipt({ intentId: "join-a", credentialSha256Hex: member.lease.proof.credentialSha256Hex }, other.lease)).toThrow(/another participant/);
   expect(f.store.listConnections()).toHaveLength(0);
+});
+it("does not let a task guest dispatch, resume, approve or switch through an owner remote Agent source", async () => {
+  const f = await fixture(), guest = f.member("a");
+  const local = f.store.getBackend("backend").descriptor;
+  f.store.upsertBackend({ ...local, id: "remote-source", capabilities: new Map([["model.remote_execution", { key: "model.remote_execution", supported: true }]]) });
+  const runtime = createTaskSharingRuntime({ store: f.store, sessionHost: {} } as unknown as ConnectServiceDependencies, {
+    snapshot: f.host.readSnapshot.bind(f.host), read: async () => new Uint8Array(), projectEvent: () => undefined
+  } as unknown as Pick<TaskSharingRuntimePort, "snapshot" | "read" | "projectEvent">);
+  const switchSource = create(contract.SubmitOperationRequestSchema, { operationId: "guest-select-remote", mutation: { payload: {
+    case: "setSessionRuntime", value: { sessionId: "session", backendId: "remote-source", expectedRuntimeGeneration: 1n, providerId: "provider", modelId: "model" }
+  } } });
+  expect(() => runtime.prepareOperation(guest.lease, switchSource)).toThrow(/not available/);
+  f.store.upsertBackend({ ...local, capabilities: new Map([["model.remote_execution", { key: "model.remote_execution", supported: true }]]) });
+  const requests = [
+    create(contract.SubmitOperationRequestSchema, { operationId: "guest-resume", mutation: { payload: { case: "resumeSession", value: { sessionId: "session" } } } }),
+    create(contract.SubmitOperationRequestSchema, { operationId: "guest-prompt", mutation: { payload: { case: "sendInput", value: { sessionId: "session" } } } }),
+    create(contract.SubmitOperationRequestSchema, { operationId: "guest-queue", mutation: { payload: { case: "resumeQueue", value: { sessionId: "session" } } } }),
+    create(contract.SubmitOperationRequestSchema, { operationId: "guest-approve", mutation: { payload: { case: "resolveInteraction", value: { interactionId: "owner-permission", interactionGeneration: 1n } } } })
+  ];
+  for (const request of requests) {
+    expect(() => runtime.prepareOperation(guest.lease, request)).toThrow(/not available/);
+    expect(f.store.findOperation(request.operationId)).toBeUndefined();
+  }
+  expect(f.store.listQueueItems()).toHaveLength(0);
 });
 it("shares only public application history for the exact task", async () => {
   const f = await fixture(), guest = f.member("a");

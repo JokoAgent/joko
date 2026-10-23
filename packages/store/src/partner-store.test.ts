@@ -16,6 +16,23 @@ afterEach(async () => {
 });
 
 describe("PartnerStore", () => {
+  it("defaults private input handoff on, persists its independent false switch and freezes the prior profile across reopen", async () => {
+    const f = await fileStore();
+    let profile = f.store.createPartner({ ...draft("Private input owner"), expectedDirectoryRevision: f.store.directoryState().revision });
+    expect(profile.capabilities.inputHandoff).toBe(true);
+    profile = f.store.updatePartner(profile.id, profile.revision, { capabilities: { ...profile.capabilities, inputHandoff: false } });
+    expect(profile.capabilities.inputHandoff).toBe(false);
+    expect(f.store.listProfileVersions(profile.id).map(version => version.capabilities.inputHandoff)).toEqual([false, true]);
+    f.store.close(); const reopened = new PartnerStore(f.path); cleanups.push(async () => reopened.close());
+    expect(reopened.getPartner(profile.id).capabilities.inputHandoff).toBe(false);
+    reopened.setDirectoryDefaults(reopened.directoryState().revision, { ...capabilities(), inputHandoff: false });
+    const follower = reopened.createPartner({ ...draft("Inherited private input"), usesDirectoryDefaults: true, expectedDirectoryRevision: reopened.directoryState().revision });
+    expect(follower.capabilities.inputHandoff).toBe(false);
+    reopened.setDirectoryDefaults(reopened.directoryState().revision, { ...capabilities(), inputHandoff: true });
+    expect(reopened.getPartner(follower.id).capabilities.inputHandoff).toBe(true);
+    expect(reopened.getPartner(profile.id).capabilities.inputHandoff).toBe(false);
+    expectStoreError(() => reopened.updatePartner(profile.id, reopened.getPartner(profile.id).revision, { capabilities: { ...capabilities(), inputHandoff: "false" as unknown as boolean } }), "PARTNER_INVALID");
+  });
   it("persists three exact permission modes across defaults, inherited profiles, versions, CAS and reopen", async () => {
     const f = await fileStore();
     f.store.setDirectoryDefaults(f.store.directoryState().revision, { ...capabilities(), permissionMode: "bypassPermissions" });
@@ -726,7 +743,8 @@ function capabilities(): PartnerCapabilitiesRecord {
   return {
     modelChain: [route("backend-one", "provider-one", "model-one")],
     permissionMode: "ask",
-    planMode: false
+    planMode: false,
+    inputHandoff: true
   };
 }
 

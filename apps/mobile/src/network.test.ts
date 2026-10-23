@@ -494,8 +494,8 @@ describe("mobile Partner creation network", () => {
       const draft = { ...mobilePartnerCreationDraft(creationSnapshot)!, displayName: "Nova", avatar: { base64: "/9j/2w==" } };
       await expect(mobileNetwork.createPartner!(credential, requestId, 4n, draft)).resolves.toMatchObject({ kind: "found", partner: { partnerId: "partner-a" } });
       expect(drafts[0]?.draft?.capabilities).toBeUndefined();
-      await mobileNetwork.createPartner!(credential, requestId, 4n, { ...draft, usesDirectoryDefaults: false });
-      expect(drafts[1]?.draft?.capabilities).toMatchObject({ permissionMode: PermissionMode.ASK, modelChain: [{ providerId: "alpha", modelId: "a", effort: "low" }] });
+      await mobileNetwork.createPartner!(credential, requestId, 4n, { ...draft, usesDirectoryDefaults: false, capabilities: { ...draft.capabilities, inputHandoff: false } });
+      expect(drafts[1]?.draft?.capabilities).toMatchObject({ inputHandoff: false, permissionMode: PermissionMode.ASK, modelChain: [{ providerId: "alpha", modelId: "a", effort: "low" }] });
     } finally { fetcher.mockRestore(); }
   });
   it("distinguishes typed rejection from unknown and typed lookup absence without matching error text", async () => {
@@ -688,14 +688,15 @@ describe("mobile Partner catalog network", () => {
     });
     try {
       await expect(mobileNetwork.getPartnerProfileOptions!(credential)).resolves.toMatchObject({ revision: 4n });
-      const draft = { ...mobilePartnerProfileDraft(profilePartner), displayName: "Ada Two" };
+      const draft = { ...mobilePartnerProfileDraft(profilePartner), displayName: "Ada Two", capabilities: { ...profilePartner.capabilities, inputHandoff: false } };
       await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, draft))
         .resolves.toMatchObject({ revision: 3n, profileVersion: 4n });
       await mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, { ...draft, usesDirectoryDefaults: true });
       expect(patches[0]?.patch).toMatchObject({ modelChain: { routes: [{ providerId: "alpha", modelId: "a", effort: "low" }] },
-        permissionMode: PermissionMode.ASK, planMode: false, usesDirectoryDefaults: false });
+        permissionMode: PermissionMode.ASK, planMode: false, inputHandoff: false, usesDirectoryDefaults: false });
       expect(patches[1]?.patch).toMatchObject({ usesDirectoryDefaults: true });
       expect(patches[1]?.patch?.modelChain).toBeUndefined(); expect(patches[1]?.patch?.permissionMode).toBeUndefined();
+      expect(patches[1]?.patch?.inputHandoff).toBeUndefined();
       expect(patches[1]?.patch?.taskModelPreference).toEqual({ case: "inheritTaskModel", value: true });
       const task = { ...profilePartner.capabilities.modelChain[0]!, backendId: "task-backend", modelId: "task-model" };
       await expect(mobileNetwork.updatePartnerProfile!(credential, "partner-a", 2n, { ...draft, usesDirectoryDefaults: true, taskModelOverride: task }))

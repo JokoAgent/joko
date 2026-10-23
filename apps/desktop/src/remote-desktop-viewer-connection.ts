@@ -26,6 +26,7 @@ export class DesktopRemoteDesktopViewerConnection {
       readonly current: () => DesktopRemoteDesktopViewerOwner | undefined;
       readonly readAuthKey: (profileId: string) => Promise<string | undefined>;
       readonly transport?: (origin: string, key?: string) => Transport;
+      readonly inputHandoffRequestId?: string;
     }) {}
 
   get lease(): RemoteDesktopLease | undefined { return this.#lease; }
@@ -88,7 +89,12 @@ export class DesktopRemoteDesktopViewerConnection {
         if (selected?.route === undefined) throw new ConnectError("Target access unavailable.", Code.PermissionDenied);
         this.#peer = selected.route;
       }
-      const input = fromBinary(method.input, bytes) as Message & { peer?: DevicePeerRouteIdentity; leaseId?: string; lockScreen?: boolean; controlGeneration?: bigint; displayId?: string; control?: boolean };
+      const input = fromBinary(method.input, bytes) as Message & { peer?: DevicePeerRouteIdentity; leaseId?: string; lockScreen?: boolean; controlGeneration?: bigint; displayId?: string; control?: boolean; inputHandoffRequestId?: string };
+      if (this.deps.inputHandoffRequestId) {
+        if (!["getRemoteDesktopCapabilities", "getRemoteDesktopPermissions", "showRemoteDesktopPermissionGuide", "startRemoteDesktop", "heartbeatRemoteDesktop", "stopRemoteDesktop", "setRemoteDesktopControl", "setRemoteDesktopPresentation", "sendRemoteDesktopInput", "getRemoteDesktopIceConfiguration", "createRemoteDesktopOffer", "exchangeRemoteDesktopIce", "getRemoteDesktopFrame"].includes(name)
+          || input.lockScreen) throw new ConnectError("This viewer is confined to its input window.", Code.PermissionDenied);
+        if (starting) input.inputHandoffRequestId = this.deps.inputHandoffRequestId;
+      } else if (input.inputHandoffRequestId !== undefined) throw new TypeError("Viewer cannot select an input window.");
       const mode = changingMode ? input as Message & { leaseId: string; controlGeneration: bigint; temporary: boolean } : undefined;
       const viewer = fitting || restoring ? input as Message & { leaseId: string; controlGeneration: bigint; width?: number; height?: number } : undefined;
       if (mode || viewer) {
@@ -223,7 +229,20 @@ export class DesktopRemoteDesktopViewerConnection {
         }
         this.#modeUncertain = false;
       }
-      if (starting && output.lease !== undefined) { this.#lease = output.lease; this.#sourceDisplayId = input.displayId || output.lease.display?.displayId; }
+      if (starting && output.lease !== undefined) {
+        if (output.lease.inputHandoffRequestId !== this.deps.inputHandoffRequestId || this.deps.inputHandoffRequestId && !output.lease.window) {
+          await createClient(RemoteDesktopService, transport).stopRemoteDesktop({ peer: this.#peer, leaseId: output.lease.leaseId }, { timeoutMs: 2_000 }).catch(() => undefined);
+          throw new ConnectError("Input window authority changed.", Code.PermissionDenied);
+        }
+        this.#lease = output.lease; this.#sourceDisplayId = output.lease.display?.displayId;
+      }
+      if (output.capabilities && this.deps.inputHandoffRequestId) {
+        const caps = output.capabilities;
+        if (caps.platform !== "darwin" || !caps.handoffWindow) throw new ConnectError("Input window is unavailable.", Code.FailedPrecondition);
+        output.capabilities = { ...caps, systemAudio: false, clipboardText: false, clipboardContent: false, clipboardSync: false,
+          clipboardInline: false, displayModes: false, resolutionRestore: false, viewerDisplay: false, viewerDisplayRestore: false,
+          hostMute: false, lockOnExit: false, privacyScreen: false, nativeCredentials: false, workspaceNavigation: false, systemMenu: false };
+      }
       if (output.capabilities !== undefined) this.#caps = output.capabilities;
       if (output.state !== undefined && this.#lease !== undefined && this.#lease.leaseId === requestLeaseId && output.state.controlGeneration >= this.#lease.controlGeneration) {
         this.#lease = { ...this.#lease, controlling: output.state.controlling, controlGeneration: output.state.controlGeneration };

@@ -42,6 +42,8 @@ export interface AuxiliaryTextRunOptions {
   readonly user: string;
   readonly maxTokens: number;
   readonly timeoutMs: number;
+  readonly totalTimeoutMs?: number;
+  readonly firstAttemptTimeoutMs?: number;
   readonly signal?: AbortSignal;
   readonly stillCurrent?: () => boolean;
   readonly validate: (raw: string) => string | undefined;
@@ -157,7 +159,10 @@ export class AuxiliaryTextRouting {
     }
     const owner = new AbortController();
     this.#flights.add(owner);
-    const deadline = AbortSignal.timeout(MAXIMUM_CHAIN_TIME_MS);
+    const totalTimeout = input.totalTimeoutMs ?? MAXIMUM_CHAIN_TIME_MS;
+    if (!Number.isSafeInteger(totalTimeout) || totalTimeout < 1 || totalTimeout > MAXIMUM_CHAIN_TIME_MS
+      || input.firstAttemptTimeoutMs !== undefined && (!Number.isSafeInteger(input.firstAttemptTimeoutMs) || input.firstAttemptTimeoutMs < 1)) throw new RangeError("Auxiliary text inference budget is invalid.");
+    const deadline = AbortSignal.timeout(totalTimeout), startedAt = Date.now();
     const signal = AbortSignal.any([owner.signal, deadline, ...(input.signal === undefined ? [] : [input.signal])]);
     let attempted = false;
     try {
@@ -170,8 +175,10 @@ export class AuxiliaryTextRouting {
         const ready = stopped();
         if (ready !== undefined) return ready;
         if (route === undefined) continue;
+        const attemptBudget = Math.min(input.timeoutMs, MAXIMUM_ATTEMPT_TIME_MS, totalTimeout - (Date.now() - startedAt), !attempted ? input.firstAttemptTimeoutMs ?? MAXIMUM_ATTEMPT_TIME_MS : MAXIMUM_ATTEMPT_TIME_MS);
+        if (attemptBudget < 1) break;
         attempted = true;
-        const attemptTimeout = AbortSignal.timeout(Math.min(input.timeoutMs, MAXIMUM_ATTEMPT_TIME_MS));
+        const attemptTimeout = AbortSignal.timeout(attemptBudget);
         const attemptSignal = AbortSignal.any([signal, attemptTimeout]);
         try {
           const raw = await waitForInference(this.#infer({
@@ -179,7 +186,7 @@ export class AuxiliaryTextRouting {
             system: input.system,
             user: input.user,
             maxTokens: input.maxTokens,
-            timeoutMs: Math.min(input.timeoutMs, MAXIMUM_ATTEMPT_TIME_MS),
+            timeoutMs: attemptBudget,
             signal: attemptSignal,
             assertCurrent: () => {
               if (stopped() !== undefined) throw new Error("Auxiliary text inference owner changed.");

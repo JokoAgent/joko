@@ -8,6 +8,16 @@ import { projectMobilePartnerCapabilities, mobilePartnerPermissionToProto } from
 import { profilePartner, profilePartnerWire, profileSnapshot } from "./test/mobile-partner-profile";
 
 describe("mobile Partner profile validation", () => {
+  it("defaults input handoff on, preserves explicit false, and uses current inherited owner defaults", () => {
+    const wire = profilePartnerWire().capabilities!;
+    expect(projectMobilePartnerCapabilities({ ...wire, inputHandoff: undefined }).inputHandoff).toBe(true);
+    expect(projectMobilePartnerCapabilities({ ...wire, inputHandoff: false }).inputHandoff).toBe(false);
+    const draft = { ...mobilePartnerProfileDraft(profilePartner), capabilities: { ...profilePartner.capabilities, inputHandoff: false } };
+    expect(validateMobilePartnerProfileDraft(profileSnapshot, draft).capabilities.inputHandoff).toBe(false);
+    expect(mobilePartnerProfileDraft({ ...profilePartner, capabilities: draft.capabilities }).capabilities.inputHandoff).toBe(false);
+    expect(validateMobilePartnerProfileDraft({ ...profileSnapshot, options: { ...profileSnapshot.options,
+      defaultCapabilities: { ...profilePartner.capabilities, inputHandoff: false } } }, { ...draft, usesDirectoryDefaults: true }).capabilities.inputHandoff).toBe(false);
+  });
   it("keeps all three exact permission values and refuses full access after any selected route loses support", () => {
     const snapshot = { ...profileSnapshot, permissionModes: ["ask", "auto", "bypassPermissions"] as const };
     const draft = { ...mobilePartnerProfileDraft(profilePartner), capabilities: { ...profilePartner.capabilities, permissionMode: "bypassPermissions" as const } };

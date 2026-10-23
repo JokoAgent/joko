@@ -1,0 +1,19 @@
+.partner-network-section > header > div { display: flex; gap: 12px; flex-wrap: wrap; }
+.partner-network-section > input { width: 100%; padding: 9px 12px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); }
+.partner-network-page time { font-size: var(--text-11); color: var(--text-faint); margin-left: auto; }
+.partner-network-message-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--text-soft); font-size: var(--text-12); }
+.partner-network-message-actions .button { min-height: 28px; padding: 4px 8px; font-size: var(--text-12); }
+.partner-network-composer { padding: 16px; border-top: 1px solid var(--line); display: grid; gap: 12px; }
+.partner-network-composer textarea { width: 100%; min-height: 80px; max-height: 220px; resize: vertical; border: 1px solid var(--line); border-radius: var(--radius); background: var(--surface); color: var(--text); padding: 12px; font: inherit; }
+.partner-network-composer > div { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.partner-network-composer input[type=file] { width: 1px; height: 1px; position: absolute; opacity: 0; }
+.partner-network-composer details > label { display: flex; gap: 12px; align-items: center; padding: 6px; }
+.partner-network-member { display: grid; gap: 12px; padding: 16px; border: 1px solid var(--line); border-radius: var(--radius); }
+.partner-network-member small { color: var(--text-soft); }
+.partner-network-photo { display: block; border: 0; padding: 0; background: transparent; cursor: zoom-in; }
+.partner-network-photo img { display: block; max-width: min(100%, 360px); max-height: 300px; border-radius: var(--radius); }
+.partner-network-media { margin-top: 8px; }
+.partner-network-task { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--line); border-radius: var(--radius); }
+.partner-network-reaction { display: inline-flex; align-items: center; gap: 4px; }
+.partner-network-initial { display: inline-grid; place-items: center; min-width: 20px; height: 20px; border-radius: 50%; background: var(--surface-subtle); color: var(--text-soft); }
+@media (max-width: 640px) { .partner-network-section > header { align-items: flex-start; flex-direction: column; } .partner-network-composer { padding: 12px; } }

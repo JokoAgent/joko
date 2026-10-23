@@ -277,6 +277,12 @@ describe("OperationalStore visible message search", () => {
       objectiveContinuation: { ownerGeneration: 1, turn: 1 }
     });
     appendMessage(fixture.store, "event-visible-continuation-control", "session-a", 20, visible("visible control marker"));
+    appendMessage(fixture.store, "event-input-handoff-continuation", "session-a", 19, {
+      type: "message_complete", role: "user", blocks: [{ kind: "text", text: "input handoff ended internal marker" }],
+      inputHandoffContinuation: { requestId: "original-request" }
+    });
+    expect(fixture.store.searchSessionMessages({ scope: { sessionId: "session-a" }, query: "input handoff ended internal marker" }).matches.map(value => value.eventId))
+      .not.toContain("event-input-handoff-continuation");
 
     expect(fixture.store.searchSessionMessages({
       scope: { sessionId: "session-a" },

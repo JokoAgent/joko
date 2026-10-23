@@ -961,7 +961,7 @@ export class PartnerManager {
 
   #followingDefaults(current?: PartnerProfileRecord): PartnerCapabilitiesRecord | undefined {
     const route = this.#appDefaultModel?.();
-    return route === undefined ? undefined : { modelChain: [route], permissionMode: current?.capabilities.permissionMode ?? "ask", planMode: current?.capabilities.planMode ?? false };
+    return route === undefined ? undefined : { modelChain: [route], permissionMode: current?.capabilities.permissionMode ?? "ask", planMode: current?.capabilities.planMode ?? false, inputHandoff: current?.capabilities.inputHandoff ?? true };
   }
   #effectiveDefaults(current: PartnerProfileRecord, modelOnly: boolean): PartnerCapabilitiesRecord | undefined {
     const defaults = this.#store.directoryState().defaultCapabilities ?? this.#followingDefaults(current);

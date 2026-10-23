@@ -33,10 +33,12 @@ import { formatTokenCount, resolveDisplayContextWindow } from "./ContextCapacity
 import { ErrorTailBanner } from "./ErrorTailBanner.js";
 import { InteractionDialog } from "./InteractionDialog.js";
 import { InteractionPromptHost } from "./InteractionPortal.js";
+import { InputHandoffPanel } from "./InputHandoffCard.js";
 import { MessageDeleteDialog } from "./MessageDeleteDialog.js";
 import { MessageForkDialog } from "./MessageForkDialog.js";
 import { MessageRewindDialog, type MessageRewindPreviewState } from "./MessageRewindDialog.js";
 import { ModelPicker } from "./ModelPicker.js";
+import type { TaskProviderGroupUsageView } from "../provider-group-task-usage.js";
 import { PermissionSelector } from "./PermissionSelector.js";
 import { PinnedPlanPanel } from "./PinnedPlanPanel.js";
 import { RetryStatusIndicator } from "./RetryStatusIndicator.js";
@@ -212,6 +214,28 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   readonly onOpenSessionWindow?: () => void;
 }): JSX.Element {
   const guest = controller.state.sessionAccess?.role === "guest";
+  const providerGroupOwnerKey = JSON.stringify([controller.state.activeProfile?.serverId, controller.state.activeProfile?.id,
+    controller.state.connectionGeneration, session.id, session.generation.toString(), session.backendId, session.model?.providerId, session.model?.modelId]);
+  const providerGroupOwnerRef = useRef(providerGroupOwnerKey);
+  providerGroupOwnerRef.current = providerGroupOwnerKey;
+  const providerGroupReadRef = useRef<AbortController | undefined>(undefined);
+  const [providerGroupRead, setProviderGroupRead] = useState<{ readonly key: string; readonly value?: TaskProviderGroupUsageView }>();
+  const refreshTaskProviderGroupUsage = useCallback(async () => {
+    providerGroupReadRef.current?.abort();
+    const read = new AbortController(); providerGroupReadRef.current = read;
+    if (guest || reviewReadOnly || !controller.readTaskProviderGroupUsage) return;
+    try {
+      const value = await controller.readTaskProviderGroupUsage(session.id, session.generation, read.signal);
+      if (!read.signal.aborted && providerGroupOwnerRef.current === providerGroupOwnerKey) setProviderGroupRead({ key: providerGroupOwnerKey, ...(value ? { value } : {}) });
+    } catch {
+      if (!read.signal.aborted && providerGroupOwnerRef.current === providerGroupOwnerKey) setProviderGroupRead({ key: providerGroupOwnerKey });
+    }
+  }, [controller.readTaskProviderGroupUsage, providerGroupOwnerKey, session.id, session.generation, guest, reviewReadOnly]);
+  useEffect(() => {
+    void refreshTaskProviderGroupUsage();
+    return () => providerGroupReadRef.current?.abort();
+  }, [refreshTaskProviderGroupUsage]);
+  const providerGroupUsage = providerGroupRead?.key === providerGroupOwnerKey ? providerGroupRead.value : undefined;
   const exportDownload = useArtifactDownload(session.id, controller.exportSession);
   const partnerConversation = usePartnerConversation();
   const partnerRuntimeLocked = partnerConversation?.kind !== "task";
@@ -252,6 +276,25 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const [backgroundStopError, setBackgroundStopError] = useState<string>();
   const [collaborationOpen, setCollaborationOpen] = useState(false);
   const [sharingOpen, setSharingOpen] = useState(false);
+  const [modelRuntimeControl, setModelRuntimeControl] = useState<{
+    readonly sessionId: string; readonly ownerKey: string; readonly control: import("@joko/contracts").TaskShareRuntimeControl;
+  }>();
+  useEffect(() => {
+    if (guest || !controller.getSessionRuntimeControl) return;
+    let current = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = async (): Promise<void> => {
+      try {
+        const control = await controller.getSessionRuntimeControl!(session.id);
+        if (!current || providerGroupOwnerRef.current !== providerGroupOwnerKey) return;
+        setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
+        if (control.pending) timer = setTimeout(() => { void read(); }, 2_000);
+      } catch { /* The current Session snapshot remains authoritative when a read fails. */ }
+    };
+    void read();
+    return () => { current = false; if (timer) clearTimeout(timer); };
+  }, [providerGroupOwnerKey, session.id, session.generation, session.backendId, session.activeRunId, guest,
+    modelRuntimeControl?.control.pendingGeneration, controller.getSessionRuntimeControl]);
   const [objectiveDialogRequest, setObjectiveDialogRequest] = useState<(ObjectiveDialogRequest & { readonly handoffId?: string })>();
   const objectiveDialogRequestIdRef = useRef(0);
   const collaborationButtonRef = useRef<HTMLButtonElement>(null);
@@ -739,7 +782,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
   const errorTailActions = errorTailProjection?.bannerVisible === true && errorTailProjection.item.error !== undefined
     ? executableRecoveryActions(errorTailProjection.item.error, recoveryContext)
     : [];
-  const accountUsageResetAt = providerAccountUsageResetAt(
+  const accountUsageResetAt = providerGroupUsage ? providerGroupUsage.resetAt : providerAccountUsageResetAt(
     controller.state.snapshot.providers,
     session.model?.providerId,
     Date.now(),
@@ -1792,6 +1835,13 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
     } : {})
   });
 
+  const runtimeSelection = modelRuntimeControl?.sessionId === session.id && modelRuntimeControl.ownerKey === providerGroupOwnerKey
+    ? modelRuntimeControl.control.pending ?? modelRuntimeControl.control.effective : undefined;
+  const unifiedSessionModels = !guest && controller.setRuntimeModel ? controller.state.snapshot.models.filter(model =>
+    controller.state.snapshot.backends.some(candidate => candidate.id === model.backendId
+      && candidate.capabilities.get("input.text")?.supported && candidate.capabilities.get("model.switch")?.supported)
+    && controller.state.snapshot.settings.backendSettings.find(setting => setting.backendId === model.backendId)?.enabled !== false)
+    : backendModels;
   const composerControls = partnerRuntimeLocked ? undefined : (
     <div className="composer__controls" aria-label={t("session.controls")}>
       {canSetPermission && <PermissionSelector
@@ -1807,30 +1857,44 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       )}
       {(canSwitchModel || ((canSetEffort || canSetFast) && session.model !== undefined)) && <ModelPicker
         className="control-select"
-        models={canSwitchModel ? backendModels : session.model === undefined ? [] : [session.model]}
+        models={canSwitchModel ? unifiedSessionModels : session.model === undefined ? [] : [session.model]}
         ownerId={modelPreferenceOwnerId(controller.state.activeProfile?.serverId)}
         favoriteSettings={controller.state.snapshot.settings.modelFavorites}
         onMutateFavorite={guest ? undefined : controller.updateModelFavorites}
-        value={session.model === undefined ? undefined : {
+        value={runtimeSelection ? { backendId: runtimeSelection.backendId, providerId: runtimeSelection.providerId,
+          modelId: runtimeSelection.modelId, effort: runtimeSelection.effort, fastMode: runtimeSelection.fastMode }
+          : session.model === undefined ? undefined : {
           backendId: session.backendId,
           providerId: session.model.providerId,
           modelId: session.model.modelId,
           ...(session.effort === undefined ? {} : { effort: session.effort }),
           fastMode: session.fastMode
         }}
-        effortEnabled={canSetEffort}
-        fastEnabled={canSetFast}
+        effortEnabled={!!controller.setRuntimeModel || canSetEffort}
+        fastEnabled={!!controller.setRuntimeModel || canSetFast}
         useMorphPopover
+        retainCurrentSource
         onSelectionFocus={() => setComposerFocusRequest((current) => current + 1)}
         t={t}
-        onOpen={() => controller.refreshProviderModels(session.backendId, undefined, true).catch(() => undefined)}
+        providerGroupUsage={providerGroupUsage}
+        onOpen={() => Promise.allSettled([controller.refreshProviderModels(session.backendId, undefined, true), refreshTaskProviderGroupUsage(),
+          controller.getSessionRuntimeControl?.(session.id).then(control => {
+            if (providerGroupOwnerRef.current === providerGroupOwnerKey) setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
+          })]).then(() => undefined)}
         onConnectSource={guest ? undefined : () => { window.location.hash = "#/settings/providers"; }}
-        onSelect={(selection) => {
+        onSelect={async (selection) => {
           if (selection === undefined) return;
-          const model = backendModels.find((candidate) =>
-            candidate.providerId === selection.providerId && candidate.modelId === selection.modelId);
-          if (model === undefined || !model.available) return;
-          runAction("model", () => controller.setModel(
+          const model = unifiedSessionModels.find((candidate) => candidate.backendId === selection.backendId
+            && candidate.providerId === selection.providerId && candidate.modelId === selection.modelId);
+          if (!model?.available) throw new Error("The model source is no longer available.");
+          if (!guest && controller.setRuntimeModel) {
+            await controller.setRuntimeModel(session.id, { backendId: model.backendId, providerId: model.providerId,
+              modelId: model.modelId, effort: selection.effort, fastMode: model.supportsFast && selection.fastMode });
+            const control = await controller.getSessionRuntimeControl?.(session.id);
+            if (control && providerGroupOwnerRef.current === providerGroupOwnerKey) setModelRuntimeControl({ sessionId: session.id, ownerKey: providerGroupOwnerKey, control });
+            return;
+          }
+          await controller.setModel(
             session.id,
             model.providerId,
             model.modelId,
@@ -1838,9 +1902,10 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
               ? selection.effort
               : undefined,
             canSetFast && model.supportsFast && selection.fastMode
-          ));
+          );
         }}
       />}
+      {modelRuntimeControl?.sessionId === session.id && modelRuntimeControl.ownerKey === providerGroupOwnerKey && modelRuntimeControl.control.pending && <Pill>{t("taskSharing.pending")}</Pill>}
     </div>
   );
 
@@ -2166,6 +2231,9 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
       </div>}
       {activeCompaction !== undefined && <CompactionStatusIndicator compaction={activeCompaction} t={t} />}
       {activeRetry !== undefined && <RetryStatusIndicator retry={activeRetry} t={t} />}
+      {!guest && !reviewReadOnly && controller.inputHandoff && <InputHandoffPanel api={controller.inputHandoff} sessionId={session.id}
+        ownerKey={`${timelineResourceOwnerKey}:${controller.state.connectionGeneration}:${session.generation}`}
+        viewer={{ deviceId: controller.state.activeProfile?.deviceId ?? null }} />}
       {interaction !== undefined && interaction.kind !== "plan" && partnerConversation?.kind === "partner" && <PartnerWorkingStatus
         controller={controller} session={session} backgroundTaskIds={backgroundTaskIds} waiting
         suppressed={reviewReadOnly || currentShareSelection !== undefined} t={t} />}
@@ -2175,7 +2243,7 @@ function SessionPaneContent({ controller, session, target, backend, reviewReadOn
         placeholder={presentation === "filesRail" ? <div className="interaction-files-rail-placeholder" role="status">{t("interaction.waitForReply")}</div> : undefined}
       >
         {guest && interaction !== undefined && !["permission", "question", "plan"].includes(interaction.kind)
-          ? <div role="status" className="settings-card">{t("taskSharing.waitingHost")}</div>
+          ? <div role="status" className="settings-card settings-card--content">{t("taskSharing.waitingHost")}</div>
           : <InteractionDialog key={interaction === undefined ? "interaction:none" : `${interaction.sessionId}:${interaction.id}`} controller={controller} interaction={interaction} remaining={remainingInteractions} inline t={t} runAction={runAction} />}
       </InteractionPromptHost>
       {currentShareSelection !== undefined && <ShareSelectionBar ownerKey={`${timelineResourceOwnerKey}:${session.generation}`} sessionId={session.id} sessionName={session.name} messages={shareableMessages} selectedIds={currentShareSelection.selectedIds} locale={controller.state.effectiveLocale} t={t} getTimelineRoot={getTimelineRoot} onToggleAll={toggleAllShareMessages} onCancel={closeShareSelection} />}

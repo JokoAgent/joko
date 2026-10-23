@@ -10,6 +10,9 @@ import Fastify, { type FastifyInstance } from "fastify";
 import type { OrchestratorApplication } from "./application.js";
 import { isLoopbackHost, isPrivateLanHost, isPrivateLanHttpOrigin, readTls } from "./config.js";
 import { registerConnectServices } from "./connect-services.js";
+import { registerHostedAgentDesktopService } from "./hosted-agent-desktop-service.js";
+import { registerInputHandoffNativeHost } from "./input-handoff/native-host.js";
+import { DESKTOP_HOST_AUTHORIZATION_HEADER } from "@joko/contracts/desktop-bootstrap";
 import { ConnectionAuthenticationError } from "./connection-manager.js";
 import { ExtensionMainViewError, surfaceHeaders } from "./extension-main-view-manager.js";
 import type { NativeAuthRunnerProof, RemoteNativeAuthRunnerAttestation } from "./native-auth-recovery.js";
@@ -39,7 +42,8 @@ export async function createPublicServer(application: OrchestratorApplication): 
   const server = Fastify({
     logger: {
       level: process.env.JOKO_LOG_LEVEL ?? "info",
-      redact: ["req.headers.authorization", "req.headers.cookie", "request.headers.authorization"]
+      redact: ["req.headers.authorization", "req.headers.cookie", "request.headers.authorization",
+        `req.headers["${DESKTOP_HOST_AUTHORIZATION_HEADER}"]`, `request.headers["${DESKTOP_HOST_AUTHORIZATION_HEADER}"]`]
     },
     disableRequestLogging: true,
     trustProxy: false,
@@ -242,6 +246,11 @@ export async function createPublicServer(application: OrchestratorApplication): 
   );
 
   const projectionShutdown = new AbortController();
+  if (application.hostedAgents) await registerHostedAgentDesktopService(server, {
+    runtime: application.hostedAgents, connections: application.connections, serverId: application.serverId,
+    ...(application.providerGroups ? { groupOptions: application.providerGroups.connectOptions(() => { throw new Error("A current Device route is required."); }) } : {})
+  });
+  if (application.nativeInputHandoff) await registerInputHandoffNativeHost(server, application.nativeInputHandoff);
   // Idle projections must not hold the graceful request drain open.
   server.addHook("preClose", async () => { projectionShutdown.abort(); });
   await server.register(fastifyConnectPlugin, {
@@ -343,6 +352,7 @@ export async function createInternalServer(application: OrchestratorApplication)
       const toolName = body["toolName"];
       const argumentsValue = body["arguments"];
       const partnerLearningProof = body["partnerLearningProof"];
+      const nativeRootProof = body["nativeRootProof"];
       const headerGeneration = request.headers["x-joko-pi-generation"];
       if (
         typeof requestId !== "string" || requestId.length < 1 || requestId.length > 1_024 ||
@@ -354,6 +364,7 @@ export async function createInternalServer(application: OrchestratorApplication)
         typeof toolName !== "string" || toolName === "" ||
         (argumentsValue !== undefined && !isRecord(argumentsValue)) ||
         (partnerLearningProof !== undefined && (typeof partnerLearningProof !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(partnerLearningProof))) ||
+        (nativeRootProof !== undefined && (typeof nativeRootProof !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(nativeRootProof))) ||
         typeof headerGeneration !== "string" || Number(headerGeneration) !== generation
       ) return reply.code(400).send({ error: "MCP bridge request failed its generation or schema fence." });
       const cancellation = new AbortController();
@@ -373,6 +384,7 @@ export async function createInternalServer(application: OrchestratorApplication)
           toolName,
           signal: cancellation.signal,
           ...(partnerLearningProof === undefined ? {} : { partnerLearningProof: partnerLearningProof as string }),
+          ...(nativeRootProof === undefined ? {} : { nativeRootProof: nativeRootProof as string }),
           ...(argumentsValue === undefined ? {} : { arguments: argumentsValue })
         });
         return result;

@@ -4,6 +4,12 @@ import { nativeTaskStatusAvatar } from "./native-task-status-avatar.js";
 import type { AppDefaultModelUiPort } from "./app-default-model-ui.js";
 import type { SessionAccess, TaskSource } from "./task-sharing.js";
 import type { TaskSharingApi } from "@joko/contracts";
+import type { ProviderSharingApi, GetHostedAgentCatalogResponse } from "@joko/contracts";
+import type { PartnerNetworkApi } from "./partner-network-api.js";
+import type { PartnerIdentityApi } from "./partner-identity-api.js";
+import type { InputHandoffApi } from "./input-handoff.js";
+import type { ProviderGroupSettingsApi } from "./provider-group-settings.js";
+import { desktopRemoteDesktopViewerOwner, openDesktopRemoteDesktopViewer } from "./remote-desktop-viewer-bridge.js";
 import darkAppIconUrl from "@joko/brand-assets/icon-dark.svg?url";
 import lightAppIconUrl from "@joko/brand-assets/icon-light.svg?url";
 import { assertBrowserActionCurrent, WorkspaceHtmlExternalUnavailableError, type HttpLinkOpenOptions } from "./browser-action.js";
@@ -213,6 +219,12 @@ export interface ControllerState {
 
 export interface AppController extends OperationApi {
   readonly taskSharing?: TaskSharingApi;
+  readonly inputHandoff?: InputHandoffApi;
+  readonly providerSharing?: ProviderSharingApi;
+  readonly partnerNetwork?: PartnerNetworkApi;
+  readonly partnerIdentity?: PartnerIdentityApi;
+  readonly providerGroups?: ProviderGroupSettingsApi;
+  readonly readProviderSharingCatalog?: (signal: AbortSignal) => Promise<GetHostedAgentCatalogResponse>;
   readonly appDefaultModelUi?: AppDefaultModelUiPort;
   readonly state: ControllerState;
   /** True only when the Desktop-managed local Orchestrator reports shutdown-blocking work. */
@@ -2299,6 +2311,19 @@ export function useAppController(): AppController {
     }
     return artifactGateway;
   }, [artifactGateway, linkGatewayGeneration]);
+  const ownerServices = useMemo(() => {
+    if (!artifactGateway || state.connectionState !== "connected") return {};
+    const expected = desktopRemoteDesktopViewerOwner(state);
+    const currentState = () => ({ ...state, activeProfile: activeProfileRef.current, connectionState: connectionStateRef.current,
+      connectionGeneration: gatewayGenerationRef.current, snapshot: snapshotRef.current });
+    return { inputHandoff: artifactGateway.inputHandoffApi(window.jokoDesktop?.remoteDesktopViewer ? async (peer, requestId, signal) => {
+      signal.throwIfAborted(); catalogGateway();
+      await openDesktopRemoteDesktopViewer({ get state() { return currentState(); } }, expected,
+        { deviceId: peer.targetDeviceId, name: "Input window", inputHandoffRequestId: requestId });
+      signal.throwIfAborted(); catalogGateway();
+    } : undefined), providerSharing: artifactGateway.providerSharingApi(), partnerNetwork: artifactGateway.partnerNetworkApi(), partnerIdentity: artifactGateway.partnerIdentityApi(), providerGroups: artifactGateway.providerGroupSettingsApi(),
+    readProviderSharingCatalog: (signal: AbortSignal) => catalogGateway().providerSharingCatalog(signal) };
+  }, [artifactGateway, state.connectionState, state.activeProfile, linkGatewayGeneration, catalogGateway]);
   useEffect(() => {
     for (const [pageId, preview] of htmlPreviewsRef.current) {
       const browser = state.snapshot.browsers.find((value) => value.id === preview.browserId);
@@ -2539,6 +2564,19 @@ export function useAppController(): AppController {
       hasPendingDeviceNameUpdate: (deviceId: string) => artifactGateway?.hasPendingDeviceNameUpdate(deviceId) ?? false
     };
   }, [artifactGateway]);
+  const hostedAgentApi = useMemo(() => {
+    const original = (): OrchestratorGateway => {
+      if (artifactGateway === undefined || gatewayRef.current !== artifactGateway || gatewayGenerationRef.current !== linkGatewayGeneration || connectionStateRef.current !== "connected") {
+        throw new Error("The model management connection changed.");
+      }
+      return artifactGateway;
+    };
+    return {
+      getHostedAgentSettings: (...args: Parameters<OperationApi["getHostedAgentSettings"]>) => original().getHostedAgentSettings(...args),
+      getHostedAgentCatalog: (...args: Parameters<OperationApi["getHostedAgentCatalog"]>) => original().getHostedAgentCatalog(...args),
+      updateHostedAgentSettings: (...args: Parameters<OperationApi["updateHostedAgentSettings"]>) => original().updateHostedAgentSettings(...args)
+    };
+  }, [artifactGateway, linkGatewayGeneration]);
   const remoteHostApi = useMemo(() => {
     const original = (): OrchestratorGateway => {
       if (artifactGateway === undefined) throw new Error("Connect to Joko before managing remote workspaces.");
@@ -2838,6 +2876,7 @@ export function useAppController(): AppController {
   }, [artifactGateway]);
   return useMemo<AppController>(() => ({
     state,
+    ...ownerServices,
     ...(artifactGateway === undefined || state.connectionState !== "connected" ? {} : { taskSharing: artifactGateway.taskSharingApi() }),
     appDefaultModelUi: {
       watchAppDefaultModel: (id, signal) => gateway().watchAppDefaultModel(id, signal),
@@ -2969,6 +3008,7 @@ export function useAppController(): AppController {
     ...newTaskDraftApi,
     ...inputApi,
     refreshProviderAccountUsage: (backendId, providerId) => gateway().refreshProviderAccountUsage(backendId, providerId),
+    readTaskProviderGroupUsage: (sessionId, generation, signal) => gateway().readTaskProviderGroupUsage?.(sessionId, generation, signal) ?? Promise.resolve(undefined),
     getArtifactStorageStats: (protectedSha256) => gateway().getArtifactStorageStats(protectedSha256),
     scanArtifactStorage: (protectedSha256) => gateway().scanArtifactStorage(protectedSha256),
     reconcileArtifactStorage: (protectedSha256) => gateway().reconcileArtifactStorage(protectedSha256),
@@ -3031,6 +3071,10 @@ export function useAppController(): AppController {
     addExtraDirectory: (workspaceId, serverPath, access) => gateway().addExtraDirectory(workspaceId, serverPath, access),
     removeExtraDirectory: (extraDirectoryId) => gateway().removeExtraDirectory(extraDirectoryId),
     setModel: (sessionId, providerId, modelId, effort, fastMode) => gateway().setModel(sessionId, providerId, modelId, effort, fastMode),
+    getSessionRuntimeControl: sessionId => gateway().getSessionRuntimeControl?.(sessionId)
+      ?? Promise.reject(new Error("The task runtime controls are unavailable.")),
+    setRuntimeModel: (sessionId, selection) => gateway().setRuntimeModel?.(sessionId, selection)
+      ?? Promise.reject(new Error("The task runtime selection is unavailable.")),
     setPermission: (sessionId, mode) => gateway().setPermission(sessionId, mode),
     setPlanMode: (sessionId, enabled) => gateway().setPlanMode(sessionId, enabled),
     compact: (sessionId, customInstructions) => gateway().compact(sessionId, customInstructions),
@@ -3249,6 +3293,7 @@ export function useAppController(): AppController {
     listWorkspaceFiles: (workspaceId, signal) => gateway().listWorkspaceFiles(workspaceId, signal),
     watchWorkspaceFileChanges: (scope, signal) => gateway().watchWorkspaceFileChanges(scope, signal),
     readWorkspaceFile,
+    peekWorkspaceFile: (workspaceId, path) => artifactGateway?.peekWorkspaceFile?.(workspaceId, path),
     readWorkspaceHtmlSnapshot,
     writeWorkspaceTextFile: (workspaceId, draft) => gateway().writeWorkspaceTextFile(workspaceId, draft),
     searchWorkspace: (workspaceId, query) => gateway().searchWorkspace(workspaceId, query),
@@ -3273,6 +3318,7 @@ export function useAppController(): AppController {
     cancelLocalBackendRuntimeInstall: (backendId, requestId) => gateway().cancelLocalBackendRuntimeInstall(backendId, requestId),
     updateBackendSettings: (backendId, patch) => gateway().updateBackendSettings(backendId, patch),
     ...deviceNameApi,
+    ...hostedAgentApi,
     setDeviceRemoteControlEnabled: (enabled) => gateway().setDeviceRemoteControlEnabled(enabled),
     setDeviceControlTargetEnabled: (targetDeviceId, enabled) => gateway().setDeviceControlTargetEnabled(targetDeviceId, enabled),
     setDeviceControllerAllowed: (controllerDeviceId, allowed) => gateway().setDeviceControllerAllowed(controllerDeviceId, allowed),

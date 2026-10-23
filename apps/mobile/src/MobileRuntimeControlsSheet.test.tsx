@@ -77,6 +77,7 @@ vi.mock("./MobileKeyboardAvoidingView", async () => {
 });
 
 import { MobileRuntimeControlsSheet } from "./MobileRuntimeControlsSheet";
+import { MobileNewTaskModelSelector } from "./MobileNewTaskModelSelector";
 
 const colors = {
   background: "#fff",
@@ -204,6 +205,16 @@ async function clickText(text: string): Promise<void> {
 }
 
 describe("MobileRuntimeControlsSheet model favorites", () => {
+  it("applies the exact new-task source configuration and keeps the selector available after a failed save", async () => {
+    const route = { ...controls.models[0]!, backendId: "opaque-device", key: "other-source-model", canSetEffort: true, canSetFastMode: true };
+    const select = vi.fn(async () => { throw new Error("Source changed"); });
+    await act(async () => root.render(createElement(MobileNewTaskModelSelector, { models: [route], colors, locale: "en", disabled: false,
+      favorites: undefined, onSelect: select, onFavorite: async () => undefined })));
+    await click("Model"); await click("Alpha Model, Alpha Provider"); await clickText("High");
+    await clickText("Apply model");
+    expect(select).toHaveBeenCalledExactlyOnceWith({ backendId: "opaque-device", providerId: "alpha", modelId: "a", effortId: "high", fastMode: false });
+    expect(host.textContent).toContain("Source changed"); expect(host.querySelector('input[aria-label="Search task models"]')).not.toBeNull();
+  });
   it("keeps a same-owner observation marked stale when the visible quota refresh fails", async () => {
     vi.useFakeTimers();
     const provider = create(ProviderDescriptorSchema, { backendId: "backend", providerId: "alpha", displayName: "Alpha",

@@ -169,6 +169,30 @@ message ModelDescriptor {
   optional string protocol_mode = 30;
   optional string context_window_source = 31;
   optional string max_output_tokens_source = 32;
+  ModelSourceDescriptor source = 33;
+}
+
+enum ModelSourceKind {
+  MODEL_SOURCE_KIND_UNSPECIFIED = 0;
+  MODEL_SOURCE_KIND_LOCAL = 1;
+  MODEL_SOURCE_KIND_DEVICE = 2;
+  MODEL_SOURCE_KIND_SHARE = 3;
+  MODEL_SOURCE_KIND_GROUP = 4;
+}
+
+// Display and selection facts captured by the owning service. The complete
+// Backend/Provider/Model route remains authoritative; clients never infer an
+// execution location from an identifier or a display name.
+message ModelSourceDescriptor {
+  ModelSourceKind kind = 1;
+  string display_name = 2;
+  string node_id = 3;
+  string node_name = 4;
+  string native_adapter_kind = 5;
+  uint32 group_member_count = 6;
+  // A member is retained for existing tasks, but offered through its group
+  // when selecting a source for new work. Saved favorites are not deleted.
+  bool grouped = 7;
 }
 
 message ModelModalityValues { repeated string values = 1; }

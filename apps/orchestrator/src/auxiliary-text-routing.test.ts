@@ -14,6 +14,14 @@ afterEach(() => {
 });
 
 describe("AuxiliaryTextRouting", () => {
+  it("bounds automatic work planning to eight seconds with five seconds for the first candidate and only the remaining fallback budget", async () => {
+    const { routing, infer } = setup(); let now = 1_000;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    infer.mockImplementationOnce(async input => { expect(input.timeoutMs).toBe(5_000); now += 5_000; return "malformed"; })
+      .mockImplementationOnce(async input => { expect(input.timeoutMs).toBe(3_000); now += 3_000; return "malformed"; });
+    await expect(routing.run(routing.capture(), { ...request(), totalTimeoutMs: 8_000, firstAttemptTimeoutMs: 5_000 })).resolves.toEqual({ status: "exhausted" });
+    expect(infer).toHaveBeenCalledTimes(2);
+  });
   it("uses explicit backend defaults then stable exact routes without creating a stored override", () => {
     const fixture = setup();
     const { store, routing } = fixture;

@@ -569,11 +569,43 @@ class ScriptedPiProcess extends EventEmitter {
 }
 
 describe("PiBackendAdapter", () => {
-  it.each([false, true])("uses the exact native account model without tools or durable credential files (revoked=%s)", async revoked => {
+  it("keeps askpass in each local task process and refreshes its private route on resume", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-askpass-")), specs: PiProcessSpec[] = []; let route = "first";
+    const taskShellEnv = vi.fn((context: AdapterContext) => ({ JOKO_INPUT_HANDOFF_ROUTE: `${context.sessionId}:${route}`, SUDO_ASKPASS: "/private/askpass" }));
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1", taskShellEnv,
+      processFactory: spec => { specs.push(spec); return new ScriptedPiProcess(spec) as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "askpass", backendId: "pi", displayName: "Local", workspaceRoot: directory, managed: true, trusted: true };
+    const first = { ...makeContext(target, []), sessionId: "askpass-first" }, second = { ...makeContext(target, []), sessionId: "askpass-second" };
+    try {
+      const binding = await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, first);
+      await adapter.createSession({ target, fastMode: false, permissionMode: "ask" }, second);
+      expect(specs[0]!.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-first:first", SUDO_ASKPASS: "/private/askpass" });
+      expect(specs[1]!.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-second:first" });
+      await adapter.closeSession(binding, { ...first, binding }); route = "resumed";
+      await adapter.resumeSession(binding, { ...first, binding });
+      expect(specs.at(-1)!.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-first:resumed" });
+      expect(specs[1]!.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-second:first" });
+    } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it("does not grant the owner askpass route to a native read-only review", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "joko-pi-review-askpass-")), specs: PiProcessSpec[] = [];
+    const taskShellEnv = vi.fn(() => ({ JOKO_INPUT_HANDOFF_ROUTE: "private-owner-route" }));
+    const adapter = createPiAdapter({ agentHome: directory, sessionRoot: directory, versionProbe: async () => "pi 0.85.1", taskShellEnv,
+      processFactory: spec => { specs.push(spec); return new ScriptedPiProcess(spec) as unknown as PiProcessHandle; } });
+    const target: TargetDescriptor = { id: "review-askpass", backendId: "pi", displayName: "Review", workspaceRoot: directory, managed: true, trusted: true };
+    const context = { ...makeContext(target, []), runtimePolicy: "review_read_only" as const };
+    try {
+      await adapter.createSession({ target, runtimePolicy: "review_read_only", fastMode: false, permissionMode: "ask" }, context);
+      expect(taskShellEnv).not.toHaveBeenCalled(); expect(specs[0]!.env).not.toHaveProperty("JOKO_INPUT_HANDOFF_ROUTE");
+    } finally { await adapter.dispose(); await rm(directory, { recursive: true, force: true }); }
+  });
+
+  it.each([[false, false], [true, false], [false, true]])("uses the exact native account model without tools or durable credential files (revoked=%s, images=%s)", async (revoked, withImage) => {
     const home = await mkdtemp(join(tmpdir(), "joko-native-review-")); let current = true;
     const initial = { type: "oauth" as const, access: "private-access", refresh: "private-refresh", expires: Date.now() + 60_000 };
     const refreshed = { ...initial, access: "refreshed-access" }, persisted = vi.fn(async () => ({ catalogGeneration: 2, credentialReferenceId: "native" }));
-    const model = { provider: "openai-codex", id: "exact-native" };
+    const model = { provider: "openai-codex", id: "exact-native", input: ["text", "image"] };
     const complete = vi.fn(async (_model: unknown, _context: unknown, _options: unknown) => {
       if (revoked) current = false;
       await captured!.credentials!.modify("openai-codex", async () => refreshed);
@@ -587,11 +619,12 @@ describe("PiBackendAdapter", () => {
       nativeModels: [{ providerId: "openai-codex", modelId: "exact-native", displayName: "Exact", api: "openai-responses", contextWindow: 32_000, maxOutputTokens: 1024, supportsImages: false, thinkingLevels: [], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }],
       loadNativeAuth: () => ({ catalogGeneration: 1, credentials: { "openai-codex": initial } }), persistNativeAuth: persisted });
     try {
-      const result = adapter.inferNativeText({ providerId: "openai-codex", modelId: "exact-native", backendInstanceGeneration: 0, system: "Review", user: "Action", timeoutMs: 10_000,
+      const images = withImage ? [{ data: new Uint8Array([1, 2, 3]), mimeType: "image/png" }] : [];
+      const result = adapter.inferNativeText({ providerId: "openai-codex", modelId: "exact-native", backendInstanceGeneration: 0, system: "Review", user: "Action", images, timeoutMs: 10_000,
         signal: new AbortController().signal, assertCurrent: () => { if (!current) throw new Error("Revoked"); }, assertModelAllowed: (provider, id) => { expect([provider, id]).toEqual(["openai-codex", "exact-native"]); } });
       if (revoked) await expect(result).rejects.toThrow("Revoked"); else await expect(result).resolves.toBe("approved");
       expect(captured).toMatchObject({ modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
-      expect(complete).toHaveBeenCalledWith(model, { systemPrompt: "Review", messages: [{ role: "user", content: [{ type: "text", text: "Action" }], timestamp: expect.any(Number) }] }, expect.objectContaining({ cacheRetention: "none", maxTokens: 512 }));
+      expect(complete).toHaveBeenCalledWith(model, { systemPrompt: "Review", messages: [{ role: "user", content: [{ type: "text", text: "Action" }, ...withImage ? [{ type: "image", data: "AQID", mimeType: "image/png" }] : []], timestamp: expect.any(Number) }] }, expect.objectContaining({ cacheRetention: "none", maxTokens: 512 }));
       expect(persisted).toHaveBeenCalledTimes(revoked ? 0 : 1); await expect(access(join(home, "auth.json"))).rejects.toThrow();
     } finally { create.mockRestore(); await adapter.dispose(); await rm(home, { recursive: true, force: true }); }
   });

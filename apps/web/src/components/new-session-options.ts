@@ -1,5 +1,6 @@
 import type { AppSnapshot, BackendView, ModelView, NewSessionDraftSelection, PermissionMode, TargetView } from "../model.js";
 import { isRoutableConversationModel } from "../model-capabilities.js";
+import { modelSourceSelectable } from "../model-source-catalog.js";
 import { advertisedPermissionModes } from "./backend-control-capabilities.js";
 
 export interface NewSessionExecutionOptions {
@@ -21,7 +22,7 @@ type BackendNewTaskSettings = AppSnapshot["settings"]["backendSettings"];
 export function resolveNewSessionExecutionOptions(backend: BackendView | undefined, models: readonly ModelView[], modelKey: string): NewSessionExecutionOptions {
   const availableModels = backend === undefined
     ? []
-    : models.filter((model) => model.backendId === backend.id && isRoutableConversationModel(model));
+    : models.filter((model) => model.backendId === backend.id && isRoutableConversationModel(model) && modelSourceSelectable(model));
   const modelSwitchSupported = backend?.capabilities.get("model.switch")?.supported === true;
   const selectedModel = modelSwitchSupported ? availableModels.find((model) => modelKeyFor(model.providerId, model.modelId) === modelKey) : undefined;
   const effortSupported = backend?.capabilities.get("model.effort")?.supported === true;

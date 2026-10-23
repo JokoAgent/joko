@@ -184,6 +184,8 @@ export type EventPayload =
         readonly ownerGeneration: number;
         readonly turn: number;
       };
+      /** Host-authored input handoff completion; hidden from authored history. */
+      readonly inputHandoffContinuation?: { readonly requestId: string };
       /** Opaque Backend-owned history semantics used only for branch navigation/reconciliation. */
       readonly nativeHistory?: NativeHistoryEventContext;
     }

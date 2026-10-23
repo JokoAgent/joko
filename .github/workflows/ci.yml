@@ -36,7 +36,7 @@ concurrency:
 jobs:
   verify:
     if: ${{ inputs.scope != 'windows-runtime-diagnostics' }}
-    name: ${{ matrix.os }} / Node 24.16 / ${{ matrix.workload }}${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
+    name: ${{ matrix.os }} / Node 24.19 / ${{ matrix.workload }}${{ inputs.scope == 'windows-native' && ' / native regressions' || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
@@ -55,10 +55,10 @@ jobs:
           version: 11.22.0
           run_install: false
 
-      - name: Install Node.js 24.16.0
+      - name: Install Node.js 24.19.0
         uses: actions/setup-node@v4
         with:
-          node-version: 24.16.0
+          node-version: 24.19.0
           cache: pnpm
 
       - name: Use the canonical temporary directory
@@ -663,10 +663,10 @@ jobs:
         with:
           version: 11.22.0
           run_install: false
-      - name: Install Node.js 24.16.0
+      - name: Install Node.js 24.19.0
         uses: actions/setup-node@v4
         with:
-          node-version: 24.16.0
+          node-version: 24.19.0
           cache: pnpm
       - name: Use the canonical temporary directory for parser owners
         run: |

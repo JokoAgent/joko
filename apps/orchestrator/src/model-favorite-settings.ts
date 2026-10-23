@@ -1,4 +1,4 @@
-import type { BackendDescriptor } from "@joko/core";
+import type { BackendDescriptor, ProviderModel } from "@joko/core";
 import { RevisionConflictError, type OperationalStore } from "@joko/store";
 
 import { modelRoutingEnabled } from "./backend-model-access.js";
@@ -27,6 +27,13 @@ export type ModelFavoriteMutation =
   | { readonly kind: "remove"; readonly favoriteId: string }
   | { readonly kind: "seed"; readonly item: ModelFavoriteConfiguration };
 
+export interface ModelFavoriteSourceCatalog {
+  readonly models: (backend: BackendDescriptor) => readonly ProviderModel[];
+  /** Undefined keeps local Backend admission; an empty reason confirms a live
+   * Source/group independently of the anchor computer's native account. */
+  readonly unavailableReason: (backendId: string, providerId: string, modelId: string) => string | undefined;
+}
+
 interface StoredModelFavoriteConfiguration {
   readonly favoriteId: string;
   readonly backendId: string;
@@ -45,9 +52,11 @@ interface StoredModelFavoriteSettings {
 /** Node-owned model-picker favorites. Mutations run inside the authenticated Operation transaction. */
 export class ModelFavoriteSettings {
   readonly #store: OperationalStore;
+  readonly #sources?: ModelFavoriteSourceCatalog;
 
-  constructor(store: OperationalStore) {
+  constructor(store: OperationalStore, sources?: ModelFavoriteSourceCatalog) {
     this.#store = store;
+    this.#sources = sources;
   }
 
   snapshot(): ModelFavoriteSettingsSnapshot {
@@ -148,19 +157,21 @@ export class ModelFavoriteSettings {
     fastMode: boolean
   ): string {
     if (backend === undefined) return "Backend is no longer available.";
+    const sourceReason = this.#sources?.unavailableReason(backend.id, providerId, modelId);
+    if (sourceReason) return sourceReason;
     if (this.#store.findSetting<{ readonly enabled?: boolean }>(
       "service", "orchestrator", `settings.backend.${backend.id}`
     )?.value.enabled === false) return "Backend is disabled.";
-    if (backend.health === "unavailable"
-      || (backend.installationState !== "installed" && backend.installationState !== "update_available")) {
+    if (sourceReason !== "" && (backend.health === "unavailable"
+      || (backend.installationState !== "installed" && backend.installationState !== "update_available"))) {
       return "Backend runtime is unavailable.";
     }
-    const models = backend.models.filter((model) => model.providerId === providerId && model.modelId === modelId);
+    const models = (this.#sources?.models(backend) ?? backend.models).filter((model) => model.providerId === providerId && model.modelId === modelId);
     if (models.length !== 1) return "Model is no longer uniquely available in the Backend catalog.";
     const providers = backend.providers?.filter((provider) => provider.providerId === providerId);
     if (providers !== undefined && providers.length !== 1) return "Model Provider is no longer uniquely available.";
     const authenticationState = providers?.[0]?.authenticationState ?? backend.authenticationState;
-    if (authenticationState !== "authenticated" && authenticationState !== "not_required") {
+    if (sourceReason !== "" && authenticationState !== "authenticated" && authenticationState !== "not_required") {
       return "Model Provider authentication is unavailable.";
     }
     if (!modelRoutingEnabled(this.#store, backend.id, providerId, modelId)) return "Model route is disabled.";

@@ -16,6 +16,12 @@ afterEach(async () => {
 });
 
 describe("ClaudeFreshContextOwner", () => {
+  it("opens the same durable owner inside a deep isolated native home", async () => {
+    const { root, identity } = await fixture();
+    const options = { rootDirectory: join(root, "n".repeat(120), "native", "session-store"), namespace: "owner.deep", generation: 1 };
+    const owner = new ClaudeFreshContextOwner(options), reserved = owner.reserve(identity);
+    expect(new ClaudeFreshContextOwner(options).getForOperation(identity.operationId)).toEqual(reserved);
+  });
   it("persists an exact unused child and claims its trusted Host binding after complete retirement", async () => {
     const { identity, owner, createOwner } = await fixture();
     const reserved = owner.reserve(identity);

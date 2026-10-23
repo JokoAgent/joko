@@ -1177,7 +1177,9 @@ function classifyProviderSmokeInference(body) {
 
 function isExactProviderSmokeTimelineInference(body, expectedPrompt = PACKAGED_SMOKE_TIMELINE_PROMPT) {
   const system = exactProviderSmokeTextMessage(body.messages[0], "system");
-  if (Object.keys(body).sort().join(",") !== "max_completion_tokens,messages,model,store,stream,stream_options,tools"
+  if (body.prompt_cache_key !== undefined && (typeof body.prompt_cache_key !== "string" || !body.prompt_cache_key.trim() || body.prompt_cache_key.length > 64)
+    || body.prompt_cache_retention !== undefined && body.prompt_cache_retention !== "24h") return false;
+  if (Object.keys(body).filter(key => key !== "prompt_cache_key" && key !== "prompt_cache_retention").sort().join(",") !== "max_completion_tokens,messages,model,store,stream,stream_options,tools"
     || body.stream !== true || body.store !== false || body.max_completion_tokens !== 65_536
     || typeof body.stream_options !== "object" || body.stream_options === null || Array.isArray(body.stream_options)
     || Object.keys(body.stream_options).sort().join(",") !== "include_usage"
@@ -1231,8 +1233,14 @@ function runProviderSmokeClassifierRegressionTests() {
   };
   const timeline = providerSmokeTimelineInferenceFixture();
   expect(classifyProviderSmokeInference(timeline) === "timeline", "exact Timeline request is classified");
+  expect(classifyProviderSmokeInference({ ...timeline, prompt_cache_key: "packaged-task", prompt_cache_retention: "24h" }) === "timeline",
+    "installed Pi cache parameters are accepted");
   for (const [label, mutate] of [
     ["top-level extra field", (body) => { body.extra = true; }],
+    ["invalid cache key", (body) => { body.prompt_cache_key = {}; }],
+    ["empty cache key", (body) => { body.prompt_cache_key = ""; }],
+    ["oversized cache key", (body) => { body.prompt_cache_key = "a".repeat(65); }],
+    ["invalid cache retention", (body) => { body.prompt_cache_retention = "forever"; }],
     ["stream options extra field", (body) => { body.stream_options.extra = true; }],
     ["system message extra field", (body) => { body.messages[0].extra = true; }],
     ["user message extra field", (body) => { body.messages[1].extra = true; }],

@@ -4,6 +4,12 @@ import { StoreError } from "./errors.js";
 import type { OperationalStore } from "./operational-store.js";
 
 export const SESSION_RUNTIME_HANDOFF_SCOPE = "session.runtime-handoffs";
+const RUNTIME_CREATION_SCOPE = "session.runtime-creations";
+export interface RuntimeCreationAdmission {
+  readonly format: 1; readonly operationId: string; readonly operationBodyHash: string; readonly sessionId: string;
+  readonly targetId: string; readonly targetRevision: string; readonly backendId: string; readonly backendInstanceGeneration: number;
+  readonly workspaceRoot: string; readonly phase: "prepared" | "effect" | "closed" | "unknown";
+}
 export interface RuntimeHandoffProfile {
   readonly backendId: string; readonly providerId: string; readonly modelId: string;
   readonly effort?: string; readonly fastMode: boolean;
@@ -26,6 +32,7 @@ export interface PendingRuntimeHandoff {
   readonly effect?: "close" | "resume" | "create" | "configure";
   readonly backendInstanceGeneration?: number;
   readonly binding?: NativeSessionBinding; readonly resumed?: boolean; readonly handoff?: string;
+  readonly fresh?: boolean;
 }
 export interface RuntimeHandoffRecord {
   readonly format: 1; readonly generation: number;
@@ -61,11 +68,37 @@ export class SessionRuntimeHandoffStore {
     }
     const operation = input.operationId === undefined ? undefined : this.store.findOperation(input.operationId);
     const body = operation?.body;
+    const creation = input.operationId === undefined ? undefined : this.creation(input.operationId);
+    if (creation && operation?.status === "started" && object(body) && body["targetId"] === input.targetId
+      && creation.phase === "effect" && creation.operationBodyHash === operation.bodyHash && creation.targetId === input.targetId
+      && creation.targetRevision === target.revision.toString() && creation.backendId === input.backendId
+      && creation.backendInstanceGeneration === input.backendInstanceGeneration && creation.workspaceRoot === input.workspaceRoot
+      && creation.sessionId === input.sessionId && input.generation === 1) return true;
     return operation?.kind === "create_partner_session" && operation.status === "started" && object(body)
       && body["targetId"] === input.targetId && body["runtimeBackendId"] === input.backendId
       && input.generation === 1 && input.workspaceRoot === target.descriptor.workspaceRoot
       && input.sessionId === `session-${createHash("sha256").update(operation.id).digest("hex").slice(0, 24)}`;
   }
+  creation(operationId: string): RuntimeCreationAdmission | undefined {
+    const value = this.store.findSetting("service", RUNTIME_CREATION_SCOPE, operationId)?.value;
+    if (value === undefined) return undefined;
+    if (!object(value) || !keys(value, ["format", "operationId", "operationBodyHash", "sessionId", "targetId", "targetRevision", "backendId", "backendInstanceGeneration", "workspaceRoot", "phase"])
+      || value["format"] !== 1 || !["operationId", "operationBodyHash", "sessionId", "targetId", "targetRevision", "backendId", "workspaceRoot"].every(key => boundedText(value[key], 16_384))
+      || !integer(value["backendInstanceGeneration"]) || !["prepared", "effect", "closed", "unknown"].includes(String(value["phase"]))) throw new StoreError("The native runtime creation admission is invalid.");
+    return value as unknown as RuntimeCreationAdmission;
+  }
+  stageCreation(input: Omit<RuntimeCreationAdmission, "format" | "phase">): void {
+    const previous = this.creation(input.operationId); if (previous && previous.phase !== "closed" && previous.phase !== "prepared") throw new StoreError("The previous native creation effect must be reconciled before selecting another member.");
+    const operation = this.store.getOperation(input.operationId), target = this.store.getTarget(input.targetId);
+    if (operation.status !== "started" || operation.bodyHash !== input.operationBodyHash || target.revision.toString() !== input.targetRevision
+      || !target.descriptor.trusted || target.descriptor.remoteWorkspace !== undefined) throw new StoreError("The runtime creation admission lost its original Operation or Target.");
+    this.store.setSetting("service", RUNTIME_CREATION_SCOPE, input.operationId, { format: 1, ...input, phase: "prepared" });
+  }
+  creationPhase(operationId: string, phase: RuntimeCreationAdmission["phase"]): void {
+    const current = this.creation(operationId); if (!current || current.phase === "unknown" && phase !== "unknown") throw new StoreError("The native creation effect is unknown.");
+    this.store.setSetting("service", RUNTIME_CREATION_SCOPE, operationId, { ...current, phase });
+  }
+  finishCreation(operationId: string): void { this.store.deleteSetting("service", RUNTIME_CREATION_SCOPE, operationId); }
   read(sessionId: string): RuntimeHandoffRecord | undefined {
     const value = this.store.findSetting("service", SESSION_RUNTIME_HANDOFF_SCOPE, sessionId)?.value;
     return value === undefined ? undefined : readRuntimeHandoffRecord(value);
@@ -74,7 +107,7 @@ export class SessionRuntimeHandoffStore {
     readRuntimeHandoffRecord(record);
     this.store.setSetting("service", SESSION_RUNTIME_HANDOFF_SCOPE, sessionId, record);
   }
-  stage(sessionId: string, generation: number, profile: RuntimeHandoffProfile, source: "agent" | "fallback"): void {
+  stage(sessionId: string, generation: number, profile: RuntimeHandoffProfile, source: "agent" | "fallback", fresh = false): void {
     this.store.transaction(() => {
       const current = this.read(sessionId);
       if (generation <= (current?.generation ?? -1)) throw new StoreError("Runtime selection generation did not advance.");
@@ -84,6 +117,7 @@ export class SessionRuntimeHandoffStore {
       this.save(sessionId, { format: 1, generation, parked: current?.parked ?? [],
         ...(current?.injection === undefined ? {} : { injection: current.injection }),
         pending: { generation, profile, source, phase: current?.pending?.phase === "closed" ? "closed" : "pending",
+          ...(fresh ? { fresh: true } : {}),
           ...(current?.pending?.origin === undefined ? {} : { origin: current.pending.origin }) } });
     });
   }
@@ -142,7 +176,7 @@ export function readRuntimeHandoffRecord(value: unknown): RuntimeHandoffRecord {
     || value["format"] !== 1 || !integer(value["generation"]) || !Array.isArray(value["parked"])
     || !value["parked"].every(parked) || new Set(value["parked"].map(row => row.backendId)).size !== value["parked"].length) throw invalid();
   const pending = value["pending"];
-  if (pending !== undefined && (!object(pending) || !keys(pending, ["generation", "source", "profile", "phase", "origin", "effect", "backendInstanceGeneration", "binding", "resumed", "handoff"])
+  if (pending !== undefined && (!object(pending) || !keys(pending, ["generation", "source", "profile", "phase", "origin", "effect", "backendInstanceGeneration", "binding", "resumed", "handoff", "fresh"])
     || pending["generation"] !== value["generation"] || !["agent", "fallback"].includes(String(pending["source"]))
     || !profile(pending["profile"]) || !["pending", "closed", "effect", "ready", "unknown"].includes(String(pending["phase"]))
     || pending["origin"] !== undefined && !origin(pending["origin"])
@@ -152,6 +186,7 @@ export function readRuntimeHandoffRecord(value: unknown): RuntimeHandoffRecord {
     || pending["backendInstanceGeneration"] !== undefined && !integer(pending["backendInstanceGeneration"])
     || pending["binding"] !== undefined && !binding(pending["binding"])
     || pending["resumed"] !== undefined && typeof pending["resumed"] !== "boolean"
+    || pending["fresh"] !== undefined && typeof pending["fresh"] !== "boolean"
     || pending["handoff"] !== undefined && !boundedText(pending["handoff"], 20_000)
     || pending["phase"] === "ready" && (!binding(pending["binding"]) || !integer(pending["backendInstanceGeneration"])
       || typeof pending["resumed"] !== "boolean" || !boundedText(pending["handoff"], 20_000)))) throw invalid();

@@ -164,7 +164,9 @@ describe("mobile Timeline preview artifacts", () => {
       }) } })
     });
     expect(resolveMobileTimelinePreviewArtifact([event, appended], selected)?.blob.fileName).toBe("song.mp3");
-    expect(mobileTimelinePreviewWindowKey([event])).not.toBe(mobileTimelinePreviewWindowKey([event, appended]));
+    expect(mobileTimelinePreviewWindowKey([event])).toBe(mobileTimelinePreviewWindowKey([event, appended]));
+    const refreshed = create(EventSchema, { ...event, cursor: { ...event.cursor!, opaqueToken: "new-read-ticket" } });
+    expect(mobileTimelinePreviewWindowKey([event])).toBe(mobileTimelinePreviewWindowKey([refreshed]));
   });
 });
 

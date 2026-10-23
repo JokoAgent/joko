@@ -159,6 +159,38 @@ describe("CodexMcpBridgeManager", () => {
     expect(() => bridge.assertCurrent()).toThrow();
   });
 
+  it("admits a protected handoff only through the native root lease, never an owned descendant on the same facade", async () => {
+    const fixture = await createFixture();
+    const calls: BridgeToolCallContext[] = [];
+    const original = provider(calls);
+    fixture.router.registerBridgeToolProvider({ ...original,
+      tools: original.tools.map(tool => ({ ...tool, requiresNativeRoot: true as const }))
+    });
+    let active = true;
+    const bridge = await fixture.manager.openLocal({
+      sessionId: "session-local", targetId: "target-local", generation: 1, threadId: "native-local-root",
+      assertSessionCurrent: () => { if (!active) throw new Error("Local Session changed"); },
+      beginToolCall: threadId => {
+        if (!active || !["native-local-root", "owned-descendant"].includes(threadId)) throw new Error("Native turn changed");
+        const assertCurrent = () => { if (!active) throw new Error("Native turn changed"); };
+        return { signal: new AbortController().signal, assertCurrent, release: () => undefined,
+          ...(threadId === "native-local-root" ? { assertNativeRoot: assertCurrent } : {}) };
+      }
+    });
+    const client = new Client({ name: "root-handoff-fixture", version: "1.0.0" }, { capabilities: {} });
+    cleanups.push(async () => client.close());
+    await client.connect(new StreamableHTTPClientTransport(new URL(bridge.routes[0]!.url)));
+    await expect(client.callTool({ name: "echo", arguments: { value: "descendant", root: true },
+      _meta: { threadId: "owned-descendant", root: true } })).rejects.toThrow();
+    expect(calls).toHaveLength(0);
+    expect(await client.callTool({ name: "echo", arguments: { value: "root" },
+      _meta: { threadId: "native-local-root" } })).toMatchObject({ isError: false });
+    expect(calls).toHaveLength(1); expect(calls[0]!.assertNativeRoot).toBeTypeOf("function");
+    active = false;
+    expect(() => calls[0]!.assertNativeRoot!()).toThrow();
+    await bridge.release();
+  });
+
   it("keeps remote text usable without SSH forwarding when the frozen tool snapshot is empty", async () => {
     const fixture = await createFixture();
     const assertForwardingCurrent = vi.fn(() => { throw new Error("No forwarding authority should be required."); });

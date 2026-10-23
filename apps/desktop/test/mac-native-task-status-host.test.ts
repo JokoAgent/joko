@@ -238,6 +238,17 @@ describe("macOS native task-status host", () => {
     expect(render([])).not.toContain('class="count"');
   });
 
+  it("labels the private input wait separately and opens its original task without approve controls", () => {
+    const snapshot = parseDesktopNativeTaskStatusSnapshot({ ownerId: "owner", revision: "1", locale: "zh-CN", sessions: [{
+      sessionId: "private-task", title: "Original task", detail: "需要你代为输入，请打开原任务继续。", phase: "interaction", inputHandoff: true, activityLines: [], updatedAt: 1
+    }] });
+    const html = renderNativeTaskStatusDocument(projectDesktopNativeTaskStatusSurface(snapshot), {
+      enabled: true, display: { mode: "all" }, layout: "normal", sounds: SOUND_SETTINGS
+    }, "zh-CN");
+    expect(html).toContain("需要你代为输入"); expect(html).toContain("joko-task-status://focus?sessionId=private-task");
+    expect(html).not.toContain('href="joko-task-status://permission'); expect(html).not.toContain('class="permission-actions"');
+  });
+
   it("restores an unexpectedly closed ambient window with bounded retry and stops after opt-out", () => {
     const clock = new FakeClock();
     const windows: FakeWindow[] = [];

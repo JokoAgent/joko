@@ -36,7 +36,6 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
   const owned = useRef<{ readonly abort: AbortController; readonly sourceKey: string; readonly local: LocalState; readonly leaveOwner: string } | undefined>(undefined);
   const historyFlight = useRef(false);
   const snapshotRef = useRef<AppSnapshot | undefined>(undefined);
-  const accessRef = useRef<SessionAccess>({ role: "guest", editableQueueItemIds: new Set() });
   const api = home.taskSharing, profile = home.state.activeProfile;
   const connectionKey = JSON.stringify([profile?.id, profile?.serverId, profile?.origin, home.state.connectionGeneration, home.state.connectionState]);
   useEffect(() => {
@@ -60,6 +59,9 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
     setError(undefined); setView(undefined); setHistory([]); setBefore(undefined); setLoadingHistory(false); setLeaveOperation(undefined);
     let gateway: OrchestratorGateway | undefined;
     let facade: TaskSharingController | undefined;
+    // Retiring the connection must not erase state still read by the outgoing React tree.
+    let ownedSnapshot: AppSnapshot | undefined;
+    let ownedAccess: SessionAccess = { role: "guest", editableQueueItemIds: new Set() };
     let ready = false;
     const fail = (cause: unknown): void => {
       if (!currentHome()) return;
@@ -95,7 +97,8 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
             setHistory([]); setBefore(undefined);
           }
           snapshotRef.current = projected;
-          accessRef.current = { role: "guest", memberId: source.memberId, editableQueueItemIds: new Set(projected.queue.filter(item => {
+          ownedSnapshot = projected;
+          ownedAccess = { role: "guest", memberId: source.memberId, editableQueueItemIds: new Set(projected.queue.filter(item => {
             const author = item.sharedTaskAuthor;
             return author?.shareId === source.shareId && author.shareGeneration === source.generation
               && author.memberId === source.memberId && author.memberGeneration === source.memberGeneration;
@@ -115,7 +118,7 @@ export function TaskSharingSession({ controller: home, joinId, profileId, t, run
         finish: operationId => local.setTaskSharingOperation(key, operationId, false)
       }));
       facade = createTaskSharingController({ home: () => homeRef.current, gateway, source,
-        snapshot: () => snapshotRef.current!, access: () => accessRef.current, current: currentHome, local });
+        snapshot: () => ownedSnapshot!, access: () => ownedAccess, current: currentHome, local });
       gatewayRef.current = gateway;
       await gateway.connect();
       if (!currentHome()) return;

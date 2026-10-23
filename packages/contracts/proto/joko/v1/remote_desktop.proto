@@ -99,6 +99,7 @@ message StartRemoteDesktopRequest {
   string display_id = 2;
   RemoteDesktopStartMode mode = 3;
   bool control = 4;
+  optional string input_handoff_request_id = 5;
 }
 
 message StartRemoteDesktopResponse {

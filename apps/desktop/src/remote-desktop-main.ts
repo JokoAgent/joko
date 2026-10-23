@@ -40,6 +40,7 @@ import { desktopRemoteDesktopWindowsHost } from "./remote-desktop-windows-host.j
 import { readDesktopSystemAudioSupport } from "./remote-desktop-media-settings.js";
 import type { DesktopRemoteDesktopSettingsStore } from "./remote-desktop-settings.js";
 import type { SystemAudioMuteGuard } from "./system-audio-mute.js";
+import type { DesktopInputHandoffHost } from "./input-handoff-native-host.js";
 import { DesktopRemoteDesktopControlledOverlay } from "./remote-desktop-controlled-overlay.js";
 import type { DesktopRemoteDesktopControllerDirectory } from "./remote-desktop-controller-directory.js";
 import type { DesktopLocale } from "./channels.js";
@@ -80,6 +81,7 @@ export function refreshDesktopRemoteDesktopLocalNotices(): void { for (const not
 
 export interface DesktopRemoteDesktopMainOptions {
   readonly sourceDirectory: string;
+  readonly inputHandoff?: Pick<DesktopInputHandoffHost, "resolveLiveWindow" | "isLiveWindowCurrent" | "liveViewEnded" | "liveInputOwnership">;
   readonly settings: DesktopRemoteDesktopSettingsStore;
   readonly connectionsAllowed?: () => boolean;
   readonly credentialsOwner?: DesktopRemoteCredentialsNativeOwner;
@@ -298,6 +300,12 @@ export function createDesktopRemoteDesktopMainHost(
   };
   host = new DesktopRemoteDesktopHost({
     platform: process.platform,
+    ...(process.platform === "darwin" && options.inputHandoff ? { handoff: {
+      resolve: (requestId: string, controllerDeviceId: string, signal: AbortSignal) => options.inputHandoff!.resolveLiveWindow(requestId, controllerDeviceId, signal),
+      current: (window, controllerDeviceId, signal) => options.inputHandoff!.isLiveWindowCurrent(window, controllerDeviceId, signal),
+      ended: (window, controllerDeviceId) => options.inputHandoff!.liveViewEnded(window, controllerDeviceId),
+      inputOwnership: (window, controllerDeviceId) => options.inputHandoff!.liveInputOwnership(window, controllerDeviceId)
+    } } : {}),
     systemAudio: readDesktopSystemAudioSupport(),
     enabled: () => options.settings.get().enabled && (options.connectionsAllowed?.() ?? true),
     sessionState: desktopSessionState,

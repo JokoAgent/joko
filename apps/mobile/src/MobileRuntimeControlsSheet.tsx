@@ -11,7 +11,7 @@ import {
   View
 } from "react-native";
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
-import { PermissionMode } from "@joko/contracts";
+import { ModelSourceKind, PermissionMode } from "@joko/contracts";
 import { MobileKeyboardAvoidingView, useMobileKeyboardState } from "./MobileKeyboardAvoidingView";
 import type { MobileInteractionSheetColors } from "./MobileInteractionSheet";
 import type { MobileSupportedLocale } from "./mobile-locale-preference";
@@ -236,7 +236,7 @@ export function MobileRuntimeControlsSheet({
               favoriteId: activeFavorite.favoriteId, backendId: activeFavorite.backendId, ...selection
             } })}
             onAddFavorite={() => mutateFavorite({ kind: "add", item: {
-              favoriteId: newFavoriteId(), backendId: controls.backend.backendId, ...selection
+              favoriteId: newFavoriteId(), backendId: activeRoute.backendId, ...selection
             } })}
             onRemoveFavorite={() => activeFavorite && mutateFavorite({ kind: "remove", favoriteId: activeFavorite.favoriteId })} />}
           {view.kind === "model" && activeRoute && providerUsageTransport?.providers.some(provider => provider.backendId === activeRoute.backendId && provider.providerId === activeRoute.providerId)
@@ -273,7 +273,7 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
   const configurableCurrent = current?.route !== undefined && current.selectable
     && (controls.canSetEffort || controls.canSetFastMode);
   const favoriteRows = controls.favorites.flatMap((favorite) => {
-    const route = controls.models.find((candidate) => candidate.providerId === favorite.providerId
+    const route = controls.models.find((candidate) => candidate.backendId === favorite.backendId && candidate.providerId === favorite.providerId
       && candidate.modelId === favorite.modelId);
     if (route === undefined || !mobileModelRouteMatchesQuery(route, query)) return [];
     return [{ favorite, route }];
@@ -281,6 +281,10 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
   let previousProvider = "";
   return <View style={styles.stack}>
     <SectionTitle label={mobileMessage(locale, "common.model")} colors={colors} />
+    {controls.pendingModel && <View style={[styles.currentCard, { borderColor: colors.accent, backgroundColor: colors.background }]}>
+      <Text style={[styles.rowLabel, { color: colors.ink }]}>{mobileMessage(locale, "controls.pendingModel")}: {controls.pendingModel.displayName}</Text>
+      <Text style={[styles.caption, { color: colors.muted }]}>{mobileModelSourceLabel(controls.pendingModel)} · {controls.pendingModel.effortId ?? ""}{controls.pendingModel.fastMode ? " · Fast" : ""}</Text>
+    </View>}
     {current ? <Pressable accessibilityRole={configurableCurrent ? "button" : undefined}
       accessibilityLabel={mobileMessage(locale, "controls.currentModelLabel", { name: current.displayName })}
       disabled={disabled || !configurableCurrent}
@@ -306,13 +310,14 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
       {favoriteRows.length > 0 && <>
         <Text style={[styles.providerHeading, { color: colors.muted }]}>{mobileMessage(locale, "controls.favorites")}</Text>
         {favoriteRows.map(({ favorite, route }) => {
-          const selected = sameModelConfiguration(current, favorite);
+          const selected = sameModelConfiguration(current ? { ...current, backendId: controls.backend.backendId } : undefined, favorite);
           return <Pressable key={favorite.favoriteId} accessibilityRole="radio" accessibilityState={{ selected, disabled }}
-            disabled={disabled} accessibilityLabel={`${route.displayName}, ${mobileMessage(locale, "controls.savedFavorite")}`}
+            disabled={disabled} accessibilityLabel={`${route.displayName}${route.source ? `, ${mobileModelSourceLabel(route)}` : ""}, ${mobileMessage(locale, "controls.savedFavorite")}`}
             onPress={() => onOpenModel(route, favorite)}
             style={[styles.routeRow, { borderColor: selected ? colors.accent : colors.border }, disabled && styles.disabled]}>
             <View style={styles.flex}>
               <Text style={[styles.rowLabel, { color: colors.ink }]}>★ {route.displayName}</Text>
+              {route.source && <Text style={[styles.caption, { color: colors.muted }]}>{mobileModelSourceLabel(route)}</Text>}
               <Text style={[styles.caption, { color: colors.muted }]}>{favorite.effortId
                 ? mobileMessage(locale, "controls.effortValue", { effort: favorite.effortId })
                 : mobileMessage(locale, "controls.defaultEffort")}{favorite.fastMode ? mobileMessage(locale, "controls.fastSuffix") : ""}</Text>
@@ -322,12 +327,13 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
         })}
       </>}
       {routes.map((route) => {
-        const showProvider = route.providerId !== previousProvider;
-        previousProvider = route.providerId;
-        const selected = current?.providerId === route.providerId && current.modelId === route.modelId;
+        const sourceKey = JSON.stringify([route.backendId, route.providerId]);
+        const showProvider = sourceKey !== previousProvider;
+        previousProvider = sourceKey;
+        const selected = controls.backend.backendId === route.backendId && current?.providerId === route.providerId && current.modelId === route.modelId;
         const modelQuota = mobileModelAccountQuotaLabel(accountUsage.snapshots[mobileUsageProviderKey(route)], route.modelId, accountUsage.now, locale, accountUsage.failed);
         return <View key={route.key}>
-          {showProvider && <Text style={[styles.providerHeading, { color: colors.muted }]}>{route.providerName}</Text>}
+          {showProvider && <Text style={[styles.providerHeading, { color: colors.muted }]}>{mobileModelSourceLabel(route)}</Text>}
           {showProvider && providerUsageTransport?.providers.some(provider => provider.backendId === route.backendId && provider.providerId === route.providerId)
             && <MobileAccountUsageSummary snapshot={accountUsage.snapshots[mobileUsageProviderKey(route)]} providerName={route.providerName}
               loading={accountUsage.loading} failed={accountUsage.failed} now={accountUsage.now} colors={colors} locale={locale} />}
@@ -337,6 +343,7 @@ function RootControls({ controls, routes, query, disabled, colors, locale, onQue
             style={[styles.routeRow, { borderColor: selected ? colors.accent : colors.border }, disabled && styles.disabled]}>
             <View style={styles.flex}>
               <Text style={[styles.rowLabel, { color: colors.ink }]}>{route.displayName}</Text>
+              {route.source && <Text style={[styles.caption, { color: colors.muted }]}>{mobileModelSourceLabel(route)}</Text>}
               <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens, locale)} · {route.modelId}</Text>
               {modelQuota && <Text style={[styles.caption, { color: colors.muted }]}>{modelQuota}</Text>}
             </View>
@@ -399,30 +406,31 @@ function ModelOptions({ route, controls, selection, favorite, disabled, colors, 
   catch {
     selectionValid = false;
     const current = controls.currentModel;
-    const unchanged = current?.providerId === selection.providerId && current.modelId === selection.modelId
+    const unchanged = (selection.backendId ?? controls.backend.backendId) === controls.backend.backendId
+      && current?.providerId === selection.providerId && current.modelId === selection.modelId
       && (current.effortId ?? "") === (selection.effortId ?? "")
       && (current.fastMode ?? false) === selection.fastMode;
     if (!unchanged) validationError = mobileMessage(locale, "controls.modelInvalid");
   }
   const favoriteConfiguration = {
     favoriteId: favorite?.favoriteId ?? "",
-    backendId: controls.backend.backendId,
+    backendId: route.backendId,
     ...selection
   } satisfies MobileModelFavoriteConfiguration;
   const duplicateFavorite = controls.favorites.some((candidate) => candidate.favoriteId !== favorite?.favoriteId
     && sameModelConfiguration(candidate, favoriteConfiguration));
   const favoriteUnchanged = favorite !== undefined && sameModelConfiguration(favorite, favoriteConfiguration);
   const favoriteSelectionValid = route.providerId === selection.providerId && route.modelId === selection.modelId
-    && (selection.effortId === undefined || controls.canSetEffort
+    && (selection.effortId === undefined || (route.canSetEffort ?? controls.canSetEffort)
       && route.efforts.some((effort) => effort.id === selection.effortId))
-    && (!selection.fastMode || controls.canSetFastMode && route.supportsFastMode);
+    && (!selection.fastMode || (route.canSetFastMode ?? controls.canSetFastMode) && route.supportsFastMode);
   return <View style={styles.stack}>
     <View style={[styles.currentCard, { borderColor: colors.border, backgroundColor: colors.background }]}>
       <Text style={[styles.modelTitle, { color: colors.ink }]}>{route.displayName}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{route.providerName} · {route.providerId}/{route.modelId}</Text>
       <Text style={[styles.caption, { color: colors.muted }]}>{formatMobileTokenLimit(route.contextWindowTokens, locale)}</Text>
     </View>
-    {controls.canSetEffort && route.efforts.length > 0 && <>
+    {(route.canSetEffort ?? controls.canSetEffort) && route.efforts.length > 0 && <>
       <SectionTitle label={mobileMessage(locale, "common.effort")} colors={colors} />
       <View style={styles.choiceStack}>
         {route.efforts.map((effort) => <ChoiceRow key={effort.id} label={effort.label}
@@ -431,7 +439,7 @@ function ModelOptions({ route, controls, selection, favorite, disabled, colors, 
           onPress={() => onSelection({ ...selection, effortId: effort.id })} />)}
       </View>
     </>}
-    {controls.canSetFastMode && <>
+    {(route.canSetFastMode ?? controls.canSetFastMode) && <>
       <SectionTitle label={mobileMessage(locale, "controls.fastMode")} colors={colors} />
       <View style={[styles.settingRow, { borderColor: colors.border }]}>
         <View style={styles.flex}>
@@ -449,7 +457,7 @@ function ModelOptions({ route, controls, selection, favorite, disabled, colors, 
     <View style={styles.actions}>
       <SheetButton label={mobileMessage(locale, "controls.applyModel")} disabled={disabled || !selectionValid}
         colors={colors} onPress={onApply} />
-      {controls.favoritesAvailable !== false && (favorite === undefined
+      {controls.favoritesAvailable !== false && route.source?.kind !== ModelSourceKind.SHARE && route.source?.grouped !== true && (favorite === undefined
         ? <SheetButton label={mobileMessage(locale, "controls.addFavorite")}
             disabled={disabled || !favoriteSelectionValid || duplicateFavorite} colors={colors} onPress={onAddFavorite} />
         : <>
@@ -556,18 +564,19 @@ function favoriteModelSelection(
   route: MobileModelRoute,
   favorite: MobileModelFavoriteConfiguration
 ): MobileModelControlSelection {
-  const favoriteEffort = controls.canSetEffort && favorite.effortId !== undefined
+  const favoriteEffort = (route.canSetEffort ?? controls.canSetEffort) && favorite.effortId !== undefined
     && route.efforts.some((effort) => effort.id === favorite.effortId)
     ? favorite.effortId
     : undefined;
   const defaultEffort = route.efforts.find((effort) => effort.default)?.id ?? route.efforts[0]?.id;
   return {
+    ...(controls.unifiedSources ? { backendId: route.backendId } : {}),
     providerId: route.providerId,
     modelId: route.modelId,
-    ...(controls.canSetEffort && (favoriteEffort ?? defaultEffort) !== undefined
+    ...((route.canSetEffort ?? controls.canSetEffort) && (favoriteEffort ?? defaultEffort) !== undefined
       ? { effortId: favoriteEffort ?? defaultEffort }
       : {}),
-    fastMode: controls.canSetFastMode && route.supportsFastMode && favorite.fastMode
+    fastMode: (route.canSetFastMode ?? controls.canSetFastMode) && route.supportsFastMode && favorite.fastMode
   };
 }
 
@@ -578,15 +587,23 @@ function mobileModelRouteMatchesQuery(route: MobileModelRoute, query: string): b
     route.modelId,
     route.providerName,
     route.providerId,
-    route.family
+    route.family,
+    mobileModelSourceLabel(route)
   ].some((value) => value.toLocaleLowerCase("en-US").includes(needle));
 }
 
+function mobileModelSourceLabel(route: MobileModelRoute): string {
+  return route.source ? [route.source.displayName, route.source.nodeName, route.source.nativeAdapterKind,
+    route.source.groupMemberCount > 0 ? `×${route.source.groupMemberCount}` : undefined].filter(Boolean).join(" · ")
+    : route.providerName;
+}
+
 function sameModelConfiguration(
-  left: Pick<MobileModelControlSelection, "providerId" | "modelId" | "effortId" | "fastMode"> | undefined,
-  right: Pick<MobileModelControlSelection, "providerId" | "modelId" | "effortId" | "fastMode">
+  left: MobileModelControlSelection | undefined,
+  right: MobileModelControlSelection
 ): boolean {
   return left !== undefined
+    && (left.backendId === undefined || right.backendId === undefined || left.backendId === right.backendId)
     && left.providerId === right.providerId
     && left.modelId === right.modelId
     && (left.effortId ?? "") === (right.effortId ?? "")

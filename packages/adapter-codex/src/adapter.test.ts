@@ -33,7 +33,7 @@ import {
 } from "./adapter.js";
 import type { CodexSmartRoutingPreparation } from "./smart-subagent-routing.js";
 import { AppServerHost } from "./host.js";
-import { TransportFault } from "./errors.js";
+import { remoteRpcFault, TransportFault } from "./errors.js";
 import type { JsonObject } from "./protocol.js";
 import { FakeCodexAppServer } from "./testing.js";
 
@@ -44,10 +44,110 @@ afterEach(async () => {
 });
 
 describe("CodexBackendAdapter", () => {
-  it.each([false, true])("keeps native one-shot inference on an isolated exact-model protocol and original owner (cancelled=%s)", async cancelled => {
-    const setup = await createSetup(), owner = new AbortController(), allowed = vi.fn(); await setup.adapter.describe();
+  it.each(["success", "unarchive-fails", "resume-fails-again", "other-thread", "missing-path", "busy", "cancel", "stale-host", "ambiguous"] as const)(
+    "recovers only a proven archived native resume before any user turn (%s)", async outcome => {
+      const setup = await createSetup(), owner = new AbortController();
+      const initial = { ...context(setup.target, [], { backendInstanceGeneration: 7 }), signal: owner.signal };
+      const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+      await setup.adapter.closeSession(binding, { ...initial, binding });
+      const transport = setup.fake.transport!, request = transport.request.bind(transport), methods: string[] = [];
+      let archived = true, resumes = 0;
+      transport.request = async (method, params, options) => {
+        options?.beforeDispatch?.(); methods.push(method);
+        if (method === "thread/resume") {
+          resumes++;
+          if (archived || outcome === "resume-fails-again") {
+            if (outcome === "cancel") owner.abort();
+            if (outcome === "stale-host") await setup.host.forceShutdown();
+            if (outcome === "ambiguous") throw new TransportFault("request_timeout", "Unknown preparation outcome", { stateMayHaveChanged: true });
+            const id = outcome === "other-thread" ? "unrelated-thread" : binding.nativeSessionId!;
+            throw remoteRpcFault(-32600, `session ${id} is archived. Run \`codex unarchive ${id}\` to unarchive it first.`, undefined, binding.nativeSessionId!);
+          }
+        }
+        if (method === "thread/unarchive") {
+          expect(params).toEqual({ threadId: binding.nativeSessionId });
+          if (outcome === "unarchive-fails") throw new Error("Native unarchive unavailable");
+          archived = false; return {};
+        }
+        const result = await request(method, params, options);
+        if (method !== "thread/read") return result;
+        const raw = result as JsonObject;
+        return { ...raw, thread: { ...raw["thread"] as JsonObject,
+          ...(outcome === "missing-path" ? {} : { path: `/history/${archived ? "archived_sessions" : "sessions"}/thread.jsonl` }),
+          ...(outcome === "busy" ? { status: { type: "active" } } : {}) } };
+      };
+      const resuming = setup.adapter.resumeSession(binding, { ...initial, binding });
+      if (outcome === "success") {
+        await expect(resuming).resolves.toMatchObject({ binding });
+        expect(transport.requests.findLast(item => item.method === "thread/resume")?.params)
+          .toMatchObject({ threadId: binding.nativeSessionId, path: "/history/sessions/thread.jsonl" });
+      } else await expect(resuming).rejects.toBeDefined();
+      expect(resumes).toBe(outcome === "success" || outcome === "resume-fails-again" ? 2 : 1);
+      expect(methods.filter(method => method === "thread/unarchive")).toHaveLength(
+        ["success", "unarchive-fails", "resume-fails-again"].includes(outcome) ? 1 : 0);
+      expect(methods).not.toContain("thread/start"); expect(methods).not.toContain("turn/start");
+    }
+  );
+  it("keeps input handoff on each local thread configuration across start and resume", async () => {
+    let revision = 1;
+    const taskShellEnv = vi.fn((ctx: AdapterContext) => ({ JOKO_INPUT_HANDOFF_ROUTE: `private-route-${ctx.sessionId}-${revision}`,
+      GIT_ASKPASS: "private-askpass", UNRELATED_HOST_SECRET: "never-forward" }));
+    const setup = await createSetup(7, { taskShellEnv });
+    const first = context(setup.target, [], { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), first);
+    const second = { ...first, sessionId: "second-session" };
+    await setup.adapter.createSession(sessionInput(setup.target), second);
+    const starts = setup.fake.transport!.requests.filter(request => request.method === "thread/start");
+    expect(starts[0]!.params).toMatchObject({ config: { "shell_environment_policy.set.JOKO_INPUT_HANDOFF_ROUTE": `private-route-${first.sessionId}-1`, "shell_environment_policy.set.GIT_ASKPASS": "private-askpass" } });
+    expect(starts[1]!.params).toMatchObject({ config: { "shell_environment_policy.set.JOKO_INPUT_HANDOFF_ROUTE": "private-route-second-session-1" } });
+    expect(JSON.stringify(starts)).not.toContain("never-forward");
+    await setup.adapter.closeSession(binding, { ...first, binding }); revision = 2;
+    await setup.adapter.resumeSession(binding, { ...first, binding });
+    expect(setup.fake.transport!.requests.findLast(request => request.method === "thread/resume")!.params)
+      .toMatchObject({ config: { "shell_environment_policy.set.JOKO_INPUT_HANDOFF_ROUTE": `private-route-${first.sessionId}-2` } });
+  });
+  it("does not request local input handoff for a remote thread", async () => {
+    const taskShellEnv = vi.fn(() => ({ GIT_ASKPASS: "local-secret-route" }));
+    const setup = await createRemoteSetup({ taskShellEnv });
+    setup.remoteFake.seedThread("/srv/joko-project");
+    const candidate = (await setup.adapter.listNativeSessions(setup.target))[0]!;
+    await setup.adapter.createSession({ ...sessionInput(setup.target), nativeStart: { kind: "attach", nativeReference: candidate.nativeReference } }, context(setup.target, [], { backendInstanceGeneration: 7 }));
+    expect(taskShellEnv).not.toHaveBeenCalled();
+    expect(JSON.stringify(setup.remoteFake.transport!.requests)).not.toContain("local-secret-route");
+  });
+  it.each([false, true])("persists a native dispatch fence at the write queue and rejects changed history before dispatch (changed=%s)", async changed => {
+    const setup = await createSetup(), events: EventPayload[] = [];
+    const initial = context(setup.target, events, { backendInstanceGeneration: 7 });
+    const binding = await setup.adapter.createSession(sessionInput(setup.target), initial);
+    const active = { ...initial, binding, operationId: "fenced-native-input" };
+    let release!: () => void;
+    const persist = vi.fn(async preparation => {
+      expect(preparation.inputFingerprint).toMatch(/^[a-f0-9]{64}$/u);
+      expect(preparation.nativeHistory.activeLineage).toEqual([]);
+      expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(0);
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    const sending = setup.adapter.sendWithDurableNativeDispatchFence(prompt("Fenced input"), active, persist);
+    const observed = sending.catch(error => error);
+    await vi.waitFor(() => expect(persist).toHaveBeenCalledTimes(1));
+    await setup.fake.transport!.emitNotification(changed ? "thread/reverted" : "thread/name/updated", {
+      threadId: binding.nativeSessionId!, ...(changed ? {} : { threadName: "New metadata name" })
+    });
+    release();
+    const result = await observed;
+    if (changed) {
+      expect(result).toBeInstanceOf(Error);
+      expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(0);
+    } else {
+      expect(result).toBeUndefined();
+      expect(setup.fake.transport!.requests.filter(request => request.method === "turn/start")).toHaveLength(1);
+    }
+  });
+  it.each([[false, false], [true, false], [false, true]])("keeps native one-shot inference on an isolated exact-model protocol and original owner (cancelled=%s, images=%s)", async (cancelled, withImage) => {
+    const setup = await createSetup(), owner = new AbortController(), allowed = vi.fn();
+    setup.fake.modelList = setup.fake.modelList.map(model => ({ ...model, inputModalities: ["text", "image"] })); await setup.adapter.describe();
     expect(setup.adapter.nativeTextInferenceCapabilities).toEqual({ pluginOneshot: true, maxTokens: false });
-    const result = setup.adapter.inferNativeText({ providerId: "openai", modelId: "gpt-test", system: "Answer exactly", user: "Question", maxTokens: 512,
+    const result = setup.adapter.inferNativeText({ providerId: "openai", modelId: "gpt-test", system: "Answer exactly", user: "Question", images: withImage ? [{ data: new Uint8Array([1, 2, 3]), mimeType: "image/png" }] : [], maxTokens: 512,
       timeoutMs: 10_000, signal: owner.signal, backendInstanceGeneration: 7, assertCurrent: () => owner.signal.throwIfAborted(), assertModelAllowed: allowed });
     await vi.waitFor(() => expect(setup.fake.transport?.requests.some(request => request.method === "turn/start")).toBe(true));
     const start = setup.fake.transport!.requests.find(request => request.method === "thread/start")!.params as JsonObject;
@@ -56,6 +156,7 @@ describe("CodexBackendAdapter", () => {
     if (cancelled) { owner.abort(); await expect(result).rejects.toThrow(); }
     else {
       const turn = setup.fake.transport!.requests.find(request => request.method === "turn/start")!.params as JsonObject;
+      expect(turn["input"]).toEqual([{ type: "text", text: "Question" }, ...withImage ? [{ type: "image", url: "data:image/png;base64,AQID" }] : []]);
       await setup.fake.completeTurn(turn["threadId"] as string, "Exact answer"); await expect(result).resolves.toBe("Exact answer");
     }
     expect(allowed).toHaveBeenCalledWith("openai", "gpt-test");
@@ -2507,9 +2608,19 @@ describe("CodexBackendAdapter", () => {
     }));
     const call = opened[0]!.beginToolCall(threadId, { requestId: "local-tool", serverId: "tools", toolName: "read" });
     expect(() => call.assertCurrent()).not.toThrow();
+    expect(call.assertNativeRoot).toBeTypeOf("function"); expect(() => call.assertNativeRoot!()).not.toThrow();
+    const childThreadId = "local-owned-tool-child";
+    await setup.fake.transport!.emitNotification("thread/started", { thread: { id: childThreadId, parentThreadId: threadId, agentRole: "worker" } });
+    await setup.fake.transport!.emitNotification("turn/started", { threadId: childThreadId, turn: { id: "local-child-turn", status: "inProgress", items: [], error: null } });
+    await setup.fake.transport!.emitNotification("item/started", { threadId, turnId: "turn-1", item: { type: "collabAgentToolCall", id: "local-spawn", tool: "spawnAgent",
+      status: "inProgress", senderThreadId: threadId, receiverThreadIds: [childThreadId], agentsStates: { [childThreadId]: { status: "running", message: null } } } });
+    const child = opened[0]!.beginToolCall(childThreadId, { requestId: "local-child-tool", serverId: "tools", toolName: "read" });
+    expect(child.assertNativeRoot).toBeUndefined(); child.release();
+    await setup.fake.transport!.emitNotification("turn/completed", { threadId: childThreadId, turn: { id: "local-child-turn", status: "completed", items: [], error: null } });
     expect(() => opened[0]!.beginToolCall("foreign-thread", { requestId: "foreign-tool", serverId: "tools", toolName: "read" })).toThrow();
     await setup.fake.completeTurn(threadId);
     expect(call.signal.aborted).toBe(true);
+    expect(() => call.assertNativeRoot!()).toThrow();
     call.release();
 
     await setup.adapter.setPermissionMode("auto", bound);
@@ -2850,6 +2961,7 @@ describe("CodexBackendAdapter", () => {
     }));
     const call = opened[0]!.beginToolCall(threadId, { requestId: "remote-tool", serverId: "tools", toolName: "read" });
     expect(() => call.assertCurrent()).not.toThrow();
+    expect(call.assertNativeRoot).toBeUndefined();
     expect(() => opened[0]!.beginToolCall("unowned-native-thread", { requestId: "unowned-tool", serverId: "tools", toolName: "read" })).toThrow();
 
     bridgeGeneration = 2;
@@ -5822,6 +5934,7 @@ async function createRemoteSkillInputSetup() {
 }
 
 async function createRemoteSetup(options: {
+  readonly taskShellEnv?: CodexAdapterOptions["taskShellEnv"];
   readonly openMcpBridge?: CodexRemoteRuntime["openMcpBridge"];
   readonly resolveNativeMemoryEnabled?: CodexAdapterOptions["resolveNativeMemoryEnabled"];
   readonly targetWorkspaceRoot?: string;
@@ -5860,6 +5973,7 @@ async function createRemoteSetup(options: {
   const adapter = new CodexBackendAdapter({
     id: "codex-test",
     instanceGeneration: 7,
+    ...(options.taskShellEnv === undefined ? {} : { taskShellEnv: options.taskShellEnv }),
     host: localHost,
     remoteRuntimes: {
       resolve: resolveRemote,

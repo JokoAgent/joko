@@ -1,0 +1,144 @@
+syntax = "proto3";
+
+package joko.v1;
+
+import "joko/v1/model.proto";
+import "joko/v1/capability.proto";
+import "joko/v1/provider_group.proto";
+
+// Private native execution between an original task node and a Provider node.
+// Authentication classifies owner/guest and supplies the source Device; neither
+// can be supplied in these messages. Task-sharing credentials confer no access.
+service HostedAgentService {
+  rpc GetHostedAgentCatalog(GetHostedAgentCatalogRequest) returns (GetHostedAgentCatalogResponse);
+  rpc GetHostedAgentSettings(GetHostedAgentSettingsRequest) returns (GetHostedAgentSettingsResponse);
+  rpc UpdateHostedAgentSettings(UpdateHostedAgentSettingsRequest) returns (UpdateHostedAgentSettingsResponse);
+  rpc OpenHostedAgent(OpenHostedAgentRequest) returns (OpenHostedAgentResponse);
+  rpc CallHostedAgent(CallHostedAgentRequest) returns (CallHostedAgentResponse);
+  rpc PollHostedAgents(PollHostedAgentsRequest) returns (PollHostedAgentsResponse);
+  rpc ReplyHostedAgent(ReplyHostedAgentRequest) returns (ReplyHostedAgentResponse);
+  rpc ReadHostedAgentArtifact(ReadHostedAgentArtifactRequest) returns (ReadHostedAgentArtifactResponse);
+  rpc CloseHostedAgent(CloseHostedAgentRequest) returns (CloseHostedAgentResponse);
+}
+
+// Closed dispatch surface for the authenticated Device route. This cannot
+// invoke unrelated product, credential, file or process services.
+enum HostedAgentPeerMethod {
+  HOSTED_AGENT_PEER_METHOD_UNSPECIFIED = 0;
+  HOSTED_AGENT_PEER_METHOD_GET_SETTINGS = 1;
+  HOSTED_AGENT_PEER_METHOD_UPDATE_SETTINGS = 2;
+  HOSTED_AGENT_PEER_METHOD_OPEN = 3;
+  HOSTED_AGENT_PEER_METHOD_CALL = 4;
+  HOSTED_AGENT_PEER_METHOD_POLL = 5;
+  HOSTED_AGENT_PEER_METHOD_REPLY = 6;
+  HOSTED_AGENT_PEER_METHOD_READ_ARTIFACT = 7;
+  HOSTED_AGENT_PEER_METHOD_CLOSE = 8;
+  HOSTED_AGENT_PEER_METHOD_GET_CATALOG = 9;
+  HOSTED_AGENT_PEER_METHOD_GROUP_GET = 10;
+  HOSTED_AGENT_PEER_METHOD_GROUP_PICK = 11;
+  HOSTED_AGENT_PEER_METHOD_GROUP_COOL = 12;
+  HOSTED_AGENT_PEER_METHOD_GROUP_LEASES = 13;
+  HOSTED_AGENT_PEER_METHOD_GROUP_USAGE_REPORT = 14;
+  HOSTED_AGENT_PEER_METHOD_GROUP_USAGE = 15;
+  HOSTED_AGENT_PEER_METHOD_GROUP_SCHEDULING_STATE = 16;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CATALOG = 17;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_OPEN = 18;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CALL = 19;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_POLL = 20;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_REPLY = 21;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_READ_ARTIFACT = 22;
+  HOSTED_AGENT_PEER_METHOD_GUEST_RELAY_CLOSE = 23;
+}
+
+// Only the authenticated private Device route accepts this envelope. The group
+// service captures the already approved person's identity and native model
+// scope. Ordinary HostedAgentService opens cannot declare relay or trust.
+message HostedAgentGuestRelayScope {
+  string relay_id = 1;
+  string backend_id = 2;
+  string provider_id = 3;
+  repeated string model_ids = 4;
+}
+message HostedAgentGuestRelayRequest {
+  HostedAgentGuestRelayScope scope = 1;
+  bytes request_bytes = 2;
+  // A captured group grant may request final deletion after native closure.
+  // Valid only for GUEST_RELAY_CLOSE; never part of a public Source open.
+  bool purge = 3;
+}
+
+// A complete, credential-free view of actual native factories on this node.
+// Disabled Providers remain identifiable so an existing choice can be retained.
+message HostedAgentProviderCatalog {
+  string provider_id = 1;
+  string display_name = 2;
+  bool remote_invocation_enabled = 3;
+  bool connected = 4;
+  repeated ModelDescriptor models = 5;
+  string access_kind = 6;
+  string access_product = 7;
+  ProviderGroupSummary group = 8;
+}
+message HostedAgentBackendCatalog {
+  string backend_id = 1;
+  string display_name = 2;
+  repeated HostedAgentProviderCatalog providers = 3;
+  repeated Capability capabilities = 4;
+  string version = 5;
+  string native_adapter_kind = 6;
+  // Stable identity of the actual native execution service, separate from the
+  // Device route that may delegate to it.
+  string node_id = 7;
+  // Exact native process instance for isolated, task-free inference admission.
+  uint64 instance_generation = 8;
+}
+message GetHostedAgentCatalogRequest { uint32 format = 1; }
+message GetHostedAgentCatalogResponse {
+  uint32 format = 1;
+  bool remote_control_enabled = 2;
+  repeated HostedAgentBackendCatalog backends = 3;
+}
+
+message HostedAgentProviderPermission { string backend_id = 1; string provider_id = 2; bool enabled = 3; }
+message HostedAgentLimits { uint32 per_device = 1; uint32 total = 2; }
+message HostedAgentLimitUsage { uint32 total = 1; uint32 devices = 2; uint32 maximum_device = 3; }
+message HostedAgentSettings {
+  uint64 revision = 1;
+  bool remote_control_enabled = 2;
+  repeated HostedAgentProviderPermission providers = 3;
+  HostedAgentLimits limits = 4;
+  bool limits_overridden = 5;
+  HostedAgentLimitUsage usage = 6;
+}
+message GetHostedAgentSettingsRequest {}
+message GetHostedAgentSettingsResponse { HostedAgentSettings settings = 1; }
+message HostedAgentRemoteControlPermission { bool enabled = 1; }
+message HostedAgentResetLimits {}
+message UpdateHostedAgentSettingsRequest {
+  uint64 expected_revision = 1;
+  oneof update {
+    HostedAgentRemoteControlPermission remote_control = 2;
+    HostedAgentProviderPermission provider = 3;
+    HostedAgentLimits limits = 4;
+    HostedAgentResetLimits reset_limits = 5;
+  }
+}
+message UpdateHostedAgentSettingsResponse { HostedAgentSettings settings = 1; }
+
+// Native Adapter values use the closed current-v1 codec at the service boundary.
+// They are private transport values, never persisted as product Events, Sessions
+// or Workspaces. The service rejects unknown fields and unsupported operations.
+message OpenHostedAgentRequest { uint32 format = 1; bytes open_json = 2; }
+message OpenHostedAgentResponse { uint32 format = 1; string run_id = 2; string virtual_root = 3; }
+message CallHostedAgentRequest { uint32 format = 1; string run_id = 2; string call_id = 3; bytes command_json = 4; }
+message CallHostedAgentResponse { uint32 format = 1; bytes result_json = 2; }
+message HostedAgentPollCursor { string run_id = 1; uint64 after = 2; }
+message HostedAgentPollRun { string run_id = 1; uint64 cursor = 2; bool finished = 3; bytes frames_json = 4; }
+message PollHostedAgentsRequest { uint32 format = 1; repeated HostedAgentPollCursor cursors = 2; }
+message PollHostedAgentsResponse { uint32 format = 1; repeated HostedAgentPollRun runs = 2; }
+message ReplyHostedAgentRequest { uint32 format = 1; string run_id = 2; string request_id = 3; bytes result_json = 4; }
+message ReplyHostedAgentResponse { uint32 format = 1; }
+message ReadHostedAgentArtifactRequest { uint32 format = 1; string run_id = 2; string artifact_id = 3; uint64 offset = 4; uint32 maximum_bytes = 5; }
+message ReadHostedAgentArtifactResponse { uint32 format = 1; bytes data = 2; }
+message CloseHostedAgentRequest { uint32 format = 1; string run_id = 2; }
+message CloseHostedAgentResponse { uint32 format = 1; }

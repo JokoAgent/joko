@@ -29,7 +29,7 @@ export function preparePartnerImportCreation(partners: PartnerManager, selection
   let name: string; try { name = normalizedPartnerName(selection.name); } catch { throw new AgentImportError("INVALID_SELECTION"); }
   if (partners.listPartners().some(profile => profile.id !== importedPartnerId(selection.requestId) && normalizedPartnerName(profile.displayName) === name)) throw new AgentImportError("IMPORT_NAME_EXISTS");
   return JSON.stringify({ version: 1, directoryRevision: directory.revision.toString(), capabilities: directory.defaultCapabilities
-    ?? { modelChain: [], permissionMode: "ask", planMode: false } } satisfies CreationDraft);
+    ?? { modelChain: [], permissionMode: "ask", planMode: false, inputHandoff: true } } satisfies CreationDraft);
 }
 
 /** Explicit model/policy mapping can adopt those fields, but cannot adopt edits to imported identity or a different task. */

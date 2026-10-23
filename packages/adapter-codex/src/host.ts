@@ -8,6 +8,7 @@ import {
 } from "./protocol.js";
 import { StdioJsonRpcTransport, type RpcRequestOptions, type RpcTransport, type StdioJsonRpcTransportOptions } from "./transport.js";
 import { TransportFault } from "./errors.js";
+import { CODEX_EXTERNAL_AUTH_REFRESH, CodexExternalAuthSession, assertCodexEphemeralAuth, type CodexExternalAuth } from "./external-auth.js";
 
 export interface HostSubscriptionHandlers {
   readonly onNotification: (method: string, params: JsonValue) => void | Promise<void>;
@@ -26,6 +27,9 @@ export interface HostSubscription {
 }
 
 export interface AppServerHostOptions {
+  readonly externalAuth?: CodexExternalAuth;
+  readonly apiKeyAuth?: () => Promise<string>;
+  readonly requireEphemeralAuth?: boolean;
   readonly transport?: StdioJsonRpcTransportOptions;
   readonly transportFactory?: () => RpcTransport;
   readonly clientName?: string;
@@ -42,6 +46,7 @@ interface Subscriber {
   readonly generation: number;
   readonly handlers: HostSubscriptionHandlers;
   historyRevision: bigint;
+  contentRevision: bigint;
   pendingNotifications: number;
   notificationDrain?: () => void;
 }
@@ -81,9 +86,12 @@ export class AppServerHost {
   #bufferedBytes = 0;
   #closing = false;
   #nextHistoryRevision = 0n;
+  readonly #externalAuth: CodexExternalAuthSession | undefined;
   readonly #notificationOwners = new WeakMap<RpcNotification, Subscriber>();
 
   constructor(options: AppServerHostOptions = {}) {
+    if (options.externalAuth && options.apiKeyAuth) throw new TypeError("A native process has one account authority.");
+    this.#externalAuth = options.externalAuth ? new CodexExternalAuthSession(options.externalAuth) : undefined;
     this.#options = {
       ...options,
       clientName: options.clientName ?? "joko",
@@ -139,6 +147,11 @@ export class AppServerHost {
     return this.isActiveGeneration(hostGeneration) && subscriber?.generation === hostGeneration
       ? subscriber.historyRevision
       : undefined;
+  }
+  /** Wire-arrival revision of entries, distinct from name/status metadata. */
+  contentRevision(threadId: string, hostGeneration: number): bigint | undefined {
+    const subscriber = this.#subscribers.get(threadId);
+    return this.isActiveGeneration(hostGeneration) && subscriber?.generation === hostGeneration ? subscriber.contentRevision : undefined;
   }
 
   /** Pending delivery can contain activity that the Adapter has not observed yet. */
@@ -254,7 +267,8 @@ export class AppServerHost {
       throw new TransportFault("protocol_violation", "A Codex descendant thread already belongs to an active root subscription.");
     }
     this.#detachedThreads.delete(threadId);
-    const subscriber: Subscriber = { generation: expectedHostGeneration, handlers, historyRevision: ++this.#nextHistoryRevision, pendingNotifications: 0 };
+    const revision = ++this.#nextHistoryRevision;
+    const subscriber: Subscriber = { generation: expectedHostGeneration, handlers, historyRevision: revision, contentRevision: revision, pendingNotifications: 0 };
     this.#subscribers.set(threadId, subscriber);
     const waiting = this.#takeBuffered(threadId);
     try {
@@ -385,8 +399,22 @@ export class AppServerHost {
       if (this.#transport !== transport || generation !== this.#generation) {
         throw new TransportFault("process_exited", "The Codex app-server generation changed during initialization.");
       }
-      this.#initializeResult = parseInitializeResult(result);
+      const initializeResult = parseInitializeResult(result);
       await transport.notify("initialized");
+      const assertCurrent = () => { if (this.#closing || this.#transport !== transport || !transport.running || generation !== this.#generation) throw new Error("Native authentication authority changed."); };
+      const request = async (method: string, params: unknown) => { assertCurrent(); const result = await transport.request(method, params as JsonValue,
+        { timeoutMs: 10_000, beforeDispatch: assertCurrent }); assertCurrent(); return result; };
+      if (this.#options.requireEphemeralAuth || this.#externalAuth || this.#options.apiKeyAuth) await assertCodexEphemeralAuth(request);
+      if (this.#externalAuth) { await this.#externalAuth.authenticate(request); assertCurrent(); }
+      if (this.#options.apiKeyAuth) {
+        try {
+          const apiKey = await this.#options.apiKeyAuth(); assertCurrent();
+          if (!apiKey || apiKey.length > 65_536 || apiKey.includes("\0")) throw new Error();
+          const response = await request("account/login/start", { type: "apiKey", apiKey });
+          if (!isJsonObject(response) || response["type"] !== "apiKey") throw new Error();
+        } catch { throw new Error("Codex could not initialize isolated account authentication"); }
+      }
+      assertCurrent(); this.#initializeResult = initializeResult;
       return generation;
     } catch (error) {
       if (this.#transport === transport) {
@@ -404,6 +432,7 @@ export class AppServerHost {
     if (!validThreadIdentity(threadId)) return;
     const subscriber = this.#subscribers.get(threadId);
     if (subscriber?.generation === generation && changesNativeHistory(notification.method)) subscriber.historyRevision = ++this.#nextHistoryRevision;
+    if (subscriber?.generation === generation && changesNativeContent(notification.method)) subscriber.contentRevision = ++this.#nextHistoryRevision;
     const lineage = this.#descendants.get(threadId);
     const started = notification.method === "thread/started" ? descendantStartMetadata(notification.params) : undefined;
     const parent = started === undefined ? undefined : this.#subscribers.get(started.parentThreadId)
@@ -465,6 +494,19 @@ export class AppServerHost {
     request: RpcServerRequest
   ): Promise<void> {
     if (transport !== this.#transport || generation !== this.#generation) return;
+    if (request.method === CODEX_EXTERNAL_AUTH_REFRESH) {
+      try {
+        if (!this.#externalAuth || this.#closing || !isJsonObject(request.params) || request.params["reason"] !== "unauthorized") throw new Error();
+        const tokens = await this.#externalAuth.tokens(true, request.params["previousAccountId"]);
+        if (this.#closing || transport !== this.#transport || generation !== this.#generation) return;
+        await transport.respond(request.id, { ...tokens });
+      } catch {
+        if (!this.#closing && transport === this.#transport && generation === this.#generation) {
+          await transport.respondError(request.id, -32600, "The selected native account authentication is unavailable.");
+        }
+      }
+      return;
+    }
     const threadId = threadIdFromParams(request.params);
     const direct = threadId === undefined ? undefined : this.#subscribers.get(threadId);
     const lineage = threadId === undefined ? undefined : this.#descendants.get(threadId);
@@ -668,6 +710,10 @@ function changesNativeHistory(method: string): boolean {
     || method === "thread/started" || method === "thread/reverted" || method === "thread/compacted"
     || method === "thread/deleted" || method === "thread/closed" || method === "thread/status/changed"
     || method === "thread/name/updated";
+}
+function changesNativeContent(method: string): boolean {
+  return method.startsWith("turn/") || method.startsWith("item/") || method === "thread/started"
+    || method === "thread/reverted" || method === "thread/compacted" || method === "thread/deleted" || method === "thread/closed";
 }
 
 function descendantStartMetadata(params: JsonValue): {

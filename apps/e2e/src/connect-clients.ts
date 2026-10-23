@@ -17,6 +17,7 @@ import {
   ObjectiveService,
   PartnerService,
   PartnerGroupService,
+  PartnerNetworkService,
   PartnerRoutineService,
   PartnerImportService,
   PiService,
@@ -48,6 +49,7 @@ export interface E2eClients {
   readonly objective: Client<typeof ObjectiveService>;
   readonly partner: Client<typeof PartnerService>;
   readonly partnerGroup: Client<typeof PartnerGroupService>;
+  readonly partnerNetwork: Client<typeof PartnerNetworkService>;
   readonly partnerRoutine: Client<typeof PartnerRoutineService>;
   readonly partnerImport: Client<typeof PartnerImportService>;
   readonly backend: Client<typeof BackendService>;
@@ -104,6 +106,7 @@ export function createE2eClients(baseUrl: string, authKey?: string, timeoutMs = 
     objective: createClient(ObjectiveService, transport),
     partner: createClient(PartnerService, transport),
     partnerGroup: createClient(PartnerGroupService, transport),
+    partnerNetwork: createClient(PartnerNetworkService, transport),
     partnerRoutine: createClient(PartnerRoutineService, transport),
     partnerImport: createClient(PartnerImportService, transport),
     backend: createClient(BackendService, transport),

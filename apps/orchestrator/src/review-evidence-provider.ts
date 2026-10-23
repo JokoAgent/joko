@@ -331,6 +331,7 @@ function visibleMessages(store: OperationalStore, sessionId: string, events: Lis
       event.payload.type !== "message_complete"
       || event.payload.automaticContinuation !== undefined
       || event.payload.objectiveContinuation !== undefined
+      || event.payload.inputHandoffContinuation !== undefined
       || deleted.has(event.id)
     ) return [];
     if (event.payload.role === "user" && event.runId !== undefined && disposition.get(event.runId) !== "prompt") return [];

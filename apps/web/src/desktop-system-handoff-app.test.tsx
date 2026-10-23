@@ -186,6 +186,51 @@ describe("Desktop system handoff App boundary", () => {
     await fixture.dispose();
   });
 
+  it("reuses history during navigation but reads the latest page after reconnecting with an unchanged Session descriptor", async () => {
+    const task = session("task-a");
+    const initial = connectedState({ route: { kind: "session", sessionId: task.id }, sessions: [task] });
+    const loadSessionTimelinePage = vi.fn<AppController["loadSessionTimelinePage"]>()
+      .mockResolvedValueOnce({ items: [timelineItem("earlier-answer")] })
+      .mockResolvedValueOnce({ items: [{ ...timelineItem("offline-answer"), sequence: 2n }] });
+    const fixture = renderApp(initial, { loadSessionTimelinePage });
+    await fixture.render();
+    expect(loadSessionTimelinePage).toHaveBeenCalledOnce();
+    await fixture.render({ ...initial, route: { kind: "settings" } });
+    await fixture.render();
+    expect(loadSessionTimelinePage).toHaveBeenCalledOnce();
+
+    await fixture.render({ ...initial, connectionState: "offline" });
+    await fixture.render();
+    expect(loadSessionTimelinePage).toHaveBeenCalledTimes(2);
+    expect(loadSessionTimelinePage).toHaveBeenLastCalledWith(task.id, undefined, 240);
+    await fixture.dispose();
+  });
+
+  it("keeps the cursor between a refreshed latest page and an exhausted older window", async () => {
+    const task = session("task-a");
+    const initial = connectedState({ route: { kind: "session", sessionId: task.id }, sessions: [task] });
+    const earlier = timelineItem("earlier-answer");
+    const middle = { ...timelineItem("middle-answer"), sequence: 2n };
+    const latest = { ...timelineItem("latest-answer"), sequence: 3n };
+    const loadSessionTimelinePage = vi.fn<AppController["loadSessionTimelinePage"]>()
+      .mockResolvedValueOnce({ items: [earlier] })
+      .mockResolvedValueOnce({ items: [latest], nextBeforeCursor: historyCursor(3n) })
+      .mockResolvedValueOnce({ items: [earlier, middle] });
+    const fixture = renderApp(initial, { loadSessionTimelinePage });
+    await fixture.render();
+    await fixture.render({ ...initial, connectionState: "offline" });
+    await fixture.render({ ...initial, snapshot: { ...initial.snapshot, sessions: [{ ...task, updatedAt: 2 }] } });
+    await act(async () => {
+      fixture.container.querySelector(".timeline")!.dispatchEvent(new Event("scroll", { bubbles: true }));
+    });
+    await act(async () => {
+      [...fixture.container.querySelectorAll("button")].find(button => button.textContent === "Load earlier activity")?.click();
+    });
+    expect(loadSessionTimelinePage).toHaveBeenCalledTimes(3);
+    expect(loadSessionTimelinePage).toHaveBeenLastCalledWith(task.id, historyCursor(3n), 240);
+    await fixture.dispose();
+  });
+
   it("reports a message-only link after authoritative history is exhausted", async () => {
     const task = session("task-a");
     const loadSessionTimelinePage = vi.fn(async () => ({ items: [] }));
@@ -231,8 +276,9 @@ describe("Desktop system handoff App boundary", () => {
     expect(retry).toBeDefined();
     await act(async () => { retry?.click(); });
     await act(async () => {
-      await vi.waitFor(() => expect(loadSessionTimelinePage).toHaveBeenCalledTimes(4));
+      await vi.waitFor(() => expect(loadSessionTimelinePage).toHaveBeenCalledTimes(3));
     });
+    expect(loadSessionTimelinePage).toHaveBeenLastCalledWith(task.id, historyCursor(10n), 240);
     expect(fixture.container.textContent).toContain("Message search is unavailable.");
     await fixture.dispose();
   });

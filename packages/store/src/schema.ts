@@ -2642,6 +2642,7 @@ CREATE TRIGGER enqueue_visible_message_embedding
             AND json_extract(NEW.payload_json, '$.payload.role') IN ('user', 'assistant')
             AND json_extract(NEW.payload_json, '$.payload.automaticContinuation') IS NULL
             AND json_extract(NEW.payload_json, '$.payload.objectiveContinuation') IS NULL
+            AND json_extract(NEW.payload_json, '$.payload.inputHandoffContinuation') IS NULL
           )
           OR (
             json_extract(NEW.payload_json, '$.payload.type') = 'interaction_opened'

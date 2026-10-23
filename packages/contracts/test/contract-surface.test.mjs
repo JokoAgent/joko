@@ -347,7 +347,7 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "set_remote_desktop_clipboard_sync", "get_remote_desktop_clipboard_version", "set_remote_desktop_privacy_screen",
     "get_remote_desktop_lock_state", "request_remote_desktop_credentials", "close_remote_desktop_credentials",
     "set_remote_desktop_viewer_display", "restore_remote_desktop_viewer_display",
-    "perform_remote_desktop_system_action"
+    "perform_remote_desktop_system_action", "invoke_hosted_agent"
   ]);
   assert.deepEqual(oneofMembers(contract.DevicePeerAgentResultSchema, "payload"), [
     "acknowledgement", "recent_directories", "directories", "directory_inspection", "directory_created",
@@ -364,7 +364,7 @@ test("device-peer contracts fence exact authority and keep workspace locations d
     "remote_desktop_display_modes", "remote_desktop_host_mute", "remote_desktop_clipboard_sync",
     "remote_desktop_clipboard_version", "remote_desktop_privacy_screen", "remote_desktop_lock_state",
     "remote_desktop_credentials", "remote_desktop_display_mode", "remote_desktop_viewer_display",
-    "remote_desktop_system_action", "failure"
+    "remote_desktop_system_action", "hosted_agent", "failure"
   ]);
   assert.deepEqual([...fieldNames(contract.OpenDevicePeerAgentRouteRequestSchema)], [
     "target_device_id", "route_generation", "request_id", "hello", "result", "heartbeat"

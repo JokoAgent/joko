@@ -13,6 +13,7 @@ export interface TaskSharingHostOptions {
   readonly store: OperationalStore; readonly serverId: string; readonly origin: string;
   readonly generation: () => bigint; readonly runtime: TaskSharingRuntimePort;
   readonly artifacts?: ArtifactStore;
+  readonly authorizeShare?: (shareId: string, sessionId: string) => void;
 }
 
 /** Host authority for one canonical task. Guest keys are never Connections. */
@@ -94,10 +95,12 @@ export class TaskSharingHost {
   previewInvitation(invitation: string): contract.TaskShare {
     const parsed = this.invitation(invitation), share = this.shares.active(parsed.shareId);
     if (BigInt(share.shareGeneration) !== parsed.shareGeneration || share.invitationSha256Hex !== hash(parsed.inviteSecret)) throw denied("The task invitation is no longer available.");
+    this.options.authorizeShare?.(share.shareId, share.sessionId);
     return this.publicShare(share);
   }
   acceptJoin(input: { readonly intentId: string; readonly invitation: string; readonly credentialSha256Hex: string;
     readonly displayName: string; readonly homeServerId: string; readonly homeDeviceId: string }): { share: contract.TaskShare; member: contract.TaskShareMember } {
+    this.previewInvitation(input.invitation);
     const parsed = this.invitation(input.invitation);
     const result = this.shares.join({ ...input, shareId: parsed.shareId, shareGeneration: safeGeneration(parsed.shareGeneration),
       invitationSha256Hex: hash(parsed.inviteSecret), memberId: `member-${randomUUID()}` });
@@ -117,6 +120,7 @@ export class TaskSharingHost {
     let current;
     try { current = this.shares.byCredential(hash(secret)); } catch { throw denied("Task membership is unavailable or revoked."); }
     const { share, member } = current;
+    this.options.authorizeShare?.(share.shareId, share.sessionId);
     const proof = { shareId: share.shareId, shareGeneration: share.shareGeneration, memberId: member.memberId,
       memberGeneration: member.memberGeneration, credentialSha256Hex: hash(secret) };
     const scope = create(contract.TaskShareScopeSchema, { hostServerId: this.options.serverId, shareId: share.shareId,
@@ -127,6 +131,7 @@ export class TaskSharingHost {
       assertCurrent: () => {
         controller.signal.throwIfAborted();
         if (this.#closed) throw denied("Task sharing is closed.");
+        this.options.authorizeShare?.(share.shareId, share.sessionId);
         this.shares.authorize(proof);
       } };
     this.#leases.add({ lease, controller });

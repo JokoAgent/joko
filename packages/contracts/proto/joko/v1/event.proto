@@ -245,7 +245,11 @@ message MessageStartedEvent {
   CollaborationReportOrigin collaboration_report_origin = 14;
   TaskMessageOrigin task_message_origin = 15;
   SharedTaskAuthor shared_task_author = 16;
+  // The original task Host authored this handoff completion. Never public input.
+  InputHandoffContinuation input_handoff_continuation = 17;
 }
+
+message InputHandoffContinuation { string request_id = 1; }
 
 message TaskMessageOrigin {
   string sender_session_id = 1;

@@ -10,6 +10,34 @@ import { TransportFault } from "./errors.js";
 const fixture = fileURLToPath(new URL("./fixtures/fake-app-server.mjs", import.meta.url));
 
 describe("StdioJsonRpcTransport", () => {
+  it.each(["exact", "other-thread", "wrong-code", "with-data", "other-method", "extra-text"] as const)(
+    "retains only the exact archived resume classification and redacts remote error data (%s)", async outcome => {
+      let handlers!: JsonRpcRecordChannelHandlers, running = false;
+      const message = `session thread-one is archived. Run \`codex unarchive thread-one\` to unarchive it first.`;
+      const transport = new StdioJsonRpcTransport({ channelFactory: () => ({
+        get running() { return running; },
+        async start(value) { handlers = value; running = true; },
+        async write(bytes, admission) {
+          if (admission?.beforeWrite && !await admission.beforeWrite()) return;
+          if (admission?.finalBeforeWrite?.() === false) return;
+          const value = JSON.parse(bytes.toString("utf8")) as { id: number };
+          handlers.onData(`${JSON.stringify({ id: value.id, error: { code: outcome === "wrong-code" ? -32602 : -32600,
+            message: `${message}${outcome === "extra-text" ? " private credential" : ""}`,
+            ...(outcome === "with-data" ? { data: "private credential" } : {}) } })}\n`);
+        },
+        async close() { running = false; }
+      }) });
+      try {
+        await transport.start({ onNotification() {}, onRequest() {}, onExit() {} });
+        const error = await transport.request(outcome === "other-method" ? "thread/read" : "thread/resume",
+          { threadId: outcome === "other-thread" ? "thread-two" : "thread-one" }).catch((error: unknown) => error);
+        expect(error).toMatchObject({ message: "The Codex app-server rejected the request.",
+          archivedResumeThreadId: outcome === "exact" ? "thread-one" : undefined });
+        expect(JSON.stringify(error)).not.toContain("private credential");
+        expect(String(error)).not.toContain("is archived");
+      } finally { await transport.close(); }
+    }
+  );
   it.each(["tamper", "revoke", "cancel", "timeout"] as const)("checks queued asynchronous proof and final synchronous ownership after %s", async boundary => {
     let handlers: JsonRpcRecordChannelHandlers | undefined, running = false;
     let releasePrior!: () => void, releaseProof!: () => void, entered!: () => void;

@@ -7,7 +7,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics } from "./mobile-ios-runtime-diagnostics.mjs";
+import { assertNoNotificationStartupError, collectHostResources, collectRuntimeFailureDiagnostics, isUiRunnerAccessibilityStartupFailure } from "./mobile-ios-runtime-diagnostics.mjs";
 
 const exec = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -469,7 +469,8 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
   const common = ["-project", project, "-scheme", "JokoCIUITests", "-configuration", "Debug", "-sdk", "iphonesimulator",
     "-destination", `platform=iOS Simulator,id=${udid}`, "-destination-timeout", "30", "-derivedDataPath", derivedData,
     "-parallel-testing-enabled", "NO", "-maximum-concurrent-test-simulator-destinations", "1"];
-  const xcresult = join(evidence, "gui.xcresult"), screenshots = join(evidence, "gui-screenshots");
+  let xcresult = join(evidence, "gui.xcresult");
+  const screenshots = join(evidence, "gui-screenshots");
   let executionError;
   try {
     stage = "Apple UI-test target preparation";
@@ -484,6 +485,19 @@ async function runConnectionUiTests(app, port, expectedSha, expectedHash, reopen
       await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
         "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], "gui-test.log", 5 * 60_000);
     } catch (error) { executionError = error; }
+    if (executionError && !abort.signal.aborted && existsSync(xcresult)) {
+      const initial = JSON.parse(await command("xcrun", ["xcresulttool", "get", "test-results", "summary", "--path", xcresult]));
+      if (isUiRunnerAccessibilityStartupFailure(initial, requests, unexpectedRequests)) {
+        save("gui-initial-summary.json", initial);
+        await assertIdentity("post-ui-build");
+        xcresult = join(evidence, "gui-retry.xcresult");
+        executionError = undefined;
+        try {
+          await guiCommand([...common, "test-without-building", "-resultBundlePath", xcresult,
+            "-only-testing:JokoCIUITests/JokoConnectionUITests/testConnectionPageInteractions"], "gui-test-retry.log", 5 * 60_000);
+        } catch (error) { executionError = error; }
+      }
+    }
     if (existsSync(xcresult)) {
       stage = "Apple UI-test evidence export";
       const summary = JSON.parse(await command("xcrun", ["xcresulttool", "get", "test-results", "summary", "--path", xcresult]));

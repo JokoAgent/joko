@@ -34,6 +34,10 @@ export function createTaskSharingRuntime(
       // A collision with an ordinary/service operation is never adopted as a guest receipt.
       if (store.findOperation(request.operationId)) throw denied();
       const sessionId = lease.scope.sessionId;
+      const currentBackendId = store.getSession(sessionId).descriptor.backendId;
+      const targetBackendId = mutation.payload.case === "setSessionRuntime" ? mutation.payload.value.backendId ?? currentBackendId : currentBackendId;
+      if (["sendInput", "setSessionRuntime", "resumeQueue", "resumeSession", "editQueueItem", "setSessionModel", "resolveInteraction"].includes(mutation.payload.case)
+        && [currentBackendId, targetBackendId].some(id => store.getBackend(id).descriptor.capabilities.get("model.remote_execution")?.supported === true)) throw denied();
       const assertCurrent = () => {
         lease.assertCurrent();
         validatePreconditions(store, mutation);

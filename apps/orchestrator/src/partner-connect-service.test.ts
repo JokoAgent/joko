@@ -60,6 +60,21 @@ afterEach(async () => {
 });
 
 describe("PartnerService", () => {
+  it("round-trips an independent private-input switch through the actual current profile and owner CAS", async () => {
+    const f = await createFixture(), service = createPartnerConnectService(f.manager, () => undefined);
+    const profile = await f.manager.createPartner(partnerInput(f.partnerStore, "Private input owner"));
+    expect(profile.capabilities.inputHandoff).toBe(true);
+    const request = create(contract.UpdatePartnerRequestSchema, { partnerId: profile.id, expectedRevision: revision(profile.revision),
+      patch: { inputHandoff: false } });
+    const result = await service.updatePartner(request, context());
+    expect(result.partner?.capabilities?.inputHandoff).toBe(false);
+    expect(f.partnerStore.getPartner(profile.id).capabilities.inputHandoff).toBe(false);
+    expect(f.partnerStore.listProfileVersions(profile.id).at(-1)?.capabilities.inputHandoff).toBe(true);
+    await expect(service.updatePartner(request, context())).rejects.toMatchObject({ code: Code.Aborted });
+    const restored = await service.updatePartner(create(contract.UpdatePartnerRequestSchema, { partnerId: profile.id, expectedRevision: result.partner!.revision,
+      patch: { inputHandoff: true } }), context());
+    expect(restored.partner?.capabilities?.inputHandoff).toBe(true);
+  });
   it("round-trips the exact permission modes through defaults, create and profile updates", async () => {
     const f = await createFixture(), service = createPartnerConnectService(f.manager, () => undefined);
     const defaults = await service.updatePartnerDefaults(create(contract.UpdatePartnerDefaultsRequestSchema, {

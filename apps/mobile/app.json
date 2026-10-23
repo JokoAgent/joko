@@ -59,6 +59,7 @@
       ]
     },
     "plugins": [
+      "./with-joko-storage-budget.cjs",
       "./with-joko-photo-library-boundary.cjs",
       "./with-joko-native-brand.cjs",
       "./with-joko-incoming-share.cjs",

@@ -97,7 +97,8 @@ export function createRemoteDesktopConnectService(
       const lease = await dependencies.coordinator.start(connection, peer, {
         displayId: request.displayId,
         mode: request.mode,
-        ...(request.control ? { control: true } : {})
+        ...(request.control ? { control: true } : {}),
+        ...(request.inputHandoffRequestId === undefined ? {} : { inputHandoffRequestId: request.inputHandoffRequestId })
       }, context.signal);
       dependencies.connections.fence(connection);
       return create(contract.StartRemoteDesktopResponseSchema, {

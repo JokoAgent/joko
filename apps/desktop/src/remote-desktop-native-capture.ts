@@ -58,6 +58,7 @@ export class DesktopRemoteDesktopNativeCapture {
   #cancel: ((error?: Error) => void) | undefined;
   #excludedWindows = "";
   #confirmedExclusion = "";
+  #onlyWindow = "";
   readonly #linux: DesktopRemoteDesktopLinuxCapture | undefined;
   readonly #windows: DesktopRemoteDesktopWindowsCapture | undefined;
 
@@ -73,6 +74,12 @@ export class DesktopRemoteDesktopNativeCapture {
     this.stop();
     this.#excludedWindows = next;
   }
+  setWindow(windowId: number | null): void {
+    if (windowId !== null && (!Number.isSafeInteger(windowId) || windowId < 1 || windowId > 0xffff_ffff)) throw new Error("REMOTE_DESKTOP_HANDOFF_UNAVAILABLE");
+    const next = windowId === null ? "" : `window:${windowId}`;
+    if (next === this.#onlyWindow) return;
+    this.stop(); this.#onlyWindow = next;
+  }
 
   constructor(runtime: DesktopRemoteDesktopNativeCaptureRuntime = nativeCaptureRuntime()) {
     this.#runtime = runtime;
@@ -87,6 +94,7 @@ export class DesktopRemoteDesktopNativeCapture {
     settings?: DesktopRemoteDesktopVideoSettings,
     signal?: AbortSignal
   ): Promise<DesktopRemoteDesktopNativeFrame | null> {
+    if (this.#onlyWindow && (this.#runtime.platform !== "darwin" || !streaming)) return null;
     if (this.#linux !== undefined) return this.#linux.frame(displayId, streaming, cursorOverlay, settings, signal);
     if (this.#windows !== undefined) return this.#windows.frame(displayId, streaming, cursorOverlay, settings, signal);
     if (this.#runtime.platform !== "darwin" || !/^[0-9]{1,10}$/u.test(displayId)) return null;
@@ -112,7 +120,8 @@ export class DesktopRemoteDesktopNativeCapture {
               String(fps), String(profile.jpegQuality), String(profile.physicalMaxEdge),
               String(profile.maxFrameBytes)]
           : [displayId];
-        if (this.#excludedWindows) arguments_.push(this.#excludedWindows);
+        if (this.#onlyWindow) arguments_.push(this.#onlyWindow);
+        else if (this.#excludedWindows) arguments_.push(this.#excludedWindows);
         const child = this.#runtime.spawn(binary, arguments_);
         this.#child = child;
         this.#displayId = displayId;

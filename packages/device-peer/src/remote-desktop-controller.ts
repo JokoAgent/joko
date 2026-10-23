@@ -17,6 +17,7 @@ import {
   type RemoteDesktopInput,
   type RemoteDesktopJpegFrame,
   type RemoteDesktopLease,
+  type RemoteDesktopHandoffWindow,
   type RemoteDesktopPermissions,
   type RemoteDesktopPlatform,
   type RemoteDesktopSystemAction,
@@ -76,7 +77,7 @@ export interface RemoteDesktopControllerDependencies {
     readonly cursorOverlay: boolean;
     readonly current: () => boolean;
   }, authority: RemoteDesktopAuthority): Promise<RemoteDesktopJpegFrame | null>;
-  startInput(displayId: string, authority: RemoteDesktopAuthority): Promise<void>;
+  startInput(displayId: string, authority: RemoteDesktopAuthority, window?: RemoteDesktopHandoffWindow): Promise<void>;
   input(events: readonly RemoteDesktopInput[], authority: RemoteDesktopAuthority): void;
   stopInput(): void;
   releaseInput?(): Promise<void>;
@@ -130,6 +131,9 @@ export interface RemoteDesktopControllerDependencies {
   changed(): void;
   now?(): number;
   createLeaseId?(): string;
+  handoffWindow?(requestId: string, authority: RemoteDesktopAuthority): Promise<RemoteDesktopHandoffWindow | null>;
+  handoffCurrent?(window: RemoteDesktopHandoffWindow, authority: RemoteDesktopAuthority): Promise<boolean>;
+  handoffEnded?(window: RemoteDesktopHandoffWindow, authority: RemoteDesktopAuthority): void;
 }
 
 interface ActiveRemoteDesktopLease {
@@ -163,6 +167,7 @@ interface ActiveRemoteDesktopLease {
   sequence: number;
   backgroundViewing: boolean;
   presentationProofSequence: number;
+  readonly handoff?: RemoteDesktopHandoffWindow;
 }
 
 /**
@@ -210,6 +215,8 @@ export class RemoteDesktopController {
     readonly controlGeneration: number;
   } | undefined;
   #lockPending: Promise<void> | undefined;
+  #handoffInputTail: Promise<void> = Promise.resolve();
+  #handoffInputPending = 0;
 
   constructor(dependencies: RemoteDesktopControllerDependencies) {
     this.#dependencies = dependencies;
@@ -255,6 +262,11 @@ export class RemoteDesktopController {
     if (!validAuthority(authority)) return false;
     this.tick();
     return this.#active?.lease === lease && sameAuthority(this.#active.authority, authority);
+  }
+  handoffWindow(lease: string): RemoteDesktopHandoffWindow | undefined { return this.#active?.lease === lease ? this.#active.handoff : undefined; }
+  async checkHandoff(lease: string): Promise<boolean> {
+    const active = this.#active; if (!active || active.lease !== lease) return false;
+    try { await this.#ensureHandoff(active); return this.hasLease(active.authority, lease); } catch { return false; }
   }
 
   /** Trusted capture-renderer acknowledgement of an actual system presentation. */
@@ -319,6 +331,7 @@ export class RemoteDesktopController {
     if (this.#active !== undefined) {
       this.#lastEnded = { peer: peerKey(this.#active.authority), lease: this.#active.lease };
       this.#clearHostMute(this.#active);
+      if (this.#active.handoff) this.#dependencies.handoffEnded?.(this.#active.handoff, this.#active.authority);
     } else {
       for (const owner of this.#pendingMuteRestores) this.#queueMuteRestore(owner);
       for (const owner of this.#pendingPrivacyRestores) this.#queuePrivacyRestore(owner);
@@ -532,6 +545,17 @@ export class RemoteDesktopController {
     if (!active.controlling) throw new Error("REMOTE_DESKTOP_VIEW_ONLY");
     if (sequence <= active.sequence) return;
     active.sequence = sequence;
+    if (active.handoff) {
+      // DataChannel delivery is ordered, but source authority validation is
+      // asynchronous. Recheck immediately before each native input batch.
+      if (++this.#handoffInputPending > 64) { this.#handoffInputPending--; this.stop(authority); return; }
+      this.#handoffInputTail = this.#handoffInputTail.then(async () => {
+        await this.#ensureHandoff(active);
+        if (this.#active !== active || !active.controlling) return;
+        this.#dependencies.input(request.events, authority);
+      }).catch(() => { if (this.#active === active) this.stop(authority); }).finally(() => { this.#handoffInputPending--; });
+      return;
+    }
     try {
       this.#dependencies.input(request.events, authority);
       this.#inputRecoveryUsed = false;
@@ -597,6 +621,12 @@ export class RemoteDesktopController {
     catch (error) {
       if (request.op === "stop" && request.lockScreen) throw new Error("REMOTE_DESKTOP_LOCK_EXPIRED");
       throw error;
+    }
+    if (active.handoff) {
+      await this.#ensureHandoff(active);
+      if (!["stop", "heartbeat", "control", "presentation", "input", "offer", "ice", "frame"].includes(request.op)
+        || request.op === "stop" && request.lockScreen
+        || request.op === "offer" && request.settings?.audio) throw new Error("REMOTE_DESKTOP_HANDOFF_UNAVAILABLE");
     }
     if (this.#displayModePending && request.op !== "stop" && request.op !== "heartbeat") {
       throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
@@ -727,6 +757,7 @@ export class RemoteDesktopController {
   ): Promise<RemoteDesktopLease> {
     const authenticationSession = this.#requireAuthentication(authority);
     const peer = peerKey(authority);
+    if (request.inputHandoffRequestId !== undefined && (!this.#dependencies.handoffWindow || !this.#dependencies.handoffCurrent)) throw new Error("REMOTE_DESKTOP_HANDOFF_UNAVAILABLE");
     if (this.#locking !== undefined) throw new Error("REMOTE_DESKTOP_BUSY");
     if (request.resume === true && this.#locallyStopped.has(peer)) {
       throw new Error("REMOTE_DESKTOP_STOPPED");
@@ -734,7 +765,8 @@ export class RemoteDesktopController {
     const resumesActive = request.resume === true
       && this.#active !== undefined
       && sameAuthority(this.#active.authority, authority)
-      && this.#active.sourceDisplayId === request.displayId;
+      && (request.inputHandoffRequestId === undefined ? !this.#active.handoff && this.#active.sourceDisplayId === request.displayId
+        : this.#active.handoff?.requestId === request.inputHandoffRequestId);
     if (this.#displayModePending && request.takeover !== true) throw new Error("REMOTE_DESKTOP_DISPLAY_BUSY");
     if (this.#starting
       || (this.#active !== undefined && request.takeover !== true && !resumesActive)) {
@@ -760,7 +792,13 @@ export class RemoteDesktopController {
         () => this.#dependencies.capabilities(authority)
       ));
       if (!capabilities.enabled) throw new Error("REMOTE_DESKTOP_DISABLED");
-      let display = capabilities.displays.find((candidate) => candidate.id === request.displayId);
+      const handoff = request.inputHandoffRequestId === undefined ? undefined
+        : await this.#runChecked(authority, undefined, () => this.#dependencies.handoffWindow!(request.inputHandoffRequestId!, authority)) ?? undefined;
+      if (request.inputHandoffRequestId !== undefined && (!handoff || capabilities.platform !== "darwin"
+        || handoff.requestId !== request.inputHandoffRequestId || !Number.isSafeInteger(handoff.windowId) || handoff.windowId < 1
+        || !Number.isSafeInteger(handoff.pid) || handoff.pid < 1 || ![handoff.width, handoff.height].every(value => Number.isSafeInteger(value) && value >= 1 && value <= 32_768))) throw new Error("REMOTE_DESKTOP_HANDOFF_UNAVAILABLE");
+      const displayId = handoff?.displayId ?? request.displayId;
+      let display = capabilities.displays.find((candidate) => candidate.id === displayId);
       if (display === undefined) throw new Error("REMOTE_DESKTOP_DISPLAY_MISSING");
       if (this.#startingPeer !== peer || generation !== this.#controlGeneration) {
         throw new Error("REMOTE_DESKTOP_ACCESS_REVOKED");
@@ -778,7 +816,7 @@ export class RemoteDesktopController {
         capabilities = parseRemoteDesktopHostCapabilities(await this.#runChecked(
           authority, undefined, () => this.#dependencies.capabilities(authority)));
         if (this.#startingPeer !== peer) throw new Error("REMOTE_DESKTOP_ACCESS_REVOKED");
-        display = capabilities.displays.find((candidate) => candidate.id === request.displayId);
+        display = capabilities.displays.find((candidate) => candidate.id === displayId);
         if (display === undefined) throw new Error("REMOTE_DESKTOP_DISPLAY_MISSING");
       }
       if (this.#dependencies.prepare !== undefined) {
@@ -797,7 +835,7 @@ export class RemoteDesktopController {
         if (!remoteDesktopPermissionReady(capabilities.permissions.screenRecording)) {
           throw new Error("REMOTE_DESKTOP_SCREEN_PERMISSION_REQUIRED");
         }
-        display = capabilities.displays.find(candidate => candidate.id === request.displayId);
+        display = capabilities.displays.find(candidate => candidate.id === displayId);
         if (display === undefined) throw new Error("REMOTE_DESKTOP_DISPLAY_MISSING");
       }
       if (this.#requireAuthentication(authority) !== authenticationSession) {
@@ -808,19 +846,20 @@ export class RemoteDesktopController {
         lease: this.#createLeaseId(),
         platform: capabilities.platform,
         sourceDisplayId: display.id,
-        display: Object.freeze({ ...display }),
+        display: Object.freeze({ ...display, ...(handoff ? { width: handoff.width, height: handoff.height, name: handoff.app } : {}) }),
+        ...(handoff ? { handoff } : {}),
         canControl: capabilities.canControl,
-        displayModes: capabilities.displayModes,
-        resolutionRestore: capabilities.resolutionRestore,
-        viewerDisplay: capabilities.viewerDisplay,
-        viewerDisplayRestore: capabilities.viewerDisplayRestore,
-        cursorOverlay: capabilities.cursorOverlay,
-        hostMute: capabilities.hostMute,
-        lockOnExit: capabilities.lockOnExit,
-        clipboardSyncAvailable: capabilities.clipboardSync,
-        privacyScreen: capabilities.privacyScreen,
-        workspaceNavigation: capabilities.workspaceNavigation,
-        systemMenu: capabilities.systemMenu,
+        displayModes: !handoff && capabilities.displayModes,
+        resolutionRestore: !handoff && capabilities.resolutionRestore,
+        viewerDisplay: !handoff && capabilities.viewerDisplay,
+        viewerDisplayRestore: !handoff && capabilities.viewerDisplayRestore,
+        cursorOverlay: handoff ? true : capabilities.cursorOverlay,
+        hostMute: !handoff && capabilities.hostMute,
+        lockOnExit: !handoff && capabilities.lockOnExit,
+        clipboardSyncAvailable: !handoff && capabilities.clipboardSync,
+        privacyScreen: !handoff && capabilities.privacyScreen,
+        workspaceNavigation: !handoff && capabilities.workspaceNavigation,
+        systemMenu: !handoff && capabilities.systemMenu,
         privacyLockOnExit: false,
         privacyRevision: 0,
         clipboardSync: false,
@@ -897,7 +936,8 @@ export class RemoteDesktopController {
         await this.#runChecked(
           authority,
           active,
-          () => this.#dependencies.startInput(active.display.id, authority)
+          () => active.handoff ? this.#dependencies.startInput(active.display.id, authority, active.handoff)
+            : this.#dependencies.startInput(active.display.id, authority)
         );
         if (generation !== this.#controlGeneration || this.#active !== active) {
           throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
@@ -1487,6 +1527,15 @@ export class RemoteDesktopController {
     }
     this.#requireAuthentication(authority);
   }
+  async #ensureHandoff(active: ActiveRemoteDesktopLease): Promise<void> {
+    if (!active.handoff) return;
+    let current = false;
+    try { current = await this.#dependencies.handoffCurrent?.(active.handoff, active.authority) === true; } catch { /* Source proof failed closed. */ }
+    if (!current || this.#active !== active || !this.#authorityCurrent(active.authority) || !this.#authenticationCurrent(active)) {
+      if (this.#active === active) this.stop(active.authority);
+      throw new Error("REMOTE_DESKTOP_LEASE_EXPIRED");
+    }
+  }
 
   #authenticationSession(authority: RemoteDesktopAuthority): string | null | undefined {
     if (authority.authenticationOwner === undefined) return undefined;
@@ -1534,7 +1583,8 @@ function leaseView(active: ActiveRemoteDesktopLease): RemoteDesktopLease {
     lease: active.lease,
     display: active.display,
     controlling: active.controlling,
-    controlGeneration: active.controlGeneration
+    controlGeneration: active.controlGeneration,
+    ...(active.handoff ? { inputHandoffRequestId: active.handoff.requestId, window: { app: active.handoff.app, ...(active.handoff.title ? { title: active.handoff.title } : {}) } } : {})
   });
 }
 

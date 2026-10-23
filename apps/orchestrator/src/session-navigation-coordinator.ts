@@ -320,7 +320,7 @@ export class SessionNavigationCoordinator {
           break;
         }
         if (event.payload.type !== "message_complete" || event.payload.automaticContinuation !== undefined
-          || event.payload.objectiveContinuation !== undefined) continue;
+          || event.payload.objectiveContinuation !== undefined || event.payload.inputHandoffContinuation !== undefined) continue;
         if (excludeActiveRuns && event.runId !== undefined && this.#runIsActive(event.runId)) continue;
         const text = event.payload.blocks
           .filter((block): block is Extract<(typeof event.payload.blocks)[number], { readonly kind: "text" }> => block.kind === "text")

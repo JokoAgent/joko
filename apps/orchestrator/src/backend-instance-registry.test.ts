@@ -15,6 +15,19 @@ afterEach(() => {
 });
 
 describe("BackendInstanceRegistry", () => {
+  it("adds a discovered source without changing local process authority and consumes its own durable generation once", async () => {
+    const { registry, store } = fixture(), local = adapter("local"), source = adapter("source");
+    await registry.provision([factory("local", local)]);
+    let release!: () => void; const wait = new Promise<void>(resolve => { release = resolve; });
+    const create = vi.fn(async () => { await wait; return source; });
+    const nativeFactory = dynamicFactory("source", create);
+    const first = registry.add(nativeFactory), second = registry.add(nativeFactory);
+    expect(first).toBe(second); expect(store.getBackendInstanceGenerationAuthority("source").highWaterGeneration).toBe(1);
+    release(); expect(await first).toMatchObject({ instanceId: "source", state: "available", generation: 1 });
+    expect(registry.adapter("local")).toBe(local); expect(registry.adapter("source")).toBe(source); expect(create).toHaveBeenCalledTimes(1);
+    expect(local.dispose).not.toHaveBeenCalled(); expect(() => registry.add(nativeFactory)).toThrow("already registered");
+    await registry.dispose();
+  });
   it("reserves every durable generation before constructing any candidate", async () => {
     const { registry, store } = fixture();
     const observations: string[] = [];

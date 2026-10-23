@@ -2391,6 +2391,7 @@ export function VisualHarness(): JSX.Element {
         record(`session-create:${id}`);
         return { sessionId: id, generation: next.generation };
       },
+      getSessionRuntimeControl: undefined,
       hasPendingDeviceNameUpdate: () => false
     } satisfies Partial<AppController>;
     const fallbackMethods = new Map<PropertyKey, () => Promise<undefined>>();

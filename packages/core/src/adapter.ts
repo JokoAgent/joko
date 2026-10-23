@@ -13,6 +13,7 @@ import type {
   NativeSessionStart,
   PermissionMode,
   PromptInput,
+  QueueItemId,
   ArtifactReferenceSnapshot,
   ProviderModel,
   SessionId,
@@ -49,6 +50,8 @@ export interface PartnerLearningTurnHandle {
 }
 
 export interface AdapterContext {
+  /** Service-issued reverse tool channel; never supplied by a model or client. */
+  readonly hostedExecution?: import("./hosted-execution.js").HostedExecution;
   readonly nativeToolAuthorization?: import("./native-tool-authorization.js").NativeToolAuthorization;
   readonly sessionId: SessionId;
   readonly generation: number;
@@ -63,6 +66,8 @@ export interface AdapterContext {
   readonly resolveModelWorkingContext?: (selection: { readonly providerId: string; readonly modelId: string }) => number | undefined;
   /** Stable host operation identity for idempotent Backend mutations. */
   readonly operationId?: string;
+  /** Original durable input owner, minted by SessionHost rather than native callers. */
+  readonly inputQueueItemId?: QueueItemId;
   /** Private authority for one user-owned dispatch. A Backend may recover a
    * deterministic optional-field rejection only before producing output or
    * running tools. Recheck after learning and immediately before replay. */
@@ -493,6 +498,16 @@ export interface NativeTextInferenceInput {
   readonly providerId?: string;
   readonly modelId?: string;
   readonly maxTokens?: number;
+  /** Immutable message attachments; no filesystem reference or tool authority. */
+  readonly images?: readonly { readonly data: Uint8Array; readonly mimeType: string }[];
+}
+
+export function nativeTextInferenceImages(input: NativeTextInferenceInput): NonNullable<NativeTextInferenceInput["images"]> {
+  const images = input.images ?? [];
+  if (images.length > 40 || images.reduce((sum, image) => sum + image.data.byteLength, 0) > 20 * 1024 * 1024
+    || images.some(image => !(image.data instanceof Uint8Array) || image.data.byteLength < 1 || image.data.byteLength > 5 * 1024 * 1024
+      || !/^image\/(?:png|jpeg|gif|webp)$/u.test(image.mimeType))) throw new Error("Image attachments exceed the isolated inference capability.");
+  return images;
 }
 
 export interface BackgroundTaskOutputResult {
@@ -506,6 +521,8 @@ export interface BackgroundTaskOutputResult {
 
 export interface BackendAdapter {
   readonly id: string;
+  /** Native execution support, separate from remote HTTP model inference. */
+  readonly hostedExecutionCapabilities?: { readonly toolsOnSource: true; readonly isolatedGuests: true };
   /** Text review channels do not implicitly expose plugin one-shot inference. */
   readonly nativeTextInferenceCapabilities?: { readonly pluginOneshot: true; readonly maxTokens: boolean };
   describe(): Promise<BackendDescriptor>;

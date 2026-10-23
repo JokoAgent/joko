@@ -1,8 +1,9 @@
 import { create, fromBinary } from "@bufbuild/protobuf";
 import * as wire from "@joko/contracts";
+import { networkHash } from "@joko/store";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { afterEach, expect, it } from "vitest";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { waitFor } from "./fixture.js";
 import { submit } from "./operations.js";
@@ -48,7 +49,6 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
         capabilities: { modelChain: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID, fastMode: false }], permissionMode: wire.PermissionMode.AUTO, planMode: false } }) });
     expect(created.partner?.initializationState).toBe(wire.PartnerInitializationState.READY); profiles.push(created.partner!);
   }
-  members = profiles.map(profile => profile.partnerId);
   const auxiliary = (await manager.clients.settings.getSettings({})).settings!.auxiliaryText!;
   await submit(manager.clients.operation, manager.connectionId, create(wire.OperationMutationSchema, { payload: { case: "updateAuxiliaryTextSettings", value: {
     expectedRevision: auxiliary.revision, models: [{ backendId: "pi", providerId: REAL_PI_PROVIDER_ID, modelId: REAL_PI_MODEL_ID }] } } }));
@@ -57,48 +57,54 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
   await page.emulateMedia({ colorScheme: "light" });
   page.on("pageerror", error => errors.push(error.message));
   await pairPage(page, fixture);
-  let createCalls = 0, requestId = "";
-  await page.route("**/joko.v1.PartnerGroupService/CreatePartnerGroup", async route => {
-    createCalls++; requestId = fromBinary(wire.CreatePartnerGroupRequestSchema, route.request().postDataBuffer()!).requestId;
-    const response = await route.fetch(); expect(response.status()).toBe(200); await route.abort("failed");
+  const creationIds: string[] = [];
+  await page.route("**/joko.v1.PartnerNetworkService/CreatePartnerNetwork", async route => {
+    creationIds.push(fromBinary(wire.CreatePartnerNetworkRequestSchema, route.request().postDataBuffer()!).operationId);
+    const response = await route.fetch(); expect(response.status()).toBe(200);
+    if (creationIds.length === 1) await route.abort("failed"); else await route.fulfill({ response });
   });
-  await page.locator(".partner-groups-section").getByRole("button", { name: "Create group", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Create group", exact: true });
+  await page.getByRole("region", { name: "Group conversations", exact: true }).getByRole("button", { name: "Start a group", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Start a group", exact: true });
   await dialog.getByLabel("Group name", { exact: true }).fill("Shared work");
+  await dialog.getByLabel("Your display name", { exact: true }).fill("Group owner");
   await dialog.getByLabel("Aster", { exact: true }).check(); await dialog.getByLabel("Beryl", { exact: true }).check();
-  await dialog.getByRole("button", { name: "Create group", exact: true }).click();
-  await dialog.getByRole("button", { name: "Check creation", exact: true }).waitFor();
-  const receipt = await waitFor(() => manager.clients.partnerGroup.getPartnerGroupCreation({ requestId }), value => !!value.group, "the committed group receipt");
-  const groupId = receipt.group!.id;
-  await page.unroute("**/joko.v1.PartnerGroupService/CreatePartnerGroup");
-  await dialog.getByRole("button", { name: "Check creation", exact: true }).click();
+  await dialog.getByRole("button", { name: "Start a group", exact: true }).click();
+  await dialog.getByRole("alert").waitFor();
+  const receipt = await waitFor(() => manager.clients.partnerNetwork.listPartnerNetwork({}), value => value.rooms.length === 1, "the committed group receipt");
+  const groupId = receipt.rooms[0]!.id;
+  members = profiles.map(profile => receipt.rooms[0]!.members.find(actor => actor.partnerId === profile.partnerId)!.id);
+  await dialog.getByRole("button", { name: "Start a group", exact: true }).click();
   await page.locator(".partner-group-header h1").filter({ hasText: "Shared work" }).waitFor();
-  expect(createCalls).toBe(1); expect((await manager.clients.partnerGroup.listPartnerGroups({})).groups).toHaveLength(1);
-  expect(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith("joko.group-creation.v1:")).length)).toBe(0);
+  expect(creationIds).toHaveLength(2); expect(new Set(creationIds).size).toBe(1);
+  expect((await manager.clients.partnerNetwork.listPartnerNetwork({})).rooms).toHaveLength(1);
+  expect(await page.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith("joko.conversation-entry.v1:"))
+    .every(key => JSON.parse(localStorage.getItem(key)!).confirmed === true))).toBe(true);
   await page.getByRole("button", { name: "Group settings", exact: true }).click();
   const settings = page.getByRole("dialog", { name: "Group settings", exact: true });
-  await settings.getByLabel("Who replies", { exact: true }).selectOption(String(wire.PartnerGroupReplyMode.MENTIONED));
-  await waitFor(() => manager.clients.partnerGroup.getPartnerGroup({ groupId }), value => value.detail?.group?.replyMode === wire.PartnerGroupReplyMode.MENTIONED, "the shared reply setting");
-  await settings.getByRole("button", { name: "Cancel", exact: true }).click();
-  const composer = page.getByRole("textbox", { name: "Message the group · @mention a partner", exact: true });
-  await composer.fill("@Aster GROUP_QUESTION");
-  await page.locator(".partner-group-header").dispatchEvent("drop", { dataTransfer: await page.evaluateHandle(() => {
+  await settings.getByRole("combobox", { name: /^Reply mode/ }).selectOption("mentioned");
+  await waitFor(() => manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId }), value => value.snapshot?.room?.replyMode === "mentioned", "the shared reply setting");
+  await settings.getByRole("button", { name: "Close", exact: true }).click();
+  const composer = page.getByRole("textbox", { name: "Message", exact: true });
+  await page.locator(".partner-network-composer summary").click();
+  await page.getByRole("button", { name: "@Aster (Group owner)", exact: true }).click();
+  await composer.press("End"); await composer.pressSequentially(" GROUP_QUESTION");
+  await page.locator(".partner-network-composer").dispatchEvent("drop", { dataTransfer: await page.evaluateHandle(() => {
     const transfer = new DataTransfer(); transfer.items.add(new File(["Group attachment bytes"], "group-notes.txt", { type: "text/plain" })); return transfer;
   }) });
-  await page.locator(".partner-group-composer").getByRole("button", { name: "Send", exact: true }).click();
+  await page.locator(".attachment-list").getByText("group-notes.txt", { exact: true }).waitFor();
+  await page.locator(".partner-network-composer").getByRole("button", { name: "Send", exact: true }).click();
   await page.getByText("Which group result should I produce?", { exact: true }).waitFor({ timeout: 30_000 });
   await page.locator(".question-choice-grid label").filter({ hasText: "Short result" }).click();
   await page.locator(".partner-group-timeline").getByText("GROUP_TOOL_FINISHED", { exact: true }).waitFor({ timeout: 30_000 });
-  const conversation = await manager.clients.partnerGroup.getPartnerGroup({ groupId });
-  expect(conversation.detail!.messages.find(message => message.authorKind === wire.PartnerGroupAuthorKind.USER)?.attachments).toHaveLength(1);
-  expect(conversation.interactions).toHaveLength(0);
-  expect(fixture.application.partners!.listSessions(members[0]!).every(item => item.link.role !== "group")).toBe(true);
-  await page.locator(".partner-group-attachments").getByRole("button", { name: "Preview: group-notes.txt", exact: true }).click();
-  await page.getByRole("dialog").getByText("Group attachment bytes", { exact: true }).waitFor();
-  await page.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).click();
-  await composer.fill("GROUP_WORK_REQUEST"); await page.getByRole("button", { name: "More actions", exact: true }).click();
-  await page.getByRole("menuitem", { name: "Arrange work", exact: false }).click();
-  await page.locator(".partner-group-composer").getByRole("button", { name: "Send", exact: true }).click();
+  const conversation = await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId });
+  expect(conversation.snapshot!.messages.find(message => message.authorId === conversation.snapshot!.room!.selfId && message.text.includes("GROUP_QUESTION"))?.attachments).toHaveLength(1);
+  expect((await manager.clients.partnerNetwork.getPartnerNetworkOwnerControls({ roomId: groupId })).controls).toHaveLength(0);
+  expect(fixture.application.partners!.listSessions(profiles[0]!.partnerId).every(item => item.link.role !== "group")).toBe(true);
+  const downloadPromise = page.waitForEvent("download");
+  await page.locator(".partner-network-media").getByRole("button", { name: "group-notes.txt · Download", exact: true }).click();
+  const download = await downloadPromise; expect(await readFile((await download.path())!, "utf8")).toBe("Group attachment bytes");
+  await composer.fill("GROUP_WORK_REQUEST"); await page.getByRole("button", { name: "Arrange work", exact: true }).click();
+  await page.locator(".partner-network-composer").getByRole("button", { name: "Send", exact: true }).click();
   await page.locator(".partner-group-plan").getByRole("button", { name: "Start", exact: true }).waitFor({ timeout: 30_000 });
   await captureGroupEvidence(page, "groups-web-proposed-wide-dark");
   await page.setViewportSize({ width: 390, height: 844 });
@@ -106,10 +112,12 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
   await captureGroupEvidence(page, "groups-web-proposed-narrow-dark"); await page.setViewportSize({ width: 1440, height: 960 });
   await page.locator(".partner-group-plan").getByRole("button", { name: "Start", exact: true }).click();
   await page.getByRole("button", { name: "Continue to next partner", exact: true }).waitFor({ timeout: 30_000 });
-  const firstStep = await manager.clients.partnerGroup.getPartnerGroup({ groupId }), plan = firstStep.detail!.plans.at(-1)!;
-  expect(plan.steps[0]!.status).toBe(wire.PartnerGroupStepStatus.DONE); expect(plan.workDir).toBeTruthy();
-  const handoff = firstStep.detail!.messages.find(message => message.files.includes("group-result-1.txt"))!;
-  const file = await manager.clients.partnerGroup.readPartnerGroupFile({ groupId, messageId: handoff.id, relativePath: "group-result-1.txt" }); expect(file.blob!.byteSize).toBeGreaterThan(0n);
+  const firstStep = await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId }), plan = firstStep.snapshot!.plans.at(-1)!;
+  expect(plan.steps[0]!.status).toBe("completed");
+  const workDirectory = planWorkDirectory(fixture, firstStep.snapshot!.room!, plan);
+  const handoff = firstStep.snapshot!.messages.find(message => message.id === plan.steps[0]!.resultMessageId)!;
+  const file = await manager.clients.partnerNetwork.mediaPartnerNetwork({ roomId: groupId, action: "read", mediaId: handoff.attachments.find(file => file.name === "group-result-1.txt")!.id });
+  expect(new TextDecoder().decode(file.data)).toBe("Group step 1 completed.\n");
   await captureGroupEvidence(page, "groups-web-wide-dark");
   await page.setViewportSize({ width: 390, height: 844 }); await page.emulateMedia({ colorScheme: "dark" });
   if (await page.locator(".panel-scrim--navigation").isVisible()) await page.locator(".sidebar").getByRole("button", { name: "Close navigation", exact: true }).click();
@@ -119,7 +127,7 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
   await page.goto(`${fixture.baseUrl}/#/settings`, { waitUntil: "domcontentloaded" });
   await page.getByRole("radio", { name: "Light", exact: true }).click();
   await page.waitForFunction(() => document.documentElement.dataset.theme === "light");
-  await page.goto(`${fixture.baseUrl}/#/partners/groups/${encodeURIComponent(groupId)}`, { waitUntil: "domcontentloaded" });
+  await page.goto(`${fixture.baseUrl}/#/partners/groups/${encodeURIComponent(`network:host:${groupId}`)}`, { waitUntil: "domcontentloaded" });
   await page.getByRole("button", { name: "Continue to next partner", exact: true }).waitFor();
   await captureGroupEvidence(page, "groups-web-wide-light");
   await page.setViewportSize({ width: 390, height: 844 });
@@ -130,13 +138,14 @@ mountedIt("recovers a created group in mounted Web, delivers an attachment and d
   await fixture.close({ removeRoot: false }); fixture = undefined;
   fixture = await RealPiSystemFixture.start({ rootDirectory, webDirectory: webDirectory!, port, internalPort, providerResponder: responder, enableInternalServer: true });
   manager = { authKey, connectionId, deviceId, clients: fixture.clients(authKey) };
-  const restored = await manager.clients.partnerGroup.getPartnerGroup({ groupId }); expect(restored.detail!.plans.at(-1)!.workDir).toBe(plan.workDir);
-  await manager.clients.partnerGroup.actPartnerGroupPlan({ groupId, planId: plan.id, expectedRevision: restored.detail!.plans.at(-1)!.revision, action: wire.PartnerGroupPlanAction.CONTINUE });
-  const done = await waitFor(() => manager.clients.partnerGroup.getPartnerGroup({ groupId }), value => value.detail!.plans.at(-1)?.status === wire.PartnerGroupPlanStatus.DONE, "the second group's shared work step", 30_000);
-  expect(done.detail!.plans.at(-1)!.steps.every(step => step.status === wire.PartnerGroupStepStatus.DONE)).toBe(true);
-  expect(done.detail!.plans.at(-1)!.workDir).toBe(plan.workDir);
-  const final = done.detail!.group!; await manager.clients.partnerGroup.deletePartnerGroup({ groupId, expectedRevision: final.revision });
-  expect((await manager.clients.partnerGroup.getPartnerGroupCreation({ requestId })).retired).toBe(true);
+  const restored = await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId });
+  expect(planWorkDirectory(fixture, restored.snapshot!.room!, restored.snapshot!.plans.at(-1)!)).toBe(workDirectory);
+  await manager.clients.partnerNetwork.planPartnerNetwork({ roomId: groupId, operationId: crypto.randomUUID(), planId: plan.id, expectedRevision: restored.snapshot!.plans.at(-1)!.revision, action: "continue" });
+  const done = await waitFor(() => manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId }), value => value.snapshot!.plans.at(-1)?.status === "completed", "the second group's shared work step", 30_000);
+  expect(done.snapshot!.plans.at(-1)!.steps.every(step => step.status === "completed")).toBe(true);
+  expect(await readFile(resolve(workDirectory, "group-result-2.txt"), "utf8")).toBe("Group step 2 completed.\n");
+  const final = done.snapshot!.room!; await manager.clients.partnerNetwork.managePartnerNetwork({ roomId: groupId, operationId: crypto.randomUUID(), expectedRevision: final.revision, action: "dissolve" });
+  expect((await manager.clients.partnerNetwork.getPartnerNetwork({ roomId: groupId })).snapshot!.room!.state).toBe("dissolved");
   for (const profile of profiles) expect(fixture.application.store.getSession(profile.canonicalSessionId!).descriptor.archived).toBe(false);
   expect(errors).toEqual([]);
 }, 180_000);
@@ -149,7 +158,13 @@ async function pairPage(page: Page, system: RealPiSystemFixture) {
   await page.getByLabel("Pairing code", { exact: true }).fill(system.pairingCode(begun.challenge!.challengeId));
   await page.getByLabel("Device name", { exact: true }).fill("Group Web");
   await page.locator("form.pair-form button[type=submit]").click();
-  await page.locator(".partner-groups-section").waitFor({ state: "visible", timeout: 30_000 });
+  await page.getByRole("region", { name: "Group conversations", exact: true }).waitFor({ state: "visible", timeout: 30_000 });
+}
+function planWorkDirectory(system: RealPiSystemFixture, room: wire.PartnerNetworkRoom, plan: wire.PartnerNetworkPlan): string {
+  const workspaces = system.application.partnerNetwork!.options.planWorkspaces!;
+  const saved = workspaces.store.findSetting<{ localPlanId: string }>("service", "partner-network-plan-workspaces", networkHash([room.hostServerId, room.id, plan.id]))!;
+  const directory = workspaces.lanes.getPlan(saved.value.localPlanId).workDir;
+  expect(directory).toBeTruthy(); return directory!;
 }
 function record(value: unknown): Record<string, unknown> | undefined { return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined; }
 async function captureGroupEvidence(page: Page, name: string): Promise<void> {
@@ -164,7 +179,7 @@ async function captureGroupEvidence(page: Page, name: string): Promise<void> {
   await page.screenshot({ path: resolve(directory, `${name}.png`) });
   const metrics = await page.evaluate(() => ({ theme: document.documentElement.dataset.theme, dpr: devicePixelRatio, viewport: { width: innerWidth, height: innerHeight },
     overflow: document.documentElement.scrollWidth - document.documentElement.clientWidth,
-    elements: [".partner-group-timeline", ".partner-group-timeline-content", ".partner-group-plan-card", ".partner-group-composer-frame", ".partner-group-follow-up", ".partner-group-follow-up-actions"].map(selector => {
+    elements: [".partner-group-timeline", ".partner-group-timeline-content", ".partner-group-plan-card", ".partner-network-composer", ".partner-group-follow-up", ".partner-group-follow-up-actions"].map(selector => {
       const element = document.querySelector(selector), rect = element?.getBoundingClientRect(), style = element && getComputedStyle(element);
       return { selector, x: rect?.x, y: rect?.y, bottom: rect?.bottom, width: rect?.width, height: rect?.height, gap: style?.gap, padding: style?.padding, font: style?.font };
     }) }));

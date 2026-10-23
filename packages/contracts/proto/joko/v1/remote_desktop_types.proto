@@ -70,6 +70,7 @@ message RemoteDesktopCapabilities {
   bool channel_requests = 30;
   // Grant input within the same lease/geometry request when explicitly requested.
   bool auto_control = 31;
+  bool handoff_window = 32;
 }
 
 enum RemoteDesktopSystemActionKind {
@@ -261,11 +262,14 @@ message RemoteDesktopIceServer {
   google.protobuf.Timestamp expires_at = 4;
 }
 
+message RemoteDesktopWindow { string app = 1; optional string title = 2; }
 message RemoteDesktopLease {
   string lease_id = 1;
   RemoteDesktopDisplay display = 2;
   bool controlling = 3;
   uint64 control_generation = 4;
+  optional string input_handoff_request_id = 5;
+  RemoteDesktopWindow window = 6;
 }
 
 // A successful temporary change retains its lease; permanent changes have no

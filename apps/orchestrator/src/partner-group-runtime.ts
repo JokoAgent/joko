@@ -202,7 +202,7 @@ export class PartnerGroupSessionRuntime implements PartnerGroupRuntime {
       if (!accepted && item.backendAcceptedAt !== undefined) { input.onAccepted(); accepted = true; }
       if (run.state === "dispatch_unknown" || run.error?.stateMayHaveChanged) { await this.stop(sessionId); return { status: "unknown", text: "" }; }
       if (run.state === "completed") return { status: "completed", text: this.#reply(sessionId, run.id) };
-      if (run.state === "failed") return { status: "failed", text: "" };
+      if (run.state === "failed") return { status: "failed", text: "", ...(run.error ? { error: run.error } : {}) };
       if (run.state === "aborted" || item.state === "cancelled") return { status: "cancelled", text: "" };
       await waitForObservation(input.signal);
     }

@@ -9,6 +9,7 @@ import { BrowserToolBridgeProvider, type BrowserUserKnowledgeLayer } from "./bro
 import type { BrowserTransferCoordinator } from "./browser-transfers.js";
 import { OperationalBrowserState } from "./operational-browser-state.js";
 import { MULTILINGUAL_FIXTURES } from "./i18n/multilingual-fixtures.js";
+import { clearSecretPages, markSecretEntered } from "./input-handoff/secretTaint.js";
 
 function fixture(
   remoteNodes?: BrowserRemoteNodeRouter,
@@ -163,6 +164,33 @@ function fixture(
 }
 
 describe("BrowserToolBridgeProvider", () => {
+  it("pauses all script, console and network reads of a handoff page while allowing screenshots and later navigation", async () => {
+    const { bridge, browser, captureScreenshot, readConsoleMessages, readHttpRequestSummaries } = fixture();
+    clearSecretPages(); markSecretEntered("https://example.test/?entry=private");
+    try {
+      const call = (args: Readonly<Record<string, unknown>>) => bridge.callTool("call_tool", { name: "browser", args: { targetId: "page-1", ...args } });
+      for (const args of [{ action: "console" }, { action: "requests" }, { action: "responseBody", url: "https://example.test/api" },
+        { action: "act", request: { kind: "evaluate", fn: "() => document.title" } },
+        { action: "act", request: { kind: "wait", fn: "() => true" } }, { action: "extract", extract: { fields: { title: "h1" } } }]) {
+        expect((await call(args)).isError).toBe(true);
+      }
+      expect(readConsoleMessages).not.toHaveBeenCalled(); expect(readHttpRequestSummaries).not.toHaveBeenCalled();
+      expect(browser.evaluatePage).not.toHaveBeenCalled(); expect(browser.readResponseBody).not.toHaveBeenCalled(); expect(browser.extract).not.toHaveBeenCalled();
+      expect((await call({ action: "screenshot" })).isError).toBe(false); expect(captureScreenshot).toHaveBeenCalledOnce();
+      vi.mocked(browser.listPages).mockResolvedValue([{ id: "page-1", url: "https://example.test/next", title: "Next", state: "ready" }]);
+      expect((await call({ action: "console" })).isError).toBe(false); expect(readConsoleMessages).toHaveBeenCalledOnce();
+    } finally { clearSecretPages(); }
+  });
+
+  it("withholds a pending page-state response when the owner enters private text during the read", async () => {
+    const { bridge, browser } = fixture(); clearSecretPages();
+    vi.mocked(browser.evaluatePage).mockImplementation(async () => { markSecretEntered("https://example.test/"); return "private script value"; });
+    try {
+      const response = await bridge.callTool("call_tool", { name: "browser", args: { action: "act", targetId: "page-1", request: { kind: "evaluate", fn: "() => document.title" } } });
+      expect(response.isError).toBe(true); expect(JSON.stringify(response)).not.toContain("private script value");
+      expect(browser.evaluatePage).toHaveBeenCalledOnce();
+    } finally { clearSecretPages(); }
+  });
   it("awaits the persistent global mode owner and rejects misplaced or remote startup options before effects", async () => {
     const setBackend = vi.fn(async (mode: "external" | "sidebar", assertCurrent: () => void) => { assertCurrent(); return mode; });
     const { bridge, start } = fixture(undefined, undefined, { setBackend });

@@ -85,6 +85,8 @@ export interface PartnerCapabilitiesRecord {
   readonly modelChain: readonly PartnerModelRouteRecord[];
   readonly permissionMode: PartnerPermissionMode;
   readonly planMode: boolean;
+  /** Missing means enabled for the current v1 profile. Persisted explicitly. */
+  readonly inputHandoff?: boolean;
 }
 
 export interface PartnerDirectoryState {

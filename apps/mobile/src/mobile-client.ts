@@ -1,12 +1,15 @@
 import { extensionCardFormDeliveryScope, pendingExtensionCardFormDelivery } from "@joko/contracts";
 import { clone, create, equals, toBinary } from "@bufbuild/protobuf";
 import { projectPartnerSessionTask } from "@joko/contracts";
-import { TaskShareMethod, SetSessionRuntimeMutationSchema, type JoinedTaskShare, type TaskSharingApi } from "@joko/contracts";
+import { TaskShareMethod, SetSessionRuntimeMutationSchema, type JoinedTaskShare, type TaskSharingApi, type TaskShareRuntimeControl } from "@joko/contracts";
 import { mobileTaskSharingApi, mobileJoinedTaskNetwork, assertMobileSharedTaskSnapshot,
   assertMobileSharedTaskOperation, mobileSharedTaskAuthorMatches, mobileTaskSharingDelay,
   mobileSharedTaskDraftProfileId,
   type MobileJoinedTaskSource, type MobileTaskSource } from "./mobile-task-sharing";
 import { resolveMobileSharedRuntimeControls } from "./mobile-runtime-controls";
+import { MobileNewTaskModelMemory, type MobileNewTaskSourceSelection } from "./mobile-new-task-model-memory";
+import { sameMobileModelSourceProject } from "./mobile-model-source-project";
+import { CreateRemoteTargetMutationSchema, CreateDevicePeerTargetMutationSchema } from "@joko/contracts";
 import { resolveMobileSharedContextControls } from "./mobile-context-controls";
 import { normalizeMobileObjectiveInput, type MobileObjectiveInput, type MobileObjectiveApi } from "./mobile-objective";
 import { MobileObjectiveRecovery, type MobileObjectiveRecoveryIdentity } from "./mobile-objective-recovery";
@@ -21,6 +24,7 @@ import { createMobileGroupImageTools } from "./mobile-partner-group-images";
 import { createMobileGroupMedia } from "./mobile-partner-group-media";
 import type { MobilePartnerAvatarTransport } from "./mobile-partner-avatar";
 import { mobilePartnerRosterSourceKey, type MobilePartnerRosterSource, type MobilePartnerRosterSourceTransport } from "./mobile-partner-roster";
+import { readMobilePartnerOfflineConversation } from "./mobile-partner-offline-conversation";
 import type { MobilePartnerGroupSourceTransport, MobilePartnerGroupSelection } from "./mobile-partner-group-roster";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
@@ -30,6 +34,7 @@ import {
   PartnerGroupAttachmentSchema, PartnerGroupAttachmentCategory,
   ArchiveSessionMutationSchema, BlobDisposition, BlobRefSchema, CancelQueueItemMutationSchema, CapabilitySupport, CompactSessionMutationSchema, CompactSessionOutcome,
   ConnectionState, CreateScheduleMutationSchema, CreateSessionMutationSchema, CloneSessionMutationSchema, ForkSessionMutationSchema, SessionDerivationKind,
+  CreateTargetMutationSchema, TargetWorkspaceInputSchema,
   CreateTaskTagMutationSchema, UpdateTaskTagMutationSchema, ReorderTaskTagsMutationSchema, SetSessionTaskTagsMutationSchema, DeleteTaskTagMutationSchema,
   DeleteScheduleMutationSchema, DeleteSessionMessageMutationSchema, DeleteSessionMutationSchema, DeviceKind, DismissInteractionMutationSchema,
   EditQueueItemMutationSchema, EntityKind, EntityRefSchema, EventSchema, ExecuteUserShellMutationSchema, ExecuteWorkspaceRewindMutationSchema,
@@ -38,6 +43,7 @@ import {
   RemoteDesktopPrivacyScreenRequestSchema,
   ModelKeySchema, ModelSelectionSchema, NativeSessionPlacement, NativeSessionStartSchema, NewNativeSessionSchema,
   ModelFavoriteConfigurationSchema, UpdateModelFavoritesMutationSchema,
+  ModelSourceKind,
   DeleteScheduleRunMutationSchema, LogoutConnectionMutationSchema, MarkAllScheduleRunsReadMutationSchema,
   MarkScheduleRunReadMutationSchema, MarkScheduleRunsReadMutationSchema, NavigateSessionBranchMutationSchema,
   OperationPreconditionSchema, OperationState, OperationMutationSchema, RewindSafety,
@@ -222,6 +228,7 @@ import {
   type MobileInteractionSubmission
 } from "./mobile-interactions";
 import type { MobileInteractionDraftIdentity } from "./interaction-draft-store";
+import type { MobileInputHandoffApi, MobileInputHandoffTasksApi } from "./mobile-input-handoff";
 import type {
   MobileComposerDraftIdentity,
   MobileComposerDraftSnapshot,
@@ -308,6 +315,7 @@ import {
   type MobileWorkspacePathPasteResolution
 } from "./mobile-workspace-path-paste";
 import {
+  mergeMobileNewTaskUnsentInput,
   type MobileNewTaskCreateSubmission,
   type MobileNewTaskDraft,
   type MobileNewTaskDraftIdentity,
@@ -323,6 +331,7 @@ import {
   assertMobilePlanMode,
   resolveMobileExplicitNewTaskModelAuthority,
   resolveMobileNewTaskDefaultModelAuthority,
+  resolveMobileNewTaskExecutionAuthority,
   resolveMobileRuntimeControls,
   resolveMobileSessionModelAuthority,
   type MobileModelControlSelection,
@@ -537,6 +546,7 @@ export interface MobileTaskSendObserver {
 }
 
 export interface MobileNewTaskUploadObserver {
+  readonly optimisticConversation?: boolean;
   readonly signal: AbortSignal;
   readonly waitForLeaveDecision: () => Promise<boolean>;
   readonly onUploadingChange: (uploading: boolean) => void;
@@ -927,6 +937,8 @@ export class MobileClient {
   #partnerPrivateSourceSessionId?: string;
   #partnerPrivateSourceTargetId?: string;
   #partnerCreationFlight?: { readonly ownerKey: string; readonly token: symbol };
+  #newTaskModelMemory?: MobileNewTaskModelMemory;
+  #runtimeModelSelection?: { readonly ownerKey: string; readonly control: TaskShareRuntimeControl };
   #partnerCreationKnown?: { readonly ownerKey: string; readonly requestId: string };
   #partnerPrivateResume?: {
     readonly credentialKey: string;
@@ -1173,6 +1185,15 @@ export class MobileClient {
   partnerRosterSources(): readonly MobilePartnerRosterSource[] {
     return this.#state.saved.filter(profile => !["missing", "unreadable", "identity-conflict"].includes(profile.credentialState))
       .map(profile => ({ profile, key: mobilePartnerRosterSourceKey(profile), current: profile.profileId === this.#activeProfileId }));
+  }
+
+  async readPartnerOfflineConversation(source: MobilePartnerRosterSource,
+    row: import("./mobile-partner-roster").MobilePartnerRosterDisplay, signal: AbortSignal) {
+    if (!this.offlineCache) throw new Error("Saved offline conversations are unavailable on this device.");
+    const epoch = this.#partnerRosterEpoch;
+    return readMobilePartnerOfflineConversation(this.offlineCache, source, row,
+      () => !this.#disposed && this.#foreground && epoch === this.#partnerRosterEpoch
+        && this.partnerRosterSources().some(candidate => candidate.key === source.key), signal);
   }
 
   /** A saved roster has its own authenticated owner; the active Session filter is unrelated. */
@@ -2125,6 +2146,47 @@ export class MobileClient {
     return this.network.partnerGroupApi(context.credential, context.authorityKey, this.newId, signal => {
       signal.throwIfAborted(); if (this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey || this.#credential !== context.credential) throw new Error("Partner group owner changed.");
     });
+  }
+  partnerNetworkApi(): import("./mobile-partner-network").MobilePartnerNetworkApi | undefined {
+    const context = this.#partnerPrivateContext(), ownerSignal = this.#abort?.signal, epoch = this.#epoch;
+    if (!context || !this.network.partnerNetworkApi || !ownerSignal || this.#joinedTask) return undefined;
+    return this.network.partnerNetworkApi(context.credential, `${context.authorityKey}:${epoch}`, signal => {
+      signal.throwIfAborted(); ownerSignal.throwIfAborted();
+      if (!this.#current(epoch) || this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey) throw new Error("The group conversation owner changed.");
+    });
+  }
+  partnerIdentityApi(): import("./mobile-partner-identity").MobilePartnerIdentityApi | undefined {
+    const context = this.#partnerPrivateContext(), ownerSignal = this.#abort?.signal, epoch = this.#epoch;
+    if (!context || !this.network.partnerIdentityApi || !ownerSignal || this.#joinedTask) return undefined;
+    return this.network.partnerIdentityApi(context.credential, `${context.authorityKey}:${epoch}`, signal => {
+      signal.throwIfAborted(); ownerSignal.throwIfAborted();
+      if (!this.#current(epoch) || this.#joinedTask || this.#credential !== context.credential || this.#partnerPrivateAuthorityKey(this.#state) !== context.authorityKey) throw new Error("The Partner identity owner changed.");
+    });
+  }
+
+  inputHandoffTasksApi(): MobileInputHandoffTasksApi | undefined {
+    const context = this.#partnerPrivateContext(), read = this.network.listInputHandoffTasks, ownerSignal = this.#abort?.signal, epoch = this.#epoch;
+    if (!context || !read || !ownerSignal || this.#joinedTask) return undefined;
+    const ownerKey = `${context.authorityKey}\u001f${epoch}`;
+    const current = () => !ownerSignal.aborted && this.#current(epoch) && !this.#joinedTask && this.#credential === context.credential
+      && this.#partnerPrivateAuthorityKey(this.#state) === context.authorityKey;
+    return { ownerKey, isCurrent: current, list: async signal => {
+      const active = AbortSignal.any([signal, ownerSignal]); active.throwIfAborted(); if (!current()) throw new Error("The input task owner changed.");
+      const tasks = await read.call(this.network, context.credential, active); active.throwIfAborted(); if (!current()) throw new Error("The input task owner changed.");
+      return tasks.filter(task => this.#state.owner?.sessions.some(session => !session.archived && session.sessionId === task.sessionId
+        && session.nativeBinding?.runtimeGeneration === task.generation));
+    } };
+  }
+
+  taskInputHandoffApi(): MobileInputHandoffApi | undefined {
+    const credential = this.#credential, ownerKey = this.taskHeaderSourceKey(), session = this.#selectedSession();
+    if (this.#joinedTask || !credential || !ownerKey || !session || session.archived || !this.#foreground
+      || this.#state.status !== "connected" || !this.#abort || !this.network.inputHandoffApi) return undefined;
+    const signal = this.#abort.signal;
+    return this.network.inputHandoffApi(credential, { ownerKey, sessionId: session.sessionId, deviceId: credential.deviceId, signal,
+      assertCurrent: active => { active.throwIfAborted(); signal.throwIfAborted();
+        if (this.#credential !== credential || this.#joinedTask || !this.#foreground || this.taskHeaderSourceKey() !== ownerKey
+          || this.#selectedSession()?.archived) throw new Error("The input handoff owner changed."); } });
   }
 
   mcpAppApi(sessionId: string): import("./mobile-mcp-app-api").MobileMcpAppApi | undefined {
@@ -8808,6 +8870,134 @@ export class MobileClient {
     return key && this.network.objectiveRpc ? `${key}\u001fobjective-create\u001f${this.#epoch}` : undefined;
   }
 
+  newTaskModels(targetId: string) {
+    if (!this.#newTaskAuthorityKey(targetId)) return [];
+    const owner = this.#state.owner;
+    const target = owner?.targets.find(row => row.targetId === targetId), workspace = owner?.workspaces.find(row => row.workspaceId === target?.workspaceId);
+    return owner?.backends.flatMap(backend => {
+      if (workspace?.location?.kind.case === "sshHost" && backend.capabilities?.capabilities.some(row => row.name === "model.remote_execution" && row.support === CapabilitySupport.SUPPORTED)) return [];
+      const execution = resolveMobileNewTaskExecutionAuthority(owner, backend.backendId);
+      return execution?.canSelectModel ? execution.models.map(route => ({ ...route,
+        key: JSON.stringify([route.backendId, route.providerId, route.modelId]), canSetEffort: execution.canSetEffort,
+        canSetFastMode: execution.canSetFastMode })) : [];
+    }) ?? [];
+  }
+
+  #modelMemory(targetId: string) {
+    const credential = this.#credential, owner = this.#state.owner;
+    const target = owner?.targets.find(row => row.targetId === targetId);
+    const nativeAdapterKind = owner?.models.find(row => row.backendId === target?.backendId && row.source?.nativeAdapterKind)?.source?.nativeAdapterKind;
+    if (!credential || !nativeAdapterKind || !this.newTaskDrafts) return undefined;
+    return { memory: this.#newTaskModelMemory ??= new MobileNewTaskModelMemory(this.newTaskDrafts.driver),
+      identity: { profileId: credential.profileId, serverId: credential.serverId, nativeAdapterKind } };
+  }
+
+  newTaskModelSelection(targetId: string): MobileNewTaskSourceSelection | undefined {
+    const owner = this.#state.owner, target = owner?.targets.find(row => row.targetId === targetId), memory = this.#modelMemory(targetId);
+    const remembered = memory?.memory.current(memory.identity);
+    if (remembered?.backendId === target?.backendId && resolveMobileExplicitNewTaskModelAuthority(owner, target?.backendId, remembered)) return remembered;
+    const selection = resolveMobileNewTaskDefaultModelAuthority(owner, target?.backendId)?.selection;
+    return selection && target ? { ...selection, backendId: target.backendId } : undefined;
+  }
+
+  async restoreNewTaskModel(targetId: string): Promise<string> {
+    const authority = this.#newTaskAuthorityKey(targetId), memory = this.#modelMemory(targetId);
+    if (!authority || !memory) return targetId;
+    const selection = await memory.memory.read(memory.identity);
+    if (this.#newTaskAuthorityKey(targetId) !== authority || !selection) return targetId;
+    const owner = this.#state.owner, target = owner?.targets.find(row => row.targetId === targetId);
+    if (!resolveMobileExplicitNewTaskModelAuthority(owner, selection.backendId, selection)) return targetId;
+    const workspace = owner?.workspaces.find(row => row.workspaceId === target?.workspaceId);
+    return owner?.targets.find(row => row.backendId === selection.backendId && row.state === TargetState.ACTIVE
+      && workspace !== undefined && owner.workspaces.some(candidate => candidate.workspaceId === row.workspaceId
+        && sameMobileModelSourceProject(workspace, candidate)))?.targetId ?? targetId;
+  }
+
+  async selectNewTaskModel(targetId: string, selection: MobileNewTaskSourceSelection, isCurrent: () => boolean = () => true): Promise<string> {
+    const owner = this.#state.owner, authority = this.#newTaskAuthorityKey(targetId), credential = this.#ready();
+    const target = owner?.targets.find(row => row.targetId === targetId), workspace = owner?.workspaces.find(row => row.workspaceId === target?.workspaceId);
+    const model = resolveMobileExplicitNewTaskModelAuthority(owner, selection.backendId, selection);
+    const execution = resolveMobileNewTaskExecutionAuthority(owner, selection.backendId);
+    if (!target || !workspace || !model || !execution?.canSelectModel || !authority) throw new Error("The model source is unavailable for this project.");
+    if (workspace.location?.kind.case === "sshHost" && owner?.backends.find(row => row.backendId === selection.backendId)?.capabilities?.capabilities
+      .some(row => row.name === "model.remote_execution" && row.support === CapabilitySupport.SUPPORTED)) {
+      throw new Error("This Agent source requires a project on the task computer and cannot use an SSH project.");
+    }
+    if (selection.effortId && !execution.canSetEffort || selection.fastMode && !execution.canSetFastMode) throw new Error("The selected model controls are unavailable.");
+    const memory = this.#modelMemory(targetId);
+    if (!memory) throw new Error("Model source preferences are unavailable.");
+    const assertOwner = (): void => {
+      if (!isCurrent() || this.#credential !== credential || this.#newTaskAuthorityKey(targetId) !== authority) throw new Error("The model source owner changed.");
+    };
+    let selectedTarget = owner!.targets.find(row => row.state === TargetState.ACTIVE && row.backendId === selection.backendId
+      && owner!.workspaces.some(candidate => candidate.workspaceId === row.workspaceId && sameMobileModelSourceProject(workspace, candidate)))?.targetId;
+    if (!selectedTarget) {
+      if (this.#state.pending.some(row => row.kind === "model-source-target")) throw new Error("The previous model source project is still pending. Recover its operation before retrying.");
+      const mutation = create(OperationMutationSchema, {
+        preconditions: [create(OperationPreconditionSchema, { entity: { kind: EntityKind.TARGET, id: targetId }, expectedRevision: target.version?.revision })]
+      });
+      const location = workspace.location?.kind;
+      if (location?.case === "serviceNode") {
+        mutation.payload = { case: "createTarget", value: create(CreateTargetMutationSchema, { backendId: selection.backendId,
+          displayName: target.displayName, workspace: create(TargetWorkspaceInputSchema, { kind: workspace.kind,
+            serverPath: workspace.serverPathDisplay, createIfMissing: false }) }) };
+      } else if (location?.case === "sshHost") {
+        if (!this.network.listModelSourceRemoteHosts) throw new Error("The SSH Host catalog is unavailable on this node.");
+        const hosts = await this.network.listModelSourceRemoteHosts(credential, location.value.hostTargetId, this.#abort?.signal); assertOwner();
+        const exact = hosts.filter(row => row.targetId === location.value.hostTargetId && row.hostId === location.value.hostId);
+        const hostTarget = this.#state.owner?.targets.find(row => row.targetId === location.value.hostTargetId && row.state === TargetState.ACTIVE);
+        if (exact.length !== 1 || !exact[0]!.revision?.value || !hostTarget?.version?.revision?.value) throw new Error("The original SSH Host authority is unavailable.");
+        if (hostTarget.targetId !== targetId) mutation.preconditions.push(create(OperationPreconditionSchema, {
+          entity: { kind: EntityKind.TARGET, id: hostTarget.targetId }, expectedRevision: hostTarget.version.revision }));
+        mutation.payload = { case: "createRemoteTarget", value: create(CreateRemoteTargetMutationSchema, {
+          backendId: selection.backendId, displayName: target.displayName, hostTargetId: location.value.hostTargetId,
+          hostId: location.value.hostId, expectedHostRevision: exact[0]!.revision,
+          workspacePath: location.value.workspaceRootDisplay, createIfMissing: false }) };
+      } else if (location?.case === "devicePeer") {
+        if (credential.deviceId !== location.value.controllerDeviceId || !this.network.listModelSourceDevicePeers) throw new Error("The original task computer controller is unavailable.");
+        const peers = await this.network.listModelSourceDevicePeers(credential, this.#abort?.signal); assertOwner();
+        const exact = peers.filter(row => row.route?.targetDeviceId === location.value.targetDeviceId);
+        if (exact.length !== 1 || !exact[0]!.route?.relationId || !exact[0]!.route?.routeGeneration
+          || !exact[0]!.route?.relationRevision?.value || !exact[0]!.route?.targetDeviceRevision?.value) throw new Error("The original task computer route is unavailable.");
+        mutation.payload = { case: "createDevicePeerTarget", value: create(CreateDevicePeerTargetMutationSchema, {
+          backendId: selection.backendId, displayName: target.displayName, peer: exact[0]!.route,
+          workspacePath: location.value.workspaceRootDisplay, createIfMissing: false }) };
+      } else throw new Error("The original project location is unavailable.");
+      assertOwner();
+      const result = await this.#submitTerminal(mutation, { kind: "model-source-target", targetId, backendId: selection.backendId });
+      const payload = result.operation?.result?.payload;
+      if (!result.accepted || !result.definitive || payload?.case !== "target") throw new Error("The model source project result is unconfirmed. It was not resent.");
+      selectedTarget = payload.value.targetId;
+    }
+    assertOwner();
+    const destinationMemory = this.#modelMemory(selectedTarget);
+    if (!destinationMemory) throw new Error("The selected model source preferences are unavailable.");
+    await destinationMemory.memory.save(destinationMemory.identity, selection);
+    assertOwner();
+    return selectedTarget;
+  }
+
+  async addNewTaskModelFavorite(targetId: string, selection: MobileNewTaskSourceSelection): Promise<void> {
+    const owner = this.#state.owner;
+    if (!this.#newTaskAuthorityKey(targetId) || !resolveMobileExplicitNewTaskModelAuthority(owner, selection.backendId, selection)) {
+      throw new Error("The model source is no longer available.");
+    }
+    if (owner?.models.find(model => model.backendId === selection.backendId && model.key?.providerId === selection.providerId
+      && model.key.modelId === selection.modelId)?.source?.kind === ModelSourceKind.SHARE) throw new Error("Shared model favorites are unavailable on mobile.");
+    const settings = owner?.settings?.modelFavorites;
+    if (!settings?.revision) throw new Error("Model favorites are unavailable.");
+    if (settings.favorites.some(favorite => favorite.backendId === selection.backendId && favorite.selection?.model?.providerId === selection.providerId
+      && favorite.selection.model.modelId === selection.modelId && (favorite.selection.effortId || "") === (selection.effortId ?? "")
+      && favorite.selection.fastMode === selection.fastMode)) throw new Error("The same model favorite configuration is already saved.");
+    if (this.#state.pending.some(row => row.kind === "model-favorite")) throw new Error("The previous favorite change is still pending.");
+    const result = await this.#submitTerminal(create(OperationMutationSchema, { payload: { case: "updateModelFavorites", value: create(UpdateModelFavoritesMutationSchema, {
+      expectedRevision: settings.revision, change: { case: "add", value: create(ModelFavoriteConfigurationSchema, {
+        favoriteId: this.newModelFavoriteId(), backendId: selection.backendId, selection: create(ModelSelectionSchema, {
+          model: create(ModelKeySchema, { providerId: selection.providerId, modelId: selection.modelId }),
+          effortId: selection.effortId ?? "", fastMode: selection.fastMode }) }) } }) } }), { kind: "model-favorite" });
+    if (!result.accepted || !result.definitive) throw new Error("The model favorite result is unconfirmed. It was not resent.");
+  }
+
   async create(targetId: string, name: string, firstInput: MobileComposerDraft, objective?: MobileObjectiveInput, collaboration?: MobileWorkerForm,
     uploadObserver?: MobileNewTaskUploadObserver): Promise<MobileNewTaskResult> {
     const input = normalizeMobileComposerDraft(firstInput);
@@ -8842,7 +9032,8 @@ export class MobileClient {
     }
     const authorityKey = this.#newTaskAuthorityKey(targetId);
     if (!authorityKey) throw new Error("The selected project authority is unavailable.");
-    const receivingModel = resolveMobileNewTaskDefaultModelAuthority(owner, backend.backendId);
+    const receivingModel = resolveMobileExplicitNewTaskModelAuthority(owner, backend.backendId, this.newTaskModelSelection(targetId))
+      ?? resolveMobileNewTaskDefaultModelAuthority(owner, backend.backendId);
     const attachmentControls = this.newTaskAttachmentControls(targetId);
     if (objectiveInput === undefined && input.attachments.length > 0) {
       if (!attachmentControls) throw new Error("This Backend does not accept attachments for a new task.");
@@ -8870,6 +9061,9 @@ export class MobileClient {
         ...(workerForm === undefined ? {} : { collaboration: workerForm }),
         createOperationId
       });
+      if (uploadObserver?.optimisticConversation && objectiveInput === undefined) {
+        await this.newTaskDrafts.openConversation(identity, createOperationId);
+      }
       try {
         await this.network.prepareTarget(credential, target, this.#abort?.signal);
         if (objectiveInput === undefined) await this.#validateNewTaskSubmissionInput(submission, authorityKey);
@@ -9180,8 +9374,7 @@ export class MobileClient {
       return { sessionId: initial.sessionId, created: true, sent: false, definitive: false };
     }
     if (authority.status === "blocked") {
-      await this.#recoverNewTaskComposerDraft(identity, initial.sessionId, initial.input);
-      await this.newTaskDrafts.clear(identity);
+      await this.#releaseNewTaskConversation(identity, initial, true);
       this.#set({ error: authority.message });
       return { sessionId: initial.sessionId, created: true, sent: false, definitive: true };
     }
@@ -9200,8 +9393,7 @@ export class MobileClient {
       const recovery = retained?.phase === "sending" && retained.createOperationId === initial.createOperationId
         ? retained
         : prepared;
-      await this.#recoverNewTaskComposerDraft(identity, initial.sessionId, recovery.input);
-      await this.newTaskDrafts.clear(identity);
+      await this.#releaseNewTaskConversation(identity, recovery, true);
       throw error;
     }
     const sendOperationId = prepared.sendOperationId ?? this.newId();
@@ -9224,7 +9416,8 @@ export class MobileClient {
 
   async #uploadNewTaskAttachments(
     identity: MobileNewTaskDraftIdentity,
-    initial: MobileNewTaskSendSubmission
+    initial: MobileNewTaskSendSubmission,
+    followUpOperationId?: string
   ): Promise<MobileNewTaskSendSubmission> {
     if (!this.newTaskDrafts) throw new Error("Retained new-task drafts are unavailable.");
     if (initial.input.attachments.every((attachment) => attachment.state === "uploaded")) return initial;
@@ -9268,12 +9461,10 @@ export class MobileClient {
           uploaded
         )
       });
-      const next = await this.newTaskDrafts.replaceSubmissionInput(
-        identity,
-        submission.createOperationId,
-        submission.input,
-        input
-      );
+      const next = followUpOperationId === undefined
+        ? await this.newTaskDrafts.replaceSubmissionInput(identity, submission.createOperationId, submission.input, input)
+        : await this.newTaskDrafts.updateFollowUp(identity, submission.createOperationId, followUpOperationId, { input })
+          .then(() => ({ ...submission, input }));
       if (next.phase !== "sending") throw new Error("The retained new-task send phase changed.");
       submission = next;
       await this.#removeCommittedAttachmentFile(identity.profileId, attachment);
@@ -9288,12 +9479,13 @@ export class MobileClient {
   ): Promise<MobileNewTaskResult> {
     if (!this.newTaskDrafts || !this.composerDrafts) throw new Error("Retained new-task drafts are unavailable.");
     if (!result.definitive) {
-      await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
+      if (!this.newTaskDrafts.readSync(identity)?.conversation) {
+        await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
+      }
       return { sessionId: submission.sessionId, created: true, sent: false, definitive: false };
     }
     if (!result.accepted || result.operation?.state !== OperationState.SUCCEEDED) {
-      await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
-      await this.newTaskDrafts.clear(identity);
+      await this.#releaseNewTaskConversation(identity, submission, true);
       return { sessionId: submission.sessionId, created: true, sent: false, definitive: true };
     }
     const exactOperation = submission.sendOperationId !== undefined
@@ -9304,8 +9496,7 @@ export class MobileClient {
       : undefined;
     if (!queued || queued.sessionId !== submission.sessionId || queued.backendId !== submission.backendId
       || queued.targetId !== submission.targetId) {
-      await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
-      await this.newTaskDrafts.clear(identity);
+      await this.#releaseNewTaskConversation(identity, submission, true);
       this.#set({ error: "The first-message operation returned an invalid queue result. The text remains in the task composer; verify the task before sending again." });
       return { sessionId: submission.sessionId, created: true, sent: false, definitive: true };
     }
@@ -9314,11 +9505,86 @@ export class MobileClient {
       submission.sessionId,
       submission.input
     );
-    await this.newTaskDrafts.clear(identity);
     if (recoveredInputRemoved) {
       await this.#removeCommittedAnnotationSources(identity.profileId, submission.input.attachments);
     }
+    const conversation = this.newTaskDrafts.readSync(identity)?.conversation;
+    if (conversation) {
+      const confirmed = await this.newTaskDrafts.markFirstInputAccepted(identity, submission.createOperationId);
+      return this.#sendNewTaskFollowUps(identity, confirmed);
+    }
+    await this.newTaskDrafts.clear(identity);
     return { sessionId: submission.sessionId, created: true, sent: true, definitive: true };
+  }
+
+  async #releaseNewTaskConversation(identity: MobileNewTaskDraftIdentity, submission: MobileNewTaskSendSubmission,
+    includeFirst: boolean): Promise<void> {
+    if (!this.newTaskDrafts) throw new Error("The new-task draft store is unavailable.");
+    const current = this.newTaskDrafts.readSync(identity);
+    if (current?.submission?.createOperationId !== submission.createOperationId) throw new Error("The retained creation owner changed.");
+    const sealed = current.conversation ? await this.newTaskDrafts.sealConversation(identity, submission.createOperationId) : current;
+    const input = mergeMobileNewTaskUnsentInput(sealed, includeFirst);
+    if (input.text.trim() || input.attachments.length) await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, input);
+    await this.newTaskDrafts.clear(identity);
+  }
+
+  async #sendNewTaskFollowUps(identity: MobileNewTaskDraftIdentity, submission: MobileNewTaskSendSubmission): Promise<MobileNewTaskResult> {
+    const store = this.newTaskDrafts!;
+    const result = (definitive: boolean, sent: boolean): MobileNewTaskResult => ({ sessionId: submission.sessionId, created: true, sent, definitive });
+    for (;;) {
+      const current = store.readSync(identity);
+      if (current?.submission?.createOperationId !== submission.createOperationId) throw new Error("The retained conversation owner changed.");
+      const followUp = current.conversation?.followUps.find(item => item.state !== "accepted");
+      if (!followUp || current.conversation?.sealed) {
+        await this.#releaseNewTaskConversation(identity, submission, false);
+        return result(true, true);
+      }
+      let receipt: TrackedMutationResult;
+      if (followUp.state === "dispatching") {
+        const observed = await this.#observeRetainedNewTaskOperation({ ...submission, sendOperationId: followUp.operationId }, this.#epoch);
+        if (!observed) return result(false, false);
+        if (observed === "not-dispatched") {
+          await this.#releaseNewTaskConversation(identity, submission, false);
+          this.#set({ error: "The retained follow-up had no durable operation receipt. Its input remains in the created task composer for review." });
+          return result(true, false);
+        }
+        receipt = trackedOperation(observed);
+      } else {
+        const authority = this.#newTaskSendAuthority({ ...submission, input: followUp.input });
+        if (authority.status === "deferred") { this.#set({ error: authority.message }); return result(false, false); }
+        if (authority.status === "blocked") {
+          await this.#releaseNewTaskConversation(identity, submission, false);
+          this.#set({ error: authority.message }); return result(true, false);
+        }
+        let prepared: MobileNewTaskSendSubmission;
+        try {
+          await this.#validateNewTaskSubmissionInput({ ...submission, input: followUp.input });
+          prepared = await this.#uploadNewTaskAttachments(identity, { ...submission, input: followUp.input }, followUp.operationId);
+        } catch (error) {
+          await this.#releaseNewTaskConversation(identity, submission, false);
+          throw error;
+        }
+        await store.updateFollowUp(identity, submission.createOperationId, followUp.operationId, { state: "dispatching" });
+        receipt = await this.#submitTerminal(create(OperationMutationSchema, {
+          preconditions: [create(OperationPreconditionSchema, { entity: create(EntityRefSchema, { kind: EntityKind.SESSION, id: submission.sessionId }),
+            expectedGeneration: BigInt(submission.runtimeGeneration) })],
+          payload: { case: "sendInput", value: create(SendInputMutationSchema, { sessionId: submission.sessionId,
+            input: mobileComposerInput(prepared.input), deliveryMode: QueueDeliveryMode.PROMPT }) }
+        }), { kind: "send", sessionId: submission.sessionId }, followUp.operationId);
+      }
+      if (!receipt.definitive) return result(false, false);
+      const operation = receipt.operation, queued = operation?.result?.payload.case === "queueItem" ? operation.result.payload.value : undefined;
+      if (!receipt.accepted || operation?.state !== OperationState.SUCCEEDED || operation.operationId !== followUp.operationId
+        || operation.connectionId !== submission.connectionId || !queued || queued.sessionId !== submission.sessionId
+        || queued.backendId !== submission.backendId || queued.targetId !== submission.targetId) {
+        await this.#releaseNewTaskConversation(identity, submission, false);
+        this.#set({ error: "The follow-up was not confirmed. Its structured input remains in the created task composer for review." });
+        return result(true, false);
+      }
+      await store.updateFollowUp(identity, submission.createOperationId, followUp.operationId, { state: "accepted" });
+      const accepted = store.readSync(identity)?.conversation?.followUps.find(item => item.operationId === followUp.operationId);
+      if (accepted) await this.#removeCommittedAnnotationSources(identity.profileId, accepted.input.attachments);
+    }
   }
 
   async send(draft: MobileComposerDraft, observer: MobileTaskSendObserver = {}): Promise<boolean> {
@@ -9705,12 +9971,26 @@ export class MobileClient {
     if (this.#joinedTask) return resolveMobileSharedRuntimeControls(this.#state.detail, this.#taskAuthorityKey());
     const credential = this.#credential;
     if (!credential || !this.#taskAuthorityKey()) return undefined;
-    return resolveMobileRuntimeControls({
+    const controls = resolveMobileRuntimeControls({
       profileId: credential.profileId,
       connectionId: credential.connectionId,
       deviceId: credential.deviceId,
       serverId: credential.serverId
-    }, this.#state.owner, this.#state.detail, this.#state.selectedId);
+    }, this.#state.owner, this.#state.detail, this.#state.selectedId, this.network.getSessionRuntimeControl !== undefined);
+    if (!controls) return undefined;
+    const runtimeSelection = this.#runtimeModelSelection;
+    const pending = runtimeSelection && runtimeSelection.ownerKey === this.#taskAuthorityKey() ? runtimeSelection.control.pending : undefined;
+    const route = pending ? controls.models.find(route => route.backendId === pending.backendId && route.providerId === pending.providerId && route.modelId === pending.modelId) : undefined;
+    return route && pending ? { ...controls, pendingModel: { ...route, effortId: pending.effort, fastMode: pending.fastMode } } : controls;
+  }
+
+  async refreshTaskRuntimeSelection(): Promise<boolean> {
+    const credential = this.#credential, session = this.#selectedSession(), ownerKey = this.#taskAuthorityKey();
+    if (!credential || !session || !ownerKey || this.#joinedTask || !this.network.getSessionRuntimeControl) return false;
+    const control = await this.network.getSessionRuntimeControl(credential, session.sessionId, this.#abort?.signal);
+    if (credential !== this.#credential || ownerKey !== this.#taskAuthorityKey()) return false;
+    this.#runtimeModelSelection = { ownerKey, control }; this.#set({});
+    return control.pending !== undefined;
   }
 
   taskProviderUsageTransport(): MobileProviderUsageTransport | undefined {
@@ -9771,7 +10051,8 @@ export class MobileClient {
     const credential = this.#credential;
     const target = uniqueValue(owner?.targets ?? [], (candidate) => candidate.targetId === targetId);
     const backend = uniqueValue(owner?.backends ?? [], (candidate) => candidate.backendId === target?.backendId);
-    const model = resolveMobileNewTaskDefaultModelAuthority(owner, backend?.backendId);
+    const model = resolveMobileExplicitNewTaskModelAuthority(owner, backend?.backendId, this.newTaskModelSelection(targetId))
+      ?? resolveMobileNewTaskDefaultModelAuthority(owner, backend?.backendId);
     const policy = resolveMobileAttachmentPolicy(backend, model?.supportsImages === true);
     if (!authorityKey || !credential || !policy) return undefined;
     return {
@@ -11094,6 +11375,22 @@ export class MobileClient {
     this.#assertNoPendingRuntimeControl(controls.session.sessionId);
     const action = this.#claimMutation();
     try {
+      if (controls.unifiedSources && this.network.getSessionRuntimeControl) {
+        const credential = this.#ready();
+        const control = await this.network.getSessionRuntimeControl(credential, controls.session.sessionId, this.#abort?.signal);
+        this.#runtimeControlContext(authorityKey);
+        if (control.handoffState === "unknown") throw new Error("Recover the previous model source handoff before choosing another source.");
+        const result = await this.#submitTerminal(create(OperationMutationSchema, {
+          preconditions: [this.#sessionRuntimePrecondition(controls.session)],
+          payload: { case: "setSessionRuntime", value: create(SetSessionRuntimeMutationSchema, {
+            sessionId: controls.session.sessionId, expectedRuntimeGeneration: control.generation,
+            backendId: selected.backendId ?? controls.backend.backendId, providerId: selected.providerId,
+            modelId: selected.modelId, effort: selected.effortId ?? "", fastMode: selected.fastMode
+          }) }
+        }), { kind: "session-model", sessionId: controls.session.sessionId });
+        if (result.accepted && result.definitive) await this.refreshTaskRuntimeSelection().catch(() => undefined);
+        return result.accepted && result.definitive;
+      }
       const result = await this.#submitTerminal(create(OperationMutationSchema, {
         preconditions: [this.#sessionRuntimePrecondition(controls.session)],
         payload: { case: "setSessionModel", value: create(SetSessionModelMutationSchema, {
@@ -15066,11 +15363,17 @@ export class MobileClient {
         await this.#finishNewTaskPreparation(identity, submission);
         return;
       }
-      await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
+      if (submission.firstInputAccepted) {
+        await this.#selectCreatedNewTask(submission);
+        await this.#sendNewTaskFollowUps(identity, submission);
+        return;
+      }
+      if (!this.newTaskDrafts.readSync(identity)?.conversation) {
+        await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
+      }
       const observed = await this.#observeRetainedNewTaskOperation(submission, epoch);
       if (observed === "not-dispatched") {
-        await this.#recoverNewTaskComposerDraft(identity, submission.sessionId, submission.input);
-        await this.newTaskDrafts.clear(identity);
+        await this.#releaseNewTaskConversation(identity, submission, true);
         this.#set({ error: "The retained first message had no durable operation receipt and was not dispatched. Its structured input remains in the created task composer." });
         return;
       }

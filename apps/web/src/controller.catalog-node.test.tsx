@@ -126,6 +126,7 @@ async function mount(connectFirst = true) {
       if (active) activeConnections.push(value.id);
       callbacks.onSnapshot?.(snapshot(value)); callbacks.onState?.("connected");
     }, disconnect: () => undefined, taskSharingApi: () => undefined,
+    inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined,
     refresh: async () => callbacks.onSnapshot?.(snapshot(value)),
     listPartners: async () => ({ partners: [], directory: { revision: 1n, templates: [], avatarPresets: [], activeCount: 0, archivedCount: 0, errorCount: 0, updatedAt: 1 } }),
     setResourceEnabled: async (id: string) => { actions.push(`${value.serverId}:resource:${id}`); },

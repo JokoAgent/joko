@@ -5,6 +5,8 @@ import {
   cloneMobileComposerDraft,
   mobileComposerDraftsEqual,
   normalizeMobileComposerDraft,
+  emptyMobileComposerDraft,
+  prependMobileComposerDraft,
   type MobileComposerDraft
 } from "./mobile-composer-document";
 
@@ -46,6 +48,7 @@ export interface MobileNewTaskCreateSubmission extends MobileNewTaskSubmissionBa
 }
 
 export interface MobileNewTaskSendSubmission extends MobileNewTaskSubmissionBase {
+  readonly firstInputAccepted?: true;
   readonly collaborationHandled?: boolean;
   readonly phase: "sending";
   readonly sessionId: string;
@@ -58,6 +61,19 @@ export type MobileNewTaskSubmission = MobileNewTaskCreateSubmission | MobileNewT
 
 export interface MobileNewTaskDraft extends MobileNewTaskEditableDraft {
   readonly submission?: MobileNewTaskSubmission;
+  readonly conversation?: MobileNewTaskConversation;
+}
+
+export interface MobileNewTaskFollowUp {
+  readonly operationId: string;
+  readonly input: MobileComposerDraft;
+  readonly state: "queued" | "dispatching" | "accepted";
+}
+
+export interface MobileNewTaskConversation {
+  readonly input: MobileComposerDraft;
+  readonly followUps: readonly MobileNewTaskFollowUp[];
+  readonly sealed?: true;
 }
 
 export type MobileNewTaskDraftErrorListener = (
@@ -83,8 +99,18 @@ export class MobileNewTaskDraftStore {
   readonly #operations = new Map<string, Promise<void>>();
   readonly #listeners = new Set<MobileNewTaskDraftErrorListener>();
   readonly #revisions = new Map<string, number>();
+  readonly #changes = new Set<() => void>();
 
   constructor(readonly driver: MobilePlainStorageDriver) {}
+
+  subscribe(listener: () => void): () => void {
+    this.#changes.add(listener);
+    return () => this.#changes.delete(listener);
+  }
+
+  revision(identity: MobileNewTaskDraftIdentity): number {
+    return this.#revisions.get(identityKey(identity)) ?? 0;
+  }
 
   subscribeErrors(listener: MobileNewTaskDraftErrorListener): () => void {
     this.#listeners.add(listener);
@@ -144,6 +170,11 @@ export class MobileNewTaskDraftStore {
     const key = identityKey(exact);
     if (this.#memory.get(key)?.submission !== undefined) return;
     const value = normalizeEditableDraft(draft);
+    this.#save(exact, value);
+  }
+
+  #save(exact: MobileNewTaskDraftIdentity, value: MobileNewTaskDraft): void {
+    const key = identityKey(exact);
     const serialized = serializeRecord(exact, value);
     this.#cancelTimer(key);
     this.#bumpRevision(key);
@@ -156,6 +187,71 @@ export class MobileNewTaskDraftStore {
       void this.#persistIfCurrent(exact, value, serialized).catch(() => undefined);
     }, persistDebounceMilliseconds);
     this.#timers.set(key, timer);
+    this.#publish();
+  }
+
+  async openConversation(identity: MobileNewTaskDraftIdentity, createOperationId: string): Promise<void> {
+    const current = this.#conversationOwner(identity, createOperationId);
+    if (current.conversation) return;
+    await this.#replace(identity, { ...current, conversation: { input: emptyMobileComposerDraft(), followUps: [] } });
+  }
+
+  saveConversationInput(identity: MobileNewTaskDraftIdentity, createOperationId: string, input: MobileComposerDraft): void {
+    const current = this.#conversationOwner(identity, createOperationId);
+    if (!current.conversation || current.conversation.sealed) throw new Error("The local task conversation is being transferred to its created task.");
+    const next = { ...current, conversation: { ...current.conversation, input: normalizeNewTaskInput(input) } };
+    mergeMobileNewTaskUnsentInput(next, true);
+    this.#save(identity, next);
+  }
+
+  async queueFollowUp(identity: MobileNewTaskDraftIdentity, createOperationId: string, operationId: string,
+    expected: MobileComposerDraft): Promise<void> {
+    const current = this.#conversationOwner(identity, createOperationId), conversation = current.conversation;
+    if (!conversation || conversation.sealed || !mobileComposerDraftsEqual(conversation.input, expected)) {
+      throw new Error("The local follow-up changed before it could be saved.");
+    }
+    assertIdentity(operationId, "follow-up operation");
+    if (!hasComposerInput(expected) || conversation.followUps.length >= 100
+      || conversation.followUps.some(item => item.operationId === operationId) || operationId === createOperationId) {
+      throw new Error("The local follow-up cannot be queued.");
+    }
+    await this.#replace(identity, { ...current, conversation: { ...conversation, input: emptyMobileComposerDraft(),
+      followUps: [...conversation.followUps, { operationId, input: normalizeNewTaskInput(expected), state: "queued" }] } });
+  }
+
+  async updateFollowUp(identity: MobileNewTaskDraftIdentity, createOperationId: string, operationId: string,
+    change: { readonly input?: MobileComposerDraft; readonly state?: MobileNewTaskFollowUp["state"] }): Promise<void> {
+    const current = this.#conversationOwner(identity, createOperationId), conversation = current.conversation;
+    const previous = conversation?.followUps.find(item => item.operationId === operationId);
+    if (!conversation || !previous || previous.state === "accepted" || change.input && previous.state !== "queued"
+      || change.state === "queued" || change.state === "accepted" && previous.state !== "dispatching") {
+      throw new Error("The retained follow-up owner changed.");
+    }
+    await this.#replace(identity, { ...current, conversation: { ...conversation,
+      followUps: conversation.followUps.map(item => item === previous ? { ...item, ...change } : item) } });
+  }
+
+  async markFirstInputAccepted(identity: MobileNewTaskDraftIdentity, createOperationId: string): Promise<MobileNewTaskSendSubmission> {
+    const current = this.#conversationOwner(identity, createOperationId), submission = current.submission;
+    if (submission?.phase !== "sending" || !submission.sendOperationId) throw new Error("The first-message receipt is unavailable.");
+    const next = { ...submission, firstInputAccepted: true as const };
+    await this.#replace(identity, { ...current, submission: next });
+    return next;
+  }
+
+  async sealConversation(identity: MobileNewTaskDraftIdentity, createOperationId: string): Promise<MobileNewTaskDraft> {
+    const current = this.#conversationOwner(identity, createOperationId);
+    const next = current.conversation ? { ...current, conversation: { ...current.conversation, sealed: true as const } } : current;
+    await this.#replace(identity, next);
+    return cloneDraft(next);
+  }
+
+  #conversationOwner(identity: MobileNewTaskDraftIdentity, createOperationId: string): MobileNewTaskDraft {
+    const current = this.#required(identity);
+    if (current.submission?.createOperationId !== createOperationId || current.submission.objective) {
+      throw new Error("The retained new-task conversation belongs to a different creation.");
+    }
+    return current;
   }
 
   async readSnapshot(identity: MobileNewTaskDraftIdentity): Promise<MobileNewTaskDraftSnapshot> {
@@ -306,7 +402,7 @@ export class MobileNewTaskDraftStore {
     if (submission === undefined || activeOperationId !== operationId) {
       throw new Error("The retained new-task operation changed before it could be released.");
     }
-    const editable = normalizeEditableDraft(current);
+    const editable = normalizeEditableDraft({ ...current, input: mergeMobileNewTaskUnsentInput(current, true) });
     await this.#replace(exact, editable);
     return cloneEditableDraft(editable);
   }
@@ -320,6 +416,7 @@ export class MobileNewTaskDraftStore {
     this.#cleared.add(key);
     this.#dirty.add(key);
     this.#identities.set(key, exact);
+    this.#publish();
     await this.#removeIfCurrent(exact);
   }
 
@@ -356,8 +453,11 @@ export class MobileNewTaskDraftStore {
     this.#cleared.delete(key);
     this.#dirty.add(key);
     this.#identities.set(key, identity);
+    this.#publish();
     await this.#persistIfCurrent(identity, value, serialized);
   }
+
+  #publish(): void { for (const listener of this.#changes) listener(); }
 
   #required(identity: MobileNewTaskDraftIdentity): MobileNewTaskDraft {
     const draft = this.#memory.get(identityKey(identity));
@@ -441,7 +541,32 @@ function normalizeDraft(value: MobileNewTaskDraft): MobileNewTaskDraft {
   const editable = normalizeEditableDraft(value);
   return value.submission === undefined
     ? editable
-    : { ...editable, submission: normalizeSubmission(value.submission) };
+    : { ...editable, submission: normalizeSubmission(value.submission),
+      ...(value.conversation === undefined ? {} : { conversation: normalizeConversation(value.conversation) }) };
+}
+
+function normalizeConversation(value: MobileNewTaskConversation): MobileNewTaskConversation {
+  if (!value || !Array.isArray(value.followUps) || value.followUps.length > 100 || value.sealed !== undefined && value.sealed !== true) {
+    throw new Error("The retained local task conversation is invalid.");
+  }
+  const ids = new Set<string>();
+  const followUps = value.followUps.map(item => {
+    assertIdentity(item.operationId, "follow-up operation");
+    if (ids.has(item.operationId) || !["queued", "dispatching", "accepted"].includes(item.state)) throw new Error("The retained follow-up is invalid.");
+    ids.add(item.operationId);
+    const input = normalizeNewTaskInput(item.input);
+    if (!hasComposerInput(input)) throw new Error("The retained follow-up is empty.");
+    return { operationId: item.operationId, state: item.state, input };
+  });
+  return { input: normalizeNewTaskInput(value.input), followUps, ...(value.sealed ? { sealed: true } : {}) };
+}
+
+/** Keep structured ranges and attachment ownership while returning unsent input to an editor. */
+export function mergeMobileNewTaskUnsentInput(draft: MobileNewTaskDraft, includeFirst: boolean): MobileComposerDraft {
+  const inputs = [...(includeFirst ? [draft.input] : []),
+    ...(draft.conversation?.followUps.filter(item => item.state !== "accepted").map(item => item.input) ?? []),
+    ...(draft.conversation ? [draft.conversation.input] : [])].filter(hasComposerInput);
+  return inputs.reduceRight((tail, input) => prependMobileComposerDraft(input, tail), emptyMobileComposerDraft());
 }
 
 function normalizeEditableDraft(value: MobileNewTaskEditableDraft): MobileNewTaskEditableDraft {
@@ -495,6 +620,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
   positiveDecimal(value.runtimeGeneration, "task runtime generation");
   if (value.sendOperationId !== undefined) assertIdentity(value.sendOperationId, "first-message operation");
   if (value.objectiveRequestId !== undefined) assertIdentity(value.objectiveRequestId, "objective request");
+  if (value.firstInputAccepted !== undefined && (value.firstInputAccepted !== true || !value.sendOperationId || value.objective)) throw new Error("The first-message confirmation is invalid.");
   if (value.collaborationHandled !== undefined && (value.collaborationHandled !== true || value.collaboration === undefined)) throw new Error("The retained collaboration preparation is invalid.");
   if (value.objective !== undefined ? value.sendOperationId !== undefined : value.objectiveRequestId !== undefined) {
     throw new Error("The retained task submission has conflicting input owners.");
@@ -504,6 +630,7 @@ function normalizeSubmission(value: MobileNewTaskSubmission): MobileNewTaskSubmi
     ...base,
     sessionId: value.sessionId,
     runtimeGeneration: value.runtimeGeneration,
+    ...(value.firstInputAccepted ? { firstInputAccepted: true } : {}),
     ...(value.collaborationHandled === undefined ? {} : { collaborationHandled: true }),
     ...(value.sendOperationId === undefined ? {} : { sendOperationId: value.sendOperationId }),
     ...(value.objectiveRequestId === undefined ? {} : { objectiveRequestId: value.objectiveRequestId })
@@ -517,7 +644,8 @@ function serializeRecord(identity: MobileNewTaskDraftIdentity, draft: MobileNewT
     identity: normalizeIdentity(identity),
     draft: exact.submission === undefined
       ? exact
-      : { ...cloneEditableDraft(exact), submission: persistedSubmission(exact.submission) }
+      : { ...cloneEditableDraft(exact), submission: persistedSubmission(exact.submission),
+        ...(exact.conversation === undefined ? {} : { conversation: exact.conversation }) }
   });
   if (serialized.length > maximumStoredCharacters) throw new Error("The local Joko new-task draft is too large.");
   return serialized;
@@ -548,13 +676,15 @@ function readRecord(serialized: string, identity: MobileNewTaskDraftIdentity): M
     throw new Error("invalid new-task submission envelope");
   }
   const submission = { ...draft["submission"], input: editable.input } as unknown as MobileNewTaskSubmission;
-  return { ...editable, submission: normalizeSubmission(submission) };
+  return normalizeDraft({ ...editable, submission,
+    ...(draft["conversation"] === undefined ? {} : { conversation: draft["conversation"] as unknown as MobileNewTaskConversation }) });
 }
 
 function cloneDraft(draft: MobileNewTaskDraft): MobileNewTaskDraft {
   return {
     ...cloneEditableDraft(draft),
-    ...(draft.submission === undefined ? {} : { submission: cloneSubmission(draft.submission) })
+    ...(draft.submission === undefined ? {} : { submission: cloneSubmission(draft.submission) }),
+    ...(draft.conversation === undefined ? {} : { conversation: normalizeConversation(draft.conversation) })
   };
 }
 
@@ -576,6 +706,7 @@ function persistedSubmission(submission: MobileNewTaskSubmission): Omit<MobileNe
 function sameDraft(left: MobileNewTaskDraft, right: MobileNewTaskDraft): boolean {
   return left.targetId === right.targetId && left.name === right.name
     && JSON.stringify(left.collaboration) === JSON.stringify(right.collaboration)
+    && JSON.stringify(left.conversation) === JSON.stringify(right.conversation)
     && mobileComposerDraftsEqual(left.input, right.input)
     && (left.submission === undefined && right.submission === undefined
       || left.submission !== undefined && right.submission !== undefined
@@ -609,7 +740,8 @@ function sameSubmission(left: MobileNewTaskSubmission, right: MobileNewTaskSubmi
   return left.phase === "creating" && right.phase === "creating"
     || left.phase === "sending" && right.phase === "sending"
       && left.sessionId === right.sessionId && left.runtimeGeneration === right.runtimeGeneration
-      && left.sendOperationId === right.sendOperationId && left.objectiveRequestId === right.objectiveRequestId && left.collaborationHandled === right.collaborationHandled;
+      && left.sendOperationId === right.sendOperationId && left.firstInputAccepted === right.firstInputAccepted
+      && left.objectiveRequestId === right.objectiveRequestId && left.collaborationHandled === right.collaborationHandled;
 }
 
 function normalizeNewTaskModelSelection(

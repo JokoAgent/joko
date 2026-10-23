@@ -5,6 +5,7 @@ import {
   DEVICE_PEER_AGENT_AUTHORIZATION_HEADER,
   DEVICE_PEER_PROTOCOL_VERSION,
   DevicePeerProtocolError,
+  devicePeerNativeAgentMethodEffect,
   DevicePeerRegistryError,
   type DevicePeerAbortFrame,
   type DevicePeerCapability,
@@ -1042,6 +1043,14 @@ function commandMetadata(command: contract.DevicePeerCommand): {
   readonly effectKind: DevicePeerEffectKind;
 } {
   const action = command.action.case;
+  if (action === "invokeHostedAgent") {
+    const effectKind = devicePeerNativeAgentMethodEffect(command.action.value.method);
+    if (effectKind === undefined || command.capability !== contract.DevicePeerCapabilityKind.NATIVE_AGENTS
+      || command.effect !== (effectKind === "read_only" ? contract.DevicePeerEffectKind.READ_ONLY : contract.DevicePeerEffectKind.SIDE_EFFECT)) {
+      throw protocolViolation("The native Agent command capability or effect is invalid.");
+    }
+    return { capability: "native_agents", effectKind };
+  }
   if (action === undefined) throw protocolViolation("The Device peer command action is required.");
   const readOnly = action === "listRecentDirectories" || action === "listDirectories"
     || action === "inspectDirectory" || action === "realpath" || action === "statFile"
@@ -1277,6 +1286,7 @@ function toProtoCapability(value: DevicePeerCapability): contract.DevicePeerCapa
     case "terminal": return contract.DevicePeerCapabilityKind.TERMINAL;
     case "forwarding": return contract.DevicePeerCapabilityKind.FORWARDING;
     case "remote_desktop": return contract.DevicePeerCapabilityKind.REMOTE_DESKTOP;
+    case "native_agents": return contract.DevicePeerCapabilityKind.NATIVE_AGENTS;
   }
 }
 
@@ -1287,6 +1297,7 @@ function fromProtoCapability(value: contract.DevicePeerCapabilityKind): DevicePe
     case contract.DevicePeerCapabilityKind.TERMINAL: return "terminal";
     case contract.DevicePeerCapabilityKind.FORWARDING: return "forwarding";
     case contract.DevicePeerCapabilityKind.REMOTE_DESKTOP: return "remote_desktop";
+    case contract.DevicePeerCapabilityKind.NATIVE_AGENTS: return "native_agents";
     default: throw new ConnectError("The Device peer capability is invalid.", Code.InvalidArgument);
   }
 }

@@ -595,6 +595,38 @@ describe("MobilePartnerDirectoryScreen", () => {
     expect(onOpenTask).toHaveBeenCalledWith("remote-canonical");
   });
 
+  it("opens cached Partner text read-only and retires it when the original source is forgotten", async () => {
+    const profile = { profileId: "remote", origin: "https://remote.test", serverId: "remote-server", connectionId: "remote-connection", deviceId: "phone", displayName: "Remote node" };
+    const source = { key: mobilePartnerRosterSourceKey(profile), profile, current: false };
+    let offline = false;
+    const roster = new MobilePartnerRoster({ getItem: async () => null, setItem: async () => undefined, removeItem: async () => undefined },
+      async (_id, signal) => {
+        if (offline) throw new Error("Network offline");
+        return { sourceKey: source.key, profile, ownerKey: "remote-owner", isCurrent: () => !signal.aborted,
+          list: async () => ({ ...catalog, partners: [ada] }), observation: () => undefined,
+          canonical: vi.fn(async () => { throw new Error("Offline content must not open a live task."); }) };
+      });
+    roster.setSources([source]);
+    const event = create(groupWire.EventSchema, { eventId: "saved-reply", identity: { sessionId: ada.canonicalSessionId },
+      cursor: { generation: 1n, sequence: 1n }, payload: { kind: { case: "messageCompleted", value: { messageId: "reply",
+        role: groupWire.MessageRole.ASSISTANT, blocks: [{ content: { case: "text", value: "Saved reply from the original node" } }] } } } });
+    const read = vi.fn(async () => ({ sourceKey: source.key, partnerId: ada.partnerId, sessionId: ada.canonicalSessionId!,
+      displayName: ada.displayName, savedAt: 1234, events: [event] }));
+    await render(undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, { roster, readOfflineConversation: read });
+    await act(async () => { await vi.waitFor(() => expect(roster.snapshot[0]?.status).toBe("online")); });
+    offline = true;
+    await act(async () => { roster.refresh(); await vi.waitFor(() => expect(roster.snapshot[0]?.status).toBe("offline")); });
+    await act(async () => container.querySelector<HTMLButtonElement>('[data-testid="partnerDirectory.cached.remote.ada"]')!.click());
+    expect(read).toHaveBeenCalledWith(source, expect.objectContaining({ partnerId: "ada" }), expect.any(AbortSignal));
+    expect(container.textContent).toContain("Saved reply from the original node");
+    expect(container.textContent).toContain("read-only");
+    expect(container.querySelector("input, textarea")).toBeNull();
+    expect(onOpenTask).not.toHaveBeenCalled();
+    await act(async () => roster.setSources([]));
+    expect(container.querySelector('[data-testid="partnerOfflineConversation.screen"]')).toBeNull();
+    expect(container.textContent).not.toContain("Saved reply from the original node");
+  });
+
   it("shows canonical working and waiting state, preserves the same owner's reply offline and retires it on owner loss", async () => {
     const active = transport();
     vi.mocked(active.list).mockResolvedValue({ ...catalog, partners: [{ ...ada,

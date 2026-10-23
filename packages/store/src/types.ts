@@ -1394,6 +1394,9 @@ export type DeferredEffectOperationClaim<T> =
     };
 
 export interface AppendEventInput {
+  /** Private Host recovery lease: persist the failed lifecycle fact while
+   * postponing its attention edge until recovery is exhausted. */
+  readonly holdTerminalAttention?: boolean;
   readonly id?: EventId;
   readonly emittedAt?: UnixMillis;
   readonly backendId: BackendId;
@@ -2226,6 +2229,8 @@ export interface UpdateRunStateInput {
   readonly operationId?: OperationId;
   /** A host policy may suppress only a successful terminal attention edge. */
   readonly suppressTerminalAttention?: boolean;
+  /** Private Host recovery lease; only a failed Run may defer its attention. */
+  readonly holdTerminalAttention?: boolean;
   /** A successful Scheduler run declared no user-visible result and is born read. */
   readonly markScheduleRunRead?: boolean;
 }

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, parse, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse, resolve, toNamespacedPath } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { NativeSessionBinding } from "@joko/core";
 
@@ -292,7 +292,7 @@ export class ClaudeFreshContextOwner {
       const markerExists = existsSync(markerPath);
       if (markerExists) verifyMarker(markerPath, marker);
       if (markerExists && !databaseExists) throw failure("CORRUPT");
-      database = new DatabaseSync(databasePath, {
+      database = new DatabaseSync(toNamespacedPath(databasePath), {
         allowExtension: false, enableForeignKeyConstraints: true, enableDoubleQuotedStringLiterals: false
       });
       database.enableLoadExtension(false);

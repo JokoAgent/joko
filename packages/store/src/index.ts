@@ -1,5 +1,6 @@
 export * from "./errors.js";
 export * from "./task-share-store.js";
+export * from "./hosted-agent-store.js";
 export * from "./session-runtime-handoff-store.js";
 export type { PartnerLearningTurnRecord } from "./partner-learning-shape.js";
 export * from "./partner-workbench-store.js";
@@ -78,3 +79,9 @@ export {
   ResourceUsageReportQueryError,
   ResourceUsageReportCapacityError
 } from "./resource-usage-report.js";
+export * from "./provider-sharing-store.js";
+export * from "./provider-group-store.js";
+export * from "./provider-group-usage-store.js";
+export * from "./partner-network-store.js";
+export * from "./partner-network-plans.js";
+export * from "./partner-network-rounds.js";

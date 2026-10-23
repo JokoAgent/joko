@@ -13,6 +13,9 @@ import {
   ModelInputModality,
   ModelKeySchema,
   ModelOutputModality,
+  ModelSourceKind,
+  ModelSourceDescriptorSchema,
+  ModelFavoriteSettingsSchema,
   ModelSelectionSchema,
   PermissionMode,
   ProviderDescriptorSchema,
@@ -49,6 +52,37 @@ const identity = {
 };
 
 describe("mobile runtime controls", () => {
+  it("retains an already running grouped source and its trusted input capability while hiding its saved favorite", () => {
+    const { owner, detail } = snapshots();
+    const grouped = create(SnapshotSchema, { ...owner, models: owner.models.map(model => create(ModelDescriptorSchema, { ...model,
+      source: create(ModelSourceDescriptorSchema, { kind: ModelSourceKind.DEVICE, displayName: "Account", nativeAdapterKind: "native", grouped: true }) })) });
+    const controls = resolveMobileRuntimeControls(identity, grouped, detail, "session")!;
+    expect(controls.currentModel?.selectable).toBe(true); expect(controls.models).toHaveLength(1); expect(controls.favorites).toEqual([]);
+    expect(resolveMobileSessionModelAuthority(grouped, grouped.sessions[0])).toBeDefined();
+  });
+  it("keeps same-name models and favorites separate across authenticated sources and hides grouped member entries", () => {
+    const { owner, detail } = snapshots();
+    const native = owner.backends[0]!;
+    const remoteModel = create(ModelDescriptorSchema, { ...owner.models[0]!, backendId: "opaque-device", source: create(ModelSourceDescriptorSchema, {
+      kind: ModelSourceKind.DEVICE, displayName: "Account", nodeId: "other-node", nodeName: "Studio", nativeAdapterKind: "native", grouped: false }) });
+    const remote = create(BackendDescriptorSchema, { ...native, backendId: "opaque-device", displayName: "Studio",
+      capabilities: create(CapabilityManifestSchema, { ...native.capabilities!, capabilities: [...native.capabilities!.capabilities,
+        create(CapabilitySchema, { name: capabilityNames.inputText, support: CapabilitySupport.SUPPORTED })] }) });
+    const member = create(ModelDescriptorSchema, { ...remoteModel, backendId: "grouped-member", source: { ...remoteModel.source!, grouped: true } });
+    const unifiedOwner = create(SnapshotSchema, { ...owner, backends: [...owner.backends, remote, { ...remote, backendId: "grouped-member" }],
+      models: [...owner.models, remoteModel, member], providers: [...owner.providers, { ...owner.providers[0]!, backendId: "opaque-device" }, { ...owner.providers[0]!, backendId: "grouped-member" }],
+      settings: { ...owner.settings!, modelFavorites: create(ModelFavoriteSettingsSchema, { ...owner.settings!.modelFavorites!, favorites: [...owner.settings!.modelFavorites!.favorites,
+        { ...owner.settings!.modelFavorites!.favorites[0]!, favoriteId: "remote-copy", backendId: "opaque-device" }] }) } });
+    const controls = resolveMobileRuntimeControls(identity, unifiedOwner, detail, "session", true)!;
+    expect(controls.models.filter(route => route.providerId === "alpha" && route.modelId === "a").map(route => route.backendId)).toEqual(["backend", "opaque-device"]);
+    expect(controls.models.find(route => route.backendId === "grouped-member")).toBeUndefined();
+    expect(controls.favorites.map(favorite => favorite.backendId)).toEqual(["backend", "opaque-device"]);
+    expect(assertMobileModelSelection(controls, { backendId: "opaque-device", providerId: "alpha", modelId: "a", effortId: "high", fastMode: false })).toEqual({
+      backendId: "opaque-device", providerId: "alpha", modelId: "a", effortId: "high", fastMode: false });
+    expect(assertMobileModelFavoriteMutation(controls, { kind: "replace", item: { ...controls.favorites[1]!, effortId: "high" } })).toMatchObject({
+      item: { backendId: "opaque-device", effortId: "high" } });
+    expect(controls.favorites[0]?.effortId).toBe("low");
+  });
   it("projects only current Backend text routes allowed by Provider and model-access settings", () => {
     const modelA = model("alpha", "a", "Alpha Model", { context: 128_000n });
     const modelB = model("beta", "b", "Beta Model");

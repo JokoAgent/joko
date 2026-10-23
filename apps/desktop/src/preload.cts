@@ -373,7 +373,7 @@ const desktopApi = Object.freeze({
       ipcRenderer.invoke("joko:remote-desktop-viewer:bind", mainDocumentOccurrence, owner),
     retire: (owner: DesktopRemoteDesktopViewerOwner): Promise<void> =>
       ipcRenderer.invoke("joko:remote-desktop-viewer:retire", mainDocumentOccurrence, owner),
-    open: (owner: DesktopRemoteDesktopViewerOwner, target: { readonly deviceId: string; readonly name: string }): Promise<{ readonly focusedExisting: boolean }> =>
+    open: (owner: DesktopRemoteDesktopViewerOwner, target: { readonly deviceId: string; readonly name: string; readonly inputHandoffRequestId?: string }): Promise<{ readonly focusedExisting: boolean }> =>
       ipcRenderer.invoke("joko:remote-desktop-viewer:open", mainDocumentOccurrence, owner, target)
   }) }),
   appInfo: Object.freeze({

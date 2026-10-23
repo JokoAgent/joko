@@ -1098,7 +1098,7 @@ export function VoiceInputSettings({ controller, t }: {
       </div>
       {refinementEnabled && <>
         <div className="voice-input-setting-stack">
-          <div><strong>{t("settings.voiceInputRefinementInstructions")}</strong><span>{t("settings.voiceInputRefinementInstructionsHint")}</span></div>
+          <div className="voice-input-setting-copy"><strong>{t("settings.voiceInputRefinementInstructions")}</strong><span>{t("settings.voiceInputRefinementInstructionsHint")}</span></div>
           <textarea
             value={preferences.refinementInstructions}
             disabled={invalidPreferences}
@@ -1128,9 +1128,9 @@ export function VoiceInputSettings({ controller, t }: {
             }}
           />
         </div>
+        <VoiceDictionaryPeers api={controller} t={t} enabled={dictionary?.syncEnabled ?? false} />
         <div className="voice-input-setting-stack">
-          <VoiceDictionaryPeers api={controller} t={t} enabled={dictionary?.syncEnabled ?? false} />
-          <div><strong>{t("settings.voiceInputDictionary")}</strong><span>{t("settings.voiceInputDictionaryHint")}</span></div>
+          <div className="voice-input-setting-copy"><strong>{t("settings.voiceInputDictionary")}</strong><span>{t("settings.voiceInputDictionaryHint")}</span></div>
           <div className="voice-input-dictionary-add">
             <input
               value={dictionaryDraft}
@@ -1271,7 +1271,7 @@ export function VoiceInputSettings({ controller, t }: {
         </div>
       </>}
     </section>
-    <section className="settings-card voice-input-usage-settings" aria-label={t("settings.voiceInputUsage") }>
+    <section className="settings-card settings-card--content voice-input-usage-settings" aria-label={t("settings.voiceInputUsage") }>
       <div className="voice-input-usage-heading">
         <div><strong>{t("settings.voiceInputUsage")}</strong><span>{t("settings.voiceInputUsageHint")}</span></div>
         <Button tone="ghost" disabled={usage.sessionCount === 0 && usage.entries.length === 0} onClick={() => {

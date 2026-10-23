@@ -264,6 +264,7 @@ export class DesktopRemoteDesktopViewerController {
       this.publish({ caps });
       const display = caps.displays.find((item) => item.displayId === displayId) ?? caps.displays[0]!;
       const started = await rpc.startRemoteDesktop({ displayId: display.displayId,
+        inputHandoffRequestId: this.#scope?.target?.inputHandoffRequestId,
         mode: takeover ? RemoteDesktopStartMode.TAKEOVER : resume ? RemoteDesktopStartMode.RESUME : RemoteDesktopStartMode.NEW,
         control: caps.autoControl && caps.canControl }, this.options());
       if (!this.current(epoch)) return;

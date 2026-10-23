@@ -81,6 +81,15 @@ export {
 } from "./oauth-account.js";
 export { loadClaudeRemoteManagerSource } from "./remote-manager-source.js";
 export {
+  CLAUDE_HOSTED_EXECUTOR_SERVER,
+  CLAUDE_HOSTED_FILE_TOOLS,
+  CLAUDE_HOSTED_DISALLOWED_TOOLS,
+  CLAUDE_HOSTED_GUEST_TOOLS,
+  claudeHostedToolDefinitions,
+  createClaudeHostedTools,
+  type ClaudeHostedToolName
+} from "./hosted-tools.js";
+export {
   claudeNativeRuntimePackageCandidates,
   locateClaudeNativeRuntime,
   type ClaudeNativeRuntimeLocation,

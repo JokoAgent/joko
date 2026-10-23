@@ -176,7 +176,7 @@ function createFixture(
   const application = {
     config: { publicOrigin: "https://orchestrator.example.test" },
     store,
-    connections: { authenticate: () => authenticated },
+    connections: { authenticate: () => authenticated, fence: () => undefined },
     artifacts: {},
     blobTransfers: {},
     artifactRepository: {},

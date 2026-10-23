@@ -842,6 +842,20 @@ describe("public computer automation surface", () => {
     expect(connection.callRequests[2]?.arguments["screenshot_out_file"]).toBe("D:\\workspace\\explicit.png");
   });
 
+  it("yields before sending another text chunk when the product input owner changes", async () => {
+    let allowed = true;
+    const connection = new FakeConnection({ callTool: async () => { allowed = false; return { structuredContent: { ok: true, inserted: 400 } }; } });
+    const provider = new UndecoratedComputerToolProvider({ connectionFactory: connectionHarness([connection]).factory, idFactory: () => "fence" });
+    try {
+      const fence = await provider.openSession("session");
+      const result = await provider.callTool(fence, "type_text", { pid: 7, text: "x".repeat(450) }, undefined,
+        { assertInputCurrent: () => { if (!allowed) throw new Error("Desktop input yielded to owner."); } });
+      expect(result).toMatchObject({ isError: true, structuredContent: { inserted_chars: 400, remaining_chars: 50, outcome: { next_step: "fresh_state" } } });
+      expect(connection.callRequests.filter(value => value.name === "type_text")).toHaveLength(1);
+      expect(connection.callRequests[0]?.arguments["text"]).toHaveLength(400);
+    } finally { await provider.closeAll(); }
+  });
+
   it("preserves known Unicode input progress without replaying an unconfirmed chunk after transport loss", async () => {
     let firstCalls = 0;
     const first = new FakeConnection({

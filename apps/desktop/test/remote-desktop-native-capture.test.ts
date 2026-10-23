@@ -11,6 +11,14 @@ import { DesktopRemoteDesktopNativeCapture, parseDesktopRemoteDesktopNativeFrame
   "../src/remote-desktop-native-capture.js";
 
 describe("Remote Desktop native capture boundary", () => {
+  it("uses only the exact native window stream and cannot fall back to a display photograph", async () => {
+    const child = fakeChild(), spawn = vi.fn<DesktopRemoteDesktopNativeCaptureRuntime["spawn"]>(() => child.process);
+    const capture = new DesktopRemoteDesktopNativeCapture({ platform: "darwin", resolveBinary: async () => "/capture", spawn }); capture.setWindow(91);
+    await expect(capture.frame("1", false, false)).resolves.toBeNull(); expect(spawn).not.toHaveBeenCalled();
+    const pending = capture.frame("1", true, true, { fps: 30, quality: "auto", audio: false });
+    await vi.waitFor(() => expect(spawn).toHaveBeenCalledOnce()); expect(spawn.mock.calls[0]?.[1].at(-1)).toBe("window:91");
+    child.stdout.write(`${JSON.stringify({ jpeg: "AQ==", width: 1, height: 1, cursor: null })}\n`); await expect(pending).resolves.toMatchObject({ width: 1 }); capture.stop();
+  });
   afterEach(() => vi.useRealTimers());
   it("allows ten seconds for a cold helper and bounds a later frame to three seconds", async () => {
     vi.useFakeTimers(); const child = fakeChild();

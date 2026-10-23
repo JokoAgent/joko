@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, toNamespacedPath } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { SessionKey, SessionStore, SessionStoreEntry } from "@anthropic-ai/claude-agent-sdk";
 
@@ -491,7 +491,7 @@ export function inspectClaudeSessionStoreSession(
       if (path === directory ? !info.isDirectory() : !info.isFile()) return "unknown";
     }
     verifyInitializationMarker(markerPath, `${STORE_SCHEMA_BASELINE}\n${digest}\n`);
-    const database = new DatabaseSync(databasePath, {
+    const database = new DatabaseSync(toNamespacedPath(databasePath), {
       readOnly: true,
       allowExtension: false,
       enableForeignKeyConstraints: true,
@@ -1720,7 +1720,7 @@ function openDatabaseOnce(authority: ClaudeSessionStoreAuthority): DatabaseSync 
       throw failure("CORRUPT");
     }
     const mayInitialize = !databaseExists && !markerExists;
-    database = new DatabaseSync(databasePath, {
+    database = new DatabaseSync(toNamespacedPath(databasePath), {
       allowExtension: false,
       enableForeignKeyConstraints: true,
       enableDoubleQuotedStringLiterals: false,

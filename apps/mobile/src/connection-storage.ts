@@ -29,7 +29,7 @@ export interface PendingOperation {
     | "schedule-run" | "schedule-enable" | "schedule-run-restart" | "schedule-run-read"
     | "schedule-runs-read" | "schedule-all-read" | "schedule-run-delete"
     | "schedule-create" | "schedule-update" | "schedule-delete" | "schedule-promote"
-    | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings" | "model-favorite"
+    | "schedule-clone" | "schedule-project-remove" | "schedule-project-reconcile" | "voice-settings" | "model-favorite" | "model-source-target"
     | "extension-enabled" | "extension-sidebar"
     | "extension-setup-begin" | "extension-setup-interaction" | "extension-setup-credential"
     | "extension-setup-complete" | "extension-setup-cancel" | "extension-setup-revoke";
@@ -410,7 +410,7 @@ function isPending(value: unknown): value is PendingOperation {
       "session-branch", "session-shell", "session-reset", "session-review", "session-clone", "session-fork", "session-rewind", "workspace-rewind", "schedule-run", "schedule-enable",
       "schedule-run-restart", "schedule-run-read", "schedule-runs-read", "schedule-all-read",
       "schedule-run-delete", "schedule-create", "schedule-update", "schedule-delete", "schedule-promote",
-      "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings", "model-favorite",
+      "schedule-clone", "schedule-project-remove", "schedule-project-reconcile", "voice-settings", "model-favorite", "model-source-target",
       "extension-enabled", "extension-sidebar", "extension-setup-begin", "extension-setup-interaction",
       "extension-setup-credential", "extension-setup-complete", "extension-setup-cancel",
       "extension-setup-revoke"].includes(String(record.kind))

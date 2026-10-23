@@ -1,6 +1,7 @@
 import type { Duplex, Readable, Writable } from "node:stream";
 
 import {
+  type HostedAgentPeerMethod,
   RemoteDesktopFailureReason,
   type RemoteDesktopClipboardContent,
   type RemoteDesktopCapabilities,
@@ -19,6 +20,15 @@ import {
   type RemoteDesktopStartMode,
   type RemoteDesktopVideoSettings
 } from "@joko/contracts";
+
+/** Present only when an actual Orchestrator owns native Agent factories.
+ * A generic file/process agent must not advertise or emulate this service. */
+export interface DevicePeerNativeAgentPort {
+  invoke(method: HostedAgentPeerMethod, request: Uint8Array, signal: AbortSignal,
+    authority: { readonly controllerDeviceId: string }): Promise<Uint8Array>;
+  /** Retires only the native authority owned by this exact route instance. */
+  retire(): Promise<void>;
+}
 
 export type DevicePeerFileKind = "file" | "directory" | "symbolic_link" | "other";
 
@@ -167,6 +177,7 @@ export interface DevicePeerRemoteDesktopHostPort {
     readonly displayId: string;
     readonly mode: RemoteDesktopStartMode;
     readonly control?: boolean;
+    readonly inputHandoffRequestId?: string;
   }): Promise<RemoteDesktopLease>;
   heartbeat(request: DevicePeerRemoteDesktopLeaseRequest): Promise<RemoteDesktopControlState>;
   stop(request: DevicePeerRemoteDesktopLeaseRequest & {

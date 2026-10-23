@@ -6,7 +6,7 @@ import { mobilePartnerRosterSourceKey } from "./mobile-partner-roster";
 import type { MobileConnectionProfile } from "./connection-storage";
 
 const models: MobilePartnerGroupRoster[] = [];
-afterEach(() => { for (const model of models.splice(0)) model.setActive(false); });
+afterEach(() => { for (const model of models.splice(0)) model.setActive(false); vi.useRealTimers(); });
 const profile = (id: string): MobileConnectionProfile => ({ profileId: id, origin: `https://${id}.test`, serverId: `server-${id}`,
   connectionId: `connection-${id}`, deviceId: `phone-${id}`, displayName: "Same node name" });
 const source = (id: string) => ({ profile: profile(id), key: mobilePartnerRosterSourceKey(profile(id)), current: id === "a" });
@@ -28,6 +28,27 @@ function model(storage: ReturnType<typeof store>, resolve: ConstructorParameters
   const result = new MobilePartnerGroupRoster(storage, resolve, () => 1234); models.push(result); return result;
 }
 describe("paired group directory display ownership", () => {
+  it("recovers a transient source and ends a stalled cold read without waiting indefinitely", async () => {
+    vi.useFakeTimers();
+    let offline = true;
+    const resolve = vi.fn(async (id: string, signal: AbortSignal) => {
+      if (offline) throw new TypeError("Network offline");
+      return transport(id, async () => catalog("Recovered group"), signal);
+    });
+    const roster = model(store(), resolve); roster.setSources([source("a")]); roster.setActive(true);
+    await vi.advanceTimersByTimeAsync(0); expect(roster.snapshot[0]?.status).toBe("offline");
+    offline = false; await vi.advanceTimersByTimeAsync(900);
+    expect(roster.snapshot[0]).toMatchObject({ status: "online", display: [{ name: "Recovered group" }] });
+    const stalled = model(store(), async (id, signal) => transport(id, () => new Promise(() => {}), signal));
+    stalled.setSources([source("a")]); stalled.setActive(true);
+    await vi.advanceTimersByTimeAsync(9_999); expect(stalled.snapshot[0]?.status).toBe("loading");
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stalled.snapshot[0]).toMatchObject({ status: "offline", refreshing: false, settled: true });
+    stalled.setActive(false); roster.setActive(false);
+    const calls = resolve.mock.calls.length; await vi.advanceTimersByTimeAsync(60_000);
+    expect(resolve).toHaveBeenCalledTimes(calls);
+  });
+
   it("keeps same group IDs separate and retains only the failed source's display", async () => {
     const storage = store(); let failed = false;
     const roster = model(storage, async (id, signal, expected) => {

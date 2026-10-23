@@ -361,6 +361,7 @@ import {
 import { capturePackagedSmokeProcessBirthIdentitySync } from "./packaged-smoke-process-identity.js";
 import { DesktopDevicePeerAgentExecutor } from "./device-peer-agent.js";
 import { DesktopDevicePeerAgentLifecycle } from "./device-peer-agent-lifecycle.js";
+import { createDesktopHostedAgentDelegate, probeDesktopHostedAgentDelegate } from "./hosted-agent-delegate.js";
 import { createAuditedDesktopDevicePeerTerminalPort } from "./device-peer-terminal.js";
 import {
   createAuditedDesktopDevicePeerRuntimeExecutables,
@@ -415,6 +416,7 @@ import {
 } from "./desktop-open-with-document.js";
 import { NativeArtifactSourceRevealer } from "./native-artifact-source-revealer.js";
 import { DesktopPersonalDevelopmentHost } from "./personal-development-native-host.js";
+import { DesktopInputHandoffHost } from "./input-handoff-native-host.js";
 import { DesktopPersonalDevelopmentVersions } from "./personal-development-native-versions.js";
 import { personalVersionProfileOverride } from "./personal-development-version-bootstrap.js";
 import { resolveManagedArtifactSource } from "./managed-artifact-source.js";
@@ -885,6 +887,7 @@ let desktopUpdateNativeInstallQuitHandoffPending = false;
 let desktopCompleteExitQuitHandoffPending = false;
 let desktopPersonalVersionQuitHandoffPending = false;
 let desktopPersonalDevelopmentHost: DesktopPersonalDevelopmentHost | undefined;
+let desktopInputHandoffHost: DesktopInputHandoffHost | undefined;
 let desktopCompleteExit: Promise<void> | undefined;
 let desktopUpdateAutoRelaunchPolicy: DesktopUpdateAutoRelaunchPolicy | undefined;
 let desktopUpdateAutoRelaunchPolicyInitialization: Promise<void> | undefined;
@@ -986,6 +989,7 @@ if (!app.requestSingleInstanceLock()) {
   desktopOpenIntentIngress.activateSingleInstance(process.argv);
   app.on("before-quit", (event) => {
     desktopPersonalDevelopmentHost?.close();
+    desktopInputHandoffHost?.close();
     nativeFileClipboard?.cancelPending();
     nativeFileOpener?.cancelPending();
     windowsOpenWithApps?.cancelPending();
@@ -1970,7 +1974,26 @@ async function verifyPackagedSmokeInspectorWindow(owner: BrowserWindow): Promise
   foreground.show();
   foreground.focus();
   await waitForPackagedSmokeInspectorCondition(() => foreground.isFocused(), "pre-crash independent focus");
-  owner.webContents.forcefullyCrashRenderer();
+  const ownerContents = owner.webContents;
+  const ownerRendererLost = new Promise<void>((resolveLoss) => ownerContents.once("render-process-gone", () => resolveLoss()));
+  if (process.platform === "win32") {
+    // Crash IPC can remain pending in a background packaged renderer. Exercise
+    // real process loss using the exact owner PID and its OS birth identity.
+    const pid = ownerContents.getOSProcessId();
+    if (pid < 1 || pid === process.pid || pid === foreground.webContents.getOSProcessId()) {
+      throw new Error("Inspector smoke renderer is not an independent owned process.");
+    }
+    const identity = capturePackagedSmokeProcessBirthIdentitySync(pid);
+    if (identity === undefined || ownerContents.isDestroyed() || ownerContents.getOSProcessId() !== pid
+      || capturePackagedSmokeProcessBirthIdentitySync(pid) !== identity) {
+      throw new Error("Inspector smoke renderer changed before process termination.");
+    }
+    process.kill(pid, "SIGKILL");
+  } else {
+    ownerContents.forcefullyCrashRenderer();
+  }
+  await waitForPackagedSmokeDeadline(ownerRendererLost, 10_000, "Inspector owner renderer crash");
+  recordPackagedSmokeProgress("inspector_owner_renderer_gone");
   await waitForPackagedSmokeInspectorDestroyed(crashing, "owner crash");
   if (inspectorWindow !== undefined || inspectorWindowOwner !== undefined || inspectorWindowLifecycle !== undefined ||
     inspectorWindowOccurrence !== undefined) {
@@ -6246,6 +6269,7 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
   childWindow.webContents.on("will-prevent-unload", notifyDesktopQuitBlocked);
   childWindow.on("close", () => {
     inspectorWindowLifecycle?.markUserClosing(childWindow);
+    if (!quitting) inspectorWindowLifecycle?.returnFocusBeforeClose(childWindow);
   });
   childWindow.webContents.on("render-process-gone", () => {
     if (inspectorWindowLifecycle?.markChildFailed(childWindow) === true && !childWindow.isDestroyed()) {
@@ -6275,7 +6299,6 @@ function installInspectorWindowSecurity(childWindow: BrowserWindow, owner: Brows
         notifyOwner.send(DESKTOP_CHANNELS.inspectorWindowClosed, Object.freeze({ occurrence, reason: decision.reason }));
       } catch { /* The owner retired after validation. */ }
     }
-    if (decision.returnFocus && !quitting && !owner.isDestroyed() && BrowserWindow.getFocusedWindow() === owner) owner.focus();
   });
 }
 
@@ -7441,6 +7464,7 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
       remoteDesktop = createDesktopRemoteDesktopMainHost({
         connectionsAllowed: () => !desktopRemoteDesktopWindowsSetupBusy,
         sourceDirectory,
+        inputHandoff: desktopInputHandoffHost,
         settings,
         credentialsOwner: { profileId: connection.profileId, serverId: connection.serverId, deviceId: connection.deviceId },
         systemAudioMute: globalVoiceSystemAudio,
@@ -7468,6 +7492,9 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
       capturedDesktopRemoteDesktopHosts.add(remoteDesktop);
       desktopRemoteDesktopHost = remoteDesktop;
       void broadcastDesktopRemoteDesktopSnapshot();
+      const nativeAgents = await createDesktopHostedAgentDelegate({ connection, readAuthKey: readCredential,
+        readHostKey: readDesktopDevicePeerAgentRouteAuthorization, isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent
+      }).catch(() => undefined);
       return new DesktopDevicePeerAgentExecutor({
         recentDirectoriesPath: join(
           app.getPath("userData"),
@@ -7476,13 +7503,18 @@ function initializeDesktopDevicePeerAgentLifecycle(): void {
         ),
         terminals,
         runtimeExecutables: locatedExecutables,
+        ...(nativeAgents === undefined ? {} : { nativeAgents }),
         remoteDesktop
       });
     },
     readAuthKey: readCredential,
     readRouteAuthorization: readDesktopDevicePeerAgentRouteAuthorization,
     readDefaultDeviceName: () => hostname().trim() || "Unknown Device",
-    isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent
+    isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent,
+    recoverNativeAgents(connection, signal) {
+      return probeDesktopHostedAgentDelegate({ connection, signal, readAuthKey: readCredential,
+        readHostKey: readDesktopDevicePeerAgentRouteAuthorization, isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent });
+    }
   });
   reconcileDesktopDevicePeerAgentLifecycle();
 }
@@ -7497,6 +7529,11 @@ function reconcileDesktopDevicePeerAgentLifecycle(): void {
     && isDesktopDevicePeerAgentAuthorityCurrent(managedOrchestratorConnection)
     ? managedOrchestratorConnection
     : undefined;
+  if (desktopInputHandoffHost === undefined && connection !== undefined) {
+    desktopInputHandoffHost = new DesktopInputHandoffHost({ readAuthKey: readCredential,
+      readHostKey: readDesktopDevicePeerAgentRouteAuthorization, isAuthorityCurrent: isDesktopDevicePeerAgentAuthorityCurrent });
+  }
+  desktopInputHandoffHost?.setConnection(connection);
   desktopDevicePeerAgentLifecycle?.setConnection(connection);
   if (desktopPersonalDevelopmentHost === undefined && connection !== undefined) {
     const versions = new DesktopPersonalDevelopmentVersions({ profileDirectory: app.getPath("userData"),

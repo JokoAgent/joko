@@ -16,7 +16,7 @@ import {
   clearModelEffort
 } from "../model-picker-preferences.js";
 import type { ModelView } from "../model.js";
-import { ModelPicker, type ModelPickerSelection } from "./ModelPicker.js";
+import { ModelPicker, type ModelPickerProps, type ModelPickerSelection } from "./ModelPicker.js";
 import { Modal } from "./ui.js";
 
 const roots: Root[] = [];
@@ -42,6 +42,63 @@ afterEach(async () => {
 });
 
 describe("ModelPicker", () => {
+  it("aggregates exact-source favorites and filters both rows and favorites by the selected source while hiding grouped members", async () => {
+    const source = { kind: "local" as const, displayName: "Account", nodeId: "owner", nodeName: "Desk", nativeAdapterKind: "engine", groupMemberCount: 0, grouped: false };
+    const local = { ...models[0]!, source };
+    const remote = { ...models[0]!, backendId: "opaque-device", source: { ...source, kind: "device" as const, nodeId: "other", nodeName: "Studio" } };
+    const member = { ...models[0]!, backendId: "opaque-member", source: { ...source, kind: "device" as const, nodeName: "Grouped", grouped: true } };
+    for (const model of [local, remote, member]) addModelFavorite("owner-one", { backendId: model.backendId, providerId: model.providerId, modelId: model.modelId });
+    await renderPicker(vi.fn(), "owner-one", undefined, false, undefined, [local, remote, member]); await openPicker();
+    expect(document.querySelectorAll('.model-picker__row.is-favorite')).toHaveLength(2);
+    expect(document.querySelector('.model-picker__list')?.textContent).not.toContain("Grouped");
+    const sourceButton = required([...document.querySelectorAll<HTMLButtonElement>('.model-picker__rail button')].find(button => button.textContent?.includes("Studio")));
+    await act(async () => sourceButton.click());
+    const rows = [...document.querySelectorAll('.model-picker__row')];
+    expect(rows).toHaveLength(2); expect(rows.every(row => row.textContent?.includes("Studio"))).toBe(true);
+    expect(rows.filter(row => row.classList.contains("is-favorite"))).toHaveLength(1);
+    expect(readModelPickerOwnerPreferences("owner-one").favorites).toHaveLength(3);
+  });
+
+  it("waits for a model-source save and preserves the open picker after a rejected handoff", async () => {
+    let reject!: (error: Error) => void;
+    const onSelect = vi.fn(() => new Promise<void>((_resolve, failed) => { reject = failed; }));
+    await renderPicker(onSelect); await openPicker();
+    await act(async () => findRow("Small").click());
+    expect(document.querySelector('.model-picker__list')).not.toBeNull();
+    await act(async () => findRow("Large").click()); expect(onSelect).toHaveBeenCalledOnce();
+    await act(async () => reject(new Error("The source changed")));
+    expect(document.querySelector('.model-picker__list')).not.toBeNull();
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain("could not be saved");
+  });
+
+  it.each([false, true])("shows the exact group member quota after the group owner routes to another Backend (member=%s)", async member => {
+    const usage = { group: { backendId: member ? "group-owner" : "backend-picker", providerId: "provider-a" },
+      ...(member ? { memberRoute: { backendId: "backend-picker", providerId: "provider-a" } } : {}),
+      nodeName: "Studio computer", quotaReadable: true, usedPercent: 42.5, resetAt: 1000 };
+    const otherBackend = { ...models[0]!, backendId: "another-backend", modelId: "other-model", name: "Other model" };
+    const onSelect = vi.fn(), selected = { backendId: "backend-picker", providerId: "provider-a", modelId: "model-small", fastMode: false };
+    await renderPicker(onSelect, "owner-one", undefined, false, undefined, [...models, otherBackend], selected, undefined, usage);
+    const running = translate("en", "modelPicker.groupRunning", { name: usage.nodeName }), quota = translate("en", "modelPicker.groupUsage", { percent: 42.5 });
+    expect(document.querySelector(".model-picker-trigger")?.getAttribute("title")).toContain(running);
+    await openPicker();
+    const small = findRow("Small"); expect(small.textContent).toContain(running); expect(small.textContent).toContain(quota);
+    expect(findRow("Large").title).toContain(quota); expect(findRow("Beta model").textContent).not.toContain(running); expect(findRow("Other model").textContent).not.toContain(running);
+    expect(document.querySelectorAll('.model-picker__rail button[title]')).toHaveLength(1);
+    expect(document.querySelector('.model-picker__rail button[title]')?.getAttribute("title")).toContain(quota);
+    await act(async () => small.click()); expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining(selected));
+  });
+
+  it.each([false, true])("withholds private or unknown group quota without inventing zero (readable=%s)", async quotaReadable => {
+    const usage = { group: { backendId: "backend-picker", providerId: "provider-a" }, nodeName: "Shared computer", quotaReadable,
+      ...(quotaReadable ? {} : { usedPercent: 99 }) };
+    await renderPicker(vi.fn(), "owner-one", undefined, false, undefined, models, undefined, undefined, usage); await openPicker();
+    const small = findRow("Small"), hidden = translate("en", "modelPicker.groupPrivateUsage");
+    expect(small.textContent).toContain(translate("en", "modelPicker.groupRunning", { name: usage.nodeName }));
+    expect(small.textContent?.includes(hidden)).toBe(!quotaReadable);
+    expect(small.textContent).not.toContain(translate("en", "modelPicker.groupUsage", { percent: 0 }));
+    expect(small.textContent).not.toContain(translate("en", "modelPicker.groupUsage", { percent: 99 }));
+    expect(findRow("Beta model").textContent).not.toContain(hidden);
+  });
   it("uses declared defaults and observes external exact-route effort changes and reset without a stale row cache", async () => {
     const declared = { ...models[0]!, metadata: { defaultEffort: "high" } };
     const onSelect = vi.fn();
@@ -449,7 +506,8 @@ async function renderPicker(
   onOpen?: () => void | Promise<void>,
   pickerModels: readonly ModelView[] = models,
   value?: ModelPickerSelection,
-  onConnectSource?: () => void
+  onConnectSource?: () => void,
+  providerGroupUsage?: ModelPickerProps["providerGroupUsage"]
 ): Promise<void> {
   const container = document.createElement("div");
   document.body.append(container);
@@ -465,6 +523,7 @@ async function renderPicker(
     onConnectSource={onConnectSource}
     allowDefault={allowDefault}
     seedDefault={seedDefault}
+    providerGroupUsage={providerGroupUsage}
   />));
 }
 

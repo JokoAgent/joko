@@ -1,0 +1,61 @@
+syntax = "proto3";
+package joko.v1;
+
+import "joko/v1/task_sharing.proto";
+import "joko/v1/task_sharing_types.proto";
+
+// Public identity and Home alias only. Credentials and profiles are not projected.
+message PartnerIdentity {
+  string authority_server_id = 1;
+  string partner_id = 2;
+  string display_name = 3;
+  string description = 4;
+}
+message PartnerIdentityGrant {
+  string grant_id = 1;
+  PartnerIdentity identity = 2;
+  string status = 3;
+}
+message PartnerIdentityLink {
+  string link_id = 1;
+  PartnerIdentity identity = 2;
+  string alias = 3;
+  string status = 4;
+  string join_id = 5;
+}
+message ListPartnerIdentitiesRequest {}
+message ListPartnerIdentitiesResponse {
+  repeated PartnerIdentityGrant grants = 1;
+  repeated PartnerIdentityLink links = 2;
+}
+message IssuePartnerIdentityRequest { string operation_id = 1; string partner_id = 2; uint64 expected_revision = 3; }
+message IssuePartnerIdentityResponse { PartnerIdentityGrant grant = 1; string invitation = 2; }
+message RevokePartnerIdentityRequest { string operation_id = 1; string grant_id = 2; }
+message RevokePartnerIdentityResponse { PartnerIdentityGrant grant = 1; }
+message ImportPartnerIdentityRequest { string invitation = 1; string alias = 2; }
+message ImportPartnerIdentityResponse { PartnerIdentityLink link = 1; }
+message RenamePartnerIdentityRequest { string link_id = 1; string alias = 2; }
+message RenamePartnerIdentityResponse { PartnerIdentityLink link = 1; }
+message ForgetPartnerIdentityRequest { string operation_id = 1; string link_id = 2; }
+message ForgetPartnerIdentityResponse {}
+message OpenPartnerIdentityRequest { string operation_id = 1; string link_id = 2; string display_name = 3; }
+message OpenPartnerIdentityResponse { PartnerIdentityLink link = 1; TaskShareJoinIntent intent = 2; JoinedTaskShare joined = 3; }
+message InspectPartnerIdentityRequest { string grant_id = 1; string partner_id = 2; }
+message InspectPartnerIdentityResponse { PartnerIdentity identity = 1; }
+message ResolvePartnerIdentityRequest { string operation_id = 1; string grant_id = 2; string partner_id = 3; }
+message ResolvePartnerIdentityResponse { PartnerIdentity identity = 1; TaskShare share = 2; string invitation = 3; }
+
+service PartnerIdentityService {
+  rpc ListPartnerIdentities(ListPartnerIdentitiesRequest) returns (ListPartnerIdentitiesResponse);
+  rpc IssuePartnerIdentity(IssuePartnerIdentityRequest) returns (IssuePartnerIdentityResponse);
+  rpc RevokePartnerIdentity(RevokePartnerIdentityRequest) returns (RevokePartnerIdentityResponse);
+  rpc ImportPartnerIdentity(ImportPartnerIdentityRequest) returns (ImportPartnerIdentityResponse);
+  rpc RenamePartnerIdentity(RenamePartnerIdentityRequest) returns (RenamePartnerIdentityResponse);
+  rpc ForgetPartnerIdentity(ForgetPartnerIdentityRequest) returns (ForgetPartnerIdentityResponse);
+  rpc OpenPartnerIdentity(OpenPartnerIdentityRequest) returns (OpenPartnerIdentityResponse);
+}
+// A limited identity credential never authenticates a node Connection.
+service PartnerIdentityGuestService {
+  rpc InspectPartnerIdentity(InspectPartnerIdentityRequest) returns (InspectPartnerIdentityResponse);
+  rpc ResolvePartnerIdentity(ResolvePartnerIdentityRequest) returns (ResolvePartnerIdentityResponse);
+}

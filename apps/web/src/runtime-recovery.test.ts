@@ -16,6 +16,24 @@ const error: ErrorView = {
 };
 
 describe("runtime recovery presentation", () => {
+  it("clears the pending reconnect presentation on fresh visible root thinking without claiming recovery success", () => {
+    const pending = item("recovery", 10n, "runtimeRecovery", {
+      runtimeRecovery: { ...recovery("running"), continuationRunId: "run-b" }
+    });
+    const thought = item("thought", 11n, "thinking", { runId: "run-b", text: "Continuing the response", streaming: true });
+    const items = [pending, thought];
+    expect(activeRuntimeRecovery(items)).toBeUndefined();
+    expect(projectRuntimeRecoveryTimeline(items).map(value => value.id)).toEqual(["thought"]);
+    expect(pending.runtimeRecovery?.state).toBe("running");
+    for (const other of [
+      { ...thought, runId: "background-run" },
+      { ...thought, text: " \u200b\u2060" },
+      { ...thought, createdAt: 9, lastActivityAt: 9 },
+      { ...thought, kind: "background" as const }
+    ]) expect(activeRuntimeRecovery([pending, other])?.id).toBe("recover-a");
+    expect(activeRuntimeRecovery([{ ...pending, runtimeRecovery: { ...pending.runtimeRecovery!, state: "waiting" } }, thought])?.id).toBe("recover-a");
+  });
+
   it("hides the claimed error and internal prompt behind one active row", () => {
     const items = [
       item("error", 1n, "error", { runId: "run-a", error }),
@@ -27,6 +45,9 @@ describe("runtime recovery presentation", () => {
       }),
       item("hidden-objective-prompt", 4n, "user", {
         objectiveContinuation: { ownerGeneration: 2n, turn: 3 }
+      }),
+      item("hidden-handoff-completion", 5n, "user", {
+        inputHandoffContinuation: { requestId: "original-request" }
       })
     ];
 

@@ -5,7 +5,7 @@ import type { MobileConnectionProfile } from "./connection-storage";
 import type { MobilePartnerCatalog } from "./mobile-partner-directory";
 
 const models: MobilePartnerRoster[] = [];
-afterEach(() => { for (const model of models.splice(0)) model.setActive(false); });
+afterEach(() => { for (const model of models.splice(0)) model.setActive(false); vi.useRealTimers(); });
 const profile = (id: string): MobileConnectionProfile => ({ profileId: id, origin: `https://${id}.test`, serverId: `server-${id}`,
   connectionId: `connection-${id}`, deviceId: `phone-${id}`, displayName: "Same node name" });
 const source = (id: string) => ({ profile: profile(id), key: mobilePartnerRosterSourceKey(profile(id)), current: id === "a" });
@@ -26,6 +26,41 @@ function model(storage: ReturnType<typeof store>, resolve: ConstructorParameters
   const result = new MobilePartnerRoster(storage, resolve, () => 1234); models.push(result); return result;
 }
 describe("paired Partner roster source ownership", () => {
+  it("recovers a failed source without a page reopen and cancels retries when it is forgotten", async () => {
+    vi.useFakeTimers();
+    let offline = true;
+    const resolve = vi.fn(async (id: string, signal: AbortSignal) => {
+      if (offline) throw new TypeError("Network offline");
+      return transport(id, async () => catalog("Recovered"), signal);
+    });
+    const roster = model(store(), resolve); roster.setSources([source("a")]); roster.setActive(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(roster.snapshot[0]).toMatchObject({ status: "offline", settled: true });
+    offline = false; await vi.advanceTimersByTimeAsync(900);
+    expect(roster.snapshot[0]).toMatchObject({ status: "online", display: [{ displayName: "Recovered" }] });
+    offline = true; roster.refresh(); await vi.advanceTimersByTimeAsync(0);
+    expect(roster.snapshot[0]?.status).toBe("offline");
+    roster.setSources([]); await vi.advanceTimersByTimeAsync(30_000);
+    expect(resolve).toHaveBeenCalledTimes(3); expect(roster.snapshot).toEqual([]);
+  });
+
+  it("bounds cold loading and lets another source proceed after a stalled directory", async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    const roster = model(store(), async (id, signal) => {
+      signals.push(signal);
+      return transport(id, () => id === "a" || id === "b" ? new Promise(() => {}) : Promise.resolve(catalog("Third")), signal);
+    });
+    roster.setSources([source("a"), source("b"), source("c")]); roster.setActive(true);
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(roster.snapshot[0]).toMatchObject({ status: "loading", refreshing: true });
+    expect(signals).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(roster.snapshot[0]).toMatchObject({ status: "offline", refreshing: false, settled: true });
+    expect(signals[0]?.aborted).toBe(true);
+    expect(roster.snapshot[2]?.status).toBe("online");
+  });
+
   it("keeps same-ID sources isolated and updates successful shards independently of another failure", async () => {
     const storage = store(); let failed = false;
     const resolve = vi.fn(async (id: string, signal: AbortSignal) => transport(id, async () => {
@@ -39,7 +74,8 @@ describe("paired Partner roster source ownership", () => {
     expect(roster.snapshot[0]).toMatchObject({ status: "online", display: [{ partnerId: "same-partner", displayName: "Ada" }] });
     expect(roster.snapshot[1]).toMatchObject({ display: [{ partnerId: "same-partner", displayName: "Bea" }] });
     expect(roster.transport(source("a").key)).toBeDefined(); expect(roster.transport(source("b").key)).toBeUndefined();
-    expect([...storage.values.values()].join(" ")).not.toContain("canonicalSessionId");
+    expect([...storage.values.values()].join(" ")).not.toContain("revision");
+    expect(roster.snapshot[1]?.display[0]?.conversation?.sessionId).toBeDefined();
     expect([...storage.values.values()].join(" ")).not.toContain("identitySource");
   });
   it("bounds concurrent reads to two and retires forgotten or background late results", async () => {

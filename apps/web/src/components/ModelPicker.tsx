@@ -46,6 +46,7 @@ import type {
 import { randomUuid } from "../web-crypto.js";
 import { isConversationModel, isRoutableConversationModel } from "../model-capabilities.js";
 import { applyProviderDisplayOrder } from "../provider-display-order.js";
+import { modelSourceLabel, modelSourceSelectable } from "../model-source-catalog.js";
 import { placeModelPickerConfigFlyout, type ModelPickerConfigFlyoutRect } from "./model-picker-config-flyout.js";
 import type { Translator } from "./types.js";
 import { Button, IconButton, Tip, cx, CheckboxControl } from "./ui.js";
@@ -65,7 +66,7 @@ export interface ModelPickerProps {
   readonly ownerId: string | undefined;
   readonly value: ModelPickerSelection | undefined;
   readonly t: Translator;
-  readonly onSelect: (value: ModelPickerSelection | undefined) => void;
+  readonly onSelect: (value: ModelPickerSelection | undefined) => void | Promise<void>;
   /** Called after a committed selection so an adjacent composer can reclaim focus. */
   readonly onSelectionFocus?: () => void;
   readonly onOpen?: () => void | Promise<void>;
@@ -83,6 +84,15 @@ export interface ModelPickerProps {
   readonly effortEnabled?: boolean;
   readonly fastEnabled?: boolean;
   readonly useMorphPopover?: boolean;
+  readonly retainCurrentSource?: boolean;
+  readonly providerGroupUsage?: {
+    readonly group: { readonly backendId: string; readonly providerId: string };
+    readonly memberRoute?: { readonly backendId: string; readonly providerId: string };
+    readonly nodeName: string;
+    readonly quotaReadable: boolean;
+    readonly usedPercent?: number;
+    readonly resetAt?: number;
+  };
 }
 
 interface PickerRow {
@@ -125,7 +135,9 @@ export function ModelPicker({
   onMutateFavorite,
   effortEnabled = true,
   fastEnabled = true,
-  useMorphPopover = false
+  useMorphPopover = false,
+  providerGroupUsage,
+  retainCurrentSource = false
 }: ModelPickerProps): JSX.Element {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
@@ -144,9 +156,12 @@ export function ModelPicker({
   const [justFavoritedKey, setJustFavoritedKey] = useState<string>();
   const [favoriteBusy, setFavoriteBusy] = useState(false);
   const [favoriteError, setFavoriteError] = useState(false);
+  const [selectionBusy, setSelectionBusy] = useState(false);
+  const [selectionError, setSelectionError] = useState(false);
   const [panelStyle, setPanelStyle] = useState<CSSProperties>();
   const favoriteFlightRef = useRef(0);
   const favoriteSeedAttemptRef = useRef<string | undefined>(undefined);
+  const selectionBusyRef = useRef(false);
   const favoriteOwnerRef = useRef(ownerId);
   favoriteOwnerRef.current = ownerId;
   const favorites = favoriteSettings?.favorites ?? preferences.favorites;
@@ -156,18 +171,19 @@ export function ModelPicker({
   const modelsByKey = useMemo(() => new Map(models.map((model) => [modelKey(model), model] as const)), [models]);
   const visibleModels = useMemo(() => models.filter((model) =>
     isRoutableConversationModel(model)
+    && (modelSourceSelectable(model) || retainCurrentSource && value !== undefined && modelKey(model) === modelKey(value))
     && isModelVisible(preferences, model.backendId, model.providerId, model.modelId, model.defaultVisible ?? true)
-  ), [models, preferences]);
-  const routableModels = useMemo(() => models.filter(isRoutableConversationModel), [models]);
+  ), [models, preferences, retainCurrentSource, value]);
+  const routableModels = useMemo(() => models.filter(model => isRoutableConversationModel(model) && modelSourceSelectable(model)), [models]);
   const selectedModel = value === undefined ? undefined : modelsByKey.get(modelKey(value));
   const selectedModelUnavailable = value !== undefined
     && (selectedModel === undefined || !isRoutableConversationModel(selectedModel));
   const connectSourceRequired = routableModels.length === 0 && onConnectSource !== undefined;
   const providerGroups = useMemo(() => {
-    const groups = new Map<string, { readonly id: string; readonly providerId: string; readonly name: string; readonly models: ModelView[] }>();
+    const groups = new Map<string, { readonly id: string; readonly backendId: string; readonly providerId: string; readonly name: string; readonly models: ModelView[] }>();
     for (const model of visibleModels) {
       const id = providerPreferenceKey(model.backendId, model.providerId);
-      const group = groups.get(id) ?? { id, providerId: model.providerId, name: model.providerName, models: [] };
+      const group = groups.get(id) ?? { id, backendId: model.backendId, providerId: model.providerId, name: modelSourceLabel(model), models: [] };
       group.models.push(model);
       groups.set(id, group);
     }
@@ -209,7 +225,7 @@ export function ModelPicker({
 
   const favoriteRows = useMemo(() => favorites.flatMap((favorite): PickerRow[] => {
     const model = modelsByKey.get(modelKey(favorite));
-    if (model === undefined || !isConversationModel(model) || !model.available || model.routingEnabled === false || !isModelVisible(
+    if (model === undefined || !isConversationModel(model) || !modelSourceSelectable(model) || !model.available || model.routingEnabled === false || !isModelVisible(
       preferences,
       favorite.backendId,
       favorite.providerId,
@@ -253,6 +269,7 @@ export function ModelPicker({
       row.model.name,
       row.model.modelId,
       row.model.providerName,
+      modelSourceLabel(row.model),
       row.model.providerId,
       row.effort ?? "",
       row.fastMode ? "fast" : ""
@@ -260,7 +277,7 @@ export function ModelPicker({
     if (rail === "favorites") return favoriteRows.filter(matches);
     if (rail.startsWith("provider:")) {
       const providerId = rail.slice("provider:".length);
-      return regularRows.filter((row) => providerPreferenceKey(row.model.backendId, row.model.providerId) === providerId && matches(row));
+      return [...favoriteRows, ...regularRows].filter((row) => providerPreferenceKey(row.model.backendId, row.model.providerId) === providerId && matches(row));
     }
     return [...favoriteRows, ...regularRows].filter(matches);
   }, [favoriteRows, query, rail, regularRows]);
@@ -359,6 +376,9 @@ export function ModelPicker({
     favoriteSeedAttemptRef.current = undefined;
     setFavoriteBusy(false);
     setFavoriteError(false);
+    selectionBusyRef.current = false;
+    setSelectionBusy(false);
+    setSelectionError(false);
   }, [ownerId]);
 
   useEffect(() => {
@@ -366,9 +386,24 @@ export function ModelPicker({
     rowRefs.current.get(activeRowKey)?.scrollIntoView?.({ block: "nearest" });
   }, [activeRowKey]);
 
+  const commitSelection = (selection: ModelPickerSelection | undefined): void => {
+    if (selectionBusyRef.current) return;
+    setSelectionError(false);
+    let result: void | Promise<void>;
+    try { result = onSelect(selection); }
+    catch { setSelectionError(true); return; }
+    if (result === undefined) { closeAfterSelection(); return; }
+    const owner = ownerId;
+    selectionBusyRef.current = true;
+    setSelectionBusy(true);
+    void result.then(() => { if (favoriteOwnerRef.current === owner) closeAfterSelection(); })
+      .catch(() => { if (favoriteOwnerRef.current === owner) setSelectionError(true); })
+      .finally(() => { if (favoriteOwnerRef.current === owner) { selectionBusyRef.current = false; setSelectionBusy(false); } });
+  };
+
   const selectRow = (row: PickerRow): void => {
     if (!row.model.available) return;
-    onSelect({
+    commitSelection({
       backendId: row.model.backendId,
       providerId: row.model.providerId,
       modelId: row.model.modelId,
@@ -376,7 +411,6 @@ export function ModelPicker({
       fastMode: fastEnabled && row.fastMode && row.model.supportsFast,
       ...(row.favorite === undefined ? {} : { favoriteUid: row.favorite.uid })
     });
-    closeAfterSelection();
   };
 
   const configureRow = (row: PickerRow, patch: Partial<RowConfiguration>): void => {
@@ -398,22 +432,31 @@ export function ModelPicker({
       return;
     }
     const storedConfiguration = readModelConfiguration(preferences, row.model.backendId, row.model.providerId, row.model.modelId);
-    setModelConfiguration(ownerId, row.model.backendId, row.model.providerId, row.model.modelId, {
+    const saveConfiguration = (): void => setModelConfiguration(ownerId, row.model.backendId, row.model.providerId, row.model.modelId, {
       ...(effortEnabled ? { effort } : storedConfiguration?.effort === undefined ? {} : { effort: storedConfiguration.effort }),
       fast: fastEnabled ? fastMode : storedConfiguration?.fast === true
     });
-    if (isSelectedRow(row, value)) onSelect({
+    if (!isSelectedRow(row, value)) { saveConfiguration(); return; }
+    if (selectionBusyRef.current) return;
+    let result: void | Promise<void>;
+    try { result = onSelect({
       backendId: row.model.backendId,
       providerId: row.model.providerId,
       modelId: row.model.modelId,
       ...(effort === undefined ? {} : { effort }),
       fastMode
-    });
+    }); } catch { setSelectionError(true); return; }
+    if (result === undefined) { saveConfiguration(); return; }
+    const owner = ownerId;
+    selectionBusyRef.current = true; setSelectionBusy(true); setSelectionError(false);
+    void result.then(() => { if (favoriteOwnerRef.current === owner) saveConfiguration(); })
+      .catch(() => { if (favoriteOwnerRef.current === owner) setSelectionError(true); })
+      .finally(() => { if (favoriteOwnerRef.current === owner) { selectionBusyRef.current = false; setSelectionBusy(false); } });
   };
 
   const toggleFavorite = (event: MouseEvent, row: PickerRow): void => {
     event.stopPropagation();
-    if (favoriteBusy) return;
+    if (favoriteBusy || !modelSourceSelectable(row.model)) return;
     if (row.favorite !== undefined) {
       if (remoteFavorites) void mutateRemoteFavorite({ kind: "remove", favoriteId: row.favorite.uid });
       else removeModelFavorite(ownerId, row.favorite.uid);
@@ -510,6 +553,7 @@ export function ModelPicker({
   const selectedEffortLabel = effortEnabled && selectedModel !== undefined && value?.effort !== undefined
     ? effortLabel(selectedModel, value.effort, t)
     : undefined;
+  const selectedGroupUsage = value === undefined ? undefined : groupUsageText(value, providerGroupUsage, t);
   const panelContents = <>
       <header className="model-picker__header">
         <Search aria-hidden="true" />
@@ -535,16 +579,18 @@ export function ModelPicker({
             key={provider.id}
             active={rail === `provider:${provider.id}`}
             label={provider.name}
+            detail={groupUsageText(provider, providerGroupUsage, t)}
             mark={providerMark(provider.name, provider.id)}
             onClick={() => { setRail(`provider:${provider.id}`); setActiveRowKey(undefined); setConfigRowKey(undefined); }}
           />)}
         </nav>
         <div className="model-picker__content">
-          {favoriteError && <p className="inline-error" role="alert">{t("modelPicker.favoriteSaveFailed")}</p>}
+          {(favoriteError || selectionError) && <p className="inline-error" role="alert">{t(selectionError ? "modelPicker.selectionSaveFailed" : "modelPicker.favoriteSaveFailed")}</p>}
           {allowDefault && query.trim() === "" && rail === "all" && <button
             type="button"
             className={cx("model-picker__default-row", value === undefined && "is-selected")}
-            onClick={() => { onSelect(undefined); closeAfterSelection(); }}
+            disabled={selectionBusy}
+            onClick={() => commitSelection(undefined)}
           ><span><Bot aria-hidden="true" /></span><strong>{defaultLabel ?? t("modelPicker.default")}</strong>{value === undefined && <Check aria-hidden="true" />}</button>}
           <div id={listboxId} className="model-picker__list" role="listbox">
             <ModelRows
@@ -567,7 +613,8 @@ export function ModelPicker({
               onChangeConfiguration={configureRow}
               effortEnabled={effortEnabled}
               fastEnabled={fastEnabled}
-              favoriteActionsDisabled={favoriteBusy}
+              favoriteActionsDisabled={favoriteBusy || selectionBusy}
+              providerGroupUsage={providerGroupUsage}
             />
             {filteredRows.length === 0 && (routableModels.length === 0 && onConnectSource !== undefined
               ? <div className="model-picker__empty"><Unplug aria-hidden="true" /><strong>{t("modelPicker.noSources")}</strong><span>{t("modelPicker.noSourcesBody")}</span><Button tone="primary" onClick={() => { close(false); onConnectSource(); }}>{t("modelPicker.connectSource")}</Button></div>
@@ -612,6 +659,7 @@ export function ModelPicker({
         : connectSourceRequired ? t("modelPicker.connectSource")
         : ariaLabel ?? t("controls.model")}
       aria-haspopup="dialog"
+      title={selectedGroupUsage === undefined ? undefined : `${selectedLabel} · ${selectedGroupUsage}`}
       aria-expanded={open}
       disabled={disabled}
       onMouseDown={useMorphPopover && onSelectionFocus !== undefined ? (event) => event.preventDefault() : undefined}
@@ -621,7 +669,7 @@ export function ModelPicker({
       }}
     >
       <span className="model-picker-trigger__mark">{providerMark(selectedModel?.providerName ?? "", selectedModel?.providerId ?? value?.providerId ?? "")}</span>
-      <span className={cx("model-picker-trigger__label", selectedModelUnavailable && "is-unavailable")}><strong>{selectedLabel}</strong>{value !== undefined && <small>{selectedModel?.providerName ?? value.providerId}{selectedModelUnavailable ? ` · ${t("modelPicker.sourceDisconnected")}` : ""}</small>}</span>
+      <span className={cx("model-picker-trigger__label", selectedModelUnavailable && "is-unavailable")}><strong>{selectedLabel}</strong>{value !== undefined && <small>{selectedModel?.providerName ?? value.providerId}{selectedGroupUsage === undefined ? "" : ` · ${selectedGroupUsage}`}{selectedModelUnavailable ? ` · ${t("modelPicker.sourceDisconnected")}` : ""}</small>}</span>
       <span className="model-picker-trigger__configuration">
         {selectedEffortLabel !== undefined && <small>{selectedEffortLabel}</small>}
         {fastEnabled && selectedModel !== undefined && value !== undefined && value.fastMode && selectedModel.supportsFast && <Zap aria-label={t("controls.fast")} />}
@@ -667,7 +715,8 @@ function ModelRows({
   onChangeConfiguration,
   effortEnabled,
   fastEnabled,
-  favoriteActionsDisabled
+  favoriteActionsDisabled,
+  providerGroupUsage
 }: {
   readonly rows: readonly PickerRow[];
   readonly value: ModelPickerSelection | undefined;
@@ -689,18 +738,20 @@ function ModelRows({
   readonly effortEnabled: boolean;
   readonly fastEnabled: boolean;
   readonly favoriteActionsDisabled: boolean;
+  readonly providerGroupUsage?: ModelPickerProps["providerGroupUsage"];
 }): JSX.Element {
   let previousSection = "";
   return <>{rows.map((row) => {
-    const section = row.favorite === undefined ? row.model.providerName : t("modelPicker.favorites");
+    const section = row.favorite === undefined ? modelSourceLabel(row.model) : t("modelPicker.favorites");
     const showSection = layout !== "original" && section !== previousSection;
     previousSection = section;
     const selected = isSelectedRow(row, value);
     const active = activeRowKey === row.key;
     const tier = priceTiers.get(modelKey(row.model)) ?? 0;
     const rowEffortLabel = row.effort === undefined ? undefined : effortLabel(row.model, row.effort, t);
+    const usage = groupUsageText(row.model, providerGroupUsage, t);
     return <div className="model-picker__section-fragment" key={row.key}>
-      {showSection && <div className="model-picker__section-label">{section}</div>}
+      {showSection && <div className="model-picker__section-label">{section}{row.favorite === undefined && usage ? ` · ${usage}` : ""}</div>}
       <div
         ref={(element) => { if (element === null) rowRefs.delete(row.key); else rowRefs.set(row.key, element); }}
         id={rowDomId(listboxId, row.key)}
@@ -715,6 +766,7 @@ function ModelRows({
         aria-selected={selected}
         aria-disabled={!row.model.available}
         aria-keyshortcuts="ArrowLeft"
+        title={usage === undefined ? undefined : `${row.model.name} · ${usage}`}
         tabIndex={row.model.available ? 0 : -1}
         onFocus={() => onActivate(row.key)}
         onPointerMove={() => onActivate(row.key)}
@@ -736,6 +788,8 @@ function ModelRows({
         <span className="model-picker__row-copy">
           <span><strong>{row.model.name}</strong>{row.favorite !== undefined && <small>{t("modelPicker.savedConfiguration")}</small>}</span>
           {layout !== "badge" && <small>{row.model.modelId}</small>}
+          {row.model.source !== undefined && <small>{modelSourceLabel(row.model)}</small>}
+          {usage && <small className="model-picker__group-usage">{usage}</small>}
         </span>
         <PriceMark model={row.model} tier={tier} t={t} />
         <span className="model-picker__row-config-summary">
@@ -745,7 +799,7 @@ function ModelRows({
         </span>
         <IconButton
           className={cx("model-picker__star", (row.favorite !== undefined || justFavoritedKey === row.key) && "is-on")}
-          disabled={!row.model.available || favoriteActionsDisabled}
+          disabled={!row.model.available || !modelSourceSelectable(row.model) || favoriteActionsDisabled}
           label={row.favorite === undefined ? t("modelPicker.addFavorite") : t("modelPicker.removeFavorite")}
           disabledReason={!row.model.available ? t("common.unavailable") : favoriteActionsDisabled ? t("common.working") : undefined}
           onClick={(event) => onToggleFavorite(event, row)}
@@ -891,16 +945,25 @@ function configFlyoutBounds(panelElement: HTMLDivElement | null): ModelPickerCon
   return bounds.right > bounds.left && bounds.bottom > bounds.top ? bounds : viewport;
 }
 
-function RailButton({ active, label, mark, onClick, children }: {
+function RailButton({ active, label, detail, mark, onClick, children }: {
   readonly active: boolean;
   readonly label: string;
+  readonly detail?: string;
   readonly mark?: string;
   readonly onClick: () => void;
   readonly children?: JSX.Element;
 }): JSX.Element {
-  return <button type="button" className={active ? "is-active" : undefined} aria-pressed={active} onClick={onClick}>
-    <span>{children ?? mark}</span><small>{label}</small>
+  return <button type="button" className={active ? "is-active" : undefined} aria-pressed={active} title={detail === undefined ? undefined : `${label} · ${detail}`} onClick={onClick}>
+    <span>{children ?? mark}</span><small>{label}</small>{detail && <small className="model-picker__group-usage">{detail}</small>}
   </button>;
+}
+
+function groupUsageText(route: { readonly backendId: string; readonly providerId: string }, usage: ModelPickerProps["providerGroupUsage"], t: Translator): string | undefined {
+  if (!usage || ![usage.group, usage.memberRoute].some(candidate => candidate?.backendId === route.backendId && candidate.providerId === route.providerId)) return undefined;
+  const running = t("modelPicker.groupRunning", { name: usage.nodeName });
+  if (!usage.quotaReadable) return `${running} · ${t("modelPicker.groupPrivateUsage")}`;
+  return typeof usage.usedPercent === "number" && Number.isFinite(usage.usedPercent) && usage.usedPercent >= 0
+    ? `${running} · ${t("modelPicker.groupUsage", { percent: usage.usedPercent })}` : running;
 }
 
 function PriceMark({ model, tier, t }: { readonly model: ModelView; readonly tier: 0 | 1 | 2 | 3; readonly t: Translator }): JSX.Element | null {

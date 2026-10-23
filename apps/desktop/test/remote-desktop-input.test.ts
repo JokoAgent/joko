@@ -14,6 +14,21 @@ import {
 } from "../src/remote-desktop-input.js";
 
 describe("Desktop Remote Desktop terminal lock helper", () => {
+  it("confines the helper and waits for Source human admission and native ACK before completing input", async () => {
+    const child = inputChild(), complete = vi.fn(async () => {}), closed = vi.fn(async () => {});
+    let admit!: () => void; const admitted = new Promise<void>(resolve => { admit = resolve; });
+    const ownership = { begin: vi.fn(async () => { await admitted; return complete; }), close: closed };
+    const runtime: DesktopRemoteDesktopInputRuntime = { platform: "darwin", resolveBinary: async () => "helper", spawn: vi.fn(() => child as unknown as ChildProcessWithoutNullStreams),
+      display: () => ({ id: "1", name: "Display", width: 100, height: 100, x: 400, y: 500 }), toPhysicalPoint: point => point };
+    const input = new DesktopRemoteDesktopInput(vi.fn(), runtime), window = { windowId: 71, pid: 80 };
+    const starting = input.start("1", new AbortController().signal, window, ownership); await vi.waitFor(() => expect(runtime.spawn).toHaveBeenCalledOnce()); child.stdout.write("ready\n"); await starting;
+    expect(runtime.spawn).toHaveBeenCalledWith("helper", ["--window", "71", "80"]);
+    input.send([{ kind: "button", button: 0, down: true, x: .2, y: .7 }]);
+    await vi.waitFor(() => expect(ownership.begin).toHaveBeenCalledOnce()); expect(child.stdin.read()).toBeNull();
+    admit(); await vi.waitFor(() => expect(child.stdin.read()?.toString()).toContain('"x":0.2,"y":0.7'));
+    expect(complete).not.toHaveBeenCalled(); child.stdout.write("ok\n"); await vi.waitFor(() => expect(complete).toHaveBeenCalledOnce());
+    const stopping = input.release(); expect(closed).not.toHaveBeenCalled(); child.emit("close", 0, null); await stopping; expect(closed).toHaveBeenCalled();
+  });
   it("keeps each complete pointer batch hidden until its native ACK and samples wheel position when dispatched", async () => {
     const child = inputChild(), completions: ReturnType<typeof vi.fn>[] = [], points: { x: number; y: number }[][] = [];
     const pointer = vi.fn((batch: { x: number; y: number }[]) => { points.push(batch); const completed = vi.fn(); completions.push(completed); return completed; });

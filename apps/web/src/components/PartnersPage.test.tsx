@@ -42,6 +42,16 @@ afterEach(async () => {
 });
 
 describe("PartnersPage", () => {
+  it("defaults private input handoff on and autosaves the independent owner switch both ways", async () => {
+    vi.useFakeTimers(); const view = await mountPermissionProfile();
+    const control = required(view.host.querySelector<HTMLButtonElement>('[role="checkbox"][aria-label="Input handoff"]'));
+    expect(control.getAttribute("aria-checked")).toBe("true");
+    await act(async () => { control.click(); await vi.advanceTimersByTimeAsync(700); });
+    expect(view.updatePartner).toHaveBeenLastCalledWith("partner-one", 8n, expect.objectContaining({ inputHandoff: false }));
+    expect(control.getAttribute("aria-checked")).toBe("false");
+    await act(async () => { control.click(); await vi.advanceTimersByTimeAsync(700); });
+    expect(view.updatePartner).toHaveBeenLastCalledWith("partner-one", 9n, expect.objectContaining({ inputHandoff: true }));
+  });
   it("shows the original failed initialization card without a Profile dialog and dispatches its existing explicit retry", async () => {
     const base = controller(), owner = base.state.activeProfile!;
     const failed = partner({ initializationState: "error", invitationStage: "failed", canonicalSessionId: undefined });
@@ -951,7 +961,8 @@ async function mountPermissionProfile() {
   const updatePartner = vi.fn<AppController["updatePartner"]>(async (_id, _revision, patch) => ({
     partner: savedProfile = { ...savedProfile, displayName: patch.displayName ?? savedProfile.displayName,
       revision: savedProfile.revision + 1n, profileVersion: savedProfile.profileVersion + 1n,
-      capabilities: { ...savedProfile.capabilities, permissionMode: patch.permissionMode ?? savedProfile.capabilities.permissionMode } }, directory: directory() }));
+      capabilities: { ...savedProfile.capabilities, permissionMode: patch.permissionMode ?? savedProfile.capabilities.permissionMode,
+        inputHandoff: patch.inputHandoff ?? savedProfile.capabilities.inputHandoff } }, directory: directory() }));
   const app = controller({ updatePartner, getPartner: vi.fn(async () => savedProfile) });
   const render = async (next?: { readonly profile?: PartnerProfileView; readonly catalog?: AppSnapshot; readonly owner?: string }): Promise<void> => {
     profile = next?.profile ?? profile; catalog = next?.catalog ?? catalog; owner = next?.owner ?? owner;
@@ -1080,7 +1091,8 @@ function capabilities() {
   return {
     modelChain: [{ backendId: "backend-1", providerId: "provider-1", modelId: "model-1", effort: "medium", fastMode: false }],
     permissionMode: "ask" as const,
-    planMode: false
+    planMode: false,
+    inputHandoff: true
   };
 }
 

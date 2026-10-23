@@ -8,6 +8,13 @@ import { createTaskSharingConnectService, createTaskSharingGuestConnectService }
 import { readTaskBackgroundOutput } from "./background-task-output.js";
 import { createAppDefaultModelConnectService } from "./app-default-model-connect-service.js";
 import { createHelpConnectService } from "./help-connect-service.js";
+import { createHostedAgentConnectService } from "./hosted-agent-connect-service.js";
+import { createInputHandoffConnectService } from "./input-handoff-connect-service.js";
+import { createProviderSharingConnectService, createProviderSharingGuestConnectService } from "./provider-sharing-connect-service.js";
+import { createProviderGroupConnectService } from "./provider-group-connect-service.js";
+import { createPartnerNetworkService, createPartnerNetworkGuestService } from "./partner-network-connect-service.js";
+import { createPartnerIdentityService, createPartnerIdentityGuestService } from "./partner-identity-connect-service.js";
+import { HOSTED_AGENT_WIRE_ENVELOPE_BYTES } from "./hosted-agent-wire.js";
 import { createMcpAppConnectService } from "./mcp-apps/connect-service.js";
 import { createExtensionCardConnectService } from "./extension-cards/connect-service.js";
 import { createExtensionNetworkConnectService } from "./extension-cards/network-connect-service.js";
@@ -419,6 +426,7 @@ import type { SessionNavigationCoordinator } from "./session-navigation-coordina
 import type { AuxiliaryTextRouting } from "./auxiliary-text-routing.js";
 import type { SubagentModelSettings } from "./subagent-model-settings.js";
 import type { ModelFavoriteSettings } from "./model-favorite-settings.js";
+import { modelSourceCatalogModels, projectModelSource } from "./model-source-catalog.js";
 import {
   evaluateSessionProjectPlacement,
   SessionProjectPlacementError,
@@ -493,6 +501,7 @@ import {
 import type { LocalCodexRuntime, LocalBackendRuntimeSnapshot } from "./local-codex-runtime.js";
 
 export interface ConnectServiceDependencies {
+  readonly hostedAgentSources?: OrchestratorApplication["hostedAgentSources"];
   readonly taskShares?: TaskShareStore;
   readonly connections: ConnectionManager;
   readonly store: OperationalStore;
@@ -761,6 +770,8 @@ function toProtoArtifactCleanupProgress(progress: ArtifactCleanupJob) {
 export interface ConnectServiceSet {
   readonly taskSharing?: ServiceImpl<typeof contract.TaskSharingService>;
   readonly taskSharingGuest?: ServiceImpl<typeof contract.TaskSharingGuestService>;
+  readonly partnerIdentity?: ServiceImpl<typeof contract.PartnerIdentityService>;
+  readonly partnerIdentityGuest?: ServiceImpl<typeof contract.PartnerIdentityGuestService>;
   readonly personalDevelopment: ServiceImpl<typeof contract.PersonalDevelopmentService>;
   readonly personalDevelopmentNative: ServiceImpl<typeof contract.DesktopPersonalDevelopmentHostService>;
   readonly help: ServiceImpl<typeof contract.HelpService>;
@@ -1156,8 +1167,46 @@ const RUNTIME_GENERATION = BigInt(Date.now());
 /** Register all public v1 services. Every descriptor method receives a concrete handler. */
 export function registerConnectServices(router: ConnectRouter, application: OrchestratorApplication, projectionShutdownSignal?: AbortSignal): void {
   const services = createConnectServices(application, projectionShutdownSignal);
+  if (application.hostedAgents) router.service(contract.HostedAgentService, createHostedAgentConnectService(application.hostedAgents.connectOptions()),
+    { readMaxBytes: HOSTED_AGENT_WIRE_ENVELOPE_BYTES, writeMaxBytes: HOSTED_AGENT_WIRE_ENVELOPE_BYTES });
+  if (application.inputHandoff && application.nativeInputHandoff && application.devicePeers) router.service(contract.InputHandoffService,
+    createInputHandoffConnectService({ coordinator: application.inputHandoff, native: application.nativeInputHandoff,
+      connections: application.connections, peers: application.devicePeers }));
+  if (application.providerSharing) {
+    router.service(contract.ProviderSharingService, createProviderSharingConnectService(application.providerSharing.connectOptions()));
+    router.service(contract.ProviderSharingGuestService, createProviderSharingGuestConnectService(application.providerSharing.host));
+  }
+  if (application.partnerNetwork) {
+    const network = application.partnerNetwork.options;
+    router.service(contract.PartnerNetworkService, createPartnerNetworkService({ host: network.host, home: network.home, connections: application.connections,
+      configureProject: (request, auth) => application.partnerNetwork!.configureProject(request, auth),
+      ownerControls: (request, auth) => application.partnerNetwork!.ownerControls(request, auth),
+      respondOwnerInteraction: (request, auth) => application.partnerNetwork!.respondOwnerInteraction(request, auth, current => {
+        const resolution = interactionDecisionSubmission(current.resolution!);
+        if (resolution.kind === "dismissal") application.sessionHost.dismissInteraction(current.interactionId, Number(current.generation), resolution.reason || "Dismissed by the companion owner.", `network-owner:${current.executionId}`);
+        else application.sessionHost.resolveInteraction(current.interactionId, Number(current.generation), resolution.value, `network-owner:${current.executionId}`);
+      }) }));
+    router.service(contract.PartnerNetworkGuestService, createPartnerNetworkGuestService(network.host));
+  }
+  if (application.providerGroups) router.service(contract.ProviderGroupService, createProviderGroupConnectService({ ...application.providerGroups.connectOptions(context => {
+    const connection = application.connections.authenticate(context.requestHeader.get("authorization") ?? undefined);
+    return { id: connection.id, trust: "owner", management: true,
+      assertCurrent: () => { context.signal.throwIfAborted(); application.connections.fence(connection); } };
+  }), taskAccountUsage: async (sessionId, generation, signal) => {
+    const assertCurrent = () => {
+      signal.throwIfAborted();
+      const session = application.store.getSession(sessionId).descriptor;
+      if (BigInt(session.binding.generation) !== generation || session.deletedAt !== undefined) throw new ConnectError("The original task generation is no longer current.", Code.FailedPrecondition);
+    };
+    assertCurrent();
+    const usage = await application.providerGroups!.taskAccountUsage(sessionId, signal);
+    assertCurrent();
+    return usage;
+  } }));
   if (services.taskSharing) router.service(contract.TaskSharingService, withConnectErrors(services.taskSharing));
   if (services.taskSharingGuest) router.service(contract.TaskSharingGuestService, withConnectErrors(services.taskSharingGuest));
+  if (services.partnerIdentity) router.service(contract.PartnerIdentityService, withConnectErrors(services.partnerIdentity));
+  if (services.partnerIdentityGuest) router.service(contract.PartnerIdentityGuestService, withConnectErrors(services.partnerIdentityGuest));
   router.service(contract.ConnectionService, withConnectErrors(services.connection));
   router.service(contract.AppDefaultModelService, withConnectErrors(services.appDefaultModel));
   router.service(contract.HelpService, withConnectErrors(services.help));
@@ -1236,6 +1285,7 @@ export function createConnectServices(application: OrchestratorApplication, proj
     connections: application.connections,
     store: application.store,
     devicePeers,
+    ...(application.hostedAgentSources === undefined ? {} : { hostedAgentSources: application.hostedAgentSources }),
     adapters: () => application.adapters,
     restartBackend: application.restartBackend,
     ...(application.localBackendRuntimeSetup === undefined ? {} : { localBackendRuntimeSetup: application.localBackendRuntimeSetup }),
@@ -1357,13 +1407,19 @@ export function createConnectServices(application: OrchestratorApplication, proj
   const sharingHost = application.taskSharingHome === undefined ? undefined : new TaskSharingHost({
     store: dependencies.store, serverId: application.serverId, origin: application.config.publicOrigin,
     generation: () => generation, artifacts: application.artifacts,
+    ...(application.partnerIdentity === undefined ? {} : { authorizeShare: (shareId: string, sessionId: string) => application.partnerIdentity!.authorizeScope(shareId, sessionId) }),
     runtime: createTaskSharingRuntime(dependencies, new TaskSharingReads(dependencies, () => generation))
   });
   if (sharingHost) application.registerServiceCleanup?.(() => sharingHost.close());
+  if (sharingHost) application.partnerIdentity?.attachHost(sharingHost);
   const taskSharingServices = sharingHost && application.taskSharingHome ? {
     taskSharing: createTaskSharingConnectService({ host: sharingHost, home: application.taskSharingHome,
       connections: dependencies.connections }),
-    taskSharingGuest: createTaskSharingGuestConnectService(sharingHost)
+    taskSharingGuest: createTaskSharingGuestConnectService(sharingHost),
+    ...(application.partnerIdentity === undefined ? {} : {
+      partnerIdentity: createPartnerIdentityService(application.partnerIdentity, dependencies.connections),
+      partnerIdentityGuest: createPartnerIdentityGuestService(application.partnerIdentity)
+    })
   } : {};
   const sessionCodeHostContext = installSessionCodeHostContextRuntime({
     store: dependencies.store,
@@ -2013,8 +2069,10 @@ export function createConnectServices(application: OrchestratorApplication, proj
       if (owner === undefined) throw new ConnectError("Local runtime setup is unavailable.", Code.Unimplemented);
       return { cancelled: owner.cancel(request.backendId, request.requestId) };
     },
-    listBackends: (request, context) => {
-      authenticate(context);
+    listBackends: async (request, context) => {
+      const connection = authenticate(context);
+      await dependencies.hostedAgentSources?.refresh(connection);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
       const result = paginate(dependencies.store.listBackends().map(toProtoBackend), request.page);
       return { backends: result.values, page: result.page };
     },
@@ -2045,7 +2103,9 @@ export function createConnectServices(application: OrchestratorApplication, proj
       };
     },
     listProviders: async (request, context) => {
-      authenticate(context);
+      const connection = authenticate(context);
+      await dependencies.hostedAgentSources?.refresh(connection);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
       const records = request.backendId === ""
         ? dependencies.store.listBackends()
         : [dependencies.store.getBackend(request.backendId)];
@@ -2314,8 +2374,10 @@ export function createConnectServices(application: OrchestratorApplication, proj
         )
       };
     },
-    listModels: (request, context) => {
-      authenticate(context);
+    listModels: async (request, context) => {
+      const connection = authenticate(context);
+      await dependencies.hostedAgentSources?.refresh(connection);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
       const records = request.backendId === ""
         ? dependencies.store.listBackends()
         : [dependencies.store.getBackend(request.backendId)];
@@ -2332,7 +2394,8 @@ export function createConnectServices(application: OrchestratorApplication, proj
           descriptor.available = authenticationState === undefined
             ? backendAuthenticationAvailable(record.descriptor.authenticationState)
             : authenticationState === "authenticated" || authenticationState === "not_required";
-          return descriptor;
+          descriptor.available &&= dependencies.hostedAgentSources?.modelAvailable(record.descriptor.id, model.providerId, model.modelId) !== false;
+          return projectModelSource(dependencies, descriptor);
         }));
       const result = paginate(values, request.page);
       return { models: result.values, page: result.page };
@@ -2445,6 +2508,14 @@ export function createConnectServices(application: OrchestratorApplication, proj
     };
   };
   const session = {
+    getSessionRuntimeControl: (request, context) => {
+      const connection = authenticate(context);
+      context.signal.throwIfAborted(); dependencies.connections.fence(connection);
+      const control = dependencies.sessionHost.getSessionRuntimeControl(request.sessionId);
+      return { control: { generation: BigInt(control.generation), baseline: control.baseline, effective: control.effective,
+        ...(control.pending ? { pending: control.pending.profile, pendingGeneration: BigInt(control.pending.generation) } : {}),
+        handoffState: control.handoffState ?? "" } };
+    },
     listSessions: async (request, context) => {
       authenticate(context);
       let records = dependencies.store.listSessions({
@@ -8926,11 +8997,12 @@ export function backendCatalogModels(
   dependencies: ConnectServiceDependencies,
   backend: BackendDescriptor
 ): readonly ProviderModel[] {
+  const catalog = modelSourceCatalogModels(dependencies, backend);
   if (
     dependencies.providers === undefined
     || backend.capabilities.get(MANAGED_PROVIDER_CATALOG_CAPABILITY)?.supported !== true
-  ) return backend.models;
-  const models = new Map<string, ProviderModel>(backend.models.map((model) => [
+  ) return catalog;
+  const models = new Map<string, ProviderModel>(catalog.map((model) => [
     `${model.providerId}\u0000${model.modelId}`,
     model
   ]));
@@ -13799,7 +13871,7 @@ async function enrichSnapshot(
   if (owner) {
     for (const backend of projected.backends) {
       const record = backendRecords.get(backend.backendId);
-      if (record === undefined || !managedProviderCatalogApplies(dependencies, backend.backendId)) continue;
+      if (record === undefined) continue;
       for (const model of backendCatalogModels(dependencies, record.descriptor)) {
         projectedModelMap.set(
           modelDescriptorKey(backend.backendId, model.providerId, model.modelId),
@@ -13857,7 +13929,7 @@ async function enrichSnapshot(
     const available = state === undefined
       ? model.available
       : state === contract.AuthenticationState.AUTHENTICATED || state === contract.AuthenticationState.NOT_REQUIRED;
-    return create(contract.ModelDescriptorSchema, { ...model, available });
+    return projectModelSource(dependencies, create(contract.ModelDescriptorSchema, { ...model, available }));
   });
 
   const allToolProviders = toolProviders(dependencies);
@@ -17213,16 +17285,27 @@ async function dispatchMutation(
       const disposition = deliveryMode(payload.value.deliveryMode);
       const prompt = fromProtoInputContent(payload.value.input, disposition);
       const overrides = coreTurnOverrides(payload.value.overrides);
+      const needsWorkspaceRestore = dependencies.store.getSession(payload.value.sessionId).descriptor.archived
+        && dependencies.store.getSession(payload.value.sessionId).descriptor.worktree?.state === "preserved";
       const execution = await host.mutate({
         operationId,
         connection,
         kind: payload.case,
         body: mutation,
+        ...(needsWorkspaceRestore ? {
+          precondition: () => host.assertArchivedSessionSendRestorable(payload.value.sessionId),
+          effect: async () => {
+            host.assertArchivedSessionSendRestorable(payload.value.sessionId);
+            if (dependencies.sessionWorktrees === undefined) throw new ConnectError("Isolated workspace lifecycle is unavailable.", Code.FailedPrecondition);
+            await dependencies.sessionWorktrees.restore(payload.value.sessionId);
+          }
+        } : {}),
         commit: (store) => {
           const queued = host.commitQueuedInput(store, {
             operationId,
             sessionId: payload.value.sessionId,
             prompt,
+            restoreArchived: true,
             ...(overrides === undefined ? {} : { overrides })
           });
           return { accepted: true, resultCase: "queueItem", entityId: queued.queueItemId } satisfies OperationOutcome;

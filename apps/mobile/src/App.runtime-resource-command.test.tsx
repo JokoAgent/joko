@@ -25,6 +25,7 @@ let contextSheet: ComponentProps<typeof MobileContextSheet>;
 let objectiveSheet: MobileObjectiveSheetProps;
 let activeObjectiveApi: MobileObjectiveApi | undefined;
 let activeCollaborationApi: MobileCollaborationApi | undefined;
+let activeInputHandoffApi: import("./mobile-input-handoff").MobileInputHandoffApi | undefined;
 let taskRole: "ordinary" | "lead" | "worker" = "ordinary";
 let root: Root;
 let host: HTMLDivElement;
@@ -72,6 +73,7 @@ const client = new Proxy({
   taskNativeTreeControls: () => undefined, send, taskContextControls: () => undefined,
   taskObjectiveApi: () => current ? activeObjectiveApi : undefined,
   taskCollaborationApi: () => current ? activeCollaborationApi : undefined,
+  taskInputHandoffApi: () => current ? activeInputHandoffApi : undefined,
   taskCatalogMentionControls: () => undefined, taskTimelineRows: () => empty,
   partnerConversationTransport: () => activePartner ? { ownerKey: "private-task", sessionId: "session" } : undefined,
   partnerDirectoryTransport: () => activePartner ? { ownerKey: "private-node", list: privateDirectory } : undefined
@@ -128,6 +130,7 @@ beforeAll(async () => {
     }), MobileComposerAtomChips: () => null, MobileAttachmentTray: () => null
   }));
   vi.doMock("./MobileRuntimeCommandPalette", () => ({ MobileRuntimeCommandPalette: (_props: ComponentProps<typeof MobileRuntimeCommandPalette>) => { palette = _props; return null; } }));
+  vi.doMock("./MobileInputHandoffPanel", () => ({ MobileInputHandoffPanel: (props: { api: import("./mobile-input-handoff").MobileInputHandoffApi }) => createElement("div", { "data-input-handoff-owner": props.api.ownerKey }, "Owner input handoff") }));
   const screens = ["MobileSharedConnectionScreen", "MobileFileTextPreview", "MobileFilesPreviewPager", "MobileTimelineImage", "MobileNativeIntentNotice", "MobilePhotoLibrarySheet", "MobileThinkingCard", "MobileWorkGroupCard", "MobilePlanCard", "MobileAudioMetadataCard", "MobileToolCallCard", "MobileDelegatedTaskCard", "MobileDrawer", "MobileActionSheet", "MobileTaskDerivationSheet", "MobileMessageRewindSheet", "MobileSessionDerivationMarker", "MobileComposerAtomSheet", "MobileCommandHelpSheet", "MobileQuoteSelectionSheet", "MobileInteractionSheet", "MobileRuntimeControlsSheet", "MobileNativeTreeSheet", "MobileSessionMentionSheet", "MobileWorkspaceMentionSheet", "MobileCatalogMentionSheet", "MobileMarkdownMessage", "MobileConversationShareBar", "MobileConversationShareRenderer", "MobileImageLightbox", "MobileMediaPlayer", "MobilePdfViewer", "MobileModelViewer", "MobileOfflineNotice", "MobileAutomationsScreen", "MobilePartnersScreen", "MobilePartnerDirectoryScreen", "MobilePartnerWorkingStatus", "MobilePartnerProfileSheet", "MobileConversationSearchSheet", "MobilePartnerResourcesScreen", "MobileExtensionsScreen", "MobileFilesToolbar", "MobileFilesBrowser", "MobileSettingsScreen", "MobileRemoteDesktopScreen", "MobileUpdateSurface"];
   for (const name of screens) vi.doMock(`./${name}`, () => new Proxy({}, {
     get: (_object, key) => key === "then" ? undefined : () => null,
@@ -156,7 +159,7 @@ beforeEach(async () => {
   current = true; resolveResource.mockReset().mockResolvedValue(resource); send.mockClear();
   activePartner = undefined; renderedState = state; privateDirectory.mockClear(); openPrivateThread.mockClear();
   activeObjectiveApi = undefined;
-  activeCollaborationApi = undefined; taskRole = "ordinary";
+  activeCollaborationApi = undefined; activeInputHandoffApi = undefined; taskRole = "ordinary";
   drafts.save(identity, plainTextMobileComposerDraft("/an arguments")); await drafts.flush(identity);
   host = document.body.appendChild(document.createElement("div")); root = createRoot(host);
 });
@@ -213,6 +216,16 @@ describe("actual App slash Skill selection", () => {
     expect(input.draft.text).toBe(retirement === "edit" ? "/an arguments changed" : "/an arguments");
     expect(input.draft.mentions).toEqual([]); expect(send).not.toHaveBeenCalled();
   });
+});
+
+it("mounts owner input handoff above the actual composer and removes it when its task connection retires", async () => {
+  activeInputHandoffApi = { ownerKey: "current-native-owner", sessionId: "session", deviceId: "phone", isCurrent: () => current,
+    list: async () => [], decide: async () => true, submit: async () => true, picture: async () => ({ mime: "image/jpeg", width: 1, height: 1, data: "/9j/" }) };
+  await render(false);
+  const panel = host.querySelector('[data-input-handoff-owner="current-native-owner"]'), composer = host.querySelector('[data-input="composer"]');
+  expect(panel).not.toBeNull(); expect(composer).not.toBeNull(); expect(panel!.compareDocumentPosition(composer!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  renderedState = { ...state, status: "offline" }; await render(false); expect(host.querySelector("[data-input-handoff-owner]")).toBeNull();
+  expect(send).not.toHaveBeenCalled();
 });
 
 it("opens the actual Context collaboration form, creates a waiting worker, and keeps the lead composer", async () => {

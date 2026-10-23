@@ -131,6 +131,8 @@ export interface PiMcpToolDescriptor {
   readonly outputSchema?: Readonly<Record<string, unknown>>;
   /** Service-owned policy hint. Only an explicit false is treated as read-only. */
   readonly requiresPermission: boolean;
+  /** Owner assistance can only originate in the authenticated native root turn. */
+  readonly requiresNativeRoot?: true;
 }
 
 export interface PiMcpBridgeDescriptor {
@@ -398,6 +400,7 @@ export async function writeMcpDescriptor(path: string, descriptor: PiMcpBridgeDe
     if (typeof tool.requiresPermission !== "boolean") {
       throw piError("PI_MCP_INVALID_PERMISSION_HINT", `MCP tool '${fullName}' has an invalid permission hint`, "provision");
     }
+    if (tool.requiresNativeRoot !== undefined && tool.requiresNativeRoot !== true) throw piError("PI_MCP_INVALID_ROOT_HINT", "Invalid native root tool requirement", "provision");
   }
   await atomicWriteJson(path, descriptor);
 }
@@ -646,7 +649,7 @@ function assertHeaderName(value: string): void {
   if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value)) throw piError("PI_INVALID_HEADER", `Invalid provider header name '${value}'`, "provision");
 }
 
-function keylessEnvName(providerId: string): string {
+export function keylessEnvName(providerId: string): string {
   return `JOKO_PI_KEYLESS_${providerId.replace(/[^A-Za-z0-9]/g, "_").toUpperCase()}`;
 }
 

@@ -218,7 +218,7 @@ export function createPartnerConnectService(
         }
         const current = active.getPartner(request.partnerId);
         const hasCapabilityPatch = patch.modelChain !== undefined
-          || patch.permissionMode !== undefined || patch.planMode !== undefined;
+          || patch.permissionMode !== undefined || patch.planMode !== undefined || patch.inputHandoff !== undefined;
         if (patch.usesDirectoryDefaults === true && hasCapabilityPatch) {
           throw new ConnectError("Capability overrides cannot accompany uses_directory_defaults=true.", Code.InvalidArgument);
         }
@@ -230,7 +230,8 @@ export function createPartnerConnectService(
               permissionMode: patch.permissionMode === undefined
                 ? current.capabilities.permissionMode
                 : fromProtoPermission(patch.permissionMode),
-              planMode: patch.planMode ?? current.capabilities.planMode
+              planMode: patch.planMode ?? current.capabilities.planMode,
+              inputHandoff: patch.inputHandoff ?? current.capabilities.inputHandoff ?? true
             }
           : undefined;
         const partner = await active.updatePartner(
@@ -665,7 +666,8 @@ function toProtoCapabilities(value: PartnerCapabilitiesRecord): contract.Partner
     permissionMode: value.permissionMode === "ask"
       ? contract.PermissionMode.ASK
       : value.permissionMode === "acceptEdits" ? contract.PermissionMode.ACCEPT_EDITS : value.permissionMode === "auto" ? contract.PermissionMode.AUTO : contract.PermissionMode.BYPASS_PERMISSIONS,
-    planMode: value.planMode
+    planMode: value.planMode,
+    inputHandoff: value.inputHandoff !== false
   });
 }
 
@@ -673,7 +675,8 @@ function fromProtoCapabilities(value: contract.PartnerCapabilities): PartnerCapa
   return {
     modelChain: value.modelChain.map(fromProtoRoute),
     permissionMode: fromProtoPermission(value.permissionMode),
-    planMode: value.planMode
+    planMode: value.planMode,
+    inputHandoff: value.inputHandoff ?? true
   };
 }
 

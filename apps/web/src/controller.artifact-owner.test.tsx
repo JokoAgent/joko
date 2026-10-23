@@ -52,7 +52,8 @@ it("retires anonymous discovery when an explicit connection begins and rejects i
   vi.mocked(probeOrchestratorOrigin).mockImplementation(() => new Promise(resolve => { releaseProbe = resolve; }));
   vi.mocked(createOrchestratorGateway).mockImplementation((_profile, _key, callbacks) => ({
     connect: async () => { callbacks.onState?.("connected"); callbacks.onSnapshot?.(emptySnapshot()); },
-    disconnect: vi.fn(), taskSharingApi: () => undefined
+    disconnect: vi.fn(), taskSharingApi: () => undefined,
+    inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined
   } as unknown as OrchestratorGateway));
   let current!: AppController;
   function Probe(): null { current = useAppController(); return null; }
@@ -211,6 +212,7 @@ it("keeps resource and auxiliary operations bound to the controller snapshot's g
       },
       disconnect: () => { disposed = true; live.clear(); },
       taskSharingApi: () => undefined,
+      inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined,
       ...inputOperations, ...workspaceOperations, ...voiceOperations, ...queueOperations, ...remoteOperations, ...loginOperations, ...sshOperations,
       watchRemoteHosts: async function* () { if (disposed) throw new Error("Remote workspace owner disconnected"); yield []; },
       readWorkspaceFile: read, readWorkspaceHtmlSnapshot, performBrowserTakeoverAction, getArtifactUrl: get, releaseArtifactUrl: release,
@@ -689,7 +691,8 @@ it("retains a message deep-link target while connecting its saved machine", asyn
       callbacks.onState?.("connected");
       callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
     },
-    disconnect: vi.fn(), taskSharingApi: () => undefined
+    disconnect: vi.fn(), taskSharingApi: () => undefined,
+    inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined
   } as unknown as OrchestratorGateway));
 
   let current!: AppController;
@@ -782,7 +785,8 @@ it("does not let a stale cross-machine task open replace a newer navigation occu
       callbacks.onState?.("connected");
       callbacks.onSnapshot?.(snapshots.get(owner!.id)!);
     },
-    disconnect: vi.fn(), taskSharingApi: () => undefined
+    disconnect: vi.fn(), taskSharingApi: () => undefined,
+    inputHandoffApi: () => undefined, providerSharingApi: () => undefined, partnerNetworkApi: () => undefined, partnerIdentityApi: () => undefined, providerGroupSettingsApi: () => undefined
   } as unknown as OrchestratorGateway));
 
   let current!: AppController;

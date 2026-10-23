@@ -84,13 +84,13 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
         if (result.failedShareIds.length) setNotice(t("taskSharing.partial", { count: result.failedShareIds.length })); }
     });
   };
-  const shareCard = (share: TaskShare): JSX.Element => <article className="settings-card" key={share.shareId} data-task-sharing-owned data-share-id={share.shareId} data-session-id={share.sessionId}>
+  const shareCard = (share: TaskShare): JSX.Element => <article className="settings-card settings-card--content" key={share.shareId} data-task-sharing-owned data-share-id={share.shareId} data-session-id={share.sessionId}>
     <h3>{share.title || share.sessionId}</h3><p>{share.hostOrigin}</p>
     <div className="settings-actions"><Button data-task-sharing-invite disabled={busy || !!unknown} onClick={() => copyInvitation(share)}>{t("taskSharing.invite")}</Button>
       <Button data-task-sharing-end tone="danger" disabled={busy || !!unknown} onClick={() => setConfirmation({ kind: "end", share })}>{t("taskSharing.end")}</Button></div>
     <h4>{t("taskSharing.participants")}</h4>
     {share.members.filter(member => member.status === "active").map(member => <div className="setting-row" key={member.memberId}>
-      <strong>{member.displayName}</strong><Button disabled={busy || !!unknown} onClick={() => setConfirmation({ kind: "remove", share, member })}>{t("taskSharing.remove")}</Button>
+      <div><strong>{member.displayName}</strong></div><Button disabled={busy || !!unknown} onClick={() => setConfirmation({ kind: "remove", share, member })}>{t("taskSharing.remove")}</Button>
     </div>)}
   </article>;
   const heading = <header className="settings-heading"><h2>{t("taskSharing.title")}</h2><p>{t("taskSharing.body")}</p></header>;
@@ -99,7 +99,7 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
     {heading}
     {directory.error && <ErrorBanner message={directory.error} retryLabel={t("common.retry")} onRetry={() => { void directory.refresh(); }} />}
     {error && <ErrorBanner message={error} />}{notice && <p role="status">{notice}</p>}
-    {unknown && <div role="status" className="settings-card"><p>{t("taskSharing.unknown")}</p><Button disabled={busy} onClick={() => {
+    {unknown && <div role="status" className="settings-card settings-card--content"><p>{t("taskSharing.unknown")}</p><Button disabled={busy} onClick={() => {
       if (flight.current) return; flight.current = true; setBusy(true);
       const signal = lifetime.current.signal, local = storage.current;
       void (unknown.kind === "join" ? api.lookupJoin(unknown.operationId, signal).then(result => {
@@ -124,7 +124,7 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
       <div role="tablist" aria-label={t("taskSharing.title")}>{(["owned", "joined", "join"] as const).map(value => <Button key={value} role="tab" aria-selected={tab === value} disabled={busy} onClick={() => { setTab(value); setError(undefined); }}>{t(`taskSharing.${value}`)}</Button>)}</div>
       {directory.loading && !directory.value && <Spinner label={t("common.loading")} />}
       {tab === "owned" && <>{owned.length === 0 && <p>{t("taskSharing.emptyOwned")}</p>}{owned.map(shareCard)}{owned.length > 0 && <Button tone="danger" disabled={busy || !!unknown} onClick={() => setConfirmation({ kind: "endAll", shares: owned })}>{t("taskSharing.endAll")}</Button>}</>}
-      {tab === "joined" && <>{joined.length === 0 && <p>{t("taskSharing.emptyJoined")}</p>}{joined.map(item => <article className="settings-card" key={item.joinId}>
+      {tab === "joined" && <>{joined.length === 0 && <p>{t("taskSharing.emptyJoined")}</p>}{joined.map(item => <article className="settings-card settings-card--content" key={item.joinId}>
         <h3>{item.share?.title || item.share?.sessionId}</h3><p>{item.share?.hostOrigin}</p><Pill>{item.status}</Pill>
         <div className="settings-actions"><Button data-task-sharing-open data-join-id={item.joinId} disabled={busy || !canOpenJoinedTask(item.status)} onClick={() => open(item)}>{t(item.status === "disconnected" ? "connection.reconnect" : "common.open")}</Button><Button data-task-sharing-leave tone="danger" disabled={busy || !!unknown || item.status === "left"} onClick={() => setConfirmation({ kind: "leave", joined: item })}>{t("taskSharing.leave")}</Button></div>
       </article>)}</>}
@@ -135,11 +135,11 @@ export function TaskSharingSettings({ controller, t, sessionId, initialInvitatio
         <label>{t("taskSharing.invitation")}<textarea data-task-sharing-invitation value={invitation} maxLength={8192} disabled={busy || !!unknown} onChange={event => { setInvitation(event.target.value); setPreview(undefined); }} autoComplete="off" spellCheck={false} /></label>
         <label>{t("taskSharing.name")}<input data-task-sharing-name value={name} maxLength={128} disabled={busy || !!unknown} onChange={event => setName(event.target.value)} autoComplete="off" /></label>
         <Button data-task-sharing-preview type="submit" disabled={busy || !!unknown || !invitation.trim()}>{t("taskSharing.preview")}</Button>
-        {preview && <article className="settings-card"><h3>{preview.title || preview.sessionId}</h3><p>{preview.hostOrigin}</p><Button data-task-sharing-join tone="primary" disabled={busy || !!unknown || !name.trim()} onClick={() => { void run("join", async (id, signal) => {
+        {preview && <article className="settings-card settings-card--content"><h3>{preview.title || preview.sessionId}</h3><p>{preview.hostOrigin}</p><div className="settings-actions"><Button data-task-sharing-join tone="primary" disabled={busy || !!unknown || !name.trim()} onClick={() => { void run("join", async (id, signal) => {
           const result = await api.join(id, invitation, name.trim(), signal);
           if (!result.intent?.joined) throw new ConnectError(t("taskSharing.unknown"), Code.Unknown);
           setInvitation(""); setPreview(undefined); clearTaskSharingInvitation(invitation); open(result.intent.joined);
-        }); }}>{t("taskSharing.confirmJoin")}</Button><Button disabled={busy} onClick={() => setPreview(undefined)}>{t("common.cancel")}</Button></article>}
+        }); }}>{t("taskSharing.confirmJoin")}</Button><Button disabled={busy} onClick={() => setPreview(undefined)}>{t("common.cancel")}</Button></div></article>}
       </form>}
     </>}
     <Modal open={confirmation !== undefined} title={t("taskSharing.manage")} onClose={() => { if (!busy) setConfirmation(undefined); }}>

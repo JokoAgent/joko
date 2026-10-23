@@ -5,6 +5,16 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
+
+export function isUiRunnerAccessibilityStartupFailure(summary, identityRequests, unexpectedRequests) {
+  const failure = summary?.testFailures?.[0];
+  return identityRequests === 0 && unexpectedRequests === 0
+    && summary?.result === "Failed" && summary.totalTestCount === 1
+    && summary.passedTests === 0 && summary.failedTests === 1 && summary.skippedTests === 0
+    && Array.isArray(summary.testFailures) && summary.testFailures.length === 1 && failure?.targetName === "JokoCIUITests"
+    && /^JokoCIUITests-Runner \(\d+\) encountered an error$/.test(failure.testIdentifierString)
+    && failure.failureText === "The test runner failed to initialize for UI testing. (Underlying Error: Timed out waiting for AX loaded notification)";
+}
 const processGroups = new Map([
   ["mds", "spotlight"], ["mds_stores", "spotlight"], ["mdworker", "spotlight"], ["mdworker_shared", "spotlight"],
   ["simdiskimaged", "runtimeImages"], ["com.apple.CoreSimulator.CoreSimulatorService", "simulatorService"],

@@ -61,6 +61,66 @@ const target: TargetDescriptor = {
 };
 
 describe("ClaudeCodeAdapter", () => {
+  test("keeps askpass in the original local task Query and refreshes its private route on resume", async () => {
+    const sdk = new FakeSdkRuntime(); let route = "route-first";
+    const taskShellEnv = vi.fn((context: AdapterContext) => ({ JOKO_INPUT_HANDOFF_ROUTE: `${context.sessionId}:${route}`, SUDO_ASKPASS: "/private/askpass" }));
+    const adapter = adapterFor(sdk, { taskShellEnv });
+    const first = { ...contextFor().context, sessionId: "askpass-first" }, second = { ...contextFor().context, sessionId: "askpass-second" };
+    try {
+      const binding = await adapter.createSession(createInput(), first);
+      await adapter.createSession(createInput(), second);
+      expect(sdk.queries[0]!.params.options.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-first:route-first", SUDO_ASKPASS: "/private/askpass" });
+      expect(sdk.queries[1]!.params.options.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-second:route-first" });
+      await adapter.closeSession(binding, { ...first, binding }); route = "route-resumed";
+      await adapter.resumeSession(binding, { ...first, binding });
+      expect(sdk.queries.at(-1)!.params.options.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-first:route-resumed" });
+      expect(sdk.queries[1]!.params.options.env).toMatchObject({ JOKO_INPUT_HANDOFF_ROUTE: "askpass-second:route-first" });
+    } finally { await adapter.dispose(); }
+  });
+
+  test("does not grant the owner askpass route to a native read-only review", async () => {
+    const sdk = new FakeSdkRuntime(), taskShellEnv = vi.fn(() => ({ JOKO_INPUT_HANDOFF_ROUTE: "private-owner-route" }));
+    const adapter = adapterFor(sdk, { taskShellEnv });
+    try {
+      await adapter.createSession(createInput({ runtimePolicy: "review_read_only" }), contextFor(undefined, { runtimePolicy: "review_read_only" }).context);
+      expect(taskShellEnv).not.toHaveBeenCalled();
+      expect(sdk.queries[0]!.params.options.env).not.toHaveProperty("JOKO_INPUT_HANDOFF_ROUTE");
+    } finally { await adapter.dispose(); }
+  });
+
+  test("waits for the durable Source confirmation before the SDK can consume the exact native input", async () => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk);
+    const binding = await adapter.createSession(createInput(), contextFor().context);
+    const { context } = contextFor(binding, { operationId: "source-native-fence" });
+    let confirm!: () => void, fingerprint = "";
+    const confirmed = new Promise<void>(ready => { confirm = ready; });
+    const sending = adapter.sendWithDurableNativeDispatchFence(textPrompt("Exact Source input"), context, async preparation => {
+      fingerprint = preparation.inputFingerprint; expect(preparation.nativeHistory.activeLineage).toEqual([]); await confirmed;
+    });
+    try {
+      await vi.waitFor(() => expect(fingerprint).toMatch(/^[a-f0-9]{64}$/u));
+      expect(sdk.queries[0]!.receivedInputs).toHaveLength(0);
+      await expect(adapter.setModel("claude-code", "model-a", context)).rejects.toMatchObject({ publicError: { code: "SESSION_BUSY" } });
+      confirm(); await sending;
+      const native = sdk.queries[0]!.receivedInputs[0]!;
+      sdk.messages.set(binding.nativeSessionId!, [historyMessage("user", native.uuid!, binding.nativeSessionId!, native.message)]);
+      const history = await adapter.getNativeHistoryProjection(context);
+      expect(history.events.find(event => event.projectionKind === "message_user")?.metadata?.fields["nativeDispatchFingerprint"]).toBe(fingerprint);
+    } finally { confirm(); await sending.catch(() => {}); await adapter.dispose(); }
+  });
+
+  test.each(["rejected", "history changed"] as const)("keeps native input unread when durable Source confirmation is %s", async failure => {
+    const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk);
+    const binding = await adapter.createSession(createInput(), contextFor().context), { context } = contextFor(binding, { operationId: "source-native-rejected" });
+    try {
+      await expect(adapter.sendWithDurableNativeDispatchFence(textPrompt("Undispatched input"), context, async () => {
+        if (failure === "rejected") throw new Error("Source persistence unavailable");
+        sdk.messages.set(binding.nativeSessionId!, [historyMessage("user", randomUUID(), binding.nativeSessionId!, { role: "user", content: "Another writer" })]);
+      })).rejects.toThrow();
+      expect(sdk.queries[0]!.receivedInputs).toHaveLength(0);
+    } finally { await adapter.dispose(); }
+  });
+
   test("observes edit mode and checks native PreToolUse authority even when file edits bypass canUseTool", async () => {
     const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk); let current = true;
     const review = vi.fn(async () => ({ verdict: "allow" as const, authorizationRevision: "original" }));
@@ -79,15 +139,17 @@ describe("ClaudeCodeAdapter", () => {
       expect(review).toHaveBeenCalledOnce();
     } finally { await adapter.dispose(); }
   });
-  test("uses a temporary tool-free native Query for exact-model text review and retires it", async () => {
+  test.each([false, true])("uses a temporary tool-free native Query for exact-model text/image review and retires it (images=%s)", async withImage => {
     const sdk = new FakeSdkRuntime(), adapter = adapterFor(sdk), allowed = vi.fn();
     try {
-      const result = adapter.inferNativeText({ system: "Review the action", user: "Exact action", providerId: "claude-code", modelId: "model-a",
+      const result = adapter.inferNativeText({ system: "Review the action", user: "Exact action", providerId: "claude-code", modelId: "model-a", images: withImage ? [{ data: new Uint8Array([1, 2, 3]), mimeType: "image/png" }] : [],
         maxTokens: 1500, backendInstanceGeneration: INSTANCE_GENERATION, signal: new AbortController().signal, timeoutMs: 10_000, assertCurrent: () => {}, assertModelAllowed: allowed });
       await eventually(() => sdk.queries.length === 1);
       const query = sdk.queries[0]!;
       expect(query.params.options).toMatchObject({ model: "model-a", persistSession: false, tools: [], agents: {}, skills: [], settingSources: [], strictMcpConfig: true, mcpServers: {}, additionalDirectories: [] });
       expect(query.params.options.env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"]).toBe("1500");
+      await eventually(() => query.receivedInputs.length === 1);
+      expect(query.receivedInputs[0]!.message.content).toEqual(withImage ? [{ type: "text", text: "Exact action" }, { type: "image", source: { type: "base64", media_type: "image/png", data: "AQID" } }] : "Exact action");
       query.push(resultMessage(query.params.options.sessionId!, { result: '{"verdict":"allow","reason":"In scope"}', totalCostUsd: 0 }));
       await expect(result).resolves.toContain('"verdict":"allow"');
       expect(allowed).toHaveBeenCalledWith("claude-code", "model-a"); expect(sdk.retiredQueries).toContain(query);
@@ -460,6 +522,7 @@ describe("ClaudeCodeAdapter", () => {
     let modelCall: Parameters<NonNullable<ClaudeMcpRuntimeLease["models"]>[number]["connect"]>[1] | undefined;
     const tool = {
       serverId: "approved-tools", name: "echo", description: "Echo an approved value",
+      requiresNativeRoot: true,
       inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] },
       outputSchema: { type: "object", properties: { echoed: { type: "string" } }, required: ["echoed"] }
     } as const;
@@ -474,7 +537,7 @@ describe("ClaudeCodeAdapter", () => {
       release: () => { released = true; }
     };
     const bridge: ClaudeMcpBridgePort = { open: vi.fn(() => { if (!committed) throw new Error("Not durable"); return lease; }) };
-    const adapter = adapterFor(sdk, { mcpBridge: bridge });
+    const adapter = adapterFor(sdk, { mcpBridge: bridge, redactValues: ["native-approved", "mcp__joko_"] });
     const binding = await adapter.createSession(createInput(), contextFor().context);
     expect(bridge.open).not.toHaveBeenCalled();
     expect(sdk.queries[0]!.params.options).toMatchObject({ strictMcpConfig: true, mcpServers: {}, settingSources: ["user", "project", "local"] });
@@ -507,7 +570,10 @@ describe("ClaudeCodeAdapter", () => {
     await expect(earlyCall).resolves.toMatchObject({ content: [{ type: "text", text: "approved" }], structuredContent: { echoed: "approved" } });
     expect(calls).toHaveLength(1);
     expect(calls[0]!.arguments).toEqual({ value: "hello" });
+    expect(calls[0]!.nativeRootCall?.arguments).toEqual({ value: "hello" });
+    calls[0]!.nativeRootCall!.assertCurrent();
     expect(calls[0]!.modelCallId).toBe("original-model-request");
+    expect(source.events.find(event => event.type === "tool_start")).toMatchObject({ callId: "[REDACTED]-call", name: expect.stringMatching(/^\[REDACTED\]/u) });
     expect(calls[0]!.partnerLearningAuthority).toMatchObject({ source: learningSource, requestId: calls[0]!.requestId, serverId: tool.serverId, toolName: tool.name });
     expect(nativeReply).toHaveBeenCalledWith(assistantUuid);
     sdk.queries[1]!.push(assistantMessage(binding.nativeSessionId!, assistantUuid, [{ type: "text", text: "Repeated native frame" }]));

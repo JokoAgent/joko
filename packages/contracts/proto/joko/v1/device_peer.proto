@@ -4,6 +4,7 @@ package joko.v1;
 
 import "google/protobuf/timestamp.proto";
 import "joko/v1/common.proto";
+import "joko/v1/hosted_agent.proto";
 import "joko/v1/remote_desktop_types.proto";
 import "joko/v1/runtime.proto";
 
@@ -30,6 +31,7 @@ enum DevicePeerCapabilityKind {
   DEVICE_PEER_CAPABILITY_KIND_TERMINAL = 3;
   DEVICE_PEER_CAPABILITY_KIND_FORWARDING = 4;
   DEVICE_PEER_CAPABILITY_KIND_REMOTE_DESKTOP = 5;
+  DEVICE_PEER_CAPABILITY_KIND_NATIVE_AGENTS = 6;
 }
 
 // Exact authority snapshot selected by a controller. All unary peer requests
@@ -377,6 +379,7 @@ message DevicePeerStartRemoteDesktopAction {
   string display_id = 1;
   RemoteDesktopStartMode mode = 2;
   bool control = 3;
+  optional string input_handoff_request_id = 4;
 }
 
 message DevicePeerHeartbeatRemoteDesktopAction {
@@ -456,6 +459,13 @@ message DevicePeerRestoreRemoteDesktopViewerDisplayAction {
   bool control = 3;
 }
 
+message DevicePeerInvokeHostedAgentAction {
+  HostedAgentPeerMethod method = 1;
+  bytes request_bytes = 2;
+}
+
+message DevicePeerHostedAgentResult { bytes response_bytes = 1; }
+
 message DevicePeerCommand {
   DevicePeerCapabilityKind capability = 1;
   DevicePeerEffectKind effect = 2;
@@ -517,6 +527,7 @@ message DevicePeerCommand {
     DevicePeerSetRemoteDesktopViewerDisplayAction set_remote_desktop_viewer_display = 74;
     DevicePeerRestoreRemoteDesktopViewerDisplayAction restore_remote_desktop_viewer_display = 75;
     RemoteDesktopSystemActionRequest perform_remote_desktop_system_action = 76;
+    DevicePeerInvokeHostedAgentAction invoke_hosted_agent = 77;
   }
 }
 
@@ -712,6 +723,7 @@ message DevicePeerAgentResult {
     RemoteDesktopDisplayModeResult remote_desktop_display_mode = 57;
     RemoteDesktopViewerDisplayResult remote_desktop_viewer_display = 58;
     RemoteDesktopSystemActionResult remote_desktop_system_action = 59;
+    DevicePeerHostedAgentResult hosted_agent = 60;
     DevicePeerFailure failure = 30;
   }
 }

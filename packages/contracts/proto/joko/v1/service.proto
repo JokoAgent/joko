@@ -29,6 +29,7 @@ import "joko/v1/settings.proto";
 import "joko/v1/skill.proto";
 import "joko/v1/snapshot.proto";
 import "joko/v1/subagent.proto";
+import "joko/v1/task_sharing.proto";
 import "joko/v1/tool.proto";
 import "joko/v1/voice.proto";
 import "joko/v1/workspace.proto";
@@ -113,6 +114,7 @@ service TargetService {
 service SessionService {
   rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc GetSessionRuntimeControl(GetSessionRuntimeControlRequest) returns (GetSessionRuntimeControlResponse);
   rpc ListTaskTags(ListTaskTagsRequest) returns (ListTaskTagsResponse);
   rpc GetSessionTaskTags(GetSessionTaskTagsRequest) returns (GetSessionTaskTagsResponse);
   rpc FindSessionsByTaskTag(FindSessionsByTaskTagRequest) returns (FindSessionsByTaskTagResponse);
@@ -1774,6 +1776,9 @@ message GetWorkspaceRequest {
 message GetWorkspaceResponse {
   WorkspaceDescriptor workspace = 1;
 }
+
+message GetSessionRuntimeControlRequest { string session_id = 1; }
+message GetSessionRuntimeControlResponse { TaskShareRuntimeControl control = 1; }
 
 message OwnerWorkspaceFileChangeScope {}
 

@@ -98,7 +98,7 @@ export function mobileTimelineArtifactWindowKey(events: readonly Event[]): strin
 }
 
 export function mobileTimelinePreviewWindowKey(events: readonly Event[]): string {
-  return timelineWindowKey(events, mobileTimelinePreviewArtifacts);
+  return timelineWindowKey(events.filter((event) => mobileTimelinePreviewArtifacts(event).length > 0), mobileTimelinePreviewArtifacts);
 }
 
 function timelineWindowKey(
@@ -111,7 +111,6 @@ function timelineWindowKey(
     event.identity?.sessionId ?? "",
     event.cursor?.generation.toString(10) ?? "",
     event.cursor?.sequence.toString(10) ?? "",
-    event.cursor?.opaqueToken ?? "",
     event.payload?.kind.case ?? "",
     project(event).map((artifact) => [
       artifact.artifactId,

@@ -3,6 +3,7 @@ import type { PartnerAvatarView, PartnerAvatarInputView } from "./partner-avatar
 import type { SessionWorkingStatus, VoiceDictionaryPeerApi, VoiceInputSaucSettingsView, VoiceInputRecognitionContextView, PartnerWorkbenchRoutine, BackgroundTaskOutput } from "@joko/contracts";
 import type { PartnerLearningFeedbackView, PersonalDevelopmentDoctorRun, PersonalDevelopmentTask } from "@joko/contracts";
 import type { PersonalDevelopmentApi } from "./personal-development-api.js";
+import type { HostedAgentSettingsApi } from "./hosted-agent-settings.js";
 
 export type Locale = "en" | "zh-CN" | "en-XA";
 export type SystemLocale = Exclude<Locale, "en-XA">;
@@ -362,6 +363,17 @@ export interface ModelView {
   readonly currencyCode: string;
   /** Declared display facts are separate from the effective admission flags. */
   readonly metadata?: ModelAdvancedMetadataView;
+  readonly source?: ModelSourceView;
+}
+
+export interface ModelSourceView {
+  readonly kind: "local" | "device" | "share" | "group";
+  readonly displayName: string;
+  readonly nodeId: string;
+  readonly nodeName: string;
+  readonly nativeAdapterKind: string;
+  readonly groupMemberCount: number;
+  readonly grouped: boolean;
 }
 
 export interface ModelAdvancedMetadataView {
@@ -559,6 +571,7 @@ export interface PartnerCapabilitiesView {
   readonly modelChain: readonly PartnerModelRouteView[];
   readonly permissionMode: PartnerPermissionModeView;
   readonly planMode: boolean;
+  readonly inputHandoff?: boolean;
 }
 
 export interface PartnerTemplateView {
@@ -711,6 +724,7 @@ export interface PartnerPatchView {
   readonly modelChain?: readonly PartnerModelRouteView[];
   readonly permissionMode?: PartnerPermissionModeView;
   readonly planMode?: boolean;
+  readonly inputHandoff?: boolean;
   readonly usesDirectoryDefaults?: boolean;
   readonly taskModelOverride?: PartnerModelRouteView | null;
 }
@@ -1635,6 +1649,7 @@ export interface TimelineItemView {
     readonly ownerGeneration: bigint;
     readonly turn: number;
   };
+  readonly inputHandoffContinuation?: { readonly requestId: string };
   readonly tool?: ToolCallView;
   /** Inline projection replacing one or more raw plan tool rows. */
   readonly inlinePlan?: TimelinePlanView;
@@ -5170,6 +5185,8 @@ export interface McpServerDraft {
 }
 
 export interface AppSnapshot {
+  /** Current owner-only process state. Never retained across a connection. */
+  readonly inputHandoffs?: readonly { readonly sessionId: string; readonly requestId: string; readonly generation: number; readonly stepNumber: number }[];
   readonly revision: bigint;
   readonly cursor: bigint;
   readonly generation: bigint;
@@ -5964,7 +5981,7 @@ export type ExtensionCardApi = Pick<import("@connectrpc/connect").Client<typeof 
   }>;
 };
 
-export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmentApi {
+export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmentApi, HostedAgentSettingsApi {
   mcpAppApi(): McpAppApi | undefined;
   extensionCardApi(): ExtensionCardApi | undefined;
   extensionNetworkApi(): ExtensionNetworkApi | undefined;
@@ -5982,6 +5999,7 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   closeTerminal(sessionId: string, terminalId: string, generation: bigint, signal?: AbortSignal): Promise<void>;
   refresh(): Promise<void>;
   refreshProviderAccountUsage(backendId: string, providerId: string): Promise<void>;
+  readTaskProviderGroupUsage?(sessionId: string, generation: bigint, signal?: AbortSignal): Promise<import("./provider-group-task-usage.js").TaskProviderGroupUsageView | undefined>;
   getArtifactStorageStats(protectedSha256?: readonly string[]): Promise<ArtifactStorageMaintenanceView>;
   listSessionArtifacts(sessionId: string, signal?: AbortSignal): Promise<readonly ArtifactView[]>;
   listArtifactReferenceCatalog(targetSessionId: string, targetGeneration: bigint, signal?: AbortSignal): Promise<readonly ArtifactReferenceCatalogItemView[]>;
@@ -6081,6 +6099,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   addExtraDirectory(workspaceId: string, serverPath: string, access: ExtraDirectoryView["access"]): Promise<void>;
   removeExtraDirectory(extraDirectoryId: string): Promise<void>;
   setModel(sessionId: string, providerId: string, modelId: string, effort: string | undefined, fastMode: boolean): Promise<void>;
+  getSessionRuntimeControl?(sessionId: string): Promise<import("@joko/contracts").TaskShareRuntimeControl>;
+  setRuntimeModel?(sessionId: string, selection: import("./session-runtime-gateway.js").SessionRuntimeModelSelection): Promise<void>;
   setPermission(sessionId: string, mode: PermissionMode): Promise<void>;
   setPlanMode(sessionId: string, enabled: boolean): Promise<void>;
   compact(sessionId: string, customInstructions?: string): Promise<CompactSessionOutcomeView>;
@@ -6347,6 +6367,8 @@ export interface OperationApi extends VoiceDictionaryPeerApi, PersonalDevelopmen
   watchWorkspaceFileChanges(scope: WorkspaceFileChangeScopeView, signal?: AbortSignal): AsyncIterable<WorkspaceFileChangeView>;
   readWorkspaceHtmlSnapshot(sessionId: string, workspaceId: string, path: string, signal: AbortSignal): Promise<{ readonly file: { readonly workspaceId: string; readonly relativePath: string; readonly expectedRevision: string }; readonly html: string }>;
   readWorkspaceFile(workspaceId: string, path: string): Promise<WorkspaceFilePreviewView>;
+  /** Previous text for immediate display; a fresh read still verifies access. */
+  peekWorkspaceFile?(workspaceId: string, path: string): WorkspaceFilePreviewView | undefined;
   writeWorkspaceTextFile(workspaceId: string, draft: WorkspaceTextFileWriteDraft): Promise<WorkspaceTextFileWriteResultView>;
   searchWorkspace(workspaceId: string, query: string): Promise<readonly WorkspaceSearchMatchView[]>;
   searchWorkspacePage(workspaceId: string, request: WorkspaceSearchRequestView, signal?: AbortSignal): Promise<WorkspaceSearchPageView>;

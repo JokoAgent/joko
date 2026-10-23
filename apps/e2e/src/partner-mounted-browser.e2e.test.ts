@@ -315,7 +315,7 @@ describe("mounted Partner collaboration product chain", () => {
         { cause: error }
       );
     }
-    await page.getByRole("button", { name: "Refresh", exact: true }).click();
+    await page.getByLabel("Partner directory summary").getByRole("button", { name: "Refresh", exact: true }).click();
     const secondCard = page.locator(partnerCard(second.partnerId));
     await waitFor(() => secondCard.textContent(), (value) => value?.includes("unread replies") === true, "the unread Partner card");
     await secondCard.getByRole("button", { name: "Open task" }).click();

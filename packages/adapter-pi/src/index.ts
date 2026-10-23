@@ -1,4 +1,5 @@
 export * from "./adapter.js";
+export * from "./auto-review.js";
 export * from "./command-gate-bridge.js";
 export * from "./config.js";
 export * from "./durable-subagent-runs.js";

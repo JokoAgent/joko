@@ -8,7 +8,7 @@ export const profilePartner: MobilePartnerDirectoryProfile = {
   identitySource: "Product work", templateId: "general", lifecycle: "active", initializationState: "ready",
   invitationStage: "ready", homeTargetId: "target", canonicalSessionId: "session", usesDirectoryDefaults: false,
   capabilities: { modelChain: [{ backendId: "backend", providerId: "alpha", modelId: "a", effort: "low", fastMode: false }],
-    permissionMode: "ask", planMode: false }, createdAt: 1_000, updatedAt: 2_000,
+    permissionMode: "ask", planMode: false, inputHandoff: true }, createdAt: 1_000, updatedAt: 2_000,
   activity: { partnerId: "partner-a", unreadReplyCount: 0, artifactCount: 0, activeDelegationCount: 0,
     readThroughCursor: 0n, readUpdatedAt: 1_000 }
 };
@@ -31,7 +31,7 @@ export function profilePartnerWire(partner = profilePartner) {
     identitySource: partner.identitySource, templateId: partner.templateId,
     lifecycle: PartnerLifecycle.ACTIVE, initializationState: PartnerInitializationState.READY, invitationStage: PartnerInvitationStage.READY,
     homeTargetId: partner.homeTargetId, canonicalSessionId: partner.canonicalSessionId, usesDirectoryDefaults: partner.usesDirectoryDefaults,
-    capabilities: { modelChain: [...partner.capabilities.modelChain], permissionMode: PermissionMode.ASK, planMode: false },
+    capabilities: { modelChain: [...partner.capabilities.modelChain], permissionMode: PermissionMode.ASK, planMode: false, inputHandoff: partner.capabilities.inputHandoff ?? true },
     ...(partner.taskModelOverride === undefined ? {} : { taskModelOverride: partner.taskModelOverride }),
     createdAt: { seconds: 1n }, updatedAt: { seconds: 2n }, activity: {
       partnerId: partner.partnerId, readThroughCursor: { value: 0n }, readUpdatedAt: { seconds: 1n }

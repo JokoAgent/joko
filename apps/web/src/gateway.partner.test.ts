@@ -18,6 +18,22 @@ import { createOrchestratorGateway, mapSnapshot } from "./gateway.js";
 import * as contract from "@joko/contracts";
 
 describe("Partner gateway", () => {
+  it("keeps the private-input switch independent of tool settings through generated owner requests", async () => {
+    const requests: Array<{ method: string; input: any; signal?: AbortSignal }> = []; let inputHandoff: boolean | undefined;
+    const gateway = connectedGateway(partnerTransport(method => {
+      const result = partnerResponse(method);
+      return ["getPartner", "createPartner", "updatePartner"].includes(method)
+        ? { ...result, partner: { ...profile(), capabilities: { ...capabilities(), inputHandoff } } } : result;
+    }, requests));
+    await gateway.connect(); expect((await gateway.getPartner("partner-one")).capabilities.inputHandoff).toBe(true);
+    inputHandoff = false;
+    expect((await gateway.getPartner("partner-one")).capabilities.inputHandoff).toBe(false);
+    await gateway.updatePartner("partner-one", 8n, { inputHandoff: false });
+    expect(requests.find(request => request.method === "updatePartner")?.input.patch).toMatchObject({ inputHandoff: false });
+    await gateway.updatePartnerDefaults(4n, { ...capabilities(), permissionMode: "ask", inputHandoff: false });
+    expect(requests.find(request => request.method === "updatePartnerDefaults")?.input.capabilities.inputHandoff).toBe(false);
+    gateway.disconnect();
+  });
   it("strictly roundtrips Partner permission values for defaults create and profile writes", async () => {
     const requests: Array<{ method: string; input: any; signal?: AbortSignal }> = [];
     let mode = PermissionMode.ASK;

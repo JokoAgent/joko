@@ -4,6 +4,8 @@ import {
   DeviceKind,
   ModelInputModality,
   ModelOutputModality,
+  ModelSourceKind,
+  type ModelSourceDescriptor,
   PermissionMode,
   capabilityNames,
   type BackendDescriptor,
@@ -43,6 +45,9 @@ export interface MobileModelRoute {
   readonly maximumOutputTokens: bigint;
   readonly efforts: readonly MobileEffortOption[];
   readonly supportsFastMode: boolean;
+  readonly source?: ModelSourceDescriptor;
+  readonly canSetEffort?: boolean;
+  readonly canSetFastMode?: boolean;
 }
 
 export interface MobileCurrentModel {
@@ -74,9 +79,12 @@ export interface MobileRuntimeControls {
   readonly favoriteRevision: bigint;
   readonly favoritesSeeded: boolean;
   readonly favoritesAvailable?: boolean;
+  readonly unifiedSources?: boolean;
+  readonly pendingModel?: MobileModelRoute & MobileModelControlSelection;
 }
 
 export interface MobileModelControlSelection {
+  readonly backendId?: string;
   readonly providerId: string;
   readonly modelId: string;
   readonly effortId?: string;
@@ -120,7 +128,8 @@ export function resolveMobileRuntimeControls(
   identity: MobileRuntimeOwnerIdentity | undefined,
   owner: Snapshot | undefined,
   detail: Snapshot | undefined,
-  selectedSessionId: string | undefined
+  selectedSessionId: string | undefined,
+  unifiedSources = false
 ): MobileRuntimeControls | undefined {
   if (!identity || !owner || !detail || !strictText(selectedSessionId)
     || !strictText(identity.profileId) || !strictText(identity.connectionId)
@@ -197,9 +206,17 @@ export function resolveMobileRuntimeControls(
     const route = mobileModelRoute(model, provider);
     if (!route) continue;
     structuralRoutes.set(key, route);
-    if (canListModels && modelRouteEnabled(owner, backendSettings[0], provider, route)) validRoutes.push(route);
+    const currentRoute = session.model?.model?.providerId === route.providerId && session.model.model.modelId === route.modelId;
+    if (canListModels && (model.source?.grouped !== true || currentRoute) && modelRouteEnabled(owner, backendSettings[0], provider, route)) validRoutes.push(route);
   }
   validRoutes.sort(compareModelRoutes);
+  if (unifiedSources && canSwitchModel) for (const candidate of owner.backends) {
+    if (candidate.backendId === session.backendId) continue;
+    const authority = resolveMobileNewTaskExecutionAuthority(owner, candidate.backendId);
+    if (!authority?.canSelectModel) continue;
+    validRoutes.push(...authority.models.map(route => ({ ...route, key: JSON.stringify([route.backendId, route.providerId, route.modelId]),
+      backendName: candidate.displayName, canSetEffort: authority.canSetEffort, canSetFastMode: authority.canSetFastMode })));
+  }
 
   const currentKey = session.model?.model === undefined
     ? undefined
@@ -279,9 +296,12 @@ export function resolveMobileRuntimeControls(
     permissionModes,
     canSetPermission,
     canSetPlanMode,
-    favorites: favorites.filter((favorite) => favorite.backendId === session.backendId),
+    favorites: favorites.filter((favorite) => (unifiedSources || favorite.backendId === session.backendId)
+      && validRoutes.some(route => route.backendId === favorite.backendId && route.providerId === favorite.providerId && route.modelId === favorite.modelId
+        && route.source?.kind !== ModelSourceKind.SHARE && route.source?.grouped !== true)),
     favoriteRevision: favoriteSettings.revision.value,
-    favoritesSeeded: favoriteSettings.seeded
+    favoritesSeeded: favoriteSettings.seeded,
+    ...(unifiedSources ? { unifiedSources: true } : {})
   };
 }
 
@@ -371,6 +391,7 @@ export function resolveMobileNewTaskExecutionAuthority(
     for (const [key, matches] of groupBy(owner.models.filter((model) => model.backendId === backendId), modelKey)) {
       if (matches.length !== 1) continue;
       const model = matches[0]!;
+      if (model.source?.grouped === true) continue;
       const providerId = model.key?.providerId;
       const providerMatches = strictText(providerId) ? providers.get(providerId) ?? [] : [];
       if (providerMatches.length > 1) continue;
@@ -413,19 +434,20 @@ export function defaultMobileModelSelection(
   route: MobileModelRoute
 ): MobileModelControlSelection {
   const current = controls.currentModel;
-  const sameRoute = current?.providerId === route.providerId && current.modelId === route.modelId;
+  const sameRoute = route.backendId === controls.backend.backendId && current?.providerId === route.providerId && current.modelId === route.modelId;
   const currentEffort = sameRoute && current?.effortId !== undefined
     && route.efforts.some((effort) => effort.id === current.effortId)
     ? current.effortId
     : undefined;
   const defaultEffort = route.efforts.find((effort) => effort.default)?.id ?? route.efforts[0]?.id;
   return {
+    ...(controls.unifiedSources ? { backendId: route.backendId } : {}),
     providerId: route.providerId,
     modelId: route.modelId,
-    ...(controls.canSetEffort && (currentEffort ?? defaultEffort) !== undefined
+    ...((route.canSetEffort ?? controls.canSetEffort) && (currentEffort ?? defaultEffort) !== undefined
       ? { effortId: currentEffort ?? defaultEffort }
       : {}),
-    fastMode: controls.canSetFastMode && route.supportsFastMode && sameRoute && current?.fastMode === true
+    fastMode: (route.canSetFastMode ?? controls.canSetFastMode) && route.supportsFastMode && sameRoute && current?.fastMode === true
   };
 }
 
@@ -437,11 +459,13 @@ export function assertMobileModelSelection(
     || (selection.effortId !== undefined && !strictText(selection.effortId))) {
     throw new Error("Choose a current advertised model route and effort.");
   }
-  const route = controls.models.find((candidate) => candidate.providerId === selection.providerId
+  const route = controls.models.find((candidate) => candidate.backendId === (selection.backendId ?? controls.backend.backendId)
+    && candidate.providerId === selection.providerId
     && candidate.modelId === selection.modelId);
   if (!route) throw new Error("This model route is no longer available to the current task.");
   const current = controls.currentModel;
-  const routeChanged = current?.providerId !== route.providerId || current.modelId !== route.modelId;
+  const crossSource = route.backendId !== controls.backend.backendId;
+  const routeChanged = crossSource || current?.providerId !== route.providerId || current.modelId !== route.modelId;
   if (routeChanged && !controls.canSwitchModel) {
     throw new Error("This Backend does not currently allow task model switching.");
   }
@@ -454,10 +478,10 @@ export function assertMobileModelSelection(
   if (effortChanged && !controls.canSetEffort) {
     throw new Error("This Backend does not currently allow effort changes.");
   }
-  if (routeChanged && effortId && !controls.canSetEffort) {
+  if (routeChanged && effortId && !(route.canSetEffort ?? controls.canSetEffort)) {
     throw new Error("This Backend does not currently allow choosing an effort for the new model.");
   }
-  if (selection.fastMode && (!route.supportsFastMode || !controls.canSetFastMode)) {
+  if (selection.fastMode && (!route.supportsFastMode || !(route.canSetFastMode ?? controls.canSetFastMode))) {
     throw new Error("Fast Mode is not available for the selected model.");
   }
   const fastChanged = !routeChanged && selection.fastMode !== (current?.fastMode ?? false);
@@ -468,6 +492,7 @@ export function assertMobileModelSelection(
     throw new Error("Choose a different model setting before applying.");
   }
   return {
+    ...(controls.unifiedSources ? { backendId: route.backendId } : {}),
     providerId: route.providerId,
     modelId: route.modelId,
     ...(effortId ? { effortId } : {}),
@@ -487,7 +512,8 @@ export function assertMobileModelFavoriteMutation(
     return { kind: "remove", favoriteId: change.favoriteId };
   }
   const item = change.item;
-  if (!strictText(item.favoriteId) || item.favoriteId.length > 128 || item.backendId !== controls.backend.backendId) {
+  if (!strictText(item.favoriteId) || item.favoriteId.length > 128 || !strictText(item.backendId)
+    || !controls.unifiedSources && item.backendId !== controls.backend.backendId) {
     throw new Error("The model favorite identity is invalid for this Backend.");
   }
   const existing = controls.favorites.find((favorite) => favorite.favoriteId === item.favoriteId);
@@ -501,14 +527,16 @@ export function assertMobileModelFavoriteMutation(
   if (change.kind === "seed" && controls.favoritesSeeded) {
     throw new Error("The default model favorite was already considered.");
   }
-  const route = controls.models.find((candidate) => candidate.providerId === item.providerId
+  const route = controls.models.find((candidate) => candidate.backendId === item.backendId && candidate.providerId === item.providerId
     && candidate.modelId === item.modelId);
   if (route === undefined) throw new Error("This model route is no longer available.");
-  if (item.effortId !== undefined && (!controls.canSetEffort
+  if (route.source?.grouped === true) throw new Error("Select this model through its Provider group before saving a favorite.");
+  if (route.source?.kind === ModelSourceKind.SHARE) throw new Error("Shared model favorites are unavailable on mobile.");
+  if (item.effortId !== undefined && (!(route.canSetEffort ?? controls.canSetEffort)
     || !route.efforts.some((effort) => effort.id === item.effortId))) {
     throw new Error("This effort is not available for model favorites.");
   }
-  if (item.fastMode && (!controls.canSetFastMode || !route.supportsFastMode)) {
+  if (item.fastMode && (!(route.canSetFastMode ?? controls.canSetFastMode) || !route.supportsFastMode)) {
     throw new Error("Fast Mode is not available for model favorites.");
   }
   const normalized: MobileModelFavoriteConfiguration = {
@@ -661,7 +689,8 @@ function mobileModelRoute(
     contextWindowTokens: model.contextWindowTokens,
     maximumOutputTokens: model.maximumOutputTokens,
     efforts,
-    supportsFastMode: model.supportsFastMode
+    supportsFastMode: model.supportsFastMode,
+    ...(model.source ? { source: model.source } : {})
   };
 }
 
@@ -681,6 +710,7 @@ function resolveTrustedMobileModel(
     && candidate.providerId === selection.providerId);
   if (providers.length > 1) return undefined;
   const model = models[0]!;
+  if (requireRoutingEnabled && model.source?.grouped === true) return undefined;
   const route = mobileModelRoute(model, providers[0]);
   if (!route) return undefined;
   const settings = owner.settings?.backends.filter((candidate) => candidate.backendId === backendId) ?? [];

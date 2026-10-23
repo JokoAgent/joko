@@ -162,6 +162,12 @@ export function MobilePartnerProfileForm({ fields: snapshot, original, draft, di
                 disabled={!capabilitiesEditable || !canSetPlanMode && !effective?.planMode} onValueChange={(planMode) => change({ ...draft,
                   capabilities: { ...draft.capabilities, planMode } })} />
             </View>
+            <View style={styles.toggle}>
+              <Text style={[styles.body, styles.grow, { color: colors.ink }]}>{mobileMessage(locale, "partnerProfile.inputHandoff")}</Text>
+              <Switch accessibilityLabel={mobileMessage(locale, "partnerProfile.inputHandoff")} value={effective?.inputHandoff ?? true}
+                disabled={!capabilitiesEditable} onValueChange={inputHandoff => change({ ...draft, capabilities: { ...draft.capabilities, inputHandoff } })} />
+            </View>
+            <Text style={[styles.body, { color: colors.muted }]}>{mobileMessage(locale, "partnerProfile.inputHandoffHint")}</Text>
   </>;
 }
 

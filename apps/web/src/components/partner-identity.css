@@ -1,0 +1,11 @@
+.partner-identity-section { display: grid; gap: 12px; }
+.partner-identity-section > header { margin-bottom: 0; }
+.partner-identity-section label { display: grid; gap: 5px; color: var(--text-soft); }
+.partner-identity-section input, .partner-identity-section select, .partner-identity-section textarea { min-width: 0; max-width: 100%; border: 1px solid var(--line); border-radius: var(--radius); padding: 8px; background: var(--surface); color: var(--text); font: inherit; }
+.partner-identity-section textarea { width: 100%; min-height: 90px; resize: vertical; }
+.partner-identity-section .partner-group-inline-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+.partner-identity-section .partner-group-inline-form label { flex: 1 1 180px; }
+.partner-identity-section .partner-identity-link { flex-wrap: wrap; cursor: default; }
+.partner-identity-link > span:first-child { display: grid; gap: 4px; flex: 1 1 160px; min-width: 0; }
+.partner-identity-link input { flex: 1 1 140px; }
+@media (max-width: 600px) { .partner-identity-section > header { flex-wrap: wrap; } }

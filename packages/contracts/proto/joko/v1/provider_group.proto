@@ -1,0 +1,117 @@
+syntax = "proto3";
+package joko.v1;
+
+import "joko/v1/model.proto";
+
+// Management and direct group coordination require an authenticated owner.
+// Provider guests use HostedAgentService with their server-owned share grant;
+// they cannot call management or declare a recipient in these messages.
+service ProviderGroupService {
+  rpc ListProviderGroups(ListProviderGroupsRequest) returns (ListProviderGroupsResponse);
+  rpc GetProviderGroup(GetProviderGroupRequest) returns (GetProviderGroupResponse);
+  rpc ListProviderGroupCandidates(ListProviderGroupCandidatesRequest) returns (ListProviderGroupCandidatesResponse);
+  rpc UpdateProviderGroup(UpdateProviderGroupRequest) returns (UpdateProviderGroupResponse);
+  rpc GetProviderGroupUsage(GetProviderGroupUsageRequest) returns (GetProviderGroupUsageResponse);
+  rpc GetTaskProviderGroupUsage(GetTaskProviderGroupUsageRequest) returns (GetTaskProviderGroupUsageResponse);
+  rpc PickProviderGroupMember(PickProviderGroupMemberRequest) returns (PickProviderGroupMemberResponse);
+  rpc CoolProviderGroupMember(CoolProviderGroupMemberRequest) returns (CoolProviderGroupMemberResponse);
+  rpc ReportProviderGroupLeases(ReportProviderGroupLeasesRequest) returns (ReportProviderGroupLeasesResponse);
+  rpc ReportProviderGroupUsage(ReportProviderGroupUsageRequest) returns (ReportProviderGroupUsageResponse);
+  rpc GetProviderSchedulingState(GetProviderSchedulingStateRequest) returns (GetProviderSchedulingStateResponse);
+}
+message ProviderGroupKey { string backend_id = 1; string provider_id = 2; }
+enum ProviderGroupStrategy {
+  PROVIDER_GROUP_STRATEGY_UNSPECIFIED = 0;
+  PROVIDER_GROUP_STRATEGY_LEAST_BUSY = 1;
+  PROVIDER_GROUP_STRATEGY_ROUND_ROBIN = 2;
+  PROVIDER_GROUP_STRATEGY_ORDERED = 3;
+  PROVIDER_GROUP_STRATEGY_WEIGHTED = 4;
+}
+enum ProviderGroupMemberKind {
+  PROVIDER_GROUP_MEMBER_KIND_UNSPECIFIED = 0;
+  PROVIDER_GROUP_MEMBER_KIND_LOCAL = 1;
+  PROVIDER_GROUP_MEMBER_KIND_DEVICE = 2;
+  PROVIDER_GROUP_MEMBER_KIND_SHARE = 3;
+}
+message ProviderGroupSummary { ProviderGroupStrategy strategy = 1; bool auto_switch = 2; uint32 member_count = 3; }
+message ProviderGroupReceivedIdentity {
+  string join_id = 1; string share_id = 2; string member_id = 3; uint64 generation = 4;
+  string host_server_id = 5; string native_backend_id = 6; string provider_id = 7;
+}
+message ProviderGroupMember {
+  string key = 1; ProviderGroupMemberKind kind = 2; string backend_id = 3; string provider_id = 4;
+  string node_id = 5; string display_name = 6; uint32 capacity = 7; uint32 weight = 8; bool paused = 9;
+  ProviderGroupReceivedIdentity received = 10; string native_backend_id = 11;
+}
+message ProviderGroupConfig { ProviderGroupStrategy strategy = 1; bool auto_switch = 2; repeated ProviderGroupMember members = 3; }
+message ProviderGroupSnapshot { ProviderGroupKey key = 1; uint64 revision = 2; ProviderGroupConfig config = 3; }
+message ProviderGroupCandidate {
+  ProviderGroupMember member = 1; string provider_name = 2; string agent_kind = 3;
+  bool available = 4; bool remotely_enabled = 5; repeated ModelDescriptor models = 6;
+}
+message ListProviderGroupsRequest {}
+message ListProviderGroupsResponse { repeated ProviderGroupSnapshot groups = 1; }
+message GetProviderGroupRequest { ProviderGroupKey key = 1; optional string agent_kind = 2; optional string model_id = 3; optional string logical_model_id = 4; }
+message GetProviderGroupResponse { ProviderGroupSnapshot group = 1; repeated ProviderGroupMemberState members = 2; }
+message ListProviderGroupCandidatesRequest { ProviderGroupKey key = 1; }
+message ListProviderGroupCandidatesResponse { repeated ProviderGroupCandidate candidates = 1; }
+message DeleteProviderGroup {}
+message UpdateProviderGroupRequest {
+  ProviderGroupKey key = 1; uint64 expected_revision = 2;
+  oneof update { ProviderGroupConfig config = 3; DeleteProviderGroup delete = 4; }
+}
+message UpdateProviderGroupResponse { ProviderGroupSnapshot group = 1; }
+message ProviderGroupQuota {
+  bool limited = 1; optional double usage_percent = 2; optional double reset_at = 3;
+  optional double weekly_reset_at = 4; optional double five_hour_reset_at = 5;
+}
+message ProviderGroupMemberState {
+  string member_key = 1; bool available = 2; bool reachable = 3; string model_id = 4;
+  ProviderGroupQuota quota = 5; uint32 running = 6; string reason = 7;
+}
+message PickProviderGroupMemberRequest {
+  ProviderGroupKey key = 1; string session_id = 2; string agent_kind = 3; string model_id = 4;
+  optional string logical_model_id = 5; repeated string exclude_member_keys = 6;
+}
+message PickProviderGroupMemberResponse {
+  ProviderGroupSnapshot group = 1; ProviderGroupMember member = 2; string model_id = 3;
+  ProviderGroupQuota quota = 4; uint32 running = 5;
+}
+message CoolProviderGroupMemberRequest {
+  ProviderGroupKey key = 1; string member_key = 2; string model_id = 3;
+  string cause = 4; optional double reset_at = 5; bool model_scoped = 6;
+}
+message CoolProviderGroupMemberResponse {}
+message ProviderGroupActiveLease { string session_id = 1; string member_key = 2; string backend_id = 3; string provider_id = 4; }
+message ReportProviderGroupLeasesRequest { uint64 sequence = 1; repeated ProviderGroupActiveLease leases = 2; }
+message ReportProviderGroupLeasesResponse { bool accepted = 1; }
+message ProviderGroupUsageRow {
+  ProviderGroupKey group = 1; string member_key = 2; string node_id = 3; string node_name = 4;
+  string party_id = 5; string party_name = 6; string agent_kind = 7; string backend_id = 8;
+  string provider_id = 9; string model_id = 10; string day = 11; uint64 turns = 12;
+  uint64 input_tokens = 13; uint64 output_tokens = 14; uint64 cache_read_tokens = 15;
+  uint64 cache_write_tokens = 16; uint64 total_tokens = 17; uint64 cost_micros = 18;
+  string currency_code = 19; bool estimated = 20; bool tokens_complete = 21; bool cost_complete = 22; double last_at = 23;
+}
+message GetProviderGroupUsageRequest {
+  ProviderGroupKey key = 1; optional string from_day = 2; optional string through_day = 3;
+  optional string party_id = 4; optional string node_id = 5; optional string model_id = 6;
+}
+message GetProviderGroupUsageResponse { repeated ProviderGroupUsageRow rows = 1; }
+message GetTaskProviderGroupUsageRequest { string session_id = 1; uint64 generation = 2; }
+message TaskProviderGroupMember {
+  ProviderGroupKey group = 1; string member_key = 2; string node_name = 3;
+  string backend_id = 4; string provider_id = 5; string model_id = 6; bool quota_readable = 7;
+}
+message GetTaskProviderGroupUsageResponse {
+  TaskProviderGroupMember member = 1; ProviderAccountUsageSnapshot account_usage = 2; ProviderGroupQuota quota = 3;
+}
+// A bounded part of one complete replacement report. It is applied only once
+// every part with the same report identity has arrived and passed admission.
+message ReportProviderGroupUsageRequest {
+  uint64 sequence = 1; string since_day = 2; uint32 part_index = 3; uint32 part_count = 4;
+  repeated ProviderGroupUsageRow rows = 5;
+}
+message ReportProviderGroupUsageResponse { bool accepted = 1; bool complete = 2; }
+message GetProviderSchedulingStateRequest { ProviderGroupKey key = 1; string model_id = 2; }
+message GetProviderSchedulingStateResponse { uint32 active_turns = 1; ProviderAccountUsageSnapshot account_usage = 2; }

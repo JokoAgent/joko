@@ -12,7 +12,7 @@ export function desktopRemoteDesktopViewerOwner(state: ControllerState): Desktop
 }
 
 export async function openDesktopRemoteDesktopViewer(controller: Pick<AppController, "state">,
-  expected: DesktopRemoteDesktopViewerOwner | undefined, target: { readonly deviceId: string; readonly name: string }): Promise<void> {
+  expected: DesktopRemoteDesktopViewerOwner | undefined, target: { readonly deviceId: string; readonly name: string; readonly inputHandoffRequestId?: string }): Promise<void> {
   const api = window.jokoDesktop?.remoteDesktopViewer;
   if (expected === undefined || api === undefined || !sameDesktopRemoteDesktopViewerOwner(expected, desktopRemoteDesktopViewerOwner(controller.state))) return;
   await api.bind(expected);

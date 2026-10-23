@@ -45,7 +45,7 @@ describe("Inspector production trees", () => {
   it("navigates and expands the Files tree without tabbing through every row button", async () => {
     const entries = [directory("src"), file("README.md")];
     const listWorkspaceEntries = vi.fn(async (_workspaceId: string, path: string) => path === "src" ? [file("src/App.tsx")] : entries);
-    const controller = { listWorkspaceEntries } as unknown as AppController;
+    const controller = { state: { connectionGeneration: 1 }, listWorkspaceEntries } as unknown as AppController;
     const host = await render(<FilesPanel
       controller={controller}
       workspace={workspace(entries)}

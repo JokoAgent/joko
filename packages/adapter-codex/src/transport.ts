@@ -16,7 +16,7 @@ import {
   type RpcNotification,
   type RpcServerRequest
 } from "./protocol.js";
-import { RpcRemoteFault, TransportFault } from "./errors.js";
+import { remoteRpcFault, TransportFault } from "./errors.js";
 
 export interface RpcTransportHandlers {
   /** Synchronous wire-arrival observation, before asynchronous notification delivery. */
@@ -100,6 +100,7 @@ export interface StdioJsonRpcTransportOptions {
 
 interface PendingRequest {
   readonly method: string;
+  readonly resumeThreadId?: string;
   readonly mutation: boolean;
   dispatched: boolean;
   readonly resolve: (value: JsonValue) => void;
@@ -246,7 +247,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
     }
     await this.#processOwner?.prepare(this.#options.shutdownTimeoutMs);
     const command = this.#options.command ?? "codex";
-    const args = [...(this.#options.args ?? ["app-server", "--stdio"])];
+    const args = [...(this.#options.args ?? ["app-server", "--listen", "stdio://"])];
     const environment = {
       ...(this.#options.env ?? createChildRuntimeEnvironment({
         allowedKeys: CODEX_RUNTIME_ENVIRONMENT_KEYS
@@ -344,6 +345,8 @@ export class StdioJsonRpcTransport implements RpcTransport {
       options.signal?.addEventListener("abort", finishCancelled, { once: true });
       this.#pending.set(key, {
         method,
+        ...(method === "thread/resume" && isJsonObject(params) && typeof params["threadId"] === "string"
+          ? { resumeThreadId: params["threadId"] } : {}),
         mutation: options.mutation ?? false,
         dispatched: false,
         resolve,
@@ -686,7 +689,7 @@ export class StdioJsonRpcTransport implements RpcTransport {
         ));
         return true;
       }
-      pending.reject(new RpcRemoteFault(error["code"]));
+      pending.reject(remoteRpcFault(error["code"], error["message"], error["data"], pending.resumeThreadId));
       return true;
     }
     pending.resolve(value["result"] as JsonValue);

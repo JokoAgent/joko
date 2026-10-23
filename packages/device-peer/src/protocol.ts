@@ -2,7 +2,7 @@ export const DEVICE_PEER_PROTOCOL_VERSION = 1 as const;
 /** Public route RPCs accept only this host-owned authorization purpose. */
 export const DEVICE_PEER_AGENT_AUTHORIZATION_HEADER = "x-joko-device-peer-agent-authorization";
 
-export const DEVICE_PEER_CAPABILITIES = ["files", "process", "terminal", "forwarding", "remote_desktop"] as const;
+export const DEVICE_PEER_CAPABILITIES = ["files", "process", "terminal", "forwarding", "remote_desktop", "native_agents"] as const;
 export type DevicePeerCapability = (typeof DEVICE_PEER_CAPABILITIES)[number];
 export type DevicePeerEffectKind = "read_only" | "side_effect";
 
@@ -306,7 +306,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isCapability(value: unknown): value is DevicePeerCapability {
   return value === "files" || value === "process" || value === "terminal" || value === "forwarding"
-    || value === "remote_desktop";
+    || value === "remote_desktop"
+    || value === "native_agents";
 }
 
 function assertIdentifier(value: unknown, name: string, maximumLength = 256): asserts value is string {

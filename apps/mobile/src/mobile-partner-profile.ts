@@ -72,7 +72,7 @@ export function projectMobilePartnerProfileOptions(value: PartnerDirectory | und
 
 export function mobilePartnerProfileDraft(partner: MobilePartnerDirectoryProfile): MobilePartnerProfileDraft {
   return { displayName: partner.displayName, description: partner.description, avatar: partner.avatar, identitySource: partner.identitySource,
-    capabilities: partner.capabilities, usesDirectoryDefaults: partner.usesDirectoryDefaults,
+    capabilities: { ...partner.capabilities, inputHandoff: partner.capabilities.inputHandoff ?? true }, usesDirectoryDefaults: partner.usesDirectoryDefaults,
     ...(partner.taskModelOverride === undefined ? {} : { taskModelOverride: partner.taskModelOverride }) };
 }
 
@@ -117,6 +117,7 @@ export function validateMobilePartnerDraftFields(snapshot: MobilePartnerDraftFie
   const capabilities = draft.usesDirectoryDefaults ? snapshot.options.defaultCapabilities : draft.capabilities;
   if (!capabilities) throw new MobilePartnerProfileValidationError("defaults", "Partner directory defaults are not configured.");
   const chain = capabilities.modelChain;
+  if (capabilities.inputHandoff !== undefined && typeof capabilities.inputHandoff !== "boolean") throw new MobilePartnerProfileValidationError("modelChain", "Select the current input handoff setting.");
   if (chain.length < 1 || chain.length > 5 || new Set(chain.map((route) => `${route.backendId}\u001f${route.providerId}\u001f${route.modelId}`)).size !== chain.length
     || !["ask", "acceptEdits", "auto", "bypassPermissions"].includes(capabilities.permissionMode)) throw new MobilePartnerProfileValidationError("modelChain", "Select 1–5 unique Partner model routes.");
   for (const route of chain) {
@@ -144,7 +145,7 @@ export function validateMobilePartnerDraftFields(snapshot: MobilePartnerDraftFie
       throw new MobilePartnerProfileValidationError("modelUnavailable", "The selected task model or option is no longer available.");
     }
   }
-  return { ...draft, displayName, description, identitySource, capabilities };
+  return { ...draft, displayName, description, identitySource, capabilities: { ...capabilities, inputHandoff: capabilities.inputHandoff ?? true } };
 }
 
 export function projectMobilePartnerProfileUpdate(partnerId: string, expectedRevision: bigint,

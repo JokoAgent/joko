@@ -48,6 +48,7 @@ import {
   type RemoteDesktopDisplay,
   type RemoteDesktopDisplayMode,
   type RemoteDesktopHostCapabilities,
+  type RemoteDesktopHandoffWindow,
   type RemoteDesktopIceCandidate,
   type RemoteDesktopHostIceServer,
   type RemoteDesktopInput,
@@ -72,6 +73,8 @@ export interface DesktopRemoteDesktopMediaPort {
     readonly cursorOverlay: boolean;
     readonly current: () => boolean;
     readonly signal: AbortSignal;
+    readonly window?: RemoteDesktopHandoffWindow;
+    readonly validateWindow?: () => Promise<boolean>;
   }): Promise<RemoteDesktopJpegFrame | null>;
   offer(request: {
     readonly displayId: string;
@@ -83,6 +86,8 @@ export interface DesktopRemoteDesktopMediaPort {
     readonly iceServers?: readonly RemoteDesktopHostIceServer[];
     readonly current: () => boolean;
     readonly signal: AbortSignal;
+    readonly window?: RemoteDesktopHandoffWindow;
+    readonly validateWindow?: () => Promise<boolean>;
   }): Promise<string>;
   exchangeIce(request: {
     readonly leaseId: string;
@@ -114,12 +119,17 @@ export interface DesktopRemoteDesktopMediaPort {
 }
 
 export interface DesktopRemoteDesktopInputPort {
-  start(displayId: string, signal: AbortSignal): Promise<void>;
+  start(displayId: string, signal: AbortSignal, window?: RemoteDesktopHandoffWindow, ownership?: DesktopRemoteDesktopInputOwnership): Promise<void>;
   resumeAfterPrivacy?(displayId: string, current: () => boolean, signal: AbortSignal): Promise<void>;
   send(events: readonly RemoteDesktopInput[]): void;
   stop(): void;
   release(): Promise<void>;
   retire(): Promise<void>;
+}
+export interface DesktopRemoteDesktopInputOwnership {
+  begin(events: readonly RemoteDesktopInput[], signal: AbortSignal): Promise<() => Promise<void>>;
+  /** Called after the native helper confirmed release/exit. */
+  close(): Promise<void>;
 }
 
 export interface DesktopRemoteDesktopClipboardPort {
@@ -141,6 +151,12 @@ export interface DesktopRemoteDesktopClipboardPort {
 
 export interface DesktopRemoteDesktopHostDependencies {
   readonly platform: "darwin" | "win32" | "linux";
+  readonly handoff?: {
+    resolve(requestId: string, controllerDeviceId: string, signal: AbortSignal): Promise<RemoteDesktopHandoffWindow | null>;
+    current(window: RemoteDesktopHandoffWindow, controllerDeviceId: string, signal: AbortSignal): Promise<boolean>;
+    ended(window: RemoteDesktopHandoffWindow, controllerDeviceId: string): void;
+    inputOwnership(window: RemoteDesktopHandoffWindow, controllerDeviceId: string): DesktopRemoteDesktopInputOwnership;
+  };
   readonly systemAudio: boolean;
   enabled(): boolean;
   sessionState(signal: AbortSignal): Promise<DesktopRemoteDesktopSessionState>;
@@ -249,6 +265,12 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       authenticationSession: (authority) => authority.authenticationOwner === undefined ? undefined
         : this.#credentials?.authenticationSession(authority.authenticationOwner) ?? null,
       capabilities: async () => this.#capabilities(),
+      ...(dependencies.platform === "darwin" && dependencies.handoff ? {
+        handoffWindow: (requestId: string, authority: RemoteDesktopAuthority) => dependencies.handoff!.resolve(requestId, authority.controllerDeviceId, this.#signal()),
+        handoffCurrent: async (window: RemoteDesktopHandoffWindow, authority: RemoteDesktopAuthority) => dependencies.enabled()
+          && this.#sessionState === "unlocked" && await dependencies.handoff!.current(window, authority.controllerDeviceId, this.#signal()),
+        handoffEnded: (window: RemoteDesktopHandoffWindow, authority: RemoteDesktopAuthority) => dependencies.handoff!.ended(window, authority.controllerDeviceId)
+      } : {}),
       permissions: async (action) => {
         this.#requireEnabled();
         if (action === "guide") await dependencies.showPermissionGuide(this.#signal());
@@ -256,12 +278,13 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       },
       frame: (request) => this.#whileSessionViewable(
         (sessionGeneration) => dependencies.media.frame({ ...request, signal: this.#signal(),
+          ...(this.#controller.handoffWindow(request.leaseId) ? { window: this.#controller.handoffWindow(request.leaseId), validateWindow: () => this.#controller.checkHandoff(request.leaseId) } : {}),
           current: () => request.current() && sessionGeneration === this.#sessionGeneration
             && isViewableSession(this.#sessionState) }),
         () => null
       ),
-      startInput: (displayId) => this.#whileSessionControllable(
-        () => dependencies.input.start(displayId, this.#signal())
+      startInput: (displayId, authority, window) => this.#whileSessionControllable(
+        () => dependencies.input.start(displayId, this.#signal(), window, window ? dependencies.handoff!.inputOwnership(window, authority.controllerDeviceId) : undefined)
       ),
       input: (events) => dependencies.input.send(events),
       stopInput: () => dependencies.input.stop(),
@@ -397,6 +420,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         this.#whileSessionViewable((sessionGeneration) => dependencies.media.offer({
           displayId: lease.display.id,
           leaseId: lease.lease,
+          ...(this.#controller.handoffWindow(lease.lease) ? { window: this.#controller.handoffWindow(lease.lease), validateWindow: () => this.#controller.checkHandoff(lease.lease) } : {}),
           attemptId,
           offerSdp: sdp,
           cursorOverlay,
@@ -639,12 +663,14 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       readonly systemMenu: boolean;
       readonly channelRequests?: boolean;
       readonly autoControl?: boolean;
+      readonly handoffWindow?: boolean;
     };
     return create(RemoteDesktopCapabilitiesSchema, {
       protocolVersion: value.version,
       enabled: value.enabled,
       canControl: value.canControl,
       autoControl: value.autoControl === true,
+      handoffWindow: value.handoffWindow === true,
       platform: value.platform,
       displays: value.displays.map((display) => create(RemoteDesktopDisplaySchema, {
         displayId: display.id,
@@ -693,11 +719,13 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     readonly displayId: string;
     readonly mode: RemoteDesktopStartMode;
     readonly control?: boolean;
+    readonly inputHandoffRequestId?: string;
   }) {
     const value = await this.#request(request, {
       op: "start",
       displayId: request.displayId,
       ...(request.control ? { control: true } : {}),
+      ...(request.inputHandoffRequestId === undefined ? {} : { inputHandoffRequestId: request.inputHandoffRequestId }),
       ...(request.mode === RemoteDesktopStartMode.RESUME ? { resume: true } : {}),
       ...(request.mode === RemoteDesktopStartMode.TAKEOVER ? { takeover: true } : {})
     }) as {
@@ -705,6 +733,8 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
       readonly display: RemoteDesktopDisplay;
       readonly controlling: boolean;
       readonly controlGeneration: number;
+      readonly inputHandoffRequestId?: string;
+      readonly window?: { readonly app: string; readonly title?: string };
     };
     return create(RemoteDesktopLeaseSchema, {
       leaseId: value.lease,
@@ -715,7 +745,9 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
         height: value.display.height
       }),
       controlling: value.controlling,
-      controlGeneration: BigInt(value.controlGeneration)
+      controlGeneration: BigInt(value.controlGeneration),
+      inputHandoffRequestId: value.inputHandoffRequestId,
+      window: value.window
     });
   }
 
@@ -1219,6 +1251,7 @@ export class DesktopRemoteDesktopHost implements DevicePeerRemoteDesktopHostPort
     return Object.freeze({
       version: 1,
       enabled: true,
+      handoffWindow: this.#dependencies.platform === "darwin" && this.#dependencies.handoff !== undefined,
       canControl: (this.#sessionState === "unlocked" && (this.#dependencies.platform !== "linux" || linux?.canControl === true))
         || this.#sessionState === "locked-logged-in" && windows?.canControl === true,
       clipboardText: this.#sessionState === "unlocked" && this.#dependencies.clipboard !== undefined,
@@ -1578,6 +1611,7 @@ function translateFailure(error: unknown): unknown {
     case "REMOTE_DESKTOP_VIEW_ONLY": return failure(RemoteDesktopFailureReason.VIEW_ONLY, false);
     case "REMOTE_DESKTOP_VIDEO_BUSY": return failure(RemoteDesktopFailureReason.VIDEO_BUSY, true);
     case "REMOTE_DESKTOP_VIDEO_TIMEOUT": return failure(RemoteDesktopFailureReason.VIDEO_TIMEOUT, true);
+    case "REMOTE_DESKTOP_HANDOFF_UNAVAILABLE":
     case "REMOTE_DESKTOP_VIDEO_UNAVAILABLE": return failure(RemoteDesktopFailureReason.VIDEO_UNAVAILABLE, true);
     case "REMOTE_DESKTOP_CAPTURE_PENDING": return failure(RemoteDesktopFailureReason.CAPTURE_PENDING, true);
     case "REMOTE_DESKTOP_AUDIO_UNAVAILABLE": return failure(RemoteDesktopFailureReason.AUDIO_UNAVAILABLE, true);

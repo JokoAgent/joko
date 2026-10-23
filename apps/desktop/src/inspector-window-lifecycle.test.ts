@@ -14,7 +14,8 @@ function fixture() {
     isDestroyed: () => ownerDestroyed,
     isFocused: () => ownerFocused,
     isVisible: () => ownerVisible,
-    isMinimized: () => ownerMinimized
+    isMinimized: () => ownerMinimized,
+    focus: vi.fn()
   };
   const child = {
     isDestroyed: () => childDestroyed,
@@ -105,6 +106,27 @@ describe("detached Inspector owner lifecycle", () => {
     unfocused.setChildFocused(false);
     expect(unfocused.lifecycle.markUserClosing(unfocused.child)).toBe(true);
     expect(unfocused.lifecycle.closeDecision(unfocused.child)).toEqual({ notifyOwner: true, returnFocus: false, reason: "user" });
+  });
+
+  it("hands focus back before native destruction and refuses a lost or retired activation", () => {
+    const value = fixture();
+    value.setOwnerFocused(false);
+    value.lifecycle.markReady(value.child);
+    value.lifecycle.markUserClosing(value.child);
+    expect(value.lifecycle.returnFocusBeforeClose(value.child)).toBe(true);
+    expect(value.owner.focus).toHaveBeenCalledOnce();
+    value.setChildFocused(false);
+    expect(value.lifecycle.returnFocusBeforeClose(value.child)).toBe(false);
+    value.setChildFocused(true);
+    value.setCurrent(false);
+    expect(value.lifecycle.returnFocusBeforeClose(value.child)).toBe(false);
+    expect(value.owner.focus).toHaveBeenCalledOnce();
+
+    const passive = fixture();
+    passive.lifecycle.markReady(passive.child);
+    passive.lifecycle.markPassiveClosing(passive.child);
+    expect(passive.lifecycle.returnFocusBeforeClose(passive.child)).toBe(false);
+    expect(passive.owner.focus).not.toHaveBeenCalled();
   });
 
   it("activates only the ready exact child from its focused visible owner", () => {

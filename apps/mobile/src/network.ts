@@ -7,6 +7,7 @@ import { partnerSessionTaskAction, projectPartnerSessionTask, type PartnerSessio
 import { base64Decode, base64Encode } from "@bufbuild/protobuf/wire";
 import { create } from "@bufbuild/protobuf";
 import { OperationMutationSchema } from "@joko/contracts";
+import { DevicePeerService, RemoteHostService, type RemoteHost } from "@joko/contracts";
 import { RemoteDesktopSystemActionKind, type RemoteDesktopSystemAction } from "@joko/contracts";
 import { CollaborationService } from "@joko/contracts";
 import { ObjectiveService } from "@joko/contracts";
@@ -24,9 +25,12 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { createPartnerRoutineApi, PartnerRoutineService, type PartnerRoutineApi, createPartnerImportApi, PartnerImportService, type PartnerImportApi } from "@joko/contracts";
 import { createPartnerHomeApi, PartnerHomeService, type PartnerHomeApi } from "@joko/contracts";
 import { createPartnerGroupApi, PartnerGroupService, type PartnerGroupApi } from "@joko/contracts";
+import { createMobilePartnerNetworkApi, type MobilePartnerNetworkApi } from "./mobile-partner-network";
+import { createMobilePartnerIdentityApi, type MobilePartnerIdentityApi } from "./mobile-partner-identity";
 import { createPartnerMemoryApi, type PartnerMemoryApi } from "@joko/contracts";
 import { createPartnerConnectionsApi, type PartnerConnectionsApi } from "@joko/contracts";
 import { createPartnerSkillsApi, type PartnerSkillsApi } from "@joko/contracts";
+import { createMobileInputHandoffApi, readMobileInputHandoffTasks, type MobileInputHandoffApi, type MobileInputHandoffScope, type MobileInputHandoffTask } from "./mobile-input-handoff";
 import {
   ArtifactKind, ArtifactService, BackendService, BlobDisposition, ConnectionService, DeviceKind, EventService, FileKind, ImageThumbnailUnavailableReason,
   MobilePushEnvironment as WireMobilePushEnvironment, MobilePushLocale as WireMobilePushLocale,
@@ -191,6 +195,12 @@ export interface MobilePushCapabilityResult {
 }
 
 export interface MobileNetwork {
+  listModelSourceRemoteHosts?(credential: PairedCredential, targetId: string, signal?: AbortSignal): Promise<readonly RemoteHost[]>;
+  listModelSourceDevicePeers?(credential: PairedCredential, signal?: AbortSignal): Promise<readonly DevicePeerDescriptor[]>;
+  getSessionRuntimeControl?(credential: PairedCredential, sessionId: string,
+    signal?: AbortSignal): Promise<import("@joko/contracts").TaskShareRuntimeControl>;
+  inputHandoffApi?(credential: PairedCredential, scope: MobileInputHandoffScope): MobileInputHandoffApi;
+  listInputHandoffTasks?(credential: PairedCredential, signal: AbortSignal): Promise<readonly MobileInputHandoffTask[]>;
   mcpAppApi?(credential: PairedCredential, ownerKey: string): MobileMcpAppApi;
   extensionCardApi?(credential: PairedCredential): import("./mobile-extension-card-api").MobileExtensionCardApi;
   getProviderUsage?(credential: PairedCredential, backendId: string, providerId: string,
@@ -278,6 +288,8 @@ export interface MobileNetwork {
     newRequestId: () => string, assertCurrent: (signal: AbortSignal) => void): PartnerRoutineApi;
   partnerGroupApi?(credential: PairedCredential, ownerKey: string, newRequestId: () => string,
     assertCurrent: (signal: AbortSignal) => void): PartnerGroupApi;
+  partnerNetworkApi?(credential: PairedCredential, ownerKey: string, assertCurrent: (signal: AbortSignal) => void): MobilePartnerNetworkApi;
+  partnerIdentityApi?(credential: PairedCredential, ownerKey: string, assertCurrent: (signal: AbortSignal) => void): MobilePartnerIdentityApi;
   listPartnerCatalog?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerCatalog>;
   getPartnerProfileOptions?(credential: PairedCredential, signal?: AbortSignal): Promise<MobilePartnerProfileOptions>;
   resumePartner?(credential: PairedCredential, partnerId: string, expectedRevision: bigint,
@@ -1445,6 +1457,8 @@ function validRemoteDesktopDisplayModes(modes: readonly RemoteDesktopDisplayMode
 }
 
 export const mobileNetwork: MobileNetwork = {
+  inputHandoffApi: (credential, scope) => createMobileInputHandoffApi({ credential, scope, transport: transport(credential.origin, credential.authKey) }),
+  listInputHandoffTasks: (credential, signal) => readMobileInputHandoffTasks(transport(credential.origin, credential.authKey), signal),
   async inspect(origin, signal) {
     const response = await createClient(ConnectionService, transport(normalizeNodeOrigin(origin))).getServerInfo({}, options(signal));
     return parseNodeIdentity(response.server);
@@ -1507,6 +1521,46 @@ export const mobileNetwork: MobileNetwork = {
       throw new Error("The Joko node returned an incomplete or ambiguous owner snapshot.");
     }
     return { connection: connections[0]!, device: devices[0]!, snapshot };
+  },
+  async listModelSourceRemoteHosts(credential, targetId, signal) {
+    const client = createClient(RemoteHostService, transport(credential.origin, credential.authKey));
+    const rows: RemoteHost[] = [], tokens = new Set<string>();
+    let pageToken = "";
+    for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
+      const response = await client.listRemoteHosts({ targetId, page: { pageSize: 500, pageToken } }, options(signal));
+      signal?.throwIfAborted();
+      for (const host of response.hosts) {
+        if (host.targetId !== targetId || !host.hostId || !host.revision?.value || rows.some(row => row.hostId === host.hostId)) {
+          throw new Error("The model source SSH Host catalog returned an invalid or duplicate identity.");
+        }
+        rows.push(host);
+      }
+      const next = response.page?.nextPageToken ?? "";
+      if (!next) return rows;
+      if (next.length > 2_048 || tokens.has(next) || next === pageToken) throw new Error("The model source SSH Host catalog cursor is invalid.");
+      tokens.add(next); pageToken = next;
+    }
+    throw new Error("The model source SSH Host catalog exceeded its page limit.");
+  },
+  async listModelSourceDevicePeers(credential, signal) {
+    const client = createClient(DevicePeerService, transport(credential.origin, credential.authKey));
+    const rows: DevicePeerDescriptor[] = [], tokens = new Set<string>();
+    let pageToken = "";
+    for (let pageIndex = 0; pageIndex < 100; pageIndex += 1) {
+      const response = await client.listDevicePeers({ page: { pageSize: 500, pageToken } }, options(signal));
+      signal?.throwIfAborted();
+      for (const peer of response.peers) {
+        if (!remoteDesktopPeerKey(peer.route) || rows.some(row => row.route?.targetDeviceId === peer.route?.targetDeviceId)) {
+          throw new Error("The model source task computer catalog returned an invalid or duplicate identity.");
+        }
+        rows.push(peer);
+      }
+      const next = response.page?.nextPageToken ?? "";
+      if (!next) return rows;
+      if (next.length > 2_048 || tokens.has(next) || next === pageToken) throw new Error("The model source task computer catalog cursor is invalid.");
+      tokens.add(next); pageToken = next;
+    }
+    throw new Error("The model source task computer catalog exceeded its page limit.");
   },
   async getProviderUsage(credential, backendId, providerId, signal) {
     signal?.throwIfAborted();
@@ -1806,6 +1860,12 @@ export const mobileNetwork: MobileNetwork = {
         if (result.state === OperationState.FAILED) throw new Error(result.error?.message ?? "The group response failed.");
       } });
   },
+  partnerIdentityApi(credential, ownerKey, assertCurrent) {
+    return createMobilePartnerIdentityApi(transport(credential.origin, credential.authKey), ownerKey, assertCurrent);
+  },
+  partnerNetworkApi(credential, ownerKey, assertCurrent) {
+    return createMobilePartnerNetworkApi(transport(credential.origin, credential.authKey), ownerKey, assertCurrent);
+  },
   partnerMemoryApi(credential, partnerId, ownerKey, assertCurrent) {
     return createPartnerMemoryApi({ rpc: createClient(PartnerService, transport(credential.origin, credential.authKey)),
       partnerId, ownerKey, assertCurrent });
@@ -1882,7 +1942,7 @@ export const mobileNetwork: MobileNetwork = {
           avatar: protoMobilePartnerAvatar(draft.avatar), identitySource: draft.identitySource, templateId: draft.templateId,
           usesDirectoryDefaults: draft.usesDirectoryDefaults, ...(draft.usesDirectoryDefaults ? {} : { capabilities: {
             modelChain: [...capabilities.modelChain], permissionMode: mobilePartnerPermissionToProto(capabilities.permissionMode),
-            planMode: capabilities.planMode } }) } }, options(signal));
+            planMode: capabilities.planMode, inputHandoff: capabilities.inputHandoff ?? true } }) } }, options(signal));
       signal?.throwIfAborted();
       projectMobilePartnerCreationOptions(response.directory);
       return projectMobilePartnerCreationResult(response.partner);
@@ -1999,7 +2059,7 @@ export const mobileNetwork: MobileNetwork = {
         usesDirectoryDefaults: draft.usesDirectoryDefaults,
         ...(draft.usesDirectoryDefaults ? {} : { modelChain: { routes: [...draft.capabilities.modelChain] },
           permissionMode: mobilePartnerPermissionToProto(draft.capabilities.permissionMode),
-          planMode: draft.capabilities.planMode })
+          planMode: draft.capabilities.planMode, inputHandoff: draft.capabilities.inputHandoff ?? true })
       } }, options(signal));
     const partner = projectMobilePartnerProfileUpdate(partnerId, expectedRevision, response);
     if (typeof draft.avatar === "string" ? partner.avatar !== draft.avatar
@@ -2764,6 +2824,12 @@ export const mobileNetwork: MobileNetwork = {
         revision: responseRevision(response.revision)
       };
     });
+  },
+  async getSessionRuntimeControl(credential, sessionId, signal) {
+    const result = await createClient(SessionService, transport(credential.origin, credential.authKey))
+      .getSessionRuntimeControl({ sessionId }, options(signal));
+    if (!result.control) throw new Error("The task runtime selection is unavailable.");
+    return result.control;
   },
   async listRuntimeCommands(credential, sessionId, signal) {
     if (!validCatalogIdentity(sessionId, 1_024)) throw new Error("A current task is required for its runtime command catalog.");

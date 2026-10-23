@@ -30,6 +30,7 @@ import { mobileFilesPreviewCanSwipe, type MobileFilesPreviewPager as FilesPrevie
 import { MobileTimelineImage } from "./MobileTimelineImage";
 import { MobileUploadLeaveDecision } from "./mobile-upload-leave-decision";
 import { MobileUserMessageContent } from "./MobileUserMessageContent";
+import { MobilePendingNewTaskConversation } from "./MobilePendingNewTaskConversation";
 import { MobileMessageRunFacts } from "./MobileMessageRunFacts";
 import { MobileMcpAppCard } from "./MobileMcpAppCard";
 import { MobileExtensionCard, MobileExtensionCardsProvider } from "./MobileExtensionCard";
@@ -239,7 +240,10 @@ import {
   type MobileQuoteSelectionLease
 } from "./mobile-composer-quote";
 import { MobileInteractionSheet } from "./MobileInteractionSheet";
+import { MobileInputHandoffPanel } from "./MobileInputHandoffPanel";
+import { MobileInputHandoffTasks } from "./MobileInputHandoffTasks";
 import { MobileRuntimeControlsSheet } from "./MobileRuntimeControlsSheet";
+import { MobileNewTaskModelSelector } from "./MobileNewTaskModelSelector";
 import { MobileAccountUsageSummary } from "./MobileAccountUsageSummary";
 import { mobileUsageProviderKey } from "./mobile-account-usage";
 import { useMobileAccountUsage } from "./use-mobile-account-usage";
@@ -318,6 +322,8 @@ import { mobileOfflineAgeLabel } from "./mobile-offline-cache";
 import { MobileOfflineNotice } from "./MobileOfflineNotice";
 import { MobileAutomationsScreen } from "./MobileAutomationsScreen";
 import { MobilePartnersScreen } from "./MobilePartnersScreen";
+import { MobilePartnerNetworkScreen } from "./MobilePartnerNetworkScreen";
+import { MobilePartnerIdentityScreen } from "./MobilePartnerIdentityScreen";
 import { MobilePartnerDirectoryScreen } from "./MobilePartnerDirectoryScreen";
 import { useMobilePartnerIdentity, useMobilePartnerRead } from "./use-mobile-partner-read";
 import { MobilePartnerAvatar, MobilePartnerAvatarProvider } from "./MobilePartnerAvatar";
@@ -425,7 +431,7 @@ const mobileUpdateActions: MobileUpdateActions = {
   onOpenUpdate: (target) => mobileUpdates.openUpdate(target),
   onRecheckForced: () => mobileUpdates.recheckForced()
 };
-type Page = "home" | "connection" | "new" | "task" | "task-sharing" | "files" | "automations" | "extensions" | "partner-directory" | "partner-resources" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
+type Page = "home" | "connection" | "new" | "task" | "task-sharing" | "files" | "automations" | "extensions" | "partner-directory" | "partner-network" | "partner-identities" | "partner-resources" | "partners" | "settings" | "connections" | "devices" | "device" | "remote-desktop";
 
 interface MobileRemoteDesktopEntry {
   readonly ownerKey: string;
@@ -1031,12 +1037,13 @@ export function App() {
                     setFocusTaskComposer(true);
                     setPage("task");
                   }} /> :
+                page === "partner-network" ? <MobilePartnerNetworkScreen key={client.partnerNetworkApi()?.ownerKey ?? "offline"} api={client.partnerNetworkApi()} directory={client.partnerDirectoryTransport()} colors={colors} locale={locale.effectiveLocale} foreground={foreground} storage={mobilePlainStorage} onBack={() => setPage("partner-directory")} /> :
+                page === "partner-identities" ? <MobilePartnerIdentityScreen key={client.partnerIdentityApi()?.ownerKey ?? "offline"} api={client.partnerIdentityApi()} directory={client.partnerDirectoryTransport()} colors={colors} locale={locale.effectiveLocale} onBack={() => setPage("partner-directory")} onOpen={async joined => { await client.openJoinedTask(joined); setPage("task"); }} /> :
                 page === "partner-directory" ? <MobilePartnerDirectoryScreen colors={colors}
+                  onOpenConversations={() => setPage("partner-network")}
+                  onOpenIdentities={() => setPage("partner-identities")}
                   roster={partnerRoster} rosterActive={foreground}
-                  groupRoster={partnerGroupRoster} groupSourceKey={client.partnerRosterSources().find(source => source.current)?.key}
-                  groupSourceClaimCurrent={selection => client.partnerGroupSourceClaimCurrent(selection)}
-                  groupSourceClaimRetained={selection => client.partnerGroupSourceClaimRetained(selection)}
-                  onOpenGroupSource={(source, groupId, signal) => client.openPartnerGroupRosterSource(source.profile.profileId, groupId, signal, source.key)}
+                  readOfflineConversation={(source, row, signal) => client.readPartnerOfflineConversation(source, row, signal)}
                   onOpenSourceInitialization={(source, partner, signal) => client.openPartnerRosterInitializationSource(source.profile.profileId, partner, signal)}
                   onOpenSource={async (source, partner, mode, signal) => {
                     const result = await client.openPartnerRosterSource(source.profile.profileId, partner, signal, mode);
@@ -1056,9 +1063,6 @@ export function App() {
                   memoryFactory={partner => client.partnerMemoryEditor(partner)}
                   creationTransport={client.partnerCreationTransport()}
                   importFactory={() => client.partnerImportEditor(mobilePlainStorage)}
-                  groupApi={client.partnerGroupApi()} groupAttachments={client.partnerGroupAttachmentTransport()}
-                  groupCreationStorage={mobilePlainStorage} groupReceiptScope={client.partnerGroupReceiptScope()}
-                  initialGroupSelection={nativeIntentGroupSelection} onGroupOpened={() => setNativeIntentGroupSelection(undefined)}
                   onBack={() => setPage("home")} onOpenTask={() => setPage("task")} /> :
                 page === "partner-resources" ? <MobilePartnerResourcesScreen colors={colors}
                   locale={locale.effectiveLocale} transport={client.partnerResourceTransport()}
@@ -1455,6 +1459,7 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
       {!newTaskInSystemBar && <Action label={mobileMessage(locale, "common.new")} onPress={() => navigate({ kind: "new-task" })} colors={colors} compact disabled={state.status !== "connected"} />}
     </View>
     <MobileSharedTaskEntries client={client} colors={colors} locale={locale} foreground={foreground} onOpen={onSelect} />
+    {foreground && state.status === "connected" && <MobileInputHandoffHomeEntry colors={colors} state={state} locale={locale} onOpen={sessionId => navigate({ kind: "session", sessionId })} />}
     {(incomingShare.batch || incomingShare.error) && <View style={[styles.card,
       { marginHorizontal: 16, marginBottom: 8, backgroundColor: colors.surface, borderColor: colors.border }]}>
       <Text accessibilityRole="alert" style={[styles.caption, { color: incomingShare.error ? colors.negative : colors.ink }]}>
@@ -1611,6 +1616,11 @@ export function SessionsScreen({ colors, state, locale, onNew, onSelect, onMenu,
 }
 
 type SessionOption = "rename" | "copy-link" | "pin" | "archive" | "delete" | "tags" | `tag:${string}`;
+
+function MobileInputHandoffHomeEntry({ colors, state, locale, onOpen }: ScreenProps & { readonly onOpen: (sessionId: string) => void }) {
+  const api = client.inputHandoffTasksApi?.();
+  return api ? <MobileInputHandoffTasks key={api.ownerKey} api={api} sessions={state.owner?.sessions ?? []} colors={colors} locale={locale} onOpen={onOpen} /> : null;
+}
 
 function HomeMenu({ visible, colors, state, locale, onClose, onClosed, onMountedChange, onSearch, onAutomations, onExtensions, onPartnerResources, onPartners, onPartnerChats, onSwitch, onSettings, onDevices }: ScreenProps & {
   visible: boolean; onClose: () => void; onClosed: () => void; onMountedChange: (mounted: boolean) => void;
@@ -1910,12 +1920,46 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
   const profileIdRef = useRef(profileId);
   profileIdRef.current = profileId;
   const identity = profileId ? { profileId } : undefined;
-  const retained = identity ? mobileNewTaskDrafts.readSync(identity)?.submission : undefined;
+  const newTaskRevision = useSyncExternalStore(listener => mobileNewTaskDrafts.subscribe(listener),
+    () => identity ? mobileNewTaskDrafts.revision(identity) : 0);
+  const retainedDraft = identity ? mobileNewTaskDrafts.readSync(identity) : null;
+  const retained = retainedDraft?.submission;
+  const localConversationOwner = useRef<{ readonly profileId: string; readonly operationId: string; readonly sessionId?: string } | undefined>(undefined);
+  useEffect(() => {
+    if (retained && retainedDraft?.conversation && profileId) {
+      localConversationOwner.current = { profileId, operationId: retained.createOperationId,
+        ...(retained.phase === "sending" ? { sessionId: retained.sessionId } : {}) };
+      return;
+    }
+    const previous = localConversationOwner.current;
+    if (!previous || previous.profileId !== profileId || state.busy) return;
+    localConversationOwner.current = undefined;
+    if (previous.sessionId && state.selectedId === previous.sessionId) { onCreated(); return; }
+    // A definitive create failure returns all local messages to the editable form.
+    if (retainedDraft && !retained) {
+      const restored = { targetId: retainedDraft.targetId, name: retainedDraft.name, input: retainedDraft.input,
+        ...(retainedDraft.collaboration ? { collaboration: retainedDraft.collaboration } : {}) };
+      draftRef.current = restored; setDraft(restored);
+      setComposerSelection({ start: restored.input.text.length, end: restored.input.text.length });
+    }
+  }, [newTaskRevision, profileId, state.busy, state.selectedId]);
   const pendingCreate = state.pending.some((item) => item.kind === "create");
   const targets = state.owner?.targets.filter((target) => target.state === TargetState.ACTIVE &&
     state.owner?.backends.some((backend) => backend.backendId === target.backendId
       && backend.capabilities?.capabilities.some((capability) => capability.name === capabilityNames.inputText && capability.support === CapabilitySupport.SUPPORTED))) ?? [];
   const targetAvailable = targets.some((target) => target.targetId === draft.targetId);
+  useEffect(() => {
+    if (!draftReady || !targetAvailable || !client.restoreNewTaskModel) return;
+    let current = true;
+    const targetId = draft.targetId;
+    void client.restoreNewTaskModel(targetId).then(restoredTargetId => {
+      if (!current || !mountedRef.current || draftRef.current.targetId !== targetId || restoredTargetId === targetId) return;
+      const next = { ...draftRef.current, targetId: restoredTargetId };
+      draftRef.current = next; setDraft(next);
+      if (identity) mobileNewTaskDrafts.save(identity, next);
+    }).catch(() => undefined);
+    return () => { current = false; };
+  }, [draftReady, draft.targetId, profileId, targetAvailable]);
   const voiceTransport = client.newTaskVoiceTransport(draft.targetId);
   const sessionMentionControls = client.newTaskSessionMentionControls(draft.targetId);
   const workspaceMentionControls = client.newTaskWorkspaceMentionControls(draft.targetId);
@@ -2992,14 +3036,19 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
     setError("");
     mobileNewTaskDrafts.save(identity, draft);
     void mobileNewTaskDrafts.flush(identity).then(() => client.create(draft.targetId, draft.name, draft.input, undefined, draft.collaboration, {
+      optimisticConversation: true,
       signal: decision.controller.signal, waitForLeaveDecision: () => decision.waitForLeaveDecision(),
       onUploadingChange: uploading => { if (mountedRef.current && uploadLeaveDecisionRef.current === decision) {
         uploadingSubmissionRef.current = uploading; setUploadingSubmission(uploading);
       } }
     })).then((result) => {
-      if (result.sessionId) onCreated();
+      if (result.sessionId && result.definitive && !mobileNewTaskDrafts.readSync(identity)?.submission && mountedRef.current
+        && client.state.activeProfileId === identity.profileId && client.state.selectedId === result.sessionId) onCreated();
     }).catch((failure) => { if (mountedRef.current && !decision.controller.signal.aborted) setError(errorText(failure)); });
   };
+  if (identity && retained && retainedDraft?.conversation) return <MobilePendingNewTaskConversation
+    key={`${identity.profileId}:${retained.createOperationId}`} client={client} store={mobileNewTaskDrafts} identity={identity}
+    draft={retainedDraft} colors={colors} locale={locale} onBack={requestLeave} error={error || state.error} />;
   return <ScrollView contentContainerStyle={styles.screen} keyboardShouldPersistTaps="handled">
     <Back label={mobileMessage(locale, "common.tasks")}
       accessibilityLabel={mobileMessage(locale, "common.backTo", { label: mobileMessage(locale, "common.tasks") })}
@@ -3283,6 +3332,17 @@ function NewTaskScreen({ colors, state, locale, onBack, onCreated, onImportedExi
           setComposerSelection(nextSelection);
         }} />
     </View>
+    {ownerReady && targetAvailable && client.newTaskModels && <MobileNewTaskModelSelector models={client.newTaskModels(draft.targetId)}
+      value={client.newTaskModelSelection(draft.targetId)} favorites={state.owner?.settings?.modelFavorites}
+      colors={colors} locale={locale} disabled={state.busy || attachmentBusy || voice.busy || retained !== undefined || pendingCreate}
+      onSelect={async selection => {
+        const source = draftRef.current, ownerProfileId = profileIdRef.current;
+        const targetId = await client.selectNewTaskModel(source.targetId, selection,
+          () => mountedRef.current && profileIdRef.current === ownerProfileId && draftRef.current === source);
+        if (!mountedRef.current || profileIdRef.current !== ownerProfileId || draftRef.current !== source) throw new Error(mobileMessage(locale, "newTask.returnActive"));
+        patchDraft({ targetId });
+      }}
+      onFavorite={selection => client.addNewTaskModelFavorite(draftRef.current.targetId, selection)} />}
     {retained && <View accessibilityLiveRegion="polite" style={[styles.card, { backgroundColor: colors.brandBackground, borderColor: colors.border }]}>
       <Text style={[styles.label, { color: colors.ink }]}>{mobileMessage(locale,
         retained.phase === "creating" ? "newTask.creationRetained" : "newTask.messageRetained")}</Text>
@@ -3480,7 +3540,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const [runtimeControlsVisible, setRuntimeControlsVisible] = useState(false);
   const [sharedBackendChoices, setSharedBackendChoices] = useState(false);
   const [partnerSettingsOwner, setPartnerSettingsOwner] = useState<string>();
-  const [partnerHome, setPartnerHome] = useState<{ readonly api: import("@joko/contracts").PartnerHomeApi; readonly partnerId: string; readonly revision: bigint }>();
+  const [partnerHome, setPartnerHome] = useState<{ readonly api: import("@joko/contracts").PartnerHomeApi; readonly partnerId: string; readonly revision: bigint; readonly inputHandoff: boolean }>();
   const [partnerLearningEntry, setPartnerLearningEntry] = useState<{ readonly owner: string;
     readonly destination: PartnerLearningSettingsDestination; readonly messageId: string; readonly completionEventId: string }>();
   const [partnerOutputsShell, setPartnerOutputsShell] = useState<{ readonly identity: string; readonly owner: string;
@@ -3881,7 +3941,21 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
   const advertisedQueueCapabilities = client.taskQueueCapabilities();
   const queueCapabilities = workerReadOnly ? { ...advertisedQueueCapabilities, edit: false, cancel: false, reorder: false } : advertisedQueueCapabilities;
   const interactions = state.status === "connected" ? client.taskInteractions() : [];
+  const inputHandoffApi = state.status === "connected" && !workerReadOnly ? client.taskInputHandoffApi?.() : undefined;
   const runtimeControls = state.status === "connected" ? client.taskRuntimeControls() : undefined;
+  useEffect(() => {
+    if (!runtimeControls || !client.refreshTaskRuntimeSelection || workerReadOnly) return;
+    let current = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const read = async (): Promise<void> => {
+      try {
+        const pending = await client.refreshTaskRuntimeSelection();
+        if (current && pending) timer = setTimeout(() => { void read(); }, 2_000);
+      } catch { /* Retain the last exact-owner display until the next foreground read. */ }
+    };
+    void read();
+    return () => { current = false; if (timer) clearTimeout(timer); };
+  }, [runtimeControls?.surfaceOwnerKey, runtimeControls?.pendingModel?.key, runtimeControlsVisible, workerReadOnly]);
   const providerUsageTransport = state.status === "connected" ? client.taskProviderUsageTransport() : undefined;
   const usageProviders = providerUsageTransport?.providers.filter(provider => provider.providerId === session?.model?.model?.providerId) ?? [];
   const usageProvider = usageProviders.length === 1 ? usageProviders[0] : undefined;
@@ -6451,6 +6525,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       <Action label={mobileMessage(locale, "composer.cancelEdit")} colors={colors} compact disabled={state.status !== "connected" || state.busy}
         onPress={cancelQueueEdit} />
     </View>}
+    {inputHandoffApi && !conversationShare.active && <MobileInputHandoffPanel api={inputHandoffApi} colors={colors} locale={locale} />}
     {partnerRead.partner?.lifecycle === "paused" && <Text accessibilityLiveRegion="polite" style={{ color: colors.muted }}>{partnerResumeMessages(locale).paused}</Text>}
     {partnerRead.partner && partnerWorkingStatus && !conversationShare.active && interactions.length === 0
       && <View style={[styles.partnerWorkingFrame, { backgroundColor: colors.surface }]}>
@@ -6826,6 +6901,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       }}
       onError={setLocalError} />
     {partnerHome && <MobilePartnerHomeSheet key={partnerHome.api.ownerKey} api={partnerHome.api} partnerId={partnerHome.partnerId} revision={partnerHome.revision}
+      inputHandoff={partnerHome.inputHandoff}
       locale={locale} colors={colors} newRequestId={randomUUID} onClose={() => setPartnerHome(undefined)} onChanged={sessionId => {
         void client.refresh().then(() => client.select(sessionId)).then(() => setPartnerHome(undefined)).catch(() => setLocalError(mobileMessage(locale, "partnerProfile.failed")));
       }} />}
@@ -6836,7 +6912,7 @@ export function TaskScreen({ colors, state, locale, onBack, onHome, onNew, onFil
       memoryFactory={(partner, ownerKey) => client.partnerMemoryEditor(partner, ownerKey)}
       connectionsFactory={(partner, ownerKey) => client.partnerConnectionsEditor(partner, ownerKey)}
       skillsFactory={(partner, ownerKey) => client.partnerSkillsEditor(partner, ownerKey)}
-      onOpenHome={partner => { const api = client.partnerHomeApi(); if (api) setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision }); }}
+      onOpenHome={partner => { const api = client.partnerHomeApi(); if (api) setPartnerHome({ api, partnerId: partner.partnerId, revision: partner.revision, inputHandoff: partner.capabilities.inputHandoff ?? true }); }}
       deletionTransport={client.partnerDeletionTransport()}
       restartTransport={client.partnerRestartTransport()}
       resumeFactory={partner => client.partnerResumeEditor(partner, partnerProfileTransport?.ownerKey)}
